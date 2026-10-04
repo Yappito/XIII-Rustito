@@ -1,0 +1,46 @@
+{
+  "date": "2026-10-04",
+  "scope": "research metadata and design handoff; no runtime implementation",
+  "gog": {
+    "hashed_files": 344,
+    "package_tables_passed": 196,
+    "package_errors": 0
+  },
+  "steam_local_patched": {
+    "hashed_files": 376,
+    "package_tables_passed": 213,
+    "package_errors": 0
+  },
+  "asset_comparison": {
+    "identical": 310,
+    "changed": 4,
+    "ambiguous": 0,
+    "only_gog": 0,
+    "only_steam": 17
+  },
+  "synthetic_tests": {
+    "command": "python3 -m unittest discover -s tools -p 'test_*.py'",
+    "passed": 8,
+    "failed": 0
+  },
+  "evidence_rebuild": {
+    "command": "python3 tools/build_evidence.py --gog-root XIII_Game",
+    "exit_code": 0,
+    "focus_packages_hash_checked": 8
+  },
+  "documentation": {
+    "local_markdown_links_checked": true,
+    "missing_links": []
+  },
+  "not_tested": [
+    "object payload/geometry decode",
+    "animation playback",
+    "function bytecode decode/execution",
+    "native behavior compatibility",
+    "HX bank decoding",
+    "Bink playback",
+    "native Windows Bevy build/run",
+    "original game/editor/UCC execution"
+  ],
+  "source_installation_mutations_by_this_work": []
+}

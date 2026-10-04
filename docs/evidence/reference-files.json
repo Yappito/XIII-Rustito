@@ -1,0 +1,115 @@
+{
+  "checked": "2026-10-04",
+  "files": [
+    {
+      "local_research_file": "iw4l-readme.md",
+      "source": "https://github.com/vladtrc/iw4L/blob/d352dbdfd8778f12b5f93908bb5ccbc55561acca/README.md",
+      "sha256": "dae44dd47ccc68a1ef9b1571fb2b06e2b33da36815283631e7eb8bc80881d00f"
+    },
+    {
+      "local_research_file": "iw4l-cargo.toml",
+      "source": "https://github.com/vladtrc/iw4L/blob/d352dbdfd8778f12b5f93908bb5ccbc55561acca/Cargo.toml",
+      "sha256": "1961656e9ed11c3f336d776c64e19c86f618182046e1eb0ce36d4e9ca8a4113f"
+    },
+    {
+      "local_research_file": "iw4l-map-load.md",
+      "source": "https://github.com/vladtrc/iw4L/blob/d352dbdfd8778f12b5f93908bb5ccbc55561acca/docs/MAP-LOAD.md",
+      "sha256": "830792faed99927e3757968e76f62dfbdaee5d31574af2f6a23b52047a317df2"
+    },
+    {
+      "local_research_file": "iw4l-gsc-runtime.md",
+      "source": "https://github.com/vladtrc/iw4L/blob/d352dbdfd8778f12b5f93908bb5ccbc55561acca/docs/GSC-RUNTIME.md",
+      "sha256": "07d74cc712f4dd029bc2bb7abfe20c2f4c61df7ff99238638a8a9aac1c272015"
+    },
+    {
+      "local_research_file": "iw4l-render.md",
+      "source": "https://github.com/vladtrc/iw4L/blob/d352dbdfd8778f12b5f93908bb5ccbc55561acca/docs/RENDER.md",
+      "sha256": "361943c2d26363a32f5d1e0fac2ac310148e3979b6626136c3d28bfa58470405"
+    },
+    {
+      "local_research_file": "iw4l-sim-step.md",
+      "source": "https://github.com/vladtrc/iw4L/blob/d352dbdfd8778f12b5f93908bb5ccbc55561acca/docs/SIM-STEP.md",
+      "sha256": "ea3cd7331473cd75a6c37f5795f273bc344e26443a6acc10ac8e650edac9d314"
+    },
+    {
+      "local_research_file": "iw4l-steam.rs",
+      "source": "https://github.com/vladtrc/iw4L/blob/d352dbdfd8778f12b5f93908bb5ccbc55561acca/crates/asset_transport/src/steam.rs",
+      "sha256": "0755861fd3388dbc46b0cc8855a035b853438261ea52ca373a583ef9379fa6ce"
+    },
+    {
+      "local_research_file": "iw4l-artifact-cache.rs",
+      "source": "https://github.com/vladtrc/iw4L/blob/d352dbdfd8778f12b5f93908bb5ccbc55561acca/crates/asset_transport/src/artifact_cache.rs",
+      "sha256": "b20c533caa21a8b12798887d9420c65a2621a773dc162b3fe98af21c5a9c7b0e"
+    },
+    {
+      "local_research_file": "umodel-LICENSE.txt",
+      "source": "https://github.com/gildor2/UEViewer/blob/a0bfb468d42be831b126632fd8a0ae6b3614f981/LICENSE.txt",
+      "sha256": "23831a13a99f726e62388efade7f0b8a778f1b84e40dec8a4bf4a1e481ccbdfe"
+    },
+    {
+      "local_research_file": "umodel-Unreal_UnrealMaterial_UnTexture2.cpp",
+      "source": "https://github.com/gildor2/UEViewer/blob/a0bfb468d42be831b126632fd8a0ae6b3614f981/Unreal/UnrealMaterial/UnTexture2.cpp",
+      "sha256": "675e3afe367d1bc949fedb03d4301e3ba09391ae606a5c6b1aecb45a7ab7ad72"
+    },
+    {
+      "local_research_file": "umodel-Unreal_UnrealMesh_UnMesh2.cpp",
+      "source": "https://github.com/gildor2/UEViewer/blob/a0bfb468d42be831b126632fd8a0ae6b3614f981/Unreal/UnrealMesh/UnMesh2.cpp",
+      "sha256": "c1c2778392b39aad168fe7a31893ea9f64b90e34945868d00b7bd948b373df46"
+    },
+    {
+      "local_research_file": "umodel-Unreal_UnrealMesh_UnMesh2.h",
+      "source": "https://github.com/gildor2/UEViewer/blob/a0bfb468d42be831b126632fd8a0ae6b3614f981/Unreal/UnrealMesh/UnMesh2.h",
+      "sha256": "8557058200be31a6bd133e0a9bbd912b06360475dd10f7fcf085f311eb38dfcb"
+    },
+    {
+      "local_research_file": "umodel-Unreal_UnrealPackage_UnPackage.cpp",
+      "source": "https://github.com/gildor2/UEViewer/blob/a0bfb468d42be831b126632fd8a0ae6b3614f981/Unreal/UnrealPackage/UnPackage.cpp",
+      "sha256": "2fecd42bc53d6d7253ad3fba7e7fde56e5ff609716aa12514deffed83ff50a00"
+    },
+    {
+      "local_research_file": "uelib-LICENSE",
+      "source": "https://github.com/EliotVU/Unreal-Library/blob/3207a17e9b294be3d1bf26b18e07ccff7e1d4b0c/LICENSE",
+      "sha256": "1decb3e8db7537e570b2dd348450f5f9d33fcc112c0951928f740600f7f09253"
+    },
+    {
+      "local_research_file": "vgmstream-hx.c",
+      "source": "https://github.com/vgmstream/vgmstream/blob/7dc938fa2f210943b37c7b6511852b516ef432ab/src/meta/ubi_hx.c",
+      "sha256": "a264e8a86aef8c0851e8cdb92fcd73a07549afc67c9f9070829ce146f10348aa"
+    },
+    {
+      "local_research_file": "vgmstream-license.txt",
+      "source": "https://github.com/vgmstream/vgmstream/blob/7dc938fa2f210943b37c7b6511852b516ef432ab/COPYING",
+      "sha256": "fcc26d35c4c4365e31f21734f846e4ee362ff0b57ba696085605a7b4768d8763"
+    },
+    {
+      "local_research_file": "xiii-scripts-readme.md",
+      "source": "https://github.com/pingwindev/xiii-unrealscript/blob/9c2568a6e0fa3c5fbf753dbf6e457876f5e4593e/README.md",
+      "sha256": "304052018c361635c0999223cb24ff8d02a83eb63ffb51017bbc846e34cffd33"
+    },
+    {
+      "local_research_file": "surreal-readme.md",
+      "source": "https://github.com/dpjudas/SurrealEngine/blob/cd0d0a229be22ce167c45a3ddb48e48e15201691/README.md",
+      "sha256": "89de5da7806e265c814d9d78bb6ee03ffaf33f990467884072c08feabcee0670"
+    },
+    {
+      "local_research_file": "bevy-cargo.toml",
+      "source": "https://github.com/bevyengine/bevy/blob/v0.19.1/Cargo.toml",
+      "sha256": "d9c961b48e848c55c39c5a58bfade2f82432fe0d013ea4f34c4497ad55e7fccf"
+    },
+    {
+      "local_research_file": "bevy-asset-loader.rs",
+      "source": "https://github.com/bevyengine/bevy/blob/v0.19.1/examples/asset/custom_asset.rs",
+      "sha256": "e293ec15603cf48a82135dd46b9f12fa081c6da9639ec8e4d041f3529bdb558f"
+    },
+    {
+      "local_research_file": "bevy-material.rs",
+      "source": "https://github.com/bevyengine/bevy/blob/v0.19.1/examples/shader/shader_material.rs",
+      "sha256": "f163b6be22dbd8b5a7d93cf3e933d88d49ec8b50aedf3c72e3755d07ccda0799"
+    },
+    {
+      "local_research_file": "bevy-fixed.rs",
+      "source": "https://github.com/bevyengine/bevy/blob/v0.19.1/examples/movement/physics_in_fixed_timestep.rs",
+      "sha256": "dcf3bccbbd7cbfadddd69af3623dad9f22e9735890903113789af86a48b4ef82"
+    }
+  ]
+}

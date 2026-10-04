@@ -1,0 +1,1285 @@
+{
+  "identical": [
+    {
+      "gog_path": "Sounds/PC/Amos01.hsc",
+      "steam_path": "Sounds/PC/Amos01.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Amos01.hxc",
+      "steam_path": "Sounds/PC/Amos01.hxc"
+    },
+    {
+      "gog_path": "Maps/Amos01.unr",
+      "steam_path": "Maps/BaseSP/Amos01.unr"
+    },
+    {
+      "gog_path": "Sounds/Amos01Voices.uax",
+      "steam_path": "Sounds/Amos01Voices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/Banque01.hsc",
+      "steam_path": "Sounds/PC/Banque01.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Banque01.hxc",
+      "steam_path": "Sounds/PC/Banque01.hxc"
+    },
+    {
+      "gog_path": "Maps/Banque01.unr",
+      "steam_path": "Maps/BaseSP/Banque01.unr"
+    },
+    {
+      "gog_path": "Sounds/Banque01Voices.uax",
+      "steam_path": "Sounds/Banque01Voices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/Base01.hsc",
+      "steam_path": "Sounds/PC/Base01.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Base01.hxc",
+      "steam_path": "Sounds/PC/Base01.hxc"
+    },
+    {
+      "gog_path": "Maps/Base01.unr",
+      "steam_path": "Maps/BaseSP/Base01.unr"
+    },
+    {
+      "gog_path": "Sounds/Base01Voices.uax",
+      "steam_path": "Sounds/Base01Voices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/Base_Multi.hxc",
+      "steam_path": "Sounds/PC/Base_Multi.hxc"
+    },
+    {
+      "gog_path": "Sounds/PC/Bateau01.hsc",
+      "steam_path": "Sounds/PC/Bateau01.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Bateau01.hxc",
+      "steam_path": "Sounds/PC/Bateau01.hxc"
+    },
+    {
+      "gog_path": "Maps/Bateau01.unr",
+      "steam_path": "Maps/BaseSP/Bateau01.unr"
+    },
+    {
+      "gog_path": "Sounds/Bateau01Voices.uax",
+      "steam_path": "Sounds/Bateau01Voices.uax"
+    },
+    {
+      "gog_path": "StaticMeshes/Bateau_pack.usx",
+      "steam_path": "StaticMeshes/Bateau_pack.usx"
+    },
+    {
+      "gog_path": "Video/Cine00.bik",
+      "steam_path": "Video/Cine00.bik"
+    },
+    {
+      "gog_path": "Video/Cine01.bik",
+      "steam_path": "Video/Cine01.bik"
+    },
+    {
+      "gog_path": "Video/Cine02.bik",
+      "steam_path": "Video/Cine02.bik"
+    },
+    {
+      "gog_path": "Video/Cine03.bik",
+      "steam_path": "Video/Cine03.bik"
+    },
+    {
+      "gog_path": "Video/Cine04.bik",
+      "steam_path": "Video/Cine04.bik"
+    },
+    {
+      "gog_path": "Video/Cine05.bik",
+      "steam_path": "Video/Cine05.bik"
+    },
+    {
+      "gog_path": "Video/Cine06.bik",
+      "steam_path": "Video/Cine06.bik"
+    },
+    {
+      "gog_path": "Video/Cine07.bik",
+      "steam_path": "Video/Cine07.bik"
+    },
+    {
+      "gog_path": "Video/Cine08.bik",
+      "steam_path": "Video/Cine08.bik"
+    },
+    {
+      "gog_path": "Video/Cine09.bik",
+      "steam_path": "Video/Cine09.bik"
+    },
+    {
+      "gog_path": "Video/Cine10.bik",
+      "steam_path": "Video/Cine10.bik"
+    },
+    {
+      "gog_path": "Video/Cine11.bik",
+      "steam_path": "Video/Cine11.bik"
+    },
+    {
+      "gog_path": "Video/Cine12.bik",
+      "steam_path": "Video/Cine12.bik"
+    },
+    {
+      "gog_path": "Video/Cine13.bik",
+      "steam_path": "Video/Cine13.bik"
+    },
+    {
+      "gog_path": "Video/Cine14.bik",
+      "steam_path": "Video/Cine14.bik"
+    },
+    {
+      "gog_path": "Video/Cine15.bik",
+      "steam_path": "Video/Cine15.bik"
+    },
+    {
+      "gog_path": "system/core.u",
+      "steam_path": "System/Core.u"
+    },
+    {
+      "gog_path": "Sounds/PC/CTF_Base.hxc",
+      "steam_path": "Sounds/PC/CTF_Base.hxc"
+    },
+    {
+      "gog_path": "Maps/CTF_Base.unr",
+      "steam_path": "Maps/BaseMP/CTF_Base.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/CTF_Sanc.hxc",
+      "steam_path": "Sounds/PC/CTF_Sanc.hxc"
+    },
+    {
+      "gog_path": "Maps/ctf_Sanc.unr",
+      "steam_path": "Maps/BaseMP/ctf_Sanc.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/CTF_Snow.hxc",
+      "steam_path": "Sounds/PC/CTF_Snow.hxc"
+    },
+    {
+      "gog_path": "Maps/CTF_Snow.unr",
+      "steam_path": "Maps/BaseMP/CTF_Snow.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/CTF_Temple.hxc",
+      "steam_path": "Sounds/PC/CTF_Temple.hxc"
+    },
+    {
+      "gog_path": "Maps/CTF_Temple.unr",
+      "steam_path": "Maps/BaseMP/CTF_Temple.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/CTF_Toits.hxc",
+      "steam_path": "Sounds/PC/CTF_Toits.hxc"
+    },
+    {
+      "gog_path": "Maps/CTF_Toits.unr",
+      "steam_path": "Maps/BaseMP/CTF_Toits.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/defaultmulti.hsc",
+      "steam_path": "Sounds/PC/defaultmulti.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/defaultmulti.hxc",
+      "steam_path": "Sounds/PC/defaultmulti.hxc"
+    },
+    {
+      "gog_path": "Sounds/PC/DM_Amos.hxc",
+      "steam_path": "Sounds/PC/DM_Amos.hxc"
+    },
+    {
+      "gog_path": "Maps/DM_Amos.unr",
+      "steam_path": "Maps/BaseMP/DM_Amos.unr"
+    },
+    {
+      "gog_path": "Maps/DM_Banque.unr",
+      "steam_path": "Maps/BaseMP/DM_Banque.unr"
+    },
+    {
+      "gog_path": "Maps/DM_Base.unr",
+      "steam_path": "Maps/BaseMP/DM_Base.unr"
+    },
+    {
+      "gog_path": "Maps/DM_Base2.unr",
+      "steam_path": "Maps/BaseMP/DM_Base2.unr"
+    },
+    {
+      "gog_path": "Maps/DM_Base_XBox.unr",
+      "steam_path": "Maps/BaseMP/DM_Base_XBox.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/DM_BXbox.hxc",
+      "steam_path": "Sounds/PC/DM_BXbox.hxc"
+    },
+    {
+      "gog_path": "Maps/DM_Hual04a.unr",
+      "steam_path": "Maps/BaseMP/DM_Hual04a.unr"
+    },
+    {
+      "gog_path": "Maps/DM_Hual1.unr",
+      "steam_path": "Maps/BaseMP/DM_Hual1.unr"
+    },
+    {
+      "gog_path": "Maps/DM_LostTemple.unr",
+      "steam_path": "Maps/BaseMP/DM_LostTemple.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/DM_Pal.hxc",
+      "steam_path": "Sounds/PC/DM_Pal.hxc"
+    },
+    {
+      "gog_path": "Maps/DM_Pal.unr",
+      "steam_path": "Maps/BaseMP/DM_Pal.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/DM_PRock.hxc",
+      "steam_path": "Sounds/PC/DM_PRock.hxc"
+    },
+    {
+      "gog_path": "Maps/DM_PRock.unr",
+      "steam_path": "Maps/BaseMP/DM_PRock.unr"
+    },
+    {
+      "gog_path": "Maps/DM_PRock01a.unr",
+      "steam_path": "Maps/BaseMP/DM_PRock01a.unr"
+    },
+    {
+      "gog_path": "Maps/DM_SM01.unr",
+      "steam_path": "Maps/BaseMP/DM_SM01.unr"
+    },
+    {
+      "gog_path": "Maps/DM_SPADS.unr",
+      "steam_path": "Maps/BaseMP/DM_SPADS.unr"
+    },
+    {
+      "gog_path": "Maps/DM_SPADS_XBox.unr",
+      "steam_path": "Maps/BaseMP/DM_SPADS_XBox.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/DM_SXbox.hxc",
+      "steam_path": "Sounds/PC/DM_SXbox.hxc"
+    },
+    {
+      "gog_path": "Maps/dm_testpath.unr",
+      "steam_path": "Maps/BaseMP/dm_testpath.unr"
+    },
+    {
+      "gog_path": "Maps/DM_USA01.unr",
+      "steam_path": "Maps/BaseMP/DM_USA01.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/DM_USA2.hsc",
+      "steam_path": "Sounds/PC/DM_USA2.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/DM_USA2.hxc",
+      "steam_path": "Sounds/PC/DM_USA2.hxc"
+    },
+    {
+      "gog_path": "Maps/DM_USA2_demo.unr",
+      "steam_path": "Maps/BaseMP/DM_USA2_demo.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/DM_Warehouse.hxc",
+      "steam_path": "Sounds/PC/DM_Warehouse.hxc"
+    },
+    {
+      "gog_path": "Maps/DM_Warehouse.unr",
+      "steam_path": "Maps/BaseMP/DM_Warehouse.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/DU_PPRock01a.hxc",
+      "steam_path": "Sounds/PC/DU_PPRock01a.hxc"
+    },
+    {
+      "gog_path": "Sounds/PC/DU_SM01.hxc",
+      "steam_path": "Sounds/PC/DU_SM01.hxc"
+    },
+    {
+      "gog_path": "Sounds/PC/DU_USA01.hxc",
+      "steam_path": "Sounds/PC/DU_USA01.hxc"
+    },
+    {
+      "gog_path": "Sounds/PC/DuelRoom.hxc",
+      "steam_path": "Sounds/PC/DuelRoom.hxc"
+    },
+    {
+      "gog_path": "system/editor.u",
+      "steam_path": "System/Editor.u"
+    },
+    {
+      "gog_path": "Maps/Empty.unr",
+      "steam_path": "Maps/BaseSP/Empty.unr"
+    },
+    {
+      "gog_path": "system/engine.u",
+      "steam_path": "System/Engine.u"
+    },
+    {
+      "gog_path": "Maps/Entry.unr",
+      "steam_path": "Maps/BaseSP/Entry.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/Fix.hxc",
+      "steam_path": "Sounds/PC/Fix.hxc"
+    },
+    {
+      "gog_path": "Sounds/Footsteps.uax",
+      "steam_path": "Sounds/Footsteps.uax"
+    },
+    {
+      "gog_path": "StaticMeshes/FredPrivate.usx",
+      "steam_path": "StaticMeshes/FredPrivate.usx"
+    },
+    {
+      "gog_path": "system/gameplay.u",
+      "steam_path": "System/GamePlay.u"
+    },
+    {
+      "gog_path": "system/PC/gui.u",
+      "steam_path": "System/GUI.u"
+    },
+    {
+      "gog_path": "TexturesPC/GUIContent.utx",
+      "steam_path": "Textures/GUIContent.utx"
+    },
+    {
+      "gog_path": "Sounds/PC/Hu04a.hxc",
+      "steam_path": "Sounds/PC/Hu04a.hxc"
+    },
+    {
+      "gog_path": "Sounds/PC/Hual01a.hsc",
+      "steam_path": "Sounds/PC/Hual01a.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Hual01a.hxc",
+      "steam_path": "Sounds/PC/Hual01a.hxc"
+    },
+    {
+      "gog_path": "Maps/Hual01a.unr",
+      "steam_path": "Maps/BaseSP/Hual01a.unr"
+    },
+    {
+      "gog_path": "Sounds/Hual01aVoices.uax",
+      "steam_path": "Sounds/Hual01aVoices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/Hual01b.hsc",
+      "steam_path": "Sounds/PC/Hual01b.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Hual01b.hxc",
+      "steam_path": "Sounds/PC/Hual01b.hxc"
+    },
+    {
+      "gog_path": "Maps/Hual01b.unr",
+      "steam_path": "Maps/BaseSP/Hual01b.unr"
+    },
+    {
+      "gog_path": "Sounds/Hual01bVoices.uax",
+      "steam_path": "Sounds/Hual01bVoices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/Hual02.hsc",
+      "steam_path": "Sounds/PC/Hual02.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Hual02.hxc",
+      "steam_path": "Sounds/PC/Hual02.hxc"
+    },
+    {
+      "gog_path": "Maps/Hual02.unr",
+      "steam_path": "Maps/BaseSP/Hual02.unr"
+    },
+    {
+      "gog_path": "Sounds/Hual02Voices.uax",
+      "steam_path": "Sounds/Hual02Voices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/Hual04a.hsc",
+      "steam_path": "Sounds/PC/Hual04a.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Hual04a.hxc",
+      "steam_path": "Sounds/PC/Hual04a.hxc"
+    },
+    {
+      "gog_path": "Maps/Hual04a.unr",
+      "steam_path": "Maps/BaseSP/Hual04a.unr"
+    },
+    {
+      "gog_path": "Sounds/Hual04aVoices.uax",
+      "steam_path": "Sounds/Hual04aVoices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/Hual04c.hsc",
+      "steam_path": "Sounds/PC/Hual04c.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Hual04c.hxc",
+      "steam_path": "Sounds/PC/Hual04c.hxc"
+    },
+    {
+      "gog_path": "Maps/Hual04c.unr",
+      "steam_path": "Maps/BaseSP/Hual04c.unr"
+    },
+    {
+      "gog_path": "Sounds/Hual04cVoices.uax",
+      "steam_path": "Sounds/Hual04cVoices.uax"
+    },
+    {
+      "gog_path": "system/ipdrv.u",
+      "steam_path": "System/IpDrv.u"
+    },
+    {
+      "gog_path": "Sounds/PC/Kello01a.hsc",
+      "steam_path": "Sounds/PC/Kello01a.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Kello01a.hxc",
+      "steam_path": "Sounds/PC/Kello01a.hxc"
+    },
+    {
+      "gog_path": "Maps/Kello01a.unr",
+      "steam_path": "Maps/BaseSP/Kello01a.unr"
+    },
+    {
+      "gog_path": "Sounds/Kello01aVoices.uax",
+      "steam_path": "Sounds/Kello01aVoices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/Kello01b.hsc",
+      "steam_path": "Sounds/PC/Kello01b.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Kello01b.hxc",
+      "steam_path": "Sounds/PC/Kello01b.hxc"
+    },
+    {
+      "gog_path": "Maps/Kello01b.unr",
+      "steam_path": "Maps/BaseSP/Kello01b.unr"
+    },
+    {
+      "gog_path": "Sounds/Kello01bVoices.uax",
+      "steam_path": "Sounds/Kello01bVoices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/MapCredits.hsc",
+      "steam_path": "Sounds/PC/MapCredits.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/MapCredits.hxc",
+      "steam_path": "Sounds/PC/MapCredits.hxc"
+    },
+    {
+      "gog_path": "Maps/MapCredits.unr",
+      "steam_path": "Maps/BaseSP/MapCredits.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/MapMenu.hsc",
+      "steam_path": "Sounds/PC/MapMenu.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/MapMenu.hxc",
+      "steam_path": "Sounds/PC/MapMenu.hxc"
+    },
+    {
+      "gog_path": "Maps/MapMenu.unr",
+      "steam_path": "Maps/BaseSP/MapMenu.unr"
+    },
+    {
+      "gog_path": "TexturesPC/MenuDemo.utx",
+      "steam_path": "Textures/MenuDemo.utx"
+    },
+    {
+      "gog_path": "StaticMeshes/MeshArmesPickup.usx",
+      "steam_path": "StaticMeshes/MeshArmesPickup.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/Meshes_Communs.usx",
+      "steam_path": "StaticMeshes/Meshes_Communs.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/Meshes_Smarin.usx",
+      "steam_path": "StaticMeshes/Meshes_Smarin.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/Meshes_Vehicules.usx",
+      "steam_path": "StaticMeshes/Meshes_Vehicules.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/MeshObjetsPickup.usx",
+      "steam_path": "StaticMeshes/MeshObjetsPickup.usx"
+    },
+    {
+      "gog_path": "TexturesPC/MUL_Common.utx",
+      "steam_path": "Textures/MUL_Common.utx"
+    },
+    {
+      "gog_path": "Sounds/Onomatopees.uax",
+      "steam_path": "Sounds/Onomatopees.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/Palace01.hsc",
+      "steam_path": "Sounds/PC/Palace01.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Palace01.hxc",
+      "steam_path": "Sounds/PC/Palace01.hxc"
+    },
+    {
+      "gog_path": "Maps/Palace01.unr",
+      "steam_path": "Maps/BaseSP/Palace01.unr"
+    },
+    {
+      "gog_path": "Sounds/Palace01Voices.uax",
+      "steam_path": "Sounds/Palace01Voices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/Payback.hxc",
+      "steam_path": "Sounds/PC/Payback.hxc"
+    },
+    {
+      "gog_path": "StaticMeshes/PersosMorts.usx",
+      "steam_path": "StaticMeshes/PersosMorts.usx"
+    },
+    {
+      "gog_path": "Sounds/PC/Plage00.hsc",
+      "steam_path": "Sounds/PC/Plage00.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Plage00.hxc",
+      "steam_path": "Sounds/PC/Plage00.hxc"
+    },
+    {
+      "gog_path": "Maps/Plage00.unr",
+      "steam_path": "Maps/BaseSP/Plage00.unr"
+    },
+    {
+      "gog_path": "Sounds/Plage00Voices.uax",
+      "steam_path": "Sounds/Plage00Voices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/Plage01.hsc",
+      "steam_path": "Sounds/PC/Plage01.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Plage01.hxc",
+      "steam_path": "Sounds/PC/Plage01.hxc"
+    },
+    {
+      "gog_path": "Maps/Plage01.unr",
+      "steam_path": "Maps/BaseSP/Plage01.unr"
+    },
+    {
+      "gog_path": "Sounds/Plage01Voices.uax",
+      "steam_path": "Sounds/Plage01Voices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/PRock01a.hsc",
+      "steam_path": "Sounds/PC/PRock01a.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/PRock01a.hxc",
+      "steam_path": "Sounds/PC/PRock01a.hxc"
+    },
+    {
+      "gog_path": "Maps/PRock01a.unr",
+      "steam_path": "Maps/BaseSP/PRock01a.unr"
+    },
+    {
+      "gog_path": "Sounds/Prock01aVoices.uax",
+      "steam_path": "Sounds/Prock01aVoices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/PRock03.hsc",
+      "steam_path": "Sounds/PC/PRock03.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/PRock03.hxc",
+      "steam_path": "Sounds/PC/PRock03.hxc"
+    },
+    {
+      "gog_path": "Maps/PRock03.unr",
+      "steam_path": "Maps/BaseSP/PRock03.unr"
+    },
+    {
+      "gog_path": "Sounds/Prock03Voices.uax",
+      "steam_path": "Sounds/Prock03Voices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/PRock04a.hsc",
+      "steam_path": "Sounds/PC/PRock04a.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/PRock04a.hxc",
+      "steam_path": "Sounds/PC/PRock04a.hxc"
+    },
+    {
+      "gog_path": "Maps/PRock04a.unr",
+      "steam_path": "Maps/BaseSP/PRock04a.unr"
+    },
+    {
+      "gog_path": "Sounds/Prock04aVoices.uax",
+      "steam_path": "Sounds/Prock04aVoices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/PRock04b.hsc",
+      "steam_path": "Sounds/PC/PRock04b.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/PRock04b.hxc",
+      "steam_path": "Sounds/PC/PRock04b.hxc"
+    },
+    {
+      "gog_path": "Maps/PRock04b.unr",
+      "steam_path": "Maps/BaseSP/PRock04b.unr"
+    },
+    {
+      "gog_path": "Sounds/Prock04bVoices.uax",
+      "steam_path": "Sounds/Prock04bVoices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/Sanc01.hsc",
+      "steam_path": "Sounds/PC/Sanc01.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Sanc01.hxc",
+      "steam_path": "Sounds/PC/Sanc01.hxc"
+    },
+    {
+      "gog_path": "Maps/Sanc01.unr",
+      "steam_path": "Maps/BaseSP/Sanc01.unr"
+    },
+    {
+      "gog_path": "Sounds/Sanc01Voices.uax",
+      "steam_path": "Sounds/Sanc01Voices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/Sanc02a.hsc",
+      "steam_path": "Sounds/PC/Sanc02a.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Sanc02a.hxc",
+      "steam_path": "Sounds/PC/Sanc02a.hxc"
+    },
+    {
+      "gog_path": "Maps/Sanc02a.unr",
+      "steam_path": "Maps/BaseSP/Sanc02a.unr"
+    },
+    {
+      "gog_path": "Sounds/Sanc02aVoices.uax",
+      "steam_path": "Sounds/Sanc02aVoices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/Sanc02b.hsc",
+      "steam_path": "Sounds/PC/Sanc02b.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Sanc02b.hxc",
+      "steam_path": "Sounds/PC/Sanc02b.hxc"
+    },
+    {
+      "gog_path": "Maps/Sanc02b.unr",
+      "steam_path": "Maps/BaseSP/Sanc02b.unr"
+    },
+    {
+      "gog_path": "Sounds/Sanc02bVoices.uax",
+      "steam_path": "Sounds/Sanc02bVoices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/Sanc03.hsc",
+      "steam_path": "Sounds/PC/Sanc03.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Sanc03.hxc",
+      "steam_path": "Sounds/PC/Sanc03.hxc"
+    },
+    {
+      "gog_path": "Maps/Sanc03.unr",
+      "steam_path": "Maps/BaseSP/Sanc03.unr"
+    },
+    {
+      "gog_path": "Sounds/Sanc03Voices.uax",
+      "steam_path": "Sounds/Sanc03Voices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/SB_Camp.hsc",
+      "steam_path": "Sounds/PC/SB_Camp.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/SB_Camp.hxc",
+      "steam_path": "Sounds/PC/SB_Camp.hxc"
+    },
+    {
+      "gog_path": "Maps/SB_Camp.unr",
+      "steam_path": "Maps/BaseMP/SB_Camp.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/SB_Hual01a.hsc",
+      "steam_path": "Sounds/PC/SB_Hual01a.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/SB_Hual01a.hxc",
+      "steam_path": "Sounds/PC/SB_Hual01a.hxc"
+    },
+    {
+      "gog_path": "Maps/SB_Hual1a.unr",
+      "steam_path": "Maps/BaseMP/SB_Hual1a.unr"
+    },
+    {
+      "gog_path": "Maps/SB_USA2.unr",
+      "steam_path": "Maps/BaseMP/SB_USA2.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/SM01.hsc",
+      "steam_path": "Sounds/PC/SM01.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/SM01.hxc",
+      "steam_path": "Sounds/PC/SM01.hxc"
+    },
+    {
+      "gog_path": "Sounds/SM01Voices.uax",
+      "steam_path": "Sounds/SM01Voices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/SM02.hsc",
+      "steam_path": "Sounds/PC/SM02.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/SM02.hxc",
+      "steam_path": "Sounds/PC/SM02.hxc"
+    },
+    {
+      "gog_path": "Sounds/SM02Voices.uax",
+      "steam_path": "Sounds/SM02Voices.uax"
+    },
+    {
+      "gog_path": "Maps/SMarin01.unr",
+      "steam_path": "Maps/BaseSP/SMarin01.unr"
+    },
+    {
+      "gog_path": "Maps/SMarin02.unr",
+      "steam_path": "Maps/BaseSP/SMarin02.unr"
+    },
+    {
+      "gog_path": "Sounds/PC/SPADS01.hsc",
+      "steam_path": "Sounds/PC/SPADS01.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/SPADS01.hxc",
+      "steam_path": "Sounds/PC/SPADS01.hxc"
+    },
+    {
+      "gog_path": "Maps/SPADS01.unr",
+      "steam_path": "Maps/BaseSP/SPADS01.unr"
+    },
+    {
+      "gog_path": "Sounds/SPADS01Voices.uax",
+      "steam_path": "Sounds/SPADS01Voices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/SPADS02a.hsc",
+      "steam_path": "Sounds/PC/SPADS02a.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/SPADS02a.hxc",
+      "steam_path": "Sounds/PC/SPADS02a.hxc"
+    },
+    {
+      "gog_path": "Maps/SPADS02a.unr",
+      "steam_path": "Maps/BaseSP/SPADS02a.unr"
+    },
+    {
+      "gog_path": "Sounds/SPADS02aVoices.uax",
+      "steam_path": "Sounds/SPADS02aVoices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/SPADS02b.hsc",
+      "steam_path": "Sounds/PC/SPADS02b.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/SPADS02b.hxc",
+      "steam_path": "Sounds/PC/SPADS02b.hxc"
+    },
+    {
+      "gog_path": "Maps/SPADS02b.unr",
+      "steam_path": "Maps/BaseSP/SPADS02b.unr"
+    },
+    {
+      "gog_path": "Sounds/SPADS02bVoices.uax",
+      "steam_path": "Sounds/SPADS02bVoices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/SSH101a.hsc",
+      "steam_path": "Sounds/PC/SSH101a.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/SSH101a.hxc",
+      "steam_path": "Sounds/PC/SSH101a.hxc"
+    },
+    {
+      "gog_path": "Maps/SSH101a.unr",
+      "steam_path": "Maps/BaseSP/SSH101a.unr"
+    },
+    {
+      "gog_path": "Sounds/SSH101aVoices.uax",
+      "steam_path": "Sounds/SSH101aVoices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/SSH101b.hsc",
+      "steam_path": "Sounds/PC/SSH101b.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/SSH101b.hxc",
+      "steam_path": "Sounds/PC/SSH101b.hxc"
+    },
+    {
+      "gog_path": "Maps/SSH101b.unr",
+      "steam_path": "Maps/BaseSP/SSH101b.unr"
+    },
+    {
+      "gog_path": "Sounds/SSH101bVoices.uax",
+      "steam_path": "Sounds/SSH101bVoices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/SSH101c.hsc",
+      "steam_path": "Sounds/PC/SSH101c.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/SSH101c.hxc",
+      "steam_path": "Sounds/PC/SSH101c.hxc"
+    },
+    {
+      "gog_path": "Maps/SSH101c.unr",
+      "steam_path": "Maps/BaseSP/SSH101c.unr"
+    },
+    {
+      "gog_path": "Sounds/SSH101cVoices.uax",
+      "steam_path": "Sounds/SSH101cVoices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/SSH102b.hsc",
+      "steam_path": "Sounds/PC/SSH102b.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/SSH102b.hxc",
+      "steam_path": "Sounds/PC/SSH102b.hxc"
+    },
+    {
+      "gog_path": "Maps/SSH102b.unr",
+      "steam_path": "Maps/BaseSP/SSH102b.unr"
+    },
+    {
+      "gog_path": "Sounds/SSH102bVoices.uax",
+      "steam_path": "Sounds/SSH102bVoices.uax"
+    },
+    {
+      "gog_path": "StaticMeshes/SSH1_Pack.usx",
+      "steam_path": "StaticMeshes/SSH1_Pack.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StatiBarfight.usx",
+      "steam_path": "StaticMeshes/StatiBarfight.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/Static_SM.usx",
+      "steam_path": "StaticMeshes/Static_SM.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StaticAdmin.usx",
+      "steam_path": "StaticMeshes/StaticAdmin.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StatiCale.usx",
+      "steam_path": "StaticMeshes/StatiCale.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StatiCamp.usx",
+      "steam_path": "StaticMeshes/StatiCamp.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StatiCanyon.usx",
+      "steam_path": "StaticMeshes/StatiCanyon.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StaticBanque.usx",
+      "steam_path": "StaticMeshes/StaticBanque.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StaticBase.usx",
+      "steam_path": "StaticMeshes/StaticBase.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StaticExplosifs.usx",
+      "steam_path": "StaticMeshes/StaticExplosifs.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StatiChalet.usx",
+      "steam_path": "StaticMeshes/StatiChalet.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StatiChaletkellob.usx",
+      "steam_path": "StaticMeshes/StatiChaletkellob.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StatiChual01.usx",
+      "steam_path": "StaticMeshes/StatiChual01.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StaticPlage2.usx",
+      "steam_path": "StaticMeshes/StaticPlage2.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StaticPrison.usx",
+      "steam_path": "StaticMeshes/StaticPrison.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StaticPRock03.usx",
+      "steam_path": "StaticMeshes/StaticPRock03.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StaticSanc01.usx",
+      "steam_path": "StaticMeshes/StaticSanc01.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StaticSanc02a.usx",
+      "steam_path": "StaticMeshes/StaticSanc02a.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StaticSanc02b.usx",
+      "steam_path": "StaticMeshes/StaticSanc02b.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StaticSanc03.usx",
+      "steam_path": "StaticMeshes/StaticSanc03.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StaticSPADS01.usx",
+      "steam_path": "StaticMeshes/StaticSPADS01.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StaticUSA.usx",
+      "steam_path": "StaticMeshes/StaticUSA.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StatiPalace.usx",
+      "steam_path": "StaticMeshes/StatiPalace.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/StatiToit.usx",
+      "steam_path": "StaticMeshes/StatiToit.usx"
+    },
+    {
+      "gog_path": "StaticMeshes/TelephStatic.usx",
+      "steam_path": "StaticMeshes/TelephStatic.usx"
+    },
+    {
+      "gog_path": "Sounds/PC/Toits01.hsc",
+      "steam_path": "Sounds/PC/Toits01.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/Toits01.hxc",
+      "steam_path": "Sounds/PC/Toits01.hxc"
+    },
+    {
+      "gog_path": "Maps/Toits01.unr",
+      "steam_path": "Maps/BaseSP/Toits01.unr"
+    },
+    {
+      "gog_path": "Sounds/Toits01Voices.uax",
+      "steam_path": "Sounds/Toits01Voices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/USA01.hsc",
+      "steam_path": "Sounds/PC/USA01.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/USA01.hxc",
+      "steam_path": "Sounds/PC/USA01.hxc"
+    },
+    {
+      "gog_path": "Maps/USA01.unr",
+      "steam_path": "Maps/BaseSP/USA01.unr"
+    },
+    {
+      "gog_path": "Sounds/USA01Voices.uax",
+      "steam_path": "Sounds/USA01Voices.uax"
+    },
+    {
+      "gog_path": "Sounds/PC/USA02.hsc",
+      "steam_path": "Sounds/PC/USA02.hsc"
+    },
+    {
+      "gog_path": "Sounds/PC/USA02.hxc",
+      "steam_path": "Sounds/PC/USA02.hxc"
+    },
+    {
+      "gog_path": "Maps/USA02.unr",
+      "steam_path": "Maps/BaseSP/USA02.unr"
+    },
+    {
+      "gog_path": "Sounds/USA02Voices.uax",
+      "steam_path": "Sounds/USA02Voices.uax"
+    },
+    {
+      "gog_path": "system/uweb.u",
+      "steam_path": "System/UWeb.u"
+    },
+    {
+      "gog_path": "TexturesPC/UWindowFonts.utx",
+      "steam_path": "Textures/UWindowFonts.utx"
+    },
+    {
+      "gog_path": "system/xidcine.u",
+      "steam_path": "System/XIDCine.u"
+    },
+    {
+      "gog_path": "system/xidmaps.u",
+      "steam_path": "System/XIDMaps.u"
+    },
+    {
+      "gog_path": "system/xidpawn.u",
+      "steam_path": "System/XIDPawn.u"
+    },
+    {
+      "gog_path": "system/PC/xidspec.u",
+      "steam_path": "System/XIDSpec.u"
+    },
+    {
+      "gog_path": "system/xiii.u",
+      "steam_path": "System/XIII.u"
+    },
+    {
+      "gog_path": "TexturesPC/XIII_Bateau.utx",
+      "steam_path": "Textures/XIII_Bateau.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIII_Hualpar.utx",
+      "steam_path": "Textures/XIII_Hualpar.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIII_SSH1.utx",
+      "steam_path": "Textures/XIII_SSH1.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIAdmin.utx",
+      "steam_path": "Textures/XIIIAdmin.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIAmos.utx",
+      "steam_path": "Textures/XIIIAmos.utx"
+    },
+    {
+      "gog_path": "StaticMeshes/XIIIAmoStatic.usx",
+      "steam_path": "StaticMeshes/XIIIAmoStatic.usx"
+    },
+    {
+      "gog_path": "system/PC/xiiiarmes.u",
+      "steam_path": "System/XIIIArmes.u"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIBanque.utx",
+      "steam_path": "Textures/XIIIBanque.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIBar.utx",
+      "steam_path": "Textures/XIIIBar.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIBaseT.utx",
+      "steam_path": "Textures/XIIIBaseT.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIICale.utx",
+      "steam_path": "Textures/XIIICale.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIICamp.utx",
+      "steam_path": "Textures/XIIICamp.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIChalet.utx",
+      "steam_path": "Textures/XIIIChalet.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIICine.utx",
+      "steam_path": "Textures/XIIICine.utx"
+    },
+    {
+      "gog_path": "system/PC/xiiideco.u",
+      "steam_path": "System/XIIIDeco.u"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIFonts.utx",
+      "steam_path": "Textures/XIIIFonts.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIHual2.utx",
+      "steam_path": "Textures/XIIIHual2.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIKello01b.utx",
+      "steam_path": "Textures/XIIIKello01b.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIMenu.utx",
+      "steam_path": "Textures/XIIIMenu.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIMenuStart.utx",
+      "steam_path": "Textures/XIIIMenuStart.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIMeshArmes.utx",
+      "steam_path": "Textures/XIIIMeshArmes.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIMeshesSmarin.utx",
+      "steam_path": "Textures/XIIIMeshesSmarin.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIMeshObjets.utx",
+      "steam_path": "Textures/XIIIMeshObjets.utx"
+    },
+    {
+      "gog_path": "system/PC/XIIIMP.u",
+      "steam_path": "System/XIIIMP.u"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIPalace.utx",
+      "steam_path": "Textures/XIIIPalace.utx"
+    },
+    {
+      "gog_path": "system/PC/xiiipersos.u",
+      "steam_path": "System/XIIIPersos.u"
+    },
+    {
+      "gog_path": "system/PC/xiiipersosG.u",
+      "steam_path": "System/XIIIPersosG.u"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIPlage.utx",
+      "steam_path": "Textures/XIIIPlage.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIPlainRock.utx",
+      "steam_path": "Textures/XIIIPlainRock.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIPlainRock03.utx",
+      "steam_path": "Textures/XIIIPlainRock03.utx"
+    },
+    {
+      "gog_path": "StaticMeshes/XIIIPortes.usx",
+      "steam_path": "StaticMeshes/XIIIPortes.usx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIPrison.utx",
+      "steam_path": "Textures/XIIIPrison.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIISanc01.utx",
+      "steam_path": "Textures/XIIISanc01.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIISanc02a.utx",
+      "steam_path": "Textures/XIIISanc02a.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIISanc02b.utx",
+      "steam_path": "Textures/XIIISanc02b.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIISanc03.utx",
+      "steam_path": "Textures/XIIISanc03.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIISMarin.utx",
+      "steam_path": "Textures/XIIISMarin.utx"
+    },
+    {
+      "gog_path": "Sounds/XIIISound.uax",
+      "steam_path": "Sounds/XIIISound.uax"
+    },
+    {
+      "gog_path": "TexturesPC/XIIISPADS.utx",
+      "steam_path": "Textures/XIIISPADS.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIITelepherique.utx",
+      "steam_path": "Textures/XIIITelepherique.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIToits.utx",
+      "steam_path": "Textures/XIIIToits.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIUSA.utx",
+      "steam_path": "Textures/XIIIUSA.utx"
+    },
+    {
+      "gog_path": "system/PC/xiiivehicule.u",
+      "steam_path": "System/XIIIVehicule.u"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIVertexshaders.utx",
+      "steam_path": "Textures/XIIIVertexshaders.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIVignettes.utx",
+      "steam_path": "Textures/XIIIVignettes.utx"
+    },
+    {
+      "gog_path": "TexturesPC/XIIIXboxPacket.utx",
+      "steam_path": "Textures/XIIIXboxPacket.utx"
+    }
+  ],
+  "changed": [
+    {
+      "gog_path": "Video/alien.bik",
+      "steam_path": "Video/alien.bik"
+    },
+    {
+      "gog_path": "Video/nvidia.bik",
+      "steam_path": "Video/nvidia.bik"
+    },
+    {
+      "gog_path": "Video/ubi.bik",
+      "steam_path": "Video/ubi.bik"
+    },
+    {
+      "gog_path": "system/PC/xidinterf.u",
+      "steam_path": "System/XIDInterf.u"
+    }
+  ],
+  "ambiguous": [],
+  "only_gog": [],
+  "only_steam": [
+    "engineplus.u",
+    "fragface.u",
+    "ipdrvplus.u",
+    "libhttp.u",
+    "meshes_communsplus.usx",
+    "mightyfists.u",
+    "mul_commonplus.utx",
+    "previewpackage.utx",
+    "wutils.u",
+    "xidinterfplus.u",
+    "xiiimpgame.u",
+    "xiiimpgamecfg.u",
+    "xiiimpmutator.u",
+    "xiiimpmutatorcfg.u",
+    "xiiimpplus.u",
+    "xiiipersosplus.u",
+    "xiiiplus.u"
+  ],
+  "schema": 1,
+  "match_rule": "unique case-insensitive asset basename; no runtime precedence implied"
+}

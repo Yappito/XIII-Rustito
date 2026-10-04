@@ -1,0 +1,5 @@
+[toolchain]
+# Tested toolchain; Bevy 0.19.1 declares rust-version 1.95.0.
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-msvc"]

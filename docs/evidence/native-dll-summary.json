@@ -1,0 +1,152 @@
+{
+  "schema": 2,
+  "method": "objdump PE named-export table; unique decorated ?exec method symbols only; not a complete native operation inventory",
+  "dlls": {
+    "Core.dll": {
+      "named_exports": 2031,
+      "exec_method_exports": 263,
+      "examples": [
+        "?execAbs@UObject@@QAEXAAUFFrame@@QAX@Z",
+        "?execAcos@UObject@@QAEXAAUFFrame@@QAX@Z",
+        "?execAddAdd_Byte@UObject@@QAEXAAUFFrame@@QAX@Z",
+        "?execAddAdd_Int@UObject@@QAEXAAUFFrame@@QAX@Z",
+        "?execAddAdd_PreByte@UObject@@QAEXAAUFFrame@@QAX@Z"
+      ]
+    },
+    "D3DDrv.dll": {
+      "named_exports": 42,
+      "exec_method_exports": 0,
+      "examples": []
+    },
+    "Editor.dll": {
+      "named_exports": 960,
+      "exec_method_exports": 14,
+      "examples": [
+        "?execBadParameters@UBrushBuilder@@QAEXAAUFFrame@@QAX@Z",
+        "?execBeginBrush@UBrushBuilder@@QAEXAAUFFrame@@QAX@Z",
+        "?execConsoleCommand@UMaterialFactory@@QAEXAAUFFrame@@QAX@Z",
+        "?execEndBrush@UBrushBuilder@@QAEXAAUFFrame@@QAX@Z",
+        "?execGetPolyCount@UBrushBuilder@@QAEXAAUFFrame@@QAX@Z"
+      ]
+    },
+    "Engine.dll": {
+      "named_exports": 6428,
+      "exec_method_exports": 593,
+      "examples": [
+        "?execAbandonProjector@AProjector@@QAEXAAUFFrame@@QAX@Z",
+        "?execAcceptFriendRequest@UXboxLiveManager@@QAEXAAUFFrame@@QAX@Z",
+        "?execAcceptGameInvite@UXboxLiveManager@@QAEXAAUFFrame@@QAX@Z",
+        "?execActorInIterationCategory@AActor@@QAEXAAUFFrame@@QAX@Z",
+        "?execAddController@AController@@QAEXAAUFFrame@@QAX@Z"
+      ]
+    },
+    "GUI.dll": {
+      "named_exports": 568,
+      "exec_method_exports": 56,
+      "examples": [
+        "?execActualHeight@UGUIComponent@@QAEXAAUFFrame@@QAX@Z",
+        "?execActualLeft@UGUIComponent@@QAEXAAUFFrame@@QAX@Z",
+        "?execActualTop@UGUIComponent@@QAEXAAUFFrame@@QAX@Z",
+        "?execActualWidth@UGUIComponent@@QAEXAAUFFrame@@QAX@Z",
+        "?execDoesMemoryCardIncludeThisProfile@UGUIController@@QAEXAAUFFrame@@QAX@Z"
+      ]
+    },
+    "HXAudio.dll": {
+      "named_exports": 757,
+      "exec_method_exports": 0,
+      "examples": []
+    },
+    "IpDrv.dll": {
+      "named_exports": 380,
+      "exec_method_exports": 27,
+      "examples": [
+        "?execBindPort@ATcpLink@@QAEXAAUFFrame@@QAX@Z",
+        "?execBindPort@AUdpLink@@QAEXAAUFFrame@@QAX@Z",
+        "?execClose@ATcpLink@@QAEXAAUFFrame@@QAX@Z",
+        "?execDecodeBuffer@AXBOXClientBeaconReceiver@@QAEXAAUFFrame@@QAX@Z",
+        "?execDecodeBuffer@AXBOXServerBeacon@@QAEXAAUFFrame@@QAX@Z"
+      ]
+    },
+    "MSVCRT.dll": {
+      "named_exports": 759,
+      "exec_method_exports": 0,
+      "examples": []
+    },
+    "UWeb.dll": {
+      "named_exports": 47,
+      "exec_method_exports": 9,
+      "examples": [
+        "?execAddVariable@UWebRequest@@QAEXAAUFFrame@@QAX@Z",
+        "?execClearSubst@UWebResponse@@QAEXAAUFFrame@@QAX@Z",
+        "?execDecodeBase64@UWebRequest@@QAEXAAUFFrame@@QAX@Z",
+        "?execGetVariable@UWebRequest@@QAEXAAUFFrame@@QAX@Z",
+        "?execGetVariableCount@UWebRequest@@QAEXAAUFFrame@@QAX@Z"
+      ]
+    },
+    "WinDrv.dll": {
+      "named_exports": 148,
+      "exec_method_exports": 0,
+      "examples": []
+    },
+    "Window.dll": {
+      "named_exports": 1285,
+      "exec_method_exports": 0,
+      "examples": []
+    },
+    "XIDCine.dll": {
+      "named_exports": 66,
+      "exec_method_exports": 6,
+      "examples": [
+        "?execAutoPosition@APositionInfo@@QAEXAAUFFrame@@QAX@Z",
+        "?execCharIsNum@ACineController2@@QAEXAAUFFrame@@QAX@Z",
+        "?execFindAnActor@ACineController2@@QAEXAAUFFrame@@QAX@Z",
+        "?execGetFirstWord@ACineController2@@QAEXAAUFFrame@@QAX@Z",
+        "?execOnTheSpotRotation@ACine2@@QAEXAAUFFrame@@QAX@Z"
+      ]
+    },
+    "XIDPawn.dll": {
+      "named_exports": 108,
+      "exec_method_exports": 14,
+      "examples": [
+        "?execAllianceLevel@AIAController@@QAEXAAUFFrame@@QAX@Z",
+        "?execDirectionDuTir@AIAController@@QAEXAAUFFrame@@QAX@Z",
+        "?execEyePosition@ABaseSoldier@@QAEXAAUFFrame@@QAX@Z",
+        "?execFindBestPathTo@AIAController@@QAEXAAUFFrame@@QAX@Z",
+        "?execFindBestPathToward@AIAController@@QAEXAAUFFrame@@QAX@Z"
+      ]
+    },
+    "XIIIMP.dll": {
+      "named_exports": 84,
+      "exec_method_exports": 19,
+      "examples": [
+        "?execAddOrder@ABotController@@QAEXAAUFFrame@@QAX@Z",
+        "?execCalcPathWeight@ABotController@@QAEXAAUFFrame@@QAX@Z",
+        "?execClearAllOrders@ABotController@@QAEXAAUFFrame@@QAX@Z",
+        "?execExcludeOrders@ABotController@@QAEXAAUFFrame@@QAX@Z",
+        "?execExtendFindPathToward@ABotController@@QAEXAAUFFrame@@QAX@Z"
+      ]
+    },
+    "Xiii.dll": {
+      "named_exports": 66,
+      "exec_method_exports": 1,
+      "examples": [
+        "?execGrowBloodFlow@ABloodFlow@@QAEXAAUFFrame@@QAX@Z"
+      ]
+    },
+    "binkw32.dll": {
+      "named_exports": 85,
+      "exec_method_exports": 0,
+      "examples": []
+    },
+    "msvci70.dll": {
+      "named_exports": 445,
+      "exec_method_exports": 0,
+      "examples": []
+    },
+    "msvcr70.dll": {
+      "named_exports": 839,
+      "exec_method_exports": 0,
+      "examples": []
+    }
+  }
+}

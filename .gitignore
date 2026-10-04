@@ -1,0 +1,25 @@
+# Owned game data and private research outputs must stay local.
+/XIII_Game/
+/.research/
+/local/
+/artifacts/
+/cache/
+/target/
+**/__pycache__/
+*.pyc
+.env
+
+# Defense in depth if source assets are copied outside the installation.
+*.unr
+*.utx
+*.usx
+*.uax
+*.ukx
+*.u
+*.hxc
+*.hsc
+*.bik
+*.dll
+*.exe
+*.pdb
+*.usa

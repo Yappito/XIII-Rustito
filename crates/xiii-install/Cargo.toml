@@ -1,0 +1,15 @@
+[package]
+name = "xiii-install"
+description = "Read-only XIII installation discovery, profile detection and logical package resolution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+# Intentionally dependency-free: package headers are only sniffed for the
+# 4-byte magic here; full parsing belongs to xiii-package.
+[dependencies]
+
+[lints]
+workspace = true

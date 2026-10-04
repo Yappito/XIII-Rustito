@@ -1,0 +1,59 @@
+[workspace]
+resolver = "3"
+members = ["crates/xiii-package", "crates/xiii-install", "crates/xiii-tool", "crates/xiii-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "UNLICENSED"
+
+[workspace.dependencies]
+xiii-package = { path = "crates/xiii-package" }
+xiii-install = { path = "crates/xiii-install" }
+# Exact pin; used by xiii-tool for --json output and inventory comparison.
+serde_json = "=1.0.151"
+# Exact pin; feature names verified against the bevy 0.19.1 crate manifest.
+# Rationale per feature: crates/xiii-app/README.md.
+bevy = { version = "=0.19.1", default-features = false, features = [
+    # App core, tasks, logging, assets
+    "std",
+    "multi_threaded",
+    "async_executor",
+    "bevy_log",
+    "bevy_asset",
+    # Native window + input (keyboard/mouse are opt-in in 0.19)
+    "bevy_winit",
+    "bevy_window",
+    "keyboard",
+    "mouse",
+    # 3D PBR rendering (wgpu DX12 + Vulkan backends come with bevy_render)
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_gizmos_render",
+    # Default Camera3d tonemapping (TonyMcMapface) needs the KTX2/zstd LUTs
+    "tonemapping_luts",
+    "ktx2",
+    "zstd_rust",
+    # PNG for screenshots
+    "png",
+    # UI text overlay with the embedded default font
+    "bevy_ui",
+    "bevy_ui_render",
+    "default_font",
+    # Audio output (rodio/cpal) + WAV decoding
+    "bevy_audio",
+    "wav",
+] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.dev]
+opt-level = 1
+
+# Bevy recommends optimizing dependencies even in dev builds.
+[profile.dev.package."*"]
+opt-level = 3

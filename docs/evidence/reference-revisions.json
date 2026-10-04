@@ -1,0 +1,34 @@
+{
+  "checked": "2026-10-04",
+  "references": [
+    {
+      "repo": "gildor2/UEViewer",
+      "commit": "a0bfb468d42be831b126632fd8a0ae6b3614f981",
+      "date": "2024-02-23T08:53:57Z"
+    },
+    {
+      "repo": "EliotVU/Unreal-Library",
+      "commit": "3207a17e9b294be3d1bf26b18e07ccff7e1d4b0c",
+      "date": "2026-08-15T01:11:11Z"
+    },
+    {
+      "repo": "vgmstream/vgmstream",
+      "commit": "7dc938fa2f210943b37c7b6511852b516ef432ab",
+      "date": "2026-09-27T22:38:30Z"
+    },
+    {
+      "repo": "pingwindev/xiii-unrealscript",
+      "commit": "9c2568a6e0fa3c5fbf753dbf6e457876f5e4593e",
+      "date": "2020-08-13T22:15:15Z"
+    },
+    {
+      "repo": "dpjudas/SurrealEngine",
+      "commit": "cd0d0a229be22ce167c45a3ddb48e48e15201691",
+      "date": "2026-09-29T11:14:45Z"
+    },
+    {
+      "repo": "vladtrc/iw4L",
+      "commit": "d352dbdfd8778f12b5f93908bb5ccbc55561acca"
+    }
+  ]
+}
