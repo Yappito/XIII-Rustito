@@ -7,8 +7,8 @@ use std::fmt::Write as _;
 
 use serde_json::{Value, json};
 use xiii_package::{
-    Limits, ObjectProperties, ObjectRef, Package, PackageError, Property, PropertyValue,
-    RawReason, StructValue,
+    Limits, ObjectProperties, ObjectRef, Package, PackageError, Property, PropertyValue, RawReason,
+    StructValue,
 };
 
 /// `Class'Path'` for a reference (`None` for null). Imports start with their root package.
@@ -16,7 +16,10 @@ pub fn ref_text(p: &Package, r: ObjectRef) -> String {
     match r {
         ObjectRef::Null => "None".to_owned(),
         ObjectRef::Import(i) => {
-            let class = p.imports().get(i as usize).map_or("?", |o| p.name(o.class_name));
+            let class = p
+                .imports()
+                .get(i as usize)
+                .map_or("?", |o| p.name(o.class_name));
             format!("{class}'{}'", p.object_path(r).unwrap_or("?"))
         }
         ObjectRef::Export(i) => {
@@ -174,7 +177,9 @@ fn value_json(p: &Package, prop: &Property) -> Value {
         PropertyValue::Array { count, elements } => {
             json!({"array_count": count, "element_span": [elements.start, elements.end]})
         }
-        PropertyValue::Raw(r) => json!({"raw_bytes": prop.value_span.len(), "reason": raw_reason_text(r)}),
+        PropertyValue::Raw(r) => {
+            json!({"raw_bytes": prop.value_span.len(), "reason": raw_reason_text(r)})
+        }
     }
 }
 

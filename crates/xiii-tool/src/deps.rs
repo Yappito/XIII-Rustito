@@ -114,7 +114,10 @@ impl DepsReport {
 
     /// Top-level class imports absent from their package (native-only class candidates).
     pub fn absent_classes(&self) -> u64 {
-        self.packages.iter().map(|p| p.absent_classes.len() as u64).sum()
+        self.packages
+            .iter()
+            .map(|p| p.absent_classes.len() as u64)
+            .sum()
     }
 
     /// Imports neither resolved nor absent-class candidates.
@@ -193,7 +196,9 @@ pub fn analyze(
         let o = match map.read_object_properties(map_data, i, &limits) {
             Ok(o) => o,
             Err(err) => {
-                report.property_failures.push(format!("{path} ({class}): {err}"));
+                report
+                    .property_failures
+                    .push(format!("{path} ({class}): {err}"));
                 continue;
             }
         };
@@ -247,7 +252,11 @@ pub fn analyze(
         }
         if is_sma {
             report.static_mesh_actors[0] += 1;
-            if sample.static_mesh.as_deref().is_some_and(|s| !s.contains("(export")) {
+            if sample
+                .static_mesh
+                .as_deref()
+                .is_some_and(|s| !s.contains("(export"))
+            {
                 report.static_mesh_actors[1] += 1;
             }
             report.static_mesh_actors[2] += u64::from(sample.location.is_some());
@@ -270,8 +279,9 @@ pub fn analyze(
         let files = index.get(&key).map(Vec::as_slice).unwrap_or(&[]);
         dep.files = files.iter().map(|(rel, _)| rel.clone()).collect();
         let Some((rel, path)) = files.first() else {
-            dep.failures
-                .push(format!("package '{name}' not found under the game directory"));
+            dep.failures.push(format!(
+                "package '{name}' not found under the game directory"
+            ));
             report.packages.push(dep);
             continue;
         };
@@ -307,12 +317,14 @@ pub fn analyze(
                 map.name(imp.class_name)
             );
             match by_path.get(&rel_path.to_lowercase()) {
-                None if want_class.eq_ignore_ascii_case("Core.Class") && !rel_path.contains('.') => {
+                None if want_class.eq_ignore_ascii_case("Core.Class")
+                    && !rel_path.contains('.') =>
+                {
                     dep.absent_classes.push(full.to_owned());
                 }
-                None => dep
-                    .failures
-                    .push(format!("{want_class} {full}: no export '{rel_path}' in {rel}")),
+                None => dep.failures.push(format!(
+                    "{want_class} {full}: no export '{rel_path}' in {rel}"
+                )),
                 Some(cands) => {
                     let classes: Vec<String> = cands
                         .iter()

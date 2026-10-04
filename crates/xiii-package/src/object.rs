@@ -375,16 +375,15 @@ impl Package {
         let bytes = self.export_payload(data, export)?;
         let e = &self.exports()[export];
         let base = e.serial_offset as usize;
-        let ctx = |err: PackageError| rebase(err, base).in_entry(Table::Payload, Some(export as u32));
+        let ctx =
+            |err: PackageError| rebase(err, base).in_entry(Table::Payload, Some(export as u32));
         let mut c = Cursor::new(bytes);
         let state_frame = if e.flags & RF_HAS_STACK != 0 {
             Some(self.read_state_frame(&mut c, base).map_err(ctx)?)
         } else {
             None
         };
-        let block = self
-            .read_block(bytes, c.pos(), base, limits)
-            .map_err(ctx)?;
+        let block = self.read_block(bytes, c.pos(), base, limits).map_err(ctx)?;
         Ok(ObjectProperties {
             export: export as u32,
             payload: abs(base, 0, bytes.len()),
@@ -427,9 +426,12 @@ impl Package {
             .read_ref(c)
             .map_err(|e| e.in_field("state_frame.state_node"))?;
         let probe_mask = {
-            let lo = c.u32().map_err(|e| e.in_field("state_frame.probe_mask"))?;
-            let hi = c.u32().map_err(|e| e.in_field("state_frame.probe_mask"))?;
-            u64::from(lo) | (u64::from(hi) << 32)
+            let raw = c
+                .take(8)
+                .map_err(|e| e.in_field("state_frame.probe_mask"))?;
+            let mut le = [0u8; 8];
+            le.copy_from_slice(raw);
+            u64::from_le_bytes(le)
         };
         let latent_action = c
             .u32()
@@ -614,9 +616,15 @@ impl Package {
                     c.i32()?,
                 ])))
             }),
-            PropertyType::Object => self.variable(bytes, |c| Ok(PropertyValue::Object(self.read_ref(c)?))),
-            PropertyType::Class => self.variable(bytes, |c| Ok(PropertyValue::Class(self.read_ref(c)?))),
-            PropertyType::Name => self.variable(bytes, |c| Ok(PropertyValue::Name(self.read_name(c)?))),
+            PropertyType::Object => {
+                self.variable(bytes, |c| Ok(PropertyValue::Object(self.read_ref(c)?)))
+            }
+            PropertyType::Class => {
+                self.variable(bytes, |c| Ok(PropertyValue::Class(self.read_ref(c)?)))
+            }
+            PropertyType::Name => {
+                self.variable(bytes, |c| Ok(PropertyValue::Name(self.read_name(c)?)))
+            }
             PropertyType::Delegate => self.variable(bytes, |c| {
                 Ok(PropertyValue::Delegate {
                     object: self.read_ref(c)?,
@@ -745,7 +753,7 @@ fn vec4(c: &mut Cursor<'_>) -> Result<[f32; 4]> {
 
 /// UE1/UE2 static-array index: `0xxxxxxx` (7 bits), `10xxxxxx b` (14 bits), or
 /// `11xxxxxx b b b` (30 bits), most significant byte first. (UModel masks the four-byte form
-/// to 22 bits; UELib keeps 30 bits. The four-byte form was not observed in the corpus.)
+/// to 22 bits; UELib keeps 30 bits. Only the one-byte form occurs in the GOG corpus: max 15.)
 fn read_array_index(c: &mut Cursor<'_>) -> Result<u32> {
     let b0 = u32::from(c.u8()?);
     if b0 & 0x80 == 0 {

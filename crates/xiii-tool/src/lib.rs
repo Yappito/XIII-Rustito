@@ -1,4 +1,5 @@
-//! Library half of `xiii-tool`: package reports and read-only corpus scanning/comparison.
+//! Library half of `xiii-tool`: package reports, read-only corpus scanning/comparison,
+//! property decoding reports, property coverage and map dependency checks.
 //!
 //! Installation directories are only ever read. Nothing here writes files.
 

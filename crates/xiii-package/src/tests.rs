@@ -7,7 +7,7 @@ use crate::*;
 // ---------------------------------------------------------------------------------------------
 
 /// Encodes an old-style Unreal compact index (inverse of `Cursor::compact_index`).
-fn compact(value: i32) -> Vec<u8> {
+pub(crate) fn compact(value: i32) -> Vec<u8> {
     let mut magnitude = u64::from(value.unsigned_abs());
     let mut first = (magnitude & 0x3f) as u8;
     if value < 0 {
@@ -37,7 +37,7 @@ fn compact(value: i32) -> Vec<u8> {
     out
 }
 
-fn latin1(text: &str) -> Vec<u8> {
+pub(crate) fn latin1(text: &str) -> Vec<u8> {
     let bytes: Vec<u8> = text
         .chars()
         .map(|c| u8::try_from(u32::from(c)).unwrap())
@@ -48,7 +48,7 @@ fn latin1(text: &str) -> Vec<u8> {
     out
 }
 
-fn utf16(text: &str) -> Vec<u8> {
+pub(crate) fn utf16(text: &str) -> Vec<u8> {
     let units: Vec<u16> = text.encode_utf16().collect();
     let mut out = compact(-i32::try_from(units.len() + 1).unwrap());
     for u in units {
@@ -67,19 +67,19 @@ struct RawImport {
 }
 
 #[derive(Clone)]
-struct RawExport {
+pub(crate) struct RawExport {
     class: i32,
     super_ref: i32,
     outer: i32,
     name: i32,
-    flags: u32,
-    payload: Vec<u8>,
+    pub(crate) flags: u32,
+    pub(crate) payload: Vec<u8>,
     /// Overrides the computed (size, offset) pair; offset is written only when size != 0.
     span_override: Option<(i32, i32)>,
 }
 
 impl RawExport {
-    fn new(class: i32, outer: i32, name: i32, payload_len: usize) -> Self {
+    pub(crate) fn new(class: i32, outer: i32, name: i32, payload_len: usize) -> Self {
         Self {
             class,
             super_ref: 0,
@@ -93,7 +93,7 @@ impl RawExport {
 }
 
 #[derive(Clone)]
-struct Builder {
+pub(crate) struct Builder {
     version: u16,
     licensee: u16,
     flags: u32,
@@ -107,15 +107,15 @@ struct Builder {
     exports: Vec<RawExport>,
 }
 
-struct Built {
-    bytes: Vec<u8>,
+pub(crate) struct Built {
+    pub(crate) bytes: Vec<u8>,
     name_offset: usize,
     import_offset: usize,
     export_offset: usize,
 }
 
 impl Builder {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             version: 100,
             licensee: 58,
@@ -129,13 +129,19 @@ impl Builder {
         }
     }
 
-    fn name(&mut self, text: &str) -> i32 {
+    pub(crate) fn name(&mut self, text: &str) -> i32 {
         self.names.push((latin1(text), 0x0007_0010));
         i32::try_from(self.names.len() - 1).unwrap()
     }
 
     /// Adds an import and returns its raw (negative) reference.
-    fn import(&mut self, class_package: i32, class_name: i32, outer: i32, name: i32) -> i32 {
+    pub(crate) fn import(
+        &mut self,
+        class_package: i32,
+        class_name: i32,
+        outer: i32,
+        name: i32,
+    ) -> i32 {
         self.imports.push(RawImport {
             class_package,
             class_name,
@@ -146,12 +152,12 @@ impl Builder {
     }
 
     /// Adds an export and returns its raw (positive) reference.
-    fn export(&mut self, export: RawExport) -> i32 {
+    pub(crate) fn export(&mut self, export: RawExport) -> i32 {
         self.exports.push(export);
         i32::try_from(self.exports.len()).unwrap()
     }
 
-    fn build(&self) -> Built {
+    pub(crate) fn build(&self) -> Built {
         let generations = self
             .generations
             .clone()

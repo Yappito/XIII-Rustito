@@ -43,4 +43,6 @@ pub fn has_package_tag(prefix: &[u8]) -> bool {
 }
 
 #[cfg(test)]
+mod object_tests;
+#[cfg(test)]
 mod tests;

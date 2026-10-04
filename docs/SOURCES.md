@@ -54,6 +54,7 @@ The checked [UModel license](https://github.com/gildor2/UEViewer/blob/a0bfb468d4
 | [native-dll-summary.json](evidence/native-dll-summary.json) | Named PE exports and example decorated native method symbols, without disassembly or implementations |
 | [reference-revisions.json](evidence/reference-revisions.json) | Upstream commit IDs sampled during research |
 | [reference-files.json](evidence/reference-files.json) | Hashes and source links for downloaded reference files |
+| [property-coverage-gog.json](evidence/property-coverage-gog.json) | `xiii-tool coverage` over the GOG copy: per-class property-block results, tail sizes, struct/type/encoding histograms; metadata only, no property values. Tag layout references: UModel `Unreal/UnObject.cpp` and UELib `UStateFrame.cs`/`UDefaultProperty.cs`/`PackageObjectLegacyVersion.cs` at the revisions above (local copies in `.research/`) |
 | [verification.json](evidence/verification.json) | Final research check results and explicit untested scope |
 
 Additional observations came from the supplied `system/Default.ini`, `MapList.ini`, PE headers, the local Steam app manifest, its existing `XIII.log` and unofficial patch credit file. These files were read in place. User-account fields and full logs were not copied into the evidence bundle. The bundled manual and readme are available for subsequent reference but were not analyzed in this pass.

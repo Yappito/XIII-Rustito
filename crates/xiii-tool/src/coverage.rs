@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 use xiii_package::{
-    Limits, ObjectRef, Package, PropertyType, PropertyValue, RawReason, RF_HAS_STACK,
+    Limits, ObjectRef, Package, PropertyType, PropertyValue, RF_HAS_STACK, RawReason,
 };
 
 use crate::corpus::tagged_files;
@@ -184,7 +184,12 @@ pub fn add_package(cov: &mut Coverage, rel: &str, p: &Package, data: &[u8], limi
                 if st.first_error.is_none() {
                     let rel_off = err
                         .offset
-                        .map(|o| format!(" (payload+{})", o.saturating_sub(u64::from(e.serial_offset))))
+                        .map(|o| {
+                            format!(
+                                " (payload+{})",
+                                o.saturating_sub(u64::from(e.serial_offset))
+                            )
+                        })
                         .unwrap_or_default();
                     st.first_error = Some(format!("{rel} {path}: {err}{rel_off}"));
                 }
@@ -236,8 +241,7 @@ pub fn add_package(cov: &mut Coverage, rel: &str, p: &Package, data: &[u8], limi
                 for q in &o.block.properties {
                     let type_name = q.kind.name();
                     *cov.property_types.entry(type_name.to_owned()).or_default() += 1;
-                    *cov
-                        .size_codes
+                    *cov.size_codes
                         .entry(format!("{type_name}:{}", (q.info >> 4) & 7))
                         .or_default() += 1;
                     if q.array_index != 0 {
@@ -278,8 +282,7 @@ pub fn add_package(cov: &mut Coverage, rel: &str, p: &Package, data: &[u8], limi
                                 .is_ok_and(|b| b.span.end == q.value_span.end);
                             cov.raw_structs_tagged_like[usize::from(!tagged)] += 1;
                             let n = q.struct_name.map_or("?", |s| p.name(s));
-                            *cov
-                                .raw_structs
+                            *cov.raw_structs
                                 .entry(n.to_owned())
                                 .or_default()
                                 .entry(q.size)
@@ -292,8 +295,7 @@ pub fn add_package(cov: &mut Coverage, rel: &str, p: &Package, data: &[u8], limi
                             Some(s) => format!("Struct<{}>", p.name(s)),
                             None => type_name.to_owned(),
                         };
-                        *cov
-                            .anomalies
+                        *cov.anomalies
                             .entry(format!("{label} {}", raw_reason_key(reason)))
                             .or_default() += 1;
                         if cov.anomaly_examples.len() < MAX_EXAMPLES {
@@ -329,6 +331,9 @@ pub fn totals(cov: &Coverage) -> ClassStats {
         t.consumed_bytes += s.consumed_bytes;
         t.has_stack += s.has_stack;
         t.properties += s.properties;
+        for (k, n) in &s.error_kinds {
+            *t.error_kinds.entry(k.clone()).or_default() += n;
+        }
     }
     t
 }
