@@ -59,9 +59,14 @@ Disassembled (`llvm-objdump`, raw in `local/re/`) and read against the engine's 
 
 - The pawn moves an **extent box** `(R,R,H)`, confirmed: `MoveActor` receives an extent vector
   and `stepUp` multiplies the step vector by the fixed up magnitude `35.0` UU.
-- `MINFLOORZ = 0.7` (`0x10483428`) is the walkability threshold; `physWalking` tests it on the
-  **floor** `FCheckResult.Normal.Z` from a separate downward check, not on the horizontal
-  blocking contact's normal.
+- `MINFLOORZ = 0.7` (`0x10483428`) is the walkability threshold. The branch at `0x103be058`
+  tests the **horizontal `MoveActor` contact normal** (`FCheckResult.Normal.Z` at struct offset
+  `0x14`; `Time` at `0x24`) with `fld Normal.Z; fcomp 0.7; test ah,0x5; jp`: the parity test is
+  taken when `Normal.Z > 0.7`, so a **walkable** contact enters `0x103be547` and an **unwalkable**
+  one falls through to `0x103be06c`; which body is the stair-step and which the slope-walk is
+  **hypothesis**. The `0x104831ac` = 37 UU constant is **measured**, but no branch where its
+  result gates `stepUp` was located, so the crate's floor gate is a measurement-chosen
+  **approximation (hypothesis)**.
 - `physWalking` iterates at most `8` sub-steps (`cmpl $0x8`, `0x103bde14`) and uses the
   `1.9`/`2.4` UU constants (`0x10483420`/`0x10483424`) beside its floor snap. Our harness's
   `0.05` UU skin is empirical, not an engine constant (`stepUp` uses no separate skin).
@@ -76,16 +81,28 @@ against two-sided triangles, an empirical 1 mm skin, and a step-up heuristic gat
 near-vertical contact normal (`|n_y| < 0.3`). A near-horizontal small floor rise reported
 through a near-horizontal contact therefore never triggers it.
 
-`walk_move` is a closer (still approximate) `APawn::physWalking`:
+`walk_move` keeps the measured branch structure of `APawn::physWalking` (item1k) and adds
+host approximations:
 
 1. sweep the full delta; on no hit, move and finish;
-2. on a hit, back off by `skin`; try step-up — sweep up by `max_step_height`, forward by the
-   remaining travel, then down by `max_step_height` + epsilon, accepting only a walkable
-   landing; otherwise slide along the hit plane exactly as `move_slide`. The engine gates this
-   on the pawn's *floor* (a separate downward probe); `walk_move` approximates it by
-   attempting on any horizontal block and requiring a walkable landing;
+2. on a hit, back off by `skin`; run a downward **floor probe** of
+   `max_step_height * 37/35` (the 37 UU constant is measured, but the gate is a
+   **measurement-chosen approximation**, not a proven engine branch) and, when a walkable floor
+   is under the pawn, try the three-sweep step-up — up by `max_step_height`, forward by the
+   travel, then down by the raise plus `max_step_height`. Two **host approximations** in the
+   step: the up and forward sweeps ignore a walkable floor the box is already touching
+   (`SweepParams::ignore_resting_floor_z`), and the down-sweep spans the raise plus
+   `max_step_height`; together they stop a grazing near-horizontal floor from defeating the step
+   (the walkable-ledge stall). `physWalking`'s own measured branch keys on the horizontal
+   `MoveActor` contact normal; attempting the step on any block with a walkable landing covers
+   both bodies. If the step fails, slide along the hit plane exactly as `move_slide`;
 3. after the move, floor-follow: sweep down by `max_step_height` and snap to a walkable floor,
    else set `falling` (no gravity is applied; the caller stops and reports).
+
+`ULevel::FindSpot` (`0x1038a080`, item1k) is ported as `find_spot`: the engine's four corner
+candidates at `(±0.5*Extent.X, ±0.5*Extent.Y)` with single-candidate extrapolation to twice the
+offset, then a caller-visible settle onto a walkable floor. The previous vertical raise is an
+explicit, disabled-by-default fallback for embedded boxes.
 
 Both retain UE2's extent-box primitive and the empirical 1 mm skin; neither reproduces UE2's
 cylinder/contact ordering, penetration resolution, the `8`-sub-step loop, or per-step
@@ -106,4 +123,9 @@ force on a randomized soup.
 `walk_move`: over a 1.8 cm plank edge; up a 14-degree ramp; a step just below the limit passes
 and just above is blocked; walking off a ledge reports `falling`; a corridor floor of 0.5 m
 tiles with randomized sub-2 mm seams never sticks or falls through (deterministic LCG); 1000
-small steps into a wall never tunnel through it.
+small steps into a wall never tunnel through it; a series of walkable plank seams and a
+walkable bevel are crossed; a walkable ledge under a low overhang steps through.
+
+`find_spot` (`ULevel::FindSpot` port): a free centre is used and settled; a zero extent is
+rejected; no floor is `NoFloor`; an embedded box raises when enabled and is `NoFreeSpot` when
+not; a single free corner extrapolates to twice its offset.

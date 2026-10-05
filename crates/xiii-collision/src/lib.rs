@@ -17,12 +17,14 @@
 #![warn(missing_docs)]
 
 mod bvh;
+mod spot;
 mod sweep;
 mod walk;
 
 pub use bvh::{Aabb, Bvh};
+pub use spot::{FindSpot, FindSpotError, FindSpotParams, find_spot};
 pub use sweep::{SweepHit, SweepParams, sweep_aabb};
-pub use walk::{WalkParams, walk_move};
+pub use walk::{FLOOR_PROBE_RATIO, WalkParams, walk_move};
 
 /// A triangle in Bevy space (metres).
 pub type Triangle = [[f32; 3]; 3];
