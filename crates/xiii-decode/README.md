@@ -199,7 +199,7 @@ about Z).
 | Engine.StaticMesh | 6,128 | 6,128 | 6,128 | 61,280 B of unknown-meaning bytes (XIII UPrimitive extension + 2-byte block) |
 | Engine.Polys | 7,194 | 7,194 | 7,194 | 34,395 polygons |
 | Engine.TerrainSector | 2,208 | 2,208 | 2,208 | |
-| Engine.Model | 7,194 | 7,194 | 0 | prefix up to NumZones decoded; 9,568,116 B unsupported tail (zones, Polys ref, lightmaps, bounds, leaves...) |
+| Engine.Model | 7,194 | 7,194 | 0 | prefix through zones and the `Polys` ref decoded; 9,496,581 B unsupported tail (lightmaps, bounds, leaves...) |
 | Engine.TerrainInfo | 18 | 18 | 0 | sectors, vertices, sector grid; 2,052 B unsupported tail |
 
 Texture formats are taken from the game's own `Engine.ETextureFormat` enum in `engine.u`: P8,
@@ -259,11 +259,23 @@ uninitialized memory.
 - Verts: `{u16 pVertex, i16 iSide}`. Only the ranges that nodes reference hold valid point
   indices.
 - i32 NumSharedSides, then i32 NumZones.
+- u32 `reserved` (always 0 in the corpus; meaning unknown).
+- Zones: `NumZones` records of `{ compact ZoneActor; u64 Connectivity; u64 Visibility;
+  f32 LastRenderTime }`. The record is **variable length** because `ZoneActor` is a compact
+  object index (1 to 5 bytes); the remaining 20 bytes are fixed. Zone 0's actor is null in all
+  64 zoned maps; the other actors are `Engine.ZoneInfo` or `Engine.SkyZoneInfo` exports.
+  `Connectivity` is a zone bitmask: measured over all 1,350 zone records of the 64 zoned GOG
+  maps, bit `z` is set for zone `z` and no bit at or above `NumZones` is set. `Visibility`
+  and `LastRenderTime` positions/sizes are forced by the record length, but their meaning is
+  not established (`Visibility` is not itself a `NumZones`-bit mask).
+`Polys`: a compact object reference. It resolves to an `Engine.Polys` export in every one
+of the 7,194 GOG Models (null never occurs).
 
-Zone records did not have a uniform size in Plage00/Plage01, so decoding stops there and the
-rest is the unsupported tail. In Plage00 the `Polys6` reference sits right after the zones,
-followed by two empty arrays and an FBox array. The level BSP is the only `Model` that no
-`Brush` property references.
+What follows the `Polys` reference (LightMap, LightBits, Bounds, LeafHulls, Leaves, Lights,
+RootOutside/Linked and the large lightmap byte region) is **not** decoded and is the
+`model.lightmaps_and_after` unsupported tail. Leaf -> zone assignments can be derived exactly
+from the nodes' `iLeaf`/`iZone` pairs (0 conflicts over all 64 zoned maps); this is what
+`xiii-tool zones` uses. The level BSP is the only `Model` that no `Brush` property references.
 
 **Polys.** i32 Num, i32 Max, then per polygon: compact vertex count, Base, Normal, TextureU,
 TextureV, vertices, u32 PolyFlags, compact Actor, compact Material, compact ItemName, compact
@@ -316,7 +328,8 @@ flips the numeric orientation of triangles.
   defaults are not applied.
 - **BSP:** node planes and children; PolyFlags `PF_NotSolid` 0x8, `PF_Semisolid` 0x20,
   `PF_Invisible` 0x1 and portal 0x04000000; the node collision-bound index (meaning inferred).
-  Leaves, zones and hulls are in the undecoded tail.
+  Zones (actor + connectivity/visibility) are decoded; leaf zones are derived from the nodes.
+  Lightmaps, bounds, hulls and the leaf array are in the undecoded tail.
 - **Terrain:** world-space vertices, quad visibility (holes; Plage01 has 33 hidden quads) and
   edge turns. The bit conventions follow UE2 naming and are not verified in play.
 - **Ray probes:** `xiii-app --dump` casts rays (not capsule sweeps) from the PlayerStart
@@ -326,10 +339,13 @@ flips the numeric orientation of triangles.
 
 ### Unknown / next
 
-- The Model tail (zones, lightmaps, leaves, bounds, hulls) and the TerrainInfo tail.
-- The meaning of the texture trailing bytes, the static-mesh unknown block and the node padding.
+- The Model tail after the `Polys` reference (lightmaps, light bits, bounds, leaf hulls, the
+  leaf array, lights) and the TerrainInfo tail.
+- The meaning of the `reserved` zone-field u32, of `Zone.Visibility` and of
+  `Zone.LastRenderTime`, and of the texture trailing bytes, the static-mesh unknown block and
+  the node padding.
 - Scale calibration against the player cylinder; PrePivot.
 - Material semantics: Shader, FinalBlend and modifiers are only followed to a texture.
-- The sky zone.
+- Sky-zone selection order and the meaning of the per-zone sky settings (`LinkToSkybox`).
 - Vertex lighting: `StaticMeshInstance`, sector colours and BSP lightmaps.
 - A capsule sweep with the original movement rules.
