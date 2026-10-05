@@ -4912,10 +4912,16 @@ name = "xiii-app"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "xiii-collision",
  "xiii-decode",
  "xiii-install",
  "xiii-package",
+ "xiii-script",
 ]
+
+[[package]]
+name = "xiii-collision"
+version = "0.1.0"
 
 [[package]]
 name = "xiii-decode"

@@ -1,5 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "instructions": ["docs/AGENT_TASK_RULES.md"],
   "permission": {
     "read": {
       "*": "allow",
@@ -17,6 +18,7 @@
       "AGENTS.md": "deny",
       "CLAUDE.md": "deny",
       "docs/HANDOFF.md": "deny",
+      "docs/AGENT_TASK_RULES.md": "deny",
       "rust-toolchain.toml": "deny",
       "local/tasks/**": "deny"
     },
