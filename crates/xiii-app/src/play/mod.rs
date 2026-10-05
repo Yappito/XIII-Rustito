@@ -1630,7 +1630,13 @@ mod tests {
         let mut found: Vec<(String, xiii_script::ObjectId)> = Vec::new();
         for _ in 0..180 {
             let loc = session.player_location().unwrap_or([0.0; 3]);
-            session.step(1.0 / 60.0, loc, 0.0, [0.0; 3]);
+            session.step(
+                1.0 / 60.0,
+                loc,
+                0.0,
+                [0.0; 3],
+                &crate::play::session::PlayerVMModes::default(),
+            );
         }
         {
             let vm = session.vm();

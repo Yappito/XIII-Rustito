@@ -507,7 +507,13 @@ mod tests {
         let mut with_text = 0usize;
         let mut loc = session.player_location().unwrap_or([0.0; 3]);
         for _ in 0..3600 {
-            session.step(1.0 / 60.0, loc, 0.0, [0.0; 3]);
+            session.step(
+                1.0 / 60.0,
+                loc,
+                0.0,
+                [0.0; 3],
+                &crate::play::session::PlayerVMModes::default(),
+            );
             with_text += collect_dialogues(&mut session, &mut seen, &mut lines);
             loc = session.player_location().unwrap_or(loc);
         }
@@ -572,7 +578,13 @@ mod tests {
         let mut lines = Vec::new();
         let loc = [6746.321, -474.648, 830.0];
         for _ in 0..600 {
-            session.step(1.0 / 60.0, loc, 0.0, [0.0; 3]);
+            session.step(
+                1.0 / 60.0,
+                loc,
+                0.0,
+                [0.0; 3],
+                &crate::play::session::PlayerVMModes::default(),
+            );
             collect_dialogues(&mut session, &mut seen, &mut lines);
         }
         assert_eq!(
@@ -615,7 +627,13 @@ mod tests {
         let mut with_text = 0usize;
         let mut loc = session.player_location().unwrap_or([0.0; 3]);
         for _ in 0..600 {
-            session.step(1.0 / 60.0, loc, 0.0, [0.0; 3]);
+            session.step(
+                1.0 / 60.0,
+                loc,
+                0.0,
+                [0.0; 3],
+                &crate::play::session::PlayerVMModes::default(),
+            );
             with_text += collect_dialogues(&mut session, &mut seen, &mut lines);
             loc = session.player_location().unwrap_or(loc);
         }
