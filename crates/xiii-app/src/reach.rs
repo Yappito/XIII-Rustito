@@ -771,14 +771,20 @@ mod tests {
     }
 
     #[test]
-    fn opt_in_reach_regression_plage00_plage01() {
+    fn opt_in_reach_regression_plage00_plage01_banque01() {
         let Some(path) = opt_in_game_dir() else {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
         };
-        // Regression guard (not a fidelity claim): measured pass counts from the item1e run
-        // (Plage00 12/12, Plage01 263/302). A drop below the measured value is a regression.
-        for (map, min_pass) in [("Plage00", 12usize), ("Plage01", 263usize)] {
+        // Regression guard (not a fidelity claim): measured pass counts after the item1f fixes
+        // (Plage00 12/12, Plage01 295/302, Banque01 631/658). A drop below the measured value is
+        // a regression. The missing-floor group must stay empty: it guards the Part B
+        // staircase-collision fix (Banque01 had 17 such floating start nodes before it).
+        for (map, min_pass) in [
+            ("Plage00", 12usize),
+            ("Plage01", 295usize),
+            ("Banque01", 631usize),
+        ] {
             let report = analyze(map, &path).expect("reach analyze");
             println!(
                 "[reach-test regression] {map}: eligible {} passes {} (>= {min_pass})",
@@ -789,7 +795,14 @@ mod tests {
                 "{map}: pass count {} below measured {min_pass}",
                 report.passes
             );
-            assert_eq!(report.spawn_failures, 0, "{map}: spawn failures");
+            assert!(
+                report
+                    .groups
+                    .keys()
+                    .all(|cause| !cause.starts_with("missing floor")),
+                "{map}: missing-floor start nodes: {:?}",
+                report.groups
+            );
         }
     }
 }

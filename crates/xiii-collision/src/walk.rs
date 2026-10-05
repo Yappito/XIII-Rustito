@@ -3,14 +3,20 @@
 //! [`walk_move`] is a documented **approximation** of `UPawn::physWalking` + `stepUp`, not a
 //! fidelity claim. It exists because [`crate::move_slide`]'s step-up is gated on a
 //! near-vertical contact normal, so a small floor rise seen through a near-horizontal contact
-//! (for example a plank edge) never triggers it. `walk_move` instead gates step-up on the
-//! contact surface being **not walkable** (its up component below `min_floor_z`), and follows
-//! the floor after every step.
+//! (for example a plank edge) never triggers it.
+//!
+//! The upstream UE2 `physWalking`/`stepUp` are native and their source is not public; the
+//! behaviour approximated here is (a) UT2004 `Pawn.uc` (the `MAXSTEPHEIGHT` constant and its
+//! use) together with the widely-mirrored UE3 `UCharacterMovementComponent::PhysWalking`
+//! step-up pipeline, and (b) the UE2 `MINFLOORZ` walkable threshold. The step is attempted on
+//! **any** blocked horizontal move, not only on a non-walkable hit (a walkable-normal hit
+//! while moving horizontally is the edge of a step the pawn is running into), and when the up
+//! sweep is blocked it lifts by the swept fraction (the hit time) rather than aborting.
 //!
 //! Per step:
 //! 1. Sweep the full delta. On no hit, move and finish.
-//! 2. On a hit, back off by `skin`. If the hit surface is not walkable, try step-up: sweep up
-//!    by `max_step_height`, forward by the remaining travel, then down by `max_step_height`
+//! 2. On a hit, back off by `skin`. Try step-up: sweep up by `max_step_height` (or only as far
+//!    as the sweep allows), forward by the remaining travel, then down by `max_step_height`
 //!    plus a small epsilon; accept when the landing surface is a walkable floor.
 //! 3. Otherwise slide along the hit plane as [`crate::move_slide`] does.
 //!
@@ -90,13 +96,12 @@ pub fn walk_move(
             position: at,
         });
 
-        // Step-up on a surface that cannot simply be walked on. Unlike `move_slide`, this is
-        // not gated on the hit normal being near-vertical: any hit whose up component is below
-        // `min_floor_z` triggers it, including a near-horizontal surface that still blocks
-        // forward motion. A genuinely walkable surface is slid along instead.
-        let walkable = hit.normal[1] >= params.min_floor_z;
+        // Step-up on a blocked horizontal move. Unlike `move_slide`, this is not gated on the
+        // hit normal being near-vertical nor on it being non-walkable: a hit with a walkable
+        // normal while moving horizontally is the edge of a step the pawn is running into, and
+        // UE2 `physWalking` still tries `stepUp`. (Gating on non-walkability is what stalled
+        // the Plage01 near-horizontal rises.)
         if params.max_step_height > 1e-6
-            && !walkable
             && let Some(stepped) =
                 try_step_walk(world, pos, dir, travel, half_extents, params, &mut contacts)
         {
@@ -150,8 +155,10 @@ pub fn walk_move(
 }
 
 /// Attempts the UE2 three-sweep step: up by `max_step_height`, forward by `travel`, then down
-/// by `max_step_height` plus epsilon. Returns the landing position only when the forward path
-/// is clear and the landing surface is a walkable floor.
+/// by `max_step_height` plus epsilon. If the up sweep is blocked, only the swept fraction (the
+/// hit time) is available, so the step can still clear a low obstacle under a low ceiling.
+/// Returns the landing position only when the forward path is clear and the landing surface is
+/// a walkable floor.
 #[allow(clippy::too_many_arguments)]
 fn try_step_walk(
     world: &CollisionWorld,
@@ -164,13 +171,23 @@ fn try_step_walk(
 ) -> Option<Vec3> {
     let up = [0.0, params.max_step_height, 0.0];
     let up_target = add(pos, up);
-    if sweep_aabb(world, pos, up_target, half_extents, &SweepParams::default()).is_some() {
-        return None;
-    }
-    let fwd_target = add(up_target, mul(dir, travel.max(0.0)));
+    // UE2 `stepUp` sweeps up by `MAXSTEPHEIGHT`; a blocked sweep lifts by the swept fraction
+    // (hit time) and carries on, rather than failing outright.
+    let rise = match sweep_aabb(world, pos, up_target, half_extents, &SweepParams::default()) {
+        Some(h) => {
+            let available = h.t * params.max_step_height - params.skin;
+            if available <= params.skin {
+                return None;
+            }
+            available
+        }
+        None => params.max_step_height,
+    };
+    let raised = add(pos, [0.0, rise, 0.0]);
+    let fwd_target = add(raised, mul(dir, travel.max(0.0)));
     if let Some(h) = sweep_aabb(
         world,
-        up_target,
+        raised,
         fwd_target,
         half_extents,
         &SweepParams::default(),
@@ -180,15 +197,13 @@ fn try_step_walk(
             triangle: h.triangle,
             t: h.t,
             normal: h.normal,
-            height: up_target[1] - pos[1],
-            position: up_target,
+            height: raised[1] - pos[1],
+            position: raised,
         });
         return None;
     }
-    let down_target = add(
-        fwd_target,
-        [0.0, -(params.max_step_height + params.skin + 1e-4), 0.0],
-    );
+    let down = [0.0, -(params.max_step_height + params.skin + 1e-4), 0.0];
+    let down_target = add(fwd_target, down);
     let land = sweep_aabb(
         world,
         fwd_target,
@@ -196,6 +211,5 @@ fn try_step_walk(
         half_extents,
         &SweepParams::default(),
     )?;
-    (land.normal[1] >= params.min_floor_z)
-        .then(|| add(fwd_target, mul(sub(down_target, fwd_target), land.t)))
+    (land.normal[1] >= params.min_floor_z).then(|| add(fwd_target, mul(down, land.t)))
 }

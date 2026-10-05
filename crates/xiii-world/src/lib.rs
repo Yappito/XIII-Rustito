@@ -424,7 +424,50 @@ impl Importer<'_> {
                     .first()
                     .map(|s| s.uvs.clone())
                     .unwrap_or_else(|| vec![[0.0; 2]; m.vertices.len()]);
-                let cs = &m.collision[0];
+                // UE2 `UStaticMesh.UseSimpleLineCollision` selects the simplified collision
+                // set for line checks/traces; when the mesh sets it, the per-triangle set 0 is
+                // not what the engine collides with. Some meshes (e.g.
+                // `Staticbanque.bankesca2`) carry an empty set 0 and only the simplified set.
+                // The property is the mesh's own tagged value; absent ⇒ set 0 as before.
+                let simple = mesh_uses_simple_line_collision(&pkg, idx);
+                let cs_index = if simple && !m.collision[1].triangles.is_empty() {
+                    1
+                } else {
+                    0
+                };
+                if simple {
+                    if cs_index == 1 {
+                        self.scene.count("collision.static_mesh.simple_line_set", 1);
+                        self.scene
+                            .examples
+                            .entry("collision.static_mesh.simple_line_set".to_owned())
+                            .or_insert_with(|| {
+                                format!(
+                                    "{label}: {} simplified triangles",
+                                    m.collision[1].triangles.len()
+                                )
+                            });
+                    } else {
+                        self.scene
+                            .count("note.collision.static_mesh.simple_line_empty", 1);
+                    }
+                } else if m.collision[0].triangles.is_empty()
+                    && !m.collision[1].triangles.is_empty()
+                {
+                    // Not selected by the engine property; imported as no collision.
+                    let key = "note.collision.static_mesh.empty_set0";
+                    self.scene.count(key, 1);
+                    self.scene
+                        .examples
+                        .entry(key.to_owned())
+                        .or_insert_with(|| {
+                            format!(
+                                "{label}: set 0 empty, {} simplified triangles",
+                                m.collision[1].triangles.len()
+                            )
+                        });
+                }
+                let cs = &m.collision[cs_index];
                 let collision: Vec<[[f32; 3]; 3]> = cs
                     .triangles
                     .iter()
@@ -768,6 +811,21 @@ fn identity() -> BevyTransform {
         rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         scale: [1.0; 3],
     }
+}
+
+/// True when a static mesh's own `UseSimpleLineCollision` tagged property is set. When set,
+/// UE2 traces against the simplified collision set instead of the per-triangle set 0. An
+/// absent or undecodable property returns `false` (the per-triangle default).
+fn mesh_uses_simple_line_collision(pkg: &Loaded, idx: usize) -> bool {
+    let Ok(props) = pkg
+        .package
+        .read_object_properties(&pkg.data, idx, &Limits::default())
+    else {
+        return false;
+    };
+    xiii_decode::common::Props::new(&pkg.package, &props)
+        .bool("UseSimpleLineCollision")
+        .unwrap_or(false)
 }
 
 /// Imports a map: static-mesh actors, the level BSP and terrain.
@@ -1378,5 +1436,54 @@ mod local_tests {
                 scene.examples
             );
         }
+    }
+
+    /// `XIII_GOG_DIR` resolved against the workspace root, or `None` in CI.
+    fn opt_in_root() -> Option<std::path::PathBuf> {
+        let root = std::env::var_os("XIII_GOG_DIR")?;
+        let path = std::path::PathBuf::from(&root);
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        Some(if path.is_relative() {
+            ws.join(path)
+        } else {
+            path
+        })
+    }
+
+    #[test]
+    fn banque01_staircase_simple_collision_is_imported() {
+        let Some(path) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        // `Staticbanque.bankesca2` sets `UseSimpleLineCollision=true` and has an empty
+        // per-triangle collision set 0 but 20 simplified triangles in set 1. The importer must
+        // use set 1 for it; otherwise the mesh contributes no collision and the PathNodes
+        // based on the staircases float ~1000 UU above the atrium floor.
+        let mut cache = PackageCache::open(&path).expect("open install");
+        let scene = import_map(&mut cache, "Banque01").expect("import Banque01");
+        let stair_contributors = scene
+            .collision_sources
+            .iter()
+            .filter(|s| s.contains("bankesca2"))
+            .count();
+        assert!(
+            stair_contributors > 0,
+            "no source contains 'bankesca2'; staircase collision was skipped"
+        );
+        // PathNode119 (export 95) is based on StaticMeshActor707 -> bankesca2 at Unreal
+        // (78.0159, -4080.3564, 1076.8217). A downward ray must find the stair floor within the
+        // 3 m FindSpot drop that `--reach-test` uses.
+        let node = to_bevy_position([78.0159, -4080.3564, 1076.8217]);
+        let world =
+            xiii_collision::CollisionWorld::new(scene.collision.iter().map(|(t, s)| (*t, *s)));
+        let hit = world
+            .ray(node, [node[0], node[1] - 3.0, node[2]])
+            .expect("the staircase floor must be within 3 m below PathNode119");
+        assert!(
+            hit.normal[1] > 0.7,
+            "PathNode119 floor normal {:?} is not walkable",
+            hit.normal
+        );
     }
 }
