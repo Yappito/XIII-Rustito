@@ -31,8 +31,10 @@ pub type Triangle = [[f32; 3]; 3];
 pub type Vec3 = [f32; 3];
 
 /// Default movement skin in metres. UE2 offsets the pawn from the surface by a small amount;
-/// 1 mm is small relative to the imported unit scale (50 units/m) and documented as an
-/// approximation, not a measured engine constant.
+/// 1 mm is small relative to the imported unit scale (90 units/m) and documented as an
+/// approximation, not a measured engine constant. The engine's `APawn::stepUp` (`Engine.dll`
+/// `0x103baa30`) has no separate skin constant; `xiii-world::reach` supplies its own empirical
+/// `SKIN_UU = 0.05`, so this crate default is only for callers that do not override it.
 pub const DEFAULT_SKIN: f32 = 0.001;
 
 /// One overlap hit against a triangle.
