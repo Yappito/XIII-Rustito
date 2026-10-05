@@ -28,6 +28,7 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::ecs::system::{NonSend, NonSendMut};
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::mesh::skinning::SkinnedMeshInverseBindposes;
+use bevy::pbr::decal::ForwardDecalMaterial;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
 use bevy::time::Fixed;
@@ -148,6 +149,8 @@ impl Plugin for PlayPlugin {
         .init_resource::<cinematics::CinematicState>()
         .init_resource::<cartoon::CartoonState>()
         .init_resource::<cartoon::CartoonRenderTarget>()
+        .init_resource::<viewer::decals::RuntimeProjectorDecals>()
+        .insert_resource(viewer::fog::FogDisabled(viewer::fog::fog_disabled()))
         .add_systems(Startup, setup)
         .add_systems(FixedUpdate, fixed_step)
         .add_systems(
@@ -161,6 +164,8 @@ impl Plugin for PlayPlugin {
                 cinematics::draw,
                 viewer::sky_follow,
                 viewer::animate_uv,
+                viewer::fog::update_fog,
+                viewer::decals::update_runtime_projectors,
                 sync_particle_triggers,
                 pawns::update_pawns,
                 weapons::update_weapon_view,
@@ -360,6 +365,7 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
+    mut decal_materials: ResMut<Assets<ForwardDecalMaterial<StandardMaterial>>>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let session = match session.as_mut() {
@@ -379,6 +385,7 @@ fn setup(
         &mut materials,
         &mut images,
         &mut bindposes,
+        &mut decal_materials,
     ) {
         Ok(()) => {}
         Err(e) => {
@@ -398,6 +405,7 @@ fn setup_inner(
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
     bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
+    decal_materials: &mut Assets<ForwardDecalMaterial<StandardMaterial>>,
 ) -> Result<(), String> {
     let started = Instant::now();
     let game_dir = opts
@@ -528,7 +536,7 @@ fn setup_inner(
 
     // Render entities per map actor for the one-way sync of VM-moved actors. The scene object
     // path starts with the map export name (`Actor -> Package.Mesh`).
-    let geometry = viewer::spawn_scene_geometry(
+    let (geometry, image_handles) = viewer::spawn_scene_geometry(
         commands,
         meshes,
         materials,
@@ -545,6 +553,26 @@ fn setup_inner(
             .to_owned();
         sync.entities.entry(actor).or_default().push(*entity);
     }
+    // Fog table (per-zone, camera-selected each frame) and the static map projectors' decals.
+    let projection_assets =
+        viewer::decals::setup_projector_assets(images, &image_handles, &scene, decal_materials);
+    let decals_spawned = viewer::decals::spawn_static_projectors(
+        commands,
+        &scene,
+        &projection_assets,
+        decal_materials,
+    );
+    commands.insert_resource(projection_assets);
+    commands.insert_resource(viewer::decals::GroundQuery::from_scene(&scene));
+    commands.insert_resource(viewer::fog::FogContext::new(&scene));
+    println!(
+        "[play] fog: {} zones ({} fogged, {} from class default, {} disabled by map); projectors: {} static ({decals_spawned} decals)",
+        scene.fog.params.len(),
+        scene.fog.params.iter().filter(|p| p.is_fogged()).count(),
+        scene.fog.from_class_default,
+        scene.fog.disabled_by_map,
+        scene.projectors.len(),
+    );
     let scene_tris: usize = scene
         .objects
         .iter()
@@ -561,15 +589,27 @@ fn setup_inner(
     let eye = to_bevy_position(sim.eye_location(&params));
     let sky_position = viewer::scene_sky_position(&scene);
     let sky_enabled = viewer::sky_camera_enabled(&sky_position);
+    let start_params = scene
+        .fog
+        .params_at(eye, viewer::scene_sky_zone(&scene))
+        .cloned()
+        .unwrap_or_else(xiii_world::fog::FogParams::none);
     commands.spawn((
         Camera3d::default(),
         viewer::main_camera_config(sky_enabled),
         RenderLayers::layer(viewer::MAIN_LAYER),
+        bevy::core_pipeline::prepass::DepthPrepass,
+        viewer::fog::distance_fog(&start_params),
+        viewer::fog::ambient_light(&start_params).unwrap_or_else(|| AmbientLight {
+            color: Color::NONE,
+            brightness: 0.0,
+            ..default()
+        }),
         Transform::from_translation(Vec3::from_array(eye)),
         PlayCam,
     ));
     if sky_enabled && let Some(p) = sky_position {
-        viewer::spawn_sky_camera(commands, p);
+        viewer::spawn_sky_camera(commands, p, viewer::scene_sky_zone(&scene));
         println!(
             "[play] sky camera at ({:.1}, {:.1}, {:.1}) m from the map's sky zone",
             p.x, p.y, p.z
@@ -1038,6 +1078,8 @@ fn overlay(
     session: NonSend<Result<session::Session, String>>,
     pawns: Option<Res<pawns::PawnScene>>,
     hud: Option<Res<hud::HudRuntime>>,
+    projector_decals: Option<Res<viewer::decals::RuntimeProjectorDecals>>,
+    fog_ctx: Option<Res<viewer::fog::FogContext>>,
     weapon_view: Option<Res<weapons::WeaponView>>,
     mut perf: ResMut<crate::perf::Perf>,
     mut text: Query<&mut Text, With<PlayOverlay>>,
@@ -1115,6 +1157,22 @@ fn overlay(
         }
         None => "HUD unavailable".to_owned(),
     };
+    let projectors_line = {
+        let (runtime, grounded) = projector_decals
+            .as_deref()
+            .map_or((0, 0), |d| (d.active.len(), d.grounded));
+        let counts = fog_ctx.as_deref().map_or_else(
+            || "fog unavailable".to_owned(),
+            |c| {
+                format!(
+                    "fog zones {} (fogged {})",
+                    c.fog.params.len(),
+                    c.fog.params.iter().filter(|p| p.is_fogged()).count()
+                )
+            },
+        );
+        format!("{counts} | runtime projector decals {runtime} (grounded {grounded})")
+    };
     let combat_line = match &*session {
         Ok(s) => {
             let health = s
@@ -1141,6 +1199,7 @@ fn overlay(
          {}\n\
          {pawns_line}\n\
          {hud_line}\n\
+         {projectors_line}\n\
          WASD move | mouse look | Space jump | Shift walk | C crouch | Left mouse fire | E use | Esc quit",
         cfg.options.map.as_deref().unwrap_or("?"),
         s.location[0],
