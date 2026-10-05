@@ -1,0 +1,62 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "read": {
+      "*": "allow",
+      "*.env": "deny",
+      "*auth.json": "deny"
+    },
+    "edit": {
+      "*": "allow",
+      "XIII_Game/**": "deny",
+      "*XIII_Game*": "deny",
+      "*SteamLibrary*": "deny",
+      "*.cargo*": "deny",
+      ".git/**": "deny",
+      "opencode.json": "deny",
+      "AGENTS.md": "deny",
+      "CLAUDE.md": "deny",
+      "docs/HANDOFF.md": "deny",
+      "rust-toolchain.toml": "deny",
+      "local/tasks/**": "deny"
+    },
+    "external_directory": "deny",
+    "bash": {
+      "*": "allow",
+      "git push*": "deny",
+      "git commit*": "deny",
+      "git reset*": "deny",
+      "git checkout*": "deny",
+      "git switch*": "deny",
+      "git restore*": "deny",
+      "git clean*": "deny",
+      "git rebase*": "deny",
+      "git merge*": "deny",
+      "git stash*": "deny",
+      "git remote*": "deny",
+      "git config*": "deny",
+      "winget*": "deny",
+      "npm *": "deny",
+      "npx *": "deny",
+      "pip *": "deny",
+      "rustup*": "deny",
+      "cargo install*": "deny",
+      "cargo update*": "deny",
+      "cargo add*": "deny",
+      "cargo publish*": "deny",
+      "*SteamLibrary*": "deny",
+      "rm *XIII_Game*": "deny",
+      "mv *XIII_Game*": "deny",
+      "cp *XIII_Game*": "deny",
+      "del *": "deny",
+      "rmdir *": "deny",
+      "Remove-Item*": "deny",
+      "rm -rf*": "deny",
+      "rm -r *": "deny"
+    },
+    "webfetch": "allow",
+    "websearch": "allow",
+    "doom_loop": "deny",
+    "question": "deny"
+  }
+}
