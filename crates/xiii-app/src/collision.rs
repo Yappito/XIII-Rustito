@@ -61,9 +61,11 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
     let actors = level::scan_level(&map_pkg.package, &map_pkg.data);
     let scene = xiii_world::import_map(&mut cache, map)?;
     println!(
-        "[collision-test] {map}: imported in {:.2}s ({} collision triangles, {} sources)",
+        "[collision-test] {map}: imported in {:.2}s ({} shared collision triangles; box soup {} entries, line soup {} entries; {} sources)",
         import_started.elapsed().as_secs_f32(),
-        scene.collision.len(),
+        scene.collision_triangles.len(),
+        scene.collision_box.len(),
+        scene.collision_line.len(),
         scene.collision_sources.len()
     );
 
@@ -92,9 +94,9 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
         println!("[collision-test] mesh-height: could not measure the pawn mesh: {e}");
     }
 
-    // ---- collision world -----------------------------------------------------------------
+    // ---- collision world (extent/box soup: the walker models pawn movement) --------------
     let build_started = Instant::now();
-    let world = CollisionWorld::new(scene.collision.iter().map(|(t, src)| (*t, *src)));
+    let world = CollisionWorld::new(scene.box_collision());
     let build = build_started.elapsed();
     println!(
         "[collision-test] collision world: {} triangles ({} degenerate dropped), {} BVH nodes, built in {:.2} ms",
@@ -176,10 +178,8 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
     // ---- door opening measurement --------------------------------------------------------
     let without_door = CollisionWorld::new(
         scene
-            .collision
-            .iter()
-            .filter(|(_, src)| !scene.collision_sources[*src as usize].contains("Porte6"))
-            .map(|(t, src)| (*t, *src)),
+            .box_collision()
+            .filter(|(_, src)| !scene.collision_sources[*src as usize].contains("Porte6")),
     );
     let opening = measure_opening(
         &without_door,
@@ -989,13 +989,14 @@ fn horizontal_axes(b: Box3) -> (Vec3, Vec3) {
 /// Finds the actor class/location and the collision sources for an actor path fragment.
 fn identify_door(scene: &WorldScene, actors: &level::LevelActors, name: &str) -> Option<DoorInfo> {
     let mut sources = Vec::new();
+    let box_tris: Vec<([[f32; 3]; 3], u32)> = scene.box_collision().collect();
     for (i, s) in scene.collision_sources.iter().enumerate() {
         if !s.contains(name) {
             continue;
         }
         let mut b = door_bbox_empty();
         let mut n = 0usize;
-        for (t, src) in &scene.collision {
+        for (t, src) in &box_tris {
             if *src as usize != i {
                 continue;
             }
@@ -1600,8 +1601,8 @@ fn report_static_mesh_actor(
     // Walkable surfaces: upward-facing collision triangles of this actor, grouped by floor
     // height (Bevy Y), with the fraction of area near the PlayerStart XY.
     let mut surfaces: Vec<(f32, f32)> = Vec::new(); // (u UU, area m^2)
-    for (tris, src) in &scene.collision {
-        let src_path = &scene.collision_sources[*src as usize];
+    for (tris, src) in scene.box_collision() {
+        let src_path = &scene.collision_sources[src as usize];
         if !src_path.starts_with(&prefix) {
             continue;
         }
