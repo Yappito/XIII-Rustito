@@ -440,6 +440,7 @@ pub fn draw(
     mut commands: Commands,
     mut hud: ResMut<HudRuntime>,
     mut images: ResMut<Assets<Image>>,
+    cartoon: Option<Res<super::cartoon::CartoonRenderTarget>>,
     mut perf: ResMut<crate::perf::Perf>,
 ) {
     let t0 = std::time::Instant::now();
@@ -524,12 +525,23 @@ pub fn draw(
                 let Some(path) = material else {
                     continue;
                 };
-                let handle = match hud.texture_cache.get(path) {
-                    Some(h) => h.clone(),
-                    None => {
-                        let decoded = decode_texture_path(&mut hud.packages, path, &mut images);
-                        hud.texture_cache.insert(path.clone(), decoded.clone());
-                        decoded
+                // The comic-panel material (`XIIIBaseHud.CWndMat`) is an `Engine.RenderTargetMaterial`,
+                // not a texture export: sample the cartoon render-to-texture image instead.
+                let render_target = cartoon.as_deref().and_then(|rt| {
+                    (rt.material.as_deref() == Some(path.as_str()))
+                        .then(|| rt.image.clone())
+                        .flatten()
+                });
+                let handle = if let Some(h) = render_target {
+                    Some(h)
+                } else {
+                    match hud.texture_cache.get(path) {
+                        Some(h) => h.clone(),
+                        None => {
+                            let decoded = decode_texture_path(&mut hud.packages, path, &mut images);
+                            hud.texture_cache.insert(path.clone(), decoded.clone());
+                            decoded
+                        }
                     }
                 };
                 let Some(handle) = handle else {

@@ -12,6 +12,7 @@
 pub mod animation;
 pub mod bytecode;
 pub mod canvas;
+pub mod cartoon;
 pub mod cinematics;
 pub mod disasm;
 mod error;
@@ -33,14 +34,14 @@ pub mod voice;
 pub use animation::{AnimationData, FixedAnimation, SeqInfo};
 pub use bytecode::{Call, Label, Script, ScriptLimits, Token, TokenKind, decode_script};
 pub use error::{Result, ScriptError, ScriptErrorKind};
-pub use events::{DialogueEvent, PresentationEvent, SoundEvent};
+pub use events::{DialogueEvent, PresentationEvent, RenderTargetEvent, SoundEvent};
 pub use external::ExternalObjectData;
 pub use linker::{ExternalLookup, ExternalPackage, GlobalRef, ScriptPackage, ScriptSet};
 pub use localize::{LocalizationData, placeholder};
 pub use navigation::{
     EmptyNavigation, NavEdgeInfo, NavPointInfo, NavigationData, find_path, move_step, nearest_point,
 };
-pub use physics::{MoveOutcome, WorldHit, WorldPhysics};
+pub use physics::{CylinderZones, HitZones, MoveOutcome, WorldHit, WorldPhysics};
 pub use reader::{Reader, Tables};
 pub use reflect::{
     Class, Function, Property, PropertyKind, ScriptClassKind, ScriptObject, State, StructHeader,

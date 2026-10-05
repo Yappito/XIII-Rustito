@@ -136,8 +136,10 @@ not a silent success.
 Filesystem-free and engine-free: the caller loads packages into a `ScriptSet`, the `Vm`
 borrows it.
 
-- **Objects**: `Vm::load_level(map)` instantiates every map export whose class derives from
-  `Actor` (Plage00: 371). `ClassLayout` = one slot per property of the class chain (static
+- **Objects**: `Vm::load_level(map)` instantiates every map export whose class resolves to a
+  script class (Plage00: 371 Actors), including non-actor subobjects such as the
+  `Engine.SpriteEmitter` elements of an `Emitter.Emitters` array; only Actor instances are
+  returned for lifecycle. `ClassLayout` = one slot per property of the class chain (static
   arrays expanded), defaults = zero values, then the class-default blocks root to leaf, then the
   map's tagged properties. Values: `Int/Float/Bool/Byte/Name/Str/Object/Vector/Rotator/Struct/
   Array`; anything the loader cannot convert is `Unsupported(desc)` and reading it is an

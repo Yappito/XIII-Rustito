@@ -30,7 +30,7 @@ use crate::localize::{LocalizationData, placeholder};
 use crate::navigation::{
     NavEdgeInfo, NavPointInfo, NavigationData, find_path, move_step, nearest_point, point_fits,
 };
-use crate::physics::WorldPhysics;
+use crate::physics::{HitZones, WorldPhysics};
 use crate::reflect::{Property, PropertyKind, ScriptObject, function_flags, property_flags};
 use crate::registry::{NativeCtx, NativeDef, NativeOutcome, Registry};
 use crate::value::{ObjRef, ObjectId, Ty, Value};
@@ -1120,6 +1120,13 @@ pub struct Vm<'s> {
     /// Decoded navigation graph (pathing natives). `None` = every native that needs it fails
     /// with [`VmErrorKind::NoNavProvider`].
     pub(crate) navigation: Option<Box<dyn NavigationData>>,
+    /// Hit-zone provider for `Actor.GetLastTraceBone` (item14). `None` = the default
+    /// [`crate::physics::CylinderZones`] is used.
+    hit_zones: Option<Box<dyn HitZones>>,
+    /// Bone name recorded by the most recent `Actor.Trace` actor hit, returned by
+    /// `Actor.GetLastTraceBone` (`XIIIPawn.LastBoneHit`). `"None"` when the last trace hit world
+    /// geometry (or nothing).
+    last_trace_bone: String,
     /// Voice-wave duration provider (dialogue natives). `None` = `Actor.GetWaveDuration` reports
     /// `0` with a visible note (the script then falls back to its own default wave length).
     pub(crate) voice_duration: Option<Box<dyn crate::voice::VoiceDuration>>,
@@ -1190,6 +1197,8 @@ impl<'s> Vm<'s> {
             physics: None,
             animation: None,
             navigation: None,
+            hit_zones: None,
+            last_trace_bone: "None".to_owned(),
             voice_duration: None,
             events: Vec::new(),
             local_url: String::new(),
@@ -1361,6 +1370,18 @@ impl<'s> Vm<'s> {
     /// True when a navigation provider is available.
     pub fn has_navigation(&self) -> bool {
         self.navigation.is_some()
+    }
+
+    /// Installs a hit-zone provider for `Actor.GetLastTraceBone` (item14). Without one the
+    /// default [`crate::physics::CylinderZones`] classifies hits against the target cylinder.
+    pub fn set_hit_zones(&mut self, provider: Box<dyn HitZones>) {
+        self.hit_zones = Some(provider);
+    }
+
+    /// Bone name recorded by the most recent `Actor.Trace` actor hit (a name constant such as
+    /// `X Head`/`X Spine1`/`X Spine`, or `None`). Read by `Actor.GetLastTraceBone`.
+    pub fn last_trace_bone(&self) -> &str {
+        &self.last_trace_bone
     }
 
     /// Sets the voice-wave duration provider (dialogue natives). Call before runs that need a
@@ -2065,16 +2086,20 @@ impl<'s> Vm<'s> {
             }
             (PropertyValue::Struct(StructValue::Vector(v)), Ty::Vector) => Value::Vector(*v),
             (PropertyValue::Struct(StructValue::Rotator(v)), Ty::Rotator) => Value::Rotator(*v),
-            // A serialized `Color` default (4 bytes, stored order) decoded into the named struct
-            // members the script accesses (`b`,`g`,`r`,`a`). Measured: `Default__.XIIIGoalMessage`
-            // `DrawColor = (250,230,230,200)` reaches `LocalMessage.GetColor` as a `struct<Color>`;
-            // without this arm the HUD message widgets aborted on the default.
-            (PropertyValue::Struct(StructValue::Color(c)), Ty::Struct(members))
-                if members.len() == 4 =>
-            {
-                let mut fields = Vec::with_capacity(4);
-                for (i, (name, _)) in members.iter().enumerate() {
-                    fields.push((name.clone(), Value::Byte(c[i])));
+            // The package reader stores a `Color` as four bytes (`b,g,r,a`); the script layout
+            // spells the member names, so map by name (a class default like
+            // `XIIIDialogMessage.MessageColor` is read as a `struct<Color>`).
+            (PropertyValue::Struct(StructValue::Color(c)), Ty::Struct(members)) => {
+                let mut fields = Vec::with_capacity(members.len());
+                for (name, _) in members {
+                    let byte = match name.to_ascii_lowercase().as_str() {
+                        "b" => c[0],
+                        "g" => c[1],
+                        "r" => c[2],
+                        "a" => c[3],
+                        _ => return Value::Unsupported(format!("color member {name}")),
+                    };
+                    fields.push((name.clone(), Value::Byte(byte)));
                 }
                 Value::Struct(fields)
             }
@@ -2238,11 +2263,19 @@ impl<'s> Vm<'s> {
         Ok(id)
     }
 
-    /// Instantiates every actor export of a loaded map package (two passes: create, then
-    /// apply the map's tagged properties). Returns the created ids in export order.
+    /// Instantiates every script-class export of a loaded map package (two passes: create, then
+    /// apply the map's tagged properties). Returns the created Actor ids in export order; non-actor
+    /// subobjects are created and property-loaded but not returned for lifecycle.
     pub fn load_level(&mut self, map: usize, limits: &Limits) -> VmResult<Vec<ObjectId>> {
         let set = self.set;
         let p = &set.packages[map];
+        // Every map export whose class resolves to a script class is instantiated: not only
+        // `Actor`s but also their non-actor subobjects, which UE2 serialises as top-level map
+        // exports (e.g. the `Engine.SpriteEmitter` elements of an `Emitter.Emitters` array).
+        // Only the Actor-derived instances are returned for lifecycle; the rest exist so script
+        // property access on them (`.Disabled = ...`) resolves to an instance, not a static
+        // reference. Evidence: `xidcine.TrigerredEmitter.PostBeginPlay` walks `Emitters[i]`.
+        let mut actors = Vec::new();
         let mut created = Vec::new();
         for (i, e) in p.package.exports().iter().enumerate() {
             let Some(class) = set.resolve(map, e.class) else {
@@ -2251,10 +2284,14 @@ impl<'s> Vm<'s> {
             if !matches!(set.object(class), Some(ScriptObject::Class(_))) {
                 continue;
             }
-            let layout = self.class_layout(class)?;
-            if !layout.chain_names.iter().any(|n| n == "actor") || e.serial_size == 0 {
+            if e.serial_size == 0 {
                 continue;
             }
+            let is_actor = self
+                .class_layout(class)?
+                .chain_names
+                .iter()
+                .any(|n| n == "actor");
             let name = p.ref_name(ObjectRef::Export(i as u32)).to_owned();
             let id = self.spawn(class, &name)?;
             let g = GlobalRef {
@@ -2264,6 +2301,9 @@ impl<'s> Vm<'s> {
             self.objects[id as usize].export = Some(g);
             self.by_export.insert(g, id);
             created.push(id);
+            if is_actor {
+                actors.push(id);
+            }
         }
         for &id in &created {
             let g = self.objects[id as usize].export.expect("set above");
@@ -2281,7 +2321,7 @@ impl<'s> Vm<'s> {
             self.apply_block(map, &props.block, &layout, &mut values);
             self.objects[id as usize].props = values;
         }
-        Ok(created)
+        Ok(actors)
     }
 
     /// Object id by display name (case-insensitive).
@@ -2290,6 +2330,13 @@ impl<'s> Vm<'s> {
             .iter()
             .position(|o| !o.deleted && o.name.eq_ignore_ascii_case(name))
             .map(|i| i as ObjectId)
+    }
+
+    /// Class-level function by name, ignoring state shadowing. Host-driven verbs that the engine
+    /// resolves against the class (for example the player's `Fire` while a weapon state defines an
+    /// empty shadow) can call this instead of [`Vm::send_event`], which is state-aware.
+    pub fn class_function(&self, id: ObjectId, name: &str) -> Option<GlobalRef> {
+        self.find_function(id, name, false)
     }
 
     /// Marks an object as executed (in scope).
@@ -2788,6 +2835,11 @@ impl<'s> Vm<'s> {
                 self.process_state(id, dt)?;
             }
         }
+        for id in 0..self.objects.len() as ObjectId {
+            if self.objects[id as usize].active && self.objects[id as usize].is_actor {
+                self.dispatch_tick(id, dt)?;
+            }
+        }
         Ok(())
     }
 
@@ -2880,7 +2932,28 @@ impl<'s> Vm<'s> {
         if profiling {
             self.profile.state_micros += t0.elapsed().as_micros() as u64;
         }
+        for id in 0..self.objects.len() as ObjectId {
+            if self.objects[id as usize].active
+                && self.objects[id as usize].is_actor
+                && let Err(e) = self.dispatch_tick(id, dt)
+            {
+                let suspended = self.suspend_for_error(id, &e);
+                errors.push((suspended, e));
+            }
+        }
         errors
+    }
+
+    /// Fires the per-frame `Tick(DeltaTime)` event on one active actor. UE2's engine calls
+    /// `AActor::Tick` (the script `event Tick`) each frame; the VM runs state code latently but
+    /// must also dispatch `Tick` or per-frame script (the `CineController2` sequence interpreter,
+    /// `XIIIBaseHud.Tick`, pawn controllers) never runs. `Tick` is looked up in the actor's
+    /// current state first, then the class chain.
+    fn dispatch_tick(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
+        if let Some(f) = self.find_function(id, "Tick", true) {
+            self.call_values(f, id, vec![Value::Float(dt)])?;
+        }
+        Ok(())
     }
 
     /// Suspends the actor that should stop after a failing tick: the innermost object on the
@@ -3277,12 +3350,14 @@ impl<'s> Vm<'s> {
             };
         }
         let layout = self.func_layout(func);
-        // A `static` script function dispatches on the class default object, which is never part
-        // of the executed scope. UE2 runs statics regardless of instance scope (e.g.
-        // `LocalMessage.GetString` called by `HudObjectifMessage.SetUpLocalizedMessage`,
-        // `Message.static.GetString`), so they must not be deferred like instance methods on a
-        // suspended actor. Non-static calls on an inactive target keep the DEFERRED behaviour.
-        if !self.objects[target as usize].active && !f.is_static() {
+        // A class-default object (`Default__Class`) is never `active`, and a `static` function
+        // dispatches on the class default object; UE2 runs both regardless of instance scope
+        // (`MessageClass.default.GetColor`, `Message.static.GetString`). Only non-static calls
+        // on *placed* actors outside the executed scope are deferred.
+        if !self.objects[target as usize].active
+            && !self.objects[target as usize].name.starts_with("Default__")
+            && !f.is_static()
+        {
             let o = &self.objects[target as usize];
             let (tname, class) = (o.name.clone(), set.path(o.class));
             if layout.ret.is_some() {
@@ -4027,11 +4102,11 @@ impl<'s> Vm<'s> {
     }
 
     /// Property object referenced directly by a variable token.
-    fn member_property(&self, frame: &Frame<'s>, member: &Token) -> Option<GlobalRef> {
+    fn member_property(&self, pkg: usize, member: &Token) -> Option<GlobalRef> {
         use TokenKind as K;
         match &member.kind {
             K::InstanceVariable(r) | K::DefaultVariable(r) | K::LocalVariable(r) => {
-                self.set.resolve(frame.pkg, *r)
+                self.set.resolve(pkg, *r)
             }
             _ => None,
         }
@@ -4039,21 +4114,35 @@ impl<'s> Vm<'s> {
 
     /// Static class of an object-typed token (`self`, a class literal, a variable whose declared
     /// type is an object/class, or a chained context), when it can be determined.
-    fn context_object_class(&self, frame: &Frame<'s>, t: &Token) -> Option<GlobalRef> {
+    pub(crate) fn context_object_class(
+        &self,
+        pkg: usize,
+        this: ObjectId,
+        t: &Token,
+    ) -> Option<GlobalRef> {
         use TokenKind as K;
         match &t.kind {
-            K::SelfRef => Some(self.objects[frame.this as usize].class),
+            K::SelfRef => Some(self.objects[this as usize].class),
             K::ObjectConst(r) => {
-                let g = self.set.resolve(frame.pkg, *r)?;
+                let g = self.set.resolve(pkg, *r)?;
                 matches!(self.set.object(g), Some(ScriptObject::Class(_))).then_some(g)
             }
             K::Context(c) => {
                 // The context object must itself be an object; then the member's declared type
                 // is the result class.
-                self.context_object_class(frame, &c.object)?;
-                self.property_class(self.member_property(frame, &c.member)?)
+                self.context_object_class(pkg, this, &c.object)?;
+                self.property_class(self.member_property(pkg, &c.member)?)
             }
-            _ => self.property_class(self.member_property(frame, t)?),
+            // `Pawn(Other)`-style class cast: the result's static type is the cast target, so a
+            // function call through a `None` cast (a failed dynamic cast) must resolve its return
+            // type there. Without this, `Pawn(Other).IsPlayerPawn()` on a non-pawn `Other` fell
+            // back to the calling actor's class, found no such function and yielded `void`,
+            // suspending `xiii.ZigouillateurTrigger.Touch` / `engine.Ammunition.AddAmmo`.
+            K::DynamicCast { class, .. } => {
+                let g = self.set.resolve(pkg, *class)?;
+                matches!(self.set.object(g), Some(ScriptObject::Class(_))).then_some(g)
+            }
+            _ => self.property_class(self.member_property(pkg, t)?),
         }
     }
 
@@ -4073,7 +4162,7 @@ impl<'s> Vm<'s> {
     /// return type of a called function found in the object expression's static class.
     fn zero_of_context(&mut self, frame: &Frame<'s>, c: &Context, target: ObjectId) -> Value {
         use TokenKind as K;
-        if let Some(g) = self.member_property(frame, &c.member)
+        if let Some(g) = self.member_property(frame.pkg, &c.member)
             && let Some(ScriptObject::Property(p)) = self.set.object(g)
         {
             return self.ty_of(g.package, &p.kind, 0).zero();
@@ -4095,7 +4184,7 @@ impl<'s> Vm<'s> {
             _ => return self.zero_for(frame, &c.member, target),
         };
         let class = self
-            .context_object_class(frame, &c.object)
+            .context_object_class(frame.pkg, frame.this, &c.object)
             .or_else(|| Some(self.objects[target as usize].class));
         let f = class.and_then(|c| {
             self.class_chain(c)
@@ -4434,7 +4523,7 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn primitive_cast(&self, cast: u8, v: Value) -> VmResult<Value> {
+    pub(crate) fn primitive_cast(&self, cast: u8, v: Value) -> VmResult<Value> {
         // UE2 conversion codes (ECastToken), confirmed on corpus uses (0x3F int->float on
         // ints, 0x44 float->int, 0x53/0x56/0x57 to string on int/object/name operands).
         let bad = |s: &Self, v: &Value| s.type_err("castable value", v);
@@ -4447,6 +4536,18 @@ impl<'s> Vm<'s> {
                     pitch.cos() * yaw.cos(),
                     pitch.cos() * yaw.sin(),
                     pitch.sin(),
+                ])
+            }
+            // UE2 `VectorToRotator` (ECastToken 0x50): `FVector::Rotation()` (yaw from XY, pitch
+            // from Z, roll 0; rotator units, rounded).
+            (0x50, Value::Vector(v)) => {
+                let units = 65536.0 / std::f32::consts::TAU;
+                let yaw = v[1].atan2(v[0]);
+                let pitch = v[2].atan2((v[0] * v[0] + v[1] * v[1]).sqrt());
+                Value::Rotator([
+                    (pitch * units).round() as i32,
+                    (yaw * units).round() as i32,
+                    0,
                 ])
             }
             (0x3A, Value::Byte(b)) => Value::Int(i32::from(*b)),
@@ -4477,7 +4578,21 @@ impl<'s> Vm<'s> {
             (0x56, Value::Object(Some(r))) => Value::Str(self.obj_label(r)),
             (0x56, Value::NativeClass(n)) => Value::Str(n.clone()),
             (0x57, Value::Name(n)) => Value::Str(n.clone()),
-            (c, _) if !(0x39..=0x59).contains(&c) => return Err(bad(self, &v)),
+            // UE2 `VectorToString` (0x58): comma-separated X,Y,Z with the same 2-decimal float
+            // format as `FloatToString`; decoded at `xidmaps.Spads01.FirstFrame` 0x0045
+            // (`Log("SpotOffset" @ string(vector))`). BeyondUnreal "Typecast".
+            (0x58, Value::Vector(v)) => Value::Str(format!("{:.2},{:.2},{:.2}", v[0], v[1], v[2])),
+            // UE2 `RotatorToString` (0x59): Pitch,Yaw,Roll each reduced to the 0..65535 range.
+            (0x59, Value::Rotator(r)) => Value::Str(format!(
+                "{},{},{}",
+                r[0] & 0xffff,
+                r[1] & 0xffff,
+                r[2] & 0xffff
+            )),
+            // UE2 `StringToName` (ECastToken 0x5A): intern the string as an FName. The cine
+            // interpreter casts the `GetFirstWord` action tag to `name` for StartDialogue.
+            (0x5A, Value::Str(s)) => Value::Name(s.clone()),
+            (c, _) if !(0x39..=0x5B).contains(&c) => return Err(bad(self, &v)),
             _ => {
                 return Err(self.err(VmErrorKind::Other(format!(
                     "primitive cast 0x{cast:02X} on {} not implemented",
@@ -5557,8 +5672,24 @@ impl<'s> Vm<'s> {
         extent: [f32; 3],
     ) -> Option<(f32, ObjectId, [f32; 3])> {
         let mut best: Option<(f32, ObjectId, [f32; 3])> = None;
+        // UE2 selects actor hits by the trace extent: a zero-extent (line) trace needs
+        // `bBlockZeroExtentTraces`, a swept box needs `bBlockNonZeroExtentTraces`. A pawn may have
+        // `bCollideActors=false` yet still block hitscan traces (measured: `BaseSoldier6`), so the
+        // extent flag is the correct gate here.
+        let nonzero = extent[0] + extent[1] + extent[2] > 0.0;
         for b in 0..self.objects.len() as ObjectId {
-            if b == id || !self.is_live_actor(b) || !self.bool_prop(b, "bCollideActors") {
+            if b == id || !self.is_live_actor(b) {
+                continue;
+            }
+            let gate = if nonzero {
+                self.bool_prop(b, "bBlockNonZeroExtentTraces")
+            } else {
+                self.bool_prop(b, "bBlockZeroExtentTraces")
+            };
+            // The engine's actor-trace also reaches actors in the collision list (`bCollideActors`)
+            // even when they do not set the extent flag (a traced pawn may clear `bCollideActors`
+            // but still block a hitscan through `bBlockZeroExtentTraces`); accept either.
+            if !gate && !self.bool_prop(b, "bCollideActors") {
                 continue;
             }
             // Skip actors in the tracer's owner chain (upstream TraceFirstHit IsOwnedBy).
@@ -5608,11 +5739,26 @@ impl<'s> Vm<'s> {
         {
             best = Some((t, Some(b), n));
         }
-        Ok(match best {
+        let out = match best {
             Some((t, Some(b), n)) => (Some(b), lerp3(start, end, t), n),
             Some((t, None, n)) => (self.find_level_info(), lerp3(start, end, t), n),
             None => (None, end, [0.0, 0.0, 0.0]),
-        })
+        };
+        // item14: record the hit zone for `Actor.GetLastTraceBone` (`XIIIPawn.LastBoneHit`).
+        // A world/LevelInfo hit is not a pawn, so the bone stays `None`.
+        self.last_trace_bone = match out.0 {
+            Some(b) if !self.is_a(b, "levelinfo") => {
+                let (center, radius, half_height) = self.actor_cylinder(b);
+                match &self.hit_zones {
+                    Some(z) => z.bone_at(center, radius, half_height, out.1),
+                    None => {
+                        crate::physics::CylinderZones.bone_at(center, radius, half_height, out.1)
+                    }
+                }
+            }
+            _ => "None".to_owned(),
+        };
+        Ok(out)
     }
 
     /// `Actor.FastTrace`: world-only line trace; true when clear.
@@ -6164,6 +6310,16 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
+    /// `Actor.StopAnimating` (native 417): stop every animation channel and clear the animation
+    /// properties, like UE2 `AActor::StopAnimating`. Decoded call site
+    /// `engine.Inventory.DropFrom` 0x003A (immediately before `GotoState('None')`).
+    pub(crate) fn stop_animating(&mut self, id: ObjectId) {
+        self.objects[id as usize].anim.channels.clear();
+        self.set_property(id, "AnimSequence", 0, Value::Name("None".into()));
+        self.set_property(id, "AnimRate", 0, Value::Float(0.0));
+        self.set_property(id, "AnimFrame", 0, Value::Float(0.0));
+    }
+
     /// `Actor.HasAnim`: whether any of the actor's animation sources has `sequence`.
     pub(crate) fn has_anim(
         &mut self,
@@ -6709,7 +6865,10 @@ fn member_get(v: &Value, m: &str) -> Option<Value> {
         (Value::Rotator(a), "pitch") => Some(Value::Int(a[0])),
         (Value::Rotator(a), "yaw") => Some(Value::Int(a[1])),
         (Value::Rotator(a), "roll") => Some(Value::Int(a[2])),
-        (Value::Struct(ms), m) => ms.iter().find(|(n, _)| n == m).map(|(_, v)| v.clone()),
+        (Value::Struct(ms), m) => ms
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(m))
+            .map(|(_, v)| v.clone()),
         _ => None,
     }
 }
@@ -6722,7 +6881,7 @@ fn member_set(v: &mut Value, m: &str, x: Value) -> bool {
         (Value::Rotator(a), "pitch", Value::Int(i)) => a[0] = i,
         (Value::Rotator(a), "yaw", Value::Int(i)) => a[1] = i,
         (Value::Rotator(a), "roll", Value::Int(i)) => a[2] = i,
-        (Value::Struct(ms), m, x) => match ms.iter_mut().find(|(n, _)| n == m) {
+        (Value::Struct(ms), m, x) => match ms.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(m)) {
             Some(slot) => slot.1 = x,
             None => return false,
         },
@@ -6731,10 +6890,14 @@ fn member_set(v: &mut Value, m: &str, x: Value) -> bool {
     true
 }
 
-/// UnrealScript equality used by `switch` and struct comparisons (names case-insensitive).
+/// UnrealScript equality used by `switch` and struct comparisons: `Name` and `string` compare
+/// case-insensitively (`appStricmp`/`FName`), the rest by Rust equality. The cine interpreter's
+/// `switch (GetFirstWord(Argument))` relies on this: the map scripts use lowercase action words
+/// (`dial`, `event`, `wait`) while the compiled `case` values are `Dial`/`Event`/`Wait`.
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Name(x), Value::Name(y)) => x.eq_ignore_ascii_case(y),
+        (Value::Str(x), Value::Str(y)) => x.eq_ignore_ascii_case(y),
         (Value::Int(x), Value::Byte(y)) | (Value::Byte(y), Value::Int(x)) => *x == i32::from(*y),
         _ => a == b,
     }

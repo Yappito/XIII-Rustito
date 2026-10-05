@@ -62,6 +62,47 @@ pub trait WorldPhysics {
     fn set_mover(&mut self, _actor: &str, _location: [f32; 3], _rotation: [i32; 3]) {}
 }
 
+/// Hit-zone resolution for `Actor.GetLastTraceBone` (item14).
+///
+/// The decoded `SkeletalMesh` carries a trailing per-bone hit-box array
+/// (`xiii-decode::skeletal::mesh::RawSkeletalMesh::bone_boxes`), but the boxes are expressed in
+/// each bone's local space and therefore require the **animated** pose to become world-space
+/// volumes. The headless VM does not evaluate a pose; it only has each actor's collision
+/// cylinder. This trait is the small provider seam: the default [`CylinderZones`] classifies the
+/// world hit point against the target's cylinder, and a host that evaluates the decoded pose can
+/// install a per-bone provider without changing the VM.
+pub trait HitZones {
+    /// Bone name for a world-space `hit` on an actor whose collision cylinder is
+    /// `(center, radius, half_height)`. Returns a name constant (`X Head`, `X Spine1`, `X Spine`,
+    /// or `None`).
+    fn bone_at(&self, center: [f32; 3], radius: f32, half_height: f32, hit: [f32; 3]) -> String;
+}
+
+/// Default hit-zone model over the collision cylinder. XIII's `XIIIPawn.GetDamageLocation`
+/// already classifies a hit by its offset from the pawn centre (head / spine / below), so the
+/// only information the script's `LastBoneHit` gate needs is the vertical band. The top half of
+/// the cylinder maps to `X Head`, the middle band to `X Spine1`, the rest to `X Spine`.
+///
+/// **Partial** (documented): this is not the decoded bone-box test; see [`HitZones`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CylinderZones;
+
+impl HitZones for CylinderZones {
+    fn bone_at(&self, center: [f32; 3], _radius: f32, half_height: f32, hit: [f32; 3]) -> String {
+        if half_height <= 0.0 {
+            return "None".to_owned();
+        }
+        let dz = hit[2] - center[2];
+        if dz > half_height * 0.5 {
+            "X Head".to_owned()
+        } else if dz > -half_height * 0.5 {
+            "X Spine1".to_owned()
+        } else {
+            "X Spine".to_owned()
+        }
+    }
+}
+
 /// Diagnostic provider: a single infinite floor plane at Unreal Z `floor_z`, nothing else.
 ///
 /// This is **not** the map: it exists so the headless harness and diagnostics can run past

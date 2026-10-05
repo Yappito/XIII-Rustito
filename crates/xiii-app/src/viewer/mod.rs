@@ -9,6 +9,7 @@
 
 pub mod decals;
 pub mod fog;
+pub mod particles;
 pub mod skinned;
 
 use std::collections::HashSet;
@@ -129,6 +130,7 @@ impl Plugin for ViewerPlugin {
         .init_resource::<ShotFlag>()
         .init_resource::<PickData>()
         .insert_resource(fog::FogDisabled(fog::fog_disabled()))
+        .add_plugins(particles::ParticlePlugin)
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -380,6 +382,7 @@ pub(crate) fn spawn_scene_geometry(
     images: &mut Assets<Image>,
     scene: &WorldScene,
     baked: bool,
+    force_particles: bool,
 ) -> (Vec<Entity>, Vec<Handle<Image>>) {
     let image_handles: Vec<Handle<Image>> = scene
         .textures
@@ -453,6 +456,15 @@ pub(crate) fn spawn_scene_geometry(
         }
         entities.push(entity);
     }
+    particles::spawn_particles(
+        commands,
+        meshes,
+        materials,
+        images,
+        &image_handles,
+        scene,
+        force_particles,
+    );
     (entities, image_handles)
 }
 
@@ -491,6 +503,7 @@ fn setup(
         &mut images,
         &scene,
         baked,
+        cfg.options.particles == crate::cli::Particles::All,
     );
     // Projector decals: one per static map-placed `Projector`/`ShadowProjector`.
     let projection_assets =
@@ -920,6 +933,7 @@ fn overlay(
     state: Res<RunState>,
     cams: Query<&Transform, With<FlyCam>>,
     sky_cams: Query<&SkyCamera>,
+    emitters: Query<&particles::ParticleEmitterRender>,
     mut perf: ResMut<crate::perf::Perf>,
     mut text: Query<&mut Text, With<OverlayText>>,
 ) {
@@ -939,8 +953,14 @@ fn overlay(
         })
         .unwrap_or_default();
     let mut s = format!(
-        "{}\ncamera {:.1} {:.1} {:.1} m{sky} | problems (skip./fail. counters): {}\ncrosshair: {}\n",
-        summary.title, cam.x, cam.y, cam.z, summary.problems, state.picked
+        "{}\ncamera {:.1} {:.1} {:.1} m{sky} | problems (skip./fail. counters): {} | live particles {}\ncrosshair: {}\n",
+        summary.title,
+        cam.x,
+        cam.y,
+        cam.z,
+        summary.problems,
+        particles::live_particle_count(&emitters),
+        state.picked
     );
     for l in &summary.lines {
         s.push_str(l);

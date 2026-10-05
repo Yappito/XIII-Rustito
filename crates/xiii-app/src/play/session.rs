@@ -85,6 +85,37 @@ pub struct Session {
     pub tick_count: u64,
 }
 
+/// Host-owned player movement fields published to the VM pawn each fixed tick (item7b).
+///
+/// The simulation owns the values; the VM reads them in the pawn's own code (`Landed`,
+/// `TakeFallingDamage`, states). `landed_velocity_z` is `Some` on the tick the player touches
+/// down, so `Pawn.Landed(HitNormal)` sees the impact velocity in `Pawn.Velocity.Z`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerVMModes {
+    /// `bIsCrouched` / `bWantsToCrouch`.
+    pub crouched: bool,
+    /// `bUnderWater`.
+    pub in_water: bool,
+    /// UE2 `EPhysics` byte (`PHYS_Walking`, `PHYS_Falling`, `PHYS_Swimming`, `PHYS_Ladder`).
+    pub physics: u8,
+    /// Downward velocity (Unreal units/s) at the landing, when the player landed this tick.
+    pub landed_velocity_z: Option<f32>,
+    /// Floor normal (Unreal axes) for the `Landed(HitNormal)` argument.
+    pub floor_normal: [f32; 3],
+}
+
+impl Default for PlayerVMModes {
+    fn default() -> Self {
+        Self {
+            crouched: false,
+            in_water: false,
+            physics: crate::play::sim::PHYS_WALKING,
+            landed_velocity_z: None,
+            floor_normal: [0.0, 0.0, 1.0],
+        }
+    }
+}
+
 /// Outcome of a host use action on a mover/door.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UseOutcome {
@@ -97,6 +128,17 @@ pub enum UseOutcome {
     /// An (unlocked) door was triggered to open/close.
     Triggered,
     /// The script raised on the transition.
+    Error(String),
+}
+
+/// Outcome of a host fire action (item14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FireOutcome {
+    /// The player's weapon ran its own `Fire` path (trace/projectile/damage by script).
+    Fired,
+    /// The player pawn has no `Weapon`: nothing to fire.
+    NoWeapon,
+    /// The script raised on the fire path (the error carries the VM stack).
     Error(String),
 }
 
@@ -324,16 +366,36 @@ impl Session {
     /// One fixed step, in the documented order: write the player pawn state (owned by the
     /// movement simulation) into the VM, refresh its touches, tick the VM tolerantly, drain the
     /// presentation events and record the actors the VM moved.
-    pub fn step(&mut self, dt: f32, location: [f32; 3], yaw: f32, velocity: [f32; 3]) {
+    ///
+    /// `modes` carries the movement-mode fields the host owns (crouch/water/physics and, on the
+    /// landing tick, the impact velocity). When the player landed, the pawn's own
+    /// `Landed(HitNormal)` event runs through the VM (`XIIIPawn.Landed` ->
+    /// `TakeFallingDamage` -> `TakeDamage`), so falling damage is computed by the game's code.
+    pub fn step(
+        &mut self,
+        dt: f32,
+        location: [f32; 3],
+        yaw: f32,
+        velocity: [f32; 3],
+        modes: &PlayerVMModes,
+    ) {
         self.moved.clear();
         let profiling = self.vm.native_profile().enabled;
         let t0 = Instant::now();
         let _ = self
             .vm
             .set_property(self.player, "Location", 0, Value::Vector(location));
-        let _ = self
-            .vm
-            .set_property(self.player, "Velocity", 0, Value::Vector(velocity));
+        // On the landing tick, publish the impact velocity so `TakeFallingDamage` reads it.
+        let published_velocity = match modes.landed_velocity_z {
+            Some(vz) => [velocity[0], velocity[1], vz],
+            None => velocity,
+        };
+        let _ = self.vm.set_property(
+            self.player,
+            "Velocity",
+            0,
+            Value::Vector(published_velocity),
+        );
         let yaw_units = (yaw / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN).round() as i32;
         let _ = self.vm.set_property(
             self.player,
@@ -341,6 +403,49 @@ impl Session {
             0,
             Value::Rotator([0, yaw_units, 0]),
         );
+        // The engine tracks the look direction on the `PlayerController` (`Pawn.GetViewRotation`
+        // returns `Controller.Rotation` for a player pawn); the host owns the player's yaw, so
+        // write it to the controller too. Without this `XIIIWeapon.RealTraceFire` traces along the
+        // controller default rotation (item14).
+        if let Some(ctrl) = self.controller {
+            let _ = self
+                .vm
+                .set_property(ctrl, "Rotation", 0, Value::Rotator([0, yaw_units, 0]));
+        }
+        // The host owns the player's movement; keep the held weapon at the eye so the script's
+        // damage falloff (`XIIIBulletsAmmo.ProcessTraceHit` measures `HitLocation - W.Location`)
+        // sees the muzzle distance, not the weapon's stale spawn position. The engine's
+        // `XIIIWeapon.Active.BeginState` does `SetLocation(Instigator.Location + CalcDrawOffset)`.
+        if let Some(weapon) = self.player_weapon() {
+            let eye = match self.vm.get_property(self.player, "EyeHeight") {
+                Some(Value::Float(h)) => *h,
+                _ => match self.vm.get_property(self.player, "BaseEyeHeight") {
+                    Some(Value::Float(h)) => *h,
+                    _ => 0.0,
+                },
+            };
+            let _ = self.vm.set_property(
+                weapon,
+                "Location",
+                0,
+                Value::Vector([location[0], location[1], location[2] + eye]),
+            );
+        }
+        let _ = self
+            .vm
+            .set_property(self.player, "bIsCrouched", 0, Value::Bool(modes.crouched));
+        let _ = self.vm.set_property(
+            self.player,
+            "bWantsToCrouch",
+            0,
+            Value::Bool(modes.crouched),
+        );
+        let _ = self
+            .vm
+            .set_property(self.player, "bUnderWater", 0, Value::Bool(modes.in_water));
+        let _ = self
+            .vm
+            .set_property(self.player, "Physics", 0, Value::Byte(modes.physics));
         if profiling {
             self.vm.native_profile_mut().player_write_micros += t0.elapsed().as_micros() as u64;
         }
@@ -356,6 +461,15 @@ impl Session {
             self.vm.native_profile_mut().touch_micros += t0.elapsed().as_micros() as u64;
         }
         self.drain_events();
+
+        // The pawn's own landing path (fall damage is the game's code, not the host's).
+        if modes.landed_velocity_z.is_some() {
+            let arg = Value::Vector(modes.floor_normal);
+            if let Err(e) = self.vm.send_event(self.player, "Landed", vec![arg]) {
+                self.record_failure("Landed", &e);
+            }
+            self.drain_events();
+        }
 
         for (id, e) in self.vm.tick_suspending(dt) {
             self.suspend(id, &e);
@@ -501,6 +615,14 @@ impl Session {
     /// Current player `Location` (UU).
     pub fn player_location(&self) -> Option<[f32; 3]> {
         self.vm.vector_prop(self.player, "Location")
+    }
+
+    /// Current player pawn `Physics` byte (`PHYS_*`).
+    pub fn player_physics(&self) -> Option<u8> {
+        match self.vm.get_property(self.player, "Physics") {
+            Some(Value::Byte(p)) => Some(*p),
+            _ => None,
+        }
     }
 
     /// Live item in `id`'s `Inventory` chain, if the property is an object reference.
@@ -672,6 +794,164 @@ impl Session {
     /// First failure formatted with its stack, if any.
     pub fn first_error(&self) -> Option<&str> {
         self.first_error.as_deref()
+    }
+
+    /// The player pawn's current `Weapon` object, if any.
+    pub fn player_weapon(&self) -> Option<ObjectId> {
+        instance_prop(&self.vm, self.player, "Weapon")
+    }
+
+    /// `Fire` on the player's weapon through the game's own entry point: the controller's exec
+    /// `Fire(1.0)` (`XIIIPlayerController.Fire` -> `Pawn.Weapon.Fire`), or the weapon directly
+    /// when the pawn has no controller. The weapon runs its own `ServerFire` ->
+    /// `TraceFire`/`ProjectileFire` -> `ProcessTraceHit` -> `TakeDamage` chain (item14).
+    pub fn fire(&mut self, yaw: f32) -> FireOutcome {
+        let Some(weapon) = self.player_weapon() else {
+            return FireOutcome::NoWeapon;
+        };
+        // The host owns the player yaw; the VM's controller state code does not sync it, so
+        // re-assert it here where the script reads `GetViewRotation` (item14).
+        let yaw_units = (yaw / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN).round() as i32;
+        let _ = self.vm.set_property(
+            self.player,
+            "Rotation",
+            0,
+            Value::Rotator([0, yaw_units, 0]),
+        );
+        if let Some(ctrl) = self.controller {
+            let _ = self
+                .vm
+                .set_property(ctrl, "Rotation", 0, Value::Rotator([0, yaw_units, 0]));
+            // `XIIIPlayerController.AdjustAim` returns `OldAdjustAim`/`AdjustedAimForFiring` for
+            // an instant-hit weapon; the engine refreshes those from the view each frame, which
+            // the headless VM does not. Feed the host view direction (item14).
+            let dir = Value::Vector([yaw.cos(), yaw.sin(), 0.0]);
+            let _ = self.vm.set_property(ctrl, "OldAdjustAim", 0, dir.clone());
+            let _ = self.vm.set_property(ctrl, "AdjustedAimForFiring", 0, dir);
+            self.vm.set_property(ctrl, "bFire", 0, Value::Byte(1));
+            self.vm.set_property(ctrl, "bWeaponMode", 0, Value::Byte(1));
+        }
+        let target = self
+            .controller
+            .filter(|c| self.vm.objects.get(*c as usize).is_some_and(|o| !o.deleted));
+        let target = target.unwrap_or(weapon);
+        // `XIIIWeapon`'s `Active` state defines an empty `Fire` shadow, so the state-aware virtual
+        // call from `PlayerController.Fire` is a no-op while the weapon is idle. The engine
+        // resolves `Pawn.Weapon.Fire` against the class once the state stops shadowing (e.g. the
+        // `Idle` state's own `Fire(0.0)` poll); resolve the class `Fire` explicitly.
+        let r = match self.vm.class_function(weapon, "Fire") {
+            Some(f) => self
+                .vm
+                .call_function(f, weapon, vec![Value::Float(1.0)])
+                .map(Some),
+            None => self.vm.send_event(target, "Fire", vec![Value::Float(1.0)]),
+        };
+        match r {
+            Ok(_) => FireOutcome::Fired,
+            Err(e) => FireOutcome::Error(e.to_string()),
+        }
+    }
+
+    /// Diagnostic weapon bootstrap for `--play-script` (item14): spawn `class_path`, run the
+    /// game's own `Weapon.GiveTo`/`BringUp`, and wire the player's `Weapon`/`PendingWeapon` so the
+    /// normal fire path works. The campaign maps start the player with `XIII.Fists`; the real
+    /// pickup/equip chain (`Pickup.Touch` -> `Pawn.AddInventory` -> `ChangedWeapon`) needs a walk
+    /// to a map pickup, which the deterministic demonstration does not include. This grant is
+    /// reported, never silent, and the firing/damage/death behaviour is still the game's scripts.
+    pub fn grant_weapon(&mut self, class_path: &str) -> Result<String, String> {
+        let class = runtime::resolve_class_path(self.vm.set(), class_path)
+            .ok_or_else(|| format!("weapon class {class_path} is not loaded"))?;
+        let pawn = self.player;
+        // `spawn_actor` runs the weapon's own PreBeginPlay/BeginPlay/PostBeginPlay lifecycle.
+        let loc = self.vm.vector_prop(pawn, "Location");
+        let id = self
+            .vm
+            .spawn_actor(pawn, Some(class), Some(pawn), None, loc, None)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("spawning {class_path} returned None"))?;
+        let p = Value::Object(Some(ObjRef::Instance(pawn)));
+        // The normal path sets these in `Inventory.GiveTo`/`ChangedWeapon`; wire them explicitly.
+        self.vm.set_property(id, "Instigator", 0, p.clone());
+        self.vm.set_property(id, "Owner", 0, p.clone());
+        // The game's own GiveTo adds the weapon to the inventory chain and creates its ammo.
+        let give = self.vm.send_event(id, "GiveTo", vec![p.clone()]);
+        self.vm
+            .set_property(pawn, "Weapon", 0, Value::Object(Some(ObjRef::Instance(id))));
+        self.vm.set_property(
+            pawn,
+            "PendingWeapon",
+            0,
+            Value::Object(Some(ObjRef::Instance(id))),
+        );
+        // `Weapon.GiveTo` normally runs `GiveAmmo` + `AmmoType.AddAmmo(ReloadCount)`; the HUD
+        // notification inside GiveTo is a deferred message native, so run the ammo half here.
+        let give_ammo = self.vm.send_event(id, "GiveAmmo", vec![p.clone()]);
+        if let Some(ammo) = instance_prop(&self.vm, id, "AmmoType") {
+            let amount = match self.vm.get_property(id, "ReloadCount") {
+                Some(Value::Int(n)) if *n > 0 => *n,
+                _ => 13,
+            };
+            self.vm
+                .set_property(ammo, "AmmoAmount", 0, Value::Int(amount));
+            self.vm
+                .set_property(ammo, "MaxAmmo", 0, Value::Int(amount.max(50)));
+        }
+        let bring = self.vm.send_event(id, "BringUp", vec![]);
+        let name = self.vm.objects[id as usize].name.clone();
+        if let Err(e) = &give {
+            // Not fatal: the explicit wiring above still arms the weapon, and `GiveAmmo` above
+            // creates the ammo. Reported so a real regression is visible.
+            self.blocked
+                .push(format!("grant_weapon {name} GiveTo: {e}"));
+        }
+        Ok(format!(
+            "granted {name} ({class_path}); GiveTo {give:?}, GiveAmmo {give_ammo:?}, BringUp {bring:?}"
+        ))
+    }
+
+    /// The player weapon's first-person mesh path: the decoded `MeshName` string
+    /// (`XIIIWeapon`/`Weapon` load `Mesh` from it in `PostBeginPlay`), falling back to the
+    /// resolved `Mesh` object path.
+    pub fn weapon_mesh_name(&self, weapon: ObjectId) -> Option<String> {
+        if let Some(Value::Str(s)) | Some(Value::Name(s)) = self.vm.get_property(weapon, "MeshName")
+            && !s.is_empty()
+        {
+            return Some(s.clone());
+        }
+        self.vm.mesh_object(weapon).map(|(p, _)| p)
+    }
+
+    /// A vector property of a weapon (`PlayerViewOffset`, `FPMFRelativeLoc`).
+    pub fn weapon_vector(&self, weapon: ObjectId, name: &str) -> Option<[f32; 3]> {
+        self.vm.vector_prop(weapon, name)
+    }
+
+    /// A float property of a weapon (`DrawScale`).
+    pub fn weapon_float(&self, weapon: ObjectId, name: &str) -> Option<f32> {
+        match self.vm.get_property(weapon, name) {
+            Some(Value::Float(v)) => Some(*v),
+            Some(Value::Int(v)) => Some(*v as f32),
+            _ => None,
+        }
+    }
+
+    /// Current `Health` of `id` (int or float), if present.
+    pub fn actor_health(&self, id: ObjectId) -> Option<f32> {
+        match self.vm.get_property(id, "Health") {
+            Some(Value::Int(h)) => Some(*h as f32),
+            Some(Value::Float(h)) => Some(*h),
+            _ => None,
+        }
+    }
+
+    /// The player pawn's current `Health`, if present.
+    pub fn player_health(&self) -> Option<f32> {
+        self.actor_health(self.player)
+    }
+
+    /// `bIsDead` on `id` (the `XIIIPawn.Died` flag), if present.
+    pub fn actor_is_dead(&self, id: ObjectId) -> bool {
+        matches!(self.vm.get_property(id, "bIsDead"), Some(Value::Bool(true)))
     }
 
     fn drain_events(&mut self) {
@@ -986,7 +1266,7 @@ mod tests {
             );
             for _ in 0..120 {
                 let loc = session.player_location().unwrap_or([0.0; 3]);
-                session.step(1.0 / 60.0, loc, 0.0, [0.0; 3]);
+                session.step(1.0 / 60.0, loc, 0.0, [0.0; 3], &PlayerVMModes::default());
             }
             let after = session.player_pawn_actors();
             assert_eq!(
@@ -996,5 +1276,40 @@ mod tests {
             );
             println!("[dupe test] {map}: one player pawn {:?}", after[0].1);
         }
+    }
+
+    /// Opt-in: falling damage comes from the pawn's own VM code. A published impact velocity
+    /// runs `XIIIPawn.Landed` -> `TakeFallingDamage` -> `TakeDamage`; the resulting `Health`
+    /// read back from the VM must be lower. A failure is never silent: the pawn's `Landed`
+    /// error (if any) is recorded and printed.
+    #[test]
+    fn opt_in_banque01_falling_damage_through_vm() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Banque01").expect("open Banque01");
+        let h0 = session.player_health();
+        let loc = session.player_location().expect("player location");
+        // Land from a terminal fall: the game decides the damage.
+        let modes = PlayerVMModes {
+            landed_velocity_z: Some(-1500.0),
+            floor_normal: [0.0, 0.0, 1.0],
+            ..Default::default()
+        };
+        session.step(1.0 / 60.0, loc, 0.0, [0.0, 0.0, 0.0], &modes);
+        let h1 = session.player_health();
+        println!(
+            "[fall test] Banque01 Health {h0:?} -> {h1:?}; Landed error: {}",
+            session.first_error().unwrap_or("none")
+        );
+        let (Some(h0), Some(h1)) = (h0, h1) else {
+            panic!("the pawn has no health property");
+        };
+        assert!(
+            h1 < h0,
+            "the VM's fall damage did not reduce Health ({h0} -> {h1}); first error: {:?}",
+            session.first_error()
+        );
     }
 }

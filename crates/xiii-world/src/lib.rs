@@ -25,8 +25,10 @@ pub mod animation;
 pub mod audio;
 pub mod fog;
 pub mod materials;
+pub mod movement_volumes;
 pub mod nav_provider;
 pub mod navigation;
+pub mod particles;
 pub mod physics;
 pub mod projectors;
 pub mod reach;
@@ -165,6 +167,8 @@ pub struct WorldScene {
     pub fog: fog::SceneFog,
     /// Static `Projector`/`ShadowProjector` actors placed in the map (Bevy-space poses).
     pub projectors: Vec<projectors::ProjectorPose>,
+    /// Decoded particle emitter systems placed in the map (see [`particles`]).
+    pub particle_systems: Vec<particles::ParticleSystem>,
 }
 
 impl WorldScene {
@@ -387,7 +391,7 @@ struct MeshSections {
     collision_slot_disabled: usize,
 }
 
-struct Importer<'a> {
+pub(crate) struct Importer<'a> {
     cache: &'a mut PackageCache,
     scene: WorldScene,
     textures: HashMap<ObjectKey, Result<usize, String>>,
@@ -1015,7 +1019,7 @@ impl ClassDefaults {
     }
 
     /// Resolved layout of a class path (`Package.Class` as written in the map), cached.
-    fn layout(&mut self, class_path: &str) -> Result<SharedLayout, String> {
+    pub fn layout(&mut self, class_path: &str) -> Result<SharedLayout, String> {
         let key = class_path.to_ascii_lowercase();
         if let Some(l) = self.layouts.get(&key) {
             return Ok(l.clone());
@@ -1047,6 +1051,24 @@ impl ClassDefaults {
     pub fn is_navigation_point(&mut self, class_path: &str) -> Result<bool, String> {
         let l = self.layout(class_path)?;
         Ok(l.chain_names.iter().any(|n| n == "navigationpoint"))
+    }
+
+    /// Lowercase class names of `class_path`'s inheritance chain, most derived first.
+    pub fn class_chain(&mut self, class_path: &str) -> Result<Vec<String>, String> {
+        Ok(self.layout(class_path)?.chain_names.clone())
+    }
+
+    /// Resolved inherited bool default of a property, or `None` when the property is absent
+    /// from the class chain (or is not a bool).
+    pub fn bool_default(&mut self, class_path: &str, name: &str) -> Result<Option<bool>, String> {
+        let l = self.layout(class_path)?;
+        let Some(s) = l.slot_by_name(name) else {
+            return Ok(None);
+        };
+        Ok(match l.defaults.get(s.base) {
+            Some(xiii_script::Value::Bool(v)) => Some(*v),
+            _ => None,
+        })
     }
 
     /// Resolved inherited float default of a property, or `None` when the property is absent
@@ -1586,6 +1608,7 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
 
     import_bsp(&mut im, &map_pkg);
     import_terrain(&mut im, &map_pkg);
+    particles::import_particles(&mut im, &map_pkg, &mut defaults);
     // Per-zone object counts (static-mesh actors, BSP groups), after every object exists.
     let mut counts = vec![0usize; im.scene.zones.len()];
     let mut unzoned = 0usize;
@@ -1856,17 +1879,25 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 continue;
             }
         };
-        // The base region drives the layer composite and the vertex colours; extra detail
-        // regions are added as their own geometry with the same material.
+        // Only the base region (index 0, `HeightmapX * HeightmapY` vertices at
+        // `TerrainScale`) is the engine's terrain: `ATerrainInfo::LineCheck` indexes
+        // `Vertices[HeightmapX * y + x]` with `x < HeightmapX`, `y < HeightmapY`, and
+        // `ATerrainInfo::Render` iterates only the sectors (each indexes the same base grid);
+        // the trailing vertices are editor-only selection scratch and are never collided or
+        // drawn, and their world positions are not a continuation of the base grid. Importing
+        // them as extra geometry produced the Hual01b reach regression (detail regions built
+        // over the playable base). The base region must match the `TerrainMap` texture (checked
+        // by `mesh`); a mismatch is a failure, never a silent skip.
         let base = &regions[0];
-        for region in &regions {
-            im.scene.count("terrain.hidden_quads", region.hidden_quads);
-        }
+        im.scene.count("terrain.hidden_quads", base.hidden_quads);
         im.scene.count("terrain.regions", regions.len());
-        im.scene.count(
-            "terrain.region_extra_vertices",
-            t.vertices.len() - base.positions.len(),
-        );
+        if regions.len() > 1 {
+            im.scene.count("note.terrain.extra_vertices_ignored", 1);
+            im.scene.count(
+                "terrain.region_extra_vertices_ignored",
+                t.vertices.len() - base.positions.len(),
+            );
+        }
         let composite = composite_terrain_texture(im, map_pkg, &t, base);
         let (material, material_index) = match composite {
             Some(img) => {
@@ -1918,58 +1949,38 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 None
             }
         };
-        for (ri, region) in regions.iter().enumerate() {
-            let terrain_tris: Vec<[[f32; 3]; 3]> = region
-                .indices
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .map(|tri| tri.map(|i| to_bevy_position(region.positions[i as usize])))
-                .collect();
-            im.scene.add_collision(
-                if ri == 0 {
-                    format!("{path} (terrain)")
-                } else {
-                    format!("{path} (terrain region {ri})")
-                },
-                terrain_tris,
-            );
-            let positions: Vec<[f32; 3]> = region
-                .positions
-                .iter()
-                .map(|&v| to_bevy_position(v))
-                .collect();
-            let normals = grid_normals(&region.positions, region.width, region.height);
-            im.scene.meshes.push(SceneMesh {
-                label: if ri == 0 {
-                    format!("{path} heightfield")
-                } else {
-                    format!("{path} heightfield region {ri}")
-                },
-                positions,
-                normals,
-                uvs: region.grid_uv.clone(),
-                indices: region.indices.clone(),
-                material: material.clone(),
-                material_index,
-            });
-            im.scene.objects.push(SceneObject {
-                mesh: im.scene.meshes.len() - 1,
-                transform: identity(),
-                path: if ri == 0 {
-                    path.clone()
-                } else {
-                    format!("{path} region {ri}")
-                },
-                placement: None,
-                zone: None,
-                colors: if ri == 0 {
-                    terrain_colors.clone()
-                } else {
-                    None
-                },
-            });
-        }
+        let terrain_tris: Vec<[[f32; 3]; 3]> = base
+            .indices
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|tri| tri.map(|i| to_bevy_position(base.positions[i as usize])))
+            .collect();
+        im.scene
+            .add_collision(format!("{path} (terrain)"), terrain_tris);
+        let positions: Vec<[f32; 3]> = base
+            .positions
+            .iter()
+            .map(|&v| to_bevy_position(v))
+            .collect();
+        let normals = grid_normals(&base.positions, base.width, base.height);
+        im.scene.meshes.push(SceneMesh {
+            label: format!("{path} heightfield"),
+            positions,
+            normals,
+            uvs: base.grid_uv.clone(),
+            indices: base.indices.clone(),
+            material: material.clone(),
+            material_index,
+        });
+        im.scene.objects.push(SceneObject {
+            mesh: im.scene.meshes.len() - 1,
+            transform: identity(),
+            path: path.clone(),
+            placement: None,
+            zone: None,
+            colors: terrain_colors.clone(),
+        });
         im.scene.count("terrain.infos", 1);
     }
 }
@@ -2971,6 +2982,72 @@ mod local_tests {
             "PathNode119 floor normal {:?} is not walkable",
             hit.normal
         );
+    }
+
+    /// Opt-in: the maps whose terrain payload stores extra editor vertices after the base
+    /// heightfield grid must import exactly one terrain mesh each, at the size of the
+    /// `TerrainMap` texture, with the trailing vertices counted (never imported). The engine
+    /// collides/renders only the base grid, so importing the trailing vertices regressed
+    /// Hual01b reach (item1h) and must not come back.
+    #[test]
+    fn opt_in_terrain_imports_base_region_only() {
+        let Some(path) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        for map in ["Hual01b", "Hual04c", "Kello01a", "PRock04a"] {
+            let scene = import_map(&mut cache, map).expect("import");
+            let get = |k: &str| scene.counters.get(k).copied().unwrap_or(0);
+            let terrain_meshes: usize = scene
+                .meshes
+                .iter()
+                .filter(|m| m.label.contains("heightfield"))
+                .count();
+            assert!(
+                terrain_meshes >= 1,
+                "{map}: no terrain heightfield mesh imported"
+            );
+            assert!(
+                !scene
+                    .meshes
+                    .iter()
+                    .any(|m| m.label.contains("heightfield region")),
+                "{map}: a non-base terrain region was imported as render geometry: {:?}",
+                scene
+                    .meshes
+                    .iter()
+                    .filter(|m| m.label.contains("region"))
+                    .map(|m| &m.label)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !scene
+                    .collision_sources
+                    .iter()
+                    .any(|s| s.contains("terrain region")),
+                "{map}: a non-base terrain region was imported as collision: {:?}",
+                scene
+                    .collision_sources
+                    .iter()
+                    .filter(|s| s.contains("terrain"))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                get("note.terrain.extra_vertices_ignored") >= 1,
+                "{map}: the trailing terrain vertices were not reported: {:?}",
+                scene.counters
+            );
+            assert!(
+                get("terrain.region_extra_vertices_ignored") > 0,
+                "{map}: trailing vertex count missing"
+            );
+            println!(
+                "[terrain] {map}: heightfield meshes {terrain_meshes}, ignored trailing vertices {}, collision sources {}",
+                get("terrain.region_extra_vertices_ignored"),
+                scene.collision_sources.len()
+            );
+        }
     }
 
     /// Opt-in baked-lighting invariants on the three maps that the task names: every placed

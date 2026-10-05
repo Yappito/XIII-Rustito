@@ -502,7 +502,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 232);
+    assert_eq!(defs.len(), 264);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -5096,6 +5096,30 @@ fn campaign_operator_natives_match_ue2_semantics() {
         [0.0, 0.0, 0.0]
     );
 
+    let mut a = [Value::Vector([2.0, 4.0, 6.0]), Value::Float(2.0)];
+    assert_eq!(
+        vec_result(call_native(
+            &mut vm,
+            "Object.Divide_VectorFloat",
+            o,
+            &[false, false],
+            &mut a
+        )),
+        [1.0, 2.0, 3.0]
+    );
+    // UE2 does not guard division by zero: IEEE infinity, not a silent clamp.
+    let mut a = [Value::Vector([1.0, 1.0, 1.0]), Value::Float(0.0)];
+    assert!(
+        vec_result(call_native(
+            &mut vm,
+            "Object.Divide_VectorFloat",
+            o,
+            &[false, false],
+            &mut a
+        ))[0]
+            .is_infinite()
+    );
+
     let mut a = [
         Value::Vector([1.0, 2.0, 3.0]),
         Value::Vector([1.0, 2.0, 3.0]),
@@ -5369,6 +5393,199 @@ fn player_can_see_me_uses_a_player_line_of_sight() {
 }
 
 // ---------------------------------------------------------------------------------------
+// item14: synthetic combat tests (no proprietary data)
+
+/// Synthetic package with `Object` <- `Actor` carrying the collision fields the actor trace
+/// reads (`Location`, `CollisionRadius`, `CollisionHeight`, `bBlockZeroExtentTraces`). The two
+/// integer native operators declared under `Object` are the registry's real indices (147 `-`,
+/// 152 `<=`).
+fn damage_package() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let native_op = ff::FINAL | ff::NATIVE | ff::OPERATOR | ff::STATIC;
+    // Native integer operators.
+    let sub = b.reserve(IMP_FUNCTION, object, "Subtract_IntInt");
+    let le = b.reserve(IMP_FUNCTION, object, "LessEqual_IntInt");
+    let sub_a = b.reserve(IMP_INTPROP, sub, "A");
+    let sub_b = b.reserve(IMP_INTPROP, sub, "B");
+    let sub_r = b.reserve(IMP_INTPROP, sub, "ReturnValue");
+    b.prop(sub_a, sub_b, pf::PARM);
+    b.prop(sub_b, sub_r, pf::PARM);
+    b.prop(sub_r, 0, pf::PARM | pf::RETURN_PARM);
+    b.func(sub, le, sub_a, &[], 0, 147, native_op);
+    let le_a = b.reserve(IMP_INTPROP, le, "A");
+    let le_b = b.reserve(IMP_INTPROP, le, "B");
+    let le_r = b.reserve(IMP_INTPROP, le, "ReturnValue");
+    b.prop(le_a, le_b, pf::PARM);
+    b.prop(le_b, le_r, pf::PARM);
+    b.prop(le_r, 0, pf::PARM | pf::RETURN_PARM);
+    b.func(le, 0, le_a, &[], 0, 152, native_op);
+    // Pawn: Health, bIsDead, Deaths, TakeDamage(int).
+    let health = b.reserve(IMP_INTPROP, pawn, "Health");
+    let dead = b.reserve(B_BOOLPROP, pawn, "bIsDead");
+    let deaths = b.reserve(IMP_INTPROP, pawn, "Deaths");
+    let take = b.reserve(IMP_FUNCTION, pawn, "TakeDamage");
+    let damage = b.reserve(IMP_INTPROP, take, "Damage");
+    b.prop(health, dead, 0);
+    b.prop(dead, deaths, 0);
+    b.prop(deaths, take, 0);
+    b.prop(damage, 0, pf::PARM);
+    let (h, dm, dd, deaths_f) = (health as u8, damage as u8, dead as u8, deaths as u8);
+    #[rustfmt::skip]
+    let take_code: Vec<u8> = vec![
+        0x0F, 0x01, h, 0x93, 0x01, h, 0x01, dm, 0x16,       // Health = Health - Damage
+        0x07, 0x2B, 0x00, 0x98, 0x01, h, 0x25, 0x16,       // if !(Health <= 0) goto 0x2B
+        0x0F, 0x01, dd, 0x27,                                // bIsDead = true
+        0x0F, 0x01, deaths_f, 0x26,                          // Deaths = 1
+        0x04, 0x0B,                                          // return
+    ];
+    // 45 is the decoded script's UE memory size (`ScriptSize`), not its byte length: every
+    // `object()`/`name()` operand counts 4 memory bytes (1 in the file), so the 6 instance
+    // variable operands add 18 to the 27 bytes.
+    b.func(take, 0, damage, &take_code, 45, 0, ff::DEFINED);
+    b.class(object, 0, sub);
+    b.class(actor, object, 0);
+    b.class(pawn, actor, health);
+    b.build()
+}
+
+#[test]
+fn synthetic_take_damage_reduces_health_and_dies_at_or_below_zero() {
+    let set = set_of(damage_package());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let p = vm.spawn(g(&set, "Pawn"), "P").unwrap();
+    vm.set_property(p, "Health", 0, Value::Int(50));
+    let take = g(&set, "Pawn.TakeDamage");
+    // Non-lethal: health drops, the death flag and the counter stay clear.
+    vm.call_function(take, p, vec![Value::Int(20)]).unwrap();
+    assert_eq!(vm.get_property(p, "Health"), Some(&Value::Int(30)));
+    assert_eq!(vm.get_property(p, "bIsDead"), Some(&Value::Bool(false)));
+    assert_eq!(vm.get_property(p, "Deaths"), Some(&Value::Int(0)));
+    // Exactly zero is a death (`<= 0`).
+    vm.call_function(take, p, vec![Value::Int(30)]).unwrap();
+    assert_eq!(vm.get_property(p, "Health"), Some(&Value::Int(0)));
+    assert_eq!(vm.get_property(p, "bIsDead"), Some(&Value::Bool(true)));
+    assert_eq!(vm.get_property(p, "Deaths"), Some(&Value::Int(1)));
+    // Beyond zero: health goes negative, the death counter does not double.
+    vm.call_function(take, p, vec![Value::Int(10)]).unwrap();
+    assert_eq!(vm.get_property(p, "Health"), Some(&Value::Int(-10)));
+    assert_eq!(vm.get_property(p, "Deaths"), Some(&Value::Int(1)));
+}
+
+/// Synthetic package with an `Actor` carrying the collision fields the actor trace reads.
+fn trace_package() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let vector = b.reserve(IMP_CORE, 0, "Vector");
+    let rotator = b.reserve(IMP_CORE, 0, "Rotator");
+    let loc = b.reserve(B_STRUCTPROP, actor, "Location");
+    let rot = b.reserve(B_STRUCTPROP, actor, "Rotation");
+    let radius = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
+    let height = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
+    let collide = b.reserve(B_BOOLPROP, actor, "bCollideActors");
+    let bzero = b.reserve(B_BOOLPROP, actor, "bBlockZeroExtentTraces");
+    let bnz = b.reserve(B_BOOLPROP, actor, "bBlockNonZeroExtentTraces");
+    b.prop_with(loc, rot, 0, &compact(vector));
+    b.prop_with(rot, radius, 0, &compact(rotator));
+    b.prop(radius, height, 0);
+    b.prop(height, collide, 0);
+    b.prop(collide, bzero, 0);
+    b.prop(bzero, bnz, 0);
+    b.prop(bnz, 0, 0);
+    b.class(object, 0, 0);
+    b.class(actor, object, loc);
+    b.build()
+}
+
+fn trace_args() -> Vec<Value> {
+    vec![
+        Value::Vector([0.0; 3]),           // HitLocation (out)
+        Value::Vector([0.0; 3]),           // HitNormal (out)
+        Value::Vector([1000.0, 0.0, 0.0]), // TraceEnd
+        Value::Vector([0.0; 3]),           // TraceStart
+        Value::Bool(true),                 // bTraceActors
+        Value::Vector([0.0; 3]),           // Extent (line)
+    ]
+}
+
+#[test]
+fn synthetic_trace_hits_the_nearest_pawn_before_world_geometry() {
+    let set = set_of(trace_package());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    // A world wall beyond both actors: the nearest actor must win.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([900.0, -100.0, -100.0], [950.0, 100.0, 100.0]),
+    ));
+    let near = vm.spawn(g(&set, "Actor"), "Near").unwrap();
+    let far = vm.spawn(g(&set, "Actor"), "Far").unwrap();
+    // The tracer is a third actor off the ray: `Actor.Trace` skips its own object.
+    let shooter = vm.spawn(g(&set, "Actor"), "Shooter").unwrap();
+    vm.set_active(shooter, true);
+    for (id, x) in [(near, 100.0), (far, 300.0)] {
+        vm.set_property(id, "Location", 0, Value::Vector([x, 0.0, 0.0]));
+        vm.set_property(id, "CollisionRadius", 0, Value::Float(40.0));
+        vm.set_property(id, "CollisionHeight", 0, Value::Float(40.0));
+        vm.set_property(id, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+        vm.set_active(id, true);
+    }
+    let mut args = trace_args();
+    let hit = call_native(
+        &mut vm,
+        "Actor.Trace",
+        shooter,
+        &[false, false, false, false, false, false],
+        &mut args,
+    );
+    assert_eq!(
+        hit,
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(near)))),
+        "the trace must hit the nearest blocking actor"
+    );
+    // The hit point is on the near cylinder's -X face and the zone is a spine band.
+    match &args[0] {
+        Value::Vector(l) => assert!((l[0] - 60.0).abs() < 1.0, "hit at {l:?}"),
+        other => panic!("expected hit location, got {other:?}"),
+    }
+    assert_eq!(vm.last_trace_bone(), "X Spine1");
+    // `Actor.GetLastTraceBone` returns the recorded zone.
+    let bone = call_native(&mut vm, "Actor.GetLastTraceBone", near, &[], &mut []);
+    assert_eq!(bone, NativeOutcome::Value(Value::Name("X Spine1".into())));
+}
+
+#[test]
+fn synthetic_trace_world_geometry_closer_than_the_pawn_wins() {
+    let set = set_of(trace_package());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    // The wall sits between the start and the only actor.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([50.0, -100.0, -100.0], [60.0, 100.0, 100.0]),
+    ));
+    let a = vm.spawn(g(&set, "Actor"), "A").unwrap();
+    vm.set_property(a, "Location", 0, Value::Vector([300.0, 0.0, 0.0]));
+    vm.set_property(a, "CollisionRadius", 0, Value::Float(40.0));
+    vm.set_property(a, "CollisionHeight", 0, Value::Float(40.0));
+    vm.set_property(a, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    vm.set_active(a, true);
+    let mut args = trace_args();
+    let hit = call_native(
+        &mut vm,
+        "Actor.Trace",
+        a,
+        &[false, false, false, false, false, false],
+        &mut args,
+    );
+    // No LevelInfo in this fixture: a world hit returns Null.
+    assert_eq!(
+        hit,
+        NativeOutcome::Value(Value::Object(None)),
+        "the closer world wall must win over the pawn"
+    );
+    assert_eq!(vm.last_trace_bone(), "None");
+}
+
 // Localisation provider, localized class defaults and static calls on class defaults.
 
 /// A provider whose `get` answers `Thing.label` with `value` and everything else `None`.
@@ -5764,4 +5981,210 @@ fn dialogue_line_text_reads_nested_speaker_sentences() {
         crate::cinematics::line_text_from_values(0, &bad, &speakers),
         None
     );
+}
+
+/// UE2 `switch` and `==` on strings/names are case-insensitive (`appStricmp`); the cine
+/// interpreter switches on lowercase action words (`dial`) against `Dial` case values.
+#[test]
+fn values_equal_is_case_insensitive_for_strings_and_names() {
+    use crate::value::Value;
+    use crate::vm::values_equal;
+    assert!(values_equal(
+        &Value::Str("dial".into()),
+        &Value::Str("Dial".into())
+    ));
+    assert!(values_equal(
+        &Value::Str("Event".into()),
+        &Value::Str("event".into())
+    ));
+    assert!(!values_equal(
+        &Value::Str("dial".into()),
+        &Value::Str("dialman".into())
+    ));
+    assert!(values_equal(
+        &Value::Name("dial_debut".into()),
+        &Value::Name("DIAL_DEBUT".into())
+    ));
+    // An int/byte pair still compares by value, and unrelated values are not equal.
+    assert!(values_equal(&Value::Int(1), &Value::Byte(1)));
+    assert!(!values_equal(&Value::Int(1), &Value::Byte(2)));
+    assert!(!values_equal(&Value::Str("1".into()), &Value::Int(1)));
+}
+
+// ---------------------------------------------------------------------------------------
+// item3n: campaign-suspension fixes (cast, class-cast context, Box.IsValid, natives)
+
+#[test]
+fn vector_to_rotator_and_string_casts_match_ue2() {
+    let set = spawn_set();
+    let vm = Vm::new(&set, VmLimits::default());
+    // VectorToRotator (0x50): yaw = atan2(Y,X), pitch = atan2(Z,|XY|), roll 0; 65536 per turn.
+    assert_eq!(
+        vm.primitive_cast(0x50, Value::Vector([1.0, 0.0, 0.0]))
+            .unwrap(),
+        Value::Rotator([0, 0, 0])
+    );
+    assert_eq!(
+        vm.primitive_cast(0x50, Value::Vector([0.0, 1.0, 0.0]))
+            .unwrap(),
+        Value::Rotator([0, 16384, 0])
+    );
+    assert_eq!(
+        vm.primitive_cast(0x50, Value::Vector([0.0, 0.0, 1.0]))
+            .unwrap(),
+        Value::Rotator([16384, 0, 0])
+    );
+    // The zero vector has no direction: zero rotator (BeyondUnreal "Typecast").
+    assert_eq!(
+        vm.primitive_cast(0x50, Value::Vector([0.0, 0.0, 0.0]))
+            .unwrap(),
+        Value::Rotator([0, 0, 0])
+    );
+    // VectorToString (0x58) / RotatorToString (0x59).
+    assert_eq!(
+        vm.primitive_cast(0x58, Value::Vector([1.5, -2.0, 0.0]))
+            .unwrap(),
+        Value::Str("1.50,-2.00,0.00".into())
+    );
+    assert_eq!(
+        vm.primitive_cast(0x59, Value::Rotator([-1, 65536, 32768]))
+            .unwrap(),
+        Value::Str("65535,0,32768".into())
+    );
+    // A wrong operand type is still an explicit error, never a silent value.
+    assert!(vm.primitive_cast(0x50, Value::Int(1)).is_err());
+}
+
+#[test]
+fn context_object_class_resolves_a_class_cast_target() {
+    use crate::bytecode::{Token, TokenKind};
+    use xiii_package::ObjectRef;
+    let set = spawn_set();
+    let vm = Vm::new(&set, VmLimits::default());
+    let child = sg(&set, "Child");
+    let no_object = Token {
+        offset: 0,
+        file_offset: 0,
+        memory_size: 1,
+        opcode: 0x2A,
+        kind: TokenKind::NoObject,
+    };
+    let cast = Token {
+        offset: 0,
+        file_offset: 0,
+        memory_size: 6,
+        opcode: 0x2E,
+        kind: TokenKind::DynamicCast {
+            class: ObjectRef::Export(child.export),
+            expr: Box::new(no_object),
+        },
+    };
+    // Regression: a `DynamicCast` used to fall through to `member_property`, which is `None` for
+    // a cast, so `Pawn(Other).IsPlayerPawn()` on a failed cast resolved no return type and
+    // suspended with `TypeMismatch { expected: "bool", found: "void" }`.
+    assert_eq!(vm.context_object_class(0, 0, &cast), Some(child));
+}
+
+#[test]
+fn get_axes_fills_the_rotator_basis() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Actor"), "O").unwrap();
+    let mut a = vec![
+        Value::Rotator([0, 0, 0]),
+        Value::Vector([9.0; 3]),
+        Value::Vector([9.0; 3]),
+        Value::Vector([9.0; 3]),
+    ];
+    let out = call_native(
+        &mut vm,
+        "Object.GetAxes",
+        o,
+        &[false, false, false, false],
+        &mut a,
+    );
+    assert!(matches!(out, NativeOutcome::Value(Value::Void)));
+    assert_eq!(a[1], Value::Vector([1.0, 0.0, 0.0]));
+    assert_eq!(a[2], Value::Vector([0.0, 1.0, 0.0]));
+    assert_eq!(a[3], Value::Vector([0.0, 0.0, 1.0]));
+}
+
+#[test]
+fn get_bounding_box_reports_isvalid_as_a_byte() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Actor"), "O").unwrap();
+    vm.set_property(o, "Location", 0, Value::Vector([10.0, 20.0, 30.0]));
+    let out = call_native(&mut vm, "Engine.Actor.GetBoundingBox", o, &[], &mut []);
+    let NativeOutcome::Value(Value::Struct(members)) = out else {
+        panic!("expected a Box struct, got {out:?}");
+    };
+    let get = |n: &str| members.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(get("min"), Some(Value::Vector([10.0, 20.0, 30.0])));
+    assert_eq!(get("max"), Some(Value::Vector([10.0, 20.0, 30.0])));
+    // The script reads `cast<byte->int>(Box.IsValid)`; a byte keeps that cast working.
+    assert_eq!(get("isvalid"), Some(Value::Byte(1)));
+    assert_eq!(
+        vm.primitive_cast(0x3A, Value::Byte(1)).unwrap(),
+        Value::Int(1)
+    );
+}
+
+#[test]
+fn stop_animating_clears_every_channel() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Actor"), "O").unwrap();
+    vm.objects[o as usize].anim.channels.insert(
+        0,
+        crate::vm::AnimChannel {
+            sequence: "Run".into(),
+            frames: 10,
+            rate: 30.0,
+            frame: 4.0,
+            looping: true,
+            active: true,
+            tween_remaining: 0.0,
+            notifies: Vec::new(),
+            notify_idx: 0,
+        },
+    );
+    let out = call_native(&mut vm, "Engine.Actor.StopAnimating", o, &[], &mut []);
+    assert!(matches!(out, NativeOutcome::Value(Value::Void)));
+    assert!(vm.objects[o as usize].anim.channels.is_empty());
+}
+
+#[test]
+fn snow_natives_record_and_do_not_fail() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Actor"), "L").unwrap();
+    let mut a = vec![
+        Value::Object(None),
+        Value::Int(4),
+        Value::Float(0.5),
+        Value::Float(10.0),
+    ];
+    let out = call_native(
+        &mut vm,
+        "LevelInfo.InitRndCubeSpr",
+        o,
+        &[false, false, false, false],
+        &mut a,
+    );
+    assert!(matches!(out, NativeOutcome::Value(Value::Void)));
+    assert!(vm.trace.iter().any(|e| matches!(
+        &e.kind,
+        TraceKind::Log(s) if s.contains("InitRndCubeSpr") && s.contains("no particle subsystem")
+    )));
+    // ChangeRndCubeSprProp returns false (not applied), never a silent true.
+    let mut a = vec![Value::Float(1.0), Value::Float(1.0), Value::Float(1.0)];
+    let out = call_native(
+        &mut vm,
+        "LevelInfo.ChangeRndCubeSprProp",
+        o,
+        &[false, false, false],
+        &mut a,
+    );
+    assert!(matches!(out, NativeOutcome::Value(Value::Bool(false))));
 }

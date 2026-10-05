@@ -286,14 +286,24 @@ pub fn decode_sector(package: &Package, data: &[u8], export: usize) -> DecodeRes
 /// different spacings, e.g. Hual04c `TerrainInfo1` is a 64x64 grid (spacing 250) followed by a
 /// 128x96 grid (spacing 100). Treating the whole array as one grid produced the reported
 /// `heightmap WxH does not match N vertices` failures.
+///
+/// **Only region 0 (the base grid) is the engine's terrain.** `Engine.dll` `ATerrainInfo::Line
+/// Check` (0x10409eb0) and `Render` (0x1040c0c0) index `Vertices[HeightmapX * y + x]` and iterate
+/// only the sectors, both bounded by `HeightmapX`/`HeightmapY`; `GetHeightmap` (0x104080a0) uses
+/// the same base stride. The trailing grids are editor scratch that the shipped game never
+/// collides or draws (their Z is not a continuation of the base surface). The importer must
+/// import region 0 only; treating a trailing grid as extra geometry regressed the Hual01b reach
+/// walk (item1h/item1i). `mesh` still returns every region so the decode is complete and a
+/// malformed trailing grid is still reported.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerrainMesh {
     /// Grid width (vertices).
     pub width: usize,
     /// Grid height in rows.
     pub height: usize,
-    /// Base region index (0) or a detail region (1..). Only region 0 is described by the
-    /// `TerrainMap` texture, the sectors and the visibility/edge bitmaps.
+    /// Base region index (0) or a trailing editor region (1..). Only region 0 is the engine's
+    /// terrain, described by the `TerrainMap` texture, the sectors and the visibility/edge
+    /// bitmaps.
     pub region: usize,
     /// Vertices (world space, source coordinates), `width * height`.
     pub positions: Vec<[f32; 3]>,

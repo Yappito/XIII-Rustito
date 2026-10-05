@@ -21,7 +21,13 @@ imports into their root package. `import_map(&mut cache, "Plage01")` returns a `
 - `player_start`: the first PlayerStart's Bevy-space position and Unreal rotator.
 - `collision` / `collision_sources`: the world triangle soup in Bevy space (metres, Y up) with
   a source id per triangle. Static meshes contribute their decoded collision set 0, the BSP its
-  solid node polygons (invisible walls included), the terrain its quads.
+  solid node polygons (invisible walls included), the terrain its base-region quads.
+  A `TerrainInfo` whose `Vertices` array is longer than `HeightmapX * HeightmapY` stores trailing
+  editor grids after the base heightfield (see `xiii_decode::terrain`); only the base grid is the
+  engine's terrain (`ATerrainInfo::LineCheck`/`Render` in `Engine.dll` index it), so the importer
+  ignores the trailing vertices and counts them as `note.terrain.extra_vertices_ignored` /
+  `terrain.region_extra_vertices_ignored`. Treating them as extra geometry regressed the Hual01b
+  reach walk.
 - `counters` / `examples`: every import outcome, including `skip.*`, `fail.*` and `note.*`
   categories. Nothing is dropped silently; [`WorldScene::problem_total`] sums the `skip.`/
   `fail.` counters.
