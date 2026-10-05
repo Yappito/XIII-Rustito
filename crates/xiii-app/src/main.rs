@@ -60,6 +60,9 @@ fn main() -> AppExit {
             title: match opts.mode {
                 cli::Mode::Smoke => "XIII Classic runtime - smoke test".into(),
                 cli::Mode::Viewer => "XIII Classic runtime - map viewer (diagnostic)".into(),
+                cli::Mode::Skinned => {
+                    "XIII Classic runtime - skinned character viewer (diagnostic)".into()
+                }
             },
             resolution: (opts.width, opts.height).into(),
             present_mode,
@@ -74,6 +77,9 @@ fn main() -> AppExit {
         }
         cli::Mode::Viewer => {
             app.add_plugins(viewer::ViewerPlugin { options: opts });
+        }
+        cli::Mode::Skinned => {
+            app.add_plugins(viewer::skinned::SkinnedPlugin { options: opts });
         }
     }
 
