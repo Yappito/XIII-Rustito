@@ -101,6 +101,13 @@ struct PlayCam;
 #[derive(Component)]
 struct PlayOverlay;
 
+/// Cursor into the VM trace for the particle-trigger host bridge (index of the next unread
+/// trace record).
+#[derive(Resource, Default)]
+struct ParticleTriggerCursor {
+    trace_len: usize,
+}
+
 impl Plugin for PlayPlugin {
     fn build(&self, app: &mut App) {
         // Load the script session before the window opens. `Session` holds `Rc`-based VM state
@@ -117,6 +124,8 @@ impl Plugin for PlayPlugin {
         .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
         .init_resource::<ShotFlag>()
         .init_resource::<RenderSync>()
+        .init_resource::<ParticleTriggerCursor>()
+        .add_plugins(viewer::particles::ParticlePlugin)
         .add_systems(Startup, setup)
         .add_systems(FixedUpdate, fixed_step)
         .add_systems(
@@ -128,6 +137,7 @@ impl Plugin for PlayPlugin {
                 sync_camera,
                 viewer::sky_follow,
                 viewer::animate_uv,
+                sync_particle_triggers,
                 pawns::update_pawns,
                 overlay,
                 unattended,
@@ -427,6 +437,7 @@ fn setup_inner(
         images,
         &scene,
         opts.lighting == crate::cli::Lighting::Baked,
+        opts.particles == crate::cli::Particles::All,
     );
     for (o, entity) in scene.objects.iter().zip(&geometry) {
         let actor = o
@@ -693,6 +704,65 @@ fn fixed_step(
         println!("[play] {}", format_trace(state.tick, elapsed, &sim.0));
         if let Ok(sess) = session.as_ref() {
             println!("[play] {}", format_vm_trace(sess));
+        }
+    }
+}
+
+/// Host bridge for triggered emitters. The VM does not instantiate `ParticleEmitter` subobjects
+/// (their class chain is `Object`, not `Actor`, and `Vm::load_level` only creates Actors), so the
+/// script's `Emitters[i].Disabled = ...` cannot be read back from the VM. Instead this observes the
+/// VM trace for `Trigger` events delivered to a triggered-emitter actor and applies the same
+/// effect the `TriggerEmit`/`TriggerToggle` state handlers would: toggle the matching host
+/// simulator (a `TriggerControl` handler resets to the level-start state). Ordinary `Emitter`
+/// actors are not toggled, matching their lack of a `Trigger` override.
+fn sync_particle_triggers(
+    mut session: NonSendMut<Result<session::Session, String>>,
+    data: Res<viewer::particles::ParticleRenderData>,
+    mut cursor: ResMut<ParticleTriggerCursor>,
+    mut emitters: Query<&mut viewer::particles::ParticleEmitterRender>,
+) {
+    let Ok(sess) = session.as_mut() else {
+        return;
+    };
+    let trace = &sess.vm().trace;
+    if trace.len() < cursor.trace_len {
+        cursor.trace_len = 0;
+    }
+    let start = cursor.trace_len.min(trace.len());
+    let mut events: Vec<(String, String)> = Vec::new();
+    for ev in &trace[start..] {
+        if let xiii_script::TraceKind::Event {
+            target, function, ..
+        } = &ev.kind
+            && function.to_ascii_lowercase().contains("trigger")
+        {
+            events.push((target.clone(), function.clone()));
+        }
+    }
+    cursor.trace_len = trace.len();
+    if events.is_empty() {
+        return;
+    }
+    for mut e in &mut emitters {
+        let Some(system) = data.systems.get(e.system) else {
+            continue;
+        };
+        if !system.triggered {
+            continue;
+        }
+        for (target, function) in &events {
+            if !system.path.eq_ignore_ascii_case(target) {
+                continue;
+            }
+            if function.to_ascii_lowercase().contains("triggercontrol") {
+                e.sim.reset();
+                if let Some(desc) = system.emitters.get(e.emitter) {
+                    e.sim
+                        .set_enabled(xiii_world::particles::initially_enabled(system, desc));
+                }
+            } else {
+                e.sim.toggle();
+            }
         }
     }
 }
