@@ -22,12 +22,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 pub mod animation;
+pub mod materials;
 pub mod nav_provider;
 pub mod navigation;
 pub mod physics;
 pub mod runtime;
 pub mod zones;
 
+use materials::{BlendMode, MaterialNode, NodeKey, ResolvedMaterial, UvOp};
 use xiii_decode::common::{
     BevyTransform, Mat3, Props, actor_to_bevy_pre_pivot, to_bevy_direction, to_bevy_position,
 };
@@ -94,8 +96,10 @@ pub struct SceneMesh {
     pub uvs: Vec<[f32; 2]>,
     /// Triangle list.
     pub indices: Vec<u32>,
-    /// Material.
+    /// Material (base texture or the reason it is missing) for compatibility/diagnostics.
     pub material: MaterialSlot,
+    /// Index into [`WorldScene::materials`] with the full resolved description.
+    pub material_index: usize,
 }
 
 /// Placed object (one per mesh section instance).
@@ -125,6 +129,9 @@ pub struct WorldScene {
     pub textures: Vec<SceneTexture>,
     /// Objects.
     pub objects: Vec<SceneObject>,
+    /// One [`materials::ResolvedMaterial`] per distinct surface material (indexed by
+    /// [`SceneMesh::material_index`]); blend, two-sidedness and animated UV transforms.
+    pub materials: Vec<ResolvedMaterial>,
     /// Player start position (Bevy space) and Unreal rotator.
     pub player_start: Option<([f32; 3], [i32; 3])>,
     /// Named counters ("imported" and "skipped" categories).
@@ -376,9 +383,311 @@ struct Importer<'a> {
     scene: WorldScene,
     textures: HashMap<ObjectKey, Result<usize, String>>,
     meshes: HashMap<ObjectKey, Result<MeshSections, String>>,
+    /// Decoded material nodes by object key (the graph walker asks for one at a time).
+    nodes: HashMap<NodeKey, MaterialNode>,
+    /// Resolved materials by root object key (a root reused by many surfaces is walked once).
+    resolved: HashMap<NodeKey, usize>,
 }
 
 impl Importer<'_> {
+    /// Export key of an object reference, resolving imports into their root package.
+    fn key_of(&mut self, pkg: &Arc<Loaded>, r: ObjectRef) -> Option<NodeKey> {
+        if r.is_null() {
+            return None;
+        }
+        let (target, idx) = self.cache.resolve(pkg, r).ok()?;
+        Some((target.name.to_ascii_lowercase(), idx))
+    }
+
+    /// Decodes one material object into a [`MaterialNode`] (cached). A `Texture` decodes and
+    /// registers its image; every other class is read from its tagged properties.
+    fn node_for(&mut self, pkg: &Arc<Loaded>, idx: usize) -> Result<MaterialNode, String> {
+        let key = (pkg.name.to_ascii_lowercase(), idx);
+        if let Some(n) = self.nodes.get(&key) {
+            return Ok(n.clone());
+        }
+        let class_full = pkg.package.export_class_path(idx).unwrap_or("?").to_owned();
+        let class = class_full.rsplit('.').next().unwrap_or("").to_owned();
+        let result = if class.eq_ignore_ascii_case("Texture") {
+            let t = self.texture_from(pkg, ObjectRef::Export(idx as u32), 0)?;
+            let texture_alpha = match self.scene.textures[t].alpha {
+                AlphaKind::Opaque => None,
+                AlphaKind::Mask => Some(BlendMode::Masked(0.5)),
+                AlphaKind::Blend => Some(BlendMode::Alpha),
+            };
+            Ok(MaterialNode {
+                class,
+                texture: Some(t),
+                texture_alpha,
+                ..Default::default()
+            })
+        } else {
+            let props = pkg
+                .package
+                .read_object_properties(&pkg.data, idx, &Limits::default())
+                .map_err(|e| format!("{class_full} properties: {e}"))?;
+            let p = Props::new(&pkg.package, &props);
+            Ok(self.build_node(pkg, &class, &p))
+        };
+        if let Ok(n) = &result {
+            self.nodes.insert(key, n.clone());
+        }
+        result
+    }
+
+    /// Node lookup for the graph walker: the key names a loaded package and export.
+    fn node_for_key(&mut self, key: &NodeKey) -> Option<MaterialNode> {
+        let pkg = self.cache.get(&key.0).ok()?;
+        self.node_for(&pkg, key.1).ok()
+    }
+
+    /// Builds a [`MaterialNode`] from a decoded property block. Object links are resolved
+    /// against `pkg` so the graph walker only ever sees [`NodeKey`]s.
+    fn build_node(&mut self, pkg: &Arc<Loaded>, class: &str, p: &Props) -> MaterialNode {
+        let mut n = MaterialNode {
+            class: class.to_owned(),
+            ..Default::default()
+        };
+        match class.to_ascii_lowercase().as_str() {
+            "shader" => {
+                let diffuse = self.key_of(pkg, p.object("Diffuse").unwrap_or(ObjectRef::Null));
+                let self_illum =
+                    self.key_of(pkg, p.object("SelfIllumination").unwrap_or(ObjectRef::Null));
+                // Unlit/bright shaders often carry the image in SelfIllumination; fall back to
+                // it when Diffuse is empty (the previous resolver did the same).
+                let have_diffuse = diffuse.is_some();
+                let have_self = self_illum.is_some();
+                n.diffuse = diffuse.or(self_illum);
+                if !have_diffuse && have_self {
+                    n.ignored
+                        .push("shader.self_illumination_as_base".to_owned());
+                } else if have_self {
+                    n.ignored.push("shader.self_illumination".to_owned());
+                }
+                n.output_blending = p.byte("OutputBlending");
+                n.two_sided = p.bool("TwoSided");
+                for (name, note) in [
+                    ("Opacity", "shader.opacity"),
+                    ("Specular", "shader.specular"),
+                    ("SpecularityMask", "shader.specularity_mask"),
+                    ("FallbackMaterial", "shader.fallback_material"),
+                ] {
+                    if p.object(name).is_some_and(|o| !o.is_null()) {
+                        n.ignored.push(note.to_owned());
+                    }
+                }
+            }
+            "finalblend" => {
+                n.material = self.key_of(pkg, p.object("Material").unwrap_or(ObjectRef::Null));
+                n.frame_buffer_blending = p.byte("FrameBufferBlending");
+                n.two_sided = p.bool("TwoSided");
+                n.alpha_test = p.bool("AlphaTest");
+                n.alpha_ref = p.byte("AlphaRef");
+                if p.bool("ZWrite") == Some(false) || p.bool("ZTest") == Some(false) {
+                    n.ignored.push("finalblend.no_depth".to_owned());
+                }
+            }
+            "texpanner" => {
+                n.material = self.key_of(pkg, p.object("Material").unwrap_or(ObjectRef::Null));
+                let rate = p.float("PanRate").unwrap_or(0.1);
+                let dir = p.rotator("PanDirection").unwrap_or([0, 0, 0]);
+                let yaw = rotator_radians(dir[1]);
+                if rate != 0.0 {
+                    n.uv_ops.push(UvOp::Pan {
+                        speed_u: rate * yaw.cos(),
+                        speed_v: rate * yaw.sin(),
+                    });
+                }
+                if dir[0] != 0 || dir[2] != 0 {
+                    n.ignored.push("texpanner.pan_pitch_roll".to_owned());
+                }
+            }
+            "texrotator" => {
+                n.material = self.key_of(pkg, p.object("Material").unwrap_or(ObjectRef::Null));
+                let rot = p.rotator("Rotation").unwrap_or([0, 0, 0]);
+                let constant = p.bool("ConstantRotation").unwrap_or(false);
+                let cu = p.float("URotCenter").unwrap_or(0.0);
+                let cv = p.float("VRotCenter").unwrap_or(0.0);
+                let yaw = rotator_radians(rot[1]);
+                if constant {
+                    if yaw != 0.0 {
+                        n.uv_ops.push(UvOp::Rotate {
+                            base: 0.0,
+                            rate: yaw,
+                            center_u: cu,
+                            center_v: cv,
+                        });
+                    }
+                } else if yaw != 0.0 {
+                    n.uv_ops.push(UvOp::Rotate {
+                        base: yaw,
+                        rate: 0.0,
+                        center_u: cu,
+                        center_v: cv,
+                    });
+                }
+                if rot[0] != 0 || rot[2] != 0 {
+                    n.ignored.push("texrotator.rotation_pitch_roll".to_owned());
+                }
+            }
+            "texoscillator" => {
+                n.material = self.key_of(pkg, p.object("Material").unwrap_or(ObjectRef::Null));
+                let rate_u = p.float("UOscillationRate").unwrap_or(1.0);
+                let rate_v = p.float("VOscillationRate").unwrap_or(1.0);
+                let amp_u = p.float("UOscillationAmplitude").unwrap_or(0.1);
+                let amp_v = p.float("VOscillationAmplitude").unwrap_or(0.1);
+                let phase_u = p.float("UOscillationPhase").unwrap_or(0.0);
+                let phase_v = p.float("VOscillationPhase").unwrap_or(0.0);
+                let type_u = p.byte("UOscillationType").unwrap_or(0);
+                let type_v = p.byte("VOscillationType").unwrap_or(0);
+                if type_u != type_v {
+                    n.ignored.push("texoscillator.mixed_types".to_owned());
+                }
+                // OT_Pan = 0, OT_Stretch = 1 (measured enum order).
+                if type_u == 0 {
+                    n.uv_ops.push(UvOp::OscillatePan {
+                        amplitude_u: amp_u,
+                        amplitude_v: amp_v,
+                        rate_u,
+                        rate_v,
+                        phase_u,
+                        phase_v,
+                    });
+                } else {
+                    n.uv_ops.push(UvOp::OscillateScale {
+                        amplitude_u: amp_u,
+                        amplitude_v: amp_v,
+                        rate_u,
+                        rate_v,
+                        phase_u,
+                        phase_v,
+                    });
+                }
+                if p.float("UCenter").unwrap_or(0.0) != 0.0
+                    || p.float("VCenter").unwrap_or(0.0) != 0.0
+                {
+                    n.ignored.push("texoscillator.center".to_owned());
+                }
+            }
+            "texscaler" => {
+                n.material = self.key_of(pkg, p.object("Material").unwrap_or(ObjectRef::Null));
+                let su = p.float("UScale").unwrap_or(1.0);
+                let sv = p.float("VScale").unwrap_or(1.0);
+                if su != 1.0 || sv != 1.0 {
+                    n.uv_ops.push(UvOp::Scale {
+                        scale_u: su,
+                        scale_v: sv,
+                    });
+                }
+            }
+            "colormodifier" => {
+                n.material = self.key_of(pkg, p.object("Material").unwrap_or(ObjectRef::Null));
+                if let Some(prop) = p.get("Color")
+                    && let PropertyValue::Struct(StructValue::Color(c)) = &prop.value
+                {
+                    n.color = Some([
+                        f32::from(c[0]) / 255.0,
+                        f32::from(c[1]) / 255.0,
+                        f32::from(c[2]) / 255.0,
+                        f32::from(c[3]) / 255.0,
+                    ]);
+                }
+            }
+            "combiner" => {
+                n.material1 = self.key_of(pkg, p.object("Material1").unwrap_or(ObjectRef::Null));
+                n.material2 = self.key_of(pkg, p.object("Material2").unwrap_or(ObjectRef::Null));
+            }
+            _ => {
+                // Every other material class (TexEnvMap, SinusModifier, TexCoordSource,
+                // TexModifier and unknown subclasses) follows its `Material`/`Diffuse` input if
+                // it has one; the class itself is listed as unsupported by the walker.
+                n.material = self.key_of(pkg, p.object("Material").unwrap_or(ObjectRef::Null));
+                n.diffuse = self.key_of(pkg, p.object("Diffuse").unwrap_or(ObjectRef::Null));
+            }
+        }
+        n
+    }
+
+    /// Resolves the surface material `r` to a description and registers it, returning the
+    /// compatibility [`MaterialSlot`] and the index into [`WorldScene::materials`].
+    fn material(&mut self, from: &Arc<Loaded>, r: ObjectRef, what: &str) -> (MaterialSlot, usize) {
+        if r.is_null() {
+            self.scene.count(&format!("skip.{what}.material_none"), 1);
+            let idx = self.push_material(ResolvedMaterial::default());
+            return (MaterialSlot::Missing("None".into()), idx);
+        }
+        let start = match self.cache.resolve(from, r) {
+            Ok((pkg, idx)) => (pkg.name.to_ascii_lowercase(), idx),
+            Err(e) => {
+                let label = from.package.object_path(r).unwrap_or("?").to_owned();
+                self.scene.fail(
+                    &format!("skip.{what}.material (unresolved)"),
+                    format!("{label}: {e}"),
+                );
+                let idx = self.push_material(ResolvedMaterial::default());
+                return (MaterialSlot::Missing(e), idx);
+            }
+        };
+        if let Some(&idx) = self.resolved.get(&start) {
+            return (self.slot_for(idx), idx);
+        }
+        let resolved = {
+            let mut lookup = |k: &NodeKey| self.node_for_key(k);
+            materials::resolve(Some(start.clone()), &mut lookup)
+        };
+        let idx = self.push_material(resolved);
+        self.resolved.insert(start, idx);
+        self.count_material(idx, what);
+        (self.slot_for(idx), idx)
+    }
+
+    /// Compatibility slot derived from the resolved base texture.
+    fn slot_for(&self, idx: usize) -> MaterialSlot {
+        match self.scene.materials[idx].base {
+            Some(t) => MaterialSlot::Texture(t),
+            None => {
+                let m = &self.scene.materials[idx];
+                let reason = if m.unsupported.is_empty() {
+                    "no texture".to_owned()
+                } else {
+                    m.unsupported.join(",")
+                };
+                MaterialSlot::Missing(reason)
+            }
+        }
+    }
+
+    fn push_material(&mut self, m: ResolvedMaterial) -> usize {
+        self.scene.materials.push(m);
+        self.scene.materials.len() - 1
+    }
+
+    /// Counts blend/two-sided/animated-UV/unsupported features for the overlay.
+    fn count_material(&mut self, idx: usize, what: &str) {
+        let m = self.scene.materials[idx].clone();
+        let base_missing = m.base.is_none();
+        self.scene.count(&format!("material.resolved.{what}"), 1);
+        self.scene
+            .count(&format!("material.blend.{}", m.blend.name()), 1);
+        if m.two_sided {
+            self.scene.count(&format!("material.two_sided.{what}"), 1);
+        }
+        if !m.uv_transform.is_empty() {
+            self.scene.count(&format!("material.uv_animated.{what}"), 1);
+            self.scene.count("material.uv_ops", m.uv_transform.len());
+        }
+        for u in &m.unsupported {
+            self.scene.count(&format!("material.unsupported ({u})"), 1);
+        }
+        if base_missing {
+            self.scene.count(&format!("skip.{what}.no_base_texture"), 1);
+            self.scene
+                .examples
+                .entry(format!("skip.{what}.no_base_texture"))
+                .or_insert_with(|| m.class_chain.join(" -> "));
+        }
+    }
+
     fn texture_from(
         &mut self,
         from: &Arc<Loaded>,
@@ -448,25 +757,6 @@ impl Importer<'_> {
         };
         self.textures.insert(key, result.clone());
         result
-    }
-
-    fn material(&mut self, from: &Arc<Loaded>, r: ObjectRef, what: &str) -> MaterialSlot {
-        if r.is_null() {
-            self.scene.count(&format!("skip.{what}.material_none"), 1);
-            return MaterialSlot::Missing("None".into());
-        }
-        match self.texture_from(from, r, 0) {
-            Ok(t) => MaterialSlot::Texture(t),
-            Err(e) => {
-                let cat = e.split(':').next().unwrap_or("").to_owned();
-                let label = from.package.object_path(r).unwrap_or("?").to_owned();
-                self.scene.fail(
-                    &format!("skip.{what}.material ({cat})"),
-                    format!("{label}: {e}"),
-                );
-                MaterialSlot::Missing(e)
-            }
-        }
     }
 
     /// Converted per-section meshes of a static mesh, cached.
@@ -561,11 +851,12 @@ impl Importer<'_> {
                     if s.num_faces == 0 {
                         continue;
                     }
-                    let material = match m.materials.get(si) {
+                    let (material, material_index) = match m.materials.get(si) {
                         Some(mm) => self.material(&pkg, mm.material, "mesh"),
                         None => {
                             self.scene.count("skip.mesh.section_without_material", 1);
-                            MaterialSlot::Missing("no slot".into())
+                            let idx = self.push_material(ResolvedMaterial::default());
+                            (MaterialSlot::Missing("no slot".into()), idx)
                         }
                     };
                     // Source winding is kept: the det -1 axis change makes it CCW.
@@ -581,6 +872,7 @@ impl Importer<'_> {
                         uvs: uvs.clone(),
                         indices,
                         material,
+                        material_index,
                     });
                     out.push((self.scene.meshes.len() - 1, label.clone()));
                 }
@@ -897,6 +1189,11 @@ fn alpha_kind(t: &Texture, img: &RgbaImage) -> AlphaKind {
     }
 }
 
+/// Unreal rotator component (65536 per turn) to radians.
+fn rotator_radians(units: i32) -> f32 {
+    units as f32 * (std::f32::consts::TAU / 65536.0)
+}
+
 /// Applies a [`BevyTransform`] to a Bevy-space point: per-axis scale, rotation, translation.
 pub fn apply_transform_pub(t: &BevyTransform, v: [f32; 3]) -> [f32; 3] {
     apply_transform(t, v)
@@ -990,6 +1287,8 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
         scene: WorldScene::default(),
         textures: HashMap::new(),
         meshes: HashMap::new(),
+        nodes: HashMap::new(),
+        resolved: HashMap::new(),
     };
     let actors = level::scan_level(&map_pkg.package, &map_pkg.data);
     im.scene
@@ -1391,7 +1690,7 @@ fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
         }
         let key = (i64::from(surf.material.raw()), zone);
         if let std::collections::btree_map::Entry::Vacant(slot) = groups.entry(key) {
-            let material = im.material(map_pkg, surf.material, "bsp");
+            let (material, material_index) = im.material(map_pkg, surf.material, "bsp");
             slot.insert((
                 material.clone(),
                 SceneMesh {
@@ -1401,13 +1700,14 @@ fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                     uvs: Vec::new(),
                     indices: Vec::new(),
                     material,
+                    material_index,
                 },
             ));
         }
-        let (material, mesh) = groups.get_mut(&key).expect("inserted");
-        let tex_size = match material {
-            MaterialSlot::Texture(t) => im.scene.textures[*t].size,
-            MaterialSlot::Missing(_) => [64, 64],
+        let (_, mesh) = groups.get_mut(&key).expect("inserted");
+        let tex_size = match im.scene.materials[mesh.material_index].base {
+            Some(t) => im.scene.textures[t].size,
+            None => [64, 64],
         };
         let base = m.points[surf.base as usize];
         let tu = m.vectors[surf.texture_u as usize];
@@ -1497,7 +1797,7 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
         };
         im.scene.count("terrain.hidden_quads", mesh.hidden_quads);
         let composite = composite_terrain_texture(im, map_pkg, &t, &mesh);
-        let material = match composite {
+        let (material, material_index) = match composite {
             Some(img) => {
                 im.scene.textures.push(SceneTexture {
                     label: format!("{path} layer composite"),
@@ -1505,9 +1805,20 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                     image: img,
                     alpha: AlphaKind::Opaque,
                 });
-                MaterialSlot::Texture(im.scene.textures.len() - 1)
+                let base = im.scene.textures.len() - 1;
+                let idx = im.push_material(ResolvedMaterial {
+                    base: Some(base),
+                    ..Default::default()
+                });
+                (MaterialSlot::Texture(base), idx)
             }
-            None => MaterialSlot::Missing("terrain layers".into()),
+            None => {
+                let idx = im.push_material(ResolvedMaterial {
+                    unsupported: vec!["terrain.layers".into()],
+                    ..Default::default()
+                });
+                (MaterialSlot::Missing("terrain layers".into()), idx)
+            }
         };
         let terrain_tris: Vec<[[f32; 3]; 3]> = mesh
             .indices
@@ -1558,6 +1869,7 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
             uvs: mesh.grid_uv.clone(),
             indices: mesh.indices.clone(),
             material,
+            material_index,
         });
         im.scene.objects.push(SceneObject {
             mesh: im.scene.meshes.len() - 1,
@@ -1938,6 +2250,118 @@ mod local_tests {
                 sky.polygon_count,
                 sky.object_count,
                 sky.location
+            );
+        }
+    }
+
+    /// The blend mapping in [`materials`] is derived from the game's own reflected enums. This
+    /// opt-in test pins the enumerator order so a corpus change or a mapping drift is caught.
+    #[test]
+    fn opt_in_material_enum_names_match_blend_mapping() {
+        let Some(path) = gog_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let data = std::fs::read(path.join("system/engine.u")).expect("read engine.u");
+        let pkg = xiii_script::ScriptPackage::load(
+            "engine",
+            data,
+            &xiii_script::ScriptLimits::default(),
+            &Limits::default(),
+        )
+        .expect("load engine.u");
+        let names_of = |path: &str| -> Vec<String> {
+            let e = pkg
+                .export_by_path(path)
+                .unwrap_or_else(|| panic!("enum {path} not found"));
+            match pkg.objects.get(&e) {
+                Some(xiii_script::ScriptObject::Enum(en)) => en
+                    .names
+                    .iter()
+                    .map(|&n| pkg.name_text(n).to_owned())
+                    .collect(),
+                other => panic!("{path}: expected enum, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            names_of("Shader.EOutputBlending"),
+            [
+                "OB_Normal",
+                "OB_Masked",
+                "OB_Modulate",
+                "OB_Translucent",
+                "OB_Invisible",
+                "OB_AlphaBlend",
+                "OB_Darken",
+                "OB_Brighten",
+                "OB_AddWhiteFog",
+            ]
+        );
+        assert_eq!(
+            names_of("FinalBlend.EFrameBufferBlending"),
+            [
+                "FB_Overwrite",
+                "FB_Modulate",
+                "FB_AlphaBlend",
+                "FB_AlphaModulate_MightNotFogCorrectly",
+                "FB_Translucent",
+                "FB_Darken",
+                "FB_Brighten",
+                "FB_Invisible",
+            ]
+        );
+        assert_eq!(
+            names_of("TexOscillator.ETexOscillationType"),
+            ["OT_Pan", "OT_Stretch"]
+        );
+    }
+
+    /// Opt-in material-resolution invariants on the three maps the task names: no `fail.*`
+    /// counters, every surface resolves a base texture, and the feature counters are printed.
+    #[test]
+    fn opt_in_material_resolution_on_three_maps() {
+        let Some(path) = gog_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        for map in ["Plage00", "Plage01", "Banque01"] {
+            let scene = import_map(&mut cache, map).expect("import");
+            let get = |k: &str| scene.counters.get(k).copied().unwrap_or(0);
+            let fails: Vec<_> = scene
+                .counters
+                .keys()
+                .filter(|k| k.starts_with("fail."))
+                .collect();
+            assert!(fails.is_empty(), "{map}: {fails:?} {:?}", scene.examples);
+            let missing: Vec<_> = scene
+                .materials
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.base.is_none())
+                .map(|(i, m)| format!("{i}:{:?}", m.class_chain))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{map}: {} materials without a base texture: {missing:?}",
+                missing.len()
+            );
+            let mut blends: std::collections::BTreeMap<&str, usize> = Default::default();
+            let mut unsupported: std::collections::BTreeMap<&str, usize> = Default::default();
+            let mut uv_ops = 0usize;
+            for m in &scene.materials {
+                *blends.entry(m.blend.name()).or_default() += 1;
+                uv_ops += m.uv_transform.len();
+                for u in &m.unsupported {
+                    *unsupported.entry(u.as_str()).or_default() += 1;
+                }
+            }
+            println!(
+                "[materials] {map}: materials {} blends {blends:?} two_sided {} uv_ops {uv_ops} unsupported {unsupported:?}",
+                scene.materials.len(),
+                get("material.two_sided.mesh")
+                    + get("material.two_sided.bsp")
+                    + get("material.two_sided.terrain"),
             );
         }
     }
