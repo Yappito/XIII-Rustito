@@ -22,9 +22,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 pub mod animation;
+pub mod audio;
 pub mod materials;
+pub mod movement_volumes;
 pub mod nav_provider;
 pub mod navigation;
+pub mod particles;
 pub mod physics;
 pub mod reach;
 pub mod runtime;
@@ -157,6 +160,8 @@ pub struct WorldScene {
     pub zones: Vec<zones::SceneZone>,
     /// Indices into [`WorldScene::zones`] of the sky zones (`is_sky`), in increasing order.
     pub sky_zones: Vec<u32>,
+    /// Decoded particle emitter systems placed in the map (see [`particles`]).
+    pub particle_systems: Vec<particles::ParticleSystem>,
 }
 
 impl WorldScene {
@@ -379,7 +384,7 @@ struct MeshSections {
     collision_slot_disabled: usize,
 }
 
-struct Importer<'a> {
+pub(crate) struct Importer<'a> {
     cache: &'a mut PackageCache,
     scene: WorldScene,
     textures: HashMap<ObjectKey, Result<usize, String>>,
@@ -1007,7 +1012,7 @@ impl ClassDefaults {
     }
 
     /// Resolved layout of a class path (`Package.Class` as written in the map), cached.
-    fn layout(&mut self, class_path: &str) -> Result<SharedLayout, String> {
+    pub fn layout(&mut self, class_path: &str) -> Result<SharedLayout, String> {
         let key = class_path.to_ascii_lowercase();
         if let Some(l) = self.layouts.get(&key) {
             return Ok(l.clone());
@@ -1039,6 +1044,24 @@ impl ClassDefaults {
     pub fn is_navigation_point(&mut self, class_path: &str) -> Result<bool, String> {
         let l = self.layout(class_path)?;
         Ok(l.chain_names.iter().any(|n| n == "navigationpoint"))
+    }
+
+    /// Lowercase class names of `class_path`'s inheritance chain, most derived first.
+    pub fn class_chain(&mut self, class_path: &str) -> Result<Vec<String>, String> {
+        Ok(self.layout(class_path)?.chain_names.clone())
+    }
+
+    /// Resolved inherited bool default of a property, or `None` when the property is absent
+    /// from the class chain (or is not a bool).
+    pub fn bool_default(&mut self, class_path: &str, name: &str) -> Result<Option<bool>, String> {
+        let l = self.layout(class_path)?;
+        let Some(s) = l.slot_by_name(name) else {
+            return Ok(None);
+        };
+        Ok(match l.defaults.get(s.base) {
+            Some(xiii_script::Value::Bool(v)) => Some(*v),
+            _ => None,
+        })
     }
 
     /// Resolved inherited float default of a property, or `None` when the property is absent
@@ -1532,6 +1555,7 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
 
     import_bsp(&mut im, &map_pkg);
     import_terrain(&mut im, &map_pkg);
+    particles::import_particles(&mut im, &map_pkg, &mut defaults);
     // Per-zone object counts (static-mesh actors, BSP groups), after every object exists.
     let mut counts = vec![0usize; im.scene.zones.len()];
     let mut unzoned = 0usize;

@@ -495,7 +495,13 @@ mod tests {
         let mut loc = session.player_location().unwrap_or([0.0; 3]);
         // 90 s at the fixed 60 Hz step.
         for _ in 0..5400 {
-            session.step(1.0 / 60.0, loc, 0.0, [0.0; 3]);
+            session.step(
+                1.0 / 60.0,
+                loc,
+                0.0,
+                [0.0; 3],
+                &crate::play::session::PlayerVMModes::default(),
+            );
             {
                 let vm = session.vm_mut();
                 vm.set_property(canvas, "ClipX", 0, Value::Float(1280.0));

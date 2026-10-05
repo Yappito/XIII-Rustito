@@ -363,19 +363,6 @@ fn not_equal_vv(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<Na
     val(Value::Bool(vector(vm, a, 0)? != vector(vm, a, 1)?))
 }
 
-/// `Object.GetAxes(Rotator A, out Vector X, out Vector Y, out Vector Z)` (native 229): the actor
-/// rotation basis (`FRotationMatrix` axes), written to the three out parameters.
-fn get_axes(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let r = rotator(vm, a, 0)?;
-    let (x, y, z) = crate::registry::rotator_basis(r);
-    if a.len() >= 4 {
-        a[1] = Value::Vector(x);
-        a[2] = Value::Vector(y);
-        a[3] = Value::Vector(z);
-    }
-    val(Value::Void)
-}
-
 /// Core operator natives on the cartoon/cine path. Called from [`cartoon_defs`].
 fn missing_core_defs() -> Vec<NativeDef> {
     vec![
@@ -393,14 +380,6 @@ fn missing_core_defs() -> Vec<NativeDef> {
             "core.u Object.NotEqual_VectorVector decoded (native 218); negation of the \
              EqualEqual_VectorVector operator; used by pawn/cine Tick velocity checks",
             not_equal_vv,
-        ),
-        def(
-            "Object.GetAxes",
-            "native(229) final native static function GetAxes(struct<Rotator> A, struct<Vector> X, \
-             struct<Vector> Y, struct<Vector> Z)",
-            "core.u Object.GetAxes decoded (native 229); FRotationMatrix basis written to the \
-             three out vectors; used by HelicoDeco/decor Tick",
-            get_axes,
         ),
     ]
 }
