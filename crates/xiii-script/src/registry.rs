@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::events::PresentationEvent;
 use crate::linker::GlobalRef;
 use crate::value::{ObjRef, ObjectId, Value};
 use crate::vm::{Latent, TraceKind, Vm, VmErrorKind, VmResult};
@@ -203,6 +204,152 @@ float2!(le_ff, |x, y| Value::Bool(x <= y));
 float2!(ge_ff, |x, y| Value::Bool(x >= y));
 float2!(eq_ff, |x, y| Value::Bool(x == y));
 float2!(ne_ff, |x, y| Value::Bool(x != y));
+
+/// Compound-assignment operator over two `int`s: the first argument is `out` in the decoded
+/// declaration (`AddEqual_IntInt(int A, int B)`), so the new value is also written to `args[0]`,
+/// which the VM stores back into the lvalue. The native returns the new value.
+macro_rules! int_assign2 {
+    ($name:ident, $op:expr) => {
+        fn $name(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+            let (x, y) = (int(vm, a, 0)?, int(vm, a, 1)?);
+            let f: fn(i32, i32) -> i32 = $op;
+            let r = f(x, y);
+            a[0] = Value::Int(r);
+            val(Value::Int(r))
+        }
+    };
+}
+
+/// Compound-assignment operator over two `float`s (see [`int_assign2`]).
+macro_rules! float_assign2 {
+    ($name:ident, $op:expr) => {
+        fn $name(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+            let (x, y) = (float(vm, a, 0)?, float(vm, a, 1)?);
+            let f: fn(f32, f32) -> f32 = $op;
+            let r = f(x, y);
+            a[0] = Value::Float(r);
+            val(Value::Float(r))
+        }
+    };
+}
+
+int_assign2!(add_eq_ii, |x, y| x.wrapping_add(y));
+int_assign2!(sub_eq_ii, |x, y| x.wrapping_sub(y));
+float_assign2!(add_eq_ff, |x, y| x + y);
+float_assign2!(sub_eq_ff, |x, y| x - y);
+float_assign2!(mul_eq_ff, |x, y| x * y);
+float_assign2!(div_eq_ff, |x, y| x / y);
+
+/// `int *= float` / `int /= float` (decoded `MultiplyEqual_IntFloat`/`DivideEqual_IntFloat`).
+fn mul_eq_if(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let x = int(vm, a, 0)?;
+    let y = float(vm, a, 1)?;
+    let r = (x as f32 * y) as i32;
+    a[0] = Value::Int(r);
+    val(Value::Int(r))
+}
+
+fn div_eq_if(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let x = int(vm, a, 0)?;
+    let y = float(vm, a, 1)?;
+    if y == 0.0 {
+        return Err(vm.err(VmErrorKind::DivisionByZero));
+    }
+    let r = (x as f32 / y) as i32;
+    a[0] = Value::Int(r);
+    val(Value::Int(r))
+}
+
+/// Compound vector assignment: `A += B` / `A -= B`, first argument `out`.
+fn add_eq_vv(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let (x, y) = (vector2(vm, a, 0)?, vector2(vm, a, 1)?);
+    let r = [x[0] + y[0], x[1] + y[1], x[2] + y[2]];
+    a[0] = Value::Vector(r);
+    val(Value::Vector(r))
+}
+
+fn sub_eq_vv(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let (x, y) = (vector2(vm, a, 0)?, vector2(vm, a, 1)?);
+    let r = [x[0] - y[0], x[1] - y[1], x[2] - y[2]];
+    a[0] = Value::Vector(r);
+    val(Value::Vector(r))
+}
+
+fn mul_eq_vf(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let x = vector2(vm, a, 0)?;
+    let s = float(vm, a, 1)?;
+    let r = [x[0] * s, x[1] * s, x[2] * s];
+    a[0] = Value::Vector(r);
+    val(Value::Vector(r))
+}
+
+fn div_eq_vf(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let x = vector2(vm, a, 0)?;
+    let s = float(vm, a, 1)?;
+    if s == 0.0 {
+        return Err(vm.err(VmErrorKind::DivisionByZero));
+    }
+    let r = [x[0] / s, x[1] / s, x[2] / s];
+    a[0] = Value::Vector(r);
+    val(Value::Vector(r))
+}
+
+fn mul_eq_vv(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let (x, y) = (vector2(vm, a, 0)?, vector2(vm, a, 1)?);
+    let r = [x[0] * y[0], x[1] * y[1], x[2] * y[2]];
+    a[0] = Value::Vector(r);
+    val(Value::Vector(r))
+}
+
+/// Compound rotator assignment (`A += B` etc.), component-wise.
+fn add_eq_rr(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let (x, y) = (rotator2(vm, a, 0)?, rotator2(vm, a, 1)?);
+    let r = [
+        x[0].wrapping_add(y[0]),
+        x[1].wrapping_add(y[1]),
+        x[2].wrapping_add(y[2]),
+    ];
+    a[0] = Value::Rotator(r);
+    val(Value::Rotator(r))
+}
+
+fn sub_eq_rr(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let (x, y) = (rotator2(vm, a, 0)?, rotator2(vm, a, 1)?);
+    let r = [
+        x[0].wrapping_sub(y[0]),
+        x[1].wrapping_sub(y[1]),
+        x[2].wrapping_sub(y[2]),
+    ];
+    a[0] = Value::Rotator(r);
+    val(Value::Rotator(r))
+}
+
+fn mul_eq_rf(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let x = rotator2(vm, a, 0)?;
+    let s = float(vm, a, 1)?;
+    let r = [
+        (x[0] as f32 * s) as i32,
+        (x[1] as f32 * s) as i32,
+        (x[2] as f32 * s) as i32,
+    ];
+    a[0] = Value::Rotator(r);
+    val(Value::Rotator(r))
+}
+
+fn div_eq_rf(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let x = rotator2(vm, a, 0)?;
+    let s = float(vm, a, 1)?;
+    if s == 0.0 {
+        return Err(vm.err(VmErrorKind::DivisionByZero));
+    }
+    let r = [
+        (x[0] as f32 / s) as i32,
+        (x[1] as f32 / s) as i32,
+        (x[2] as f32 / s) as i32,
+    ];
+    a[0] = Value::Rotator(r);
+    val(Value::Rotator(r))
+}
 
 fn div_ii(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let (x, y) = (int(vm, a, 0)?, int(vm, a, 1)?);
@@ -437,6 +584,60 @@ fn fmax_ff(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOu
 fn fmin_ff(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let (x, y) = (float(vm, a, 0)?, float(vm, a, 1)?);
     val(Value::Float(if x <= y { x } else { y }))
+}
+
+fn fclamp_fff(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let v = float(vm, a, 0)?;
+    let lo = float(vm, a, 1)?;
+    let hi = float(vm, a, 2)?;
+    val(Value::Float(v.clamp(lo.min(hi), hi.max(lo))))
+}
+
+fn min_ii(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Int(int(vm, a, 0)?.min(int(vm, a, 1)?)))
+}
+
+fn max_ii(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Int(int(vm, a, 0)?.max(int(vm, a, 1)?)))
+}
+
+fn lerp_fff(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let alpha = float(vm, a, 0)?;
+    let v0 = float(vm, a, 1)?;
+    let v1 = float(vm, a, 2)?;
+    val(Value::Float(v0 + (v1 - v0) * alpha))
+}
+
+fn abs_f(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Float(float(vm, a, 0)?.abs()))
+}
+
+fn sqrt_f(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Float(float(vm, a, 0)?.sqrt()))
+}
+
+fn exp_f(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Float(float(vm, a, 0)?.exp()))
+}
+
+fn loge_f(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Float(float(vm, a, 0)?.ln()))
+}
+
+fn sin_f(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Float(float(vm, a, 0)?.sin()))
+}
+
+fn cos_f(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Float(float(vm, a, 0)?.cos()))
+}
+
+fn tan_f(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Float(float(vm, a, 0)?.tan()))
+}
+
+fn atan_f(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Float(float(vm, a, 0)?.atan()))
 }
 
 fn complement_equal_ss(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -678,6 +879,17 @@ fn goto_state(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nativ
 fn is_a(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let n = name(vm, a, 0)?;
     val(Value::Bool(vm.is_a(c.this, &n)))
+}
+
+fn is_in_state(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let n = name(vm, a, 0)?;
+    val(Value::Bool(vm.is_in_state(c.this, &n)))
+}
+
+fn get_state_name(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Name(
+        vm.state_name(c.this).unwrap_or_else(|| "None".to_owned()),
+    ))
 }
 
 fn disable(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -1019,6 +1231,287 @@ fn set_view_target(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<
     let target = object(vm, a, 0)?;
     vm.set_property(c.this, "ViewTarget", 0, Value::Object(target));
     val(Value::Void)
+}
+
+fn play_sound(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    vm.emit_sound(false, c.this, a, &c.omitted);
+    val(Value::Void)
+}
+
+fn play_music(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    vm.emit_sound(true, c.this, a, &c.omitted);
+    val(Value::Void)
+}
+
+fn replace_texture_by_another(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let src = object(vm, a, 0)?.map(|r| vm.obj_label(&r));
+    let dst = object(vm, a, 1)?.map(|r| vm.obj_label(&r));
+    let actor = vm.objects[c.this as usize].name.clone();
+    let time = vm.time;
+    vm.emit_event(PresentationEvent::ReplaceTexture {
+        actor,
+        source: src,
+        destination: dst,
+        time,
+    });
+    val(Value::Void)
+}
+
+fn refresh_displaying(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    let actor = vm.objects[c.this as usize].name.clone();
+    let time = vm.time;
+    vm.emit_event(PresentationEvent::RefreshDisplaying { actor, time });
+    val(Value::Void)
+}
+
+fn set_injured_effect(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let new_state = boolean(vm, a, 0)?;
+    let delay = if c.omitted(1) { 0.0 } else { float(vm, a, 1)? };
+    let actor = vm.objects[c.this as usize].name.clone();
+    let time = vm.time;
+    vm.emit_event(PresentationEvent::SetInjuredEffect {
+        actor,
+        new_state,
+        delay,
+        time,
+    });
+    val(Value::Void)
+}
+
+fn attach_projector(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    let actor = vm.objects[c.this as usize].name.clone();
+    let time = vm.time;
+    vm.emit_event(PresentationEvent::ProjectorAttach { actor, time });
+    val(Value::Void)
+}
+
+fn detach_projector(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let force = if c.omitted(0) {
+        false
+    } else {
+        boolean(vm, a, 0)?
+    };
+    let actor = vm.objects[c.this as usize].name.clone();
+    let time = vm.time;
+    vm.emit_event(PresentationEvent::ProjectorDetach { actor, force, time });
+    val(Value::Void)
+}
+
+fn abandon_projector(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let lifetime = if c.omitted(0) { 0.0 } else { float(vm, a, 0)? };
+    let actor = vm.objects[c.this as usize].name.clone();
+    let time = vm.time;
+    vm.emit_event(PresentationEvent::ProjectorAbandon {
+        actor,
+        lifetime,
+        time,
+    });
+    val(Value::Void)
+}
+
+fn set_owner(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let owner = object(vm, a, 0)?;
+    vm.set_property(c.this, "Owner", 0, Value::Object(owner));
+    val(Value::Void)
+}
+
+fn is_player_pawn(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    // UE2 `APawn::IsPlayerPawn`: true for a player pawn. XIII has no `bIsPlayerPawn` field
+    // (measured), so this is the class-chain test (the same approximation as `is_player_or_projectile`).
+    val(Value::Bool(vm.is_a(c.this, "PlayerPawn")))
+}
+
+fn find_inventory_type(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    // UE2 `APawn::FindInventoryType`: walks `Inventory` -> `Inventory` (the item chain) and
+    // returns the first item whose class derives from `DesiredClass`. XIII's decoded signature
+    // has no `bExactClass` flag.
+    let desired = match object(vm, a, 0)? {
+        Some(ObjRef::Static(g)) => g,
+        _ => return val(Value::Object(None)),
+    };
+    let mut cur = prop_object(vm, c.this, "Inventory");
+    let mut guard = 0;
+    while let Some(id) = cur {
+        guard += 1;
+        if guard > 65_536 {
+            break;
+        }
+        if vm.is_child_of_class(vm.objects[id as usize].class, desired) {
+            return val(Value::Object(Some(ObjRef::Instance(id))));
+        }
+        cur = prop_object(vm, id, "Inventory");
+    }
+    val(Value::Object(None))
+}
+
+fn play_rolloff_sound(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    vm.emit_rolloff_sound(c.this, a, &c.omitted);
+    val(Value::Void)
+}
+
+fn set_base(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    // UE2 `AActor::SetBase`: sets `Base` (and `Floor` when supplied). No attachment transform
+    // is evaluated (the VM has no rendering/movement solver).
+    let base = object(vm, a, 0)?;
+    vm.set_property(c.this, "Base", 0, Value::Object(base));
+    if !c.omitted(1)
+        && let Some(Value::Vector(v)) = a.get(1)
+    {
+        vm.set_property(c.this, "Floor", 0, Value::Vector(*v));
+    }
+    val(Value::Void)
+}
+
+fn set_relative_location(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let loc = vector2(vm, a, 0)?;
+    vm.set_property(c.this, "RelativeLocation", 0, Value::Vector(loc));
+    val(Value::Bool(true))
+}
+
+fn set_relative_rotation(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let rot = rotator2(vm, a, 0)?;
+    vm.set_property(c.this, "RelativeRotation", 0, Value::Rotator(rot));
+    val(Value::Bool(true))
+}
+
+fn set_draw_type(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let dt = match a.first() {
+        Some(Value::Byte(b)) => *b,
+        Some(other) => return Err(type_err(vm, "byte", other)),
+        None => 0,
+    };
+    vm.set_property(c.this, "DrawType", 0, Value::Byte(dt));
+    val(Value::Void)
+}
+
+fn set_draw_scale(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let s = float(vm, a, 0)?;
+    vm.set_property(c.this, "DrawScale", 0, Value::Float(s));
+    val(Value::Void)
+}
+
+fn set_draw_scale3d(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let s = vector2(vm, a, 0)?;
+    vm.set_property(c.this, "DrawScale3D", 0, Value::Vector(s));
+    val(Value::Void)
+}
+
+fn attach_to_bone(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    // UE2 `AActor::AttachToBone(AActor* Attachment, FName BoneName)`: the attachment is based on
+    // this actor and remembers the bone. The VM records the base link and the bone name; no
+    // skeletal attachment transform is evaluated.
+    let Some(ObjRef::Instance(id)) = object(vm, a, 0)? else {
+        return val(Value::Bool(false));
+    };
+    vm.set_property(id, "Base", 0, Value::Object(Some(ObjRef::Instance(c.this))));
+    if !c.omitted(1)
+        && let Some(Value::Name(n)) = a.get(1)
+    {
+        vm.set_property(id, "AttachBone", 0, Value::Name(n.clone()));
+    }
+    val(Value::Bool(true))
+}
+
+fn anim_blend_to_alpha(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let stage = int(vm, a, 0)?;
+    let target = float(vm, a, 1)?;
+    let time = float(vm, a, 2)?;
+    vm.anim_blend_params(c.this, stage, target, time, 0.0, None);
+    val(Value::Void)
+}
+
+fn controlled_by_player(vm: &Vm<'_>, id: ObjectId) -> bool {
+    vm.obj_prop(id, "Controller")
+        .is_some_and(|c| vm.is_a(c, "PlayerController"))
+}
+
+fn is_locally_controlled(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    // No network/local-player model in the headless VM: a PlayerController is the only
+    // possible local controller (labelled Partial).
+    val(Value::Bool(controlled_by_player(vm, c.this)))
+}
+
+fn is_human_controlled(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Bool(controlled_by_player(vm, c.this)))
+}
+
+/// `int` property value, or `0` when absent/another type.
+fn int_prop(vm: &Vm<'_>, id: ObjectId, name: &str) -> i32 {
+    match vm.get_property(id, name) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    }
+}
+
+fn ammunition_has_ammo(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Bool(int_prop(vm, c.this, "AmmoAmount") > 0))
+}
+
+fn weapon_has_ammo(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    // UE2 `AWeapon::HasAmmo`: an AmmoType exists with ammo left.
+    val(Value::Bool(
+        vm.obj_prop(c.this, "AmmoType")
+            .is_some_and(|a| int_prop(vm, a, "AmmoAmount") > 0),
+    ))
+}
+
+fn get_anim_params(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    // `Actor.GetAnimParams(int Channel, out name OutSeqName, out float OutAnimFrame,
+    // out float OutAnimRate)`: the VM's channel state holds the frame/rate; the sequence name
+    // is the actor's `AnimSequence` property (the channel itself does not store the name).
+    let ch = channel(vm, a, 0, c.omitted(0))?;
+    let name = vm
+        .get_property(c.this, "AnimSequence")
+        .cloned()
+        .unwrap_or_else(|| Value::Name("None".to_owned()));
+    let (frame, rate) = vm.anim_channel_params(c.this, ch).unwrap_or((0.0, 0.0));
+    if a.len() > 1 {
+        a[1] = name;
+    }
+    if a.len() > 2 {
+        a[2] = Value::Float(frame);
+    }
+    if a.len() > 3 {
+        a[3] = Value::Float(rate);
+    }
+    val(Value::Void)
+}
+
+fn adjust_counter(vm: &mut Vm<'_>, c: &NativeCtx, name: &str, delta: i32) -> NativeOutcome {
+    vm.adjust_music_var(c.this, name, delta);
+    NativeOutcome::Value(Value::Void)
+}
+
+fn inc_attente(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    Ok(adjust_counter(vm, c, "NbAttente", 1))
+}
+
+fn dec_attente(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    Ok(adjust_counter(vm, c, "NbAttente", -1))
+}
+
+fn inc_alerte(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    Ok(adjust_counter(vm, c, "NbAlerte", 1))
+}
+
+fn dec_alerte(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    Ok(adjust_counter(vm, c, "NbAlerte", -1))
 }
 
 fn noop(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -1431,6 +1924,180 @@ fn builtin_defs() -> Vec<NativeDef> {
             fmin_ff,
         ),
         def(
+            "Object.FClamp",
+            "native(246) final static function float FClamp(float V, float A, float B)",
+            "UE2: bounds V into [min(A,B), max(A,B)]; Core.dll ?execFClamp@UObject",
+            fclamp_fff,
+        ),
+        def(
+            "Object.Min",
+            "native(249) final static function int Min(int A, int B)",
+            "UE2: smaller of two ints; Core.dll ?execMin@UObject",
+            min_ii,
+        ),
+        def(
+            "Object.Max",
+            "native(250) final static function int Max(int A, int B)",
+            "UE2: larger of two ints; Core.dll ?execMax@UObject",
+            max_ii,
+        ),
+        def(
+            "Object.Lerp",
+            "native(247) final static function float Lerp(float Alpha, float A, float B)",
+            "UE2: A + (B-A)*Alpha; Core.dll ?execLerp@UObject",
+            lerp_fff,
+        ),
+        def(
+            "Object.Abs",
+            "native(186) final static function float Abs(float A)",
+            "UE2: absolute value; Core.dll ?execAbs@UObject",
+            abs_f,
+        ),
+        def(
+            "Object.Sqrt",
+            "native(193) final static function float Sqrt(float A)",
+            "UE2: square root; Core.dll ?execSqrt@UObject",
+            sqrt_f,
+        ),
+        def(
+            "Object.Exp",
+            "native(191) final static function float Exp(float A)",
+            "UE2: e^A; Core.dll ?execExp@UObject",
+            exp_f,
+        ),
+        def(
+            "Object.Loge",
+            "native(192) final static function float Loge(float A)",
+            "UE2: natural logarithm; Core.dll ?execLoge@UObject",
+            loge_f,
+        ),
+        def(
+            "Object.Sin",
+            "native(187) final static function float Sin(float A)",
+            "UE2: sine (radians); Core.dll ?execSin@UObject",
+            sin_f,
+        ),
+        def(
+            "Object.Cos",
+            "native(188) final static function float Cos(float A)",
+            "UE2: cosine (radians); Core.dll ?execCos@UObject",
+            cos_f,
+        ),
+        def(
+            "Object.Tan",
+            "native(189) final static function float Tan(float A)",
+            "UE2: tangent (radians); Core.dll ?execTan@UObject",
+            tan_f,
+        ),
+        def(
+            "Object.Atan",
+            "native(190) final static function float Atan(float A)",
+            "UE2: arctangent; Core.dll ?execAtan@UObject",
+            atan_f,
+        ),
+        def(
+            "Object.AddEqual_IntInt",
+            "native(161) final operator out int +=(out int A, int B)",
+            UE2_OP,
+            add_eq_ii,
+        ),
+        def(
+            "Object.SubtractEqual_IntInt",
+            "native(162) final operator out int -=(out int A, int B)",
+            UE2_OP,
+            sub_eq_ii,
+        ),
+        def(
+            "Object.MultiplyEqual_IntFloat",
+            "native(159) final operator out int *=(out int A, float B)",
+            UE2_OP,
+            mul_eq_if,
+        ),
+        def(
+            "Object.DivideEqual_IntFloat",
+            "native(160) final operator out int /=(out int A, float B)",
+            "UE2; division by zero is an error here",
+            div_eq_if,
+        ),
+        def(
+            "Object.AddEqual_FloatFloat",
+            "native(184) final operator out float +=(out float A, float B)",
+            UE2_OP,
+            add_eq_ff,
+        ),
+        def(
+            "Object.SubtractEqual_FloatFloat",
+            "native(185) final operator out float -=(out float A, float B)",
+            UE2_OP,
+            sub_eq_ff,
+        ),
+        def(
+            "Object.MultiplyEqual_FloatFloat",
+            "native(182) final operator out float *=(out float A, float B)",
+            UE2_OP,
+            mul_eq_ff,
+        ),
+        def(
+            "Object.DivideEqual_FloatFloat",
+            "native(183) final operator out float /=(out float A, float B)",
+            "UE2; division by zero is an error here",
+            div_eq_ff,
+        ),
+        def(
+            "Object.AddEqual_VectorVector",
+            "native(223) final operator out vector +=(out vector A, vector B)",
+            UE2_OP,
+            add_eq_vv,
+        ),
+        def(
+            "Object.SubtractEqual_VectorVector",
+            "native(224) final operator out vector -=(out vector A, vector B)",
+            UE2_OP,
+            sub_eq_vv,
+        ),
+        def(
+            "Object.MultiplyEqual_VectorFloat",
+            "native(221) final operator out vector *=(out vector A, float B)",
+            UE2_OP,
+            mul_eq_vf,
+        ),
+        def(
+            "Object.DivideEqual_VectorFloat",
+            "native(222) final operator out vector /=(out vector A, float B)",
+            "UE2; division by zero is an error here",
+            div_eq_vf,
+        ),
+        def(
+            "Object.MultiplyEqual_VectorVector",
+            "native(297) final operator out vector *=(out vector A, vector B)",
+            "UE2: component-wise product; Core.dll operator thunk",
+            mul_eq_vv,
+        ),
+        def(
+            "Object.AddEqual_RotatorRotator",
+            "native(318) final operator out rotator +=(out rotator A, rotator B)",
+            UE2_OP,
+            add_eq_rr,
+        ),
+        def(
+            "Object.SubtractEqual_RotatorRotator",
+            "native(319) final operator out rotator -=(out rotator A, rotator B)",
+            UE2_OP,
+            sub_eq_rr,
+        ),
+        def(
+            "Object.MultiplyEqual_RotatorFloat",
+            "native(290) final operator out rotator *=(out rotator A, float B)",
+            UE2_OP,
+            mul_eq_rf,
+        ),
+        def(
+            "Object.DivideEqual_RotatorFloat",
+            "native(291) final operator out rotator /=(out rotator A, float B)",
+            "UE2; division by zero is an error here",
+            div_eq_rf,
+        ),
+        def(
             "Object.Clamp",
             "native(251) final static function int Clamp(int V, int A, int B)",
             "UE2: bounds V into [min(A,B), max(A,B)]; Core.dll ?execClamp@UObject",
@@ -1613,6 +2280,18 @@ fn builtin_defs() -> Vec<NativeDef> {
             is_a,
         ),
         def(
+            "Object.IsInState",
+            "native(281) final static function bool IsInState(name TestState)",
+            "UE2: true when the current state or a super state has the name (None matches no state); Core.dll ?execIsInState@UObject",
+            is_in_state,
+        ),
+        def(
+            "Object.GetStateName",
+            "native(284) final static function name GetStateName()",
+            "UE2: name of the current state (None when stateless); Core.dll ?execGetStateName@UObject",
+            get_state_name,
+        ),
+        def(
             "Object.Disable",
             "native(118) final function Disable(name ProbeFunc)",
             "UE2: probe mask bit cleared; engine events for that probe are dropped; Core.dll ?execDisable@UObject",
@@ -1653,6 +2332,162 @@ fn builtin_defs() -> Vec<NativeDef> {
             "engine.u Actor.Destroy decoded; UE2 AActor::execDestroy (Destroyed event, bDeleteMe, references become None); Engine.dll ?execDestroy@AActor",
             destroy,
         ),
+        def(
+            "Engine.Actor.SetOwner",
+            "native(272) final static function SetOwner(object<Actor> NewOwner)",
+            "engine.u Actor.SetOwner decoded (NewOwner, void); UE2 AActor::execSetOwner sets Owner; Engine.dll ?execSetOwner@AActor",
+            set_owner,
+        ),
+        def(
+            "Engine.Pawn.IsPlayerPawn",
+            "native(0) final function bool IsPlayerPawn()",
+            "engine.u Pawn.IsPlayerPawn decoded (bool); class-chain test (XIII has no bIsPlayerPawn field; measured)",
+            is_player_pawn,
+        ),
+        def(
+            "Engine.Pawn.FindInventoryType",
+            "native(0) final function Inventory FindInventoryType(class<Object> DesiredClass)",
+            "engine.u Pawn.FindInventoryType decoded (DesiredClass, Inventory); UE2 walks the Inventory->Inventory chain and returns the first deriving item",
+            find_inventory_type,
+        ),
+        def(
+            "Engine.Pawn.IsLocallyControlled",
+            "native(0) simulated function bool IsLocallyControlled()",
+            "engine.u Pawn.IsLocallyControlled decoded (bool); no local-player/network model, true when the Controller is a PlayerController (Partial)",
+            is_locally_controlled,
+        ),
+        def(
+            "Engine.Pawn.IsHumanControlled",
+            "native(0) simulated function bool IsHumanControlled()",
+            "engine.u Pawn.IsHumanControlled decoded (bool); true when the Controller is a PlayerController (Partial)",
+            is_human_controlled,
+        ),
+        def(
+            "Engine.Ammunition.HasAmmo",
+            "native(0) function bool HasAmmo()",
+            "engine.u Ammunition.HasAmmo decoded (bool); UE2: AmmoAmount > 0",
+            ammunition_has_ammo,
+        ),
+        def(
+            "Engine.Weapon.HasAmmo",
+            "native(0) function bool HasAmmo()",
+            "engine.u Weapon.HasAmmo decoded (bool); UE2: AmmoType != None && AmmoType.AmmoAmount > 0",
+            weapon_has_ammo,
+        ),
+        NativeDef {
+            status: NativeStatus::Partial(
+                "the channel state stores frame/rate but not the sequence name; OutSeqName is the actor's AnimSequence property",
+            ),
+            ..def(
+                "Engine.Actor.GetAnimParams",
+                "native(396) final static function GetAnimParams(int Channel, out name OutSeqName, out float OutAnimFrame, out float OutAnimRate)",
+                "engine.u Actor.GetAnimParams decoded; fills the channel's sequence name (the AnimSequence property) and the VM's frame/rate",
+                get_anim_params,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial(
+                "updates the `MusicVars` counter named NbAttente (hypothesis: the counter name is inferred from the LevelInfo defaults; the DLL setter is not decoded)",
+            ),
+            ..def(
+                "Engine.LevelInfo.IncAttente",
+                "native(593) final native static function IncAttente()",
+                "engine.u LevelInfo.IncAttente decoded (void); increments the MusicVars counter NbAttente",
+                inc_attente,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial(
+                "updates the `MusicVars` counter named NbAttente (hypothesis: the counter name is inferred from the LevelInfo defaults; the DLL setter is not decoded)",
+            ),
+            ..def(
+                "Engine.LevelInfo.DecAttente",
+                "native(592) final native static function DecAttente()",
+                "engine.u LevelInfo.DecAttente decoded (void); decrements the MusicVars counter NbAttente",
+                dec_attente,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial(
+                "updates the `MusicVars` counter named NbAlerte (hypothesis: the counter name is inferred from the LevelInfo defaults; the DLL setter is not decoded)",
+            ),
+            ..def(
+                "Engine.LevelInfo.IncAlerte",
+                "native(591) final native static function IncAlerte()",
+                "engine.u LevelInfo.IncAlerte decoded (void); increments the MusicVars counter NbAlerte",
+                inc_alerte,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial(
+                "updates the `MusicVars` counter named NbAlerte (hypothesis: the counter name is inferred from the LevelInfo defaults; the DLL setter is not decoded)",
+            ),
+            ..def(
+                "Engine.LevelInfo.DecAlerte",
+                "native(590) final native static function DecAlerte()",
+                "engine.u LevelInfo.DecAlerte decoded (void); decrements the MusicVars counter NbAlerte",
+                dec_alerte,
+            )
+        },
+        def(
+            "Engine.Actor.PlayRolloffSound",
+            "native(350) final static function PlayRolloffSound(object<Sound> Sound, object<Actor> RollOffActor, optional int Param1, optional int Param2, optional int Param3, optional int Param4, optional int Param5)",
+            "engine.u Actor.PlayRolloffSound decoded (Sound, RollOffActor + five optional ints, void); emits PresentationEvent::PlayRolloffSound",
+            play_rolloff_sound,
+        ),
+        def(
+            "Engine.Actor.SetBase",
+            "native(298) final static function SetBase(object<Actor> NewBase, optional vector NewFloor)",
+            "engine.u Actor.SetBase decoded (NewBase, optional NewFloor, void); sets Base and Floor; no attachment transform (headless)",
+            set_base,
+        ),
+        def(
+            "Engine.Actor.SetRelativeLocation",
+            "native(420) final static function bool SetRelativeLocation(vector NewLocation)",
+            "engine.u Actor.SetRelativeLocation decoded (NewLocation, bool); sets RelativeLocation; returns true (headless)",
+            set_relative_location,
+        ),
+        def(
+            "Engine.Actor.SetRelativeRotation",
+            "native(421) final static function bool SetRelativeRotation(rotator NewRotation)",
+            "engine.u Actor.SetRelativeRotation decoded (NewRotation, bool); sets RelativeRotation; returns true (headless)",
+            set_relative_rotation,
+        ),
+        def(
+            "Engine.Actor.SetDrawType",
+            "native(422) final static function SetDrawType(byte<EDrawType> NewDrawType)",
+            "engine.u Actor.SetDrawType decoded (byte, void); stores the DrawType property (no renderer)",
+            set_draw_type,
+        ),
+        def(
+            "Engine.Actor.SetDrawScale",
+            "native(424) final static function SetDrawScale(float NewScale)",
+            "engine.u Actor.SetDrawScale decoded (float, void); stores the DrawScale property",
+            set_draw_scale,
+        ),
+        def(
+            "Engine.Actor.SetDrawScale3D",
+            "native(423) final static function SetDrawScale3D(vector NewScale3D)",
+            "engine.u Actor.SetDrawScale3D decoded (vector, void); stores the DrawScale3D property",
+            set_draw_scale3d,
+        ),
+        def(
+            "Engine.Actor.AttachToBone",
+            "native(404) final static function bool AttachToBone(object<Actor> Attachment, name BoneName)",
+            "engine.u Actor.AttachToBone decoded (Attachment, BoneName, bool); bases the attachment on self and records the bone; no skeletal transform (headless)",
+            attach_to_bone,
+        ),
+        NativeDef {
+            status: NativeStatus::Partial(
+                "stores the target blend alpha/time like the other animation channel parameters; no skeletal blending is evaluated",
+            ),
+            ..def(
+                "Engine.Actor.AnimBlendToAlpha",
+                "native(411) final static function AnimBlendToAlpha(int Stage, float TargetAlpha, float TimeInterval)",
+                "engine.u Actor.AnimBlendToAlpha decoded (Stage, TargetAlpha, TimeInterval, void); UE2 blends a channel's alpha over time",
+                anim_blend_to_alpha,
+            )
+        },
         NativeDef {
             status: NativeStatus::Partial(
                 "world move via the physics provider (move_box, no sliding); actor blocking is a cylinder-sweep stop; no Bump/EncroachingOn events; player/projectile bBlockPlayers pairing is inferred from class names (XIII has no bIsPlayerPawn field)",
@@ -1847,6 +2682,56 @@ fn builtin_defs() -> Vec<NativeDef> {
         "native(513) final function SetViewTarget(object<Actor> NewViewTarget)",
         "engine.u PlayerController.SetViewTarget decoded (NewViewTarget); sets ViewTarget (no camera/rendering)",
         set_view_target,
+    ));
+    // Presentation natives: the VM is headless, so these enqueue a typed PresentationEvent and
+    // return the decoded declaration's value (void). Consumed with Vm::drain_events.
+    v.push(def(
+        "Engine.Actor.PlaySound",
+        "native(264) final static function PlaySound(object<Sound> Sound, optional int Param1, optional int Param2, optional int Param3, optional int Param4, optional int Param5)",
+        "engine.u Actor.PlaySound decoded (Sound + five optional ints, void); emits PresentationEvent::PlaySound",
+        play_sound,
+    ));
+    v.push(def(
+        "Engine.Actor.PlayMusic",
+        "native(358) final static function PlayMusic(object<Sound> Sound, optional int Param1, optional int Param2, optional int Param3, optional int Param4, optional int Param5)",
+        "engine.u Actor.PlayMusic decoded (Sound + five optional ints, void); emits PresentationEvent::PlayMusic",
+        play_music,
+    ));
+    v.push(def(
+        "Engine.Actor.ReplaceATextureByAnOther",
+        "native(0) final static function ReplaceATextureByAnOther(object<Texture> SrcTexture, object<Texture> DestTexture)",
+        "engine.u Actor.ReplaceATextureByAnOther decoded (two Texture objects, void); emits PresentationEvent::ReplaceTexture",
+        replace_texture_by_another,
+    ));
+    v.push(def(
+        "Engine.Actor.RefreshDisplaying",
+        "native(0) final function RefreshDisplaying()",
+        "engine.u Actor.RefreshDisplaying decoded (void); emits PresentationEvent::RefreshDisplaying",
+        refresh_displaying,
+    ));
+    v.push(def(
+        "Engine.LevelInfo.SetInjuredEffect",
+        "native(0) simulated function SetInjuredEffect(bool NewState, float Delay)",
+        "engine.u LevelInfo.SetInjuredEffect decoded (bool, float, void); emits PresentationEvent::SetInjuredEffect",
+        set_injured_effect,
+    ));
+    v.push(def(
+        "Engine.Projector.AttachProjector",
+        "native(0) final function AttachProjector()",
+        "engine.u Projector.AttachProjector decoded (void, no args); emits PresentationEvent::ProjectorAttach",
+        attach_projector,
+    ));
+    v.push(def(
+        "Engine.Projector.DetachProjector",
+        "native(0) final function DetachProjector(optional bool Force)",
+        "engine.u Projector.DetachProjector decoded (optional bool, void); emits PresentationEvent::ProjectorDetach",
+        detach_projector,
+    ));
+    v.push(def(
+        "Engine.Projector.AbandonProjector",
+        "native(0) final function AbandonProjector(optional float Lifetime)",
+        "engine.u Projector.AbandonProjector decoded (optional float, void); emits PresentationEvent::ProjectorAbandon",
+        abandon_projector,
     ));
     // Paths are matched without the package ("Class.Function"): strip it.
     for d in &mut v {
