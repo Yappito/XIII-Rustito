@@ -25,6 +25,7 @@ pub mod animation;
 pub mod nav_provider;
 pub mod navigation;
 pub mod physics;
+pub mod reach;
 pub mod runtime;
 pub mod zones;
 

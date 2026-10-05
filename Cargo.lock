@@ -4956,6 +4956,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "xiii-audio",
+ "xiii-collision",
  "xiii-decode",
  "xiii-install",
  "xiii-package",
