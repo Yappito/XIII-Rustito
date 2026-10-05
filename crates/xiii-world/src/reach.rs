@@ -1015,12 +1015,14 @@ mod tests {
         }
     }
 
-    /// Regression guard for the maps whose terrain previously failed to decode (the vertex
-    /// array holds a base region plus a differently-spaced detail region; see
-    /// `xiii_decode::terrain::TerrainInfo::mesh`). Before the multi-region decode these maps had
-    /// no terrain collision and collapsed: Hual04c 47/437, Kello01a 299/1488, PRock04a 56/721
-    /// (item9 sweep). A drop below the measured values, or any missing-floor start node, is a
-    /// regression. Values measured 2026-10-05 on the GOG corpus.
+    /// Regression guard for the maps whose terrain payloads store extra editor vertices after
+    /// the base heightfield grid (the base grid is `HeightmapX * HeightmapY`; see
+    /// `xiii_decode::terrain::TerrainInfo::mesh`). Only the base grid is the engine's terrain
+    /// (`ATerrainInfo::LineCheck`/`Render` index it; `Engine.dll` 0x10409eb0/0x1040c0c0), so the
+    /// importer now imports only region 0. Importing the trailing vertices as detail geometry
+    /// had regressed Hual01b 729 -> 668 (item1h); with the base-only import Hual01b is 726.
+    /// A drop below the measured values, or any missing-floor start node, is a regression.
+    /// Values measured 2026-10-05 on the GOG corpus (item1i).
     #[test]
     fn opt_in_reach_regression_multi_region_terrains() {
         let Some(path) = opt_in_game_dir() else {
@@ -1028,9 +1030,10 @@ mod tests {
             return;
         };
         for (map, min_pass, eligible) in [
-            ("Hual04c", 415usize, 437usize),
-            ("Kello01a", 1391usize, 1488usize),
-            ("PRock04a", 692usize, 721usize),
+            ("Hual01b", 726usize, 816usize),
+            ("Hual04c", 432usize, 437usize),
+            ("Kello01a", 1443usize, 1488usize),
+            ("PRock04a", 693usize, 721usize),
         ] {
             let report = analyze(map, &path).expect("reach analyze");
             let missing_floor: usize = report
