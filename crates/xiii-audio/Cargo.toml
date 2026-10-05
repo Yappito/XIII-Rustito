@@ -1,0 +1,13 @@
+[package]
+name = "xiii-audio"
+description = "Bounded, filesystem-free parser/decoder for XIII (Ubisoft HXAudio) .hxc/.hsc audio banks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 mod anim_cmd;
+mod audio_cmd;
 
 use xiii_package::{Limits, Package};
 use xiii_tool::{corpus, coverage, deps, props, report};
@@ -49,6 +50,11 @@ USAGE:
   xiii-tool anim <coverage|list|validate|render|export> ...
       Skeletal meshes and animation (M2b): run 'xiii-tool anim' for details.
 
+  xiii-tool audio <coverage|export|link> ...
+      HXAudio banks (M2 audio spike): parse .hxc banks, decode PCM/UBI ADPCM to
+      WAV, and link .uax Sound objects to bank entries. Run 'xiii-tool audio' for
+      details.
+
   xiii-tool script <classes|functions|disasm|natives|coverage> ...
       Compiled UnrealScript (M2c): run 'xiii-tool script' for details.
 
@@ -87,6 +93,7 @@ fn main() -> ExitCode {
         Some("coverage") => coverage_cmd(&args[1..]),
         Some("deps") => deps_cmd(&args[1..]),
         Some("anim") => anim_cmd::run(&args[1..]),
+        Some("audio") => audio_cmd::run(&args[1..]),
         Some("script") => xiii_tool::script_cmd::run(&args[1..]),
         Some(cmd) if xiii_tool::world_cmd::COMMANDS.contains(&cmd) => {
             xiii_tool::world_cmd::run(cmd, &args[1..])

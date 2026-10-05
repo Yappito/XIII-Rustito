@@ -4920,6 +4920,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "xiii-audio"
+version = "0.1.0"
+
+[[package]]
 name = "xiii-collision"
 version = "0.1.0"
 
@@ -4950,6 +4954,7 @@ name = "xiii-tool"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "xiii-audio",
  "xiii-decode",
  "xiii-install",
  "xiii-package",
