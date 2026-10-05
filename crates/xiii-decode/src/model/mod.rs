@@ -20,11 +20,23 @@
 //! Verts             TArray<{u16 pVertex; i16 iSide}>
 //! NumSharedSides    i32
 //! NumZones          i32
+//! reserved          u32 (always 0 in the corpus; meaning unknown)
+//! Zones             NumZones x { compact ZoneActor; u64 Connectivity; u64 Visibility;
+//!                                 f32 LastRenderTime }
+//! Polys             compact object reference (an Engine.Polys export in the corpus)
 //! ```
 //!
-//! What follows (zones, Polys reference, lightmaps, bounds, leaves, ...) is **not** decoded
-//! and is reported as an explicit unsupported tail (`PayloadReport::unsupported_tail`).
-//! Zone records do not have a uniform size in the inspected maps.
+//! The zone record is variable-length because `ZoneActor` is a compact object index (1 to 5
+//! bytes); the remaining 20 bytes per zone are fixed. `Connectivity` is proven to be a zone
+//! bitmask: every zone `z` has bit `z` set and no bit at or above `NumZones` is set, in all
+//! 1,350 zone records of the 64 zoned GOG maps. The position and size of the following
+//! `Visibility` (u64) and `LastRenderTime` (f32) are forced by the record size, but their
+//! semantics are **not** verified (Visibility is not itself a `NumZones`-bit bitmask).
+//!
+//! What follows the `Polys` reference (lightmaps, light bits, bounds, leaf hulls, leaves,
+//! lights, RootOutside/Linked and the large lightmap byte region) is **not** decoded and is
+//! reported as an explicit unsupported tail (`model.lightmaps_and_after`). Zone records do not
+//! have a uniform size, which is why earlier revisions stopped at `NumZones`.
 //!
 //! `Polys` is decoded completely: `i32 Num, i32 Max`, then per polygon: compact vertex
 //! count, Base, Normal, TextureU, TextureV, vertices, u32 PolyFlags, compact Actor, compact
@@ -143,6 +155,21 @@ pub struct BspVert {
     pub side: i16,
 }
 
+/// One BSP zone (`FZoneProperties`): the `ZoneInfo` actor and its masks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Zone {
+    /// Zone actor (`ZoneInfo`/`SkyZoneInfo`/`WarpZoneInfo` or a subclass); null for zone 0 in
+    /// every inspected map.
+    pub actor: ObjectRef,
+    /// Zone connectivity bitmask. Verified: zone `z` has bit `z`, bits >= `NumZones` are clear.
+    pub connectivity: u64,
+    /// Second mask. Position and size verified by the record length; meaning not established.
+    pub visibility: u64,
+    /// Trailing `f32` in the 20-byte zone record. Position verified; meaning not established
+    /// (upstream UE2 serializes `LastRenderTime` only above a version gate).
+    pub last_render_time: f32,
+}
+
 /// Decoded (prefix of a) BSP model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
@@ -162,6 +189,12 @@ pub struct Model {
     pub num_shared_sides: i32,
     /// Zone count.
     pub num_zones: i32,
+    /// Reserved `u32` between `NumZones` and the zone records (always 0 in the corpus).
+    pub reserved: u32,
+    /// Zone records (length equals a non-negative `num_zones`).
+    pub zones: Vec<Zone>,
+    /// `Polys` object reference stored after the zone records.
+    pub polys: Option<ObjectRef>,
     /// Byte accounting (with the unsupported tail).
     pub report: PayloadReport,
 }
@@ -208,14 +241,41 @@ fn invalid(at: usize, field: &'static str, msg: String) -> DecodeError {
     DecodeError::at(DecodeErrorKind::Invalid(msg), at).in_field(field)
 }
 
-/// Decodes a Model up to NumZones; the rest is reported as an unsupported tail.
+/// Short text of a reference for summaries: `Class'Path'` for exports and imports, `None`
+/// for null and no object.
+fn ref_text(package: &Package, r: Option<ObjectRef>) -> String {
+    match r {
+        None | Some(ObjectRef::Null) => "None".to_owned(),
+        Some(ObjectRef::Import(i)) => {
+            let class = package
+                .imports()
+                .get(i as usize)
+                .map_or("?", |o| package.name(o.class_name));
+            format!(
+                "{class}'{}'",
+                package.object_path(ObjectRef::Import(i)).unwrap_or("?")
+            )
+        }
+        Some(ObjectRef::Export(i)) => {
+            let class = package.export_class_path(i as usize).unwrap_or("?");
+            let class = class.rsplit('.').next().unwrap_or(class);
+            format!(
+                "{class}'{}' (export {i})",
+                package.object_path(ObjectRef::Export(i)).unwrap_or("?")
+            )
+        }
+    }
+}
+
+/// Decodes a Model up to and including the `Polys` reference; the rest (lightmaps, bounds,
+/// leaves, and the large lightmap byte region) is reported as an unsupported tail.
 pub fn decode_model(package: &Package, data: &[u8], export: usize) -> DecodeResult<Model> {
     let props = read_properties(package, data, export, MODEL_CLASS)?;
     let ctx = |e: DecodeError| e.in_export(package, export);
     let mut r = PayloadReader::after_properties(data, &props).map_err(ctx)?;
     let m = decode_model_body(package, &mut r).map_err(ctx)?;
     let report = r
-        .finish_with_unsupported_tail("model.zones_and_after", props.block.span.end)
+        .finish_with_unsupported_tail("model.lightmaps_and_after", props.block.span.end)
         .map_err(ctx)?;
     Ok(Model { report, ..m })
 }
@@ -303,6 +363,9 @@ fn decode_model_body(package: &Package, r: &mut PayloadReader<'_>) -> DecodeResu
     if !(0..=64).contains(&num_zones) {
         return Err(invalid(at, "num_zones", format!("{num_zones}")));
     }
+    let reserved = r.u32().map_err(|e| e.in_field("reserved"))?;
+    let zones = decode_zones(package, r, num_zones)?;
+    let polys = decode_polys_ref(package, r)?;
     // Cross-checks: every node polygon must reference valid verts/points/surfs.
     let at = r.pos();
     for (i, n) in nodes.iter().enumerate() {
@@ -364,6 +427,9 @@ fn decode_model_body(package: &Package, r: &mut PayloadReader<'_>) -> DecodeResu
         verts,
         num_shared_sides,
         num_zones,
+        reserved,
+        zones,
+        polys,
         report: PayloadReport {
             payload: r.payload(),
             properties_end: 0,
@@ -371,6 +437,65 @@ fn decode_model_body(package: &Package, r: &mut PayloadReader<'_>) -> DecodeResu
             unsupported_tail: None,
         },
     })
+}
+
+/// Reads the variable-length zone records.
+fn decode_zones(
+    package: &Package,
+    r: &mut PayloadReader<'_>,
+    num_zones: i32,
+) -> DecodeResult<Vec<Zone>> {
+    let mut zones = Vec::with_capacity(num_zones.max(0) as usize);
+    for zone in 0..num_zones.max(0) as usize {
+        let start = r.pos();
+        let actor = r
+            .object_ref(package)
+            .map_err(|e| e.in_field("zones.actor"))?;
+        let connectivity = r.u64().map_err(|e| e.in_field("zones.connectivity"))?;
+        let visibility = r.u64().map_err(|e| e.in_field("zones.visibility"))?;
+        let last_render_time = r.u32().map_err(|e| e.in_field("zones.last_render_time"))?;
+        let last_render_time = f32::from_bits(last_render_time);
+        // Invariant (all 1,350 measured zone records): the connectivity mask is a zone
+        // bitmask; zone `z` connects to itself and no out-of-range zone is set.
+        let in_range = if num_zones >= 64 {
+            true
+        } else {
+            connectivity >> num_zones == 0
+        };
+        if connectivity & (1u64 << zone) == 0 || !in_range {
+            return Err(invalid(
+                start,
+                "zones.connectivity",
+                format!("zone {zone} connectivity 0x{connectivity:x} with num_zones {num_zones}"),
+            ));
+        }
+        zones.push(Zone {
+            actor,
+            connectivity,
+            visibility,
+            last_render_time,
+        });
+    }
+    Ok(zones)
+}
+
+/// Reads the `Polys` object reference stored after the zone records. `None` when the payload
+/// ends there (the reference is required by the layout, so a missing reference is reported).
+fn decode_polys_ref(
+    package: &Package,
+    r: &mut PayloadReader<'_>,
+) -> DecodeResult<Option<ObjectRef>> {
+    let at = r.pos();
+    let raw = r.compact().map_err(|e| e.in_field("polys"))?;
+    match package.resolve(raw) {
+        Some(ObjectRef::Null) => Ok(None),
+        Some(r) => Ok(Some(r)),
+        None => Err(invalid(
+            at,
+            "polys",
+            format!("polys reference {raw} out of range"),
+        )),
+    }
 }
 
 /// Decodes a Polys export completely.
@@ -504,12 +629,68 @@ impl Model {
             .report
             .unsupported_tail
             .map_or(0, |(_, s)| s.len() as u64);
+        let zone_actors = self.zones.iter().filter(|z| !z.actor.is_null()).count() as u64;
         vec![
             ("nodes", self.nodes.len() as u64),
             ("surfs", self.surfs.len() as u64),
             ("node_polygons", polys),
+            ("zones", self.zones.len() as u64),
+            ("zone_actors", zone_actors),
+            ("polys_ref", u64::from(self.polys.is_some())),
             ("unsupported_tail_bytes", tail),
         ]
+    }
+
+    /// Class path of the zone actor's export, if the actor is an export of this package.
+    pub fn zone_actor_class<'p>(&self, package: &'p Package, zone: &Zone) -> Option<&'p str> {
+        match zone.actor {
+            ObjectRef::Export(e) => package.export_class_path(e as usize),
+            _ => None,
+        }
+    }
+
+    /// True when the zone actor's class path contains `zone` (case-insensitive): a
+    /// `ZoneInfo`, `SkyZoneInfo` or `WarpZoneInfo` (or subclass). Null actors are `false`.
+    pub fn zone_actor_is_zone_info(&self, package: &Package, zone: &Zone) -> bool {
+        self.zone_actor_class(package, zone)
+            .is_some_and(|c| c.to_ascii_lowercase().contains("zone"))
+    }
+
+    /// True when the zone actor's class path ends in `skyzoneinfo` (case-insensitive).
+    pub fn zone_actor_is_sky(&self, package: &Package, zone: &Zone) -> bool {
+        self.zone_actor_class(package, zone)
+            .is_some_and(|c| c.to_ascii_lowercase().ends_with("skyzoneinfo"))
+    }
+
+    /// Map of BSP leaf index -> zone index, derived from the two `iLeaf`/`iZone` pairs of
+    /// each node. Returns `(zone_of_leaf, conflicts)`; an entry is `None` when no node
+    /// references that leaf. Two nodes that reference the same leaf with different zones
+    /// increment `conflicts` (0 in the whole GOG corpus).
+    pub fn leaf_zones(&self) -> (Vec<Option<u8>>, u64) {
+        let max_leaf = self.nodes.iter().flat_map(|n| n.leaf).max().unwrap_or(-1);
+        let n = (max_leaf + 1).max(0) as usize;
+        let mut out = vec![None; n];
+        let mut conflicts = 0u64;
+        for node in &self.nodes {
+            for (k, &leaf) in node.leaf.iter().enumerate() {
+                if leaf < 0 {
+                    continue;
+                }
+                let leaf = leaf as usize;
+                if leaf >= n {
+                    continue;
+                }
+                match out[leaf] {
+                    None => out[leaf] = Some(node.zone[k]),
+                    Some(z) => {
+                        if z != node.zone[k] {
+                            conflicts += 1;
+                        }
+                    }
+                }
+            }
+        }
+        (out, conflicts)
     }
 
     /// Winding of node polygons against their node plane in source coordinates:
@@ -530,6 +711,65 @@ impl Model {
         }
         out
     }
+}
+
+/// Text listing of the zones of one model for `xiii-tool zones`.
+pub fn zones_text(package: &Package, export: usize, m: &Model) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{} zones {} (reserved {} polys {})",
+        package
+            .object_path(ObjectRef::Export(export as u32))
+            .unwrap_or("?"),
+        m.zones.len(),
+        m.reserved,
+        ref_text(package, m.polys)
+    );
+    let (zone_of_leaf, conflicts) = m.leaf_zones();
+    let mut leaf_counts = vec![0u64; m.zones.len()];
+    for zone in zone_of_leaf.iter().flatten() {
+        if let Some(c) = leaf_counts.get_mut(*zone as usize) {
+            *c += 1;
+        }
+    }
+    if conflicts != 0 {
+        let _ = writeln!(
+            out,
+            "  WARNING: {conflicts} leaf/zone conflicts in the nodes"
+        );
+    }
+    for (i, z) in m.zones.iter().enumerate() {
+        let class = m.zone_actor_class(package, z).unwrap_or("");
+        let sky = if m.zone_actor_is_sky(package, z) {
+            " SKY"
+        } else {
+            ""
+        };
+        let actor = match z.actor {
+            ObjectRef::Null => "None".to_owned(),
+            _ => format!(
+                "{} {}{}",
+                package.object_path(z.actor).unwrap_or("?"),
+                class,
+                sky
+            ),
+        };
+        let _ = writeln!(
+            out,
+            "  zone {i:>2} leaves {:>5} connectivity 0x{:<16x} visibility 0x{:<16x} actor {}",
+            leaf_counts.get(i).copied().unwrap_or(0),
+            z.connectivity,
+            z.visibility,
+            actor
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  total leaves {} (zone conflicts {conflicts})",
+        zone_of_leaf.len()
+    );
+    out
 }
 
 /// Text summary for `xiii-tool bsp`.
@@ -577,6 +817,26 @@ pub fn summary_text(package: &Package, export: usize, m: &Model) -> String {
     let _ = writeln!(out, "  materials ({}):", mats.len());
     for (k, v) in &mats {
         let _ = writeln!(out, "    {v:>5} {k}");
+    }
+    let _ = writeln!(
+        out,
+        "  reserved {} polys {} zones:",
+        m.reserved,
+        ref_text(package, m.polys)
+    );
+    for (i, z) in m.zones.iter().enumerate() {
+        let class = m
+            .zone_actor_class(package, z)
+            .unwrap_or(if z.actor.is_null() { "(null)" } else { "?" });
+        let _ = writeln!(
+            out,
+            "    zone {i}: actor {} class {} connectivity 0x{:x} visibility 0x{:x} last_render_time {}",
+            ref_text(package, Some(z.actor)),
+            class,
+            z.connectivity,
+            z.visibility,
+            z.last_render_time
+        );
     }
     if let Some((label, span)) = m.report.unsupported_tail {
         let _ = writeln!(
@@ -650,8 +910,88 @@ mod tests {
             .c(0);
         b = b.v3([0.0, 0.0, 1.0]).f32(0.0);
         b = b.c(3).u16(0).i16(-1).u16(1).i16(-1).u16(2).i16(-1);
-        b = b.i32(0).i32(0).raw(tail);
+        // num_shared_sides, num_zones (0), reserved, Polys reference (null), then the tail.
+        b = b.i32(0).i32(0).i32(0).c(0).raw(tail);
         b.0
+    }
+
+    /// Model bytes with `num_zones` raw zone records and a compact `Polys` reference.
+    fn model_with_zones(vert_pool: i32, num_zones: i32, zones: &[u8], polys: &[u8]) -> Vec<u8> {
+        let mut b = Bytes::default().c(0);
+        b = b
+            .v3([0.0; 3])
+            .v3([1.0; 3])
+            .u8(1)
+            .v3([0.0; 3])
+            .f32(1.0)
+            .raw(&[0; 8]);
+        b = b
+            .c(3)
+            .v3([0.0, 0.0, 1.0])
+            .v3([1.0, 0.0, 0.0])
+            .v3([0.0, 1.0, 0.0]);
+        b = b
+            .c(3)
+            .v3([0.0, 0.0, 0.0])
+            .v3([1.0, 0.0, 0.0])
+            .v3([0.0, 1.0, 0.0]);
+        b = b
+            .c(1)
+            .v3([0.0, 0.0, 1.0])
+            .f32(0.0)
+            .i32(1)
+            .i32(0)
+            .u8(0)
+            .i32(vert_pool);
+        for v in [0i16, -1, -1, -1, -1, -1, 0] {
+            b = b.i16(v);
+        }
+        b = b
+            .v3([0.5, 0.5, 0.0])
+            .f32(1.0)
+            .u8(0)
+            .u8(1)
+            .u8(3)
+            .i16(-1)
+            .i16(-1)
+            .i16(0)
+            .u16(0);
+        b = b
+            .c(1)
+            .c(0)
+            .i32(0)
+            .i16(0)
+            .i16(0)
+            .i16(1)
+            .i16(2)
+            .i16(-1)
+            .i16(0)
+            .u8(0)
+            .c(0);
+        b = b.v3([0.0, 0.0, 1.0]).f32(0.0);
+        b = b.c(3).u16(0).i16(-1).u16(1).i16(-1).u16(2).i16(-1);
+        b = b.i32(0).i32(num_zones).i32(0).raw(zones).raw(polys);
+        b.0
+    }
+
+    /// A zone record with a pre-encoded actor reference (so non-minimal compact encodings
+    /// can be exercised), then connectivity, visibility and last render time.
+    fn zone_bytes_raw(actor: &[u8], connectivity: u64, visibility: u64, lrt: f32) -> Vec<u8> {
+        let mut b = Bytes::default().raw(actor);
+        b = b.raw(&connectivity.to_le_bytes());
+        b = b.raw(&visibility.to_le_bytes());
+        b = b.f32(lrt);
+        b.0
+    }
+
+    /// A zone record with a minimal compact actor reference.
+    fn zone_bytes(actor: i32, connectivity: u64, visibility: u64, lrt: f32) -> Vec<u8> {
+        zone_bytes_raw(
+            &crate::common::test_package::compact(actor),
+            connectivity,
+            visibility,
+            lrt,
+        )
     }
 
     #[test]
@@ -663,8 +1003,10 @@ mod tests {
         let m = decode_model(&p, &bytes, i).unwrap();
         assert_eq!(m.nodes.len(), 1);
         assert_eq!(m.polygons()[0].vertices.len(), 3);
+        assert_eq!(m.zones.len(), 0);
+        assert_eq!(m.polys, None);
         let (label, span) = m.report.unsupported_tail.unwrap();
-        assert_eq!((label, span.len()), ("model.zones_and_after", 3));
+        assert_eq!((label, span.len()), ("model.lightmaps_and_after", 3));
         // Node polygon is (0,0,0),(1,0,0),(0,1,0) with plane +Z: numerically along the plane.
         assert_eq!(m.winding_statistics(), (0, 1, 0));
         // A vert pool outside the verts array is rejected.
@@ -673,6 +1015,175 @@ mod tests {
         let bytes = b.build();
         let p = parse(&bytes);
         assert!(decode_model(&p, &bytes, i).is_err());
+    }
+
+    #[test]
+    fn synthetic_zones_variable_size_and_polys() {
+        // Two zones whose actor compacts are 1 and 4 bytes, with a Polys export reference
+        // after them. The 4-byte form (export 65536) needs a builder with that many exports
+        // only for resolution; instead use a non-minimal 2-byte encoding of export 0.
+        // A non-minimal 2-byte encoding of export 0 (raw 1), then the minimal 1-byte form
+        // (zone 1): the two records are 22 and 21 bytes, proving the variable-size handling.
+        let z0 = zone_bytes_raw(&[0x41, 0x00], 0b01, 0, 0.0);
+        let z1 = zone_bytes(1, 0b10, 0xffff_ffff_ffff_ffff, 1.5);
+        assert_eq!(z0.len(), 22);
+        assert_eq!(z1.len(), 21);
+        let mut zones = z0.clone();
+        zones.extend_from_slice(&z1);
+        let mut b = Builder::new();
+        let polys_i = b.export("Polys", "P", vec![]);
+        let model_i = b.export(
+            "Model",
+            "M",
+            model_with_zones(
+                0,
+                2,
+                &zones,
+                &crate::common::test_package::compact(polys_i as i32 + 1),
+            ),
+        );
+        let bytes = b.build();
+        let p = parse(&bytes);
+        let m = decode_model(&p, &bytes, model_i).unwrap();
+        assert_eq!(m.reserved, 0);
+        assert_eq!(m.zones.len(), 2);
+        assert_eq!(m.zones[0].actor, ObjectRef::Export(0));
+        assert_eq!(m.zones[0].connectivity, 0b01);
+        assert_eq!(m.zones[1].actor, ObjectRef::Export(0));
+        assert_eq!(m.zones[1].visibility, u64::MAX);
+        assert_eq!(m.zones[1].last_render_time, 1.5);
+        assert_eq!(m.polys, Some(ObjectRef::Export(polys_i as u32)));
+        // A wrong connectivity (no self bit) is rejected.
+        let bad = zone_bytes(0, 0b10, 0, 0.0);
+        let mut b = Builder::new();
+        let polys_i = b.export("Polys", "P", vec![]);
+        let model_i = b.export(
+            "Model",
+            "M",
+            model_with_zones(
+                0,
+                1,
+                &bad,
+                &crate::common::test_package::compact(polys_i as i32 + 1),
+            ),
+        );
+        let bytes = b.build();
+        let p = parse(&bytes);
+        let e = decode_model(&p, &bytes, model_i).unwrap_err();
+        assert_eq!(e.field, Some("zones.connectivity"));
+    }
+
+    #[test]
+    fn synthetic_model_truncated_zone_tail_errors() {
+        let z0 = zone_bytes(0, 0b01, 0, 0.0);
+        // claim two zones but only provide one record
+        let mut b = Builder::new();
+        let model_i = b.export("Model", "M", model_with_zones(0, 2, &z0, &[]));
+        let bytes = b.build();
+        let p = parse(&bytes);
+        let e = decode_model(&p, &bytes, model_i).unwrap_err();
+        assert!(matches!(
+            e.kind,
+            DecodeErrorKind::Package(_) | DecodeErrorKind::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn local_corpus_model_zones() {
+        let Some(dir) = std::env::var_os("XIII_GOG_DIR") else {
+            println!("SKIPPED: set XIII_GOG_DIR to run the model zone corpus test");
+            return;
+        };
+        let root = std::path::Path::new(&dir);
+        let mut files = Vec::new();
+        collect_tagged(root, &mut files);
+        files.sort();
+        let (mut models, mut zoned, mut zones_total, mut actor_exports, mut null_actors) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut polys_export = 0u64;
+        for (rel, path) in &files {
+            let data = std::fs::read(path).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            let p = Package::parse(&data, &xiii_package::Limits::default())
+                .unwrap_or_else(|e| panic!("{rel}: {e}"));
+            for i in 0..p.exports().len() {
+                if p.exports()[i].serial_size == 0 {
+                    continue;
+                }
+                let Some(class) = p.export_class_path(i) else {
+                    continue;
+                };
+                if !class.eq_ignore_ascii_case(MODEL_CLASS) {
+                    continue;
+                }
+                let m = decode_model(&p, &data, i).unwrap_or_else(|e| panic!("{rel}: {e}"));
+                models += 1;
+                assert_eq!(m.zones.len(), m.num_zones.max(0) as usize, "{rel}");
+                // Polys reference, when present, resolves to an Engine.Polys export.
+                if let Some(ObjectRef::Export(e)) = m.polys {
+                    assert!(
+                        p.export_class_path(e as usize)
+                            .is_some_and(|c| c.eq_ignore_ascii_case(POLYS_CLASS)),
+                        "{rel}: polys ref is not Polys"
+                    );
+                    polys_export += 1;
+                }
+                // Leaf -> zone derivation is consistent (0 conflicts) in the whole corpus.
+                let (_, conflicts) = m.leaf_zones();
+                assert_eq!(conflicts, 0, "{rel} export {i}");
+                let nz = m.num_zones.max(0) as usize;
+                if nz > 0 {
+                    zoned += 1;
+                    // Zone 0 has a null actor and an empty leaf assignment in every map.
+                    assert!(m.zones[0].actor.is_null(), "{rel}: zone 0 actor not null");
+                    assert!(
+                        m.zones
+                            .iter()
+                            .enumerate()
+                            .all(|(z, zone)| zone.connectivity & (1u64 << z) != 0
+                                && zone.connectivity >> nz == 0),
+                        "{rel}: connectivity invariant"
+                    );
+                    zones_total += nz as u64;
+                }
+                for zone in &m.zones {
+                    match zone.actor {
+                        ObjectRef::Null => null_actors += 1,
+                        ObjectRef::Export(_) => actor_exports += 1,
+                        other => panic!("{rel}: unexpected zone actor {other:?}"),
+                    }
+                }
+            }
+        }
+        assert_eq!(models, 7194, "model count");
+        assert_eq!(zoned, 64, "zoned model count");
+        assert_eq!(zones_total, 1350, "zone count");
+        assert_eq!(polys_export, 7194, "polys references");
+        assert_eq!(actor_exports, 369, "zone actor exports");
+        assert_eq!(null_actors, 981, "null zone actors");
+    }
+
+    fn collect_tagged(dir: &std::path::Path, out: &mut Vec<(String, std::path::PathBuf)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_tagged(&path, out);
+            } else if let Ok(prefix) = read_prefix(&path)
+                && xiii_package::has_package_tag(&prefix)
+            {
+                out.push((path.display().to_string(), path));
+            }
+        }
+    }
+
+    fn read_prefix(path: &std::path::Path) -> std::io::Result<[u8; 4]> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path)?;
+        let mut b = [0u8; 4];
+        f.read_exact(&mut b)?;
+        Ok(b)
     }
 
     fn polys_payload(extra: &[u8]) -> Vec<u8> {

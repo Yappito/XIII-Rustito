@@ -36,6 +36,10 @@ pub enum Value {
     Str(String),
     /// `object` / `class` reference (`None` = null).
     Object(Option<ObjRef>),
+    /// A native-only meta-class (`class'Core.Class'`) that has no export in any loaded package.
+    /// Distinct from `Object(None)` so class checks and `DynamicLoadObject` do not silently
+    /// treat it as null.
+    NativeClass(String),
     /// `vector`.
     Vector([f32; 3]),
     /// `rotator`.
@@ -60,6 +64,7 @@ impl Value {
             Value::Name(_) => "name",
             Value::Str(_) => "string",
             Value::Object(_) => "object",
+            Value::NativeClass(_) => "class",
             Value::Vector(_) => "vector",
             Value::Rotator(_) => "rotator",
             Value::Struct(_) => "struct",
@@ -140,6 +145,7 @@ impl fmt::Display for Value {
             Value::Object(Some(ObjRef::Static(g))) => {
                 write!(f, "static#{}:{}", g.package, g.export)
             }
+            Value::NativeClass(n) => write!(f, "class'{n}'"),
             Value::Vector([x, y, z]) => write!(f, "vect({x:?},{y:?},{z:?})"),
             Value::Rotator([p, y, r]) => write!(f, "rot({p},{y},{r})"),
             Value::Struct(m) => write!(f, "struct({} members)", m.len()),

@@ -34,6 +34,14 @@ to `AGENTS.md` and the task spec. A reviewer checks every result against them.
 - Opt-in game-data tests read the install at runtime and print `SKIPPED` without the env var.
   Never commit proprietary bytes, dumps or extracted data.
 
+## Do not stop early
+
+You run headless: nobody can answer questions or tell you to continue. Do not end your turn
+after investigating or planning. Keep working until the spec is implemented, the acceptance
+commands have run and the report is written. If you are genuinely blocked, write the report
+explaining the block (what you tried, the exact error) and then end. Remove scratch/debug files
+you created before finishing.
+
 ## Before you finish: self-review
 
 1. Re-read the spec line by line and check off each requirement in the report (done / partial
@@ -49,5 +57,9 @@ to `AGENTS.md` and the task spec. A reviewer checks every result against them.
 
 - Stay inside the files the spec lets you own. If you need to change something else, stop
   and explain in the report.
+- Never modify, revert or delete files you do not own, by any means (edit tool, shell
+  redirection, scripts). Other files in the tree may change while you work (the reviewer and
+  other tasks edit them); that is expected. Leave them alone and mention them in the report if
+  relevant. A permission denial is final: do not work around it.
 - Never write to `XIII_Game/` or any game installation. No git commands that change history,
   branches or the index. No new dependencies unless the spec allows them.

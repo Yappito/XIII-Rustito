@@ -14,6 +14,7 @@ use std::process::ExitCode;
 
 use xiii_package::Limits;
 use xiii_script::linker::GlobalRef;
+use xiii_script::physics::FlatPhysics;
 use xiii_script::registry::NativeStatus;
 use xiii_script::{
     ObjRef, ScriptLimits, ScriptPackage, ScriptSet, TraceEvent, TraceKind, Value, Vm, VmError,
@@ -41,6 +42,16 @@ pub struct RunConfig {
     pub touch_tick: u64,
     /// Interpreter limits.
     pub limits: VmLimits,
+    /// Run the level-start lifecycle (`begin_play`) before the touch.
+    pub begin_play: bool,
+    /// GameInfo class for `--begin-play` (`Package.Class`); overrides `default_game`.
+    pub game_class: Option<String>,
+    /// `Default.ini` `[Engine.Engine] DefaultGame`, filled by the CLI from the install.
+    pub default_game: Option<String>,
+    /// Diagnostic survey: continue past unimplemented natives, counting them.
+    pub survey: bool,
+    /// Diagnostic physics provider: `flat:<z>` installs an infinite floor at Unreal Z.
+    pub physics_flat_z: Option<f32>,
 }
 
 impl Default for RunConfig {
@@ -55,6 +66,11 @@ impl Default for RunConfig {
             dt: 1.0 / 30.0,
             touch_tick: 1,
             limits: VmLimits::default(),
+            begin_play: false,
+            game_class: None,
+            default_game: None,
+            survey: false,
+            physics_flat_z: None,
         }
     }
 }
@@ -91,11 +107,20 @@ pub struct RunReport {
     pub load_warnings: usize,
     /// Failure, if the run stopped on an error.
     pub error: Option<VmError>,
+    /// Survey mode: distinct unimplemented natives, first-hit stack included.
+    pub missing_natives: Vec<xiii_script::vm::MissingNative>,
 }
 
 /// Runs the touch chain on a loaded set (`map` is the map package index).
 pub fn run_touch_chain(set: &ScriptSet, map: usize, cfg: &RunConfig) -> Result<RunReport, String> {
     let mut vm = Vm::new(set, cfg.limits);
+    vm.survey = cfg.survey;
+    if let Some(z) = cfg.physics_flat_z {
+        vm.set_physics(Box::new(FlatPhysics::new(z)));
+        vm.note(TraceKind::Note(format!(
+            "diagnostic physics (flat floor at Unreal Z={z}), not the map"
+        )));
+    }
     let actors = vm
         .load_level(map, &Limits::default())
         .map_err(|e| e.to_string())?;
@@ -135,16 +160,43 @@ pub fn run_touch_chain(set: &ScriptSet, map: usize, cfg: &RunConfig) -> Result<R
     let player = vm
         .spawn(player_class, "XIIIPlayerPawn(synthetic)")
         .map_err(|e| e.to_string())?;
-    vm.note(TraceKind::Note(
-        "PreBeginPlay/BeginPlay not run (need GameInfo/mutators, not simulated); running PostBeginPlay + SetInitialState for the executed scope".into(),
-    ));
     let mut error = None;
     'run: {
-        for &id in &active {
-            for ev in ["PostBeginPlay", "SetInitialState"] {
-                if let Err(e) = vm.send_event(id, ev, Vec::new()) {
-                    error = Some(e);
-                    break 'run;
+        if cfg.begin_play {
+            let game_class = match cfg.game_class.as_deref() {
+                Some(path) => resolve_class_path(set, path),
+                None => cfg
+                    .default_game
+                    .as_deref()
+                    .and_then(|path| resolve_class_path(set, path)),
+            };
+            let Some(game_class) = game_class else {
+                return Err(
+                    "--begin-play needs a GameInfo class: pass --game-class <Package.Class> \
+                     (Default.ini [Engine.Engine] DefaultGame was not found)"
+                        .into(),
+                );
+            };
+            vm.note(TraceKind::Note(format!(
+                "--begin-play: spawning GameInfo {} and running the level-start lifecycle {} for the executed scope ({})",
+                vm.short_path(game_class),
+                xiii_script::vm::LEVEL_START_LIFECYCLE.join(", "),
+                active_names.join(", ")
+            )));
+            if let Err(e) = vm.begin_play_with_game_info(&active, game_class) {
+                error = Some(e);
+                break 'run;
+            }
+        } else {
+            vm.note(TraceKind::Note(
+                "PreBeginPlay/BeginPlay not run (need GameInfo/mutators, not simulated); running PostBeginPlay + SetInitialState for the executed scope".into(),
+            ));
+            for &id in &active {
+                for ev in ["PostBeginPlay", "SetInitialState"] {
+                    if let Err(e) = vm.send_event(id, ev, Vec::new()) {
+                        error = Some(e);
+                        break 'run;
+                    }
                 }
             }
         }
@@ -198,6 +250,7 @@ pub fn run_touch_chain(set: &ScriptSet, map: usize, cfg: &RunConfig) -> Result<R
         actors_loaded: actors.len(),
         load_warnings: vm.load_warnings.len(),
         error,
+        missing_natives: vm.missing_natives.values().cloned().collect(),
     })
 }
 
@@ -208,6 +261,65 @@ fn find_class(set: &ScriptSet, package: &str, path: &str) -> Option<GlobalRef> {
         package: pi,
         export,
     })
+}
+
+/// Resolves a `Package.Class` (or bare `Class`) path to a loaded class.
+pub fn resolve_class_path(set: &ScriptSet, path: &str) -> Option<GlobalRef> {
+    match path.split_once('.') {
+        Some((package, class)) => find_class(set, package, class),
+        None => (0..set.packages.len()).find_map(|pi| {
+            let export = set.packages[pi].export_by_path(path)?;
+            Some(GlobalRef {
+                package: pi,
+                export,
+            })
+        }),
+    }
+}
+
+/// Reads `[Engine.Engine] DefaultGame` from the installation's `Default.ini`.
+pub fn default_game_from_ini(root: &Path) -> Option<String> {
+    for name in [
+        "Default.ini",
+        "default.ini",
+        "System/Default.ini",
+        "system/Default.ini",
+    ] {
+        let path = root.join(name);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(v) = ini_value(&text, "Engine.Engine", "DefaultGame") {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn ini_value(text: &str, section: &str, key: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if let Some(s) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            in_section = s.eq_ignore_ascii_case(section);
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=')
+            && k.trim().eq_ignore_ascii_case(key)
+        {
+            let v = v.split(';').next().unwrap_or(v).trim();
+            if !v.is_empty() {
+                return Some(v.to_owned());
+            }
+        }
+    }
+    None
 }
 
 /// Finds a map file by stem under the installation (case-insensitive).
@@ -233,6 +345,12 @@ pub fn load_with_map(root: &Path, map: &str) -> Result<(ScriptSet, usize), Strin
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let idx = set.add(pkg);
     Ok((set, idx))
+}
+
+/// Parses a `--physics` value. Only `flat:<unreal_z>` is supported (diagnostic provider).
+pub fn parse_physics(spec: &str) -> Option<f32> {
+    let z = spec.strip_prefix("flat:")?;
+    z.trim().parse::<f32>().ok()
 }
 
 /// `xiii-tool script run ...`.
@@ -265,6 +383,22 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(cfg.limits.max_steps)
             }
+            "--begin-play" => cfg.begin_play = true,
+            "--game-class" => cfg.game_class = val(),
+            "--survey" => cfg.survey = true,
+            "--physics" => {
+                let v = val().unwrap_or_default();
+                match parse_physics(&v) {
+                    Some(z) => cfg.physics_flat_z = Some(z),
+                    None => {
+                        eprintln!(
+                            "error: invalid --physics '{v}'; expected flat:<unreal_z>\n\n{}",
+                            crate::script_cmd::USAGE
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             "--trace" => show_trace = true,
             "--no-natives" => natives = false,
             other => {
@@ -283,6 +417,13 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
         );
         return ExitCode::from(2);
     };
+    cfg.default_game = default_game_from_ini(&root);
+    if cfg.survey {
+        eprintln!(
+            "warning: --survey is diagnostic only: unimplemented natives are counted and \
+             skipped, so the run does NOT prove the chain works"
+        );
+    }
     let (set, map_idx) = match load_with_map(&root, &map) {
         Ok(v) => v,
         Err(e) => {
@@ -330,6 +471,30 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
             "  {idx:>5} {:<32} x{:<3} {} | {sym} | {}",
             n.path, n.calls, n.status, n.evidence
         );
+    }
+    if cfg.survey {
+        let mut missing = report.missing_natives.clone();
+        missing.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.path.cmp(&b.path)));
+        let _ = writeln!(
+            out,
+            "survey (DIAGNOSTIC ONLY, not success): {} distinct unimplemented natives",
+            missing.len()
+        );
+        for (rank, m) in missing.iter().enumerate() {
+            let idx = m.index.map(|i| format!("#{i}")).unwrap_or_default();
+            let site = m
+                .first_stack
+                .last()
+                .map_or_else(|| "-".to_owned(), |s| s.function.clone());
+            let off = m.first_stack.last().map_or(0, |s| s.offset);
+            let _ = writeln!(
+                out,
+                "  {:>3}. {idx:>5} {:<38} x{:<4} first at {site} code 0x{off:04X}",
+                rank + 1,
+                m.path,
+                m.calls
+            );
+        }
     }
     let code = match &report.error {
         None => ExitCode::SUCCESS,

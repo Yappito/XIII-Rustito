@@ -8,7 +8,7 @@ use crate::linker::{GlobalRef, ScriptPackage, ScriptSet};
 use crate::reflect::function_flags as ff;
 use crate::reflect::property_flags as pf;
 use crate::tests::{Exp, build_package, compact};
-use crate::value::Value;
+use crate::value::{ObjRef, ObjectId, Value};
 use crate::vm::{TraceKind, Vm, VmErrorKind, VmLimits};
 
 struct B {
@@ -453,7 +453,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 47);
+    assert_eq!(defs.len(), 86);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -466,4 +466,1771 @@ fn registry_entries_are_documented() {
             d.path
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Actor.Spawn / Destroy / lifecycle
+
+const IMP_OBJECTPROP: i32 = -7;
+const IMP_BOOLPROP: i32 = -8;
+const IMP_STRUCTPROP: i32 = -9;
+const IMP_STRUCT: i32 = -10;
+
+/// Builds a package with an `Object` base and an `Actor`/`Child`/`AbstractChild` tree for
+/// spawn and lifecycle tests.
+///
+/// `Actor` properties: `Owner`, `Level` (objects), `Tag` (name), `Location`, `Rotation`,
+/// `Calls` (ints, set to vectors/rotators directly), `bStatic` (bool). Each lifecycle event
+/// increments `Calls`; `Destroyed` also increments it. `AbstractChild` carries class flag 1.
+struct SpawnB {
+    names: Vec<String>,
+    exports: Vec<Exp>,
+}
+
+impl SpawnB {
+    fn new() -> Self {
+        let mut b = Self {
+            names: Vec::new(),
+            exports: Vec::new(),
+        };
+        for n in [
+            "None",
+            "Core",
+            "Class",
+            "Package",
+            "Function",
+            "State",
+            "IntProperty",
+            "FloatProperty",
+            "NameProperty",
+            "ObjectProperty",
+            "BoolProperty",
+            "System",
+        ] {
+            b.name(n);
+        }
+        b
+    }
+
+    fn name(&mut self, s: &str) -> i32 {
+        match self.names.iter().position(|n| n == s) {
+            Some(i) => i as i32,
+            None => {
+                self.names.push(s.to_owned());
+                self.names.len() as i32 - 1
+            }
+        }
+    }
+
+    fn reserve(&mut self, class: i32, outer: i32, name: &str) -> i32 {
+        let name = self.name(name);
+        self.exports.push(Exp {
+            class,
+            outer,
+            name,
+            flags: 0,
+            payload: Vec::new(),
+        });
+        self.exports.len() as i32
+    }
+
+    fn set(&mut self, r: i32, payload: Vec<u8>) {
+        self.exports[(r - 1) as usize].payload = payload;
+    }
+
+    fn prop(&mut self, r: i32, next: i32, flags: u32) {
+        self.prop_with(r, next, flags, &[]);
+    }
+
+    /// Property with a trailing type-specific reference (e.g. `ObjectProperty.PropertyClass`).
+    fn prop_with(&mut self, r: i32, next: i32, flags: u32, extra: &[u8]) {
+        let mut p = compact(0);
+        p.extend(compact(0));
+        p.extend(compact(next));
+        p.extend(1i16.to_le_bytes());
+        p.extend(flags.to_le_bytes());
+        p.extend(compact(0));
+        p.extend(extra);
+        self.set(r, p);
+    }
+
+    /// Dynamic `ArrayProperty` whose element template is the export `inner`.
+    fn prop_array(&mut self, r: i32, next: i32, flags: u32, inner: i32) {
+        let extra = compact(inner);
+        self.prop_with(r, next, flags, &extra);
+    }
+
+    fn header(
+        &self,
+        sup: i32,
+        next: i32,
+        children: i32,
+        friendly: i32,
+        script: &[u8],
+        mem: u32,
+    ) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend(compact(sup));
+        p.extend(compact(next));
+        p.extend(compact(0));
+        p.extend(compact(children));
+        p.extend(compact(friendly));
+        p.extend(1i32.to_le_bytes());
+        p.extend(0i32.to_le_bytes());
+        p.extend((mem as i32).to_le_bytes());
+        p.extend(script);
+        p
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn func(
+        &mut self,
+        r: i32,
+        next: i32,
+        children: i32,
+        script: &[u8],
+        mem: u32,
+        native: u16,
+        flags: u32,
+    ) {
+        let friendly = self.exports[(r - 1) as usize].name;
+        let mut p = compact(0);
+        p.extend(self.header(0, next, children, friendly, script, mem));
+        p.extend(native.to_le_bytes());
+        p.push(0);
+        p.extend(&flags.to_le_bytes()[..3]);
+        self.set(r, p);
+    }
+
+    /// A `Core.Class` with the given low `class_flags` u16.
+    fn class(&mut self, r: i32, sup: i32, children: i32, class_flags: u16) {
+        let friendly = self.exports[(r - 1) as usize].name;
+        let system = self.name("System");
+        let mut p = self.header(sup, 0, children, friendly, &[], 0);
+        p.extend(0u64.to_le_bytes());
+        p.extend(u64::MAX.to_le_bytes());
+        p.extend(0xFFFFu16.to_le_bytes());
+        p.extend(0u16.to_le_bytes());
+        p.extend(class_flags.to_le_bytes());
+        p.extend([0u8; 16]);
+        p.extend(compact(0));
+        p.extend(compact(0));
+        p.extend(compact(0));
+        p.extend(compact(system));
+        p.extend(compact(0));
+        p.extend(compact(0));
+        self.set(r, p);
+    }
+
+    fn build(mut self) -> Vec<u8> {
+        let core = self.name("Core");
+        let package = self.name("Package");
+        let class = self.name("Class");
+        let imports = vec![
+            (core, package, 0, core),
+            (core, class, -1, self.name("Function")),
+            (core, class, -1, self.name("State")),
+            (core, class, -1, self.name("IntProperty")),
+            (core, class, -1, self.name("FloatProperty")),
+            (core, class, -1, self.name("NameProperty")),
+            (core, class, -1, self.name("ObjectProperty")),
+            (core, class, -1, self.name("BoolProperty")),
+            (core, class, -1, self.name("StructProperty")),
+            (core, class, -1, self.name("Vector")),
+            (core, class, -1, self.name("Rotator")),
+            (core, class, -1, self.name("ArrayProperty")),
+        ];
+        let names: Vec<&str> = self.names.iter().map(String::as_str).collect();
+        build_package(&names, &imports, &self.exports)
+    }
+}
+
+fn spawn_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let child = b.reserve(0, 0, "Child");
+    let abstract_child = b.reserve(0, 0, "AbstractChild");
+
+    // `Add_IntInt` native (index 146) used by the lifecycle bump code.
+    let add = b.reserve(IMP_FUNCTION, object, "Add_IntInt");
+    let add_a = b.reserve(IMP_INTPROP, add, "A");
+    let add_b = b.reserve(IMP_INTPROP, add, "B");
+    let add_r = b.reserve(IMP_INTPROP, add, "ReturnValue");
+    b.prop(add_a, add_b, PARM);
+    b.prop(add_b, add_r, PARM);
+    b.prop(add_r, 0, PARM | RETURN_PARM);
+    b.func(
+        add,
+        0,
+        add_a,
+        &[],
+        0,
+        146,
+        FINAL | NATIVE | OPERATOR | STATIC,
+    );
+
+    // Actor properties.
+    let object_class = 0; // ObjectProperty.PropertyClass = null (any object)
+    let object_extra = compact(object_class);
+    // StructProperty.Struct = imported Vector/Rotator.
+    let vector_struct = IMP_STRUCT; // first of the two struct imports (Vector)
+    let rotator_struct = IMP_STRUCT - 1; // second (Rotator)
+    let vector_extra = compact(vector_struct);
+    let rotator_extra = compact(rotator_struct);
+    let owner = b.reserve(IMP_OBJECTPROP, actor, "Owner");
+    let level = b.reserve(IMP_OBJECTPROP, actor, "Level");
+    let tag = b.reserve(IMP_NAMEPROP, actor, "Tag");
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let rotation = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
+    let calls = b.reserve(IMP_INTPROP, actor, "Calls");
+    let bstatic = b.reserve(IMP_BOOLPROP, actor, "bStatic");
+    let deleted = b.reserve(IMP_BOOLPROP, actor, "bDeleteMe");
+    let spawned = b.reserve(IMP_FUNCTION, actor, "Spawned");
+    b.prop_with(owner, level, 0, &object_extra);
+    b.prop_with(level, tag, 0, &object_extra);
+    b.prop(tag, location, 0);
+    b.prop_with(location, rotation, 0, &vector_extra);
+    b.prop_with(rotation, calls, 0, &rotator_extra);
+    b.prop(calls, bstatic, 0);
+    b.prop(bstatic, deleted, 0);
+    // Single child list: properties first, then the lifecycle functions.
+    b.prop(deleted, spawned, 0);
+
+    // Lifecycle events: each bumps Calls and returns.
+
+    let pre = b.reserve(IMP_FUNCTION, actor, "PreBeginPlay");
+    let begin = b.reserve(IMP_FUNCTION, actor, "BeginPlay");
+    let post = b.reserve(IMP_FUNCTION, actor, "PostBeginPlay");
+    let net = b.reserve(IMP_FUNCTION, actor, "PostNetBeginPlay");
+    let initial = b.reserve(IMP_FUNCTION, actor, "SetInitialState");
+    let destroyed = b.reserve(IMP_FUNCTION, actor, "Destroyed");
+    let bump = |b: &mut SpawnB, r: i32, next: i32| {
+        let rc = calls as u8;
+        let code = vec![
+            0x0F, 0x01, rc, 0x92, 0x00, rc, 0x26, 0x16, // Calls = Calls + 1
+            0x04, 0x0B, // return
+        ];
+        b.func(r, next, 0, &code, 0x10, 0, DEFINED);
+    };
+    bump(&mut b, spawned, pre);
+    bump(&mut b, pre, begin);
+    bump(&mut b, begin, post);
+    bump(&mut b, post, net);
+    bump(&mut b, net, initial);
+    bump(&mut b, initial, destroyed);
+    bump(&mut b, destroyed, 0);
+
+    b.class(object, 0, add, 0);
+    b.class(actor, object, owner, 0);
+    b.class(child, actor, 0, 0);
+    b.class(abstract_child, actor, 0, 1);
+    b.build()
+}
+
+fn spawn_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Test",
+        spawn_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+fn sg(set: &ScriptSet, path: &str) -> GlobalRef {
+    GlobalRef {
+        package: 0,
+        export: set.packages[0].export_by_path(path).expect(path),
+    }
+}
+
+fn lifecycle_calls(vm: &Vm<'_>, id: ObjectId) -> Option<i32> {
+    match vm.get_property(id, "Calls") {
+        Some(Value::Int(i)) => Some(*i),
+        _ => None,
+    }
+}
+
+#[test]
+fn spawn_sets_defaults_owner_tag_and_location() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let spawner = vm.spawn(sg(&set, "Actor"), "Spawner").unwrap();
+    vm.set_property(spawner, "Location", 0, Value::Vector([1.0, 2.0, 3.0]));
+    vm.set_property(spawner, "Rotation", 0, Value::Rotator([10, 20, 30]));
+    let owner = vm.spawn(sg(&set, "Actor"), "Owner").unwrap();
+    let child_class = sg(&set, "Child");
+    let id = vm
+        .spawn_actor(
+            spawner,
+            Some(child_class),
+            Some(owner),
+            Some("mytag"),
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("spawned");
+    assert_eq!(
+        vm.get_property(id, "Owner"),
+        Some(&Value::Object(Some(ObjRef::Instance(owner))))
+    );
+    assert_eq!(
+        vm.get_property(id, "Tag"),
+        Some(&Value::Name("mytag".into()))
+    );
+    // No explicit location/rotation: taken from the spawner.
+    assert_eq!(
+        vm.get_property(id, "Location"),
+        Some(&Value::Vector([1.0, 2.0, 3.0]))
+    );
+    assert_eq!(
+        vm.get_property(id, "Rotation"),
+        Some(&Value::Rotator([10, 20, 30]))
+    );
+    assert!(vm.objects[id as usize].active);
+    // Default tag when none is supplied is the class name.
+    let id2 = vm
+        .spawn_actor(spawner, Some(child_class), None, None, None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        vm.get_property(id2, "Tag"),
+        Some(&Value::Name("Child".into()))
+    );
+}
+
+#[test]
+fn spawn_none_class_returns_none_and_abstract_refused() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let spawner = vm.spawn(sg(&set, "Actor"), "Spawner").unwrap();
+    assert_eq!(
+        vm.spawn_actor(spawner, None, None, None, None, None)
+            .unwrap(),
+        None
+    );
+    // Abstract child (class flag 1): refused with a trace and None.
+    let r = vm
+        .spawn_actor(
+            spawner,
+            Some(sg(&set, "AbstractChild")),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(r, None);
+    assert!(vm.trace.iter().any(
+        |e| matches!(&e.kind, TraceKind::SpawnRefused { reason } if reason.contains("abstract"))
+    ));
+}
+
+#[test]
+fn runtime_spawn_runs_lifecycle_in_order() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let spawner = vm.spawn(sg(&set, "Actor"), "Spawner").unwrap();
+    let id = vm
+        .spawn_actor(spawner, Some(sg(&set, "Child")), None, None, None, None)
+        .unwrap()
+        .unwrap();
+    // Spawned, PreBeginPlay, BeginPlay, PostBeginPlay, PostNetBeginPlay, SetInitialState.
+    assert_eq!(lifecycle_calls(&vm, id), Some(6));
+    let events: Vec<String> = vm
+        .trace
+        .iter()
+        .filter_map(|e| match &e.kind {
+            TraceKind::Event { function, .. }
+                if function.contains("Child") || function.contains("Actor.") =>
+            {
+                Some(function.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let lifecycle: Vec<&String> = events
+        .iter()
+        .filter(|f| {
+            [
+                "Spawned",
+                "PreBeginPlay",
+                "BeginPlay",
+                "PostBeginPlay",
+                "PostNetBeginPlay",
+                "SetInitialState",
+            ]
+            .iter()
+            .any(|e| f.ends_with(e))
+        })
+        .collect();
+    assert_eq!(lifecycle.len(), 6, "{events:?}");
+}
+
+#[test]
+fn level_start_lifecycle_is_grouped_by_event() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Child"), "A").unwrap();
+    let b = vm.spawn(sg(&set, "Child"), "B").unwrap();
+    vm.begin_play(&[a, b]).unwrap();
+    // Each actor runs every level-start event once.
+    assert_eq!(lifecycle_calls(&vm, a), Some(5));
+    assert_eq!(lifecycle_calls(&vm, b), Some(5));
+    // Grouping: all of A's PreBeginPlay/BeginPlay come before... check the sequence is
+    // A.PreBeginPlay, B.PreBeginPlay, A.BeginPlay, B.BeginPlay, ...
+    let seq: Vec<(String, String)> = vm
+        .trace
+        .iter()
+        .filter_map(|e| match &e.kind {
+            TraceKind::Event {
+                target, function, ..
+            } if [
+                "PreBeginPlay",
+                "BeginPlay",
+                "PostBeginPlay",
+                "PostNetBeginPlay",
+                "SetInitialState",
+            ]
+            .iter()
+            .any(|x| function.ends_with(x)) =>
+            {
+                Some((
+                    target.clone(),
+                    function.rsplit('.').next().unwrap_or("").to_owned(),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    let expected: Vec<(String, String)> = [
+        "PreBeginPlay",
+        "BeginPlay",
+        "PostBeginPlay",
+        "PostNetBeginPlay",
+        "SetInitialState",
+    ]
+    .iter()
+    .flat_map(|ev| {
+        [
+            ("A".to_owned(), (*ev).to_owned()),
+            ("B".to_owned(), (*ev).to_owned()),
+        ]
+    })
+    .collect();
+    assert_eq!(seq, expected);
+}
+
+#[test]
+fn destroy_gives_accessed_none_and_removes_from_iterators() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Child"), "Gone").unwrap();
+    let b = vm.spawn(sg(&set, "Child"), "Stays").unwrap();
+    let before = vm.dynamic_actors(None, None);
+    assert!(before.contains(&a) && before.contains(&b));
+    assert!(vm.destroy(a).unwrap());
+    // Destroyed event ran once.
+    assert_eq!(lifecycle_calls(&vm, a), Some(1));
+    assert!(vm.objects[a as usize].deleted);
+    // References behave as None.
+    assert_eq!(vm.find_live_object("Gone"), None);
+    assert_eq!(vm.find_object("Gone"), None);
+    // Iterators skip it.
+    let after = vm.dynamic_actors(None, None);
+    assert!(!after.contains(&a) && after.contains(&b));
+    let all = vm.all_actors(None, None);
+    assert!(!all.contains(&a) && all.contains(&b));
+    // Destroying again is idempotent.
+    assert!(vm.destroy(a).unwrap());
+}
+
+#[test]
+fn destroy_during_own_execution_does_not_panic() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Child"), "A").unwrap();
+    vm.set_active(a, true);
+    // A nested Destroy from inside Destroyed: `destroy` marks first, so the event's own
+    // destroy call is a no-op and does not recurse.
+    vm.destroy(a).unwrap();
+    assert!(vm.objects[a as usize].deleted);
+}
+
+// ---------------------------------------------------------------------------------------
+// Native semantics corrections: optional args, strings, PRNG, lists
+
+use crate::registry::{NativeCtx, NativeDef, NativeOutcome, Registry};
+use crate::vm::VmResult;
+
+fn native(path: &str) -> NativeDef {
+    // Registry keys are "Class.Function"; only the `Engine.` package prefix is stripped on
+    // registration, so `Engine.Actor.Spawn` is keyed as `Actor.Spawn` but `Object.Mid` stays.
+    let key = path
+        .strip_prefix("Engine.")
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    Registry::builtin()
+        .get(&key)
+        .unwrap_or_else(|| panic!("{path} not registered"))
+        .clone()
+}
+
+fn ctx(this: ObjectId, omitted: &[bool], path: &str) -> NativeCtx {
+    NativeCtx {
+        this,
+        in_state_code: false,
+        path: path.to_owned(),
+        omitted: omitted.to_vec(),
+    }
+}
+
+fn call_native(
+    vm: &mut Vm<'_>,
+    path: &str,
+    this: ObjectId,
+    omitted: &[bool],
+    args: &mut [Value],
+) -> NativeOutcome {
+    let def = native(path);
+    (def.f)(vm, &ctx(this, omitted, path), args).expect("native")
+}
+
+fn str_result(o: NativeOutcome) -> String {
+    match o {
+        NativeOutcome::Value(Value::Str(s)) => s,
+        other => panic!("expected string, got {other:?}"),
+    }
+}
+
+fn bool_result(o: NativeOutcome) -> bool {
+    match o {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("expected bool, got {other:?}"),
+    }
+}
+
+fn int_result(o: NativeOutcome) -> i32 {
+    match o {
+        NativeOutcome::Value(Value::Int(i)) => i,
+        other => panic!("expected int, got {other:?}"),
+    }
+}
+
+#[test]
+fn string_native_edges_match_ue2_clamping() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Object"), "O").unwrap();
+
+    // Mid with the count omitted returns the rest of the string.
+    let mut a = vec![Value::Str("abcdef".into()), Value::Int(2)];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "Object.Mid",
+            o,
+            &[false, false, true],
+            &mut a
+        )),
+        "cdef"
+    );
+    // Mid explicit count.
+    let mut a = vec![Value::Str("abcdef".into()), Value::Int(1), Value::Int(3)];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "Object.Mid",
+            o,
+            &[false, false, false],
+            &mut a
+        )),
+        "bcd"
+    );
+    // Mid negative start -> "" (unsigned clamp to Len), per the reviewer contract.
+    let mut a = vec![Value::Str("abcdef".into()), Value::Int(-2), Value::Int(3)];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "Object.Mid",
+            o,
+            &[false, false, false],
+            &mut a
+        )),
+        ""
+    );
+    // Mid oversized start / count clamp to Len.
+    let mut a = vec![Value::Str("abc".into()), Value::Int(5), Value::Int(10)];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "Object.Mid",
+            o,
+            &[false, false, false],
+            &mut a
+        )),
+        ""
+    );
+    let mut a = vec![Value::Str("abc".into()), Value::Int(1), Value::Int(99)];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "Object.Mid",
+            o,
+            &[false, false, false],
+            &mut a
+        )),
+        "bc"
+    );
+    // Mid on empty and count at exactly Len.
+    let mut a = vec![Value::Str(String::new()), Value::Int(0), Value::Int(0)];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "Object.Mid",
+            o,
+            &[false, false, false],
+            &mut a
+        )),
+        ""
+    );
+    // Left / Right clamping.
+    let mut a = vec![Value::Str("abc".into()), Value::Int(-1)];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "Object.Left",
+            o,
+            &[false, false],
+            &mut a
+        )),
+        ""
+    );
+    let mut a = vec![Value::Str("abc".into()), Value::Int(99)];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "Object.Left",
+            o,
+            &[false, false],
+            &mut a
+        )),
+        "abc"
+    );
+    let mut a = vec![Value::Str("abc".into()), Value::Int(99)];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "Object.Right",
+            o,
+            &[false, false],
+            &mut a
+        )),
+        "abc"
+    );
+    let mut a = vec![Value::Str("abc".into()), Value::Int(0)];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "Object.Right",
+            o,
+            &[false, false],
+            &mut a
+        )),
+        ""
+    );
+    // InStr is case-sensitive.
+    let mut a = vec![Value::Str("Hello World".into()), Value::Str("World".into())];
+    assert_eq!(
+        int_result(call_native(
+            &mut vm,
+            "Object.InStr",
+            o,
+            &[false, false],
+            &mut a
+        )),
+        6
+    );
+    let mut a = vec![Value::Str("Hello World".into()), Value::Str("world".into())];
+    assert_eq!(
+        int_result(call_native(
+            &mut vm,
+            "Object.InStr",
+            o,
+            &[false, false],
+            &mut a
+        )),
+        -1
+    );
+    // ComplementEqual is case-insensitive equality, not its negation.
+    let mut a = vec![Value::Str("AbC".into()), Value::Str("aBc".into())];
+    assert!(bool_result(call_native(
+        &mut vm,
+        "Object.ComplementEqual_StrStr",
+        o,
+        &[false, false],
+        &mut a
+    )));
+    let mut a = vec![Value::Str("abc".into()), Value::Str("abd".into())];
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "Object.ComplementEqual_StrStr",
+        o,
+        &[false, false],
+        &mut a
+    )));
+}
+
+#[test]
+fn spawn_optional_location_uses_origin_or_spawner() {
+    let set = spawn_set();
+    let child = sg(&set, "Child");
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let spawner = vm.spawn(sg(&set, "Actor"), "Spawner").unwrap();
+    vm.set_property(spawner, "Location", 0, Value::Vector([1.0, 2.0, 3.0]));
+    vm.set_property(spawner, "Rotation", 0, Value::Rotator([10, 20, 30]));
+
+    // Explicit zero location/rotation must spawn at the origin, not fall back to the spawner.
+    let mut args = vec![
+        Value::Object(Some(ObjRef::Static(child))),
+        Value::Object(None),
+        Value::Name("None".into()),
+        Value::Vector([0.0, 0.0, 0.0]),
+        Value::Rotator([0, 0, 0]),
+    ];
+    let id = match call_native(
+        &mut vm,
+        "Engine.Actor.Spawn",
+        spawner,
+        &[false, true, true, false, false],
+        &mut args,
+    ) {
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(id)))) => id,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        vm.get_property(id, "Location"),
+        Some(&Value::Vector([0.0, 0.0, 0.0]))
+    );
+
+    // Omitted location/rotation use the spawner's.
+    let mut args = vec![Value::Object(Some(ObjRef::Static(child)))];
+    let id2 = match call_native(
+        &mut vm,
+        "Engine.Actor.Spawn",
+        spawner,
+        &[false, true, true, true, true],
+        &mut args,
+    ) {
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(id)))) => id,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        vm.get_property(id2, "Location"),
+        Some(&Value::Vector([1.0, 2.0, 3.0]))
+    );
+    assert_eq!(
+        vm.get_property(id2, "Rotation"),
+        Some(&Value::Rotator([10, 20, 30]))
+    );
+    // Omitted tag defaults to the class name.
+    assert_eq!(
+        vm.get_property(id2, "Tag"),
+        Some(&Value::Name("Child".into()))
+    );
+}
+
+#[test]
+fn rng_is_deterministic_and_seeded() {
+    let set = spawn_set();
+    let mut a = Vm::new(&set, VmLimits::default());
+    let mut b = Vm::new(&set, VmLimits::default());
+    let a_seq: Vec<u64> = (0..8).map(|_| a.next_random()).collect();
+    let b_seq: Vec<u64> = (0..8).map(|_| b.next_random()).collect();
+    assert_eq!(a_seq, b_seq, "same default seed -> same sequence");
+    let mut c = Vm::new(
+        &set,
+        VmLimits {
+            rng_seed: 12345,
+            ..VmLimits::default()
+        },
+    );
+    assert_ne!(
+        c.next_random(),
+        a_seq[0],
+        "different seed -> different first value"
+    );
+    let mut d = Vm::new(&set, VmLimits::default());
+    for _ in 0..1000 {
+        let f = d.rand_float();
+        assert!((0.0..1.0).contains(&f), "{f}");
+        let i = d.rand_int(7);
+        assert!((0..7).contains(&i), "{i}");
+    }
+    assert_eq!(d.rand_int(0), 0);
+    assert_eq!(d.rand_int(-5), 0);
+}
+
+#[test]
+fn dynamic_load_object_checks_requested_class() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Object"), "O").unwrap();
+    // `Test.Child` is a Core.Class export; requesting class'Class' succeeds.
+    let mut a = vec![
+        Value::Str("Test.Child".into()),
+        Value::NativeClass("Class".into()),
+    ];
+    match call_native(
+        &mut vm,
+        "Object.DynamicLoadObject",
+        o,
+        &[false, false, true],
+        &mut a,
+    ) {
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Static(g)))) => {
+            assert_eq!(vm.short_path(g), "Child");
+        }
+        other => panic!("expected a loaded object, got {other:?}"),
+    }
+    // Requesting a class the object is not returns None and records a note.
+    let before = vm.trace.len();
+    let mut a = vec![
+        Value::Str("Test.Child".into()),
+        Value::NativeClass("Mesh".into()),
+    ];
+    assert!(matches!(
+        call_native(
+            &mut vm,
+            "Object.DynamicLoadObject",
+            o,
+            &[false, false, false],
+            &mut a
+        ),
+        NativeOutcome::Value(Value::Object(None))
+    ));
+    assert!(
+        vm.trace[before..]
+            .iter()
+            .any(|e| matches!(&e.kind, TraceKind::Note(s) if s.contains("DynamicLoadObject")))
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Pawn / Controller list natives
+
+/// `Object`/`Actor` fixture with `Level` and the pawn/controller list links.
+fn list_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "Controller");
+    let add = b.reserve(IMP_FUNCTION, object, "Add_IntInt");
+    let add_a = b.reserve(IMP_INTPROP, add, "A");
+    let add_b = b.reserve(IMP_INTPROP, add, "B");
+    let add_r = b.reserve(IMP_INTPROP, add, "ReturnValue");
+    b.prop(add_a, add_b, PARM);
+    b.prop(add_b, add_r, PARM);
+    b.prop(add_r, 0, PARM | RETURN_PARM);
+    b.func(
+        add,
+        0,
+        add_a,
+        &[],
+        0,
+        146,
+        FINAL | NATIVE | OPERATOR | STATIC,
+    );
+
+    // A script (non-native) function with an optional parameter, used to check that an omitted
+    // optional still gets the default zero in a script call. `Tag` is a NameProperty (no
+    // type-specific reference); it links to the `Echo` function to make one child list.
+    let echo = b.reserve(IMP_FUNCTION, actor, "Echo");
+    let object_extra = compact(0);
+    let level = b.reserve(IMP_OBJECTPROP, actor, "Level");
+    let pawn_list = b.reserve(IMP_OBJECTPROP, actor, "PawnList");
+    let next_pawn = b.reserve(IMP_OBJECTPROP, actor, "NextPawn");
+    let controller_list = b.reserve(IMP_OBJECTPROP, actor, "ControllerList");
+    let next_controller = b.reserve(IMP_OBJECTPROP, actor, "NextController");
+    let tag = b.reserve(IMP_NAMEPROP, actor, "Tag");
+    b.prop_with(level, pawn_list, 0, &object_extra);
+    b.prop_with(pawn_list, next_pawn, 0, &object_extra);
+    b.prop_with(next_pawn, controller_list, 0, &object_extra);
+    b.prop_with(controller_list, next_controller, 0, &object_extra);
+    b.prop_with(next_controller, tag, 0, &object_extra);
+    // Single child list: properties first, then the `Echo` function.
+    b.prop(tag, echo, 0);
+
+    let echo_a = b.reserve(IMP_INTPROP, echo, "A");
+    let echo_r = b.reserve(IMP_INTPROP, echo, "ReturnValue");
+    b.prop(echo_a, echo_r, PARM | OPTIONAL_PARM);
+    b.prop(echo_r, 0, PARM | RETURN_PARM);
+    let ra = echo_a as u8;
+    // `return A;` = Return(1) + LocalVariable(1 opcode + 4 object) = 6 bytes.
+    b.func(echo, 0, echo_a, &[0x04, 0x00, ra], 6, 0, DEFINED);
+
+    b.class(object, 0, add, 0);
+    b.class(actor, object, level, 0);
+    b.class(pawn, actor, 0, 0);
+    b.class(controller, actor, 0, 0);
+    b.build()
+}
+
+fn list_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Test",
+        list_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+#[test]
+fn pawn_and_controller_lists_insert_and_unlink() {
+    let set = list_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let level = vm.spawn(sg(&set, "Actor"), "Level").unwrap();
+    let p1 = vm.spawn(sg(&set, "Pawn"), "P1").unwrap();
+    let p2 = vm.spawn(sg(&set, "Pawn"), "P2").unwrap();
+    let p3 = vm.spawn(sg(&set, "Pawn"), "P3").unwrap();
+    for p in [p1, p2, p3] {
+        vm.set_property(p, "Level", 0, Value::Object(Some(ObjRef::Instance(level))));
+        call_native(&mut vm, "Engine.Pawn.AddPawnToList", p, &[], &mut []);
+    }
+    // Head is the newest; links chain in reverse insertion order.
+    assert_eq!(
+        vm.get_property(level, "PawnList"),
+        Some(&Value::Object(Some(ObjRef::Instance(p3))))
+    );
+    assert_eq!(
+        vm.get_property(p3, "NextPawn"),
+        Some(&Value::Object(Some(ObjRef::Instance(p2))))
+    );
+    assert_eq!(
+        vm.get_property(p2, "NextPawn"),
+        Some(&Value::Object(Some(ObjRef::Instance(p1))))
+    );
+    assert_eq!(vm.get_property(p1, "NextPawn"), Some(&Value::Object(None)));
+    // Remove the middle element.
+    call_native(&mut vm, "Engine.Pawn.RemovePawnFromList", p2, &[], &mut []);
+    assert_eq!(
+        vm.get_property(p3, "NextPawn"),
+        Some(&Value::Object(Some(ObjRef::Instance(p1))))
+    );
+    assert_eq!(vm.get_property(p2, "NextPawn"), Some(&Value::Object(None)));
+    // Remove the head.
+    call_native(&mut vm, "Engine.Pawn.RemovePawnFromList", p3, &[], &mut []);
+    assert_eq!(
+        vm.get_property(level, "PawnList"),
+        Some(&Value::Object(Some(ObjRef::Instance(p1))))
+    );
+    // Removing an object not in the list is a no-op.
+    call_native(&mut vm, "Engine.Pawn.RemovePawnFromList", p2, &[], &mut []);
+    assert_eq!(
+        vm.get_property(level, "PawnList"),
+        Some(&Value::Object(Some(ObjRef::Instance(p1))))
+    );
+
+    // Controllers use the parallel list.
+    let c1 = vm.spawn(sg(&set, "Controller"), "C1").unwrap();
+    let c2 = vm.spawn(sg(&set, "Controller"), "C2").unwrap();
+    for c in [c1, c2] {
+        vm.set_property(c, "Level", 0, Value::Object(Some(ObjRef::Instance(level))));
+        call_native(&mut vm, "Engine.Controller.AddController", c, &[], &mut []);
+    }
+    assert_eq!(
+        vm.get_property(level, "ControllerList"),
+        Some(&Value::Object(Some(ObjRef::Instance(c2))))
+    );
+    assert_eq!(
+        vm.get_property(c2, "NextController"),
+        Some(&Value::Object(Some(ObjRef::Instance(c1))))
+    );
+    call_native(
+        &mut vm,
+        "Engine.Controller.RemoveController",
+        c2,
+        &[],
+        &mut [],
+    );
+    assert_eq!(
+        vm.get_property(level, "ControllerList"),
+        Some(&Value::Object(Some(ObjRef::Instance(c1))))
+    );
+}
+
+#[test]
+fn script_optional_param_defaults_to_zero() {
+    let set = list_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    // Explicit argument.
+    assert_eq!(
+        vm.call_function(sg(&set, "Actor.Echo"), a, vec![Value::Int(7)])
+            .unwrap(),
+        Value::Int(7)
+    );
+    // Omitted optional: the script local keeps its type zero.
+    assert_eq!(
+        vm.call_function(sg(&set, "Actor.Echo"), a, vec![]).unwrap(),
+        Value::Int(0)
+    );
+}
+
+#[test]
+fn survey_counts_missing_natives_without_aborting() {
+    let set = set_of(fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.survey = true;
+    let obj = vm.spawn(g(&set, "Object"), "O").unwrap();
+    vm.set_active(obj, true);
+    // `CallsDup` calls index 150 with no args -> `Unimpl`, no return value.
+    let r = vm
+        .call_function(g(&set, "Object.CallsDup"), obj, vec![])
+        .unwrap();
+    assert_eq!(r, Value::Void);
+    assert_eq!(vm.missing_natives.len(), 1);
+    let m = vm.missing_natives.get("Object.Unimpl").expect("counted");
+    assert_eq!(m.calls, 1);
+    assert_eq!(m.index, Some(150));
+    assert!(!m.first_stack.is_empty());
+    // Normal mode still fails explicitly.
+    let mut vm2 = Vm::new(&set, VmLimits::default());
+    let obj2 = vm2.spawn(g(&set, "Object"), "O").unwrap();
+    vm2.set_active(obj2, true);
+    let e = vm2
+        .call_function(g(&set, "Object.CallsDup"), obj2, vec![])
+        .unwrap_err();
+    assert_eq!(
+        e.kind,
+        VmErrorKind::UnimplementedNative {
+            path: "Object.Unimpl".into(),
+            index: Some(150)
+        }
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// World physics bridge: Move/SetLocation/Trace/FastTrace/SetCollision(Size) + touching
+
+use crate::physics::{MoveOutcome, WorldHit, WorldPhysics};
+
+const IMP_ARRAYPROP: i32 = -12;
+
+/// `Object`/`Actor`/`Child`/`LevelInfo` fixture with collision fields, a dynamic `Touching`
+/// array and `Touch`/`UnTouch` counters.
+fn phys_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let child = b.reserve(0, 0, "Child");
+    let levelinfo = b.reserve(0, 0, "LevelInfo");
+
+    let add = b.reserve(IMP_FUNCTION, object, "Add_IntInt");
+    let add_a = b.reserve(IMP_INTPROP, add, "A");
+    let add_b = b.reserve(IMP_INTPROP, add, "B");
+    let add_r = b.reserve(IMP_INTPROP, add, "ReturnValue");
+    b.prop(add_a, add_b, PARM);
+    b.prop(add_b, add_r, PARM);
+    b.prop(add_r, 0, PARM | RETURN_PARM);
+    b.func(
+        add,
+        0,
+        add_a,
+        &[],
+        0,
+        146,
+        FINAL | NATIVE | OPERATOR | STATIC,
+    );
+
+    let object_extra = compact(0);
+    let vector_extra = compact(IMP_STRUCT);
+    let rotator_extra = compact(IMP_STRUCT - 1);
+
+    // Touch/UnTouch handlers first (their refs go into the property chain).
+    let touch_fn = b.reserve(IMP_FUNCTION, actor, "Touch");
+    let touch_other = b.reserve(IMP_OBJECTPROP, touch_fn, "Other");
+    let untouch_fn = b.reserve(IMP_FUNCTION, actor, "UnTouch");
+    let untouch_other = b.reserve(IMP_OBJECTPROP, untouch_fn, "Other");
+
+    let owner = b.reserve(IMP_OBJECTPROP, actor, "Owner");
+    let level = b.reserve(IMP_OBJECTPROP, actor, "Level");
+    let base = b.reserve(IMP_OBJECTPROP, actor, "Base");
+    let tag = b.reserve(IMP_NAMEPROP, actor, "Tag");
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let rotation = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
+    let radius = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
+    let height = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
+    let collide_actors = b.reserve(IMP_BOOLPROP, actor, "bCollideActors");
+    let collide_world = b.reserve(IMP_BOOLPROP, actor, "bCollideWorld");
+    let collide_placing = b.reserve(IMP_BOOLPROP, actor, "bCollideWhenPlacing");
+    let block_actors = b.reserve(IMP_BOOLPROP, actor, "bBlockActors");
+    let block_players = b.reserve(IMP_BOOLPROP, actor, "bBlockPlayers");
+    let block_zero = b.reserve(IMP_BOOLPROP, actor, "bBlockZeroExtentTraces");
+    let block_nonzero = b.reserve(IMP_BOOLPROP, actor, "bBlockNonZeroExtentTraces");
+    let movable = b.reserve(IMP_BOOLPROP, actor, "bMovable");
+    let bstatic = b.reserve(IMP_BOOLPROP, actor, "bStatic");
+    let touches = b.reserve(IMP_INTPROP, actor, "Touches");
+    let untouches = b.reserve(IMP_INTPROP, actor, "UnTouches");
+    let touching = b.reserve(IMP_ARRAYPROP, actor, "Touching");
+    let touching_template = b.reserve(IMP_OBJECTPROP, touching, "Touching");
+
+    b.prop_with(owner, level, 0, &object_extra);
+    b.prop_with(level, base, 0, &object_extra);
+    b.prop_with(base, tag, 0, &object_extra);
+    b.prop(tag, location, 0);
+    b.prop_with(location, rotation, 0, &vector_extra);
+    b.prop_with(rotation, radius, 0, &rotator_extra);
+    b.prop(radius, height, 0);
+    b.prop(height, collide_actors, 0);
+    b.prop(collide_actors, collide_world, 0);
+    b.prop(collide_world, collide_placing, 0);
+    b.prop(collide_placing, block_actors, 0);
+    b.prop(block_actors, block_players, 0);
+    b.prop(block_players, block_zero, 0);
+    b.prop(block_zero, block_nonzero, 0);
+    b.prop(block_nonzero, movable, 0);
+    b.prop(movable, bstatic, 0);
+    b.prop(bstatic, touches, 0);
+    b.prop(touches, untouches, 0);
+    b.prop(untouches, touching, 0);
+    b.prop_with(touching_template, 0, 0, &object_extra);
+    b.prop_array(touching, touch_fn, 0, touching_template);
+
+    let tc = touches as u8;
+    let touch_code = vec![0x0F, 0x01, tc, 0x92, 0x00, tc, 0x26, 0x16, 0x04, 0x0B];
+    b.prop_with(touch_other, 0, PARM, &object_extra);
+    b.func(
+        touch_fn,
+        untouch_fn,
+        touch_other,
+        &touch_code,
+        0x10,
+        0,
+        DEFINED,
+    );
+    let uc = untouches as u8;
+    let untouch_code = vec![0x0F, 0x01, uc, 0x92, 0x00, uc, 0x26, 0x16, 0x04, 0x0B];
+    b.prop_with(untouch_other, 0, PARM, &object_extra);
+    b.func(
+        untouch_fn,
+        0,
+        untouch_other,
+        &untouch_code,
+        0x10,
+        0,
+        DEFINED,
+    );
+
+    b.class(object, 0, add, 0);
+    b.class(actor, object, owner, 0);
+    b.class(child, actor, 0, 0);
+    b.class(levelinfo, actor, 0, 0);
+    b.build()
+}
+
+fn phys_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Test",
+        phys_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+fn pg(set: &ScriptSet, path: &str) -> GlobalRef {
+    GlobalRef {
+        package: 0,
+        export: set.packages[0].export_by_path(path).expect(path),
+    }
+}
+
+/// Test provider: static axis-aligned walls (min, max) in Unreal coordinates.
+struct MockWorld {
+    walls: Vec<([f32; 3], [f32; 3])>,
+    blocked_point: bool,
+}
+
+impl MockWorld {
+    fn new() -> Self {
+        Self {
+            walls: Vec::new(),
+            blocked_point: false,
+        }
+    }
+
+    fn with_wall(mut self, min: [f32; 3], max: [f32; 3]) -> Self {
+        self.walls.push((min, max));
+        self
+    }
+}
+
+impl WorldPhysics for MockWorld {
+    fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
+        let d = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+        let mut best: Option<(f32, [f32; 3])> = None;
+        for &(mn, mx) in &self.walls {
+            if let Some((t, n)) = swept_aabb(start, d, extent, mn, mx)
+                && best.is_none_or(|(bt, _)| t < bt)
+            {
+                best = Some((t, n));
+            }
+        }
+        best.map(|(t, n)| WorldHit {
+            location: [
+                start[0] + d[0] * t,
+                start[1] + d[1] * t,
+                start[2] + d[2] * t,
+            ],
+            normal: n,
+            time: t,
+        })
+    }
+
+    fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        let end = [
+            start[0] + delta[0],
+            start[1] + delta[1],
+            start[2] + delta[2],
+        ];
+        match self.trace(start, end, extent) {
+            Some(hit) => MoveOutcome {
+                end: [
+                    start[0] + delta[0] * hit.time,
+                    start[1] + delta[1] * hit.time,
+                    start[2] + delta[2] * hit.time,
+                ],
+                hit: Some(hit),
+            },
+            None => MoveOutcome { end, hit: None },
+        }
+    }
+
+    fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool {
+        if self.blocked_point {
+            return false;
+        }
+        !self
+            .walls
+            .iter()
+            .any(|&(mn, mx)| aabb_overlaps(location, extent, mn, mx))
+    }
+}
+
+fn aabb_overlaps(c: [f32; 3], e: [f32; 3], mn: [f32; 3], mx: [f32; 3]) -> bool {
+    (0..3).all(|i| c[i] + e[i] > mn[i] && c[i] - e[i] < mx[i])
+}
+
+/// Swept AABB vs static AABB; returns `(fraction, normal)`.
+fn swept_aabb(
+    start: [f32; 3],
+    d: [f32; 3],
+    e: [f32; 3],
+    mn: [f32; 3],
+    mx: [f32; 3],
+) -> Option<(f32, [f32; 3])> {
+    let mut t_enter = 0.0f32;
+    let mut t_exit = 1.0f32;
+    let mut axis = 0usize;
+    for i in 0..3 {
+        let smin = start[i] - e[i];
+        let smax = start[i] + e[i];
+        if d[i].abs() < 1e-9 {
+            if smax <= mn[i] || smin >= mx[i] {
+                return None;
+            }
+        } else {
+            let mut t1 = (mn[i] - smax) / d[i];
+            let mut t2 = (mx[i] - smin) / d[i];
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            if t1 > t_enter {
+                t_enter = t1;
+                axis = i;
+            }
+            if t2 < t_exit {
+                t_exit = t2;
+            }
+            if t_enter > t_exit {
+                return None;
+            }
+        }
+    }
+    if t_enter > 1.0 {
+        return None;
+    }
+    let sign = if d[axis] > 0.0 {
+        -1.0
+    } else if d[axis] < 0.0 {
+        1.0
+    } else {
+        0.0
+    };
+    let mut n = [0.0; 3];
+    n[axis] = sign;
+    Some((t_enter.max(0.0), n))
+}
+
+fn try_native(
+    vm: &mut Vm<'_>,
+    path: &str,
+    this: ObjectId,
+    omitted: &[bool],
+    args: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let def = native(path);
+    (def.f)(vm, &ctx(this, omitted, path), args)
+}
+
+fn phys_actor(vm: &mut Vm<'_>, set: &ScriptSet, name: &str, loc: [f32; 3]) -> ObjectId {
+    let id = vm.spawn(pg(set, "Actor"), name).unwrap();
+    vm.set_property(id, "Location", 0, Value::Vector(loc));
+    id
+}
+
+fn set_collision_fields(vm: &mut Vm<'_>, id: ObjectId, colliding: bool, blocking: bool) {
+    vm.set_property(id, "bCollideActors", 0, Value::Bool(colliding));
+    vm.set_property(id, "bCollideWorld", 0, Value::Bool(true));
+    vm.set_property(id, "bBlockActors", 0, Value::Bool(blocking));
+    vm.set_property(id, "bBlockPlayers", 0, Value::Bool(blocking));
+    vm.set_property(id, "bBlockNonZeroExtentTraces", 0, Value::Bool(blocking));
+    vm.set_property(id, "bBlockZeroExtentTraces", 0, Value::Bool(blocking));
+    vm.set_property(id, "bMovable", 0, Value::Bool(true));
+    vm.set_property(id, "CollisionRadius", 0, Value::Float(10.0));
+    vm.set_property(id, "CollisionHeight", 0, Value::Float(10.0));
+}
+
+#[test]
+fn move_into_wall_stops_at_hit_and_bcollideworld_false_ignores_it() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([100.0, -1000.0, -1000.0], [200.0, 1000.0, 1000.0]),
+    ));
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, false, false);
+
+    let mut args = [Value::Vector([100.0, 0.0, 0.0])];
+    let moved = match try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap() {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(!moved, "blocked by the wall");
+    assert_eq!(
+        vm.get_property(a, "Location"),
+        Some(&Value::Vector([90.0, 0.0, 0.0]))
+    );
+
+    // bCollideWorld = false: the wall is ignored.
+    vm.set_property(a, "bCollideWorld", 0, Value::Bool(false));
+    let mut args = [Value::Vector([100.0, 0.0, 0.0])];
+    let moved = match try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap() {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(moved);
+    assert_eq!(
+        vm.get_property(a, "Location"),
+        Some(&Value::Vector([190.0, 0.0, 0.0]))
+    );
+}
+
+#[test]
+fn move_without_provider_fails_and_survey_counts_it() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, false, false);
+    for path in [
+        "Engine.Actor.Move",
+        "Engine.Actor.SetLocation",
+        "Engine.Actor.Trace",
+        "Engine.Actor.FastTrace",
+    ] {
+        let (mut args, omitted): (Vec<Value>, Vec<bool>) = match path {
+            "Engine.Actor.Trace" => (
+                vec![Value::Vector([0.0; 3]); 9],
+                vec![false, false, false, true, true, true, true, true, true],
+            ),
+            "Engine.Actor.FastTrace" => (
+                vec![Value::Vector([1.0, 0.0, 0.0]), Value::Vector([0.0; 3])],
+                vec![false, true, true, true],
+            ),
+            _ => (vec![Value::Vector([1.0, 0.0, 0.0])], vec![false]),
+        };
+        let e = try_native(&mut vm, path, a, &omitted, &mut args).unwrap_err();
+        assert!(
+            matches!(&e.kind, VmErrorKind::NoPhysicsProvider { native } if native == path.trim_start_matches("Engine.")),
+            "{path}: {e}"
+        );
+    }
+    // Survey mode: counted like a missing native and the run continues.
+    vm.survey = true;
+    let mut args = [Value::Vector([1.0, 0.0, 0.0])];
+    let r = try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Bool(false)));
+    let m = vm.missing_natives.get("Actor.Move").expect("counted");
+    assert_eq!(m.index, Some(266));
+    assert_eq!(m.calls, 1);
+}
+
+#[test]
+fn move_into_cylinder_touches_both_sides_and_leaving_untouches() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    let b = phys_actor(&mut vm, &set, "B", [50.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, true, false);
+    set_collision_fields(&mut vm, b, true, false);
+
+    let mut args = [Value::Vector([50.0, 0.0, 0.0])];
+    try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    assert_eq!(vm.get_property(a, "Touches"), Some(&Value::Int(1)));
+    assert_eq!(
+        vm.get_property(b, "Touches"),
+        Some(&Value::Int(1)),
+        "both sides"
+    );
+    assert_eq!(vm.touching_list(a), vec![b]);
+    assert_eq!(vm.touching_list(b), vec![a]);
+
+    // Moving while still overlapping must not touch again.
+    let mut args = [Value::Vector([1.0, 0.0, 0.0])];
+    try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    assert_eq!(vm.get_property(a, "Touches"), Some(&Value::Int(1)));
+    assert_eq!(vm.get_property(b, "Touches"), Some(&Value::Int(1)));
+
+    // Leaving the cylinder sends UnTouch to both and clears both arrays.
+    let mut args = [Value::Vector([100.0, 0.0, 0.0])];
+    try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    assert_eq!(vm.get_property(a, "UnTouches"), Some(&Value::Int(1)));
+    assert_eq!(vm.get_property(b, "UnTouches"), Some(&Value::Int(1)));
+    assert!(vm.touching_list(a).is_empty());
+    assert!(vm.touching_list(b).is_empty());
+}
+
+#[test]
+fn exact_contact_boundary_overlaps() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    let b = phys_actor(&mut vm, &set, "B", [20.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, true, false);
+    set_collision_fields(&mut vm, b, true, false);
+    // Zero delta still recomputes touching; distance == r1+r2 counts as overlap in XIII's
+    // decoded comparison (`VSize <= r1+r2`).
+    let mut args = [Value::Vector([0.0, 0.0, 0.0])];
+    try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    assert_eq!(vm.get_property(a, "Touches"), Some(&Value::Int(1)));
+    assert_eq!(vm.get_property(b, "Touches"), Some(&Value::Int(1)));
+}
+
+#[test]
+fn set_collision_false_ends_touching() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    let b = phys_actor(&mut vm, &set, "B", [5.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, true, false);
+    set_collision_fields(&mut vm, b, true, false);
+    let mut args = [Value::Vector([0.0, 0.0, 0.0])];
+    try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    assert_eq!(vm.touching_list(a), vec![b]);
+
+    let mut args = [Value::Bool(false), Value::Bool(false), Value::Bool(false)];
+    try_native(
+        &mut vm,
+        "Engine.Actor.SetCollision",
+        a,
+        &[false, false, false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(vm.get_property(a, "UnTouches"), Some(&Value::Int(1)));
+    assert_eq!(vm.get_property(b, "UnTouches"), Some(&Value::Int(1)));
+    assert!(vm.touching_list(a).is_empty());
+}
+
+#[test]
+fn set_collision_omitted_arguments_keep_current_values() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, true, true);
+    let mut args = [Value::Bool(false), Value::Bool(false), Value::Bool(false)];
+    try_native(
+        &mut vm,
+        "Engine.Actor.SetCollision",
+        a,
+        &[true, true, true],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(
+        vm.get_property(a, "bCollideActors"),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(vm.get_property(a, "bBlockActors"), Some(&Value::Bool(true)));
+
+    let mut args = [Value::Bool(false), Value::Bool(false), Value::Bool(false)];
+    try_native(
+        &mut vm,
+        "Engine.Actor.SetCollision",
+        a,
+        &[false, true, true],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(
+        vm.get_property(a, "bCollideActors"),
+        Some(&Value::Bool(false))
+    );
+    assert_eq!(vm.get_property(a, "bBlockActors"), Some(&Value::Bool(true)));
+}
+
+#[test]
+fn blocking_actor_stops_the_move_and_is_not_touched() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    let b = phys_actor(&mut vm, &set, "B", [50.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, true, true);
+    set_collision_fields(&mut vm, b, true, true);
+
+    let mut args = [Value::Vector([50.0, 0.0, 0.0])];
+    let moved = match try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap() {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(!moved);
+    // Stops exactly at contact (distance == r1 + r2), never past it.
+    match vm.get_property(a, "Location") {
+        Some(Value::Vector(v)) => assert!((v[0] - 30.0).abs() < 1e-3, "{v:?}"),
+        other => panic!("{other:?}"),
+    }
+    // An actor cannot touch what blocks it (upstream TryMove).
+    assert_eq!(vm.get_property(a, "Touches"), Some(&Value::Int(0)));
+    assert_eq!(vm.get_property(b, "Touches"), Some(&Value::Int(0)));
+}
+
+#[test]
+fn trace_hits_nearer_of_world_and_actor_and_fasttrace_ignores_actors() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([100.0, -100.0, -100.0], [200.0, 100.0, 100.0]),
+    ));
+    let _li = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    let b = phys_actor(&mut vm, &set, "B", [40.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, b, true, false);
+
+    // Actor closer than the wall -> the actor is returned.
+    let mut args = vec![
+        Value::Vector([0.0; 3]),
+        Value::Vector([0.0; 3]),
+        Value::Vector([200.0, 0.0, 0.0]),
+        Value::Vector([0.0; 3]),
+        Value::Bool(true),
+        Value::Vector([0.0; 3]),
+        Value::Object(None),
+        Value::Int(0),
+        Value::Int(0),
+    ];
+    let out = try_native(
+        &mut vm,
+        "Engine.Actor.Trace",
+        tracer,
+        &[false, false, false, false, false, true, true, true, true],
+        &mut args,
+    )
+    .unwrap();
+    match out {
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(i)))) => assert_eq!(i, b),
+        other => panic!("{other:?}"),
+    }
+    match &args[0] {
+        Value::Vector(v) => assert!((v[0] - 30.0).abs() < 0.01, "{v:?}"),
+        other => panic!("{other:?}"),
+    }
+
+    // Actor beyond the wall -> the world hit returns the map LevelInfo.
+    vm.set_property(b, "Location", 0, Value::Vector([150.0, 0.0, 0.0]));
+    let mut args = vec![
+        Value::Vector([0.0; 3]),
+        Value::Vector([0.0; 3]),
+        Value::Vector([200.0, 0.0, 0.0]),
+        Value::Vector([0.0; 3]),
+        Value::Bool(true),
+        Value::Vector([0.0; 3]),
+        Value::Object(None),
+        Value::Int(0),
+        Value::Int(0),
+    ];
+    let out = try_native(
+        &mut vm,
+        "Engine.Actor.Trace",
+        tracer,
+        &[false, false, false, false, false, true, true, true, true],
+        &mut args,
+    )
+    .unwrap();
+    let li = vm.find_level_info().unwrap();
+    match out {
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(i)))) => assert_eq!(i, li),
+        other => panic!("{other:?}"),
+    }
+
+    // FastTrace is world-only: the actor between start and end does not block it.
+    vm.set_property(b, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    let mut args = [Value::Vector([60.0, 0.0, 0.0]), Value::Vector([0.0; 3])];
+    let clear = match try_native(
+        &mut vm,
+        "Engine.Actor.FastTrace",
+        tracer,
+        &[false, false, true, true],
+        &mut args,
+    )
+    .unwrap()
+    {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(clear, "world-only FastTrace ignores the actor");
+    // ... but the wall blocks it.
+    let mut args = [Value::Vector([200.0, 0.0, 0.0]), Value::Vector([0.0; 3])];
+    let clear = match try_native(
+        &mut vm,
+        "Engine.Actor.FastTrace",
+        tracer,
+        &[false, false, true, true],
+        &mut args,
+    )
+    .unwrap()
+    {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(!clear);
+}
+
+#[test]
+fn set_location_refuses_encroachment_and_moves_when_free() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([40.0, -5.0, -5.0], [60.0, 5.0, 5.0]),
+    ));
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    let b = phys_actor(&mut vm, &set, "B", [500.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, true, false);
+    set_collision_fields(&mut vm, b, true, false);
+    // Both sides block: B blocks the destination.
+    vm.set_property(a, "bBlockActors", 0, Value::Bool(true));
+    vm.set_property(b, "bBlockActors", 0, Value::Bool(true));
+    vm.set_property(b, "bBlockNonZeroExtentTraces", 0, Value::Bool(true));
+    let mut args = [Value::Vector([500.0, 5.0, 0.0])];
+    let ok = match try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap()
+    {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(!ok, "encroached by a blocking actor");
+    assert_eq!(
+        vm.get_property(a, "Location"),
+        Some(&Value::Vector([0.0, 0.0, 0.0]))
+    );
+
+    // World-blocked destination is refused.
+    let mut args = [Value::Vector([50.0, 0.0, 0.0])];
+    let ok = match try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap()
+    {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(!ok, "destination inside the wall");
+    assert_eq!(
+        vm.get_property(a, "Location"),
+        Some(&Value::Vector([0.0, 0.0, 0.0]))
+    );
+
+    // A free destination moves and touches an actor already there.
+    let c = phys_actor(&mut vm, &set, "C", [0.0, 100.0, 0.0]);
+    set_collision_fields(&mut vm, c, true, false);
+    let mut args = [Value::Vector([0.0, 100.0, 0.0])];
+    let ok = match try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap()
+    {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(ok);
+    assert_eq!(
+        vm.get_property(a, "Location"),
+        Some(&Value::Vector([0.0, 100.0, 0.0]))
+    );
+    assert_eq!(vm.get_property(a, "Touches"), Some(&Value::Int(1)));
+    assert_eq!(vm.get_property(c, "Touches"), Some(&Value::Int(1)));
+}
+
+#[test]
+fn touching_actors_iterator_filters_by_base_class() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, true, false);
+    let b = vm.spawn(pg(&set, "Child"), "B").unwrap();
+    vm.set_property(b, "Location", 0, Value::Vector([5.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, b, true, false);
+    let c = phys_actor(&mut vm, &set, "C", [0.0, 5.0, 0.0]);
+    set_collision_fields(&mut vm, c, true, false);
+    let mut args = [Value::Vector([0.0, 0.0, 0.0])];
+    try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    assert_eq!(vm.touching_list(a).len(), 2);
+
+    let base = Value::Object(Some(ObjRef::Static(pg(&set, "Child"))));
+    let mut args = [base.clone(), Value::Object(None)];
+    let items = match try_native(
+        &mut vm,
+        "Engine.Actor.TouchingActors",
+        a,
+        &[false, false],
+        &mut args,
+    )
+    .unwrap()
+    {
+        NativeOutcome::Iterate(items) => items,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0], Value::Object(Some(ObjRef::Instance(b))));
 }

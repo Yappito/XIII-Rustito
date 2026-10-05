@@ -353,6 +353,13 @@ impl<'a> PayloadReader<'a> {
     pub fn i32(&mut self) -> DecodeResult<i32> {
         Ok(self.cur.i32()?)
     }
+    /// Reads a little-endian u64.
+    pub fn u64(&mut self) -> DecodeResult<u64> {
+        let raw = self.cur.take(8)?;
+        let mut le = [0u8; 8];
+        le.copy_from_slice(raw);
+        Ok(u64::from_le_bytes(le))
+    }
     /// Reads a little-endian f32.
     pub fn f32(&mut self) -> DecodeResult<f32> {
         Ok(f32::from_bits(self.cur.u32()?))

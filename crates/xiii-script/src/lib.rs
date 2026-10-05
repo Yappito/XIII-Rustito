@@ -15,6 +15,7 @@ mod error;
 pub mod linker;
 pub mod natives;
 pub mod pe;
+pub mod physics;
 mod reader;
 pub mod reflect;
 pub mod registry;
@@ -24,6 +25,7 @@ pub mod vm;
 pub use bytecode::{Call, Label, Script, ScriptLimits, Token, TokenKind, decode_script};
 pub use error::{Result, ScriptError, ScriptErrorKind};
 pub use linker::{GlobalRef, ScriptPackage, ScriptSet};
+pub use physics::{MoveOutcome, WorldHit, WorldPhysics};
 pub use reader::{Reader, Tables};
 pub use reflect::{
     Class, Function, Property, PropertyKind, ScriptClassKind, ScriptObject, State, StructHeader,

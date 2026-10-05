@@ -1,0 +1,117 @@
+//! Physics-provider bridge between the interpreter and outside world collision.
+//!
+//! The VM keeps Unreal units and Unreal axes (X east, Y north, **Z up**); every coordinate
+//! crossing this trait is Unreal. Any metre/axis conversion is the provider implementation's
+//! business, never the VM's.
+//!
+//! No provider set: every native that needs one fails with
+//! [`crate::vm::VmErrorKind::NoPhysicsProvider`] — never a silent success.
+
+/// World-geometry hit (upstream `FCheckResult`-like fields the VM needs).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorldHit {
+    /// Hit location (Unreal units).
+    pub location: [f32; 3],
+    /// Surface normal at the hit (unit length when the provider can supply one).
+    pub normal: [f32; 3],
+    /// Fraction of the swept segment at which the hit occurred, `0.0..=1.0`.
+    pub time: f32,
+}
+
+/// Result of a provider [`WorldPhysics::move_box`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MoveOutcome {
+    /// Where the box ended up when the move was blocked (`start + delta * hit.time`).
+    pub end: [f32; 3],
+    /// The blocking world hit, if any. `time < 1.0` means blocked.
+    pub hit: Option<WorldHit>,
+}
+
+/// World collision the VM calls into. Implemented by the host (Bevy app, tests, diagnostics);
+/// the VM only holds `Box<dyn WorldPhysics>`.
+pub trait WorldPhysics {
+    /// Swept **world-geometry-only** query from `start` to `end` with half-extent `extent`
+    /// (a zero extent is a line in upstream terms). Returns the first blocking hit.
+    fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit>;
+
+    /// UE2 `MoveActor`-like swept box move: from `start`, try to move by `delta` with
+    /// half-extents `extent`, stopping at the **first blocking** world hit. No sliding —
+    /// sliding is physics/script logic layered above this. Returns the end position and the
+    /// blocking hit, if any (`MoveOutcome.time` < 1 means the move was cut short).
+    fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome;
+
+    /// Point/free placement test: can a box of the given half-extents sit at `location`
+    /// without overlapping world geometry? For `SetLocation`/spawn placement checks.
+    fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool;
+}
+
+/// Diagnostic provider: a single infinite floor plane at Unreal Z `floor_z`, nothing else.
+///
+/// This is **not** the map: it exists so the headless harness and diagnostics can run past
+/// movement/trace natives (the harness labels its output "diagnostic physics (flat floor),
+/// not the map"). The real decoded triangle soup provider belongs to a later task.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlatPhysics {
+    /// Floor height in Unreal units (Z up).
+    pub floor_z: f32,
+}
+
+impl FlatPhysics {
+    /// Floor plane at Unreal Z `floor_z`.
+    pub fn new(floor_z: f32) -> Self {
+        Self { floor_z }
+    }
+}
+
+impl WorldPhysics for FlatPhysics {
+    fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
+        let ez = extent[2];
+        let bottom_end = end[2] - ez;
+        if start[2] - ez < self.floor_z {
+            // Already below the floor: report contact at the segment start.
+            return Some(WorldHit {
+                location: [start[0], start[1], self.floor_z],
+                normal: [0.0, 0.0, 1.0],
+                time: 0.0,
+            });
+        }
+        if end[2] < start[2] && bottom_end < self.floor_z {
+            let dz = end[2] - start[2];
+            let t = ((self.floor_z + ez) - start[2]) / dz;
+            let t = t.clamp(0.0, 1.0);
+            return Some(WorldHit {
+                location: [
+                    start[0] + (end[0] - start[0]) * t,
+                    start[1] + (end[1] - start[1]) * t,
+                    self.floor_z,
+                ],
+                normal: [0.0, 0.0, 1.0],
+                time: t,
+            });
+        }
+        None
+    }
+
+    fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        let end = [
+            start[0] + delta[0],
+            start[1] + delta[1],
+            start[2] + delta[2],
+        ];
+        match self.trace(start, end, extent) {
+            Some(hit) => MoveOutcome {
+                end: [
+                    start[0] + delta[0] * hit.time,
+                    start[1] + delta[1] * hit.time,
+                    self.floor_z + extent[2],
+                ],
+                hit: Some(hit),
+            },
+            None => MoveOutcome { end, hit: None },
+        }
+    }
+
+    fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool {
+        location[2] - extent[2] >= self.floor_z
+    }
+}
