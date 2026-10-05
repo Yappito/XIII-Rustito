@@ -795,6 +795,7 @@ pub fn error_kind_name(k: &VmErrorKind) -> String {
         VmErrorKind::NoPhysicsProvider { .. } => "NoPhysicsProvider",
         VmErrorKind::NoAnimationProvider { .. } => "NoAnimationProvider",
         VmErrorKind::NoNavProvider { .. } => "NoNavProvider",
+        VmErrorKind::NoLocalizationProvider { .. } => "NoLocalizationProvider",
         VmErrorKind::UnknownAnimation { .. } => "UnknownAnimation",
         VmErrorKind::AnimationDataError { .. } => "AnimationDataError",
         VmErrorKind::NewOnActor { .. } => "NewOnActor",

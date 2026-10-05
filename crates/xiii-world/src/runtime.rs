@@ -154,6 +154,95 @@ pub fn configure_local_url(vm: &mut Vm, root: &Path, map: &str) {
     vm.set_address_url(level_address(root));
 }
 
+/// Adapter from the installation's [`xiii_locale::Localizer`] to the VM's filesystem-free
+/// [`xiii_script::LocalizationData`] boundary. All `.int` file access stays in `xiii-locale`.
+pub struct InstallLocalizer(xiii_locale::Localizer);
+
+impl xiii_script::LocalizationData for InstallLocalizer {
+    fn get(&self, package: &str, section: &str, key: &str) -> Option<String> {
+        self.0.get(package, section, key).map(str::to_owned)
+    }
+
+    fn language(&self) -> &str {
+        self.0.language()
+    }
+}
+
+/// Opens the installation's localisation files and installs them on `vm`. Call before any actor
+/// or class layout is built, because a `localized` class default is filled from the `.int` when
+/// the layout is first constructed and the layout is cached. Returns the active language code.
+pub fn configure_localization(vm: &mut Vm, root: &Path) -> Result<String, String> {
+    let install = Installation::open(root, &OpenOptions::default()).map_err(|e| e.to_string())?;
+    let localizer = xiii_locale::Localizer::from_installation(&install);
+    let language = localizer.language().to_owned();
+    vm.set_localization(Box::new(InstallLocalizer(localizer)));
+    Ok(language)
+}
+
+/// Resolves `USize`/`VSize` of `Texture` objects that live in non-script packages (`.utx`), so a
+/// script that reads `someTexture.USize` (for example `HudState.DrawStt` using the HUD's
+/// `FondMsg`) gets the decoded size instead of an unsupported-property error. Other properties
+/// stay unknown (the VM keeps its explicit error).
+pub struct TextureProperties {
+    cache: RefCell<PackageCache>,
+    sizes: RefCell<std::collections::HashMap<String, Option<[i32; 2]>>>,
+}
+
+impl TextureProperties {
+    /// Opens the installation read-only.
+    pub fn open(root: &Path) -> Result<Self, String> {
+        Ok(Self {
+            cache: RefCell::new(PackageCache::open(root)?),
+            sizes: RefCell::new(std::collections::HashMap::new()),
+        })
+    }
+
+    fn size(&self, path: &str) -> Option<[i32; 2]> {
+        if let Some(cached) = self.sizes.borrow().get(path) {
+            return *cached;
+        }
+        let computed = self.decode_size(path);
+        self.sizes.borrow_mut().insert(path.to_owned(), computed);
+        computed
+    }
+
+    fn decode_size(&self, path: &str) -> Option<[i32; 2]> {
+        let (package, object) = path.split_once('.')?;
+        let loaded = self.cache.borrow_mut().get(package).ok()?;
+        let export = (0..loaded.package.exports().len()).find(|&e| {
+            loaded
+                .package
+                .object_path(xiii_package::ObjectRef::Export(e as u32))
+                .is_some_and(|p| p.eq_ignore_ascii_case(object))
+        })?;
+        let texture =
+            xiii_decode::texture::decode_texture(&loaded.package, &loaded.data, export).ok()?;
+        Some([texture.size[0] as i32, texture.size[1] as i32])
+    }
+}
+
+impl xiii_script::ExternalObjectData for TextureProperties {
+    fn property(&self, path: &str, property: &str) -> Option<Value> {
+        if !matches!(property, "usize" | "vsize") {
+            return None;
+        }
+        let size = self.size(path)?;
+        Some(Value::Int(if property == "usize" {
+            size[0]
+        } else {
+            size[1]
+        }))
+    }
+}
+
+/// Installs the decoded texture-property resolver (best effort; a failure leaves the explicit
+/// unsupported-property error in place).
+pub fn configure_external_objects(vm: &mut Vm, root: &Path) {
+    if let Ok(provider) = TextureProperties::open(root) {
+        vm.set_external_object_data(Box::new(provider));
+    }
+}
+
 fn ini_value(text: &str, section: &str, key: &str) -> Option<String> {
     let mut in_section = false;
     for line in text.lines() {
@@ -609,5 +698,47 @@ mod tests {
         assert_eq!(options, "?Name=XIII?Class=XIII.XIIIPlayerPawn?Team=255");
         // `[URL] Host=` is empty and `Port=7777` in the GOG `Default.ini`.
         assert_eq!(level_address(&path), ":7777");
+    }
+
+    /// Opt-in corpus test: a `localized` class default is filled from the install's active
+    /// `.int` through the host provider. `xidmaps.Plage01CahuteKeyPick.PickupMessage` is shipped
+    /// as `[Plage01CahuteKeyPick] PickupMessage=Cahute Key` in `xidmaps.int`; the class default
+    /// block does not carry the text.
+    #[test]
+    fn gog_localized_class_default_reaches_the_vm() {
+        use xiii_script::{Value, Vm, VmLimits};
+        let Some(root) = std::env::var_os("XIII_GOG_DIR") else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let path = PathBuf::from(&root);
+        let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = if path.is_relative() {
+            ws.join(path)
+        } else {
+            path
+        };
+        let (set, _map) = load_with_map(&path, "Plage01").expect("load Plage01 script set");
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let language = configure_localization(&mut vm, &path).expect("install localisation");
+        let class = resolve_class_path(&set, "XIDMaps.Plage01CahuteKeyPick")
+            .expect("Plage01CahuteKeyPick class");
+        let layout = vm.class_layout(class).expect("class layout");
+        let slot = layout
+            .slot_by_name("pickupmessage")
+            .expect("PickupMessage property slot");
+        println!(
+            "[runtime test] language={language} overrides={}",
+            vm.localized_overrides
+        );
+        assert_eq!(
+            layout.defaults[slot.base],
+            Value::Str("Cahute Key".to_owned()),
+            "PickupMessage must come from xidmaps.int"
+        );
+        assert!(
+            vm.localized_overrides > 0,
+            "at least one class default must have been overridden"
+        );
     }
 }

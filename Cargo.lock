@@ -4983,6 +4983,7 @@ dependencies = [
  "xiii-collision",
  "xiii-decode",
  "xiii-install",
+ "xiii-locale",
  "xiii-package",
  "xiii-script",
 ]

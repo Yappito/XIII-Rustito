@@ -529,6 +529,29 @@ fn caps_s(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOut
     val(Value::Str(string(vm, a, 0)?.to_ascii_uppercase()))
 }
 
+/// `Object.Localize(string SectionName, string KeyName, string PackageName)` (native 199).
+///
+/// Measured (`Core.dll` `?execLocalize@UObject` RVA `0x1DD40` -> `Localize` RVA `0x281A0`): the
+/// engine looks the key up in the package's active-language `.int`, falling back as configured,
+/// and on a miss returns the literal `"<?%s?%s.%s.%s?>"` formatted with the active language,
+/// package, section and key (observed format bytes at `0x10179574`), logging
+/// `"No localization for ..."`. The host provider owns the file lookup and fallback; the VM
+/// builds the placeholder from the provider's language. Without a provider the call fails
+/// explicitly.
+fn localize_native(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let section = string(vm, a, 0)?;
+    let key = string(vm, a, 1)?;
+    let package = string(vm, a, 2)?;
+    let value = vm
+        .localize_or_placeholder(&package, &section, &key)
+        .ok_or_else(|| {
+            vm.err(VmErrorKind::NoLocalizationProvider {
+                native: "Object.Localize".to_owned(),
+            })
+        })?;
+    val(Value::Str(value))
+}
+
 fn class_is_child_of(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let test = class_ref(vm, a, 0)?;
     let parent = class_ref(vm, a, 1)?;
@@ -1873,6 +1896,88 @@ fn make_color(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nativ
     ]))
 }
 
+/// The named byte members of a `Color` struct value.
+fn color_fields(vm: &Vm<'_>, a: &[Value], i: usize) -> VmResult<Vec<(String, Value)>> {
+    match a.get(i) {
+        Some(Value::Struct(f)) if f.len() == 4 => Ok(f.clone()),
+        Some(v) => Err(type_err(vm, "struct<Color>", v)),
+        None => Err(vm.err(VmErrorKind::Other("missing Color argument".into()))),
+    }
+}
+
+fn color_channel(fields: &[(String, Value)], name: &str) -> i32 {
+    fields
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .and_then(|(_, v)| match v {
+            Value::Byte(b) => Some(i32::from(*b)),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn clamp_byte(v: i32) -> Value {
+    Value::Byte(v.clamp(0, 255) as u8)
+}
+
+/// A `Color` rebuilt in the component order of the first operand, from `(b, g, r, a)`.
+fn color_from_bgra(order: &[(String, Value)], bgra: [i32; 4]) -> Value {
+    let pick = |name: &str| match name.to_ascii_lowercase().as_str() {
+        "b" => clamp_byte(bgra[0]),
+        "g" => clamp_byte(bgra[1]),
+        "r" => clamp_byte(bgra[2]),
+        "a" => clamp_byte(bgra[3]),
+        _ => Value::Byte(0),
+    };
+    Value::Struct(order.iter().map(|(k, _)| (k.clone(), pick(k))).collect())
+}
+
+/// `Actor.Multiply_ColorFloat(Color A, float B)` (native 552): componentwise `A * B`, truncated
+/// and clamped to `[0,255]` (UE2 `FColor` scalar multiply). Called by the HUD widget draw path
+/// (`XIIIBaseHud`/`HudState.DrawStt`).
+fn multiply_color_float(
+    vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let fields = color_fields(vm, a, 0)?;
+    let f = float(vm, a, 1)?;
+    let m = |name: &str| (color_channel(&fields, name) as f32 * f) as i32;
+    val(color_from_bgra(&fields, [m("b"), m("g"), m("r"), m("a")]))
+}
+
+/// `Actor.Multiply_FloatColor(float A, Color B)` (native 550): the reversed operand order.
+fn multiply_float_color(
+    vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let fields = color_fields(vm, a, 1)?;
+    let f = float(vm, a, 0)?;
+    let m = |name: &str| (color_channel(&fields, name) as f32 * f) as i32;
+    val(color_from_bgra(&fields, [m("b"), m("g"), m("r"), m("a")]))
+}
+
+/// `Actor.Add_ColorColor(Color A, Color B)` (native 551): componentwise sum, clamped.
+fn add_color_color(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let x = color_fields(vm, a, 0)?;
+    let y = color_fields(vm, a, 1)?;
+    let s = |name: &str| color_channel(&x, name) + color_channel(&y, name);
+    val(color_from_bgra(&x, [s("b"), s("g"), s("r"), s("a")]))
+}
+
+/// `Actor.Subtract_ColorColor(Color A, Color B)` (native 549): componentwise difference, clamped.
+fn subtract_color_color(
+    vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let x = color_fields(vm, a, 0)?;
+    let y = color_fields(vm, a, 1)?;
+    let d = |name: &str| color_channel(&x, name) - color_channel(&y, name);
+    val(color_from_bgra(&x, [d("b"), d("g"), d("r"), d("a")]))
+}
+
 fn play_sound(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     vm.emit_sound(false, c.this, a, &c.omitted);
     val(Value::Void)
@@ -2694,6 +2799,12 @@ fn builtin_defs() -> Vec<NativeDef> {
             "native(258) final static function bool ClassIsChildOf(class<Object> TestClass, class<Object> ParentClass)",
             "UE2: class-chain containment; Core.dll ?execClassIsChildOf@UObject",
             class_is_child_of,
+        ),
+        def(
+            "Object.Localize",
+            "native(199) final native static function string Localize(string SectionName, string KeyName, string PackageName)",
+            "Core.dll ?execLocalize@UObject RVA 0x1DD40 -> ?Localize RVA 0x281A0; miss placeholder \"<?%s?%s.%s.%s?>\" at VA 0x10179574",
+            localize_native,
         ),
         def(
             "Object.ComplementEqual_StrStr",
@@ -3881,6 +3992,34 @@ fn builtin_defs() -> Vec<NativeDef> {
         "native(0) static function string ConsoleCommand(string Command)",
         "engine.u PlayerController.ConsoleCommand decoded; Engine.dll ?execConsoleCommand@APlayerController RVA 0x698F0; implements the campaign commands GETPING and Get GameInfo GoreLevel, logs the rest",
         console_command,
+    ));
+    // `Color` operators (native 549-552). The HUD widget draw path (`HudState.DrawStt` ->
+    // `XIIIBaseHud.DrawHUD`) multiplies/tints colors; before these the HUD `PostRender`
+    // suspended on `Actor.Multiply_ColorFloat`. UE2 `FColor` scalar/vector arithmetic
+    // (truncate then clamp to 0..255).
+    v.push(def(
+        "Engine.Actor.Multiply_ColorFloat",
+        "native(552) final native operator static function Color Multiply_ColorFloat(struct<Color> A, float B)",
+        "engine.u Actor.Multiply_ColorFloat decoded; UE2 FColor::operator*(float), componentwise, clamped",
+        multiply_color_float,
+    ));
+    v.push(def(
+        "Engine.Actor.Multiply_FloatColor",
+        "native(550) final native operator static function Color Multiply_FloatColor(float A, struct<Color> B)",
+        "engine.u Actor.Multiply_FloatColor decoded; UE2 FColor::operator*(float) operand order, clamped",
+        multiply_float_color,
+    ));
+    v.push(def(
+        "Engine.Actor.Add_ColorColor",
+        "native(551) final native operator static function Color Add_ColorColor(struct<Color> A, struct<Color> B)",
+        "engine.u Actor.Add_ColorColor decoded; UE2 FColor::operator+(FColor), componentwise, clamped",
+        add_color_color,
+    ));
+    v.push(def(
+        "Engine.Actor.Subtract_ColorColor",
+        "native(549) final native operator static function Color Subtract_ColorColor(struct<Color> A, struct<Color> B)",
+        "engine.u Actor.Subtract_ColorColor decoded; UE2 FColor::operator-(FColor), componentwise, clamped",
+        subtract_color_color,
     ));
     // Canvas draw-recording natives (`crates/xiii-script/src/canvas.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.

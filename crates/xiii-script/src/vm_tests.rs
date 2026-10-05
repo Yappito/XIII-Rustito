@@ -5,6 +5,7 @@ use xiii_package::Limits;
 
 use crate::bytecode::ScriptLimits;
 use crate::linker::{GlobalRef, ScriptPackage, ScriptSet};
+use crate::localize::LocalizationData;
 use crate::reflect::function_flags as ff;
 use crate::reflect::property_flags as pf;
 use crate::tests::{Exp, build_package, compact};
@@ -28,6 +29,8 @@ const IMP_NAMEPROP: i32 = -6;
 const IMP_OBJPROP: i32 = -7;
 const B_STRUCTPROP: i32 = -8;
 const B_BOOLPROP: i32 = -9;
+/// `Core.StrProperty` import appended at the end of the `B` import table (see `B::build`).
+const B_STRPROP: i32 = -10;
 
 impl B {
     fn new() -> Self {
@@ -183,7 +186,9 @@ impl B {
         let n = self.externals.len() as i32;
         self.externals
             .push((package.to_owned(), class.to_owned(), object.to_owned()));
-        -(11 + 2 * n)
+        // `B::build` has 10 fixed imports (through `StrProperty`), so an external's package
+        // import is at index 11 and its object import at 12; each extra external adds two.
+        -(12 + 2 * n)
     }
 
     fn build(mut self) -> Vec<u8> {
@@ -202,6 +207,8 @@ impl B {
             (core, class, -1, self.name("ObjectProperty")),
             (core, class, -1, self.name("StructProperty")),
             (core, class, -1, self.name("BoolProperty")),
+            // -10: appended last so every existing negative import index is unchanged.
+            (core, class, -1, self.name("StrProperty")),
         ];
         for (pkg, cls, object) in &externals {
             let pn = self.name(pkg);
@@ -495,7 +502,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 224);
+    assert_eq!(defs.len(), 229);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -5359,4 +5366,259 @@ fn player_can_see_me_uses_a_player_line_of_sight() {
         &[],
         &mut []
     )));
+}
+
+// ---------------------------------------------------------------------------------------
+// Localisation provider, localized class defaults and static calls on class defaults.
+
+/// A provider whose `get` answers `Thing.label` with `value` and everything else `None`.
+struct MapLoc(&'static str);
+
+impl LocalizationData for MapLoc {
+    fn get(&self, package: &str, section: &str, key: &str) -> Option<String> {
+        (package.eq_ignore_ascii_case("Test")
+            && section.eq_ignore_ascii_case("Thing")
+            && key.eq_ignore_ascii_case("label"))
+        .then(|| self.0.to_owned())
+    }
+
+    fn language(&self) -> &str {
+        "int"
+    }
+}
+
+/// `Object` -> `Thing` with a `localized` string `Label` (XIII bit `0x400000`) and a plain int
+/// `Count`.
+fn localized_fixture() -> Vec<u8> {
+    use pf::*;
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let thing = b.reserve(0, 0, "Thing");
+    let label = b.reserve(B_STRPROP, thing, "Label");
+    let count = b.reserve(IMP_INTPROP, thing, "Count");
+    b.prop(label, count, LOCALIZED);
+    b.prop(count, 0, 0);
+    b.class(thing, object, label);
+    b.class(object, 0, 0);
+    b.build()
+}
+
+#[test]
+fn localized_class_default_is_filled_from_the_provider() {
+    let set = set_of(localized_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_localization(Box::new(MapLoc("from-int")));
+    let class = sg(&set, "Thing");
+    let layout = vm.class_layout(class).unwrap();
+    let value = |n: &str| layout.defaults[layout.slot_by_name(n).unwrap().base].clone();
+    assert_eq!(value("label"), Value::Str("from-int".to_owned()));
+    // The non-localized sibling keeps its zero default.
+    assert_eq!(value("count"), Value::Int(0));
+    assert_eq!(vm.localized_overrides, 1);
+}
+
+#[test]
+fn localized_class_default_miss_leaves_the_serialized_value() {
+    struct Missing;
+    impl LocalizationData for Missing {
+        fn get(&self, _p: &str, _s: &str, _k: &str) -> Option<String> {
+            None
+        }
+        fn language(&self) -> &str {
+            "int"
+        }
+    }
+    let set = set_of(localized_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_localization(Box::new(Missing));
+    let class = sg(&set, "Thing");
+    let layout = vm.class_layout(class).unwrap();
+    let base = layout.slot_by_name("label").unwrap().base;
+    assert_eq!(layout.defaults[base], Value::Str(String::new()));
+    assert_eq!(vm.localized_overrides, 0);
+}
+
+#[test]
+fn object_localize_returns_the_provider_value_and_the_placeholder_on_miss() {
+    let set = set_of(localized_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_localization(Box::new(MapLoc("localized-text")));
+    let t = vm.spawn(sg(&set, "Thing"), "T").unwrap();
+
+    let mut hit = [
+        Value::Str("Thing".to_owned()),
+        Value::Str("Label".to_owned()),
+        Value::Str("Test".to_owned()),
+    ];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "Object.Localize",
+            t,
+            &[false; 3],
+            &mut hit
+        )),
+        "localized-text"
+    );
+    assert_eq!(vm.localization_hits, 1);
+
+    let mut miss = [
+        Value::Str("Thing".to_owned()),
+        Value::Str("Nope".to_owned()),
+        Value::Str("Test".to_owned()),
+    ];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "Object.Localize",
+            t,
+            &[false; 3],
+            &mut miss
+        )),
+        "<?int?Test.Thing.Nope?>"
+    );
+    assert_eq!(vm.localization_misses, 1);
+}
+
+#[test]
+fn object_localize_without_a_provider_is_an_explicit_error() {
+    let set = set_of(localized_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let t = vm.spawn(sg(&set, "Thing"), "T").unwrap();
+    let mut args = [
+        Value::Str("Thing".to_owned()),
+        Value::Str("Label".to_owned()),
+        Value::Str("Test".to_owned()),
+    ];
+    let def = native("Object.Localize");
+    let err = (def.f)(&mut vm, &ctx(t, &[false; 3], "Object.Localize"), &mut args).unwrap_err();
+    assert!(matches!(
+        err.kind,
+        VmErrorKind::NoLocalizationProvider { .. }
+    ));
+}
+
+/// `Object` -> `Thing` with a `static` `GetLabel()` returning a string constant, and an
+/// `Object.Call()` that returns `Thing.static.GetLabel()` through a `ClassContext`.
+fn static_on_default_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let thing = b.reserve(0, 0, "Thing");
+    let get = b.reserve(IMP_FUNCTION, thing, "GetLabel");
+    let get_r = b.reserve(B_STRPROP, get, "ReturnValue");
+    b.prop(get_r, 0, RETURN_PARM);
+    let mut body = vec![0x04, 0x1F];
+    body.extend_from_slice(b"hello");
+    body.push(0);
+    // Return opcode (1) + StringConst opcode (1) + 5 chars + NUL.
+    b.func(get, 0, get_r, &body, 8, 0, STATIC | DEFINED);
+
+    let call = b.reserve(IMP_FUNCTION, object, "Call");
+    let call_r = b.reserve(B_STRPROP, call, "ReturnValue");
+    b.prop(call_r, 0, RETURN_PARM);
+    let get_name = b.exports[(get - 1) as usize].name;
+    let mut code = vec![0x04, 0x12, 0x20];
+    code.extend(compact(thing));
+    code.extend(0u16.to_le_bytes());
+    code.push(0);
+    code.push(0x38);
+    code.extend(compact(get_name));
+    code.push(0x16);
+    // Return (1) + ClassContext (1) + ObjectConst (1 + object 4) + skip u16 (2) + size (1)
+    // + GlobalFunction (1 + name 4) + EndFunctionParms (1).
+    b.func(call, 0, call_r, &code, 16, 0, DEFINED);
+
+    b.class(thing, object, get);
+    b.class(object, 0, call);
+    b.build()
+}
+
+#[test]
+fn static_function_runs_on_an_inactive_class_default_object() {
+    let set = set_of(static_on_default_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let host = vm.spawn(sg(&set, "Object"), "Host").unwrap();
+    vm.set_active(host, true);
+    // `Object.Call()` evaluates `Thing.static.GetLabel()` on `Default__Thing`, which is not in
+    // the executed scope. Before the fix this returned `DeferredWithReturnValue`.
+    let value = vm
+        .call_function(sg(&set, "Object.Call"), host, Vec::new())
+        .expect("a static function on a class default object must run");
+    assert_eq!(value, Value::Str("hello".to_owned()));
+}
+
+#[test]
+fn color_operator_natives_clamp_componentwise() {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let thing = b.reserve(0, 0, "Thing");
+    let count = b.reserve(IMP_INTPROP, thing, "Count");
+    b.prop(count, 0, 0);
+    b.class(thing, object, count);
+    b.class(object, 0, 0);
+    let set = set_of(b.build());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let t = vm.spawn(sg(&set, "Thing"), "T").unwrap();
+    let color = |b: u8, g: u8, r: u8, a: u8| {
+        Value::Struct(vec![
+            ("b".to_owned(), Value::Byte(b)),
+            ("g".to_owned(), Value::Byte(g)),
+            ("r".to_owned(), Value::Byte(r)),
+            ("a".to_owned(), Value::Byte(a)),
+        ])
+    };
+    let channel = |v: &Value, n: &str| match v {
+        Value::Struct(f) => f
+            .iter()
+            .find(|(k, _)| k == n)
+            .and_then(|(_, v)| match v {
+                Value::Byte(b) => Some(*b),
+                _ => None,
+            })
+            .unwrap(),
+        other => panic!("{other:?}"),
+    };
+
+    // 255 * 0.5 truncates to 127 (not rounded) and stays in range.
+    let mut a = [color(255, 255, 255, 255), Value::Float(0.5)];
+    let v = call_native(&mut vm, "Actor.Multiply_ColorFloat", t, &[false; 2], &mut a);
+    let NativeOutcome::Value(v) = v else { panic!() };
+    assert_eq!(channel(&v, "r"), 127);
+    assert_eq!(channel(&v, "a"), 127);
+
+    // Add clamps at 255; subtract clamps at 0.
+    let mut a = [color(200, 10, 255, 1), color(200, 10, 255, 1)];
+    let v = call_native(&mut vm, "Actor.Add_ColorColor", t, &[false; 2], &mut a);
+    let NativeOutcome::Value(v) = v else { panic!() };
+    assert_eq!(channel(&v, "b"), 255);
+    assert_eq!(channel(&v, "g"), 20);
+    let mut a = [color(10, 0, 5, 0), color(20, 0, 255, 0)];
+    let v = call_native(&mut vm, "Actor.Subtract_ColorColor", t, &[false; 2], &mut a);
+    let NativeOutcome::Value(v) = v else { panic!() };
+    assert_eq!(channel(&v, "b"), 0);
+    assert_eq!(channel(&v, "r"), 0);
+}
+
+#[test]
+fn object_class_property_answers_the_objects_class() {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let thing = b.reserve(0, 0, "Thing");
+    let cls = b.reserve(IMP_OBJPROP, object, "Class");
+    b.prop_with(cls, 0, 0, &compact(0));
+    let count = b.reserve(IMP_INTPROP, thing, "Count");
+    b.prop(count, 0, 0);
+    b.class(thing, object, count);
+    b.class(object, 0, cls);
+    let set = set_of(b.build());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let t = vm.spawn(sg(&set, "Thing"), "T").unwrap();
+    // `Object.Class` is the object's UClass, not a serialized null default; scripts read it to
+    // identify a class (`default.Class` in the local-message chain).
+    assert_eq!(
+        vm.get_property(t, "Class"),
+        Some(&Value::Object(Some(ObjRef::Static(sg(&set, "Thing")))))
+    );
 }

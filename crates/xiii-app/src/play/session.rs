@@ -67,6 +67,11 @@ pub struct Session {
     pub moved: Vec<MovedActor>,
     /// `XIIIDispatcher0`, if the map has one (the trigger chain's end state).
     pub dispatcher: Option<ObjectId>,
+    /// Active language code of the install's localisation files (`int`, `frt`, ...).
+    pub localization_language: String,
+    /// Number of `localized` class-default values filled from the `.int` files while building
+    /// the level's class layouts.
+    pub localized_overrides: u64,
     /// Fixed steps run.
     pub tick_count: u64,
 }
@@ -94,6 +99,14 @@ impl Session {
         let (set, map_idx) = runtime::load_with_map(game_dir, map)?;
         let set: &'static ScriptSet = Box::leak(Box::new(set));
         let mut vm = Vm::new(set, VmLimits::default());
+
+        // Install the install's localisation files before the first class layout is built, so
+        // `localized` class defaults (for example `Plage01CahuteKeyPick.PickupMessage`) are
+        // filled from the active-language `.int` as the game's classes load them.
+        let localization_language = runtime::configure_localization(&mut vm, game_dir)?;
+        // Decoded `USize`/`VSize` for textures in non-script packages (the HUD widgets read the
+        // HUD's `FondMsg` texture size while drawing).
+        runtime::configure_external_objects(&mut vm, game_dir);
 
         let anim_log = Rc::new(RefCell::new(Vec::new()));
         let providers = runtime::build_map_providers(
@@ -285,8 +298,11 @@ impl Session {
             player_touching: Vec::new(),
             moved: Vec::new(),
             dispatcher,
+            localization_language,
+            localized_overrides: 0,
             tick_count: 0,
         };
+        session.localized_overrides = session.vm.localized_overrides;
         session.suspended.dedup();
         session.drain_events();
         session.update_touches();
