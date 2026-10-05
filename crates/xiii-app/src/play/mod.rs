@@ -456,6 +456,10 @@ fn setup_inner(
         "[play] login path: script={} bootstrap={}",
         session.login_script, session.login_bootstrap
     );
+    println!("[play] hit boxes: {}", session.hitbox_summary());
+    for e in &session.hitbox_errors {
+        println!("[play]   hit-box mesh failed: {e}");
+    }
     println!(
         "[play] localisation: language={} localized class-default overrides={}",
         session.localization_language, session.localized_overrides
@@ -842,16 +846,17 @@ fn fixed_step(
         Ok(sess) => cinematics::input_suppressed(sess),
         Err(_) => false,
     };
-    let (input, weapons) = if suppressed {
-        (Input::default(), Vec::new())
+    let (input, weapons, equip) = if suppressed {
+        (Input::default(), Vec::new(), false)
     } else {
         match script.drive.as_mut() {
             Some(drive) => {
                 let input = drive.advance(elapsed, &mut sim.0);
                 let weapons = drive.take_weapons();
-                (input, weapons)
+                let equip = drive.take_equip();
+                (input, weapons, equip)
             }
-            None => (read_keyboard(&keys, &buttons), Vec::new()),
+            None => (read_keyboard(&keys, &buttons), Vec::new(), false),
         }
     };
     let use_action = input.use_action;
@@ -900,11 +905,17 @@ fn fixed_step(
                 Err(e) => println!("[play] weapon grant failed {path}: {e}"),
             }
         }
+        if equip {
+            match sess.equip_inventory_weapon() {
+                Ok(msg) => println!("[play] equip {msg}"),
+                Err(e) => println!("[play] equip failed: {e}"),
+            }
+        }
         if use_action {
             perform_use(sess, &wr.world, &wr.sources, &sim.0, &params.0);
         }
         if fire {
-            match sess.fire(sim.0.yaw) {
+            match sess.fire(sim.0.yaw, sim.0.pitch) {
                 session::FireOutcome::Fired => {}
                 other => println!("[play] fire: {other:?}"),
             }
@@ -1380,6 +1391,7 @@ pub(crate) fn run_script(
         let elapsed = tick as f32 * DT;
         let input = drive.advance(elapsed, &mut sim);
         let weapons = drive.take_weapons();
+        let equip = drive.take_equip();
         let fired = input.fire;
         if volumes.is_empty() {
             sim.step(DT, &world, params, input, sources);
@@ -1402,11 +1414,17 @@ pub(crate) fn run_script(
                 Err(e) => println!("[play] weapon grant failed {path}: {e}"),
             }
         }
+        if equip {
+            match session.equip_inventory_weapon() {
+                Ok(msg) => println!("[play] equip {msg}"),
+                Err(e) => println!("[play] equip failed: {e}"),
+            }
+        }
         if input.use_action {
             perform_use(&mut session, &world, sources, &sim, params);
         }
         if fired {
-            match session.fire(sim.yaw) {
+            match session.fire(sim.yaw, sim.pitch) {
                 session::FireOutcome::Fired => {
                     println!(
                         "[play] fire [{elapsed:.3}s] player {} bone {} | {}",
@@ -1541,6 +1559,10 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
         "[play] login path: script={} bootstrap={}",
         session.login_script, session.login_bootstrap
     );
+    println!("[play] hit boxes: {}", session.hitbox_summary());
+    for e in &session.hitbox_errors {
+        println!("[play]   hit-box mesh failed: {e}");
+    }
     println!(
         "[play] localisation: language={} localized class-default overrides={}",
         session.localization_language, session.localized_overrides
@@ -2099,12 +2121,16 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        // BaseSoldier6 is at (1802.4, -12832.0, 1070.8). Place the player 40 UU in +X facing -X
-        // and fire headshots; the battle is entirely script-driven.
+        // BaseSoldier6 is at (1802.4, -12832.0, 1070.8). Place the player 160 UU in -Y facing +Y
+        // (yaw 90) and aim at the top of the head (pitch +5 deg). With the decoded per-bone hit
+        // boxes (item14b) the large `X Spine1` box overlaps the lower head, so a point-blank
+        // horizontal shot is a chest hit; the head needs the ray to clear the torso first. The
+        // battle is entirely script-driven (no host damage).
         let script = script::Script::parse(
             "t=0.00 weapon XIII.Beretta\n\
-             t=0.20 teleport 1842.4 -12832.0 1070.8\n\
-             t=0.20 yaw 180\n\
+             t=0.20 teleport 1802.4131 -12992.034 1070.843\n\
+             t=0.20 yaw 90\n\
+             t=0.20 pitch 5\n\
              t=0.30 fire\nt=0.90 fire\nt=1.50 fire\nt=2.10 fire\nt=2.70 fire\nt=3.30 fire\n\
              t=3.90 fire\nt=4.50 fire\nt=5.10 fire\nt=5.70 fire\nt=6.30 fire\n",
         )

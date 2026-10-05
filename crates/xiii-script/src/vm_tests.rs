@@ -502,9 +502,10 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    // item3p added the five missing rotator operators (142, 203, 287, 288, 289), the float
-    // power operator (170) and a visible Partial for `ParticleEmitter.SetMaxParticles`: 264 -> 271.
-    assert_eq!(defs.len(), 271);
+    // item14b added 10 AI natives (264 -> 274); item3p added the five missing rotator operators
+    // (142, 203, 287, 288, 289), the float power operator (170) and a visible Partial for
+    // `ParticleEmitter.SetMaxParticles` (274 -> 281).
+    assert_eq!(defs.len(), 281);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),

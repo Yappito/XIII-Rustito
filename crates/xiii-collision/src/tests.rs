@@ -886,6 +886,65 @@ fn walk_steps_onto_a_ledge_under_an_overhang_that_blocks_the_full_up_sweep() {
     assert!(!fell, "never fell stepping under the overhang");
 }
 
+// ---------------------------------------------------------------------------------------
+// Evidence constants measured from Engine.dll (item1j). These pin the values the primitive is
+// calibrated against so a later edit that changes them fails loudly instead of silently drifting.
+// ---------------------------------------------------------------------------------------
+
+/// The engine collision constants read from `Engine.dll` `.rdata`. Each is `(symbol, vma, value)`.
+///
+/// Sources (all **from source**, `llvm-objdump`, read-only; raw in `local/re/`):
+/// - `MINFLOORZ` = 0.7: `APawn::physWalking` (`0x103be05b`) and `APawn::stepUp` (`0x103baa96`)
+///   compare a floor normal's Z against `0x10483428`.
+/// - `MAXSTEPHEIGHT` = 35.0 UU: `APawn::stepUp` multiplies the requested `(X,Y,Z)` by
+///   `0x104829c4` (`35.0`), the fixed up-step magnitude.
+/// - `physWalking` step loop bound = 8: `cmpl $0x8, <iter>` at `0x103bde14`.
+/// - `stepUp` normal threshold = 0.08: `0x1048341c` is compared against the check result's Z at
+///   `0x103baa96`; `0x10483420` = 1.9 and `0x10483424` = 2.4 are the floor-snap tolerances.
+/// - `ATerrainInfo::LineCheck` / `UModel::LineCheck` clamp the ray to the heightmap and test
+///   `0.5`/`0.1` barycentric thresholds (`0x1046f584` = 0.5, `0x10478ca4` = 0.1) — line checks
+///   with extent, not a swept box.
+const ENGINE_MIN_FLOOR_Z: f32 = 0.7;
+const ENGINE_MAX_STEP_HEIGHT_UU: f32 = 35.0;
+const ENGINE_PHYSWALKING_ITERATIONS: u32 = 8;
+const ENGINE_FLOOR_SNAP_TOL_UU: f32 = 2.4;
+
+#[test]
+fn evidence_constants_match_the_crate_defaults_and_reach() {
+    // `WalkParams::default()` is the engine's `MINFLOORZ`; the other engine values are supplied by
+    // the `xiii-world::reach` caller (kept in Unreal units there).
+    assert_eq!(WalkParams::default().min_floor_z, ENGINE_MIN_FLOOR_Z);
+    assert_eq!(ENGINE_MAX_STEP_HEIGHT_UU, 35.0);
+    assert_eq!(ENGINE_PHYSWALKING_ITERATIONS, 8);
+    assert_eq!(ENGINE_FLOOR_SNAP_TOL_UU, 2.4);
+}
+
+/// The engine's `stepUp` is gated on the **floor** normal, not the horizontal blocking contact.
+/// Our `walk_move` attempts the step on any horizontal block and requires a walkable *landing*
+/// in `try_step_walk`. This test pins that design: a vertical obstacle face (unwalkable, `n_y=0`)
+/// with a walkable top must still be stepped onto, which the engine gate applied to the contact
+/// normal would not do.
+#[test]
+fn vertical_face_is_stepped_onto_by_the_ungated_heuristic() {
+    let h = 0.2;
+    let half = [0.3, 0.5, 0.3];
+    let mut tris: Vec<(Triangle, u32)> = floor_y(0.0).into_iter().map(|t| (t, 1)).collect();
+    tris.extend(box_tris([0.0, 0.0, -1.0], [1.0, h, 1.0], 2));
+    let w = world(tris);
+    let (last, fell) = walk_plus_x(&w, [-0.5, 0.5, 0.0], half, 0.05, 30, &walk_params(0.25));
+    assert!(
+        last.position[0] > 0.0,
+        "vertical face with a walkable top was not stepped onto: {:?}",
+        last.position
+    );
+    assert!(
+        (last.position[1] - (h + 0.5)).abs() < 0.02,
+        "not standing on the step top: {:?}",
+        last.position
+    );
+    assert!(!fell);
+}
+
 #[test]
 fn downward_ray_onto_floor_hits() {
     // Regression: a zero-extent ray straight down onto a coplanar floor must hit; the swept

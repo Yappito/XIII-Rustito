@@ -76,6 +76,16 @@ pub trait HitZones {
     /// `(center, radius, half_height)`. Returns a name constant (`X Head`, `X Spine1`, `X Spine`,
     /// or `None`).
     fn bone_at(&self, center: [f32; 3], radius: f32, half_height: f32, hit: [f32; 3]) -> String;
+
+    /// Nearest decoded per-bone hit-box along the ray `start..end` on `actor`, when the provider
+    /// holds a posed skeleton for it. Returns the bone name `Actor.GetLastTraceBone` should give
+    /// (`X Head`, `X Spine1`, ...). `None` (the default) means the provider has no per-bone data
+    /// for this actor and the caller falls back to [`HitZones::bone_at`]. The default
+    /// [`CylinderZones`] never overrides it.
+    fn ray_bone(&self, actor: crate::ObjectId, start: [f32; 3], end: [f32; 3]) -> Option<String> {
+        let _ = (actor, start, end);
+        None
+    }
 }
 
 /// Default hit-zone model over the collision cylinder. XIII's `XIIIPawn.GetDamageLocation`
