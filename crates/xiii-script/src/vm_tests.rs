@@ -410,12 +410,11 @@ fn unimplemented_and_unregistered_natives_fail_with_stack() {
         .call_function(g(&set, "Object.CallsUnknownIndex"), obj, vec![])
         .unwrap_err();
     assert_eq!(e.kind, VmErrorKind::UnregisteredNative { index: 200 });
-    let e = vm
-        .call_function(g(&set, "Object.CallsNew"), obj, vec![])
-        .unwrap_err();
-    assert!(
-        matches!(e.kind, VmErrorKind::UnsupportedToken { opcode: 0x11, .. }),
-        "{e}"
+    // `new` is implemented: `new None` yields `None`; the function then returns void.
+    assert_eq!(
+        vm.call_function(g(&set, "Object.CallsNew"), obj, vec![])
+            .unwrap(),
+        Value::Void
     );
 }
 
@@ -453,7 +452,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 86);
+    assert_eq!(defs.len(), 99);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -619,6 +618,51 @@ impl SpawnB {
         p.extend(compact(system));
         p.extend(compact(0));
         p.extend(compact(0));
+        self.set(r, p);
+    }
+
+    /// A `Core.Class` whose tagged defaults set one int property to `default_value`.
+    fn class_with_int_default(
+        &mut self,
+        r: i32,
+        sup: i32,
+        children: i32,
+        class_flags: u16,
+        default_name: i32,
+        default_value: i32,
+    ) {
+        let friendly = self.exports[(r - 1) as usize].name;
+        let system = self.name("System");
+        let mut p = self.header(sup, 0, children, friendly, &[], 0);
+        p.extend(0u64.to_le_bytes());
+        p.extend(u64::MAX.to_le_bytes());
+        p.extend(0xFFFFu16.to_le_bytes());
+        p.extend(0u16.to_le_bytes());
+        p.extend(class_flags.to_le_bytes());
+        p.extend([0u8; 16]);
+        p.extend(compact(0)); // dependencies
+        p.extend(compact(0)); // package imports
+        p.extend(compact(0)); // within
+        p.extend(compact(system));
+        p.extend(compact(0)); // hide categories
+        if default_name != 0 {
+            // IntProperty tag: name, info 0x22 (size code 2 = 4 bytes), value.
+            p.extend(compact(default_name));
+            p.push(0x22);
+            p.extend(default_value.to_le_bytes());
+        }
+        p.extend(compact(0)); // defaults terminator
+        self.set(r, p);
+    }
+
+    fn state(&mut self, r: i32, next: i32, script: &[u8], mem: u32, labels_at: u16) {
+        let friendly = self.exports[(r - 1) as usize].name;
+        let mut p = compact(0);
+        p.extend(self.header(0, next, 0, friendly, script, mem));
+        p.extend(u64::MAX.to_le_bytes());
+        p.extend(u64::MAX.to_le_bytes());
+        p.extend(labels_at.to_le_bytes());
+        p.extend(0u16.to_le_bytes());
         self.set(r, p);
     }
 
@@ -2233,4 +2277,578 @@ fn touching_actors_iterator_filters_by_base_class() {
     };
     assert_eq!(items.len(), 1);
     assert_eq!(items[0], Value::Object(Some(ObjRef::Instance(b))));
+}
+
+// ---------------------------------------------------------------------------------------
+// `New` opcode: non-actor construction with class defaults
+
+/// `Object` with an int `Value` defaulting to 7 and two functions that `new` an `Object`
+/// or an `Actor`.
+fn new_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let make_object = b.reserve(IMP_FUNCTION, object, "MakeObject");
+    let make_actor = b.reserve(IMP_FUNCTION, object, "MakeActor");
+    let value = b.reserve(IMP_INTPROP, object, "Value");
+    let value_name = b.name("Value");
+    let object_extra = compact(0);
+    let mo_ret = b.reserve(IMP_OBJECTPROP, make_object, "ReturnValue");
+    let ma_ret = b.reserve(IMP_OBJECTPROP, make_actor, "ReturnValue");
+
+    // Child chain: Value -> MakeObject -> MakeActor; the returns are children of the functions.
+    b.prop_with(mo_ret, 0, PARM | RETURN_PARM, &object_extra);
+    b.prop_with(ma_ret, 0, PARM | RETURN_PARM, &object_extra);
+    b.prop(value, make_object, 0);
+
+    // `return new (None, None, None) Object;` — ObjectConst (0x20) + export ref.
+    let co = object as u8;
+    let ca = actor as u8;
+    let make_object_code = [0x04, 0x11, 0x0B, 0x0B, 0x0B, 0x20, co];
+    let make_actor_code = [0x04, 0x11, 0x0B, 0x0B, 0x0B, 0x20, ca];
+    b.func(
+        make_object,
+        make_actor,
+        mo_ret,
+        &make_object_code,
+        10,
+        0,
+        DEFINED,
+    );
+    b.func(make_actor, 0, ma_ret, &make_actor_code, 10, 0, DEFINED);
+    b.class_with_int_default(object, 0, value, 0, value_name, 7);
+    b.class(actor, object, 0, 0);
+    b.build()
+}
+
+fn new_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Test",
+        new_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+#[test]
+fn new_object_applies_defaults_and_makes_distinct_instances() {
+    let set = new_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let host = vm.spawn(sg(&set, "Object"), "Host").unwrap();
+    vm.set_active(host, true);
+    let id1 = match vm
+        .call_function(sg(&set, "Object.MakeObject"), host, vec![])
+        .unwrap()
+    {
+        Value::Object(Some(ObjRef::Instance(i))) => i,
+        other => panic!("expected an instance, got {other:?}"),
+    };
+    // Class defaults (Value = 7) are applied.
+    assert_eq!(vm.get_property(id1, "Value"), Some(&Value::Int(7)));
+    assert!(vm.is_a(id1, "Object") && !vm.is_a(id1, "Actor"));
+    let id2 = match vm
+        .call_function(sg(&set, "Object.MakeObject"), host, vec![])
+        .unwrap()
+    {
+        Value::Object(Some(ObjRef::Instance(i))) => i,
+        other => panic!("expected an instance, got {other:?}"),
+    };
+    assert_ne!(id1, id2, "each `new` is a fresh object");
+    // No lifecycle events: a non-actor gets no BeginPlay/PostBeginPlay.
+    assert!(
+        !vm.trace
+            .iter()
+            .any(|e| matches!(&e.kind, TraceKind::Event { target, .. } if target == "Object"))
+    );
+}
+
+#[test]
+fn new_on_actor_class_fails_explicitly() {
+    let set = new_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let host = vm.spawn(sg(&set, "Object"), "Host").unwrap();
+    vm.set_active(host, true);
+    let e = vm
+        .call_function(sg(&set, "Object.MakeActor"), host, vec![])
+        .unwrap_err();
+    assert!(
+        matches!(&e.kind, VmErrorKind::NewOnActor { class } if class.ends_with("Actor")),
+        "{e}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Animation natives, FinishAnim latency and SetViewTarget
+
+/// `Object`/`Actor`/`PlayerController` fixture with the animation channels, a latent
+/// `FinishAnim` state and `SetViewTarget`.
+fn anim_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pc = b.reserve(0, 0, "PlayerController");
+    let object_extra = compact(0);
+
+    let anim_sequence = b.reserve(IMP_NAMEPROP, actor, "AnimSequence");
+    let anim_rate = b.reserve(IMP_FLOATPROP, actor, "AnimRate");
+    let anim_frame = b.reserve(IMP_FLOATPROP, actor, "AnimFrame");
+    let banim_finished = b.reserve(IMP_BOOLPROP, actor, "bAnimFinished");
+    let mesh = b.reserve(IMP_OBJECTPROP, actor, "Mesh");
+    let counter = b.reserve(IMP_INTPROP, actor, "Counter");
+
+    let link = b.reserve(IMP_FUNCTION, actor, "LinkSkelAnim");
+    let link_anim = b.reserve(IMP_OBJECTPROP, link, "Anim");
+    let play = b.reserve(IMP_FUNCTION, actor, "PlayAnim");
+    let play_seq = b.reserve(IMP_NAMEPROP, play, "Sequence");
+    let play_rate = b.reserve(IMP_FLOATPROP, play, "Rate");
+    let play_tween = b.reserve(IMP_FLOATPROP, play, "TweenTime");
+    let play_ch = b.reserve(IMP_INTPROP, play, "Channel");
+    let loopf = b.reserve(IMP_FUNCTION, actor, "LoopAnim");
+    let loop_seq = b.reserve(IMP_NAMEPROP, loopf, "Sequence");
+    let loop_rate = b.reserve(IMP_FLOATPROP, loopf, "Rate");
+    let loop_tween = b.reserve(IMP_FLOATPROP, loopf, "TweenTime");
+    let loop_ch = b.reserve(IMP_INTPROP, loopf, "Channel");
+    let tween = b.reserve(IMP_FUNCTION, actor, "TweenAnim");
+    let tween_seq = b.reserve(IMP_NAMEPROP, tween, "Sequence");
+    let tween_time = b.reserve(IMP_FLOATPROP, tween, "Time");
+    let tween_ch = b.reserve(IMP_INTPROP, tween, "Channel");
+    let isanim = b.reserve(IMP_FUNCTION, actor, "IsAnimating");
+    let ia_ch = b.reserve(IMP_INTPROP, isanim, "Channel");
+    let ia_ret = b.reserve(IMP_BOOLPROP, isanim, "ReturnValue");
+    let finish = b.reserve(IMP_FUNCTION, actor, "FinishAnim");
+    let fin_ch = b.reserve(IMP_INTPROP, finish, "Channel");
+    let has = b.reserve(IMP_FUNCTION, actor, "HasAnim");
+    let has_seq = b.reserve(IMP_NAMEPROP, has, "Sequence");
+    let has_ret = b.reserve(IMP_BOOLPROP, has, "ReturnValue");
+    let animating = b.reserve(IMP_STATE, actor, "Animating");
+
+    let view_target = b.reserve(IMP_OBJECTPROP, pc, "ViewTarget");
+    let svt = b.reserve(IMP_FUNCTION, pc, "SetViewTarget");
+    let svt_param = b.reserve(IMP_OBJECTPROP, svt, "NewViewTarget");
+
+    b.prop(anim_sequence, anim_rate, 0);
+    b.prop(anim_rate, anim_frame, 0);
+    b.prop(anim_frame, banim_finished, 0);
+    b.prop(banim_finished, mesh, 0);
+    b.prop_with(mesh, counter, 0, &object_extra);
+    b.prop(counter, link, 0);
+
+    b.prop_with(link_anim, 0, PARM, &object_extra);
+    b.func(link, play, link_anim, &[], 0, 413, FINAL | NATIVE | STATIC);
+
+    b.prop(play_seq, play_rate, PARM);
+    b.prop(play_rate, play_tween, PARM);
+    b.prop(play_tween, play_ch, PARM);
+    b.prop(play_ch, 0, PARM);
+    b.func(play, loopf, play_seq, &[], 0, 259, FINAL | NATIVE | STATIC);
+
+    b.prop(loop_seq, loop_rate, PARM);
+    b.prop(loop_rate, loop_tween, PARM);
+    b.prop(loop_tween, loop_ch, PARM);
+    b.prop(loop_ch, 0, PARM);
+    b.func(loopf, tween, loop_seq, &[], 0, 260, FINAL | NATIVE | STATIC);
+
+    b.prop(tween_seq, tween_time, PARM);
+    b.prop(tween_time, tween_ch, PARM);
+    b.prop(tween_ch, 0, PARM);
+    b.func(
+        tween,
+        isanim,
+        tween_seq,
+        &[],
+        0,
+        294,
+        FINAL | NATIVE | STATIC,
+    );
+
+    b.prop(ia_ch, ia_ret, PARM);
+    b.prop(ia_ret, 0, PARM | RETURN_PARM);
+    b.func(isanim, finish, ia_ch, &[], 0, 282, FINAL | NATIVE | STATIC);
+
+    b.prop(fin_ch, 0, PARM);
+    b.func(
+        finish,
+        has,
+        fin_ch,
+        &[],
+        0,
+        261,
+        FINAL | NATIVE | STATIC | LATENT,
+    );
+
+    b.prop(has_seq, has_ret, PARM);
+    b.prop(has_ret, 0, PARM | RETURN_PARM);
+    b.func(
+        has,
+        animating,
+        has_seq,
+        &[],
+        0,
+        263,
+        FINAL | NATIVE | STATIC,
+    );
+
+    // State `Animating`: Counter=0; FinishAnim(0); Counter=1; stop.
+    let begin = b.name("Begin") as u8;
+    let rc = counter as u8;
+    let mut anim_code = vec![0x0F, 0x01, rc, 0x25];
+    anim_code.extend([0x61, 0x05, 0x25, 0x16]);
+    anim_code.extend([0x0F, 0x01, rc, 0x26]);
+    anim_code.push(0x08);
+    anim_code.extend([0x0C, begin, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b.state(animating, 0, &anim_code, 0x24, 0x13);
+
+    b.prop_with(view_target, svt, 0, &object_extra);
+    b.prop_with(svt_param, 0, PARM, &object_extra);
+    b.func(svt, 0, svt_param, &[], 0, 513, FINAL | NATIVE | STATIC);
+
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, anim_sequence, 0);
+    b.class(pc, actor, view_target, 0);
+    b.build()
+}
+
+fn anim_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Test",
+        anim_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+fn anim_end_count(vm: &Vm<'_>) -> usize {
+    vm.trace
+        .iter()
+        .filter(|e| matches!(e.kind, TraceKind::AnimEnd { .. }))
+        .count()
+}
+
+fn play_anim(vm: &mut Vm<'_>, id: ObjectId, seq: &str, rate: f32, ch: i32) {
+    let mut args = [
+        Value::Name(seq.to_owned()),
+        Value::Float(rate),
+        Value::Float(0.0),
+        Value::Int(ch),
+    ];
+    try_native(
+        vm,
+        "Engine.Actor.PlayAnim",
+        id,
+        &[false, false, false, false],
+        &mut args,
+    )
+    .expect("PlayAnim");
+}
+
+#[test]
+fn play_anim_fires_anim_end_once_at_the_right_tick() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(4, 1.0)));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    play_anim(&mut vm, a, "Walk", 1.0, 0);
+
+    // 4 frames at 1 fps with a 0.5 s step: 8 ticks exactly.
+    for _ in 0..7 {
+        vm.tick(0.5).unwrap();
+    }
+    assert!(
+        vm.anim_channel_active(a, 0),
+        "still animating before the end"
+    );
+    assert_eq!(anim_end_count(&vm), 0);
+    vm.tick(0.5).unwrap();
+    assert!(!vm.anim_channel_active(a, 0));
+    assert_eq!(anim_end_count(&vm), 1, "AnimEnd fires once at the end");
+    assert_eq!(
+        vm.get_property(a, "bAnimFinished"),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(vm.get_property(a, "AnimFrame"), Some(&Value::Float(4.0)));
+    // Further ticks do not fire it again.
+    vm.tick(0.5).unwrap();
+    assert_eq!(anim_end_count(&vm), 1);
+}
+
+#[test]
+fn loop_anim_loops_without_anim_end_and_reports_is_animating() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(4, 1.0)));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    let mut args = [
+        Value::Name("Walk".into()),
+        Value::Float(1.0),
+        Value::Float(0.0),
+        Value::Int(0),
+    ];
+    try_native(
+        &mut vm,
+        "Engine.Actor.LoopAnim",
+        a,
+        &[false, false, false, false],
+        &mut args,
+    )
+    .unwrap();
+    for _ in 0..20 {
+        vm.tick(0.5).unwrap();
+    }
+    assert_eq!(anim_end_count(&vm), 0, "LoopAnim never ends");
+    assert!(vm.anim_channel_active(a, 0));
+
+    let mut args = [Value::Int(0)];
+    let r = try_native(&mut vm, "Engine.Actor.IsAnimating", a, &[false], &mut args).unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Bool(true)));
+}
+
+#[test]
+fn finish_anim_resumes_state_code_on_anim_end() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(4, 1.0)));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    play_anim(&mut vm, a, "Walk", 1.0, 0);
+    vm.goto_state(a, "Animating", None).unwrap();
+    // First tick runs Counter=0 then suspends inside FinishAnim.
+    vm.tick(0.5).unwrap();
+    assert_eq!(vm.get_property(a, "Counter"), Some(&Value::Int(0)));
+    assert!(
+        vm.trace
+            .iter()
+            .any(|e| matches!(&e.kind, TraceKind::AnimSuspend { .. }))
+    );
+    for _ in 0..7 {
+        vm.tick(0.5).unwrap();
+    }
+    // The animation ended on tick 8: state code resumed and ran Counter=1, then stop.
+    assert_eq!(vm.get_property(a, "Counter"), Some(&Value::Int(1)));
+    assert!(
+        vm.trace.iter().any(|e| matches!(&e.kind, TraceKind::LatentResume { native, .. } if native == "Actor.FinishAnim"))
+    );
+    assert!(
+        vm.trace
+            .iter()
+            .any(|e| matches!(&e.kind, TraceKind::StateStop { .. }))
+    );
+}
+
+#[test]
+fn animation_without_provider_fails_and_survey_counts_it() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    let cases: [(&str, Vec<Value>, Vec<bool>); 4] = [
+        (
+            "Engine.Actor.PlayAnim",
+            vec![
+                Value::Name("Walk".into()),
+                Value::Float(1.0),
+                Value::Float(0.0),
+                Value::Int(0),
+            ],
+            vec![false, false, false, false],
+        ),
+        (
+            "Engine.Actor.LoopAnim",
+            vec![Value::Name("Walk".into())],
+            vec![false],
+        ),
+        (
+            "Engine.Actor.TweenAnim",
+            vec![Value::Name("Walk".into()), Value::Float(0.5)],
+            vec![false, false],
+        ),
+        (
+            "Engine.Actor.HasAnim",
+            vec![Value::Name("Walk".into())],
+            vec![false],
+        ),
+    ];
+    for (path, mut args, omitted) in cases {
+        let e = try_native(&mut vm, path, a, &omitted, &mut args).unwrap_err();
+        assert!(
+            matches!(&e.kind, VmErrorKind::NoAnimationProvider { native } if native == path.trim_start_matches("Engine.")),
+            "{path}: {e}"
+        );
+    }
+    // Survey mode counts it and continues.
+    vm.survey = true;
+    let mut args = [Value::Name("Walk".into())];
+    try_native(&mut vm, "Engine.Actor.LoopAnim", a, &[false], &mut args).unwrap();
+    let m = vm.missing_natives.get("Actor.LoopAnim").expect("counted");
+    assert_eq!(m.index, Some(260));
+    assert_eq!(m.calls, 1);
+}
+
+/// Test provider with explicit notify times.
+struct ScriptedAnim {
+    frames: u32,
+    rate: f32,
+    notifies: Vec<(f32, String)>,
+}
+
+impl crate::animation::AnimationData for ScriptedAnim {
+    fn sequence(&mut self, _mesh: &str, _seq: &str) -> Option<crate::animation::SeqInfo> {
+        Some(crate::animation::SeqInfo {
+            frames: self.frames,
+            rate: self.rate,
+            notifies: self.notifies.clone(),
+        })
+    }
+}
+
+#[test]
+fn animation_notifies_fire_when_crossed() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(ScriptedAnim {
+        frames: 4,
+        rate: 1.0,
+        notifies: vec![(0.5, "Notify".into())],
+    }));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    play_anim(&mut vm, a, "Walk", 1.0, 0);
+    // Notify at time01 0.5 == frame 2: crossed on the 4th 0.5 s tick.
+    for _ in 0..3 {
+        vm.tick(0.5).unwrap();
+    }
+    assert!(
+        !vm.trace
+            .iter()
+            .any(|e| matches!(e.kind, TraceKind::AnimNotify { .. }))
+    );
+    vm.tick(0.5).unwrap();
+    let n = vm
+        .trace
+        .iter()
+        .filter(
+            |e| matches!(&e.kind, TraceKind::AnimNotify { function, .. } if function == "Notify"),
+        )
+        .count();
+    assert_eq!(n, 1, "notify fires exactly once");
+}
+
+#[test]
+fn link_skel_anim_records_the_mesh() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    let mesh = sg(&set, "Actor");
+    let mut args = [Value::Object(Some(ObjRef::Static(mesh)))];
+    try_native(&mut vm, "Engine.Actor.LinkSkelAnim", a, &[false], &mut args).unwrap();
+    assert_eq!(
+        vm.get_property(a, "Mesh"),
+        Some(&Value::Object(Some(ObjRef::Static(mesh))))
+    );
+    assert!(vm.objects[a as usize].anim.mesh.ends_with("Actor"));
+}
+
+#[test]
+fn set_view_target_sets_the_field() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pc = vm.spawn(sg(&set, "PlayerController"), "PC").unwrap();
+    let target = vm.spawn(sg(&set, "Actor"), "T").unwrap();
+    let mut args = [Value::Object(Some(ObjRef::Instance(target)))];
+    try_native(
+        &mut vm,
+        "Engine.PlayerController.SetViewTarget",
+        pc,
+        &[false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(
+        vm.get_property(pc, "ViewTarget"),
+        Some(&Value::Object(Some(ObjRef::Instance(target))))
+    );
+}
+
+#[test]
+fn vector_rotator_operators_match_the_basis() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    let rotate = |vm: &mut Vm<'_>, path: &str, v: [f32; 3], r: [i32; 3]| -> [f32; 3] {
+        let mut args = [Value::Vector(v), Value::Rotator(r)];
+        match try_native(vm, path, a, &[false, false], &mut args).unwrap() {
+            NativeOutcome::Value(Value::Vector(out)) => out,
+            other => panic!("{other:?}"),
+        }
+    };
+    let close = |a: [f32; 3], b: [f32; 3]| (0..3).all(|i| (a[i] - b[i]).abs() < 1e-4);
+
+    // Identity rotator: both directions are the identity.
+    assert!(close(
+        rotate(
+            &mut vm,
+            "Object.GreaterGreater_VectorRotator",
+            [1.0, 2.0, 3.0],
+            [0, 0, 0]
+        ),
+        [1.0, 2.0, 3.0]
+    ));
+    assert!(close(
+        rotate(
+            &mut vm,
+            "Object.LessLess_VectorRotator",
+            [1.0, 2.0, 3.0],
+            [0, 0, 0]
+        ),
+        [1.0, 2.0, 3.0]
+    ));
+    // Yaw 16384 == 90 degrees: local+X becomes world+Y.
+    assert!(close(
+        rotate(
+            &mut vm,
+            "Object.GreaterGreater_VectorRotator",
+            [1.0, 0.0, 0.0],
+            [0, 16384, 0]
+        ),
+        [0.0, 1.0, 0.0]
+    ));
+    assert!(close(
+        rotate(
+            &mut vm,
+            "Object.LessLess_VectorRotator",
+            [0.0, 1.0, 0.0],
+            [0, 16384, 0]
+        ),
+        [1.0, 0.0, 0.0]
+    ));
+    // Pitch 16384 == 90 degrees: local+X becomes world+Z.
+    assert!(close(
+        rotate(
+            &mut vm,
+            "Object.GreaterGreater_VectorRotator",
+            [1.0, 0.0, 0.0],
+            [16384, 0, 0]
+        ),
+        [0.0, 0.0, 1.0]
+    ));
+    // Round trip local -> world -> local.
+    let r = [4096, 12000, 3000];
+    let v = [3.0, -1.0, 2.0];
+    let world = rotate(&mut vm, "Object.GreaterGreater_VectorRotator", v, r);
+    let back = rotate(&mut vm, "Object.LessLess_VectorRotator", world, r);
+    assert!(close(back, v), "{back:?}");
 }

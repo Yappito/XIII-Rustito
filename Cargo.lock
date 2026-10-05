@@ -4917,6 +4917,7 @@ dependencies = [
  "xiii-install",
  "xiii-package",
  "xiii-script",
+ "xiii-world",
 ]
 
 [[package]]
@@ -4955,6 +4956,17 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "xiii-audio",
+ "xiii-decode",
+ "xiii-install",
+ "xiii-package",
+ "xiii-script",
+]
+
+[[package]]
+name = "xiii-world"
+version = "0.1.0"
+dependencies = [
+ "xiii-collision",
  "xiii-decode",
  "xiii-install",
  "xiii-package",

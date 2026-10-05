@@ -1,40 +1,40 @@
 # Handoff for the next implementation agent
 
-Updated: **2026-10-05**. Research phase (2026-10-04) plus the first implementation sessions (M0, M1, M2 first passes) are complete. The next session should start with **"Next session: start here"** below.
+Updated: **2026-10-05 (second session)**. Research phase (2026-10-04), M0, M1 and the M2 first passes are done; the second 2026-10-05 session added collision, placement, BSP zones and the script VM's spawn/lifecycle/physics layer. Start with **"Next session: start here"** below.
 
 ## Next session: start here
 
-State at the end of the 2026-10-05 session: everything is committed and pushed (`main` at `7da4862` or later on `git@github.com:Yappito/XIII-Rustito.git`). The working tree was clean apart from this handoff update. Results are in "Implementation status", the priority list is in "Exact next work".
+State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `148a4bb` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
 ### How the user wants work organized
 
-- The coordinating Claude session **oversees and reviews**. It avoids bloating its own context: it delegates implementation and does not read large files or transcripts itself.
-- **New preference (2026-10-05):** use **opencode CLI with `ollama-cloud/deepseek-v4.1-flash`** for the grunt work. Claude writes task specs, runs opencode headless, then reviews the result with git diff, fmt/clippy/tests, corpus checks and screenshots, sends corrections, and commits only verified work. Keep reverse-engineering judgement calls and final verification on the Claude side. If opencode is unavailable, fall back to Claude sub-agents (the Agent tool), as used so far.
-- The user is fine with commits and pushes to `origin/main` after the checks pass. Commit messages end with the Co-Authored-By line from the session's attribution reminder. Ask before other outward-facing actions.
-- Ask the user when a decision is genuinely theirs. Report honestly: a map viewer is not a playable mission, and a headless trace is not gameplay.
+- The coordinating Claude session **oversees and reviews**; it keeps its own context small and delegates implementation.
+- Delegation uses the **opencode CLI**, currently **`opencode-go/deepseek-v4.1-flash`** (OpenCode Go provider, added by the user after the Ollama Cloud Pro 5-hour limit was hit; `ollama-cloud/*` models also work when that quota is available, and the user briefly preferred `glm-5.3-flash`, which exists on both providers). **On a usage-limit error, ask the user before switching provider/subscription.** If opencode is unavailable, fall back to Claude sub-agents.
+- Claude writes one spec per task under git-ignored `local/tasks/`, runs opencode headless, reviews (diff, fmt/clippy/full tests incl. opt-in corpus, screenshots, semantics against UE2), sends corrections in the same session, then commits and pushes verified work to `origin/main` (commit messages end with the session's Co-Authored-By line). Ask before other outward-facing actions.
+- Report honestly: a map viewer is not a playable mission, a headless trace is not gameplay.
+- Credentials: the user enters API keys themselves (`opencode auth login`). Never enter a key yourself, even if pasted in chat; give the user the command instead.
 
-### opencode setup status
+### opencode workflow (verified 2026-10-05)
 
-- Installed with `winget install SST.opencode` (v1.18.33). Executable: `%LOCALAPPDATA%\Microsoft\WinGet\Packages\SST.opencode_Microsoft.Winget.Source_8wekyb3d8bbwe\opencode.exe`. That folder is on the **user** PATH, but processes started before the install (Claude Desktop and its terminals) don't see it until restarted. Use the full path when in doubt.
-- `opencode models` lists `ollama-cloud/deepseek-v4.1-flash` (also `deepseek-v4-pro`, `kimi-k2.7-code`, `glm-5.3`, ...).
-- **Credentials:** the user enters the Ollama Cloud key themselves with `opencode auth login` (provider "Ollama Cloud"). Never ask for the key in chat, and never write it into repo files. When this handoff was written, the login had been explained but not yet confirmed. Check with `opencode auth list`, or by running a trivial `opencode run` against the model.
-- **Not done yet:**
-  1. Smoke-test: `opencode run -m ollama-cloud/deepseek-v4.1-flash "<trivial task>"` in `P:\AI\XIII`. Confirm it can read `AGENTS.md`, edit a file and run `cargo`.
-  2. Add a project `opencode.json` with permission guardrails. Verify the permission syntax against the installed version's schema (`https://opencode.ai/config.json`, or `opencode debug config`) before relying on it. It should deny edits under `XIII_Game/**` and outside the repo, deny `git push`, `git commit`, `winget`/`npm install`/`cargo install`, and anything touching the Steam install. Allow cargo, git status/diff, and reads.
-  3. Planned workflow: one spec file per task under git-ignored `local/tasks/` (exact files and ownership, tests to add, acceptance commands, prohibitions such as no proprietary bytes in fixtures and no edits to the game dirs). Run `opencode run -m ollama-cloud/deepseek-v4.1-flash --file local/tasks/<task>.md "Implement the attached spec"`, or put the spec in the message. Use `--continue` / `--session <id>` for corrections. Check the real flags with `opencode run --help`. Use a per-task `CARGO_TARGET_DIR` if tasks run in parallel.
+- Executable: `%LOCALAPPDATA%\Microsoft\WinGet\Packages\SST.opencode_Microsoft.Winget.Source_8wekyb3d8bbwe\opencode.exe` (v1.18.33; may not be on PATH). Credentials: OpenAI, Ollama Cloud, Z.AI Coding Plan, OpenCode Go.
+- Command: `opencode run "<message>" -m opencode-go/deepseek-v4.1-flash --auto --title <t> [--dir <worktree>] --file local/tasks/<spec>.md`. The **message must come before `--file`** (array option swallows it). `--auto` is required headless; deny rules still apply. Corrections: `--session <id>` (`opencode session list`). Run through the Bash tool with `run_in_background` (not nohup) to get completion notices.
+- `opencode.json` (committed): permission guardrails (deny edits to `XIII_Game`, Steam, `.git`, coordinator files; deny commit/push/reset/checkout/stash, installers, `cargo add/update/install`, and any bash command mentioning the protected files) and `"instructions": ["docs/AGENT_TASK_RULES.md"]`, which loads the shared delegate rules into every session.
+- `docs/AGENT_TASK_RULES.md`: acceptance cases are a contract (no swapped cases), no tuning to pass, claim labels (measured / upstream / hypothesis), invariant checks (units, scale invariance), adversarial tests, a Deviations section, self-review, "do not stop early", never touch unowned files. Each rule exists because a delegate broke it once.
+- Parallel tasks run in git worktrees under `local/wt/<name>` (branch per task) with a directory junction `XIII_Game -> P:\AI\XIII\XIII_Game`; use an absolute `XIII_GOG_DIR` inside the worktree. Merge `origin/main` into the task branch, verify there, push `HEAD:main`.
+- Observed failure modes: models end their turn after investigating (resume with "do not end your turn until ..."); swapping the requested acceptance case; scale-invariance reasoning errors; silent no-op natives; inverted operator semantics; a delegate reverting a coordinator edit through a shell script (now denied). Review semantics, not just green tests.
 
-### Environment notes for the next session
+### Environment notes
 
-- cargo/rustc are in `C:\Users\ZoliBen\.cargo\bin`. Git Bash: `export PATH="$HOME/.cargo/bin:$PATH"`. Rust 1.99.0 is pinned. MSVC 14.44 Build Tools are installed. No `gh` CLI.
-- Full verification (about 2 minutes warm):
-  `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && XIII_GOG_DIR=P:/AI/XIII/XIII_Game XIII_STEAM_DIR="P:/SteamLibrary/steamapps/common/XIII - Classic" cargo test --workspace`. Last result: 153 passed, 0 failed.
-- Viewer: `cargo run -p xiii-app --release -- --map Plage01 --game-dir P:/AI/XIII/XIII_Game` (add `--exit-after-secs N --screenshot <png>` for unattended checks). Smoke test: `cargo run -p xiii-app`.
-- Scratch outputs (screenshots, traces, disassembly) went to the session scratchpad, which is temporary. Re-create them under git-ignored `local/` if needed. Proprietary-derived outputs must never be committed.
-- Bash heredocs containing long Python can trip the tool's quoting. Write scripts to a file first, then run them.
+- cargo/rustc in `C:\Users\ZoliBen\.cargo\bin` (Git Bash: `export PATH="$HOME/.cargo/bin:$PATH"`). Rust 1.99.0 pinned, MSVC 14.44. No `gh` CLI.
+- Full verification (about 2-4 minutes warm): `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && XIII_GOG_DIR=P:/AI/XIII/XIII_Game XIII_STEAM_DIR="P:/SteamLibrary/steamapps/common/XIII - Classic" cargo test --workspace`. Last result (`148a4bb`): **205 passed, 0 failed**. Use absolute paths: some older opt-in tests resolve relative `XIII_GOG_DIR` against the crate directory.
+- Viewer: `cargo run -p xiii-app --release -- --map Plage01 --game-dir XIII_Game` (`--exit-after-secs N --screenshot <png>`, `--dump`, `--collision-test`).
+- Reports and screenshots of each task: `local/reports/` (git-ignored; proprietary-derived outputs never committed).
 
-### Immediate next task
+### In flight when this was written
 
-Start item 1 of "Exact next work" (close the M2a exit): a collision capsule/cylinder sweep, the Plage01 `Porte6` doorway test, and scale calibration from Pawn collision defaults. In parallel, candidates are item 3 (`Actor.Spawn` and the actor lifecycle in `xiii-script`) and item 2 (skinned character in the viewer). These touch disjoint crates except `xiii-app`, so don't run items 1 and 2 concurrently in `xiii-app`.
+- `item1d-world-walker` (main tree): extract the Bevy-free `xiii-world` crate from `xiii-app/src/viewer/load.rs`, a `WorldPhysics` adapter (Unreal space) on `xiii-collision`, and UE2-style `walk_move` (step-up at `MAXSTEPHEIGHT` 35 UU, floor-follow, `MINFLOORZ` 0.7) so the PlayerStart doorway case can pass. Spec `local/tasks/item1d-world-crate-walker.md`.
+- `item3c-new-anim` (worktree `local/wt/item3`): `New` opcode, animation natives through an `AnimationData` provider trait, `SetViewTarget`, next survey ranking. Spec in that worktree's `local/tasks/`.
+- `item6-audio` (worktree `local/wt/audio`): `xiii-audio` crate, HX `.hxc`/`.hsc` parsing, one codec decode, `.uax` linkage. Spec `local/tasks/item6-audio-spike.md`.
 
 ## User intent
 
@@ -69,6 +69,7 @@ Implementation started on 2026-10-04. M0 and M1 are complete; first passes of al
 | `crates/xiii-install` | Read-only installation open/profile detection/case-insensitive logical index (no deps) | Done for GOG + patched Steam; no precedence rule needed (no duplicates found) |
 | `crates/xiii-decode` | Payload decoders to normalized assets (textures, palettes, static meshes, BSP Model/Polys, terrain, skeletal meshes, animation) and the single Unreal-to-Bevy coordinate policy (`common.rs`) | M2a/M2b first pass; see below |
 | `crates/xiii-script` | UStruct/UClass/UFunction/UState/UProperty reflection, bytecode decoder/disassembler, native catalog, `class_defaults()`, minimal VM + native registry | M2c first pass; see below |
+| `crates/xiii-collision` | Dependency-free collision: BVH, SAT swept AABB (two-sided; start contact skipped only when not moving into it), ray, overlap, `move_slide` (approximation) | Added 2026-10-05 (second session) |
 | `crates/xiii-tool` | CLI: `inspect`, `corpus`, `props`, `coverage`, `deps`, `world-coverage` (+ world dump commands), `anim coverage/list/validate/render/export`, `script classes/functions/disasm/natives/coverage/run` | Working |
 | `crates/xiii-app` | Bevy 0.19.1 runtime: M0 smoke test (default) and diagnostic map viewer (`--map Plage00 --game-dir <root>`) | Working natively |
 
@@ -107,6 +108,27 @@ Each crate has a README with verified layouts, evidence and rationale.
 - Minimal VM (no Bevy/filesystem): loads all 371 Plage00 actors with class defaults + map properties (0 failures); state-aware virtual dispatch, labels, latent `Sleep`, iterators, out params, Accessed-None semantics, per-tick budget, explicit errors with script stack traces. 47-entry native registry with evidence/status.
 - A real authored chain runs unmodified: `TouchTrigger2.Touch` -> `DynamicActors` -> `XIIIDispatcher0` enters `Dispatch`, `Sleep`s, resumes, triggers BaseSoldier15/14 (logged **DEFERRED**, out of scope) and ends in `Fin`. Widening the scope to soldiers fails explicitly at `UnimplementedNative Actor.Spawn (#278)`. Touch is delivered by the harness (no collision yet).
 - **Go/no-go: GO** on retaining compiled campaign logic. Remaining cost is the native layer (~200 distinct native numbers called by game packages), not the VM. Native semantics have not been checked against original-engine behavior.
+
+### Second 2026-10-05 session results — measured, not playable
+
+Per-task reports with all numbers and commands: `local/reports/item1-collision.md`, `item1c-placement.md`, `item1b-bsp-tail.md` (in `local/wt/bsp`), `item3-spawn-lifecycle.md`, `item3b-physics-bridge.md` (in `local/wt/item3`).
+
+**Collision / doorway / scale (M2a exit, partial)** — `cargo run -p xiii-app --release -- --map Plage01 --game-dir XIII_Game --collision-test`
+- Player: `XIII.XIIIPlayerPawn` (via `Default.ini DefaultGame=XIII.XIIIGameInfo` -> `DefaultPlayerClassName`); inherited defaults CollisionRadius 34, CollisionHeight 75 (half), BaseEyeHeight 60, GroundSpeed 472, JumpZ 420. `xiii-tool script defaults <pkg> <Class>` prints resolved inherited defaults.
+- Extent-box primitive (UE2 world collision uses an axis-aligned extent box; upstream claim, unverified for XIII). 24,369 Plage01 collision triangles, BVH build ~9 ms.
+- `Porte6` (`XIDCine.Porte`, mesh `StaticPlage2.Pl_porte01T`): **aligned door case PASS** (closed: blocked by Porte6; open: passes 27.7 m beyond). Clear opening ~2.56 m x 4.16 m at 50 u/m (128 x 208 UU). **PlayerStart case FAIL**: walker stuck on a 1.8 UU plank edge of `GR_interieur01` (no floor-following/step-up in `move_slide`); being fixed by `walk_move` (in flight).
+- Scale (fit is scale-invariant; only metres change): pawn 150 UU tall, visible mesh `xiiipersos.XIIIM` bind pose 160.3 UU, door 208 UU. Human-size assumptions give **~85-105 UU/m**, i.e. the 50 u/m constant is ~2x too small. **Not changed yet** — decide with original-engine captures or accept the estimate (a coordinator/user decision).
+- Placement: map property -> inherited class default -> engine default, counted per field (`placement.*` counters). PrePivot applied (`T(L) R S T(-PrePivot)`) but 0 placed mesh actors on Plage00/01 have one, so sign/order is not empirically verified. PlayerStart rests on the floor per the UE2 rule (map CollisionHeight 10, residual +2 UU). Static-mesh collision set 0 equals render geometry for `GR_interieur01`.
+
+**BSP zones** — `xiii-tool zones XIII_Game/Maps/Plage01.unr`
+- After NumZones: u32 (always 0), NumZones variable-length zone records `{compact ZoneActor, u64 Connectivity, u64 (labelled Visibility; values look like uninitialised floats, semantics unverified), f32 LastRenderTime}`, then the Polys reference. 7,194/7,194 Models; zone actors ZoneInfo 334 / SkyZoneInfo 35; Connectivity invariant 1,350/1,350; leaf->zone from nodes 0 conflicts. Sky zones: Plage00 zone 3, Plage01 zone 4. Remaining tail `model.lightmaps_and_after` 9,496,581 B (arrays after Polys fail on the 13 maps with non-empty LightMap; not guessed).
+
+**Script VM growth (M2c -> M3)** — `xiii-tool script run --game-dir XIII_Game --map Plage00 [--begin-play] [--survey] [--physics flat:0]`
+- `Actor.Spawn`/`Destroy`, lifecycle tables (level start: PreBeginPlay, BeginPlay, PostBeginPlay, PostNetBeginPlay, SetInitialState; runtime spawn adds Spawned first; cross-actor grouping is a hypothesis), GameInfo from `Default.ini` + `InitGame` (spawns XIIISoloMutator etc.).
+- Exact omitted-optional-argument presence (EX_Nothing) for natives; ~45 more natives (strings with FString clamping, `~=` case-insensitive equality, case-sensitive `InStr`, vectors/rotators, AllActors, pawn/controller lists, seeded deterministic FRand/Rand, DynamicLoadObject with class check, native-class identity).
+- `WorldPhysics` provider trait (Unreal space) + `Move`/`SetLocation`/`Trace`/`FastTrace`/`SetCollision`/`SetCollisionSize`/`TouchingActors`; actor touching from XIII's decoded `Actor.TouchingActor` cylinder test with symmetric Touch/UnTouch. Without a provider these fail explicitly. `--physics flat:<z>` is a diagnostic floor only.
+- Plage00 all-classes survey: 3 missing natives left (`LinkSkelAnim`, `LoopAnim`, `SetViewTarget`), then the `New` opcode (in flight: item3c). The Plage00 dispatcher chain with soldiers active runs to `Fin` past `Actor.Spawn`.
+- Semantics references: UE2 conventions; `dpjudas/SurrealEngine@380f525` (UE1 reimplementation) consulted for Move/Trace return conventions, no code copied.
 
 ### Verified results
 
@@ -162,14 +184,14 @@ Native Windows reports an RTX 4090. Rust/Cargo were not found on the inspected W
 
 ## Exact next work
 
-M0/M1 done; M2a/b/c first passes done (see above). Remaining work, in priority order:
+M0/M1 done; M2a/b/c first passes done; second 2026-10-05 session closed most of the M2a exit and grew the VM toward M3 (see above). Remaining work, in priority order:
 
-1. **Close the M2a exit:** capsule/cylinder sweep against decoded collision (static-mesh collision, BSP, terrain) with a doorway pass test on Plage01 (`Porte6`); calibrate scale from the player collision cylinder (Pawn defaults via `class_defaults()`); decode enough of the BSP tail (zones/leaves) for zone/sky handling; apply class defaults and PrePivot to actor placement.
-2. **Animation in the runtime:** upload a decoded skeletal mesh + clip into Bevy (skinned mesh) in the viewer; place map Pawns with their meshes; compare several frames against original-game captures.
-3. **Native layer growth (M2c to M3):** `Actor.Spawn` (#278) and the actor lifecycle (PreBeginPlay/BeginPlay/PostBeginPlay, GameInfo), timers, collision-driven `Touch`/`UnTouch`, then AI/pathing/animation natives in campaign-dependency order. Track per-native status in the registry. Integrate the VM with the Bevy fixed-step simulation schedule, keeping one authoritative owner per field.
-4. **Original-engine reference captures** (still outstanding from M0): isolated writable copy; opening map order, movement speed/scale, event timing for the Plage00 dispatcher chain.
-5. **Materials:** sky zone/skybox, translucency/modulation, SinusModifier and similar, vertex lighting; then the comic outline treatment.
-6. **Audio spike** (HX banks / vgmstream) before M3.
+1. **Finish the M2a exit:** review/land `item1d` (`xiii-world` crate, `WorldPhysics` adapter, `walk_move`); the PlayerStart doorway case must pass legitimately or be explained. Then wire the real map physics into `xiii-tool script run` (`--physics map`) so `Move`/`Trace` run against Plage00/01 collision. Decide the units-per-metre constant (estimate ~85-105 UU/m vs current 50; needs a user/coordinator decision or original-engine captures). Sky zone handling in the viewer using the decoded zones.
+2. **Animation in the runtime:** land `item3c` (`New`, animation natives via `AnimationData`, `SetViewTarget`); then implement `AnimationData` from decoded MeshAnimation (`xiii-decode`), upload a skinned mesh + clip into Bevy in the viewer, place map Pawns with their meshes; compare frames against original-game captures.
+3. **Native layer growth (M3):** continue the survey ranking after item3c in campaign-dependency order (AI/pathing next); timers; integrate the VM with the Bevy fixed-step schedule, one authoritative owner per field (VM owns script state; physics owns positions via the provider).
+4. **Original-engine reference captures** (needs the user / an isolated writable copy): opening map order, movement speed/scale, event timing for the Plage00 dispatcher chain. This would also settle the scale constant.
+5. **Materials:** skybox from the sky zone, translucency/modulation, SinusModifier, vertex lighting (BSP lightmap arrays still undecoded), then the comic outline treatment.
+6. **Audio:** land `item6` (HX bank parsing/decoding spike), then Bevy playback and `.uax` sound-object mapping.
 
 Do not stop at a generic Bevy FPS sample. Do not report playable progress from the map viewer or the headless VM trace.
 

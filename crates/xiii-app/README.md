@@ -28,23 +28,34 @@ drops the box to the floor and walks it through the doorway twice with `move_sli
 - **open** (`Porte6` sources excluded): expected to pass >= 1 m beyond the door plane.
 
 Each case prints a `PASS`/`FAIL` line with the blocking source path, contact normal and
-height, plus timings. The 50 units/m constant is not changed; the measured calibration data
-is in `local/reports/item1-collision.md`. The player pawn resolves to `XIII.XIIIPlayerPawn`
-(CollisionRadius 34, CollisionHeight 75 — a half height — via `XIII.XIIIPawn` -> `Engine.Pawn`).
-An opt-in integration test (`tests/local_collision.rs`, `XIII_GOG_DIR`) asserts both cases.
+height, plus timings. The PlayerStart case uses the UE2-style `xiii_collision::walk_move`
+(step-up on non-walkable contacts, floor following; `MINFLOORZ` 0.7 and upstream
+`MAXSTEPHEIGHT` 35 UU converted with the coordinate policy); the aligned door case and a
+labelled `move_slide` diagnostic line are kept for comparison. The 50 units/m constant is not
+changed; the measured calibration data is in `local/reports/item1-collision.md`. The player
+pawn resolves to `XIII.XIIIPlayerPawn` (CollisionRadius 34, CollisionHeight 75 — a half height
+— via `XIII.XIIIPawn` -> `Engine.Pawn`). An opt-in integration test
+(`tests/local_collision.rs`, `XIII_GOG_DIR`) asserts the aligned door case.
 
-`src/viewer/load.rs` imports the map without Bevy types, using `xiii-install` for read-only
-package resolution and `xiii-decode`. It places static-mesh actors (Location, Rotation,
-DrawScale x DrawScale3D; PrePivot ignored), the level BSP and the terrain heightfield, and bakes
-the terrain layers into one texture. Materials are followed through
+The map import itself lives in the Bevy-free `xiii-world` crate (moved out of
+`src/viewer/load.rs`); `xiii-app` keeps only the Bevy conversion. It imports the map using
+`xiii-install` for read-only package resolution and `xiii-decode`. Actor placement uses
+**effective** values: the map's
+tagged property if present, else the inherited class default resolved read-only through
+`xiii_script` (`Vm::class_layout`), else the documented `Engine.Actor` default; the source of
+every field is counted (`placement.<field>.map|class_default|engine_default`). `PrePivot` is
+applied before scale/rotation (`xiii_decode::common::actor_to_bevy_pre_pivot`). It places
+static-mesh actors, the level BSP and the terrain heightfield, and bakes the terrain layers
+into one texture. Materials are followed through
 Shader/FinalBlend/Tex*/SinusModifier/Combiner down to a texture and drawn unlit with a
 `StandardMaterial`; unresolved materials are drawn magenta. Every skipped item is a `skip.*`,
 `fail.*` or `note.*` counter, shown in the overlay and printed. The crosshair reports the
 object path (CPU ray against the render triangles). The fly camera starts at the PlayerStart
 (or `--view x,y,z,yaw,pitch`, given in Bevy metres and degrees). `--dump` imports without a
-window and adds collision ray probes. Known gaps: no skybox (sky-backdrop BSP surfaces are
-skipped and counted), translucent/modulated sea materials render dark, and there is no vertex
-lighting. This is an importer diagnostic, not a playable mode.
+window, adds collision ray probes, per-map placement statistics (top-20 actors by `|PrePivot|`)
+and the `placement.*` provenance counters. Known gaps: no skybox (sky-backdrop BSP surfaces
+are skipped and counted), translucent/modulated sea materials render dark, and there is no
+vertex lighting. This is an importer diagnostic, not a playable mode.
 
 ## Run
 

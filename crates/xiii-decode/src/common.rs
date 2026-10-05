@@ -714,10 +714,12 @@ impl<'p> Props<'p> {
 // Coordinate conversion (the only place where Unreal axes become Bevy axes).
 // ---------------------------------------------------------------------------------------
 
-/// Provisional scale: Unreal units per metre. **Not measured** for XIII; chosen so that the
-/// imported beach has plausible human scale in the diagnostic viewer. Calibrate against the
-/// player collision cylinder and original captures before using it for movement.
-pub const UNREAL_UNITS_PER_METER: f32 = 50.0;
+/// Scale: Unreal units per metre. **Estimated, not measured against the original engine**
+/// (decided 2026-10-05). Evidence (scale-free sizes in UU): player pawn collision 150 tall
+/// (`XIIIPawn` CollisionHeight 75 half), visible `xiiipersos.XIIIM` bind pose 160.3, `Porte6`
+/// door opening 208. Human-size assumptions give ~85-105 UU/m; 90 puts the visible character
+/// at ~1.78 m and the door at ~2.3 m. Replace with original-engine captures when available.
+pub const UNREAL_UNITS_PER_METER: f32 = 90.0;
 
 /// Unreal rotator units per full turn.
 pub const ROTATOR_UNITS_PER_TURN: f32 = 65536.0;
@@ -852,6 +854,51 @@ pub fn actor_to_bevy(location: [f32; 3], rotation: [i32; 3], scale: [f32; 3]) ->
     }
 }
 
+/// World-space (source axes) location of an actor whose mesh-space point `pre_pivot` lands on
+/// `location`, i.e. `T(Location) * R * S * T(-PrePivot) * pre_pivot = Location`. Adding this
+/// shifted location and using [`actor_to_bevy`] is equivalent to applying `T(-PrePivot)` to
+/// every mesh-space point before scale and rotation, because there is only one rotation:
+/// `Location + R*(S*(v - PrePivot)) = (Location - R*(S*PrePivot)) + R*(S*v)`.
+pub fn pre_pivot_shifted_location(
+    location: [f32; 3],
+    rotation: [i32; 3],
+    scale: [f32; 3],
+    pre_pivot: [f32; 3],
+) -> [f32; 3] {
+    let r = unreal_rotator_matrix(rotation);
+    let s = [
+        pre_pivot[0] * scale[0],
+        pre_pivot[1] * scale[1],
+        pre_pivot[2] * scale[2],
+    ];
+    [
+        location[0] - (r[0][0] * s[0] + r[0][1] * s[1] + r[0][2] * s[2]),
+        location[1] - (r[1][0] * s[0] + r[1][1] * s[1] + r[1][2] * s[2]),
+        location[2] - (r[2][0] * s[0] + r[2][1] * s[1] + r[2][2] * s[2]),
+    ]
+}
+
+/// Converts an actor placement with `PrePivot` applied **before scale/rotation**, the upstream
+/// UE2 hypothesis: a mesh-space point becomes `T(Location) * R * S * T(-PrePivot) * v` (the
+/// stored `PrePivot` is the mesh-space point that maps to `Location`). Equivalent to
+/// [`actor_to_bevy`] with the translation shifted by [`pre_pivot_shifted_location`].
+///
+/// The sign/order could not be distinguished empirically on Plage00/Plage01: no placed
+/// renderable actor on either map (or in the other GOG campaign maps) has a non-zero effective
+/// `PrePivot`; see `local/reports/item1c-placement.md`. The upstream formula is implemented.
+pub fn actor_to_bevy_pre_pivot(
+    location: [f32; 3],
+    rotation: [i32; 3],
+    scale: [f32; 3],
+    pre_pivot: [f32; 3],
+) -> BevyTransform {
+    actor_to_bevy(
+        pre_pivot_shifted_location(location, rotation, scale, pre_pivot),
+        rotation,
+        scale,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,7 +921,10 @@ mod tests {
         assert_eq!(to_bevy_direction([1.0, 0.0, 0.0]), [0.0, 0.0, -1.0]);
         assert_eq!(to_bevy_direction([0.0, 1.0, 0.0]), [1.0, 0.0, 0.0]);
         assert_eq!(to_bevy_direction([0.0, 0.0, 1.0]), [0.0, 1.0, 0.0]);
-        assert_eq!(to_bevy_position([50.0, 0.0, 0.0]), [0.0, 0.0, -1.0]);
+        assert_eq!(
+            to_bevy_position([UNREAL_UNITS_PER_METER, 0.0, 0.0]),
+            [0.0, 0.0, -1.0]
+        );
         assert!(
             (mat3_det(&SOURCE_TO_BEVY) + 1.0).abs() < 1e-6,
             "handedness change"
@@ -955,6 +1005,71 @@ mod tests {
         assert!(
             dot > 0.0,
             "Bevy CCW normal agrees with the converted stored normal"
+        );
+    }
+
+    #[test]
+    fn pre_pivot_shift_matches_point_apply() {
+        // T(L)*R*S*T(PrePivot) applied to a point equals actor_to_bevy with the shifted
+        // location: `L + R*(S*PrePivot) + R*(S*v)`.
+        let (l, r, s, pp) = (
+            [10.0, 20.0, 30.0],
+            [2000, -10000, 5000],
+            [2.0, 3.0, 4.0],
+            [7.0, -5.0, 11.0],
+        );
+        let rm = unreal_rotator_matrix(r);
+        let apply = |v: [f32; 3]| -> [f32; 3] {
+            // p' = v - PrePivot, then scale, rotate, translate (the implemented order).
+            let sv = [
+                (v[0] - pp[0]) * s[0],
+                (v[1] - pp[1]) * s[1],
+                (v[2] - pp[2]) * s[2],
+            ];
+            let rv = [
+                rm[0][0] * sv[0] + rm[0][1] * sv[1] + rm[0][2] * sv[2],
+                rm[1][0] * sv[0] + rm[1][1] * sv[1] + rm[1][2] * sv[2],
+                rm[2][0] * sv[0] + rm[2][1] * sv[1] + rm[2][2] * sv[2],
+            ];
+            [l[0] + rv[0], l[1] + rv[1], l[2] + rv[2]]
+        };
+        let t = actor_to_bevy_pre_pivot(l, r, s, pp);
+        let m = rotator_to_bevy_matrix(r);
+        let transform_point = |p: [f32; 3]| -> [f32; 3] {
+            let local = to_bevy_position(p);
+            [
+                m[0][0] * local[0] * t.scale[0]
+                    + m[0][1] * local[1] * t.scale[1]
+                    + m[0][2] * local[2] * t.scale[2]
+                    + t.translation[0],
+                m[1][0] * local[0] * t.scale[0]
+                    + m[1][1] * local[1] * t.scale[1]
+                    + m[1][2] * local[2] * t.scale[2]
+                    + t.translation[1],
+                m[2][0] * local[0] * t.scale[0]
+                    + m[2][1] * local[1] * t.scale[1]
+                    + m[2][2] * local[2] * t.scale[2]
+                    + t.translation[2],
+            ]
+        };
+        // The stored PrePivot is the mesh-space point that maps to Location.
+        let at_pivot = transform_point(pp);
+        let want_pivot = to_bevy_position(l);
+        assert!(
+            at_pivot
+                .iter()
+                .zip(want_pivot)
+                .all(|(a, b)| (a - b).abs() < 1e-3),
+            "PrePivot must map to Location: {at_pivot:?} vs {want_pivot:?}"
+        );
+        let v = [3.0, -2.0, 1.5];
+        let world = to_bevy_position(apply(v));
+        let via_transform = transform_point(v);
+        assert!(
+            world
+                .iter()
+                .zip(via_transform)
+                .all(|(a, b)| (a - b).abs() < 1e-4)
         );
     }
 

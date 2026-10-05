@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use xiii_package::Limits;
+use xiii_script::animation::FixedAnimation;
 use xiii_script::linker::GlobalRef;
 use xiii_script::physics::FlatPhysics;
 use xiii_script::registry::NativeStatus;
@@ -52,6 +53,8 @@ pub struct RunConfig {
     pub survey: bool,
     /// Diagnostic physics provider: `flat:<z>` installs an infinite floor at Unreal Z.
     pub physics_flat_z: Option<f32>,
+    /// Diagnostic animation provider: `fixed:<frames>,<rate>` gives every sequence that length.
+    pub anim_fixed: Option<(u32, f32)>,
 }
 
 impl Default for RunConfig {
@@ -71,6 +74,7 @@ impl Default for RunConfig {
             default_game: None,
             survey: false,
             physics_flat_z: None,
+            anim_fixed: None,
         }
     }
 }
@@ -119,6 +123,12 @@ pub fn run_touch_chain(set: &ScriptSet, map: usize, cfg: &RunConfig) -> Result<R
         vm.set_physics(Box::new(FlatPhysics::new(z)));
         vm.note(TraceKind::Note(format!(
             "diagnostic physics (flat floor at Unreal Z={z}), not the map"
+        )));
+    }
+    if let Some((frames, rate)) = cfg.anim_fixed {
+        vm.set_animation_data(Box::new(FixedAnimation::new(frames, rate)));
+        vm.note(TraceKind::Note(format!(
+            "diagnostic animation (every sequence has {frames} frames at {rate} fps), not the mesh"
         )));
     }
     let actors = vm
@@ -353,6 +363,16 @@ pub fn parse_physics(spec: &str) -> Option<f32> {
     z.trim().parse::<f32>().ok()
 }
 
+/// Parses an `--anim` value. Only `fixed:<frames>,<rate>` is supported (diagnostic provider).
+pub fn parse_anim(spec: &str) -> Option<(u32, f32)> {
+    let rest = spec.strip_prefix("fixed:")?;
+    let (frames, rate) = rest.split_once(',')?;
+    Some((
+        frames.trim().parse::<u32>().ok()?,
+        rate.trim().parse::<f32>().ok()?,
+    ))
+}
+
 /// `xiii-tool script run ...`.
 pub fn run_cmd(args: &[String]) -> ExitCode {
     let mut cfg = RunConfig::default();
@@ -393,6 +413,19 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
                     None => {
                         eprintln!(
                             "error: invalid --physics '{v}'; expected flat:<unreal_z>\n\n{}",
+                            crate::script_cmd::USAGE
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--anim" => {
+                let v = val().unwrap_or_default();
+                match parse_anim(&v) {
+                    Some(fr) => cfg.anim_fixed = Some(fr),
+                    None => {
+                        eprintln!(
+                            "error: invalid --anim '{v}'; expected fixed:<frames>,<rate>\n\n{}",
                             crate::script_cmd::USAGE
                         );
                         return ExitCode::from(2);

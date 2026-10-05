@@ -1,13 +1,30 @@
-//! CPU-side world import for the diagnostic map viewer. No Bevy types: this module turns a
-//! map from an owned installation into converted (Bevy-space) meshes, RGBA textures and
-//! object records, and counts everything it could not import. Nothing falls back silently:
-//! every skipped actor/material/surface increments a named counter that the overlay shows.
+//! Bevy-free world import and the Unreal-space physics adapter.
+//!
+//! This crate turns a map from an owned installation into converted (Bevy-space) meshes, RGBA
+//! textures, object records and a collision triangle soup, and counts everything it could not
+//! import. Nothing falls back silently: every skipped actor/material/surface increments a
+//! named counter.
+//!
+//! Actor placement uses **effective** values: the map's tagged property if present, else the
+//! inherited class default resolved read-only through `xiii_script` (`Vm::class_layout`), else
+//! the documented `Engine.Actor` default (Location 0, Rotation 0, DrawScale 1, DrawScale3D 1,
+//! PrePivot 0). The source of every field is counted as `placement.<field>.<source>` and
+//! `actor.player_start.<field>.<source>`. `PrePivot` is applied before scale/rotation (see
+//! `xiii_decode::common::actor_to_bevy_pre_pivot`).
+//!
+//! [`physics::WorldPhysicsAdapter`] implements `xiii_script::physics::WorldPhysics` on top of
+//! the imported collision, converting between Unreal axes/units (Z up) and the Bevy collision
+//! space (Y up, metres) with the single coordinate policy in `xiii_decode::common`.
+
+#![warn(missing_docs)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+pub mod physics;
+
 use xiii_decode::common::{
-    BevyTransform, Mat3, actor_to_bevy, to_bevy_direction, to_bevy_position,
+    BevyTransform, Mat3, actor_to_bevy_pre_pivot, to_bevy_direction, to_bevy_position,
 };
 use xiii_decode::model::{self, level, poly_flags};
 use xiii_decode::static_mesh::decode_static_mesh;
@@ -15,6 +32,7 @@ use xiii_decode::terrain;
 use xiii_decode::texture::{RgbaImage, Texture, TextureFormat, decode_texture};
 use xiii_install::{Installation, OpenOptions};
 use xiii_package::{Limits, ObjectRef, Package, PropertyValue};
+use xiii_script::{ScriptLimits, ScriptPackage, ScriptSet, Vm, VmLimits};
 
 /// Parsed package bytes.
 pub struct Loaded {
@@ -82,6 +100,8 @@ pub struct SceneObject {
     pub transform: BevyTransform,
     /// Source object path (map export path, plus the mesh path).
     pub path: String,
+    /// Resolved effective placement values (map + class-default + engine-default fallbacks).
+    pub placement: Option<ResolvedPlacement>,
 }
 
 /// Imported world.
@@ -201,6 +221,11 @@ impl PackageCache {
         self.get(&format!("{stem}.unr"))
     }
 
+    /// Installation root the cache was opened from (for loading the `.u` class defaults).
+    pub fn root(&self) -> &std::path::Path {
+        self.install.root()
+    }
+
     /// Resolves an object reference of `from` to (package, export index). Imports are
     /// followed into their root package and matched by path and class name.
     pub fn resolve(
@@ -262,6 +287,9 @@ type ObjectKey = (String, usize);
 struct MeshSections {
     sections: Vec<(usize, String)>,
     collision: Arc<Vec<[[f32; 3]; 3]>>,
+    /// Collision triangles of set 0 whose material slot has `EnableCollision` = false. UE2
+    /// would not block the player with these; they are counted (not silently kept or dropped).
+    collision_slot_disabled: usize,
 }
 
 struct Importer<'a> {
@@ -403,6 +431,18 @@ impl Importer<'_> {
                             .map(|v| to_bevy_position(cs.vertices[v as usize]))
                     })
                     .collect();
+                // Collision triangles whose material slot has EnableCollision = false: under
+                // UE2 these do not block the player. Counted, not filtered (evidence only).
+                let collision_slot_disabled = cs
+                    .triangles
+                    .iter()
+                    .filter(|t| {
+                        usize::try_from(t.material)
+                            .ok()
+                            .and_then(|si| m.materials.get(si))
+                            .is_some_and(|mm| !mm.enable_collision)
+                    })
+                    .count();
                 let mut out = Vec::new();
                 for (si, s) in m.sections.iter().enumerate() {
                     if s.num_faces == 0 {
@@ -434,12 +474,201 @@ impl Importer<'_> {
                 Ok(MeshSections {
                     sections: out,
                     collision: Arc::new(collision),
+                    collision_slot_disabled,
                 })
             }
         };
         self.meshes.insert(key, result.clone());
         result
     }
+}
+
+/// Effective values of one actor: map property, else inherited class default, else the
+/// documented `Engine.Actor` default. Sources are counted per field.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResolvedPlacement {
+    /// Effective location in Unreal units.
+    pub location: [f32; 3],
+    /// Effective rotation rotator `(pitch, yaw, roll)`.
+    pub rotation: [i32; 3],
+    /// Effective uniform `DrawScale`.
+    pub draw_scale: f32,
+    /// Effective per-axis `DrawScale3D`.
+    pub draw_scale_3d: [f32; 3],
+    /// Effective `PrePivot` (Unreal units, mesh space).
+    pub pre_pivot: [f32; 3],
+}
+
+/// Loaded `.u` packages for resolving inherited class defaults.
+pub struct ClassDefaults {
+    set: ScriptSet,
+    layouts: HashMap<String, std::rc::Rc<xiii_script::vm::ClassLayout>>,
+}
+
+type SharedLayout = std::rc::Rc<xiii_script::vm::ClassLayout>;
+
+impl ClassDefaults {
+    /// Loads every code package of the installation (read-only; ~10 packages).
+    pub fn open(game_dir: &std::path::Path) -> Result<Self, String> {
+        let install =
+            Installation::open(game_dir, &OpenOptions::default()).map_err(|e| e.to_string())?;
+        let mut set = ScriptSet::new();
+        for entry in install.packages() {
+            if entry.kind != xiii_install::PackageKind::Code {
+                continue;
+            }
+            let data =
+                std::fs::read(&entry.path).map_err(|e| format!("{}: {e}", entry.path.display()))?;
+            let p = ScriptPackage::load(
+                &entry.name,
+                data,
+                &ScriptLimits::default(),
+                &Limits::default(),
+            )
+            .map_err(|e| format!("{}: {e}", entry.path.display()))?;
+            set.add(p);
+        }
+        Ok(Self {
+            set,
+            layouts: HashMap::new(),
+        })
+    }
+
+    /// Resolved layout of a class path (`Package.Class` as written in the map), cached.
+    fn layout(&mut self, class_path: &str) -> Result<SharedLayout, String> {
+        let key = class_path.to_ascii_lowercase();
+        if let Some(l) = self.layouts.get(&key) {
+            return Ok(l.clone());
+        }
+        let (pkg, class) = class_path
+            .split_once('.')
+            .ok_or_else(|| format!("class {class_path:?} is not Package.Class"))?;
+        let pi = self
+            .set
+            .package_index(pkg)
+            .ok_or_else(|| format!("package {pkg} not loaded"))?;
+        let e = self.set.packages[pi]
+            .export_by_path(class)
+            .ok_or_else(|| format!("class {class_path} not found in {pkg}"))?;
+        let class_ref = xiii_script::GlobalRef {
+            package: pi,
+            export: e,
+        };
+        let mut vm = Vm::new(&self.set, VmLimits::default());
+        let l = vm
+            .class_layout(class_ref)
+            .map_err(|err| format!("class layout of {class_path}: {err}"))?;
+        self.layouts.insert(key, l.clone());
+        Ok(l)
+    }
+
+    /// Resolves placement values of one actor: map property, else class default, else
+    /// documented `Engine.Actor` default. Returns the values and which fields came from
+    /// map / class-default / engine-default.
+    pub fn resolve(
+        &mut self,
+        class_path: &str,
+        a: &level::ActorPlacement,
+    ) -> Result<(ResolvedPlacement, [level::PlacementSource; 5]), String> {
+        let l = self.layout(class_path)?;
+        let get_f = |name: &str| -> Option<f32> {
+            let s = l.slot_by_name(name)?;
+            match l.defaults.get(s.base) {
+                Some(xiii_script::Value::Float(v)) => Some(*v),
+                _ => None,
+            }
+        };
+        let get_v = |name: &str| -> Option<[f32; 3]> {
+            let s = l.slot_by_name(name)?;
+            match l.defaults.get(s.base) {
+                Some(xiii_script::Value::Vector(v)) => Some(*v),
+                _ => None,
+            }
+        };
+        let get_r = |name: &str| -> Option<[i32; 3]> {
+            let s = l.slot_by_name(name)?;
+            match l.defaults.get(s.base) {
+                Some(xiii_script::Value::Rotator(v)) => Some(*v),
+                _ => None,
+            }
+        };
+        let pick_v = |map: Option<[f32; 3]>, class: Option<[f32; 3]>, engine: [f32; 3]| {
+            let src = |a: bool, b: bool| {
+                if a {
+                    level::PlacementSource::MapProperty
+                } else if b {
+                    level::PlacementSource::ClassDefault
+                } else {
+                    level::PlacementSource::EngineDefault
+                }
+            };
+            (
+                map.or(class).unwrap_or(engine),
+                src(map.is_some(), class.is_some()),
+            )
+        };
+        let pick_e = |map: Option<f32>, class: Option<f32>, engine: f32| {
+            let src = |a: bool, b: bool| {
+                if a {
+                    level::PlacementSource::MapProperty
+                } else if b {
+                    level::PlacementSource::ClassDefault
+                } else {
+                    level::PlacementSource::EngineDefault
+                }
+            };
+            (
+                map.or(class).unwrap_or(engine),
+                src(map.is_some(), class.is_some()),
+            )
+        };
+        let (location, s_location) = pick_v(a.location, get_v("Location"), [0.0; 3]);
+        let (rotation, s_rotation) = {
+            let class = get_r("Rotation");
+            let v = match a.rotation {
+                Some(v) => Some(v),
+                None => class,
+            };
+            let src = if a.rotation.is_some() {
+                level::PlacementSource::MapProperty
+            } else if class.is_some() {
+                level::PlacementSource::ClassDefault
+            } else {
+                level::PlacementSource::EngineDefault
+            };
+            (v.unwrap_or([0; 3]), src)
+        };
+        let (draw_scale, s_draw_scale) = pick_e(a.draw_scale, get_f("DrawScale"), 1.0);
+        let (draw_scale_3d, s_scale_3d) = pick_v(a.draw_scale_3d, get_v("DrawScale3D"), [1.0; 3]);
+        let (pre_pivot, s_pre_pivot) = pick_v(a.pre_pivot, get_v("PrePivot"), [0.0; 3]);
+        Ok((
+            ResolvedPlacement {
+                location,
+                rotation,
+                draw_scale,
+                draw_scale_3d,
+                pre_pivot,
+            },
+            [
+                s_location,
+                s_rotation,
+                s_draw_scale,
+                s_scale_3d,
+                s_pre_pivot,
+            ],
+        ))
+    }
+}
+
+/// Bakes a resolved placement into a Bevy transform with PrePivot applied before
+/// scale/rotation.
+pub fn placement_transform(a: &ResolvedPlacement) -> BevyTransform {
+    let src_scale = [
+        a.draw_scale_3d[0] * a.draw_scale,
+        a.draw_scale_3d[1] * a.draw_scale,
+        a.draw_scale_3d[2] * a.draw_scale,
+    ];
+    actor_to_bevy_pre_pivot(a.location, a.rotation, src_scale, a.pre_pivot)
 }
 
 fn alpha_kind(t: &Texture, img: &RgbaImage) -> AlphaKind {
@@ -451,6 +680,11 @@ fn alpha_kind(t: &Texture, img: &RgbaImage) -> AlphaKind {
     } else {
         AlphaKind::Mask
     }
+}
+
+/// Applies a [`BevyTransform`] to a Bevy-space point: per-axis scale, rotation, translation.
+pub fn apply_transform_pub(t: &BevyTransform, v: [f32; 3]) -> [f32; 3] {
+    apply_transform(t, v)
 }
 
 fn apply_transform(t: &BevyTransform, v: [f32; 3]) -> [f32; 3] {
@@ -499,7 +733,13 @@ fn identity() -> BevyTransform {
 }
 
 /// Imports a map: static-mesh actors, the level BSP and terrain.
+///
+/// Actor placement resolves Location/Rotation/DrawScale/DrawScale3D/PrePivot from the map's
+/// tagged properties, falling back to the inherited class defaults (`Vm::class_layout`) and
+/// then to the documented `Engine.Actor` defaults; every fallback is counted
+/// (`placement.<field>.<source>`), never applied silently.
 pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, String> {
+    let root = cache.root().to_path_buf();
     let map_pkg = cache.map(map)?;
     let mut im = Importer {
         cache,
@@ -510,8 +750,14 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
     let actors = level::scan_level(&map_pkg.package, &map_pkg.data);
     im.scene
         .count("actor.property_failures", actors.failures.len());
+    let mut defaults =
+        ClassDefaults::open(&root).map_err(|e| format!("loading class defaults: {e}"))?;
     if let Some(ps) = actors.player_starts.first() {
-        im.scene.player_start = Some((to_bevy_position(ps.location), ps.rotation));
+        let (eff, src) = defaults
+            .resolve(&ps.class, ps)
+            .map_err(|e| format!("PlayerStart {}: {e}", ps.path))?;
+        count_placement_sources(&mut im.scene, "actor.player_start", &src);
+        im.scene.player_start = Some((to_bevy_position(eff.location), eff.rotation));
     }
     im.scene
         .count("actor.player_starts", actors.player_starts.len());
@@ -537,11 +783,45 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
             continue;
         }
         let Some(r) = a.static_mesh else { continue };
+        let (eff, src) = match defaults.resolve(&a.class, a) {
+            Ok(v) => v,
+            Err(e) => {
+                im.scene
+                    .fail(&format!("fail.actor.class_defaults ({class_short})"), e);
+                continue;
+            }
+        };
+        for (field, s) in PLACEMENT_FIELDS.iter().zip(src) {
+            let name = source_name(source_index(s));
+            im.scene.count(&format!("placement.{field}.{name}"), 1);
+        }
         match im.static_mesh(&map_pkg, r) {
             Ok(converted) => {
                 im.scene
                     .count(&format!("actor.static_mesh ({class_short})"), 1);
-                let transform = actor_to_bevy(a.location, a.rotation, a.scale());
+                let transform = placement_transform(&eff);
+                let non_default_pivot = eff.pre_pivot.iter().any(|v| v.abs() > 1e-6);
+                if non_default_pivot {
+                    im.scene
+                        .count(&format!("actor.pre_pivot_applied ({class_short})"), 1);
+                }
+                if converted.collision_slot_disabled > 0 {
+                    // Under UE2 these collision triangles do not block the player; reported,
+                    // not filtered, because the import has no verified per-slot rule yet.
+                    im.scene.count(
+                        &format!("note.collision.mesh_slot_disabled ({class_short})"),
+                        converted.collision_slot_disabled,
+                    );
+                    im.scene
+                        .examples
+                        .entry(format!("note.collision.mesh_slot_disabled ({class_short})"))
+                        .or_insert_with(|| {
+                            format!(
+                                "{0}: {1} collision triangles",
+                                a.path, converted.collision_slot_disabled
+                            )
+                        });
+                }
                 let mut label0 = String::new();
                 for (mesh, label) in converted.sections {
                     label0.clone_from(&label);
@@ -549,6 +829,7 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                         mesh,
                         transform,
                         path: format!("{} -> {label}", a.path),
+                        placement: Some(eff),
                     });
                 }
                 // Collision: explicit bCollideActors/bBlockPlayers = false excludes the actor.
@@ -558,6 +839,15 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                         &format!("note.collision.actor_non_blocking ({class_short})"),
                         1,
                     );
+                    im.scene
+                        .examples
+                        .entry(format!("note.collision.actor_non_blocking ({class_short})"))
+                        .or_insert_with(|| {
+                            format!(
+                                "{} [bCollideActors={:?} bBlockActors={:?} bBlockPlayers={:?}] -> {label0}",
+                                a.path, collide, a.collision_flags[1], block_players
+                            )
+                        });
                 } else {
                     let tris: Vec<[[f32; 3]; 3]> = converted
                         .collision
@@ -578,6 +868,39 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
     import_bsp(&mut im, &map_pkg);
     import_terrain(&mut im, &map_pkg);
     Ok(im.scene)
+}
+
+fn source_index(s: level::PlacementSource) -> usize {
+    match s {
+        level::PlacementSource::MapProperty => 0,
+        level::PlacementSource::ClassDefault => 1,
+        level::PlacementSource::EngineDefault => 2,
+    }
+}
+
+fn source_name(i: usize) -> &'static str {
+    ["map", "class_default", "engine_default"][i]
+}
+
+/// Field names of a resolved placement, in the `[PlacementSource; 5]` order.
+const PLACEMENT_FIELDS: [&str; 5] = [
+    "location",
+    "rotation",
+    "drawscale",
+    "drawscale3d",
+    "prepivot",
+];
+
+/// Counts the source of each placement field (map / class default / engine default).
+fn count_placement_sources(
+    scene: &mut WorldScene,
+    prefix: &str,
+    sources: &[level::PlacementSource; 5],
+) {
+    for (field, s) in PLACEMENT_FIELDS.iter().zip(sources) {
+        let name = source_name(source_index(*s));
+        scene.count(&format!("{prefix}.{field}.{name}"), 1);
+    }
 }
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -691,6 +1014,7 @@ fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 "{} {label}",
                 p.object_path(ObjectRef::Export(idx as u32)).unwrap_or("?")
             ),
+            placement: None,
         });
     }
 }
@@ -776,6 +1100,7 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
             mesh: im.scene.meshes.len() - 1,
             transform: identity(),
             path,
+            placement: None,
         });
         im.scene.count("terrain.infos", 1);
     }

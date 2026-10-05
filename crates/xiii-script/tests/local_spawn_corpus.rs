@@ -331,3 +331,122 @@ fn gog_plage00_flat_physics_survey_has_no_movement_missing() {
             .join(", ")
     );
 }
+
+/// Opt-in corpus test for the item3c work: the all-classes Plage00 survey with both diagnostic
+/// providers (flat physics and fixed animation) no longer lists `LinkSkelAnim`/`LoopAnim`/
+/// `SetViewTarget` and gets past the `New` opcode (a `CheatManager` is constructed), then prints
+/// the remaining native ranking.
+#[test]
+fn gog_plage00_all_classes_survey_with_diagnostic_providers() {
+    let Some(root) = std::env::var_os("XIII_GOG_DIR") else {
+        println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let root = if root.is_relative() {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(&root)
+    } else {
+        root
+    };
+    let mut set = ScriptSet::new();
+    for path in find_by_ext(&root, "u") {
+        let data = std::fs::read(&path).expect("read package");
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let pkg = ScriptPackage::load(&name, data, &ScriptLimits::default(), &Limits::default())
+            .expect("parse package");
+        set.add(pkg);
+    }
+    let map_path = find_by_ext(&root, "unr")
+        .into_iter()
+        .find(|p| {
+            p.file_stem()
+                .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("Plage00"))
+        })
+        .expect("Plage00 map");
+    let map_data = std::fs::read(&map_path).expect("read map");
+    let map_pkg = ScriptPackage::load(
+        "Plage00",
+        map_data,
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("parse map");
+    let map = set.add(map_pkg);
+
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.survey = true;
+    vm.set_physics(Box::new(xiii_script::physics::FlatPhysics::new(0.0)));
+    vm.set_animation_data(Box::new(xiii_script::animation::FixedAnimation::new(
+        30, 30.0,
+    )));
+    let actors = vm.load_level(map, &Limits::default()).expect("load level");
+    // The all-classes scope: every loaded actor is executed.
+    for &id in &actors {
+        vm.set_active(id, true);
+    }
+
+    let default_game = std::fs::read_to_string(root.join("system/Default.ini"))
+        .ok()
+        .and_then(|t| {
+            t.lines().find_map(|l| {
+                let l = l.trim();
+                l.strip_prefix("DefaultGame=").map(str::to_owned)
+            })
+        })
+        .expect("DefaultGame in Default.ini");
+    let game_class = default_game
+        .split_once('.')
+        .and_then(|(pkg, class)| find_class(&set, pkg, class))
+        .expect("GameInfo class");
+
+    let _ = vm.begin_play_with_game_info(&actors, game_class);
+    let touched = vm.find_object("TouchTrigger2").expect("TouchTrigger2");
+    let player = vm
+        .spawn(
+            find_class(&set, "xiii", "XIIIPlayerPawn").unwrap(),
+            "synthetic",
+        )
+        .unwrap();
+    let arg = Value::Object(Some(ObjRef::Instance(player)));
+    let _ = vm.send_event(touched, "Touch", vec![arg]);
+    for _ in 0..3 {
+        let _ = vm.tick(1.0 / 30.0);
+    }
+
+    for native in [
+        "Actor.LinkSkelAnim",
+        "Actor.LoopAnim",
+        "PlayerController.SetViewTarget",
+    ] {
+        assert!(
+            !vm.missing_natives.contains_key(native),
+            "{native} is still unimplemented"
+        );
+    }
+    assert!(
+        vm.trace
+            .iter()
+            .any(|e| matches!(&e.kind, TraceKind::NewObject { .. })),
+        "New never constructed an object"
+    );
+
+    let mut rest: Vec<(&String, u64)> = vm
+        .missing_natives
+        .iter()
+        .map(|(k, m)| (k, m.calls))
+        .collect();
+    rest.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    println!(
+        "Plage00 all-classes survey: LinkSkelAnim/LoopAnim/SetViewTarget implemented, New ran; next missing: {}",
+        rest.iter()
+            .take(15)
+            .map(|(k, c)| format!("{k} x{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}

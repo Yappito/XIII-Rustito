@@ -19,6 +19,7 @@ use std::rc::Rc;
 
 use xiii_package::{Limits, ObjectRef, PropertyBlock, PropertyValue, StructValue};
 
+use crate::animation::AnimationData;
 use crate::bytecode::{Call, Context, Script, Token, TokenKind, opcode_name};
 use crate::linker::{GlobalRef, ScriptSet};
 use crate::physics::WorldPhysics;
@@ -147,6 +148,25 @@ pub enum VmErrorKind {
         /// `Class.Function` of the native that needed it.
         native: String,
     },
+    /// A native needing sequence data ran without an animation provider set
+    /// (with [`Vm::set_animation_data`]); never silently succeeds.
+    NoAnimationProvider {
+        /// `Class.Function` of the native that needed it.
+        native: String,
+    },
+    /// A sequence the animation provider does not know (and is not the `None` name).
+    UnknownAnimation {
+        /// Sequence name.
+        sequence: String,
+        /// Mesh path the sequence was looked up on.
+        mesh: String,
+    },
+    /// `new` was asked to construct an `Actor` (or subclass); upstream forbids that
+    /// (actors are created with `Actor.Spawn`).
+    NewOnActor {
+        /// Class path.
+        class: String,
+    },
     /// State code ran past its last statement.
     StateCodeEnded,
     /// Virtual/global call with no matching function.
@@ -263,6 +283,43 @@ pub enum Latent {
         /// VM time when it started.
         started: f64,
     },
+    /// `Actor.FinishAnim`: suspend until the channel's current animation ends.
+    AnimEnd {
+        /// Channel waited on.
+        channel: u8,
+        /// VM time when it started.
+        started: f64,
+    },
+}
+
+/// Per-channel animation playback state owned by the VM.
+#[derive(Debug, Clone)]
+pub(crate) struct AnimChannel {
+    /// Total frames.
+    pub(crate) frames: u32,
+    /// Playback rate (frames/second).
+    pub(crate) rate: f32,
+    /// Current position in frames.
+    pub(crate) frame: f32,
+    /// Loop when reaching the end (no `AnimEnd`).
+    pub(crate) looping: bool,
+    /// Still playing.
+    pub(crate) active: bool,
+    /// Seconds still to be spent tweening in before playback advances.
+    pub(crate) tween_remaining: f32,
+    /// Script notifies as `(time01, function)`.
+    pub(crate) notifies: Vec<(f32, String)>,
+    /// Index of the next notify not yet fired.
+    pub(crate) notify_idx: usize,
+}
+
+/// Per-actor animation state: the linked mesh path and one channel per `Channel` argument.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AnimState {
+    /// Path of the object linked with `Actor.LinkSkelAnim` (empty when none).
+    pub(crate) mesh: String,
+    /// Channels by index (ordered for deterministic notifies/traces).
+    pub(crate) channels: std::collections::BTreeMap<u8, AnimChannel>,
 }
 
 /// One trace record.
@@ -412,6 +469,36 @@ pub enum TraceKind {
         /// Class path.
         class: String,
     },
+    /// `new` constructed a non-actor object.
+    NewObject {
+        /// New object.
+        object: String,
+        /// Class path.
+        class: String,
+    },
+    /// An animation channel reached the end of a non-looping sequence.
+    AnimEnd {
+        /// Object.
+        actor: String,
+        /// Channel.
+        channel: u8,
+    },
+    /// A script notify fired during animation playback.
+    AnimNotify {
+        /// Object.
+        actor: String,
+        /// Notify function.
+        function: String,
+        /// Channel.
+        channel: u8,
+    },
+    /// Latent `Actor.FinishAnim` suspended state code until the channel ended.
+    AnimSuspend {
+        /// Object.
+        actor: String,
+        /// Native path.
+        native: String,
+    },
     /// Harness note.
     Note(String),
 }
@@ -505,6 +592,20 @@ impl fmt::Display for TraceEvent {
             TraceKind::SpawnRefused { reason } => write!(f, "SPAWN    refused: {reason}"),
             TraceKind::GameInfo { actor, class } => {
                 write!(f, "GAMEINFO {actor} ({class})")
+            }
+            TraceKind::NewObject { object, class } => {
+                write!(f, "NEW      {object} = New({class})")
+            }
+            TraceKind::AnimEnd { actor, channel } => {
+                write!(f, "ANIMEND  {actor}: channel {channel} finished")
+            }
+            TraceKind::AnimNotify {
+                actor,
+                function,
+                channel,
+            } => write!(f, "NOTIFY   {actor}.{function}(channel {channel})"),
+            TraceKind::AnimSuspend { actor, native } => {
+                write!(f, "LATENT   {actor}: {native} suspends state code")
             }
             TraceKind::Note(s) => write!(f, "NOTE     {s}"),
         }
@@ -612,6 +713,8 @@ pub struct Instance {
     /// Map export it was loaded from.
     pub export: Option<GlobalRef>,
     timer: Option<Timer>,
+    /// Animation channels (actor animation natives).
+    pub(crate) anim: AnimState,
 }
 
 #[derive(Debug, Clone)]
@@ -694,6 +797,9 @@ pub struct Vm<'s> {
     /// World-collision provider (movement/trace natives). `None` = every collision native
     /// fails with [`VmErrorKind::NoPhysicsProvider`].
     pub(crate) physics: Option<Box<dyn WorldPhysics>>,
+    /// Animation-sequence provider (animation natives). `None` = every native that needs
+    /// sequence data fails with [`VmErrorKind::NoAnimationProvider`].
+    pub(crate) animation: Option<Box<dyn AnimationData>>,
 }
 
 fn lower(s: &str) -> String {
@@ -726,6 +832,7 @@ impl<'s> Vm<'s> {
             missing_natives: Default::default(),
             pending_latent: None,
             physics: None,
+            animation: None,
         }
     }
 
@@ -750,6 +857,17 @@ impl<'s> Vm<'s> {
         self.physics.is_some()
     }
 
+    /// Sets the animation-sequence provider (animation natives). Call before runs that need
+    /// sequence data; without one those natives fail explicitly.
+    pub fn set_animation_data(&mut self, provider: Box<dyn AnimationData>) {
+        self.animation = Some(provider);
+    }
+
+    /// True when an animation-sequence provider is available.
+    pub fn has_animation_data(&self) -> bool {
+        self.animation.is_some()
+    }
+
     /// Physics natives check this before running: `Ok(true)` when a provider is present,
     /// `Ok(false)` when the run is in survey mode and the native was counted like a missing
     /// native (the caller returns the type's zero), `Err(NoPhysicsProvider)` otherwise.
@@ -765,6 +883,26 @@ impl<'s> Vm<'s> {
         }
         if !self.survey {
             return Err(self.err(VmErrorKind::NoPhysicsProvider {
+                native: native.to_owned(),
+            }));
+        }
+        self.survey_missing(native.to_owned(), index, this, &[], ret, false)?;
+        Ok(false)
+    }
+
+    /// Animation natives check this before running, mirroring [`Vm::physics_ready`].
+    pub(crate) fn animation_ready(
+        &mut self,
+        native: &str,
+        index: Option<u16>,
+        this: ObjectId,
+        ret: Value,
+    ) -> VmResult<bool> {
+        if self.animation.is_some() {
+            return Ok(true);
+        }
+        if !self.survey {
+            return Err(self.err(VmErrorKind::NoAnimationProvider {
                 native: native.to_owned(),
             }));
         }
@@ -1104,23 +1242,54 @@ impl<'s> Vm<'s> {
         };
         let mut out = Vec::new();
         for _ in 0..count {
-            let v = match inner {
-                Ty::Int => r.i32().map(Value::Int),
-                Ty::Float => r.f32().map(Value::Float),
-                Ty::Byte => r.u8().map(Value::Byte),
-                Ty::Name => r.name().map(|n| Value::Name(p.name_text(n).to_owned())),
-                Ty::Object => r.object().map(|o| self.resolve_value_ref(pkg, o)),
-                t => return Value::Unsupported(format!("array of {t:?}")),
-            };
-            match v {
-                Ok(v) => out.push(v),
-                Err(e) => return Value::Unsupported(format!("array element: {e}")),
+            match self.decode_ty(&mut r, pkg, inner) {
+                Some(v) => out.push(v),
+                None => return Value::Unsupported(format!("array of {inner:?}")),
             }
         }
         if r.remaining() != 0 {
             return Value::Unsupported("array trailing bytes".into());
         }
         Value::Array(out)
+    }
+
+    /// Decodes one raw (untagged) value of `ty` from an array/struct element stream. Strings,
+    /// nested arrays and structs are decoded member-by-member; `None` for types without a
+    /// verified raw layout (never a silently wrong value).
+    fn decode_ty(&self, r: &mut crate::reader::Reader<'_>, pkg: usize, ty: &Ty) -> Option<Value> {
+        let p = &self.set.packages[pkg];
+        Some(match ty {
+            Ty::Int => Value::Int(r.i32().ok()?),
+            Ty::Float => Value::Float(r.f32().ok()?),
+            Ty::Byte => Value::Byte(r.u8().ok()?),
+            // A bool inside a raw array/struct element is one byte (verified against the
+            // Plage00 `MapInfo.Objectif` element size: empty FString + 3 bools = 4 bytes).
+            Ty::Bool => Value::Bool(r.u8().ok()? != 0),
+            Ty::Name => Value::Name(p.name_text(r.name().ok()?).to_owned()),
+            Ty::Str => Value::Str(r.fstring(1 << 20).ok()?),
+            Ty::Object => self.resolve_value_ref(pkg, r.object().ok()?),
+            Ty::Vector => Value::Vector([r.f32().ok()?, r.f32().ok()?, r.f32().ok()?]),
+            Ty::Rotator => Value::Rotator([r.i32().ok()?, r.i32().ok()?, r.i32().ok()?]),
+            Ty::Array(inner) => {
+                let n = r.compact().ok()?;
+                if n < 0 {
+                    return None;
+                }
+                let mut items = Vec::new();
+                for _ in 0..n {
+                    items.push(self.decode_ty(r, pkg, inner)?);
+                }
+                Value::Array(items)
+            }
+            Ty::Struct(members) => {
+                let mut fields = Vec::new();
+                for (name, t) in members {
+                    fields.push((name.clone(), self.decode_ty(r, pkg, t)?));
+                }
+                Value::Struct(fields)
+            }
+            Ty::Delegate => return None,
+        })
     }
 
     fn apply_block(
@@ -1169,6 +1338,7 @@ impl<'s> Vm<'s> {
             deleted: false,
             export: None,
             timer: None,
+            anim: AnimState::default(),
         });
         Ok(id)
     }
@@ -1524,6 +1694,13 @@ impl<'s> Vm<'s> {
                 }
             }
         }
+        // Animation playback advances before state code, so a `FinishAnim` waiter resumes in
+        // the same tick its channel ends (UE2 `AActor::Tick` order).
+        for id in 0..self.objects.len() as ObjectId {
+            if self.objects[id as usize].active {
+                self.advance_animation(id, dt)?;
+            }
+        }
         for id in 0..self.objects.len() as ObjectId {
             if self.objects[id as usize].active {
                 self.process_state(id, dt)?;
@@ -1610,34 +1787,51 @@ impl<'s> Vm<'s> {
             let Some(code) = self.objects[id as usize].state_code.clone() else {
                 return Ok(());
             };
-            if let Some(Latent::Sleep {
-                seconds,
-                remaining,
-                started,
-            }) = code.latent
-            {
-                // UE2 AActor::execPollSleep: finished once the remaining time drops below
-                // half a tick.
-                let left = remaining - dt;
-                if left >= 0.5 * dt {
-                    if let Some(c) = self.objects[id as usize].state_code.as_mut() {
-                        c.latent = Some(Latent::Sleep {
-                            seconds,
-                            remaining: left,
-                            started,
-                        });
-                    }
-                    return Ok(());
-                }
-                if let Some(c) = self.objects[id as usize].state_code.as_mut() {
-                    c.latent = None;
-                }
-                let actor = self.objects[id as usize].name.clone();
-                self.note(TraceKind::LatentResume {
-                    actor,
-                    native: "Actor.Sleep".into(),
+            match code.latent {
+                Some(Latent::Sleep {
+                    seconds,
+                    remaining,
                     started,
-                });
+                }) => {
+                    // UE2 AActor::execPollSleep: finished once the remaining time drops below
+                    // half a tick.
+                    let left = remaining - dt;
+                    if left >= 0.5 * dt {
+                        if let Some(c) = self.objects[id as usize].state_code.as_mut() {
+                            c.latent = Some(Latent::Sleep {
+                                seconds,
+                                remaining: left,
+                                started,
+                            });
+                        }
+                        return Ok(());
+                    }
+                    if let Some(c) = self.objects[id as usize].state_code.as_mut() {
+                        c.latent = None;
+                    }
+                    let actor = self.objects[id as usize].name.clone();
+                    self.note(TraceKind::LatentResume {
+                        actor,
+                        native: "Actor.Sleep".into(),
+                        started,
+                    });
+                }
+                Some(Latent::AnimEnd { channel, started }) => {
+                    // `Actor.FinishAnim`: resume once the channel stops animating.
+                    if self.anim_channel_active(id, channel) {
+                        return Ok(());
+                    }
+                    if let Some(c) = self.objects[id as usize].state_code.as_mut() {
+                        c.latent = None;
+                    }
+                    let actor = self.objects[id as usize].name.clone();
+                    self.note(TraceKind::LatentResume {
+                        actor,
+                        native: "Actor.FinishAnim".into(),
+                        started,
+                    });
+                }
+                None => {}
             }
             let Some(h) = set.object(code.owner).and_then(ScriptObject::struct_header) else {
                 return Err(self.err(VmErrorKind::Unresolved {
@@ -1668,12 +1862,16 @@ impl<'s> Vm<'s> {
                 Exit::Latent(next) => {
                     let (latent, native) = frame.pending_latent.take().expect("latent set");
                     let actor = self.objects[id as usize].name.clone();
-                    let Latent::Sleep { seconds, .. } = latent;
-                    self.note(TraceKind::LatentStart {
-                        actor,
-                        native,
-                        seconds,
-                    });
+                    match &latent {
+                        Latent::Sleep { seconds, .. } => self.note(TraceKind::LatentStart {
+                            actor,
+                            native,
+                            seconds: *seconds,
+                        }),
+                        Latent::AnimEnd { .. } => {
+                            self.note(TraceKind::AnimSuspend { actor, native })
+                        }
+                    }
                     if let Some(c) = self.objects[id as usize].state_code.as_mut() {
                         c.pc = next;
                         c.latent = Some(latent);
@@ -1997,7 +2195,19 @@ impl<'s> Vm<'s> {
                 self.set.object(func),
                 Some(ScriptObject::Function(f)) if f.flags & function_flags::ITERATOR != 0
             );
-            return self.survey_missing(self.short_path(func), index, target, &[], ret, iterator);
+            let outcome =
+                self.survey_missing(self.short_path(func), index, target, &[], ret, iterator)?;
+            if matches!(outcome, NativeOutcome::Iterate(_)) {
+                // The `foreach` driver needs an (empty) iterator frame; the loop body is skipped
+                // when a missing iterator native yields no items.
+                frame.iters.push(IterState {
+                    items: Vec::new(),
+                    idx: 0,
+                    place: None,
+                    body: 0,
+                });
+            }
+            return Ok(outcome);
         }
         let def = self.native_def(func, index)?;
         let short = def.short_circuit;
@@ -2639,6 +2849,20 @@ impl<'s> Vm<'s> {
                     }
                 }
             }
+            K::New {
+                outer,
+                name,
+                flags,
+                class,
+            } => {
+                // UE2 `FFrame::execNew`: `New (Outer, Name, Flags) Class` — operands in that
+                // order. Actors may not be constructed with `new`.
+                let outer_v = self.eval_in(frame, outer, target)?;
+                let name_v = self.eval_in(frame, name, target)?;
+                let flags_v = self.eval_in(frame, flags, target)?;
+                let class_v = self.eval_in(frame, class, target)?;
+                self.new_object(outer_v, name_v, flags_v, class_v)?
+            }
             K::Let { lhs, rhs } | K::LetBool { lhs, rhs } => {
                 let place = self.place(frame, lhs, target)?;
                 let v = self.eval(frame, rhs)?;
@@ -3153,6 +3377,60 @@ impl<'s> Vm<'s> {
             Some(ScriptObject::Class(cl)) => cl.class_flags & CLASS_FLAG_ABSTRACT != 0,
             _ => false,
         }
+    }
+
+    /// UE2 `execNew`: construct a non-actor object of `class` with its class defaults. A `None`
+    /// class returns `None`; an `Actor` subclass is an explicit error (upstream forbids `new`
+    /// on actors). `Outer`/`Name` are honoured; the object gets no lifecycle events.
+    fn new_object(
+        &mut self,
+        outer: Value,
+        name: Value,
+        _flags: Value,
+        class: Value,
+    ) -> VmResult<Value> {
+        let class = match class {
+            Value::Object(Some(ObjRef::Static(g)))
+                if matches!(self.set.object(g), Some(ScriptObject::Class(_))) =>
+            {
+                g
+            }
+            Value::Object(None) => return Ok(Value::Object(None)),
+            Value::NativeClass(n) => {
+                return Err(self.err(VmErrorKind::UnsupportedValue {
+                    desc: format!("new class'{n}' has no export to instantiate"),
+                }));
+            }
+            other => return Err(self.type_err("class", &other)),
+        };
+        if self
+            .class_layout(class)?
+            .chain_names
+            .iter()
+            .any(|n| n == "actor")
+        {
+            return Err(self.err(VmErrorKind::NewOnActor {
+                class: self.set.path(class),
+            }));
+        }
+        let class_name = self.object_name(class).to_owned();
+        let obj_name = match name {
+            Value::Name(n) if !n.eq_ignore_ascii_case("None") => self.unique_name(&n),
+            _ => self.unique_name(&class_name),
+        };
+        let id = self.spawn(class, &obj_name)?;
+        if let Value::Object(Some(ObjRef::Instance(o))) = outer
+            && self.objects.get(o as usize).is_some_and(|x| !x.deleted)
+        {
+            self.set_property(id, "Outer", 0, Value::Object(Some(ObjRef::Instance(o))));
+        }
+        // A `new`-ed object is in the executed scope (no lifecycle events for non-actors).
+        self.objects[id as usize].active = true;
+        self.note(TraceKind::NewObject {
+            object: obj_name,
+            class: self.set.path(class),
+        });
+        Ok(Value::Object(Some(ObjRef::Instance(id))))
     }
 
     /// `Actor.Spawn` semantics: instantiate `class`, set `Owner`/`Tag`/`Location`/`Rotation`,
@@ -3802,6 +4080,188 @@ impl<'s> Vm<'s> {
         Ok(true)
     }
 
+    // ------------------------------------------------------------------ animation
+
+    /// `Actor.LinkSkelAnim`: link a `MeshAnimation` object as the actor's skeletal mesh and
+    /// remember its path for sequence lookups.
+    pub(crate) fn link_skel_anim(&mut self, id: ObjectId, anim: Option<ObjRef>) {
+        let mesh = match anim {
+            Some(ObjRef::Static(g)) => self.set.path(g),
+            Some(ObjRef::Instance(i)) => self.objects[i as usize].name.clone(),
+            None => String::new(),
+        };
+        self.objects[id as usize].anim.mesh = mesh;
+        self.set_property(id, "Mesh", 0, Value::Object(anim));
+    }
+
+    /// `Actor.PlayAnim`/`LoopAnim`/`TweenAnim`: start `sequence` on `channel`. `rate <= 0`
+    /// falls back to the provider's rate; `tween_time` holds the sequence at frame 0 before it
+    /// advances. The `None` sequence stops the channel. Unknown sequences are an explicit error.
+    pub(crate) fn start_animation(
+        &mut self,
+        id: ObjectId,
+        sequence: &str,
+        rate: f32,
+        tween_time: f32,
+        channel: u8,
+        looping: bool,
+    ) -> VmResult<()> {
+        if sequence.eq_ignore_ascii_case("None") {
+            self.objects[id as usize].anim.channels.remove(&channel);
+            self.set_property(id, "AnimSequence", 0, Value::Name("None".into()));
+            self.set_property(id, "AnimRate", 0, Value::Float(0.0));
+            self.set_property(id, "AnimFrame", 0, Value::Float(0.0));
+            return Ok(());
+        }
+        let mesh = self.objects[id as usize].anim.mesh.clone();
+        let Some(info) = self
+            .animation
+            .as_mut()
+            .and_then(|p| p.sequence(&mesh, sequence))
+        else {
+            return Err(self.err(VmErrorKind::UnknownAnimation {
+                sequence: sequence.to_owned(),
+                mesh,
+            }));
+        };
+        let rate = if rate > 0.0 { rate } else { info.rate };
+        let mut notifies = info.notifies;
+        notifies.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        self.objects[id as usize].anim.channels.insert(
+            channel,
+            AnimChannel {
+                frames: info.frames,
+                rate,
+                frame: 0.0,
+                looping,
+                active: info.frames > 0,
+                tween_remaining: tween_time.max(0.0),
+                notifies,
+                notify_idx: 0,
+            },
+        );
+        self.set_property(id, "AnimSequence", 0, Value::Name(sequence.to_owned()));
+        self.set_property(id, "AnimRate", 0, Value::Float(rate));
+        self.set_property(id, "AnimFrame", 0, Value::Float(0.0));
+        self.set_property(id, "bAnimFinished", 0, Value::Bool(false));
+        Ok(())
+    }
+
+    /// `Actor.HasAnim`: whether the linked mesh has `sequence`.
+    pub(crate) fn has_anim(
+        &mut self,
+        native: &str,
+        id: ObjectId,
+        sequence: &str,
+    ) -> VmResult<bool> {
+        let mesh = self.objects[id as usize].anim.mesh.clone();
+        let Some(p) = self.animation.as_mut() else {
+            return Err(self.err(VmErrorKind::NoAnimationProvider {
+                native: native.to_owned(),
+            }));
+        };
+        Ok(p.sequence(&mesh, sequence).is_some())
+    }
+
+    /// True when `channel` currently has an active animation.
+    pub(crate) fn anim_channel_active(&self, id: ObjectId, channel: u8) -> bool {
+        self.objects
+            .get(id as usize)
+            .is_some_and(|o| o.anim.channels.get(&channel).is_some_and(|c| c.active))
+    }
+
+    /// `Actor.FinishAnim`: suspend state code until `channel` ends. Returns `false` (no latent)
+    /// when the channel is not animating; an error when called outside state code, like `Sleep`.
+    pub(crate) fn finish_anim(
+        &mut self,
+        id: ObjectId,
+        channel: u8,
+        in_state: bool,
+    ) -> VmResult<bool> {
+        if !self.anim_channel_active(id, channel) {
+            return Ok(false);
+        }
+        if !in_state {
+            return Err(self.err(VmErrorKind::LatentOutsideState {
+                path: "Actor.FinishAnim".into(),
+            }));
+        }
+        self.pending_latent = Some(Latent::AnimEnd {
+            channel,
+            started: self.time,
+        });
+        Ok(true)
+    }
+
+    /// Advances every channel of `id` by `dt` frames, firing notifies and `AnimEnd` once.
+    fn advance_animation(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
+        if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
+            return Ok(());
+        }
+        let actor = self.objects[id as usize].name.clone();
+        let mut notifies: Vec<(u8, String)> = Vec::new();
+        let mut ended: Vec<(u8, f32)> = Vec::new();
+        {
+            let o = &mut self.objects[id as usize];
+            for (&channel, st) in o.anim.channels.iter_mut() {
+                if !st.active {
+                    continue;
+                }
+                let step_dt = if st.tween_remaining > 0.0 {
+                    st.tween_remaining -= dt;
+                    if st.tween_remaining > 0.0 {
+                        continue;
+                    }
+                    -st.tween_remaining
+                } else {
+                    dt
+                };
+                let old = st.frame;
+                st.frame += (st.rate * step_dt).max(0.0);
+                while st.notify_idx < st.notifies.len() {
+                    let (t, name) = st.notifies[st.notify_idx].clone();
+                    let target = t.clamp(0.0, 1.0) * st.frames as f32;
+                    if old < target && st.frame >= target {
+                        notifies.push((channel, name));
+                        st.notify_idx += 1;
+                    } else if old >= target {
+                        st.notify_idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if st.frames > 0 && st.frame + 1e-4 >= st.frames as f32 {
+                    if st.looping {
+                        st.frame %= st.frames as f32;
+                        st.notify_idx = 0;
+                    } else {
+                        st.frame = st.frames as f32;
+                        st.active = false;
+                        ended.push((channel, st.frame));
+                    }
+                }
+            }
+        }
+        for (channel, function) in notifies {
+            self.note(TraceKind::AnimNotify {
+                actor: actor.clone(),
+                function: function.clone(),
+                channel,
+            });
+            self.send_event(id, &function, Vec::new())?;
+        }
+        for (channel, frame) in ended {
+            self.set_property(id, "AnimFrame", 0, Value::Float(frame));
+            self.set_property(id, "bAnimFinished", 0, Value::Bool(true));
+            self.note(TraceKind::AnimEnd {
+                actor: actor.clone(),
+                channel,
+            });
+            self.send_event(id, "AnimEnd", vec![Value::Int(i32::from(channel))])?;
+        }
+        Ok(())
+    }
+
     /// True when `id`'s `Owner` chain (including itself) contains `other` (UE1 `IsOwnedBy`).
     pub(crate) fn is_owned_by(&self, id: ObjectId, other: ObjectId) -> bool {
         let mut cur = Some(id);
@@ -3884,6 +4344,36 @@ impl<'s> Vm<'s> {
                 }
             }
             out.push(i as ObjectId);
+        }
+        out
+    }
+
+    /// Actors iterated by `RadiusActors`: live actors of `base` whose `Location` lies within
+    /// `radius` of `loc` (inclusive), in object order.
+    pub(crate) fn radius_actors(
+        &self,
+        base: Option<GlobalRef>,
+        radius: f32,
+        loc: [f32; 3],
+    ) -> Vec<ObjectId> {
+        let r2 = radius * radius;
+        let mut out = Vec::new();
+        for (i, o) in self.objects.iter().enumerate() {
+            if !o.is_actor || o.deleted || o.name.starts_with("Default__") {
+                continue;
+            }
+            if let Some(b) = base
+                && !o.layout.chain.contains(&b)
+            {
+                continue;
+            }
+            let l = self
+                .vector_prop(i as ObjectId, "Location")
+                .unwrap_or([0.0; 3]);
+            let (dx, dy, dz) = (l[0] - loc[0], l[1] - loc[1], l[2] - loc[2]);
+            if dx * dx + dy * dy + dz * dz <= r2 {
+                out.push(i as ObjectId);
+            }
         }
         out
     }
