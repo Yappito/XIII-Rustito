@@ -12,6 +12,7 @@
 pub mod animation;
 pub mod bytecode;
 pub mod canvas;
+pub mod cinematics;
 pub mod disasm;
 mod error;
 pub mod events;
@@ -27,11 +28,12 @@ pub mod reflect;
 pub mod registry;
 pub mod value;
 pub mod vm;
+pub mod voice;
 
 pub use animation::{AnimationData, FixedAnimation, SeqInfo};
 pub use bytecode::{Call, Label, Script, ScriptLimits, Token, TokenKind, decode_script};
 pub use error::{Result, ScriptError, ScriptErrorKind};
-pub use events::{PresentationEvent, SoundEvent};
+pub use events::{DialogueEvent, PresentationEvent, SoundEvent};
 pub use external::ExternalObjectData;
 pub use linker::{ExternalLookup, ExternalPackage, GlobalRef, ScriptPackage, ScriptSet};
 pub use localize::{LocalizationData, placeholder};
@@ -47,8 +49,9 @@ pub use reflect::{
 pub use value::{ObjRef, ObjectId, Ty, Value};
 pub use vm::{
     ActorAnimation, AnimChannelState, BoneDirection, BoneState, ExternalObject, MoverState,
-    SpineControl, TraceEvent, TraceKind, Vm, VmError, VmErrorKind, VmLimits,
+    NativeProfile, SpineControl, TraceEvent, TraceKind, Vm, VmError, VmErrorKind, VmLimits,
 };
+pub use voice::{FixedVoiceDuration, VoiceDuration};
 
 #[cfg(test)]
 mod tests;

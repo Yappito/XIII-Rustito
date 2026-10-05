@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use xiii_install::{Installation, OpenOptions, PACKAGE_MAGIC};
+use xiii_install::{Installation, OpenOptions};
 use xiii_package::Limits;
 use xiii_script::animation::{AnimationData, SeqInfo};
 use xiii_script::linker::GlobalRef;
@@ -269,57 +269,22 @@ fn ini_value(text: &str, section: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Recursively lists every regular file under `root`, sorted by relative path (matching the
-/// tool's `tagged_files` ordering).
-fn all_files(root: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
-    fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let ty = entry.file_type()?;
-            if ty.is_dir() {
-                walk(base, &path, out)?;
-            } else if ty.is_file() {
-                let rel = path
-                    .strip_prefix(base)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                out.push((rel, path));
-            }
-        }
-        Ok(())
-    }
-    let mut files = Vec::new();
-    walk(root, root, &mut files)?;
-    files.sort();
-    Ok(files)
-}
-
-/// True when the file starts with the UE2 package magic (`tagged_files`'s tag test).
-fn starts_with_tag(path: &Path) -> bool {
-    use std::io::Read as _;
-    let mut prefix = [0u8; 4];
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut filled = 0;
-    while filled < prefix.len() {
-        match file.read(&mut prefix[filled..]) {
-            Ok(0) => return false,
-            Ok(n) => filled += n,
-            Err(_) => return false,
-        }
-    }
-    prefix == PACKAGE_MAGIC
-}
-
-/// Every `.u` script package of an installation (`relative path`, full path), sorted.
+/// Every `.u` script package of an installation (`relative path`, full path), in the order the
+/// installation's own ini says to load them (`[Editor.EditorEngine] EditPackages=`), with unnamed
+/// packages appended by relative path.
+///
+/// The set comes from [`Installation`]'s profile-aware index, not from an unbounded directory
+/// walk: only this root's code search roots contribute, package magic is verified by the index,
+/// and `*Plus` packages follow their base package (patch order). A user-content directory the
+/// profile deliberately does not index (GOG `MapsUser`, Steam `Skins`) is therefore not loaded
+/// implicitly. Duplicate logical names are diagnosed by `Installation` and not silently mixed.
 pub fn script_packages(root: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
-    Ok(all_files(root)?
+    let install = Installation::open(root, &OpenOptions::default())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(install
+        .code_packages_in_load_order()
         .into_iter()
-        .filter(|(rel, _)| rel.to_ascii_lowercase().ends_with(".u"))
-        .filter(|(_, path)| starts_with_tag(path))
+        .map(|e| (e.relative, e.path))
         .collect())
 }
 
@@ -740,5 +705,42 @@ mod tests {
             vm.localized_overrides > 0,
             "at least one class default must have been overridden"
         );
+    }
+
+    /// Opt-in: the runtime's package loader follows the Steam `EditPackages=` order and finds the
+    /// split `Maps/BaseSP` maps, all from the one Steam root (no GOG mixing).
+    #[test]
+    fn steam_runtime_loads_ini_ordered_plus_packages() {
+        let Some(root) = std::env::var_os("XIII_STEAM_DIR") else {
+            println!("SKIPPED: set XIII_STEAM_DIR to the Steam installation root to run this test");
+            return;
+        };
+        let path = PathBuf::from(&root);
+        let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = if path.is_relative() {
+            ws.join(path)
+        } else {
+            path
+        };
+        let (set, failures) = load_install(&path).expect("load install");
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(set.packages.len(), 33, "Steam has 33 .u packages");
+        for name in [
+            "XIIIPlus",
+            "XIIIMPGame",
+            "XIIIPersosPlus",
+            "XIIIMPPlus",
+            "XIDInterfPlus",
+        ] {
+            assert!(set.package_index(name).is_some(), "{name} not loaded");
+        }
+        let pos = |n: &str| set.package_index(n).expect("loaded");
+        assert!(pos("XIII") < pos("XIIIPlus"));
+        assert!(pos("XIIIPersos") < pos("XIIIPersosPlus"));
+        assert!(pos("Engine") < pos("EnginePlus"));
+
+        let (set2, idx) = load_with_map(&path, "Plage00").expect("load Steam map");
+        assert!(set2.packages[idx].name.eq_ignore_ascii_case("Plage00"));
+        assert_eq!(set2.packages.len(), 34, "33 code packages plus the map");
     }
 }

@@ -1,7 +1,11 @@
-//! Minimal, read-only reader for the few `[Core.System]` fields that are
-//! useful as layout evidence. Nothing read here changes resolution: the values
-//! are reported next to the indexed layout so precedence questions can be
-//! investigated with data. No other configuration is interpreted or executed.
+//! Minimal, read-only reader for the few ini fields that are useful as layout
+//! evidence: `[Core.System]` `Paths=`/`SpecificPackage=`/`PlateForm=`, plus
+//! the package load order the engine is told to use (`[Editor.EditorEngine]`
+//! `EditPackages=` and `[Engine.GameEngine]` `ServerPackages=`). These values
+//! are reported next to the indexed layout so precedence questions are answered
+//! with the patch's own data; ordering uses them (see
+//! [`crate::Installation::code_packages_in_load_order`]), but no other
+//! configuration is interpreted or executed.
 
 use std::fs;
 use std::io::Read;
@@ -15,15 +19,22 @@ pub const MAX_INI_BYTES: u64 = 1 << 20;
 /// on first run (present in the Steam copy only).
 pub const INI_FILE_NAMES: &[&str] = &["default.ini", "xiii.ini"];
 
-/// Raw `[Core.System]` values from one ini file.
+/// Raw ini values used as layout/order evidence from one file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CoreSystemFields {
-    /// `Paths=` values in file order (commented lines excluded).
+    /// `[Core.System] Paths=` values in file order (commented lines excluded).
     pub paths: Vec<String>,
-    /// `SpecificPackage=` values in file order.
+    /// `[Core.System] SpecificPackage=` values in file order.
     pub specific_packages: Vec<String>,
-    /// `PlateForm=` value, if present.
+    /// `[Core.System] PlateForm=` value, if present.
     pub plateform: Option<String>,
+    /// `[Editor.EditorEngine] EditPackages=` package names in file order. This is the engine's
+    /// package load/compile order; in the patched Steam install the `*Plus` packages appear
+    /// directly after their base package (see the lines cited in the README).
+    pub edit_packages: Vec<String>,
+    /// `[Engine.GameEngine] ServerPackages=` package names in file order. The patch adds
+    /// `XIIIMPPlus` after the base `XIIIMP`.
+    pub server_packages: Vec<String>,
 }
 
 /// One `Paths=` entry compared with the indexed layout.
@@ -61,35 +72,46 @@ pub struct SpecificPackageCheck {
     pub found: Vec<String>,
 }
 
-/// Parses `[Core.System]` from ini text. Section and key names are matched
-/// case-insensitively; lines starting with `;` are comments.
+/// Parses the layout/order evidence fields from ini text: `[Core.System]`
+/// `Paths=`/`SpecificPackage=`/`PlateForm=`, `[Editor.EditorEngine]`
+/// `EditPackages=` and `[Engine.GameEngine]` `ServerPackages=`. Section and key
+/// names are matched case-insensitively; lines starting with `;` are comments.
 pub fn parse_core_system(text: &str) -> CoreSystemFields {
     let mut out = CoreSystemFields::default();
-    let mut in_section = false;
+    let mut section = String::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with(';') {
             continue;
         }
         if let Some(rest) = line.strip_prefix('[') {
-            in_section = rest
+            section = rest
                 .strip_suffix(']')
-                .is_some_and(|s| s.trim().eq_ignore_ascii_case("core.system"));
-            continue;
-        }
-        if !in_section {
+                .map(|s| s.trim().to_ascii_lowercase())
+                .unwrap_or_default();
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
         let (key, value) = (key.trim(), value.trim().to_owned());
-        if key.eq_ignore_ascii_case("paths") {
-            out.paths.push(value);
-        } else if key.eq_ignore_ascii_case("specificpackage") {
-            out.specific_packages.push(value);
-        } else if key.eq_ignore_ascii_case("plateform") {
-            out.plateform = Some(value);
+        match section.as_str() {
+            "core.system" => {
+                if key.eq_ignore_ascii_case("paths") {
+                    out.paths.push(value);
+                } else if key.eq_ignore_ascii_case("specificpackage") {
+                    out.specific_packages.push(value);
+                } else if key.eq_ignore_ascii_case("plateform") {
+                    out.plateform = Some(value);
+                }
+            }
+            "editor.editorengine" if key.eq_ignore_ascii_case("editpackages") => {
+                out.edit_packages.push(value);
+            }
+            "engine.gameengine" if key.eq_ignore_ascii_case("serverpackages") => {
+                out.server_packages.push(value);
+            }
+            _ => {}
         }
     }
     out
@@ -145,7 +167,9 @@ mod tests {
     const SAMPLE: &str = "[URL]\nPaths=ignored\n[Core.System]\r\nSavePath=..\\Save\r\n\
         Paths=..\\System\\*.u\r\nPaths=..\\Maps\\*.unr\r\n;;;Paths=..\\StaticMeshes\\*.usx\r\n\
         PlateForm=0\r\nSpecificPackage=XIIIPersos.u\r\nspecificpackage = GUI.u\r\n\
-        [Engine.GameEngine]\r\nPaths=..\\Other\\*.u\r\n";
+        [Engine.GameEngine]\r\nPaths=..\\Other\\*.u\r\nServerPackages=XIII\r\n\
+        ServerPackages=XIIIMPPlus\r\n\
+        [Editor.EditorEngine]\r\nEditPackages=XIII\r\neditpackages = XIIIPlus\r\n";
 
     #[test]
     fn parses_only_core_system_and_skips_comments() {
@@ -153,6 +177,16 @@ mod tests {
         assert_eq!(f.paths, ["..\\System\\*.u", "..\\Maps\\*.unr"]);
         assert_eq!(f.specific_packages, ["XIIIPersos.u", "GUI.u"]);
         assert_eq!(f.plateform.as_deref(), Some("0"));
+    }
+
+    /// `EditPackages=`/`ServerPackages=` live in their own sections; a `Paths=` line in another
+    /// section must not leak into the `[Core.System]` list.
+    #[test]
+    fn parses_package_order_from_their_sections() {
+        let f = parse_core_system(SAMPLE);
+        assert_eq!(f.edit_packages, ["XIII", "XIIIPlus"]);
+        assert_eq!(f.server_packages, ["XIII", "XIIIMPPlus"]);
+        assert!(!f.paths.iter().any(|p| p.contains("Other")));
     }
 
     #[test]

@@ -343,6 +343,55 @@ fn ini_paths_are_compared_with_indexed_roots() {
     );
 }
 
+/// The load order the runtime uses comes from the install's own `EditPackages=` list: the patch
+/// lists each `*Plus` package directly after its base, and unnamed packages are appended.
+#[test]
+fn code_packages_follow_editpackages_order_base_then_plus() {
+    let s = steam_tree();
+    let si = open(&s);
+    let names: Vec<String> = si
+        .code_packages_in_load_order()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    let pos = |n: &str| names.iter().position(|x| x.eq_ignore_ascii_case(n));
+    assert_eq!(pos("Core"), Some(0), "{names:?}");
+    assert!(pos("XIII") < pos("XIIIPlus"), "base before plus: {names:?}");
+    assert!(
+        pos("XIIIPlus") < pos("XIIIPersos"),
+        "file order is preserved: {names:?}"
+    );
+    assert_eq!(names.len(), 7, "{names:?}");
+    let mut unique = names.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        7,
+        "every code package exactly once: {names:?}"
+    );
+
+    let g = gog_tree();
+    let gi = open(&g);
+    let gnames: Vec<String> = gi
+        .code_packages_in_load_order()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(gnames[0], "core", "{gnames:?}");
+    assert!(!gnames.iter().any(|n| n.eq_ignore_ascii_case("XIIIPlus")));
+
+    let ev = &si.ini_evidence()[0];
+    assert_eq!(
+        ev.fields.edit_packages,
+        ["Core", "Engine", "XIII", "XIIIPlus", "XIIIPersos"]
+    );
+    assert_eq!(
+        ev.fields.server_packages,
+        ["GamePlay", "XIII", "XIIIMPPlus"]
+    );
+}
+
 #[test]
 fn walk_limits_are_reported() {
     let t = gog_tree();

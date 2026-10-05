@@ -502,7 +502,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 229);
+    assert_eq!(defs.len(), 232);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -5620,5 +5620,148 @@ fn object_class_property_answers_the_objects_class() {
     assert_eq!(
         vm.get_property(t, "Class"),
         Some(&Value::Object(Some(ObjRef::Static(sg(&set, "Thing")))))
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Cinematic/dialogue natives (item3l)
+
+/// `GetWaveDuration` returns the host provider's value; without one it reports 0 (the script's
+/// own fallback) rather than inventing a duration.
+#[test]
+fn get_wave_duration_reports_provider_or_zero() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    let mut args = [Value::Str("Plage00_XIIIa_00".to_owned())];
+    let r = try_native(
+        &mut vm,
+        "Engine.Actor.GetWaveDuration",
+        a,
+        &[false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Float(0.0)));
+    vm.set_voice_duration(Box::new(crate::voice::FixedVoiceDuration::new(2.5)));
+    let mut args = [Value::Str("Plage00_XIIIa_00".to_owned())];
+    let r = try_native(
+        &mut vm,
+        "Engine.Actor.GetWaveDuration",
+        a,
+        &[false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Float(2.5)));
+    assert!(vm.has_voice_duration());
+    assert_eq!(vm.voice_duration("anything"), Some(2.5));
+}
+
+/// `PlayStrVoice` emits a `Dialogue` event carrying the voice name, the speaker pawn and the
+/// provider duration; a plain actor (no `LineIndex`/`Lines`/`Speakers`) has no subtitle text.
+#[test]
+fn play_str_voice_emits_dialogue_event_with_speaker_and_duration() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let dm = vm.spawn(sg(&set, "Actor"), "DialogueManager0").unwrap();
+    let pam = vm.spawn(sg(&set, "Actor"), "Cine0").unwrap();
+    vm.set_voice_duration(Box::new(crate::voice::FixedVoiceDuration::new(2.5)));
+    let mut args = [
+        Value::Str("Plage00_XIIIa_00".to_owned()),
+        Value::Object(Some(ObjRef::Instance(pam))),
+    ];
+    let r = try_native(
+        &mut vm,
+        "Engine.Actor.PlayStrVoice",
+        dm,
+        &[false, false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Bool(true)));
+    let events = vm.drain_events();
+    // The voice name is also emitted as a `PlaySound` so the existing audio layer speaks it.
+    let dialogue = events
+        .iter()
+        .find_map(|e| match e {
+            crate::events::PresentationEvent::Dialogue(d) => Some(d),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no Dialogue event in {events:?}"));
+    assert_eq!(dialogue.actor, "DialogueManager0");
+    assert_eq!(dialogue.speaker.as_deref(), Some("Cine0"));
+    assert_eq!(dialogue.sound, "Plage00_XIIIa_00");
+    assert_eq!(dialogue.text, None);
+    assert_eq!(dialogue.duration, Some(2.5));
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            crate::events::PresentationEvent::PlaySound(s)
+                if s.sound.as_deref() == Some("Plage00_XIIIa_00")
+        )),
+        "the voice must also be emitted as a PlaySound: {events:?}"
+    );
+    // An empty voice name does not emit and reports false (the engine did not start a voice).
+    let mut args = [Value::Str(String::new()), Value::Object(None)];
+    let r = try_native(
+        &mut vm,
+        "Engine.Actor.PlayStrVoice",
+        dm,
+        &[false, false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Bool(false)));
+    assert!(vm.drain_events().is_empty());
+}
+
+/// The subtitle text comes from the `DialogueManager`'s current line: `LineIndex` selects a
+/// `Lines` element, whose `SpeakerIndex`/`SentenceIndex` select the nested speaker sentence.
+#[test]
+fn dialogue_line_text_reads_nested_speaker_sentences() {
+    let lines = Value::Array(vec![
+        Value::Struct(vec![
+            ("SpeakerIndex".to_owned(), Value::Int(-1)),
+            ("SentenceIndex".to_owned(), Value::Int(-1)),
+        ]),
+        Value::Struct(vec![
+            ("SpeakerIndex".to_owned(), Value::Int(1)),
+            ("SentenceIndex".to_owned(), Value::Int(0)),
+        ]),
+    ]);
+    let speakers = Value::Array(vec![
+        Value::Struct(vec![("Sentences".to_owned(), Value::Array(Vec::new()))]),
+        Value::Struct(vec![(
+            "Sentences".to_owned(),
+            Value::Array(vec![Value::Str("My name is XIII.".to_owned())]),
+        )]),
+    ]);
+    assert_eq!(
+        crate::cinematics::line_text_from_values(1, &lines, &speakers).as_deref(),
+        Some("My name is XIII.")
+    );
+    // A line whose indices are -1 (the script's "end of line" sentinel) has no text.
+    assert_eq!(
+        crate::cinematics::line_text_from_values(0, &lines, &speakers),
+        None
+    );
+    // Out-of-range line and negative line index do not panic.
+    assert_eq!(
+        crate::cinematics::line_text_from_values(9, &lines, &speakers),
+        None
+    );
+    assert_eq!(
+        crate::cinematics::line_text_from_values(-1, &lines, &speakers),
+        None
+    );
+    // A speaker with no sentences at the requested index yields None.
+    let bad = Value::Array(vec![Value::Struct(vec![
+        ("SpeakerIndex".to_owned(), Value::Int(0)),
+        ("SentenceIndex".to_owned(), Value::Int(0)),
+    ])]);
+    assert_eq!(
+        crate::cinematics::line_text_from_values(0, &bad, &speakers),
+        None
     );
 }

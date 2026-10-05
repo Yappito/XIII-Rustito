@@ -9,6 +9,7 @@
 //! `--play-script <file>`. Both drive the same [`sim::PlayerSim`] in `FixedUpdate` at 60 Hz.
 //! Fixed 60 Hz is a **hypothesis** (UE2 used variable ticks); see [`FIXED_HZ`].
 
+pub mod cinematics;
 pub mod hud;
 pub mod movers;
 pub mod pawns;
@@ -109,7 +110,15 @@ impl Plugin for PlayPlugin {
         // is stored and reported by `setup`, which exits with an error.
         let game_dir = self.options.game_dir.clone().unwrap_or_default();
         let map = self.options.map.clone().unwrap_or_default();
-        let session = session::Session::open(&game_dir, &map);
+        let t0 = Instant::now();
+        let mut session = session::Session::open(&game_dir, &map);
+        println!(
+            "[play] script session open (scripts, begin-play, providers): {:.2}s",
+            t0.elapsed().as_secs_f32()
+        );
+        if let Ok(s) = session.as_mut() {
+            s.enable_native_timers(self.options.perf_natives);
+        }
         app.insert_non_send(session);
         app.insert_resource(PlayConfig {
             options: self.options.clone(),
@@ -118,6 +127,7 @@ impl Plugin for PlayPlugin {
         .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
         .init_resource::<ShotFlag>()
         .init_resource::<RenderSync>()
+        .init_resource::<cinematics::CinematicState>()
         .add_systems(Startup, setup)
         .add_systems(FixedUpdate, fixed_step)
         .add_systems(
@@ -126,7 +136,9 @@ impl Plugin for PlayPlugin {
                 controls,
                 grab_cursor,
                 mouse_look,
+                cinematics::collect,
                 sync_camera,
+                cinematics::draw,
                 viewer::sky_follow,
                 viewer::animate_uv,
                 pawns::update_pawns,
@@ -136,7 +148,8 @@ impl Plugin for PlayPlugin {
                 unattended,
             )
                 .chain(),
-        );
+        )
+        .add_systems(Last, cinematics::report_exit);
     }
 }
 
@@ -453,6 +466,18 @@ fn setup_inner(
             .to_owned();
         sync.entities.entry(actor).or_default().push(*entity);
     }
+    let scene_tris: usize = scene
+        .objects
+        .iter()
+        .map(|o| scene.meshes[o.mesh].indices.len() / 3)
+        .sum();
+    commands.insert_resource(crate::perf::RenderStats::new(
+        scene.objects.len(),
+        geometry.len(),
+        meshes.len(),
+        materials.len(),
+        scene_tris,
+    ));
 
     let eye = to_bevy_position(sim.eye_location(&params));
     let sky_position = viewer::scene_sky_position(&scene);
@@ -574,6 +599,10 @@ fn setup_inner(
         shot_done: false,
         target_at: None,
     });
+    println!(
+        "[play] setup complete in {:.2}s",
+        started.elapsed().as_secs_f32()
+    );
     Ok(())
 }
 
@@ -672,30 +701,57 @@ fn fixed_step(
     mut session: NonSendMut<Result<session::Session, String>>,
     sync: Res<RenderSync>,
     mut transforms: Query<&mut Transform>,
+    mut perf: ResMut<crate::perf::Perf>,
 ) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
     }
     let elapsed = state.tick as f32 * DT;
-    let input = match script.drive.as_mut() {
-        Some(drive) => drive.advance(elapsed, &mut sim.0),
-        None => read_keyboard(&keys),
+    // Scripted cutscenes freeze the player (`CineController2.Interpret` FPC/FPL ->
+    // `NoControl`/`NoMove`, and `CameraView`/`PlayingVideo`). The host owns the player pawn's
+    // movement, so it must zero the movement input itself; the VM's state machine only sets the
+    // state. See `cinematics`.
+    let suppressed = match &*session {
+        Ok(sess) => cinematics::input_suppressed(sess),
+        Err(_) => false,
+    };
+    let input = if suppressed {
+        Input::default()
+    } else {
+        match script.drive.as_mut() {
+            Some(drive) => drive.advance(elapsed, &mut sim.0),
+            None => read_keyboard(&keys),
+        }
     };
     let use_action = input.use_action;
+    let t0 = Instant::now();
     sim.0
         .step(dt, &world.world, &params.0, input, &world.sources);
+    perf.span("player_sim", t0);
     if let Ok(sess) = session.as_mut() {
+        let t0 = Instant::now();
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity);
+        perf.span("vm_step", t0);
         // The VM owns the mover poses; write them into the dynamic collision set so the next
         // player step collides with the moved brush.
         let wr = &mut *world;
+        let t0 = Instant::now();
         let mover_states = sess.mover_states();
+        if sess.vm().native_profile().enabled {
+            let micros = t0.elapsed().as_micros() as u64;
+            sess.vm_mut().native_profile_mut().mover_states_micros += micros;
+        }
+        let t0 = Instant::now();
         wr.movers.update(&mut wr.world, &mover_states);
+        perf.span("mover_collision", t0);
         if use_action {
             perform_use(sess, &wr.world, &wr.sources, &sim.0, &params.0);
         }
+        let t0 = Instant::now();
         crate::audio::pump(sess.events.iter());
+        perf.span("audio_pump", t0);
+        let t0 = Instant::now();
         for (name, delta) in &sess.moved {
             let Some(entities) = sync.entities.get(name) else {
                 continue;
@@ -707,8 +763,10 @@ fn fixed_step(
                 }
             }
         }
+        perf.span("render_sync", t0);
     }
     state.tick += 1;
+    perf.step();
     if state.tick.is_multiple_of(TRACE_EVERY) {
         println!("[play] {}", format_trace(state.tick, elapsed, &sim.0));
         if let Ok(sess) = session.as_ref() {
@@ -770,12 +828,20 @@ fn mouse_look(
 fn sync_camera(
     sim: Res<SimRes>,
     params: Res<ParamsRes>,
+    cine: Res<cinematics::CinematicState>,
     mut cams: Query<&mut Transform, With<PlayCam>>,
 ) {
-    let eye = to_bevy_position(sim.0.eye_location(&params.0));
     for mut t in &mut cams {
-        t.translation = Vec3::from_array(eye);
-        t.rotation = Quat::from_euler(EulerRot::YXZ, -sim.0.yaw, sim.0.pitch, 0.0);
+        if let Some(v) = &cine.view {
+            // A script selected a cutscene camera (`CamView`/`ViewTarget`); render from it.
+            let (loc, rot) = cinematics::camera_transform(v.location, v.rotation);
+            t.translation = loc;
+            t.rotation = rot;
+        } else {
+            let eye = to_bevy_position(sim.0.eye_location(&params.0));
+            t.translation = Vec3::from_array(eye);
+            t.rotation = Quat::from_euler(EulerRot::YXZ, -sim.0.yaw, sim.0.pitch, 0.0);
+        }
     }
 }
 
@@ -785,8 +851,10 @@ fn overlay(
     session: NonSend<Result<session::Session, String>>,
     pawns: Option<Res<pawns::PawnScene>>,
     hud: Option<Res<hud::HudRuntime>>,
+    mut perf: ResMut<crate::perf::Perf>,
     mut text: Query<&mut Text, With<PlayOverlay>>,
 ) {
+    let t0 = Instant::now();
     let Ok(mut text) = text.single_mut() else {
         return;
     };
@@ -881,14 +949,17 @@ fn overlay(
         s.last_source.as_deref().unwrap_or("-"),
         vm,
     );
+    perf.span("overlay", t0);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn unattended(
     mut commands: Commands,
     cfg: Res<PlayConfig>,
     mut state: ResMut<TraceState>,
     flag: Res<ShotFlag>,
     sim: Res<SimRes>,
+    mut perf: ResMut<crate::perf::Perf>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let Some(secs) = state.exit_secs else {
@@ -930,6 +1001,7 @@ fn unattended(
             (None, _) => "none".into(),
         }
     );
+    perf.request_final();
     exit.write(AppExit::Success);
 }
 

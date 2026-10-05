@@ -279,14 +279,23 @@ pub fn decode_sector(package: &Package, data: &[u8], export: usize) -> DecodeRes
     Ok(TerrainSector { report, ..s })
 }
 
-/// Heightfield mesh (source coordinates).
+/// One rectangular heightfield region of a [`TerrainInfo`] (source coordinates).
+///
+/// A `TerrainInfo` stores more than one region when its native `Vertices` array is longer than
+/// `HeightmapX * HeightmapY`: the array is a sequence of concatenated row-major grids at
+/// different spacings, e.g. Hual04c `TerrainInfo1` is a 64x64 grid (spacing 250) followed by a
+/// 128x96 grid (spacing 100). Treating the whole array as one grid produced the reported
+/// `heightmap WxH does not match N vertices` failures.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerrainMesh {
     /// Grid width (vertices).
     pub width: usize,
-    /// Grid height (vertices).
+    /// Grid height in rows.
     pub height: usize,
-    /// Vertices (world space, source coordinates).
+    /// Base region index (0) or a detail region (1..). Only region 0 is described by the
+    /// `TerrainMap` texture, the sectors and the visibility/edge bitmaps.
+    pub region: usize,
+    /// Vertices (world space, source coordinates), `width * height`.
     pub positions: Vec<[f32; 3]>,
     /// Normalized grid coordinates (0..1) for alpha maps.
     pub grid_uv: Vec<[f32; 2]>,
@@ -297,62 +306,162 @@ pub struct TerrainMesh {
     pub hidden_quads: usize,
 }
 
+/// Tolerance for grouping vertices into a rectangular grid. Vertex spacing is at least tens of
+/// Unreal units, so a sub-unit tolerance cannot merge distinct rows/columns.
+const GRID_EPS: f32 = 1e-3;
+
 impl TerrainInfo {
-    /// Builds the heightfield triangles from the stored world-space vertices.
-    /// `width` x `height` is the heightmap size (from the `TerrainMap` texture).
+    /// Builds the heightfield as its concatenated rectangular regions.
     ///
-    /// Quad `(x, y)` uses bit `y * width + x` of `QuadVisibilityBitmap` (holes when clear)
-    /// and of `EdgeTurnBitmap` (diagonal choice). Both bit conventions are inferred from UE2
-    /// naming; Plage00's visibility bitmap is all ones, so holes are not yet verified.
-    pub fn mesh(&self, width: usize, height: usize) -> DecodeResult<TerrainMesh> {
-        if width < 2 || height < 2 || width * height != self.vertices.len() {
-            return Err(DecodeError::new(DecodeErrorKind::Invalid(format!(
-                "heightmap {width}x{height} does not match {} vertices",
-                self.vertices.len()
-            ))));
+    /// Each region is a row-major grid: every row has a constant `Y`, strictly increasing `X`
+    /// with a constant step, and the row `Y` advances by a constant step. A region ends when the
+    /// next row's first `X`, constant `Y` or row step no longer matches (verified byte-exactly on
+    /// every campaign terrain). The first (base) region is the one the `TerrainMap` texture, the
+    /// sectors and the bitmaps describe; later regions are extra detail geometry.
+    ///
+    /// `width` x `height` is the base region's size (from the `TerrainMap` texture). A base
+    /// mismatch is an error, never a silent skip.
+    ///
+    /// For the base region, quad `(x, y)` uses bit `y * width + x` of `QuadVisibilityBitmap`
+    /// (holes when clear) and of `EdgeTurnBitmap` (diagonal choice); the bit convention is
+    /// inferred from UE2 naming (Plage00's visibility bitmap is all ones, so holes are not yet
+    /// verified against the original). Detail regions have no bitmap and are fully drawn.
+    pub fn mesh(&self, width: usize, height: usize) -> DecodeResult<Vec<TerrainMesh>> {
+        let v = &self.vertices;
+        let n = v.len();
+        if n == 0 {
+            return Err(DecodeError::new(DecodeErrorKind::Invalid(
+                "terrain has no vertices".into(),
+            )));
         }
         let bit = |bits: &[u32], i: usize| -> Option<bool> {
             bits.get(i / 32).map(|w| (w >> (i % 32)) & 1 == 1)
         };
-        let mut indices = Vec::new();
-        let mut hidden = 0;
-        for y in 0..height - 1 {
-            for x in 0..width - 1 {
-                let q = y * width + x;
-                if bit(&self.quad_visibility, q) == Some(false) {
+        let mut regions = Vec::new();
+        let mut i = 0usize;
+        while i < n {
+            // Width of the first row: constant Y, strictly increasing X.
+            let (y0, x0) = (v[i][1], v[i][0]);
+            let mut w = 1usize;
+            while i + w < n
+                && (v[i + w][1] - y0).abs() <= GRID_EPS
+                && v[i + w][0] > v[i + w - 1][0] + GRID_EPS
+            {
+                w += 1;
+            }
+            if w < 2 {
+                return Err(DecodeError::new(DecodeErrorKind::Invalid(format!(
+                    "terrain region at vertex {i} has width {w}; not a heightfield row"
+                ))));
+            }
+            // Rows: the step from row 0 to row 1 fixes the expected `Y` of every later row.
+            let mut rows = 1usize;
+            if i + w < n && v[i + w][1] - y0 > GRID_EPS {
+                let dy = v[i + w][1] - y0;
+                loop {
+                    let base = i + rows * w;
+                    if base + w > n {
+                        break;
+                    }
+                    let ry = v[base][1];
+                    if (ry - (y0 + rows as f32 * dy)).abs() > GRID_EPS
+                        || (v[base][0] - x0).abs() > GRID_EPS
+                    {
+                        break;
+                    }
+                    let mut ok = true;
+                    for c in 0..w {
+                        if (v[base + c][1] - ry).abs() > GRID_EPS
+                            || (c > 0 && v[base + c][0] <= v[base + c - 1][0] + GRID_EPS)
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                    rows += 1;
+                }
+            }
+            if rows < 2 {
+                return Err(DecodeError::new(DecodeErrorKind::Invalid(format!(
+                    "terrain region at vertex {i} is {w}x{rows}; a heightfield needs 2 rows"
+                ))));
+            }
+            let region = regions.len();
+            regions.push(build_region(self, &bit, i, w, rows, region, width));
+            i += w * rows;
+        }
+        let Some(base) = regions.first() else {
+            return Err(DecodeError::new(DecodeErrorKind::Invalid(
+                "terrain has no regions".into(),
+            )));
+        };
+        if base.width != width || base.height != height {
+            return Err(DecodeError::new(DecodeErrorKind::Invalid(format!(
+                "heightmap {width}x{height} does not match base region {}x{} ({} vertices)",
+                base.width, base.height, n
+            ))));
+        }
+        Ok(regions)
+    }
+}
+
+/// Builds one region's triangles, UVs and hidden-quad count. `start` is the first vertex index;
+/// `base_width` is the base region's width, used only to index the bitmaps for region 0.
+fn build_region(
+    info: &TerrainInfo,
+    bit: &impl Fn(&[u32], usize) -> Option<bool>,
+    start: usize,
+    width: usize,
+    rows: usize,
+    region: usize,
+    base_width: usize,
+) -> TerrainMesh {
+    let positions = info.vertices[start..start + width * rows].to_vec();
+    let mut indices = Vec::new();
+    let mut hidden = 0;
+    for y in 0..rows - 1 {
+        for x in 0..width - 1 {
+            if region == 0 {
+                let q = y * base_width + x;
+                if bit(&info.quad_visibility, q) == Some(false) {
                     hidden += 1;
                     continue;
                 }
-                let (a, b, c, d) = (q, q + 1, q + width, q + width + 1);
-                let (a, b, c, d) = (a as u32, b as u32, c as u32, d as u32);
-                // Rows run along +Y and columns along +X (checked on Plage00/01). The order
-                // makes (b-a)x(c-a) point to -Z, the same convention as static-mesh front
-                // faces (numeric normal against the visible side in source coordinates).
-                if bit(&self.edge_turn, q) == Some(true) {
-                    indices.extend_from_slice(&[a, c, b, b, c, d]);
-                } else {
-                    indices.extend_from_slice(&[a, d, b, a, c, d]);
-                }
+            }
+            let (a, b, c, d) = (
+                y * width + x,
+                y * width + x + 1,
+                (y + 1) * width + x,
+                (y + 1) * width + x + 1,
+            );
+            let (a, b, c, d) = (a as u32, b as u32, c as u32, d as u32);
+            // Rows run along +Y and columns along +X (checked on Plage00/01). The order makes
+            // (b-a)x(c-a) point to -Z, the same convention as static-mesh front faces (numeric
+            // normal against the visible side in source coordinates).
+            let turn = region == 0 && bit(&info.edge_turn, y * base_width + x) == Some(true);
+            if turn {
+                indices.extend_from_slice(&[a, c, b, b, c, d]);
+            } else {
+                indices.extend_from_slice(&[a, d, b, a, c, d]);
             }
         }
-        let grid_uv = (0..height)
-            .flat_map(|y| {
-                (0..width).map(move |x| {
-                    [
-                        x as f32 / (width - 1) as f32,
-                        y as f32 / (height - 1) as f32,
-                    ]
-                })
-            })
-            .collect();
-        Ok(TerrainMesh {
-            width,
-            height,
-            positions: self.vertices.clone(),
-            grid_uv,
-            indices,
-            hidden_quads: hidden,
+    }
+    let grid_uv = (0..rows)
+        .flat_map(|y| {
+            (0..width).map(move |x| [x as f32 / (width - 1) as f32, y as f32 / (rows - 1) as f32])
         })
+        .collect();
+    TerrainMesh {
+        width,
+        height: rows,
+        region,
+        positions,
+        grid_uv,
+        indices,
+        hidden_quads: hidden,
     }
 }
 
@@ -445,9 +554,13 @@ pub fn color_grid(
     width: usize,
     height: usize,
 ) -> DecodeResult<TerrainColorGrid> {
-    if width == 0 || height == 0 || width * height != info.vertices.len() {
+    // Sectors index the base heightmap grid only; a `Vertices` array longer than `width *
+    // height` carries an additional detail region (see [`TerrainInfo::mesh`]) and is not an
+    // error here.
+    if width == 0 || height == 0 || width * height > info.vertices.len() {
         return Err(DecodeError::new(DecodeErrorKind::Invalid(format!(
-            "heightmap {width}x{height} does not match {} vertices",
+            "heightmap {width}x{height} needs {} vertices, terrain has {}",
+            width * height,
             info.vertices.len()
         ))));
     }
@@ -582,7 +695,7 @@ mod tests {
                 unsupported_tail: None,
             },
         };
-        let m = info.mesh(3, 3).unwrap();
+        let m = &info.mesh(3, 3).unwrap()[0];
         assert_eq!(m.hidden_quads, 1);
         assert_eq!(m.indices.len(), 3 * 6);
         for t in m.indices.as_chunks::<3>().0 {
@@ -638,6 +751,107 @@ mod tests {
                 unsupported_tail: None,
             },
         }
+    }
+
+    /// Builds a `TerrainInfo` from explicit vertices and no properties, for mesh-region tests.
+    fn info_with(vertices: Vec<[f32; 3]>) -> TerrainInfo {
+        TerrainInfo {
+            terrain_map: None,
+            terrain_scale: None,
+            location: None,
+            layers: Vec::new(),
+            quad_visibility: Vec::new(),
+            edge_turn: Vec::new(),
+            sectors: Vec::new(),
+            vertices,
+            sectors_xy: [0, 0],
+            report: PayloadReport {
+                payload: Span { start: 0, end: 0 },
+                properties_end: 0,
+                unknown: Vec::new(),
+                unsupported_tail: None,
+            },
+        }
+    }
+
+    /// Row-major grid at `step`, top-left at `origin`.
+    fn grid(
+        origin: [f32; 3],
+        w: usize,
+        h: usize,
+        step: f32,
+        z: impl Fn(usize, usize) -> f32,
+    ) -> Vec<[f32; 3]> {
+        let mut v = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                v.push([
+                    origin[0] + x as f32 * step,
+                    origin[1] + y as f32 * step,
+                    z(x, y),
+                ]);
+            }
+        }
+        v
+    }
+
+    /// The key decode bug: a `TerrainInfo` whose `Vertices` hold a base region plus a
+    /// differently-spaced detail region must split, not fail with a vertex-count mismatch.
+    #[test]
+    fn mesh_splits_concatenated_regions() {
+        let mut vertices = grid([0.0, 0.0, 0.0], 4, 3, 250.0, |_, _| 0.0);
+        vertices.extend(grid([0.0, 0.0, 0.0], 8, 6, 100.0, |x, y| (x + y) as f32));
+        let info = info_with(vertices);
+        let regions = info.mesh(4, 3).unwrap();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(
+            (regions[0].width, regions[0].height, regions[0].region),
+            (4, 3, 0)
+        );
+        assert_eq!(
+            (regions[1].width, regions[1].height, regions[1].region),
+            (8, 6, 1)
+        );
+        // Triangles per region: 2*(w-1)*(h-1) quads * 3 indices.
+        assert_eq!(regions[0].indices.len(), 2 * 3 * 2 * 3);
+        assert_eq!(regions[1].indices.len(), 2 * 7 * 5 * 3);
+        assert_eq!(regions[0].positions[0], [0.0, 0.0, 0.0]);
+        // A base-region size that does not match the texture is still an error.
+        assert!(info.mesh(4, 4).is_err());
+        assert!(info.mesh(3, 3).is_err());
+    }
+
+    /// A single region still decodes; and the base region's hidden-quad bits are read from the
+    /// bitmap while a detail region (with no bitmap) is fully drawn.
+    #[test]
+    fn mesh_region_bitmap_applies_only_to_base() {
+        let mut vertices = grid([0.0, 0.0, 0.0], 3, 3, 10.0, |_, _| 0.0);
+        vertices.extend(grid([100.0, 0.0, 0.0], 3, 3, 10.0, |_, _| 0.0));
+        let mut info = info_with(vertices);
+        // Hide quad 0 of the base (bit 0 clear) and flip quad 1's diagonal (bit 1 set).
+        info.quad_visibility = vec![!0b1];
+        info.edge_turn = vec![0b10];
+        let regions = info.mesh(3, 3).unwrap();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].hidden_quads, 1);
+        assert_eq!(regions[1].hidden_quads, 0);
+        assert_eq!(regions[0].indices.len(), (4 - 1) * 2 * 3);
+        assert_eq!(regions[1].indices.len(), 4 * 2 * 3);
+    }
+
+    /// A row whose `Y` does not advance, or a truncated array, must be an error, not a silent
+    /// partial grid.
+    #[test]
+    fn mesh_rejects_degenerate_and_truncated_regions() {
+        // All vertices share one row: no second row.
+        let flat = info_with(grid([0.0, 0.0, 0.0], 4, 1, 10.0, |_, _| 0.0));
+        assert!(flat.mesh(4, 1).is_err());
+        // Region claims 4x3 but the tail is cut to two rows.
+        let mut cut = grid([0.0, 0.0, 0.0], 4, 3, 10.0, |_, _| 0.0);
+        cut.truncate(8);
+        assert!(info_with(cut).mesh(3, 2).is_err());
+        // Empty vertex list.
+        assert!(info_with(Vec::new()).mesh(2, 2).is_err());
     }
 
     #[test]

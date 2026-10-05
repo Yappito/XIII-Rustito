@@ -399,7 +399,9 @@ pub fn refresh(
     window: Query<&Window, With<PrimaryWindow>>,
     mut session: NonSendMut<Result<Session, String>>,
     mut hud: ResMut<HudRuntime>,
+    mut perf: ResMut<crate::perf::Perf>,
 ) {
+    let t0 = std::time::Instant::now();
     let Ok(session) = session.as_mut() else {
         return;
     };
@@ -429,6 +431,7 @@ pub fn refresh(
     let commands = vm.drain_canvas();
     hud.total_commands += commands.len() as u64;
     hud.commands = commands;
+    perf.span("hud_postrender", t0);
 }
 
 /// Per-rendered-frame system: rebuild the Bevy UI nodes from [`HudRuntime::commands`].
@@ -437,7 +440,9 @@ pub fn draw(
     mut commands: Commands,
     mut hud: ResMut<HudRuntime>,
     mut images: ResMut<Assets<Image>>,
+    mut perf: ResMut<crate::perf::Perf>,
 ) {
+    let t0 = std::time::Instant::now();
     for e in hud.entities.drain(..) {
         commands.entity(e).despawn();
     }
@@ -622,6 +627,7 @@ pub fn draw(
         }
         *entry += n;
     }
+    perf.span("hud_draw", t0);
 }
 
 fn to_color(c: [u8; 4]) -> Color {

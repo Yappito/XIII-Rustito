@@ -431,7 +431,9 @@ pub(crate) fn update_pawns(
     session: NonSend<Result<Session, String>>,
     scene: Option<ResMut<PawnScene>>,
     mut transforms: Query<&mut Transform>,
+    mut perf: ResMut<crate::perf::Perf>,
 ) {
+    let t0 = std::time::Instant::now();
     let Ok(sess) = session.as_ref() else {
         return;
     };
@@ -440,13 +442,10 @@ pub(crate) fn update_pawns(
     };
     let vm = sess.vm();
     for inst in &mut scene.instances {
-        let Some(location) = vm.vector_prop(inst.id, "Location") else {
+        let Some(location) = vm.location_prop(inst.id) else {
             continue;
         };
-        let rotation = match vm.get_property(inst.id, "Rotation") {
-            Some(Value::Rotator(r)) => *r,
-            _ => [0; 3],
-        };
+        let rotation = vm.rotation_prop(inst.id).unwrap_or([0; 3]);
         let decoded = &inst.model.loaded.decoded;
         let root = root_transform(
             location,
@@ -497,6 +496,7 @@ pub(crate) fn update_pawns(
             .unwrap_or_default();
     }
     scene.pose_updates += 1;
+    perf.span("pawn_pose", t0);
 }
 
 /// Headless pawn report for the deterministic `--play-script` run (no window/GPU): the same

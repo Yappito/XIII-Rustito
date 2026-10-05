@@ -6,6 +6,7 @@
 mod audio;
 mod cli;
 mod collision;
+mod perf;
 mod play;
 mod reach;
 mod smoke;
@@ -71,6 +72,13 @@ fn main() -> AppExit {
     };
 
     let mut app = App::new();
+    app.add_plugins(perf::PerfPlugin {
+        config: perf::PerfConfig {
+            enabled: opts.perf,
+            interval: opts.perf_interval,
+            natives: opts.perf_natives,
+        },
+    });
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: match opts.mode {
