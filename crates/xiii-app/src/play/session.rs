@@ -18,7 +18,9 @@ use std::rc::Rc;
 
 use xiii_package::Limits;
 use xiii_script::vm::MoverState;
-use xiii_script::{ObjRef, ObjectId, PresentationEvent, ScriptSet, Value, Vm, VmError, VmLimits};
+use xiii_script::{
+    DialogueEvent, ObjRef, ObjectId, PresentationEvent, ScriptSet, Value, Vm, VmError, VmLimits,
+};
 use xiii_world::runtime::{self, ProviderSpec};
 
 use crate::collision;
@@ -60,6 +62,11 @@ pub struct Session {
     last_synced: HashMap<ObjectId, [f32; 3]>,
     /// Presentation events, most recent last (bounded).
     pub events: VecDeque<(f64, PresentationEvent)>,
+    /// `PlayStrVoice` dialogue events, most recent last (bounded). `dialogue_total` is the
+    /// cumulative count so a consumer can detect new entries after the bounded window wraps.
+    pub dialogues: VecDeque<(f64, DialogueEvent)>,
+    /// Cumulative number of dialogue events emitted.
+    pub dialogue_total: u64,
     /// `Touch` events involving the player, most recent last (bounded).
     pub touches: VecDeque<(f64, String)>,
     player_touching: Vec<ObjectId>,
@@ -281,6 +288,8 @@ impl Session {
             first_error: None,
             last_synced,
             events: VecDeque::new(),
+            dialogues: VecDeque::new(),
+            dialogue_total: 0,
             touches: VecDeque::new(),
             player_touching: Vec::new(),
             moved: Vec::new(),
@@ -625,11 +634,35 @@ impl Session {
     fn drain_events(&mut self) {
         for ev in self.vm.drain_events() {
             let t = self.vm.time;
+            if let PresentationEvent::Dialogue(d) = &ev {
+                self.dialogue_total += 1;
+                self.dialogues.push_back((t, d.clone()));
+            }
             self.events.push_back((t, ev));
         }
         while self.events.len() > 64 {
             self.events.pop_front();
         }
+        while self.dialogues.len() > 64 {
+            self.dialogues.pop_front();
+        }
+    }
+
+    /// Dialogue events emitted since `seen` (a cumulative count). Returns the events in order;
+    /// advances `seen` to [`Session::dialogue_total`]. Newest entries survive the bounded window.
+    pub fn new_dialogues(&self, seen: &mut u64) -> Vec<&DialogueEvent> {
+        if *seen >= self.dialogue_total {
+            return Vec::new();
+        }
+        let new = (self.dialogue_total - *seen).min(self.dialogues.len() as u64) as usize;
+        *seen = self.dialogue_total;
+        self.dialogues
+            .iter()
+            .rev()
+            .take(new)
+            .rev()
+            .map(|(_, d)| d)
+            .collect()
     }
 
     fn update_touches(&mut self) {

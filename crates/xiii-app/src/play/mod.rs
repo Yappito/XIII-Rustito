@@ -9,6 +9,7 @@
 //! `--play-script <file>`. Both drive the same [`sim::PlayerSim`] in `FixedUpdate` at 60 Hz.
 //! Fixed 60 Hz is a **hypothesis** (UE2 used variable ticks); see [`FIXED_HZ`].
 
+pub mod cinematics;
 pub mod hud;
 pub mod movers;
 pub mod pawns;
@@ -118,6 +119,7 @@ impl Plugin for PlayPlugin {
         .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
         .init_resource::<ShotFlag>()
         .init_resource::<RenderSync>()
+        .init_resource::<cinematics::CinematicState>()
         .add_systems(Startup, setup)
         .add_systems(FixedUpdate, fixed_step)
         .add_systems(
@@ -126,7 +128,9 @@ impl Plugin for PlayPlugin {
                 controls,
                 grab_cursor,
                 mouse_look,
+                cinematics::collect,
                 sync_camera,
+                cinematics::draw,
                 viewer::sky_follow,
                 viewer::animate_uv,
                 pawns::update_pawns,
@@ -136,7 +140,8 @@ impl Plugin for PlayPlugin {
                 unattended,
             )
                 .chain(),
-        );
+        )
+        .add_systems(Last, cinematics::report_exit);
     }
 }
 
@@ -674,9 +679,21 @@ fn fixed_step(
         return;
     }
     let elapsed = state.tick as f32 * DT;
-    let input = match script.drive.as_mut() {
-        Some(drive) => drive.advance(elapsed, &mut sim.0),
-        None => read_keyboard(&keys),
+    // Scripted cutscenes freeze the player (`CineController2.Interpret` FPC/FPL ->
+    // `NoControl`/`NoMove`, and `CameraView`/`PlayingVideo`). The host owns the player pawn's
+    // movement, so it must zero the movement input itself; the VM's state machine only sets the
+    // state. See `cinematics`.
+    let suppressed = match &*session {
+        Ok(sess) => cinematics::input_suppressed(sess),
+        Err(_) => false,
+    };
+    let input = if suppressed {
+        Input::default()
+    } else {
+        match script.drive.as_mut() {
+            Some(drive) => drive.advance(elapsed, &mut sim.0),
+            None => read_keyboard(&keys),
+        }
     };
     let use_action = input.use_action;
     sim.0
@@ -766,12 +783,20 @@ fn mouse_look(
 fn sync_camera(
     sim: Res<SimRes>,
     params: Res<ParamsRes>,
+    cine: Res<cinematics::CinematicState>,
     mut cams: Query<&mut Transform, With<PlayCam>>,
 ) {
-    let eye = to_bevy_position(sim.0.eye_location(&params.0));
     for mut t in &mut cams {
-        t.translation = Vec3::from_array(eye);
-        t.rotation = Quat::from_euler(EulerRot::YXZ, -sim.0.yaw, sim.0.pitch, 0.0);
+        if let Some(v) = &cine.view {
+            // A script selected a cutscene camera (`CamView`/`ViewTarget`); render from it.
+            let (loc, rot) = cinematics::camera_transform(v.location, v.rotation);
+            t.translation = loc;
+            t.rotation = rot;
+        } else {
+            let eye = to_bevy_position(sim.0.eye_location(&params.0));
+            t.translation = Vec3::from_array(eye);
+            t.rotation = Quat::from_euler(EulerRot::YXZ, -sim.0.yaw, sim.0.pitch, 0.0);
+        }
     }
 }
 

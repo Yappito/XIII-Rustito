@@ -1028,6 +1028,9 @@ pub struct Vm<'s> {
     /// Decoded navigation graph (pathing natives). `None` = every native that needs it fails
     /// with [`VmErrorKind::NoNavProvider`].
     pub(crate) navigation: Option<Box<dyn NavigationData>>,
+    /// Voice-wave duration provider (dialogue natives). `None` = `Actor.GetWaveDuration` reports
+    /// `0` with a visible note (the script then falls back to its own default wave length).
+    pub(crate) voice_duration: Option<Box<dyn crate::voice::VoiceDuration>>,
     /// Outbound presentation events emitted by presentation natives (sound, texture, display,
     /// projectors). Drained with [`Vm::drain_events`].
     events: Vec<PresentationEvent>,
@@ -1081,6 +1084,7 @@ impl<'s> Vm<'s> {
             physics: None,
             animation: None,
             navigation: None,
+            voice_duration: None,
             events: Vec::new(),
             local_url: String::new(),
             url_options: String::new(),
@@ -1162,6 +1166,24 @@ impl<'s> Vm<'s> {
     /// True when a navigation provider is available.
     pub fn has_navigation(&self) -> bool {
         self.navigation.is_some()
+    }
+
+    /// Sets the voice-wave duration provider (dialogue natives). Call before runs that need a
+    /// real subtitle lifetime; without one `Actor.GetWaveDuration` reports `0` (visible).
+    pub fn set_voice_duration(&mut self, provider: Box<dyn crate::voice::VoiceDuration>) {
+        self.voice_duration = Some(provider);
+    }
+
+    /// True when a voice-duration provider is available.
+    pub fn has_voice_duration(&self) -> bool {
+        self.voice_duration.is_some()
+    }
+
+    /// Duration of a script `SoundName` from the host provider, `None` when unavailable.
+    pub fn voice_duration(&self, sound_name: &str) -> Option<f32> {
+        self.voice_duration
+            .as_ref()
+            .and_then(|p| p.duration(sound_name))
     }
 
     /// Configures the map's local URL (`<Map>?<options>`, the `url_options` being the

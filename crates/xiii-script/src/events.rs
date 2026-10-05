@@ -45,6 +45,32 @@ pub struct SoundEvent {
     pub time: f64,
 }
 
+/// A dialogue line decoded from `Actor.PlayStrVoice` (native 354).
+///
+/// `DialogueManager.Speak` (`xidcine.u`) builds `SoundName` as
+/// `Level.Title + "_" + PawnName + "_" + zero-padded SentenceIndex` and calls
+/// `PlayStrVoice(SoundName, SpeakingSpeaker.Pawn)` (native 354), with the subtitle text taken from
+/// the speaker's `Sentences[SentenceIndex]` map property. The native records both so the host can
+/// play the wave and draw the subtitle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DialogueEvent {
+    /// Object the native ran on (the `DialogueManager`).
+    pub actor: String,
+    /// The `RollOffActor` argument (the speaking pawn), `None` when null.
+    pub speaker: Option<String>,
+    /// The decoded `SoundName` string the script built (the audio path/key, e.g.
+    /// `Plage00_XIIIa_00`); never a `Sound` object path.
+    pub sound: String,
+    /// Subtitle text read from the emitting `DialogueManager`'s current
+    /// `Speakers[..].Sentences[..].Sentences` member; `None` when the actor is not a
+    /// `DialogueManager` or the line cannot be read.
+    pub text: Option<String>,
+    /// Duration in seconds from the host voice provider, `None` when unavailable.
+    pub duration: Option<f32>,
+    /// VM time in seconds when the native ran.
+    pub time: f64,
+}
+
 /// One outbound presentation command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PresentationEvent {
@@ -137,6 +163,8 @@ pub enum PresentationEvent {
         /// VM time.
         time: f64,
     },
+    /// `Actor.PlayStrVoice`: a named dialogue voice with its subtitle (see [`DialogueEvent`]).
+    Dialogue(DialogueEvent),
 }
 
 impl PresentationEvent {
@@ -153,6 +181,7 @@ impl PresentationEvent {
             | Self::StopVoice { actor, .. }
             | Self::StopSound { actor, .. }
             | Self::PlaySndPNJOno { actor, .. } => actor,
+            Self::Dialogue(e) => &e.actor,
         }
     }
 
@@ -169,6 +198,7 @@ impl PresentationEvent {
             | Self::StopVoice { time, .. }
             | Self::StopSound { time, .. }
             | Self::PlaySndPNJOno { time, .. } => *time,
+            Self::Dialogue(e) => e.time,
         }
     }
 }
@@ -254,6 +284,16 @@ impl std::fmt::Display for PresentationEvent {
                 f,
                 "PlaySndPNJOno {actor} sound={} codeMesh={code_mesh} timbre={timbre}",
                 path(sound)
+            ),
+            Self::Dialogue(e) => write!(
+                f,
+                "Dialogue {} speaker={} sound={} duration={} text={}",
+                e.actor,
+                e.speaker.as_deref().unwrap_or("-"),
+                e.sound,
+                e.duration
+                    .map_or_else(|| "-".to_owned(), |d| format!("{d:.3}")),
+                e.text.as_deref().unwrap_or("<none>")
             ),
         }
     }

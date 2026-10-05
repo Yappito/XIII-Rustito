@@ -654,6 +654,7 @@ fn event_kind(e: &PresentationEvent) -> &'static str {
         PresentationEvent::StopVoice { .. } => "StopVoice",
         PresentationEvent::StopSound { .. } => "StopSound",
         PresentationEvent::PlaySndPNJOno { .. } => "PlaySndPNJOno",
+        PresentationEvent::Dialogue(_) => "Dialogue",
     }
 }
 
