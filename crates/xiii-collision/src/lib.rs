@@ -136,6 +136,10 @@ impl MovingObject {
 pub struct CollisionWorld {
     triangles: Vec<Triangle>,
     sources: Vec<u32>,
+    /// Position of each retained triangle in the input sequence passed to [`CollisionWorld::new`]
+    /// (degenerate triangles are dropped, so this does not shift). Lets a caller map a hit back
+    /// to its source product (for example the surface material of a floor triangle).
+    origins: Vec<u32>,
     bvh: Bvh,
     degenerate: usize,
     dynamic: Vec<MovingObject>,
@@ -147,23 +151,31 @@ impl CollisionWorld {
     pub fn new(entries: impl IntoIterator<Item = (Triangle, u32)>) -> Self {
         let mut triangles = Vec::new();
         let mut sources = Vec::new();
+        let mut origins = Vec::new();
         let mut degenerate = 0usize;
-        for (t, s) in entries {
+        for (origin, (t, s)) in entries.into_iter().enumerate() {
             if is_degenerate(&t) {
                 degenerate += 1;
                 continue;
             }
             triangles.push(t);
             sources.push(s);
+            origins.push(origin as u32);
         }
         let bvh = Bvh::build(&triangles);
         Self {
             triangles,
             sources,
+            origins,
             bvh,
             degenerate,
             dynamic: Vec::new(),
         }
+    }
+
+    /// Position of triangle `index` in the input iterator of [`CollisionWorld::new`].
+    pub fn origin(&self, index: u32) -> u32 {
+        self.origins[index as usize]
     }
 
     /// Number of retained triangles.

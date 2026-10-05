@@ -11,6 +11,7 @@
 
 pub mod cartoon;
 pub mod cinematics;
+pub mod footsteps;
 pub mod hud;
 pub mod movement_modes;
 pub mod movers;
@@ -92,6 +93,12 @@ struct RenderSync {
 struct ScriptRes {
     drive: Option<script::Drive>,
 }
+
+/// Player footstep cadence for `--play` (surface lookup table + accumulator). See
+/// [`footsteps`] for the evidence (notify-driven in the original; synthesised here because the
+/// player pawn has no third-person animation).
+#[derive(Resource)]
+struct FootstepRes(footsteps::FootstepDriver);
 
 #[derive(Resource)]
 struct TraceState {
@@ -705,6 +712,8 @@ fn setup_inner(
     commands.insert_resource(ParamsRes(params));
     commands.insert_resource(MotionRes(motion));
     commands.insert_resource(SimRes(sim));
+    commands.insert_resource(footsteps::SurfaceSounds::from_scene(&scene));
+    commands.insert_resource(FootstepRes(footsteps::FootstepDriver::new()));
     commands.insert_resource(WorldRes {
         world,
         sources,
@@ -826,9 +835,13 @@ fn fixed_step(
     mut session: NonSendMut<Result<session::Session, String>>,
     sync: Res<RenderSync>,
     motion: Res<MotionRes>,
+    mut footsteps: ResMut<FootstepRes>,
+    surfaces: Res<footsteps::SurfaceSounds>,
+    cfg: Res<PlayConfig>,
     mut transforms: Query<&mut Transform>,
     mut perf: ResMut<crate::perf::Perf>,
 ) {
+    let audio_enabled = cfg.options.audio == crate::cli::Audio::On;
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
@@ -871,6 +884,22 @@ fn fixed_step(
         );
     }
     perf.span("player_sim", t0);
+    // Player footsteps: the original fires the `PlayFootStep` notify from the third-person walk
+    // animation, which `--play` does not render, so the host synthesises it from the same
+    // surface lookup the script would read from `LastCollidedMaterial`. Emit only when audio is
+    // enabled; the queue is drained by the audio plugin.
+    if audio_enabled
+        && let Some(step) =
+            footsteps
+                .0
+                .advance(dt, &sim.0, &params.0, &world.world, &surfaces, input.walk)
+    {
+        crate::audio::queue_request(crate::audio::SoundRequest::footstep(
+            state.tick as f64 * f64::from(DT),
+            "XIIIPlayerPawn".to_owned(),
+            step.sound,
+        ));
+    }
     if let Ok(sess) = session.as_mut() {
         let t0 = Instant::now();
         let modes = session::PlayerVMModes {
@@ -1313,6 +1342,9 @@ pub(crate) struct ScriptOutcome {
     pub wall_secs: f32,
     /// Trace samples: `(tick, seconds, position UU, velocity UU/s)`.
     pub trace: Vec<(u64, f32, [f32; 3], [f32; 3])>,
+    /// Host-synthesised footsteps in order:
+    /// `(seconds, XIIIFootStepSound wrapper path, floor material path)`.
+    pub footsteps: Vec<(f32, String, Option<String>)>,
 }
 
 /// Opens a VM session and drives it with the movement simulation and an input script. No window
@@ -1376,6 +1408,11 @@ pub(crate) fn run_script(
     let ticks = (duration / DT).ceil() as u64;
     let mut drive = script::Drive::new(script);
     let mut trace = Vec::new();
+    // Player footsteps (item6e): the same notify-free synthesis `fixed_step` uses, so the
+    // headless path reports and can play them.
+    let surfaces = footsteps::SurfaceSounds::from_scene(scene);
+    let mut step_driver = footsteps::FootstepDriver::new();
+    let mut footstep_log: Vec<(f32, String, Option<String>)> = Vec::new();
     for tick in 0..ticks {
         let elapsed = tick as f32 * DT;
         let input = drive.advance(elapsed, &mut sim);
@@ -1385,6 +1422,11 @@ pub(crate) fn run_script(
             sim.step(DT, &world, params, input, sources);
         } else {
             sim.step_with_modes(DT, &world, params, input, sources, &volumes);
+        }
+        // The headless driver only records footsteps; playback belongs to the windowed
+        // `fixed_step` path (this function opens no audio device).
+        if let Some(step) = step_driver.advance(DT, &sim, params, &world, &surfaces, input.walk) {
+            footstep_log.push((elapsed, step.sound, step.material));
         }
         let modes = session::PlayerVMModes {
             crouched: sim.crouched,
@@ -1436,6 +1478,7 @@ pub(crate) fn run_script(
         ticks,
         wall_secs: started.elapsed().as_secs_f32(),
         trace,
+        footsteps: footstep_log,
     })
 }
 
@@ -1617,6 +1660,34 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
     if let Some(first) = session.first_error() {
         println!("[play] first script error: {first}");
     }
+    // Footstep summary and the full ordered list (requirement 3: count and names on Plage01).
+    let mut by_sound: std::collections::BTreeMap<String, (usize, Option<String>)> =
+        std::collections::BTreeMap::new();
+    for (_, s, mat) in &outcome.footsteps {
+        let e = by_sound.entry(s.clone()).or_insert((0, mat.clone()));
+        e.0 += 1;
+        if e.1.is_none() {
+            e.1.clone_from(mat);
+        }
+    }
+    println!(
+        "[play] footsteps: {} emitted: {}",
+        outcome.footsteps.len(),
+        by_sound
+            .iter()
+            .map(|(s, (n, mat))| match mat {
+                Some(m) => format!("{n}x {s} [{m}]"),
+                None => format!("{n}x {s} [material path unknown]"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for (t, s, mat) in &outcome.footsteps {
+        match mat {
+            Some(m) => println!("[play]   footstep [{t:.3}s] {s} [{m}]"),
+            None => println!("[play]   footstep [{t:.3}s] {s}"),
+        }
+    }
     println!(
         "[play] headless scripted VM run finished in {:.2}s wall time, {} ticks, {} trace samples",
         outcome.wall_secs,
@@ -1722,6 +1793,71 @@ mod tests {
         assert_eq!(sim.location, [4.0, 5.0, 6.0]);
         // Bad arity is rejected.
         assert!(script::Script::parse("t=0.0 teleport 1 2\n").is_err());
+    }
+
+    /// Opt-in corpus test (item6e requirement 3): a scripted shuttle walk on Plage01 emits
+    /// footsteps whose names come from the floor's `XIIIFootStepSound` material properties. The
+    /// start is on the hut interior floor (the script login spawn), whose texture carries
+    /// `XIIIPlage.PLmeub05` -> `XIIIsound.Footsteps__XIIIFSBoi.…`.
+    #[test]
+    fn opt_in_plage01_scripted_walk_plays_surface_footsteps() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let script = script::Script::parse(
+            "t=0.0 forward 1\nt=1.5 forward -1\nt=3.0 forward 1\nt=4.5 forward -1\nt=6.0 forward 1\nt=7.5 forward -1\nt=9.0 forward 0\n",
+        )
+        .unwrap();
+        let outcome = run_script(
+            &game_dir,
+            "Plage01",
+            &script,
+            &resolved.params,
+            &scene,
+            10.0,
+        )
+        .expect("run Plage01 shuttle walk");
+        assert!(
+            !outcome.footsteps.is_empty(),
+            "a 9 s scripted walk on Plage01 must emit footsteps"
+        );
+        // Every footstep names a real `XIIIFootStepSound` wrapper and a floor material path.
+        for (t, sound, material) in &outcome.footsteps {
+            assert!(
+                sound.to_ascii_lowercase().contains("footsteps__xiiifs"),
+                "footstep [{t:.3}s] sound {sound} is not a player footstep wrapper"
+            );
+            assert!(
+                material.is_some(),
+                "footstep [{t:.3}s] {sound} has no floor material path"
+            );
+        }
+        let mut names: Vec<&str> = outcome
+            .footsteps
+            .iter()
+            .map(|(_, s, _)| s.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        println!(
+            "[steps test] Plage01 {} footsteps, {} distinct: {:?}; materials {:?}",
+            outcome.footsteps.len(),
+            names.len(),
+            names,
+            outcome
+                .footsteps
+                .iter()
+                .filter_map(|(_, _, m)| m.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        );
     }
 
     /// Opt-in corpus test (requirement 6): the Plage01 script run opens the locked hut door
