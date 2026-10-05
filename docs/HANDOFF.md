@@ -4,7 +4,7 @@ Updated: **2026-10-05 (second session)**. Research phase (2026-10-04), M0, M1 an
 
 ## Next session: start here
 
-State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `c2244a4` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
+State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `1b16fd4` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
 ### How the user wants work organized
 
@@ -26,7 +26,7 @@ State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XII
 ### Environment notes
 
 - cargo/rustc in `C:\Users\ZoliBen\.cargo\bin` (Git Bash: `export PATH="$HOME/.cargo/bin:$PATH"`). Rust 1.99.0 pinned, MSVC 14.44. No `gh` CLI.
-- Full verification (about 2-4 minutes warm): `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && XIII_GOG_DIR=P:/AI/XIII/XIII_Game XIII_STEAM_DIR="P:/SteamLibrary/steamapps/common/XIII - Classic" cargo test --workspace`. Last result (`c2244a4`): **351 passed, 0 failed**. Use absolute paths: some older opt-in tests resolve relative `XIII_GOG_DIR` against the crate directory.
+- Full verification (about 2-4 minutes warm): `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && XIII_GOG_DIR=P:/AI/XIII/XIII_Game XIII_STEAM_DIR="P:/SteamLibrary/steamapps/common/XIII - Classic" cargo test --workspace`. Last result (`1b16fd4`): **554 passed, 0 failed**. Use `bash P:/AI/XIII/local/verify.sh` (git-ignored helper: fmt + clippy + full tests with real exit status) before every push; piping cargo into `tail`/`awk` once masked a compile failure and broke main. Use absolute paths: some older opt-in tests resolve relative `XIII_GOG_DIR` against the crate directory.
 - Viewer: `cargo run -p xiii-app --release -- --map Plage01 --game-dir XIII_Game` (`--exit-after-secs N --screenshot <png>`, `--dump`, `--collision-test`, `--reach-test`, `--lighting off|baked`). Character: `--model xiiipersos.XIIIM --anim Walk`. Movement + VM prototype: `--play --map Plage01 [--play-script <file>]` (E = use). Headless VM: `xiii-tool script run --game-dir XIII_Game --map Plage00 --begin-play --physics map --anim map --nav map --events`.
 - Disassembler (user-approved): `llvm-objdump` from `rustup component add llvm-tools`, at `C:/Users/ZoliBen/.rustup/toolchains/1.99.0-x86_64-pc-windows-msvc/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-objdump.exe`. DLLs are read only; disassembly output stays in git-ignored `local/re/`, never committed or pasted into code.
 - Launch parallel opencode runs a few seconds apart: simultaneous starts fail with `database is locked`.
@@ -34,12 +34,9 @@ State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XII
 
 ### In flight when this was written
 
-- `item5c-materials` (worktree `local/wt/viewer`, OpenCode Go): UE2 material graph (Shader/FinalBlend/Combiner/modifiers) in the viewer.
-- `item3h-login` (worktree `local/wt/item3`, OpenCode Go): `LevelInfo.GetLocalURL`, script-path player login (`GameInfo.Login` -> `RestartPlayer`), the `Select` animation on a mesh-less actor.
-- `item5d-lightmaps` (worktree `local/wt/bsp`, Ollama Cloud): BSP Model tail (lightmaps etc.) from `UModel::Serialize` disassembly.
-- `item9-campaign` (worktree `local/wt/sweep`, Ollama Cloud): `xiii-tool campaign` whole-campaign headless sweep and ranking.
-- `item6b-audio-play` (worktree `local/wt/audio`, Ollama Cloud): Bevy playback of VM sound/music events via `xiii-audio`.
-- Specs are in each worktree's `local/tasks/` (copies in `P:/AI/XIII/local/tasks/`); logs in `P:/AI/XIII/local/logs/`.
+- `item5e` BSP vertex stream lighting (worktree `local/wt/bsp`, Ollama Cloud; resumed once after an early stop).
+- `item5g` zone distance fog + projector (blob) shadows (worktree `local/wt/audio`, Ollama Cloud).
+- Specs in each worktree's `local/tasks/` (copies in `P:/AI/XIII/local/tasks/`); logs in `P:/AI/XIII/local/logs/`; reports in each worktree's `local/reports/`.
 
 ## User intent
 
@@ -147,6 +144,17 @@ Per-task reports with all numbers and commands: `local/reports/item1-collision.m
 - **Audio:** all 59 HX banks parse with 0 unparsed bytes; 28,631/28,631 waves decode (PCM16 + 6-bit Ubisoft ADPCM); `.uax` Sound -> HX entry by name (4,027/5,892).
 - Per-task reports with commands and numbers: `P:/AI/XIII/local/reports/item*.md` and the worktrees' `local/reports/`.
 
+### Third 2026-10-05 block (up to `1b16fd4`) — measured, prototype, not a playable mission
+
+- **Plage00 opening runs from the game's scripts in `--play`:** the VM now dispatches the per-frame `Tick` event (it never did); `XIIIBaseHud.DrawHUD` sets `MapInfo.EndCartoonEffect` (Plage00/01 `InitialCartoonEffect == 0`), `Cine2.CineInit` proceeds, Pam leans over XIII and the line *"I can't remember a thing..."* (`plage00_XIIIb_00`) plays with subtitles at 0.28 s, input frozen by the cutscene. The comic-panel cartoon effect is implemented (render-to-texture bridge) but not yet observed live (Base01 sets `HudCartoonSFX` without panel updates).
+- **Plage01 hut exit by the game's own logic:** script login spawns the player pawn (one pawn; the 12 extra were `Engine.Camera` cutscene controllers restarted by `StartMatch` - fixed with the native `bOnlySpectator` default), the key is picked up by walking (pickup/inventory chain), `E`=Grab opens `Porte6`, the HUD shows "Checkpoint reached", lock/door sounds and the `Plage01__hSortCahutte` music cue play. Remaining host workaround: `Vm::settle_pickups` (labelled hypothesis).
+- **Combat core:** `XIIIWeapon.Fire` -> `RealTraceFire` -> `ProcessTraceHit` -> `TakeDamage` -> `Died` kills `BaseSoldier6` on Plage01 (75 hp/shot); first-person Beretta view. Limits: diagnostic weapon grant, hit zones from the collision cylinder (every hit reads as head), `PlayFiringSound` and `RefreshLighting` Partial.
+- **Movement modes:** crouch (C=Duck), ladders (`LadderVolume`), swimming (`WaterVolume` brushes; XIII zones have no water flags), falling damage through the pawn's own `Landed`/`TakeFallingDamage`.
+- **Robustness:** campaign sweep (`xiii-tool campaign`, 35 maps in `MapInfo.NextMapLevelWithUnr` order): suspended actors 412 -> 3, missing natives 0; reach-walk 22,345/23,265 navigation edges (terrain: concatenated multi-region vertex arrays; only the base grid is used, per `Engine.dll` `ATerrainInfo::LineCheck`/`Render`). Steam patched install: identical results to GOG on all 35 maps (INI `EditPackages` load order).
+- **Presentation:** HUD via script `PostRender` + 27 Canvas/HUD natives + decoded fonts; localisation (`xiii-locale`, XIII `localized` flag is `0x00400000`); audio: Sound -> HX by GUID resource reference (96.7%), music streamed from `.hsc`, ambient emitters with XIII roll-off; materials (blend/two-sided/animated UVs); baked vertex lighting (static meshes, terrain); particles (815 systems; triggered emitters start inactive per `TrigerredEmitter.PostBeginPlay`); BSP Model tail decoded from `UModel::Serialize` (6,396/7,194 byte-exact; `LightMap` empty in 7,192).
+- **Performance:** VM tick 2.6 ms -> 0.36-0.52 ms (Banque01, ~900 actors); all maps > 240 FPS release on the RTX 4090.
+- **Scale:** 90 UU/m (user-approved estimate).
+
 ### Verified results
 
 | Check | Result |
@@ -201,16 +209,14 @@ Native Windows reports an RTX 4090. Rust/Cargo were not found on the inspected W
 
 ## Exact next work
 
-Priorities after the in-flight tasks land (review each against UE2 semantics, not just green tests):
+1. **Toward a completable Plage00/Plage01:** continue the Plage00 intro past the first line (dialogue sequence, `CineController2` camera moves, end of cutscene, control returned); level end/transition to the next map (`XIIIGoalTrigger`, `NextMapLevelWithUnr`); checkpoint save (`XIIISaveGameTrigger.GoSaving.DoSave` fails on struct member `bcompleted`).
+2. **Combat fidelity:** per-bone hit zones from the decoded SkeletalMesh hit boxes posed by the current animation; real weapon pickups instead of the grant; `PlayFiringSound` as a sound event; soldier attack behaviour against the player; damage/death presentation.
+3. **Residual VM errors:** `HudMessage.SetUpLocalizedMessage` TypeMismatch (suspends the player's message path), `Object.OrthoRotation`, the last 3 campaign suspensions (Amos01 `Cine2` default anim, USA02 `BreakableMover` nested subobjects).
+4. **Rendering:** land BSP vertex lighting (item5e) and fog/projectors (item5g); Beam/Spark emitters; dynamic lights (muzzle flash); the comic outline look (needs reference captures).
+5. **Collision primitive:** UE2 pawn vs world uses the extent box (assumed) - verify against `Engine.dll` (`ULevel::MoveActor`, `FCollisionHash`) and the remaining reach failures.
+6. **Menus, save/load, options** (not started).
 
-1. **Remove the `--play` shortcuts:** script-path player login (item3h), pickup/inventory natives (`PickupQuery`, `AddInventory`, `HandlePickup`, `ChangedWeapon`) so the Plage01 key is picked up for real, and an external object-reference value so `Sound` references into `XIIIsound.uax` survive into presentation events (needed by item6b audio).
-2. **Campaign sweep (item9) results drive the next native/import work** across all maps, in campaign order.
-3. **Soldier behaviour:** AI states beyond `Patrouille` (perception, combat), weapons, damage; render map pawns with skinned meshes driven by VM animation state in `--play`.
-4. **Rendering fidelity:** materials (item5c), BSP lightmaps (item5d), then the comic outline treatment; original-engine captures for comparison when the user can provide them.
-5. **Remaining collision failures:** Plage01 8 and Banque01 27 reach failures (step/overhang/AABB-corner groups); cylinder vs box for pawns.
-6. **Audio playback (item6b)**, then music/ambient zones.
-
-Do not report playable progress from the viewer, the `--play` prototype or headless traces until the shortcuts above are gone and a mission can be completed by the game's own logic.
+Do not report playable progress from the viewer, the `--play` prototype or headless traces until a mission can be completed by the game's own logic without host shortcuts.
 
 ## Validation completed
 
