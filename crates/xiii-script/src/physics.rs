@@ -43,6 +43,23 @@ pub trait WorldPhysics {
     /// Point/free placement test: can a box of the given half-extents sit at `location`
     /// without overlapping world geometry? For `SetLocation`/spawn placement checks.
     fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool;
+
+    /// Registers a UE2 `Mover`'s collision triangles so `trace`/`move_box`/`point_free` consider
+    /// them: `triangles` are world-space at the base pose `(origin, rotation)` (Unreal units and
+    /// rotator units). A provider that does not model moving brushes may ignore this (default
+    /// no-op).
+    fn register_mover(
+        &mut self,
+        _actor: &str,
+        _source: u32,
+        _triangles: &[[[f32; 3]; 3]],
+        _origin: [f32; 3],
+        _rotation: [i32; 3],
+    ) {
+    }
+
+    /// Updates a registered mover's pose (Unreal units/rotators). Default no-op.
+    fn set_mover(&mut self, _actor: &str, _location: [f32; 3], _rotation: [i32; 3]) {}
 }
 
 /// Diagnostic provider: a single infinite floor plane at Unreal Z `floor_z`, nothing else.

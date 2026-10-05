@@ -13,6 +13,8 @@
 //! - `yaw <degrees>`: set absolute yaw (Unreal convention: 0 = +X, positive toward +Y).
 //! - `turn <degrees>`: add to yaw.
 //! - `pitch <degrees>`: set camera pitch.
+//! - `use` (alias `grab`/`interact`): request one use/interact action (edge-triggered); the
+//!   host runs the VM's mover lock/unlock/open chain (`Session::use_mover`).
 //! - `teleport <x> <y> <z>` (alias `place`): move the player box centre to this Unreal-unit
 //!   position and drop the velocity. Used by the trigger demonstration because the Plage00
 //!   trigger is ~47,000 UU from the PlayerStart (about 100 s of walking at `GroundSpeed`). The
@@ -50,6 +52,8 @@ pub enum Command {
     Pitch(f32),
     /// Move the box centre to an absolute Unreal-unit position (harness bootstrap).
     Teleport([f32; 3]),
+    /// Request one use/interact action (edge-triggered; the VM `Grab`/use chain).
+    Use,
 }
 
 /// A parsed input script, time-ordered.
@@ -110,6 +114,7 @@ impl Script {
                     let z = num(&mut it)?;
                     Command::Teleport([x, y, z])
                 }
+                "use" | "grab" | "interact" => Command::Use,
                 other => return Err(format!("line {n}: unknown command {other:?}")),
             };
             events.push(Event { t, command });
@@ -139,6 +144,7 @@ pub struct Drive {
     right: f32,
     walk: bool,
     jump_pending: bool,
+    use_pending: bool,
 }
 
 impl Drive {
@@ -151,6 +157,7 @@ impl Drive {
             right: 0.0,
             walk: false,
             jump_pending: false,
+            use_pending: false,
         }
     }
 
@@ -172,15 +179,18 @@ impl Drive {
                     sim.velocity = [0.0; 3];
                     sim.grounded = false;
                 }
+                Command::Use => self.use_pending = true,
             }
             self.cursor += 1;
         }
         let jump = std::mem::take(&mut self.jump_pending);
+        let use_action = std::mem::take(&mut self.use_pending);
         Input {
             forward: self.forward,
             right: self.right,
             jump,
             walk: self.walk,
+            use_action,
         }
     }
 }

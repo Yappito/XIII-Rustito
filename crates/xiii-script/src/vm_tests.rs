@@ -9,7 +9,7 @@ use crate::reflect::function_flags as ff;
 use crate::reflect::property_flags as pf;
 use crate::tests::{Exp, build_package, compact};
 use crate::value::{ObjRef, ObjectId, Value};
-use crate::vm::{TraceKind, Vm, VmErrorKind, VmLimits};
+use crate::vm::{Latent, TraceKind, Vm, VmErrorKind, VmLimits};
 
 struct B {
     names: Vec<String>,
@@ -465,7 +465,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 182);
+    assert_eq!(defs.len(), 187);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -487,8 +487,10 @@ const IMP_OBJECTPROP: i32 = -7;
 const IMP_BOOLPROP: i32 = -8;
 const IMP_STRUCTPROP: i32 = -9;
 const IMP_STRUCT: i32 = -10;
-/// `Core.Struct` import (appended after `ArrayProperty`; used by the AI fixture).
-const IMP_STRUCT_CLASS: i32 = -13;
+/// `Core.ByteProperty` (appended after `ArrayProperty`; see [`SpawnB::build`]).
+const IMP_BYTEPROP: i32 = -13;
+/// `Core.Struct` import (appended after `ByteProperty`; used by the AI fixture).
+const IMP_STRUCT_CLASS: i32 = -14;
 
 /// Builds a package with an `Object` base and an `Actor`/`Child`/`AbstractChild` tree for
 /// spawn and lifecycle tests.
@@ -720,6 +722,7 @@ impl SpawnB {
             (core, class, -1, self.name("Vector")),
             (core, class, -1, self.name("Rotator")),
             (core, class, -1, self.name("ArrayProperty")),
+            (core, class, -1, self.name("ByteProperty")),
             (core, class, -1, self.name("Struct")),
         ];
         let names: Vec<&str> = self.names.iter().map(String::as_str).collect();
@@ -4004,6 +4007,170 @@ fn move_to_outside_state_code_is_rejected() {
     assert!(
         matches!(&e.kind, VmErrorKind::LatentOutsideState { path } if path == "Controller.MoveTo"),
         "{e}"
+    );
+}
+
+/// Synthetic mover: an `Actor` with the `PHYS_MovingBrush` properties, the `Add_IntInt` native
+/// and a `KeyFrameReached` handler. The state `Mover.InterpolateTo` leaves behind is set
+/// directly by the test (the interpreter has no mover script here).
+fn mover_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let add = b.reserve(IMP_FUNCTION, object, "Add_IntInt");
+    let add_a = b.reserve(IMP_INTPROP, add, "A");
+    let add_b = b.reserve(IMP_INTPROP, add, "B");
+    let add_r = b.reserve(IMP_INTPROP, add, "ReturnValue");
+    b.prop(add_a, add_b, PARM);
+    b.prop(add_b, add_r, PARM);
+    b.prop(add_r, 0, PARM | RETURN_PARM);
+    b.func(
+        add,
+        0,
+        add_a,
+        &[],
+        0,
+        146,
+        FINAL | NATIVE | OPERATOR | STATIC,
+    );
+    let vector_extra = compact(IMP_STRUCT);
+    let rotator_extra = compact(IMP_STRUCT - 1);
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let rotation = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
+    let old_pos = b.reserve(IMP_STRUCTPROP, actor, "OldPos");
+    let old_rot = b.reserve(IMP_STRUCTPROP, actor, "OldRot");
+    let base_pos = b.reserve(IMP_STRUCTPROP, actor, "BasePos");
+    let base_rot = b.reserve(IMP_STRUCTPROP, actor, "BaseRot");
+    let phys_alpha = b.reserve(IMP_FLOATPROP, actor, "PhysAlpha");
+    let phys_rate = b.reserve(IMP_FLOATPROP, actor, "PhysRate");
+    let key_num = b.reserve(IMP_BYTEPROP, actor, "KeyNum");
+    let interp = b.reserve(IMP_BOOLPROP, actor, "bInterpolating");
+    let key_pos = b.reserve(IMP_ARRAYPROP, actor, "KeyPos");
+    let key_rot = b.reserve(IMP_ARRAYPROP, actor, "KeyRot");
+    let key_hits = b.reserve(IMP_INTPROP, actor, "KeyHits");
+    let kf = b.reserve(IMP_FUNCTION, actor, "KeyFrameReached");
+    b.prop_with(location, rotation, 0, &vector_extra);
+    b.prop_with(rotation, old_pos, 0, &rotator_extra);
+    b.prop_with(old_pos, old_rot, 0, &vector_extra);
+    b.prop_with(old_rot, base_pos, 0, &rotator_extra);
+    b.prop_with(base_pos, base_rot, 0, &vector_extra);
+    b.prop_with(base_rot, phys_alpha, 0, &rotator_extra);
+    b.prop(phys_alpha, phys_rate, 0);
+    b.prop(phys_rate, key_num, 0);
+    // ByteProperty carries an `Enum` object reference (None here).
+    b.prop_with(key_num, interp, 0, &compact(0));
+    b.prop(interp, key_pos, 0);
+    b.prop_array_dim(key_pos, key_rot, 0, IMP_STRUCT, 8);
+    b.prop_array_dim(key_rot, key_hits, 0, IMP_STRUCT - 1, 8);
+    b.prop(key_hits, kf, 0);
+    let kh = key_hits as u8;
+    let kf_code = vec![
+        0x0F, 0x01, kh, 0x92, 0x00, kh, 0x26, 0x16, // KeyHits = KeyHits + 1
+        0x04, 0x0B, // return
+    ];
+    b.func(kf, 0, 0, &kf_code, 0x10, 0, DEFINED);
+    b.class(object, 0, add, 0);
+    b.class(actor, object, location, 0);
+    b.build()
+}
+
+fn mover_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Mover",
+        mover_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+/// `PHYS_MovingBrush` interpolation advances by `PhysRate*dt`, snaps to the key at
+/// `PhysAlpha >= 1` and fires `KeyFrameReached` exactly once.
+#[test]
+fn synthetic_mover_interpolates_and_fires_keyframe_reached() {
+    let set = mover_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "M").unwrap();
+    vm.set_active(a, true);
+    vm.set_property(a, "PhysRate", 0, Value::Float(2.0)); // 0.5 s to the key
+    vm.set_property(a, "PhysAlpha", 0, Value::Float(0.0));
+    vm.set_property(a, "KeyNum", 0, Value::Byte(1));
+    vm.set_property(a, "BasePos", 0, Value::Vector([0.0, 0.0, 0.0]));
+    vm.set_property(a, "BaseRot", 0, Value::Rotator([0, 0, 0]));
+    vm.set_property(a, "OldPos", 0, Value::Vector([0.0, 0.0, 0.0]));
+    vm.set_property(a, "OldRot", 0, Value::Rotator([0, 0, 0]));
+    vm.set_property(a, "KeyPos", 1, Value::Vector([100.0, 0.0, 0.0]));
+    vm.set_property(a, "KeyRot", 1, Value::Rotator([0, 18000, 0]));
+    vm.set_property(a, "bInterpolating", 0, Value::Bool(true));
+
+    vm.tick(0.25).unwrap();
+    let loc = vm.vector_prop(a, "Location").unwrap();
+    assert!((loc[0] - 50.0).abs() < 1e-3, "half-way location {loc:?}");
+    assert_eq!(
+        vm.get_property(a, "bInterpolating"),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(vm.get_property(a, "KeyHits"), Some(&Value::Int(0)));
+
+    vm.tick(0.25).unwrap();
+    assert_eq!(vm.vector_prop(a, "Location").unwrap()[0], 100.0);
+    assert_eq!(
+        vm.get_property(a, "Rotation"),
+        Some(&Value::Rotator([0, 18000, 0]))
+    );
+    assert_eq!(
+        vm.get_property(a, "bInterpolating"),
+        Some(&Value::Bool(false))
+    );
+    assert_eq!(
+        vm.get_property(a, "KeyHits"),
+        Some(&Value::Int(1)),
+        "KeyFrameReached must fire exactly once"
+    );
+    // Finished: further ticks do not move it and do not fire the event again.
+    vm.tick(0.25).unwrap();
+    assert_eq!(vm.vector_prop(a, "Location").unwrap()[0], 100.0);
+    assert_eq!(vm.get_property(a, "KeyHits"), Some(&Value::Int(1)));
+}
+
+/// `Actor.FinishInterpolation` is latent (sets `Latent::Interp`) and refuses a call outside state
+/// code. The resume path (`bInterpolating` clearing) is exercised by the opt-in Plage01 door test.
+#[test]
+fn finish_interpolation_is_latent_and_needs_state_code() {
+    let set = mover_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "M").unwrap();
+    vm.set_active(a, true);
+    let def = native("Engine.Actor.FinishInterpolation");
+    let mut args = [];
+    let e = (def.f)(
+        &mut vm,
+        &ctx(a, &[], "Engine.Actor.FinishInterpolation"),
+        &mut args,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(e.kind, VmErrorKind::LatentOutsideState { .. }),
+        "{e}"
+    );
+    assert!(vm.pending_latent.is_none());
+    let inner = NativeCtx {
+        this: a,
+        in_state_code: true,
+        path: "Engine.Actor.FinishInterpolation".to_owned(),
+        omitted: Vec::new(),
+    };
+    (def.f)(&mut vm, &inner, &mut args).expect("native");
+    assert!(
+        matches!(vm.pending_latent, Some(Latent::Interp { .. })),
+        "{:?}",
+        vm.pending_latent
     );
 }
 
