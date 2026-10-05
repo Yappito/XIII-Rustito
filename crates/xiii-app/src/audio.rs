@@ -853,7 +853,13 @@ mod tests {
             for tick in 0..1800 {
                 let elapsed = tick as f32 * dt;
                 let _ = drive.advance(elapsed, &mut sim);
-                session.step(dt, sim.location, sim.yaw, sim.velocity);
+                session.step(
+                    dt,
+                    sim.location,
+                    sim.yaw,
+                    sim.velocity,
+                    &crate::play::session::PlayerVMModes::default(),
+                );
             }
             let prod_sound = session
                 .events

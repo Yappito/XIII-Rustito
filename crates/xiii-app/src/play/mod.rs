@@ -10,6 +10,7 @@
 //! Fixed 60 Hz is a **hypothesis** (UE2 used variable ticks); see [`FIXED_HZ`].
 
 pub mod hud;
+pub mod movement_modes;
 pub mod movers;
 pub mod pawns;
 pub mod script;
@@ -32,6 +33,7 @@ use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use xiii_collision::CollisionWorld;
 use xiii_decode::common::{UNREAL_UNITS_PER_METER, to_bevy_direction, to_bevy_position};
 use xiii_install::{Installation, OpenOptions};
+use xiii_script::Value;
 use xiii_world::physics::bevy_to_unreal_position;
 
 use crate::cli::Options;
@@ -60,6 +62,10 @@ struct PlayConfig {
 
 #[derive(Resource)]
 struct ParamsRes(PlayerParams);
+
+/// Decoded map movement volumes (water/ladder) adapted to the simulation query.
+#[derive(Resource)]
+struct MotionRes(movement_modes::VolumeMotion);
 
 #[derive(Resource)]
 struct SimRes(PlayerSim);
@@ -176,6 +182,13 @@ fn resolve_params(game_dir: &Path) -> Result<ResolvedParams, String> {
         let v = collision::layout_float_opt(&layout, name);
         v.is_finite().then_some(v)
     };
+    let bool_opt = |name: &str| -> Option<bool> {
+        let slot = layout.slot_by_name(name)?;
+        match layout.defaults.get(slot.base) {
+            Some(Value::Bool(b)) => Some(*b),
+            _ => None,
+        }
+    };
     let radius = req("CollisionRadius")?;
     let height = req("CollisionHeight")?;
     let eye = req("BaseEyeHeight")?;
@@ -185,6 +198,16 @@ fn resolve_params(game_dir: &Path) -> Result<ResolvedParams, String> {
     let air = opt("AirControl");
     let walking = opt("WalkingPct");
     let maxfall = opt("MaxFallSpeed");
+    // Crouch/ladder/water properties decoded from the same inherited class defaults.
+    let crouch_radius = opt("CrouchRadius").unwrap_or(radius);
+    let crouch_height = opt("CrouchHeight").unwrap_or(height);
+    let crouching_pct = opt("CrouchingPct").unwrap_or(0.3);
+    let water_speed = opt("WaterSpeed").unwrap_or(300.0);
+    let ladder_speed = opt("LadderSpeed").unwrap_or(200.0);
+    let buoyancy = opt("Buoyancy").unwrap_or(0.0);
+    let under_water_time = opt("UnderWaterTime").unwrap_or(0.0);
+    let b_can_crouch = bool_opt("bCanCrouch").unwrap_or(true);
+    let b_can_climb_ladders = bool_opt("bCanClimbLadders").unwrap_or(false);
     for (name, value, src) in [
         ("CollisionRadius", radius, "class-default"),
         ("CollisionHeight (half)", height, "class-default"),
@@ -261,6 +284,16 @@ fn resolve_params(game_dir: &Path) -> Result<ResolvedParams, String> {
             }
         ));
     }
+    // Crouch/ladder/water evidence, each with its decoded inherited default.
+    lines.push(format!(
+        "  CrouchHeight (half) = {crouch_height} UU, CrouchRadius = {crouch_radius} UU [class-default]"
+    ));
+    lines.push(format!(
+        "  CrouchingPct = {crouching_pct}, WaterSpeed = {water_speed} UU/s, LadderSpeed = {ladder_speed} UU/s [class-default]"
+    ));
+    lines.push(format!(
+        "  Buoyancy = {buoyancy}, UnderWaterTime = {under_water_time} s, bCanCrouch = {b_can_crouch}, bCanClimbLadders = {b_can_climb_ladders} [class-default]"
+    ));
     lines.push(format!(
         "  fixed step {} Hz (hypothesis; UE2 used variable ticks); box half extents ({radius}, {height}, {radius}) UU",
         FIXED_HZ
@@ -269,12 +302,21 @@ fn resolve_params(game_dir: &Path) -> Result<ResolvedParams, String> {
         params: PlayerParams {
             radius_uu: radius,
             height_uu: height,
+            crouch_radius_uu: crouch_radius,
+            crouch_height_uu: crouch_height,
             base_eye_height_uu: eye,
             ground_speed: ground,
             jump_z: jump,
             accel_rate: accel,
             air_control: air,
             walking_pct: walking,
+            crouching_pct,
+            water_speed,
+            ladder_speed,
+            buoyancy,
+            under_water_time,
+            b_can_crouch,
+            b_can_climb_ladders,
             max_fall_speed: maxfall,
             gravity_z: gravity[2],
         },
@@ -345,6 +387,24 @@ fn setup_inner(
     session.register_movers(&scene);
     let resolved = resolve_params(&game_dir)?;
     let params = resolved.params;
+    // Movement volumes (water/ladder brushes) for the crouch/ladder/swim/fall modes. A failed
+    // import is reported, never silent; the modes then simply have no volumes.
+    let motion = match xiii_world::movement_volumes::MovementVolumes::import(
+        &game_dir,
+        opts.map.as_deref().unwrap_or(""),
+    ) {
+        Ok(v) => {
+            println!("[play] movement volumes: {}", v.summary());
+            for d in &v.diagnostics {
+                println!("[play]   volume diagnostic: {d}");
+            }
+            movement_modes::VolumeMotion::new(v)
+        }
+        Err(e) => {
+            println!("[play] movement volumes unavailable ({e}); ladder/water modes disabled");
+            movement_modes::VolumeMotion::default()
+        }
+    };
     println!(
         "[play] loaded {:?} in {:.2}s ({} objects, {} collision triangles in the box soup)",
         opts.map.as_deref().unwrap_or("?"),
@@ -507,7 +567,7 @@ fn setup_inner(
         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
     ));
     println!(
-        "[play] camera start {:?} m, yaw {:.1} deg | controls WASD, mouse look, Space jump, Shift walk, Esc quit",
+        "[play] camera start {:?} m, yaw {:.1} deg | controls WASD, mouse look, Space jump, Shift walk, C crouch, E use, Esc quit",
         Vec3::from_array(eye),
         yaw.to_degrees()
     );
@@ -575,6 +635,7 @@ fn setup_inner(
     let hud_runtime = hud::setup(session, game_dir.as_path(), images)?;
     commands.insert_resource(hud_runtime);
     commands.insert_resource(ParamsRes(params));
+    commands.insert_resource(MotionRes(motion));
     commands.insert_resource(SimRes(sim));
     commands.insert_resource(WorldRes {
         world,
@@ -618,6 +679,9 @@ fn read_keyboard(keys: &ButtonInput<KeyCode>) -> Input {
         jump: keys.just_pressed(KeyCode::Space),
         walk: keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]),
         use_action: keys.just_pressed(KeyCode::KeyE),
+        // XIII binds `C=Duck` (DefUser.ini); ControlLeft is accepted as the conventional
+        // alternative the task names.
+        crouch: keys.any_pressed([KeyCode::KeyC, KeyCode::ControlLeft]),
     }
 }
 
@@ -691,6 +755,7 @@ fn fixed_step(
     mut state: ResMut<TraceState>,
     mut session: NonSendMut<Result<session::Session, String>>,
     sync: Res<RenderSync>,
+    motion: Res<MotionRes>,
     mut transforms: Query<&mut Transform>,
     mut perf: ResMut<crate::perf::Perf>,
 ) {
@@ -705,12 +770,30 @@ fn fixed_step(
     };
     let use_action = input.use_action;
     let t0 = Instant::now();
-    sim.0
-        .step(dt, &world.world, &params.0, input, &world.sources);
+    if motion.0.is_empty() {
+        sim.0
+            .step(dt, &world.world, &params.0, input, &world.sources);
+    } else {
+        sim.0.step_with_modes(
+            dt,
+            &world.world,
+            &params.0,
+            input,
+            &world.sources,
+            &motion.0,
+        );
+    }
     perf.span("player_sim", t0);
     if let Ok(sess) = session.as_mut() {
         let t0 = Instant::now();
-        sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity);
+        let modes = session::PlayerVMModes {
+            crouched: sim.0.crouched,
+            in_water: sim.0.in_water,
+            physics: sim.0.physics,
+            landed_velocity_z: sim.0.landed.then_some(sim.0.land_velocity_z),
+            floor_normal: sim.0.floor_normal,
+        };
+        sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
         perf.span("vm_step", t0);
         // The VM owns the mover poses; write them into the dynamic collision set so the next
         // player step collides with the moved brush.
@@ -758,13 +841,19 @@ fn fixed_step(
 /// event count and last player touch.
 fn format_vm_trace(sess: &session::Session) -> String {
     format!(
-        "vm t={:.3}s active={} suspended={} dispatcher={} player={} events={} last_touch={}",
+        "vm t={:.3}s active={} suspended={} dispatcher={} player={} health={} physics={} events={} last_touch={}",
         sess.vm_time(),
         sess.active_actors(),
         sess.suspended.len(),
         sess.dispatcher_state().unwrap_or_else(|| "-".to_owned()),
         sess.player_location()
             .map(|l| format!("({:.1},{:.1},{:.1})", l[0], l[1], l[2]))
+            .unwrap_or_else(|| "-".to_owned()),
+        sess.player_health()
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| "-".to_owned()),
+        sess.player_physics()
+            .map(|p| p.to_string())
             .unwrap_or_else(|| "-".to_owned()),
         sess.total_events(),
         sess.last_touch().unwrap_or_else(|| "-".to_owned()),
@@ -905,7 +994,7 @@ fn overlay(
          {}\n\
          {pawns_line}\n\
          {hud_line}\n\
-         WASD move | mouse look | Space jump | Shift walk | Esc quit",
+         WASD move | mouse look | Space jump | Shift walk | C crouch | E use | Esc quit",
         cfg.options.map.as_deref().unwrap_or("?"),
         s.location[0],
         s.location[1],
@@ -1065,14 +1154,38 @@ pub(crate) fn run_script(
     };
     let mut sim = PlayerSim::new(bevy_to_unreal_position(spawn.position), start_yaw);
     sim.grounded = true;
+    let volumes = match xiii_world::movement_volumes::MovementVolumes::import(game_dir, map) {
+        Ok(v) => {
+            println!("[play] movement volumes: {}", v.summary());
+            for d in &v.diagnostics {
+                println!("[play]   volume diagnostic: {d}");
+            }
+            movement_modes::VolumeMotion::new(v)
+        }
+        Err(e) => {
+            println!("[play] movement volumes unavailable ({e}); ladder/water modes disabled");
+            movement_modes::VolumeMotion::default()
+        }
+    };
     let ticks = (duration / DT).ceil() as u64;
     let mut drive = script::Drive::new(script);
     let mut trace = Vec::new();
     for tick in 0..ticks {
         let elapsed = tick as f32 * DT;
         let input = drive.advance(elapsed, &mut sim);
-        sim.step(DT, &world, params, input, sources);
-        session.step(DT, sim.location, sim.yaw, sim.velocity);
+        if volumes.is_empty() {
+            sim.step(DT, &world, params, input, sources);
+        } else {
+            sim.step_with_modes(DT, &world, params, input, sources, &volumes);
+        }
+        let modes = session::PlayerVMModes {
+            crouched: sim.crouched,
+            in_water: sim.in_water,
+            physics: sim.physics,
+            landed_velocity_z: sim.landed.then_some(sim.land_velocity_z),
+            floor_normal: sim.floor_normal,
+        };
+        session.step(DT, sim.location, sim.yaw, sim.velocity, &modes);
         let states = session.mover_states();
         mover_collision.update(&mut world, &states);
         if input.use_action {
@@ -1556,6 +1669,195 @@ mod tests {
         assert!(
             !commands.is_empty(),
             "Plage00 HUD.PostRender produced no draw commands"
+        );
+    }
+
+    /// Opt-in corpus test (requirement 5): on Banque01 the host walks the player onto the
+    /// `LadderVolume5` brush, enters `PHYS_Ladder` and climbs up `ClimbDir` at `LadderSpeed`.
+    /// The script teleports to the volume floor (the same harness bootstrap the other map demos
+    /// use) and then *only* holds forward; the climb is the simulation's, not a teleport.
+    #[test]
+    fn opt_in_banque01_ladder_climb() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Banque01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Banque01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let volumes = xiii_world::movement_volumes::MovementVolumes::import(&game_dir, "Banque01")
+            .expect("import Banque01 volumes");
+        let lv = volumes
+            .volumes
+            .iter()
+            .find(|v| {
+                v.kind == xiii_world::movement_volumes::VolumeKind::Ladder
+                    && v.name.eq_ignore_ascii_case("LadderVolume5")
+            })
+            .expect("Banque01 places LadderVolume5");
+        let cx = (lv.min_uu[0] + lv.max_uu[0]) * 0.5;
+        let cy = (lv.min_uu[1] + lv.max_uu[1]) * 0.5;
+        let start_z = lv.min_uu[2] + resolved.params.height_uu;
+        let script = script::Script::parse(&format!(
+            "t=0.0 teleport {cx} {cy} {start_z}\nt=0.0 forward 1\nt=6.0 forward 0\n"
+        ))
+        .unwrap();
+        let outcome = run_script(
+            &game_dir,
+            "Banque01",
+            &script,
+            &resolved.params,
+            &scene,
+            8.0,
+        )
+        .expect("run Banque01 ladder climb");
+        let max_z = outcome
+            .trace
+            .iter()
+            .map(|(_, _, p, _)| p[2])
+            .fold(f32::MIN, f32::max);
+        println!(
+            "[ladder test] LadderVolume5 {:?} size {:?}; player climbed from {} to {max_z} UU (Health {})",
+            lv.min_uu,
+            lv.size_uu(),
+            start_z,
+            outcome
+                .session
+                .player_health()
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "-".into())
+        );
+        assert!(
+            max_z > start_z + 200.0,
+            "walking onto the ladder only raised the player to {max_z} UU (start {start_z})"
+        );
+    }
+
+    /// Opt-in corpus test (requirement 5): Banque01's `WaterVolume0` brush is found by the host
+    /// box query and drives the swim mode (`PHYS_Swimming`, `WaterSpeed`) for a player standing
+    /// in the water. The thin (16 UU) water slab is only touched by the pawn's box, which is why
+    /// the query uses the extent box rather than the centre point.
+    #[test]
+    fn opt_in_banque01_water_volume_swim() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Banque01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Banque01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let volumes = xiii_world::movement_volumes::MovementVolumes::import(&game_dir, "Banque01")
+            .expect("import Banque01 volumes");
+        let wv = volumes
+            .volumes
+            .iter()
+            .find(|v| v.kind == xiii_world::movement_volumes::VolumeKind::Water)
+            .expect("Banque01 places WaterVolume0");
+        let center = [
+            (wv.min_uu[0] + wv.max_uu[0]) * 0.5,
+            (wv.min_uu[1] + wv.max_uu[1]) * 0.5,
+            (wv.min_uu[2] + wv.max_uu[2]) * 0.5,
+        ];
+        let water_size = wv.size_uu();
+        let motion = movement_modes::VolumeMotion::new(volumes);
+        let world = CollisionWorld::new(scene.box_collision());
+        let mut sim = PlayerSim::new(center, 0.0);
+        sim.grounded = false;
+        let start = sim.location;
+        let mut saw_water = false;
+        for _ in 0..30 {
+            sim.step_with_modes(
+                1.0 / 60.0,
+                &world,
+                &resolved.params,
+                Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                &scene.collision_sources,
+                &motion,
+            );
+            if sim.in_water {
+                saw_water = true;
+            }
+        }
+        println!(
+            "[water test] WaterVolume0 centre {center:?} size {water_size:?}; state {} physics {} moved {} UU",
+            sim.state(),
+            sim.physics,
+            (sim.location[0] - start[0]).abs()
+        );
+        assert!(saw_water, "the water box query never found WaterVolume0");
+        assert_eq!(sim.physics, crate::play::sim::PHYS_SWIMMING);
+    }
+
+    /// Opt-in corpus test (requirement 4): finds a real low-clearance spot on a campaign map
+    /// where the standing box collides with the ceiling but the crouch box does not, and checks
+    /// the reverse at a clear spot. The spot is discovered by scanning navigation points (their
+    /// `Location.Z - CollisionHeight` is the floor) and casting a ceiling ray, so it is evidence,
+    /// not a hard-coded coordinate.
+    #[test]
+    fn opt_in_crouch_fits_where_standing_does_not() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        for map in ["Banque01", "Plage01", "Plage00"] {
+            let opts = Options {
+                map: Some(map.to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import map");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            let params = resolved.params;
+            let world = CollisionWorld::new(scene.box_collision());
+            let mut cache = xiii_world::PackageCache::open(&game_dir).expect("cache");
+            let mut defaults = xiii_world::ClassDefaults::open(&game_dir).expect("defaults");
+            let nav = xiii_world::navigation::decode_navigation(&mut cache, &mut defaults, map)
+                .expect("navigation");
+            let standing_half = params.half_extents_bevy_for(false);
+            let crouch_half = params.half_extents_bevy_for(true);
+            for p in &nav.points {
+                let floor = p.location[2] - p.collision_height;
+                let up_start = to_bevy_position([p.location[0], p.location[1], floor + 1.0]);
+                let up_end = to_bevy_position([p.location[0], p.location[1], floor + 400.0]);
+                let Some(hit) = world.ray(up_start, up_end) else {
+                    continue;
+                };
+                let ceiling = floor + hit.t * 400.0;
+                let clearance = ceiling - floor;
+                if !(100.0..148.0).contains(&clearance) {
+                    continue;
+                }
+                let stand_center =
+                    to_bevy_position([p.location[0], p.location[1], floor + params.height_uu]);
+                let crouch_center = to_bevy_position([
+                    p.location[0],
+                    p.location[1],
+                    floor + params.crouch_height_uu,
+                ]);
+                let stand_blocked = !world.overlap_aabb(stand_center, standing_half).is_empty();
+                let crouch_clear = world.overlap_aabb(crouch_center, crouch_half).is_empty();
+                if stand_blocked && crouch_clear {
+                    println!(
+                        "[crouch test] {map} {} at {:?} UU: floor {floor:.1}, clearance {clearance:.1} UU; standing box blocked, crouch box clear",
+                        p.class, p.location
+                    );
+                    return;
+                }
+            }
+        }
+        panic!(
+            "no low-clearance spot (100..148 UU) where standing is blocked and crouch fits was found"
         );
     }
 }

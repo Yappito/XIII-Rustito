@@ -5089,6 +5089,30 @@ fn campaign_operator_natives_match_ue2_semantics() {
         [0.0, 0.0, 0.0]
     );
 
+    let mut a = [Value::Vector([2.0, 4.0, 6.0]), Value::Float(2.0)];
+    assert_eq!(
+        vec_result(call_native(
+            &mut vm,
+            "Object.Divide_VectorFloat",
+            o,
+            &[false, false],
+            &mut a
+        )),
+        [1.0, 2.0, 3.0]
+    );
+    // UE2 does not guard division by zero: IEEE infinity, not a silent clamp.
+    let mut a = [Value::Vector([1.0, 1.0, 1.0]), Value::Float(0.0)];
+    assert!(
+        vec_result(call_native(
+            &mut vm,
+            "Object.Divide_VectorFloat",
+            o,
+            &[false, false],
+            &mut a
+        ))[0]
+            .is_infinite()
+    );
+
     let mut a = [
         Value::Vector([1.0, 2.0, 3.0]),
         Value::Vector([1.0, 2.0, 3.0]),

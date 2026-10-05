@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 pub mod animation;
 pub mod materials;
+pub mod movement_volumes;
 pub mod nav_provider;
 pub mod navigation;
 pub mod physics;
@@ -1039,6 +1040,24 @@ impl ClassDefaults {
     pub fn is_navigation_point(&mut self, class_path: &str) -> Result<bool, String> {
         let l = self.layout(class_path)?;
         Ok(l.chain_names.iter().any(|n| n == "navigationpoint"))
+    }
+
+    /// Lowercase class names of `class_path`'s inheritance chain, most derived first.
+    pub fn class_chain(&mut self, class_path: &str) -> Result<Vec<String>, String> {
+        Ok(self.layout(class_path)?.chain_names.clone())
+    }
+
+    /// Resolved inherited bool default of a property, or `None` when the property is absent
+    /// from the class chain (or is not a bool).
+    pub fn bool_default(&mut self, class_path: &str, name: &str) -> Result<Option<bool>, String> {
+        let l = self.layout(class_path)?;
+        let Some(s) = l.slot_by_name(name) else {
+            return Ok(None);
+        };
+        Ok(match l.defaults.get(s.base) {
+            Some(xiii_script::Value::Bool(v)) => Some(*v),
+            _ => None,
+        })
     }
 
     /// Resolved inherited float default of a property, or `None` when the property is absent
