@@ -27,6 +27,7 @@ pub mod physics;
 mod reader;
 pub mod reflect;
 pub mod registry;
+pub mod residuals;
 pub mod value;
 pub mod vm;
 pub mod voice;
@@ -34,7 +35,9 @@ pub mod voice;
 pub use animation::{AnimationData, FixedAnimation, SeqInfo};
 pub use bytecode::{Call, Label, Script, ScriptLimits, Token, TokenKind, decode_script};
 pub use error::{Result, ScriptError, ScriptErrorKind};
-pub use events::{DialogueEvent, PresentationEvent, RenderTargetEvent, SoundEvent};
+pub use events::{
+    DialogueEvent, PresentationEvent, RenderTargetEvent, SaveCheckpointEvent, SoundEvent,
+};
 pub use external::ExternalObjectData;
 pub use linker::{ExternalLookup, ExternalPackage, GlobalRef, ScriptPackage, ScriptSet};
 pub use localize::{LocalizationData, placeholder};

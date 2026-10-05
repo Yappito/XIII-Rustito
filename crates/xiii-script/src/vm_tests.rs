@@ -502,7 +502,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 264);
+    assert_eq!(defs.len(), 273);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),

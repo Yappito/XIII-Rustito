@@ -4511,6 +4511,9 @@ fn builtin_defs() -> Vec<NativeDef> {
     // Cartoon-panel natives (`crates/xiii-script/src/cartoon.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::cartoon::cartoon_defs());
+    // Intro/checkpoint residual natives (`crates/xiii-script/src/residuals.rs`). Kept in one
+    // block so a parallel edit to the registry stays out of the way.
+    v.extend(crate::residuals::residual_defs());
     // Paths are matched without the package ("Class.Function"): strip it.
     for d in &mut v {
         if let Some(rest) = d.path.strip_prefix("Engine.") {

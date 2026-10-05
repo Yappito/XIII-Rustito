@@ -511,8 +511,38 @@ pub struct BoneScale {
     pub bone: String,
 }
 
+/// `Actor.SetBoneRotation(name BoneName, rotator BoneTurn, int Space, float Alpha)`.
+///
+/// The engine forwards the request to the skeletal-mesh instance's bone controller. The headless
+/// VM stores the request per actor in call order; no skeletal transform is evaluated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoneRotation {
+    /// Target bone.
+    pub bone: String,
+    /// Bone rotation offset.
+    pub turn: [i32; 3],
+    /// Rotation space (engine value; `EX_Nothing` omitted argument reads as 0).
+    pub space: i32,
+    /// Blend alpha.
+    pub alpha: f32,
+}
+
+/// `Actor.SetBoneLocation(name BoneName, vector BoneTrans, float Alpha)`.
+///
+/// The engine forwards the request to the skeletal-mesh instance's bone controller. The headless
+/// VM stores the request per actor in call order; no skeletal transform is evaluated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoneLocation {
+    /// Target bone.
+    pub bone: String,
+    /// Bone translation offset.
+    pub trans: [f32; 3],
+    /// Blend alpha.
+    pub alpha: f32,
+}
+
 /// Per-actor bone-control state set by `Pawn.SpineYawControl` / `Actor.SetBoneDirection` /
-/// `Actor.SetBoneScalePerAxis`.
+/// `Actor.SetBoneScalePerAxis` / `Actor.SetBoneRotation` / `Actor.SetBoneLocation`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BoneState {
     /// Latest `Pawn.SpineYawControl` parameters, if the native ran.
@@ -521,6 +551,10 @@ pub struct BoneState {
     pub directions: Vec<BoneDirection>,
     /// `Actor.SetBoneScalePerAxis` requests, in call order.
     pub scales: Vec<BoneScale>,
+    /// `Actor.SetBoneRotation` requests, in call order.
+    pub rotations: Vec<BoneRotation>,
+    /// `Actor.SetBoneLocation` requests, in call order.
+    pub locations: Vec<BoneLocation>,
 }
 
 /// Read-only view of one animation channel, for a host renderer that samples the decoded
@@ -988,10 +1022,14 @@ pub struct Instance {
 enum Place {
     Local(usize),
     Slot(ObjectId, usize),
-    Elem(Box<Place>, usize),
+    /// Dynamic-array element. The third field is the declared element type, used to
+    /// initialise elements grown by an out-of-range assignment (UE2 zeroes new elements to the
+    /// element type's default, e.g. a zero struct with all its members, not an `int 0`).
+    Elem(Box<Place>, usize, Option<Ty>),
     Member(Box<Place>, String),
-    /// A dynamic array's `Length` (UE2 `Array.Length = n` resizes the array).
-    ArrayLen(Box<Place>),
+    /// A dynamic array's `Length` (UE2 `Array.Length = n` resizes the array). The second field is
+    /// the declared element type, used to zero the grown elements.
+    ArrayLen(Box<Place>, Option<Ty>),
 }
 
 struct IterState {
@@ -2465,6 +2503,38 @@ impl<'s> Vm<'s> {
     ) {
         if let Some(o) = self.objects.get_mut(id as usize) {
             o.bone.scales.push(BoneScale { slot, scale, bone });
+        }
+    }
+
+    /// `Actor.SetBoneRotation`: record the request for the renderer.
+    pub(crate) fn add_bone_rotation(
+        &mut self,
+        id: ObjectId,
+        bone: String,
+        turn: [i32; 3],
+        space: i32,
+        alpha: f32,
+    ) {
+        if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone.rotations.push(BoneRotation {
+                bone,
+                turn,
+                space,
+                alpha,
+            });
+        }
+    }
+
+    /// `Actor.SetBoneLocation`: record the request for the renderer.
+    pub(crate) fn add_bone_location(
+        &mut self,
+        id: ObjectId,
+        bone: String,
+        trans: [f32; 3],
+        alpha: f32,
+    ) {
+        if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone.locations.push(BoneLocation { bone, trans, alpha });
         }
     }
 
@@ -4112,6 +4182,32 @@ impl<'s> Vm<'s> {
         }
     }
 
+    /// Declared `Ty` of the property referenced by a variable token or a context member token.
+    /// Used to initialise dynamic-array elements grown by `Length = n` / out-of-range writes with
+    /// the element type's zero instead of guessing from the assigned scalar.
+    fn token_property_ty(&self, frame: &Frame<'s>, t: &Token) -> Option<Ty> {
+        use TokenKind as K;
+        let g = match &t.kind {
+            K::LocalVariable(r) | K::InstanceVariable(r) | K::DefaultVariable(r) => {
+                self.set.resolve(frame.pkg, *r)?
+            }
+            K::Context(c) => self.member_property(frame.pkg, &c.member)?,
+            _ => return None,
+        };
+        match self.set.object(g) {
+            Some(ScriptObject::Property(p)) => Some(self.ty_of(g.package, &p.kind, 0)),
+            _ => None,
+        }
+    }
+
+    /// Declared element type of the dynamic-array expression `t`, if it is an array property.
+    fn array_elem_ty(&self, frame: &Frame<'s>, t: &Token) -> Option<Ty> {
+        match self.token_property_ty(frame, t)? {
+            Ty::Array(inner) => Some(*inner),
+            _ => None,
+        }
+    }
+
     /// Static class of an object-typed token (`self`, a class literal, a variable whose declared
     /// type is an object/class, or a chained context), when it can be determined.
     pub(crate) fn context_object_class(
@@ -4692,6 +4788,7 @@ impl<'s> Vm<'s> {
             }
             K::DynArrayElement { index, array } => {
                 let i = self.int(frame, index)?;
+                let elem_ty = self.array_elem_ty(frame, array);
                 let Some(base) = self.place(frame, array, target)? else {
                     return Ok(None);
                 };
@@ -4701,7 +4798,7 @@ impl<'s> Vm<'s> {
                         len: 0,
                     }));
                 }
-                Place::Elem(Box::new(base), i as usize)
+                Place::Elem(Box::new(base), i as usize, elem_ty)
             }
             K::StructMember { property, expr } => {
                 let g = self.resolve_ref(frame, *property)?;
@@ -4714,10 +4811,11 @@ impl<'s> Vm<'s> {
             // `Array.Length = n` is the UE2 dynamic-array resize idiom; it is the only
             // assignable use of `DynArrayLength`.
             K::DynArrayLength(e) => {
+                let elem_ty = self.array_elem_ty(frame, e);
                 let Some(base) = self.place(frame, e, target)? else {
                     return Ok(None);
                 };
-                Place::ArrayLen(Box::new(base))
+                Place::ArrayLen(Box::new(base), elem_ty)
             }
             _ => return Err(self.err(VmErrorKind::NotAPlace { opcode: t.opcode })),
         }))
@@ -4727,7 +4825,7 @@ impl<'s> Vm<'s> {
         let v = match p {
             Place::Local(i) => frame.locals.get(*i).cloned(),
             Place::Slot(o, i) => self.objects[*o as usize].props.get(*i).cloned(),
-            Place::Elem(base, i) => match self.read(frame, base)? {
+            Place::Elem(base, i, _) => match self.read(frame, base)? {
                 Value::Array(a) => match a.get(*i) {
                     Some(v) => Some(v.clone()),
                     None => {
@@ -4743,7 +4841,7 @@ impl<'s> Vm<'s> {
                 member_get(&self.read(frame, base)?, m)
                     .ok_or_else(|| self.err(VmErrorKind::Other(format!("no struct member {m}"))))?,
             ),
-            Place::ArrayLen(base) => match self.read(frame, base)? {
+            Place::ArrayLen(base, _) => match self.read(frame, base)? {
                 Value::Array(a) => Some(Value::Int(a.len() as i32)),
                 other => return Err(self.type_err("array", &other)),
             },
@@ -4771,20 +4869,26 @@ impl<'s> Vm<'s> {
                 }
                 self.objects[*o as usize].props[*i] = v;
             }
-            Place::Elem(base, i) => {
+            Place::Elem(base, i, elem_ty) => {
                 let mut arr = match self.read(frame, base)? {
                     Value::Array(a) => a,
                     other => return Err(self.type_err("array", &other)),
                 };
                 if *i >= arr.len() {
-                    // UE2 grows a dynamic array on assignment past its end.
-                    let zero = match &v {
-                        Value::Int(_) => Value::Int(0),
-                        Value::Float(_) => Value::Float(0.0),
-                        Value::Object(_) => Value::Object(None),
-                        Value::Name(_) => Value::Name("None".into()),
-                        other => other.clone(),
-                    };
+                    // UE2 grows a dynamic array on assignment past its end and initialises the new
+                    // elements to the element type's default (a zero struct, not the assigned
+                    // scalar). The declared element type is known when the array expression is a
+                    // property; otherwise fall back to the assigned value's zero.
+                    let zero = elem_ty.as_ref().map_or_else(
+                        || match &v {
+                            Value::Int(_) => Value::Int(0),
+                            Value::Float(_) => Value::Float(0.0),
+                            Value::Object(_) => Value::Object(None),
+                            Value::Name(_) => Value::Name("None".into()),
+                            other => other.clone(),
+                        },
+                        Ty::zero,
+                    );
                     arr.resize(*i + 1, zero);
                 }
                 arr[*i] = v;
@@ -4797,7 +4901,7 @@ impl<'s> Vm<'s> {
                 }
                 self.write(frame, base, s)?;
             }
-            Place::ArrayLen(base) => {
+            Place::ArrayLen(base, elem_ty) => {
                 let n = match v {
                     Value::Int(i) => i.max(0) as usize,
                     other => return Err(self.type_err("int", &other)),
@@ -4806,14 +4910,20 @@ impl<'s> Vm<'s> {
                     Value::Array(a) => a,
                     other => return Err(self.type_err("array", &other)),
                 };
-                let zero = match arr.last() {
-                    Some(Value::Float(_)) => Value::Float(0.0),
-                    Some(Value::Object(_)) => Value::Object(None),
-                    Some(Value::Name(_)) => Value::Name("None".into()),
-                    Some(Value::Bool(_)) => Value::Bool(false),
-                    Some(Value::Byte(_)) => Value::Byte(0),
-                    _ => Value::Int(0),
-                };
+                // UE2 `Array.Length = n` initialises the grown elements to the element type's
+                // default. When the property's declared element type is known, use it (a zero
+                // struct carries all its members); otherwise infer from an existing element.
+                let zero = elem_ty.as_ref().map_or_else(
+                    || match arr.last() {
+                        Some(Value::Float(_)) => Value::Float(0.0),
+                        Some(Value::Object(_)) => Value::Object(None),
+                        Some(Value::Name(_)) => Value::Name("None".into()),
+                        Some(Value::Bool(_)) => Value::Bool(false),
+                        Some(Value::Byte(_)) => Value::Byte(0),
+                        _ => Value::Int(0),
+                    },
+                    Ty::zero,
+                );
                 arr.resize(n, zero);
                 self.write(frame, base, Value::Array(arr))?;
             }

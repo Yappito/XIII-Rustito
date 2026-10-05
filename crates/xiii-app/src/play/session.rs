@@ -20,7 +20,8 @@ use std::time::Instant;
 use xiii_package::Limits;
 use xiii_script::vm::MoverState;
 use xiii_script::{
-    DialogueEvent, ObjRef, ObjectId, PresentationEvent, ScriptSet, Value, Vm, VmError, VmLimits,
+    DialogueEvent, ObjRef, ObjectId, PresentationEvent, SaveCheckpointEvent, ScriptSet, Value, Vm,
+    VmError, VmLimits,
 };
 use xiii_world::runtime::{self, ProviderSpec};
 
@@ -57,6 +58,9 @@ pub struct Session {
     pub blocked: Vec<String>,
     /// Suspended actor names (unimplemented native or other code failure).
     pub suspended: Vec<String>,
+    /// Every distinct suspension as `(actor, error)`, in first-seen order (bounded). More useful
+    /// than `first_error` alone: several actors can fail for different reasons in one run.
+    pub failures: Vec<(String, String)>,
     /// First failure, formatted with its script stack.
     pub first_error: Option<String>,
     /// Last synced VM `Location` per object id (dense, for the one-way render sync). `None` until
@@ -69,6 +73,11 @@ pub struct Session {
     pub dialogues: VecDeque<(f64, DialogueEvent)>,
     /// Cumulative number of dialogue events emitted.
     pub dialogue_total: u64,
+    /// `Actor.SaveAtCheckpoint` requests, most recent last (bounded). The VM records these and
+    /// writes nothing to the installation; `save_total` is the cumulative count.
+    pub saves: VecDeque<(f64, SaveCheckpointEvent)>,
+    /// Cumulative number of checkpoint-save requests emitted.
+    pub save_total: u64,
     /// `Touch` events involving the player, most recent last (bounded).
     pub touches: VecDeque<(f64, String)>,
     player_touching: Vec<ObjectId>,
@@ -343,11 +352,14 @@ impl Session {
             login_bootstrap,
             blocked,
             suspended,
+            failures: Vec::new(),
             first_error: None,
             last_synced,
             events: VecDeque::new(),
             dialogues: VecDeque::new(),
             dialogue_total: 0,
+            saves: VecDeque::new(),
+            save_total: 0,
             touches: VecDeque::new(),
             player_touching: Vec::new(),
             moved: Vec::new(),
@@ -961,6 +973,10 @@ impl Session {
                 self.dialogue_total += 1;
                 self.dialogues.push_back((t, d.clone()));
             }
+            if let PresentationEvent::SaveCheckpoint(s) = &ev {
+                self.save_total += 1;
+                self.saves.push_back((t, s.clone()));
+            }
             self.events.push_back((t, ev));
         }
         while self.events.len() > 64 {
@@ -968,6 +984,9 @@ impl Session {
         }
         while self.dialogues.len() > 64 {
             self.dialogues.pop_front();
+        }
+        while self.saves.len() > 64 {
+            self.saves.pop_front();
         }
     }
 
@@ -1055,8 +1074,15 @@ impl Session {
         if !self.suspended.iter().any(|s| s == name) {
             self.suspended.push(name.to_owned());
         }
+        let text = format!("{e}");
+        if !self.failures.iter().any(|(n, _)| n == name) {
+            self.failures.push((name.to_owned(), text.clone()));
+            while self.failures.len() > 32 {
+                self.failures.remove(0);
+            }
+        }
         if self.first_error.is_none() {
-            self.first_error = Some(format!("{e}"));
+            self.first_error = Some(text);
         }
     }
 }
@@ -1310,6 +1336,47 @@ mod tests {
             h1 < h0,
             "the VM's fall damage did not reduce Health ({h0} -> {h1}); first error: {:?}",
             session.first_error()
+        );
+    }
+
+    /// Opt-in corpus regression (item3o): the Plage00 level-start checkpoint path runs the
+    /// game's own `XIIISaveGameTrigger.GoSaving.DoSave`, which used to suspend on the struct-array
+    /// member `bcompleted` (`ObjectivesState.length` grew the element as `int 0`, so the
+    /// subsequent `.bCompleted` write failed with "no struct member bcompleted"). The save must
+    /// now emit the host `SaveCheckpoint` event. The intro's control-return is measured by the
+    /// acceptance `--play` run (the cutscene needs the HUD `PostRender` to leave
+    /// `WaitForFirstDisplay`, which this headless harness does not drive).
+    #[test]
+    fn opt_in_plage00_checkpoint_save_event() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00");
+        // The save trigger fires when the host delivers the player's Touch after the first steps.
+        for _ in 0..120 {
+            if session.save_total >= 1 {
+                break;
+            }
+            let loc = session.player_location().unwrap_or([0.0; 3]);
+            session.step(1.0 / 60.0, loc, 0.0, [0.0; 3], &PlayerVMModes::default());
+        }
+        assert!(
+            session.save_total >= 1,
+            "the level-start checkpoint save did not run (suspended: {:?})",
+            session.suspended
+        );
+        let save = session
+            .saves
+            .front()
+            .expect("a SaveCheckpoint event")
+            .1
+            .clone();
+        assert_eq!(save.teleporter_name, "PlayerStart");
+        assert_eq!(save.description, "Brighton Beach 1");
+        println!(
+            "[save test] checkpoint {:?} teleporter={:?} description={:?}",
+            save.actor, save.teleporter_name, save.description
         );
     }
 }
