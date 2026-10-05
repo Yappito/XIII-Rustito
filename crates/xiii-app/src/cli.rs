@@ -12,6 +12,8 @@ pub enum Mode {
     Smoke,
     /// Diagnostic map viewer (M2a): `--map` + `--game-dir`.
     Viewer,
+    /// Diagnostic skinned-character viewer (M2b): `--model` + `--game-dir`.
+    Skinned,
 }
 
 /// Parsed command-line options.
@@ -41,6 +43,14 @@ pub struct Options {
     pub find: Option<String>,
     /// Run the headless doorway collision test on `--map` from `--game-dir`.
     pub collision_test: bool,
+    /// Skinned viewer: `Package.Mesh` (comma-separated for several side by side).
+    pub model: Option<String>,
+    /// Skinned viewer: animation sequence name to play (default: bind pose).
+    pub anim: Option<String>,
+    /// Skinned viewer: freeze the pose at this clip frame (comparisons).
+    pub frame: Option<f32>,
+    /// Run the headless ReachSpec navigation walk test on `--map` from `--game-dir`.
+    pub reach_test: bool,
 }
 
 impl Options {
@@ -66,6 +76,10 @@ impl Default for Options {
             dump: false,
             find: None,
             collision_test: false,
+            model: None,
+            anim: None,
+            frame: None,
+            reach_test: false,
         }
     }
 }
@@ -76,13 +90,20 @@ xiii-app [--smoke] [--frames N] [--exit-after-secs S] [--screenshot PATH]
 xiii-app --map NAME --game-dir DIR [--view x,y,z,yaw,pitch] [--dump]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH]
 xiii-app --map NAME --game-dir DIR --collision-test
+xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
+         [--exit-after-secs S] [--screenshot PATH] [--size WxH]
 
   --smoke              Run the native window/GPU/input/audio smoke scene (default).
   --map NAME           Diagnostic map viewer: import NAME (e.g. Plage00) from --game-dir.
   --game-dir DIR       Owned XIII installation (read-only).
+  --model PKG.MESH     Skinned-character viewer: decode a SkeletalMesh; several comma-
+                       separated entries are placed side by side.
+  --anim SEQ           Skinned viewer: play MeshAnimation sequence SEQ (default bind pose).
+  --frame N            Skinned viewer: freeze the clip at frame N and the camera front-on.
   --view x,y,z,yaw,pitch  Viewer camera override (Bevy metres, degrees).
   --dump               Viewer: import, print counters, exit without a window.
   --collision-test     Headless swept-collision doorway test on --map (no window).
+  --reach-test         Headless ReachSpec navigation walk test on --map (no window).
   --find TEXT          With --dump: list objects whose path/texture contains TEXT.
   --frames N           Exit cleanly after N frames and print a report.
   --exit-after-secs S  Exit cleanly after S seconds and print a report.
@@ -129,6 +150,20 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
             "--game-dir" => opts.game_dir = Some(PathBuf::from(value("--game-dir")?)),
             "--dump" => opts.dump = true,
             "--collision-test" => opts.collision_test = true,
+            "--model" => {
+                opts.model = Some(value("--model")?);
+                opts.mode = Mode::Skinned;
+            }
+            "--anim" => opts.anim = Some(value("--anim")?),
+            "--frame" => {
+                let v = value("--frame")?;
+                let n: f32 = v.parse().map_err(|_| format!("invalid --frame {v:?}"))?;
+                if !(n.is_finite() && n >= 0.0) {
+                    return Err("--frame must be a finite number >= 0".into());
+                }
+                opts.frame = Some(n);
+            }
+            "--reach-test" => opts.reach_test = true,
             "--find" => opts.find = Some(value("--find")?.to_ascii_lowercase()),
             "--view" => {
                 let v = value("--view")?;
@@ -199,6 +234,29 @@ mod tests {
         assert!(p(&["--size", "800"]).is_err());
         assert!(p(&["--bogus"]).is_err());
         assert!(p(&["--view", "1,2,3"]).is_err());
+    }
+
+    #[test]
+    fn parses_skinned_flags() {
+        let o = p(&[
+            "--model",
+            "xiiipersos.XIIIM,XiiiPersos.MigA",
+            "--game-dir",
+            "G",
+            "--anim",
+            "Walk",
+            "--frame",
+            "7.5",
+        ])
+        .unwrap();
+        assert_eq!(o.mode, Mode::Skinned);
+        assert_eq!(o.model.as_deref(), Some("xiiipersos.XIIIM,XiiiPersos.MigA"));
+        assert_eq!(o.anim.as_deref(), Some("Walk"));
+        assert_eq!(o.frame, Some(7.5));
+        // --anim/--frame alone stay in the default mode.
+        assert_eq!(p(&["--anim", "Walk"]).unwrap().mode, Mode::Smoke);
+        assert!(p(&["--frame", "-1"]).is_err());
+        assert!(p(&["--frame", "x"]).is_err());
     }
 
     #[test]

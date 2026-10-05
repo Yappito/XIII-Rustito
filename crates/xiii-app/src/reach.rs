@@ -1,0 +1,808 @@
+//! `--reach-test`: validate collision + walking against the map's navigation network.
+//!
+//! Every `ReachSpec` edge of a map (decoded by [`xiii_world::navigation`]) that requires
+//! walking and is wide/tall enough for the player class is walked with the UE2-style
+//! [`xiii_collision::walk_move`] (step-up at `MAXSTEPHEIGHT` 35 UU, floor-follow at
+//! `MINFLOORZ` 0.7, both shared with `collision.rs`). The player extent box is placed at the
+//! start node with the same `FindSpot`-style raise-and-drop used by `--collision-test`, then
+//! the heading is re-aimed at the end node every step.
+//!
+//! **Pass rule (stated):** the walk passes when the final **horizontal** distance from the
+//! player box centre to the end node centre is at most `player CollisionRadius + end node
+//! CollisionRadius` (Unreal units), within a step budget of `3 x edge length` (the decoded
+//! `ReachSpec.Distance`, or the horizontal start-to-end distance when that field is zero).
+//! `walk_move` behaviour is not tuned here; failures are reported with their contact and
+//! clearance numbers, grouped by a labelled heuristic cause.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::time::Instant;
+
+use bevy::app::AppExit;
+
+use xiii_collision::{CollisionWorld, MoveContact, Vec3, WalkParams, walk_move};
+use xiii_decode::common::{UNREAL_UNITS_PER_METER, to_bevy_position};
+use xiii_install::{Installation, OpenOptions};
+use xiii_world::navigation::{Navigation, reach_flags};
+use xiii_world::{ClassDefaults, PackageCache};
+
+use crate::collision::{self, MAXSTEPHEIGHT_UU, MINFLOORZ, SKIN_UU, STEP_UU};
+
+/// One failed edge with the numbers needed to explain it.
+#[derive(Debug, Clone)]
+pub struct Failure {
+    /// Heuristic failure cause (group key).
+    pub cause: String,
+    /// Start node class and path.
+    pub start: String,
+    /// End node class and path.
+    pub end: String,
+    /// Edge `reachFlags`.
+    pub flags: u32,
+    /// Edge collision radius / height (Unreal units).
+    pub spec_radius: u16,
+    pub spec_height: u16,
+    /// Decoded cached distance (Unreal units).
+    pub distance_uu: u16,
+    /// Where the walk stopped (Unreal units).
+    pub stop_uu: [f32; 3],
+    /// Remaining horizontal distance to the end node (Unreal units).
+    pub remaining_uu: f32,
+    /// Goal radius (player + end node radius, Unreal units).
+    pub goal_uu: f32,
+    /// Steps used and the budget.
+    pub steps: usize,
+    pub budget: usize,
+    /// Whether the final step reported falling (no walkable floor below).
+    pub falling: bool,
+    /// Whether any step reported a blocking contact.
+    pub blocked: bool,
+    /// Blocking collision source path (last contact).
+    pub blocking_source: Option<String>,
+    /// Last contact normal (Bevy space).
+    pub contact_normal: Option<[f32; 3]>,
+    /// Last contact triangle centroid height above the box bottom (Unreal units).
+    pub contact_height_above_bottom_uu: Option<f32>,
+    /// Floor distance below the box centre at the stop (Unreal units).
+    pub floor_below_center_uu: Option<f32>,
+    /// Ceiling distance above the box centre at the stop (Unreal units).
+    pub ceiling_above_center_uu: Option<f32>,
+    /// Extra note (e.g. the spawn-placement error).
+    pub note: Option<String>,
+}
+
+/// Per-map result of [`analyze`].
+#[derive(Debug, Clone)]
+pub struct ReachReport {
+    /// Map name.
+    pub map: String,
+    /// Navigation point count.
+    pub nav_points: usize,
+    /// Navigation points per class.
+    pub class_counts: BTreeMap<String, usize>,
+    /// Total edges.
+    pub edges: usize,
+    /// Edge `reachFlags` histogram.
+    pub flags_hist: BTreeMap<u32, usize>,
+    /// Edges with the `R_WALK` bit.
+    pub walking_edges: usize,
+    /// Walking edges large enough for the player.
+    pub eligible: usize,
+    /// Eligible edges that passed.
+    pub passes: usize,
+    /// Failures (any cause).
+    pub failures: Vec<Failure>,
+    /// Failure count per cause.
+    pub groups: BTreeMap<String, usize>,
+    /// Walking edges skipped because the end node was not a known navigation point.
+    pub unresolved_end: usize,
+    /// Navigation decode diagnostics (non-empty lines).
+    pub diagnostics: Vec<String>,
+    /// Player class path.
+    pub player_class: String,
+    /// Player collision radius / (half) height (Unreal units).
+    pub player_radius: f32,
+    pub player_height: f32,
+    /// Collision triangles in the built world.
+    pub collision_tris: usize,
+    /// Edges whose start placement failed.
+    pub spawn_failures: usize,
+}
+
+fn scale(a: Vec3, s: f32) -> Vec3 {
+    [a[0] * s, a[1] * s, a[2] * s]
+}
+
+fn dist_xz(a: Vec3, b: Vec3) -> f32 {
+    ((a[0] - b[0]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}
+
+fn heading_xz(from: Vec3, to: Vec3) -> Vec3 {
+    let d = [to[0] - from[0], 0.0, to[2] - from[2]];
+    let l = (d[0] * d[0] + d[2] * d[2]).sqrt();
+    if l < 1e-6 {
+        [0.0, 0.0, 0.0]
+    } else {
+        [d[0] / l, 0.0, d[2] / l]
+    }
+}
+
+/// Nearest upward floor below `center`, as `(distance below, normal.y)`.
+fn floor_below(world: &CollisionWorld, center: Vec3) -> Option<(f32, f32)> {
+    let h = world.ray(center, [center[0], center[1] - 20.0, center[2]])?;
+    Some((h.t * 20.0, h.normal[1]))
+}
+
+/// Nearest ceiling above `center`, as `(distance above, normal.y)`.
+fn ceiling_above(world: &CollisionWorld, center: Vec3) -> Option<(f32, f32)> {
+    let h = world.ray(center, [center[0], center[1] + 20.0, center[2]])?;
+    Some((h.t * 20.0, h.normal[1]))
+}
+
+/// Result of walking one edge.
+#[derive(Debug)]
+struct EdgeWalk {
+    position: Vec3,
+    steps: usize,
+    falling: bool,
+    blocked: bool,
+    contacts: Vec<MoveContact>,
+    reached: bool,
+}
+
+/// Walks with `walk_move` from `start` toward `end`, re-aiming horizontally every step, until
+/// the horizontal distance to `end` is at most `goal_radius` or the budget runs out.
+#[allow(clippy::too_many_arguments)]
+fn walk_edge(
+    world: &CollisionWorld,
+    start: Vec3,
+    end: Vec3,
+    half: Vec3,
+    params: &WalkParams,
+    step: f32,
+    goal_radius: f32,
+    budget: usize,
+) -> EdgeWalk {
+    let mut pos = start;
+    let mut heading = heading_xz(start, end);
+    let mut contacts = Vec::new();
+    let mut falling = false;
+    let mut blocked = false;
+    let mut stuck = 0usize;
+    let mut steps = 0usize;
+    let mut reached = dist_xz(pos, end) <= goal_radius;
+    while steps < budget && !reached {
+        steps += 1;
+        let h = heading_xz(pos, end);
+        if h != [0.0, 0.0, 0.0] {
+            heading = h;
+        }
+        let delta = scale(heading, step);
+        let r = walk_move(world, pos, delta, half, params);
+        falling = r.falling;
+        blocked |= r.blocked;
+        contacts.extend(r.contacts.iter().copied());
+        let before = pos;
+        pos = r.position;
+        if dist_xz(pos, end) <= goal_radius {
+            reached = true;
+            break;
+        }
+        let moved = ((pos[0] - before[0]).powi(2) + (pos[2] - before[2]).powi(2)).sqrt();
+        if moved < 1e-4 {
+            stuck += 1;
+        } else {
+            stuck = 0;
+        }
+        if stuck >= 5 {
+            break;
+        }
+    }
+    EdgeWalk {
+        position: pos,
+        steps,
+        falling,
+        blocked,
+        contacts,
+        reached,
+    }
+}
+
+/// Heuristic cause for a failed stop, from the last contact normal and the clearance.
+fn classify(world: &CollisionWorld, walk: &EdgeWalk, box_height: f32) -> String {
+    if walk.falling {
+        return "falling (no walkable floor under the stop)".to_owned();
+    }
+    let Some(c) = walk.contacts.last() else {
+        return "no progress without contact".to_owned();
+    };
+    let ny = c.normal[1];
+    let ceiling = ceiling_above(world, walk.position).map(|(d, _)| d);
+    if ny <= -0.3 {
+        return "ceiling/overhang contact".to_owned();
+    }
+    if ny >= MINFLOORZ {
+        return "walkable ledge (near-horizontal rise not stepped)".to_owned();
+    }
+    if ceiling.is_some_and(|d| d < box_height) {
+        return "overhang (insufficient headroom for step-up)".to_owned();
+    }
+    if ny.abs() < 0.3 {
+        let diag = c.normal[0].abs() > 0.3 && c.normal[2].abs() > 0.3;
+        return if diag {
+            "diagonal wall (AABB corner vs cylinder hypothesis)".to_owned()
+        } else {
+            "vertical wall".to_owned()
+        };
+    }
+    "steep surface".to_owned()
+}
+
+/// Imports a map, decodes its navigation and walks every eligible walking edge.
+pub fn analyze(map: &str, game_dir: &Path) -> Result<ReachReport, String> {
+    let import_started = Instant::now();
+    let mut cache = PackageCache::open(game_dir)?;
+    let scene = xiii_world::import_map(&mut cache, map)?;
+    let mut defaults = ClassDefaults::open(game_dir)?;
+    let nav: Navigation =
+        xiii_world::navigation::decode_navigation(&mut cache, &mut defaults, map)?;
+    let import_secs = import_started.elapsed().as_secs_f32();
+
+    let install = Installation::open(game_dir, &OpenOptions::default())
+        .map_err(|e| format!("opening installation for class defaults: {e}"))?;
+    let (set, _gameinfo, player_class) = collision::resolve_player_class(&install)?;
+    let (player_radius, player_height, _eye, _gs, _jz) =
+        collision::player_extents(&set, &player_class)?;
+    let half = [
+        player_radius / UNREAL_UNITS_PER_METER,
+        player_height / UNREAL_UNITS_PER_METER,
+        player_radius / UNREAL_UNITS_PER_METER,
+    ];
+
+    let world = CollisionWorld::new(scene.collision.iter().map(|(t, s)| (*t, *s)));
+
+    let params = WalkParams {
+        skin: SKIN_UU / UNREAL_UNITS_PER_METER,
+        max_iterations: 4,
+        max_step_height: MAXSTEPHEIGHT_UU / UNREAL_UNITS_PER_METER,
+        min_floor_z: MINFLOORZ,
+    };
+    let step = STEP_UU / UNREAL_UNITS_PER_METER;
+
+    let mut report = ReachReport {
+        map: map.to_owned(),
+        nav_points: nav.points.len(),
+        class_counts: nav.class_counts.clone(),
+        edges: nav.edges.len(),
+        flags_hist: nav.flags_hist.clone(),
+        walking_edges: 0,
+        eligible: 0,
+        passes: 0,
+        failures: Vec::new(),
+        groups: BTreeMap::new(),
+        unresolved_end: 0,
+        diagnostics: nav_diagnostics(&nav),
+        player_class,
+        player_radius,
+        player_height,
+        collision_tris: world.triangle_count(),
+        spawn_failures: 0,
+    };
+
+    for edge in &nav.edges {
+        if !edge.is_walk() {
+            continue;
+        }
+        report.walking_edges += 1;
+        if f32::from(edge.collision_radius) < player_radius
+            || f32::from(edge.collision_height) < player_height
+        {
+            continue;
+        }
+        let Some(end_idx) = edge.end_point else {
+            report.unresolved_end += 1;
+            continue;
+        };
+        report.eligible += 1;
+
+        let start_idx = edge.start_point.unwrap_or(edge.owner);
+        let start_pt = &nav.points[start_idx];
+        let end_pt = &nav.points[end_idx];
+        let start = to_bevy_position(start_pt.location);
+        let end = to_bevy_position(end_pt.location);
+
+        let end_radius = if end_pt.collision_radius.is_finite() {
+            end_pt.collision_radius.max(0.0)
+        } else {
+            0.0
+        };
+        let goal_radius = (player_radius + end_radius) / UNREAL_UNITS_PER_METER;
+        let edge_len_uu = if edge.distance > 0 {
+            f32::from(edge.distance)
+        } else {
+            dist_xz(start, end) * UNREAL_UNITS_PER_METER
+        };
+        let budget = (((3.0 * edge_len_uu) / STEP_UU).ceil() as usize).max(4);
+
+        // The NavigationPoint `Location` is the centre of its collision cylinder (measured:
+        // `Location.Z - floor - CollisionHeight` clusters on 0; see `collision-test`), so the
+        // player box centre starts at the node and the FindSpot-style raise+drop follows.
+        let spawn =
+            match collision::place_spawn(&world, [start[0], start[1] - half[1], start[2]], half) {
+                Ok(s) => s,
+                Err(e) => {
+                    report.spawn_failures += 1;
+                    let cause = if e.contains("no floor") {
+                        "missing floor under start node (no downward hit within the 3 m drop)"
+                            .to_owned()
+                    } else if e.contains("still overlaps") {
+                        "spawn overlap (start node embedded in collision)".to_owned()
+                    } else {
+                        "spawn placement failed".to_owned()
+                    };
+                    *report.groups.entry(cause.clone()).or_default() += 1;
+                    report.failures.push(Failure {
+                        cause,
+                        start: format!("{} {}", start_pt.class, start_pt.path),
+                        end: format!("{} {}", end_pt.class, end_pt.path),
+                        flags: edge.reach_flags,
+                        spec_radius: edge.collision_radius,
+                        spec_height: edge.collision_height,
+                        distance_uu: edge.distance,
+                        stop_uu: [
+                            start[0] * UNREAL_UNITS_PER_METER,
+                            start[1] * UNREAL_UNITS_PER_METER,
+                            start[2] * UNREAL_UNITS_PER_METER,
+                        ],
+                        remaining_uu: dist_xz(start, end) * UNREAL_UNITS_PER_METER,
+                        goal_uu: goal_radius * UNREAL_UNITS_PER_METER,
+                        steps: 0,
+                        budget,
+                        falling: false,
+                        blocked: false,
+                        blocking_source: None,
+                        contact_normal: None,
+                        contact_height_above_bottom_uu: None,
+                        floor_below_center_uu: floor_below(&world, start)
+                            .map(|(d, _)| d * UNREAL_UNITS_PER_METER),
+                        ceiling_above_center_uu: ceiling_above(&world, start)
+                            .map(|(d, _)| d * UNREAL_UNITS_PER_METER),
+                        note: Some(e),
+                    });
+                    continue;
+                }
+            };
+
+        let walk = walk_edge(
+            &world,
+            spawn.position,
+            end,
+            half,
+            &params,
+            step,
+            goal_radius,
+            budget,
+        );
+        if walk.reached {
+            report.passes += 1;
+            continue;
+        }
+
+        let cause = classify(&world, &walk, 2.0 * half[1]);
+        *report.groups.entry(cause.clone()).or_default() += 1;
+        let remaining_uu = dist_xz(walk.position, end) * UNREAL_UNITS_PER_METER;
+        let blocking_source = walk
+            .contacts
+            .last()
+            .map(|c| scene.collision_sources[c.source as usize].clone());
+        let contact_normal = walk.contacts.last().map(|c| c.normal);
+        let contact_height_above_bottom_uu = walk.contacts.last().map(|c| {
+            let tri = world.triangle(c.triangle);
+            let centroid_y = (tri[0][1] + tri[1][1] + tri[2][1]) / 3.0;
+            (centroid_y - (c.position[1] - half[1])) * UNREAL_UNITS_PER_METER
+        });
+        let floor_below_center_uu =
+            floor_below(&world, walk.position).map(|(d, _)| d * UNREAL_UNITS_PER_METER);
+        let ceiling_above_center_uu =
+            ceiling_above(&world, walk.position).map(|(d, _)| d * UNREAL_UNITS_PER_METER);
+        report.failures.push(Failure {
+            cause,
+            start: format!("{} {}", start_pt.class, start_pt.path),
+            end: format!("{} {}", end_pt.class, end_pt.path),
+            flags: edge.reach_flags,
+            spec_radius: edge.collision_radius,
+            spec_height: edge.collision_height,
+            distance_uu: edge.distance,
+            stop_uu: [
+                walk.position[0] * UNREAL_UNITS_PER_METER,
+                walk.position[1] * UNREAL_UNITS_PER_METER,
+                walk.position[2] * UNREAL_UNITS_PER_METER,
+            ],
+            remaining_uu,
+            goal_uu: goal_radius * UNREAL_UNITS_PER_METER,
+            steps: walk.steps,
+            budget,
+            falling: walk.falling,
+            blocked: walk.blocked,
+            blocking_source,
+            contact_normal,
+            contact_height_above_bottom_uu,
+            floor_below_center_uu,
+            ceiling_above_center_uu,
+            note: None,
+        });
+    }
+
+    println!(
+        "[reach-test] {map}: imported in {import_secs:.2}s; nav points {} edges {}; collision {} triangles",
+        report.nav_points, report.edges, report.collision_tris
+    );
+    Ok(report)
+}
+
+/// Non-empty decode diagnostics of a navigation network.
+fn nav_diagnostics(nav: &Navigation) -> Vec<String> {
+    let mut out = Vec::new();
+    if !nav.unresolved_class.is_empty() {
+        out.push(format!(
+            "{} navigation-looking exports had an unresolvable class (first: {:?})",
+            nav.unresolved_class.len(),
+            nav.unresolved_class.first()
+        ));
+    }
+    if !nav.property_failures.is_empty() {
+        out.push(format!(
+            "{} navigation exports failed property decode (first: {:?})",
+            nav.property_failures.len(),
+            nav.property_failures.first()
+        ));
+    }
+    if !nav.tail_failures.is_empty() {
+        out.push(format!(
+            "{} navigation exports failed PathList decode (first: {:?})",
+            nav.tail_failures.len(),
+            nav.tail_failures.first()
+        ));
+    }
+    if nav.empty_path_lists > 0 {
+        out.push(format!(
+            "{} navigation exports have an empty native tail (no PathList)",
+            nav.empty_path_lists
+        ));
+    }
+    if nav.null_start_edges > 0 {
+        out.push(format!(
+            "{} edges have a null decoded Start (owner used as start)",
+            nav.null_start_edges
+        ));
+    }
+    if nav.start_mismatch_edges > 0 {
+        out.push(format!(
+            "{} edges have a Start different from the owning node",
+            nav.start_mismatch_edges
+        ));
+    }
+    if nav.import_end_edges > 0 {
+        out.push(format!(
+            "{} edges have an End that is an import, not a map instance",
+            nav.import_end_edges
+        ));
+    }
+    if nav.unresolved_end_edges > 0 {
+        out.push(format!(
+            "{} edges have an End export that is not a decoded navigation point",
+            nav.unresolved_end_edges
+        ));
+    }
+    out
+}
+
+/// Prints the full report.
+pub fn print_report(r: &ReachReport) {
+    let classes: Vec<String> = r
+        .class_counts
+        .iter()
+        .map(|(c, n)| format!("{c}:{n}"))
+        .collect();
+    println!(
+        "[reach-test] player {} CollisionRadius={} CollisionHeight={} (half) Unreal units",
+        r.player_class, r.player_radius, r.player_height
+    );
+    println!("[reach-test] nav points by class: {}", classes.join(", "));
+    let flags: Vec<String> = r
+        .flags_hist
+        .iter()
+        .map(|(f, n)| format!("0x{f:x}[{}]:{n}", reach_flags::names(*f).join("|")))
+        .collect();
+    println!(
+        "[reach-test] edge reachFlags histogram: {}",
+        flags.join(", ")
+    );
+    for d in &r.diagnostics {
+        println!("[reach-test] note: {d}");
+    }
+    println!(
+        "[reach-test] edges {} total, {} walking; eligible {} (R_WALK and spec R>={} H>={}); passes {} failures {}; unresolved-end {} spawn-failures {}",
+        r.edges,
+        r.walking_edges,
+        r.eligible,
+        r.player_radius,
+        r.player_height,
+        r.passes,
+        r.failures.len(),
+        r.unresolved_end,
+        r.spawn_failures
+    );
+    if !r.groups.is_empty() {
+        println!("[reach-test] failure groups:");
+        for (cause, n) in &r.groups {
+            println!("[reach-test]   {n:>5}  {cause}");
+        }
+    }
+    for f in &r.failures {
+        let flags = reach_flags::names(f.flags).join("|");
+        let normal = f
+            .contact_normal
+            .map(|n| format!("({:.2},{:.2},{:.2})", n[0], n[1], n[2]))
+            .unwrap_or_else(|| "-".to_owned());
+        let contact_h = f
+            .contact_height_above_bottom_uu
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "-".to_owned());
+        let floor = f
+            .floor_below_center_uu
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "-".to_owned());
+        let ceiling = f
+            .ceiling_above_center_uu
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_else(|| "-".to_owned());
+        let stop = format!(
+            "({:.1},{:.1},{:.1})",
+            f.stop_uu[0], f.stop_uu[1], f.stop_uu[2]
+        );
+        let note = f
+            .note
+            .as_deref()
+            .map(|n| format!(" note={n}"))
+            .unwrap_or_default();
+        println!(
+            "[reach-test] FAIL [{}] {} -> {} flags=0x{:x}({}) spec R/H={}/{} d={} goal={:.1}U; stop={stop} remaining={:.1}U steps={}/{} falling={} blocked={} source={} normal={normal} contact_h={contact_h}U floor={floor}U ceiling={ceiling}U{note}",
+            f.cause,
+            f.start,
+            f.end,
+            f.flags,
+            flags,
+            f.spec_radius,
+            f.spec_height,
+            f.distance_uu,
+            f.goal_uu,
+            f.remaining_uu,
+            f.steps,
+            f.budget,
+            f.falling,
+            f.blocked,
+            f.blocking_source.as_deref().unwrap_or("-"),
+        );
+    }
+    println!(
+        "[reach-test] RESULT {}: nav={} specs={} walk={} elig={} pass={} fail={}",
+        r.map,
+        r.nav_points,
+        r.edges,
+        r.walking_edges,
+        r.eligible,
+        r.passes,
+        r.failures.len()
+    );
+}
+
+/// Entry point for `--reach-test`.
+pub fn run(map: &str, game_dir: &Path) -> AppExit {
+    match analyze(map, game_dir) {
+        Ok(report) => {
+            print_report(&report);
+            AppExit::Success
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            AppExit::Error(std::num::NonZeroU8::new(1).expect("nonzero"))
+        }
+    }
+}
+
+/// Resolves `XIII_GOG_DIR` against the workspace root, like the other opt-in tests.
+#[cfg(test)]
+fn opt_in_game_dir() -> Option<std::path::PathBuf> {
+    let root = std::env::var_os("XIII_GOG_DIR")?;
+    let path = std::path::PathBuf::from(&root);
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    Some(if path.is_relative() {
+        ws.join(path)
+    } else {
+        path
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn walk_params() -> WalkParams {
+        WalkParams {
+            skin: SKIN_UU / UNREAL_UNITS_PER_METER,
+            max_iterations: 4,
+            max_step_height: MAXSTEPHEIGHT_UU / UNREAL_UNITS_PER_METER,
+            min_floor_z: MINFLOORZ,
+        }
+    }
+
+    /// A 20x20 m floor at Bevy Y=0.
+    fn floor_world() -> CollisionWorld {
+        CollisionWorld::new(vec![
+            (
+                [[-10.0, 0.0, -10.0], [10.0, 0.0, -10.0], [10.0, 0.0, 10.0]],
+                0u32,
+            ),
+            (
+                [[-10.0, 0.0, -10.0], [10.0, 0.0, 10.0], [-10.0, 0.0, 10.0]],
+                0u32,
+            ),
+        ])
+    }
+
+    /// The floor plus a 3 m wall at Bevy X=2.
+    fn wall_world() -> CollisionWorld {
+        CollisionWorld::new(vec![
+            (
+                [[-10.0, 0.0, -10.0], [10.0, 0.0, -10.0], [10.0, 0.0, 10.0]],
+                0u32,
+            ),
+            (
+                [[-10.0, 0.0, -10.0], [10.0, 0.0, 10.0], [-10.0, 0.0, 10.0]],
+                0u32,
+            ),
+            ([[2.0, 0.0, -1.0], [2.0, 3.0, -1.0], [2.0, 3.0, 1.0]], 1u32),
+            ([[2.0, 0.0, -1.0], [2.0, 3.0, 1.0], [2.0, 0.0, 1.0]], 1u32),
+        ])
+    }
+
+    /// A floor only for Bevy X <= 0 (a ledge edge at X=0).
+    fn ledge_world() -> CollisionWorld {
+        CollisionWorld::new(vec![
+            (
+                [[-10.0, 0.0, -10.0], [0.0, 0.0, -10.0], [0.0, 0.0, 10.0]],
+                0u32,
+            ),
+            (
+                [[-10.0, 0.0, -10.0], [0.0, 0.0, 10.0], [-10.0, 0.0, 10.0]],
+                0u32,
+            ),
+        ])
+    }
+
+    #[test]
+    fn walk_edge_reaches_a_clear_target_on_a_floor() {
+        let world = floor_world();
+        let half = [
+            34.0 / UNREAL_UNITS_PER_METER,
+            75.0 / UNREAL_UNITS_PER_METER,
+            34.0 / UNREAL_UNITS_PER_METER,
+        ];
+        let start = [0.0, half[1], 0.0];
+        let end = [5.0, half[1], 0.0];
+        let w = walk_edge(
+            &world,
+            start,
+            end,
+            half,
+            &walk_params(),
+            STEP_UU / UNREAL_UNITS_PER_METER,
+            0.4,
+            400,
+        );
+        assert!(
+            w.reached,
+            "not reached, remaining {}",
+            dist_xz(w.position, end)
+        );
+    }
+
+    #[test]
+    fn walk_edge_wall_is_classified_as_vertical_wall() {
+        let world = wall_world();
+        let half = [
+            34.0 / UNREAL_UNITS_PER_METER,
+            75.0 / UNREAL_UNITS_PER_METER,
+            34.0 / UNREAL_UNITS_PER_METER,
+        ];
+        let start = [0.0, half[1], 0.0];
+        let end = [5.0, half[1], 0.0];
+        let w = walk_edge(
+            &world,
+            start,
+            end,
+            half,
+            &walk_params(),
+            STEP_UU / UNREAL_UNITS_PER_METER,
+            0.4,
+            400,
+        );
+        assert!(!w.reached, "walked through the wall to {:?}", w.position);
+        assert_eq!(classify(&world, &w, 2.0 * half[1]), "vertical wall");
+    }
+
+    #[test]
+    fn walk_edge_below_a_gap_reports_falling() {
+        let world = ledge_world();
+        let half = [
+            34.0 / UNREAL_UNITS_PER_METER,
+            75.0 / UNREAL_UNITS_PER_METER,
+            34.0 / UNREAL_UNITS_PER_METER,
+        ];
+        // Start fully past the ledge edge (box left face beyond X=0); the budget is too small
+        // to reach the far end.
+        let start = [0.5, half[1], 0.0];
+        let end = [5.0, half[1], 0.0];
+        let w = walk_edge(
+            &world,
+            start,
+            end,
+            half,
+            &walk_params(),
+            STEP_UU / UNREAL_UNITS_PER_METER,
+            0.4,
+            1,
+        );
+        assert!(!w.reached);
+        assert!(w.falling, "expected falling, got {:?}", w);
+        assert_eq!(
+            classify(&world, &w, 2.0 * half[1]),
+            "falling (no walkable floor under the stop)"
+        );
+    }
+
+    #[test]
+    fn edge_step_budget_is_three_times_the_length() {
+        // 300 UU with a 2.5 UU step: 3*300/2.5 = 360 steps.
+        let edge_len_uu = 300.0f32;
+        let budget = (((3.0 * edge_len_uu) / STEP_UU).ceil() as usize).max(4);
+        assert_eq!(budget, 360);
+    }
+
+    #[test]
+    fn opt_in_reach_regression_plage00_plage01_banque01() {
+        let Some(path) = opt_in_game_dir() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        // Regression guard (not a fidelity claim): measured pass counts after the item1f fixes
+        // (Plage00 12/12, Plage01 295/302, Banque01 631/658). A drop below the measured value is
+        // a regression. The missing-floor group must stay empty: it guards the Part B
+        // staircase-collision fix (Banque01 had 17 such floating start nodes before it).
+        for (map, min_pass) in [
+            ("Plage00", 12usize),
+            ("Plage01", 295usize),
+            ("Banque01", 631usize),
+        ] {
+            let report = analyze(map, &path).expect("reach analyze");
+            println!(
+                "[reach-test regression] {map}: eligible {} passes {} (>= {min_pass})",
+                report.eligible, report.passes
+            );
+            assert!(
+                report.passes >= min_pass,
+                "{map}: pass count {} below measured {min_pass}",
+                report.passes
+            );
+            assert!(
+                report
+                    .groups
+                    .keys()
+                    .all(|cause| !cause.starts_with("missing floor")),
+                "{map}: missing-floor start nodes: {:?}",
+                report.groups
+            );
+        }
+    }
+}

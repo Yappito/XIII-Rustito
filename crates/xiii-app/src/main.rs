@@ -5,6 +5,7 @@
 
 mod cli;
 mod collision;
+mod reach;
 mod smoke;
 mod viewer;
 
@@ -36,6 +37,14 @@ fn main() -> AppExit {
         return collision::run(map, dir);
     }
 
+    if opts.reach_test {
+        let (Some(dir), Some(map)) = (&opts.game_dir, &opts.map) else {
+            eprintln!("error: --reach-test needs --map and --game-dir");
+            return AppExit::error();
+        };
+        return reach::run(map, dir);
+    }
+
     if opts.unattended() {
         println!(
             "[app] unattended run: frames={:?} exit_after_secs={:?} screenshot={:?} size={}x{} no_vsync={}",
@@ -60,6 +69,9 @@ fn main() -> AppExit {
             title: match opts.mode {
                 cli::Mode::Smoke => "XIII Classic runtime - smoke test".into(),
                 cli::Mode::Viewer => "XIII Classic runtime - map viewer (diagnostic)".into(),
+                cli::Mode::Skinned => {
+                    "XIII Classic runtime - skinned character viewer (diagnostic)".into()
+                }
             },
             resolution: (opts.width, opts.height).into(),
             present_mode,
@@ -74,6 +86,9 @@ fn main() -> AppExit {
         }
         cli::Mode::Viewer => {
             app.add_plugins(viewer::ViewerPlugin { options: opts });
+        }
+        cli::Mode::Skinned => {
+            app.add_plugins(viewer::skinned::SkinnedPlugin { options: opts });
         }
     }
 

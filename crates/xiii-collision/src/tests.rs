@@ -714,6 +714,178 @@ fn walk_does_not_tunnel_through_a_wall_after_1000_steps() {
     assert!(pos[2] > 10.0, "slid along the wall, z={}", pos[2]);
 }
 
+// ---------------------------------------------------------------------------------------
+// walk_move against the failure shapes reported for Plage01 (player-scale box, 90 UU/m).
+// ---------------------------------------------------------------------------------------
+
+/// Unreal units per metre at the importer's current scale (see `xiii-decode::common`).
+const UU_PER_M: f32 = 90.0;
+/// Player extent half-size (radius, half height, radius) in metres (R 34, H 75 UU).
+const PLAYER_HALF: Vec3 = [34.0 / UU_PER_M, 75.0 / UU_PER_M, 34.0 / UU_PER_M];
+/// Reach walk step in metres (2.5 UU).
+const PLAYER_STEP: f32 = 2.5 / UU_PER_M;
+/// UE2 `MAXSTEPHEIGHT` in metres (35 UU).
+const PLAYER_MAX_STEP: f32 = 35.0 / UU_PER_M;
+/// The reported 1.8 UU plank/ledge rise in metres.
+const LEDGE_H: f32 = 1.8 / UU_PER_M;
+
+fn player_params() -> WalkParams {
+    WalkParams {
+        skin: 0.05 / UU_PER_M,
+        max_iterations: 4,
+        max_step_height: PLAYER_MAX_STEP,
+        min_floor_z: 0.7,
+    }
+}
+
+/// A big floor at y=0 plus a raised deck at `h` whose leading edge is a shallow (14 degree)
+/// bevel with a walkable normal, starting at x=`x0`.
+fn bevel_ledge(x0: f32, h: f32) -> Vec<(Triangle, u32)> {
+    let bevel_w = h / 14.0f32.to_radians().tan();
+    let mut tris: Vec<(Triangle, u32)> = big_floor(0.0).into_iter().map(|t| (t, 1)).collect();
+    tris.extend(
+        quad(
+            [x0, 0.0, -1.0],
+            [x0 + bevel_w, h, -1.0],
+            [x0 + bevel_w, h, 1.0],
+            [x0, 0.0, 1.0],
+        )
+        .into_iter()
+        .map(|t| (t, 2)),
+    );
+    tris.extend(
+        quad(
+            [x0 + bevel_w, h, -1.0],
+            [x0 + 4.0, h, -1.0],
+            [x0 + 4.0, h, 1.0],
+            [x0 + bevel_w, h, 1.0],
+        )
+        .into_iter()
+        .map(|t| (t, 2)),
+    );
+    tris
+}
+
+#[test]
+fn walk_steps_onto_a_ledge_behind_a_walkable_bevel() {
+    // The blocking contact is the walkable bevel (normal up ~0.97), so the old walkability
+    // gate never attempted a step and the box stalled at the bevel.
+    let w = world(bevel_ledge(0.0, LEDGE_H));
+    let (last, fell) = walk_plus_x(
+        &w,
+        [-1.5, PLAYER_HALF[1], 0.0],
+        PLAYER_HALF,
+        PLAYER_STEP,
+        120,
+        &player_params(),
+    );
+    assert!(
+        last.position[0] > 0.4,
+        "did not cross the bevel: {:?}",
+        last.position
+    );
+    assert!(
+        (last.position[1] - (LEDGE_H + PLAYER_HALF[1])).abs() < 1e-3,
+        "not standing on the deck: {:?}",
+        last.position
+    );
+    assert!(!fell, "never fell crossing the bevel");
+}
+
+#[test]
+fn large_box_crosses_a_series_of_walkable_plank_seams() {
+    // Several 1.8 UU planks, each reached by a walkable bevel: the 150 UU box must step over
+    // every seam, not stall at the first.
+    let mut tris: Vec<(Triangle, u32)> = big_floor(0.0).into_iter().map(|t| (t, 1)).collect();
+    let plank_w = 0.6f32;
+    let n = 4u32;
+    for i in 0..n {
+        let x0 = i as f32 * plank_w;
+        let y0 = i as f32 * LEDGE_H;
+        let y1 = (i + 1) as f32 * LEDGE_H;
+        let bw = LEDGE_H / 14.0f32.to_radians().tan();
+        tris.extend(
+            quad(
+                [x0, y0, -1.0],
+                [x0 + bw, y1, -1.0],
+                [x0 + bw, y1, 1.0],
+                [x0, y0, 1.0],
+            )
+            .into_iter()
+            .map(|t| (t, 2)),
+        );
+        tris.extend(
+            quad(
+                [x0 + bw, y1, -1.0],
+                [x0 + plank_w, y1, -1.0],
+                [x0 + plank_w, y1, 1.0],
+                [x0 + bw, y1, 1.0],
+            )
+            .into_iter()
+            .map(|t| (t, 2)),
+        );
+    }
+    let w = world(tris);
+    // Walk just far enough to end on the top plank, tracking the highest standing height.
+    let params = player_params();
+    let mut pos = [-1.0, PLAYER_HALF[1], 0.0];
+    let mut max_y = pos[1];
+    let mut fell = false;
+    for _ in 0..110 {
+        let r = walk_move(&w, pos, [PLAYER_STEP, 0.0, 0.0], PLAYER_HALF, &params);
+        pos = r.position;
+        max_y = max_y.max(pos[1]);
+        fell |= r.falling;
+    }
+    let top = n as f32 * LEDGE_H;
+    assert!(pos[0] > 1.8, "did not cross the plank seams: {:?}", pos);
+    assert!(
+        (max_y - (top + PLAYER_HALF[1])).abs() < 2e-3,
+        "did not reach the top plank: max_y={max_y} expected {}",
+        top + PLAYER_HALF[1]
+    );
+    assert!(!fell, "never fell crossing the seams");
+}
+
+#[test]
+fn walk_steps_onto_a_ledge_under_an_overhang_that_blocks_the_full_up_sweep() {
+    // A down-facing overhang leaves only 0.35 m of headroom, less than MAXSTEPHEIGHT (0.389 m),
+    // so the full up-sweep is blocked. The required rise is only the 1.8 UU ledge, so the step
+    // must still succeed by not sweeping the full height (UE2 uses the sweep hit time).
+    let mut tris = bevel_ledge(0.0, LEDGE_H);
+    let ceiling = 2.0 * PLAYER_HALF[1] + 0.35;
+    tris.extend(
+        quad(
+            [-2.0, ceiling, -1.0],
+            [0.0, ceiling, -1.0],
+            [0.0, ceiling, 1.0],
+            [-2.0, ceiling, 1.0],
+        )
+        .into_iter()
+        .map(|t| (t, 3)),
+    );
+    let w = world(tris);
+    let (last, fell) = walk_plus_x(
+        &w,
+        [-1.5, PLAYER_HALF[1], 0.0],
+        PLAYER_HALF,
+        PLAYER_STEP,
+        120,
+        &player_params(),
+    );
+    assert!(
+        last.position[0] > 0.4,
+        "did not step through under the overhang: {:?}",
+        last.position
+    );
+    assert!(
+        (last.position[1] - (LEDGE_H + PLAYER_HALF[1])).abs() < 1e-3,
+        "not on the deck: {:?}",
+        last.position
+    );
+    assert!(!fell, "never fell stepping under the overhang");
+}
+
 #[test]
 fn downward_ray_onto_floor_hits() {
     // Regression: a zero-extent ray straight down onto a coplanar floor must hit; the swept
