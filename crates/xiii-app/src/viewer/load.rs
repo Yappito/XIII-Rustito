@@ -981,7 +981,16 @@ mod local_tests {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
         };
-        let mut cache = PackageCache::open(std::path::Path::new(&root)).expect("open install");
+        // A relative value is resolved against the workspace root, so the acceptance command
+        // `XIII_GOG_DIR=XIII_Game cargo test` works from anywhere (test CWD is the crate dir).
+        let path = std::path::PathBuf::from(&root);
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = if path.is_relative() {
+            ws.join(path)
+        } else {
+            path
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
         for (map, actors, bsp_polys) in [("Plage00", 156, 344), ("Plage01", 133, 338)] {
             let scene = import_map(&mut cache, map).expect("import");
             let get = |k: &str| scene.counters.get(k).copied().unwrap_or(0);

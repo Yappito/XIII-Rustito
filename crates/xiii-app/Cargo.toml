@@ -12,6 +12,8 @@ bevy = { workspace = true }
 xiii-package.workspace = true
 xiii-install.workspace = true
 xiii-decode.workspace = true
+xiii-script.workspace = true
+xiii-collision.workspace = true
 
 [lints]
 workspace = true
