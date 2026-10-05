@@ -42,10 +42,18 @@ xiii-tool script: compiled UnrealScript (M2c)
   xiii-tool script run --game-dir <root> [--map Plage00] [--touch TouchTrigger2]
                        [--ticks 60] [--dt 0.0333] [--touch-tick 1] [--trace]
                        [--active TouchTrigger,XIIIDispatcher] [--no-natives] [--budget N]
+                       [--begin-play] [--game-class Package.Class] [--survey]
       Headless interpreter harness: load the map's actors, run PostBeginPlay and
       SetInitialState for the executed scope, deliver Touch(synthetic player) to
       the touched actor, tick at a fixed step and print the behaviour trace.
       Calls into actors outside the scope are reported as DEFERRED (not run).
+      --begin-play runs the full level-start lifecycle (PreBeginPlay, BeginPlay,
+      PostBeginPlay, PostNetBeginPlay, SetInitialState) and spawns a GameInfo;
+      the class comes from [Engine.Engine] DefaultGame in Default.ini unless
+      --game-class overrides it.
+      --survey is DIAGNOSTIC ONLY: it continues past unimplemented natives,
+      counts each distinct one with its first-hit location, and never reports the
+      run as success.
       Exits 1 on a script error (printed with its script stack).";
 
 const GAME_PACKAGES: &[&str] = &["xidmaps", "xiii", "xidcine"];

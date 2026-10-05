@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 use xiii_package::{Limits, ObjectRef, PropertyBlock, PropertyValue, StructValue};
 
-use crate::bytecode::{Call, Script, Token, TokenKind, opcode_name};
+use crate::bytecode::{Call, Context, Script, Token, TokenKind, opcode_name};
 use crate::linker::{GlobalRef, ScriptSet};
 use crate::reflect::{Property, PropertyKind, ScriptObject, function_flags, property_flags};
 use crate::registry::{NativeCtx, NativeDef, NativeOutcome, Registry};
@@ -34,6 +34,9 @@ pub struct VmLimits {
     pub max_call_depth: usize,
     /// Maximum struct nesting when building types.
     pub max_type_depth: u32,
+    /// Seed of the VM's deterministic PRNG (`Rand`/`FRand`). Default `0x9E3779B97F4A7C15`
+    /// (the 64-bit golden-ratio constant); the engine's own RNG sequence is not reproduced.
+    pub rng_seed: u64,
 }
 
 impl Default for VmLimits {
@@ -42,6 +45,7 @@ impl Default for VmLimits {
             max_steps: 1_000_000,
             max_call_depth: 250,
             max_type_depth: 16,
+            rng_seed: 0x9E37_79B9_7F4A_7C15,
         }
     }
 }
@@ -151,6 +155,19 @@ pub enum VmErrorKind {
     Other(String),
 }
 
+/// One distinct native a script called that has no implementation, collected in survey mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingNative {
+    /// `Class.Function` (or `#<index>` for an unregistered index).
+    pub path: String,
+    /// Declared native index, if any.
+    pub index: Option<u16>,
+    /// Calls seen.
+    pub calls: u64,
+    /// Script stack at the first call.
+    pub first_stack: Vec<StackEntry>,
+}
+
 /// One stack-trace entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackEntry {
@@ -189,6 +206,43 @@ impl std::error::Error for VmError {}
 
 /// Result alias.
 pub type VmResult<T> = Result<T, VmError>;
+
+/// Level-start actor lifecycle order (`UGameEngine::LoadMap`): every actor runs each event
+/// before the next event starts. Status/evidence in the report:
+///
+/// - `PreBeginPlay`, `BeginPlay`, `PostBeginPlay`, `PostNetBeginPlay` exist in `engine.u` and are
+///   declared `event`; `SetInitialState` is a `simulated event` whose decoded body sets
+///   `bScriptInitialized` and calls `GotoState`. That body is the evidence that it is the last
+///   step of the lifecycle, not the first.
+/// - The exact cross-actor grouping is not encoded in the retail packages; it follows the UE2
+///   engine (community reconstruction) and is labelled a **hypothesis** here.
+///
+/// This one table is used by [`Vm::begin_play`] (level start, grouped) and is kept next to
+/// [`RUNTIME_SPAWN_LIFECYCLE`] so the two orders cannot drift apart.
+pub const LEVEL_START_LIFECYCLE: &[&str] = &[
+    "PreBeginPlay",
+    "BeginPlay",
+    "PostBeginPlay",
+    "PostNetBeginPlay",
+    "SetInitialState",
+];
+
+/// Actor lifecycle run on a runtime `Actor.Spawn` (`ULevel::SpawnActor`): the spawned actor runs
+/// these events in order. `Spawned` has no declaration in the GOG packages (no handler is a
+/// no-op), so its presence is a hypothesis from the UE2 engine, recorded here explicitly.
+pub const RUNTIME_SPAWN_LIFECYCLE: &[&str] = &[
+    "Spawned",
+    "PreBeginPlay",
+    "BeginPlay",
+    "PostBeginPlay",
+    "PostNetBeginPlay",
+    "SetInitialState",
+];
+
+/// UE2 `CLASS_Abstract` class flag (stock Engine `0x00000001`). XIII narrows class flags to a
+/// `u16`; no class in the GOG corpus sets bit 0, so the position is **unverified** and this
+/// check never fires on retail data (documented in the report).
+const CLASS_FLAG_ABSTRACT: u16 = 0x0001;
 
 /// Latent action of a state frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -325,6 +379,32 @@ pub enum TraceKind {
         /// Object.
         actor: String,
     },
+    /// `Actor.Spawn` created a new actor.
+    Spawned {
+        /// New object.
+        actor: String,
+        /// Requested class.
+        class: String,
+    },
+    /// `Actor.Destroy` deleted an object.
+    Destroyed {
+        /// Object.
+        actor: String,
+        /// Return value.
+        result: bool,
+    },
+    /// `Actor.Spawn` was asked for a class it refuses (None or abstract).
+    SpawnRefused {
+        /// Why.
+        reason: String,
+    },
+    /// GameInfo selected at level start.
+    GameInfo {
+        /// Object.
+        actor: String,
+        /// Class path.
+        class: String,
+    },
     /// Harness note.
     Note(String),
 }
@@ -409,6 +489,16 @@ impl fmt::Display for TraceEvent {
             TraceKind::StateStop { actor } => write!(f, "STOP     {actor}: state code stopped"),
             TraceKind::Log(s) => write!(f, "LOG      {s}"),
             TraceKind::Timer { actor } => write!(f, "TIMER    {actor}.Timer"),
+            TraceKind::Spawned { actor, class } => {
+                write!(f, "SPAWN    {actor} = Spawn({class})")
+            }
+            TraceKind::Destroyed { actor, result } => {
+                write!(f, "DESTROY  {actor} -> {result}")
+            }
+            TraceKind::SpawnRefused { reason } => write!(f, "SPAWN    refused: {reason}"),
+            TraceKind::GameInfo { actor, class } => {
+                write!(f, "GAMEINFO {actor} ({class})")
+            }
             TraceKind::Note(s) => write!(f, "NOTE     {s}"),
         }
     }
@@ -510,6 +600,8 @@ pub struct Instance {
     pub active: bool,
     /// Derives from `Actor`.
     pub is_actor: bool,
+    /// Destroyed: behaves as `None` for further references.
+    pub deleted: bool,
     /// Map export it was loaded from.
     pub export: Option<GlobalRef>,
     timer: Option<Timer>,
@@ -521,6 +613,8 @@ enum Place {
     Slot(ObjectId, usize),
     Elem(Box<Place>, usize),
     Member(Box<Place>, String),
+    /// A dynamic array's `Length` (UE2 `Array.Length = n` resizes the array).
+    ArrayLen(Box<Place>),
 }
 
 struct IterState {
@@ -582,8 +676,13 @@ pub struct Vm<'s> {
     limits: VmLimits,
     /// Properties the loader could not place (name not in layout, bad index).
     pub load_warnings: Vec<String>,
+    rng: u64,
     /// Native functions called (path -> (index, count)).
     pub natives_used: std::collections::BTreeMap<String, (Option<u16>, u64)>,
+    /// Survey mode: unimplemented natives are counted and skipped instead of failing.
+    pub survey: bool,
+    /// Distinct unimplemented natives seen in survey mode (path -> record, first-hit order).
+    pub missing_natives: std::collections::BTreeMap<String, MissingNative>,
     pub(crate) pending_latent: Option<Latent>,
 }
 
@@ -611,7 +710,10 @@ impl<'s> Vm<'s> {
             steps: 0,
             limits,
             load_warnings: Vec::new(),
+            rng: limits.rng_seed,
             natives_used: Default::default(),
+            survey: false,
+            missing_natives: Default::default(),
             pending_latent: None,
         }
     }
@@ -915,10 +1017,17 @@ impl<'s> Vm<'s> {
                 Some(id) => Value::Object(Some(ObjRef::Instance(*id))),
                 None => Value::Object(Some(ObjRef::Static(g))),
             },
-            None => Value::Unsupported(format!(
-                "unresolved reference {}",
-                self.set.packages[pkg].ref_path(r)
-            )),
+            None => {
+                let path = self.set.packages[pkg].ref_path(r);
+                // `class'Core.Class'` names the native meta-class, which has no export in
+                // core.u. Give it a distinct value (not `None`) so class checks and
+                // `DynamicLoadObject` see a class, not a null.
+                if meta_class_path(&path) {
+                    Value::NativeClass(self.set.packages[pkg].ref_name(r).to_owned())
+                } else {
+                    Value::Unsupported(format!("unresolved reference {path}"))
+                }
+            }
         }
     }
 
@@ -1013,6 +1122,7 @@ impl<'s> Vm<'s> {
             disabled: HashSet::new(),
             active: false,
             is_actor,
+            deleted: false,
             export: None,
             timer: None,
         });
@@ -1069,7 +1179,7 @@ impl<'s> Vm<'s> {
     pub fn find_object(&self, name: &str) -> Option<ObjectId> {
         self.objects
             .iter()
-            .position(|o| o.name.eq_ignore_ascii_case(name))
+            .position(|o| !o.deleted && o.name.eq_ignore_ascii_case(name))
             .map(|i| i as ObjectId)
     }
 
@@ -1135,6 +1245,49 @@ impl<'s> Vm<'s> {
 
     fn is_child_of(&self, class: GlobalRef, base: GlobalRef) -> bool {
         self.class_chain(class).contains(&base)
+    }
+
+    /// Class-chain test used by `ClassIsChildOf` (both operands are classes).
+    pub fn is_child_of_class(&self, class: GlobalRef, base: GlobalRef) -> bool {
+        self.class_chain(class).contains(&base)
+    }
+
+    /// Class path string of an export as recorded in its package (`Core.Class`,
+    /// `Engine.StaticMesh`, ...), or `None` when the package/export is unknown.
+    pub fn class_path_of(&self, g: GlobalRef) -> Option<String> {
+        self.set
+            .packages
+            .get(g.package)?
+            .package
+            .export_class_path(g.export as usize)
+            .map(str::to_owned)
+    }
+
+    /// Loaded object by a `Package.Object.Path` (or bare `Class`/`Object`) name, for the subset
+    /// of `DynamicLoadObject` that resolves names already present in the script set. Returns the
+    /// export even when it is not instantiated.
+    pub fn find_loaded_object(&self, name: &str) -> Option<GlobalRef> {
+        let (package, path) = match name.split_once('.') {
+            Some((p, rest)) => (Some(p), rest),
+            None => (None, name),
+        };
+        if let Some(pkg) = package {
+            let pi = self.set.package_index(pkg)?;
+            let export = self.set.packages[pi].export_by_path(path)?;
+            return Some(GlobalRef {
+                package: pi,
+                export,
+            });
+        }
+        for pi in 0..self.set.packages.len() {
+            if let Some(export) = self.set.packages[pi].export_by_path(path) {
+                return Some(GlobalRef {
+                    package: pi,
+                    export,
+                });
+            }
+        }
+        None
     }
 
     fn find_function_in(&self, scope: GlobalRef, name: &str) -> Option<GlobalRef> {
@@ -1513,8 +1666,9 @@ impl<'s> Vm<'s> {
         };
         if f.is_native() {
             let mut a = args;
+            let omitted = vec![false; a.len()];
             return self
-                .invoke_native(func, None, this, &mut a, false)
+                .invoke_native(func, None, this, &mut a, &omitted, false)
                 .and_then(|o| match o {
                     NativeOutcome::Value(v) => Ok(v),
                     _ => Err(self.err(VmErrorKind::Other(
@@ -1735,6 +1889,49 @@ impl<'s> Vm<'s> {
         })
     }
 
+    /// Survey mode: records an unimplemented native, traces it and returns `ret` so the run can
+    /// continue past it. Never called outside survey mode.
+    fn survey_missing(
+        &mut self,
+        path: String,
+        declared: Option<u16>,
+        this: ObjectId,
+        args: &[Value],
+        ret: Value,
+        iterator: bool,
+    ) -> VmResult<NativeOutcome> {
+        let stack = self.stack.clone();
+        match self.missing_natives.get_mut(&path) {
+            Some(m) => m.calls += 1,
+            None => {
+                self.missing_natives.insert(
+                    path.clone(),
+                    MissingNative {
+                        path: path.clone(),
+                        index: declared,
+                        calls: 1,
+                        first_stack: stack,
+                    },
+                );
+            }
+        }
+        if self.trace_natives {
+            self.note(TraceKind::Native {
+                path,
+                index: declared,
+                this: self.objects[this as usize].name.clone(),
+                args: args.iter().map(|a| self.value_text(a)).collect(),
+                result: "<survey: unimplemented>".into(),
+            });
+        }
+        // An iterator native must yield items, so a foreach over it skips its body rather than
+        // failing; a value native yields its return type's zero.
+        if iterator {
+            return Ok(NativeOutcome::Iterate(Vec::new()));
+        }
+        Ok(NativeOutcome::Value(ret))
+    }
+
     fn native_from_tokens(
         &mut self,
         frame: &mut Frame<'s>,
@@ -1743,11 +1940,27 @@ impl<'s> Vm<'s> {
         target: ObjectId,
         index: Option<u16>,
     ) -> VmResult<NativeOutcome> {
+        if self.survey && self.registry.get(&lower(&self.short_path(func))).is_none() {
+            // Arguments are not evaluated in survey mode: their evaluation can itself fail
+            // (e.g. an unresolved class literal passed to DynamicLoadObject) and would stop the
+            // survey. Only the missing native is counted.
+            let ret = self
+                .func_layout(func)
+                .ret
+                .as_ref()
+                .map_or(Value::Void, |(_, ty)| ty.zero());
+            let iterator = matches!(
+                self.set.object(func),
+                Some(ScriptObject::Function(f)) if f.flags & function_flags::ITERATOR != 0
+            );
+            return self.survey_missing(self.short_path(func), index, target, &[], ret, iterator);
+        }
         let def = self.native_def(func, index)?;
         let short = def.short_circuit;
         let layout = self.func_layout(func);
         let mut args = Vec::with_capacity(layout.params.len());
         let mut places = Vec::with_capacity(layout.params.len());
+        let mut omitted = Vec::with_capacity(layout.params.len());
         for (i, p) in layout.params.iter().enumerate() {
             let tok = call.args.get(i);
             if i == 1
@@ -1761,6 +1974,7 @@ impl<'s> Vm<'s> {
                     index,
                     target,
                     &mut a,
+                    &[false],
                     frame.state_of.is_some(),
                     Some(Value::Bool(stop)),
                 )?;
@@ -1770,10 +1984,12 @@ impl<'s> Vm<'s> {
                 None => {
                     args.push(p.ty.zero());
                     places.push(None);
+                    omitted.push(true);
                 }
                 Some(t) if matches!(t.kind, TokenKind::Nothing) => {
                     args.push(p.ty.zero());
                     places.push(None);
+                    omitted.push(true);
                 }
                 Some(t) if p.out => {
                     let place = self.place(frame, t, frame.this)?;
@@ -1783,15 +1999,18 @@ impl<'s> Vm<'s> {
                     };
                     args.push(v);
                     places.push(place);
+                    omitted.push(false);
                 }
                 Some(t) => {
                     args.push(self.eval(frame, t)?);
                     places.push(None);
+                    omitted.push(false);
                 }
             }
         }
         let in_state = frame.state_of == Some(target);
-        let outcome = self.finish_native(func, index, target, &mut args, in_state, None)?;
+        let outcome =
+            self.finish_native(func, index, target, &mut args, &omitted, in_state, None)?;
         for (i, p) in layout.params.iter().enumerate() {
             if p.out
                 && let Some(Some(pl)) = places.get(i)
@@ -1837,23 +2056,42 @@ impl<'s> Vm<'s> {
         index: Option<u16>,
         this: ObjectId,
         args: &mut [Value],
+        omitted: &[bool],
         in_state: bool,
     ) -> VmResult<NativeOutcome> {
-        self.finish_native(func, index, this, args, in_state, None)
+        self.finish_native(func, index, this, args, omitted, in_state, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_native(
         &mut self,
         func: GlobalRef,
         index: Option<u16>,
         this: ObjectId,
         args: &mut [Value],
+        omitted: &[bool],
         in_state: bool,
         preset: Option<Value>,
     ) -> VmResult<NativeOutcome> {
         self.step()?;
         let path = self.short_path(func);
-        let f = self.native_def(func, index)?.f;
+        let f = if self.survey && self.registry.get(&path.to_ascii_lowercase()).is_none() {
+            // `preset` short-circuits `&&`/`||` before this point; otherwise no registry entry
+            // means unimplemented. Arguments are not inspected (see `native_from_tokens`).
+            let _ = args;
+            let ret = self
+                .func_layout(func)
+                .ret
+                .as_ref()
+                .map_or(Value::Void, |(_, ty)| ty.zero());
+            let iterator = matches!(
+                self.set.object(func),
+                Some(ScriptObject::Function(f)) if f.flags & function_flags::ITERATOR != 0
+            );
+            return self.survey_missing(path, index, this, &[], ret, iterator);
+        } else {
+            self.native_def(func, index)?.f
+        };
         let declared = match self.set.object(func) {
             Some(ScriptObject::Function(fun)) if fun.native_index != 0 => Some(fun.native_index),
             _ => index,
@@ -1875,6 +2113,7 @@ impl<'s> Vm<'s> {
                     this,
                     in_state_code: in_state,
                     path: path.clone(),
+                    omitted: omitted.to_vec(),
                 };
                 f(self, &ctx, args)?
             }
@@ -2152,6 +2391,9 @@ impl<'s> Vm<'s> {
     ) -> VmResult<Option<ObjectId>> {
         let v = self.eval_in(frame, object, target)?;
         match v {
+            Value::Object(Some(ObjRef::Instance(i))) if self.objects[i as usize].deleted => {
+                Ok(None)
+            }
             Value::Object(Some(ObjRef::Instance(i))) => Ok(Some(i)),
             Value::Object(Some(ObjRef::Static(g))) => {
                 if matches!(self.set.object(g), Some(ScriptObject::Class(_))) {
@@ -2163,6 +2405,9 @@ impl<'s> Vm<'s> {
                 }
             }
             Value::Object(None) => Ok(None),
+            // A native-only meta-class has no instance in the VM; accessing through it is
+            // Accessed-None, same as a null object.
+            Value::NativeClass(_) => Ok(None),
             Value::Unsupported(d) => Err(self.err(VmErrorKind::UnsupportedValue { desc: d })),
             other => Err(self.type_err("object", &other)),
         }
@@ -2194,6 +2439,11 @@ impl<'s> Vm<'s> {
                         .map_or(Value::Void, |(_, ty)| ty.zero())
                 });
             }
+            // Accessing a member of `None` yields the member's zero (UE2 Accessed None). When
+            // the object expression has a known static class, resolve the member there (its
+            // declared type can be found) instead of on `self`, which usually has no such
+            // member. This keeps chained contexts returning the leaf type rather than `void`.
+            K::Context(c) | K::ClassContext(c) => return self.zero_of_context(frame, c, target),
             K::NativeCall { index, call } => {
                 return match self.resolve_native_index(*index, call.args.len()) {
                     Ok(g) => self
@@ -2210,6 +2460,90 @@ impl<'s> Vm<'s> {
             Some(ScriptObject::Property(p)) => self.ty_of(frame.pkg, &p.kind, 0).zero(),
             _ => Value::Void,
         }
+    }
+
+    /// Property object referenced directly by a variable token.
+    fn member_property(&self, frame: &Frame<'s>, member: &Token) -> Option<GlobalRef> {
+        use TokenKind as K;
+        match &member.kind {
+            K::InstanceVariable(r) | K::DefaultVariable(r) | K::LocalVariable(r) => {
+                self.set.resolve(frame.pkg, *r)
+            }
+            _ => None,
+        }
+    }
+
+    /// Static class of an object-typed token (`self`, a class literal, a variable whose declared
+    /// type is an object/class, or a chained context), when it can be determined.
+    fn context_object_class(&self, frame: &Frame<'s>, t: &Token) -> Option<GlobalRef> {
+        use TokenKind as K;
+        match &t.kind {
+            K::SelfRef => Some(self.objects[frame.this as usize].class),
+            K::ObjectConst(r) => {
+                let g = self.set.resolve(frame.pkg, *r)?;
+                matches!(self.set.object(g), Some(ScriptObject::Class(_))).then_some(g)
+            }
+            K::Context(c) => {
+                // The context object must itself be an object; then the member's declared type
+                // is the result class.
+                self.context_object_class(frame, &c.object)?;
+                self.property_class(self.member_property(frame, &c.member)?)
+            }
+            _ => self.property_class(self.member_property(frame, t)?),
+        }
+    }
+
+    /// Class an object/class-typed property refers to.
+    fn property_class(&self, prop: GlobalRef) -> Option<GlobalRef> {
+        let Some(ScriptObject::Property(p)) = self.set.object(prop) else {
+            return None;
+        };
+        let class = match p.kind {
+            PropertyKind::Object { class } | PropertyKind::Class { class, .. } => class,
+            _ => return None,
+        };
+        self.set.resolve(prop.package, class)
+    }
+
+    /// Zero value of a member accessed through `None`: the declared property type, or the
+    /// return type of a called function found in the object expression's static class.
+    fn zero_of_context(&mut self, frame: &Frame<'s>, c: &Context, target: ObjectId) -> Value {
+        use TokenKind as K;
+        if let Some(g) = self.member_property(frame, &c.member)
+            && let Some(ScriptObject::Property(p)) = self.set.object(g)
+        {
+            return self.ty_of(g.package, &p.kind, 0).zero();
+        }
+        let name = match &c.member.kind {
+            K::VirtualFunction { name, .. } | K::GlobalFunction { name, .. } => {
+                self.set.packages[frame.pkg].name_text(*name).to_owned()
+            }
+            K::FinalFunction { function, .. } => {
+                let Some(g) = self.set.resolve(frame.pkg, *function) else {
+                    return Value::Void;
+                };
+                return self
+                    .func_layout(g)
+                    .ret
+                    .as_ref()
+                    .map_or(Value::Void, |(_, ty)| ty.zero());
+            }
+            _ => return self.zero_for(frame, &c.member, target),
+        };
+        let class = self
+            .context_object_class(frame, &c.object)
+            .or_else(|| Some(self.objects[target as usize].class));
+        let f = class.and_then(|c| {
+            self.class_chain(c)
+                .into_iter()
+                .find_map(|sc| self.find_function_in(sc, &name))
+        });
+        f.map_or(Value::Void, |g| {
+            self.func_layout(g)
+                .ret
+                .as_ref()
+                .map_or(Value::Void, |(_, ty)| ty.zero())
+        })
     }
 
     fn resolve_ref(&self, frame: &Frame<'s>, r: ObjectRef) -> VmResult<GlobalRef> {
@@ -2237,7 +2571,7 @@ impl<'s> Vm<'s> {
                 Some(obj) => self.eval_in(frame, &c.member, obj)?,
                 None => {
                     self.accessed_none();
-                    self.zero_for(frame, &c.member, target)
+                    self.zero_of_context(frame, c, target)
                 }
             },
             K::ClassContext(c) => {
@@ -2247,7 +2581,7 @@ impl<'s> Vm<'s> {
                     Value::Object(Some(ObjRef::Instance(i))) => {
                         Some(self.objects[i as usize].class)
                     }
-                    Value::Object(None) => None,
+                    Value::Object(None) | Value::NativeClass(_) => None,
                     other => return Err(self.type_err("class", &other)),
                 };
                 match class {
@@ -2343,7 +2677,7 @@ impl<'s> Vm<'s> {
                             Value::Object(None)
                         }
                     }
-                    Value::Object(_) => Value::Object(None),
+                    Value::Object(_) | Value::NativeClass(_) => Value::Object(None),
                     other => return Err(self.type_err("object", &other)),
                 }
             }
@@ -2354,7 +2688,7 @@ impl<'s> Vm<'s> {
                     Value::Object(Some(ObjRef::Static(g))) if self.is_child_of(g, class) => {
                         Value::Object(Some(ObjRef::Static(g)))
                     }
-                    Value::Object(_) => Value::Object(None),
+                    Value::Object(_) | Value::NativeClass(_) => Value::Object(None),
                     other => return Err(self.type_err("class", &other)),
                 }
             }
@@ -2459,6 +2793,16 @@ impl<'s> Vm<'s> {
         // ints, 0x44 float->int, 0x53/0x56/0x57 to string on int/object/name operands).
         let bad = |s: &Self, v: &Value| s.type_err("castable value", v);
         Ok(match (cast, &v) {
+            // UE2 `RotationToVector` (ECastToken 0x39): unit vector from a rotator.
+            (0x39, Value::Rotator(r)) => {
+                let to_rad = |u: i32| (u as f32) * std::f32::consts::TAU / 65536.0;
+                let (pitch, yaw) = (to_rad(r[0]), to_rad(r[1]));
+                Value::Vector([
+                    pitch.cos() * yaw.cos(),
+                    pitch.cos() * yaw.sin(),
+                    pitch.sin(),
+                ])
+            }
             (0x3A, Value::Byte(b)) => Value::Int(i32::from(*b)),
             (0x3B, Value::Byte(b)) => Value::Bool(*b != 0),
             (0x3C, Value::Byte(b)) => Value::Float(f32::from(*b)),
@@ -2472,6 +2816,7 @@ impl<'s> Vm<'s> {
             (0x44, Value::Float(f)) => Value::Int(*f as i32),
             (0x45, Value::Float(f)) => Value::Bool(*f != 0.0),
             (0x47, Value::Object(o)) => Value::Bool(o.is_some()),
+            (0x47, Value::NativeClass(_)) => Value::Bool(true),
             (0x48, Value::Name(n)) => Value::Bool(!n.eq_ignore_ascii_case("None")),
             (0x4A, Value::Str(s)) => Value::Int(s.trim().parse().unwrap_or(0)),
             (0x4B, Value::Str(s)) => Value::Bool(
@@ -2484,6 +2829,7 @@ impl<'s> Vm<'s> {
             (0x55, Value::Float(f)) => Value::Str(format!("{f:.2}")),
             (0x56, Value::Object(None)) => Value::Str("None".into()),
             (0x56, Value::Object(Some(r))) => Value::Str(self.obj_label(r)),
+            (0x56, Value::NativeClass(n)) => Value::Str(n.clone()),
             (0x57, Value::Name(n)) => Value::Str(n.clone()),
             (c, _) if !(0x39..=0x59).contains(&c) => return Err(bad(self, &v)),
             _ => {
@@ -2604,6 +2950,14 @@ impl<'s> Vm<'s> {
                 };
                 Place::Member(Box::new(base), name)
             }
+            // `Array.Length = n` is the UE2 dynamic-array resize idiom; it is the only
+            // assignable use of `DynArrayLength`.
+            K::DynArrayLength(e) => {
+                let Some(base) = self.place(frame, e, target)? else {
+                    return Ok(None);
+                };
+                Place::ArrayLen(Box::new(base))
+            }
             _ => return Err(self.err(VmErrorKind::NotAPlace { opcode: t.opcode })),
         }))
     }
@@ -2628,6 +2982,10 @@ impl<'s> Vm<'s> {
                 member_get(&self.read(frame, base)?, m)
                     .ok_or_else(|| self.err(VmErrorKind::Other(format!("no struct member {m}"))))?,
             ),
+            Place::ArrayLen(base) => match self.read(frame, base)? {
+                Value::Array(a) => Some(Value::Int(a.len() as i32)),
+                other => return Err(self.type_err("array", &other)),
+            },
         };
         let v = v.ok_or_else(|| self.err(VmErrorKind::Other("bad slot".into())))?;
         if let Value::Unsupported(d) = &v {
@@ -2678,6 +3036,26 @@ impl<'s> Vm<'s> {
                 }
                 self.write(frame, base, s)?;
             }
+            Place::ArrayLen(base) => {
+                let n = match v {
+                    Value::Int(i) => i.max(0) as usize,
+                    other => return Err(self.type_err("int", &other)),
+                };
+                let mut arr = match self.read(frame, base)? {
+                    Value::Array(a) => a,
+                    other => return Err(self.type_err("array", &other)),
+                };
+                let zero = match arr.last() {
+                    Some(Value::Float(_)) => Value::Float(0.0),
+                    Some(Value::Object(_)) => Value::Object(None),
+                    Some(Value::Name(_)) => Value::Name("None".into()),
+                    Some(Value::Bool(_)) => Value::Bool(false),
+                    Some(Value::Byte(_)) => Value::Byte(0),
+                    _ => Value::Int(0),
+                };
+                arr.resize(n, zero);
+                self.write(frame, base, Value::Array(arr))?;
+            }
         }
         Ok(())
     }
@@ -2701,6 +3079,246 @@ impl<'s> Vm<'s> {
         });
     }
 
+    /// A display name that does not collide with any existing object (`Name`, `Name1`, ...).
+    fn unique_name(&self, base: &str) -> String {
+        if !self
+            .objects
+            .iter()
+            .any(|o| o.name.eq_ignore_ascii_case(base))
+        {
+            return base.to_owned();
+        }
+        for n in 1.. {
+            let candidate = format!("{base}{n}");
+            if !self
+                .objects
+                .iter()
+                .any(|o| o.name.eq_ignore_ascii_case(&candidate))
+            {
+                return candidate;
+            }
+        }
+        base.to_owned()
+    }
+
+    /// True when a class itself carries the UE2 `abstract` class flag. `abstract` is not
+    /// inherited (a concrete subclass of an abstract class clears the bit), so only the class's
+    /// own flags are tested.
+    pub fn class_is_abstract(&self, class: GlobalRef) -> bool {
+        match self.set.object(class) {
+            Some(ScriptObject::Class(cl)) => cl.class_flags & CLASS_FLAG_ABSTRACT != 0,
+            _ => false,
+        }
+    }
+
+    /// `Actor.Spawn` semantics: instantiate `class`, set `Owner`/`Tag`/`Location`/`Rotation`,
+    /// mark the actor in scope and run [`RUNTIME_SPAWN_LIFECYCLE`]. `None` class returns `None`;
+    /// an abstract class is refused with a trace (`SpawnRefused`) and returns `None`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_actor(
+        &mut self,
+        spawner: ObjectId,
+        class: Option<GlobalRef>,
+        owner: Option<ObjectId>,
+        tag: Option<&str>,
+        location: Option<[f32; 3]>,
+        rotation: Option<[i32; 3]>,
+    ) -> VmResult<Option<ObjectId>> {
+        let Some(id) = self.spawn_actor_inner(spawner, class, owner, tag, location, rotation)?
+        else {
+            return Ok(None);
+        };
+        self.run_lifecycle(id, RUNTIME_SPAWN_LIFECYCLE)?;
+        Ok(Some(id))
+    }
+
+    /// Creates an actor like [`Vm::spawn_actor`] but without running the runtime spawn
+    /// lifecycle, for level start where the grouped [`Vm::begin_play`] covers it.
+    pub fn spawn_level_actor(
+        &mut self,
+        spawner: ObjectId,
+        class: GlobalRef,
+        owner: Option<ObjectId>,
+        tag: Option<&str>,
+    ) -> VmResult<Option<ObjectId>> {
+        self.spawn_actor_inner(spawner, Some(class), owner, tag, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_actor_inner(
+        &mut self,
+        spawner: ObjectId,
+        class: Option<GlobalRef>,
+        owner: Option<ObjectId>,
+        tag: Option<&str>,
+        location: Option<[f32; 3]>,
+        rotation: Option<[i32; 3]>,
+    ) -> VmResult<Option<ObjectId>> {
+        let Some(class) = class else {
+            return Ok(None);
+        };
+        if self.class_is_abstract(class) {
+            self.note(TraceKind::SpawnRefused {
+                reason: format!("{} is abstract", self.set.path(class)),
+            });
+            return Ok(None);
+        }
+        let class_name = self.object_name(class).to_owned();
+        let name = self.unique_name(&class_name);
+        let id = self.spawn(class, &name)?;
+        // UE2 `SpawnActor` defaults Location/Rotation to the *spawning* actor's (the script
+        // `this`), not the new actor's Owner.
+        let (loc, rot) = (
+            location.or_else(|| self.vector_prop(spawner, "Location")),
+            rotation.or_else(|| self.rotator_prop(spawner, "Rotation")),
+        );
+        self.set_property(id, "Owner", 0, Value::Object(owner.map(ObjRef::Instance)));
+        self.set_property(
+            id,
+            "Tag",
+            0,
+            Value::Name(tag.map_or_else(|| class_name.clone(), str::to_owned)),
+        );
+        if let Some(v) = loc {
+            self.set_property(id, "Location", 0, Value::Vector(v));
+        }
+        if let Some(r) = rot {
+            self.set_property(id, "Rotation", 0, Value::Rotator(r));
+        }
+        self.objects[id as usize].active = true;
+        self.note(TraceKind::Spawned {
+            actor: name,
+            class: self.set.path(class),
+        });
+        Ok(Some(id))
+    }
+
+    fn vector_prop(&self, id: ObjectId, name: &str) -> Option<[f32; 3]> {
+        match self.get_property(id, name)? {
+            Value::Vector(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn rotator_prop(&self, id: ObjectId, name: &str) -> Option<[i32; 3]> {
+        match self.get_property(id, name)? {
+            Value::Rotator(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn run_lifecycle(&mut self, id: ObjectId, events: &[&str]) -> VmResult<()> {
+        for ev in events {
+            if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
+                break;
+            }
+            self.send_event(id, ev, Vec::new())?;
+        }
+        Ok(())
+    }
+
+    /// First live `LevelInfo` instance, if the map has one (it is normally not in the executed
+    /// scope, so the harness does not supply it).
+    pub fn find_level_info(&self) -> Option<ObjectId> {
+        (0..self.objects.len() as ObjectId).find(|&id| {
+            let o = &self.objects[id as usize];
+            !o.deleted && o.is_actor && o.layout.chain_names.iter().any(|n| n == "levelinfo")
+        })
+    }
+
+    /// Level start with a GameInfo: spawns `game_class` (no lifecycle yet), points
+    /// `LevelInfo.Game` at it, sets `Level` on every actor, then runs [`Vm::begin_play`] over
+    /// `map_ids` and the GameInfo together. Returns the GameInfo id.
+    pub fn begin_play_with_game_info(
+        &mut self,
+        map_ids: &[ObjectId],
+        game_class: GlobalRef,
+    ) -> VmResult<ObjectId> {
+        let level_info = self.find_level_info();
+        let level = level_info.unwrap_or(0);
+        // UE2 ULevel::SpawnActor sets the new actor's Level; the engine sets it for every actor
+        // at load, and Actor.PreBeginPlay reads `Level.Game.BaseMutator`.
+        if level_info.is_some() {
+            for id in 0..self.objects.len() as ObjectId {
+                if self.objects[id as usize].is_actor && !self.objects[id as usize].deleted {
+                    self.set_property(id, "Level", 0, Value::Object(Some(ObjRef::Instance(level))));
+                }
+            }
+        }
+        let Some(info) = self.spawn_level_actor(level, game_class, None, None)? else {
+            return Err(self.err(VmErrorKind::Other(format!(
+                "GameInfo class {} was refused (None or abstract)",
+                self.set.path(game_class)
+            ))));
+        };
+        if let Some(li) = level_info {
+            self.set_property(li, "Game", 0, Value::Object(Some(ObjRef::Instance(info))));
+            self.set_property(info, "Level", 0, Value::Object(Some(ObjRef::Instance(li))));
+        }
+        self.note(TraceKind::GameInfo {
+            actor: self.objects[info as usize].name.clone(),
+            class: self.set.path(game_class),
+        });
+        // UE2 UGameEngine::InitGame spawns the GameInfo, then calls GameInfo.InitGame (which
+        // builds GameInfo.BaseMutator and the other helpers) before any actor begins play.
+        if let Some(f) = self.find_function(info, "InitGame", false) {
+            self.call_values(
+                f,
+                info,
+                vec![Value::Str(String::new()), Value::Str(String::new())],
+            )?;
+        }
+        let mut ids = map_ids.to_vec();
+        ids.push(info);
+        self.begin_play(&ids)?;
+        Ok(info)
+    }
+
+    /// Runs the level-start lifecycle ([`LEVEL_START_LIFECYCLE`]) for every actor in `ids`.
+    pub fn begin_play(&mut self, ids: &[ObjectId]) -> VmResult<()> {
+        for ev in LEVEL_START_LIFECYCLE {
+            for &id in ids {
+                if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
+                    continue;
+                }
+                self.send_event(id, ev, Vec::new())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `Actor.Destroy`: runs `Destroyed`, then marks the object deleted so later references act
+    /// as `None` and it leaves iterators. Idempotent; a nested `Destroy` during `Destroyed` is
+    /// ignored (the object is already marked), so it cannot recurse or panic.
+    pub fn destroy(&mut self, id: ObjectId) -> VmResult<bool> {
+        if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
+            return Ok(true);
+        }
+        self.objects[id as usize].deleted = true;
+        self.objects[id as usize].active = false;
+        self.objects[id as usize].state = None;
+        self.objects[id as usize].state_code = None;
+        self.objects[id as usize].timer = None;
+        self.objects[id as usize].generation += 1;
+        if let Some(f) = self.find_function(id, "Destroyed", true) {
+            self.call_values(f, id, Vec::new())?;
+        }
+        let actor = self.objects[id as usize].name.clone();
+        self.note(TraceKind::Destroyed {
+            actor,
+            result: true,
+        });
+        Ok(true)
+    }
+
+    /// First live (not deleted) object with a name (case-insensitive).
+    pub fn find_live_object(&self, name: &str) -> Option<ObjectId> {
+        self.objects
+            .iter()
+            .position(|o| !o.deleted && o.name.eq_ignore_ascii_case(name))
+            .map(|i| i as ObjectId)
+    }
+
     /// Actors iterated by `DynamicActors` (non-static actors of a class with a tag), in
     /// object order.
     pub(crate) fn dynamic_actors(
@@ -2710,7 +3328,7 @@ impl<'s> Vm<'s> {
     ) -> Vec<ObjectId> {
         let mut out = Vec::new();
         for (i, o) in self.objects.iter().enumerate() {
-            if !o.is_actor || o.name.starts_with("Default__") {
+            if !o.is_actor || o.deleted || o.name.starts_with("Default__") {
                 continue;
             }
             if let Some(b) = base
@@ -2742,14 +3360,74 @@ impl<'s> Vm<'s> {
         out
     }
 
+    /// Actors iterated by `AllActors`: all live actors of a class (static included), in object
+    /// order.
+    pub(crate) fn all_actors(&self, base: Option<GlobalRef>, tag: Option<&str>) -> Vec<ObjectId> {
+        let mut out = Vec::new();
+        for (i, o) in self.objects.iter().enumerate() {
+            if !o.is_actor || o.deleted || o.name.starts_with("Default__") {
+                continue;
+            }
+            if let Some(b) = base
+                && !o.layout.chain.contains(&b)
+            {
+                continue;
+            }
+            if let Some(tag) = tag {
+                let t = o
+                    .layout
+                    .slot_by_name("Tag")
+                    .and_then(|s| o.props.get(s.base));
+                match t {
+                    Some(Value::Name(n)) if n.eq_ignore_ascii_case(tag) => {}
+                    _ => continue,
+                }
+            }
+            out.push(i as ObjectId);
+        }
+        out
+    }
+
     pub(crate) fn time_now(&self) -> f64 {
         self.time
+    }
+
+    /// Deterministic PRNG step (splitmix64). Used by `Rand`/`FRand`; the engine's own RNG
+    /// sequence is not reproduced (see the registry status).
+    pub(crate) fn next_random(&mut self) -> u64 {
+        self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// `FRand`: a deterministic float in `[0, 1)`.
+    pub(crate) fn rand_float(&mut self) -> f32 {
+        (self.next_random() >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// `Rand(Max)`: a deterministic int in `[0, Max)` (0 when `Max <= 0`).
+    pub(crate) fn rand_int(&mut self, max: i32) -> i32 {
+        if max <= 0 {
+            0
+        } else {
+            (self.next_random() % u64::from(max as u32)) as i32
+        }
     }
 
     /// Statistic: functions in the set flagged native (for reports).
     pub fn is_native_function(&self, g: GlobalRef) -> bool {
         matches!(self.set.object(g), Some(ScriptObject::Function(f)) if f.flags & function_flags::NATIVE != 0)
     }
+}
+
+/// Paths of the native meta-classes (`Core.Class` and friends) that have no export.
+fn meta_class_path(path: &str) -> bool {
+    matches!(
+        path.to_ascii_lowercase().as_str(),
+        "core.class" | "core.object" | "core.struct" | "core.function" | "core.state"
+    )
 }
 
 fn member_get(v: &Value, m: &str) -> Option<Value> {
