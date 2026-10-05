@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn trace_down_hits_floor_at_expected_unreal_height() {
         let mut p = WorldPhysicsAdapter::from_entries(tiny_soup());
-        // Bevy floor y=0 => Unreal z=0. Start Bevy y=4 m (Unreal 200) and go to y=-1 m.
+        // Bevy floor y=0 => Unreal z=0. Start Bevy y=4 m and go to y=-1 m.
         let start = u([0.0, 4.0, 0.0]);
         let end = u([0.0, -1.0, 0.0]);
         let hit = p.trace(start, end, [0.0; 3]).expect("downward trace hits");
@@ -194,7 +194,11 @@ mod tests {
         let start = u([-4.0, 0.25, 0.0]);
         let end = u([-6.0, 0.25, 0.0]);
         let hit = p
-            .trace(start, end, [5.0, 5.0, 5.0])
+            .trace(
+                start,
+                end,
+                [0.1 * xiii_decode::common::UNREAL_UNITS_PER_METER; 3],
+            )
             .expect("moving into the wall with an extent must hit");
         assert!(hit.time < 1.0, "{hit:?}");
         // Contact when the box's leading face reaches the wall: center Bevy x = -4.9 => t=0.45.

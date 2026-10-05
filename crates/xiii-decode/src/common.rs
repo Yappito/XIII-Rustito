@@ -714,10 +714,12 @@ impl<'p> Props<'p> {
 // Coordinate conversion (the only place where Unreal axes become Bevy axes).
 // ---------------------------------------------------------------------------------------
 
-/// Provisional scale: Unreal units per metre. **Not measured** for XIII; chosen so that the
-/// imported beach has plausible human scale in the diagnostic viewer. Calibrate against the
-/// player collision cylinder and original captures before using it for movement.
-pub const UNREAL_UNITS_PER_METER: f32 = 50.0;
+/// Scale: Unreal units per metre. **Estimated, not measured against the original engine**
+/// (decided 2026-10-05). Evidence (scale-free sizes in UU): player pawn collision 150 tall
+/// (`XIIIPawn` CollisionHeight 75 half), visible `xiiipersos.XIIIM` bind pose 160.3, `Porte6`
+/// door opening 208. Human-size assumptions give ~85-105 UU/m; 90 puts the visible character
+/// at ~1.78 m and the door at ~2.3 m. Replace with original-engine captures when available.
+pub const UNREAL_UNITS_PER_METER: f32 = 90.0;
 
 /// Unreal rotator units per full turn.
 pub const ROTATOR_UNITS_PER_TURN: f32 = 65536.0;
@@ -919,7 +921,10 @@ mod tests {
         assert_eq!(to_bevy_direction([1.0, 0.0, 0.0]), [0.0, 0.0, -1.0]);
         assert_eq!(to_bevy_direction([0.0, 1.0, 0.0]), [1.0, 0.0, 0.0]);
         assert_eq!(to_bevy_direction([0.0, 0.0, 1.0]), [0.0, 1.0, 0.0]);
-        assert_eq!(to_bevy_position([50.0, 0.0, 0.0]), [0.0, 0.0, -1.0]);
+        assert_eq!(
+            to_bevy_position([UNREAL_UNITS_PER_METER, 0.0, 0.0]),
+            [0.0, 0.0, -1.0]
+        );
         assert!(
             (mat3_det(&SOURCE_TO_BEVY) + 1.0).abs() < 1e-6,
             "handedness change"

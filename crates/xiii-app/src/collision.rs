@@ -31,6 +31,15 @@ const MINFLOORZ: f32 = 0.7;
 /// documented upstream hypothesis for XIII, not a measured XIII value.
 const MAXSTEPHEIGHT_UU: f32 = 35.0;
 
+// Harness distances in Unreal units, so the test does not change with the metre scale
+// (values equal the original metre literals at the former 50 UU/m).
+const SKIN_UU: f32 = 0.05;
+const STEP_UU: f32 = 2.5;
+const DOOR_FRONT_UU: f32 = 100.0;
+const FLOOR_PROBE_UU: f32 = 100.0;
+const START_LIFT_UU: f32 = 2.5;
+const RAISE_INC_UU: f32 = 1.0;
+
 /// Entry point for `--collision-test`.
 pub fn run(map: &str, game_dir: &std::path::Path) -> bevy::app::AppExit {
     match run_inner(map, game_dir) {
@@ -340,12 +349,12 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
     // Walk parameters. The doorway harness uses UE2's MAXSTEPHEIGHT (35 UU, upstream
     // constant) converted with the coordinate policy, and MINFLOORZ 0.7.
     let walk_params = WalkParams {
-        skin: 0.001,
+        skin: SKIN_UU / UNREAL_UNITS_PER_METER,
         max_iterations: 4,
         max_step_height: MAXSTEPHEIGHT_UU / UNREAL_UNITS_PER_METER,
         min_floor_z: MINFLOORZ,
     };
-    let step = 0.05f32;
+    let step = STEP_UU / UNREAL_UNITS_PER_METER;
 
     // ---- Case 1: UE2-style walk from the real PlayerStart, re-aiming every step ----------
     let walk_started = Instant::now();
@@ -423,7 +432,7 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
 
     // Old walker kept as a labelled diagnostic (the previous task's flat `move_slide`).
     let slide_params = MoveParams {
-        skin: 0.001,
+        skin: SKIN_UU / UNREAL_UNITS_PER_METER,
         max_iterations: 4,
         max_step_height: 0.0,
     };
@@ -445,16 +454,24 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
         diag.blocked, diag_src, diag_past, diag.steps
     );
 
-    // ---- Case 2: aligned door case, 2 m in front of the leaf along its normal -------------
+    // ---- Case 2: aligned door case, 100 UU in front of the leaf along its normal -------------
     let door_normal = door_plane_normal(bbox, spawn.position, door_center);
     let door_front = [
-        door_center[0] - door_normal[0] * 2.0,
+        door_center[0] - door_normal[0] * DOOR_FRONT_UU / UNREAL_UNITS_PER_METER,
         door_center[1],
-        door_center[2] - door_normal[2] * 2.0,
+        door_center[2] - door_normal[2] * DOOR_FRONT_UU / UNREAL_UNITS_PER_METER,
     ];
-    let floor_door = floor_y_at(&world, door_front, door_center[1] + 2.0)
-        .ok_or_else(|| "no floor was found in front of Porte6".to_string())?;
-    let aligned_start = [door_front[0], floor_door + 0.05 + half[1], door_front[2]];
+    let floor_door = floor_y_at(
+        &world,
+        door_front,
+        door_center[1] + FLOOR_PROBE_UU / UNREAL_UNITS_PER_METER,
+    )
+    .ok_or_else(|| "no floor was found in front of Porte6".to_string())?;
+    let aligned_start = [
+        door_front[0],
+        floor_door + START_LIFT_UU / UNREAL_UNITS_PER_METER + half[1],
+        door_front[2],
+    ];
     println!(
         "[collision-test] aligned door case start {:?} (floor {:.2} m, box bottom {:.2} m, top {:.2} m); heading along door normal ({:.2},{:.2},{:.2})",
         aligned_start,
@@ -1068,7 +1085,7 @@ fn place_spawn(world: &CollisionWorld, player_start: Vec3, half: Vec3) -> Result
     // Start with the box bottom at the PlayerStart (UE2 spawns the pawn with its feet there).
     let base_center = [player_start[0], player_start[1] + half[1], player_start[2]];
     let cap = 2.0 * half[1];
-    let inc = 0.02f32;
+    let inc = RAISE_INC_UU / UNREAL_UNITS_PER_METER;
     let mut y = base_center[1];
     let mut raise = 0.0f32;
     loop {
