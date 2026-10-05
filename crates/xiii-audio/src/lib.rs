@@ -25,8 +25,13 @@ pub mod library;
 pub mod wav;
 
 pub use error::{AudioError, AudioErrorKind, Result};
-pub use hx::{Codec, DataLocation, HxBank, HxEntry, HxKind, HxLimits, Span, WaveResource};
-pub use library::{BankEntryRef, LibraryStats, ResolveFailure, SoundLibrary};
+pub use hx::{
+    Codec, Cuuid, DataLocation, HxBank, HxEntry, HxKind, HxLimits, SoundRef, Span, WaveResource,
+};
+pub use library::{
+    BankEntryRef, LibraryStats, ResolutionRule, ResolutionSummary, ResolveFailure, ResolvedSound,
+    SoundLibrary,
+};
 pub use wav::write_wav;
 
 /// Decoded PCM16 audio, interleaved by channel.
