@@ -335,6 +335,25 @@ pub enum Latent {
     },
 }
 
+/// An object reference into a package outside the loaded script set (e.g. a `Sound` in a
+/// `.uax`). Interned by the VM so [`ObjRef::External`] stays `Copy` and equality is by path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalObject {
+    /// Full `Package.Outer.Object` path as the referencing package spells it.
+    pub path: String,
+    /// Class path recorded for the reference: from the referencing package's import table, or
+    /// from the external package's own export when the runtime registered and verified it.
+    pub class: Option<String>,
+}
+
+/// Intern table for [`ExternalObject`]s. Equality by path is guaranteed because a path maps to
+/// one id; the class is taken from the first resolution of that path.
+#[derive(Debug, Default)]
+struct ExternalTable {
+    list: Vec<ExternalObject>,
+    index: HashMap<String, u32>,
+}
+
 /// Current state of a UE2 `Mover` (`PHYS_MovingBrush`) actor, for the host's dynamic collision
 /// and diagnostics. Unreal units/rotators, exactly as stored in the VM.
 #[derive(Debug, Clone, PartialEq)]
@@ -946,6 +965,8 @@ pub struct Vm<'s> {
     /// (UE2 `ALevelInfo::GetAddressURL` formats the URL host and port as `%s:%i`). Empty until
     /// the runtime configures it.
     address_url: String,
+    /// Interned object references into packages outside the loaded script set.
+    externals: std::cell::RefCell<ExternalTable>,
 }
 
 fn lower(s: &str) -> String {
@@ -984,6 +1005,7 @@ impl<'s> Vm<'s> {
             local_url: String::new(),
             url_options: String::new(),
             address_url: String::new(),
+            externals: std::cell::RefCell::new(ExternalTable::default()),
         }
     }
 
@@ -1174,6 +1196,9 @@ impl<'s> Vm<'s> {
                 .get(*i as usize)
                 .map_or_else(|| format!("obj#{i}"), |o| o.name.clone()),
             ObjRef::Static(g) => self.set.path(*g),
+            ObjRef::External(id) => self
+                .external_object(*id)
+                .map_or_else(|| format!("external#{id}"), |o| o.path),
         }
     }
 
@@ -1193,6 +1218,7 @@ impl<'s> Vm<'s> {
                 self.objects.get(*i as usize).map(|o| o.name.clone())
             }
             Value::Object(Some(ObjRef::Static(g))) => Some(self.set.path(*g)),
+            Value::Object(Some(ObjRef::External(id))) => self.external_path(&ObjRef::External(*id)),
             _ => None,
         }
     }
@@ -1532,19 +1558,84 @@ impl<'s> Vm<'s> {
                 // those names never have an export).
                 if meta_class_path(&path) || self.native_only_class(&path) {
                     Value::NativeClass(self.set.packages[pkg].ref_name(r).to_owned())
-                } else if !self.ref_package_loaded(&path) {
-                    // The referenced package is not among the loaded script packages: it is a
-                    // non-script asset package (e.g. a sound object in a `.uax`, which the
-                    // audio subsystem does not import). The engine would load the object; here
-                    // it is absent, so the reference is `None` rather than a decode failure.
-                    // This does not hide a decode error in a *loaded* package (that stays
-                    // `Unsupported` below).
-                    Value::Object(None)
-                } else {
+                } else if self.ref_package_loaded(&path) {
+                    // Unresolved inside a *loaded* script package: a real decode/reference
+                    // error (never silently hidden).
                     Value::Unsupported(format!("unresolved reference {path}"))
+                } else {
+                    // The referenced package is not among the loaded script packages: a
+                    // non-script asset package (a `.uax` sound, a `.utx` texture, ...). Keep a
+                    // real object value carrying the full path and the class from the
+                    // referencing package's import table, so presentation events (sounds,
+                    // music, textures) receive the path instead of `None`. When the runtime
+                    // registered the external package, a missing package/export is an explicit
+                    // error (counted), not `None`.
+                    self.external_object_value(pkg, r, &path)
                 }
             }
         }
+    }
+
+    /// Builds the value for an unresolved reference into a non-script package. The class comes
+    /// from the referencing package's import table (always available) or, when the runtime
+    /// registered and verified the external package, from the package's own export.
+    fn external_object_value(&self, pkg: usize, r: ObjectRef, path: &str) -> Value {
+        match self.set.external_lookup(path) {
+            crate::linker::ExternalLookup::MissingPackage => Value::Unsupported(format!(
+                "unresolved external object {path}: package not found"
+            )),
+            crate::linker::ExternalLookup::MissingExport => Value::Unsupported(format!(
+                "unresolved external object {path}: export not found"
+            )),
+            crate::linker::ExternalLookup::Found(class) => {
+                let class = self.set.packages[pkg].import_class_path(r).unwrap_or(class);
+                Value::Object(Some(ObjRef::External(
+                    self.intern_external(path, Some(class)),
+                )))
+            }
+            crate::linker::ExternalLookup::Unknown => {
+                let class = self.set.packages[pkg].import_class_path(r);
+                Value::Object(Some(ObjRef::External(self.intern_external(path, class))))
+            }
+        }
+    }
+
+    /// Interns an external object path, returning its id. A path maps to exactly one id, so
+    /// equality by path holds even when two references record different classes.
+    fn intern_external(&self, path: &str, class: Option<String>) -> u32 {
+        let mut table = self.externals.borrow_mut();
+        if let Some(&id) = table.index.get(path) {
+            return id;
+        }
+        let id = table.list.len() as u32;
+        table.index.insert(path.to_owned(), id);
+        table.list.push(ExternalObject {
+            path: path.to_owned(),
+            class,
+        });
+        id
+    }
+
+    /// The external object interned at `id` (path and recorded class), if any.
+    pub fn external_object(&self, id: u32) -> Option<ExternalObject> {
+        self.externals.borrow().list.get(id as usize).cloned()
+    }
+
+    /// Full path of an external object reference (`None` for other references).
+    pub fn external_path(&self, r: &ObjRef) -> Option<String> {
+        match r {
+            ObjRef::External(id) => self.external_object(*id).map(|o| o.path),
+            _ => None,
+        }
+    }
+
+    /// `IsA`-style class test for an external object, against the class recorded from the
+    /// referencing import table (or the verified external export). Uses the native-class table
+    /// from `registry::native_class_is_a`; an object with no recorded class matches nothing.
+    pub fn external_is_a(&self, id: u32, name: &str) -> bool {
+        self.external_object(id)
+            .and_then(|o| o.class)
+            .is_some_and(|c| crate::registry::native_class_is_a(&c, name))
     }
 
     /// True when the package named by a `Package.Object.Path` reference is one of the loaded
@@ -3340,6 +3431,17 @@ impl<'s> Vm<'s> {
             // A native-only meta-class has no instance in the VM; accessing through it is
             // Accessed-None, same as a null object.
             Value::NativeClass(_) => Ok(None),
+            // An object in a non-script package has no VM instance and no property layout:
+            // property access on it is an explicit unsupported error, never a silent success.
+            Value::Object(Some(ObjRef::External(id))) => {
+                Err(self.err(VmErrorKind::UnsupportedValue {
+                    desc: format!(
+                        "property access on external object {}",
+                        self.external_path(&ObjRef::External(id))
+                            .unwrap_or_else(|| format!("external#{id}"))
+                    ),
+                }))
+            }
             Value::Unsupported(d) => Err(self.err(VmErrorKind::UnsupportedValue { desc: d })),
             other => Err(self.type_err("object", &other)),
         }
@@ -3656,6 +3758,16 @@ impl<'s> Vm<'s> {
                         });
                         if ok {
                             Value::Object(Some(ObjRef::Static(g)))
+                        } else {
+                            Value::Object(None)
+                        }
+                    }
+                    // An external object keeps its reference when the recorded class (from the
+                    // referencing import table, or verified against the external package) is the
+                    // cast target or derives from it under the native-class table from item3h.
+                    Value::Object(Some(ObjRef::External(id))) => {
+                        if self.external_is_a(id, &target_leaf) {
+                            Value::Object(Some(ObjRef::External(id)))
                         } else {
                             Value::Object(None)
                         }
@@ -4396,6 +4508,14 @@ impl<'s> Vm<'s> {
         let mut ids = map_ids.to_vec();
         ids.push(info);
         self.begin_play(&ids)?;
+        // Level-start placement: a placed pickup's collision cylinder rests on the first walkable
+        // surface below it (`Location.Z = surface + CollisionHeight`). Measured: Plage01
+        // `Plage01CahuteKeyPick0` has `Location.Z=1257.59`, `CollisionHeight=8`, and the floor
+        // plank under it is at 1259.91, so the decoded `Location` is the cylinder base and the
+        // pickup is sunk into the plank; `ValidTouch`'s eye->key `FastTrace` then hits the plank.
+        // This corrects the cylinder onto its support (no-op without a physics provider and
+        // idempotent once resting).
+        self.settle_pickups();
         // Upstream clears `bStartup` again once the level-start events have run (hypothesis
         // for XIII); leaving it set would make every later runtime spawn look like a
         // level-start spawn (e.g. auto-possession in `Pawn.PostBeginPlay`).
@@ -4417,6 +4537,56 @@ impl<'s> Vm<'s> {
             }
         }
         Ok(())
+    }
+
+    /// **Host workaround (hypothesis, not engine behaviour found in the data):** at level start,
+    /// put each placed `Pickup`'s collision cylinder on the first walkable surface below it,
+    /// i.e. `Location.Z = surface_z + CollisionHeight`.
+    ///
+    /// Measured: Plage01 `Plage01CahuteKeyPick0` has `Location.Z=1257.5927`, `CollisionHeight=8`
+    /// and the plank under it at 1259.91, so its centre is 2.3 UU below the surface and
+    /// `ValidTouch`'s eye->key `FastTrace` hits the plank. Pickups keep `Physics=0` and no decoded
+    /// script moves them, so how the original engine makes this pickup touchable is unknown
+    /// (candidates: our placement/collision of the desk, one-sided line checks, or a different
+    /// `ValidTouch` trace). Replace this with the real mechanism once found. Uses the
+    /// world-physics provider; without one it is a no-op; idempotent. Returns the number of
+    /// actors moved (callers should count/log it).
+    pub fn settle_pickups(&mut self) -> usize {
+        if self.physics.is_none() {
+            return 0;
+        }
+        let mut settled = 0;
+        for id in 0..self.objects.len() as ObjectId {
+            if !self.is_live_actor(id) || !self.is_a(id, "pickup") {
+                continue;
+            }
+            if !self.bool_prop(id, "bCollideWorld") {
+                continue;
+            }
+            let Some(loc) = self.vector_prop(id, "Location") else {
+                continue;
+            };
+            let h = self.f32_prop(id, "CollisionHeight");
+            if h <= 0.0 {
+                continue;
+            }
+            let end = [loc[0], loc[1], loc[2] - 2.0 * h - 32.0];
+            let hit = match self.physics.as_mut() {
+                Some(p) => p.trace(loc, end, [0.0; 3]),
+                None => continue,
+            };
+            let Some(hit) = hit else { continue };
+            // Rest only on an upward-facing (walkable) surface; a ceiling/steep face is skipped.
+            if hit.normal[2] < 0.7 {
+                continue;
+            }
+            let new_z = hit.location[2] + h;
+            if (new_z - loc[2]).abs() > 0.01 {
+                self.set_property(id, "Location", 0, Value::Vector([loc[0], loc[1], new_z]));
+                settled += 1;
+            }
+        }
+        settled
     }
 
     /// `Actor.Destroy`: runs `Destroyed`, then marks the object deleted so later references act
@@ -5231,6 +5401,9 @@ impl<'s> Vm<'s> {
                 .get(*i as usize)
                 .map(|o| o.name.clone())
                 .unwrap_or_default(),
+            ObjRef::External(id) => self
+                .external_object(*id)
+                .map_or_else(String::new, |o| o.path),
         }
     }
 

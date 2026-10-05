@@ -14,6 +14,9 @@ use crate::vm::{Latent, TraceKind, Vm, VmErrorKind, VmLimits};
 struct B {
     names: Vec<String>,
     exports: Vec<Exp>,
+    /// External imports `(package, class, object)` appended after the seven fixed imports; each
+    /// contributes two import entries (the package root, then the object).
+    externals: Vec<(String, String, String)>,
 }
 
 const IMP_CORE: i32 = -1;
@@ -22,12 +25,16 @@ const IMP_STATE: i32 = -3;
 const IMP_INTPROP: i32 = -4;
 const IMP_FLOATPROP: i32 = -5;
 const IMP_NAMEPROP: i32 = -6;
+const IMP_OBJPROP: i32 = -7;
+const B_STRUCTPROP: i32 = -8;
+const B_BOOLPROP: i32 = -9;
 
 impl B {
     fn new() -> Self {
         let mut b = Self {
             names: Vec::new(),
             exports: Vec::new(),
+            externals: Vec::new(),
         };
         for n in [
             "None",
@@ -168,11 +175,24 @@ impl B {
         self.set(r, p);
     }
 
+    /// Appends an external import `package.class` named `object` and returns the object import's
+    /// raw reference (the value an `ObjectConst` token uses). Import entries: the nine fixed ones
+    /// come first, then two per external (package root, object), so external `n`'s object import
+    /// has index `10 + 2n` and raw `-(11 + 2n)`.
+    fn add_external(&mut self, package: &str, class: &str, object: &str) -> i32 {
+        let n = self.externals.len() as i32;
+        self.externals
+            .push((package.to_owned(), class.to_owned(), object.to_owned()));
+        -(11 + 2 * n)
+    }
+
     fn build(mut self) -> Vec<u8> {
         let core = self.name("Core");
         let package = self.name("Package");
         let class = self.name("Class");
-        let imports = vec![
+        let engine = self.name("Engine");
+        let externals = std::mem::take(&mut self.externals);
+        let mut imports = vec![
             (core, package, 0, core),
             (core, class, -1, self.name("Function")),
             (core, class, -1, self.name("State")),
@@ -180,7 +200,17 @@ impl B {
             (core, class, -1, self.name("FloatProperty")),
             (core, class, -1, self.name("NameProperty")),
             (core, class, -1, self.name("ObjectProperty")),
+            (core, class, -1, self.name("StructProperty")),
+            (core, class, -1, self.name("BoolProperty")),
         ];
+        for (pkg, cls, object) in &externals {
+            let pn = self.name(pkg);
+            let cn = self.name(cls);
+            let on = self.name(object);
+            let pkg_idx = imports.len() as i32;
+            imports.push((core, package, 0, pn));
+            imports.push((engine, cn, -(pkg_idx + 1), on));
+        }
         let names: Vec<&str> = self.names.iter().map(String::as_str).collect();
         build_package(&names, &imports, &self.exports)
     }
@@ -4462,4 +4492,307 @@ fn pick_start_point_prefers_a_patrol_point_then_falls_back() {
         call_native(&mut vm, "IAController.PickStartPoint", ctrl, &[], &mut args),
         NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(near))))
     );
+}
+
+/// A synthetic package with an `ExtRef.GetExt` function whose body is an `ObjectConst` into an
+/// external import `Ext.Snd` of class `Engine.Sound` (the package `Ext` is never loaded as a
+/// script package).
+fn external_ref_set() -> ScriptSet {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let extref = b.reserve(0, 0, "ExtRef");
+    let getext = b.reserve(IMP_FUNCTION, extref, "GetExt");
+    let ret = b.reserve(IMP_OBJPROP, getext, "ReturnValue");
+    b.prop_with(ret, 0, pf::PARM | pf::RETURN_PARM, &compact(0));
+    let raw = b.add_external("Ext", "Sound", "Snd");
+    let mut code = vec![0x04, 0x20]; // return ObjectConst(<external import>)
+    code.extend(compact(raw));
+    b.func(getext, 0, ret, &code, 6, 0, ff::DEFINED);
+    b.class(object, 0, 0);
+    b.class(extref, object, getext);
+    set_of(b.build())
+}
+
+#[test]
+fn external_lookup_reports_found_missing_and_unknown() {
+    let mut set = ScriptSet::new();
+    // A registered non-script package with the export path `Snd`.
+    let bytes = build_package(
+        &["None", "Core", "Package", "Snd"],
+        &[(1, 2, 0, 1)],
+        &[Exp {
+            class: -1,
+            outer: 0,
+            name: 3,
+            flags: 0,
+            payload: Vec::new(),
+        }],
+    );
+    set.add_external_package("Ext", &bytes, &Limits::default())
+        .expect("external package parses");
+    use crate::linker::ExternalLookup;
+    assert!(
+        matches!(set.external_lookup("Ext.Snd"), ExternalLookup::Found(_)),
+        "{:?}",
+        set.external_lookup("Ext.Snd")
+    );
+    assert_eq!(
+        set.external_lookup("Ext.Missing"),
+        ExternalLookup::MissingExport
+    );
+    set.add_missing_external("Gone");
+    assert_eq!(
+        set.external_lookup("Gone.Thing"),
+        ExternalLookup::MissingPackage
+    );
+    // A package never registered is unknown (the VM keeps a lazy external object).
+    assert_eq!(set.external_lookup("Never.Thing"), ExternalLookup::Unknown);
+}
+
+#[test]
+fn object_constant_into_a_non_script_package_keeps_path_and_import_class() {
+    let set = external_ref_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let id = vm.spawn(g(&set, "ExtRef"), "R").unwrap();
+    vm.set_active(id, true);
+    let func = g(&set, "ExtRef.GetExt");
+    let v = vm.call_function(func, id, Vec::new()).unwrap();
+    let Value::Object(Some(ObjRef::External(x))) = v else {
+        panic!("expected an external object value, got {v:?}");
+    };
+    assert_eq!(
+        vm.external_path(&ObjRef::External(x)).as_deref(),
+        Some("Ext.Snd")
+    );
+    // The class comes from the referencing import table (`Engine.Sound`).
+    assert_eq!(
+        vm.external_object(x).unwrap().class.as_deref(),
+        Some("Engine.Sound")
+    );
+    assert!(vm.external_is_a(x, "Sound"));
+    assert!(vm.external_is_a(x, "Engine.Sound"));
+    assert!(!vm.external_is_a(x, "Texture"));
+    // Equality by path: a second evaluation interns to the same id.
+    let v2 = vm.call_function(func, id, Vec::new()).unwrap();
+    assert_eq!(v, v2, "external refs with the same path must compare equal");
+}
+
+#[test]
+fn external_reference_to_a_missing_package_is_an_explicit_error() {
+    let mut set = external_ref_set();
+    set.add_missing_external("Ext");
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let id = vm.spawn(g(&set, "ExtRef"), "R").unwrap();
+    vm.set_active(id, true);
+    let func = g(&set, "ExtRef.GetExt");
+    let err = vm
+        .call_function(func, id, Vec::new())
+        .expect_err("a missing external package must not resolve to None");
+    match err.kind {
+        VmErrorKind::UnsupportedValue { desc } => {
+            assert!(desc.contains("Ext.Snd"), "{desc}");
+            assert!(desc.contains("package not found"), "{desc}");
+        }
+        other => panic!("expected UnsupportedValue, got {other:?}"),
+    }
+}
+
+/// Synthetic package with `Object` <- `Inventory` <- `Pawn` and a `Pawn.AddInventory` script that
+/// reproduces the decoded UE2 chain (walk the `Inventory` links, reject a duplicate, link the new
+/// item at the tail). No proprietary data.
+fn inventory_package() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let inventory = b.reserve(0, 0, "Inventory");
+    let pawn = b.reserve(0, 0, "Pawn");
+    // `Inventory` properties (inherited by `Pawn`): the link and the owner.
+    let inv_inv = b.reserve(IMP_OBJPROP, inventory, "Inventory");
+    let inv_owner = b.reserve(IMP_OBJPROP, inventory, "Owner");
+    b.prop_with(inv_inv, inv_owner, 0, &compact(0));
+    b.prop_with(inv_owner, 0, 0, &compact(0));
+    // Native object operators the script calls (declared so `resolve_native_index` finds them).
+    let native_op = ff::FINAL | ff::NATIVE | ff::OPERATOR | ff::STATIC;
+    let neq = b.reserve(IMP_FUNCTION, object, "NotEqual_ObjectObject");
+    let eq = b.reserve(IMP_FUNCTION, object, "EqualEqual_ObjectObject");
+    let neq_a = b.reserve(IMP_OBJPROP, neq, "A");
+    let neq_b = b.reserve(IMP_OBJPROP, neq, "B");
+    let neq_r = b.reserve(IMP_OBJPROP, neq, "ReturnValue");
+    b.prop_with(neq_a, neq_b, pf::PARM, &compact(0));
+    b.prop_with(neq_b, neq_r, pf::PARM, &compact(0));
+    b.prop_with(neq_r, 0, pf::PARM | pf::RETURN_PARM, &compact(0));
+    b.func(neq, eq, neq_a, &[], 0, 119, native_op);
+    let eq_a = b.reserve(IMP_OBJPROP, eq, "A");
+    let eq_b = b.reserve(IMP_OBJPROP, eq, "B");
+    let eq_r = b.reserve(IMP_OBJPROP, eq, "ReturnValue");
+    b.prop_with(eq_a, eq_b, pf::PARM, &compact(0));
+    b.prop_with(eq_b, eq_r, pf::PARM, &compact(0));
+    b.prop_with(eq_r, 0, pf::PARM | pf::RETURN_PARM, &compact(0));
+    b.func(eq, 0, eq_a, &[], 0, 114, native_op);
+    // `Pawn.AddInventory(Inventory NewItem) -> int` with locals `Inv`, `Last`.
+    let add = b.reserve(IMP_FUNCTION, pawn, "AddInventory");
+    let newitem = b.reserve(IMP_OBJPROP, add, "NewItem");
+    let ret = b.reserve(IMP_INTPROP, add, "ReturnValue");
+    let inv = b.reserve(IMP_OBJPROP, add, "Inv");
+    let last = b.reserve(IMP_OBJPROP, add, "Last");
+    b.prop_with(newitem, ret, pf::PARM, &compact(0));
+    b.prop(ret, inv, pf::PARM | pf::RETURN_PARM);
+    b.prop_with(inv, last, 0, &compact(0));
+    b.prop_with(last, 0, 0, &compact(0));
+    let ri = inv as u8; // local `Inv`
+    let rn = newitem as u8; // local/param `NewItem`
+    let rl = last as u8; // local `Last`
+    let pi = inv_inv as u8; // the `Inventory` link property
+    #[rustfmt::skip]
+    let code: Vec<u8> = vec![
+        0x0F, 0x00, rl, 0x17,                                                   // 0000 Last = self
+        0x0F, 0x00, ri, 0x01, pi,                                               // 0007 Inv = self.Inventory
+        0x07, 0x50, 0x00, 0x77, 0x00, ri, 0x2A, 0x16,                          // 0012 if !(Inv != None) goto 0x50 (END)
+        0x07, 0x2E, 0x00, 0x72, 0x00, ri, 0x00, rn, 0x16,                      // 001D if Inv == NewItem goto 0x2E (ELSE)
+        0x04, 0x28,                                                             // 002C return false
+        0x0F, 0x00, rl, 0x00, ri,                                               // 002E Last = Inv
+        0x0F, 0x00, ri, 0x19, 0x00, ri, 0xFF, 0xFF, 0x00, 0x01, pi,           // 0039 Inv = Inv.Inventory
+        0x06, 0x12, 0x00,                                                       // 004D goto 0x12 (LOOP)
+        0x0F, 0x19, 0x00, rl, 0xFF, 0xFF, 0x00, 0x01, pi, 0x00, rn,           // 0050 Last.Inventory = NewItem
+        0x04, 0x27,                                                             // 0064 return true
+    ];
+    b.func(add, 0, newitem, &code, 102, 0, ff::DEFINED);
+    b.class(object, 0, neq);
+    b.class(inventory, object, inv_inv);
+    b.class(pawn, inventory, add);
+    b.build()
+}
+
+#[test]
+fn synthetic_add_inventory_links_the_chain_and_rejects_duplicates() {
+    let set = set_of(inventory_package());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pawn = vm.spawn(g(&set, "Pawn"), "P").unwrap();
+    let a = vm.spawn(g(&set, "Inventory"), "A").unwrap();
+    let b_item = vm.spawn(g(&set, "Inventory"), "B").unwrap();
+    vm.set_active(pawn, true);
+    let add = g(&set, "Pawn.AddInventory");
+    let call = |vm: &mut Vm, item: ObjectId| {
+        vm.call_function(add, pawn, vec![Value::Object(Some(ObjRef::Instance(item)))])
+            .unwrap()
+    };
+    assert_ne!(
+        call(&mut vm, a),
+        Value::Bool(false),
+        "first item must be added"
+    );
+    assert_eq!(
+        vm.get_property(pawn, "Inventory"),
+        Some(&Value::Object(Some(ObjRef::Instance(a)))),
+        "the pawn must link the first item"
+    );
+    assert_ne!(
+        call(&mut vm, b_item),
+        Value::Bool(false),
+        "second item must be added"
+    );
+    assert_eq!(
+        vm.get_property(a, "Inventory"),
+        Some(&Value::Object(Some(ObjRef::Instance(b_item)))),
+        "the chain must link A -> B"
+    );
+    // A duplicate must be rejected and leave the chain unchanged.
+    assert_eq!(
+        call(&mut vm, a),
+        Value::Bool(false),
+        "a duplicate must be refused"
+    );
+    assert_eq!(
+        vm.get_property(pawn, "Inventory"),
+        Some(&Value::Object(Some(ObjRef::Instance(a))))
+    );
+    assert_eq!(
+        vm.get_property(a, "Inventory"),
+        Some(&Value::Object(Some(ObjRef::Instance(b_item))))
+    );
+    assert_eq!(
+        vm.get_property(b_item, "Inventory"),
+        Some(&Value::Object(None)),
+        "the tail's link stays None"
+    );
+}
+
+/// Synthetic package with a `Pickup` class carrying `Location` (`Core.Struct` `Vector`),
+/// `CollisionHeight` (`float`) and `bCollideWorld` (`bool`) — the fields `settle_pickups` reads.
+fn settle_package() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    // A zero-size `Vector` export (class `Core`, so it is not decoded as a script object); the
+    // struct property's `Struct` reference only needs the object *name* to type it as a vector.
+    let vector = b.reserve(IMP_CORE, 0, "Vector");
+    let pickup = b.reserve(0, 0, "Pickup");
+    let loc = b.reserve(B_STRUCTPROP, pickup, "Location");
+    let height = b.reserve(IMP_FLOATPROP, loc, "CollisionHeight");
+    let collide = b.reserve(B_BOOLPROP, height, "bCollideWorld");
+    b.prop_with(loc, height, 0, &compact(vector));
+    b.prop(height, collide, 0);
+    b.prop(collide, 0, 0);
+    b.class(object, 0, 0);
+    b.class(actor, object, 0);
+    b.class(pickup, actor, loc);
+    b.build()
+}
+
+#[test]
+fn settle_pickups_rests_a_placed_pickup_on_its_support() {
+    let set = set_of(settle_package());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(crate::physics::FlatPhysics::new(100.0)));
+    let p = vm.spawn(g(&set, "Pickup"), "Key").unwrap();
+    // The decoded map `Location` is the cylinder base: `z == floor` -> embedded; the cylinder
+    // centre must become `floor + CollisionHeight`.
+    vm.set_property(p, "Location", 0, Value::Vector([10.0, 20.0, 100.0]));
+    vm.set_property(p, "CollisionHeight", 0, Value::Float(8.0));
+    vm.set_property(p, "bCollideWorld", 0, Value::Bool(true));
+    assert_eq!(vm.settle_pickups(), 1, "the embedded pickup must be moved");
+    assert_eq!(
+        vm.vector_prop(p, "Location").unwrap(),
+        [10.0, 20.0, 108.0],
+        "the cylinder centre rests on the floor + CollisionHeight"
+    );
+    // Idempotent once resting.
+    assert_eq!(vm.settle_pickups(), 0);
+    // A pickup with `bCollideWorld=false` is left alone.
+    let q = vm.spawn(g(&set, "Pickup"), "Floating").unwrap();
+    vm.set_property(q, "Location", 0, Value::Vector([0.0, 0.0, 100.0]));
+    vm.set_property(q, "CollisionHeight", 0, Value::Float(8.0));
+    vm.set_property(q, "bCollideWorld", 0, Value::Bool(false));
+    assert_eq!(vm.settle_pickups(), 0);
+    assert_eq!(vm.vector_prop(q, "Location").unwrap(), [0.0, 0.0, 100.0]);
+}
+
+#[test]
+fn external_reference_to_a_registered_missing_export_is_an_explicit_error() {
+    let mut set = external_ref_set();
+    // A registered package that does not contain `Snd`.
+    let bytes = build_package(
+        &["None", "Core", "Package", "Other"],
+        &[(1, 2, 0, 1)],
+        &[Exp {
+            class: -1,
+            outer: 0,
+            name: 3,
+            flags: 0,
+            payload: Vec::new(),
+        }],
+    );
+    set.add_external_package("Ext", &bytes, &Limits::default())
+        .unwrap();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let id = vm.spawn(g(&set, "ExtRef"), "R").unwrap();
+    vm.set_active(id, true);
+    let err = vm
+        .call_function(g(&set, "ExtRef.GetExt"), id, Vec::new())
+        .expect_err("a missing external export must not resolve to None");
+    match err.kind {
+        VmErrorKind::UnsupportedValue { desc } => {
+            assert!(desc.contains("export not found"), "{desc}");
+        }
+        other => panic!("expected UnsupportedValue, got {other:?}"),
+    }
 }

@@ -19,6 +19,10 @@
 //!   position and drop the velocity. Used by the trigger demonstration because the Plage00
 //!   trigger is ~47,000 UU from the PlayerStart (about 100 s of walking at `GroundSpeed`). The
 //!   final approach into the trigger volume is still walked.
+//! - `goto <x> <y> [z]`: autopilot to an Unreal-unit waypoint. Each tick the driver re-aims the
+//!   player (yaw toward the waypoint) and holds the forward axis until it is within a small
+//!   radius, then stops. The simulation still owns the movement (this is not a teleport); it is
+//!   used to follow a decoded `ReachSpec` path through a room)
 
 use std::path::Path;
 
@@ -52,6 +56,8 @@ pub enum Command {
     Pitch(f32),
     /// Move the box centre to an absolute Unreal-unit position (harness bootstrap).
     Teleport([f32; 3]),
+    /// Autopilot toward an Unreal-unit waypoint (the driver re-aims and walks; not a teleport).
+    Goto([f32; 3]),
     /// Request one use/interact action (edge-triggered; the VM `Grab`/use chain).
     Use,
 }
@@ -114,6 +120,13 @@ impl Script {
                     let z = num(&mut it)?;
                     Command::Teleport([x, y, z])
                 }
+                "goto" => {
+                    let x = num(&mut it)?;
+                    let y = num(&mut it)?;
+                    // The waypoint Z is optional; 0 is fine for the horizontal autopilot.
+                    let z = it.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+                    Command::Goto([x, y, z])
+                }
                 "use" | "grab" | "interact" => Command::Use,
                 other => return Err(format!("line {n}: unknown command {other:?}")),
             };
@@ -145,6 +158,8 @@ pub struct Drive {
     walk: bool,
     jump_pending: bool,
     use_pending: bool,
+    /// Active `goto` waypoint (Unreal units), if any.
+    goto: Option<[f32; 3]>,
 }
 
 impl Drive {
@@ -158,6 +173,7 @@ impl Drive {
             walk: false,
             jump_pending: false,
             use_pending: false,
+            goto: None,
         }
     }
 
@@ -178,10 +194,28 @@ impl Drive {
                     sim.location = p;
                     sim.velocity = [0.0; 3];
                     sim.grounded = false;
+                    self.goto = None;
                 }
+                Command::Goto(p) => self.goto = Some(p),
                 Command::Use => self.use_pending = true,
             }
             self.cursor += 1;
+        }
+        // `goto` autopilot: re-aim and hold forward until within reach of the waypoint. The
+        // simulation still moves the player; only the yaw/axis are driven.
+        if let Some(target) = self.goto {
+            let (dx, dy) = (target[0] - sim.location[0], target[1] - sim.location[1]);
+            if dx * dx + dy * dy <= 24.0 * 24.0 {
+                self.goto = None;
+                self.forward = 0.0;
+            } else {
+                let mut yaw = dy.atan2(dx);
+                if yaw < 0.0 {
+                    yaw += std::f32::consts::TAU;
+                }
+                sim.yaw = yaw;
+                self.forward = 1.0;
+            }
         }
         let jump = std::mem::take(&mut self.jump_pending);
         let use_action = std::mem::take(&mut self.use_pending);
@@ -220,6 +254,23 @@ mod tests {
         // Jump is consumed: the next tick has no jump.
         let i3 = d.advance(1.02, &mut sim);
         assert!(!i3.jump);
+    }
+
+    #[test]
+    fn goto_reaims_and_walks_then_stops_at_the_waypoint() {
+        let s = Script::parse("t=0.0 goto 100 0\nt=5.0 forward 0\n").unwrap();
+        assert_eq!(s.events.len(), 2);
+        let mut sim = PlayerSim::new([0.0; 3], std::f32::consts::PI); // facing -X
+        let mut d = Drive::new(&s);
+        let i0 = d.advance(0.0, &mut sim);
+        assert_eq!(i0.forward, 1.0, "goto holds forward");
+        assert!(sim.yaw.abs() < 1e-4, "re-aimed toward +X, got {}", sim.yaw);
+        // Once within the arrival radius the autopilot releases and clears forward.
+        sim.location = [90.0, 0.0, 0.0];
+        let i1 = d.advance(0.3, &mut sim);
+        assert_eq!(i1.forward, 0.0);
+        // A bad/absent coordinate is rejected.
+        assert!(Script::parse("t=0.0 goto 1\n").is_err());
     }
 
     #[test]
