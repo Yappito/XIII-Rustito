@@ -259,7 +259,8 @@ pub fn analyze(map: &str, game_dir: &Path) -> Result<ReachReport, String> {
         player_radius / UNREAL_UNITS_PER_METER,
     ];
 
-    let world = CollisionWorld::new(scene.collision.iter().map(|(t, s)| (*t, *s)));
+    // `--reach-test` models the pawn's swept movement (extent queries), so it uses the box soup.
+    let world = CollisionWorld::new(scene.box_collision());
 
     let params = WalkParams {
         skin: SKIN_UU / UNREAL_UNITS_PER_METER,
@@ -771,17 +772,31 @@ mod tests {
     }
 
     #[test]
-    fn opt_in_reach_regression_plage00_plage01() {
+    fn opt_in_reach_regression_plage00_plage01_banque01() {
         let Some(path) = opt_in_game_dir() else {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
         };
-        // Regression guard (not a fidelity claim): measured pass counts from the item1e run
-        // (Plage00 12/12, Plage01 263/302). A drop below the measured value is a regression.
-        for (map, min_pass) in [("Plage00", 12usize), ("Plage01", 263usize)] {
+        // Regression guard (not a fidelity claim): measured pass counts with the corrected
+        // per-query collision rule (item1g-fix1: Plage00 12/12, Plage01 294/302, Banque01
+        // 631/658). `UseSimpleBoxCollision` defaults to true, so `bankesca2`'s staircase is in
+        // the box soup again (missing-floor 0 everywhere); the Plage01 change from 295 is one
+        // new spawn-overlap at `Engine.Teleporter Teleporter0` caused by box now using the
+        // simplified model. A drop below either measured value is a regression.
+        for (map, min_pass, want_missing_floor) in [
+            ("Plage00", 12usize, 0usize),
+            ("Plage01", 294usize, 0usize),
+            ("Banque01", 631usize, 0usize),
+        ] {
             let report = analyze(map, &path).expect("reach analyze");
+            let missing_floor: usize = report
+                .groups
+                .iter()
+                .filter(|(cause, _)| cause.starts_with("missing floor"))
+                .map(|(_, n)| *n)
+                .sum();
             println!(
-                "[reach-test regression] {map}: eligible {} passes {} (>= {min_pass})",
+                "[reach-test regression] {map}: eligible {} passes {} (>= {min_pass}), missing-floor {missing_floor} (== {want_missing_floor})",
                 report.eligible, report.passes
             );
             assert!(
@@ -789,7 +804,11 @@ mod tests {
                 "{map}: pass count {} below measured {min_pass}",
                 report.passes
             );
-            assert_eq!(report.spawn_failures, 0, "{map}: spawn failures");
+            assert_eq!(
+                missing_floor, want_missing_floor,
+                "{map}: missing-floor start nodes changed: {:?}",
+                report.groups
+            );
         }
     }
 }

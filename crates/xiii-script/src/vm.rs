@@ -17,10 +17,11 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
-use xiii_package::{Limits, ObjectRef, PropertyBlock, PropertyValue, StructValue};
+use xiii_package::{Limits, ObjectRef, PropertyBlock, PropertyValue, RawReason, StructValue};
 
 use crate::animation::{AnimationData, SeqInfo};
 use crate::bytecode::{Call, Context, Script, Token, TokenKind, opcode_name};
+use crate::events::{PresentationEvent, SoundEvent};
 use crate::linker::{GlobalRef, ScriptSet};
 use crate::physics::WorldPhysics;
 use crate::reflect::{Property, PropertyKind, ScriptObject, function_flags, property_flags};
@@ -830,6 +831,9 @@ pub struct Vm<'s> {
     /// Animation-sequence provider (animation natives). `None` = every native that needs
     /// sequence data fails with [`VmErrorKind::NoAnimationProvider`].
     pub(crate) animation: Option<Box<dyn AnimationData>>,
+    /// Outbound presentation events emitted by presentation natives (sound, texture, display,
+    /// projectors). Drained with [`Vm::drain_events`].
+    events: Vec<PresentationEvent>,
 }
 
 fn lower(s: &str) -> String {
@@ -863,6 +867,7 @@ impl<'s> Vm<'s> {
             pending_latent: None,
             physics: None,
             animation: None,
+            events: Vec::new(),
         }
     }
 
@@ -985,6 +990,100 @@ impl<'s> Vm<'s> {
             Value::Object(Some(r)) => self.obj_label(r),
             other => other.to_string(),
         }
+    }
+
+    /// `Package.Object.Path` of an object value (the instance display name for an instance),
+    /// or `None` for a null/other value. Used to record presentation arguments.
+    pub fn obj_path(&self, v: &Value) -> Option<String> {
+        match v {
+            Value::Object(Some(ObjRef::Instance(i))) => {
+                self.objects.get(*i as usize).map(|o| o.name.clone())
+            }
+            Value::Object(Some(ObjRef::Static(g))) => Some(self.set.path(*g)),
+            _ => None,
+        }
+    }
+
+    /// Drains the outbound presentation events emitted since the last call.
+    pub fn drain_events(&mut self) -> Vec<PresentationEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Number of presentation events waiting to be drained.
+    pub fn queued_events(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Appends a presentation event at the current VM time.
+    pub(crate) fn emit_event(&mut self, event: PresentationEvent) {
+        self.events.push(event);
+    }
+
+    /// Emits a `PlaySound`/`PlayMusic` event from a native's decoded arguments. `args[0]` is the
+    /// `Sound`; `args[1..=5]` are `Param1..Param5` (an omitted optional argument becomes `None`).
+    pub(crate) fn emit_sound(
+        &mut self,
+        music: bool,
+        this: ObjectId,
+        args: &[Value],
+        omitted: &[bool],
+    ) {
+        let sound = args.first().and_then(|v| self.obj_path(v));
+        let param = |i: usize| -> Option<i32> {
+            if omitted.get(i).copied().unwrap_or(true) {
+                return None;
+            }
+            match args.get(i) {
+                Some(Value::Int(v)) => Some(*v),
+                Some(Value::Byte(v)) => Some(i32::from(*v)),
+                _ => None,
+            }
+        };
+        let event = SoundEvent {
+            actor: self.objects[this as usize].name.clone(),
+            sound,
+            rolloff_actor: None,
+            slot: param(1),
+            volume: param(2),
+            radius: param(3),
+            pitch: param(4),
+            param5: param(5),
+            time: self.time,
+        };
+        self.events.push(if music {
+            PresentationEvent::PlayMusic(event)
+        } else {
+            PresentationEvent::PlaySound(event)
+        });
+    }
+
+    /// Emits an `Actor.PlayRolloffSound` event: `args[0]` is the `Sound`, `args[1]` the
+    /// `RollOffActor`, `args[2..=6]` are `Param1..Param5`.
+    pub(crate) fn emit_rolloff_sound(&mut self, this: ObjectId, args: &[Value], omitted: &[bool]) {
+        let sound = args.first().and_then(|v| self.obj_path(v));
+        let rolloff_actor = args.get(1).and_then(|v| self.obj_path(v));
+        let param = |i: usize| -> Option<i32> {
+            if omitted.get(i).copied().unwrap_or(true) {
+                return None;
+            }
+            match args.get(i) {
+                Some(Value::Int(v)) => Some(*v),
+                Some(Value::Byte(v)) => Some(i32::from(*v)),
+                _ => None,
+            }
+        };
+        let event = SoundEvent {
+            actor: self.objects[this as usize].name.clone(),
+            sound,
+            rolloff_actor,
+            slot: param(2),
+            volume: param(3),
+            radius: param(4),
+            pitch: param(5),
+            param5: param(6),
+            time: self.time,
+        };
+        self.events.push(PresentationEvent::PlayRolloffSound(event));
     }
 
     /// Short `Class.Function` path of an export (package omitted).
@@ -1233,13 +1332,29 @@ impl<'s> Vm<'s> {
                 let path = self.set.packages[pkg].ref_path(r);
                 // `class'Core.Class'` names the native meta-class, which has no export in
                 // core.u. Give it a distinct value (not `None`) so class checks and
-                // `DynamicLoadObject` see a class, not a null.
-                if meta_class_path(&path) {
+                // `DynamicLoadObject` see a class, not a null. The same holds for engine
+                // classes declared native-only (no export in engine.u), e.g. `Engine.Mesh`,
+                // `Engine.SkeletalMesh`, `Engine.Level`; an unresolved reference into a
+                // *loaded* package is therefore treated as a native-only class (measured:
+                // those names never have an export).
+                if meta_class_path(&path) || self.native_only_class(&path) {
                     Value::NativeClass(self.set.packages[pkg].ref_name(r).to_owned())
                 } else {
                     Value::Unsupported(format!("unresolved reference {path}"))
                 }
             }
+        }
+    }
+
+    /// True when `Package.Object.Path` names a package that is loaded but has no such export
+    /// (a native-only class such as `Engine.Mesh`), as opposed to an unresolved external.
+    fn native_only_class(&self, path: &str) -> bool {
+        let Some((pkg, object)) = path.split_once('.') else {
+            return false;
+        };
+        match self.set.package_index(pkg) {
+            Some(pi) => self.set.packages[pi].export_by_path(object).is_none(),
+            None => false,
         }
     }
 
@@ -1260,8 +1375,41 @@ impl<'s> Vm<'s> {
             (PropertyValue::Array { count, elements }, Ty::Array(inner)) => {
                 self.decode_array(pkg, *count, *elements, inner)
             }
+            // A struct the package reader kept raw (`RawReason::UnknownStruct`) can still be
+            // decoded from its value span member-by-member when the script class layout gives
+            // the member types (e.g. `BaseSoldier.InitialInventory[i]` = {Inventory, Count}).
+            // A member that cannot be decoded stays an explicit `Unsupported`, never a guess.
+            (PropertyValue::Raw(RawReason::UnknownStruct), Ty::Struct(members)) => {
+                self.decode_raw_struct(pkg, q.value_span, members)
+            }
             (v, t) => Value::Unsupported(format!("{v:?} as {t:?}")),
         }
+    }
+
+    /// Decodes an untagged struct value ([`PropertyValue::Raw`] with a known class-layout type)
+    /// from its raw value span. `None`/unsupported on any member or trailing bytes.
+    fn decode_raw_struct(
+        &self,
+        pkg: usize,
+        span: xiii_package::Span,
+        members: &[(String, Ty)],
+    ) -> Value {
+        let p = &self.set.packages[pkg];
+        let tables = crate::reader::Tables::of(&p.package);
+        let Ok(mut r) = crate::reader::Reader::new(&p.data, span.start, span.end, tables) else {
+            return Value::Unsupported("struct span".into());
+        };
+        let mut fields = Vec::new();
+        for (name, t) in members {
+            match self.decode_ty(&mut r, pkg, t) {
+                Some(v) => fields.push((name.clone(), v)),
+                None => return Value::Unsupported(format!("raw struct member {name}")),
+            }
+        }
+        if r.remaining() != 0 {
+            return Value::Unsupported("struct trailing bytes".into());
+        }
+        Value::Struct(fields)
     }
 
     fn decode_array(&self, pkg: usize, count: u32, span: xiii_package::Span, inner: &Ty) -> Value {
@@ -1457,12 +1605,70 @@ impl<'s> Vm<'s> {
         true
     }
 
+    /// Adjust the `value` member of the `MusicVars` entry named `name` (case-insensitive) by
+    /// `delta`, returning the new value. `None` when the property or entry is absent — the
+    /// `LevelInfo.{Inc,Dec}{Attente,Alerte}` counters live there.
+    pub(crate) fn adjust_music_var(&mut self, id: ObjectId, name: &str, delta: i32) -> Option<i32> {
+        let arr = match self.get_property(id, "MusicVars")? {
+            Value::Array(a) => a.clone(),
+            _ => return None,
+        };
+        let mut new_value = None;
+        let mut out = Vec::with_capacity(arr.len());
+        for v in arr {
+            if let Value::Struct(mut fields) = v {
+                let is_entry = fields.iter().any(|(n, fv)| {
+                    n.eq_ignore_ascii_case("name")
+                        && matches!(fv, Value::Str(s) if s.eq_ignore_ascii_case(name))
+                });
+                if is_entry {
+                    for (n, fv) in fields.iter_mut() {
+                        if n.eq_ignore_ascii_case("value")
+                            && let Value::Int(i) = fv
+                        {
+                            *i = i.wrapping_add(delta);
+                            new_value = Some(*i);
+                        }
+                    }
+                }
+                out.push(Value::Struct(fields));
+            } else {
+                out.push(v);
+            }
+        }
+        self.set_property(id, "MusicVars", 0, Value::Array(out));
+        new_value
+    }
+
     /// Name of the current state.
     pub fn state_name(&self, id: ObjectId) -> Option<String> {
         self.objects
             .get(id as usize)?
             .state
             .map(|g| self.object_name(g).to_owned())
+    }
+
+    /// `Object.IsInState`: true when the object's current state, or one of its super states,
+    /// has the given name. `None` matches an object with no state.
+    pub fn is_in_state(&self, id: ObjectId, name: &str) -> bool {
+        let mut st = self.objects.get(id as usize).and_then(|o| o.state);
+        if st.is_none() {
+            return name.eq_ignore_ascii_case("None");
+        }
+        let mut guard = 0;
+        while let Some(s) = st {
+            if self.object_name(s).eq_ignore_ascii_case(name) {
+                return true;
+            }
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            st = self
+                .struct_header(s)
+                .and_then(|h| self.set.resolve(s.package, h.field.super_field));
+        }
+        false
     }
 
     fn default_object(&mut self, class: GlobalRef) -> VmResult<ObjectId> {
@@ -2964,18 +3170,41 @@ impl<'s> Vm<'s> {
                 }
             }
             K::DynamicCast { class, expr } => {
-                let class = self.resolve_ref(frame, *class)?;
+                // A class reference may name a native-only meta-class with no export
+                // (`Engine.SkeletalMesh`, `Engine.Mesh`, ...): fall back to its leaf name
+                // instead of failing. Static assets keep their reference when the decoded
+                // class leaf matches the cast target.
+                let target_leaf = match self.set.resolve(frame.pkg, *class) {
+                    Some(g) => self.object_name(g).to_owned(),
+                    None => self.set.packages[frame.pkg].ref_name(*class).to_owned(),
+                };
                 let v = self.eval(frame, expr)?;
                 match v {
                     Value::Object(Some(ObjRef::Instance(i))) => {
-                        let c = self.objects[i as usize].class;
-                        if self.is_child_of(c, class) {
+                        if self.objects[i as usize]
+                            .layout
+                            .chain_names
+                            .iter()
+                            .any(|n| n.eq_ignore_ascii_case(&target_leaf))
+                        {
                             Value::Object(Some(ObjRef::Instance(i)))
                         } else {
                             Value::Object(None)
                         }
                     }
-                    Value::Object(_) | Value::NativeClass(_) => Value::Object(None),
+                    Value::Object(Some(ObjRef::Static(g))) => {
+                        let ok = self.class_path_of(g).is_some_and(|p| {
+                            p.rsplit('.')
+                                .next()
+                                .is_some_and(|l| l.eq_ignore_ascii_case(&target_leaf))
+                        });
+                        if ok {
+                            Value::Object(Some(ObjRef::Static(g)))
+                        } else {
+                            Value::Object(None)
+                        }
+                    }
+                    Value::Object(None) | Value::NativeClass(_) => Value::Object(None),
                     other => return Err(self.type_err("object", &other)),
                 }
             }
@@ -3537,6 +3766,12 @@ impl<'s> Vm<'s> {
         if let Some(r) = rot {
             self.set_property(id, "Rotation", 0, Value::Rotator(r));
         }
+        // UE2 `ULevel::SpawnActor` sets `Actor->Level = Level` for every spawned actor. The VM
+        // represents `Level` as the map's `LevelInfo`; without this a spawned controller reads
+        // `Level.Game` as None and `Actor.PreBeginPlay` destroys it (`CheckRelevance`).
+        if let Some(level) = self.obj_prop(spawner, "Level") {
+            self.set_property(id, "Level", 0, Value::Object(Some(ObjRef::Instance(level))));
+        }
         self.objects[id as usize].active = true;
         self.note(TraceKind::Spawned {
             actor: name,
@@ -3620,9 +3855,25 @@ impl<'s> Vm<'s> {
                 vec![Value::Str(String::new()), Value::Str(String::new())],
             )?;
         }
+        // UE2 `UGameEngine::LoadMap` marks the level as "startup" before actors begin play:
+        // `LevelInfo.bStartup` is the gate `Pawn.PostBeginPlay` reads before spawning its
+        // `ControllerClass` and calling `Controller.Possess`. Without it, level-placed pawns
+        // never get a controller (the no-agent case reported in item3d). `bBegunPlay` is set
+        // once the level-start lifecycle has run (upstream sets it at the end of `LoadMap`;
+        // the touch engine reads it).
+        if let Some(li) = level_info {
+            self.set_property(li, "bStartup", 0, Value::Bool(true));
+        }
         let mut ids = map_ids.to_vec();
         ids.push(info);
         self.begin_play(&ids)?;
+        // Upstream clears `bStartup` again once the level-start events have run (hypothesis
+        // for XIII); leaving it set would make every later runtime spawn look like a
+        // level-start spawn (e.g. auto-possession in `Pawn.PostBeginPlay`).
+        if let Some(li) = level_info {
+            self.set_property(li, "bStartup", 0, Value::Bool(false));
+            self.set_property(li, "bBegunPlay", 0, Value::Bool(true));
+        }
         Ok(info)
     }
 
@@ -4295,6 +4546,14 @@ impl<'s> Vm<'s> {
         self.objects
             .get(id as usize)
             .is_some_and(|o| o.anim.channels.get(&channel).is_some_and(|c| c.active))
+    }
+
+    /// `(frame, rate)` of `channel`'s current animation, if the channel exists.
+    pub(crate) fn anim_channel_params(&self, id: ObjectId, channel: u8) -> Option<(f32, f32)> {
+        self.objects
+            .get(id as usize)
+            .and_then(|o| o.anim.channels.get(&channel))
+            .map(|c| (c.frame, c.rate))
     }
 
     /// `Actor.FinishAnim`: suspend state code until `channel` ends. Returns `false` (no latent)

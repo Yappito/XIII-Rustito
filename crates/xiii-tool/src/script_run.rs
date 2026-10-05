@@ -20,8 +20,8 @@ use xiii_script::linker::GlobalRef;
 use xiii_script::physics::{FlatPhysics, WorldPhysics};
 use xiii_script::registry::NativeStatus;
 use xiii_script::{
-    ObjRef, ScriptLimits, ScriptPackage, ScriptSet, TraceEvent, TraceKind, Value, Vm, VmError,
-    VmLimits,
+    ObjRef, PresentationEvent, ScriptLimits, ScriptPackage, ScriptSet, TraceEvent, TraceKind,
+    Value, Vm, VmError, VmLimits,
 };
 use xiii_world::PackageCache;
 use xiii_world::animation::MapAnimationProvider;
@@ -126,6 +126,8 @@ pub struct RunReport {
     pub error: Option<VmError>,
     /// Survey mode: distinct unimplemented natives, first-hit stack included.
     pub missing_natives: Vec<xiii_script::vm::MissingNative>,
+    /// Presentation events drained from the VM, with the tick they were drained at.
+    pub events: Vec<(u64, PresentationEvent)>,
 }
 
 /// Runs the touch chain on a loaded set (`map` is the map package index), without map
@@ -209,6 +211,7 @@ pub fn run_touch_chain_with_providers(
         .spawn(player_class, "XIIIPlayerPawn(synthetic)")
         .map_err(|e| e.to_string())?;
     let mut error = None;
+    let mut events: Vec<(u64, PresentationEvent)> = Vec::new();
     'run: {
         if cfg.begin_play {
             let game_class = match cfg.game_class.as_deref() {
@@ -248,6 +251,10 @@ pub fn run_touch_chain_with_providers(
                 }
             }
         }
+        // Presentation events emitted during the level-start lifecycle (tick 0).
+        for ev in vm.drain_events() {
+            events.push((vm.tick_count, ev));
+        }
         for t in 1..=cfg.ticks {
             if t == cfg.touch_tick {
                 vm.note(TraceKind::Note(format!(
@@ -264,8 +271,18 @@ pub fn run_touch_chain_with_providers(
                 error = Some(e);
                 break 'run;
             }
+            let tick = vm.tick_count;
+            for ev in vm.drain_events() {
+                events.push((tick, ev));
+            }
         }
     }
+    // Drain anything emitted before the first tick (level start) or on the tick that errored.
+    let tick = vm.tick_count;
+    for ev in vm.drain_events() {
+        events.push((tick, ev));
+    }
+    events.sort_by_key(|e| e.0);
     let final_states = active
         .iter()
         .map(|i| (vm.objects[*i as usize].name.clone(), vm.state_name(*i)))
@@ -299,6 +316,7 @@ pub fn run_touch_chain_with_providers(
         load_warnings: vm.load_warnings.len(),
         error,
         missing_natives: vm.missing_natives.values().cloned().collect(),
+        events,
     })
 }
 
@@ -516,6 +534,7 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
     let mut cfg = RunConfig::default();
     let (mut root, mut map, mut show_trace, mut natives) =
         (None, "Plage00".to_owned(), false, true);
+    let mut show_events = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().cloned();
@@ -585,6 +604,7 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
                 }
             }
             "--trace" => show_trace = true,
+            "--events" => show_events = true,
             "--no-natives" => natives = false,
             other => {
                 eprintln!(
@@ -698,6 +718,21 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
             "animation events: {anim_end} AnimEnd, {notify} AnimNotify"
         );
     }
+    if show_events {
+        let _ = writeln!(
+            out,
+            "presentation events (--events): {} drained, by tick",
+            report.events.len()
+        );
+        let mut last_tick = None;
+        for (tick, ev) in &report.events {
+            if Some(*tick) != last_tick {
+                let _ = writeln!(out, "  tick {tick}:");
+                last_tick = Some(*tick);
+            }
+            let _ = writeln!(out, "    [{:.3}s] {ev}", ev.time());
+        }
+    }
     if cfg.survey {
         let mut missing = report.missing_natives.clone();
         missing.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.path.cmp(&b.path)));
@@ -753,8 +788,9 @@ mod local_tests {
         })
     }
 
-    /// The Plage00 dispatcher chain with real map physics and decoded animation ends in `Fin`,
-    /// and the map providers do not need the diagnostic `flat:`/`fixed:` modes.
+    /// The Plage00 dispatcher chain with real map physics and decoded animation creates one
+    /// controller per active soldier and still reaches `Fin`. Possession then runs the soldiers'
+    /// game AI, which stops at the first unimplemented AI native (reported, not stubbed).
     #[test]
     fn gog_plage00_map_providers_chain_ends_in_fin() {
         let Some(path) = gog_root() else {
@@ -779,22 +815,38 @@ mod local_tests {
         assert!(physics.is_some() && animation.is_some());
         let report =
             run_touch_chain_with_providers(&set, map_idx, &cfg, physics, animation).expect("run");
-        if let Some(e) = &report.error {
-            panic!("{e}");
-        }
         assert_eq!(report.actors_loaded, 371);
         assert_eq!(
             report.final_states["XIIIDispatcher0"].as_deref(),
             Some("Fin")
         );
-        // Movement natives are registered and ran against the map (only zero-delta moves in this
-        // opening chain); no `NoPhysicsProvider`/`NoAnimationProvider` error stopped the run.
+        // `Pawn.PostBeginPlay` possession spawns one `IAController` per active soldier.
+        let controllers = report
+            .trace
+            .iter()
+            .filter(|e| matches!(&e.kind, TraceKind::Spawned { class, .. } if class.ends_with("IAController")))
+            .count();
+        assert_eq!(controllers, 2, "one controller per active soldier");
+        // The run stops at the first unimplemented AI native (not a decode/provider error).
+        if let Some(e) = &report.error {
+            assert!(
+                matches!(e.kind, xiii_script::VmErrorKind::UnimplementedNative { .. }),
+                "{e}"
+            );
+        }
         assert!(report.natives.iter().all(|n| n.status != "missing"));
         println!(
-            "Plage00 with map providers: {} actors, {} natives, dispatcher Fin, {} animation queries",
+            "Plage00 with map providers: {} actors, {} natives, {controllers} controllers, dispatcher Fin, {} animation queries, stop: {}",
             report.actors_loaded,
             report.natives.len(),
-            anim_log.borrow().len()
+            anim_log.borrow().len(),
+            report
+                .error
+                .as_ref()
+                .map_or("none".to_owned(), |e| match &e.kind {
+                    xiii_script::VmErrorKind::UnimplementedNative { path, .. } => path.clone(),
+                    other => format!("{other:?}"),
+                })
         );
     }
 }
