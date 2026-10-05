@@ -1,8 +1,13 @@
+//! Viewer modes: the map importer diagnostic (this module) and the skinned-character
+//! viewer (`skinned`).
+//!
 //! Diagnostic map viewer (M2a): imports a map from an owned installation through
 //! `xiii-install` + `xiii-decode` and shows static-mesh actors, the level BSP and terrain
 //! with unlit textured `StandardMaterial`s. A fly camera starts at the PlayerStart; the
 //! overlay shows the object path under the crosshair and every import counter, including
 //! skipped/failed categories. This is an importer diagnostic, not a playable mission.
+
+pub mod skinned;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

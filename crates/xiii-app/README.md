@@ -57,6 +57,49 @@ and the `placement.*` provenance counters. Known gaps: no skybox (sky-backdrop B
 are skipped and counted), translucent/modulated sea materials render dark, and there is no
 vertex lighting. This is an importer diagnostic, not a playable mode.
 
+## Skinned-character viewer (M2b diagnostic)
+
+```sh
+cargo run --release -p xiii-app -- --model xiiipersos.XIIIM --anim Walk \
+    --game-dir P:/AI/XIII/XIII_Game --exit-after-secs 4 --screenshot out.png
+cargo run --release -p xiii-app -- --model xiiipersos.XIIIM --anim WaitNeutre \
+    --game-dir ... --frame 0 --screenshot idle0.png
+cargo run --release -p xiii-app -- --model xiiipersos.XIIIM,xiiipersos.SlaterM \
+    --anim Walk --game-dir ...
+```
+
+`--model PKG.MESH[,PKG.MESH...]` decodes one or more `Engine.SkeletalMesh` exports and their
+`Engine.MeshAnimation` (the mesh's own reference, resolved through the installation). The
+mesh is uploaded as a GPU-skinned Bevy `Mesh` (positions/normals/UVs, `JOINT_INDEX`
+`Uint16x4`, `JOINT_WEIGHT` `Float32x4`, one `SkinnedMesh` per section with inverse-bind
+matrices from the decoded bind pose) and one entity per bone. `--anim SEQ` plays a decoded
+sequence (`xiii-tool anim list` prints the real names); without it the bind pose is shown.
+`--frame N` freezes the clip at frame N and the camera front-on for comparison captures.
+
+Joints are driven by **the shared CPU sampler** (`xiii_decode::skeletal::normalize::evaluate_pose`,
+the one `xiii-tool anim render/validate` uses), not Bevy's animation graph. The Unreal -> Bevy
+coordinate policy is applied in exactly one function, `skinned::source_to_bevy_transform`,
+built only from `xiii_decode::common` (`to_bevy_position`, `to_bevy_direction`,
+`SOURCE_TO_BEVY`); because the change of basis is linear, converting every local bone
+transform is the same as applying it once at the skeleton root. The decoded mesh `RotOrigin`
+(XIII characters are authored +Y-forward; XIIIM/SlaterM store yaw 49152 = 270 deg) is applied
+as the character root rotation so the character faces the policy forward (source +X -> Bevy
+-Z). `MeshScale`/`MeshOrigin` are not baked (not needed for the bind pose; `MeshOrigin.z` is
+~80 UU and applying it would lift the feet). The mesh gets `NoFrustumCulling` (skinned AABBs
+are not recomputed here).
+
+Turntable camera, 1 m grid, forward/right/up axis lines and a clip/frame/time overlay;
+`--exit-after-secs`/`--screenshot` behave as in the other modes. Materials are decoded from
+the mesh's material references through the existing texture decoder and drawn unlit (magenta
+= unresolved). Skipped/dropped influences are printed (`influence_stats`), never hidden. This
+is an importer diagnostic, not a playable mode.
+
+Opt-in tests (`XIII_GOG_DIR`) compare the CPU-skinned positions (what `anim render` draws)
+with a CPU mirror of the GPU skinning chain (`joint_global * inverse_bindpose`, LBS) for
+`XIIIM` `Walk`/`WaitNeutre` at frames 0, n/4, n/2 (max error ~1e-4 UU, asserted < 0.01), and
+check idle frame 0 (feet 0.1 UU, height 160.9 UU, facing). A unit test builds a synthetic
+2-bone rig to exercise the same path without game data.
+
 ## Run
 
 ```sh
