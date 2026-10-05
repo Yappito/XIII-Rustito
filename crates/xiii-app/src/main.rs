@@ -5,6 +5,7 @@
 
 mod cli;
 mod collision;
+mod reach;
 mod smoke;
 mod viewer;
 
@@ -34,6 +35,14 @@ fn main() -> AppExit {
             return AppExit::error();
         };
         return collision::run(map, dir);
+    }
+
+    if opts.reach_test {
+        let (Some(dir), Some(map)) = (&opts.game_dir, &opts.map) else {
+            eprintln!("error: --reach-test needs --map and --game-dir");
+            return AppExit::error();
+        };
+        return reach::run(map, dir);
     }
 
     if opts.unattended() {

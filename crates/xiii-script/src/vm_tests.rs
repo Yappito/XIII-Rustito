@@ -452,7 +452,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 99);
+    assert_eq!(defs.len(), 100);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -2706,12 +2706,16 @@ struct ScriptedAnim {
 }
 
 impl crate::animation::AnimationData for ScriptedAnim {
-    fn sequence(&mut self, _mesh: &str, _seq: &str) -> Option<crate::animation::SeqInfo> {
-        Some(crate::animation::SeqInfo {
+    fn sequence(
+        &mut self,
+        _source: &str,
+        _seq: &str,
+    ) -> Result<Option<crate::animation::SeqInfo>, String> {
+        Ok(Some(crate::animation::SeqInfo {
             frames: self.frames,
             rate: self.rate,
             notifies: self.notifies.clone(),
-        })
+        }))
     }
 }
 
@@ -2748,18 +2752,177 @@ fn animation_notifies_fire_when_crossed() {
 }
 
 #[test]
-fn link_skel_anim_records_the_mesh() {
+fn link_skel_anim_records_the_animation_source() {
     let set = anim_set();
     let mut vm = Vm::new(&set, VmLimits::default());
     let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
-    let mesh = sg(&set, "Actor");
-    let mut args = [Value::Object(Some(ObjRef::Static(mesh)))];
+    let anim = sg(&set, "Actor");
+    let mut args = [Value::Object(Some(ObjRef::Static(anim)))];
     try_native(&mut vm, "Engine.Actor.LinkSkelAnim", a, &[false], &mut args).unwrap();
+    let path = vm.set().path(anim);
     assert_eq!(
-        vm.get_property(a, "Mesh"),
-        Some(&Value::Object(Some(ObjRef::Static(mesh))))
+        vm.objects[a as usize].anim.linked_anims,
+        vec![path],
+        "the linked MeshAnimation path is remembered"
     );
-    assert!(vm.objects[a as usize].anim.mesh.ends_with("Actor"));
+    // The render `Mesh` is not clobbered with the MeshAnimation (upstream keeps them separate).
+    assert_ne!(
+        vm.get_property(a, "Mesh"),
+        Some(&Value::Object(Some(ObjRef::Static(anim))))
+    );
+    // Linking the same animation twice is idempotent.
+    let mut args = [Value::Object(Some(ObjRef::Static(anim)))];
+    try_native(&mut vm, "Engine.Actor.LinkSkelAnim", a, &[false], &mut args).unwrap();
+    assert_eq!(vm.objects[a as usize].anim.linked_anims.len(), 1);
+}
+
+/// Provider that records which sources it was asked about and answers from a script.
+struct RecordingAnim {
+    queried: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    answer: fn(&str) -> Result<Option<crate::animation::SeqInfo>, String>,
+}
+
+impl crate::animation::AnimationData for RecordingAnim {
+    fn sequence(
+        &mut self,
+        source: &str,
+        _seq: &str,
+    ) -> Result<Option<crate::animation::SeqInfo>, String> {
+        self.queried.borrow_mut().push(source.to_owned());
+        (self.answer)(source)
+    }
+}
+
+#[test]
+fn animation_sources_are_queried_linked_first_then_mesh() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let queried = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    vm.set_animation_data(Box::new(RecordingAnim {
+        queried: queried.clone(),
+        answer: |_| Ok(None),
+    }));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    let linked = sg(&set, "Actor");
+    let mut args = [Value::Object(Some(ObjRef::Static(linked)))];
+    try_native(&mut vm, "Engine.Actor.LinkSkelAnim", a, &[false], &mut args).unwrap();
+    // A distinct `Mesh` source (export 0 of the fixture package is `Object`).
+    let mesh = GlobalRef {
+        package: 0,
+        export: 0,
+    };
+    vm.set_property(a, "Mesh", 0, Value::Object(Some(ObjRef::Static(mesh))));
+    // `HasAnim` queries every source; all return None, so it answers false without erroring.
+    let mut args = [Value::Name("Walk".into())];
+    let r = try_native(&mut vm, "Engine.Actor.HasAnim", a, &[false], &mut args).unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Bool(false)));
+    let sources = vm.animation_sources(a);
+    assert_eq!(sources.len(), 2, "{sources:?}");
+    assert_eq!(
+        *queried.borrow(),
+        sources,
+        "query order is the source order"
+    );
+    assert!(
+        sources[0].contains("Actor") && sources[1].contains("Object"),
+        "{sources:?}"
+    );
+}
+
+#[test]
+fn animation_decode_error_is_explicit() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(RecordingAnim {
+        queried: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        answer: |_| Err("corrupt payload at 0x10".into()),
+    }));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    let mut args = [
+        Value::Name("Walk".into()),
+        Value::Float(1.0),
+        Value::Float(0.0),
+        Value::Int(0),
+    ];
+    let e = try_native(
+        &mut vm,
+        "Engine.Actor.PlayAnim",
+        a,
+        &[false, false, false, false],
+        &mut args,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&e.kind, VmErrorKind::AnimationDataError { message, .. } if message.contains("corrupt")),
+        "{e}"
+    );
+}
+
+#[test]
+fn anim_blend_params_stores_channel_values_and_defaults() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    let mut args = [
+        Value::Int(2),
+        Value::Float(0.25),
+        Value::Float(0.5),
+        Value::Float(0.75),
+        Value::Name("Pelvis".into()),
+    ];
+    try_native(
+        &mut vm,
+        "Engine.Actor.AnimBlendParams",
+        a,
+        &[false, false, false, false, false],
+        &mut args,
+    )
+    .unwrap();
+    let p = vm.objects[a as usize].anim.blend_params.get(&2).unwrap();
+    assert_eq!(p.blend_alpha, 0.25);
+    assert_eq!(p.in_time, 0.5);
+    assert_eq!(p.out_time, 0.75);
+    assert_eq!(p.bone_name.as_deref(), Some("Pelvis"));
+    // Omitted optional arguments: upstream defaults are BlendAlpha=1, InTime=OutTime=0, no bone.
+    let mut args = [Value::Int(5)];
+    try_native(
+        &mut vm,
+        "Engine.Actor.AnimBlendParams",
+        a,
+        &[false, true, true, true, true],
+        &mut args,
+    )
+    .unwrap();
+    let p = vm.objects[a as usize].anim.blend_params.get(&5).unwrap();
+    assert_eq!(p.blend_alpha, 1.0);
+    assert_eq!(p.in_time, 0.0);
+    assert_eq!(p.out_time, 0.0);
+    assert_eq!(p.bone_name, None);
+    // `BoneName = None` is also no filter.
+    let mut args = [
+        Value::Int(6),
+        Value::Float(0.5),
+        Value::Float(0.0),
+        Value::Float(0.0),
+        Value::Name("None".into()),
+    ];
+    try_native(
+        &mut vm,
+        "Engine.Actor.AnimBlendParams",
+        a,
+        &[false, false, false, false, false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(
+        vm.objects[a as usize]
+            .anim
+            .blend_params
+            .get(&6)
+            .unwrap()
+            .bone_name,
+        None
+    );
 }
 
 #[test]

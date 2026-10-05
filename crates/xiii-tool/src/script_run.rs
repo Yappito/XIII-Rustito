@@ -7,20 +7,26 @@
 //! `PreBeginPlay`/`BeginPlay` are not run because they need a GameInfo and mutators, which
 //! the harness does not simulate; `PostBeginPlay` and `SetInitialState` are.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::rc::Rc;
 
 use xiii_package::Limits;
-use xiii_script::animation::FixedAnimation;
+use xiii_script::animation::{AnimationData, FixedAnimation, SeqInfo};
 use xiii_script::linker::GlobalRef;
-use xiii_script::physics::FlatPhysics;
+use xiii_script::physics::{FlatPhysics, WorldPhysics};
 use xiii_script::registry::NativeStatus;
 use xiii_script::{
     ObjRef, ScriptLimits, ScriptPackage, ScriptSet, TraceEvent, TraceKind, Value, Vm, VmError,
     VmLimits,
 };
+use xiii_world::PackageCache;
+use xiii_world::animation::MapAnimationProvider;
+use xiii_world::import_map;
+use xiii_world::physics::WorldPhysicsAdapter;
 
 use crate::corpus::tagged_files;
 use crate::script_cmd::{dll_exec_symbols, load_install};
@@ -53,8 +59,13 @@ pub struct RunConfig {
     pub survey: bool,
     /// Diagnostic physics provider: `flat:<z>` installs an infinite floor at Unreal Z.
     pub physics_flat_z: Option<f32>,
+    /// Real map physics: build the map collision with `xiii-world` and install
+    /// `WorldPhysicsAdapter` (mutually exclusive with `physics_flat_z`).
+    pub physics_map: bool,
     /// Diagnostic animation provider: `fixed:<frames>,<rate>` gives every sequence that length.
     pub anim_fixed: Option<(u32, f32)>,
+    /// Real animation: install the decoded `MeshAnimation` provider from `xiii-world`.
+    pub anim_map: bool,
 }
 
 impl Default for RunConfig {
@@ -74,7 +85,9 @@ impl Default for RunConfig {
             default_game: None,
             survey: false,
             physics_flat_z: None,
+            physics_map: false,
             anim_fixed: None,
+            anim_map: false,
         }
     }
 }
@@ -115,17 +128,42 @@ pub struct RunReport {
     pub missing_natives: Vec<xiii_script::vm::MissingNative>,
 }
 
-/// Runs the touch chain on a loaded set (`map` is the map package index).
+/// Runs the touch chain on a loaded set (`map` is the map package index), without map
+/// providers (diagnostic `flat:`/`fixed:` modes still apply through `cfg`).
 pub fn run_touch_chain(set: &ScriptSet, map: usize, cfg: &RunConfig) -> Result<RunReport, String> {
+    run_touch_chain_with_providers(set, map, cfg, None, None)
+}
+
+/// Runs the touch chain with optional pre-built world providers (`--physics map` /
+/// `--anim map`). `map_physics` replaces the diagnostic flat floor; `map_animation` is
+/// installed instead of / in addition to a diagnostic provider (the map provider wins).
+pub fn run_touch_chain_with_providers(
+    set: &ScriptSet,
+    map: usize,
+    cfg: &RunConfig,
+    map_physics: Option<Box<dyn WorldPhysics>>,
+    map_animation: Option<Box<dyn AnimationData>>,
+) -> Result<RunReport, String> {
     let mut vm = Vm::new(set, cfg.limits);
     vm.survey = cfg.survey;
-    if let Some(z) = cfg.physics_flat_z {
+    if let Some(provider) = map_physics {
+        vm.set_physics(provider);
+        vm.note(TraceKind::Note(
+            "map physics (decoded map collision), not the diagnostic flat floor".into(),
+        ));
+    } else if let Some(z) = cfg.physics_flat_z {
         vm.set_physics(Box::new(FlatPhysics::new(z)));
         vm.note(TraceKind::Note(format!(
             "diagnostic physics (flat floor at Unreal Z={z}), not the map"
         )));
     }
-    if let Some((frames, rate)) = cfg.anim_fixed {
+    if let Some(provider) = map_animation {
+        vm.set_animation_data(provider);
+        vm.note(TraceKind::Note(
+            "map animation (decoded MeshAnimation sequences), not the diagnostic fixed provider"
+                .into(),
+        ));
+    } else if let Some((frames, rate)) = cfg.anim_fixed {
         vm.set_animation_data(Box::new(FixedAnimation::new(frames, rate)));
         vm.note(TraceKind::Note(format!(
             "diagnostic animation (every sequence has {frames} frames at {rate} fps), not the mesh"
@@ -357,20 +395,120 @@ pub fn load_with_map(root: &Path, map: &str) -> Result<(ScriptSet, usize), Strin
     Ok((set, idx))
 }
 
-/// Parses a `--physics` value. Only `flat:<unreal_z>` is supported (diagnostic provider).
-pub fn parse_physics(spec: &str) -> Option<f32> {
-    let z = spec.strip_prefix("flat:")?;
-    z.trim().parse::<f32>().ok()
+/// `--physics` value: the real map collision or the diagnostic flat floor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PhysicsSpec {
+    /// Build the map's decoded collision (`xiii-world`).
+    Map,
+    /// Diagnostic infinite floor at Unreal Z.
+    Flat(f32),
 }
 
-/// Parses an `--anim` value. Only `fixed:<frames>,<rate>` is supported (diagnostic provider).
-pub fn parse_anim(spec: &str) -> Option<(u32, f32)> {
+/// `--anim` value: the decoded `MeshAnimation` data or the diagnostic fixed provider.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AnimSpec {
+    /// Install the decoded map animation provider (`xiii-world`).
+    Map,
+    /// Diagnostic: every sequence has this many frames at this rate.
+    Fixed(u32, f32),
+}
+
+/// Parses a `--physics` value: `map` or `flat:<unreal_z>`.
+pub fn parse_physics(spec: &str) -> Option<PhysicsSpec> {
+    if spec.eq_ignore_ascii_case("map") {
+        return Some(PhysicsSpec::Map);
+    }
+    let z = spec.strip_prefix("flat:")?;
+    z.trim().parse::<f32>().ok().map(PhysicsSpec::Flat)
+}
+
+/// Parses an `--anim` value: `map` or `fixed:<frames>,<rate>`.
+pub fn parse_anim(spec: &str) -> Option<AnimSpec> {
+    if spec.eq_ignore_ascii_case("map") {
+        return Some(AnimSpec::Map);
+    }
     let rest = spec.strip_prefix("fixed:")?;
     let (frames, rate) = rest.split_once(',')?;
-    Some((
+    Some(AnimSpec::Fixed(
         frames.trim().parse::<u32>().ok()?,
         rate.trim().parse::<f32>().ok()?,
     ))
+}
+
+/// One animation lookup recorded for the report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnimQuery {
+    /// Animation source path queried (`Package.Object`).
+    pub source: String,
+    /// Sequence name requested.
+    pub sequence: String,
+    /// `found`, `not found` or `error: ...`.
+    pub outcome: String,
+}
+
+/// Wraps an `AnimationData` provider and records every lookup, so the harness can report which
+/// sequences were requested and whether they were found (requirement of this task).
+pub struct LoggingAnim {
+    inner: Box<dyn AnimationData>,
+    log: Rc<RefCell<Vec<AnimQuery>>>,
+}
+
+impl AnimationData for LoggingAnim {
+    fn sequence(&mut self, source: &str, seq: &str) -> Result<Option<SeqInfo>, String> {
+        let result = self.inner.sequence(source, seq);
+        let outcome = match &result {
+            Ok(Some(info)) => format!(
+                "found ({} frames, {} fps, {} notifies)",
+                info.frames,
+                info.rate,
+                info.notifies.len()
+            ),
+            Ok(None) => "not found".to_owned(),
+            Err(e) => format!("error: {e}"),
+        };
+        self.log.borrow_mut().push(AnimQuery {
+            source: source.to_owned(),
+            sequence: seq.to_owned(),
+            outcome,
+        });
+        result
+    }
+}
+
+/// Optional real-map providers constructed for `--physics map` / `--anim map`.
+type MapProviders = (
+    Option<Box<dyn WorldPhysics>>,
+    Option<Box<dyn AnimationData>>,
+);
+
+/// Builds the optional real-map providers for `--physics map` / `--anim map`. One
+/// [`PackageCache`] is opened and reused (the map import and the animation provider share it).
+fn build_map_providers(
+    root: &Path,
+    map: &str,
+    cfg: &RunConfig,
+    anim_log: &Rc<RefCell<Vec<AnimQuery>>>,
+) -> Result<MapProviders, String> {
+    if !cfg.physics_map && !cfg.anim_map {
+        return Ok((None, None));
+    }
+    let mut cache = PackageCache::open(root)?;
+    let physics = if cfg.physics_map {
+        let scene = import_map(&mut cache, map)?;
+        Some(Box::new(WorldPhysicsAdapter::from_scene(&scene)) as Box<dyn WorldPhysics>)
+    } else {
+        None
+    };
+    let animation = if cfg.anim_map {
+        let provider = MapAnimationProvider::from_cache(cache);
+        Some(Box::new(LoggingAnim {
+            inner: Box::new(provider),
+            log: anim_log.clone(),
+        }) as Box<dyn AnimationData>)
+    } else {
+        None
+    };
+    Ok((physics, animation))
 }
 
 /// `xiii-tool script run ...`.
@@ -409,10 +547,17 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
             "--physics" => {
                 let v = val().unwrap_or_default();
                 match parse_physics(&v) {
-                    Some(z) => cfg.physics_flat_z = Some(z),
+                    Some(PhysicsSpec::Flat(z)) => {
+                        cfg.physics_flat_z = Some(z);
+                        cfg.physics_map = false;
+                    }
+                    Some(PhysicsSpec::Map) => {
+                        cfg.physics_map = true;
+                        cfg.physics_flat_z = None;
+                    }
                     None => {
                         eprintln!(
-                            "error: invalid --physics '{v}'; expected flat:<unreal_z>\n\n{}",
+                            "error: invalid --physics '{v}'; expected map or flat:<unreal_z>\n\n{}",
                             crate::script_cmd::USAGE
                         );
                         return ExitCode::from(2);
@@ -422,10 +567,17 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
             "--anim" => {
                 let v = val().unwrap_or_default();
                 match parse_anim(&v) {
-                    Some(fr) => cfg.anim_fixed = Some(fr),
+                    Some(AnimSpec::Fixed(frames, rate)) => {
+                        cfg.anim_fixed = Some((frames, rate));
+                        cfg.anim_map = false;
+                    }
+                    Some(AnimSpec::Map) => {
+                        cfg.anim_map = true;
+                        cfg.anim_fixed = None;
+                    }
                     None => {
                         eprintln!(
-                            "error: invalid --anim '{v}'; expected fixed:<frames>,<rate>\n\n{}",
+                            "error: invalid --anim '{v}'; expected map or fixed:<frames>,<rate>\n\n{}",
                             crate::script_cmd::USAGE
                         );
                         return ExitCode::from(2);
@@ -464,13 +616,22 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let report = match run_touch_chain(&set, map_idx, &cfg) {
-        Ok(r) => r,
+    let anim_log = Rc::new(RefCell::new(Vec::new()));
+    let (map_physics, map_animation) = match build_map_providers(&root, &map, &cfg, &anim_log) {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::from(1);
         }
     };
+    let report =
+        match run_touch_chain_with_providers(&set, map_idx, &cfg, map_physics, map_animation) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(1);
+            }
+        };
     let dll = dll_exec_symbols(&root.join("system")).unwrap_or_default();
     let mut out = String::new();
     let _ = writeln!(
@@ -503,6 +664,38 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
             out,
             "  {idx:>5} {:<32} x{:<3} {} | {sym} | {}",
             n.path, n.calls, n.status, n.evidence
+        );
+    }
+    if cfg.anim_map {
+        let log = anim_log.borrow();
+        let mut groups: BTreeMap<(String, String, String), u64> = BTreeMap::new();
+        for q in log.iter() {
+            *groups
+                .entry((q.source.clone(), q.sequence.clone(), q.outcome.clone()))
+                .or_default() += 1;
+        }
+        let _ = writeln!(
+            out,
+            "animation lookups (DIAGNOSTIC, --anim map): {} queries, {} distinct source/sequence/outcome",
+            log.len(),
+            groups.len()
+        );
+        for ((source, sequence, outcome), calls) in &groups {
+            let _ = writeln!(out, "  x{calls:<4} {source} :: {sequence} -> {outcome}");
+        }
+        let anim_end = report
+            .trace
+            .iter()
+            .filter(|e| matches!(e.kind, TraceKind::AnimEnd { .. }))
+            .count();
+        let notify = report
+            .trace
+            .iter()
+            .filter(|e| matches!(e.kind, TraceKind::AnimNotify { .. }))
+            .count();
+        let _ = writeln!(
+            out,
+            "animation events: {anim_end} AnimEnd, {notify} AnimNotify"
         );
     }
     if cfg.survey {
@@ -542,4 +735,66 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
         .write_all(out.as_bytes())
         .and_then(|()| stdout.flush());
     code
+}
+
+/// Opt-in corpus tests (`XIII_GOG_DIR`); print `SKIPPED` without it.
+#[cfg(test)]
+mod local_tests {
+    use super::*;
+
+    fn gog_root() -> Option<PathBuf> {
+        let root = std::env::var_os("XIII_GOG_DIR")?;
+        let path = PathBuf::from(root);
+        let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        Some(if path.is_relative() {
+            ws.join(path)
+        } else {
+            path
+        })
+    }
+
+    /// The Plage00 dispatcher chain with real map physics and decoded animation ends in `Fin`,
+    /// and the map providers do not need the diagnostic `flat:`/`fixed:` modes.
+    #[test]
+    fn gog_plage00_map_providers_chain_ends_in_fin() {
+        let Some(path) = gog_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let (set, map_idx) = load_with_map(&path, "Plage00").expect("load Plage00");
+        let cfg = RunConfig {
+            begin_play: true,
+            physics_map: true,
+            anim_map: true,
+            default_game: default_game_from_ini(&path),
+            active: ["TouchTrigger", "XIIIDispatcher", "BaseSoldier"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            ..RunConfig::default()
+        };
+        let anim_log = Rc::new(RefCell::new(Vec::new()));
+        let (physics, animation) =
+            build_map_providers(&path, "Plage00", &cfg, &anim_log).expect("build providers");
+        assert!(physics.is_some() && animation.is_some());
+        let report =
+            run_touch_chain_with_providers(&set, map_idx, &cfg, physics, animation).expect("run");
+        if let Some(e) = &report.error {
+            panic!("{e}");
+        }
+        assert_eq!(report.actors_loaded, 371);
+        assert_eq!(
+            report.final_states["XIIIDispatcher0"].as_deref(),
+            Some("Fin")
+        );
+        // Movement natives are registered and ran against the map (only zero-delta moves in this
+        // opening chain); no `NoPhysicsProvider`/`NoAnimationProvider` error stopped the run.
+        assert!(report.natives.iter().all(|n| n.status != "missing"));
+        println!(
+            "Plage00 with map providers: {} actors, {} natives, dispatcher Fin, {} animation queries",
+            report.actors_loaded,
+            report.natives.len(),
+            anim_log.borrow().len()
+        );
+    }
 }

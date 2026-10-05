@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 use xiii_package::{Limits, ObjectRef, PropertyBlock, PropertyValue, StructValue};
 
-use crate::animation::AnimationData;
+use crate::animation::{AnimationData, SeqInfo};
 use crate::bytecode::{Call, Context, Script, Token, TokenKind, opcode_name};
 use crate::linker::{GlobalRef, ScriptSet};
 use crate::physics::WorldPhysics;
@@ -160,6 +160,16 @@ pub enum VmErrorKind {
         sequence: String,
         /// Mesh path the sequence was looked up on.
         mesh: String,
+    },
+    /// The animation provider failed to decode/resolve a source (never treated as an unknown
+    /// sequence).
+    AnimationDataError {
+        /// Source path the lookup was on.
+        source: String,
+        /// Sequence name.
+        sequence: String,
+        /// Provider message.
+        message: String,
     },
     /// `new` was asked to construct an `Actor` (or subclass); upstream forbids that
     /// (actors are created with `Actor.Spawn`).
@@ -313,13 +323,33 @@ pub(crate) struct AnimChannel {
     pub(crate) notify_idx: usize,
 }
 
-/// Per-actor animation state: the linked mesh path and one channel per `Channel` argument.
+/// Per-actor animation state: the animation sources and one channel per `Channel` argument.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AnimState {
-    /// Path of the object linked with `Actor.LinkSkelAnim` (empty when none).
-    pub(crate) mesh: String,
+    /// `MeshAnimation` object paths linked with `Actor.LinkSkelAnim`, in call order.
+    pub(crate) linked_anims: Vec<String>,
     /// Channels by index (ordered for deterministic notifies/traces).
     pub(crate) channels: std::collections::BTreeMap<u8, AnimChannel>,
+    /// `Actor.AnimBlendParams` parameters by blend stage/channel (nil `Entry` = no call).
+    pub(crate) blend_params: std::collections::BTreeMap<i32, AnimBlendParams>,
+}
+
+/// `Actor.AnimBlendParams` blending parameters for one animation stage/channel.
+///
+/// The decoded XIII signature has no `bGlobalPose` argument (unlike UT2003/2004); the values
+/// are stored per channel exactly as passed. `bone_name` is the optional bone filter: upstream
+/// applies the blend only to that bone's subtree, which the VM does not model (the native is
+/// registered `Partial` for that reason).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AnimBlendParams {
+    /// Blend amount (`0` = lower channel, `1` = this channel).
+    pub(crate) blend_alpha: f32,
+    /// Seconds to interpolate the blend in.
+    pub(crate) in_time: f32,
+    /// Seconds to interpolate the blend out.
+    pub(crate) out_time: f32,
+    /// Bone filter (`None` = `BoneName` was omitted or `None`).
+    pub(crate) bone_name: Option<String>,
 }
 
 /// One trace record.
@@ -4082,16 +4112,113 @@ impl<'s> Vm<'s> {
 
     // ------------------------------------------------------------------ animation
 
-    /// `Actor.LinkSkelAnim`: link a `MeshAnimation` object as the actor's skeletal mesh and
-    /// remember its path for sequence lookups.
+    /// Display path of an object reference (empty when it cannot be named).
+    fn ref_path(&self, r: &ObjRef) -> String {
+        match r {
+            ObjRef::Static(g) => self.set.path(*g),
+            ObjRef::Instance(i) => self
+                .objects
+                .get(*i as usize)
+                .map(|o| o.name.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Candidate animation sources of `id`: the `LinkSkelAnim` links in call order, then the
+    /// actor's `Mesh` (a `SkeletalMesh` path, which carries the default `MeshAnimation`).
+    ///
+    /// UE2 keeps the render `Mesh` and the linked skeletal animations separately; the provider
+    /// resolves a `SkeletalMesh` source through its default animation and a `MeshAnimation`
+    /// source directly, so the VM does not need to decode either.
+    pub(crate) fn animation_sources(&self, id: ObjectId) -> Vec<String> {
+        let linked = self
+            .objects
+            .get(id as usize)
+            .map(|o| o.anim.linked_anims.clone())
+            .unwrap_or_default();
+        let mut sources = linked;
+        if let Some(Value::Object(Some(r))) = self.get_property(id, "Mesh") {
+            let mesh = self.ref_path(r);
+            if !mesh.is_empty() && !sources.contains(&mesh) {
+                sources.push(mesh);
+            }
+        }
+        sources
+    }
+
+    /// Queries the animation provider for `sequence` over the actor's candidate sources,
+    /// returning the first hit. `Ok(None)` = not found anywhere (unknown sequence); a provider
+    /// decode failure is returned as [`VmErrorKind::AnimationDataError`].
+    fn sequence_info(&mut self, id: ObjectId, sequence: &str) -> VmResult<Option<SeqInfo>> {
+        if self.animation.is_none() {
+            return Ok(None);
+        }
+        let mut sources = self.animation_sources(id);
+        // A diagnostic provider that ignores sources (FixedAnimation) must still be reached when
+        // the actor has no `Mesh`/link; the empty source is unknown to a real provider.
+        if sources.is_empty() {
+            sources.push(String::new());
+        }
+        let mut decode_error: Option<(String, String)> = None;
+        {
+            let provider = self.animation.as_mut().expect("checked above");
+            for source in &sources {
+                match provider.sequence(source, sequence) {
+                    Ok(Some(info)) => return Ok(Some(info)),
+                    Ok(None) => {}
+                    Err(message) => {
+                        decode_error = Some((source.clone(), message));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some((source, message)) = decode_error {
+            return Err(self.err(VmErrorKind::AnimationDataError {
+                source,
+                sequence: sequence.to_owned(),
+                message,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// `Actor.LinkSkelAnim`: link a `MeshAnimation` object as an additional animation source of
+    /// the actor. Upstream keeps the render `Mesh` separate, so the `Mesh` property is left
+    /// untouched (the VM does not overwrite a `SkeletalMesh` with a `MeshAnimation`).
     pub(crate) fn link_skel_anim(&mut self, id: ObjectId, anim: Option<ObjRef>) {
-        let mesh = match anim {
-            Some(ObjRef::Static(g)) => self.set.path(g),
-            Some(ObjRef::Instance(i)) => self.objects[i as usize].name.clone(),
+        let path = match anim {
+            Some(r) => self.ref_path(&r),
             None => String::new(),
         };
-        self.objects[id as usize].anim.mesh = mesh;
-        self.set_property(id, "Mesh", 0, Value::Object(anim));
+        if path.is_empty() {
+            return;
+        }
+        let linked = &mut self.objects[id as usize].anim.linked_anims;
+        if !linked.contains(&path) {
+            linked.push(path);
+        }
+    }
+
+    /// `Actor.AnimBlendParams`: store the blending parameters of `stage`/`channel`.
+    pub(crate) fn anim_blend_params(
+        &mut self,
+        id: ObjectId,
+        stage: i32,
+        blend_alpha: f32,
+        in_time: f32,
+        out_time: f32,
+        bone_name: Option<String>,
+    ) {
+        self.objects[id as usize].anim.blend_params.insert(
+            stage,
+            AnimBlendParams {
+                blend_alpha,
+                in_time,
+                out_time,
+                bone_name,
+            },
+        );
     }
 
     /// `Actor.PlayAnim`/`LoopAnim`/`TweenAnim`: start `sequence` on `channel`. `rate <= 0`
@@ -4113,12 +4240,13 @@ impl<'s> Vm<'s> {
             self.set_property(id, "AnimFrame", 0, Value::Float(0.0));
             return Ok(());
         }
-        let mesh = self.objects[id as usize].anim.mesh.clone();
-        let Some(info) = self
-            .animation
-            .as_mut()
-            .and_then(|p| p.sequence(&mesh, sequence))
-        else {
+        if self.animation.is_none() {
+            return Err(self.err(VmErrorKind::NoAnimationProvider {
+                native: "Actor.PlayAnim".into(),
+            }));
+        }
+        let Some(info) = self.sequence_info(id, sequence)? else {
+            let mesh = self.animation_sources(id).join(", ");
             return Err(self.err(VmErrorKind::UnknownAnimation {
                 sequence: sequence.to_owned(),
                 mesh,
@@ -4147,20 +4275,19 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    /// `Actor.HasAnim`: whether the linked mesh has `sequence`.
+    /// `Actor.HasAnim`: whether any of the actor's animation sources has `sequence`.
     pub(crate) fn has_anim(
         &mut self,
         native: &str,
         id: ObjectId,
         sequence: &str,
     ) -> VmResult<bool> {
-        let mesh = self.objects[id as usize].anim.mesh.clone();
-        let Some(p) = self.animation.as_mut() else {
+        if self.animation.is_none() {
             return Err(self.err(VmErrorKind::NoAnimationProvider {
                 native: native.to_owned(),
             }));
-        };
-        Ok(p.sequence(&mesh, sequence).is_some())
+        }
+        Ok(self.sequence_info(id, sequence)?.is_some())
     }
 
     /// True when `channel` currently has an active animation.

@@ -945,6 +945,21 @@ fn link_skel_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<N
     val(Value::Void)
 }
 
+fn anim_blend_params(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let stage = int(vm, a, 0)?;
+    let blend_alpha = if c.omitted(1) { 1.0 } else { float(vm, a, 1)? };
+    let in_time = if c.omitted(2) { 0.0 } else { float(vm, a, 2)? };
+    let out_time = if c.omitted(3) { 0.0 } else { float(vm, a, 3)? };
+    let bone_name = if c.omitted(4) {
+        None
+    } else {
+        let n = name(vm, a, 4)?;
+        (!n.eq_ignore_ascii_case("None")).then_some(n)
+    };
+    vm.anim_blend_params(c.this, stage, blend_alpha, in_time, out_time, bone_name);
+    val(Value::Void)
+}
+
 fn play_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     if !vm.animation_ready("Actor.PlayAnim", Some(259), c.this, Value::Void)? {
         return val(Value::Void);
@@ -1762,9 +1777,20 @@ fn builtin_defs() -> Vec<NativeDef> {
     v.push(def(
         "Engine.Actor.LinkSkelAnim",
         "native(413) final function LinkSkelAnim(object<MeshAnimation> Anim)",
-        "engine.u Actor.LinkSkelAnim decoded; sets the actor MeshAnimation reference (the VM remembers its path for sequence lookups)",
+        "engine.u Actor.LinkSkelAnim decoded; adds the MeshAnimation to the actor's animation sources (the VM keeps the render Mesh separate and remembers the path for sequence lookups)",
         link_skel_anim,
     ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "stores the per-channel blend parameters (BlendAlpha/InTime/OutTime and the optional BoneName); no skeletal blending is evaluated and the BoneName bone filter is not applied",
+        ),
+        ..def(
+            "Engine.Actor.AnimBlendParams",
+            "native(412) final function AnimBlendParams(int Stage, float BlendAlpha, float InTime, float OutTime, name BoneName)",
+            "engine.u Actor.AnimBlendParams decoded (Stage, BlendAlpha, InTime, OutTime, BoneName; no bGlobalPose unlike UT2003/2004); UE2 stores the values on the skeletal-mesh animation channel (MeshAnimChannel), BoneName selects a bone subtree",
+            anim_blend_params,
+        )
+    });
     v.push(NativeDef {
         status: NativeStatus::Partial(
             "sequence length/notify times come from the AnimationData provider; no skeletal evaluation; playback is frames/second and tween holds frame 0",

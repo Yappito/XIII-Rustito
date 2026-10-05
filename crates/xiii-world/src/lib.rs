@@ -21,6 +21,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+pub mod animation;
+pub mod navigation;
 pub mod physics;
 
 use xiii_decode::common::{
@@ -560,6 +562,42 @@ impl ClassDefaults {
             .map_err(|err| format!("class layout of {class_path}: {err}"))?;
         self.layouts.insert(key, l.clone());
         Ok(l)
+    }
+
+    /// True when `class_path`'s inheritance chain contains `NavigationPoint` (so the actor is
+    /// a navigation point: `PathNode`, `PlayerStart`, `Ladder`, game `*Point` subclasses, ...).
+    pub fn is_navigation_point(&mut self, class_path: &str) -> Result<bool, String> {
+        let l = self.layout(class_path)?;
+        Ok(l.chain_names.iter().any(|n| n == "navigationpoint"))
+    }
+
+    /// Resolved inherited float default of a property, or `None` when the property is absent
+    /// from the class chain (or is not a float). Map properties are handled by the caller.
+    pub fn float_default(&mut self, class_path: &str, name: &str) -> Result<Option<f32>, String> {
+        let l = self.layout(class_path)?;
+        let Some(s) = l.slot_by_name(name) else {
+            return Ok(None);
+        };
+        Ok(match l.defaults.get(s.base) {
+            Some(xiii_script::Value::Float(v)) => Some(*v),
+            _ => None,
+        })
+    }
+
+    /// Resolved inherited vector default of a property, or `None` when absent/not a vector.
+    pub fn vector_default(
+        &mut self,
+        class_path: &str,
+        name: &str,
+    ) -> Result<Option<[f32; 3]>, String> {
+        let l = self.layout(class_path)?;
+        let Some(s) = l.slot_by_name(name) else {
+            return Ok(None);
+        };
+        Ok(match l.defaults.get(s.base) {
+            Some(xiii_script::Value::Vector(v)) => Some(*v),
+            _ => None,
+        })
     }
 
     /// Resolves placement values of one actor: map property, else class default, else

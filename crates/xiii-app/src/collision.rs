@@ -24,17 +24,17 @@ const PLAYER_PAWN_FALLBACK: &str = "XIII.XIIIPlayerPawn";
 
 /// UE2 `MINFLOORZ`: a surface is walkable (a floor) when its unit normal's up component is
 /// at least this. Hypothesis for XIII, same as upstream UE2.
-const MINFLOORZ: f32 = 0.7;
+pub(crate) const MINFLOORZ: f32 = 0.7;
 
 /// Upstream UE2 `MAXSTEPHEIGHT` in Unreal units. Used because the decoded XIII class
 /// defaults contain no step-height property (see [`report_step_height_evidence`]); it is the
 /// documented upstream hypothesis for XIII, not a measured XIII value.
-const MAXSTEPHEIGHT_UU: f32 = 35.0;
+pub(crate) const MAXSTEPHEIGHT_UU: f32 = 35.0;
 
 // Harness distances in Unreal units, so the test does not change with the metre scale
 // (values equal the original metre literals at the former 50 UU/m).
-const SKIN_UU: f32 = 0.05;
-const STEP_UU: f32 = 2.5;
+pub(crate) const SKIN_UU: f32 = 0.05;
+pub(crate) const STEP_UU: f32 = 2.5;
 const DOOR_FRONT_UU: f32 = 100.0;
 const FLOOR_PROBE_UU: f32 = 100.0;
 const START_LIFT_UU: f32 = 2.5;
@@ -711,7 +711,9 @@ fn load_script_set(install: &Installation) -> Result<ScriptSet, String> {
 
 /// Finds the GameInfo class from `Default.ini` `DefaultGame=` and the pawn class from its
 /// `DefaultPlayerClassName` default. Fails loudly when any step is missing.
-fn resolve_player_class(install: &Installation) -> Result<(ScriptSet, String, String), String> {
+pub(crate) fn resolve_player_class(
+    install: &Installation,
+) -> Result<(ScriptSet, String, String), String> {
     let gameinfo_path = {
         let mut found = None;
         for ev in install.ini_evidence() {
@@ -854,7 +856,10 @@ fn layout_object(layout: &Layout, name: &str) -> Option<xiii_script::ObjRef> {
 }
 
 /// Resolved inherited collision defaults of the player pawn class.
-fn player_extents(set: &ScriptSet, pawn_path: &str) -> Result<(f32, f32, f32, f32, f32), String> {
+pub(crate) fn player_extents(
+    set: &ScriptSet,
+    pawn_path: &str,
+) -> Result<(f32, f32, f32, f32, f32), String> {
     let layout = class_layout_of(set, pawn_path, None)?;
     println!(
         "[collision-test] inheritance chain: {}",
@@ -1069,19 +1074,23 @@ fn measure_opening(
 // -------------------------------------------------------------------------------------------
 
 /// Result of a spawn placement.
-struct Spawn {
+pub(crate) struct Spawn {
     /// Final box center (Bevy metres).
-    position: Vec3,
+    pub position: Vec3,
     /// Floor height under the box.
-    floor: f32,
+    pub floor: f32,
     /// Vertical raise applied to clear an initial overlap (metres).
-    raise: f32,
+    pub raise: f32,
 }
 
 /// Places the player extent box at the PlayerStart, approximating UE2 spawn `FindSpot`:
 /// start with the box bottom at the PlayerStart; if it overlaps anything, raise it in small
 /// increments until free (cap `2*H`); then sweep straight down onto the floor.
-fn place_spawn(world: &CollisionWorld, player_start: Vec3, half: Vec3) -> Result<Spawn, String> {
+pub(crate) fn place_spawn(
+    world: &CollisionWorld,
+    player_start: Vec3,
+    half: Vec3,
+) -> Result<Spawn, String> {
     // Start with the box bottom at the PlayerStart (UE2 spawns the pawn with its feet there).
     let base_center = [player_start[0], player_start[1] + half[1], player_start[2]];
     let cap = 2.0 * half[1];
@@ -1385,7 +1394,7 @@ fn print_contacts(
 }
 
 /// Floor height (Bevy Y) directly below `p`, found by a downward ray from `p[1]`, or `None`.
-fn floor_y_at(world: &CollisionWorld, p: Vec3, from_y: f32) -> Option<f32> {
+pub(crate) fn floor_y_at(world: &CollisionWorld, p: Vec3, from_y: f32) -> Option<f32> {
     let start = [p[0], from_y, p[2]];
     let end = [p[0], from_y - 10.0, p[2]];
     world
