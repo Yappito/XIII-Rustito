@@ -9,6 +9,7 @@
 //! `--play-script <file>`. Both drive the same [`sim::PlayerSim`] in `FixedUpdate` at 60 Hz.
 //! Fixed 60 Hz is a **hypothesis** (UE2 used variable ticks); see [`FIXED_HZ`].
 
+pub mod cinematics;
 pub mod hud;
 pub mod movers;
 pub mod pawns;
@@ -109,7 +110,15 @@ impl Plugin for PlayPlugin {
         // is stored and reported by `setup`, which exits with an error.
         let game_dir = self.options.game_dir.clone().unwrap_or_default();
         let map = self.options.map.clone().unwrap_or_default();
-        let session = session::Session::open(&game_dir, &map);
+        let t0 = Instant::now();
+        let mut session = session::Session::open(&game_dir, &map);
+        println!(
+            "[play] script session open (scripts, begin-play, providers): {:.2}s",
+            t0.elapsed().as_secs_f32()
+        );
+        if let Ok(s) = session.as_mut() {
+            s.enable_native_timers(self.options.perf_natives);
+        }
         app.insert_non_send(session);
         app.insert_resource(PlayConfig {
             options: self.options.clone(),
@@ -118,6 +127,7 @@ impl Plugin for PlayPlugin {
         .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
         .init_resource::<ShotFlag>()
         .init_resource::<RenderSync>()
+        .init_resource::<cinematics::CinematicState>()
         .add_systems(Startup, setup)
         .add_systems(FixedUpdate, fixed_step)
         .add_systems(
@@ -126,7 +136,9 @@ impl Plugin for PlayPlugin {
                 controls,
                 grab_cursor,
                 mouse_look,
+                cinematics::collect,
                 sync_camera,
+                cinematics::draw,
                 viewer::sky_follow,
                 viewer::animate_uv,
                 pawns::update_pawns,
@@ -136,7 +148,8 @@ impl Plugin for PlayPlugin {
                 unattended,
             )
                 .chain(),
-        );
+        )
+        .add_systems(Last, cinematics::report_exit);
     }
 }
 
@@ -357,6 +370,20 @@ fn setup_inner(
         "[play] login path: script={} bootstrap={}",
         session.login_script, session.login_bootstrap
     );
+    println!(
+        "[play] localisation: language={} localized class-default overrides={}",
+        session.localization_language, session.localized_overrides
+    );
+    let pawns_now = session.player_pawn_actors();
+    println!(
+        "[play] player pawns: {} live XIIIPlayerPawn actor(s): {}",
+        pawns_now.len(),
+        pawns_now
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     for b in &session.blocked {
         println!("[play]   script path blocked: {b}");
     }
@@ -439,6 +466,18 @@ fn setup_inner(
             .to_owned();
         sync.entities.entry(actor).or_default().push(*entity);
     }
+    let scene_tris: usize = scene
+        .objects
+        .iter()
+        .map(|o| scene.meshes[o.mesh].indices.len() / 3)
+        .sum();
+    commands.insert_resource(crate::perf::RenderStats::new(
+        scene.objects.len(),
+        geometry.len(),
+        meshes.len(),
+        materials.len(),
+        scene_tris,
+    ));
 
     let eye = to_bevy_position(sim.eye_location(&params));
     let sky_position = viewer::scene_sky_position(&scene);
@@ -560,6 +599,10 @@ fn setup_inner(
         shot_done: false,
         target_at: None,
     });
+    println!(
+        "[play] setup complete in {:.2}s",
+        started.elapsed().as_secs_f32()
+    );
     Ok(())
 }
 
@@ -658,30 +701,57 @@ fn fixed_step(
     mut session: NonSendMut<Result<session::Session, String>>,
     sync: Res<RenderSync>,
     mut transforms: Query<&mut Transform>,
+    mut perf: ResMut<crate::perf::Perf>,
 ) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
     }
     let elapsed = state.tick as f32 * DT;
-    let input = match script.drive.as_mut() {
-        Some(drive) => drive.advance(elapsed, &mut sim.0),
-        None => read_keyboard(&keys),
+    // Scripted cutscenes freeze the player (`CineController2.Interpret` FPC/FPL ->
+    // `NoControl`/`NoMove`, and `CameraView`/`PlayingVideo`). The host owns the player pawn's
+    // movement, so it must zero the movement input itself; the VM's state machine only sets the
+    // state. See `cinematics`.
+    let suppressed = match &*session {
+        Ok(sess) => cinematics::input_suppressed(sess),
+        Err(_) => false,
+    };
+    let input = if suppressed {
+        Input::default()
+    } else {
+        match script.drive.as_mut() {
+            Some(drive) => drive.advance(elapsed, &mut sim.0),
+            None => read_keyboard(&keys),
+        }
     };
     let use_action = input.use_action;
+    let t0 = Instant::now();
     sim.0
         .step(dt, &world.world, &params.0, input, &world.sources);
+    perf.span("player_sim", t0);
     if let Ok(sess) = session.as_mut() {
+        let t0 = Instant::now();
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity);
+        perf.span("vm_step", t0);
         // The VM owns the mover poses; write them into the dynamic collision set so the next
         // player step collides with the moved brush.
         let wr = &mut *world;
+        let t0 = Instant::now();
         let mover_states = sess.mover_states();
+        if sess.vm().native_profile().enabled {
+            let micros = t0.elapsed().as_micros() as u64;
+            sess.vm_mut().native_profile_mut().mover_states_micros += micros;
+        }
+        let t0 = Instant::now();
         wr.movers.update(&mut wr.world, &mover_states);
+        perf.span("mover_collision", t0);
         if use_action {
             perform_use(sess, &wr.world, &wr.sources, &sim.0, &params.0);
         }
+        let t0 = Instant::now();
         crate::audio::pump(sess.events.iter());
+        perf.span("audio_pump", t0);
+        let t0 = Instant::now();
         for (name, delta) in &sess.moved {
             let Some(entities) = sync.entities.get(name) else {
                 continue;
@@ -693,8 +763,10 @@ fn fixed_step(
                 }
             }
         }
+        perf.span("render_sync", t0);
     }
     state.tick += 1;
+    perf.step();
     if state.tick.is_multiple_of(TRACE_EVERY) {
         println!("[play] {}", format_trace(state.tick, elapsed, &sim.0));
         if let Ok(sess) = session.as_ref() {
@@ -756,12 +828,20 @@ fn mouse_look(
 fn sync_camera(
     sim: Res<SimRes>,
     params: Res<ParamsRes>,
+    cine: Res<cinematics::CinematicState>,
     mut cams: Query<&mut Transform, With<PlayCam>>,
 ) {
-    let eye = to_bevy_position(sim.0.eye_location(&params.0));
     for mut t in &mut cams {
-        t.translation = Vec3::from_array(eye);
-        t.rotation = Quat::from_euler(EulerRot::YXZ, -sim.0.yaw, sim.0.pitch, 0.0);
+        if let Some(v) = &cine.view {
+            // A script selected a cutscene camera (`CamView`/`ViewTarget`); render from it.
+            let (loc, rot) = cinematics::camera_transform(v.location, v.rotation);
+            t.translation = loc;
+            t.rotation = rot;
+        } else {
+            let eye = to_bevy_position(sim.0.eye_location(&params.0));
+            t.translation = Vec3::from_array(eye);
+            t.rotation = Quat::from_euler(EulerRot::YXZ, -sim.0.yaw, sim.0.pitch, 0.0);
+        }
     }
 }
 
@@ -771,8 +851,10 @@ fn overlay(
     session: NonSend<Result<session::Session, String>>,
     pawns: Option<Res<pawns::PawnScene>>,
     hud: Option<Res<hud::HudRuntime>>,
+    mut perf: ResMut<crate::perf::Perf>,
     mut text: Query<&mut Text, With<PlayOverlay>>,
 ) {
+    let t0 = Instant::now();
     let Ok(mut text) = text.single_mut() else {
         return;
     };
@@ -867,14 +949,17 @@ fn overlay(
         s.last_source.as_deref().unwrap_or("-"),
         vm,
     );
+    perf.span("overlay", t0);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn unattended(
     mut commands: Commands,
     cfg: Res<PlayConfig>,
     mut state: ResMut<TraceState>,
     flag: Res<ShotFlag>,
     sim: Res<SimRes>,
+    mut perf: ResMut<crate::perf::Perf>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let Some(secs) = state.exit_secs else {
@@ -916,6 +1001,7 @@ fn unattended(
             (None, _) => "none".into(),
         }
     );
+    perf.request_final();
     exit.write(AppExit::Success);
 }
 
@@ -1105,6 +1191,20 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
     println!(
         "[play] login path: script={} bootstrap={}",
         session.login_script, session.login_bootstrap
+    );
+    println!(
+        "[play] localisation: language={} localized class-default overrides={}",
+        session.localization_language, session.localized_overrides
+    );
+    let pawns_now = session.player_pawn_actors();
+    println!(
+        "[play] player pawns: {} live XIIIPlayerPawn actor(s): {}",
+        pawns_now.len(),
+        pawns_now
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     println!(
         "[play] player {} | controller {} | GameInfo {}",
@@ -1377,6 +1477,123 @@ mod tests {
             s.dispatcher_state(),
             s.active_actors(),
             s.suspended.len()
+        );
+    }
+
+    /// Opt-in corpus test (Part B): the level-start message/objective path creates real HUD
+    /// widget objects. Before the fixes the message widgets aborted (`DeferredWithReturnValue`
+    /// on `Message.static.GetString` and a `void` `default.Class`); now `ClientSetHUD` spawns
+    /// `XIIIBaseHud`, `MapInfo.Timer` runs `FirstFrame`, and the HUD message path completes.
+    #[test]
+    fn opt_in_plage00_hud_widgets_appear_after_level_start() {
+        const WIDGETS: [&str; 8] = [
+            "HudMsg",
+            "HudObjMsg",
+            "HudMPMsg",
+            "HudEndMsg",
+            "HudDlg",
+            "HudWnd",
+            "HudFoc",
+            "HudStt",
+        ];
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = session::Session::open(&game_dir, "Plage00").expect("open Plage00");
+        let hud = {
+            let vm = session.vm();
+            session
+                .controller
+                .and_then(|c| match vm.get_property(c, "myHUD") {
+                    Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(p)))) => {
+                        Some(*p)
+                    }
+                    _ => None,
+                })
+                .or_else(|| hud::find_hud(vm))
+                .expect("the script login must create a live HUD actor")
+        };
+        let mut found: Vec<(String, xiii_script::ObjectId)> = Vec::new();
+        for _ in 0..180 {
+            let loc = session.player_location().unwrap_or([0.0; 3]);
+            session.step(1.0 / 60.0, loc, 0.0, [0.0; 3]);
+        }
+        {
+            let vm = session.vm();
+            for name in WIDGETS {
+                if let Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(id)))) =
+                    vm.get_property(hud, name)
+                {
+                    let live = vm.objects.get(*id as usize).is_some_and(|o| !o.deleted);
+                    println!(
+                        "[play test] HUD widget {name} -> {}{}",
+                        vm.objects[*id as usize].name,
+                        if live { "" } else { " (deleted)" }
+                    );
+                    if live {
+                        found.push((name.to_owned(), *id));
+                    }
+                }
+            }
+        }
+        println!(
+            "[play test] HUD {} widgets live after 3s: {:?}",
+            found.len(),
+            found.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            !found.is_empty(),
+            "the HUD must create at least one widget after level start"
+        );
+        // The class-default object of the goal message must no longer be suspended by the
+        // static `GetString` call.
+        assert!(
+            !session
+                .suspended
+                .iter()
+                .any(|s| s == "Default__XIIIGoalMessage"),
+            "Default__XIIIGoalMessage must not be suspended: {:?}",
+            session.suspended
+        );
+
+        // Drive one `HUD.PostRender` with the live widgets and assert the retail draw commands
+        // (player info + the live widget) are recorded, using the synthetic font provider.
+        let canvas_class =
+            xiii_world::runtime::resolve_class_path(session.vm().set(), "Engine.Canvas")
+                .expect("Engine.Canvas class");
+        let canvas = session
+            .vm_mut()
+            .spawn(canvas_class, "WidgetTestCanvas")
+            .expect("spawn Canvas");
+        let vm = session.vm_mut();
+        vm.set_property(canvas, "ClipX", 0, xiii_script::Value::Float(1280.0));
+        vm.set_property(canvas, "ClipY", 0, xiii_script::Value::Float(720.0));
+        vm.set_property(canvas, "Style", 0, xiii_script::Value::Byte(1));
+        vm.set_property(
+            canvas,
+            "Font",
+            0,
+            xiii_script::Value::Name("Dummy".to_owned()),
+        );
+        vm.set_canvas_fonts(Box::new(DummyFonts));
+        let arg = xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(canvas)));
+        session
+            .vm_mut()
+            .send_event(hud, "PostRender", vec![arg])
+            .expect("HUD.PostRender with live widgets");
+        let commands = session.vm_mut().drain_canvas();
+        println!(
+            "[play test] HUD.PostRender after level start: {} draw command(s)",
+            commands.len()
+        );
+        for c in commands.iter().take(8) {
+            println!("[play test]   {c:?}");
+        }
+        assert!(
+            commands.len() >= 2,
+            "HUD.PostRender must draw more than the player-info line once widgets are live: {}",
+            commands.len()
         );
     }
 

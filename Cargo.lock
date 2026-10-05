@@ -4944,6 +4944,13 @@ name = "xiii-install"
 version = "0.1.0"
 
 [[package]]
+name = "xiii-locale"
+version = "0.1.0"
+dependencies = [
+ "xiii-install",
+]
+
+[[package]]
 name = "xiii-package"
 version = "0.1.0"
 
@@ -4963,6 +4970,7 @@ dependencies = [
  "xiii-collision",
  "xiii-decode",
  "xiii-install",
+ "xiii-locale",
  "xiii-package",
  "xiii-script",
  "xiii-world",
@@ -4975,6 +4983,7 @@ dependencies = [
  "xiii-collision",
  "xiii-decode",
  "xiii-install",
+ "xiii-locale",
  "xiii-package",
  "xiii-script",
 ]

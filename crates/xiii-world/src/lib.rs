@@ -1778,7 +1778,13 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
             }
         };
         let Some(map_ref) = t.terrain_map else {
-            im.scene.fail("fail.terrain.no_heightmap", path);
+            if t.sectors.is_empty() && t.vertices.is_empty() {
+                // An empty `TerrainInfo` placeholder (no sectors, no vertices, no heightmap):
+                // nothing to draw or collide with. Counted as a note, not a decode failure.
+                im.scene.count("note.terrain.empty", 1);
+            } else {
+                im.scene.fail("fail.terrain.no_heightmap", path);
+            }
             continue;
         };
         let (w, h) = match im.cache.resolve(map_pkg, map_ref).and_then(|(pk, ix)| {
@@ -1790,15 +1796,25 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 continue;
             }
         };
-        let mesh = match t.mesh(w, h) {
+        let regions = match t.mesh(w, h) {
             Ok(m) => m,
             Err(e) => {
                 im.scene.fail("fail.terrain.mesh", e.to_string());
                 continue;
             }
         };
-        im.scene.count("terrain.hidden_quads", mesh.hidden_quads);
-        let composite = composite_terrain_texture(im, map_pkg, &t, &mesh);
+        // The base region drives the layer composite and the vertex colours; extra detail
+        // regions are added as their own geometry with the same material.
+        let base = &regions[0];
+        for region in &regions {
+            im.scene.count("terrain.hidden_quads", region.hidden_quads);
+        }
+        im.scene.count("terrain.regions", regions.len());
+        im.scene.count(
+            "terrain.region_extra_vertices",
+            t.vertices.len() - base.positions.len(),
+        );
+        let composite = composite_terrain_texture(im, map_pkg, &t, base);
         let (material, material_index) = match composite {
             Some(img) => {
                 im.scene.textures.push(SceneTexture {
@@ -1822,21 +1838,6 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 (MaterialSlot::Missing("terrain layers".into()), idx)
             }
         };
-        let terrain_tris: Vec<[[f32; 3]; 3]> = mesh
-            .indices
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|t| t.map(|i| to_bevy_position(mesh.positions[i as usize])))
-            .collect();
-        im.scene
-            .add_collision(format!("{path} (terrain)"), terrain_tris);
-        let positions: Vec<[f32; 3]> = mesh
-            .positions
-            .iter()
-            .map(|&v| to_bevy_position(v))
-            .collect();
-        let normals = grid_normals(&mesh.positions, w, h);
         let terrain_colors = match terrain::color_grid(p, &map_pkg.data, &t, w, h) {
             Ok(grid) => {
                 im.scene.count("lighting.terrain.colors", grid.colors.len());
@@ -1864,23 +1865,58 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 None
             }
         };
-        im.scene.meshes.push(SceneMesh {
-            label: format!("{path} heightfield"),
-            positions,
-            normals,
-            uvs: mesh.grid_uv.clone(),
-            indices: mesh.indices.clone(),
-            material,
-            material_index,
-        });
-        im.scene.objects.push(SceneObject {
-            mesh: im.scene.meshes.len() - 1,
-            transform: identity(),
-            path,
-            placement: None,
-            zone: None,
-            colors: terrain_colors,
-        });
+        for (ri, region) in regions.iter().enumerate() {
+            let terrain_tris: Vec<[[f32; 3]; 3]> = region
+                .indices
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|tri| tri.map(|i| to_bevy_position(region.positions[i as usize])))
+                .collect();
+            im.scene.add_collision(
+                if ri == 0 {
+                    format!("{path} (terrain)")
+                } else {
+                    format!("{path} (terrain region {ri})")
+                },
+                terrain_tris,
+            );
+            let positions: Vec<[f32; 3]> = region
+                .positions
+                .iter()
+                .map(|&v| to_bevy_position(v))
+                .collect();
+            let normals = grid_normals(&region.positions, region.width, region.height);
+            im.scene.meshes.push(SceneMesh {
+                label: if ri == 0 {
+                    format!("{path} heightfield")
+                } else {
+                    format!("{path} heightfield region {ri}")
+                },
+                positions,
+                normals,
+                uvs: region.grid_uv.clone(),
+                indices: region.indices.clone(),
+                material: material.clone(),
+                material_index,
+            });
+            im.scene.objects.push(SceneObject {
+                mesh: im.scene.meshes.len() - 1,
+                transform: identity(),
+                path: if ri == 0 {
+                    path.clone()
+                } else {
+                    format!("{path} region {ri}")
+                },
+                placement: None,
+                zone: None,
+                colors: if ri == 0 {
+                    terrain_colors.clone()
+                } else {
+                    None
+                },
+            });
+        }
         im.scene.count("terrain.infos", 1);
     }
 }
@@ -2093,6 +2129,113 @@ mod local_tests {
         } else {
             Some(path)
         }
+    }
+
+    /// Resolves `XIII_STEAM_DIR`; the patched Steam root maps live in `Maps/BaseSP`, so this also
+    /// exercises profile-aware map/package resolution rather than the GOG layout.
+    fn steam_root() -> Option<std::path::PathBuf> {
+        let root = std::env::var_os("XIII_STEAM_DIR")?;
+        let path = std::path::PathBuf::from(&root);
+        if path.is_relative() {
+            Some(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join(path),
+            )
+        } else {
+            Some(path)
+        }
+    }
+
+    /// Opt-in: the two opening Steam maps import with zero `fail.*` counters and the same decoded
+    /// counts as GOG (all 64 maps are byte-identical). `PackageCache::open` uses the Steam
+    /// `Maps/BaseSP` profile, so this fails if the map search paths or case handling regress.
+    #[test]
+    fn steam_opening_maps_import_without_failures() {
+        let Some(path) = steam_root() else {
+            println!("SKIPPED: set XIII_STEAM_DIR to the Steam installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        for (map, actors, bsp_polys) in [("Plage00", 156, 344), ("Plage01", 133, 338)] {
+            let scene = import_map(&mut cache, map).expect("import");
+            let get = |k: &str| scene.counters.get(k).copied().unwrap_or(0);
+            assert_eq!(get("actor.static_mesh (StaticMeshActor)"), actors, "{map}");
+            assert_eq!(get("bsp.polygons"), bsp_polys, "{map}");
+            assert_eq!(get("terrain.infos"), 1, "{map}");
+            assert!(scene.player_start.is_some(), "{map}");
+            let fails: Vec<_> = scene
+                .counters
+                .keys()
+                .filter(|k| k.starts_with("fail."))
+                .collect();
+            assert!(fails.is_empty(), "{map}: {fails:?} {:?}", scene.examples);
+            let missing = scene
+                .meshes
+                .iter()
+                .filter(|m| matches!(m.material, MaterialSlot::Missing(_)))
+                .count();
+            assert_eq!(
+                missing, 0,
+                "{map}: unresolved materials {:?}",
+                scene.examples
+            );
+        }
+    }
+
+    /// Opt-in: every code package the Steam ini's `EditPackages=` names resolves and loads from
+    /// this one root, and each `*Plus` package is present next to its base (no implicit mixing).
+    #[test]
+    fn steam_code_packages_load_in_ini_order_without_mixing() {
+        let Some(path) = steam_root() else {
+            println!("SKIPPED: set XIII_STEAM_DIR to the Steam installation root to run this test");
+            return;
+        };
+        let install =
+            xiii_install::Installation::open(&path, &xiii_install::OpenOptions::default())
+                .expect("open install");
+        let entries = install.code_packages_in_load_order();
+        let pos = |n: &str| entries.iter().position(|e| e.name.eq_ignore_ascii_case(n));
+        for (base, plus) in [
+            ("XIII", "XIIIPlus"),
+            ("XIIIPersos", "XIIIPersosPlus"),
+            ("XIIIMP", "XIIIMPPlus"),
+            ("XIDInterf", "XIDInterfPlus"),
+            ("Engine", "EnginePlus"),
+            ("IpDrv", "IpDrvPlus"),
+        ] {
+            let (b, p) = (pos(base), pos(plus));
+            assert!(
+                b.is_some() && p.is_some(),
+                "{base}/{plus} indexed: {entries:?}"
+            );
+            assert!(b < p, "{base} must load before {plus}");
+        }
+        assert_eq!(entries.len(), 33, "Steam has 33 .u packages");
+        for e in &entries {
+            assert_eq!(e.kind, xiii_install::PackageKind::Code);
+            assert!(
+                e.path.starts_with(install.root()),
+                "{} escaped root",
+                e.relative
+            );
+        }
+        // Maps live under the split Steam roots and resolve case-insensitively; the patch's
+        // added packages are visible only through this root.
+        let map = install
+            .resolve_map("Plage00")
+            .expect("Plage00 under Maps/BaseSP");
+        assert_eq!(map.entry.relative, "Maps/BaseSP/Plage00.unr");
+        assert_eq!(
+            install
+                .resolve_map("plage01")
+                .expect("case-insensitive")
+                .entry
+                .relative,
+            "Maps/BaseSP/Plage01.unr"
+        );
+        assert!(install.resolve_package("XIIIPlus").is_ok());
+        assert!(install.resolve_package("XIIIMPGame").is_ok());
     }
 
     #[test]

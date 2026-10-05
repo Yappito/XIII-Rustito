@@ -13,9 +13,10 @@
 //! value). Unsupported tokens, unimplemented natives, budget overruns and bad values fail with
 //! [`VmError`] carrying a script stack trace. Nothing is stubbed silently.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
+use std::time::Instant;
 
 use xiii_package::{Limits, ObjectRef, PropertyBlock, PropertyValue, RawReason, StructValue};
 
@@ -23,7 +24,9 @@ use crate::animation::{AnimationData, SeqInfo};
 use crate::bytecode::{Call, Context, Script, Token, TokenKind, opcode_name};
 use crate::canvas::CanvasState;
 use crate::events::{PresentationEvent, SoundEvent};
+use crate::external::ExternalObjectData;
 use crate::linker::{GlobalRef, ScriptSet};
+use crate::localize::{LocalizationData, placeholder};
 use crate::navigation::{
     NavEdgeInfo, NavPointInfo, NavigationData, find_path, move_step, nearest_point, point_fits,
 };
@@ -165,6 +168,12 @@ pub enum VmErrorKind {
         /// `Class.Function` of the native that needed it.
         native: String,
     },
+    /// `Object.Localize` ran without a localisation provider set (with
+    /// [`Vm::set_localization`]); never silently succeeds.
+    NoLocalizationProvider {
+        /// `Class.Function` of the native that needed it.
+        native: String,
+    },
     /// A sequence the animation provider does not know (and is not the `None` name).
     UnknownAnimation {
         /// Sequence name.
@@ -291,6 +300,31 @@ pub const RUNTIME_SPAWN_LIFECYCLE: &[&str] = &[
 /// `u16`; no class in the GOG corpus sets bit 0, so the position is **unverified** and this
 /// check never fires on retail data (documented in the report).
 const CLASS_FLAG_ABSTRACT: u16 = 0x0001;
+
+/// Native (C++) class default value that the serialized `defaultproperties` block cannot carry.
+///
+/// The VM reconstructs defaults from the tagged-property block of each `Core.Class` export; a
+/// property whose value is set only in the native class constructor keeps its zero value. The
+/// one case the corpus needs is `Engine.Camera` (`class Camera extends PlayerController native`,
+/// measured 8 serialized editor-placement defaults, none of them `bOnlySpectator`).
+///
+/// Decoded evidence that this default is required for correct single-player startup:
+/// `Engine.GameInfo.PostLogin` calls `StartMatch` when `bWaitingToStartMatch`, and
+/// `Engine.GameInfo.StartMatch` calls `RestartPlayer(P)` for every `Level.ControllerList` entry
+/// with `P.IsA('PlayerController') && P.Pawn == None && !PlayerController(P).bOnlySpectator`.
+/// `PlayerController.Possess` early-returns on `bOnlySpectator` ("This controller is not allowed
+/// to possess pawns", PlayerController.uc). The maps place 11 hidden `Engine.Camera` cutscene
+/// controllers (`Camera.ScriptText`: "A camera, used in UnrealEd"); without this native default
+/// each of them spawns a spurious `XIIIPlayerPawn` at the PlayerStart after login.
+///
+/// Keyed by lowercase short class name (matched anywhere in the class chain) and lowercase
+/// property name. Returns `None` when there is no native default to apply.
+fn native_class_default(class: &str, prop: &str) -> Option<Value> {
+    match (class, prop) {
+        ("camera", "bonlyspectator") => Some(Value::Bool(true)),
+        _ => None,
+    }
+}
 
 /// Latent action of a state frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -462,13 +496,31 @@ pub struct BoneDirection {
     pub alpha: f32,
 }
 
-/// Per-actor bone-control state set by `Pawn.SpineYawControl` / `Actor.SetBoneDirection`.
+/// `Actor.SetBoneScalePerAxis(int Slot, float X, float Y, float Z, name BoneName)`.
+///
+/// The engine forwards the request to the skeletal-mesh instance's bone controller
+/// (`?SetBoneScale@USkeletalMeshInstance`). The headless VM stores the request per actor in call
+/// order; no skeletal transform is evaluated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoneScale {
+    /// Bone-controller slot.
+    pub slot: i32,
+    /// Per-axis scale (X, Y, Z); omitted optional axes default to 1.0 in the engine.
+    pub scale: [f32; 3],
+    /// Target bone.
+    pub bone: String,
+}
+
+/// Per-actor bone-control state set by `Pawn.SpineYawControl` / `Actor.SetBoneDirection` /
+/// `Actor.SetBoneScalePerAxis`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BoneState {
     /// Latest `Pawn.SpineYawControl` parameters, if the native ran.
     pub spine: Option<SpineControl>,
     /// `Actor.SetBoneDirection` requests, in call order.
     pub directions: Vec<BoneDirection>,
+    /// `Actor.SetBoneScalePerAxis` requests, in call order.
+    pub scales: Vec<BoneScale>,
 }
 
 /// Read-only view of one animation channel, for a host renderer that samples the decoded
@@ -807,6 +859,10 @@ pub struct Slot {
     pub base: usize,
     /// Property flags.
     pub flags: u32,
+    /// Class that declares the property (for a class layout) or the function that declares the
+    /// parameter (for a function layout). Used to resolve `localized` class defaults from the
+    /// declaring class package's `.int`.
+    pub declaring: GlobalRef,
 }
 
 /// Slots of a class chain plus defaults.
@@ -826,16 +882,45 @@ pub struct ClassLayout {
     pub size: usize,
     /// Default values (class-default blocks applied root to leaf).
     pub defaults: Vec<Value>,
+    /// Precomputed `props` index of `Location` (no per-read name lookup on hot paths).
+    pub location_slot: Option<usize>,
+    /// Precomputed `props` index of `Rotation`.
+    pub rotation_slot: Option<usize>,
+    /// Precomputed `props` index of `bCollideActors`.
+    pub collide_slot: Option<usize>,
+    /// Precomputed `props` index of `bInterpolating`.
+    pub interp_slot: Option<usize>,
+    /// True when the class chain derives from `Mover` (avoids a chain scan per object per tick).
+    pub is_mover_class: bool,
 }
 
 impl ClassLayout {
     /// Slot by lowercase property name.
+    ///
+    /// Pure caching optimisation with no semantic change: instead of allocating a lowercase
+    /// `String` for every lookup (this is on the per-actor touch/sync hot paths), short ASCII
+    /// names are lowercased into a fixed stack buffer. Non-ASCII or over-long names keep the
+    /// original allocating path.
     pub fn slot_by_name(&self, name: &str) -> Option<&Slot> {
-        self.by_name
-            .get(&name.to_ascii_lowercase())
-            .map(|i| &self.slots[*i])
+        let bytes = name.as_bytes();
+        if bytes.is_ascii() && bytes.len() <= STACK_NAME_BYTES {
+            let mut buf = [0u8; STACK_NAME_BYTES];
+            for (i, b) in bytes.iter().enumerate() {
+                buf[i] = b.to_ascii_lowercase();
+            }
+            let key = std::str::from_utf8(&buf[..bytes.len()]).unwrap_or(name);
+            self.by_name.get(key).map(|i| &self.slots[*i])
+        } else {
+            self.by_name
+                .get(&name.to_ascii_lowercase())
+                .map(|i| &self.slots[*i])
+        }
     }
 }
+
+/// Stack buffer size for the allocation-free property-name lowercase path. Property names in the
+/// corpus are far shorter than this; longer names fall back to the allocating path.
+const STACK_NAME_BYTES: usize = 64;
 
 #[derive(Debug)]
 struct ParamInfo {
@@ -944,6 +1029,56 @@ enum Exit {
     Restart,
 }
 
+/// Optional VM profiling data (`Vm::enable_native_timers`). Cheap when disabled: the timing
+/// guards only run when `enabled` is set, and the accumulators are only written then.
+#[derive(Debug, Default, Clone)]
+pub struct NativeProfile {
+    /// Whether the timers are armed.
+    pub enabled: bool,
+    /// Per-native cumulative wall-clock microseconds, keyed by `Class.Function`.
+    pub micros: BTreeMap<String, u64>,
+    /// Per-native call counts.
+    pub calls: BTreeMap<String, u64>,
+    /// Cumulative microseconds in the timer loop of `tick_suspending`.
+    pub timers_micros: u64,
+    /// Cumulative microseconds in the animation-advance loop.
+    pub animation_micros: u64,
+    /// Cumulative microseconds in the mover-interpolation loop.
+    pub movers_micros: u64,
+    /// Cumulative microseconds in the state-code loop.
+    pub state_micros: u64,
+    /// Cumulative microseconds inside native implementations (sum over all natives).
+    pub natives_micros: u64,
+    /// Cumulative microseconds writing the host-owned player fields into the VM.
+    pub player_write_micros: u64,
+    /// Cumulative microseconds in `refresh_touching_of` (the host moved the player).
+    pub touch_micros: u64,
+    /// Cumulative microseconds draining presentation events / updating touches.
+    pub events_micros: u64,
+    /// Cumulative microseconds in the one-way render sync (`update_sync`).
+    pub sync_micros: u64,
+    /// Cumulative microseconds building mover collision states (`mover_states`).
+    pub mover_states_micros: u64,
+}
+
+impl NativeProfile {
+    /// Clears every accumulator (keeps `enabled`).
+    pub fn reset(&mut self) {
+        self.micros.clear();
+        self.calls.clear();
+        self.timers_micros = 0;
+        self.animation_micros = 0;
+        self.movers_micros = 0;
+        self.state_micros = 0;
+        self.natives_micros = 0;
+        self.player_write_micros = 0;
+        self.touch_micros = 0;
+        self.events_micros = 0;
+        self.sync_micros = 0;
+        self.mover_states_micros = 0;
+    }
+}
+
 /// The interpreter.
 pub struct Vm<'s> {
     set: &'s ScriptSet,
@@ -985,6 +1120,9 @@ pub struct Vm<'s> {
     /// Decoded navigation graph (pathing natives). `None` = every native that needs it fails
     /// with [`VmErrorKind::NoNavProvider`].
     pub(crate) navigation: Option<Box<dyn NavigationData>>,
+    /// Voice-wave duration provider (dialogue natives). `None` = `Actor.GetWaveDuration` reports
+    /// `0` with a visible note (the script then falls back to its own default wave length).
+    pub(crate) voice_duration: Option<Box<dyn crate::voice::VoiceDuration>>,
     /// Outbound presentation events emitted by presentation natives (sound, texture, display,
     /// projectors). Drained with [`Vm::drain_events`].
     events: Vec<PresentationEvent>,
@@ -1004,6 +1142,20 @@ pub struct Vm<'s> {
     pub canvas: CanvasState,
     /// Interned object references into packages outside the loaded script set.
     externals: std::cell::RefCell<ExternalTable>,
+    /// Host localisation provider (the install's active `.int`/language files). `None` = no
+    /// `Object.Localize` provider is installed and no `localized` class default is overridden;
+    /// `Object.Localize` then fails explicitly.
+    pub(crate) localization: Option<Box<dyn LocalizationData>>,
+    /// `localized` class-default values filled from the `.int` files while building layouts.
+    pub localized_overrides: u64,
+    /// `Object.Localize` lookups that found a key.
+    pub localization_hits: u64,
+    /// `Object.Localize` lookups that missed (the placeholder was returned and counted).
+    pub localization_misses: u64,
+    /// Host resolver for properties of objects in non-script packages (`Texture.USize`/`VSize`).
+    pub(crate) external_data: Option<Box<dyn ExternalObjectData>>,
+    /// Optional per-native/section timing (`--perf-natives`).
+    profile: NativeProfile,
 }
 
 fn lower(s: &str) -> String {
@@ -1038,18 +1190,108 @@ impl<'s> Vm<'s> {
             physics: None,
             animation: None,
             navigation: None,
+            voice_duration: None,
             events: Vec::new(),
             local_url: String::new(),
             url_options: String::new(),
             address_url: String::new(),
             canvas: CanvasState::default(),
             externals: std::cell::RefCell::new(ExternalTable::default()),
+            localization: None,
+            localized_overrides: 0,
+            localization_hits: 0,
+            localization_misses: 0,
+            external_data: None,
+            profile: NativeProfile::default(),
         }
+    }
+
+    /// Arms per-native/section timers (off by default; `--perf-natives`). Adds a timing guard
+    /// around every native implementation and around the four `tick_suspending` loops.
+    pub fn enable_native_timers(&mut self, on: bool) {
+        self.profile.enabled = on;
+    }
+
+    /// Current profiling accumulators (empty unless [`Vm::enable_native_timers`] was armed).
+    pub fn native_profile(&self) -> &NativeProfile {
+        &self.profile
+    }
+
+    /// Mutable profiling accumulators, so the hosting application can record its own spans
+    /// (player-field writes, touch refresh, event drain, render sync) alongside the VM's.
+    pub fn native_profile_mut(&mut self) -> &mut NativeProfile {
+        &mut self.profile
+    }
+
+    /// Clears the profiling accumulators (keeps the enabled flag).
+    pub fn reset_native_profile(&mut self) {
+        self.profile.reset();
     }
 
     /// Installs the host font-metrics provider used by `Canvas.StrLen`/`TextSize`.
     pub fn set_canvas_fonts(&mut self, fonts: Box<dyn crate::canvas::CanvasFonts>) {
         self.canvas.set_fonts(fonts);
+    }
+
+    /// Installs the host localisation provider (backed by `xiii-locale`). Call before loading
+    /// actors/layouts so `localized` class defaults are filled in: the VM has no filesystem and
+    /// cannot open `.int` files itself.
+    pub fn set_localization(&mut self, provider: Box<dyn LocalizationData>) {
+        self.localization = Some(provider);
+    }
+
+    /// True when a localisation provider is installed.
+    pub fn has_localization(&self) -> bool {
+        self.localization.is_some()
+    }
+
+    /// Installs the host resolver for properties of objects in non-script packages. Without it,
+    /// property access on such an object is an explicit `UnsupportedValue` error.
+    pub fn set_external_object_data(&mut self, provider: Box<dyn ExternalObjectData>) {
+        self.external_data = Some(provider);
+    }
+
+    /// `Localize(Section, Key, Package)` through the installed provider, or `None` when no
+    /// provider is installed or the key is absent. Counted in
+    /// [`Vm::localization_hits`]/[`Vm::localization_misses`].
+    pub fn localize(&mut self, package: &str, section: &str, key: &str) -> Option<String> {
+        let value = self
+            .localization
+            .as_ref()
+            .and_then(|l| l.get(package, section, key));
+        if value.is_some() {
+            self.localization_hits += 1;
+        } else {
+            self.localization_misses += 1;
+        }
+        value
+    }
+
+    /// Like [`Vm::localize`] but returns the UE2 placeholder
+    /// (`<?language?Package.Section.Key?>`) on a miss, the way `Object.Localize` returns it.
+    /// Without a provider the lookup is an explicit `None` (the caller decides), never a
+    /// silently empty string.
+    pub fn localize_or_placeholder(
+        &mut self,
+        package: &str,
+        section: &str,
+        key: &str,
+    ) -> Option<String> {
+        let lookup = self
+            .localization
+            .as_ref()
+            .map(|l| (l.language().to_owned(), l.get(package, section, key)));
+        let (language, value) = lookup?;
+        match value {
+            Some(v) => {
+                self.localization_hits += 1;
+                Some(v)
+            }
+            None => {
+                self.localization_misses += 1;
+                Some(placeholder(&language, package, section, key))
+            }
+        }
     }
 
     /// Draw commands recorded since the last [`Vm::drain_canvas`].
@@ -1119,6 +1361,24 @@ impl<'s> Vm<'s> {
     /// True when a navigation provider is available.
     pub fn has_navigation(&self) -> bool {
         self.navigation.is_some()
+    }
+
+    /// Sets the voice-wave duration provider (dialogue natives). Call before runs that need a
+    /// real subtitle lifetime; without one `Actor.GetWaveDuration` reports `0` (visible).
+    pub fn set_voice_duration(&mut self, provider: Box<dyn crate::voice::VoiceDuration>) {
+        self.voice_duration = Some(provider);
+    }
+
+    /// True when a voice-duration provider is available.
+    pub fn has_voice_duration(&self) -> bool {
+        self.voice_duration.is_some()
+    }
+
+    /// Duration of a script `SoundName` from the host provider, `None` when unavailable.
+    pub fn voice_duration(&self, sound_name: &str) -> Option<f32> {
+        self.voice_duration
+            .as_ref()
+            .and_then(|p| p.duration(sound_name))
     }
 
     /// Configures the map's local URL (`<Map>?<options>`, the `url_options` being the
@@ -1499,6 +1759,7 @@ impl<'s> Vm<'s> {
                     dim,
                     base: size,
                     flags: p.flags,
+                    declaring: *c,
                 });
                 size += dim;
             }
@@ -1509,7 +1770,13 @@ impl<'s> Vm<'s> {
                 defaults.push(s.ty.zero());
             }
         }
-        let chain_names = chain.iter().map(|g| lower(self.object_name(*g))).collect();
+        let chain_names: Vec<String> = chain.iter().map(|g| lower(self.object_name(*g))).collect();
+        let slot_base = |name: &str| by_name.get(name).map(|i| slots[*i].base);
+        let location_slot = slot_base("location");
+        let rotation_slot = slot_base("rotation");
+        let collide_slot = slot_base("bcollideactors");
+        let interp_slot = slot_base("binterpolating");
+        let is_mover_class = chain_names.iter().any(|n| n == "mover");
         let mut layout = ClassLayout {
             class,
             chain: chain.clone(),
@@ -1519,10 +1786,81 @@ impl<'s> Vm<'s> {
             by_name,
             size,
             defaults: Vec::new(),
+            location_slot,
+            rotation_slot,
+            collide_slot,
+            interp_slot,
+            is_mover_class,
         };
         for c in chain.iter().rev() {
             if let Some(ScriptObject::Class(cl)) = self.set.object(*c) {
                 self.apply_block(c.package, &cl.defaults, &layout, &mut defaults);
+            }
+        }
+        // Native defaults not present in the serialized class blocks (see native_class_default).
+        // The table only lists properties that no class in the matching lineage serializes, so
+        // applying it after the serialized blocks cannot hide an authored value.
+        for slot in &layout.slots {
+            if slot.dim == 0 {
+                continue;
+            }
+            if let Some(v) = layout
+                .chain_names
+                .iter()
+                .find_map(|n| native_class_default(n, &slot.name))
+            {
+                defaults[slot.base] = v;
+            }
+        }
+        // `localized` class defaults come from the class package's `.int` file: section = class
+        // name, key = property name (array elements as `Property[i]`, per UE2
+        // `UObject::LoadLocalizedProperty`). The class being laid out is tried first (the
+        // shipped `.int` files carry the text under the subclass section, for example
+        // `[Plage01CahuteKeyPick] PickupMessage=`), then the class that declares the property
+        // (`[Pickup]`). Applied last, so a shipped `.int` value wins over the serialized
+        // placeholder; a missing key leaves the serialized value in place.
+        let layout_pkg = self.set.packages[class.package].name.clone();
+        let layout_class = self.object_name(class).to_owned();
+        let localized: Vec<(usize, usize, String, String, GlobalRef)> = layout
+            .slots
+            .iter()
+            // Localisation is a string-property feature (`localized` is always a string upstream);
+            // a non-string slot with a stray flag bit is left alone rather than typed as text.
+            .filter(|s| {
+                s.flags & property_flags::LOCALIZED != 0 && s.dim > 0 && matches!(s.ty, Ty::Str)
+            })
+            .map(|s| {
+                (
+                    s.base,
+                    s.dim,
+                    layout_pkg.clone(),
+                    s.name.clone(),
+                    s.declaring,
+                )
+            })
+            .collect();
+        for (base, dim, package, name, declaring) in localized {
+            let declaring_pkg = self.set.packages[declaring.package].name.clone();
+            let declaring_class = self.object_name(declaring).to_owned();
+            for elem in 0..dim {
+                let key = if dim > 1 {
+                    format!("{name}[{elem}]")
+                } else {
+                    name.clone()
+                };
+                let value = self
+                    .localization
+                    .as_ref()
+                    .and_then(|l| l.get(&package, &layout_class, &key))
+                    .or_else(|| {
+                        self.localization
+                            .as_ref()
+                            .and_then(|l| l.get(&declaring_pkg, &declaring_class, &key))
+                    });
+                if let Some(v) = value {
+                    defaults[base + elem] = Value::Str(v);
+                    self.localized_overrides += 1;
+                }
             }
         }
         layout.defaults = defaults;
@@ -1560,6 +1898,7 @@ impl<'s> Vm<'s> {
                 dim,
                 base: size,
                 flags: p.flags,
+                declaring: func,
             });
             size += dim;
         }
@@ -1726,6 +2065,19 @@ impl<'s> Vm<'s> {
             }
             (PropertyValue::Struct(StructValue::Vector(v)), Ty::Vector) => Value::Vector(*v),
             (PropertyValue::Struct(StructValue::Rotator(v)), Ty::Rotator) => Value::Rotator(*v),
+            // A serialized `Color` default (4 bytes, stored order) decoded into the named struct
+            // members the script accesses (`b`,`g`,`r`,`a`). Measured: `Default__.XIIIGoalMessage`
+            // `DrawColor = (250,230,230,200)` reaches `LocalMessage.GetColor` as a `struct<Color>`;
+            // without this arm the HUD message widgets aborted on the default.
+            (PropertyValue::Struct(StructValue::Color(c)), Ty::Struct(members))
+                if members.len() == 4 =>
+            {
+                let mut fields = Vec::with_capacity(4);
+                for (i, (name, _)) in members.iter().enumerate() {
+                    fields.push((name.clone(), Value::Byte(c[i])));
+                }
+                Value::Struct(fields)
+            }
             (PropertyValue::Array { count, elements }, Ty::Array(inner)) => {
                 self.decode_array(pkg, *count, *elements, inner)
             }
@@ -1856,10 +2208,20 @@ impl<'s> Vm<'s> {
         let layout = self.class_layout(class)?;
         let is_actor = layout.chain_names.iter().any(|n| n == "actor");
         let id = self.objects.len() as ObjectId;
+        let mut props = layout.defaults.clone();
+        // UE2 `Object.Class` is a native property that always answers the object's UClass; it is
+        // not a serialized default. Scripts read `default.Class` / `self.Class` to identify a
+        // class (for example `LocalMessage.ClientReceive` passes `default.Class` to the HUD, and
+        // `XIIISaveMessage.GetString` returns `default.CheckpointReached`). Without this, an
+        // object's `Class` default stayed `None` and static dispatch from it returned `Void`,
+        // suspending the HUD message widgets.
+        if let Some(slot) = layout.slot_by_name("class") {
+            props[slot.base] = Value::Object(Some(ObjRef::Static(class)));
+        }
         self.objects.push(Instance {
             class,
             name: name.to_owned(),
-            props: layout.defaults.clone(),
+            props,
             layout,
             state: None,
             state_code: None,
@@ -2043,6 +2405,19 @@ impl<'s> Vm<'s> {
                 trans,
                 alpha,
             });
+        }
+    }
+
+    /// `Actor.SetBoneScalePerAxis`: record the request for the renderer.
+    pub(crate) fn add_bone_scale(
+        &mut self,
+        id: ObjectId,
+        slot: i32,
+        scale: [f32; 3],
+        bone: String,
+    ) {
+        if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone.scales.push(BoneScale { slot, scale, bone });
         }
     }
 
@@ -2432,6 +2807,8 @@ impl<'s> Vm<'s> {
         self.time += f64::from(dt);
         self.steps = 0;
         let mut errors = Vec::new();
+        let profiling = self.profile.enabled;
+        let t0 = Instant::now();
         for id in 0..self.objects.len() as ObjectId {
             if !self.objects[id as usize].active {
                 continue;
@@ -2464,6 +2841,10 @@ impl<'s> Vm<'s> {
                 }
             }
         }
+        if profiling {
+            self.profile.timers_micros += t0.elapsed().as_micros() as u64;
+        }
+        let t0 = Instant::now();
         for id in 0..self.objects.len() as ObjectId {
             if self.objects[id as usize].active
                 && let Err(e) = self.advance_animation(id, dt)
@@ -2472,6 +2853,10 @@ impl<'s> Vm<'s> {
                 errors.push((suspended, e));
             }
         }
+        if profiling {
+            self.profile.animation_micros += t0.elapsed().as_micros() as u64;
+        }
+        let t0 = Instant::now();
         for id in 0..self.objects.len() as ObjectId {
             if self.objects[id as usize].active
                 && let Err(e) = self.advance_interpolation(id, dt)
@@ -2480,6 +2865,10 @@ impl<'s> Vm<'s> {
                 errors.push((suspended, e));
             }
         }
+        if profiling {
+            self.profile.movers_micros += t0.elapsed().as_micros() as u64;
+        }
+        let t0 = Instant::now();
         for id in 0..self.objects.len() as ObjectId {
             if self.objects[id as usize].active
                 && let Err(e) = self.process_state(id, dt)
@@ -2487,6 +2876,9 @@ impl<'s> Vm<'s> {
                 let suspended = self.suspend_for_error(id, &e);
                 errors.push((suspended, e));
             }
+        }
+        if profiling {
+            self.profile.state_micros += t0.elapsed().as_micros() as u64;
         }
         errors
     }
@@ -2885,7 +3277,12 @@ impl<'s> Vm<'s> {
             };
         }
         let layout = self.func_layout(func);
-        if !self.objects[target as usize].active {
+        // A `static` script function dispatches on the class default object, which is never part
+        // of the executed scope. UE2 runs statics regardless of instance scope (e.g.
+        // `LocalMessage.GetString` called by `HudObjectifMessage.SetUpLocalizedMessage`,
+        // `Message.static.GetString`), so they must not be deferred like instance methods on a
+        // suspended actor. Non-static calls on an inactive target keep the DEFERRED behaviour.
+        if !self.objects[target as usize].active && !f.is_static() {
             let o = &self.objects[target as usize];
             let (tname, class) = (o.name.clone(), set.path(o.class));
             if layout.ret.is_some() {
@@ -3241,7 +3638,15 @@ impl<'s> Vm<'s> {
                     path: path.clone(),
                     omitted: omitted.to_vec(),
                 };
-                f(self, &ctx, args)?
+                let t0 = self.profile.enabled.then(Instant::now);
+                let result = f(self, &ctx, args);
+                if let Some(t0) = t0 {
+                    let micros = t0.elapsed().as_micros() as u64;
+                    *self.profile.micros.entry(path.clone()).or_default() += micros;
+                    *self.profile.calls.entry(path.clone()).or_default() += 1;
+                    self.profile.natives_micros += micros;
+                }
+                result?
             }
         };
         if self.trace_natives {
@@ -3516,6 +3921,12 @@ impl<'s> Vm<'s> {
         target: ObjectId,
     ) -> VmResult<Option<ObjectId>> {
         let v = self.eval_in(frame, object, target)?;
+        self.context_value(v)
+    }
+
+    /// Target object from an already-evaluated context object expression. `None` = UE2
+    /// Accessed-None (a null/deleted/native-only object).
+    fn context_value(&mut self, v: Value) -> VmResult<Option<ObjectId>> {
         match v {
             Value::Object(Some(ObjRef::Instance(i))) if self.objects[i as usize].deleted => {
                 Ok(None)
@@ -3548,6 +3959,22 @@ impl<'s> Vm<'s> {
             Value::Unsupported(d) => Err(self.err(VmErrorKind::UnsupportedValue { desc: d })),
             other => Err(self.type_err("object", &other)),
         }
+    }
+
+    /// A property of a non-script object through the host [`ExternalObjectData`] provider. The
+    /// member must be a plain variable (`Texture.USize`); `None` when there is no provider, the
+    /// member is not a variable, or the host does not know the property.
+    fn external_member(&self, frame: &Frame<'s>, member: &Token, id: u32) -> Option<Value> {
+        use TokenKind as K;
+        let name = match &member.kind {
+            K::InstanceVariable(r) | K::DefaultVariable(r) | K::LocalVariable(r) => self
+                .set
+                .resolve(frame.pkg, *r)
+                .map(|g| self.object_name(g).to_ascii_lowercase()),
+            _ => None,
+        }?;
+        let path = self.external_object(id)?.path.clone();
+        self.external_data.as_ref()?.property(&path, &name)
     }
 
     fn zero_for(&mut self, frame: &Frame<'s>, t: &Token, target: ObjectId) -> Value {
@@ -3718,13 +4145,34 @@ impl<'s> Vm<'s> {
                 }
                 v
             }
-            K::Context(c) => match self.context_target(frame, &c.object, target)? {
-                Some(obj) => self.eval_in(frame, &c.member, obj)?,
-                None => {
-                    self.accessed_none();
-                    self.zero_of_context(frame, c, target)
+            K::Context(c) => {
+                let v = self.eval_in(frame, &c.object, target)?;
+                if let Value::Object(Some(ObjRef::External(id))) = &v {
+                    // A property of an object in a non-script package. The host provider answers
+                    // known native properties (for example `Texture.USize`/`VSize`, read by
+                    // `HudState.DrawStt`); anything else stays the explicit error below.
+                    match self.external_member(frame, &c.member, *id) {
+                        Some(value) => value,
+                        None => {
+                            return Err(self.err(VmErrorKind::UnsupportedValue {
+                                desc: format!(
+                                    "property access on external object {}",
+                                    self.external_path(&ObjRef::External(*id))
+                                        .unwrap_or_else(|| format!("external#{id}"))
+                                ),
+                            }));
+                        }
+                    }
+                } else {
+                    match self.context_value(v)? {
+                        Some(obj) => self.eval_in(frame, &c.member, obj)?,
+                        None => {
+                            self.accessed_none();
+                            self.zero_of_context(frame, c, target)
+                        }
+                    }
                 }
-            },
+            }
             K::ClassContext(c) => {
                 let v = self.eval_in(frame, &c.object, target)?;
                 let class = match v {
@@ -4529,13 +4977,14 @@ impl<'s> Vm<'s> {
 
     /// Pose/state of a mover actor without allocating its name.
     fn mover_state_of(&self, id: ObjectId) -> Option<MoverState> {
-        if !self.is_live_actor(id) || !self.is_a(id, "mover") {
+        let o = self.objects.get(id as usize)?;
+        if !o.is_actor || o.deleted || o.name.starts_with("Default__") || !o.layout.is_mover_class {
             return None;
         }
         Some(MoverState {
             name: String::new(),
-            location: self.vector_prop(id, "Location").unwrap_or([0.0; 3]),
-            rotation: self.rotator_prop(id, "Rotation").unwrap_or([0; 3]),
+            location: self.location_prop(id).unwrap_or([0.0; 3]),
+            rotation: self.rotation_prop(id).unwrap_or([0; 3]),
             base_pos: self.vector_prop(id, "BasePos").unwrap_or([0.0; 3]),
             base_rot: self.rotator_prop(id, "BaseRot").unwrap_or([0; 3]),
             key_num: self.byte_prop(id, "KeyNum"),
@@ -4744,6 +5193,45 @@ impl<'s> Vm<'s> {
     /// `bool` property value (false when absent/another type).
     pub(crate) fn bool_prop(&self, id: ObjectId, name: &str) -> bool {
         matches!(self.get_property(id, name), Some(Value::Bool(true)))
+    }
+
+    /// `Location` read through the class layout's precomputed slot (no name lookup). Public for
+    /// the host's per-tick render sync and pawn placement.
+    pub fn location_prop(&self, id: ObjectId) -> Option<[f32; 3]> {
+        let o = self.objects.get(id as usize)?;
+        match o.props.get(o.layout.location_slot?) {
+            Some(Value::Vector(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// `Rotation` read through the class layout's precomputed slot (no name lookup).
+    pub fn rotation_prop(&self, id: ObjectId) -> Option<[i32; 3]> {
+        let o = self.objects.get(id as usize)?;
+        match o.props.get(o.layout.rotation_slot?) {
+            Some(Value::Rotator(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// `bCollideActors` read through the precomputed slot (the touch-refresh pre-filter).
+    pub(crate) fn collides(&self, id: ObjectId) -> bool {
+        let Some(o) = self.objects.get(id as usize) else {
+            return false;
+        };
+        o.layout
+            .collide_slot
+            .is_some_and(|i| matches!(o.props.get(i), Some(Value::Bool(true))))
+    }
+
+    /// `bInterpolating` read through the precomputed slot (the mover-tick pre-filter).
+    pub(crate) fn interpolating(&self, id: ObjectId) -> bool {
+        let Some(o) = self.objects.get(id as usize) else {
+            return false;
+        };
+        o.layout
+            .interp_slot
+            .is_some_and(|i| matches!(o.props.get(i), Some(Value::Bool(true))))
     }
 
     /// Object property value as a live instance id.
@@ -4962,7 +5450,7 @@ impl<'s> Vm<'s> {
         if !self.is_live_actor(id) {
             return Ok(());
         }
-        let collide = self.bool_prop(id, "bCollideActors");
+        let collide = self.collides(id);
         let current = self.touching_list(id);
         let mut valid: Vec<ObjectId> = Vec::new();
         for b in 0..self.objects.len() as ObjectId {
@@ -4970,7 +5458,7 @@ impl<'s> Vm<'s> {
                 continue;
             }
             let touches = collide
-                && self.bool_prop(b, "bCollideActors")
+                && self.collides(b)
                 && self.actors_overlap(id, b)
                 && !self.based_on(id, b)
                 && !self.based_on(b, id)
@@ -5744,7 +6232,7 @@ impl<'s> Vm<'s> {
         if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
             return Ok(());
         }
-        if !self.bool_prop(id, "bInterpolating") {
+        if !self.interpolating(id) {
             return Ok(());
         }
         let rate = self.f32_prop(id, "PhysRate");
@@ -5820,7 +6308,9 @@ impl<'s> Vm<'s> {
         if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
             return Ok(());
         }
-        let actor = self.objects[id as usize].name.clone();
+        // The actor name is only needed when a notify or animation end fires; the old code
+        // cloned it unconditionally, allocating a string for every active actor every tick
+        // (most have no active channel).
         let mut notifies: Vec<(u8, String)> = Vec::new();
         let mut ended: Vec<(u8, f32)> = Vec::new();
         {
@@ -5865,8 +6355,9 @@ impl<'s> Vm<'s> {
             }
         }
         for (channel, function) in notifies {
+            let actor = self.objects[id as usize].name.clone();
             self.note(TraceKind::AnimNotify {
-                actor: actor.clone(),
+                actor,
                 function: function.clone(),
                 channel,
             });
@@ -5875,10 +6366,8 @@ impl<'s> Vm<'s> {
         for (channel, frame) in ended {
             self.set_property(id, "AnimFrame", 0, Value::Float(frame));
             self.set_property(id, "bAnimFinished", 0, Value::Bool(true));
-            self.note(TraceKind::AnimEnd {
-                actor: actor.clone(),
-                channel,
-            });
+            let actor = self.objects[id as usize].name.clone();
+            self.note(TraceKind::AnimEnd { actor, channel });
             self.send_event(id, "AnimEnd", vec![Value::Int(i32::from(channel))])?;
         }
         Ok(())
@@ -6248,5 +6737,86 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Name(x), Value::Name(y)) => x.eq_ignore_ascii_case(y),
         (Value::Int(x), Value::Byte(y)) | (Value::Byte(y), Value::Int(x)) => *x == i32::from(*y),
         _ => a == b,
+    }
+}
+
+#[cfg(test)]
+mod stack_name_tests {
+    use super::*;
+
+    /// Builds a layout with one `Int` slot per name (base index = position, all dim 1).
+    fn layout_with(names: &[&str]) -> ClassLayout {
+        let mut by_name = HashMap::new();
+        let mut slots = Vec::new();
+        for (base, n) in names.iter().enumerate() {
+            let lower = n.to_ascii_lowercase();
+            by_name.insert(lower.clone(), slots.len());
+            slots.push(Slot {
+                prop: GlobalRef {
+                    package: 0,
+                    export: 0,
+                },
+                name: lower,
+                ty: Ty::Int,
+                dim: 1,
+                base,
+                flags: 0,
+                declaring: GlobalRef {
+                    package: 0,
+                    export: 0,
+                },
+            });
+        }
+        let size = slots.len();
+        ClassLayout {
+            class: GlobalRef {
+                package: 0,
+                export: 0,
+            },
+            chain: vec![],
+            chain_names: vec![],
+            slots,
+            by_prop: HashMap::new(),
+            by_name,
+            size,
+            defaults: vec![],
+            location_slot: None,
+            rotation_slot: None,
+            collide_slot: None,
+            interp_slot: None,
+            is_mover_class: false,
+        }
+    }
+
+    /// The allocation-free stack path (short ASCII names) and the allocating fallback (long or
+    /// non-ASCII names) must agree on case-insensitive lookups and reject missing names.
+    #[test]
+    fn slot_lookup_case_insensitive_short_long_and_non_ascii() {
+        let long = "A".repeat(80);
+        let l = layout_with(&["LoCaTiOn", "bCollideActors", &long, "café", "tail"]);
+        // Short ASCII: every case spelling maps to the same slot.
+        assert_eq!(l.slot_by_name("LOCATION").map(|s| s.base), Some(0));
+        assert_eq!(l.slot_by_name("location").map(|s| s.base), Some(0));
+        assert_eq!(l.slot_by_name("bcollideactors").map(|s| s.base), Some(1));
+        // Over the 64-byte stack buffer: the allocating fallback must still match.
+        assert_eq!(
+            l.slot_by_name(&long.to_ascii_uppercase()).map(|s| s.base),
+            Some(2)
+        );
+        // Non-ASCII: fallback path, exact bytes match.
+        assert_eq!(l.slot_by_name("café").map(|s| s.base), Some(3));
+        // The 64/65-byte boundary: both are stored lowercased and found.
+        let n64 = "b".repeat(64);
+        let n65 = format!("{}c", "b".repeat(64));
+        let l = layout_with(&[&n64, &n65]);
+        assert_eq!(
+            l.slot_by_name(&n64.to_ascii_uppercase()).map(|s| s.base),
+            Some(0)
+        );
+        assert_eq!(
+            l.slot_by_name(&n65.to_ascii_uppercase()).map(|s| s.base),
+            Some(1)
+        );
+        assert!(l.slot_by_name("missing").is_none());
     }
 }

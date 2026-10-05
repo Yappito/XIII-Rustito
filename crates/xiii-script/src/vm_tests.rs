@@ -5,6 +5,7 @@ use xiii_package::Limits;
 
 use crate::bytecode::ScriptLimits;
 use crate::linker::{GlobalRef, ScriptPackage, ScriptSet};
+use crate::localize::LocalizationData;
 use crate::reflect::function_flags as ff;
 use crate::reflect::property_flags as pf;
 use crate::tests::{Exp, build_package, compact};
@@ -28,6 +29,8 @@ const IMP_NAMEPROP: i32 = -6;
 const IMP_OBJPROP: i32 = -7;
 const B_STRUCTPROP: i32 = -8;
 const B_BOOLPROP: i32 = -9;
+/// `Core.StrProperty` import appended at the end of the `B` import table (see `B::build`).
+const B_STRPROP: i32 = -10;
 
 impl B {
     fn new() -> Self {
@@ -183,7 +186,9 @@ impl B {
         let n = self.externals.len() as i32;
         self.externals
             .push((package.to_owned(), class.to_owned(), object.to_owned()));
-        -(11 + 2 * n)
+        // `B::build` has 10 fixed imports (through `StrProperty`), so an external's package
+        // import is at index 11 and its object import at 12; each extra external adds two.
+        -(12 + 2 * n)
     }
 
     fn build(mut self) -> Vec<u8> {
@@ -202,6 +207,8 @@ impl B {
             (core, class, -1, self.name("ObjectProperty")),
             (core, class, -1, self.name("StructProperty")),
             (core, class, -1, self.name("BoolProperty")),
+            // -10: appended last so every existing negative import index is unchanged.
+            (core, class, -1, self.name("StrProperty")),
         ];
         for (pkg, cls, object) in &externals {
             let pn = self.name(pkg);
@@ -495,7 +502,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 214);
+    assert_eq!(defs.len(), 232);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -857,6 +864,53 @@ fn spawn_set() -> ScriptSet {
     let mut set = ScriptSet::new();
     set.add(p);
     set
+}
+
+/// Native class default: `Camera` is a native class whose `bOnlySpectator` is not in the
+/// serialized defaults block. `GameInfo.StartMatch` restarts every non-spectator
+/// `PlayerController` with no pawn, so every placed camera would spawn a spurious
+/// `XIIIPlayerPawn`; the VM must supply the native default. A sibling class with the same
+/// property keeps the zero default (the shim is keyed to the camera lineage).
+#[test]
+fn camera_native_default_makes_it_a_spectator() {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let controller = b.reserve(0, 0, "PlayerController");
+    let camera = b.reserve(0, 0, "Camera");
+    let other = b.reserve(0, 0, "NotACamera");
+    let spectator = b.reserve(IMP_BOOLPROP, controller, "bOnlySpectator");
+    let is_player = b.reserve(IMP_BOOLPROP, controller, "bIsPlayer");
+    b.prop(spectator, is_player, 0);
+    b.prop(is_player, 0, 0);
+    b.class(object, 0, 0, 0);
+    b.class(controller, object, spectator, 0);
+    b.class(camera, controller, 0, 0);
+    b.class(other, controller, 0, 0);
+    let pkg = ScriptPackage::load(
+        "Test",
+        b.build(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(pkg.errors.is_empty(), "{:?}", pkg.errors);
+    let mut set = ScriptSet::new();
+    set.add(pkg);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let cam = GlobalRef {
+        package: 0,
+        export: set.packages[0].export_by_path("Camera").unwrap(),
+    };
+    let other = GlobalRef {
+        package: 0,
+        export: set.packages[0].export_by_path("NotACamera").unwrap(),
+    };
+    let cam_layout = vm.class_layout(cam).unwrap();
+    let other_layout = vm.class_layout(other).unwrap();
+    let get =
+        |l: &crate::vm::ClassLayout, n: &str| l.defaults[l.slot_by_name(n).unwrap().base].clone();
+    assert_eq!(get(&cam_layout, "bOnlySpectator"), Value::Bool(true));
+    assert_eq!(get(&other_layout, "bOnlySpectator"), Value::Bool(false));
 }
 
 fn sg(set: &ScriptSet, path: &str) -> GlobalRef {
@@ -5000,4 +5054,714 @@ fn external_reference_to_a_registered_missing_export_is_an_explicit_error() {
         }
         other => panic!("expected UnsupportedValue, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// item3j: campaign missing natives
+
+fn vec_result(o: NativeOutcome) -> [f32; 3] {
+    match o {
+        NativeOutcome::Value(Value::Vector(v)) => v,
+        other => panic!("expected vector, got {other:?}"),
+    }
+}
+
+#[test]
+fn campaign_operator_natives_match_ue2_semantics() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Object"), "O").unwrap();
+
+    let mut a = [Value::Vector([2.0, 3.0, 4.0]), Value::Float(2.0)];
+    assert_eq!(
+        vec_result(call_native(
+            &mut vm,
+            "Object.Multiply_VectorFloat",
+            o,
+            &[false, false],
+            &mut a
+        )),
+        [4.0, 6.0, 8.0]
+    );
+    // A zero scale is a real value, not an "omitted" marker.
+    let mut a = [Value::Vector([1.0, -2.0, 3.0]), Value::Float(0.0)];
+    assert_eq!(
+        vec_result(call_native(
+            &mut vm,
+            "Object.Multiply_VectorFloat",
+            o,
+            &[false, false],
+            &mut a
+        )),
+        [0.0, 0.0, 0.0]
+    );
+
+    let mut a = [
+        Value::Vector([1.0, 2.0, 3.0]),
+        Value::Vector([1.0, 2.0, 3.0]),
+    ];
+    assert!(bool_result(call_native(
+        &mut vm,
+        "Object.EqualEqual_VectorVector",
+        o,
+        &[false, false],
+        &mut a
+    )));
+    let mut a = [
+        Value::Vector([1.0, 2.0, 3.0]),
+        Value::Vector([1.0, 2.0, 4.0]),
+    ];
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "Object.EqualEqual_VectorVector",
+        o,
+        &[false, false],
+        &mut a
+    )));
+}
+
+#[test]
+fn set_bone_scale_per_axis_defaults_omitted_axes_to_one() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    // `SetBoneScalePerAxis(16, 0.5, nothing, nothing, 'X Blink')` (xidcine.Cine2.CineInit.Timer).
+    let mut args = [
+        Value::Int(16),
+        Value::Float(0.5),
+        Value::Float(0.0),
+        Value::Float(0.0),
+        Value::Name("X Blink".into()),
+    ];
+    call_native(
+        &mut vm,
+        "Actor.SetBoneScalePerAxis",
+        a,
+        &[false, false, true, true, false],
+        &mut args,
+    );
+    let bs = vm.bone_state(a).expect("bone state");
+    assert_eq!(bs.scales.len(), 1);
+    assert_eq!(bs.scales[0].slot, 16);
+    assert_eq!(bs.scales[0].scale, [0.5, 1.0, 1.0]);
+    assert_eq!(bs.scales[0].bone, "X Blink");
+}
+
+#[test]
+fn voice_and_onomatopoeia_natives_emit_presentation_events() {
+    use crate::events::PresentationEvent;
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    call_native(&mut vm, "Actor.StopVoice", a, &[], &mut []);
+    // A null `Sound` does not play.
+    let mut args = [Value::Object(None), Value::Int(1), Value::Int(2)];
+    call_native(
+        &mut vm,
+        "Actor.PlaySndPNJOno",
+        a,
+        &[false, false, false],
+        &mut args,
+    );
+    // A real sound object plays, carrying CodeMesh/Timbre.
+    let mut args = [
+        Value::Object(Some(ObjRef::Instance(a))),
+        Value::Int(3),
+        Value::Int(4),
+    ];
+    call_native(
+        &mut vm,
+        "Actor.PlaySndPNJOno",
+        a,
+        &[false, false, false],
+        &mut args,
+    );
+    let mut args = [Value::Object(Some(ObjRef::Instance(a)))];
+    call_native(&mut vm, "Actor.StopSound", a, &[false], &mut args);
+
+    let events = vm.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, PresentationEvent::StopVoice { .. }))
+    );
+    let pnjo: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, PresentationEvent::PlaySndPNJOno { .. }))
+        .collect();
+    assert_eq!(pnjo.len(), 1, "null Sound must not emit: {events:?}");
+    match pnjo[0] {
+        PresentationEvent::PlaySndPNJOno {
+            code_mesh, timbre, ..
+        } => {
+            assert_eq!((*code_mesh, *timbre), (3, 4));
+        }
+        _ => unreachable!(),
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, PresentationEvent::StopSound { .. }))
+    );
+}
+
+#[test]
+fn console_command_implements_campaign_commands_and_logs_unknown() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let c = vm.spawn(sg(&set, "Actor"), "PC").unwrap();
+    let mut a = [Value::Str("GETPING".into())];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "PlayerController.ConsoleCommand",
+            c,
+            &[false],
+            &mut a
+        )),
+        "0"
+    );
+    let before = vm.trace.len();
+    let mut a = [Value::Str("MadeUpCommand 1 2".into())];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "PlayerController.ConsoleCommand",
+            c,
+            &[false],
+            &mut a
+        )),
+        ""
+    );
+    assert!(
+        vm.trace.len() > before,
+        "an unknown console command must be logged"
+    );
+}
+
+#[test]
+fn auto_position_snaps_to_the_floor_and_adds_altitude() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    // The synthetic Actor has no `fAltitude`, so the altitude is 0; the trace result is the test.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([-1000.0, -1000.0, 100.0], [1000.0, 1000.0, 110.0]),
+    ));
+    let a = spawn_at(&mut vm, &set, "Actor", "Pos", [0.0, 0.0, 500.0]);
+    call_native(&mut vm, "PositionInfo.AutoPosition", a, &[], &mut []);
+    let z = vm.vector_prop(a, "Location").unwrap()[2];
+    assert!((z - 100.0).abs() < 1.0, "Location.z {z} not on the floor");
+}
+
+#[test]
+fn find_best_path_toward_returns_true_and_fills_route_cache() {
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let _ = spawn_at(&mut vm, &set, "Actor", "Nav0", [0.0, 0.0, 0.0]);
+    let n1 = spawn_at(&mut vm, &set, "Actor", "Nav1", [500.0, 0.0, 0.0]);
+    let _ = spawn_at(&mut vm, &set, "Actor", "Nav2", [1000.0, 0.0, 0.0]);
+    let (ctrl, _pawn) = nav_actor_pair(&mut vm, &set, 40.0, 80.0, 100.0);
+    vm.set_navigation(Box::new(MockNav::line()));
+    let target = spawn_at(&mut vm, &set, "Actor", "T", [1000.0, 0.0, 0.0]);
+    let mut args = [
+        Value::Object(Some(ObjRef::Instance(target))),
+        Value::Float(70.0),
+        Value::Float(160.0),
+    ];
+    assert!(bool_result(call_native(
+        &mut vm,
+        "IAController.FindBestPathToward",
+        ctrl,
+        &[false, false, false],
+        &mut args
+    )));
+    // RouteCache drops the node the pawn stands on, so the first move target is Nav1.
+    assert_eq!(
+        route_cache_elem(&vm, ctrl, 0),
+        Value::Object(Some(ObjRef::Instance(n1)))
+    );
+    // Desired None -> false, no path.
+    let mut args = [Value::Object(None), Value::Float(70.0), Value::Float(160.0)];
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "IAController.FindBestPathToward",
+        ctrl,
+        &[false, false, false],
+        &mut args
+    )));
+}
+
+/// A minimal `PlayerController`/`Pawn` tree for the `PlayerCanSeeMe` line-of-sight test.
+fn vision_fixture() -> Vec<u8> {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pc = b.reserve(0, 0, "PlayerController");
+    let pawn_cls = b.reserve(0, 0, "Pawn");
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let eye = b.reserve(IMP_FLOATPROP, actor, "BaseEyeHeight");
+    let pawn_prop = b.reserve(IMP_OBJECTPROP, pc, "Pawn");
+    let vector_extra = compact(IMP_STRUCT);
+    let object_extra = compact(0);
+    b.prop_with(location, eye, 0, &vector_extra);
+    b.prop(eye, 0, 0);
+    b.prop_with(pawn_prop, 0, 0, &object_extra);
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, location, 0);
+    b.class(pc, actor, pawn_prop, 0);
+    b.class(pawn_cls, actor, 0, 0);
+    b.build()
+}
+
+#[test]
+fn player_can_see_me_uses_a_player_line_of_sight() {
+    let pkg = ScriptPackage::load(
+        "Test",
+        vision_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(pkg.errors.is_empty(), "{:?}", pkg.errors);
+    let mut set = ScriptSet::new();
+    set.add(pkg);
+    let g = |path: &str| GlobalRef {
+        package: 0,
+        export: set.packages[0].export_by_path(path).unwrap(),
+    };
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let target = vm.spawn(g("Actor"), "Target").unwrap();
+    vm.set_property(target, "Location", 0, Value::Vector([500.0, 0.0, 100.0]));
+    let pc = vm.spawn(g("PlayerController"), "PC").unwrap();
+    let pawn = vm.spawn(g("Pawn"), "P").unwrap();
+    vm.set_property(pawn, "Location", 0, Value::Vector([0.0, 0.0, 100.0]));
+    vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(60.0));
+    vm.set_property(pc, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+
+    assert!(bool_result(call_native(
+        &mut vm,
+        "Actor.PlayerCanSeeMe",
+        target,
+        &[],
+        &mut []
+    )));
+    // A wall between the eye and the target blocks the view.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([250.0, -100.0, 0.0], [260.0, 100.0, 200.0]),
+    ));
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "Actor.PlayerCanSeeMe",
+        target,
+        &[],
+        &mut []
+    )));
+    // No possessed pawn -> no viewer.
+    vm.set_property(pc, "Pawn", 0, Value::Object(None));
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "Actor.PlayerCanSeeMe",
+        target,
+        &[],
+        &mut []
+    )));
+}
+
+// ---------------------------------------------------------------------------------------
+// Localisation provider, localized class defaults and static calls on class defaults.
+
+/// A provider whose `get` answers `Thing.label` with `value` and everything else `None`.
+struct MapLoc(&'static str);
+
+impl LocalizationData for MapLoc {
+    fn get(&self, package: &str, section: &str, key: &str) -> Option<String> {
+        (package.eq_ignore_ascii_case("Test")
+            && section.eq_ignore_ascii_case("Thing")
+            && key.eq_ignore_ascii_case("label"))
+        .then(|| self.0.to_owned())
+    }
+
+    fn language(&self) -> &str {
+        "int"
+    }
+}
+
+/// `Object` -> `Thing` with a `localized` string `Label` (XIII bit `0x400000`) and a plain int
+/// `Count`.
+fn localized_fixture() -> Vec<u8> {
+    use pf::*;
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let thing = b.reserve(0, 0, "Thing");
+    let label = b.reserve(B_STRPROP, thing, "Label");
+    let count = b.reserve(IMP_INTPROP, thing, "Count");
+    b.prop(label, count, LOCALIZED);
+    b.prop(count, 0, 0);
+    b.class(thing, object, label);
+    b.class(object, 0, 0);
+    b.build()
+}
+
+#[test]
+fn localized_class_default_is_filled_from_the_provider() {
+    let set = set_of(localized_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_localization(Box::new(MapLoc("from-int")));
+    let class = sg(&set, "Thing");
+    let layout = vm.class_layout(class).unwrap();
+    let value = |n: &str| layout.defaults[layout.slot_by_name(n).unwrap().base].clone();
+    assert_eq!(value("label"), Value::Str("from-int".to_owned()));
+    // The non-localized sibling keeps its zero default.
+    assert_eq!(value("count"), Value::Int(0));
+    assert_eq!(vm.localized_overrides, 1);
+}
+
+#[test]
+fn localized_class_default_miss_leaves_the_serialized_value() {
+    struct Missing;
+    impl LocalizationData for Missing {
+        fn get(&self, _p: &str, _s: &str, _k: &str) -> Option<String> {
+            None
+        }
+        fn language(&self) -> &str {
+            "int"
+        }
+    }
+    let set = set_of(localized_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_localization(Box::new(Missing));
+    let class = sg(&set, "Thing");
+    let layout = vm.class_layout(class).unwrap();
+    let base = layout.slot_by_name("label").unwrap().base;
+    assert_eq!(layout.defaults[base], Value::Str(String::new()));
+    assert_eq!(vm.localized_overrides, 0);
+}
+
+#[test]
+fn object_localize_returns_the_provider_value_and_the_placeholder_on_miss() {
+    let set = set_of(localized_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_localization(Box::new(MapLoc("localized-text")));
+    let t = vm.spawn(sg(&set, "Thing"), "T").unwrap();
+
+    let mut hit = [
+        Value::Str("Thing".to_owned()),
+        Value::Str("Label".to_owned()),
+        Value::Str("Test".to_owned()),
+    ];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "Object.Localize",
+            t,
+            &[false; 3],
+            &mut hit
+        )),
+        "localized-text"
+    );
+    assert_eq!(vm.localization_hits, 1);
+
+    let mut miss = [
+        Value::Str("Thing".to_owned()),
+        Value::Str("Nope".to_owned()),
+        Value::Str("Test".to_owned()),
+    ];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "Object.Localize",
+            t,
+            &[false; 3],
+            &mut miss
+        )),
+        "<?int?Test.Thing.Nope?>"
+    );
+    assert_eq!(vm.localization_misses, 1);
+}
+
+#[test]
+fn object_localize_without_a_provider_is_an_explicit_error() {
+    let set = set_of(localized_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let t = vm.spawn(sg(&set, "Thing"), "T").unwrap();
+    let mut args = [
+        Value::Str("Thing".to_owned()),
+        Value::Str("Label".to_owned()),
+        Value::Str("Test".to_owned()),
+    ];
+    let def = native("Object.Localize");
+    let err = (def.f)(&mut vm, &ctx(t, &[false; 3], "Object.Localize"), &mut args).unwrap_err();
+    assert!(matches!(
+        err.kind,
+        VmErrorKind::NoLocalizationProvider { .. }
+    ));
+}
+
+/// `Object` -> `Thing` with a `static` `GetLabel()` returning a string constant, and an
+/// `Object.Call()` that returns `Thing.static.GetLabel()` through a `ClassContext`.
+fn static_on_default_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let thing = b.reserve(0, 0, "Thing");
+    let get = b.reserve(IMP_FUNCTION, thing, "GetLabel");
+    let get_r = b.reserve(B_STRPROP, get, "ReturnValue");
+    b.prop(get_r, 0, RETURN_PARM);
+    let mut body = vec![0x04, 0x1F];
+    body.extend_from_slice(b"hello");
+    body.push(0);
+    // Return opcode (1) + StringConst opcode (1) + 5 chars + NUL.
+    b.func(get, 0, get_r, &body, 8, 0, STATIC | DEFINED);
+
+    let call = b.reserve(IMP_FUNCTION, object, "Call");
+    let call_r = b.reserve(B_STRPROP, call, "ReturnValue");
+    b.prop(call_r, 0, RETURN_PARM);
+    let get_name = b.exports[(get - 1) as usize].name;
+    let mut code = vec![0x04, 0x12, 0x20];
+    code.extend(compact(thing));
+    code.extend(0u16.to_le_bytes());
+    code.push(0);
+    code.push(0x38);
+    code.extend(compact(get_name));
+    code.push(0x16);
+    // Return (1) + ClassContext (1) + ObjectConst (1 + object 4) + skip u16 (2) + size (1)
+    // + GlobalFunction (1 + name 4) + EndFunctionParms (1).
+    b.func(call, 0, call_r, &code, 16, 0, DEFINED);
+
+    b.class(thing, object, get);
+    b.class(object, 0, call);
+    b.build()
+}
+
+#[test]
+fn static_function_runs_on_an_inactive_class_default_object() {
+    let set = set_of(static_on_default_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let host = vm.spawn(sg(&set, "Object"), "Host").unwrap();
+    vm.set_active(host, true);
+    // `Object.Call()` evaluates `Thing.static.GetLabel()` on `Default__Thing`, which is not in
+    // the executed scope. Before the fix this returned `DeferredWithReturnValue`.
+    let value = vm
+        .call_function(sg(&set, "Object.Call"), host, Vec::new())
+        .expect("a static function on a class default object must run");
+    assert_eq!(value, Value::Str("hello".to_owned()));
+}
+
+#[test]
+fn color_operator_natives_clamp_componentwise() {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let thing = b.reserve(0, 0, "Thing");
+    let count = b.reserve(IMP_INTPROP, thing, "Count");
+    b.prop(count, 0, 0);
+    b.class(thing, object, count);
+    b.class(object, 0, 0);
+    let set = set_of(b.build());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let t = vm.spawn(sg(&set, "Thing"), "T").unwrap();
+    let color = |b: u8, g: u8, r: u8, a: u8| {
+        Value::Struct(vec![
+            ("b".to_owned(), Value::Byte(b)),
+            ("g".to_owned(), Value::Byte(g)),
+            ("r".to_owned(), Value::Byte(r)),
+            ("a".to_owned(), Value::Byte(a)),
+        ])
+    };
+    let channel = |v: &Value, n: &str| match v {
+        Value::Struct(f) => f
+            .iter()
+            .find(|(k, _)| k == n)
+            .and_then(|(_, v)| match v {
+                Value::Byte(b) => Some(*b),
+                _ => None,
+            })
+            .unwrap(),
+        other => panic!("{other:?}"),
+    };
+
+    // 255 * 0.5 truncates to 127 (not rounded) and stays in range.
+    let mut a = [color(255, 255, 255, 255), Value::Float(0.5)];
+    let v = call_native(&mut vm, "Actor.Multiply_ColorFloat", t, &[false; 2], &mut a);
+    let NativeOutcome::Value(v) = v else { panic!() };
+    assert_eq!(channel(&v, "r"), 127);
+    assert_eq!(channel(&v, "a"), 127);
+
+    // Add clamps at 255; subtract clamps at 0.
+    let mut a = [color(200, 10, 255, 1), color(200, 10, 255, 1)];
+    let v = call_native(&mut vm, "Actor.Add_ColorColor", t, &[false; 2], &mut a);
+    let NativeOutcome::Value(v) = v else { panic!() };
+    assert_eq!(channel(&v, "b"), 255);
+    assert_eq!(channel(&v, "g"), 20);
+    let mut a = [color(10, 0, 5, 0), color(20, 0, 255, 0)];
+    let v = call_native(&mut vm, "Actor.Subtract_ColorColor", t, &[false; 2], &mut a);
+    let NativeOutcome::Value(v) = v else { panic!() };
+    assert_eq!(channel(&v, "b"), 0);
+    assert_eq!(channel(&v, "r"), 0);
+}
+
+#[test]
+fn object_class_property_answers_the_objects_class() {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let thing = b.reserve(0, 0, "Thing");
+    let cls = b.reserve(IMP_OBJPROP, object, "Class");
+    b.prop_with(cls, 0, 0, &compact(0));
+    let count = b.reserve(IMP_INTPROP, thing, "Count");
+    b.prop(count, 0, 0);
+    b.class(thing, object, count);
+    b.class(object, 0, cls);
+    let set = set_of(b.build());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let t = vm.spawn(sg(&set, "Thing"), "T").unwrap();
+    // `Object.Class` is the object's UClass, not a serialized null default; scripts read it to
+    // identify a class (`default.Class` in the local-message chain).
+    assert_eq!(
+        vm.get_property(t, "Class"),
+        Some(&Value::Object(Some(ObjRef::Static(sg(&set, "Thing")))))
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Cinematic/dialogue natives (item3l)
+
+/// `GetWaveDuration` returns the host provider's value; without one it reports 0 (the script's
+/// own fallback) rather than inventing a duration.
+#[test]
+fn get_wave_duration_reports_provider_or_zero() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    let mut args = [Value::Str("Plage00_XIIIa_00".to_owned())];
+    let r = try_native(
+        &mut vm,
+        "Engine.Actor.GetWaveDuration",
+        a,
+        &[false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Float(0.0)));
+    vm.set_voice_duration(Box::new(crate::voice::FixedVoiceDuration::new(2.5)));
+    let mut args = [Value::Str("Plage00_XIIIa_00".to_owned())];
+    let r = try_native(
+        &mut vm,
+        "Engine.Actor.GetWaveDuration",
+        a,
+        &[false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Float(2.5)));
+    assert!(vm.has_voice_duration());
+    assert_eq!(vm.voice_duration("anything"), Some(2.5));
+}
+
+/// `PlayStrVoice` emits a `Dialogue` event carrying the voice name, the speaker pawn and the
+/// provider duration; a plain actor (no `LineIndex`/`Lines`/`Speakers`) has no subtitle text.
+#[test]
+fn play_str_voice_emits_dialogue_event_with_speaker_and_duration() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let dm = vm.spawn(sg(&set, "Actor"), "DialogueManager0").unwrap();
+    let pam = vm.spawn(sg(&set, "Actor"), "Cine0").unwrap();
+    vm.set_voice_duration(Box::new(crate::voice::FixedVoiceDuration::new(2.5)));
+    let mut args = [
+        Value::Str("Plage00_XIIIa_00".to_owned()),
+        Value::Object(Some(ObjRef::Instance(pam))),
+    ];
+    let r = try_native(
+        &mut vm,
+        "Engine.Actor.PlayStrVoice",
+        dm,
+        &[false, false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Bool(true)));
+    let events = vm.drain_events();
+    // The voice name is also emitted as a `PlaySound` so the existing audio layer speaks it.
+    let dialogue = events
+        .iter()
+        .find_map(|e| match e {
+            crate::events::PresentationEvent::Dialogue(d) => Some(d),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no Dialogue event in {events:?}"));
+    assert_eq!(dialogue.actor, "DialogueManager0");
+    assert_eq!(dialogue.speaker.as_deref(), Some("Cine0"));
+    assert_eq!(dialogue.sound, "Plage00_XIIIa_00");
+    assert_eq!(dialogue.text, None);
+    assert_eq!(dialogue.duration, Some(2.5));
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            crate::events::PresentationEvent::PlaySound(s)
+                if s.sound.as_deref() == Some("Plage00_XIIIa_00")
+        )),
+        "the voice must also be emitted as a PlaySound: {events:?}"
+    );
+    // An empty voice name does not emit and reports false (the engine did not start a voice).
+    let mut args = [Value::Str(String::new()), Value::Object(None)];
+    let r = try_native(
+        &mut vm,
+        "Engine.Actor.PlayStrVoice",
+        dm,
+        &[false, false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Bool(false)));
+    assert!(vm.drain_events().is_empty());
+}
+
+/// The subtitle text comes from the `DialogueManager`'s current line: `LineIndex` selects a
+/// `Lines` element, whose `SpeakerIndex`/`SentenceIndex` select the nested speaker sentence.
+#[test]
+fn dialogue_line_text_reads_nested_speaker_sentences() {
+    let lines = Value::Array(vec![
+        Value::Struct(vec![
+            ("SpeakerIndex".to_owned(), Value::Int(-1)),
+            ("SentenceIndex".to_owned(), Value::Int(-1)),
+        ]),
+        Value::Struct(vec![
+            ("SpeakerIndex".to_owned(), Value::Int(1)),
+            ("SentenceIndex".to_owned(), Value::Int(0)),
+        ]),
+    ]);
+    let speakers = Value::Array(vec![
+        Value::Struct(vec![("Sentences".to_owned(), Value::Array(Vec::new()))]),
+        Value::Struct(vec![(
+            "Sentences".to_owned(),
+            Value::Array(vec![Value::Str("My name is XIII.".to_owned())]),
+        )]),
+    ]);
+    assert_eq!(
+        crate::cinematics::line_text_from_values(1, &lines, &speakers).as_deref(),
+        Some("My name is XIII.")
+    );
+    // A line whose indices are -1 (the script's "end of line" sentinel) has no text.
+    assert_eq!(
+        crate::cinematics::line_text_from_values(0, &lines, &speakers),
+        None
+    );
+    // Out-of-range line and negative line index do not panic.
+    assert_eq!(
+        crate::cinematics::line_text_from_values(9, &lines, &speakers),
+        None
+    );
+    assert_eq!(
+        crate::cinematics::line_text_from_values(-1, &lines, &speakers),
+        None
+    );
+    // A speaker with no sentences at the requested index yields None.
+    let bad = Value::Array(vec![Value::Struct(vec![
+        ("SpeakerIndex".to_owned(), Value::Int(0)),
+        ("SentenceIndex".to_owned(), Value::Int(0)),
+    ])]);
+    assert_eq!(
+        crate::cinematics::line_text_from_values(0, &bad, &speakers),
+        None
+    );
 }

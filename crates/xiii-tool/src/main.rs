@@ -9,6 +9,7 @@ use std::time::Instant;
 
 mod anim_cmd;
 mod audio_cmd;
+mod locale_cmd;
 
 use xiii_package::{Limits, Package};
 use xiii_tool::{corpus, coverage, deps, props, report};
@@ -55,15 +56,22 @@ USAGE:
       WAV, and link .uax Sound objects to bank entries. Run 'xiii-tool audio' for
       details.
 
+  xiii-tool locale <coverage|get> ...
+      UE2 .int localisation files: per-file/language/entry coverage with hard
+      errors and warnings, or one Localize(Section, Key, Package) lookup. Run
+      'xiii-tool locale' for details.
+
   xiii-tool script <classes|functions|disasm|natives|coverage> ...
       Compiled UnrealScript (M2c): run 'xiii-tool script' for details.
 
-  xiii-tool campaign <game-dir> [--maps a,b,..] [--json <out>] [--md <out>]
+  xiii-tool campaign (<game-dir> | --root-env <VAR>) [--maps a,b,..] [--json <out>] [--md <out>]
       Headless whole-campaign sweep: per map (isolated), import counters/time,
       box/line collision soup sizes and BVH build time, navigation decode, the
       ReachSpec reach-walk, and the script level-start lifecycle with all actors
-      active in survey mode against the real map providers. Writes a metadata-only
-      JSON report and a Markdown summary. Run 'xiii-tool campaign' for details.
+      active in survey mode against the real map providers. --root-env takes the
+      root from an environment variable (a protected path is never typed). Writes a
+      metadata-only JSON report and a Markdown summary. Run 'xiii-tool campaign'
+      for details.
 
   xiii-tool <world-coverage|texture|mesh|bsp|zones|terrain> ...
       World decoding (M2a): textures, static meshes, BSP, terrain. Run
@@ -102,6 +110,7 @@ fn main() -> ExitCode {
         Some("campaign") => xiii_tool::campaign_cmd::run_cmd(&args[1..]),
         Some("anim") => anim_cmd::run(&args[1..]),
         Some("audio") => audio_cmd::run(&args[1..]),
+        Some("locale") => locale_cmd::run(&args[1..]),
         Some("script") => xiii_tool::script_cmd::run(&args[1..]),
         Some(cmd) if xiii_tool::world_cmd::COMMANDS.contains(&cmd) => {
             xiii_tool::world_cmd::run(cmd, &args[1..])

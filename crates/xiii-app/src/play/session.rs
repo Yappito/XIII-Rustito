@@ -12,13 +12,16 @@
 //! makes a play window survive the still-partial native layer.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Instant;
 
 use xiii_package::Limits;
 use xiii_script::vm::MoverState;
-use xiii_script::{ObjRef, ObjectId, PresentationEvent, ScriptSet, Value, Vm, VmError, VmLimits};
+use xiii_script::{
+    DialogueEvent, ObjRef, ObjectId, PresentationEvent, ScriptSet, Value, Vm, VmError, VmLimits,
+};
 use xiii_world::runtime::{self, ProviderSpec};
 
 use crate::collision;
@@ -56,10 +59,16 @@ pub struct Session {
     pub suspended: Vec<String>,
     /// First failure, formatted with its script stack.
     pub first_error: Option<String>,
-    /// Last synced VM `Location` per live actor (for the one-way render sync).
-    last_synced: HashMap<ObjectId, [f32; 3]>,
+    /// Last synced VM `Location` per object id (dense, for the one-way render sync). `None` until
+    /// an actor is first seen.
+    last_synced: Vec<Option<[f32; 3]>>,
     /// Presentation events, most recent last (bounded).
     pub events: VecDeque<(f64, PresentationEvent)>,
+    /// `PlayStrVoice` dialogue events, most recent last (bounded). `dialogue_total` is the
+    /// cumulative count so a consumer can detect new entries after the bounded window wraps.
+    pub dialogues: VecDeque<(f64, DialogueEvent)>,
+    /// Cumulative number of dialogue events emitted.
+    pub dialogue_total: u64,
     /// `Touch` events involving the player, most recent last (bounded).
     pub touches: VecDeque<(f64, String)>,
     player_touching: Vec<ObjectId>,
@@ -67,6 +76,11 @@ pub struct Session {
     pub moved: Vec<MovedActor>,
     /// `XIIIDispatcher0`, if the map has one (the trigger chain's end state).
     pub dispatcher: Option<ObjectId>,
+    /// Active language code of the install's localisation files (`int`, `frt`, ...).
+    pub localization_language: String,
+    /// Number of `localized` class-default values filled from the `.int` files while building
+    /// the level's class layouts.
+    pub localized_overrides: u64,
     /// Fixed steps run.
     pub tick_count: u64,
 }
@@ -94,6 +108,14 @@ impl Session {
         let (set, map_idx) = runtime::load_with_map(game_dir, map)?;
         let set: &'static ScriptSet = Box::leak(Box::new(set));
         let mut vm = Vm::new(set, VmLimits::default());
+
+        // Install the install's localisation files before the first class layout is built, so
+        // `localized` class defaults (for example `Plage01CahuteKeyPick.PickupMessage`) are
+        // filled from the active-language `.int` as the game's classes load them.
+        let localization_language = runtime::configure_localization(&mut vm, game_dir)?;
+        // Decoded `USize`/`VSize` for textures in non-script packages (the HUD widgets read the
+        // HUD's `FondMsg` texture size while drawing).
+        runtime::configure_external_objects(&mut vm, game_dir);
 
         let anim_log = Rc::new(RefCell::new(Vec::new()));
         let providers = runtime::build_map_providers(
@@ -256,14 +278,15 @@ impl Session {
 
         let dispatcher = vm.find_object("XIIIDispatcher0");
 
-        // Baseline for the one-way render sync and the initial touch state.
-        let mut last_synced = HashMap::new();
+        // Baseline for the one-way render sync and the initial touch state. Dense by object id,
+        // so the per-tick sync is a vec index rather than a hash-map lookup per actor.
+        let mut last_synced: Vec<Option<[f32; 3]>> = vec![None; vm.objects.len()];
         for (i, o) in vm.objects.iter().enumerate() {
             if o.is_actor
                 && !o.deleted
-                && let Some(l) = vm.vector_prop(i as ObjectId, "Location")
+                && let Some(l) = vm.location_prop(i as ObjectId)
             {
-                last_synced.insert(i as ObjectId, l);
+                last_synced[i] = Some(l);
             }
         }
 
@@ -281,12 +304,17 @@ impl Session {
             first_error: None,
             last_synced,
             events: VecDeque::new(),
+            dialogues: VecDeque::new(),
+            dialogue_total: 0,
             touches: VecDeque::new(),
             player_touching: Vec::new(),
             moved: Vec::new(),
             dispatcher,
+            localization_language,
+            localized_overrides: 0,
             tick_count: 0,
         };
+        session.localized_overrides = session.vm.localized_overrides;
         session.suspended.dedup();
         session.drain_events();
         session.update_touches();
@@ -298,6 +326,8 @@ impl Session {
     /// presentation events and record the actors the VM moved.
     pub fn step(&mut self, dt: f32, location: [f32; 3], yaw: f32, velocity: [f32; 3]) {
         self.moved.clear();
+        let profiling = self.vm.native_profile().enabled;
+        let t0 = Instant::now();
         let _ = self
             .vm
             .set_property(self.player, "Location", 0, Value::Vector(location));
@@ -311,10 +341,19 @@ impl Session {
             0,
             Value::Rotator([0, yaw_units, 0]),
         );
+        if profiling {
+            self.vm.native_profile_mut().player_write_micros += t0.elapsed().as_micros() as u64;
+        }
 
-        // VM touch update for the host-moved player (the walk into a trigger volume).
+        // VM touch update for the host-moved player (the walk into a trigger volume). Run every
+        // tick even when the player is stationary: movers, spawned actors and re-enabled
+        // collision can change the player's touch set without the player moving.
+        let t0 = Instant::now();
         if let Err(e) = self.vm.refresh_touching_of(self.player) {
             self.suspend(self.player, &e);
+        }
+        if profiling {
+            self.vm.native_profile_mut().touch_micros += t0.elapsed().as_micros() as u64;
         }
         self.drain_events();
 
@@ -322,9 +361,17 @@ impl Session {
             self.suspend(id, &e);
         }
         self.tick_count += 1;
+        let t0 = Instant::now();
         self.drain_events();
         self.update_touches();
+        if profiling {
+            self.vm.native_profile_mut().events_micros += t0.elapsed().as_micros() as u64;
+        }
+        let t0 = Instant::now();
         self.update_sync();
+        if profiling {
+            self.vm.native_profile_mut().sync_micros += t0.elapsed().as_micros() as u64;
+        }
     }
 
     /// VM time in seconds.
@@ -336,6 +383,11 @@ impl Session {
     /// actor locations, rotations, meshes and animation channels; it never mutates the VM).
     pub fn vm(&self) -> &Vm<'static> {
         &self.vm
+    }
+
+    /// Arms the VM's optional per-native/section timers (`--perf-natives`).
+    pub fn enable_native_timers(&mut self, on: bool) {
+        self.vm.enable_native_timers(on);
     }
 
     /// Mutable access to the script VM for the host HUD refresh (`hud.rs`): create the `Canvas`,
@@ -362,6 +414,22 @@ impl Session {
             .iter()
             .filter(|o| o.is_actor && !o.deleted)
             .count()
+    }
+
+    /// Every live, placed (`Default__`-excluded) actor whose class is (or derives from)
+    /// `XIIIPlayerPawn`. A correct single-player login creates exactly one; more means the login
+    /// path spawned duplicates. Used by the duplicate-pawn regression test and the reports.
+    pub fn player_pawn_actors(&self) -> Vec<(ObjectId, String)> {
+        (0..self.vm.objects.len())
+            .filter(|&i| {
+                let o = &self.vm.objects[i];
+                o.is_actor
+                    && !o.deleted
+                    && !o.name.starts_with("Default__")
+                    && self.vm.is_a(i as ObjectId, "XIIIPlayerPawn")
+            })
+            .map(|i| (i as ObjectId, self.vm.objects[i].name.clone()))
+            .collect()
     }
 
     /// Current dispatcher state name (`Fin` when the trigger chain completed).
@@ -609,11 +677,35 @@ impl Session {
     fn drain_events(&mut self) {
         for ev in self.vm.drain_events() {
             let t = self.vm.time;
+            if let PresentationEvent::Dialogue(d) = &ev {
+                self.dialogue_total += 1;
+                self.dialogues.push_back((t, d.clone()));
+            }
             self.events.push_back((t, ev));
         }
         while self.events.len() > 64 {
             self.events.pop_front();
         }
+        while self.dialogues.len() > 64 {
+            self.dialogues.pop_front();
+        }
+    }
+
+    /// Dialogue events emitted since `seen` (a cumulative count). Returns the events in order;
+    /// advances `seen` to [`Session::dialogue_total`]. Newest entries survive the bounded window.
+    pub fn new_dialogues(&self, seen: &mut u64) -> Vec<&DialogueEvent> {
+        if *seen >= self.dialogue_total {
+            return Vec::new();
+        }
+        let new = (self.dialogue_total - *seen).min(self.dialogues.len() as u64) as usize;
+        *seen = self.dialogue_total;
+        self.dialogues
+            .iter()
+            .rev()
+            .take(new)
+            .rev()
+            .map(|(_, d)| d)
+            .collect()
     }
 
     fn update_touches(&mut self) {
@@ -645,18 +737,24 @@ impl Session {
 
     fn update_sync(&mut self) {
         let mut moved = Vec::new();
+        if self.vm.objects.len() > self.last_synced.len() {
+            self.last_synced.resize(self.vm.objects.len(), None);
+        }
         for (i, o) in self.vm.objects.iter().enumerate() {
             if !o.is_actor || o.deleted {
                 continue;
             }
-            let id = i as ObjectId;
-            let Some(cur) = self.vm.vector_prop(id, "Location") else {
+            let Some(cur) = self.vm.location_prop(i as ObjectId) else {
                 continue;
             };
-            let base = *self.last_synced.entry(id).or_insert(cur);
-            if base != cur {
-                moved.push((o.name.clone(), render_delta(base, cur)));
-                self.last_synced.insert(id, cur);
+            match self.last_synced[i] {
+                Some(base) => {
+                    if base != cur {
+                        moved.push((o.name.clone(), render_delta(base, cur)));
+                        self.last_synced[i] = Some(cur);
+                    }
+                }
+                None => self.last_synced[i] = Some(cur),
             }
         }
         self.moved = moved;
@@ -866,5 +964,37 @@ mod tests {
             "player only {dist:.1} UU outside the door plane (need >= {:.0})",
             2.0 * UNREAL_UNITS_PER_METER
         );
+    }
+
+    /// Opt-in corpus regression (item3j Part A): the script login leaves **exactly one**
+    /// `XIIIPlayerPawn`. Before the fix, `GameInfo.PostLogin` -> `StartMatch` restarted every
+    /// placed `Engine.Camera` `PlayerController` (no pawn, not a spectator) and spawned 11 extra
+    /// pawns at the PlayerStart on each map. Checked at open and after 120 fixed ticks.
+    #[test]
+    fn opt_in_single_player_login_spawns_one_player_pawn() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        for map in ["Plage00", "Plage01"] {
+            let mut session = Session::open(&game_dir, map).expect("open session");
+            let at_open = session.player_pawn_actors();
+            assert_eq!(
+                at_open.len(),
+                1,
+                "{map}: expected one XIIIPlayerPawn at login, got {at_open:?}"
+            );
+            for _ in 0..120 {
+                let loc = session.player_location().unwrap_or([0.0; 3]);
+                session.step(1.0 / 60.0, loc, 0.0, [0.0; 3]);
+            }
+            let after = session.player_pawn_actors();
+            assert_eq!(
+                after.len(),
+                1,
+                "{map}: expected one XIIIPlayerPawn after 120 ticks, got {after:?}"
+            );
+            println!("[dupe test] {map}: one player pawn {:?}", after[0].1);
+        }
     }
 }
