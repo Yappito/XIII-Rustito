@@ -8,7 +8,7 @@
 use std::time::Instant;
 
 use xiii_collision::{CollisionWorld, MoveParams, Vec3};
-use xiii_decode::common::UNREAL_UNITS_PER_METER;
+use xiii_decode::common::{UNREAL_UNITS_PER_METER, actor_to_bevy};
 use xiii_decode::model::level;
 use xiii_decode::skeletal::validate::bounds;
 use xiii_decode::skeletal::{Skeleton, SkinnedMesh, decode_skeletal_mesh};
@@ -86,11 +86,36 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
         build.as_secs_f64() * 1000.0
     );
 
+    // NavigationPoint alignment test: in UE2 the editor places a NavigationPoint so that its
+    // collision cylinder RESTS on the floor: Location.Z = floor + CollisionHeight. For every
+    // PlayerStart / PathNode / other NavigationPoint subclass on the map, measure
+    // (Location.Z - floor below - CollisionHeight) against the imported collision world.
+    for c in [
+        "Engine.PlayerStart",
+        "Engine.PathNode",
+        "XIDPawn.AttackPoint",
+        "XIDPawn.doorpoint",
+        "XIDPawn.StrategicPoint",
+        "XIDPawn.PatrolPoint",
+        "XIDPawn.SafePoint",
+        "XIDPawn.gennmi",
+    ] {
+        navigation_point_alignment(&world, &set, &actors, c);
+    }
+
     // ---- identify Porte6 ------------------------------------------------------------------
     let door = identify_door(&scene, &actors, "Porte6");
     let door = match door {
         Some(d) => d,
-        None => return Err("no collision source contains 'Porte6' in this map".into()),
+        None if map_has_porte6(&actors) => {
+            return Err("no collision source contains 'Porte6' in this map".into());
+        }
+        None => {
+            println!(
+                "[collision-test] map has no Porte6 (no collision source, no actor); skipping the door cases"
+            );
+            return Ok(());
+        }
     };
     println!(
         "[collision-test] Porte6: class {} location {:?}",
@@ -162,6 +187,38 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
     let _ = rotation;
     println!("[collision-test] PlayerStart position {:?}", player_start);
 
+    // Effective placement of the PlayerStart (map property vs class default) and the map's
+    // own CollisionHeight override when present.
+    let mut class_defaults = crate::viewer::load::ClassDefaults::open(game_dir)?;
+    if let Some(ps) = actors.player_starts.first() {
+        match class_defaults.resolve(&ps.class, ps) {
+            Ok((eff, src)) => {
+                let tag = |s: level::PlacementSource| match s {
+                    level::PlacementSource::MapProperty => "map",
+                    level::PlacementSource::ClassDefault => "class-default",
+                    level::PlacementSource::EngineDefault => "engine-default",
+                };
+                println!(
+                    "[collision-test] PlayerStart effective: Location=({:.1},{:.1},{:.1}) UU [{}], Rotation={:?} [{}], DrawScale={} [{}]",
+                    eff.location[0],
+                    eff.location[1],
+                    eff.location[2],
+                    tag(src[0]),
+                    eff.rotation,
+                    tag(src[1]),
+                    eff.draw_scale,
+                    tag(src[2]),
+                );
+                let ch = ps
+                    .collision_height
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "<class default>".into());
+                println!("[collision-test] PlayerStart map CollisionHeight override: {ch}");
+            }
+            Err(e) => println!("[collision-test] PlayerStart effective: unresolved: {e}"),
+        }
+    }
+
     // The map's PlayerStart class (Engine.PlayerStart) has its own collision cylinder; print
     // its resolved defaults so the PlayerStart->floor offset can be interpreted.
     match class_layout_of(&set, "Engine.PlayerStart", Some("Engine")) {
@@ -211,6 +268,51 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
             f,
             f * UNREAL_UNITS_PER_METER
         );
+    }
+
+    // ---- StaticMeshActor286 / GR_interieur01 placement evidence --------------------------
+    if let Some(sma) = actors
+        .static_mesh_actors
+        .iter()
+        .find(|a| a.path.contains("StaticMeshActor286"))
+    {
+        report_static_mesh_actor(&scene, &mut class_defaults, sma, player_start);
+        // Does the mesh's collision set 0 match its render geometry? (Count triangles and
+        // compare vertex positions of the two decoded sets.)
+        if let Some(r) = sma.static_mesh
+            && let Ok((pkg, idx)) = cache.resolve(&map_pkg, r)
+        {
+            match xiii_decode::static_mesh::decode_static_mesh(&pkg.package, &pkg.data, idx) {
+                Ok(m) => {
+                    let (n0, n1) = (
+                        m.collision[0].triangles.len(),
+                        m.collision[1].triangles.len(),
+                    );
+                    let (v0, v1) = (m.collision[0].vertices.len(), m.collision[1].vertices.len());
+                    // Collision set 0 shares the render vertex positions when its vertices
+                    // equal the render vertex positions (same coordinates).
+                    let render = &m.vertices;
+                    let mut same_as_render = 0usize;
+                    for c in &m.collision[0].vertices {
+                        if render.iter().any(|v| {
+                            (v.position[0] - c[0]).abs() < 1e-3
+                                && (v.position[1] - c[1]).abs() < 1e-3
+                                && (v.position[2] - c[2]).abs() < 1e-3
+                        }) {
+                            same_as_render += 1;
+                        }
+                    }
+                    let render_tris = m.indices.len() / 3;
+                    let enabled = m.materials.iter().filter(|mm| mm.enable_collision).count();
+                    println!(
+                        "[collision-test]   GR_interieur01: collision set 0 = {n0} tris / {v0} verts ({same_as_render} of {v0} positions equal render verts), render = {render_tris} tris / {nv} verts; collision set 1 (simplified) = {n1} tris / {v1} verts; material slots with EnableCollision: {enabled}/{nm}",
+                        nv = render.len(),
+                        nm = m.materials.len(),
+                    );
+                }
+                Err(e) => println!("[collision-test]   GR_interieur01 mesh decode failed: {e}"),
+            }
+        }
     }
 
     let spawn = place_spawn(&world, player_start, half)?;
@@ -299,6 +401,36 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
         &scene.collision_sources,
         &open,
         half,
+    );
+
+    // ---- Extra case (labelled, not the acceptance case): pawn step-up ---------------------
+    // UE2 pawns step up over small floor rises natively; move_slide exposes that as
+    // max_step_height. The main cases above use 0 (fixed by the previous task). This extra
+    // run repeats the PlayerStart walk with a small step-up to separate "mis-placement" from
+    // "flat primitive without step-up". 0.08 m = 4.0 UU: above the observed deck-slat contact
+    // (1.8 UU) and the NavPoint placement residuals (+0.5..+4 UU); it is NOT measured from
+    // the game (no MaxStepHeight property exists in the corpus classes).
+    let step_up = MoveParams {
+        skin: 0.001,
+        max_iterations: 4,
+        max_step_height: 0.08,
+    };
+    let step_closed = walk_toward(
+        &world,
+        spawn.position,
+        door_center,
+        half,
+        step,
+        1200,
+        &step_up,
+    );
+    let step_past = past_plane(step_closed.position, door_center, step_closed.last_heading);
+    let step_src = step_closed
+        .last_source
+        .map(|s| scene.collision_sources[s as usize].clone());
+    println!(
+        "[collision-test] PlayerStart with step-up 0.08m (extra case): blocked={} last_source={:?} past_door_plane={:.2} m steps={}",
+        step_closed.blocked, step_src, step_past, step_closed.steps
     );
 
     // ---- Case 2: aligned door case, 2 m in front of the leaf along its normal -------------
@@ -432,6 +564,100 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
 // -------------------------------------------------------------------------------------------
 // Player class resolution
 // -------------------------------------------------------------------------------------------
+
+/// NavigationPoint alignment test (see the report): for every actor of one class with a
+/// decoded `Location`, compute `Location.Z - floor below - CollisionHeight` in UU where
+/// - CollisionHeight = the map's own property, else the class's inherited default;
+/// - "floor below" = nearest upward-facing hit of a downward ray starting just above the
+///   actor origin, from the full collision world (BSP + static meshes + terrain).
+///
+/// Prints the (n, min, median, max, histogram) of the offsets and examples.
+fn navigation_point_alignment(
+    world: &CollisionWorld,
+    set: &ScriptSet,
+    actors: &level::LevelActors,
+    class: &str,
+) {
+    let placements: Vec<&level::ActorPlacement> = actors
+        .all_located
+        .iter()
+        .filter(|a| a.class.eq_ignore_ascii_case(class))
+        .collect();
+    if placements.is_empty() {
+        return;
+    }
+    let class_h = class_layout_of(set, class, None)
+        .ok()
+        .and_then(|l| layout_float(&l, "CollisionHeight").ok());
+    let mut rows: Vec<(String, f32, f32, &'static str)> = Vec::new();
+    for a in &placements {
+        let Some(loc) = a.location else {
+            continue;
+        };
+        let bevy = xiii_decode::common::to_bevy_position(loc);
+        // The engine's "floor below" is the surface the collision cylinder would rest on: the
+        // nearest hit below the actor origin. Probing from far above would return an
+        // overhang/deck above an interior actor instead (the Plage01 PlayerStart sits in a
+        // 48 UU crawlspace under a deck), so start just above the origin.
+        let Some(floor) = floor_y_at(world, bevy, bevy[1] + 0.1) else {
+            continue;
+        };
+        let floor_uu = floor * UNREAL_UNITS_PER_METER;
+        let (ch, ch_src) = match a.collision_height {
+            Some(v) => (v, "map"),
+            None => match class_h {
+                Some(v) => (v, "class-default"),
+                None => (f32::NAN, "none"),
+            },
+        };
+        rows.push((
+            a.path.clone(),
+            loc[2] - floor_uu - if ch.is_nan() { 0.0 } else { ch },
+            ch,
+            ch_src,
+        ));
+    }
+    let tested = rows.iter().filter(|(_, _, _, s)| *s != "none").count();
+    let mut offs: Vec<f32> = rows
+        .iter()
+        .filter(|(_, _, _, s)| *s != "none")
+        .map(|(_, o, _, _)| *o)
+        .collect();
+    offs.sort_by(|a, b| a.total_cmp(b));
+    if offs.is_empty() {
+        println!("[collision-test] alignment {class}: no testable rows");
+        return;
+    }
+    let n = offs.len();
+    let median = if n % 2 == 1 {
+        offs[n / 2]
+    } else {
+        (offs[n / 2 - 1] + offs[n / 2]) / 2.0
+    };
+    let mut hist: std::collections::BTreeMap<i64, usize> = Default::default();
+    for &o in &offs {
+        *hist.entry(((o * 2.0).round() / 2.0) as i64).or_default() += 1;
+    }
+    let top = hist
+        .iter()
+        .rev()
+        .take(6)
+        .map(|(k, v)| format!("{k}:{v}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!(
+        "[collision-test] alignment {class}: {} placed, floor found for {tested}; Location.Z - floor - CollisionHeight (UU) min {:+.1} median {:+.1} max {:+.1}; histogram (round UU:count) {top}",
+        tested,
+        offs[0],
+        median,
+        offs[n - 1],
+    );
+    for (path, o, ch, src) in rows.iter().take(2) {
+        println!(
+            "[collision-test]   alignment {class} example {path}: offset {o:+.1} UU (CollisionHeight {ch} [{src}])"
+        );
+    }
+}
 
 /// Loads every `.u` package of the installation into a `ScriptSet` (read-only).
 fn load_script_set(install: &Installation) -> Result<ScriptSet, String> {
@@ -761,8 +987,8 @@ fn identify_door(scene: &WorldScene, actors: &level::LevelActors, name: &str) ->
             .map(|a| a.class.clone())
             .unwrap_or_else(|| "<no actor record>".to_owned()),
         location: actor
-            .map(|a| xiii_decode::common::to_bevy_position(a.location))
-            .unwrap_or([0.0; 3]),
+            .and_then(|a| a.location)
+            .map_or([0.0; 3], xiii_decode::common::to_bevy_position),
         sources,
     })
 }
@@ -1103,4 +1329,204 @@ fn past_plane(p: Vec3, origin: Vec3, heading: Vec3) -> f32 {
 
 fn pass_fail(ok: bool) -> &'static str {
     if ok { "PASS" } else { "FAIL" }
+}
+
+/// True when the map has an actor path containing the fragment (case-insensitive).
+fn map_has_porte6(actors: &level::LevelActors) -> bool {
+    actors
+        .static_mesh_actors
+        .iter()
+        .any(|a| a.path.to_ascii_lowercase().contains("porte6"))
+}
+
+/// Full placement report for one static-mesh actor, from the imported `WorldScene`: every
+/// effective placement value with its source (map / class default), the mesh's local bounding
+/// box, its world bbox after the transform, and the heights of its walkable surfaces nearby.
+fn report_static_mesh_actor(
+    scene: &WorldScene,
+    class_defaults: &mut crate::viewer::load::ClassDefaults,
+    a: &level::ActorPlacement,
+    player_start: Vec3,
+) {
+    let prefix = format!("{} -> ", a.path);
+    let objs: Vec<&crate::viewer::load::SceneObject> = scene
+        .objects
+        .iter()
+        .filter(|o| o.path.starts_with(&prefix))
+        .collect();
+    let Some(first) = objs.first() else {
+        println!("[collision-test] StaticMeshActor286: not placed (skipped) in the scene");
+        return;
+    };
+    let (eff, src) = match class_defaults.resolve(&a.class, a) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("[collision-test] StaticMeshActor286: class defaults unresolved: {e}");
+            return;
+        }
+    };
+    let tag = |s: level::PlacementSource| match s {
+        level::PlacementSource::MapProperty => "map",
+        level::PlacementSource::ClassDefault => "class-default",
+        level::PlacementSource::EngineDefault => "engine-default",
+    };
+    println!("[collision-test] StaticMeshActor286 -> {0}", {
+        let p = first.path.strip_prefix(&prefix).unwrap_or("?");
+        p.to_owned()
+    });
+    println!(
+        "[collision-test]   Location ({:.1},{:.1},{:.1}) UU [{}]; Rotation {:?} [{}]; DrawScale {:.3} [{}]; DrawScale3D {:?} [{}]; PrePivot {:?} [{}]",
+        eff.location[0],
+        eff.location[1],
+        eff.location[2],
+        tag(src[0]),
+        eff.rotation,
+        tag(src[1]),
+        eff.draw_scale,
+        tag(src[2]),
+        eff.draw_scale_3d,
+        tag(src[3]),
+        eff.pre_pivot,
+        tag(src[4]),
+    );
+    println!(
+        "[collision-test]   flags bCollideActors={:?} bBlockActors={:?} bBlockPlayers={:?} bStaticMeshActor-hidden={}",
+        a.collision_flags[0], a.collision_flags[1], a.collision_flags[2], a.hidden
+    );
+    // Local/world bounds of the mesh (all placed sections share one transform; bounds of the
+    // union over sections).
+    let ident = |m: &crate::viewer::load::SceneMesh| {
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in &m.positions {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        (lo, hi)
+    };
+    let t = first.transform;
+    let mut world_lo = [f32::MAX; 3];
+    let mut world_hi = [f32::MIN; 3];
+    for o in &objs {
+        let (lo, hi) = ident(&scene.meshes[o.mesh]);
+        for p in [&lo, &hi] {
+            let w = crate::viewer::load::apply_transform_pub(&t, *p);
+            for k in 0..3 {
+                world_lo[k] = world_lo[k].min(w[k]);
+                world_hi[k] = world_hi[k].max(w[k]);
+            }
+        }
+    }
+    let (mesh_lo, mesh_hi) = ident(&scene.meshes[first.mesh]);
+    let uu = |v: [f32; 3]| -> [f32; 3] {
+        [
+            v[0] * UNREAL_UNITS_PER_METER,
+            v[1] * UNREAL_UNITS_PER_METER,
+            v[2] * UNREAL_UNITS_PER_METER,
+        ]
+    };
+    println!(
+        "[collision-test]   mesh bbox (converted mesh-space, m) min {:?} max {:?} = UU {:?}..{:?}",
+        mesh_lo,
+        mesh_hi,
+        uu(mesh_lo),
+        uu(mesh_hi)
+    );
+    println!(
+        "[collision-test]   world bbox (after placement incl. PrePivot) m min {:?} max {:?} = UU {:?}..{:?}",
+        world_lo,
+        world_hi,
+        uu(world_lo),
+        uu(world_hi)
+    );
+    // "Before the fix": the legacy transform (map property, else hardcoded engine defaults;
+    // no PrePivot). Identical when every placement property is present and PrePivot is zero.
+    let legacy_scale = [
+        a.draw_scale_3d.unwrap_or([1.0; 3])[0] * a.draw_scale.unwrap_or(1.0),
+        a.draw_scale_3d.unwrap_or([1.0; 3])[1] * a.draw_scale.unwrap_or(1.0),
+        a.draw_scale_3d.unwrap_or([1.0; 3])[2] * a.draw_scale.unwrap_or(1.0),
+    ];
+    let legacy = actor_to_bevy(
+        a.location.unwrap_or([0.0; 3]),
+        a.rotation.unwrap_or([0; 3]),
+        legacy_scale,
+    );
+    let mut legacy_lo = [f32::MAX; 3];
+    let mut legacy_hi = [f32::MIN; 3];
+    for o in &objs {
+        let (lo, hi) = ident(&scene.meshes[o.mesh]);
+        for p in [&lo, &hi] {
+            let w = crate::viewer::load::apply_transform_pub(&legacy, *p);
+            for k in 0..3 {
+                legacy_lo[k] = legacy_lo[k].min(w[k]);
+                legacy_hi[k] = legacy_hi[k].max(w[k]);
+            }
+        }
+    }
+    println!(
+        "[collision-test]   world bbox BEFORE fix (map values, no PrePivot/class-defaults) m min {:?} max {:?} = UU {:?}..{:?}",
+        legacy_lo,
+        legacy_hi,
+        uu(legacy_lo),
+        uu(legacy_hi)
+    );
+    // Walkable surfaces: upward-facing collision triangles of this actor, grouped by floor
+    // height (Bevy Y), with the fraction of area near the PlayerStart XY.
+    let mut surfaces: Vec<(f32, f32)> = Vec::new(); // (u UU, area m^2)
+    for (tris, src) in &scene.collision {
+        let src_path = &scene.collision_sources[*src as usize];
+        if !src_path.starts_with(&prefix) {
+            continue;
+        }
+        let n = (tris[0][1] + tris[1][1] + tris[2][1]) / 3.0;
+        let e1 = [
+            tris[1][0] - tris[0][0],
+            tris[1][1] - tris[0][1],
+            tris[1][2] - tris[0][2],
+        ];
+        let e2 = [
+            tris[2][0] - tris[0][0],
+            tris[2][1] - tris[0][1],
+            tris[2][2] - tris[0][2],
+        ];
+        let nvec = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
+        let len = (nvec[0] * nvec[0] + nvec[1] * nvec[1] + nvec[2] * nvec[2]).sqrt();
+        if len < 1e-9 || nvec[1] / len < 0.5 {
+            continue;
+        }
+        let d = ((tris[0][0] - player_start[0]).powi(2) + (tris[0][2] - player_start[2]).powi(2))
+            .sqrt();
+        if d > 4.0 {
+            continue;
+        }
+        surfaces.push((n * UNREAL_UNITS_PER_METER, len / 2.0));
+    }
+    surfaces.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let merged: Vec<(f32, f32)> = {
+        let mut out: Vec<(f32, f32)> = Vec::new();
+        for (u, area) in surfaces {
+            if let Some(last) = out.last_mut()
+                && (u - last.0).abs() < 1.0
+            {
+                last.1 += area;
+                continue;
+            }
+            out.push((u, area));
+        }
+        out
+    };
+    for (u, area) in &merged {
+        println!(
+            "[collision-test]   walkable surface at {:.1} UU (PlayerStart XY within 4 m): area {:.0} UU^2, {:.1} UU above the BSP floor below the PlayerStart (1184.0), {:+.1} vs PlayerStart.Z (1196.0)",
+            u,
+            area * UNREAL_UNITS_PER_METER * UNREAL_UNITS_PER_METER,
+            u - 1184.0,
+            u - 1196.0
+        );
+    }
 }

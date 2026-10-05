@@ -34,17 +34,22 @@ is in `local/reports/item1-collision.md`. The player pawn resolves to `XIII.XIII
 An opt-in integration test (`tests/local_collision.rs`, `XIII_GOG_DIR`) asserts both cases.
 
 `src/viewer/load.rs` imports the map without Bevy types, using `xiii-install` for read-only
-package resolution and `xiii-decode`. It places static-mesh actors (Location, Rotation,
-DrawScale x DrawScale3D; PrePivot ignored), the level BSP and the terrain heightfield, and bakes
-the terrain layers into one texture. Materials are followed through
+package resolution and `xiii-decode`. Actor placement uses **effective** values: the map's
+tagged property if present, else the inherited class default resolved read-only through
+`xiii_script` (`Vm::class_layout`), else the documented `Engine.Actor` default; the source of
+every field is counted (`placement.<field>.map|class_default|engine_default`). `PrePivot` is
+applied before scale/rotation (`xiii_decode::common::actor_to_bevy_pre_pivot`). It places
+static-mesh actors, the level BSP and the terrain heightfield, and bakes the terrain layers
+into one texture. Materials are followed through
 Shader/FinalBlend/Tex*/SinusModifier/Combiner down to a texture and drawn unlit with a
 `StandardMaterial`; unresolved materials are drawn magenta. Every skipped item is a `skip.*`,
 `fail.*` or `note.*` counter, shown in the overlay and printed. The crosshair reports the
 object path (CPU ray against the render triangles). The fly camera starts at the PlayerStart
 (or `--view x,y,z,yaw,pitch`, given in Bevy metres and degrees). `--dump` imports without a
-window and adds collision ray probes. Known gaps: no skybox (sky-backdrop BSP surfaces are
-skipped and counted), translucent/modulated sea materials render dark, and there is no vertex
-lighting. This is an importer diagnostic, not a playable mode.
+window, adds collision ray probes, per-map placement statistics (top-20 actors by `|PrePivot|`)
+and the `placement.*` provenance counters. Known gaps: no skybox (sky-backdrop BSP surfaces
+are skipped and counted), translucent/modulated sea materials render dark, and there is no
+vertex lighting. This is an importer diagnostic, not a playable mode.
 
 ## Run
 
