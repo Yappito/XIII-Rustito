@@ -69,6 +69,9 @@ pub enum Command {
     /// gameplay maps start the player with `XIII.Fists`, so a demonstration weapon is granted
     /// through the game's own `Weapon.GiveTo`/`BringUp`).
     Weapon(String),
+    /// Equip the best weapon the player already carries in the game's own inventory chain (the
+    /// `BringUp`/`ChangedWeapon` path), e.g. after walking onto a map weapon pickup (item14b).
+    Equip,
 }
 
 /// A parsed input script, time-ordered.
@@ -153,6 +156,7 @@ impl Script {
                     }
                     Command::Weapon(path.to_owned())
                 }
+                "equip" | "select" => Command::Equip,
                 other => return Err(format!("line {n}: unknown command {other:?}")),
             };
             events.push(Event { t, command });
@@ -185,6 +189,8 @@ pub struct Drive {
     jump_pending: bool,
     use_pending: bool,
     fire_pending: bool,
+    /// `equip` requested (edge-triggered) and not yet applied by the host.
+    equip_pending: bool,
     /// Weapons requested (`weapon <Package.Class>`) and not yet applied by the host.
     weapons: Vec<String>,
     /// Active `goto` waypoint (Unreal units), if any.
@@ -204,6 +210,7 @@ impl Drive {
             jump_pending: false,
             use_pending: false,
             fire_pending: false,
+            equip_pending: false,
             weapons: Vec::new(),
             goto: None,
         }
@@ -213,6 +220,11 @@ impl Drive {
     /// [`Input`] because it is not a per-tick axis and carries a class path.
     pub fn take_weapons(&mut self) -> Vec<String> {
         std::mem::take(&mut self.weapons)
+    }
+
+    /// Takes the pending `equip` request (edge-triggered).
+    pub fn take_equip(&mut self) -> bool {
+        std::mem::take(&mut self.equip_pending)
     }
 
     /// Applies every event due at or before `elapsed` and returns this tick's input.
@@ -239,6 +251,7 @@ impl Drive {
                 Command::Use => self.use_pending = true,
                 Command::Fire => self.fire_pending = true,
                 Command::Weapon(path) => self.weapons.push(path.clone()),
+                Command::Equip => self.equip_pending = true,
             }
             self.cursor += 1;
         }

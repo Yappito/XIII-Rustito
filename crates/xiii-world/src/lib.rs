@@ -24,6 +24,7 @@ use std::sync::Arc;
 pub mod animation;
 pub mod audio;
 pub mod fog;
+pub mod hitbox;
 pub mod materials;
 pub mod movement_volumes;
 pub mod nav_provider;
@@ -1838,6 +1839,27 @@ fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
         return;
     };
     let zone_map = zones::ZoneMap::new(&m);
+    // The `FBspVertexStream` (`Model::vertex_stream`) is validated and measured here, but its
+    // 4-byte field is **not** used as BSP lighting: on every inspected map it is white at
+    // polygon corners and transparent-black (A=0) only at collinear (T-junction) vertices, so
+    // modulating by it blackens T-junction vertices (measured; see the item5e report). BSP
+    // lighting must come from the lightmap texels, which are not decoded yet. The stream is
+    // still decoded and cross-checked because it is the renderer's vertex data.
+    let bsp_stream_valid = m.vertex_stream_matches_points();
+    if bsp_stream_valid {
+        im.scene.count("lighting.bsp.stream_validated", 1);
+        im.scene
+            .count("lighting.bsp.vertices", m.vertex_stream.len());
+        for v in &m.vertex_stream {
+            match v.flags_or_color {
+                [255, 255, 255, 255] => im.scene.count("lighting.bsp.color_white", 1),
+                [0, 0, 0, 0] => im.scene.count("lighting.bsp.color_black", 1),
+                _ => im.scene.count("lighting.bsp.color_other", 1),
+            }
+        }
+    } else if !m.vertex_stream.is_empty() {
+        im.scene.count("lighting.bsp.stream_rejected", 1);
+    }
     // Group triangles per (surface material, BSP zone). Keying by zone keeps every object in
     // exactly one render layer (sky vs playable); a mesh never spans two zones.
     let mut groups: BTreeMap<(i64, Option<u32>), (MaterialSlot, SceneMesh)> = BTreeMap::new();
@@ -3271,6 +3293,56 @@ mod local_tests {
                 get("lighting.instances.decoded"),
                 get("lighting.colors.rgba"),
                 get("lighting.terrain.colors"),
+            );
+        }
+    }
+
+    /// Opt-in BSP vertex-stream invariants: the level model's `FBspVertexStream` is present
+    /// and position-validated on every referenced node vertex, the 4-byte field is counted,
+    /// and BSP scene objects deliberately carry **no** baked colours (the field is not a light
+    /// term; see the item5e report). On Plage00/Plage01 the stream is exact; Banque01's variant
+    /// tail is decoded by the corrected `LightMapBits` element array.
+    #[test]
+    fn opt_in_bsp_vertex_colors() {
+        let Some(path) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        for map in ["Plage00", "Plage01", "Banque01"] {
+            let scene = import_map(&mut cache, map).expect("import");
+            let get = |k: &str| scene.counters.get(k).copied().unwrap_or(0);
+            assert_eq!(
+                get("lighting.bsp.stream_rejected"),
+                0,
+                "{map}: BSP stream present but not position-validated"
+            );
+            assert_eq!(get("lighting.bsp.stream_validated"), 1, "{map}");
+            let vertices = get("lighting.bsp.vertices");
+            assert!(vertices > 0, "{map}");
+            assert_eq!(
+                get("lighting.bsp.color_white")
+                    + get("lighting.bsp.color_black")
+                    + get("lighting.bsp.color_other"),
+                vertices,
+                "{map}: colour classification does not cover the stream"
+            );
+            // The 4-byte field is not applied as BSP lighting.
+            for o in &scene.objects {
+                if o.path.contains(" BSP ") {
+                    assert!(
+                        o.colors.is_none(),
+                        "{map}: BSP object {} must not carry baked colours",
+                        o.path
+                    );
+                }
+            }
+            println!(
+                "[bsp-stream] {map}: vertices {} white {} black {} other {}",
+                vertices,
+                get("lighting.bsp.color_white"),
+                get("lighting.bsp.color_black"),
+                get("lighting.bsp.color_other"),
             );
         }
     }

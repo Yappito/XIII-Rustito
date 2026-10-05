@@ -22,7 +22,7 @@ per-triangle facing, so:
 - triangles are **two-sided**; the reported contact normal is oriented to oppose the sweep
   direction, not taken from the winding;
 - the source half-extents in Bevy space are `(R, H, R) / units_per_metre`, so a 34/75 pawn
-  (XIII default) is `(0.68, 1.5, 0.68)` m at 50 units/m.
+  (XIII default) is `(0.38, 0.83, 0.38)` m at 90 units/m (the project's approved scale).
 
 ## API
 
@@ -49,25 +49,49 @@ built once per world. `traverse` visits only nodes whose bounds overlap the swep
 so queries are not O(all triangles). A deterministic-LCG test asserts the BVH sweep equals a
 brute-force oracle over 500 random queries on a 400-triangle soup.
 
+## Engine evidence (item1j, `Engine.dll`, read-only)
+
+Disassembled (`llvm-objdump`, raw in `local/re/`) and read against the engine's own
+`APawn::physWalking` (`0x103bdac0`), `APawn::stepUp` (`0x103baa30`), `AActor::stepUp`
+(`0x103bb0a0`), `ULevel::MoveActor` (`0x1038a770`), `ULevel::SingleLineCheck`/`MultiLineCheck`,
+`UModel::LineCheck` (`0x10419b80`), `UStaticMesh::LineCheck` (`0x10402e00`) and
+`ATerrainInfo::LineCheck` (`0x10409eb0`):
+
+- The pawn moves an **extent box** `(R,R,H)`, confirmed: `MoveActor` receives an extent vector
+  and `stepUp` multiplies the step vector by the fixed up magnitude `35.0` UU.
+- `MINFLOORZ = 0.7` (`0x10483428`) is the walkability threshold; `physWalking` tests it on the
+  **floor** `FCheckResult.Normal.Z` from a separate downward check, not on the horizontal
+  blocking contact's normal.
+- `physWalking` iterates at most `8` sub-steps (`cmpl $0x8`, `0x103bde14`) and uses the
+  `1.9`/`2.4` UU constants (`0x10483420`/`0x10483424`) beside its floor snap. Our harness's
+  `0.05` UU skin is empirical, not an engine constant (`stepUp` uses no separate skin).
+- Every geometry `LineCheck` (`UModel` BSP, `UStaticMesh`, `ATerrainInfo`) is a **segment with
+  extent**, not a swept box: the extent expands the endpoint box. `ATerrainInfo::LineCheck`
+  clamps to the base heightmap and indexes `Vertices[HeightmapX*y + x]` (base grid only).
+
 ## Approximations (not fidelity claims)
 
-`move_slide` is a simple approximation of `UPawn::physWalking` / `stepUp`: one swept AABB
+`move_slide` is a simple approximation of `APawn::physWalking` / `stepUp`: one swept AABB
 against two-sided triangles, an empirical 1 mm skin, and a step-up heuristic gated on a
 near-vertical contact normal (`|n_y| < 0.3`). A near-horizontal small floor rise reported
 through a near-horizontal contact therefore never triggers it.
 
-`walk_move` is a closer (still approximate) `UPawn::physWalking`:
+`walk_move` is a closer (still approximate) `APawn::physWalking`:
 
 1. sweep the full delta; on no hit, move and finish;
-2. on a hit, back off by `skin`; if the surface is not walkable (its up component is below
-   `min_floor_z`), try step-up — sweep up by `max_step_height`, forward by the remaining
-   travel, then down by `max_step_height` + epsilon, accepting only a walkable landing;
-   otherwise slide along the hit plane exactly as `move_slide`;
+2. on a hit, back off by `skin`; try step-up — sweep up by `max_step_height`, forward by the
+   remaining travel, then down by `max_step_height` + epsilon, accepting only a walkable
+   landing; otherwise slide along the hit plane exactly as `move_slide`. The engine gates this
+   on the pawn's *floor* (a separate downward probe); `walk_move` approximates it by
+   attempting on any horizontal block and requiring a walkable landing;
 3. after the move, floor-follow: sweep down by `max_step_height` and snap to a walkable floor,
    else set `falling` (no gravity is applied; the caller stops and reports).
 
 Both retain UE2's extent-box primitive and the empirical 1 mm skin; neither reproduces UE2's
-cylinder/contact ordering, penetration resolution, or per-step friction/acceleration.
+cylinder/contact ordering, penetration resolution, the `8`-sub-step loop, or per-step
+friction/acceleration. The engine's `LineCheck`s are segment-with-extent, not swept; `walk_move`
+deliberately uses a continuous swept box because the reach harness needs no-tunnelling, and the
+difference is reported, not hidden.
 
 ## Tests (synthetic geometry only, no game data)
 
