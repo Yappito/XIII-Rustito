@@ -4924,6 +4924,9 @@ dependencies = [
 [[package]]
 name = "xiii-audio"
 version = "0.1.0"
+dependencies = [
+ "xiii-package",
+]
 
 [[package]]
 name = "xiii-collision"

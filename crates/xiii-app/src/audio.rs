@@ -197,6 +197,8 @@ pub struct PlayedEntry {
     pub label: String,
     /// `played`, `music`, or a failure reason.
     pub outcome: String,
+    /// How the sound was resolved (e.g. `resource_ref Fix.hxc#31 c2/0`).
+    pub resolution: String,
 }
 
 /// Playback statistics (reported in the overlay and by tests).
@@ -225,12 +227,22 @@ pub struct AudioStats {
     pub banks_parsed: usize,
     pub banks_failed: usize,
     pub names: usize,
+    /// `.uax` packages seen/parsed and `Sound` exports indexed with a resource reference.
+    pub uax_seen: usize,
+    pub uax_parsed: usize,
+    pub sound_exports: usize,
+    pub sound_refs: usize,
+    pub resources: usize,
     /// Bounded history for the overlay.
     pub last: Vec<PlayedEntry>,
 }
 
 impl AudioStats {
     fn record(&mut self, time: f64, label: String, outcome: &str) {
+        self.record_res(time, label, outcome, String::new());
+    }
+
+    fn record_res(&mut self, time: f64, label: String, outcome: &str, resolution: String) {
         if outcome != "played" && outcome != "music" {
             *self.failed.entry(reason_label(outcome)).or_default() += 1;
         }
@@ -238,6 +250,7 @@ impl AudioStats {
             time,
             label,
             outcome: outcome.to_owned(),
+            resolution,
         });
         if self.last.len() > OVERLAY_HISTORY {
             self.last.remove(0);
@@ -342,7 +355,14 @@ fn report_audio_exit(
         failures.join(", ")
     );
     for e in &s.last {
-        println!("[audio]   last [{:.3}s] {} {}", e.time, e.outcome, e.label);
+        if e.resolution.is_empty() {
+            println!("[audio]   last [{:.3}s] {} {}", e.time, e.outcome, e.label);
+        } else {
+            println!(
+                "[audio]   last [{:.3}s] {} {} [{}]",
+                e.time, e.outcome, e.label, e.resolution
+            );
+        }
     }
 }
 
@@ -377,12 +397,22 @@ fn setup_audio(mut commands: Commands, cfg: Res<AudioConfig>) {
     stats.banks_parsed = s.banks_parsed;
     stats.banks_failed = s.banks_failed;
     stats.names = s.names;
+    stats.uax_seen = s.uax_seen;
+    stats.uax_parsed = s.uax_parsed;
+    stats.sound_exports = s.sound_exports;
+    stats.sound_refs = s.sound_refs;
+    stats.resources = s.resources;
     println!(
-        "[audio] HX banks: {} seen, {} parsed, {} failed; {} named sounds ({:.2}s)",
+        "[audio] HX banks: {} seen, {} parsed, {} failed; {} named sounds, {} resource pairs, \
+         {} Sound exports with a resource reference; .uax {} seen/{} parsed ({:.2}s)",
         s.banks_seen,
         s.banks_parsed,
         s.banks_failed,
         s.names,
+        s.resources,
+        s.sound_refs,
+        s.uax_seen,
+        s.uax_parsed,
         started.elapsed().as_secs_f32()
     );
     commands.insert_resource(AudioRes { library, stats });
@@ -497,22 +527,40 @@ fn label(req: &SoundRequest) -> String {
     )
 }
 
-/// Resolves and decodes one request to an in-memory WAV `AudioSource` handle.
+/// Resolves and decodes one request to an in-memory WAV `AudioSource` handle, plus a short
+/// description of how it was resolved (rule, bank entry, candidate count/choice).
 fn source_for(
     audio: &mut AudioRes,
     sources: &mut Assets<AudioSource>,
     req: &SoundRequest,
-) -> Result<Handle<AudioSource>, ResolveFailure> {
+) -> Result<(Handle<AudioSource>, String), ResolveFailure> {
     let Some(path) = &req.sound else {
         return Err(ResolveFailure::NoSoundName);
     };
-    let Some(r) = audio.library.resolve_path(path).cloned() else {
+    let Some(r) = audio.library.resolve_path(path) else {
         return Err(ResolveFailure::NoNameMatch);
     };
-    let pcm = audio.library.load(&r)?;
-    Ok(sources.add(AudioSource {
-        bytes: wav_bytes(&pcm).into(),
-    }))
+    let pcm = audio.library.load(&r.entry)?;
+    let file = r
+        .entry
+        .bank
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| r.entry.bank.display().to_string());
+    let desc = format!(
+        "{} {}#{} c{}/{}",
+        r.rule.as_str(),
+        file,
+        r.entry.entry,
+        r.candidates,
+        r.chosen
+    );
+    Ok((
+        sources.add(AudioSource {
+            bytes: wav_bytes(&pcm).into(),
+        }),
+        desc,
+    ))
 }
 
 fn play_sound(
@@ -522,7 +570,7 @@ fn play_sound(
     req: &SoundRequest,
     positions: &impl Fn(&str) -> Option<Vec3>,
 ) {
-    let handle = match source_for(audio, sources, req) {
+    let (handle, resolution) = match source_for(audio, sources, req) {
         Ok(h) => h,
         Err(reason) => {
             audio.stats.record(req.time, label(req), reason.as_str());
@@ -553,7 +601,9 @@ fn play_sound(
         }
     }
     audio.stats.played += 1;
-    audio.stats.record(req.time, label(req), "played");
+    audio
+        .stats
+        .record_res(req.time, label(req), "played", resolution);
 }
 
 fn play_music(
@@ -563,7 +613,7 @@ fn play_music(
     req: &SoundRequest,
     music: &Query<Entity, With<MusicTrack>>,
 ) {
-    let handle = match source_for(audio, sources, req) {
+    let (handle, resolution) = match source_for(audio, sources, req) {
         Ok(h) => h,
         Err(reason) => {
             audio.stats.record(req.time, label(req), reason.as_str());
@@ -585,7 +635,9 @@ fn play_music(
     ));
     audio.stats.music += 1;
     audio.stats.played += 1;
-    audio.stats.record(req.time, label(req), "music");
+    audio
+        .stats
+        .record_res(req.time, label(req), "music", resolution);
 }
 
 /// Drops entities that never received a sink (no audio device) after [`PENDING_TIMEOUT`].
@@ -659,7 +711,16 @@ fn overlay_audio(
         let lines: Vec<String> = s
             .last
             .iter()
-            .map(|e| format!("[{:.2}s] {} {}", e.time, e.outcome, e.label))
+            .map(|e| {
+                if e.resolution.is_empty() {
+                    format!("[{:.2}s] {} {}", e.time, e.outcome, e.label)
+                } else {
+                    format!(
+                        "[{:.2}s] {} {} [{}]",
+                        e.time, e.outcome, e.label, e.resolution
+                    )
+                }
+            })
             .collect();
         out.push_str(&lines.join(" | "));
     }
@@ -831,8 +892,8 @@ mod tests {
                 let req = SoundRequest::from_event(ev, SoundKind::Sound);
                 match req.sound.as_deref() {
                     None => *prod_failed.entry("no_sound_name").or_default() += 1,
-                    Some(p) => match lib.resolve_path(p).cloned() {
-                        Some(r) => match lib.load(&r) {
+                    Some(p) => match lib.resolve_path(p) {
+                        Some(r) => match lib.load(&r.entry) {
                             Ok(_) => prod_resolved += 1,
                             Err(e) => *prod_failed.entry(e.as_str()).or_default() += 1,
                         },
@@ -952,8 +1013,8 @@ mod tests {
                         if sample.len() < 8 {
                             sample.push(format!("{} {}", req.actor, path));
                         }
-                        match lib.resolve_path(path).cloned() {
-                            Some(r) => match lib.load(&r) {
+                        match lib.resolve_path(path) {
+                            Some(r) => match lib.load(&r.entry) {
                                 Ok(_) => resolved += 1,
                                 Err(e) => *failed.entry(e.as_str()).or_default() += 1,
                             },
@@ -1003,8 +1064,8 @@ mod tests {
             forced += 1;
             let req = SoundRequest::from_event(&ev, SoundKind::Sound);
             if let Some(path) = &req.sound
-                && let Some(r) = lib.resolve_path(path).cloned()
-                && lib.load(&r).is_ok()
+                && let Some(r) = lib.resolve_path(path)
+                && lib.load(&r.entry).is_ok()
             {
                 forced_resolved += 1;
                 println!("[audio test] forced TriggerSound0 resolved {path}");
