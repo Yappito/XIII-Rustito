@@ -24,6 +24,8 @@ use std::sync::Arc;
 pub mod animation;
 pub mod audio;
 pub mod fog;
+pub mod hitbox;
+pub mod lights;
 pub mod materials;
 pub mod movement_volumes;
 pub mod nav_provider;
@@ -152,6 +154,11 @@ pub struct WorldScene {
     /// triangles), the BSP its node polygons without `PF_NotSolid`/portal flags (invisible walls
     /// included), the terrain its visible quads.
     pub collision_triangles: Vec<([[f32; 3]; 3], u32)>,
+    /// Resolved surface material index (into [`WorldScene::materials`]) per
+    /// [`WorldScene::collision_triangles`] entry. `None` for geometry with no per-triangle
+    /// material (terrain heightfield, degenerate slots). Static-mesh and BSP triangles carry the
+    /// material of their source surface, so the host can read a floor's footstep sound.
+    pub collision_materials: Vec<Option<usize>>,
     /// Indices into [`WorldScene::collision_triangles`] selected for extent (box) queries.
     pub collision_box: Vec<u32>,
     /// Indices into [`WorldScene::collision_triangles`] selected for zero-extent (line/ray)
@@ -169,6 +176,10 @@ pub struct WorldScene {
     pub projectors: Vec<projectors::ProjectorPose>,
     /// Decoded particle emitter systems placed in the map (see [`particles`]).
     pub particle_systems: Vec<particles::ParticleSystem>,
+    /// Every map-placed `Light`-subclass actor and its decoded UE2 light properties (see
+    /// [`lights`]). Baked/non-emitting lights are included for diagnostics; use
+    /// [`lights::SceneLight::render_dynamic`] to select the runtime ones.
+    pub lights: Vec<lights::SceneLight>,
 }
 
 impl WorldScene {
@@ -180,17 +191,22 @@ impl WorldScene {
     }
 
     /// Adds `tris` under an existing source id to the selected soups. Triangles selected by both
-    /// kinds are stored once in the shared pool. Counts `collision.triangles` per unique entry.
+    /// kinds are stored once in the shared pool. `materials`, when given, is a parallel list of
+    /// resolved material indices. Counts `collision.triangles` per unique entry.
     fn add_collision_tris(
         &mut self,
         id: u32,
         tris: impl IntoIterator<Item = [[f32; 3]; 3]>,
+        materials: Option<Vec<Option<usize>>>,
         to_box: bool,
         to_line: bool,
     ) {
+        let mut materials = materials.map(|m| m.into_iter());
         for t in tris {
             let index = self.collision_triangles.len() as u32;
             self.collision_triangles.push((t, id));
+            let material = materials.as_mut().and_then(|it| it.next()).flatten();
+            self.collision_materials.push(material);
             if to_box {
                 self.collision_box.push(index);
             }
@@ -201,17 +217,26 @@ impl WorldScene {
         }
     }
 
-    /// Adds one source's triangles to both soups (BSP, terrain: one geometry for every query).
-    fn add_collision(&mut self, source: String, tris: impl IntoIterator<Item = [[f32; 3]; 3]>) {
-        let id = self.new_collision_source(source);
-        self.add_collision_tris(id, tris, true, true);
-    }
-
     /// Extent (box) query `(triangle, source id)` entries.
     pub fn box_collision(&self) -> impl Iterator<Item = ([[f32; 3]; 3], u32)> + '_ {
         self.collision_box
             .iter()
             .map(|&i| self.collision_triangles[i as usize])
+    }
+
+    /// Resolved surface material (index into [`WorldScene::materials`]) of the box-query
+    /// triangle at `index` in the shared collision pool, else `None` (terrain, missing slot).
+    pub fn collision_material(&self, index: u32) -> Option<&ResolvedMaterial> {
+        self.collision_materials
+            .get(index as usize)
+            .copied()
+            .flatten()
+            .and_then(|m| self.materials.get(m))
+    }
+
+    /// Player footstep wrapper `Sound` path of a box-query collision triangle, else `None`.
+    pub fn footstep_sound(&self, index: u32) -> Option<&str> {
+        self.collision_material(index)?.footstep_sound.as_deref()
     }
 
     /// Zero-extent (line/ray) query `(triangle, source id)` entries.
@@ -386,6 +411,10 @@ struct MeshSections {
     collision_box: Arc<Vec<[[f32; 3]; 3]>>,
     /// Triangles of `line_set` (Bevy space, unscaled).
     collision_line: Arc<Vec<[[f32; 3]; 3]>>,
+    /// Resolved surface material index per `collision_box` triangle (parallel array).
+    box_materials: Arc<Vec<Option<usize>>>,
+    /// Resolved surface material index per `collision_line` triangle (parallel array).
+    line_materials: Arc<Vec<Option<usize>>>,
     /// Collision triangles of the box set whose material slot has `EnableCollision` = false. UE2
     /// would not block the player with these; they are counted (not silently kept or dropped).
     collision_slot_disabled: usize,
@@ -428,10 +457,22 @@ impl Importer<'_> {
                 AlphaKind::Mask => Some(BlendMode::Masked(0.5)),
                 AlphaKind::Blend => Some(BlendMode::Alpha),
             };
+            let props = pkg
+                .package
+                .read_object_properties(&pkg.data, idx, &Limits::default())
+                .map_err(|e| format!("{class_full} properties: {e}"))?;
+            let p = Props::new(&pkg.package, &props);
             Ok(MaterialNode {
                 class,
                 texture: Some(t),
                 texture_alpha,
+                footstep_sound: p
+                    .object("XIIIFootStepSound")
+                    .and_then(|r| self.footstep_sound(pkg, r)),
+                footstep_sound_ai: p
+                    .object("FootstepSound")
+                    .and_then(|r| self.footstep_sound(pkg, r)),
+                noise_loudness: p.float("NoiseLoudness"),
                 ..Default::default()
             })
         } else {
@@ -454,11 +495,28 @@ impl Importer<'_> {
         self.node_for(&pkg, key.1).ok()
     }
 
+    /// Dotted path of a `Sound` reference in a material property block (`XIIIFootStepSound` /
+    /// `FootstepSound`). A null or unresolvable reference is `None` (the surface simply has no
+    /// footstep wrapper); the path is kept exactly as the referencing package spells it.
+    fn footstep_sound(&mut self, from: &Arc<Loaded>, r: ObjectRef) -> Option<String> {
+        if r.is_null() {
+            return None;
+        }
+        from.package.object_path(r).map(str::to_owned)
+    }
+
     /// Builds a [`MaterialNode`] from a decoded property block. Object links are resolved
     /// against `pkg` so the graph walker only ever sees [`NodeKey`]s.
     fn build_node(&mut self, pkg: &Arc<Loaded>, class: &str, p: &Props) -> MaterialNode {
         let mut n = MaterialNode {
             class: class.to_owned(),
+            footstep_sound: p
+                .object("XIIIFootStepSound")
+                .and_then(|r| self.footstep_sound(pkg, r)),
+            footstep_sound_ai: p
+                .object("FootstepSound")
+                .and_then(|r| self.footstep_sound(pkg, r)),
+            noise_loudness: p.float("NoiseLoudness"),
             ..Default::default()
         };
         match class.to_ascii_lowercase().as_str() {
@@ -644,10 +702,15 @@ impl Importer<'_> {
         if let Some(&idx) = self.resolved.get(&start) {
             return (self.slot_for(idx), idx);
         }
-        let resolved = {
+        let material_path = from.package.object_path(r).map(str::to_owned);
+        let mut resolved = {
             let mut lookup = |k: &NodeKey| self.node_for_key(k);
             materials::resolve(Some(start.clone()), &mut lookup)
         };
+        // Record the root's own dotted path for diagnostics. If the root is itself a texture,
+        // the walker's first node already carried its sound; otherwise the resolver inherited it
+        // from the carrier material inward.
+        resolved.material_path = material_path;
         let idx = self.push_material(resolved);
         self.resolved.insert(start, idx);
         self.count_material(idx, what);
@@ -827,25 +890,66 @@ impl Importer<'_> {
                 let line_fallback = use_line && !simplified_present;
                 let box_set = usize::from(use_box && simplified_present);
                 let line_set = usize::from(use_line && simplified_present);
-                let convert = |cs: &xiii_decode::static_mesh::CollisionSet| -> Vec<[[f32; 3]; 3]> {
-                    cs.triangles
-                        .iter()
-                        .map(|t| {
-                            t.vertices
-                                .map(|v| to_bevy_position(cs.vertices[v as usize]))
-                        })
-                        .collect()
-                };
-                // Share the converted triangles when both query kinds select the same set.
-                let (collision_box, collision_line) = if box_set == line_set {
-                    let shared = Arc::new(convert(&m.collision[box_set]));
-                    (shared.clone(), shared)
-                } else {
+                // Resolve the material slots referenced by this mesh's render sections and
+                // collision triangles (shared `Materials` array). Only used slots are resolved,
+                // so the material counters are unchanged from the render-only path; the resolved
+                // index is threaded onto each collision triangle for the host's footstep lookup.
+                let mut used_slots: std::collections::BTreeSet<usize> = m
+                    .sections
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.num_faces > 0)
+                    .map(|(si, _)| si)
+                    .collect();
+                for cs in [box_set, line_set] {
+                    for t in &m.collision[cs].triangles {
+                        if let Ok(si) = usize::try_from(t.material) {
+                            used_slots.insert(si);
+                        }
+                    }
+                }
+                let mut mat_idx: Vec<Option<usize>> = vec![None; m.materials.len()];
+                for si in used_slots {
+                    if let Some(mm) = m.materials.get(si) {
+                        mat_idx[si] = Some(self.material(&pkg, mm.material, "mesh").1);
+                    }
+                }
+                let convert = |cs: &xiii_decode::static_mesh::CollisionSet| {
                     (
-                        Arc::new(convert(&m.collision[box_set])),
-                        Arc::new(convert(&m.collision[line_set])),
+                        cs.triangles
+                            .iter()
+                            .map(|t| {
+                                t.vertices
+                                    .map(|v| to_bevy_position(cs.vertices[v as usize]))
+                            })
+                            .collect::<Vec<[[f32; 3]; 3]>>(),
+                        cs.triangles
+                            .iter()
+                            .map(|t| {
+                                usize::try_from(t.material)
+                                    .ok()
+                                    .and_then(|si| mat_idx.get(si).copied().flatten())
+                            })
+                            .collect::<Vec<Option<usize>>>(),
                     )
                 };
+                // Share the converted triangles when both query kinds select the same set.
+                let (collision_box, collision_line, box_materials, line_materials) =
+                    if box_set == line_set {
+                        let (tris, mats) = convert(&m.collision[box_set]);
+                        let shared = Arc::new(tris);
+                        let shared_m = Arc::new(mats);
+                        (shared.clone(), shared, shared_m.clone(), shared_m)
+                    } else {
+                        let (box_tris, box_mats) = convert(&m.collision[box_set]);
+                        let (line_tris, line_mats) = convert(&m.collision[line_set]);
+                        (
+                            Arc::new(box_tris),
+                            Arc::new(line_tris),
+                            Arc::new(box_mats),
+                            Arc::new(line_mats),
+                        )
+                    };
                 // Collision triangles of the box (movement) set whose material slot has
                 // EnableCollision = false: under UE2 these do not block the player. Counted,
                 // not filtered (evidence only).
@@ -864,8 +968,8 @@ impl Importer<'_> {
                     if s.num_faces == 0 {
                         continue;
                     }
-                    let (material, material_index) = match m.materials.get(si) {
-                        Some(mm) => self.material(&pkg, mm.material, "mesh"),
+                    let (material, material_index) = match mat_idx.get(si).copied().flatten() {
+                        Some(index) => (self.slot_for(index), index),
                         None => {
                             self.scene.count("skip.mesh.section_without_material", 1);
                             let idx = self.push_material(ResolvedMaterial::default());
@@ -898,6 +1002,8 @@ impl Importer<'_> {
                     line_fallback,
                     collision_box,
                     collision_line,
+                    box_materials,
+                    line_materials,
                     collision_slot_disabled,
                 })
             }
@@ -1584,18 +1690,36 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                             .collision_box
                             .iter()
                             .map(|t| t.map(|v| apply_transform(&transform, v)));
-                        im.scene.add_collision_tris(id, tris, true, true);
+                        im.scene.add_collision_tris(
+                            id,
+                            tris,
+                            Some((*converted.box_materials).clone()),
+                            true,
+                            true,
+                        );
                     } else {
                         let box_tris = converted
                             .collision_box
                             .iter()
                             .map(|t| t.map(|v| apply_transform(&transform, v)));
-                        im.scene.add_collision_tris(id, box_tris, true, false);
+                        im.scene.add_collision_tris(
+                            id,
+                            box_tris,
+                            Some((*converted.box_materials).clone()),
+                            true,
+                            false,
+                        );
                         let line_tris = converted
                             .collision_line
                             .iter()
                             .map(|t| t.map(|v| apply_transform(&transform, v)));
-                        im.scene.add_collision_tris(id, line_tris, false, true);
+                        im.scene.add_collision_tris(
+                            id,
+                            line_tris,
+                            Some((*converted.line_materials).clone()),
+                            false,
+                            true,
+                        );
                     }
                 }
             }
@@ -1609,6 +1733,7 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
     import_bsp(&mut im, &map_pkg);
     import_terrain(&mut im, &map_pkg);
     particles::import_particles(&mut im, &map_pkg, &mut defaults);
+    lights::import_lights(&mut im, &map_pkg, &mut defaults);
     // Per-zone object counts (static-mesh actors, BSP groups), after every object exists.
     let mut counts = vec![0usize; im.scene.zones.len()];
     let mut unzoned = 0usize;
@@ -1744,13 +1869,16 @@ fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
     // Group triangles per (surface material, BSP zone). Keying by zone keeps every object in
     // exactly one render layer (sky vs playable); a mesh never spans two zones.
     let mut groups: BTreeMap<(i64, Option<u32>), (MaterialSlot, SceneMesh)> = BTreeMap::new();
-    let mut bsp_collision = Vec::new();
+    // Collision triangles with the resolved material of their BSP surface, so the host can read
+    // the floor's footstep sound. The material resolution is cached by `Importer::material`.
+    let mut bsp_collision: Vec<([[f32; 3]; 3], Option<usize>)> = Vec::new();
     for poly in m.polygons() {
         let surf = m.surfs[poly.surf];
         if surf.poly_flags & (poly_flags::NOT_SOLID | poly_flags::PORTAL) == 0 {
             let v: Vec<[f32; 3]> = poly.vertices.iter().map(|&p| to_bevy_position(p)).collect();
+            let material = Some(im.material(map_pkg, surf.material, "bsp").1);
             for k in 1..v.len() - 1 {
-                bsp_collision.push([v[0], v[k], v[k + 1]]);
+                bsp_collision.push(([v[0], v[k], v[k + 1]], material));
             }
         } else {
             im.scene.count("note.collision.bsp_non_solid_polygons", 1);
@@ -1830,13 +1958,15 @@ fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
         }
         im.scene.count("bsp.polygons", 1);
     }
-    im.scene.add_collision(
-        format!(
-            "{} (BSP)",
-            p.object_path(ObjectRef::Export(idx as u32)).unwrap_or("?")
-        ),
-        bsp_collision,
-    );
+    // Each BSP triangle carries its surface material. Stored as (tri, material) pairs under one
+    // shared source id, so the source-material table stays unused here (per-triangle wins).
+    let bsp_id = im.scene.new_collision_source(format!(
+        "{} (BSP)",
+        p.object_path(ObjectRef::Export(idx as u32)).unwrap_or("?")
+    ));
+    let (tris, mats): (Vec<[[f32; 3]; 3]>, Vec<Option<usize>>) = bsp_collision.into_iter().unzip();
+    im.scene
+        .add_collision_tris(bsp_id, tris, Some(mats), true, true);
     for ((_, zone), (_, mesh)) in groups {
         let label = mesh.label.clone();
         im.scene.meshes.push(mesh);
@@ -1919,6 +2049,28 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 t.vertices.len() - base.positions.len(),
             );
         }
+        // Terrain surface sounds: `TerrainInfo` carries `XIIIFootStepSound`/`FootstepSound`/
+        // `NoiseLoudness` directly (measured: Plage00 `TerrainInfo1.XIIIFootStepSound =
+        // Sound'XIIIsound.Footsteps__XIIIFSSab.XIIIFSSab__hXIIIFootSabPN'`). The footstep under the
+        // player on a heightfield is therefore uniform for the terrain region.
+        let (terrain_footstep, terrain_footstep_ai, terrain_noise) =
+            match p.read_object_properties(&map_pkg.data, i, &Limits::default()) {
+                Ok(props) => {
+                    let pv = Props::new(p, &props);
+                    let sound = |name: &str| {
+                        pv.object(name)
+                            .filter(|r| !r.is_null())
+                            .and_then(|r| p.object_path(r))
+                            .map(str::to_owned)
+                    };
+                    (
+                        sound("XIIIFootStepSound"),
+                        sound("FootstepSound"),
+                        pv.float("NoiseLoudness"),
+                    )
+                }
+                Err(_) => (None, None, None),
+            };
         let composite = composite_terrain_texture(im, map_pkg, &t, base);
         let (material, material_index) = match composite {
             Some(img) => {
@@ -1931,6 +2083,10 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 let base = im.scene.textures.len() - 1;
                 let idx = im.push_material(ResolvedMaterial {
                     base: Some(base),
+                    footstep_sound: terrain_footstep.clone(),
+                    footstep_sound_ai: terrain_footstep_ai.clone(),
+                    noise_loudness: terrain_noise,
+                    material_path: Some(path.clone()),
                     ..Default::default()
                 });
                 (MaterialSlot::Texture(base), idx)
@@ -1938,6 +2094,10 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
             None => {
                 let idx = im.push_material(ResolvedMaterial {
                     unsupported: vec!["terrain.layers".into()],
+                    footstep_sound: terrain_footstep.clone(),
+                    footstep_sound_ai: terrain_footstep_ai.clone(),
+                    noise_loudness: terrain_noise,
+                    material_path: Some(path.clone()),
                     ..Default::default()
                 });
                 (MaterialSlot::Missing("terrain layers".into()), idx)
@@ -1977,8 +2137,16 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
             .iter()
             .map(|tri| tri.map(|i| to_bevy_position(base.positions[i as usize])))
             .collect();
-        im.scene
-            .add_collision(format!("{path} (terrain)"), terrain_tris);
+        // Every terrain triangle carries the terrain's material index (its footstep sound).
+        let terrain_id = im.scene.new_collision_source(format!("{path} (terrain)"));
+        let n = terrain_tris.len();
+        im.scene.add_collision_tris(
+            terrain_id,
+            terrain_tris,
+            Some(vec![Some(material_index); n]),
+            true,
+            true,
+        );
         let positions: Vec<[f32; 3]> = base
             .positions
             .iter()

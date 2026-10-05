@@ -502,7 +502,11 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 272);
+    // item14b added 10 AI natives (264 -> 274); item3p added the five missing rotator operators
+    // (142, 203, 287, 288, 289), the float power operator (170) and a visible Partial for
+    // `ParticleEmitter.SetMaxParticles` (274 -> 281); item16 added the menu natives
+    // (`VideoPlayer.*`, `Actor.*AllSounds`, `PlayerController.ClientTravel`) (281 -> 289).
+    assert_eq!(defs.len(), 289);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -731,6 +735,44 @@ impl SpawnB {
         self.set(r, p);
     }
 
+    /// A `Core.Class` whose tagged defaults set one `ObjectProperty` to `object_ref`.
+    fn class_with_object_default(
+        &mut self,
+        r: i32,
+        sup: i32,
+        children: i32,
+        default_name: i32,
+        object_ref: i32,
+    ) {
+        let friendly = self.exports[(r - 1) as usize].name;
+        let system = self.name("System");
+        let mut p = self.header(sup, 0, children, friendly, &[], 0);
+        p.extend(0u64.to_le_bytes());
+        p.extend(u64::MAX.to_le_bytes());
+        p.extend(0xFFFFu16.to_le_bytes());
+        p.extend(0u16.to_le_bytes());
+        p.extend(0u16.to_le_bytes()); // class flags
+        p.extend([0u8; 16]);
+        p.extend(compact(0)); // dependencies
+        p.extend(compact(0)); // package imports
+        p.extend(compact(0)); // within
+        p.extend(compact(system));
+        p.extend(compact(0)); // hide categories
+        // ObjectProperty tag: name, then info = type code 5 (object) with the compact-reference
+        // length in the size nibble (0/1/2 = 1/2/4 bytes), then the compact reference.
+        p.extend(compact(default_name));
+        let reference = compact(object_ref);
+        let size_code = match reference.len() {
+            1 => 0u8,
+            2 => 1,
+            _ => 2,
+        };
+        p.push(0x05 | (size_code << 4));
+        p.extend(&reference);
+        p.extend(compact(0)); // defaults terminator
+        self.set(r, p);
+    }
+
     fn state(&mut self, r: i32, next: i32, script: &[u8], mem: u32, labels_at: u16) {
         let friendly = self.exports[(r - 1) as usize].name;
         let mut p = compact(0);
@@ -911,6 +953,117 @@ fn camera_native_default_makes_it_a_spectator() {
         |l: &crate::vm::ClassLayout, n: &str| l.defaults[l.slot_by_name(n).unwrap().base].clone();
     assert_eq!(get(&cam_layout, "bOnlySpectator"), Value::Bool(true));
     assert_eq!(get(&other_layout, "bOnlySpectator"), Value::Bool(false));
+}
+
+/// UE2 component/default subobjects are per instance: an actor class's serialized defaults hold
+/// a reference to a subobject export whose `Outer` is the class (for example
+/// `xidcine.XIIIBreakingGlassEmitter.Emitters[0]` ->
+/// `xidcine.XIIIBreakingGlassEmitter.XIIIBreakingGlassEmitterA`). Spawning must create a fresh
+/// copy per actor, apply the subobject's own serialized template, and rewrite the property to
+/// the instance so `emit.Emitters[0].StartVelocityRange = ...` resolves
+/// (`xidcine.BreakableMover.InitializeEmitters` 0x006A).
+#[test]
+fn spawn_instantiates_a_class_default_subobject_per_instance() {
+    let mut b = SpawnB::new();
+    let holder = b.reserve(0, 0, "Holder");
+    let comp = b.reserve(0, 0, "Comp");
+    let value = b.reserve(IMP_INTPROP, comp, "Value");
+    let comp_outer = b.reserve(IMP_OBJECTPROP, comp, "Outer");
+    // `Range`/`RangeVector` structs and a `Size` struct property, to exercise the FRangeVector
+    // template decode (the `XIIIBreakingGlassEmitterA.StartSizeRange` case).
+    let range = b.reserve(IMP_STRUCT_CLASS, 0, "Range");
+    let rmin = b.reserve(IMP_FLOATPROP, range, "min");
+    let rmax = b.reserve(IMP_FLOATPROP, range, "max");
+    b.prop(rmin, rmax, 0);
+    b.prop(rmax, 0, 0);
+    b.strukt(range, rmin);
+    let rv = b.reserve(IMP_STRUCT_CLASS, 0, "RangeVector");
+    let rvx = b.reserve(IMP_STRUCTPROP, rv, "x");
+    let rvy = b.reserve(IMP_STRUCTPROP, rv, "y");
+    let rvz = b.reserve(IMP_STRUCTPROP, rv, "z");
+    b.prop_with(rvx, rvy, 0, &compact(range));
+    b.prop_with(rvy, rvz, 0, &compact(range));
+    b.prop_with(rvz, 0, 0, &compact(range));
+    b.strukt(rv, rvx);
+    let size = b.reserve(IMP_STRUCTPROP, comp, "Size");
+    let rv_name = b.exports[(rv - 1) as usize].name;
+    b.prop(value, comp_outer, 0);
+    b.prop_with(comp_outer, size, 0, &compact(0));
+    b.prop_with(size, 0, 0, &compact(rv));
+    let comp_prop = b.reserve(IMP_OBJECTPROP, holder, "Comp");
+    b.prop_with(comp_prop, 0, 0, &compact(0));
+    // The subobject export: outer is the `Holder` class, its class is `Comp`.
+    let default_comp = b.reserve(comp, holder, "DefaultComp");
+    // Its serialized template sets `Value = 7` and `Size = ((1,10),(100,100),(100,100))`.
+    let value_name = b.exports[(value - 1) as usize].name;
+    let size_name = b.exports[(size - 1) as usize].name;
+    let mut template = compact(value_name);
+    template.push(0x22);
+    template.extend(7i32.to_le_bytes());
+    template.extend(compact(size_name));
+    template.push(0x5A); // struct type, explicit u8 size
+    template.extend(compact(rv_name));
+    template.push(24);
+    for r in [[1.0f32, 10.0], [100.0, 100.0], [100.0, 100.0]] {
+        template.extend(r[0].to_le_bytes());
+        template.extend(r[1].to_le_bytes());
+    }
+    template.extend(compact(0));
+    b.set(default_comp, template);
+    // `Holder`'s class default: `Comp = DefaultComp`.
+    let comp_name = b.exports[(comp_prop - 1) as usize].name;
+    b.class_with_object_default(holder, 0, comp_prop, comp_name, default_comp);
+    b.class(comp, 0, value, 0);
+
+    let pkg = ScriptPackage::load(
+        "Test",
+        b.build(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(pkg.errors.is_empty(), "{:?}", pkg.errors);
+    let mut set = ScriptSet::new();
+    set.add(pkg);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let holder_class = sg(&set, "Holder");
+
+    let h1 = vm.spawn(holder_class, "H1").unwrap();
+    let h2 = vm.spawn(holder_class, "H2").unwrap();
+    let comp1 = match vm.get_property(h1, "Comp") {
+        Some(Value::Object(Some(ObjRef::Instance(i)))) => *i,
+        other => panic!("H1.Comp must be an instance, got {other:?}"),
+    };
+    let comp2 = match vm.get_property(h2, "Comp") {
+        Some(Value::Object(Some(ObjRef::Instance(i)))) => *i,
+        other => panic!("H2.Comp must be an instance, got {other:?}"),
+    };
+    assert_ne!(comp1, comp2, "each instance gets its own subobject copy");
+    // The subobject's own serialized template was applied.
+    assert_eq!(vm.get_property(comp1, "Value"), Some(&Value::Int(7)));
+    assert_eq!(vm.get_property(comp2, "Value"), Some(&Value::Int(7)));
+    // The `RangeVector` template property decoded into the script layout's nested `{min,max}`.
+    let range = |min: f32, max: f32| {
+        Value::Struct(vec![
+            ("min".into(), Value::Float(min)),
+            ("max".into(), Value::Float(max)),
+        ])
+    };
+    let expected = Value::Struct(vec![
+        ("x".into(), range(1.0, 10.0)),
+        ("y".into(), range(100.0, 100.0)),
+        ("z".into(), range(100.0, 100.0)),
+    ]);
+    assert_eq!(vm.get_property(comp1, "Size").cloned(), Some(expected));
+    // The subobject's `Outer` is its owning actor.
+    assert_eq!(
+        vm.get_property(comp1, "Outer"),
+        Some(&Value::Object(Some(ObjRef::Instance(h1))))
+    );
+    // A write through one copy does not alias the other (the BreakableMover write path).
+    vm.set_property(comp1, "Value", 0, Value::Int(42));
+    assert_eq!(vm.get_property(comp1, "Value"), Some(&Value::Int(42)));
+    assert_eq!(vm.get_property(comp2, "Value"), Some(&Value::Int(7)));
 }
 
 fn sg(set: &ScriptSet, path: &str) -> GlobalRef {
@@ -3238,30 +3391,48 @@ fn play_anim_on_a_mesh_less_actor_is_a_noop() {
             .any(|e| matches!(&e.kind, TraceKind::Note(s) if s.contains("no mesh"))),
         "the mesh-less no-op is reported, not silent"
     );
-    // A linked animation makes the actor non-mesh-less: a missing sequence is then a real
-    // UnknownAnimation, not a no-op.
+}
+
+#[test]
+fn play_anim_with_an_unknown_sequence_is_a_ue2_noop() {
+    // UE2 `AActor::PlayAnim`/`LoopAnim` resolve the name in the mesh's animation set and play
+    // nothing when it is absent. The shipped maps rely on this: `xidcine.Cine2.PostBeginPlay`
+    // calls `LoopAnim(DefaultAnim)` with values ("Wait", "acqiesce") no source of the actor
+    // carries. A missing name is a visible no-op, not a script failure; a *decode* failure is
+    // still an explicit `AnimationDataError` (see `animation_decode_error_is_explicit`).
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(RecordingAnim {
+        queried: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        answer: |_| Ok(None),
+    }));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    // Link a source so the actor is not mesh-less; the sequence is still unknown.
     let mut args = [Value::Object(Some(ObjRef::Static(GlobalRef {
         package: 0,
         export: 0,
     })))];
     try_native(&mut vm, "Engine.Actor.LinkSkelAnim", a, &[false], &mut args).unwrap();
     let mut args = [
-        Value::Name("Select".into()),
+        Value::Name("Wait".into()),
         Value::Float(1.0),
         Value::Float(0.0),
         Value::Int(0),
     ];
-    let e = try_native(
+    let r = try_native(
         &mut vm,
-        "Engine.Actor.PlayAnim",
+        "Engine.Actor.LoopAnim",
         a,
         &[false, false, false, false],
         &mut args,
-    )
-    .unwrap_err();
+    );
+    assert!(r.is_ok(), "an unknown sequence is a no-op, got {r:?}");
+    assert!(!vm.anim_channel_active(a, 0), "no channel was started");
     assert!(
-        matches!(&e.kind, VmErrorKind::UnknownAnimation { sequence, .. } if sequence == "Select"),
-        "{e}"
+        vm.trace
+            .iter()
+            .any(|e| matches!(&e.kind, TraceKind::Note(s) if s.contains("plays nothing"))),
+        "the no-op is reported, not silent"
     );
 }
 
@@ -6109,6 +6280,124 @@ fn get_axes_fills_the_rotator_basis() {
     assert_eq!(a[3], Value::Vector([0.0, 0.0, 1.0]));
 }
 
+/// The rotator operators the campaign survey hit: `Multiply_RotatorFloat` (287,
+/// `xidcine.HelicoDeco.HelicoTick`) and `EqualEqual_RotatorRotator` (142,
+/// `xiii.MitraillTop.GoToWaitingPos.Tick`), plus the rest of the declared rotator family.
+#[test]
+fn rotator_operators_scale_divide_and_compare_componentwise() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Object"), "O").unwrap();
+
+    // Multiply_RotatorFloat (287) and Multiply_FloatRotator (288): componentwise, truncated.
+    let mut a = vec![Value::Rotator([100, -50, 3]), Value::Float(0.5)];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Object.Multiply_RotatorFloat",
+            o,
+            &[false, false],
+            &mut a
+        ),
+        NativeOutcome::Value(Value::Rotator([50, -25, 1]))
+    );
+    let mut a = vec![Value::Float(0.5), Value::Rotator([100, -50, 3])];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Object.Multiply_FloatRotator",
+            o,
+            &[false, false],
+            &mut a
+        ),
+        NativeOutcome::Value(Value::Rotator([50, -25, 1]))
+    );
+
+    // Divide_RotatorFloat (289).
+    let mut a = vec![Value::Rotator([100, -50, 3]), Value::Float(2.0)];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Object.Divide_RotatorFloat",
+            o,
+            &[false, false],
+            &mut a
+        ),
+        NativeOutcome::Value(Value::Rotator([50, -25, 1]))
+    );
+
+    // EqualEqual_RotatorRotator (142) and NotEqual_RotatorRotator (203): exact components.
+    let mut a = vec![Value::Rotator([1, 2, 3]), Value::Rotator([1, 2, 3])];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Object.EqualEqual_RotatorRotator",
+            o,
+            &[false, false],
+            &mut a
+        ),
+        NativeOutcome::Value(Value::Bool(true))
+    );
+    let mut a = vec![Value::Rotator([1, 2, 3]), Value::Rotator([1, 2, 4])];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Object.EqualEqual_RotatorRotator",
+            o,
+            &[false, false],
+            &mut a
+        ),
+        NativeOutcome::Value(Value::Bool(false))
+    );
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Object.NotEqual_RotatorRotator",
+            o,
+            &[false, false],
+            &mut a
+        ),
+        NativeOutcome::Value(Value::Bool(true))
+    );
+
+    // A zero divisor is an explicit error, not an infinity.
+    let mut a = vec![Value::Rotator([1, 2, 3]), Value::Float(0.0)];
+    let def = native("Object.Divide_RotatorFloat");
+    let e = (def.f)(&mut vm, &ctx(o, &[false, false], ""), &mut a).unwrap_err();
+    assert!(matches!(e.kind, VmErrorKind::DivisionByZero), "{e}");
+}
+
+/// `Object.MultiplyMultiply_FloatFloat` (170, `float ** float`), the next operator
+/// `xidcine.HelicoDeco.HelicoTick` reaches at 0x01FF.
+#[test]
+fn float_power_operator_matches_app_pow() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Object"), "O").unwrap();
+    let mut a = vec![Value::Float(2.0), Value::Float(10.0)];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Object.MultiplyMultiply_FloatFloat",
+            o,
+            &[false, false],
+            &mut a
+        ),
+        NativeOutcome::Value(Value::Float(1024.0))
+    );
+    let mut a = vec![Value::Float(9.0), Value::Float(0.5)];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Object.MultiplyMultiply_FloatFloat",
+            o,
+            &[false, false],
+            &mut a
+        ),
+        NativeOutcome::Value(Value::Float(3.0))
+    );
+}
+
 #[test]
 fn get_bounding_box_reports_isvalid_as_a_byte() {
     let set = spawn_set();
@@ -6187,4 +6476,26 @@ fn snow_natives_record_and_do_not_fail() {
         &mut a,
     );
     assert!(matches!(out, NativeOutcome::Value(Value::Bool(false))));
+}
+
+/// `ParticleEmitter.SetMaxParticles` has no renderer here; it must record a visible trace note
+/// and never silently claim success (`xidcine.BreakableMover.InitializeEmitters`).
+#[test]
+fn set_max_particles_records_and_does_not_fail() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Actor"), "E").unwrap();
+    let mut a = vec![Value::Int(12)];
+    let out = call_native(
+        &mut vm,
+        "ParticleEmitter.SetMaxParticles",
+        o,
+        &[false],
+        &mut a,
+    );
+    assert!(matches!(out, NativeOutcome::Value(Value::Void)));
+    assert!(vm.trace.iter().any(|e| matches!(
+        &e.kind,
+        TraceKind::Note(s) if s.contains("SetMaxParticles(12)") && s.contains("no particle subsystem")
+    )));
 }

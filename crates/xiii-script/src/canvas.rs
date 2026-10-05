@@ -1179,25 +1179,29 @@ fn client_travel(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<N
 #[allow(clippy::vec_init_then_push)]
 pub fn menu_defs() -> Vec<NativeDef> {
     let mut v: Vec<NativeDef> = Vec::new();
-    v.push(def(
+    v.push(partial(
+        "no Bink decoder yet (item17a): the video is accepted but not played; GetStatus reports finished",
         "VideoPlayer.Open",
         "native(484) final native static function bool Open(string Filename)",
         "engine.u VideoPlayer.Open decoded; XIIIMenu.InternalOnClick opens sVideo (default cine00)",
         video_player_open,
     ));
-    v.push(def(
+    v.push(partial(
+        "no Bink decoder yet (item17a): the video is accepted but not played; GetStatus reports finished",
         "VideoPlayer.Play",
         "native(483) final native static function Play()",
         "engine.u VideoPlayer.Play decoded; XIIIMenu.InternalOnClick calls it",
         video_player_play,
     ));
-    v.push(def(
+    v.push(partial(
+        "no Bink decoder yet (item17a): the video is accepted but not played; GetStatus reports finished",
         "VideoPlayer.Stop",
         "native(482) final native static function Stop()",
         "engine.u VideoPlayer.Stop decoded; XIIIMenu.InternalOnKeyEvent stops the video",
         video_player_stop,
     ));
-    v.push(def(
+    v.push(partial(
+        "no Bink decoder yet (item17a): the video is accepted but not played; GetStatus reports finished",
         "VideoPlayer.GetStatus",
         "native(476) final native static function int GetStatus()",
         "engine.u VideoPlayer.GetStatus decoded; XIIIMenu.PlayingVideo.Tick ends on 0 (index 476 also names ScriptedTexture.TextSize, separated by argument count)",
