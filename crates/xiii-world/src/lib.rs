@@ -21,6 +21,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+pub mod animation;
 pub mod physics;
 
 use xiii_decode::common::{
