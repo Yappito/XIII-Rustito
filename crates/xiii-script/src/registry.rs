@@ -628,7 +628,19 @@ fn dynamic_load_object(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmRes
         Some(Value::Object(Some(ObjRef::Instance(i)))) => {
             Some(vm.short_path(vm.objects[*i as usize].class))
         }
-        Some(Value::Object(Some(ObjRef::Static(g)))) => vm.class_path_of(*g),
+        // A class argument (`class'Engine.Texture'` / `obj'Engine.Texture'`) is itself a class
+        // object whose `class_path_of` is `Core.Class`; the requested class is the class's own
+        // path (`Engine.Texture`). A non-class static object uses its class path.
+        Some(Value::Object(Some(ObjRef::Static(g)))) => {
+            if matches!(
+                vm.set().object(*g),
+                Some(crate::reflect::ScriptObject::Class(_))
+            ) {
+                Some(vm.set().path(*g))
+            } else {
+                vm.class_path_of(*g)
+            }
+        }
         _ => None,
     };
     match vm.find_loaded_object(&name) {
@@ -649,7 +661,36 @@ fn dynamic_load_object(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmRes
             }
             val(Value::Object(Some(ObjRef::Static(g))))
         }
-        None => val(Value::Object(None)),
+        None => {
+            // Non-script packages registered by the runtime (`.utx` textures, `.usx` meshes,
+            // `.uax` sounds) are not part of the loaded script set, so `find_loaded_object`
+            // misses them. `XIDInterf.XIIIMenu.Created` loads its button/background textures
+            // this way (`DynamicLoadObject("XIIIMenuStart.continue01gris",
+            // class'Engine.Texture')`); resolve them to an `ObjRef::External` so the external
+            // property provider answers `USize`/`VSize` and the Canvas sees the texture path.
+            match vm.set().external_lookup(&name) {
+                crate::linker::ExternalLookup::Found(class) => {
+                    if let Some(req) = &requested
+                        && !native_class_is_a(&class, req)
+                    {
+                        vm.note(TraceKind::Note(format!(
+                            "DynamicLoadObject: {name} is not a {req} (class {class})"
+                        )));
+                        return val(Value::Object(None));
+                    }
+                    let id = vm.intern_external(&name, Some(class));
+                    val(Value::Object(Some(ObjRef::External(id))))
+                }
+                crate::linker::ExternalLookup::MissingPackage
+                | crate::linker::ExternalLookup::MissingExport => {
+                    vm.note(TraceKind::Note(format!(
+                        "DynamicLoadObject: {name} not found in its package"
+                    )));
+                    val(Value::Object(None))
+                }
+                crate::linker::ExternalLookup::Unknown => val(Value::Object(None)),
+            }
+        }
     }
 }
 
@@ -4505,6 +4546,9 @@ fn builtin_defs() -> Vec<NativeDef> {
     // Canvas draw-recording natives (`crates/xiii-script/src/canvas.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::canvas::canvas_defs());
+    // item16 front-end menu natives (VideoPlayer, ClientTravel, menu sounds). Kept in the same
+    // `canvas.rs` block so a parallel edit to the registry stays out of the way.
+    v.extend(crate::canvas::menu_defs());
     // Cinematic/dialogue natives (`crates/xiii-script/src/cinematics.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::cinematics::cinematic_defs());

@@ -2013,9 +2013,30 @@ impl<'s> Vm<'s> {
         }
     }
 
+    /// Resolves a `Package.Object` name against the registered external (non-script) packages
+    /// the way `DynamicLoadObject` must, returning the interned [`ObjRef::External`] value and
+    /// its recorded class path. `None` when the package is unregistered/missing or the export is
+    /// absent (or an ambiguous bare name). Used by `Object.DynamicLoadObject` for `.utx`
+    /// textures, `.usx` meshes and `.uax` sounds, and by the front-end menu host for the root
+    /// window's background textures.
+    pub fn external_asset(&self, path: &str) -> Option<(Value, String)> {
+        match self.set.external_lookup(path) {
+            crate::linker::ExternalLookup::Found(class) => {
+                let id = self.intern_external(path, Some(class.clone()));
+                Some((Value::Object(Some(ObjRef::External(id))), class))
+            }
+            _ => None,
+        }
+    }
+
     /// Interns an external object path, returning its id. A path maps to exactly one id, so
     /// equality by path holds even when two references record different classes.
-    fn intern_external(&self, path: &str, class: Option<String>) -> u32 {
+    ///
+    /// `pub(crate)` so `DynamicLoadObject` (registry.rs) can turn a registered non-script asset
+    /// path (a `.utx` texture, `.usx` mesh, `.uax` sound) into the same [`ObjRef::External`] a
+    /// reference from a script package would produce; the external-property provider then
+    /// answers `USize`/`VSize`.
+    pub(crate) fn intern_external(&self, path: &str, class: Option<String>) -> u32 {
         let mut table = self.externals.borrow_mut();
         if let Some(&id) = table.index.get(path) {
             return id;
