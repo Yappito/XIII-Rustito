@@ -12,9 +12,10 @@
 //! makes a play window survive the still-partial native layer.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Instant;
 
 use xiii_package::Limits;
 use xiii_script::vm::MoverState;
@@ -56,8 +57,9 @@ pub struct Session {
     pub suspended: Vec<String>,
     /// First failure, formatted with its script stack.
     pub first_error: Option<String>,
-    /// Last synced VM `Location` per live actor (for the one-way render sync).
-    last_synced: HashMap<ObjectId, [f32; 3]>,
+    /// Last synced VM `Location` per object id (dense, for the one-way render sync). `None` until
+    /// an actor is first seen.
+    last_synced: Vec<Option<[f32; 3]>>,
     /// Presentation events, most recent last (bounded).
     pub events: VecDeque<(f64, PresentationEvent)>,
     /// `Touch` events involving the player, most recent last (bounded).
@@ -256,14 +258,15 @@ impl Session {
 
         let dispatcher = vm.find_object("XIIIDispatcher0");
 
-        // Baseline for the one-way render sync and the initial touch state.
-        let mut last_synced = HashMap::new();
+        // Baseline for the one-way render sync and the initial touch state. Dense by object id,
+        // so the per-tick sync is a vec index rather than a hash-map lookup per actor.
+        let mut last_synced: Vec<Option<[f32; 3]>> = vec![None; vm.objects.len()];
         for (i, o) in vm.objects.iter().enumerate() {
             if o.is_actor
                 && !o.deleted
-                && let Some(l) = vm.vector_prop(i as ObjectId, "Location")
+                && let Some(l) = vm.location_prop(i as ObjectId)
             {
-                last_synced.insert(i as ObjectId, l);
+                last_synced[i] = Some(l);
             }
         }
 
@@ -298,6 +301,8 @@ impl Session {
     /// presentation events and record the actors the VM moved.
     pub fn step(&mut self, dt: f32, location: [f32; 3], yaw: f32, velocity: [f32; 3]) {
         self.moved.clear();
+        let profiling = self.vm.native_profile().enabled;
+        let t0 = Instant::now();
         let _ = self
             .vm
             .set_property(self.player, "Location", 0, Value::Vector(location));
@@ -311,10 +316,19 @@ impl Session {
             0,
             Value::Rotator([0, yaw_units, 0]),
         );
+        if profiling {
+            self.vm.native_profile_mut().player_write_micros += t0.elapsed().as_micros() as u64;
+        }
 
-        // VM touch update for the host-moved player (the walk into a trigger volume).
+        // VM touch update for the host-moved player (the walk into a trigger volume). Run every
+        // tick even when the player is stationary: movers, spawned actors and re-enabled
+        // collision can change the player's touch set without the player moving.
+        let t0 = Instant::now();
         if let Err(e) = self.vm.refresh_touching_of(self.player) {
             self.suspend(self.player, &e);
+        }
+        if profiling {
+            self.vm.native_profile_mut().touch_micros += t0.elapsed().as_micros() as u64;
         }
         self.drain_events();
 
@@ -322,9 +336,17 @@ impl Session {
             self.suspend(id, &e);
         }
         self.tick_count += 1;
+        let t0 = Instant::now();
         self.drain_events();
         self.update_touches();
+        if profiling {
+            self.vm.native_profile_mut().events_micros += t0.elapsed().as_micros() as u64;
+        }
+        let t0 = Instant::now();
         self.update_sync();
+        if profiling {
+            self.vm.native_profile_mut().sync_micros += t0.elapsed().as_micros() as u64;
+        }
     }
 
     /// VM time in seconds.
@@ -336,6 +358,11 @@ impl Session {
     /// actor locations, rotations, meshes and animation channels; it never mutates the VM).
     pub fn vm(&self) -> &Vm<'static> {
         &self.vm
+    }
+
+    /// Arms the VM's optional per-native/section timers (`--perf-natives`).
+    pub fn enable_native_timers(&mut self, on: bool) {
+        self.vm.enable_native_timers(on);
     }
 
     /// Mutable access to the script VM for the host HUD refresh (`hud.rs`): create the `Canvas`,
@@ -645,18 +672,24 @@ impl Session {
 
     fn update_sync(&mut self) {
         let mut moved = Vec::new();
+        if self.vm.objects.len() > self.last_synced.len() {
+            self.last_synced.resize(self.vm.objects.len(), None);
+        }
         for (i, o) in self.vm.objects.iter().enumerate() {
             if !o.is_actor || o.deleted {
                 continue;
             }
-            let id = i as ObjectId;
-            let Some(cur) = self.vm.vector_prop(id, "Location") else {
+            let Some(cur) = self.vm.location_prop(i as ObjectId) else {
                 continue;
             };
-            let base = *self.last_synced.entry(id).or_insert(cur);
-            if base != cur {
-                moved.push((o.name.clone(), render_delta(base, cur)));
-                self.last_synced.insert(id, cur);
+            match self.last_synced[i] {
+                Some(base) => {
+                    if base != cur {
+                        moved.push((o.name.clone(), render_delta(base, cur)));
+                        self.last_synced[i] = Some(cur);
+                    }
+                }
+                None => self.last_synced[i] = Some(cur),
             }
         }
         self.moved = moved;
