@@ -23,15 +23,18 @@ use std::sync::Arc;
 
 pub mod animation;
 pub mod audio;
+pub mod fog;
 pub mod materials;
 pub mod nav_provider;
 pub mod navigation;
 pub mod physics;
+pub mod projectors;
 pub mod reach;
 pub mod runtime;
 pub mod zones;
 
 use materials::{BlendMode, MaterialNode, NodeKey, ResolvedMaterial, UvOp};
+use projectors::ProjectorDef;
 use xiii_decode::common::{
     BevyTransform, Mat3, Props, actor_to_bevy_pre_pivot, to_bevy_direction, to_bevy_position,
 };
@@ -158,6 +161,10 @@ pub struct WorldScene {
     pub zones: Vec<zones::SceneZone>,
     /// Indices into [`WorldScene::zones`] of the sky zones (`is_sky`), in increasing order.
     pub sky_zones: Vec<u32>,
+    /// Per-zone distance fog and ambient light, resolved map-property-first.
+    pub fog: fog::SceneFog,
+    /// Static `Projector`/`ShadowProjector` actors placed in the map (Bevy-space poses).
+    pub projectors: Vec<projectors::ProjectorPose>,
 }
 
 impl WorldScene {
@@ -1358,6 +1365,52 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
     im.scene
         .count("actor.player_starts", actors.player_starts.len());
 
+    // Per-zone distance fog/ambient: map property first, then the inherited class default. The
+    // table is resolved once at import so `--play`/the viewer only classify a point per frame.
+    im.scene.fog = fog::SceneFog::build(
+        &map_pkg.package,
+        &map_pkg.data,
+        &im.scene.zones,
+        level.as_ref(),
+        Some(&mut defaults),
+    );
+    im.scene.count(
+        "zones.fog.fogged",
+        im.scene.fog.params.iter().filter(|p| p.is_fogged()).count(),
+    );
+    im.scene.count("zones.fog.unfogged", im.scene.fog.unfogged);
+    im.scene.count(
+        "zones.fog.from_class_default",
+        im.scene.fog.from_class_default,
+    );
+    im.scene
+        .count("zones.fog.disabled_by_map", im.scene.fog.disabled_by_map);
+
+    // Static map-placed projector actors (a projected light or a baked blob shadow). Resolve
+    // each `ProjTexture` through the normal material graph so the renderer gets a texture handle.
+    im.scene.projectors = projectors::map_projectors(&map_pkg.package, &map_pkg.data, &actors);
+    for i in 0..im.scene.projectors.len() {
+        let Some(r) = im.scene.projectors[i].def.texture_object else {
+            continue;
+        };
+        let (slot, index) = im.material(&map_pkg, r, "projector");
+        if let MaterialSlot::Texture(_) = slot {
+            im.scene.projectors[i].def.material_index = Some(index);
+        } else {
+            im.scene.count("skip.projector.texture_unresolved", 1);
+        }
+    }
+    im.scene
+        .count("projectors.map_placed", im.scene.projectors.len());
+    im.scene.count(
+        "projectors.map_placed_shadow",
+        im.scene
+            .projectors
+            .iter()
+            .filter(|p| ProjectorDef::is_shadow_class(&p.def.class_path))
+            .count(),
+    );
+
     for a in &actors.static_mesh_actors {
         let class_short = a.class.rsplit('.').next().unwrap_or("").to_owned();
         if class_short.ends_with("Emitter") {
@@ -2509,6 +2562,107 @@ mod local_tests {
                     + get("material.two_sided.terrain"),
             );
         }
+    }
+
+    /// Opt-in: every campaign map's zone fog records resolve to metres and at least one fogged
+    /// zone exists on every map. Prints the per-map counts (foggy maps are those with a sky-high
+    /// `DistanceFogEnd`).
+    #[test]
+    fn gog_campaign_zone_fog_survey() {
+        let Some(path) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let install =
+            xiii_install::Installation::open(&path, &xiii_install::OpenOptions::default())
+                .expect("open install");
+        let mut maps: Vec<String> = install
+            .packages()
+            .filter(|e| e.kind == xiii_install::PackageKind::Map)
+            .map(|e| e.name.clone())
+            .collect();
+        maps.sort_by_key(|a| a.to_ascii_lowercase());
+        let maps: Vec<String> = maps
+            .into_iter()
+            .filter(|m| {
+                let s = m.to_ascii_lowercase();
+                !["dm_", "ctf_", "sb_"].iter().any(|p| s.starts_with(p))
+                    && !matches!(
+                        s.as_str(),
+                        "entry" | "empty" | "mapmenu" | "mapcredits" | "credits" | "dm_testpath"
+                    )
+            })
+            .collect();
+        assert!(
+            !maps.is_empty(),
+            "campaign maps must be discovered from {path:?}"
+        );
+        let mut cache = PackageCache::open(&path).expect("open install");
+        let mut with_fog = 0usize;
+        for map in &maps {
+            let scene = import_map(&mut cache, map).expect("import");
+            assert!(!scene.fog.params.is_empty(), "{map}: no zone fog records");
+            let fogged = scene.fog.params.iter().filter(|p| p.is_fogged()).count();
+            if fogged > 0 {
+                with_fog += 1;
+            }
+        }
+        println!(
+            "[fog] campaign: {} maps, {} with a fogged zone",
+            maps.len(),
+            with_fog
+        );
+        assert!(
+            with_fog * 2 >= maps.len(),
+            "only {with_fog} of {} maps have a fogged zone",
+            maps.len()
+        );
+    }
+
+    /// Opt-in: SPADS01's single map-placed `Engine.Projector` decodes with the tagged values
+    /// (the only placed map projector in the 35-map campaign) and its `ProjTexture` resolves to a
+    /// material with a base texture.
+    #[test]
+    fn gog_spads01_map_projector_decodes() {
+        let Some(path) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        let scene = import_map(&mut cache, "SPADS01").expect("import SPADS01");
+        assert_eq!(
+            scene.projectors.len(),
+            1,
+            "SPADS01 must have exactly one map projector: {:?}",
+            scene.projectors
+        );
+        let p = &scene.projectors[0];
+        assert!(!projectors::ProjectorDef::is_shadow_class(
+            &p.def.class_path
+        ));
+        assert_eq!(p.def.fov, 20);
+        assert_eq!(p.def.max_trace_distance, 2500);
+        assert!(!p.def.b_project_bsp && !p.def.b_project_terrain);
+        assert!(p.def.b_clip_bsp && p.def.b_project_on_unlit);
+        assert!((p.def.draw_scale - 0.5).abs() < 1e-6);
+        assert_eq!(
+            p.def.texture_path.as_deref(),
+            Some("XIIIspads.spaproj_alpha")
+        );
+        let idx = p.def.material_index.expect("ProjTexture resolved");
+        assert!(
+            scene.materials[idx].base.is_some(),
+            "projector material has no base texture"
+        );
+        println!(
+            "[projector] SPADS01 {} fov {} maxtrace {} blend {:?} texture {:?} @ {:?}",
+            p.name,
+            p.def.fov,
+            p.def.max_trace_distance,
+            p.def.blend,
+            p.def.texture_path,
+            p.position
+        );
     }
 
     /// `XIII_GOG_DIR` resolved against the workspace root, or `None` in CI.
