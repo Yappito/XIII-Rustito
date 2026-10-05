@@ -17,6 +17,7 @@ use std::rc::Rc;
 use xiii_package::Limits;
 use xiii_script::animation::{AnimationData, FixedAnimation, SeqInfo};
 use xiii_script::linker::GlobalRef;
+use xiii_script::navigation::NavigationData;
 use xiii_script::physics::{FlatPhysics, WorldPhysics};
 use xiii_script::registry::NativeStatus;
 use xiii_script::{
@@ -26,6 +27,7 @@ use xiii_script::{
 use xiii_world::PackageCache;
 use xiii_world::animation::MapAnimationProvider;
 use xiii_world::import_map;
+use xiii_world::nav_provider::MapNavigationProvider;
 use xiii_world::physics::WorldPhysicsAdapter;
 
 use crate::corpus::tagged_files;
@@ -66,6 +68,8 @@ pub struct RunConfig {
     pub anim_fixed: Option<(u32, f32)>,
     /// Real animation: install the decoded `MeshAnimation` provider from `xiii-world`.
     pub anim_map: bool,
+    /// Real navigation: decode the map's `ReachSpec` graph and install the provider.
+    pub nav_map: bool,
 }
 
 impl Default for RunConfig {
@@ -88,6 +92,7 @@ impl Default for RunConfig {
             physics_map: false,
             anim_fixed: None,
             anim_map: false,
+            nav_map: false,
         }
     }
 }
@@ -128,23 +133,27 @@ pub struct RunReport {
     pub missing_natives: Vec<xiii_script::vm::MissingNative>,
     /// Presentation events drained from the VM, with the tick they were drained at.
     pub events: Vec<(u64, PresentationEvent)>,
+    /// Final `Location` (Unreal units) per executed actor that has one.
+    pub final_locations: BTreeMap<String, [f32; 3]>,
 }
 
 /// Runs the touch chain on a loaded set (`map` is the map package index), without map
 /// providers (diagnostic `flat:`/`fixed:` modes still apply through `cfg`).
 pub fn run_touch_chain(set: &ScriptSet, map: usize, cfg: &RunConfig) -> Result<RunReport, String> {
-    run_touch_chain_with_providers(set, map, cfg, None, None)
+    run_touch_chain_with_providers(set, map, cfg, None, None, None)
 }
 
 /// Runs the touch chain with optional pre-built world providers (`--physics map` /
-/// `--anim map`). `map_physics` replaces the diagnostic flat floor; `map_animation` is
-/// installed instead of / in addition to a diagnostic provider (the map provider wins).
+/// `--anim map` / `--nav map`). `map_physics` replaces the diagnostic flat floor; `map_animation`
+/// is installed instead of / in addition to a diagnostic provider (the map provider wins);
+/// `map_navigation` installs the decoded `ReachSpec` graph for the Controller pathing natives.
 pub fn run_touch_chain_with_providers(
     set: &ScriptSet,
     map: usize,
     cfg: &RunConfig,
     map_physics: Option<Box<dyn WorldPhysics>>,
     map_animation: Option<Box<dyn AnimationData>>,
+    map_navigation: Option<Box<dyn NavigationData>>,
 ) -> Result<RunReport, String> {
     let mut vm = Vm::new(set, cfg.limits);
     vm.survey = cfg.survey;
@@ -158,6 +167,15 @@ pub fn run_touch_chain_with_providers(
         vm.note(TraceKind::Note(format!(
             "diagnostic physics (flat floor at Unreal Z={z}), not the map"
         )));
+    }
+    if let Some(provider) = map_navigation {
+        let note = format!(
+            "map navigation (decoded ReachSpec graph): {} points, {} edges",
+            provider.points().len(),
+            provider.edges().len()
+        );
+        vm.set_navigation(provider);
+        vm.note(TraceKind::Note(note));
     }
     if let Some(provider) = map_animation {
         vm.set_animation_data(provider);
@@ -287,6 +305,13 @@ pub fn run_touch_chain_with_providers(
         .iter()
         .map(|i| (vm.objects[*i as usize].name.clone(), vm.state_name(*i)))
         .collect();
+    let final_locations = active
+        .iter()
+        .filter_map(|i| {
+            vm.vector_prop(*i, "Location")
+                .map(|l| (vm.objects[*i as usize].name.clone(), l))
+        })
+        .collect();
     let natives = vm
         .natives_used
         .iter()
@@ -317,6 +342,7 @@ pub fn run_touch_chain_with_providers(
         error,
         missing_natives: vm.missing_natives.values().cloned().collect(),
         events,
+        final_locations,
     })
 }
 
@@ -493,27 +519,35 @@ impl AnimationData for LoggingAnim {
     }
 }
 
-/// Optional real-map providers constructed for `--physics map` / `--anim map`.
+/// Optional real-map providers constructed for `--physics map` / `--anim map` / `--nav map`.
 type MapProviders = (
     Option<Box<dyn WorldPhysics>>,
     Option<Box<dyn AnimationData>>,
+    Option<Box<dyn NavigationData>>,
 );
 
-/// Builds the optional real-map providers for `--physics map` / `--anim map`. One
-/// [`PackageCache`] is opened and reused (the map import and the animation provider share it).
+/// Builds the optional real-map providers for `--physics map` / `--anim map` / `--nav map`. One
+/// [`PackageCache`] is opened and reused.
 fn build_map_providers(
     root: &Path,
     map: &str,
     cfg: &RunConfig,
     anim_log: &Rc<RefCell<Vec<AnimQuery>>>,
 ) -> Result<MapProviders, String> {
-    if !cfg.physics_map && !cfg.anim_map {
-        return Ok((None, None));
+    if !cfg.physics_map && !cfg.anim_map && !cfg.nav_map {
+        return Ok((None, None, None));
     }
     let mut cache = PackageCache::open(root)?;
     let physics = if cfg.physics_map {
         let scene = import_map(&mut cache, map)?;
         Some(Box::new(WorldPhysicsAdapter::from_scene(&scene)) as Box<dyn WorldPhysics>)
+    } else {
+        None
+    };
+    // Navigation is decoded before the animation provider consumes the cache.
+    let navigation = if cfg.nav_map {
+        let provider = MapNavigationProvider::from_cache(&mut cache, map)?;
+        Some(Box::new(provider) as Box<dyn NavigationData>)
     } else {
         None
     };
@@ -526,7 +560,7 @@ fn build_map_providers(
     } else {
         None
     };
-    Ok((physics, animation))
+    Ok((physics, animation, navigation))
 }
 
 /// `xiii-tool script run ...`.
@@ -535,6 +569,7 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
     let (mut root, mut map, mut show_trace, mut natives) =
         (None, "Plage00".to_owned(), false, true);
     let mut show_events = false;
+    let mut show_positions = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().cloned();
@@ -605,6 +640,19 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
             }
             "--trace" => show_trace = true,
             "--events" => show_events = true,
+            "--positions" => show_positions = true,
+            "--nav" => {
+                let v = val().unwrap_or_default();
+                if v.eq_ignore_ascii_case("map") {
+                    cfg.nav_map = true;
+                } else {
+                    eprintln!(
+                        "error: invalid --nav '{v}'; expected map\n\n{}",
+                        crate::script_cmd::USAGE
+                    );
+                    return ExitCode::from(2);
+                }
+            }
             "--no-natives" => natives = false,
             other => {
                 eprintln!(
@@ -637,21 +685,28 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
         }
     };
     let anim_log = Rc::new(RefCell::new(Vec::new()));
-    let (map_physics, map_animation) = match build_map_providers(&root, &map, &cfg, &anim_log) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let report =
-        match run_touch_chain_with_providers(&set, map_idx, &cfg, map_physics, map_animation) {
-            Ok(r) => r,
+    let (map_physics, map_animation, map_navigation) =
+        match build_map_providers(&root, &map, &cfg, &anim_log) {
+            Ok(v) => v,
             Err(e) => {
                 eprintln!("error: {e}");
                 return ExitCode::from(1);
             }
         };
+    let report = match run_touch_chain_with_providers(
+        &set,
+        map_idx,
+        &cfg,
+        map_physics,
+        map_animation,
+        map_navigation,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
     let dll = dll_exec_symbols(&root.join("system")).unwrap_or_default();
     let mut out = String::new();
     let _ = writeln!(
@@ -670,6 +725,16 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
     let _ = writeln!(out, "final states:");
     for (a, s) in &report.final_states {
         let _ = writeln!(out, "  {a}: {}", s.as_deref().unwrap_or("<none>"));
+    }
+    if show_positions {
+        let _ = writeln!(
+            out,
+            "final positions (UU, Unreal Z-up; --positions DIAGNOSTIC): {} actors",
+            report.final_locations.len()
+        );
+        for (a, l) in &report.final_locations {
+            let _ = writeln!(out, "  {a}: [{:.1}, {:.1}, {:.1}]", l[0], l[1], l[2]);
+        }
     }
     let _ = writeln!(out, "natives used:");
     for n in &report.natives {
@@ -802,6 +867,7 @@ mod local_tests {
             begin_play: true,
             physics_map: true,
             anim_map: true,
+            nav_map: true,
             default_game: default_game_from_ini(&path),
             active: ["TouchTrigger", "XIIIDispatcher", "BaseSoldier"]
                 .iter()
@@ -810,11 +876,12 @@ mod local_tests {
             ..RunConfig::default()
         };
         let anim_log = Rc::new(RefCell::new(Vec::new()));
-        let (physics, animation) =
+        let (physics, animation, navigation) =
             build_map_providers(&path, "Plage00", &cfg, &anim_log).expect("build providers");
-        assert!(physics.is_some() && animation.is_some());
+        assert!(physics.is_some() && animation.is_some() && navigation.is_some());
         let report =
-            run_touch_chain_with_providers(&set, map_idx, &cfg, physics, animation).expect("run");
+            run_touch_chain_with_providers(&set, map_idx, &cfg, physics, animation, navigation)
+                .expect("run");
         assert_eq!(report.actors_loaded, 371);
         assert_eq!(
             report.final_states["XIIIDispatcher0"].as_deref(),

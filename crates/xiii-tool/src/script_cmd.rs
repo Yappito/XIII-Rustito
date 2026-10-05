@@ -46,9 +46,9 @@ xiii-tool script: compiled UnrealScript (M2c)
       Exits 1 if any reflected export fails to decode.
   xiii-tool script run --game-dir <root> [--map Plage00] [--touch TouchTrigger2]
                        [--ticks 60] [--dt 0.0333] [--touch-tick 1] [--trace] [--events]
-                       [--active TouchTrigger,XIIIDispatcher] [--no-natives] [--budget N]
-                       [--begin-play] [--game-class Package.Class] [--survey]
-                       [--physics map|flat:<z>] [--anim map|fixed:<frames>,<rate>]
+                       [--positions] [--active TouchTrigger,XIIIDispatcher] [--no-natives]
+                       [--budget N] [--begin-play] [--game-class Package.Class] [--survey]
+                       [--physics map|flat:<z>] [--anim map|fixed:<frames>,<rate>] [--nav map]
       Headless interpreter harness: load the map's actors, run PostBeginPlay and
       SetInitialState for the executed scope, deliver Touch(synthetic player) to
       the touched actor, tick at a fixed step and print the behaviour trace.
@@ -74,6 +74,12 @@ xiii-tool script: compiled UnrealScript (M2c)
       --survey is DIAGNOSTIC ONLY: it continues past unimplemented natives,
       counts each distinct one with its first-hit location, and never reports the
       run as success.
+      --nav map installs the decoded ReachSpec navigation graph from xiii-world
+      so the Controller pathing natives (FindPathToward/FindPathTo/FindRandomDest/
+      pointReachable/actorReachable/LineOfSightTo) run over the real map. Without
+      it those natives fail with NoNavProvider.
+      --positions prints each executed actor's final Location in Unreal units
+      (diagnostic; not a playable-trajectory claim).
       --events drains and prints the VM's outbound presentation events, grouped
       by tick: PlaySound, PlayMusic, PlayRolloffSound, ReplaceATextureByAnOther,
       RefreshDisplaying, SetInjuredEffect and projector attach/detach/abandon.
