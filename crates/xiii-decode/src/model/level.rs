@@ -33,6 +33,8 @@ pub struct ActorPlacement {
     pub pre_pivot: Option<[f32; 3]>,
     /// `StaticMesh` reference.
     pub static_mesh: Option<ObjectRef>,
+    /// `StaticMeshInstance` reference (per-actor baked vertex lighting).
+    pub static_mesh_instance: Option<ObjectRef>,
     /// `DrawType` byte if present.
     pub draw_type: Option<u8>,
     /// `bHidden`.
@@ -111,6 +113,7 @@ fn placement(package: &Package, export: usize, p: &Props<'_>) -> ActorPlacement 
         },
         pre_pivot: p.vector("PrePivot"),
         static_mesh: p.object("StaticMesh").filter(|r| !r.is_null()),
+        static_mesh_instance: p.object("StaticMeshInstance").filter(|r| !r.is_null()),
         draw_type: p.byte("DrawType"),
         hidden: p.bool("bHidden").unwrap_or(false),
         collision_flags: [

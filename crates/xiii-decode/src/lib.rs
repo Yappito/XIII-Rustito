@@ -8,5 +8,6 @@ pub mod common;
 pub mod model;
 pub mod skeletal;
 pub mod static_mesh;
+pub mod static_mesh_instance;
 pub mod terrain;
 pub mod texture;

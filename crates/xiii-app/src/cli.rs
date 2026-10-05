@@ -16,6 +16,16 @@ pub enum Mode {
     Skinned,
 }
 
+/// Viewer baked-lighting mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Lighting {
+    /// Ignore the baked per-vertex colours (diagnostic unlit texture comparison).
+    Off,
+    /// Multiply textures by the decoded baked per-vertex colours (default).
+    #[default]
+    Baked,
+}
+
 /// Parsed command-line options.
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -51,6 +61,8 @@ pub struct Options {
     pub frame: Option<f32>,
     /// Run the headless ReachSpec navigation walk test on `--map` from `--game-dir`.
     pub reach_test: bool,
+    /// Baked vertex-colour modulation (`--lighting off|baked`).
+    pub lighting: Lighting,
 }
 
 impl Options {
@@ -80,6 +92,7 @@ impl Default for Options {
             anim: None,
             frame: None,
             reach_test: false,
+            lighting: Lighting::default(),
         }
     }
 }
@@ -88,7 +101,7 @@ pub const USAGE: &str = "\
 xiii-app [--smoke] [--frames N] [--exit-after-secs S] [--screenshot PATH]
          [--no-vsync] [--size WxH]
 xiii-app --map NAME --game-dir DIR [--view x,y,z,yaw,pitch] [--dump]
-         [--exit-after-secs S] [--screenshot PATH] [--size WxH]
+         [--exit-after-secs S] [--screenshot PATH] [--size WxH] [--lighting off|baked]
 xiii-app --map NAME --game-dir DIR --collision-test
 xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH]
@@ -104,6 +117,8 @@ xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
   --dump               Viewer: import, print counters, exit without a window.
   --collision-test     Headless swept-collision doorway test on --map (no window).
   --reach-test         Headless ReachSpec navigation walk test on --map (no window).
+  --lighting MODE      Viewer: modulate textures by the baked per-vertex colours
+                       (`baked`, default) or ignore them (`off`) for comparison.
   --find TEXT          With --dump: list objects whose path/texture contains TEXT.
   --frames N           Exit cleanly after N frames and print a report.
   --exit-after-secs S  Exit cleanly after S seconds and print a report.
@@ -164,6 +179,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
                 opts.frame = Some(n);
             }
             "--reach-test" => opts.reach_test = true,
+            "--lighting" => {
+                let v = value("--lighting")?;
+                opts.lighting = match v.to_ascii_lowercase().as_str() {
+                    "off" => Lighting::Off,
+                    "baked" => Lighting::Baked,
+                    other => {
+                        return Err(format!("invalid --lighting {other:?}, expected off|baked"));
+                    }
+                };
+            }
             "--find" => opts.find = Some(value("--find")?.to_ascii_lowercase()),
             "--view" => {
                 let v = value("--view")?;
@@ -273,5 +298,13 @@ mod tests {
         assert_eq!(o.mode, Mode::Viewer);
         assert_eq!(o.map.as_deref(), Some("Plage00"));
         assert_eq!(o.view, Some([1.0, 2.0, 3.0, 90.0, -10.0]));
+        // Baked is the default; `off` and `baked` both parse, anything else is rejected.
+        assert_eq!(o.lighting, Lighting::Baked);
+        assert_eq!(p(&["--lighting", "off"]).unwrap().lighting, Lighting::Off);
+        assert_eq!(
+            p(&["--lighting", "Baked"]).unwrap().lighting,
+            Lighting::Baked
+        );
+        assert!(p(&["--lighting", "maybe"]).is_err());
     }
 }

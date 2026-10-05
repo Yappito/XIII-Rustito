@@ -412,6 +412,94 @@ pub fn info_summary(package: &Package, export: usize, t: &TerrainInfo) -> String
     out
 }
 
+/// Per-vertex colour grid assembled from the sectors of one terrain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerrainColorGrid {
+    /// `width * height` colours as stored (BGRA), row-major with X fastest.
+    pub colors: Vec<[u8; 4]>,
+    /// Vertices written by two sectors with **different** colours (shared borders that agree
+    /// are not counted).
+    pub conflicts: usize,
+    /// Vertices no sector covered (`None` cells left at the end).
+    pub missing: usize,
+}
+
+impl TerrainColorGrid {
+    /// Colour `i` converted to RGBA (blue and red swapped).
+    pub fn rgba(&self, i: usize) -> [u8; 4] {
+        let c = self.colors[i];
+        [c[2], c[1], c[0], c[3]]
+    }
+}
+
+/// Assembles the `width x height` per-vertex colour grid of `info` from its sectors.
+///
+/// Sector `offset` is a vertex offset into the heightmap grid; the sector's colours are
+/// `(QuadsX+1) x (QuadsY+1)` row-major with X fastest. The measured Plage00/Plage01 sectors
+/// tile the grid: the quad counts sum to `width - 1` / `height - 1`. Non-export sector
+/// references and out-of-range cells are errors, never dropped.
+pub fn color_grid(
+    package: &Package,
+    data: &[u8],
+    info: &TerrainInfo,
+    width: usize,
+    height: usize,
+) -> DecodeResult<TerrainColorGrid> {
+    if width == 0 || height == 0 || width * height != info.vertices.len() {
+        return Err(DecodeError::new(DecodeErrorKind::Invalid(format!(
+            "heightmap {width}x{height} does not match {} vertices",
+            info.vertices.len()
+        ))));
+    }
+    let mut cells: Vec<Option<[u8; 4]>> = vec![None; width * height];
+    let mut conflicts = 0usize;
+    for (si, r) in info.sectors.iter().enumerate() {
+        let export = match r {
+            ObjectRef::Export(e) => *e as usize,
+            other => {
+                return Err(DecodeError::new(DecodeErrorKind::Invalid(format!(
+                    "sector {si} is {other:?}, not an export of this package"
+                ))));
+            }
+        };
+        let s = decode_sector(package, data, export)?;
+        let cols = (s.quads[0] + 1) as usize;
+        let rows = (s.quads[1] + 1) as usize;
+        if s.colors.len() != cols * rows {
+            return Err(DecodeError::new(DecodeErrorKind::Invalid(format!(
+                "sector {si} has {} colours for {cols}x{rows}",
+                s.colors.len()
+            ))));
+        }
+        for y in 0..rows {
+            for x in 0..cols {
+                let gx = s.offset[0] as i64 + x as i64;
+                let gy = s.offset[1] as i64 + y as i64;
+                if gx < 0 || gy < 0 || gx as usize >= width || gy as usize >= height {
+                    return Err(DecodeError::new(DecodeErrorKind::Invalid(format!(
+                        "sector {si} vertex ({gx}, {gy}) outside {width}x{height}"
+                    ))));
+                }
+                let idx = gy as usize * width + gx as usize;
+                let c = s.colors[y * cols + x];
+                match cells[idx] {
+                    None => cells[idx] = Some(c),
+                    // Adjacent sectors share their border vertex column/row; a repeated write
+                    // is only a conflict when it disagrees.
+                    Some(prev) if prev != c => conflicts += 1,
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    let missing = cells.iter().filter(|c| c.is_none()).count();
+    Ok(TerrainColorGrid {
+        colors: cells.into_iter().map(|c| c.unwrap_or([0; 4])).collect(),
+        conflicts,
+        missing,
+    })
+}
+
 /// Text summary.
 pub fn sector_summary(package: &Package, export: usize, s: &TerrainSector) -> String {
     format!(
@@ -506,5 +594,92 @@ mod tests {
             assert!(n[1] > 0.0, "Bevy CCW normal points up (+Y): {n:?}");
         }
         assert!(info.mesh(4, 2).is_err());
+    }
+
+    /// Sector payload with configurable quads/offset and per-vertex BGRA colours (offset by
+    /// `bias`, so overlapping sectors can be made to agree or disagree).
+    fn sector_grid(quads: [i32; 2], offset: [i32; 2], bias: u8) -> Vec<u8> {
+        let cols = (quads[0] + 1) as usize;
+        let rows = (quads[1] + 1) as usize;
+        let mut b = Bytes::default().c(0).c(0).i32(quads[0]).i32(quads[1]);
+        b = b.i32(offset[0]).i32(offset[1]);
+        for k in 0..8 {
+            b = b.v3([k as f32, 0.0, 0.0]);
+        }
+        b = b.c(0).c((cols * rows) as i32);
+        for y in 0..rows {
+            for x in 0..cols {
+                b = b.raw(&[
+                    (x as u8).wrapping_add(bias),
+                    (y as u8).wrapping_add(bias),
+                    (x + y) as u8,
+                    255,
+                ]);
+            }
+        }
+        b.0
+    }
+
+    fn empty_info(sectors: Vec<ObjectRef>, width: usize, height: usize) -> TerrainInfo {
+        TerrainInfo {
+            terrain_map: None,
+            terrain_scale: None,
+            location: None,
+            layers: Vec::new(),
+            quad_visibility: Vec::new(),
+            edge_turn: Vec::new(),
+            sectors,
+            vertices: vec![[0.0; 3]; width * height],
+            sectors_xy: [1, 1],
+            report: PayloadReport {
+                payload: Span { start: 0, end: 0 },
+                properties_end: 0,
+                unknown: Vec::new(),
+                unsupported_tail: None,
+            },
+        }
+    }
+
+    #[test]
+    fn color_grid_maps_sector_cells() {
+        // 4x2 vertex grid; sector covers quads (0..2)x(0..2) at offset (2,0).
+        let mut b = Builder::new();
+        let s = b.export("TerrainSector", "S", sector_grid([1, 1], [2, 0], 0));
+        let bytes = b.build();
+        let p = parse(&bytes);
+        let info = empty_info(vec![ObjectRef::Export(s as u32)], 4, 2);
+        let grid = color_grid(&p, &bytes, &info, 4, 2).unwrap();
+        assert_eq!(grid.colors.len(), 8);
+        assert_eq!(grid.conflicts, 0);
+        // Uncovered cells stay zero.
+        assert!(grid.colors[..2].iter().all(|c| *c == [0, 0, 0, 0]));
+        // Global (2,0) = local (0,0) = [0,0,0,255]; (3,1) = local (1,1) = [1,1,2,255].
+        assert_eq!(grid.colors[2], [0, 0, 0, 255]);
+        assert_eq!(grid.colors[7], [1, 1, 2, 255]);
+        // A sector that runs past the grid is rejected, not clipped.
+        let mut b = Builder::new();
+        let s = b.export("TerrainSector", "S", sector_grid([1, 1], [3, 0], 0));
+        let bytes = b.build();
+        let p = parse(&bytes);
+        let info = empty_info(vec![ObjectRef::Export(s as u32)], 4, 2);
+        assert!(color_grid(&p, &bytes, &info, 4, 2).is_err());
+    }
+
+    #[test]
+    fn color_grid_reports_conflicts_and_missing() {
+        // Two sectors over the same cells with different colours disagree at every vertex.
+        let mut b = Builder::new();
+        let s0 = b.export("TerrainSector", "A", sector_grid([1, 1], [0, 0], 0));
+        let s1 = b.export("TerrainSector", "B", sector_grid([1, 1], [0, 0], 7));
+        let bytes = b.build();
+        let p = parse(&bytes);
+        let info = empty_info(
+            vec![ObjectRef::Export(s0 as u32), ObjectRef::Export(s1 as u32)],
+            4,
+            2,
+        );
+        let grid = color_grid(&p, &bytes, &info, 4, 2).unwrap();
+        assert_eq!(grid.conflicts, 4);
+        assert_eq!(grid.missing, 4);
     }
 }

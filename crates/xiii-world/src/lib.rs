@@ -31,6 +31,7 @@ use xiii_decode::common::{
 };
 use xiii_decode::model::{self, level, poly_flags};
 use xiii_decode::static_mesh::decode_static_mesh;
+use xiii_decode::static_mesh_instance::decode_static_mesh_instance;
 use xiii_decode::terrain;
 use xiii_decode::texture::{RgbaImage, Texture, TextureFormat, decode_texture};
 use xiii_install::{Installation, OpenOptions};
@@ -108,6 +109,9 @@ pub struct SceneObject {
     /// BSP zone this object belongs to (classified from its location / polygon centroid).
     /// `None` for geometry with no zone assignment (e.g. terrain); the main view draws it.
     pub zone: Option<u32>,
+    /// Baked per-vertex colours (RGBA, alpha 255) for this placed object, when the source
+    /// provides a stream matching the mesh's vertex count. `None` renders unlit (texture only).
+    pub colors: Option<Vec<[u8; 4]>>,
 }
 
 /// Imported world.
@@ -345,6 +349,8 @@ type ObjectKey = (String, usize);
 #[derive(Clone)]
 struct MeshSections {
     sections: Vec<(usize, String)>,
+    /// Render vertex count shared by every section (== colour stream length).
+    vertices: usize,
     /// Collision set chosen for extent (box) queries (0 = per-triangle, 1 = simplified).
     box_set: u8,
     /// Collision set chosen for zero-extent (line/ray) queries.
@@ -578,6 +584,7 @@ impl Importer<'_> {
                 }
                 Ok(MeshSections {
                     sections: out,
+                    vertices: positions.len(),
                     box_set: box_set as u8,
                     line_set: line_set as u8,
                     box_fallback,
@@ -590,6 +597,66 @@ impl Importer<'_> {
         };
         self.meshes.insert(key, result.clone());
         result
+    }
+
+    /// Decoded baked vertex colours of a placed `StaticMeshInstance`, converted to RGBA.
+    /// Counts lit / unlit / mismatched objects; a colour count that does not match the mesh's
+    /// vertex count is a failure, never applied silently.
+    fn instance_colors(
+        &mut self,
+        from: &Arc<Loaded>,
+        r: ObjectRef,
+        vertex_count: usize,
+        path: &str,
+    ) -> Option<Vec<[u8; 4]>> {
+        let (pkg, idx) = match self.cache.resolve(from, r) {
+            Ok(v) => v,
+            Err(e) => {
+                self.scene
+                    .fail("fail.lighting.instance_ref", format!("{path}: {e}"));
+                return None;
+            }
+        };
+        match decode_static_mesh_instance(&pkg.package, &pkg.data, idx) {
+            Ok(inst) => {
+                self.scene.count("lighting.instances.decoded", 1);
+                self.scene
+                    .count("lighting.instances.lights", inst.lights.len());
+                if inst.colors.len() != vertex_count {
+                    self.scene.count("lighting.objects.mismatch", 1);
+                    self.scene
+                        .examples
+                        .entry("lighting.objects.mismatch".to_owned())
+                        .or_insert_with(|| {
+                            format!(
+                                "{}: {} colours for {vertex_count} mesh vertices",
+                                path,
+                                inst.colors.len()
+                            )
+                        });
+                    return None;
+                }
+                if inst.is_unlit() {
+                    self.scene.count("lighting.objects.unlit", 1);
+                    return None;
+                }
+                self.scene.count("lighting.objects.lit", 1);
+                self.scene.count("lighting.colors.rgba", inst.colors.len());
+                Some(
+                    (0..inst.colors.len())
+                        .map(|i| {
+                            let c = inst.rgba(i);
+                            [c[0], c[1], c[2], 255]
+                        })
+                        .collect(),
+                )
+            }
+            Err(e) => {
+                self.scene
+                    .fail("fail.lighting.instance_decode", format!("{path}: {e}"));
+                None
+            }
+        }
     }
 }
 
@@ -1065,6 +1132,13 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                         });
                 }
                 let mut label0 = String::new();
+                let object_colors = match a.static_mesh_instance {
+                    Some(r) => im.instance_colors(&map_pkg, r, converted.vertices, &a.path),
+                    None => {
+                        im.scene.count("lighting.objects.unlit", 1);
+                        None
+                    }
+                };
                 for (mesh, label) in converted.sections {
                     label0.clone_from(&label);
                     im.scene.objects.push(SceneObject {
@@ -1073,6 +1147,7 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                         path: format!("{} -> {label}", a.path),
                         placement: Some(eff),
                         zone,
+                        colors: object_colors.clone(),
                     });
                 }
                 // Per-query-kind evidence: which collision set the rule chose, whether the flag
@@ -1373,6 +1448,7 @@ fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
             ),
             placement: None,
             zone,
+            colors: None,
         });
     }
 }
@@ -1446,6 +1522,33 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
             .map(|&v| to_bevy_position(v))
             .collect();
         let normals = grid_normals(&mesh.positions, w, h);
+        let terrain_colors = match terrain::color_grid(p, &map_pkg.data, &t, w, h) {
+            Ok(grid) => {
+                im.scene.count("lighting.terrain.colors", grid.colors.len());
+                im.scene
+                    .count("lighting.terrain.color_conflicts", grid.conflicts);
+                if grid.missing > 0 {
+                    // A partial grid would modulate uncovered vertices to black; leave the
+                    // terrain uncoloured and report the gap instead.
+                    im.scene
+                        .count("lighting.terrain.colors_missing", grid.missing);
+                    None
+                } else {
+                    Some(
+                        (0..grid.colors.len())
+                            .map(|i| {
+                                let c = grid.rgba(i);
+                                [c[0], c[1], c[2], 255]
+                            })
+                            .collect(),
+                    )
+                }
+            }
+            Err(e) => {
+                im.scene.fail("fail.terrain.colors", e.to_string());
+                None
+            }
+        };
         im.scene.meshes.push(SceneMesh {
             label: format!("{path} heightfield"),
             positions,
@@ -1460,6 +1563,7 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
             path,
             placement: None,
             zone: None,
+            colors: terrain_colors,
         });
         im.scene.count("terrain.infos", 1);
     }
@@ -2142,5 +2246,69 @@ mod local_tests {
             "PathNode119 floor normal {:?} is not walkable",
             hit.normal
         );
+    }
+
+    /// Opt-in baked-lighting invariants on the three maps that the task names: every placed
+    /// instance's colour count matches its mesh's vertex count (no `mismatch`), decoding never
+    /// fails, at least one object is lit, and the terrain colour grid is complete and
+    /// conflict-free.
+    #[test]
+    fn opt_in_baked_lighting_invariants() {
+        let Some(path) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        for map in ["Plage00", "Plage01", "Banque01"] {
+            let scene = import_map(&mut cache, map).expect("import");
+            let get = |k: &str| scene.counters.get(k).copied().unwrap_or(0);
+            assert_eq!(
+                get("lighting.objects.mismatch"),
+                0,
+                "{map}: colour/mesh count mismatch: {:?}",
+                scene.examples
+            );
+            let fails: Vec<_> = scene
+                .counters
+                .keys()
+                .filter(|k| k.starts_with("fail."))
+                .collect();
+            assert!(fails.is_empty(), "{map}: {fails:?} {:?}", scene.examples);
+            assert!(
+                get("lighting.instances.decoded") > 0,
+                "{map}: no StaticMeshInstance decoded"
+            );
+            assert!(
+                get("lighting.objects.lit") > 0,
+                "{map}: no objects carried baked colours"
+            );
+            for o in &scene.objects {
+                if let Some(c) = &o.colors {
+                    assert_eq!(
+                        c.len(),
+                        scene.meshes[o.mesh].positions.len(),
+                        "{map}: {} colour count",
+                        o.path
+                    );
+                }
+            }
+            if map != "Banque01" {
+                assert!(
+                    get("lighting.terrain.colors") > 0,
+                    "{map}: no terrain colours"
+                );
+                assert_eq!(get("lighting.terrain.colors_missing"), 0, "{map}");
+                assert_eq!(get("lighting.terrain.color_conflicts"), 0, "{map}");
+            }
+            println!(
+                "[lighting] {map}: lit {} unlit {} mismatch {} instances {} colours {} terrain-colours {}",
+                get("lighting.objects.lit"),
+                get("lighting.objects.unlit"),
+                get("lighting.objects.mismatch"),
+                get("lighting.instances.decoded"),
+                get("lighting.colors.rgba"),
+                get("lighting.terrain.colors"),
+            );
+        }
     }
 }

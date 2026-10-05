@@ -23,7 +23,7 @@ use bevy::render::render_resource::{Extent3d, PrimitiveTopology, TextureDimensio
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
-use crate::cli::Options;
+use crate::cli::{Lighting, Options};
 use xiii_world::{AlphaKind, MaterialSlot, WorldScene};
 
 /// Render layer of the playable zones (drawn by the main camera).
@@ -145,6 +145,34 @@ fn transform_from(t: &xiii_decode::common::BevyTransform) -> Transform {
     }
 }
 
+/// A copy of `m` with a per-vertex baked colour stream (RGBA8). Bevy's `StandardMaterial`
+/// multiplies the texture by `ATTRIBUTE_COLOR`; the stored lighting value is used as a linear
+/// factor (byte/255).
+fn colored_mesh(m: &xiii_world::SceneMesh, colors: &[[u8; 4]]) -> Mesh {
+    debug_assert_eq!(m.positions.len(), colors.len());
+    let attr: Vec<[f32; 4]> = colors
+        .iter()
+        .map(|c| {
+            [
+                c[0] as f32 / 255.0,
+                c[1] as f32 / 255.0,
+                c[2] as f32 / 255.0,
+                1.0,
+            ]
+        })
+        .collect();
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, m.positions.clone());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, m.normals.clone());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, m.uvs.clone());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, attr);
+    mesh.insert_indices(Indices::U32(m.indices.clone()));
+    mesh
+}
+
 fn load_scene(opts: &Options) -> Result<WorldScene, String> {
     let game_dir = opts
         .game_dir
@@ -222,14 +250,25 @@ fn setup(
         mat_handles.push(mat);
     }
     let sky_zone_set: HashSet<u32> = scene.sky_zones.iter().copied().collect();
+    let baked = cfg.options.lighting == Lighting::Baked;
+    let mut baked_objects = 0usize;
     for o in &scene.objects {
         let transform = transform_from(&o.transform);
         // Sky-zone geometry goes on the sky-only layer; everything else (including terrain)
         // stays on the main layer, so neither camera draws the other view's geometry.
         let is_sky = o.zone.is_some_and(|z| sky_zone_set.contains(&z));
         let layer = if is_sky { SKY_LAYER } else { MAIN_LAYER };
+        // Baked lighting is per placed object: give it a private mesh carrying the colour
+        // stream, leaving the shared asset mesh uncoloured.
+        let handle = match (&o.colors, baked) {
+            (Some(colors), true) => {
+                baked_objects += 1;
+                meshes.add(colored_mesh(&scene.meshes[o.mesh], colors))
+            }
+            _ => mesh_handles[o.mesh].clone(),
+        };
         commands.spawn((
-            Mesh3d(mesh_handles[o.mesh].clone()),
+            Mesh3d(handle),
             MeshMaterial3d(mat_handles[o.mesh].clone()),
             RenderLayers::layer(layer),
             transform,
@@ -347,6 +386,11 @@ fn setup(
         scene.textures.len(),
         tris,
         load_time.as_secs_f32()
+    ));
+    lines.push(format!(
+        "lighting {} | placed objects with baked vertex colours {}",
+        if baked { "baked" } else { "off" },
+        baked_objects
     ));
     for (k, v) in &scene.counters {
         lines.push(format!("{v:>6} {k}"));
@@ -598,7 +642,7 @@ fn overlay(
         s.push_str(l);
         s.push('\n');
     }
-    s.push_str("WASD/QE move, Shift fast, RMB look, Esc quit. Unlit diagnostic materials; magenta = unresolved material.");
+    s.push_str("WASD/QE move, Shift fast, RMB look, Esc quit. Baked vertex lighting modulates the texture (--lighting off to compare); magenta = unresolved material.");
     text.0 = s;
 }
 

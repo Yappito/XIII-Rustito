@@ -70,14 +70,20 @@ applied before scale/rotation (`xiii_decode::common::actor_to_bevy_pre_pivot`). 
 static-mesh actors, the level BSP and the terrain heightfield, and bakes the terrain layers
 into one texture. Materials are followed through
 Shader/FinalBlend/Tex*/SinusModifier/Combiner down to a texture and drawn unlit with a
-`StandardMaterial`; unresolved materials are drawn magenta. Every skipped item is a `skip.*`,
+`StandardMaterial`; unresolved materials are drawn magenta. Placed static meshes and terrain
+are additionally modulated by the decoded baked vertex colours (`--lighting baked`, the
+default; `--lighting off` ignores them for comparison), carried by a private mesh per coloured
+object because the lighting is per placed actor. The stored BGRA colours are swapped to RGBA
+and the 4th byte is forced opaque; an all-zero instance is treated as unlit rather than black.
+The BSP still has no vertex lighting or lightmap (the Model lightmap tail is not decoded).
+Every skipped item is a `skip.*`,
 `fail.*` or `note.*` counter, shown in the overlay and printed. The crosshair reports the
 object path (CPU ray against the render triangles). The fly camera starts at the PlayerStart
 (or `--view x,y,z,yaw,pitch`, given in Bevy metres and degrees). `--dump` imports without a
 window, adds collision ray probes, per-map placement statistics (top-20 actors by `|PrePivot|`)
 and the `placement.*` provenance counters. The sky zone is rendered by a second camera (see
-"Sky zone" above). Known gaps: translucent/modulated sea materials render dark, there is no
-vertex lighting, and the sky uses the same unlit diagnostic materials as the rest of the
+"Sky zone" above). Known gaps: translucent/modulated sea materials render dark, the BSP has no
+baked lighting, and the sky uses the same unlit diagnostic materials as the rest of the
 import. This is an importer diagnostic, not a playable mode.
 
 ## Skinned-character viewer (M2b diagnostic)

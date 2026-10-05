@@ -38,6 +38,19 @@ explicit `skip.mesh.material (...)` counter and a `MaterialSlot::Missing`.
 This is the import that the diagnostic map viewer (`xiii-app`) renders; it is not a playable
 mode, and no class defaults are applied to actors beyond placement.
 
+### Baked vertex lighting
+
+Each `SceneObject` carries an optional `colors: Vec<[u8; 4]>` (RGBA). For a placed
+static-mesh actor the importer decodes the actor's `Engine.StaticMeshInstance` export
+(`xiii_decode::static_mesh_instance`), checks the colour count against the mesh's vertex count,
+swaps the stored BGRA bytes to RGBA and attaches one colour per render vertex. Because the
+lighting is per placed actor, the viewer builds a private mesh per coloured object; the shared
+asset mesh stays uncoloured. Counters: `lighting.instances.decoded`, `lighting.objects.lit`
+/ `unlit` / `mismatch`, `lighting.colors.rgba`. An all-zero (`[0,0,0,0]`) instance is `unlit`
+and left uncoloured rather than modulated to black. Terrain sectors contribute
+`lighting.terrain.colors` through `xiii_decode::terrain::color_grid`; shared sector borders
+that agree are not conflicts.
+
 ## Physics adapter (`physics::WorldPhysicsAdapter`)
 
 `xiii_script::physics::WorldPhysics` speaks Unreal units and axes (X forward, Y right, Z up);

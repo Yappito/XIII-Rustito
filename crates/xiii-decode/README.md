@@ -199,6 +199,7 @@ about Z).
 | Engine.StaticMesh | 6,128 | 6,128 | 6,128 | 61,280 B of unknown-meaning bytes (XIII UPrimitive extension + 2-byte block) |
 | Engine.Polys | 7,194 | 7,194 | 7,194 | 34,395 polygons |
 | Engine.TerrainSector | 2,208 | 2,208 | 2,208 | |
+| Engine.StaticMeshInstance | 14,542 | 14,542 | 14,542 | per placed static-mesh actor; colours + per-light vertex visibility |
 | Engine.Model | 7,194 | 7,194 | 0 | prefix through zones and the `Polys` ref decoded; 9,496,581 B unsupported tail (lightmaps, bounds, leaves...) |
 | Engine.TerrainInfo | 18 | 18 | 0 | sectors, vertices, sector grid; 2,052 B unsupported tail |
 
@@ -299,6 +300,50 @@ translation and HeightmapX/Y. Plage00 and Plage01 both use a 32x16 heightmap, sc
 corners, `TArray<{i16 light index; TArray<u8> visibility bits}>`, then `TArray<FColor>` vertex
 colours ((QuadsX+1)(QuadsY+1)). The light index is not an object reference (`42 00` occurs).
 
+### Baked vertex lighting (`StaticMeshInstance`, terrain colours)
+
+`xiii-tool world-coverage` counts 14,542 `Engine.StaticMeshInstance` exports corpus-wide; all
+decode exactly (0 failures) and the per-light visibility cross-check below holds for every one.
+A `StaticMeshActor` references its instance through the `StaticMeshInstance` object property,
+so the lighting is **per placed actor**, not per mesh asset. The native payload after the
+tagged-property block:
+
+```text
+TArray<FColor> Colors                 // one per render vertex of the actor's StaticMesh
+compact NumLights
+NumLights x {
+  i16     LightIndex                  // index into the level light list; -1 (0xffff) occurs
+  compact VisibilityByteCount         // == ceil(Colors.len() / 8): one bit per vertex
+  u8[VisibilityByteCount] Visibility
+  i32     Unknown                     // measured 0 or 1; meaning not established
+}
+```
+
+Evidence (measured 2026-10-05, GOG corpus): every instance consumes its payload exactly; the
+`VisibilityByteCount == ceil(Colors/8)` relation holds for all 867 instances on
+Plage00/Plage01/Banque01; the colour count equals the referenced mesh's vertex count for every
+placed actor on those three maps (0 mismatches, `opt_in_baked_lighting_invariants`). Instances
+whose whole colour array is `[0,0,0,0]` (167 of 867) have no static lighting and are treated as
+unlit rather than modulated to black. The 4th byte is 255 on every baked vertex and 0 on the
+all-zero arrays.
+
+**Channel order and scale.** `FColor` on disk is the UE2/UE3 little-endian `G,B,R,A` memory
+layout (the `FColor` union is `struct { uint8 B, G, R, A; }` on little-endian platforms in the
+UE3 `Color.h`; UE2 uses the same D3D-colour layout). Independent local evidence: the Plage
+terrain colours are warm sand (`R` mean 155, `G` 97, `B` 80) only when read as BGRA; read as
+RGBA they would be blue. The renderer swaps B and R before upload. **No half-intensity (`x2`)
+scale is applied**: the stored values span a continuous 0..255 (p50 R/G/B 62/76/93, 19-31%
+above 128, no pile-up at 128), and the same `FColor` terrain path reaches 255 on sunlit sand,
+so doubling would clip most of the terrain. This is the closest available evidence; no
+original-engine capture exists to settle it, so the scale is recorded as a **hypothesis** in
+`local/reports/item5b-baked-lighting.md`.
+
+Terrain sector colours are assembled into one `width x height` grid per `TerrainInfo`
+(`terrain::color_grid`), placing each sector's `(QuadsX+1) x (QuadsY+1)` colours at its vertex
+`offset`. Adjacent sectors share a border row/column; a repeated cell is only a conflict when
+the colours disagree (0 on Plage00/Plage01). The BSP `LightMaps`/`LightBits` tail is still not
+decoded (see below).
+
 ### Coordinates and winding (`common`)
 
 There is a single conversion point: `(x, y, z) -> (y, z, -x) / UNREAL_UNITS_PER_METER`. The
@@ -347,5 +392,8 @@ flips the numeric orientation of triangles.
 - Scale calibration against the player cylinder; PrePivot.
 - Material semantics: Shader, FinalBlend and modifiers are only followed to a texture.
 - Sky-zone selection order and the meaning of the per-zone sky settings (`LinkToSkybox`).
-- Vertex lighting: `StaticMeshInstance`, sector colours and BSP lightmaps.
+- Vertex lighting: static-mesh instance colours and terrain sector colours are decoded and
+  rendered; the BSP `LightMaps`/`LightBits` tail is still not decoded (the bytes after the
+  `Polys` reference do not start with the array count the UE2 `UModel` header order would
+  imply, and the stretch is not required).
 - A capsule sweep with the original movement rules.
