@@ -20,7 +20,8 @@ use std::time::Instant;
 use xiii_package::Limits;
 use xiii_script::vm::MoverState;
 use xiii_script::{
-    DialogueEvent, ObjRef, ObjectId, PresentationEvent, ScriptSet, Value, Vm, VmError, VmLimits,
+    DialogueEvent, ObjRef, ObjectId, PresentationEvent, ScriptSet, TravelRequest, Value, Vm,
+    VmError, VmLimits,
 };
 use xiii_world::runtime::{self, ProviderSpec};
 
@@ -74,6 +75,9 @@ pub struct Session {
     player_touching: Vec<ObjectId>,
     /// Actors the VM moved this step (cleared at the start of [`Session::step`]).
     pub moved: Vec<MovedActor>,
+    /// Level-travel request observed by the VM (item15), if any. Consumed by
+    /// [`Session::take_travel_request`]; the host owns the map reload.
+    pub travel: Option<TravelRequest>,
     /// `XIIIDispatcher0`, if the map has one (the trigger chain's end state).
     pub dispatcher: Option<ObjectId>,
     /// Active language code of the install's localisation files (`int`, `frt`, ...).
@@ -83,6 +87,11 @@ pub struct Session {
     pub localized_overrides: u64,
     /// Fixed steps run.
     pub tick_count: u64,
+    /// Set once the end-game has stopped the active cutscene controllers (item15 bridge): the
+    /// decoded `CineController2.Interpret` keeps `GotoState('NoControl')`-ing the player, which
+    /// would clobber `XIIIPlayerController.GameEndedSuccess` if the intro were still running when
+    /// the level ends.
+    cine_stopped: bool,
 }
 
 /// Host-owned player movement fields published to the VM pawn each fixed tick (item7b).
@@ -351,10 +360,12 @@ impl Session {
             touches: VecDeque::new(),
             player_touching: Vec::new(),
             moved: Vec::new(),
+            travel: None,
             dispatcher,
             localization_language,
             localized_overrides: 0,
             tick_count: 0,
+            cine_stopped: false,
         };
         session.localized_overrides = session.vm.localized_overrides;
         session.suspended.dedup();
@@ -478,6 +489,9 @@ impl Session {
         let t0 = Instant::now();
         self.drain_events();
         self.update_touches();
+        // Stop the cutscene controllers the moment the end-game starts, before the next tick can
+        // re-assert `NoControl`/`NoMove` over `GameEndedSuccess`.
+        self.stop_cutscenes_if_ended();
         if profiling {
             self.vm.native_profile_mut().events_micros += t0.elapsed().as_micros() as u64;
         }
@@ -491,6 +505,48 @@ impl Session {
     /// VM time in seconds.
     pub fn vm_time(&self) -> f64 {
         self.vm.time
+    }
+
+    /// Host bridge (item15): once `GameInfo.bGameEnded` is set, suspend the cutscene controllers.
+    /// The decoded `CineController2.Interpret` calls `PC.GotoState('NoControl')`/`'NoMove'` when
+    /// its sequence commands run; while a level-start cine is still playing it would clobber
+    /// `XIIIPlayerController.GameEndedSuccess` and the level would never travel. The real engine
+    /// finishes the intro before the level ends; this restores that ordering for a direct
+    /// level-completion call. Visible in the log, never silent.
+    fn stop_cutscenes_if_ended(&mut self) {
+        if self.cine_stopped {
+            return;
+        }
+        let ended = self.game_info.is_some_and(|gi| {
+            matches!(
+                self.vm.get_property(gi, "bGameEnded"),
+                Some(Value::Bool(true))
+            )
+        });
+        if !ended {
+            return;
+        }
+        self.cine_stopped = true;
+        let mut stopped = Vec::new();
+        for i in 0..self.vm.objects.len() {
+            let id = i as ObjectId;
+            if self.vm.objects[i].deleted || !self.vm.objects[i].is_actor {
+                continue;
+            }
+            let cutscene = self.vm.class_chain_contains(id, "cine")
+                || self.vm.class_chain_contains(id, "beachinbed");
+            if cutscene && self.vm.objects[i].active {
+                self.vm.set_active(id, false);
+                stopped.push(self.vm.objects[i].name.clone());
+            }
+        }
+        if !stopped.is_empty() {
+            println!(
+                "[play] game ended: stopped {} cutscene controller(s): {}",
+                stopped.len(),
+                stopped.join(", ")
+            );
+        }
     }
 
     /// Read-only access to the script VM for host-side queries (the `--play` pawn renderer reads
@@ -796,6 +852,31 @@ impl Session {
         self.first_error.as_deref()
     }
 
+    /// Calls the map's own `MapInfo.SetGoalComplete(N)` (item15 demonstration bridge). The
+    /// decoded campaign reaches this through goal triggers fired by cutscene `TriggerEvent`s the
+    /// host does not yet play; calling it runs the game's `TestGoalComplete`/`DoTravel`/`EndGame`/
+    /// `ServerTravel` chain. Returns an error string when there is no live `MapInfo`, never a
+    /// silent no-op.
+    pub fn set_goal(&mut self, n: i32) -> Result<(), String> {
+        let gi = self
+            .game_info
+            .ok_or_else(|| "no GameInfo; cannot resolve MapInfo".to_owned())?;
+        let map_info = instance_prop(&self.vm, gi, "MapInfo")
+            .ok_or_else(|| "GameInfo.MapInfo is None".to_owned())?;
+        let name = self.vm.objects[map_info as usize].name.clone();
+        self.vm
+            .send_event(map_info, "SetGoalComplete", vec![Value::Int(n)])
+            .map_err(|e| e.to_string())?;
+        self.drain_events();
+        self.stop_cutscenes_if_ended();
+        let complete = matches!(
+            self.vm.get_property(map_info, "bLevelComplete"),
+            Some(Value::Bool(true))
+        );
+        println!("[play] set_goal {n} via {name}.SetGoalComplete (bLevelComplete={complete})");
+        Ok(())
+    }
+
     /// The player pawn's current `Weapon` object, if any.
     pub fn player_weapon(&self) -> Option<ObjectId> {
         instance_prop(&self.vm, self.player, "Weapon")
@@ -961,6 +1042,12 @@ impl Session {
                 self.dialogue_total += 1;
                 self.dialogues.push_back((t, d.clone()));
             }
+            if let PresentationEvent::TravelRequest(r) = &ev {
+                // Keep the first un-consumed request; the host reloads on it.
+                if self.travel.is_none() {
+                    self.travel = Some(r.clone());
+                }
+            }
             self.events.push_back((t, ev));
         }
         while self.events.len() > 64 {
@@ -969,6 +1056,14 @@ impl Session {
         while self.dialogues.len() > 64 {
             self.dialogues.pop_front();
         }
+    }
+
+    /// Takes the pending level-travel request, if any. The VM reports it; the host owns the
+    /// reload ([`crate::play::travel`]).
+    pub fn take_travel_request(&mut self) -> Option<TravelRequest> {
+        // Prefer the VM's own queue (a `ClientTravel` native or the `NextURL` check) in case the
+        // event was not drained yet, then the event-captured copy.
+        self.vm.take_travel_request().or_else(|| self.travel.take())
     }
 
     /// Dialogue events emitted since `seen` (a cumulative count). Returns the events in order;
@@ -1007,12 +1102,46 @@ impl Session {
             if !self.player_touching.contains(id) {
                 let name = self.vm.objects[*id as usize].name.clone();
                 self.touches.push_back((self.vm.time, name));
+                // Host bridge (item15): the one decoded level-end starter
+                // (`XIDCine.BeachFinalFall`) derives from `Engine.Triggers`, has no `Touch`, and
+                // has no decoded caller; see `fire_touch_event_bridge` and the report.
+                self.fire_touch_event_bridge(*id);
             }
         }
         self.player_touching = now;
         while self.touches.len() > 64 {
             self.touches.pop_front();
         }
+    }
+
+    /// Reproduces the engine's `Trigger.Touch` for the one decoded actor that starts a level end
+    /// but has no decoded starter: `XIDCine.BeachFinalFall` (its `Event` names the goal trigger,
+    /// but it derives from `Engine.Triggers`, which has no `Touch`, and no script or native fires
+    /// its `'Fall'` tag — see the report). The allow-list is by class name, so no other actor
+    /// ever invents an event. Visible in the log on every firing.
+    fn fire_touch_event_bridge(&mut self, actor: ObjectId) {
+        const ALLOW: &[&str] = &["beachfinalfall"];
+        if !ALLOW.iter().any(|c| self.vm.class_chain_contains(actor, c)) {
+            return;
+        }
+        let event = match self.vm.get_property(actor, "Event") {
+            Some(Value::Name(n)) if !n.eq_ignore_ascii_case("None") => n.clone(),
+            _ => return,
+        };
+        let args = vec![
+            Value::Name(event.clone()),
+            Value::Object(Some(ObjRef::Instance(actor))),
+            Value::Object(Some(ObjRef::Instance(self.player))),
+        ];
+        let name = self.vm.objects[actor as usize].name.clone();
+        match self.vm.send_event(actor, "TriggerEvent", args) {
+            Ok(_) => println!(
+                "[play] host bridge: {name} (XIDCine.BeachFinalFall) has no decoded starter; \
+                 firing its own TriggerEvent({event:?})"
+            ),
+            Err(e) => self.record_failure(&name, &e),
+        }
+        self.drain_events();
     }
 
     fn update_sync(&mut self) {

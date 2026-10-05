@@ -4,6 +4,7 @@
 use xiii_package::Limits;
 
 use crate::bytecode::ScriptLimits;
+use crate::events::{PresentationEvent, TravelSource};
 use crate::linker::{GlobalRef, ScriptPackage, ScriptSet};
 use crate::localize::LocalizationData;
 use crate::reflect::function_flags as ff;
@@ -502,7 +503,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 264);
+    assert_eq!(defs.len(), 267);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -5226,6 +5227,46 @@ fn voice_and_onomatopoeia_natives_emit_presentation_events() {
         events
             .iter()
             .any(|e| matches!(e, PresentationEvent::StopSound { .. }))
+    );
+}
+
+#[test]
+fn client_travel_records_a_host_travel_request() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let c = vm
+        .spawn(sg(&set, "Actor"), "XIIIPlayerController0")
+        .unwrap();
+    let mut a = [
+        Value::Str("Plage01.unr".into()),
+        Value::Byte(2),
+        Value::Bool(true),
+    ];
+    let out = call_native(
+        &mut vm,
+        "PlayerController.ClientTravel",
+        c,
+        &[false, false, false],
+        &mut a,
+    );
+    assert!(matches!(out, NativeOutcome::Value(Value::Void)));
+    let req = vm.take_travel_request().expect("travel request");
+    assert_eq!(req.url, "Plage01.unr");
+    assert_eq!(req.mode, 2);
+    assert!(req.items);
+    assert_eq!(req.actor, "XIIIPlayerController0");
+    assert!(matches!(req.source, TravelSource::ClientTravel));
+    assert!(
+        vm.take_travel_request().is_none(),
+        "the request is consumed once"
+    );
+    // The request is also queued as a typed presentation event for `--events`/reporting.
+    let events = vm.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, PresentationEvent::TravelRequest(_))),
+        "a TravelRequest presentation event must be queued: {events:?}"
     );
 }
 
