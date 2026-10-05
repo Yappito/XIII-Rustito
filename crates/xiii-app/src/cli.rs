@@ -39,6 +39,8 @@ pub struct Options {
     pub dump: bool,
     /// With `--dump`: list objects whose path or texture contains this text.
     pub find: Option<String>,
+    /// Run the headless doorway collision test on `--map` from `--game-dir`.
+    pub collision_test: bool,
 }
 
 impl Options {
@@ -63,6 +65,7 @@ impl Default for Options {
             view: None,
             dump: false,
             find: None,
+            collision_test: false,
         }
     }
 }
@@ -72,12 +75,14 @@ xiii-app [--smoke] [--frames N] [--exit-after-secs S] [--screenshot PATH]
          [--no-vsync] [--size WxH]
 xiii-app --map NAME --game-dir DIR [--view x,y,z,yaw,pitch] [--dump]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH]
+xiii-app --map NAME --game-dir DIR --collision-test
 
   --smoke              Run the native window/GPU/input/audio smoke scene (default).
   --map NAME           Diagnostic map viewer: import NAME (e.g. Plage00) from --game-dir.
   --game-dir DIR       Owned XIII installation (read-only).
   --view x,y,z,yaw,pitch  Viewer camera override (Bevy metres, degrees).
   --dump               Viewer: import, print counters, exit without a window.
+  --collision-test     Headless swept-collision doorway test on --map (no window).
   --find TEXT          With --dump: list objects whose path/texture contains TEXT.
   --frames N           Exit cleanly after N frames and print a report.
   --exit-after-secs S  Exit cleanly after S seconds and print a report.
@@ -123,6 +128,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
             }
             "--game-dir" => opts.game_dir = Some(PathBuf::from(value("--game-dir")?)),
             "--dump" => opts.dump = true,
+            "--collision-test" => opts.collision_test = true,
             "--find" => opts.find = Some(value("--find")?.to_ascii_lowercase()),
             "--view" => {
                 let v = value("--view")?;

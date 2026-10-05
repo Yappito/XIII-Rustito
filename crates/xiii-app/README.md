@@ -13,7 +13,25 @@ cargo run --release -p xiii-app -- --map Plage00 --game-dir P:/AI/XIII/XIII_Game
 cargo run --release -p xiii-app -- --map Plage01 --game-dir ... --exit-after-secs 6 --screenshot out.png
 cargo run --release -p xiii-app -- --map Plage01 --game-dir ... --view -50.1,22.6,-45.8,157.5,0
 cargo run --release -p xiii-app -- --map Plage00 --game-dir ... --dump [--find closed]
+cargo run --release -p xiii-app -- --map Plage01 --game-dir ... --collision-test
 ```
+
+## Headless doorway collision test (`--collision-test`)
+
+`src/collision.rs` builds a `xiii-collision::CollisionWorld` from the imported map's
+collision triangles, resolves the player extent box from the **inherited** class defaults
+(`Default.ini` `DefaultGame=` -> GameInfo `DefaultPlayerClassName=` -> `Vm::class_layout`),
+identifies the `Porte6` collision source and its bounding box, measures the door opening,
+drops the box to the floor and walks it through the doorway twice with `move_slide`:
+
+- **closed** (all collision): expected blocked by the `Porte6` source;
+- **open** (`Porte6` sources excluded): expected to pass >= 1 m beyond the door plane.
+
+Each case prints a `PASS`/`FAIL` line with the blocking source path, contact normal and
+height, plus timings. The 50 units/m constant is not changed; the measured calibration data
+is in `local/reports/item1-collision.md`. The player pawn resolves to `XIII.XIIIPlayerPawn`
+(CollisionRadius 34, CollisionHeight 75 — a half height — via `XIII.XIIIPawn` -> `Engine.Pawn`).
+An opt-in integration test (`tests/local_collision.rs`, `XIII_GOG_DIR`) asserts both cases.
 
 `src/viewer/load.rs` imports the map without Bevy types, using `xiii-install` for read-only
 package resolution and `xiii-decode`. It places static-mesh actors (Location, Rotation,

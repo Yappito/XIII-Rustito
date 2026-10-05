@@ -4,6 +4,7 @@
 //! that import from an owned installation will be added as sibling plugins.
 
 mod cli;
+mod collision;
 mod smoke;
 mod viewer;
 
@@ -25,6 +26,14 @@ fn main() -> AppExit {
 
     if opts.mode == cli::Mode::Viewer && opts.dump {
         return dump(&opts);
+    }
+
+    if opts.collision_test {
+        let (Some(dir), Some(map)) = (&opts.game_dir, &opts.map) else {
+            eprintln!("error: --collision-test needs --map and --game-dir");
+            return AppExit::error();
+        };
+        return collision::run(map, dir);
     }
 
     if opts.unattended() {

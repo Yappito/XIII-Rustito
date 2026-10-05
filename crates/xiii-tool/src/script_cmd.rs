@@ -33,6 +33,11 @@ xiii-tool script: compiled UnrealScript (M2c)
       Disassemble one function/state, or every function/state of a class.
       --game-dir loads all .u packages of the installation to name natives and
       resolve imports. OUTPUT CONTAINS PROPRIETARY CODE: keep it local.
+  xiii-tool script defaults <package.u> <Package.Class> [--game-dir <root>] [--name <prop>]
+      Print the resolved (inherited) default values of a class: walks the class chain
+      root-to-leaf and applies each class's own defaults, so the printed value is the
+      effective default (e.g. CollisionRadius on a player pawn). --name filters by
+      case-insensitive property name; repeatable. Read-only.
   xiii-tool script natives <root> [--json]
       Catalog of native functions (package, owner, name, index, flags, params).
   xiii-tool script coverage <root> [--json-out <file>] [--dll-dir <dir>]
@@ -42,10 +47,18 @@ xiii-tool script: compiled UnrealScript (M2c)
   xiii-tool script run --game-dir <root> [--map Plage00] [--touch TouchTrigger2]
                        [--ticks 60] [--dt 0.0333] [--touch-tick 1] [--trace]
                        [--active TouchTrigger,XIIIDispatcher] [--no-natives] [--budget N]
+                       [--begin-play] [--game-class Package.Class] [--survey]
       Headless interpreter harness: load the map's actors, run PostBeginPlay and
       SetInitialState for the executed scope, deliver Touch(synthetic player) to
       the touched actor, tick at a fixed step and print the behaviour trace.
       Calls into actors outside the scope are reported as DEFERRED (not run).
+      --begin-play runs the full level-start lifecycle (PreBeginPlay, BeginPlay,
+      PostBeginPlay, PostNetBeginPlay, SetInitialState) and spawns a GameInfo;
+      the class comes from [Engine.Engine] DefaultGame in Default.ini unless
+      --game-class overrides it.
+      --survey is DIAGNOSTIC ONLY: it continues past unimplemented natives,
+      counts each distinct one with its first-hit location, and never reports the
+      run as success.
       Exits 1 on a script error (printed with its script stack).";
 
 const GAME_PACKAGES: &[&str] = &["xidmaps", "xiii", "xidcine"];
@@ -68,6 +81,7 @@ pub fn run(args: &[String]) -> ExitCode {
         Some("functions") => functions_cmd(&args[1..]),
         Some("disasm") => disasm_cmd(&args[1..]),
         Some("natives") => natives_cmd(&args[1..]),
+        Some("defaults") => defaults_cmd(&args[1..]),
         Some("coverage") => coverage_cmd(&args[1..]),
         Some("run") => crate::script_run::run_cmd(&args[1..]),
         Some("-h" | "--help" | "help") | None => {
@@ -146,6 +160,7 @@ struct Common {
     json: bool,
     json_out: Option<PathBuf>,
     dll_dir: Option<PathBuf>,
+    names: Vec<String>,
 }
 
 fn parse(args: &[String]) -> Result<Common, String> {
@@ -158,6 +173,7 @@ fn parse(args: &[String]) -> Result<Common, String> {
         json: false,
         json_out: None,
         dll_dir: None,
+        names: Vec::new(),
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -171,6 +187,7 @@ fn parse(args: &[String]) -> Result<Common, String> {
             "--class" => c.class = Some(val("--class")?),
             "--json-out" => c.json_out = Some(PathBuf::from(val("--json-out")?)),
             "--dll-dir" => c.dll_dir = Some(PathBuf::from(val("--dll-dir")?)),
+            "--name" => c.names.push(val("--name")?),
             "--tokens" => c.tokens = true,
             "--json" => c.json = true,
             s if s.starts_with("--") => return Err(format!("unknown option '{s}'")),
@@ -446,6 +463,78 @@ fn disasm_cmd(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Walks a class chain root-to-leaf applying each class's own defaults and prints the
+/// resulting (inherited/effective) values. Read-only.
+fn defaults_cmd(args: &[String]) -> ExitCode {
+    let c = match parse(args) {
+        Ok(c) => c,
+        Err(e) => return usage_error(&e),
+    };
+    let Some(file) = c.file else {
+        return usage_error("defaults needs a package file");
+    };
+    let Some(class_path) = c.rest.first() else {
+        return usage_error("defaults needs a class path (Package.Class or Class)");
+    };
+    let (set, pi) = match load_target(&file, c.game_dir.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let p = &set.packages[pi];
+    let path = class_path
+        .split_once('.')
+        .map(|(_, c)| c)
+        .unwrap_or(class_path);
+    let Some(e) = p.export_by_path(path) else {
+        eprintln!("error: no class '{class_path}' in {}", p.name);
+        return ExitCode::from(1);
+    };
+    let class = GlobalRef {
+        package: pi,
+        export: e,
+    };
+    let mut vm = xiii_script::Vm::new(&set, xiii_script::VmLimits::default());
+    let layout = match vm.class_layout(class) {
+        Ok(l) => l,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{}: {} (chain: {})",
+        file.display(),
+        set.path(class),
+        layout.chain_names.join(" <- ")
+    );
+    let filter: Vec<String> = c.names.iter().map(|s| s.to_ascii_lowercase()).collect();
+    // Layout defaults are ordered by slot; `slot_by_name` gives the first (most-derived is
+    // inserted first, then overridden by root-to-leaf application in `class_layout`).
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for slot in &layout.slots {
+        if seen.contains(&slot.name) {
+            continue;
+        }
+        seen.insert(slot.name.clone());
+        if !filter.is_empty() && !filter.iter().any(|f| slot.name.contains(f)) {
+            continue;
+        }
+        let value = layout
+            .defaults
+            .get(slot.base)
+            .map(|v| format!("{v:?}"))
+            .unwrap_or_else(|| "<missing>".into());
+        let _ = writeln!(out, "  {} = {}", slot.name, value);
+    }
+    emit(&out);
+    ExitCode::SUCCESS
 }
 
 fn param_text(n: &NativeEntry) -> String {
