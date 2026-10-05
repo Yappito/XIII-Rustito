@@ -38,7 +38,7 @@ const SURVEY_DT: f32 = 1.0 / 30.0;
 
 /// Usage text for `xiii-tool campaign`.
 pub const USAGE: &str = "\
-xiii-tool campaign <game-dir> [--maps a,b,..] [--json <out>] [--md <out>]
+xiii-tool campaign (<game-dir> | --root-env <VAR>) [--maps a,b,..] [--json <out>] [--md <out>]
     Headless sweep of the whole campaign. Finds the campaign order from each map's
     MapInfo.NextMapLevelWithUnr link (falling back to every non-multiplayer map), then
     per map, isolated: imports it (counters/time), builds the box and line collision
@@ -46,6 +46,9 @@ xiii-tool campaign <game-dir> [--maps a,b,..] [--json <out>] [--md <out>]
     the script level-start lifecycle with ALL actors active in --survey mode against the
     real physics/animation/navigation providers. A panic or error in one map is recorded
     and the sweep continues.
+    --root-env <VAR>  take the installation root from environment variable VAR, so a
+                      protected path never has to be typed on the command line
+                      (e.g. --root-env XIII_STEAM_DIR). Cannot be combined with <game-dir>.
     --maps a,b,..  explicit map list (case-insensitive), overriding discovery.
     --json <out>   write a metadata-only JSON report (refused inside <game-dir>).
     --md <out>     write the Markdown summary (refused inside <game-dir>).
@@ -1190,6 +1193,7 @@ pub fn report_markdown(r: &CampaignReport) -> String {
 
 struct Cli {
     root: Option<PathBuf>,
+    root_env: Option<String>,
     maps: Option<String>,
     json: Option<PathBuf>,
     md: Option<PathBuf>,
@@ -1198,6 +1202,7 @@ struct Cli {
 fn parse_cli(args: &[String]) -> Result<Cli, String> {
     let mut c = Cli {
         root: None,
+        root_env: None,
         maps: None,
         json: None,
         md: None,
@@ -1210,6 +1215,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 .ok_or_else(|| format!("{what} needs a value"))
         };
         match a.as_str() {
+            "--root-env" => c.root_env = Some(val("--root-env")?),
             "--maps" => c.maps = Some(val("--maps")?),
             "--json" => c.json = Some(PathBuf::from(val("--json")?)),
             "--md" => c.md = Some(PathBuf::from(val("--md")?)),
@@ -1218,10 +1224,30 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             s => return Err(format!("unexpected argument '{s}'")),
         }
     }
-    if c.root.is_none() {
-        return Err("campaign needs an installation root".into());
+    if c.root.is_some() && c.root_env.is_some() {
+        return Err("campaign takes either an installation root or --root-env, not both".into());
+    }
+    if c.root.is_none() && c.root_env.is_none() {
+        return Err("campaign needs an installation root or --root-env <VAR>".into());
     }
     Ok(c)
+}
+
+/// Resolves the root from `--root-env <VAR>`: the variable must exist and be non-empty.
+/// The value is never echoed; only the variable name is reported on error.
+fn root_from_env(var: &str) -> Result<PathBuf, String> {
+    root_from_env_value(var, std::env::var_os(var))
+}
+
+/// Pure core of [`root_from_env`]; the lookup is injected so the failure modes are testable
+/// without mutating the process environment (forbidden here).
+fn root_from_env_value(var: &str, value: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
+    match value {
+        Some(v) if !v.is_empty() => Ok(PathBuf::from(v)),
+        _ => Err(format!(
+            "environment variable {var} is not set (or empty); campaign --root-env needs it"
+        )),
+    }
 }
 
 /// `xiii-tool campaign ...`.
@@ -1230,7 +1256,14 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
         Ok(c) => c,
         Err(e) => return usage_error(&e),
     };
-    let root = cli.root.expect("checked");
+    let root = match (cli.root, cli.root_env) {
+        (Some(root), _) => root,
+        (None, Some(var)) => match root_from_env(&var) {
+            Ok(root) => root,
+            Err(e) => return usage_error(&e),
+        },
+        (None, None) => return usage_error("campaign needs an installation root or --root-env"),
+    };
     if !root.is_dir() {
         return usage_error(&format!("{} is not a directory", root.display()));
     }
@@ -1493,6 +1526,79 @@ mod tests {
             "Actor.Spawn"
         );
         assert_eq!(v["maps"][0]["import"]["fail"], 1);
+    }
+
+    /// `--root-env` is the alternative to a positional root; the two are mutually exclusive and
+    /// one of them is required. The variable's value is never part of the parsed CLI.
+    #[test]
+    fn parse_cli_root_selection() {
+        let c = parse_cli(&["--root-env".into(), "XIII_STEAM_DIR".into()]).expect("root-env alone");
+        assert_eq!(c.root, None);
+        assert_eq!(c.root_env.as_deref(), Some("XIII_STEAM_DIR"));
+
+        let c = parse_cli(&["G".into(), "--maps".into(), "A,B".into()])
+            .expect("positional root with maps");
+        assert_eq!(c.root, Some(PathBuf::from("G")));
+        assert_eq!(c.root_env, None);
+        assert_eq!(c.maps.as_deref(), Some("A,B"));
+
+        assert!(parse_cli(&[]).is_err(), "no root is an error");
+        assert!(
+            parse_cli(&["G".into(), "--root-env".into(), "XIII_STEAM_DIR".into()]).is_err(),
+            "root and --root-env together is an error"
+        );
+    }
+
+    /// An unset (or empty) variable must be a usage error, not a silent empty path.
+    #[test]
+    fn root_from_env_value_unset_and_empty_are_errors() {
+        assert!(root_from_env_value("X", None).is_err());
+        assert!(root_from_env_value("X", Some(std::ffi::OsString::new())).is_err());
+        assert_eq!(
+            root_from_env_value("X", Some(std::ffi::OsString::from("some/root"))).expect("set"),
+            PathBuf::from("some/root")
+        );
+    }
+
+    /// Reads a variable that exists in every process: the success path of [`root_from_env`].
+    #[test]
+    fn root_from_env_reads_an_existing_variable() {
+        let var = "PATH";
+        let expected = std::env::var_os(var).expect("PATH is set on every supported platform");
+        assert_eq!(root_from_env(var).expect("PATH"), PathBuf::from(expected));
+    }
+
+    /// Opt-in: the whole discovered Steam campaign sweep completes with zero panics. Every map is
+    /// imported and script-surveyed in isolation; a panic in any map fails this test (the same
+    /// condition the `xiii-tool campaign --root-env XIII_STEAM_DIR` acceptance run reports).
+    #[test]
+    fn opt_in_steam_campaign_sweep_has_no_panics() {
+        let Some(root) = std::env::var_os("XIII_STEAM_DIR") else {
+            println!("SKIPPED: set XIII_STEAM_DIR to the Steam installation root to run this test");
+            return;
+        };
+        let path = std::path::PathBuf::from(&root);
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = if path.is_relative() {
+            ws.join(path)
+        } else {
+            path
+        };
+        let discovery = discover_maps(&path, None).expect("discover Steam maps");
+        assert!(!discovery.maps.is_empty(), "no Steam maps discovered");
+        let mut panics = Vec::new();
+        for map in &discovery.maps {
+            let r = run_one(&path, map);
+            if r.status == MapStatus::Panic {
+                eprintln!("PANIC on {map}: {:?}", r.error);
+                panics.push(map.clone());
+            }
+        }
+        assert!(panics.is_empty(), "Steam campaign panicked on {panics:?}");
+        println!(
+            "steam campaign sweep: {} maps, 0 panics",
+            discovery.maps.len()
+        );
     }
 
     /// Opt-in corpus test: sweep two real maps. Prints `SKIPPED` without `XIII_GOG_DIR`.

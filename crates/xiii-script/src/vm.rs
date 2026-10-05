@@ -13,9 +13,10 @@
 //! value). Unsupported tokens, unimplemented natives, budget overruns and bad values fail with
 //! [`VmError`] carrying a script stack trace. Nothing is stubbed silently.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
+use std::time::Instant;
 
 use xiii_package::{Limits, ObjectRef, PropertyBlock, PropertyValue, RawReason, StructValue};
 
@@ -869,16 +870,45 @@ pub struct ClassLayout {
     pub size: usize,
     /// Default values (class-default blocks applied root to leaf).
     pub defaults: Vec<Value>,
+    /// Precomputed `props` index of `Location` (no per-read name lookup on hot paths).
+    pub location_slot: Option<usize>,
+    /// Precomputed `props` index of `Rotation`.
+    pub rotation_slot: Option<usize>,
+    /// Precomputed `props` index of `bCollideActors`.
+    pub collide_slot: Option<usize>,
+    /// Precomputed `props` index of `bInterpolating`.
+    pub interp_slot: Option<usize>,
+    /// True when the class chain derives from `Mover` (avoids a chain scan per object per tick).
+    pub is_mover_class: bool,
 }
 
 impl ClassLayout {
     /// Slot by lowercase property name.
+    ///
+    /// Pure caching optimisation with no semantic change: instead of allocating a lowercase
+    /// `String` for every lookup (this is on the per-actor touch/sync hot paths), short ASCII
+    /// names are lowercased into a fixed stack buffer. Non-ASCII or over-long names keep the
+    /// original allocating path.
     pub fn slot_by_name(&self, name: &str) -> Option<&Slot> {
-        self.by_name
-            .get(&name.to_ascii_lowercase())
-            .map(|i| &self.slots[*i])
+        let bytes = name.as_bytes();
+        if bytes.is_ascii() && bytes.len() <= STACK_NAME_BYTES {
+            let mut buf = [0u8; STACK_NAME_BYTES];
+            for (i, b) in bytes.iter().enumerate() {
+                buf[i] = b.to_ascii_lowercase();
+            }
+            let key = std::str::from_utf8(&buf[..bytes.len()]).unwrap_or(name);
+            self.by_name.get(key).map(|i| &self.slots[*i])
+        } else {
+            self.by_name
+                .get(&name.to_ascii_lowercase())
+                .map(|i| &self.slots[*i])
+        }
     }
 }
+
+/// Stack buffer size for the allocation-free property-name lowercase path. Property names in the
+/// corpus are far shorter than this; longer names fall back to the allocating path.
+const STACK_NAME_BYTES: usize = 64;
 
 #[derive(Debug)]
 struct ParamInfo {
@@ -987,6 +1017,56 @@ enum Exit {
     Restart,
 }
 
+/// Optional VM profiling data (`Vm::enable_native_timers`). Cheap when disabled: the timing
+/// guards only run when `enabled` is set, and the accumulators are only written then.
+#[derive(Debug, Default, Clone)]
+pub struct NativeProfile {
+    /// Whether the timers are armed.
+    pub enabled: bool,
+    /// Per-native cumulative wall-clock microseconds, keyed by `Class.Function`.
+    pub micros: BTreeMap<String, u64>,
+    /// Per-native call counts.
+    pub calls: BTreeMap<String, u64>,
+    /// Cumulative microseconds in the timer loop of `tick_suspending`.
+    pub timers_micros: u64,
+    /// Cumulative microseconds in the animation-advance loop.
+    pub animation_micros: u64,
+    /// Cumulative microseconds in the mover-interpolation loop.
+    pub movers_micros: u64,
+    /// Cumulative microseconds in the state-code loop.
+    pub state_micros: u64,
+    /// Cumulative microseconds inside native implementations (sum over all natives).
+    pub natives_micros: u64,
+    /// Cumulative microseconds writing the host-owned player fields into the VM.
+    pub player_write_micros: u64,
+    /// Cumulative microseconds in `refresh_touching_of` (the host moved the player).
+    pub touch_micros: u64,
+    /// Cumulative microseconds draining presentation events / updating touches.
+    pub events_micros: u64,
+    /// Cumulative microseconds in the one-way render sync (`update_sync`).
+    pub sync_micros: u64,
+    /// Cumulative microseconds building mover collision states (`mover_states`).
+    pub mover_states_micros: u64,
+}
+
+impl NativeProfile {
+    /// Clears every accumulator (keeps `enabled`).
+    pub fn reset(&mut self) {
+        self.micros.clear();
+        self.calls.clear();
+        self.timers_micros = 0;
+        self.animation_micros = 0;
+        self.movers_micros = 0;
+        self.state_micros = 0;
+        self.natives_micros = 0;
+        self.player_write_micros = 0;
+        self.touch_micros = 0;
+        self.events_micros = 0;
+        self.sync_micros = 0;
+        self.mover_states_micros = 0;
+    }
+}
+
 /// The interpreter.
 pub struct Vm<'s> {
     set: &'s ScriptSet,
@@ -1050,6 +1130,8 @@ pub struct Vm<'s> {
     pub canvas: CanvasState,
     /// Interned object references into packages outside the loaded script set.
     externals: std::cell::RefCell<ExternalTable>,
+    /// Optional per-native/section timing (`--perf-natives`).
+    profile: NativeProfile,
 }
 
 fn lower(s: &str) -> String {
@@ -1091,7 +1173,30 @@ impl<'s> Vm<'s> {
             address_url: String::new(),
             canvas: CanvasState::default(),
             externals: std::cell::RefCell::new(ExternalTable::default()),
+            profile: NativeProfile::default(),
         }
+    }
+
+    /// Arms per-native/section timers (off by default; `--perf-natives`). Adds a timing guard
+    /// around every native implementation and around the four `tick_suspending` loops.
+    pub fn enable_native_timers(&mut self, on: bool) {
+        self.profile.enabled = on;
+    }
+
+    /// Current profiling accumulators (empty unless [`Vm::enable_native_timers`] was armed).
+    pub fn native_profile(&self) -> &NativeProfile {
+        &self.profile
+    }
+
+    /// Mutable profiling accumulators, so the hosting application can record its own spans
+    /// (player-field writes, touch refresh, event drain, render sync) alongside the VM's.
+    pub fn native_profile_mut(&mut self) -> &mut NativeProfile {
+        &mut self.profile
+    }
+
+    /// Clears the profiling accumulators (keeps the enabled flag).
+    pub fn reset_native_profile(&mut self) {
+        self.profile.reset();
     }
 
     /// Installs the host font-metrics provider used by `Canvas.StrLen`/`TextSize`.
@@ -1574,7 +1679,13 @@ impl<'s> Vm<'s> {
                 defaults.push(s.ty.zero());
             }
         }
-        let chain_names = chain.iter().map(|g| lower(self.object_name(*g))).collect();
+        let chain_names: Vec<String> = chain.iter().map(|g| lower(self.object_name(*g))).collect();
+        let slot_base = |name: &str| by_name.get(name).map(|i| slots[*i].base);
+        let location_slot = slot_base("location");
+        let rotation_slot = slot_base("rotation");
+        let collide_slot = slot_base("bcollideactors");
+        let interp_slot = slot_base("binterpolating");
+        let is_mover_class = chain_names.iter().any(|n| n == "mover");
         let mut layout = ClassLayout {
             class,
             chain: chain.clone(),
@@ -1584,6 +1695,11 @@ impl<'s> Vm<'s> {
             by_name,
             size,
             defaults: Vec::new(),
+            location_slot,
+            rotation_slot,
+            collide_slot,
+            interp_slot,
+            is_mover_class,
         };
         for c in chain.iter().rev() {
             if let Some(ScriptObject::Class(cl)) = self.set.object(*c) {
@@ -2525,6 +2641,8 @@ impl<'s> Vm<'s> {
         self.time += f64::from(dt);
         self.steps = 0;
         let mut errors = Vec::new();
+        let profiling = self.profile.enabled;
+        let t0 = Instant::now();
         for id in 0..self.objects.len() as ObjectId {
             if !self.objects[id as usize].active {
                 continue;
@@ -2557,6 +2675,10 @@ impl<'s> Vm<'s> {
                 }
             }
         }
+        if profiling {
+            self.profile.timers_micros += t0.elapsed().as_micros() as u64;
+        }
+        let t0 = Instant::now();
         for id in 0..self.objects.len() as ObjectId {
             if self.objects[id as usize].active
                 && let Err(e) = self.advance_animation(id, dt)
@@ -2565,6 +2687,10 @@ impl<'s> Vm<'s> {
                 errors.push((suspended, e));
             }
         }
+        if profiling {
+            self.profile.animation_micros += t0.elapsed().as_micros() as u64;
+        }
+        let t0 = Instant::now();
         for id in 0..self.objects.len() as ObjectId {
             if self.objects[id as usize].active
                 && let Err(e) = self.advance_interpolation(id, dt)
@@ -2573,6 +2699,10 @@ impl<'s> Vm<'s> {
                 errors.push((suspended, e));
             }
         }
+        if profiling {
+            self.profile.movers_micros += t0.elapsed().as_micros() as u64;
+        }
+        let t0 = Instant::now();
         for id in 0..self.objects.len() as ObjectId {
             if self.objects[id as usize].active
                 && let Err(e) = self.process_state(id, dt)
@@ -2580,6 +2710,9 @@ impl<'s> Vm<'s> {
                 let suspended = self.suspend_for_error(id, &e);
                 errors.push((suspended, e));
             }
+        }
+        if profiling {
+            self.profile.state_micros += t0.elapsed().as_micros() as u64;
         }
         errors
     }
@@ -3334,7 +3467,15 @@ impl<'s> Vm<'s> {
                     path: path.clone(),
                     omitted: omitted.to_vec(),
                 };
-                f(self, &ctx, args)?
+                let t0 = self.profile.enabled.then(Instant::now);
+                let result = f(self, &ctx, args);
+                if let Some(t0) = t0 {
+                    let micros = t0.elapsed().as_micros() as u64;
+                    *self.profile.micros.entry(path.clone()).or_default() += micros;
+                    *self.profile.calls.entry(path.clone()).or_default() += 1;
+                    self.profile.natives_micros += micros;
+                }
+                result?
             }
         };
         if self.trace_natives {
@@ -4622,13 +4763,14 @@ impl<'s> Vm<'s> {
 
     /// Pose/state of a mover actor without allocating its name.
     fn mover_state_of(&self, id: ObjectId) -> Option<MoverState> {
-        if !self.is_live_actor(id) || !self.is_a(id, "mover") {
+        let o = self.objects.get(id as usize)?;
+        if !o.is_actor || o.deleted || o.name.starts_with("Default__") || !o.layout.is_mover_class {
             return None;
         }
         Some(MoverState {
             name: String::new(),
-            location: self.vector_prop(id, "Location").unwrap_or([0.0; 3]),
-            rotation: self.rotator_prop(id, "Rotation").unwrap_or([0; 3]),
+            location: self.location_prop(id).unwrap_or([0.0; 3]),
+            rotation: self.rotation_prop(id).unwrap_or([0; 3]),
             base_pos: self.vector_prop(id, "BasePos").unwrap_or([0.0; 3]),
             base_rot: self.rotator_prop(id, "BaseRot").unwrap_or([0; 3]),
             key_num: self.byte_prop(id, "KeyNum"),
@@ -4837,6 +4979,45 @@ impl<'s> Vm<'s> {
     /// `bool` property value (false when absent/another type).
     pub(crate) fn bool_prop(&self, id: ObjectId, name: &str) -> bool {
         matches!(self.get_property(id, name), Some(Value::Bool(true)))
+    }
+
+    /// `Location` read through the class layout's precomputed slot (no name lookup). Public for
+    /// the host's per-tick render sync and pawn placement.
+    pub fn location_prop(&self, id: ObjectId) -> Option<[f32; 3]> {
+        let o = self.objects.get(id as usize)?;
+        match o.props.get(o.layout.location_slot?) {
+            Some(Value::Vector(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// `Rotation` read through the class layout's precomputed slot (no name lookup).
+    pub fn rotation_prop(&self, id: ObjectId) -> Option<[i32; 3]> {
+        let o = self.objects.get(id as usize)?;
+        match o.props.get(o.layout.rotation_slot?) {
+            Some(Value::Rotator(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// `bCollideActors` read through the precomputed slot (the touch-refresh pre-filter).
+    pub(crate) fn collides(&self, id: ObjectId) -> bool {
+        let Some(o) = self.objects.get(id as usize) else {
+            return false;
+        };
+        o.layout
+            .collide_slot
+            .is_some_and(|i| matches!(o.props.get(i), Some(Value::Bool(true))))
+    }
+
+    /// `bInterpolating` read through the precomputed slot (the mover-tick pre-filter).
+    pub(crate) fn interpolating(&self, id: ObjectId) -> bool {
+        let Some(o) = self.objects.get(id as usize) else {
+            return false;
+        };
+        o.layout
+            .interp_slot
+            .is_some_and(|i| matches!(o.props.get(i), Some(Value::Bool(true))))
     }
 
     /// Object property value as a live instance id.
@@ -5055,7 +5236,7 @@ impl<'s> Vm<'s> {
         if !self.is_live_actor(id) {
             return Ok(());
         }
-        let collide = self.bool_prop(id, "bCollideActors");
+        let collide = self.collides(id);
         let current = self.touching_list(id);
         let mut valid: Vec<ObjectId> = Vec::new();
         for b in 0..self.objects.len() as ObjectId {
@@ -5063,7 +5244,7 @@ impl<'s> Vm<'s> {
                 continue;
             }
             let touches = collide
-                && self.bool_prop(b, "bCollideActors")
+                && self.collides(b)
                 && self.actors_overlap(id, b)
                 && !self.based_on(id, b)
                 && !self.based_on(b, id)
@@ -5837,7 +6018,7 @@ impl<'s> Vm<'s> {
         if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
             return Ok(());
         }
-        if !self.bool_prop(id, "bInterpolating") {
+        if !self.interpolating(id) {
             return Ok(());
         }
         let rate = self.f32_prop(id, "PhysRate");
@@ -5913,7 +6094,9 @@ impl<'s> Vm<'s> {
         if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
             return Ok(());
         }
-        let actor = self.objects[id as usize].name.clone();
+        // The actor name is only needed when a notify or animation end fires; the old code
+        // cloned it unconditionally, allocating a string for every active actor every tick
+        // (most have no active channel).
         let mut notifies: Vec<(u8, String)> = Vec::new();
         let mut ended: Vec<(u8, f32)> = Vec::new();
         {
@@ -5958,8 +6141,9 @@ impl<'s> Vm<'s> {
             }
         }
         for (channel, function) in notifies {
+            let actor = self.objects[id as usize].name.clone();
             self.note(TraceKind::AnimNotify {
-                actor: actor.clone(),
+                actor,
                 function: function.clone(),
                 channel,
             });
@@ -5968,10 +6152,8 @@ impl<'s> Vm<'s> {
         for (channel, frame) in ended {
             self.set_property(id, "AnimFrame", 0, Value::Float(frame));
             self.set_property(id, "bAnimFinished", 0, Value::Bool(true));
-            self.note(TraceKind::AnimEnd {
-                actor: actor.clone(),
-                channel,
-            });
+            let actor = self.objects[id as usize].name.clone();
+            self.note(TraceKind::AnimEnd { actor, channel });
             self.send_event(id, "AnimEnd", vec![Value::Int(i32::from(channel))])?;
         }
         Ok(())
@@ -6341,5 +6523,82 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Name(x), Value::Name(y)) => x.eq_ignore_ascii_case(y),
         (Value::Int(x), Value::Byte(y)) | (Value::Byte(y), Value::Int(x)) => *x == i32::from(*y),
         _ => a == b,
+    }
+}
+
+#[cfg(test)]
+mod stack_name_tests {
+    use super::*;
+
+    /// Builds a layout with one `Int` slot per name (base index = position, all dim 1).
+    fn layout_with(names: &[&str]) -> ClassLayout {
+        let mut by_name = HashMap::new();
+        let mut slots = Vec::new();
+        for (base, n) in names.iter().enumerate() {
+            let lower = n.to_ascii_lowercase();
+            by_name.insert(lower.clone(), slots.len());
+            slots.push(Slot {
+                prop: GlobalRef {
+                    package: 0,
+                    export: 0,
+                },
+                name: lower,
+                ty: Ty::Int,
+                dim: 1,
+                base,
+                flags: 0,
+            });
+        }
+        let size = slots.len();
+        ClassLayout {
+            class: GlobalRef {
+                package: 0,
+                export: 0,
+            },
+            chain: vec![],
+            chain_names: vec![],
+            slots,
+            by_prop: HashMap::new(),
+            by_name,
+            size,
+            defaults: vec![],
+            location_slot: None,
+            rotation_slot: None,
+            collide_slot: None,
+            interp_slot: None,
+            is_mover_class: false,
+        }
+    }
+
+    /// The allocation-free stack path (short ASCII names) and the allocating fallback (long or
+    /// non-ASCII names) must agree on case-insensitive lookups and reject missing names.
+    #[test]
+    fn slot_lookup_case_insensitive_short_long_and_non_ascii() {
+        let long = "A".repeat(80);
+        let l = layout_with(&["LoCaTiOn", "bCollideActors", &long, "café", "tail"]);
+        // Short ASCII: every case spelling maps to the same slot.
+        assert_eq!(l.slot_by_name("LOCATION").map(|s| s.base), Some(0));
+        assert_eq!(l.slot_by_name("location").map(|s| s.base), Some(0));
+        assert_eq!(l.slot_by_name("bcollideactors").map(|s| s.base), Some(1));
+        // Over the 64-byte stack buffer: the allocating fallback must still match.
+        assert_eq!(
+            l.slot_by_name(&long.to_ascii_uppercase()).map(|s| s.base),
+            Some(2)
+        );
+        // Non-ASCII: fallback path, exact bytes match.
+        assert_eq!(l.slot_by_name("café").map(|s| s.base), Some(3));
+        // The 64/65-byte boundary: both are stored lowercased and found.
+        let n64 = "b".repeat(64);
+        let n65 = format!("{}c", "b".repeat(64));
+        let l = layout_with(&[&n64, &n65]);
+        assert_eq!(
+            l.slot_by_name(&n64.to_ascii_uppercase()).map(|s| s.base),
+            Some(0)
+        );
+        assert_eq!(
+            l.slot_by_name(&n65.to_ascii_uppercase()).map(|s| s.base),
+            Some(1)
+        );
+        assert!(l.slot_by_name("missing").is_none());
     }
 }
