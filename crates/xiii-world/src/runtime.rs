@@ -72,6 +72,87 @@ pub fn default_game_from_ini(root: &Path) -> Option<String> {
     None
 }
 
+/// Reads the first of `names` that exists under `root` (`root/`, `root/System/`,
+/// `root/system/`), case as stored on disk.
+fn read_ini(root: &Path, names: &[&str]) -> Option<String> {
+    for name in names {
+        for prefix in ["", "System/", "system/"] {
+            if let Ok(text) = std::fs::read_to_string(root.join(prefix).join(name)) {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+/// Builds the single-player local URL (`<Map>?<options>`) and its `?Key=Value` options tail
+/// from the installation's `[DefaultPlayer]` (`User.ini`, else `DefUser.ini`) with a
+/// `Default.ini [URL]` fallback.
+///
+/// The engine reads `LevelInfo.GetLocalURL` from this string (`XIIIPlayerController.SetInitialState`
+/// compares its first 7 characters to `mapmenu`), and passes the options tail to
+/// `GameInfo.InitGame`/`Login`, whose `GrabOption` requires the leading `?`. Evidence:
+/// `DefUser.ini` lines 1-4 (`[DefaultPlayer] Name=XIII`, `Class=XIII.XIIIPlayerPawn`,
+/// `team=255`); `Default.ini` lines 1-13 (`[URL] Name=Player`, `Class=XIII.XIIIPlayerPawn`).
+pub fn single_player_url(root: &Path, map: &str) -> (String, String) {
+    let mut name = None;
+    let mut class = None;
+    let mut team = None;
+    for file in ["User.ini", "DefUser.ini"] {
+        if let Some(text) = read_ini(root, &[file]) {
+            name = name.or_else(|| ini_value(&text, "DefaultPlayer", "Name"));
+            class = class.or_else(|| ini_value(&text, "DefaultPlayer", "Class"));
+            team = team.or_else(|| ini_value(&text, "DefaultPlayer", "team"));
+        }
+    }
+    if let Some(text) = read_ini(root, &["Default.ini"]) {
+        name = name.or_else(|| ini_value(&text, "URL", "Name"));
+        class = class.or_else(|| ini_value(&text, "URL", "Class"));
+    }
+    let name = name.unwrap_or_else(|| "Player".to_owned());
+    let options = player_options(&name, class.as_deref(), team.as_deref());
+    (format!("{map}{options}"), options)
+}
+
+/// Builds the `?Name=..?Class=..?Team=..` options tail. A missing/empty class or team is
+/// omitted so the engine's own default applies. The leading `?` and `?`/`=` separators are the
+/// grammar `GameInfo.GrabOption`/`GetKeyValue` parse.
+pub fn player_options(name: &str, class: Option<&str>, team: Option<&str>) -> String {
+    let mut options = format!("?Name={name}");
+    if let Some(class) = class.filter(|c| !c.is_empty()) {
+        options.push_str(&format!("?Class={class}"));
+    }
+    if let Some(team) = team.filter(|t| !t.is_empty()) {
+        options.push_str(&format!("?Team={team}"));
+    }
+    options
+}
+
+/// The engine's `[URL] Host:Port` address (`Default.ini`), returned by `LevelInfo.GetAddressURL`.
+/// Engine.dll `?execGetAddressURL@ALevelInfo` formats the URL host and port with `%s:%i`; the GOG
+/// `Default.ini` has an empty `Host=` and `Port=7777`, giving `:7777`.
+pub fn level_address(root: &Path) -> String {
+    let mut host = String::new();
+    let mut port = String::new();
+    if let Some(text) = read_ini(root, &["Default.ini"]) {
+        host = ini_value(&text, "URL", "Host").unwrap_or_default();
+        port = ini_value(&text, "URL", "Port").unwrap_or_default();
+    }
+    if port.is_empty() {
+        port = "0".to_owned();
+    }
+    format!("{host}:{port}")
+}
+
+/// Configures `vm` with the installation's single-player URL for `map` (see
+/// [`single_player_url`] and [`level_address`]). The runtime owns the strings; the VM only
+/// stores them.
+pub fn configure_local_url(vm: &mut Vm, root: &Path, map: &str) {
+    let (local_url, options) = single_player_url(root, map);
+    vm.set_local_url(local_url, options);
+    vm.set_address_url(level_address(root));
+}
+
 fn ini_value(text: &str, section: &str, key: &str) -> Option<String> {
     let mut in_section = false;
     for line in text.lines() {
@@ -417,4 +498,73 @@ pub fn is_unimplemented(kind: &xiii_script::VmErrorKind) -> bool {
             | VmErrorKind::NoAnimationProvider { .. }
             | VmErrorKind::NoNavProvider { .. }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The runtime's URL options tail follows the engine's grammar: a leading `?` and `?`/`=`
+    /// separators, as decoded in `GameInfo.GrabOption`/`GetKeyValue` (leading `?` required,
+    /// first `?`..next `?` is one pair, first `=` splits key/value).
+    #[test]
+    fn player_options_follow_the_engine_url_grammar() {
+        let opts = player_options("XIII", Some("XIII.XIIIPlayerPawn"), Some("255"));
+        assert_eq!(opts, "?Name=XIII?Class=XIII.XIIIPlayerPawn?Team=255");
+
+        // Parse it the way `GameInfo.ParseOption` does (GrabOption + GetKeyValue).
+        let mut pairs = Vec::new();
+        let mut rest = opts.as_str();
+        while let Some(stripped) = rest.strip_prefix('?') {
+            let end = stripped.find('?').unwrap_or(stripped.len());
+            pairs.push(&stripped[..end]);
+            rest = &stripped[end..];
+        }
+        let get = |key: &str| {
+            pairs.iter().find_map(|p| {
+                let (k, v) = p.split_once('=')?;
+                k.eq_ignore_ascii_case(key).then_some(v)
+            })
+        };
+        assert_eq!(get("Name"), Some("XIII"));
+        assert_eq!(get("class"), Some("XIII.XIIIPlayerPawn"));
+        assert_eq!(get("Team"), Some("255"));
+
+        // A missing/empty class or team is omitted so the engine's own default applies.
+        assert_eq!(player_options("Player", None, None), "?Name=Player");
+        assert_eq!(player_options("Player", Some(""), Some("")), "?Name=Player");
+    }
+
+    /// A local URL is `<Map>` followed by the options tail, so `Left(url, 7)` is the map name
+    /// (the test `XIIIPlayerController.SetInitialState` uses to detect `mapmenu`).
+    #[test]
+    fn local_url_is_the_map_then_the_options() {
+        let opts = player_options("XIII", None, None);
+        let url = format!("Plage00{opts}");
+        assert!(url.starts_with("Plage00?"));
+        assert_eq!(&url[..7], "Plage00");
+    }
+
+    /// Opt-in corpus test: the GOG install's `[DefaultPlayer]` really is the source of the
+    /// single-player URL options (`DefUser.ini` lines 1-4).
+    #[test]
+    fn gog_single_player_url_uses_default_player() {
+        let Some(root) = std::env::var_os("XIII_GOG_DIR") else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let path = PathBuf::from(&root);
+        let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = if path.is_relative() {
+            ws.join(path)
+        } else {
+            path
+        };
+        let (url, options) = single_player_url(&path, "Plage00");
+        println!("[runtime test] single_player_url = {url}");
+        assert_eq!(url, "Plage00?Name=XIII?Class=XIII.XIIIPlayerPawn?Team=255");
+        assert_eq!(options, "?Name=XIII?Class=XIII.XIIIPlayerPawn?Team=255");
+        // `[URL] Host=` is empty and `Port=7777` in the GOG `Default.ini`.
+        assert_eq!(level_address(&path), ":7777");
+    }
 }

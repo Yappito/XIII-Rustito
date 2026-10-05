@@ -9,6 +9,7 @@
 //! `--play-script <file>`. Both drive the same [`sim::PlayerSim`] in `FixedUpdate` at 60 Hz.
 //! Fixed 60 Hz is a **hypothesis** (UE2 used variable ticks); see [`FIXED_HZ`].
 
+pub mod movers;
 pub mod script;
 pub mod session;
 pub mod sim;
@@ -26,7 +27,7 @@ use bevy::time::Fixed;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use xiii_collision::CollisionWorld;
-use xiii_decode::common::{UNREAL_UNITS_PER_METER, to_bevy_position};
+use xiii_decode::common::{UNREAL_UNITS_PER_METER, to_bevy_direction, to_bevy_position};
 use xiii_install::{Installation, OpenOptions};
 use xiii_world::physics::bevy_to_unreal_position;
 
@@ -64,6 +65,7 @@ struct SimRes(PlayerSim);
 struct WorldRes {
     world: CollisionWorld,
     sources: Vec<String>,
+    movers: movers::MoverCollision,
 }
 
 /// Render entities per map actor (the part of the scene object path before `" -> "`), for the
@@ -272,14 +274,14 @@ const DT: f32 = 1.0 / FIXED_HZ as f32;
 fn setup(
     mut commands: Commands,
     cfg: Res<PlayConfig>,
-    session: NonSend<Result<session::Session, String>>,
+    mut session: NonSendMut<Result<session::Session, String>>,
     mut sync: ResMut<RenderSync>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    let session = match &*session {
+    let session = match session.as_mut() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[play] script session failed: {e}");
@@ -307,7 +309,7 @@ fn setup(
 fn setup_inner(
     commands: &mut Commands,
     opts: &Options,
-    session: &session::Session,
+    session: &mut session::Session,
     sync: &mut RenderSync,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
@@ -319,6 +321,9 @@ fn setup_inner(
         .clone()
         .ok_or("--game-dir is required for --play")?;
     let scene = viewer::load_scene(opts)?;
+    // Give the VM's physics provider the mover brushes too (the player simulation builds its own
+    // dynamic collision below).
+    session.register_movers(&scene);
     let resolved = resolve_params(&game_dir)?;
     let params = resolved.params;
     println!(
@@ -337,11 +342,24 @@ fn setup_inner(
         session.active_actors(),
         session.bootstrap_note
     );
+    println!(
+        "[play] login path: script={} bootstrap={}",
+        session.login_script, session.login_bootstrap
+    );
     for b in &session.blocked {
         println!("[play]   script path blocked: {b}");
     }
 
-    let world = CollisionWorld::new(scene.box_collision());
+    let mover_states = session.mover_states();
+    let (mut world, mover_collision) = movers::MoverCollision::build(&scene, &mover_states);
+    mover_collision.update(&mut world, &mover_states);
+    println!(
+        "[play] movers: {} collision objects from {} live mover actors ({} static triangles): {}",
+        mover_collision.count(),
+        mover_states.len(),
+        world.triangle_count(),
+        mover_collision.names().join(", ")
+    );
     let sources = scene.collision_sources.clone();
     let (ps_bevy, rot) = scene.player_start.ok_or("map has no PlayerStart")?;
     let spawn = collision::place_spawn(&world, ps_bevy, params.half_extents_bevy())?;
@@ -352,8 +370,26 @@ fn setup_inner(
         spawn.raise * UNREAL_UNITS_PER_METER,
         (spawn.position[1] - spawn.floor) * UNREAL_UNITS_PER_METER
     );
-    let yaw = rot[1] as f32 * std::f32::consts::TAU / 65536.0;
-    let mut sim = PlayerSim::new(bevy_to_unreal_position(spawn.position), yaw);
+    // The host movement simulation owns the player pawn's `Location`/`Velocity`/`Rotation`.
+    // The script login chain (when it ran) created the pawn at the PlayerStart; the position
+    // comes from the host's FindSpot placement (the raw PlayerStart overlaps the floor) and the
+    // facing from the pawn's script-set Rotation. The host writes the placed position back to
+    // the VM on the first tick. Same rule as the scripted path in `run_script`.
+    let start_center = bevy_to_unreal_position(spawn.position);
+    let start_rot = match (session.login_script, session.player_rotation()) {
+        (1, Some(r)) => {
+            println!(
+                "[play] attaching host movement to the script-created pawn {} (VM location {:?} UU, rot {:?})",
+                session.player_name,
+                session.player_location(),
+                r
+            );
+            r
+        }
+        _ => rot,
+    };
+    let yaw = start_rot[1] as f32 * std::f32::consts::TAU / 65536.0;
+    let mut sim = PlayerSim::new(start_center, yaw);
     sim.grounded = true;
 
     // Optional deterministic script.
@@ -436,7 +472,11 @@ fn setup_inner(
     );
     commands.insert_resource(ParamsRes(params));
     commands.insert_resource(SimRes(sim));
-    commands.insert_resource(WorldRes { world, sources });
+    commands.insert_resource(WorldRes {
+        world,
+        sources,
+        movers: mover_collision,
+    });
     commands.insert_resource(ScriptRes { drive });
     commands.insert_resource(TraceState {
         tick: 0,
@@ -469,6 +509,60 @@ fn read_keyboard(keys: &ButtonInput<KeyCode>) -> Input {
         right,
         jump: keys.just_pressed(KeyCode::Space),
         walk: keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]),
+        use_action: keys.just_pressed(KeyCode::KeyE),
+    }
+}
+
+/// Reach of the `use` action in metres. A little over the pawn's 34 UU radius so the player must
+/// be at the door, matching the game's short interaction range.
+const USE_REACH_M: f32 = 3.0;
+
+/// Eye position and view direction of `sim` in Bevy space (metres).
+fn use_ray(sim: &PlayerSim, params: &PlayerParams) -> ([f32; 3], [f32; 3]) {
+    let eye = to_bevy_position(sim.eye_location(params));
+    let (sy, cy) = sim.yaw.sin_cos();
+    let (sp, cp) = sim.pitch.sin_cos();
+    let fwd = [cp * cy, cp * sy, sp];
+    (eye, to_bevy_direction(fwd))
+}
+
+/// Actor name (the part before `" -> "`) of the nearest collision hit along `origin + t*dir`.
+fn ray_target(
+    world: &CollisionWorld,
+    sources: &[String],
+    origin: [f32; 3],
+    dir: [f32; 3],
+    reach: f32,
+) -> Option<String> {
+    let end = [
+        origin[0] + dir[0] * reach,
+        origin[1] + dir[1] * reach,
+        origin[2] + dir[2] * reach,
+    ];
+    let hit = world.ray(origin, end)?;
+    let src = sources.get(hit.source as usize)?;
+    Some(
+        src.split_once(" -> ")
+            .map_or_else(|| src.clone(), |(a, _)| a.to_owned()),
+    )
+}
+
+/// Performs the `E`/`use` action: a forward ray picks the mover in front and runs the VM's own
+/// lock/unlock/open chain ([`session::Session::use_mover`]).
+fn perform_use(
+    sess: &mut session::Session,
+    world: &CollisionWorld,
+    sources: &[String],
+    sim: &PlayerSim,
+    params: &PlayerParams,
+) {
+    let (origin, dir) = use_ray(sim, params);
+    match ray_target(world, sources, origin, dir, USE_REACH_M) {
+        Some(target) => {
+            let outcome = sess.use_mover(&target);
+            println!("[play] use {target}: {outcome:?}");
+        }
+        None => println!("[play] use: nothing in reach"),
     }
 }
 
@@ -483,7 +577,7 @@ fn fixed_step(
     time: Res<Time<Fixed>>,
     mut sim: ResMut<SimRes>,
     params: Res<ParamsRes>,
-    world: Res<WorldRes>,
+    mut world: ResMut<WorldRes>,
     keys: Res<ButtonInput<KeyCode>>,
     mut script: ResMut<ScriptRes>,
     mut state: ResMut<TraceState>,
@@ -500,10 +594,19 @@ fn fixed_step(
         Some(drive) => drive.advance(elapsed, &mut sim.0),
         None => read_keyboard(&keys),
     };
+    let use_action = input.use_action;
     sim.0
         .step(dt, &world.world, &params.0, input, &world.sources);
     if let Ok(sess) = session.as_mut() {
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity);
+        // The VM owns the mover poses; write them into the dynamic collision set so the next
+        // player step collides with the moved brush.
+        let wr = &mut *world;
+        let mover_states = sess.mover_states();
+        wr.movers.update(&mut wr.world, &mover_states);
+        if use_action {
+            perform_use(sess, &wr.world, &wr.sources, &sim.0, &params.0);
+        }
         for (name, delta) in &sess.moved {
             let Some(entities) = sync.entities.get(name) else {
                 continue;
@@ -737,21 +840,48 @@ pub(crate) struct ScriptOutcome {
 
 /// Opens a VM session and drives it with the movement simulation and an input script. No window
 /// is opened; the fixed-step order is the one `fixed_step` uses.
-#[allow(clippy::too_many_arguments)]
+///
+/// The collision world (static soup + the VM's mover actors as dynamic objects) is built here so
+/// the script can never diverge from the interactive path.
 pub(crate) fn run_script(
     game_dir: &Path,
     map: &str,
     script: &script::Script,
     params: &PlayerParams,
-    world: &CollisionWorld,
-    sources: &[String],
-    start_center: [f32; 3],
-    start_yaw: f32,
+    scene: &xiii_world::WorldScene,
     duration: f32,
 ) -> Result<ScriptOutcome, String> {
     let started = Instant::now();
     let mut session = session::Session::open(game_dir, map)?;
-    let mut sim = PlayerSim::new(start_center, start_yaw);
+    session.register_movers(scene);
+    let mover_states = session.mover_states();
+    let (mut world, mover_collision) = movers::MoverCollision::build(scene, &mover_states);
+    mover_collision.update(&mut world, &mover_states);
+    println!(
+        "[play] movers: {} collision objects from {} live mover actors ({} static triangles): {}",
+        mover_collision.count(),
+        mover_states.len(),
+        world.triangle_count(),
+        mover_collision.names().join(", ")
+    );
+    let sources = &scene.collision_sources;
+    let (ps_bevy, rot) = scene.player_start.ok_or("map has no PlayerStart")?;
+    let spawn = collision::place_spawn(&world, ps_bevy, params.half_extents_bevy())?;
+    println!(
+        "[play] spawn: PlayerStart {:?} UU -> box centre {:?} UU, raise {:.2} UU",
+        bevy_to_unreal_position(ps_bevy),
+        bevy_to_unreal_position(spawn.position),
+        spawn.raise * UNREAL_UNITS_PER_METER
+    );
+    // The script login chain (item3h) created the pawn at the PlayerStart; the host owns its
+    // movement fields (item8a rule), so the position comes from the host's FindSpot placement
+    // (the raw PlayerStart overlaps the floor) and the facing from the pawn's script-set
+    // Rotation when the login path ran. The host writes the placed position back to the VM.
+    let start_yaw = match (session.login_script, session.player_rotation()) {
+        (1, Some(r)) => r[1] as f32 * std::f32::consts::TAU / 65536.0,
+        _ => rot[1] as f32 * std::f32::consts::TAU / 65536.0,
+    };
+    let mut sim = PlayerSim::new(bevy_to_unreal_position(spawn.position), start_yaw);
     sim.grounded = true;
     let ticks = (duration / DT).ceil() as u64;
     let mut drive = script::Drive::new(script);
@@ -759,14 +889,20 @@ pub(crate) fn run_script(
     for tick in 0..ticks {
         let elapsed = tick as f32 * DT;
         let input = drive.advance(elapsed, &mut sim);
-        sim.step(DT, world, params, input, sources);
+        sim.step(DT, &world, params, input, sources);
         session.step(DT, sim.location, sim.yaw, sim.velocity);
+        let states = session.mover_states();
+        mover_collision.update(&mut world, &states);
+        if input.use_action {
+            perform_use(&mut session, &world, sources, &sim, params);
+        }
         if tick.is_multiple_of(TRACE_EVERY) || tick + 1 == ticks {
             trace.push((tick, elapsed, sim.location, sim.velocity));
             println!(
-                "[play] {} | {}",
+                "[play] {} | {} | {}",
                 format_trace(tick, elapsed, &sim),
-                format_vm_trace(&session)
+                format_vm_trace(&session),
+                format_mover_trace(&session)
             );
         }
     }
@@ -776,6 +912,37 @@ pub(crate) fn run_script(
         wall_secs: started.elapsed().as_secs_f32(),
         trace,
     })
+}
+
+/// One compact entry per mover that is currently interpolating:
+/// `name key=K alpha=A loc=(x,y,z) rot=(p,y,r)`. Movers at rest are omitted (there are ~90 on
+/// Plage01), but the count is always reported so a missing mover cannot hide.
+fn format_mover_trace(sess: &session::Session) -> String {
+    let movers = sess.mover_states();
+    let moving: Vec<_> = movers.iter().filter(|m| m.interpolating).collect();
+    let parts = moving
+        .iter()
+        .map(|m| {
+            format!(
+                "{} key={} alpha={:.3} loc=({:.1},{:.1},{:.1}) rot=({},{},{})",
+                m.name,
+                m.key_num,
+                m.phys_alpha,
+                m.location[0],
+                m.location[1],
+                m.location[2],
+                m.rotation[0],
+                m.rotation[1],
+                m.rotation[2]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if parts.is_empty() {
+        format!("movers 0/{} moving (all at rest)", movers.len())
+    } else {
+        format!("movers {}/{} moving: {parts}", moving.len(), movers.len())
+    }
 }
 
 fn run_headless_inner(opts: &Options) -> Result<(), String> {
@@ -800,32 +967,16 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
     for l in &resolved.lines {
         println!("[play] {l}");
     }
-    let world = CollisionWorld::new(scene.box_collision());
-    let sources = scene.collision_sources.clone();
-    let (ps_bevy, rot) = scene.player_start.ok_or("map has no PlayerStart")?;
-    let spawn = collision::place_spawn(&world, ps_bevy, params.half_extents_bevy())?;
-    println!(
-        "[play] spawn: PlayerStart {:?} UU -> box centre {:?} UU, raise {:.2} UU",
-        bevy_to_unreal_position(ps_bevy),
-        bevy_to_unreal_position(spawn.position),
-        spawn.raise * UNREAL_UNITS_PER_METER
-    );
     let duration = opts
         .exit_after_secs
         .unwrap_or_else(|| script.last_time() + 2.0);
-    let outcome = run_script(
-        &game_dir,
-        &map,
-        &script,
-        &params,
-        &world,
-        &sources,
-        bevy_to_unreal_position(spawn.position),
-        rot[1] as f32 * std::f32::consts::TAU / 65536.0,
-        duration,
-    )?;
+    let outcome = run_script(&game_dir, &map, &script, &params, &scene, duration)?;
     let session = &outcome.session;
     println!("[play] {}", session.bootstrap_note);
+    println!(
+        "[play] login path: script={} bootstrap={}",
+        session.login_script, session.login_bootstrap
+    );
     println!(
         "[play] player {} | controller {} | GameInfo {}",
         session.player_name,
@@ -978,6 +1129,60 @@ mod tests {
         assert!(script::Script::parse("t=0.0 teleport 1 2\n").is_err());
     }
 
+    /// Opt-in corpus test (requirement 6): the Plage01 script run opens the locked hut door
+    /// (`Porte6`) with the host use action and ends with the player at least 2 m (180 UU) outside
+    /// the door plane, along the door's own forward axis. No teleport.
+    #[test]
+    fn opt_in_plage01_door_opens_and_player_walks_out() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let script = script::Script::parse(
+            "t=0.0 turn 2\nt=0.0 forward 1\nt=1.6 turn -45\nt=2.3 forward 0\nt=2.6 use\nt=3.6 use\nt=3.8 forward 1\n",
+        )
+        .unwrap();
+        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 8.0)
+            .expect("run Plage01 door walk");
+        let s = &outcome.session;
+        let door = s
+            .mover_states()
+            .into_iter()
+            .find(|m| m.name.eq_ignore_ascii_case("Porte6"))
+            .expect("Plage01 has a live Porte6");
+        assert_eq!(
+            door.key_num, 1,
+            "Porte6 did not reach its open key: {door:?}"
+        );
+        assert_ne!(
+            door.rotation, door.base_rot,
+            "Porte6 rotation did not change (door did not swing)"
+        );
+        let (_, _, pos, _) = outcome.trace.last().expect("trace sample");
+        let pos = *pos;
+        let base = door.base_pos;
+        let yaw = door.base_rot[1] as f32 * std::f32::consts::TAU / 65536.0;
+        let fwd = [yaw.cos(), yaw.sin()];
+        let dist = (pos[0] - base[0]) * fwd[0] + (pos[1] - base[1]) * fwd[1];
+        println!(
+            "[play test] Plage01 door walk: Porte6 key={} rot={:?} (base {:?}), player {:?} UU, \
+             {dist:.1} UU outside the door plane",
+            door.key_num, door.rotation, door.base_rot, pos
+        );
+        assert!(
+            dist >= 2.0 * UNREAL_UNITS_PER_METER,
+            "player only {dist:.1} UU outside the door plane (need >= {:.0})",
+            2.0 * UNREAL_UNITS_PER_METER
+        );
+    }
+
     /// Opt-in corpus test: walking (from a harness-placed start) into Plage00's `TouchTrigger2`
     /// volume fires `Touch` through the VM cylinder overlap and the `TouchTrigger2 ->
     /// XIIIDispatcher0` chain reaches `Fin`. No harness-delivered `Touch` is used anywhere in the
@@ -996,27 +1201,13 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage00");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let world = CollisionWorld::new(scene.box_collision());
-        let (ps, rot) = scene.player_start.expect("Plage00 has a PlayerStart");
-        let spawn = collision::place_spawn(&world, ps, resolved.params.half_extents_bevy())
-            .expect("spawn placement");
         // Walk from just short of TouchTrigger2 (3635.5, -44620.2, 4918) into its 130 UU cylinder.
         let script = script::Script::parse(
             "t=0.0 teleport 3380 -44620.2 4918\nt=0.0 yaw 0\nt=0.0 forward 1\nt=0.5 forward 0\n",
         )
         .unwrap();
-        let outcome = run_script(
-            &game_dir,
-            "Plage00",
-            &script,
-            &resolved.params,
-            &world,
-            &scene.collision_sources,
-            bevy_to_unreal_position(spawn.position),
-            rot[1] as f32 * std::f32::consts::TAU / 65536.0,
-            8.0,
-        )
-        .expect("run Plage00 trigger walk");
+        let outcome = run_script(&game_dir, "Plage00", &script, &resolved.params, &scene, 8.0)
+            .expect("run Plage00 trigger walk");
         let s = &outcome.session;
         let touch = s.touches().into_iter().find(|(_, a)| a == "TouchTrigger2");
         let (t, actor) = touch.unwrap_or_else(|| {

@@ -46,12 +46,99 @@ pub struct Hit {
     pub normal: Vec3,
 }
 
-/// The collision world: triangles, their source ids and a broad-phase BVH.
+/// A moving collision object: the brush of a UE2 `Mover`/`PHYS_MovingBrush`. Its triangles are
+/// kept in the object's local frame and a rigid world transform (translation of the object
+/// origin plus a rotation) is refreshed from the VM each tick. Queries test it together with the
+/// static BVH; a per-object world AABB (rebuilt on every transform update) culls it cheaply.
+///
+/// The caller must **not** also leave the mover's triangles in the static soup; this type cannot
+/// know which collision source belongs to a mover. `MovingObject::source` identifies it in query
+/// hits.
+#[derive(Debug, Clone)]
+pub struct MovingObject {
+    local: Vec<Triangle>,
+    source: u32,
+    origin: Vec3,
+    /// Rows of the rotation matrix: `world = origin + rows * local`.
+    rotation: [Vec3; 3],
+    bounds: Aabb,
+}
+
+impl MovingObject {
+    /// Builds a moving object from triangles already in world space at their initial pose. The
+    /// local frame is `rotation^T (triangle - origin)`, where the rows of `rotation` are the
+    /// initial local axes in world space.
+    pub fn from_world_triangles(
+        triangles: impl IntoIterator<Item = Triangle>,
+        source: u32,
+        origin: Vec3,
+        rotation: [Vec3; 3],
+    ) -> Self {
+        let inv = transpose(rotation);
+        let local: Vec<Triangle> = triangles
+            .into_iter()
+            .map(|t| t.map(|p| mul_mat(inv, sub(p, origin))))
+            .collect();
+        let mut object = Self {
+            local,
+            source,
+            origin,
+            rotation,
+            bounds: Aabb::empty(),
+        };
+        object.rebuild_bounds();
+        object
+    }
+
+    /// Updates the world transform (origin translation and rotation rows).
+    pub fn set_transform(&mut self, origin: Vec3, rotation: [Vec3; 3]) {
+        self.origin = origin;
+        self.rotation = rotation;
+        self.rebuild_bounds();
+    }
+
+    /// Collision source id shared by every triangle.
+    pub fn source(&self) -> u32 {
+        self.source
+    }
+
+    /// Number of local triangles.
+    pub fn triangle_count(&self) -> usize {
+        self.local.len()
+    }
+
+    /// World-space AABB of the current pose.
+    pub fn bounds(&self) -> Aabb {
+        self.bounds
+    }
+
+    fn rebuild_bounds(&mut self) {
+        let mut b = Aabb::empty();
+        for t in &self.local {
+            for p in t {
+                b.include(self.to_world(*p));
+            }
+        }
+        self.bounds = b;
+    }
+
+    fn to_world(&self, p: Vec3) -> Vec3 {
+        add(self.origin, mul_mat(self.rotation, p))
+    }
+
+    fn world_triangle(&self, i: usize) -> Triangle {
+        self.local[i].map(|p| self.to_world(p))
+    }
+}
+
+/// The collision world: triangles, their source ids and a broad-phase BVH, plus the dynamic
+/// (moving) objects.
 pub struct CollisionWorld {
     triangles: Vec<Triangle>,
     sources: Vec<u32>,
     bvh: Bvh,
     degenerate: usize,
+    dynamic: Vec<MovingObject>,
 }
 
 impl CollisionWorld {
@@ -75,6 +162,7 @@ impl CollisionWorld {
             sources,
             bvh,
             degenerate,
+            dynamic: Vec::new(),
         }
     }
 
@@ -107,6 +195,57 @@ impl CollisionWorld {
         self.bvh.traverse(query, f);
     }
 
+    /// Adds a moving collision object, returning its index.
+    pub fn add_moving(&mut self, object: MovingObject) -> usize {
+        self.dynamic.push(object);
+        self.dynamic.len() - 1
+    }
+
+    /// Number of moving collision objects.
+    pub fn moving_count(&self) -> usize {
+        self.dynamic.len()
+    }
+
+    /// A moving object by index.
+    pub fn moving(&self, index: usize) -> Option<&MovingObject> {
+        self.dynamic.get(index)
+    }
+
+    /// Replaces a moving object's world transform; `false` when the index is out of range.
+    pub fn set_moving_transform(
+        &mut self,
+        index: usize,
+        origin: Vec3,
+        rotation: [Vec3; 3],
+    ) -> bool {
+        match self.dynamic.get_mut(index) {
+            Some(object) => {
+                object.set_transform(origin, rotation);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Calls `f(world_triangle, source, local_index)` for every moving-object triangle whose
+    /// per-object AABB overlaps `query` (simple cull). The returned index is the triangle's
+    /// index within its object; `sweep`/`ray` report `u32::MAX` as the triangle field for
+    /// dynamic hits (the `source` names the mover).
+    pub(crate) fn for_each_dynamic_candidate(
+        &self,
+        query: Aabb,
+        mut f: impl FnMut(Triangle, u32, u32),
+    ) {
+        for object in &self.dynamic {
+            if !object.bounds.overlaps(&query) {
+                continue;
+            }
+            for i in 0..object.local.len() {
+                f(object.world_triangle(i), object.source, i as u32);
+            }
+        }
+    }
+
     /// Continuous swept AABB query with default parameters. See [`sweep_aabb`].
     pub fn sweep(&self, start: Vec3, end: Vec3, half_extents: Vec3) -> Option<SweepHit> {
         sweep_aabb(self, start, end, half_extents, &SweepParams::default())
@@ -124,42 +263,35 @@ impl CollisionWorld {
         query.include(end);
         let mut best: Option<SweepHit> = None;
         self.for_each_candidate(query, |i| {
-            if let Some(t) = ray_triangle(start, d, self.triangle(i))
-                && best.is_none_or(|b| t < b.t)
-            {
-                let n = normalize(triangle_normal(self.triangle(i)));
-                // Orient the normal against the ray so it points toward the origin side.
-                let normal = if dot(n, d) > 0.0 { mul(n, -1.0) } else { n };
-                best = Some(SweepHit {
-                    t,
-                    normal,
-                    triangle: i,
-                    source: self.source(i),
-                    start_penetrating: false,
-                });
-            }
+            consider_ray(&mut best, start, d, self.triangle(i), i, self.source(i));
+        });
+        self.for_each_dynamic_candidate(query, |t, source, _idx| {
+            consider_ray(&mut best, start, d, &t, u32::MAX, source);
         });
         best
     }
 
-    /// All triangles overlapping `(center, half_extents)`, in BVH traversal order.
+    /// All triangles overlapping `(center, half_extents)`, in BVH order then moving objects.
     pub fn overlap_aabb(&self, center: Vec3, half_extents: Vec3) -> Vec<Hit> {
         let q = Aabb::from_center_half(center, half_extents);
         let mut out = Vec::new();
         self.for_each_candidate(q, |i| {
-            if aabb_triangle_overlap(center, half_extents, self.triangle(i)).is_some() {
-                let n = normalize(triangle_normal(self.triangle(i)));
-                out.push(Hit {
-                    triangle: i,
-                    source: self.source(i),
-                    normal: n,
-                });
-            }
+            consider_overlap(
+                &mut out,
+                center,
+                half_extents,
+                self.triangle(i),
+                i,
+                self.source(i),
+            );
+        });
+        self.for_each_dynamic_candidate(q, |t, source, _idx| {
+            consider_overlap(&mut out, center, half_extents, &t, u32::MAX, source);
         });
         out
     }
 
-    /// True when any triangle overlaps `(center, half_extents)`.
+    /// True when any (static or moving) triangle overlaps `(center, half_extents)`.
     pub fn overlaps_aabb(&self, center: Vec3, half_extents: Vec3) -> bool {
         let q = Aabb::from_center_half(center, half_extents);
         let mut hit = false;
@@ -168,7 +300,55 @@ impl CollisionWorld {
                 hit = true;
             }
         });
+        self.for_each_dynamic_candidate(q, |t, _source, _idx| {
+            if !hit && aabb_triangle_overlap(center, half_extents, &t).is_some() {
+                hit = true;
+            }
+        });
         hit
+    }
+}
+
+/// Keeps the nearest ray hit: fills `best` when `t` is a valid hit closer than the current one.
+fn consider_ray(
+    best: &mut Option<SweepHit>,
+    start: Vec3,
+    d: Vec3,
+    tri: &Triangle,
+    index: u32,
+    source: u32,
+) {
+    if let Some(t) = ray_triangle(start, d, tri)
+        && best.is_none_or(|b| t < b.t)
+    {
+        let n = normalize(triangle_normal(tri));
+        // Orient the normal against the ray so it points toward the origin side.
+        let normal = if dot(n, d) > 0.0 { mul(n, -1.0) } else { n };
+        *best = Some(SweepHit {
+            t,
+            normal,
+            triangle: index,
+            source,
+            start_penetrating: false,
+        });
+    }
+}
+
+/// Appends an overlap hit for a triangle (static or moving) to `out`.
+fn consider_overlap(
+    out: &mut Vec<Hit>,
+    center: Vec3,
+    half_extents: Vec3,
+    tri: &Triangle,
+    index: u32,
+    source: u32,
+) {
+    if aabb_triangle_overlap(center, half_extents, tri).is_some() {
+        out.push(Hit {
+            triangle: index,
+            source,
+            normal: normalize(triangle_normal(tri)),
+        });
     }
 }
 
@@ -273,6 +453,20 @@ fn cross(a: Vec3, b: Vec3) -> Vec3 {
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// Matrix-vector product with the matrix given by rows.
+fn mul_mat(rows: [Vec3; 3], v: Vec3) -> Vec3 {
+    [dot(rows[0], v), dot(rows[1], v), dot(rows[2], v)]
+}
+
+/// Transpose of a matrix given by rows (its rows become the columns).
+fn transpose(m: [Vec3; 3]) -> [Vec3; 3] {
+    [
+        [m[0][0], m[1][0], m[2][0]],
+        [m[0][1], m[1][1], m[2][1]],
+        [m[0][2], m[1][2], m[2][2]],
     ]
 }
 
