@@ -20,7 +20,14 @@ use crate::corpus::tagged_files;
 use crate::props::find_export;
 
 /// Subcommands handled here.
-pub const COMMANDS: &[&str] = &["world-coverage", "texture", "mesh", "bsp", "terrain"];
+pub const COMMANDS: &[&str] = &[
+    "world-coverage",
+    "texture",
+    "mesh",
+    "bsp",
+    "zones",
+    "terrain",
+];
 
 /// Usage text appended to the main help.
 pub const USAGE: &str = "\
@@ -38,6 +45,11 @@ pub const USAGE: &str = "\
 
   xiii-tool bsp <map-file> [--export <index|path>]
       Decode the level BSP model (or the given Model) and its surfaces.
+
+  xiii-tool zones <map-file> [--export <index|path>]
+      Decode the level BSP model (or the given Model) and list its zones: index, ZoneActor
+      export path and class, whether the zone is a sky zone, per-zone leaf count (derived
+      from the nodes' iLeaf/iZone pairs) and the connectivity/visibility masks.
 
   xiii-tool terrain <map-file> --game-dir <install-root>
       Decode TerrainInfo/TerrainSector exports and their heightmap.";
@@ -62,6 +74,7 @@ pub fn run(cmd: &str, args: &[String]) -> ExitCode {
         "texture" => texture_cmd(args),
         "mesh" => mesh_cmd(args),
         "bsp" => bsp_cmd(args),
+        "zones" => zones_cmd(args),
         "terrain" => terrain_cmd(args),
         _ => usage_error(&format!("unknown command '{cmd}'")),
     }
@@ -727,6 +740,46 @@ fn bsp_cmd(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn zones_cmd(args: &[String]) -> ExitCode {
+    let a = match parse_args(args, &["export"]) {
+        Ok(a) => a,
+        Err(e) => return usage_error(&e),
+    };
+    let Some(file) = a.positional.first() else {
+        return usage_error("zones needs a map file");
+    };
+    let (data, package) = match load_package(Path::new(file)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let i = if a.options.contains_key("export") {
+        match select(&a, &package, file) {
+            Ok(i) => i,
+            Err(c) => return c,
+        }
+    } else {
+        match model::find_level_model(&package, &data) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    };
+    let m = match model::decode_model(&package, &data, i) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    emit(&model::zones_text(&package, i, &m));
+    ExitCode::SUCCESS
 }
 
 fn terrain_cmd(args: &[String]) -> ExitCode {
