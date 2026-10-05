@@ -64,6 +64,96 @@ impl Default for HxLimits {
     }
 }
 
+/// An HX resource identity pair (called `cuuid` in the format notes).
+///
+/// The pair is the key that links resources: a `CPCWavResData` points at its wave, a program
+/// points at its child resources, and a `.uax` `Sound` object's native tail stores the same pair
+/// as a `XXXXXXXX-XXXX-XXXX` string (see [`SoundRef::resource`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Cuuid {
+    /// First word (the low 32 bits of the stored GUID string).
+    pub id1: u32,
+    /// Second word (the high 32 bits of the stored GUID string).
+    pub id2: u32,
+}
+
+impl Cuuid {
+    /// Builds a pair from its two words.
+    pub fn new(id1: u32, id2: u32) -> Self {
+        Self { id1, id2 }
+    }
+
+    /// Formats the pair the way the `.uax` `Sound` tail stores it: `XXXXXXXX-XXXX-XXXX`, where
+    /// the second field is the high 16 bits and the third the low 16 bits of `id2`.
+    pub fn guid_string(self) -> String {
+        format!(
+            "{:08X}-{:04X}-{:04X}",
+            self.id1,
+            (self.id2 >> 16) & 0xFFFF,
+            self.id2 & 0xFFFF
+        )
+    }
+}
+
+/// A `Sound` reference decoded from a `.uax` `Engine.Sound` export's native tail.
+///
+/// The 24-byte tail (after the one-byte property terminator) is
+/// `{u8 flag, u32 id, u8 len=18, "<GUID string>"}`; the GUID string names the HX resource the
+/// engine plays. The link was established by item6c (measured; see the report): the string is
+/// the `Cuuid` of a `CPCWavResData` (directly) or a `CProgramResData`/random/switch event whose
+/// header links onward to the wave resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoundRef {
+    /// Leaf name of the `Sound` export (the object name after the last `.`).
+    pub leaf: String,
+    /// Raw tail bytes (24 for every measured PC `Sound`).
+    pub raw: Vec<u8>,
+    /// The HX resource identity, when the tail had the expected `len == 18` GUID string.
+    pub resource: Option<Cuuid>,
+}
+
+impl SoundRef {
+    /// Decodes the native tail of a `Sound` export payload. `None` when the payload is too short
+    /// or does not have the measured shape (`flag` byte, `u32`, `len` byte, GUID string).
+    pub fn parse(leaf: &str, payload: &[u8]) -> Option<Self> {
+        // Measured: 1 byte state-frame terminator-less properties (a single `None`), then a
+        // 24-byte native tail. Accept longer payloads too by taking the tail region.
+        if payload.len() < 24 {
+            return None;
+        }
+        let tail = &payload[payload.len() - 24..];
+        let raw = tail.to_vec();
+        let len = tail[5] as usize;
+        let resource = if len == 18 && tail.len() >= 6 + len {
+            std::str::from_utf8(&tail[6..6 + len])
+                .ok()
+                .and_then(parse_guid)
+        } else {
+            None
+        };
+        Some(Self {
+            leaf: leaf.to_owned(),
+            raw,
+            resource,
+        })
+    }
+}
+
+/// Parses `XXXXXXXX-XXXX-XXXX` into a [`Cuuid`] (high 16 then low 16 bits of the second word).
+fn parse_guid(s: &str) -> Option<Cuuid> {
+    let mut parts = s.split('-');
+    let a = parts.next()?;
+    let b = parts.next()?;
+    let c = parts.next()?;
+    if parts.next().is_some() || a.len() != 8 || b.len() != 4 || c.len() != 4 {
+        return None;
+    }
+    let id1 = u32::from_str_radix(a, 16).ok()?;
+    let hi = u32::from_str_radix(b, 16).ok()?;
+    let lo = u32::from_str_radix(c, 16).ok()?;
+    Some(Cuuid::new(id1, (hi << 16) | lo))
+}
+
 /// Audio codec identified by the RIFF `wFormatTag`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {

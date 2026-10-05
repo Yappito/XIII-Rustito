@@ -22,15 +22,21 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 pub mod animation;
+pub mod audio;
+pub mod fog;
 pub mod materials;
+pub mod movement_volumes;
 pub mod nav_provider;
 pub mod navigation;
+pub mod particles;
 pub mod physics;
+pub mod projectors;
 pub mod reach;
 pub mod runtime;
 pub mod zones;
 
 use materials::{BlendMode, MaterialNode, NodeKey, ResolvedMaterial, UvOp};
+use projectors::ProjectorDef;
 use xiii_decode::common::{
     BevyTransform, Mat3, Props, actor_to_bevy_pre_pivot, to_bevy_direction, to_bevy_position,
 };
@@ -157,6 +163,12 @@ pub struct WorldScene {
     pub zones: Vec<zones::SceneZone>,
     /// Indices into [`WorldScene::zones`] of the sky zones (`is_sky`), in increasing order.
     pub sky_zones: Vec<u32>,
+    /// Per-zone distance fog and ambient light, resolved map-property-first.
+    pub fog: fog::SceneFog,
+    /// Static `Projector`/`ShadowProjector` actors placed in the map (Bevy-space poses).
+    pub projectors: Vec<projectors::ProjectorPose>,
+    /// Decoded particle emitter systems placed in the map (see [`particles`]).
+    pub particle_systems: Vec<particles::ParticleSystem>,
 }
 
 impl WorldScene {
@@ -379,7 +391,7 @@ struct MeshSections {
     collision_slot_disabled: usize,
 }
 
-struct Importer<'a> {
+pub(crate) struct Importer<'a> {
     cache: &'a mut PackageCache,
     scene: WorldScene,
     textures: HashMap<ObjectKey, Result<usize, String>>,
@@ -1007,7 +1019,7 @@ impl ClassDefaults {
     }
 
     /// Resolved layout of a class path (`Package.Class` as written in the map), cached.
-    fn layout(&mut self, class_path: &str) -> Result<SharedLayout, String> {
+    pub fn layout(&mut self, class_path: &str) -> Result<SharedLayout, String> {
         let key = class_path.to_ascii_lowercase();
         if let Some(l) = self.layouts.get(&key) {
             return Ok(l.clone());
@@ -1039,6 +1051,24 @@ impl ClassDefaults {
     pub fn is_navigation_point(&mut self, class_path: &str) -> Result<bool, String> {
         let l = self.layout(class_path)?;
         Ok(l.chain_names.iter().any(|n| n == "navigationpoint"))
+    }
+
+    /// Lowercase class names of `class_path`'s inheritance chain, most derived first.
+    pub fn class_chain(&mut self, class_path: &str) -> Result<Vec<String>, String> {
+        Ok(self.layout(class_path)?.chain_names.clone())
+    }
+
+    /// Resolved inherited bool default of a property, or `None` when the property is absent
+    /// from the class chain (or is not a bool).
+    pub fn bool_default(&mut self, class_path: &str, name: &str) -> Result<Option<bool>, String> {
+        let l = self.layout(class_path)?;
+        let Some(s) = l.slot_by_name(name) else {
+            return Ok(None);
+        };
+        Ok(match l.defaults.get(s.base) {
+            Some(xiii_script::Value::Bool(v)) => Some(*v),
+            _ => None,
+        })
     }
 
     /// Resolved inherited float default of a property, or `None` when the property is absent
@@ -1357,6 +1387,52 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
     im.scene
         .count("actor.player_starts", actors.player_starts.len());
 
+    // Per-zone distance fog/ambient: map property first, then the inherited class default. The
+    // table is resolved once at import so `--play`/the viewer only classify a point per frame.
+    im.scene.fog = fog::SceneFog::build(
+        &map_pkg.package,
+        &map_pkg.data,
+        &im.scene.zones,
+        level.as_ref(),
+        Some(&mut defaults),
+    );
+    im.scene.count(
+        "zones.fog.fogged",
+        im.scene.fog.params.iter().filter(|p| p.is_fogged()).count(),
+    );
+    im.scene.count("zones.fog.unfogged", im.scene.fog.unfogged);
+    im.scene.count(
+        "zones.fog.from_class_default",
+        im.scene.fog.from_class_default,
+    );
+    im.scene
+        .count("zones.fog.disabled_by_map", im.scene.fog.disabled_by_map);
+
+    // Static map-placed projector actors (a projected light or a baked blob shadow). Resolve
+    // each `ProjTexture` through the normal material graph so the renderer gets a texture handle.
+    im.scene.projectors = projectors::map_projectors(&map_pkg.package, &map_pkg.data, &actors);
+    for i in 0..im.scene.projectors.len() {
+        let Some(r) = im.scene.projectors[i].def.texture_object else {
+            continue;
+        };
+        let (slot, index) = im.material(&map_pkg, r, "projector");
+        if let MaterialSlot::Texture(_) = slot {
+            im.scene.projectors[i].def.material_index = Some(index);
+        } else {
+            im.scene.count("skip.projector.texture_unresolved", 1);
+        }
+    }
+    im.scene
+        .count("projectors.map_placed", im.scene.projectors.len());
+    im.scene.count(
+        "projectors.map_placed_shadow",
+        im.scene
+            .projectors
+            .iter()
+            .filter(|p| ProjectorDef::is_shadow_class(&p.def.class_path))
+            .count(),
+    );
+
     for a in &actors.static_mesh_actors {
         let class_short = a.class.rsplit('.').next().unwrap_or("").to_owned();
         if class_short.ends_with("Emitter") {
@@ -1532,6 +1608,7 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
 
     import_bsp(&mut im, &map_pkg);
     import_terrain(&mut im, &map_pkg);
+    particles::import_particles(&mut im, &map_pkg, &mut defaults);
     // Per-zone object counts (static-mesh actors, BSP groups), after every object exists.
     let mut counts = vec![0usize; im.scene.zones.len()];
     let mut unzoned = 0usize;
@@ -1798,7 +1875,13 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
             }
         };
         let Some(map_ref) = t.terrain_map else {
-            im.scene.fail("fail.terrain.no_heightmap", path);
+            if t.sectors.is_empty() && t.vertices.is_empty() {
+                // An empty `TerrainInfo` placeholder (no sectors, no vertices, no heightmap):
+                // nothing to draw or collide with. Counted as a note, not a decode failure.
+                im.scene.count("note.terrain.empty", 1);
+            } else {
+                im.scene.fail("fail.terrain.no_heightmap", path);
+            }
             continue;
         };
         let (w, h) = match im.cache.resolve(map_pkg, map_ref).and_then(|(pk, ix)| {
@@ -1810,15 +1893,33 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 continue;
             }
         };
-        let mesh = match t.mesh(w, h) {
+        let regions = match t.mesh(w, h) {
             Ok(m) => m,
             Err(e) => {
                 im.scene.fail("fail.terrain.mesh", e.to_string());
                 continue;
             }
         };
-        im.scene.count("terrain.hidden_quads", mesh.hidden_quads);
-        let composite = composite_terrain_texture(im, map_pkg, &t, &mesh);
+        // Only the base region (index 0, `HeightmapX * HeightmapY` vertices at
+        // `TerrainScale`) is the engine's terrain: `ATerrainInfo::LineCheck` indexes
+        // `Vertices[HeightmapX * y + x]` with `x < HeightmapX`, `y < HeightmapY`, and
+        // `ATerrainInfo::Render` iterates only the sectors (each indexes the same base grid);
+        // the trailing vertices are editor-only selection scratch and are never collided or
+        // drawn, and their world positions are not a continuation of the base grid. Importing
+        // them as extra geometry produced the Hual01b reach regression (detail regions built
+        // over the playable base). The base region must match the `TerrainMap` texture (checked
+        // by `mesh`); a mismatch is a failure, never a silent skip.
+        let base = &regions[0];
+        im.scene.count("terrain.hidden_quads", base.hidden_quads);
+        im.scene.count("terrain.regions", regions.len());
+        if regions.len() > 1 {
+            im.scene.count("note.terrain.extra_vertices_ignored", 1);
+            im.scene.count(
+                "terrain.region_extra_vertices_ignored",
+                t.vertices.len() - base.positions.len(),
+            );
+        }
+        let composite = composite_terrain_texture(im, map_pkg, &t, base);
         let (material, material_index) = match composite {
             Some(img) => {
                 im.scene.textures.push(SceneTexture {
@@ -1842,21 +1943,6 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 (MaterialSlot::Missing("terrain layers".into()), idx)
             }
         };
-        let terrain_tris: Vec<[[f32; 3]; 3]> = mesh
-            .indices
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|t| t.map(|i| to_bevy_position(mesh.positions[i as usize])))
-            .collect();
-        im.scene
-            .add_collision(format!("{path} (terrain)"), terrain_tris);
-        let positions: Vec<[f32; 3]> = mesh
-            .positions
-            .iter()
-            .map(|&v| to_bevy_position(v))
-            .collect();
-        let normals = grid_normals(&mesh.positions, w, h);
         let terrain_colors = match terrain::color_grid(p, &map_pkg.data, &t, w, h) {
             Ok(grid) => {
                 im.scene.count("lighting.terrain.colors", grid.colors.len());
@@ -1884,22 +1970,37 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 None
             }
         };
+        let terrain_tris: Vec<[[f32; 3]; 3]> = base
+            .indices
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|tri| tri.map(|i| to_bevy_position(base.positions[i as usize])))
+            .collect();
+        im.scene
+            .add_collision(format!("{path} (terrain)"), terrain_tris);
+        let positions: Vec<[f32; 3]> = base
+            .positions
+            .iter()
+            .map(|&v| to_bevy_position(v))
+            .collect();
+        let normals = grid_normals(&base.positions, base.width, base.height);
         im.scene.meshes.push(SceneMesh {
             label: format!("{path} heightfield"),
             positions,
             normals,
-            uvs: mesh.grid_uv.clone(),
-            indices: mesh.indices.clone(),
-            material,
+            uvs: base.grid_uv.clone(),
+            indices: base.indices.clone(),
+            material: material.clone(),
             material_index,
         });
         im.scene.objects.push(SceneObject {
             mesh: im.scene.meshes.len() - 1,
             transform: identity(),
-            path,
+            path: path.clone(),
             placement: None,
             zone: None,
-            colors: terrain_colors,
+            colors: terrain_colors.clone(),
         });
         im.scene.count("terrain.infos", 1);
     }
@@ -2113,6 +2214,113 @@ mod local_tests {
         } else {
             Some(path)
         }
+    }
+
+    /// Resolves `XIII_STEAM_DIR`; the patched Steam root maps live in `Maps/BaseSP`, so this also
+    /// exercises profile-aware map/package resolution rather than the GOG layout.
+    fn steam_root() -> Option<std::path::PathBuf> {
+        let root = std::env::var_os("XIII_STEAM_DIR")?;
+        let path = std::path::PathBuf::from(&root);
+        if path.is_relative() {
+            Some(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join(path),
+            )
+        } else {
+            Some(path)
+        }
+    }
+
+    /// Opt-in: the two opening Steam maps import with zero `fail.*` counters and the same decoded
+    /// counts as GOG (all 64 maps are byte-identical). `PackageCache::open` uses the Steam
+    /// `Maps/BaseSP` profile, so this fails if the map search paths or case handling regress.
+    #[test]
+    fn steam_opening_maps_import_without_failures() {
+        let Some(path) = steam_root() else {
+            println!("SKIPPED: set XIII_STEAM_DIR to the Steam installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        for (map, actors, bsp_polys) in [("Plage00", 156, 344), ("Plage01", 133, 338)] {
+            let scene = import_map(&mut cache, map).expect("import");
+            let get = |k: &str| scene.counters.get(k).copied().unwrap_or(0);
+            assert_eq!(get("actor.static_mesh (StaticMeshActor)"), actors, "{map}");
+            assert_eq!(get("bsp.polygons"), bsp_polys, "{map}");
+            assert_eq!(get("terrain.infos"), 1, "{map}");
+            assert!(scene.player_start.is_some(), "{map}");
+            let fails: Vec<_> = scene
+                .counters
+                .keys()
+                .filter(|k| k.starts_with("fail."))
+                .collect();
+            assert!(fails.is_empty(), "{map}: {fails:?} {:?}", scene.examples);
+            let missing = scene
+                .meshes
+                .iter()
+                .filter(|m| matches!(m.material, MaterialSlot::Missing(_)))
+                .count();
+            assert_eq!(
+                missing, 0,
+                "{map}: unresolved materials {:?}",
+                scene.examples
+            );
+        }
+    }
+
+    /// Opt-in: every code package the Steam ini's `EditPackages=` names resolves and loads from
+    /// this one root, and each `*Plus` package is present next to its base (no implicit mixing).
+    #[test]
+    fn steam_code_packages_load_in_ini_order_without_mixing() {
+        let Some(path) = steam_root() else {
+            println!("SKIPPED: set XIII_STEAM_DIR to the Steam installation root to run this test");
+            return;
+        };
+        let install =
+            xiii_install::Installation::open(&path, &xiii_install::OpenOptions::default())
+                .expect("open install");
+        let entries = install.code_packages_in_load_order();
+        let pos = |n: &str| entries.iter().position(|e| e.name.eq_ignore_ascii_case(n));
+        for (base, plus) in [
+            ("XIII", "XIIIPlus"),
+            ("XIIIPersos", "XIIIPersosPlus"),
+            ("XIIIMP", "XIIIMPPlus"),
+            ("XIDInterf", "XIDInterfPlus"),
+            ("Engine", "EnginePlus"),
+            ("IpDrv", "IpDrvPlus"),
+        ] {
+            let (b, p) = (pos(base), pos(plus));
+            assert!(
+                b.is_some() && p.is_some(),
+                "{base}/{plus} indexed: {entries:?}"
+            );
+            assert!(b < p, "{base} must load before {plus}");
+        }
+        assert_eq!(entries.len(), 33, "Steam has 33 .u packages");
+        for e in &entries {
+            assert_eq!(e.kind, xiii_install::PackageKind::Code);
+            assert!(
+                e.path.starts_with(install.root()),
+                "{} escaped root",
+                e.relative
+            );
+        }
+        // Maps live under the split Steam roots and resolve case-insensitively; the patch's
+        // added packages are visible only through this root.
+        let map = install
+            .resolve_map("Plage00")
+            .expect("Plage00 under Maps/BaseSP");
+        assert_eq!(map.entry.relative, "Maps/BaseSP/Plage00.unr");
+        assert_eq!(
+            install
+                .resolve_map("plage01")
+                .expect("case-insensitive")
+                .entry
+                .relative,
+            "Maps/BaseSP/Plage01.unr"
+        );
+        assert!(install.resolve_package("XIIIPlus").is_ok());
+        assert!(install.resolve_package("XIIIMPGame").is_ok());
     }
 
     #[test]
@@ -2386,6 +2594,107 @@ mod local_tests {
                     + get("material.two_sided.terrain"),
             );
         }
+    }
+
+    /// Opt-in: every campaign map's zone fog records resolve to metres and at least one fogged
+    /// zone exists on every map. Prints the per-map counts (foggy maps are those with a sky-high
+    /// `DistanceFogEnd`).
+    #[test]
+    fn gog_campaign_zone_fog_survey() {
+        let Some(path) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let install =
+            xiii_install::Installation::open(&path, &xiii_install::OpenOptions::default())
+                .expect("open install");
+        let mut maps: Vec<String> = install
+            .packages()
+            .filter(|e| e.kind == xiii_install::PackageKind::Map)
+            .map(|e| e.name.clone())
+            .collect();
+        maps.sort_by_key(|a| a.to_ascii_lowercase());
+        let maps: Vec<String> = maps
+            .into_iter()
+            .filter(|m| {
+                let s = m.to_ascii_lowercase();
+                !["dm_", "ctf_", "sb_"].iter().any(|p| s.starts_with(p))
+                    && !matches!(
+                        s.as_str(),
+                        "entry" | "empty" | "mapmenu" | "mapcredits" | "credits" | "dm_testpath"
+                    )
+            })
+            .collect();
+        assert!(
+            !maps.is_empty(),
+            "campaign maps must be discovered from {path:?}"
+        );
+        let mut cache = PackageCache::open(&path).expect("open install");
+        let mut with_fog = 0usize;
+        for map in &maps {
+            let scene = import_map(&mut cache, map).expect("import");
+            assert!(!scene.fog.params.is_empty(), "{map}: no zone fog records");
+            let fogged = scene.fog.params.iter().filter(|p| p.is_fogged()).count();
+            if fogged > 0 {
+                with_fog += 1;
+            }
+        }
+        println!(
+            "[fog] campaign: {} maps, {} with a fogged zone",
+            maps.len(),
+            with_fog
+        );
+        assert!(
+            with_fog * 2 >= maps.len(),
+            "only {with_fog} of {} maps have a fogged zone",
+            maps.len()
+        );
+    }
+
+    /// Opt-in: SPADS01's single map-placed `Engine.Projector` decodes with the tagged values
+    /// (the only placed map projector in the 35-map campaign) and its `ProjTexture` resolves to a
+    /// material with a base texture.
+    #[test]
+    fn gog_spads01_map_projector_decodes() {
+        let Some(path) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        let scene = import_map(&mut cache, "SPADS01").expect("import SPADS01");
+        assert_eq!(
+            scene.projectors.len(),
+            1,
+            "SPADS01 must have exactly one map projector: {:?}",
+            scene.projectors
+        );
+        let p = &scene.projectors[0];
+        assert!(!projectors::ProjectorDef::is_shadow_class(
+            &p.def.class_path
+        ));
+        assert_eq!(p.def.fov, 20);
+        assert_eq!(p.def.max_trace_distance, 2500);
+        assert!(!p.def.b_project_bsp && !p.def.b_project_terrain);
+        assert!(p.def.b_clip_bsp && p.def.b_project_on_unlit);
+        assert!((p.def.draw_scale - 0.5).abs() < 1e-6);
+        assert_eq!(
+            p.def.texture_path.as_deref(),
+            Some("XIIIspads.spaproj_alpha")
+        );
+        let idx = p.def.material_index.expect("ProjTexture resolved");
+        assert!(
+            scene.materials[idx].base.is_some(),
+            "projector material has no base texture"
+        );
+        println!(
+            "[projector] SPADS01 {} fov {} maxtrace {} blend {:?} texture {:?} @ {:?}",
+            p.name,
+            p.def.fov,
+            p.def.max_trace_distance,
+            p.def.blend,
+            p.def.texture_path,
+            p.position
+        );
     }
 
     /// `XIII_GOG_DIR` resolved against the workspace root, or `None` in CI.
@@ -2694,6 +3003,72 @@ mod local_tests {
             "PathNode119 floor normal {:?} is not walkable",
             hit.normal
         );
+    }
+
+    /// Opt-in: the maps whose terrain payload stores extra editor vertices after the base
+    /// heightfield grid must import exactly one terrain mesh each, at the size of the
+    /// `TerrainMap` texture, with the trailing vertices counted (never imported). The engine
+    /// collides/renders only the base grid, so importing the trailing vertices regressed
+    /// Hual01b reach (item1h) and must not come back.
+    #[test]
+    fn opt_in_terrain_imports_base_region_only() {
+        let Some(path) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        for map in ["Hual01b", "Hual04c", "Kello01a", "PRock04a"] {
+            let scene = import_map(&mut cache, map).expect("import");
+            let get = |k: &str| scene.counters.get(k).copied().unwrap_or(0);
+            let terrain_meshes: usize = scene
+                .meshes
+                .iter()
+                .filter(|m| m.label.contains("heightfield"))
+                .count();
+            assert!(
+                terrain_meshes >= 1,
+                "{map}: no terrain heightfield mesh imported"
+            );
+            assert!(
+                !scene
+                    .meshes
+                    .iter()
+                    .any(|m| m.label.contains("heightfield region")),
+                "{map}: a non-base terrain region was imported as render geometry: {:?}",
+                scene
+                    .meshes
+                    .iter()
+                    .filter(|m| m.label.contains("region"))
+                    .map(|m| &m.label)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !scene
+                    .collision_sources
+                    .iter()
+                    .any(|s| s.contains("terrain region")),
+                "{map}: a non-base terrain region was imported as collision: {:?}",
+                scene
+                    .collision_sources
+                    .iter()
+                    .filter(|s| s.contains("terrain"))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                get("note.terrain.extra_vertices_ignored") >= 1,
+                "{map}: the trailing terrain vertices were not reported: {:?}",
+                scene.counters
+            );
+            assert!(
+                get("terrain.region_extra_vertices_ignored") > 0,
+                "{map}: trailing vertex count missing"
+            );
+            println!(
+                "[terrain] {map}: heightfield meshes {terrain_meshes}, ignored trailing vertices {}, collision sources {}",
+                get("terrain.region_extra_vertices_ignored"),
+                scene.collision_sources.len()
+            );
+        }
     }
 
     /// Opt-in baked-lighting invariants on the three maps that the task names: every placed

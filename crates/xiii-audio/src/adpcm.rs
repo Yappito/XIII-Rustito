@@ -278,99 +278,199 @@ fn decode_subframe_stereo(
     }
 }
 
-/// Decodes a complete UBI ADPCM stream (0x30 header included) to interleaved PCM16.
+/// Incremental UBI ADPCM decoder: decodes one frame (two subframes) at a time, so a caller can
+/// stream a long `.hsc` entry in bounded chunks instead of decoding the whole payload at once.
 ///
-/// `channels` and `sample_rate` come from the bank's RIFF header and are validated against the
-/// stream header. The decoded length is required to equal the declared `sample_count`.
-pub fn decode(data: &[u8], channels: u16, sample_rate: u32) -> Result<PcmAudio> {
-    let header = parse_header(data)?;
-    if header.bits_per_sample != 6 {
-        return Err(AudioError::at(
-            AudioErrorKind::UnsupportedCodec,
-            0x24,
-            format!(
-                "UBI ADPCM {}-bit not implemented (PC corpus is 6-bit)",
-                header.bits_per_sample
-            ),
-        ));
-    }
-    if header.channels as u16 != channels {
-        return Err(AudioError::at(
-            AudioErrorKind::BadAdpcmHeader,
-            0x2c,
-            format!("stream channels {} != bank {}", header.channels, channels),
-        ));
+/// The format re-reads the per-frame channel state block at the start of every frame, so frame
+/// boundaries are independent decoding units; splitting the stream at a frame boundary cannot
+/// change the output. This is what makes chunked decoding bit-exact with [`decode`]
+/// (see the `streamed_chunks_equal_full_decode` test).
+pub struct AdpcmStream {
+    header: AdpcmHeader,
+    pos: usize,
+    subframe_number: u32,
+    st: [ChannelState; 2],
+    channels: u16,
+    sample_rate: u32,
+    produced: usize,
+}
+
+impl AdpcmStream {
+    /// Builds an incremental decoder for one UBI ADPCM stream. `channels`/`sample_rate` come from
+    /// the bank's RIFF header and are validated against the stream header. The stream header is
+    /// parsed here; sample bytes are supplied to [`AdpcmStream::next_samples`] so the decoder owns
+    /// no copy. `pos` starts immediately after the 0x30-byte header at `data`'s start.
+    pub fn new(data: &[u8], channels: u16, sample_rate: u32) -> Result<Self> {
+        let header = parse_header(data)?;
+        if header.bits_per_sample != 6 {
+            return Err(AudioError::at(
+                AudioErrorKind::UnsupportedCodec,
+                0x24,
+                format!(
+                    "UBI ADPCM {}-bit not implemented (PC corpus is 6-bit)",
+                    header.bits_per_sample
+                ),
+            ));
+        }
+        if header.channels as u16 != channels {
+            return Err(AudioError::at(
+                AudioErrorKind::BadAdpcmHeader,
+                0x2c,
+                format!("stream channels {} != bank {}", header.channels, channels),
+            ));
+        }
+        Ok(Self {
+            header,
+            pos: HEADER_SIZE,
+            subframe_number: 0,
+            st: [ChannelState::default(); 2],
+            channels,
+            sample_rate,
+            produced: 0,
+        })
     }
 
-    let mut out: Vec<i16> = Vec::with_capacity(header.sample_count as usize);
-    let mut pos = HEADER_SIZE;
-    let mut subframe_number = 0u32;
-    let mut codes = Vec::with_capacity(CODES_PER_SUBFRAME_MAX);
-    let mut st = [ChannelState::default(); 2];
+    /// Parsed stream header (counts, codec bit depth, channel count).
+    pub fn header(&self) -> AdpcmHeader {
+        self.header
+    }
 
-    while subframe_number < header.subframe_count {
-        let (code_count_a, code_count_b) = if subframe_number + 1 == header.subframe_count {
-            (header.codes_per_subframe_last as usize, 0)
-        } else if subframe_number + 2 == header.subframe_count {
+    /// Channel count from the bank RIFF header (validated against the stream header).
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    /// Sample rate from the bank RIFF header.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Interleaved sample count declared by the stream.
+    pub fn total_samples(&self) -> usize {
+        self.header.sample_count as usize
+    }
+
+    /// Interleaved samples decoded so far.
+    pub fn produced(&self) -> usize {
+        self.produced
+    }
+
+    /// Restarts decoding from the first frame (used for looping playback).
+    pub fn rewind(&mut self) {
+        self.pos = HEADER_SIZE;
+        self.subframe_number = 0;
+        self.st = [ChannelState::default(); 2];
+        self.produced = 0;
+    }
+
+    /// Decodes the next frame (two subframes) from `data` into `out`. Returns `false` when the
+    /// stream is exhausted. The frame's own state block is read fresh, so this never depends on a
+    /// previous call's channel state.
+    fn decode_frame(&mut self, data: &[u8], out: &mut Vec<i16>) -> Result<bool> {
+        if self.subframe_number >= self.header.subframe_count {
+            return Ok(false);
+        }
+        let (code_count_a, code_count_b) = if self.subframe_number + 1 == self.header.subframe_count
+        {
+            (self.header.codes_per_subframe_last as usize, 0)
+        } else if self.subframe_number + 2 == self.header.subframe_count {
             (
-                header.codes_per_subframe as usize,
-                header.codes_per_subframe_last as usize,
+                self.header.codes_per_subframe as usize,
+                self.header.codes_per_subframe_last as usize,
             )
         } else {
             (
-                header.codes_per_subframe as usize,
-                header.codes_per_subframe as usize,
+                self.header.codes_per_subframe as usize,
+                self.header.codes_per_subframe as usize,
             )
         };
 
-        let setup = CHANNEL_STATE_SIZE * header.channels as usize;
-        if pos + setup > data.len() {
+        let setup = CHANNEL_STATE_SIZE * self.header.channels as usize;
+        if self.pos + setup > data.len() {
             return Err(AudioError::at(
                 AudioErrorKind::Truncated,
-                pos,
-                format!("frame setup past end ({} of {})", pos + setup, data.len()),
+                self.pos,
+                format!(
+                    "frame setup past end ({} of {})",
+                    self.pos + setup,
+                    data.len()
+                ),
             ));
         }
-        for (c, state) in st.iter_mut().enumerate().take(header.channels as usize) {
-            *state = read_channel_state(data, pos + c * CHANNEL_STATE_SIZE);
+        for (c, state) in self
+            .st
+            .iter_mut()
+            .enumerate()
+            .take(self.header.channels as usize)
+        {
+            *state = read_channel_state(data, self.pos + c * CHANNEL_STATE_SIZE);
         }
-        let mut p = pos + setup;
+        let mut p = self.pos + setup;
+        let bits = self.header.bits_per_sample;
+        let mut codes = Vec::with_capacity(CODES_PER_SUBFRAME_MAX);
 
-        let bits = header.bits_per_sample;
         let size_a = (bits as usize * code_count_a / 8) + usize::from(code_count_a > 0);
-        let size_b = (bits as usize * code_count_b / 8) + usize::from(code_count_b > 0);
-
         unpack_codes(&data[p.min(data.len())..], code_count_a, bits, &mut codes);
-        if header.channels == 1 {
-            decode_subframe_mono(&mut st, &codes, &mut out, code_count_a);
+        if self.header.channels == 1 {
+            decode_subframe_mono(&mut self.st, &codes, out, code_count_a);
         } else {
-            decode_subframe_stereo(&mut st, &codes, &mut out, code_count_a);
+            decode_subframe_stereo(&mut self.st, &codes, out, code_count_a);
         }
         p += size_a;
 
+        let size_b = (bits as usize * code_count_b / 8) + usize::from(code_count_b > 0);
         unpack_codes(&data[p.min(data.len())..], code_count_b, bits, &mut codes);
-        if header.channels == 1 {
-            decode_subframe_mono(&mut st, &codes, &mut out, code_count_b);
+        if self.header.channels == 1 {
+            decode_subframe_mono(&mut self.st, &codes, out, code_count_b);
         } else {
-            decode_subframe_stereo(&mut st, &codes, &mut out, code_count_b);
+            decode_subframe_stereo(&mut self.st, &codes, out, code_count_b);
         }
         p += size_b;
 
-        pos = p;
-        subframe_number += 2;
+        self.pos = p;
+        self.subframe_number += 2;
+        self.produced = out.len();
+        Ok(true)
     }
 
-    if out.len() != header.sample_count as usize {
+    /// Decodes up to `max_samples` interleaved samples from `data` (the whole stream file,
+    /// including the 0x30 header parsed by [`AdpcmStream::new`]). `max_samples` is rounded down to
+    /// a whole frame. Returns an empty vector at end of stream.
+    pub fn next_samples(&mut self, data: &[u8], max_samples: usize) -> Result<Vec<i16>> {
+        let mut out: Vec<i16> = Vec::new();
+        let ch = self.channels.max(1) as usize;
+        let target = max_samples / ch * ch;
+        while out.len() < target && self.subframe_number < self.header.subframe_count {
+            if !self.decode_frame(data, &mut out)? {
+                break;
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Decodes a complete UBI ADPCM stream (0x30 header included) to interleaved PCM16.
+///
+/// `channels` and `sample_rate` come from the bank's RIFF header and are validated against the
+/// stream header. The decoded length is required to equal the declared `sample_count`. This is
+/// the whole-file convenience wrapper over [`AdpcmStream`].
+pub fn decode(data: &[u8], channels: u16, sample_rate: u32) -> Result<PcmAudio> {
+    let declared = parse_header(data)?.sample_count as usize;
+    let mut stream = AdpcmStream::new(data, channels, sample_rate)?;
+    let mut out: Vec<i16> = Vec::with_capacity(declared);
+    loop {
+        let chunk = stream.next_samples(data, CODES_PER_SUBFRAME_MAX * channels.max(1) as usize)?;
+        if chunk.is_empty() {
+            break;
+        }
+        out.extend_from_slice(&chunk);
+    }
+    if out.len() != declared {
         return Err(AudioError::new(
             AudioErrorKind::SampleCountMismatch,
-            format!(
-                "decoded {} samples, declared {}",
-                out.len(),
-                header.sample_count
-            ),
+            format!("decoded {} samples, declared {}", out.len(), declared),
         ));
     }
-
     Ok(PcmAudio {
         channels,
         sample_rate,

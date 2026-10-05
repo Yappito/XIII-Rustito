@@ -45,6 +45,60 @@ pub struct SoundEvent {
     pub time: f64,
 }
 
+/// A dialogue line decoded from `Actor.PlayStrVoice` (native 354).
+///
+/// `DialogueManager.Speak` (`xidcine.u`) builds `SoundName` as
+/// `Level.Title + "_" + PawnName + "_" + zero-padded SentenceIndex` and calls
+/// `PlayStrVoice(SoundName, SpeakingSpeaker.Pawn)` (native 354), with the subtitle text taken from
+/// the speaker's `Sentences[SentenceIndex]` map property. The native records both so the host can
+/// play the wave and draw the subtitle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DialogueEvent {
+    /// Object the native ran on (the `DialogueManager`).
+    pub actor: String,
+    /// The `RollOffActor` argument (the speaking pawn), `None` when null.
+    pub speaker: Option<String>,
+    /// The decoded `SoundName` string the script built (the audio path/key, e.g.
+    /// `Plage00_XIIIa_00`); never a `Sound` object path.
+    pub sound: String,
+    /// Subtitle text read from the emitting `DialogueManager`'s current
+    /// `Speakers[..].Sentences[..].Sentences` member; `None` when the actor is not a
+    /// `DialogueManager` or the line cannot be read.
+    pub text: Option<String>,
+    /// Duration in seconds from the host voice provider, `None` when unavailable.
+    pub duration: Option<f32>,
+    /// VM time in seconds when the native ran.
+    pub time: f64,
+}
+
+/// A render-to-texture camera request decoded from `RenderTargetMaterial.Update`.
+///
+/// The comic-panel HUD (`xiii.XIIIBaseHud.DrawCartoonWindowBis`) draws each panel with
+/// `Canvas.DrawTile(HUD.CWndMat, ...)`, where `CWndMat` is an `Engine.RenderTargetMaterial`
+/// whose `Update` native renders the current player view into the material. The host records
+/// the camera pose here so `--play` can render the same view to a texture for the panels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderTargetEvent {
+    /// The `RenderTargetMaterial` actor the native ran on.
+    pub actor: String,
+    /// Destination rect left in the render target.
+    pub x: i32,
+    /// Destination rect top in the render target.
+    pub y: i32,
+    /// Destination width in the render target.
+    pub width: i32,
+    /// Destination height in the render target.
+    pub height: i32,
+    /// Camera location (Unreal units).
+    pub cam_location: [f32; 3],
+    /// Camera rotation (Unreal rotator units).
+    pub cam_rotation: [i32; 3],
+    /// Vertical FOV in degrees.
+    pub fov: f32,
+    /// VM time in seconds when the native ran.
+    pub time: f64,
+}
+
 /// One outbound presentation command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PresentationEvent {
@@ -108,6 +162,39 @@ pub enum PresentationEvent {
         /// VM time.
         time: f64,
     },
+    /// `Actor.StopVoice`: stop the actor's current voice/dialogue playback.
+    StopVoice {
+        /// Object the native ran on.
+        actor: String,
+        /// VM time.
+        time: f64,
+    },
+    /// `Actor.StopSound`: stop one sound on the actor (`sound` is the decoded object path).
+    StopSound {
+        /// Object the native ran on.
+        actor: String,
+        /// Decoded `Sound` path, `None` for a null argument.
+        sound: Option<String>,
+        /// VM time.
+        time: f64,
+    },
+    /// `Actor.PlaySndPNJOno`: play an onomatopoeia sound (`SndOno`) with a mesh code and timbre.
+    PlaySndPNJOno {
+        /// Object the native ran on.
+        actor: String,
+        /// Decoded `SndOno` path, `None` for a null argument.
+        sound: Option<String>,
+        /// Decoded `CodeMesh`.
+        code_mesh: i32,
+        /// Decoded `Timbre`.
+        timbre: i32,
+        /// VM time.
+        time: f64,
+    },
+    /// `Actor.PlayStrVoice`: a named dialogue voice with its subtitle (see [`DialogueEvent`]).
+    Dialogue(DialogueEvent),
+    /// `RenderTargetMaterial.Update`: render the camera pose into the panel material.
+    RenderTarget(RenderTargetEvent),
 }
 
 impl PresentationEvent {
@@ -120,7 +207,12 @@ impl PresentationEvent {
             | Self::SetInjuredEffect { actor, .. }
             | Self::ProjectorAttach { actor, .. }
             | Self::ProjectorDetach { actor, .. }
-            | Self::ProjectorAbandon { actor, .. } => actor,
+            | Self::ProjectorAbandon { actor, .. }
+            | Self::StopVoice { actor, .. }
+            | Self::StopSound { actor, .. }
+            | Self::PlaySndPNJOno { actor, .. } => actor,
+            Self::Dialogue(e) => &e.actor,
+            Self::RenderTarget(e) => &e.actor,
         }
     }
 
@@ -133,7 +225,12 @@ impl PresentationEvent {
             | Self::SetInjuredEffect { time, .. }
             | Self::ProjectorAttach { time, .. }
             | Self::ProjectorDetach { time, .. }
-            | Self::ProjectorAbandon { time, .. } => *time,
+            | Self::ProjectorAbandon { time, .. }
+            | Self::StopVoice { time, .. }
+            | Self::StopSound { time, .. }
+            | Self::PlaySndPNJOno { time, .. } => *time,
+            Self::Dialogue(e) => e.time,
+            Self::RenderTarget(e) => e.time,
         }
     }
 }
@@ -205,6 +302,47 @@ impl std::fmt::Display for PresentationEvent {
             Self::ProjectorAbandon {
                 actor, lifetime, ..
             } => write!(f, "AbandonProjector {actor} lifetime={lifetime:?}"),
+            Self::StopVoice { actor, .. } => write!(f, "StopVoice {actor}"),
+            Self::StopSound { actor, sound, .. } => {
+                write!(f, "StopSound {actor} sound={}", path(sound))
+            }
+            Self::PlaySndPNJOno {
+                actor,
+                sound,
+                code_mesh,
+                timbre,
+                ..
+            } => write!(
+                f,
+                "PlaySndPNJOno {actor} sound={} codeMesh={code_mesh} timbre={timbre}",
+                path(sound)
+            ),
+            Self::Dialogue(e) => write!(
+                f,
+                "Dialogue {} speaker={} sound={} duration={} text={}",
+                e.actor,
+                e.speaker.as_deref().unwrap_or("-"),
+                e.sound,
+                e.duration
+                    .map_or_else(|| "-".to_owned(), |d| format!("{d:.3}")),
+                e.text.as_deref().unwrap_or("<none>")
+            ),
+            Self::RenderTarget(e) => write!(
+                f,
+                "RenderTargetMaterial.Update {} rect {}x{} at ({},{}) cam ({:.0},{:.0},{:.0}) rot ({},{},{}) fov {:.1}",
+                e.actor,
+                e.width,
+                e.height,
+                e.x,
+                e.y,
+                e.cam_location[0],
+                e.cam_location[1],
+                e.cam_location[2],
+                e.cam_rotation[0],
+                e.cam_rotation[1],
+                e.cam_rotation[2],
+                e.fov
+            ),
         }
     }
 }

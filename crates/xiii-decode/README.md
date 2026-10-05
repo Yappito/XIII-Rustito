@@ -331,11 +331,49 @@ iLink, compact iBrushPoly. There are no PanU/PanV fields.
   UScale, f32 VScale, then 25 bytes that are all zero in the inspected maps).
 - `QuadVisibilityBitmap` and `EdgeTurnBitmap`: u32 words.
 
-Native data: `TArray<compact TerrainSector>`, a `TArray<FVector>` of world-space vertices
-(HeightmapX x HeightmapY, X fastest, rows along +Y), i32 SectorsX and i32 SectorsY. The
-remaining 113-116 bytes are an unsupported tail; they contain the scale 550/550/0.39, a
-translation and HeightmapX/Y. Plage00 and Plage01 both use a 32x16 heightmap, scale
+Native data: `TArray<compact TerrainSector>`, a `TArray<FVector>` of world-space vertices,
+i32 SectorsX and i32 SectorsY. The remaining 113-116 bytes are an unsupported tail; they
+contain the scale 550/550/0.39, a translation and the base `HeightmapX`/`HeightmapY`
+(the tail's i32 words 24/25). Plage00 and Plage01 both use a 32x16 heightmap, scale
 550/550/100 and 4x2 sectors.
+
+**Multiple vertex regions (decoded, but only the base grid is the engine's terrain).** The
+`Vertices` array is not always `HeightmapX * HeightmapY` long. It is a sequence of
+concatenated row-major grids at different spacings; the first (the *base* region) is the one
+the `TerrainMap` texture, the sectors and the two bitmaps describe. Measured (GOG corpus,
+2026-10-05):
+
+| map | TerrainInfo | base (from TerrainMap) | trailing region | total vertices |
+|---|---|---|---|---:|
+| Hual04c | TerrainInfo1 | 64x64 (step 250) | 128x96 (step 100) | 16384 |
+| Hual04c | TerrainInfo0 | 32x32 (step 1000) | 64x48 (step 100) | 4096 |
+| Hual01b | TerrainInfo2 | 64x64 (step 200) | 128x96 (step 256) | 16384 |
+| Kello01a | TerrainInfo0 | 128x128 (step 200) | 256x192 (step 128) | 65536 |
+| PRock04a | TerrainInfo0 | 256x128 (step 96x60) | 256x128 (step 96x60, +Y offset) | 65536 |
+
+`TerrainInfo::mesh(w, h)` splits the array — every row has a constant `Y` and increasing `X`,
+consecutive rows advance by a constant `Y` step — and returns a `TerrainMesh` per region. The
+base region must match the texture `w` x `h`; a mismatch is an error, never a silent skip. Only
+the base region uses `QuadVisibilityBitmap`/`EdgeTurnBitmap`.
+
+**The trailing vertices are not rendered or collided by the original engine.** `Engine.dll`
+(disassembled read-only, `local/re/`): `ATerrainInfo::LineCheck` (0x10409eb0) computes
+`Vertices[HeightmapX * y + x]` with `x < HeightmapX`, `y < HeightmapY`; `ATerrainInfo::Render`
+(0x1040c0c0) iterates only the `Sectors` array and each sector's `Offset`/`Quads` index the same
+base grid; `GetHeightmap` (0x104080a0) reads the base `HeightmapX`-strided array. No shipped code
+path touches vertices past `HeightmapX * HeightmapY` (the trailing grids' Z values, e.g.
+Hual01b region 1 Z in [-926,-835] against a base of [-3777,-705], are not a continuation of the
+surface). They are editor scratch. The importer therefore imports **only region 0** as terrain
+mesh and collision and counts the rest as `note.terrain.extra_vertices_ignored`
+(`terrain.region_extra_vertices_ignored`), never as geometry. Importing them as extra detail
+regions (item1h) built collision above the playable base and regressed Hual01b reach 729 -> 668;
+base-only is 726 (item1i). Treating the whole array as one grid had caused the `heightmap WxH
+does not match N vertices` import failures (5 on 4 maps) and, through the missing base collision,
+the reach collapses on Hual04c/Kello01a/PRock04a. Hual01b has four extra `TerrainInfo` exports
+with **no** `TerrainMap`, no sectors and no vertices (a 123-byte tail of scale/translation only);
+they are empty placeholders, counted as `note.terrain.empty`, not decode failures.
+Kello01b/PRock04b have terrain layers whose texture or alpha map is a null reference
+(`skip.terrain.layer_*`); the composite is skipped but the heightfield still imports.
 
 **TerrainSector.** Compact TerrainInfo, i32 QuadsX, QuadsY, OffsetX, OffsetY, 8 x FVector box
 corners, `TArray<{i16 light index; TArray<u8> visibility bits}>`, then `TArray<FColor>` vertex

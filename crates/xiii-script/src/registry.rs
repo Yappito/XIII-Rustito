@@ -529,6 +529,29 @@ fn caps_s(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOut
     val(Value::Str(string(vm, a, 0)?.to_ascii_uppercase()))
 }
 
+/// `Object.Localize(string SectionName, string KeyName, string PackageName)` (native 199).
+///
+/// Measured (`Core.dll` `?execLocalize@UObject` RVA `0x1DD40` -> `Localize` RVA `0x281A0`): the
+/// engine looks the key up in the package's active-language `.int`, falling back as configured,
+/// and on a miss returns the literal `"<?%s?%s.%s.%s?>"` formatted with the active language,
+/// package, section and key (observed format bytes at `0x10179574`), logging
+/// `"No localization for ..."`. The host provider owns the file lookup and fallback; the VM
+/// builds the placeholder from the provider's language. Without a provider the call fails
+/// explicitly.
+fn localize_native(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let section = string(vm, a, 0)?;
+    let key = string(vm, a, 1)?;
+    let package = string(vm, a, 2)?;
+    let value = vm
+        .localize_or_placeholder(&package, &section, &key)
+        .ok_or_else(|| {
+            vm.err(VmErrorKind::NoLocalizationProvider {
+                native: "Object.Localize".to_owned(),
+            })
+        })?;
+    val(Value::Str(value))
+}
+
 fn class_is_child_of(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let test = class_ref(vm, a, 0)?;
     let parent = class_ref(vm, a, 1)?;
@@ -768,6 +791,28 @@ fn mul_vv(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOut
     val(Value::Vector([x[0] * y[0], x[1] * y[1], x[2] * y[2]]))
 }
 
+/// `Object.Multiply_VectorFloat` (212): componentwise `vector * float`.
+fn mul_vf(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let v = vector2(vm, a, 0)?;
+    let s = float(vm, a, 1)?;
+    val(Value::Vector([v[0] * s, v[1] * s, v[2] * s]))
+}
+
+/// `Object.Divide_VectorFloat` (214): componentwise `vector / float` (UE2
+/// `operator/(FVector, FLOAT)`). Division by zero yields IEEE infinities/NaN, as in UE2 (not
+/// silently clamped).
+fn div_vf(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let v = vector2(vm, a, 0)?;
+    let s = float(vm, a, 1)?;
+    val(Value::Vector([v[0] / s, v[1] / s, v[2] / s]))
+}
+
+/// `Object.EqualEqual_VectorVector` (217): exact componentwise equality (UE2 `FVector::operator==`).
+fn eq_vv(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let (x, y) = (vector2(vm, a, 0)?, vector2(vm, a, 1)?);
+    val(Value::Bool(x == y))
+}
+
 fn dot_vv(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let (x, y) = (vector2(vm, a, 0)?, vector2(vm, a, 1)?);
     val(Value::Float(x[0] * y[0] + x[1] * y[1] + x[2] * y[2]))
@@ -793,7 +838,7 @@ fn normal_v(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeO
 
 /// Unreal rotator (`pitch, yaw, roll`; 65536 per turn) as its orthonormal basis axes
 /// (X forward, Y right, Z up), matching `FRotationMatrix`.
-fn rotator_basis(r: [i32; 3]) -> ([f32; 3], [f32; 3], [f32; 3]) {
+pub(crate) fn rotator_basis(r: [i32; 3]) -> ([f32; 3], [f32; 3], [f32; 3]) {
     let to_rad = |u: i32| (u as f32) * std::f32::consts::TAU / 65536.0;
     let (p, y, rl) = (to_rad(r[0]), to_rad(r[1]), to_rad(r[2]));
     let (sp, cp) = (p.sin(), p.cos());
@@ -1086,6 +1131,29 @@ fn find_path_to(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nat
     val(object_out(vm.nav_find_path_to(c.this, goal)?))
 }
 
+/// `IAController.FindBestPathToward(Actor Desired, float xyMargin, float heightMargin) -> bool`.
+///
+/// Disassembly evidence (XIDPawn.dll `?execFindBestPathToward@AIAController` RVA 0x1AB0): it reads
+/// `Desired` (default `None`), `xyMargin` (default `70.0`) and `heightMargin` (default `160.0`),
+/// returns false when `Desired == None`, otherwise runs the engine's A* (`FindBestPathTo`) from the
+/// controller pawn to `Desired.Location` and, on success, writes the first path node at
+/// `IAController+0x228` and its location at `+0x230`. The headless VM reuses the decoded-ReachSpec
+/// path (`Vm::nav_find_path_to`, which also fills `RouteCache`/`RouteDist`) and returns whether a
+/// path was found. The `xyMargin`/`heightMargin` goal tolerance is accepted but the nav provider
+/// already chooses the nearest reachable node to the goal location.
+fn find_best_path_toward(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let Some(target) = instance_arg(vm, a, 0)? else {
+        return val(Value::Bool(false));
+    };
+    let goal = vm.vector_prop(target, "Location").unwrap_or([0.0; 3]);
+    let first = vm.nav_find_path_to(c.this, goal)?;
+    val(Value::Bool(first.is_some()))
+}
+
 fn find_random_dest(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
     if !vm.navigation_ready(
         "Controller.FindRandomDest",
@@ -1115,6 +1183,90 @@ fn line_of_sight_to(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult
         return val(Value::Bool(false));
     };
     val(Value::Bool(vm.nav_line_of_sight_to(c.this, other)?))
+}
+
+/// `Actor.PlayerCanSeeMe() -> bool`.
+///
+/// Disassembly evidence (Engine.dll `?execPlayerCanSeeMe@AActor` RVA 0xB3850): for standalone/client
+/// net modes it takes the render-time fallback (`Level.TimeSeconds - LastRenderTime` against 0.0);
+/// otherwise it walks `Level.ControllerList` and returns true when `TestCanSeeMe(this, controller)`
+/// holds for any player controller (`?TestCanSeeMe@AActor` RVA 0xB0A60). The headless VM has no
+/// renderer, so when a physics provider is installed it uses the controller path's intent — a clear
+/// line trace from a player pawn's eye to this actor — and otherwise reports false with a visible
+/// note (never a silent success). The render-time fallback is not reproduced.
+fn player_can_see_me(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let Some(target) = vm.vector_prop(c.this, "Location") else {
+        return val(Value::Bool(false));
+    };
+    let mut controllers = Vec::new();
+    for i in 0..vm.objects.len() {
+        let id = i as ObjectId;
+        if vm.objects[i].deleted || !vm.objects[i].is_actor {
+            continue;
+        }
+        if vm.is_a(id, "PlayerController") {
+            controllers.push(id);
+        }
+    }
+    if controllers.is_empty() {
+        return val(Value::Bool(false));
+    }
+    if vm.physics.is_none() {
+        vm.note(TraceKind::Note(
+            "PlayerCanSeeMe: no physics provider, visibility not evaluated (false)".into(),
+        ));
+        return val(Value::Bool(false));
+    }
+    for pc in controllers {
+        let Some(pawn) = vm.obj_prop(pc, "Pawn") else {
+            continue;
+        };
+        let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let eye = [loc[0], loc[1], loc[2] + vm.f32_prop(pawn, "BaseEyeHeight")];
+        if vm
+            .physics
+            .as_mut()
+            .and_then(|p| p.trace(eye, target, [0.0; 3]))
+            .is_none()
+        {
+            return val(Value::Bool(true));
+        }
+    }
+    val(Value::Bool(false))
+}
+
+/// `PositionInfo.AutoPosition()` (xidcine).
+///
+/// Disassembly evidence (XIDCine.dll `?execAutoPosition@APositionInfo` RVA 0x1990): it takes
+/// `Location.Z - 1000` (the literal at VA 0x100056C8), line-checks the level upward to the actor's
+/// `Location`, copies the hit point back into `Location`, then adds `fAltitude` (default 178, the
+/// `PositionInfo` default) to `Location.Z`. So the anchor is snapped to the first surface between
+/// 1000 UU below it and its current position, then floated `fAltitude` above that surface. The
+/// headless VM performs that trace through the physics provider; without one the call fails
+/// explicitly (it is not a silent no-op).
+fn auto_position(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    if !vm.physics_ready("PositionInfo.AutoPosition", None, c.this, Value::Void)? {
+        return val(Value::Void);
+    }
+    let Some(loc) = vm.vector_prop(c.this, "Location") else {
+        return val(Value::Void);
+    };
+    let altitude = vm.f32_prop(c.this, "fAltitude");
+    let start = [loc[0], loc[1], loc[2] - 1000.0];
+    let end = loc;
+    if let Some(hit) = vm
+        .physics
+        .as_mut()
+        .and_then(|p| p.trace(start, end, [0.0; 3]))
+    {
+        vm.set_property(
+            c.this,
+            "Location",
+            0,
+            Value::Vector([end[0], end[1], hit.location[2] + altitude]),
+        );
+    }
+    val(Value::Void)
 }
 
 fn move_to(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -1403,6 +1555,28 @@ fn set_bone_direction(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResu
     let trans = vector2(vm, a, 2)?;
     let alpha = float(vm, a, 3)?;
     vm.add_bone_direction(c.this, bone, turn, trans, alpha);
+    val(Value::Void)
+}
+
+/// `Actor.SetBoneScalePerAxis(int Slot, float BoneScaleX, float BoneScaleY, float BoneScaleZ,
+/// name BoneName)`.
+///
+/// Disassembly evidence (Engine.dll `?execSetBoneScalePerAxis@AActor` RVA 0xE23B0): it defaults each
+/// omitted optional axis to `1.0` (`0x3F800000`) and forwards
+/// `SetBoneScale(Slot, X, Y, Z, BoneName)` to `?SetBoneScale@USkeletalMeshInstance` RVA 0xED210.
+/// The headless VM records the request per actor for the renderer; no skeletal transform is
+/// evaluated (documented `Partial`).
+fn set_bone_scale_per_axis(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let slot = int(vm, a, 0)?;
+    let x = if c.omitted(1) { 1.0 } else { float(vm, a, 1)? };
+    let y = if c.omitted(2) { 1.0 } else { float(vm, a, 2)? };
+    let z = if c.omitted(3) { 1.0 } else { float(vm, a, 3)? };
+    let bone = name(vm, a, 4)?;
+    vm.add_bone_scale(c.this, slot, [x, y, z], bone);
     val(Value::Void)
 }
 
@@ -1716,6 +1890,167 @@ fn make_noise(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<Nativ
     val(Value::Void)
 }
 
+/// item14 `Actor.GetLastTraceBone`: the bone name chosen by the engine's last actor trace, read
+/// by `XIIIWeapon.RealTraceFire` into `XIIIPawn.LastBoneHit` and then by
+/// `XIIIPawn.GetDamageLocation` (head/spine classification). The VM records the zone in
+/// `Vm::vm_trace`; see [`crate::physics::HitZones`].
+fn get_last_trace_bone(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Name(vm.last_trace_bone().to_owned()))
+}
+
+/// item14 `Actor.IntersectWaterPlane`: UE2 returns the `PhysicsVolume` a segment crosses at a
+/// water plane, or `None`. XIII only uses it to route bullet impacts to a water volume; the VM
+/// does not model water volumes, so it returns `None` and writes the segment end into the `out`
+/// `Intersection` (the caller only dereferences the volume when non-null).
+fn intersect_water_plane(
+    _vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    if let Some(end) = a.get(1).and_then(|v| match v {
+        Value::Vector(v) => Some(*v),
+        _ => None,
+    }) && let Some(slot) = a.get_mut(2)
+    {
+        *slot = Value::Vector(end);
+    }
+    val(Value::Object(None))
+}
+
+/// item14 `IAController.SetEnemy`: stores `Enemy` on the controller (the XIDPawn native sets the
+/// controller's current target). Returns whether the target was accepted (always true here; the
+/// native's extra `BaseS` bookkeeping is not modelled).
+fn ia_controller_set_enemy(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let enemy = object(vm, a, 0)?;
+    vm.set_property(c.this, "Enemy", 0, Value::Object(enemy));
+    val(Value::Bool(true))
+}
+
+/// item14 `Object.SubtractSubtract_Byte`: the UE2 `--` pre-decrement on a byte value
+/// (`--ReloadCount` in `XIIIWeapon.LoneFire`); returns `A - 1` as a byte.
+fn dec_byte(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let b = byte(vm, a, 0)?;
+    val(Value::Byte(b.wrapping_sub(1)))
+}
+
+/// item14 `Object.AddAdd_Byte`: the UE2 `++` pre-increment on a byte value; returns `A + 1`.
+fn inc_byte(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let b = byte(vm, a, 0)?;
+    val(Value::Byte(b.wrapping_add(1)))
+}
+
+/// item14 `Object.Warn`: the UE2 warning log. The VM has no log sink; accepted and discarded
+/// (recorded as a `Note`). `XIIIPawn.TakeDamage` warns when a dead pawn is hit again.
+fn warn_log(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    if let Some(Value::Str(s)) = a.first() {
+        vm.note(TraceKind::Note(format!("Warn: {s}")));
+    }
+    val(Value::Void)
+}
+
+/// item14 `Object.Subtract_PreVector`: the UE2 unary `-` on a vector, used by
+/// `XIIIBulletsAmmo.ProcessTraceHit` when it aims spawned emitters.
+fn neg_vector(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let v = vector2(vm, a, 0)?;
+    val(Value::Vector([-v[0], -v[1], -v[2]]))
+}
+
+/// item14 `Actor.PlaySndDeathOno`: death onomatopoeia sound; accepted and discarded (the VM has
+/// no HX sound mapping). Called by `BaseSoldier.Died`.
+fn play_snd_death_ono(_vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Void)
+}
+
+/// `Actor.RefreshLighting` (389): the engine recomputes the lighting affected by this actor
+/// (dynamic lights such as the muzzle flash). There is no script-visible result; the renderer
+/// does not draw dynamic lights yet, so the call is recorded as a visible trace note.
+fn refresh_lighting(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    let name = vm.objects[c.this as usize].name.clone();
+    vm.note(TraceKind::Note(format!(
+        "RefreshLighting on {name} (dynamic lights not rendered)"
+    )));
+    val(Value::Void)
+}
+
+/// item14 `Weapon.PlayFiringSound`: the engine-side firing sound. The VM has no per-weapon
+/// firing-sound mapping (HX resolution is host-side), so the call is accepted and discarded;
+/// `Beretta.PlayFiring` calls it on every shot.
+fn play_firing_sound(_vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Void)
+}
+
+/// item14 `Pawn.EyePosition`: the eye offset from the pawn `Location` (UE2 applies crouch/view
+/// height; the VM returns `EyeHeight` along +Z, falling back to `BaseEyeHeight`). Needed by
+/// `XIIIWeapon.RealTraceFire`'s trace start.
+fn pawn_eye_position(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let h = match vm.get_property(c.this, "EyeHeight") {
+        Some(Value::Float(f)) => *f,
+        _ => vm.f32_prop(c.this, "BaseEyeHeight"),
+    };
+    val(Value::Vector([0.0, 0.0, h]))
+}
+
+/// item14 `Pawn.GetViewRotation`: the rotation the pawn looks along. UE2 returns the controller's
+/// rotation for a player-controlled pawn; the VM returns `Controller.Rotation` when present,
+/// else the pawn's own `Rotation`.
+fn pawn_get_view_rotation(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let rot = vm
+        .obj_prop(c.this, "Controller")
+        .and_then(|ctrl| match vm.get_property(ctrl, "Rotation") {
+            Some(Value::Rotator(r)) => Some(*r),
+            _ => None,
+        })
+        .or_else(|| match vm.get_property(c.this, "Rotation") {
+            Some(Value::Rotator(r)) => Some(*r),
+            _ => None,
+        })
+        .unwrap_or([0; 3]);
+    val(Value::Rotator(rot))
+}
+
+/// item14 `Weapon.GetFireStart`: the muzzle position for the hitscan. The VM returns the
+/// instigator's eye (Location + `EyePosition`); the decoded muzzle offsets are not applied.
+fn weapon_get_fire_start(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let Some(pawn) = vm.obj_prop(c.this, "Instigator") else {
+        return val(Value::Vector([0.0; 3]));
+    };
+    let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+    let eye = match vm.get_property(pawn, "EyeHeight") {
+        Some(Value::Float(f)) => *f,
+        _ => vm.f32_prop(pawn, "BaseEyeHeight"),
+    };
+    val(Value::Vector([loc[0], loc[1], loc[2] + eye]))
+}
+
+/// item14 `Pawn.CalcDrawOffset`: the first-person draw offset of an inventory item. The VM
+/// returns the item's `PlayerViewOffset` (the scripts carry the value; the host uses it for
+/// presentation), never an error, so `Weapon.BringUp`'s `Active.BeginState` can run.
+fn pawn_calc_draw_offset(
+    vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let off = object(vm, a, 0)?
+        .and_then(|r| match r {
+            ObjRef::Instance(i) => vm.vector_prop(i, "PlayerViewOffset"),
+            _ => None,
+        })
+        .unwrap_or([0.0; 3]);
+    val(Value::Vector(off))
+}
+
 /// `Canvas.MakeColor`: UE2 packs the four bytes into the `Color` struct (A defaults to 255 when
 /// omitted). `PlayerController.ClearProgressMessages` calls it on the login/PostLogin path.
 fn make_color(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -1731,6 +2066,88 @@ fn make_color(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nativ
     ]))
 }
 
+/// The named byte members of a `Color` struct value.
+fn color_fields(vm: &Vm<'_>, a: &[Value], i: usize) -> VmResult<Vec<(String, Value)>> {
+    match a.get(i) {
+        Some(Value::Struct(f)) if f.len() == 4 => Ok(f.clone()),
+        Some(v) => Err(type_err(vm, "struct<Color>", v)),
+        None => Err(vm.err(VmErrorKind::Other("missing Color argument".into()))),
+    }
+}
+
+fn color_channel(fields: &[(String, Value)], name: &str) -> i32 {
+    fields
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .and_then(|(_, v)| match v {
+            Value::Byte(b) => Some(i32::from(*b)),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn clamp_byte(v: i32) -> Value {
+    Value::Byte(v.clamp(0, 255) as u8)
+}
+
+/// A `Color` rebuilt in the component order of the first operand, from `(b, g, r, a)`.
+fn color_from_bgra(order: &[(String, Value)], bgra: [i32; 4]) -> Value {
+    let pick = |name: &str| match name.to_ascii_lowercase().as_str() {
+        "b" => clamp_byte(bgra[0]),
+        "g" => clamp_byte(bgra[1]),
+        "r" => clamp_byte(bgra[2]),
+        "a" => clamp_byte(bgra[3]),
+        _ => Value::Byte(0),
+    };
+    Value::Struct(order.iter().map(|(k, _)| (k.clone(), pick(k))).collect())
+}
+
+/// `Actor.Multiply_ColorFloat(Color A, float B)` (native 552): componentwise `A * B`, truncated
+/// and clamped to `[0,255]` (UE2 `FColor` scalar multiply). Called by the HUD widget draw path
+/// (`XIIIBaseHud`/`HudState.DrawStt`).
+fn multiply_color_float(
+    vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let fields = color_fields(vm, a, 0)?;
+    let f = float(vm, a, 1)?;
+    let m = |name: &str| (color_channel(&fields, name) as f32 * f) as i32;
+    val(color_from_bgra(&fields, [m("b"), m("g"), m("r"), m("a")]))
+}
+
+/// `Actor.Multiply_FloatColor(float A, Color B)` (native 550): the reversed operand order.
+fn multiply_float_color(
+    vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let fields = color_fields(vm, a, 1)?;
+    let f = float(vm, a, 0)?;
+    let m = |name: &str| (color_channel(&fields, name) as f32 * f) as i32;
+    val(color_from_bgra(&fields, [m("b"), m("g"), m("r"), m("a")]))
+}
+
+/// `Actor.Add_ColorColor(Color A, Color B)` (native 551): componentwise sum, clamped.
+fn add_color_color(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let x = color_fields(vm, a, 0)?;
+    let y = color_fields(vm, a, 1)?;
+    let s = |name: &str| color_channel(&x, name) + color_channel(&y, name);
+    val(color_from_bgra(&x, [s("b"), s("g"), s("r"), s("a")]))
+}
+
+/// `Actor.Subtract_ColorColor(Color A, Color B)` (native 549): componentwise difference, clamped.
+fn subtract_color_color(
+    vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let x = color_fields(vm, a, 0)?;
+    let y = color_fields(vm, a, 1)?;
+    let d = |name: &str| color_channel(&x, name) - color_channel(&y, name);
+    val(color_from_bgra(&x, [d("b"), d("g"), d("r"), d("a")]))
+}
+
 fn play_sound(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     vm.emit_sound(false, c.this, a, &c.omitted);
     val(Value::Void)
@@ -1739,6 +2156,86 @@ fn play_sound(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nativ
 fn play_music(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     vm.emit_sound(true, c.this, a, &c.omitted);
     val(Value::Void)
+}
+
+/// `Actor.StopVoice()`: stop the actor's current voice/dialogue audio. The engine
+/// (`?execStopVoice@AActor` RVA 0xE3F00) calls the audio subsystem's voice channel
+/// (`vtable +0xA4` with `(0, 0, 4, 1)`); the headless VM emits a `StopVoice` presentation event.
+fn stop_voice(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    let actor = vm.objects[c.this as usize].name.clone();
+    let time = vm.time;
+    vm.emit_event(PresentationEvent::StopVoice { actor, time });
+    val(Value::Void)
+}
+
+/// `Actor.StopSound(object<Sound> Sound)`: stop one sound on the actor (Engine.dll
+/// `?execStopSound@AActor`, declaration `native(265)`). Emits a `StopSound` presentation event.
+fn stop_sound(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let sound = object(vm, a, 0)?.map(|r| vm.obj_label(&r));
+    let actor = vm.objects[c.this as usize].name.clone();
+    let time = vm.time;
+    vm.emit_event(PresentationEvent::StopSound { actor, sound, time });
+    val(Value::Void)
+}
+
+/// `Actor.PlaySndPNJOno(object<SndOno> Sound, int CodeMesh, int Timbre)`: play an onomatopoeia
+/// sound. Engine.dll `?execPlaySndPNJOno@AActor` RVA 0xE2D10 forwards `(this, Sound, CodeMesh,
+/// Timbre)` to the audio subsystem (`vtable +0xD8`) and no-ops on a null `Sound`. The headless VM
+/// emits a `PlaySndPNJOno` presentation event.
+fn play_snd_pn_jo(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let sound = object(vm, a, 0)?.map(|r| vm.obj_label(&r));
+    let code_mesh = int(vm, a, 1)?;
+    let timbre = int(vm, a, 2)?;
+    if sound.is_none() {
+        return val(Value::Void);
+    }
+    let actor = vm.objects[c.this as usize].name.clone();
+    let time = vm.time;
+    vm.emit_event(PresentationEvent::PlaySndPNJOno {
+        actor,
+        sound,
+        code_mesh,
+        timbre,
+        time,
+    });
+    val(Value::Void)
+}
+
+/// `PlayerController.ConsoleCommand(string Command) -> string`.
+///
+/// The campaign scripts issue a small set of commands. Implemented as VM effects/queries; every
+/// other command is logged (a visible `Note`) and returns the empty string — never silently
+/// accepted. The engine command set (Engine.dll `?execConsoleCommand@APlayerController` RVA
+/// 0x698F0) is much larger; only the commands reached on the campaign path are modelled here.
+///
+/// - `GETPING` (`PlayerReplicationInfo.Timer`): the engine returns the round-trip ping; the
+///   headless VM has no network, so it returns `0`.
+/// - `Get GameInfo GoreLevel` (`XIIIPlayerController.ClientSetHUD`): returns
+///   `Level.Game.GoreLevel` as a decimal string (the parental-lock check).
+fn console_command(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let command = string(vm, a, 0)?;
+    let norm = command.trim().to_ascii_lowercase();
+    let reply = match norm.as_str() {
+        "getping" => "0".to_owned(),
+        "get gameinfo gorelevel" => {
+            let gore = vm
+                .obj_prop(c.this, "Level")
+                .and_then(|l| vm.obj_prop(l, "Game"))
+                .and_then(|g| match vm.get_property(g, "GoreLevel") {
+                    Some(Value::Int(v)) => Some(*v),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            gore.to_string()
+        }
+        _ => {
+            vm.note(TraceKind::Note(format!(
+                "ConsoleCommand({command:?}) is not implemented; returned an empty string"
+            )));
+            String::new()
+        }
+    };
+    val(Value::Str(reply))
 }
 
 fn replace_texture_by_another(
@@ -1876,6 +2373,11 @@ fn get_bounding_box(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult
             "max".into(),
             Value::Vector([loc[0] + r, loc[1] + r, loc[2] + h]),
         ),
+        // UE2 `FBox` also carries `IsValid` (a byte; `AActor::GetBoundingBox` constructs the box
+        // valid). Script reads it as `cast<byte->int>(Box.IsValid)` before using the bounds
+        // (`xidcine.BreakableMover.ComputeDispersal` 0x0012, `xidmaps.Map06_HualparBase.StartSnow`
+        // 0x0077); omitting it made those reads fail with "no struct member isvalid".
+        ("isvalid".into(), Value::Byte(1)),
     ]))
 }
 
@@ -2214,6 +2716,89 @@ fn def(
     }
 }
 
+/// `Object.GetAxes` (native 229): fill the rotator's orthonormal basis into the out params
+/// X (forward), Y (right), Z (up), the same `FRotationMatrix` basis as `vector >> rotator`.
+/// Decoded call site `engine.Pawn.TossWeapon` 0x0014.
+fn get_axes(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let r = rotator2(vm, a, 0)?;
+    let (x, y, z) = rotator_basis(r);
+    if a.len() >= 4 {
+        a[1] = Value::Vector(x);
+        a[2] = Value::Vector(y);
+        a[3] = Value::Vector(z);
+    }
+    val(Value::Void)
+}
+
+/// `Actor.StopAnimating` (native 417): stop the actor's animation (all channels).
+fn stop_animating(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    vm.stop_animating(c.this);
+    val(Value::Void)
+}
+
+/// Records a `LevelInfo` snow-particle native call as a visible trace note. XIII drives its
+/// snow through the `RndCubeSpr` particle system (`xidmaps.Map06_HualparBase.StartSnow`); this
+/// runtime has no particle renderer, so the request is recorded rather than silently accepted.
+fn snow_note(vm: &mut Vm<'_>, name: &str, a: &[Value]) {
+    let args: Vec<String> = a.iter().map(|v| vm.value_text(v)).collect();
+    vm.note(crate::vm::TraceKind::Log(format!(
+        "LevelInfo.{name}({}): recorded; no particle subsystem",
+        args.join(", ")
+    )));
+}
+
+fn init_rnd_cube_spr(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    snow_note(vm, "InitRndCubeSpr", a);
+    val(Value::Void)
+}
+
+fn set_rnd_cube_spr_size(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    snow_note(vm, "SetRndCubeSprSize", a);
+    val(Value::Void)
+}
+
+fn set_rnd_cube_spr_speed(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    snow_note(vm, "SetRndCubeSprSpeed", a);
+    val(Value::Void)
+}
+
+fn add_rnd_cube_spr_exclude(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    snow_note(vm, "AddRndCubeSprExclude", a);
+    val(Value::Void)
+}
+
+fn set_rnd_cube_spr_state(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    snow_note(vm, "SetRndCubeSprState", a);
+    val(Value::Void)
+}
+
+fn change_rnd_cube_spr_prop(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    snow_note(vm, "ChangeRndCubeSprProp", a);
+    // No particle system to change: report that the change was not applied (never a silent
+    // success).
+    val(Value::Bool(false))
+}
+
 fn builtin_defs() -> Vec<NativeDef> {
     let mut v = vec![
         def(
@@ -2474,6 +3059,12 @@ fn builtin_defs() -> Vec<NativeDef> {
             class_is_child_of,
         ),
         def(
+            "Object.Localize",
+            "native(199) final native static function string Localize(string SectionName, string KeyName, string PackageName)",
+            "Core.dll ?execLocalize@UObject RVA 0x1DD40 -> ?Localize RVA 0x281A0; miss placeholder \"<?%s?%s.%s.%s?>\" at VA 0x10179574",
+            localize_native,
+        ),
+        def(
             "Object.ComplementEqual_StrStr",
             "native(124) final operator bool ~=(string, string)",
             "UnrealScript `~=` is case-insensitive equality (appStricmp==0), same result as string ==; Core.dll operator thunk",
@@ -2722,6 +3313,24 @@ fn builtin_defs() -> Vec<NativeDef> {
             "native(296) final operator vector *(vector, vector)",
             UE2_OP,
             mul_vv,
+        ),
+        def(
+            "Object.Multiply_VectorFloat",
+            "native(212) final operator vector *(vector, float)",
+            UE2_OP,
+            mul_vf,
+        ),
+        def(
+            "Object.Divide_VectorFloat",
+            "native(214) final operator vector /(vector, float)",
+            UE2_OP,
+            div_vf,
+        ),
+        def(
+            "Object.EqualEqual_VectorVector",
+            "native(217) final operator bool ==(vector, vector)",
+            UE2_OP,
+            eq_vv,
         ),
         def(
             "Object.Dot_VectorVector",
@@ -3579,12 +4188,329 @@ fn builtin_defs() -> Vec<NativeDef> {
             "the request is recorded per actor for the renderer; no skeletal transform is evaluated",
         ),
         ..def(
+            "Engine.Actor.SetBoneScalePerAxis",
+            "native(400) final static function SetBoneScalePerAxis(int Slot, float BoneScaleX, float BoneScaleY, float BoneScaleZ, name BoneName)",
+            "Engine.dll ?execSetBoneScalePerAxis@AActor RVA 0xE23B0 (omitted axes default to 1.0; forwards SetBoneScale to ?SetBoneScale@USkeletalMeshInstance RVA 0xED210); xidcine.Cine2.CineInit.Timer calls it for 'X Blink'",
+            set_bone_scale_per_axis,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "the request is recorded per actor for the renderer; no skeletal transform is evaluated",
+        ),
+        ..def(
             "Engine.Actor.SetBoneDirection",
             "native(399) final static function SetBoneDirection(name BoneName, rotator BoneTurn, vector BoneTrans, float Alpha)",
             "Engine.dll ?execSetBoneDirection@AActor RVA 0xE2680 -> ?SetBoneDirection@USkeletalMeshInstance RVA 0xED5C0 (applies a bone-controller request); see local/reports/item3g-xiii-ai-natives-re.md",
             set_bone_direction,
         )
     });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "the request is recorded per actor for the renderer; no skeletal bone control is evaluated",
+        ),
+        ..def(
+            "IAController.FindBestPathToward",
+            "native(0) function bool FindBestPathToward(Actor Desired, optional float xyMargin, optional float heightMargin)",
+            "XIDPawn.dll ?execFindBestPathToward@AIAController RVA 0x1AB0 (defaults 70.0/160.0; runs the A* to Desired.Location and writes the first node); decoded-ReachSpec path via Vm::nav_find_path_to",
+            find_best_path_toward,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "the engine's exact trace endpoints are inferred from the XIDCine.dll disassembly",
+        ),
+        ..def(
+            "PositionInfo.AutoPosition",
+            "native(0) function AutoPosition()",
+            "XIDCine.dll ?execAutoPosition@APositionInfo RVA 0x1990 (traces from Location.Z-1000 up to Location, sets Location to the hit, then adds fAltitude); physical trace via the physics provider",
+            auto_position,
+        )
+    });
+    v.push(def(
+        "Engine.Actor.PlayerCanSeeMe",
+        "native(532) final static function bool PlayerCanSeeMe()",
+        "Engine.dll ?execPlayerCanSeeMe@AActor RVA 0xB3850 (standalone uses LastRenderTime; otherwise controller TestCanSeeMe) and ?TestCanSeeMe@AActor RVA 0xB0A60; headless: clear eye->actor trace from a player pawn",
+        player_can_see_me,
+    ));
+    v.push(def(
+        "Engine.Actor.StopVoice",
+        "native(344) final static function StopVoice()",
+        "Engine.dll ?execStopVoice@AActor RVA 0xE3F00 (audio subsystem voice stop); emits PresentationEvent::StopVoice",
+        stop_voice,
+    ));
+    v.push(def(
+        "Engine.Actor.StopSound",
+        "native(265) final static function StopSound(object<Sound> Sound)",
+        "Engine.dll ?execStopSound@AActor (?execStopActorSounds RVA 0xE3FA0 region); emits PresentationEvent::StopSound",
+        stop_sound,
+    ));
+    v.push(def(
+        "Engine.Actor.PlaySndPNJOno",
+        "native(347) final static function PlaySndPNJOno(object<SndOno> Sound, int CodeMesh, int Timbre)",
+        "Engine.dll ?execPlaySndPNJOno@AActor RVA 0xE2D10 (audio subsystem at vtable +0xD8, null Sound no-ops); emits PresentationEvent::PlaySndPNJOno",
+        play_snd_pn_jo,
+    ));
+    v.push(def(
+        "Engine.PlayerController.ConsoleCommand",
+        "native(0) static function string ConsoleCommand(string Command)",
+        "engine.u PlayerController.ConsoleCommand decoded; Engine.dll ?execConsoleCommand@APlayerController RVA 0x698F0; implements the campaign commands GETPING and Get GameInfo GoreLevel, logs the rest",
+        console_command,
+    ));
+    // ---- item14 combat natives: firing/trace/damage entry points. Kept in their own block so
+    // parallel edits merge cleanly. ------------------------------------------------
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "dynamic lights are not rendered yet: the refresh is recorded as a VM trace Note",
+        ),
+        ..def(
+            "Engine.Actor.RefreshLighting",
+            "native(389) final function RefreshLighting()",
+            "engine.u Actor.RefreshLighting decoded (void, no params); xiii.MuzzleLight.PostBeginPlay              calls it when the Beretta's muzzle flash spawns (XIIIWeapon.Fire -> PlayFiring ->              IncrementFlashCount -> ThirdPersonEffects -> MuzzleAttach); Engine.dll              ?execRefreshLighting@AActor (relights the actor's light). No script-visible result",
+            refresh_lighting,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no log sink: the message is recorded as a VM trace Note and discarded",
+        ),
+        ..def(
+            "Object.Warn",
+            "native(232) final static function Warn(coerce string S)",
+            "core.u Object.Warn decoded (string, void); XIIIPawn.TakeDamage warns when a dead pawn \
+             is hit again",
+            warn_log,
+        )
+    });
+    v.push(def(
+        "Object.Subtract_PreVector",
+        "native(211) final preoperator vector -(vector A)",
+        "core.u Object.Subtract_PreVector decoded (unary vector negation); \
+         XIIIBulletsAmmo.ProcessTraceHit uses -HitNormal for spawned emitters",
+        neg_vector,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "accepted and discarded: the VM has no HX sound mapping for the death onomatopoeia",
+        ),
+        ..def(
+            "Engine.Actor.PlaySndDeathOno",
+            "native(346) final native static function PlaySndDeathOno(object<DeathOno> Sound, int CodeMesh, int Timbre)",
+            "engine.u Actor.PlaySndDeathOno decoded (Sound, CodeMesh, Timbre); BaseSoldier.Died \
+             calls it after Super.Died; Engine.dll ?execPlaySndDeathOno@AActor",
+            play_snd_death_ono,
+        )
+    });
+    v.push(def(
+        "Object.SubtractSubtract_Byte",
+        "native(140) final native operator static function byte --(byte A)",
+        "core.u Object.SubtractSubtract_Byte decoded (byte A, return byte); XIIIWeapon.LoneFire \
+         decrements ReloadCount through it",
+        dec_byte,
+    ));
+    v.push(def(
+        "Object.AddAdd_Byte",
+        "native(139) final native operator static function byte ++(byte A)",
+        "core.u Object.AddAdd_Byte decoded (byte A, return byte); the byte pre-increment \
+         counterpart used by the weapon/ammo scripts",
+        inc_byte,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "accepted and discarded: the VM has no per-weapon firing-sound mapping (host HX audio \
+             resolves sounds); the shot itself continues",
+        ),
+        ..def(
+            "Engine.Weapon.PlayFiringSound",
+            "native(0) native function PlayFiringSound(bool bHasSilencer)",
+            "engine.u Weapon.PlayFiringSound decoded (bool bHasSilencer, native); \
+             Beretta.PlayFiring calls it on every shot; Engine.dll ?execPlayFiringSound@AWeapon",
+            play_firing_sound,
+        )
+    });
+    v.push(def(
+        "Engine.Actor.IntersectWaterPlane",
+        "native(0) final native static function Actor IntersectWaterPlane(Vector Start, Vector End, out Vector Intersection)",
+        "engine.u Actor.IntersectWaterPlane decoded (Start, End, out Intersection, return Actor); \
+         XIIIWeapon.RealTraceFire calls it on every shot to route a water impact to a \
+         PhysicsVolume. The VM has no water volumes, so it returns None (the caller dereferences \
+         the volume only when non-null); Engine.dll ?execIntersectWaterPlane@AActor",
+        intersect_water_plane,
+    ));
+    v.push(def(
+        "Engine.Actor.GetLastTraceBone",
+        "native(364) final native static function name GetLastTraceBone()",
+        "engine.u Actor.GetLastTraceBone decoded (return name); XIIIWeapon.RealTraceFire stores it \
+         into XIIIPawn.LastBoneHit and XIIIPawn.GetDamageLocation reads 'X Head'/'X Spine1' from \
+         it; Vm::vm_trace records the actor hit zone (the default model is the collision \
+         cylinder; see xiii_script::physics::HitZones); Engine.dll ?execGetLastTraceBone@AActor",
+        get_last_trace_bone,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "stores Enemy on the controller; the XIDPawn native's BaseS bookkeeping and the \
+             engine's sight-state side effects are not modelled",
+        ),
+        ..def(
+            "IAController.SetEnemy",
+            "native(0) function bool SetEnemy(Pawn Newenemy)",
+            "xidpawn.u IAController.SetEnemy decoded (Pawn, return bool); IAController.SeePlayer/\
+             SeeEnemy set the current target through it; XIDPawn.dll ?execSetEnemy@AIAController",
+            ia_controller_set_enemy,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "returns EyeHeight/BaseEyeHeight along +Z; crouch and view-height interpolation are \
+             not modelled",
+        ),
+        ..def(
+            "Engine.Pawn.EyePosition",
+            "native(0) native function Vector EyePosition()",
+            "engine.u Pawn.EyePosition decoded (return Vector, native); XIIIPawn overrides it; \
+             XIIIWeapon.RealTraceFire adds it to Instigator.Location for the trace start; \
+             Engine.dll ?execEyePosition@APawn",
+            pawn_eye_position,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "returns the controller's Rotation when set, else the pawn's Rotation; the native's \
+             cloud/rotation blending is not modelled",
+        ),
+        ..def(
+            "Engine.Pawn.GetViewRotation",
+            "native(0) simulated native function Rotator GetViewRotation()",
+            "engine.u Pawn.GetViewRotation decoded (return Rotator, native); \
+             XIIIWeapon.RealTraceFire passes it to Object.GetAxes; Engine.dll \
+             ?execGetViewRotation@APawn",
+            pawn_get_view_rotation,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "returns the instigator's eye (Location + EyePosition); the decoded muzzle offset is \
+             not applied",
+        ),
+        ..def(
+            "Engine.Weapon.GetFireStart",
+            "native(0) native function Vector GetFireStart(Vector X, Vector Y, Vector Z)",
+            "engine.u Weapon.GetFireStart decoded (X,Y,Z, return Vector, native); \
+             XIIIWeapon.RealTraceFire uses it as StartTrace for WHand != 0/4; Engine.dll \
+             ?execGetFireStart@AWeapon",
+            weapon_get_fire_start,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "returns Inv.PlayerViewOffset; the engine combines it with the mesh eye offset and \
+             view bob",
+        ),
+        ..def(
+            "Engine.Pawn.CalcDrawOffset",
+            "native(0) simulated native function Vector CalcDrawOffset(object<Inventory> Inv)",
+            "engine.u Pawn.CalcDrawOffset decoded (Inventory, return Vector, native); \
+             XIIIWeapon.Active.BeginState calls it to place the first-person weapon; Engine.dll \
+             ?execCalcDrawOffset@APawn",
+            pawn_calc_draw_offset,
+        )
+    });
+    // `Color` operators (native 549-552). The HUD widget draw path (`HudState.DrawStt` ->
+    // `XIIIBaseHud.DrawHUD`) multiplies/tints colors; before these the HUD `PostRender`
+    // suspended on `Actor.Multiply_ColorFloat`. UE2 `FColor` scalar/vector arithmetic
+    // (truncate then clamp to 0..255).
+    v.push(def(
+        "Engine.Actor.Multiply_ColorFloat",
+        "native(552) final native operator static function Color Multiply_ColorFloat(struct<Color> A, float B)",
+        "engine.u Actor.Multiply_ColorFloat decoded; UE2 FColor::operator*(float), componentwise, clamped",
+        multiply_color_float,
+    ));
+    v.push(def(
+        "Engine.Actor.Multiply_FloatColor",
+        "native(550) final native operator static function Color Multiply_FloatColor(float A, struct<Color> B)",
+        "engine.u Actor.Multiply_FloatColor decoded; UE2 FColor::operator*(float) operand order, clamped",
+        multiply_float_color,
+    ));
+    v.push(def(
+        "Engine.Actor.Add_ColorColor",
+        "native(551) final native operator static function Color Add_ColorColor(struct<Color> A, struct<Color> B)",
+        "engine.u Actor.Add_ColorColor decoded; UE2 FColor::operator+(FColor), componentwise, clamped",
+        add_color_color,
+    ));
+    v.push(def(
+        "Engine.Actor.Subtract_ColorColor",
+        "native(549) final native operator static function Color Subtract_ColorColor(struct<Color> A, struct<Color> B)",
+        "engine.u Actor.Subtract_ColorColor decoded; UE2 FColor::operator-(FColor), componentwise, clamped",
+        subtract_color_color,
+    ));
+    // Campaign-suspension fixes (item3n): natives reached by the campaign survey after the VM
+    // fixes. Kept in one block so parallel registry edits stay out of the way.
+    v.push(def(
+        "Object.GetAxes",
+        "native(229) final native static function GetAxes(rotator A, out vector X, out vector Y, out vector Z)",
+        "core.u Object.GetAxes decoded; UE2 FRotationMatrix basis (X forward, Y right, Z up); engine.Pawn.TossWeapon 0x0014",
+        get_axes,
+    ));
+    v.push(def(
+        "Engine.Actor.StopAnimating",
+        "native(417) final function StopAnimating()",
+        "engine.u Actor.StopAnimating decoded; engine.Inventory.DropFrom 0x003A stops the dropped item's animation",
+        stop_animating,
+    ));
+    let snow_natives: [(&'static str, &'static str, NativeFn); 6] = [
+        (
+            "LevelInfo.InitRndCubeSpr",
+            "native(0) simulated function InitRndCubeSpr(object<Texture> Texture, int MaxNbrSpr, float PropSprUsed, float Distance)",
+            init_rnd_cube_spr,
+        ),
+        (
+            "LevelInfo.SetRndCubeSprSize",
+            "native(0) simulated function SetRndCubeSprSize(float NewSpriteSize, float NewSpriteSizeMax, bool IsMask)",
+            set_rnd_cube_spr_size,
+        ),
+        (
+            "LevelInfo.SetRndCubeSprSpeed",
+            "native(0) simulated function SetRndCubeSprSpeed(vector Speed, float RandomSpeed, float RandomAcc)",
+            set_rnd_cube_spr_speed,
+        ),
+        (
+            "LevelInfo.AddRndCubeSprExclude",
+            "native(0) simulated function AddRndCubeSprExclude(vector Min, vector Max)",
+            add_rnd_cube_spr_exclude,
+        ),
+        (
+            "LevelInfo.SetRndCubeSprState",
+            "native(0) simulated function SetRndCubeSprState(bool Activate)",
+            set_rnd_cube_spr_state,
+        ),
+        (
+            "LevelInfo.ChangeRndCubeSprProp",
+            "native(0) simulated function bool ChangeRndCubeSprProp(float Proportion, float FadeSpeed, float NbrSprFadePerLoop)",
+            change_rnd_cube_spr_prop,
+        ),
+    ];
+    for (path, sig, f) in snow_natives {
+        v.push(NativeDef {
+            status: NativeStatus::Partial(
+                "no particle subsystem: the call is recorded in the trace and never silently accepted",
+            ),
+            ..def(
+                path,
+                sig,
+                "engine.u LevelInfo.RndCubeSpr* decoded; xidmaps.Map06_HualparBase.StartSnow calls them",
+                f,
+            )
+        });
+    }
+    // Canvas draw-recording natives (`crates/xiii-script/src/canvas.rs`). Kept in one block so a
+    // parallel edit to the registry stays out of the way.
+    v.extend(crate::canvas::canvas_defs());
+    // Cinematic/dialogue natives (`crates/xiii-script/src/cinematics.rs`). Kept in one block so a
+    // parallel edit to the registry stays out of the way.
+    v.extend(crate::cinematics::cinematic_defs());
+    // Cartoon-panel natives (`crates/xiii-script/src/cartoon.rs`). Kept in one block so a
+    // parallel edit to the registry stays out of the way.
+    v.extend(crate::cartoon::cartoon_defs());
     // Paths are matched without the package ("Class.Function"): strip it.
     for d in &mut v {
         if let Some(rest) = d.path.strip_prefix("Engine.") {

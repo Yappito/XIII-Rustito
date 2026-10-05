@@ -7,6 +7,9 @@
 //! overlay shows the object path under the crosshair and every import counter, including
 //! skipped/failed categories. This is an importer diagnostic, not a playable mission.
 
+pub mod decals;
+pub mod fog;
+pub mod particles;
 pub mod skinned;
 
 use std::collections::HashSet;
@@ -16,10 +19,13 @@ use std::time::{Duration, Instant};
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::RenderLayers;
+use bevy::core_pipeline::prepass::DepthPrepass;
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::math::Affine2;
 use bevy::mesh::Indices;
+use bevy::pbr::DistanceFog;
+use bevy::pbr::decal::ForwardDecalMaterial;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
     Extent3d, Face, PrimitiveTopology, TextureDimension, TextureFormat,
@@ -82,6 +88,8 @@ struct OverlayText;
 #[derive(Component)]
 pub(crate) struct SkyCamera {
     pub(crate) position: Vec3,
+    /// Sky zone index whose fog this camera uses.
+    pub(crate) sky_zone: Option<u8>,
 }
 
 #[derive(Resource)]
@@ -121,11 +129,20 @@ impl Plugin for ViewerPlugin {
         })
         .init_resource::<ShotFlag>()
         .init_resource::<PickData>()
+        .insert_resource(fog::FogDisabled(fog::fog_disabled()))
+        .add_plugins(particles::ParticlePlugin)
         .add_systems(Startup, setup)
         .add_systems(
             Update,
             (
-                fly_look, fly_move, sky_follow, animate_uv, pick, overlay, unattended,
+                fly_look,
+                fly_move,
+                sky_follow,
+                animate_uv,
+                fog::update_fog,
+                pick,
+                overlay,
+                unattended,
             )
                 .chain(),
         );
@@ -222,13 +239,16 @@ pub(crate) fn animate_uv(
     time: Res<Time>,
     animated: Query<&AnimatedUv>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut perf: ResMut<crate::perf::Perf>,
 ) {
+    let t0 = Instant::now();
     let t = time.elapsed_secs();
     for a in &animated {
         if let Some(mut mat) = materials.get_mut(&a.material) {
             mat.uv_transform = uv_affine(&a.ops, t);
         }
     }
+    perf.span("animate_uv", t0);
 }
 
 fn image_from(t: &xiii_world::SceneTexture) -> Image {
@@ -299,6 +319,11 @@ pub(crate) fn scene_sky_position(scene: &WorldScene) -> Option<Vec3> {
         .map(Vec3::from_array)
 }
 
+/// First sky zone index of a scene, for the sky camera's fog selection.
+pub(crate) fn scene_sky_zone(scene: &WorldScene) -> Option<u8> {
+    scene.sky_zones.first().map(|z| *z as u8)
+}
+
 /// Whether the sky camera should be spawned: a sky zone exists and `XIII_VIEWER_NO_SKY` is
 /// unset (`XIII_VIEWER_NO_SKY` disables it for before/after comparison captures).
 pub(crate) fn sky_camera_enabled(position: &Option<Vec3>) -> bool {
@@ -321,7 +346,7 @@ pub(crate) fn main_camera_config(sky_enabled: bool) -> Camera {
 
 /// Spawns the second, sky-only camera at a fixed sky-zone position (its rotation is copied from
 /// the main camera every frame by [`sky_follow`]). Shared by the map viewer and `--play`.
-pub(crate) fn spawn_sky_camera(commands: &mut Commands, position: Vec3) {
+pub(crate) fn spawn_sky_camera(commands: &mut Commands, position: Vec3, sky_zone: Option<u8>) {
     commands.spawn((
         Camera3d::default(),
         Camera {
@@ -330,8 +355,10 @@ pub(crate) fn spawn_sky_camera(commands: &mut Commands, position: Vec3) {
             ..default()
         },
         RenderLayers::layer(SKY_LAYER),
+        DistanceFog::default(),
+        AmbientLight::default(),
         Transform::from_translation(position),
-        SkyCamera { position },
+        SkyCamera { position, sky_zone },
     ));
 }
 
@@ -355,7 +382,8 @@ pub(crate) fn spawn_scene_geometry(
     images: &mut Assets<Image>,
     scene: &WorldScene,
     baked: bool,
-) -> Vec<Entity> {
+    force_particles: bool,
+) -> (Vec<Entity>, Vec<Handle<Image>>) {
     let image_handles: Vec<Handle<Image>> = scene
         .textures
         .iter()
@@ -428,7 +456,16 @@ pub(crate) fn spawn_scene_geometry(
         }
         entities.push(entity);
     }
-    entities
+    particles::spawn_particles(
+        commands,
+        meshes,
+        materials,
+        images,
+        &image_handles,
+        scene,
+        force_particles,
+    );
+    (entities, image_handles)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -438,6 +475,7 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut decal_materials: ResMut<Assets<ForwardDecalMaterial<StandardMaterial>>>,
     mut pick: ResMut<PickData>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -458,14 +496,38 @@ fn setup(
     } else {
         0
     };
-    let _geometry = spawn_scene_geometry(
+    let (geometry, image_handles) = spawn_scene_geometry(
         &mut commands,
         &mut meshes,
         &mut materials,
         &mut images,
         &scene,
         baked,
+        cfg.options.particles == crate::cli::Particles::All,
     );
+    // Projector decals: one per static map-placed `Projector`/`ShadowProjector`.
+    let projection_assets =
+        decals::setup_projector_assets(&mut images, &image_handles, &scene, &mut decal_materials);
+    let decals_spawned = decals::spawn_static_projectors(
+        &mut commands,
+        &scene,
+        &projection_assets,
+        &mut decal_materials,
+    );
+    commands.insert_resource(projection_assets);
+    commands.insert_resource(fog::FogContext::new(&scene));
+    let scene_tris: usize = scene
+        .objects
+        .iter()
+        .map(|o| scene.meshes[o.mesh].indices.len() / 3)
+        .sum();
+    commands.insert_resource(crate::perf::RenderStats::new(
+        scene.objects.len(),
+        geometry.len(),
+        meshes.len(),
+        materials.len(),
+        scene_tris,
+    ));
     for o in &scene.objects {
         // CPU triangles for picking.
         let transform = transform_from(&o.transform);
@@ -521,10 +583,24 @@ fn setup(
     // `XIII_VIEWER_NO_SKY` disables the sky camera for before/after comparison captures.
     let sky_position = scene_sky_position(&scene);
     let sky_enabled = sky_camera_enabled(&sky_position);
+    // The main camera carries its zone's fog/ambient each frame (`fog::update_fog`) and the
+    // depth prepass the forward decals need.
+    let start_params = scene
+        .fog
+        .params_at(pos.to_array(), scene_sky_zone(&scene))
+        .cloned()
+        .unwrap_or_else(xiii_world::fog::FogParams::none);
     commands.spawn((
         Camera3d::default(),
         main_camera_config(sky_enabled),
         RenderLayers::layer(MAIN_LAYER),
+        DepthPrepass,
+        fog::distance_fog(&start_params),
+        fog::ambient_light(&start_params).unwrap_or_else(|| AmbientLight {
+            color: Color::NONE,
+            brightness: 0.0,
+            ..default()
+        }),
         Transform::from_translation(pos).with_rotation(Quat::from_euler(
             EulerRot::YXZ,
             yaw,
@@ -538,9 +614,8 @@ fn setup(
         },
     ));
     if sky_enabled && let Some(sky_position) = sky_position {
-        spawn_sky_camera(&mut commands, sky_position);
+        spawn_sky_camera(&mut commands, sky_position, scene_sky_zone(&scene));
     }
-
     let mut lines = Vec::new();
     let tris: usize = scene
         .objects
@@ -578,8 +653,26 @@ fn setup(
         lines.push(format!("{v:>6} {k}"));
     }
     for z in &scene.zones {
+        let p = scene.fog.params_for_zone(z.index as u8);
+        let fog = match p {
+            Some(f) if f.is_fogged() => {
+                let (s, e) = f.distances_m().unwrap_or((0.0, 0.0));
+                format!(
+                    "fog {s:.1}-{e:.1} m bgr({:.2},{:.2},{:.2})",
+                    f.to_bgr()[0],
+                    f.to_bgr()[1],
+                    f.to_bgr()[2]
+                )
+            }
+            Some(_) => "fog off".to_owned(),
+            None => "fog ?".to_owned(),
+        };
+        let amb = p
+            .and_then(|f| f.ambient.linear_rgb())
+            .map(|c| format!("ambient({:.2},{:.2},{:.2})", c[0], c[1], c[2]))
+            .unwrap_or_else(|| "ambient none".to_owned());
         lines.push(format!(
-            "zone {} {} {} | polygons {} objects {}{}",
+            "zone {} {} {} | polygons {} objects {} | {fog} | {amb}{}",
             z.index,
             if z.is_sky { "SKY" } else { "playable" },
             z.actor_path.as_deref().unwrap_or("(none)"),
@@ -590,6 +683,21 @@ fn setup(
                 .unwrap_or_default()
         ));
     }
+    lines.push(format!(
+        "fog zones {} (fogged {} unfogged {} from-class-default {} disabled-by-map {}) | projectors map-placed {} (shadow {}) decals spawned {}",
+        scene.fog.params.len(),
+        scene.fog.params.iter().filter(|p| p.is_fogged()).count(),
+        scene.fog.unfogged,
+        scene.fog.from_class_default,
+        scene.fog.disabled_by_map,
+        scene.projectors.len(),
+        scene
+            .projectors
+            .iter()
+            .filter(|p| xiii_world::projectors::ProjectorDef::is_shadow_class(&p.def.class_path))
+            .count(),
+        decals_spawned,
+    ));
     if let Some(p) = sky_position {
         lines.push(format!(
             "sky camera at ({:.1}, {:.1}, {:.1}) m",
@@ -611,6 +719,22 @@ fn setup(
         yaw.to_degrees(),
         pitch.to_degrees()
     );
+    if let Some(z) = scene.fog.zone_of_point(pos.to_array()) {
+        match scene.fog.params_for_zone(z) {
+            Some(p) if p.is_fogged() => {
+                let (s, e) = p.distances_m().unwrap_or((0.0, 0.0));
+                println!(
+                    "[viewer] camera start zone {z} fog {s:.1}-{e:.1} m bgr({:.2},{:.2},{:.2})",
+                    p.to_bgr()[0],
+                    p.to_bgr()[1],
+                    p.to_bgr()[2]
+                );
+            }
+            _ => println!("[viewer] camera start zone {z} has no fog"),
+        }
+    } else {
+        println!("[viewer] camera start point is outside the BSP zone tree");
+    }
     commands.insert_resource(ImportSummary {
         title: format!(
             "XIII map viewer (diagnostic) - {}",
@@ -768,7 +892,13 @@ fn ray_tri(o: Vec3, d: Vec3, t: &[Vec3; 3]) -> Option<f32> {
     (dist > 0.0).then_some(dist)
 }
 
-fn pick(data: Res<PickData>, mut state: ResMut<RunState>, cams: Query<&Transform, With<FlyCam>>) {
+fn pick(
+    data: Res<PickData>,
+    mut state: ResMut<RunState>,
+    cams: Query<&Transform, With<FlyCam>>,
+    mut perf: ResMut<crate::perf::Perf>,
+) {
+    let t0 = Instant::now();
     state.frame += 1;
     if state.frame % 6 != 1 {
         return;
@@ -795,6 +925,7 @@ fn pick(data: Res<PickData>, mut state: ResMut<RunState>, cams: Query<&Transform
         Some((dist, path)) => format!("{path} @ {dist:.1} m"),
         None => "-".into(),
     };
+    perf.span("pick", t0);
 }
 
 fn overlay(
@@ -802,8 +933,11 @@ fn overlay(
     state: Res<RunState>,
     cams: Query<&Transform, With<FlyCam>>,
     sky_cams: Query<&SkyCamera>,
+    emitters: Query<&particles::ParticleEmitterRender>,
+    mut perf: ResMut<crate::perf::Perf>,
     mut text: Query<&mut Text, With<OverlayText>>,
 ) {
+    let t0 = Instant::now();
     let (Some(summary), Ok(mut text)) = (summary, text.single_mut()) else {
         return;
     };
@@ -819,8 +953,14 @@ fn overlay(
         })
         .unwrap_or_default();
     let mut s = format!(
-        "{}\ncamera {:.1} {:.1} {:.1} m{sky} | problems (skip./fail. counters): {}\ncrosshair: {}\n",
-        summary.title, cam.x, cam.y, cam.z, summary.problems, state.picked
+        "{}\ncamera {:.1} {:.1} {:.1} m{sky} | problems (skip./fail. counters): {} | live particles {}\ncrosshair: {}\n",
+        summary.title,
+        cam.x,
+        cam.y,
+        cam.z,
+        summary.problems,
+        particles::live_particle_count(&emitters),
+        state.picked
     );
     for l in &summary.lines {
         s.push_str(l);
@@ -828,6 +968,7 @@ fn overlay(
     }
     s.push_str("WASD/QE move, Shift fast, RMB look, Esc quit. Baked vertex lighting modulates the texture (--lighting off to compare); magenta = unresolved material.");
     text.0 = s;
+    perf.span("overlay", t0);
 }
 
 fn unattended(
@@ -835,6 +976,7 @@ fn unattended(
     cfg: Res<ViewerConfig>,
     mut state: ResMut<RunState>,
     flag: Res<ShotFlag>,
+    mut perf: ResMut<crate::perf::Perf>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let Some(secs) = cfg.options.exit_after_secs else {
@@ -876,6 +1018,7 @@ fn unattended(
         }
     );
     println!("[viewer] crosshair at exit: {}", state.picked);
+    perf.request_final();
     exit.write(AppExit::Success);
 }
 
