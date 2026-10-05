@@ -778,6 +778,29 @@ fn kind_from_display(s: &str) -> String {
         .to_owned()
 }
 
+/// `(representative cause, script site)` from a suspended actor's error text. The display is
+/// `script error: Kind { .. }\n  at Package.Class.Function [Actor] code 0x..`; the site is the
+/// `Package.Class.Function` token after the first `at `.
+fn suspension_location(error: &str) -> (String, String) {
+    let mut lines = error.lines();
+    let cause = lines.next().unwrap_or(error).trim().to_owned();
+    let site = lines
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("at "))
+        .map(|rest| rest.split_whitespace().next().unwrap_or(rest).to_owned())
+        .unwrap_or_else(|| "-".to_owned());
+    (cause, site)
+}
+
+/// Actor class (`Package.Class`) from a `Package.Class.Function[.State]` site.
+fn class_from_site(site: &str) -> String {
+    let mut parts = site.split('.');
+    match (parts.next(), parts.next()) {
+        (Some(pkg), Some(class)) => format!("{pkg}.{class}"),
+        _ => "-".to_owned(),
+    }
+}
+
 /// The `VmErrorKind` variant name (`UnimplementedNative`, `NoPhysicsProvider`, ...).
 pub fn error_kind_name(k: &VmErrorKind) -> String {
     let name = match k {
@@ -843,6 +866,25 @@ pub struct CounterRank {
     pub count: usize,
 }
 
+/// One campaign-wide suspension cause: an error kind at a script location.
+#[derive(Debug, Clone)]
+pub struct SuspensionRank {
+    /// Error kind name (`UnsupportedValue`, `TypeMismatch`, ...).
+    pub kind: String,
+    /// Representative error summary (first line, map-specific object name kept).
+    pub cause: String,
+    /// Script location that suspended (`Package.Class.Function`), or `-`.
+    pub site: String,
+    /// Actor class derived from `site` (`Package.Class`), or `-`.
+    pub actor_class: String,
+    /// Number of maps that hit it.
+    pub maps: usize,
+    /// Total suspended occurrences across the campaign.
+    pub count: usize,
+    /// First map (in sweep order) that hit it.
+    pub first_map: String,
+}
+
 /// Campaign-wide aggregates.
 #[derive(Debug, Clone, Default)]
 pub struct Aggregate {
@@ -858,6 +900,8 @@ pub struct Aggregate {
     pub total_ms: f64,
     /// Missing-native ranking by (maps, hits).
     pub missing_rank: Vec<MissingRank>,
+    /// Campaign-wide suspension causes, by (maps, count).
+    pub suspension_rank: Vec<SuspensionRank>,
     /// Import problem counters by total count.
     pub import_rank: Vec<CounterRank>,
     /// Maps sorted by total measured time (slowest first).
@@ -867,6 +911,9 @@ pub struct Aggregate {
 /// Per-native aggregation tuple: maps that hit it, total hits, first map, first site, index.
 type MissingAcc = (BTreeSet<String>, u64, String, String, Option<u16>);
 
+/// Per-suspension aggregation tuple: maps that hit it, occurrences, first map, cause.
+type SuspensionAcc = (BTreeSet<String>, usize, String, String);
+
 /// Builds the aggregate from per-map results.
 pub fn aggregate(results: &[MapResult]) -> Aggregate {
     let mut a = Aggregate {
@@ -875,6 +922,8 @@ pub fn aggregate(results: &[MapResult]) -> Aggregate {
     };
     // Missing natives: path -> (set of maps, hits, first map, first site, index).
     let mut missing: BTreeMap<String, MissingAcc> = BTreeMap::new();
+    // Suspensions: (kind, site) -> (set of maps, count, first map, representative cause).
+    let mut suspensions: BTreeMap<(String, String), SuspensionAcc> = BTreeMap::new();
     let mut counters: BTreeMap<String, (BTreeSet<String>, usize)> = BTreeMap::new();
     for m in results {
         a.total_ms += m.total_ms;
@@ -907,6 +956,14 @@ pub fn aggregate(results: &[MapResult]) -> Aggregate {
                     e.3 = n.first_site.clone();
                 }
             }
+            for a in &s.suspended {
+                let (cause, site) = suspension_location(&a.error);
+                let e = suspensions
+                    .entry((a.kind.clone(), site))
+                    .or_insert_with(|| (BTreeSet::new(), 0, m.map.clone(), cause));
+                e.0.insert(m.map.clone());
+                e.1 += 1;
+            }
         }
     }
     a.missing_rank = missing
@@ -927,6 +984,26 @@ pub fn aggregate(results: &[MapResult]) -> Aggregate {
             .cmp(&x.maps)
             .then(y.hits.cmp(&x.hits))
             .then(x.path.cmp(&y.path))
+    });
+    a.suspension_rank = suspensions
+        .into_iter()
+        .map(
+            |((kind, site), (maps, count, first_map, cause))| SuspensionRank {
+                kind,
+                cause,
+                actor_class: class_from_site(&site),
+                site,
+                maps: maps.len(),
+                count,
+                first_map,
+            },
+        )
+        .collect();
+    a.suspension_rank.sort_by(|x, y| {
+        y.maps
+            .cmp(&x.maps)
+            .then(y.count.cmp(&x.count))
+            .then(x.site.cmp(&y.site))
     });
     a.import_rank = counters
         .into_iter()
@@ -1023,6 +1100,10 @@ impl Aggregate {
             "missing_native_ranking": self.missing_rank.iter().map(|m| json!({
                 "path": m.path, "index": opt_index(m.index), "maps": m.maps, "hits": m.hits,
                 "first_map": m.first_map, "first_site": m.first_site,
+            })).collect::<Vec<_>>(),
+            "suspension_ranking": self.suspension_rank.iter().map(|s| json!({
+                "kind": s.kind, "cause": s.cause, "site": s.site, "actor_class": s.actor_class,
+                "maps": s.maps, "count": s.count, "first_map": s.first_map,
             })).collect::<Vec<_>>(),
             "import_problem_ranking": self.import_rank.iter().map(|c| json!({
                 "key": c.key, "maps": c.maps, "count": c.count,
@@ -1146,6 +1227,34 @@ pub fn report_markdown(r: &CampaignReport) -> String {
         }
         let _ = writeln!(out);
     }
+    let _ = writeln!(
+        out,
+        "## Campaign-wide suspension causes (top 20, by maps then count)"
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "| # | kind | actor class | site | maps | count | first map | cause |"
+    );
+    let _ = writeln!(out, "|---:|---|---|---|---:|---:|---|---|");
+    if r.aggregate.suspension_rank.is_empty() {
+        let _ = writeln!(out, "| — | none |  |  |  |  |  |  |");
+    }
+    for (i, s) in r.aggregate.suspension_rank.iter().take(20).enumerate() {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            i + 1,
+            s.kind,
+            s.actor_class,
+            s.site,
+            s.maps,
+            s.count,
+            s.first_map,
+            s.cause.replace('|', "\\|")
+        );
+    }
+    let _ = writeln!(out);
     let _ = writeln!(out, "## Campaign-wide missing natives (by maps, then hits)");
     let _ = writeln!(out);
     let _ = writeln!(out, "| # | native | index | maps | hits | first site |");
@@ -1367,6 +1476,25 @@ mod tests {
             "UnimplementedNative"
         );
         assert_eq!(kind_from_display("no prefix Other(\"x\")"), "no");
+    }
+
+    #[test]
+    fn suspension_location_parses_cause_site_and_actor_class() {
+        let err = "script error: UnsupportedValue { desc: \"context on uninstantiated object \
+                   Plage01.SpriteEmitter135\" }\n  at xidcine.TrigerredEmitter.PostBeginPlay \
+                   [TrigerredEmitter0] code 0x0017\n";
+        let (cause, site) = suspension_location(err);
+        assert!(cause.starts_with("script error: UnsupportedValue"));
+        assert_eq!(site, "xidcine.TrigerredEmitter.PostBeginPlay");
+        assert_eq!(class_from_site(&site), "xidcine.TrigerredEmitter");
+        // A state function keeps the class prefix.
+        assert_eq!(
+            class_from_site("xiii.XIIICorpseStaticMesh.Dead.BeginState"),
+            "xiii.XIIICorpseStaticMesh"
+        );
+        // An error with no stack yields a `-` site.
+        let (_, site) = suspension_location("script error: Other(\"x\")");
+        assert_eq!(site, "-");
     }
 
     /// A chain builder: the campaign is a linked list; a repeated link must terminate.

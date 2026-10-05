@@ -2238,11 +2238,19 @@ impl<'s> Vm<'s> {
         Ok(id)
     }
 
-    /// Instantiates every actor export of a loaded map package (two passes: create, then
-    /// apply the map's tagged properties). Returns the created ids in export order.
+    /// Instantiates every script-class export of a loaded map package (two passes: create, then
+    /// apply the map's tagged properties). Returns the created Actor ids in export order; non-actor
+    /// subobjects are created and property-loaded but not returned for lifecycle.
     pub fn load_level(&mut self, map: usize, limits: &Limits) -> VmResult<Vec<ObjectId>> {
         let set = self.set;
         let p = &set.packages[map];
+        // Every map export whose class resolves to a script class is instantiated: not only
+        // `Actor`s but also their non-actor subobjects, which UE2 serialises as top-level map
+        // exports (e.g. the `Engine.SpriteEmitter` elements of an `Emitter.Emitters` array).
+        // Only the Actor-derived instances are returned for lifecycle; the rest exist so script
+        // property access on them (`.Disabled = ...`) resolves to an instance, not a static
+        // reference. Evidence: `xidcine.TrigerredEmitter.PostBeginPlay` walks `Emitters[i]`.
+        let mut actors = Vec::new();
         let mut created = Vec::new();
         for (i, e) in p.package.exports().iter().enumerate() {
             let Some(class) = set.resolve(map, e.class) else {
@@ -2251,10 +2259,14 @@ impl<'s> Vm<'s> {
             if !matches!(set.object(class), Some(ScriptObject::Class(_))) {
                 continue;
             }
-            let layout = self.class_layout(class)?;
-            if !layout.chain_names.iter().any(|n| n == "actor") || e.serial_size == 0 {
+            if e.serial_size == 0 {
                 continue;
             }
+            let is_actor = self
+                .class_layout(class)?
+                .chain_names
+                .iter()
+                .any(|n| n == "actor");
             let name = p.ref_name(ObjectRef::Export(i as u32)).to_owned();
             let id = self.spawn(class, &name)?;
             let g = GlobalRef {
@@ -2264,6 +2276,9 @@ impl<'s> Vm<'s> {
             self.objects[id as usize].export = Some(g);
             self.by_export.insert(g, id);
             created.push(id);
+            if is_actor {
+                actors.push(id);
+            }
         }
         for &id in &created {
             let g = self.objects[id as usize].export.expect("set above");
@@ -2281,7 +2296,7 @@ impl<'s> Vm<'s> {
             self.apply_block(map, &props.block, &layout, &mut values);
             self.objects[id as usize].props = values;
         }
-        Ok(created)
+        Ok(actors)
     }
 
     /// Object id by display name (case-insensitive).
@@ -4027,11 +4042,11 @@ impl<'s> Vm<'s> {
     }
 
     /// Property object referenced directly by a variable token.
-    fn member_property(&self, frame: &Frame<'s>, member: &Token) -> Option<GlobalRef> {
+    fn member_property(&self, pkg: usize, member: &Token) -> Option<GlobalRef> {
         use TokenKind as K;
         match &member.kind {
             K::InstanceVariable(r) | K::DefaultVariable(r) | K::LocalVariable(r) => {
-                self.set.resolve(frame.pkg, *r)
+                self.set.resolve(pkg, *r)
             }
             _ => None,
         }
@@ -4039,21 +4054,35 @@ impl<'s> Vm<'s> {
 
     /// Static class of an object-typed token (`self`, a class literal, a variable whose declared
     /// type is an object/class, or a chained context), when it can be determined.
-    fn context_object_class(&self, frame: &Frame<'s>, t: &Token) -> Option<GlobalRef> {
+    pub(crate) fn context_object_class(
+        &self,
+        pkg: usize,
+        this: ObjectId,
+        t: &Token,
+    ) -> Option<GlobalRef> {
         use TokenKind as K;
         match &t.kind {
-            K::SelfRef => Some(self.objects[frame.this as usize].class),
+            K::SelfRef => Some(self.objects[this as usize].class),
             K::ObjectConst(r) => {
-                let g = self.set.resolve(frame.pkg, *r)?;
+                let g = self.set.resolve(pkg, *r)?;
                 matches!(self.set.object(g), Some(ScriptObject::Class(_))).then_some(g)
             }
             K::Context(c) => {
                 // The context object must itself be an object; then the member's declared type
                 // is the result class.
-                self.context_object_class(frame, &c.object)?;
-                self.property_class(self.member_property(frame, &c.member)?)
+                self.context_object_class(pkg, this, &c.object)?;
+                self.property_class(self.member_property(pkg, &c.member)?)
             }
-            _ => self.property_class(self.member_property(frame, t)?),
+            // `Pawn(Other)`-style class cast: the result's static type is the cast target, so a
+            // function call through a `None` cast (a failed dynamic cast) must resolve its return
+            // type there. Without this, `Pawn(Other).IsPlayerPawn()` on a non-pawn `Other` fell
+            // back to the calling actor's class, found no such function and yielded `void`,
+            // suspending `xiii.ZigouillateurTrigger.Touch` / `engine.Ammunition.AddAmmo`.
+            K::DynamicCast { class, .. } => {
+                let g = self.set.resolve(pkg, *class)?;
+                matches!(self.set.object(g), Some(ScriptObject::Class(_))).then_some(g)
+            }
+            _ => self.property_class(self.member_property(pkg, t)?),
         }
     }
 
@@ -4073,7 +4102,7 @@ impl<'s> Vm<'s> {
     /// return type of a called function found in the object expression's static class.
     fn zero_of_context(&mut self, frame: &Frame<'s>, c: &Context, target: ObjectId) -> Value {
         use TokenKind as K;
-        if let Some(g) = self.member_property(frame, &c.member)
+        if let Some(g) = self.member_property(frame.pkg, &c.member)
             && let Some(ScriptObject::Property(p)) = self.set.object(g)
         {
             return self.ty_of(g.package, &p.kind, 0).zero();
@@ -4095,7 +4124,7 @@ impl<'s> Vm<'s> {
             _ => return self.zero_for(frame, &c.member, target),
         };
         let class = self
-            .context_object_class(frame, &c.object)
+            .context_object_class(frame.pkg, frame.this, &c.object)
             .or_else(|| Some(self.objects[target as usize].class));
         let f = class.and_then(|c| {
             self.class_chain(c)
@@ -4434,7 +4463,7 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn primitive_cast(&self, cast: u8, v: Value) -> VmResult<Value> {
+    pub(crate) fn primitive_cast(&self, cast: u8, v: Value) -> VmResult<Value> {
         // UE2 conversion codes (ECastToken), confirmed on corpus uses (0x3F int->float on
         // ints, 0x44 float->int, 0x53/0x56/0x57 to string on int/object/name operands).
         let bad = |s: &Self, v: &Value| s.type_err("castable value", v);
@@ -4477,6 +4506,31 @@ impl<'s> Vm<'s> {
             (0x56, Value::Object(Some(r))) => Value::Str(self.obj_label(r)),
             (0x56, Value::NativeClass(n)) => Value::Str(n.clone()),
             (0x57, Value::Name(n)) => Value::Str(n.clone()),
+            // UE2 `VectorToRotator` (ECastToken 0x50): the rotator whose Pitch/Yaw point along
+            // the vector, Roll always 0; the zero vector yields the zero rotator. Decoded call
+            // sites pass a direction vector as the `Spawn`/`SetRotation` rotation
+            // (`xiii.XIIICorpseStaticMesh.Dead.BeginState` 0x003E,
+            // `xidpawn.CameraDeSurveillance.SurveillCamMoving.BeginState` 0x0016). Semantics:
+            // BeyondUnreal "Typecast" (vector to rotator) and UE2 `FVector::Rotation`
+            // (`yaw = atan2(Y,X)`, `pitch = atan2(Z, |XY|)`), 65536 units per turn.
+            (0x50, Value::Vector(v)) => {
+                let to_units = 65536.0 / std::f32::consts::TAU;
+                let yaw = (v[1].atan2(v[0]) * to_units).round() as i32;
+                let pitch =
+                    (v[2].atan2((v[0] * v[0] + v[1] * v[1]).sqrt()) * to_units).round() as i32;
+                Value::Rotator([pitch, yaw, 0])
+            }
+            // UE2 `VectorToString` (0x58): comma-separated X,Y,Z with the same 2-decimal float
+            // format as `FloatToString`; decoded at `xidmaps.Spads01.FirstFrame` 0x0045
+            // (`Log("SpotOffset" @ string(vector))`). BeyondUnreal "Typecast".
+            (0x58, Value::Vector(v)) => Value::Str(format!("{:.2},{:.2},{:.2}", v[0], v[1], v[2])),
+            // UE2 `RotatorToString` (0x59): Pitch,Yaw,Roll each reduced to the 0..65535 range.
+            (0x59, Value::Rotator(r)) => Value::Str(format!(
+                "{},{},{}",
+                r[0] & 0xffff,
+                r[1] & 0xffff,
+                r[2] & 0xffff
+            )),
             (c, _) if !(0x39..=0x59).contains(&c) => return Err(bad(self, &v)),
             _ => {
                 return Err(self.err(VmErrorKind::Other(format!(
@@ -6162,6 +6216,16 @@ impl<'s> Vm<'s> {
         self.set_property(id, "AnimFrame", 0, Value::Float(0.0));
         self.set_property(id, "bAnimFinished", 0, Value::Bool(false));
         Ok(())
+    }
+
+    /// `Actor.StopAnimating` (native 417): stop every animation channel and clear the animation
+    /// properties, like UE2 `AActor::StopAnimating`. Decoded call site
+    /// `engine.Inventory.DropFrom` 0x003A (immediately before `GotoState('None')`).
+    pub(crate) fn stop_animating(&mut self, id: ObjectId) {
+        self.objects[id as usize].anim.channels.clear();
+        self.set_property(id, "AnimSequence", 0, Value::Name("None".into()));
+        self.set_property(id, "AnimRate", 0, Value::Float(0.0));
+        self.set_property(id, "AnimFrame", 0, Value::Float(0.0));
     }
 
     /// `Actor.HasAnim`: whether any of the actor's animation sources has `sequence`.

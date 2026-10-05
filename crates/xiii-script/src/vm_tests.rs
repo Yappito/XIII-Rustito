@@ -502,7 +502,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 232);
+    assert_eq!(defs.len(), 240);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -5764,4 +5764,182 @@ fn dialogue_line_text_reads_nested_speaker_sentences() {
         crate::cinematics::line_text_from_values(0, &bad, &speakers),
         None
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// item3n: campaign-suspension fixes (cast, class-cast context, Box.IsValid, natives)
+
+#[test]
+fn vector_to_rotator_and_string_casts_match_ue2() {
+    let set = spawn_set();
+    let vm = Vm::new(&set, VmLimits::default());
+    // VectorToRotator (0x50): yaw = atan2(Y,X), pitch = atan2(Z,|XY|), roll 0; 65536 per turn.
+    assert_eq!(
+        vm.primitive_cast(0x50, Value::Vector([1.0, 0.0, 0.0]))
+            .unwrap(),
+        Value::Rotator([0, 0, 0])
+    );
+    assert_eq!(
+        vm.primitive_cast(0x50, Value::Vector([0.0, 1.0, 0.0]))
+            .unwrap(),
+        Value::Rotator([0, 16384, 0])
+    );
+    assert_eq!(
+        vm.primitive_cast(0x50, Value::Vector([0.0, 0.0, 1.0]))
+            .unwrap(),
+        Value::Rotator([16384, 0, 0])
+    );
+    // The zero vector has no direction: zero rotator (BeyondUnreal "Typecast").
+    assert_eq!(
+        vm.primitive_cast(0x50, Value::Vector([0.0, 0.0, 0.0]))
+            .unwrap(),
+        Value::Rotator([0, 0, 0])
+    );
+    // VectorToString (0x58) / RotatorToString (0x59).
+    assert_eq!(
+        vm.primitive_cast(0x58, Value::Vector([1.5, -2.0, 0.0]))
+            .unwrap(),
+        Value::Str("1.50,-2.00,0.00".into())
+    );
+    assert_eq!(
+        vm.primitive_cast(0x59, Value::Rotator([-1, 65536, 32768]))
+            .unwrap(),
+        Value::Str("65535,0,32768".into())
+    );
+    // A wrong operand type is still an explicit error, never a silent value.
+    assert!(vm.primitive_cast(0x50, Value::Int(1)).is_err());
+}
+
+#[test]
+fn context_object_class_resolves_a_class_cast_target() {
+    use crate::bytecode::{Token, TokenKind};
+    use xiii_package::ObjectRef;
+    let set = spawn_set();
+    let vm = Vm::new(&set, VmLimits::default());
+    let child = sg(&set, "Child");
+    let no_object = Token {
+        offset: 0,
+        file_offset: 0,
+        memory_size: 1,
+        opcode: 0x2A,
+        kind: TokenKind::NoObject,
+    };
+    let cast = Token {
+        offset: 0,
+        file_offset: 0,
+        memory_size: 6,
+        opcode: 0x2E,
+        kind: TokenKind::DynamicCast {
+            class: ObjectRef::Export(child.export),
+            expr: Box::new(no_object),
+        },
+    };
+    // Regression: a `DynamicCast` used to fall through to `member_property`, which is `None` for
+    // a cast, so `Pawn(Other).IsPlayerPawn()` on a failed cast resolved no return type and
+    // suspended with `TypeMismatch { expected: "bool", found: "void" }`.
+    assert_eq!(vm.context_object_class(0, 0, &cast), Some(child));
+}
+
+#[test]
+fn get_axes_fills_the_rotator_basis() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Actor"), "O").unwrap();
+    let mut a = vec![
+        Value::Rotator([0, 0, 0]),
+        Value::Vector([9.0; 3]),
+        Value::Vector([9.0; 3]),
+        Value::Vector([9.0; 3]),
+    ];
+    let out = call_native(
+        &mut vm,
+        "Object.GetAxes",
+        o,
+        &[false, false, false, false],
+        &mut a,
+    );
+    assert!(matches!(out, NativeOutcome::Value(Value::Void)));
+    assert_eq!(a[1], Value::Vector([1.0, 0.0, 0.0]));
+    assert_eq!(a[2], Value::Vector([0.0, 1.0, 0.0]));
+    assert_eq!(a[3], Value::Vector([0.0, 0.0, 1.0]));
+}
+
+#[test]
+fn get_bounding_box_reports_isvalid_as_a_byte() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Actor"), "O").unwrap();
+    vm.set_property(o, "Location", 0, Value::Vector([10.0, 20.0, 30.0]));
+    let out = call_native(&mut vm, "Engine.Actor.GetBoundingBox", o, &[], &mut []);
+    let NativeOutcome::Value(Value::Struct(members)) = out else {
+        panic!("expected a Box struct, got {out:?}");
+    };
+    let get = |n: &str| members.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone());
+    assert_eq!(get("min"), Some(Value::Vector([10.0, 20.0, 30.0])));
+    assert_eq!(get("max"), Some(Value::Vector([10.0, 20.0, 30.0])));
+    // The script reads `cast<byte->int>(Box.IsValid)`; a byte keeps that cast working.
+    assert_eq!(get("isvalid"), Some(Value::Byte(1)));
+    assert_eq!(
+        vm.primitive_cast(0x3A, Value::Byte(1)).unwrap(),
+        Value::Int(1)
+    );
+}
+
+#[test]
+fn stop_animating_clears_every_channel() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Actor"), "O").unwrap();
+    vm.objects[o as usize].anim.channels.insert(
+        0,
+        crate::vm::AnimChannel {
+            sequence: "Run".into(),
+            frames: 10,
+            rate: 30.0,
+            frame: 4.0,
+            looping: true,
+            active: true,
+            tween_remaining: 0.0,
+            notifies: Vec::new(),
+            notify_idx: 0,
+        },
+    );
+    let out = call_native(&mut vm, "Engine.Actor.StopAnimating", o, &[], &mut []);
+    assert!(matches!(out, NativeOutcome::Value(Value::Void)));
+    assert!(vm.objects[o as usize].anim.channels.is_empty());
+}
+
+#[test]
+fn snow_natives_record_and_do_not_fail() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Actor"), "L").unwrap();
+    let mut a = vec![
+        Value::Object(None),
+        Value::Int(4),
+        Value::Float(0.5),
+        Value::Float(10.0),
+    ];
+    let out = call_native(
+        &mut vm,
+        "LevelInfo.InitRndCubeSpr",
+        o,
+        &[false, false, false, false],
+        &mut a,
+    );
+    assert!(matches!(out, NativeOutcome::Value(Value::Void)));
+    assert!(vm.trace.iter().any(|e| matches!(
+        &e.kind,
+        TraceKind::Log(s) if s.contains("InitRndCubeSpr") && s.contains("no particle subsystem")
+    )));
+    // ChangeRndCubeSprProp returns false (not applied), never a silent true.
+    let mut a = vec![Value::Float(1.0), Value::Float(1.0), Value::Float(1.0)];
+    let out = call_native(
+        &mut vm,
+        "LevelInfo.ChangeRndCubeSprProp",
+        o,
+        &[false, false, false],
+        &mut a,
+    );
+    assert!(matches!(out, NativeOutcome::Value(Value::Bool(false))));
 }

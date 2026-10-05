@@ -2203,6 +2203,11 @@ fn get_bounding_box(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult
             "max".into(),
             Value::Vector([loc[0] + r, loc[1] + r, loc[2] + h]),
         ),
+        // UE2 `FBox` also carries `IsValid` (a byte; `AActor::GetBoundingBox` constructs the box
+        // valid). Script reads it as `cast<byte->int>(Box.IsValid)` before using the bounds
+        // (`xidcine.BreakableMover.ComputeDispersal` 0x0012, `xidmaps.Map06_HualparBase.StartSnow`
+        // 0x0077); omitting it made those reads fail with "no struct member isvalid".
+        ("isvalid".into(), Value::Byte(1)),
     ]))
 }
 
@@ -2539,6 +2544,89 @@ fn def(
         short_circuit: None,
         f,
     }
+}
+
+/// `Object.GetAxes` (native 229): fill the rotator's orthonormal basis into the out params
+/// X (forward), Y (right), Z (up), the same `FRotationMatrix` basis as `vector >> rotator`.
+/// Decoded call site `engine.Pawn.TossWeapon` 0x0014.
+fn get_axes(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let r = rotator2(vm, a, 0)?;
+    let (x, y, z) = rotator_basis(r);
+    if a.len() >= 4 {
+        a[1] = Value::Vector(x);
+        a[2] = Value::Vector(y);
+        a[3] = Value::Vector(z);
+    }
+    val(Value::Void)
+}
+
+/// `Actor.StopAnimating` (native 417): stop the actor's animation (all channels).
+fn stop_animating(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    vm.stop_animating(c.this);
+    val(Value::Void)
+}
+
+/// Records a `LevelInfo` snow-particle native call as a visible trace note. XIII drives its
+/// snow through the `RndCubeSpr` particle system (`xidmaps.Map06_HualparBase.StartSnow`); this
+/// runtime has no particle renderer, so the request is recorded rather than silently accepted.
+fn snow_note(vm: &mut Vm<'_>, name: &str, a: &[Value]) {
+    let args: Vec<String> = a.iter().map(|v| vm.value_text(v)).collect();
+    vm.note(crate::vm::TraceKind::Log(format!(
+        "LevelInfo.{name}({}): recorded; no particle subsystem",
+        args.join(", ")
+    )));
+}
+
+fn init_rnd_cube_spr(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    snow_note(vm, "InitRndCubeSpr", a);
+    val(Value::Void)
+}
+
+fn set_rnd_cube_spr_size(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    snow_note(vm, "SetRndCubeSprSize", a);
+    val(Value::Void)
+}
+
+fn set_rnd_cube_spr_speed(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    snow_note(vm, "SetRndCubeSprSpeed", a);
+    val(Value::Void)
+}
+
+fn add_rnd_cube_spr_exclude(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    snow_note(vm, "AddRndCubeSprExclude", a);
+    val(Value::Void)
+}
+
+fn set_rnd_cube_spr_state(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    snow_note(vm, "SetRndCubeSprState", a);
+    val(Value::Void)
+}
+
+fn change_rnd_cube_spr_prop(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    snow_note(vm, "ChangeRndCubeSprProp", a);
+    // No particle system to change: report that the change was not applied (never a silent
+    // success).
+    val(Value::Bool(false))
 }
 
 fn builtin_defs() -> Vec<NativeDef> {
@@ -4021,6 +4109,65 @@ fn builtin_defs() -> Vec<NativeDef> {
         "engine.u Actor.Subtract_ColorColor decoded; UE2 FColor::operator-(FColor), componentwise, clamped",
         subtract_color_color,
     ));
+    // Campaign-suspension fixes (item3n): natives reached by the campaign survey after the VM
+    // fixes. Kept in one block so parallel registry edits stay out of the way.
+    v.push(def(
+        "Object.GetAxes",
+        "native(229) final native static function GetAxes(rotator A, out vector X, out vector Y, out vector Z)",
+        "core.u Object.GetAxes decoded; UE2 FRotationMatrix basis (X forward, Y right, Z up); engine.Pawn.TossWeapon 0x0014",
+        get_axes,
+    ));
+    v.push(def(
+        "Engine.Actor.StopAnimating",
+        "native(417) final function StopAnimating()",
+        "engine.u Actor.StopAnimating decoded; engine.Inventory.DropFrom 0x003A stops the dropped item's animation",
+        stop_animating,
+    ));
+    let snow_natives: [(&'static str, &'static str, NativeFn); 6] = [
+        (
+            "LevelInfo.InitRndCubeSpr",
+            "native(0) simulated function InitRndCubeSpr(object<Texture> Texture, int MaxNbrSpr, float PropSprUsed, float Distance)",
+            init_rnd_cube_spr,
+        ),
+        (
+            "LevelInfo.SetRndCubeSprSize",
+            "native(0) simulated function SetRndCubeSprSize(float NewSpriteSize, float NewSpriteSizeMax, bool IsMask)",
+            set_rnd_cube_spr_size,
+        ),
+        (
+            "LevelInfo.SetRndCubeSprSpeed",
+            "native(0) simulated function SetRndCubeSprSpeed(vector Speed, float RandomSpeed, float RandomAcc)",
+            set_rnd_cube_spr_speed,
+        ),
+        (
+            "LevelInfo.AddRndCubeSprExclude",
+            "native(0) simulated function AddRndCubeSprExclude(vector Min, vector Max)",
+            add_rnd_cube_spr_exclude,
+        ),
+        (
+            "LevelInfo.SetRndCubeSprState",
+            "native(0) simulated function SetRndCubeSprState(bool Activate)",
+            set_rnd_cube_spr_state,
+        ),
+        (
+            "LevelInfo.ChangeRndCubeSprProp",
+            "native(0) simulated function bool ChangeRndCubeSprProp(float Proportion, float FadeSpeed, float NbrSprFadePerLoop)",
+            change_rnd_cube_spr_prop,
+        ),
+    ];
+    for (path, sig, f) in snow_natives {
+        v.push(NativeDef {
+            status: NativeStatus::Partial(
+                "no particle subsystem: the call is recorded in the trace and never silently accepted",
+            ),
+            ..def(
+                path,
+                sig,
+                "engine.u LevelInfo.RndCubeSpr* decoded; xidmaps.Map06_HualparBase.StartSnow calls them",
+                f,
+            )
+        });
+    }
     // Canvas draw-recording natives (`crates/xiii-script/src/canvas.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::canvas::canvas_defs());
