@@ -15,23 +15,16 @@ use std::process::ExitCode;
 use std::rc::Rc;
 
 use xiii_package::Limits;
-use xiii_script::animation::{AnimationData, FixedAnimation, SeqInfo};
-use xiii_script::linker::GlobalRef;
+use xiii_script::animation::{AnimationData, FixedAnimation};
 use xiii_script::navigation::NavigationData;
 use xiii_script::physics::{FlatPhysics, WorldPhysics};
 use xiii_script::registry::NativeStatus;
 use xiii_script::{
-    ObjRef, PresentationEvent, ScriptLimits, ScriptPackage, ScriptSet, TraceEvent, TraceKind,
-    Value, Vm, VmError, VmLimits,
+    ObjRef, PresentationEvent, ScriptSet, TraceEvent, TraceKind, Value, Vm, VmError, VmLimits,
 };
-use xiii_world::PackageCache;
-use xiii_world::animation::MapAnimationProvider;
-use xiii_world::import_map;
-use xiii_world::nav_provider::MapNavigationProvider;
-use xiii_world::physics::WorldPhysicsAdapter;
+use xiii_world::runtime::{self, AnimQuery, ProviderSpec};
 
-use crate::corpus::tagged_files;
-use crate::script_cmd::{dll_exec_symbols, load_install};
+use crate::script_cmd::dll_exec_symbols;
 
 /// Default classes executed besides the touched actor.
 pub const DEFAULT_ACTIVE_CLASSES: &[&str] = &["TouchTrigger", "XIIIDispatcher"];
@@ -223,8 +216,8 @@ pub fn run_touch_chain_with_providers(
         active_names.join(", ")
     )));
     // Synthetic player pawn as the toucher (not executed).
-    let player_class =
-        find_class(set, "xiii", "XIIIPlayerPawn").ok_or("class XIII.XIIIPlayerPawn not loaded")?;
+    let player_class = runtime::find_class(set, "xiii", "XIIIPlayerPawn")
+        .ok_or("class XIII.XIIIPlayerPawn not loaded")?;
     let player = vm
         .spawn(player_class, "XIIIPlayerPawn(synthetic)")
         .map_err(|e| e.to_string())?;
@@ -233,11 +226,11 @@ pub fn run_touch_chain_with_providers(
     'run: {
         if cfg.begin_play {
             let game_class = match cfg.game_class.as_deref() {
-                Some(path) => resolve_class_path(set, path),
+                Some(path) => runtime::resolve_class_path(set, path),
                 None => cfg
                     .default_game
                     .as_deref()
-                    .and_then(|path| resolve_class_path(set, path)),
+                    .and_then(|path| runtime::resolve_class_path(set, path)),
             };
             let Some(game_class) = game_class else {
                 return Err(
@@ -346,99 +339,6 @@ pub fn run_touch_chain_with_providers(
     })
 }
 
-fn find_class(set: &ScriptSet, package: &str, path: &str) -> Option<GlobalRef> {
-    let pi = set.package_index(package)?;
-    let export = set.packages[pi].export_by_path(path)?;
-    Some(GlobalRef {
-        package: pi,
-        export,
-    })
-}
-
-/// Resolves a `Package.Class` (or bare `Class`) path to a loaded class.
-pub fn resolve_class_path(set: &ScriptSet, path: &str) -> Option<GlobalRef> {
-    match path.split_once('.') {
-        Some((package, class)) => find_class(set, package, class),
-        None => (0..set.packages.len()).find_map(|pi| {
-            let export = set.packages[pi].export_by_path(path)?;
-            Some(GlobalRef {
-                package: pi,
-                export,
-            })
-        }),
-    }
-}
-
-/// Reads `[Engine.Engine] DefaultGame` from the installation's `Default.ini`.
-pub fn default_game_from_ini(root: &Path) -> Option<String> {
-    for name in [
-        "Default.ini",
-        "default.ini",
-        "System/Default.ini",
-        "system/Default.ini",
-    ] {
-        let path = root.join(name);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        if let Some(v) = ini_value(&text, "Engine.Engine", "DefaultGame") {
-            return Some(v);
-        }
-    }
-    None
-}
-
-fn ini_value(text: &str, section: &str, key: &str) -> Option<String> {
-    let mut in_section = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with(';') || line.starts_with('#') {
-            continue;
-        }
-        if let Some(s) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            in_section = s.eq_ignore_ascii_case(section);
-            continue;
-        }
-        if !in_section {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=')
-            && k.trim().eq_ignore_ascii_case(key)
-        {
-            let v = v.split(';').next().unwrap_or(v).trim();
-            if !v.is_empty() {
-                return Some(v.to_owned());
-            }
-        }
-    }
-    None
-}
-
-/// Finds a map file by stem under the installation (case-insensitive).
-pub fn find_map(root: &Path, map: &str) -> std::io::Result<Option<PathBuf>> {
-    Ok(tagged_files(root)?.into_iter().map(|(_, p)| p).find(|p| {
-        p.extension().is_some_and(|e| e.eq_ignore_ascii_case("unr"))
-            && p.file_stem()
-                .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(map))
-    }))
-}
-
-/// Loads the installation's `.u` packages plus one map; returns the set and the map index.
-pub fn load_with_map(root: &Path, map: &str) -> Result<(ScriptSet, usize), String> {
-    let (mut set, failures) = load_install(root).map_err(|e| e.to_string())?;
-    if let Some((rel, e)) = failures.first() {
-        return Err(format!("{rel}: {e}"));
-    }
-    let path = find_map(root, map)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("map {map} not found under {}", root.display()))?;
-    let data = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let pkg = ScriptPackage::load(map, data, &ScriptLimits::default(), &Limits::default())
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    let idx = set.add(pkg);
-    Ok((set, idx))
-}
-
 /// `--physics` value: the real map collision or the diagnostic flat floor.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PhysicsSpec {
@@ -479,46 +379,6 @@ pub fn parse_anim(spec: &str) -> Option<AnimSpec> {
     ))
 }
 
-/// One animation lookup recorded for the report.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AnimQuery {
-    /// Animation source path queried (`Package.Object`).
-    pub source: String,
-    /// Sequence name requested.
-    pub sequence: String,
-    /// `found`, `not found` or `error: ...`.
-    pub outcome: String,
-}
-
-/// Wraps an `AnimationData` provider and records every lookup, so the harness can report which
-/// sequences were requested and whether they were found (requirement of this task).
-pub struct LoggingAnim {
-    inner: Box<dyn AnimationData>,
-    log: Rc<RefCell<Vec<AnimQuery>>>,
-}
-
-impl AnimationData for LoggingAnim {
-    fn sequence(&mut self, source: &str, seq: &str) -> Result<Option<SeqInfo>, String> {
-        let result = self.inner.sequence(source, seq);
-        let outcome = match &result {
-            Ok(Some(info)) => format!(
-                "found ({} frames, {} fps, {} notifies)",
-                info.frames,
-                info.rate,
-                info.notifies.len()
-            ),
-            Ok(None) => "not found".to_owned(),
-            Err(e) => format!("error: {e}"),
-        };
-        self.log.borrow_mut().push(AnimQuery {
-            source: source.to_owned(),
-            sequence: seq.to_owned(),
-            outcome,
-        });
-        result
-    }
-}
-
 /// Optional real-map providers constructed for `--physics map` / `--anim map` / `--nav map`.
 type MapProviders = (
     Option<Box<dyn WorldPhysics>>,
@@ -526,41 +386,25 @@ type MapProviders = (
     Option<Box<dyn NavigationData>>,
 );
 
-/// Builds the optional real-map providers for `--physics map` / `--anim map` / `--nav map`. One
-/// [`PackageCache`] is opened and reused.
+/// Builds the optional real-map providers for `--physics map` / `--anim map` / `--nav map` with
+/// the shared [`xiii_world::runtime`] implementation, returning the harness's tuple shape.
 fn build_map_providers(
     root: &Path,
     map: &str,
     cfg: &RunConfig,
     anim_log: &Rc<RefCell<Vec<AnimQuery>>>,
 ) -> Result<MapProviders, String> {
-    if !cfg.physics_map && !cfg.anim_map && !cfg.nav_map {
-        return Ok((None, None, None));
-    }
-    let mut cache = PackageCache::open(root)?;
-    let physics = if cfg.physics_map {
-        let scene = import_map(&mut cache, map)?;
-        Some(Box::new(WorldPhysicsAdapter::from_scene(&scene)) as Box<dyn WorldPhysics>)
-    } else {
-        None
-    };
-    // Navigation is decoded before the animation provider consumes the cache.
-    let navigation = if cfg.nav_map {
-        let provider = MapNavigationProvider::from_cache(&mut cache, map)?;
-        Some(Box::new(provider) as Box<dyn NavigationData>)
-    } else {
-        None
-    };
-    let animation = if cfg.anim_map {
-        let provider = MapAnimationProvider::from_cache(cache);
-        Some(Box::new(LoggingAnim {
-            inner: Box::new(provider),
-            log: anim_log.clone(),
-        }) as Box<dyn AnimationData>)
-    } else {
-        None
-    };
-    Ok((physics, animation, navigation))
+    let providers = runtime::build_map_providers(
+        root,
+        map,
+        &ProviderSpec {
+            physics: cfg.physics_map,
+            animation: cfg.anim_map,
+            navigation: cfg.nav_map,
+        },
+        anim_log,
+    )?;
+    Ok((providers.physics, providers.animation, providers.navigation))
 }
 
 /// `xiii-tool script run ...`.
@@ -670,14 +514,14 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
         );
         return ExitCode::from(2);
     };
-    cfg.default_game = default_game_from_ini(&root);
+    cfg.default_game = runtime::default_game_from_ini(&root);
     if cfg.survey {
         eprintln!(
             "warning: --survey is diagnostic only: unimplemented natives are counted and \
              skipped, so the run does NOT prove the chain works"
         );
     }
-    let (set, map_idx) = match load_with_map(&root, &map) {
+    let (set, map_idx) = match runtime::load_with_map(&root, &map) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
@@ -862,13 +706,13 @@ mod local_tests {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
         };
-        let (set, map_idx) = load_with_map(&path, "Plage00").expect("load Plage00");
+        let (set, map_idx) = runtime::load_with_map(&path, "Plage00").expect("load Plage00");
         let cfg = RunConfig {
             begin_play: true,
             physics_map: true,
             anim_map: true,
             nav_map: true,
-            default_game: default_game_from_ini(&path),
+            default_game: runtime::default_game_from_ini(&path),
             active: ["TouchTrigger", "XIIIDispatcher", "BaseSoldier"]
                 .iter()
                 .map(|s| (*s).to_owned())

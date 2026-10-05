@@ -858,6 +858,49 @@ fn layout_object(layout: &Layout, name: &str) -> Option<xiii_script::ObjRef> {
     }
 }
 
+/// Resolved **class** reference default of a class layout (e.g. the player pawn's
+/// `ControllerClass`). Only static class references are returned.
+pub(crate) fn layout_class(layout: &Layout, name: &str) -> Option<xiii_script::GlobalRef> {
+    let slot = layout.slot_by_name(name)?;
+    match layout.defaults.get(slot.base) {
+        Some(Value::Object(Some(ObjRef::Static(g)))) => Some(*g),
+        _ => None,
+    }
+}
+
+/// A string/name default declared **directly** on `class_path` (not inherited): e.g. a
+/// GameInfo's `DefaultPlayerClassName` or `PlayerControllerClassName`. `Ok(None)` when the class
+/// exists but the property is absent; `Err` for a missing package/class or a non-string value.
+pub(crate) fn class_own_string_default(
+    set: &ScriptSet,
+    class_path: &str,
+    prop: &str,
+) -> Result<Option<String>, String> {
+    let (pkg, class) = class_path
+        .split_once('.')
+        .ok_or_else(|| format!("class {class_path:?} is not Package.Class"))?;
+    let pi = set
+        .package_index(pkg)
+        .ok_or_else(|| format!("package {pkg} not loaded"))?;
+    let p = &set.packages[pi];
+    let e = p
+        .export_by_path(class)
+        .ok_or_else(|| format!("class {class_path} not found in {pkg}"))?;
+    let Some(ScriptObject::Class(cl)) = p.objects.get(&e) else {
+        return Err(format!("{class_path} is not a decoded class"));
+    };
+    for pr in &cl.defaults.properties {
+        if p.package.property_name(pr).eq_ignore_ascii_case(prop) {
+            return Ok(match &pr.value {
+                PropertyValue::Str(s) => Some(s.clone()),
+                PropertyValue::Name(n) => Some(p.package.name(*n).to_owned()),
+                _ => None,
+            });
+        }
+    }
+    Ok(None)
+}
+
 /// Resolved inherited collision defaults of the player pawn class.
 pub(crate) fn player_extents(
     set: &ScriptSet,

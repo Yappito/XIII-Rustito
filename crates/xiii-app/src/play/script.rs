@@ -13,6 +13,10 @@
 //! - `yaw <degrees>`: set absolute yaw (Unreal convention: 0 = +X, positive toward +Y).
 //! - `turn <degrees>`: add to yaw.
 //! - `pitch <degrees>`: set camera pitch.
+//! - `teleport <x> <y> <z>` (alias `place`): move the player box centre to this Unreal-unit
+//!   position and drop the velocity. Used by the trigger demonstration because the Plage00
+//!   trigger is ~47,000 UU from the PlayerStart (about 100 s of walking at `GroundSpeed`). The
+//!   final approach into the trigger volume is still walked.
 
 use std::path::Path;
 
@@ -44,6 +48,8 @@ pub enum Command {
     Turn(f32),
     /// Pitch in degrees.
     Pitch(f32),
+    /// Move the box centre to an absolute Unreal-unit position (harness bootstrap).
+    Teleport([f32; 3]),
 }
 
 /// A parsed input script, time-ordered.
@@ -98,6 +104,12 @@ impl Script {
                 "yaw" => Command::Yaw(num(&mut it)?),
                 "turn" => Command::Turn(num(&mut it)?),
                 "pitch" => Command::Pitch(num(&mut it)?),
+                "teleport" | "place" => {
+                    let x = num(&mut it)?;
+                    let y = num(&mut it)?;
+                    let z = num(&mut it)?;
+                    Command::Teleport([x, y, z])
+                }
                 other => return Err(format!("line {n}: unknown command {other:?}")),
             };
             events.push(Event { t, command });
@@ -155,6 +167,11 @@ impl Drive {
                 Command::Yaw(deg) => sim.yaw = deg.to_radians(),
                 Command::Turn(deg) => sim.yaw += deg.to_radians(),
                 Command::Pitch(deg) => sim.pitch = deg.to_radians(),
+                Command::Teleport(p) => {
+                    sim.location = p;
+                    sim.velocity = [0.0; 3];
+                    sim.grounded = false;
+                }
             }
             self.cursor += 1;
         }

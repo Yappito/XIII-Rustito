@@ -2120,6 +2120,35 @@ fn move_into_cylinder_touches_both_sides_and_leaving_untouches() {
 }
 
 #[test]
+fn host_written_location_drives_touch_refresh() {
+    // Ownership contract for the Bevy `--play` host: the movement simulation owns the player
+    // pawn's Location and writes it into the VM before the VM tick; the VM delivers Touch from
+    // that host-written Location (no script Move), so walking into a trigger volume fires it.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let player = phys_actor(&mut vm, &set, "Player", [0.0, 0.0, 0.0]);
+    let trigger = phys_actor(&mut vm, &set, "Trigger", [500.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, player, true, false);
+    set_collision_fields(&mut vm, trigger, true, false);
+
+    // Apart, then the host writes the new Location and refreshes (one fixed tick).
+    vm.refresh_touching_of(player).unwrap();
+    assert!(vm.touching_list(player).is_empty());
+    vm.set_property(player, "Location", 0, Value::Vector([500.0, 0.0, 0.0]));
+    vm.refresh_touching_of(player).unwrap();
+    assert_eq!(vm.get_property(player, "Touches"), Some(&Value::Int(1)));
+    assert_eq!(vm.get_property(trigger, "Touches"), Some(&Value::Int(1)));
+    assert_eq!(vm.touching_list(player), vec![trigger]);
+
+    // The host writes the Location away and refreshes: UnTouch on both sides.
+    vm.set_property(player, "Location", 0, Value::Vector([-500.0, 0.0, 0.0]));
+    vm.refresh_touching_of(player).unwrap();
+    assert_eq!(vm.get_property(trigger, "UnTouches"), Some(&Value::Int(1)));
+    assert!(vm.touching_list(player).is_empty());
+}
+
+#[test]
 fn exact_contact_boundary_overlaps() {
     let set = phys_set();
     let mut vm = Vm::new(&set, VmLimits::default());

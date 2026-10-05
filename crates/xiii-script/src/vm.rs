@@ -2005,6 +2005,87 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
+    /// Like [`Vm::tick`], but a failing actor is **suspended** (`active = false`) and the failure
+    /// is returned instead of aborting the whole world. The remaining actors still run their
+    /// timers, animation and state code in the same tick. The Bevy host uses this so one
+    /// unimplemented native cannot freeze the play window.
+    ///
+    /// The suspended actor is the **innermost object on the error stack** (the code that actually
+    /// failed), not necessarily the actor whose tick called it. This matters for trigger chains:
+    /// a triggered actor's failure must not suspend the triggerer. When the innermost object
+    /// cannot be resolved, the ticked actor is suspended instead. The returned vector is
+    /// `(suspended actor, error)` per failure, in processing order; the error is never silently
+    /// swallowed.
+    pub fn tick_suspending(&mut self, dt: f32) -> Vec<(ObjectId, VmError)> {
+        self.tick_count += 1;
+        self.time += f64::from(dt);
+        self.steps = 0;
+        let mut errors = Vec::new();
+        for id in 0..self.objects.len() as ObjectId {
+            if !self.objects[id as usize].active {
+                continue;
+            }
+            let mut fire = false;
+            if let Some(t) = self.objects[id as usize].timer.as_mut() {
+                t.remaining -= dt;
+                if t.remaining <= 0.0 {
+                    fire = true;
+                    if t.repeat {
+                        t.remaining += t.rate;
+                    }
+                }
+            }
+            if fire {
+                if !self.objects[id as usize]
+                    .timer
+                    .as_ref()
+                    .is_some_and(|t| t.repeat)
+                {
+                    self.objects[id as usize].timer = None;
+                }
+                let actor = self.objects[id as usize].name.clone();
+                self.note(TraceKind::Timer { actor });
+                if let Some(f) = self.find_function(id, "Timer", true)
+                    && let Err(e) = self.call_values(f, id, Vec::new())
+                {
+                    let suspended = self.suspend_for_error(id, &e);
+                    errors.push((suspended, e));
+                }
+            }
+        }
+        for id in 0..self.objects.len() as ObjectId {
+            if self.objects[id as usize].active
+                && let Err(e) = self.advance_animation(id, dt)
+            {
+                let suspended = self.suspend_for_error(id, &e);
+                errors.push((suspended, e));
+            }
+        }
+        for id in 0..self.objects.len() as ObjectId {
+            if self.objects[id as usize].active
+                && let Err(e) = self.process_state(id, dt)
+            {
+                let suspended = self.suspend_for_error(id, &e);
+                errors.push((suspended, e));
+            }
+        }
+        errors
+    }
+
+    /// Suspends the actor that should stop after a failing tick: the innermost object on the
+    /// error stack when it can be resolved, otherwise the actor being ticked. Returns the id.
+    fn suspend_for_error(&mut self, ticked: ObjectId, e: &VmError) -> ObjectId {
+        let id = e
+            .stack
+            .last()
+            .and_then(|s| self.find_live_object(&s.object))
+            .unwrap_or(ticked);
+        if let Some(o) = self.objects.get_mut(id as usize) {
+            o.active = false;
+        }
+        id
+    }
+
     // ------------------------------------------------------------------ state code
 
     pub(crate) fn do_goto_state(&mut self, id: ObjectId, state: &str, label: &str) -> VmResult<()> {
@@ -4257,6 +4338,15 @@ impl<'s> Vm<'s> {
         self.deliver_touch_event(a, "UnTouch", b)?;
         self.deliver_touch_event(b, "UnTouch", a)?;
         Ok(())
+    }
+
+    /// Public wrapper for the engine's touch refresh after an **external** (host) move of `id`.
+    /// Uses `SetLocation` semantics (`skip_blocking = false`): a blocking actor does not suppress
+    /// the touch. The Bevy host calls this after writing the player pawn's `Location` from the
+    /// movement simulation, so walking into a trigger volume delivers the `Touch` the VM would
+    /// otherwise only deliver from a script `Move`/`SetLocation`.
+    pub fn refresh_touching_of(&mut self, id: ObjectId) -> VmResult<()> {
+        self.refresh_touching(id, false)
     }
 
     /// Recomputes the touching relations of `id` after it moved or its collision changed:

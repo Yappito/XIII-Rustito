@@ -27,9 +27,9 @@ use crate::cli::Options;
 use xiii_world::{AlphaKind, MaterialSlot, WorldScene};
 
 /// Render layer of the playable zones (drawn by the main camera).
-const MAIN_LAYER: usize = 0;
+pub(crate) const MAIN_LAYER: usize = 0;
 /// Render layer of the sky zone (drawn only by the second, sky camera).
-const SKY_LAYER: usize = 1;
+pub(crate) const SKY_LAYER: usize = 1;
 
 /// Viewer plugin.
 pub struct ViewerPlugin {
@@ -75,8 +75,8 @@ struct OverlayText;
 /// Second camera that renders the sky zone. Its translation is fixed at the `SkyZoneInfo`
 /// location; `sky_follow` copies the main camera's rotation every frame.
 #[derive(Component)]
-struct SkyCamera {
-    position: Vec3,
+pub(crate) struct SkyCamera {
+    pub(crate) position: Vec3,
 }
 
 #[derive(Resource)]
@@ -145,6 +145,53 @@ fn transform_from(t: &xiii_decode::common::BevyTransform) -> Transform {
     }
 }
 
+/// Sky-camera position of the map's first sky zone (`SkyZoneInfo` location, Bevy metres), or
+/// `None` when the map has no readable sky zone. Shared by the map viewer and `--play`.
+pub(crate) fn scene_sky_position(scene: &WorldScene) -> Option<Vec3> {
+    scene
+        .sky_zones
+        .first()
+        .and_then(|z| scene.zones.get(*z as usize))
+        .and_then(|z| z.location)
+        .map(Vec3::from_array)
+}
+
+/// Whether the sky camera should be spawned: a sky zone exists and `XIII_VIEWER_NO_SKY` is
+/// unset (`XIII_VIEWER_NO_SKY` disables it for before/after comparison captures).
+pub(crate) fn sky_camera_enabled(position: &Option<Vec3>) -> bool {
+    position.is_some() && std::env::var_os("XIII_VIEWER_NO_SKY").is_none()
+}
+
+/// Main-camera configuration when a sky camera is present: drawn after (order 1), no colour
+/// clear (the sky shows through) but depth still cleared so playable geometry draws on top.
+pub(crate) fn main_camera_config(sky_enabled: bool) -> Camera {
+    Camera {
+        order: if sky_enabled { 1 } else { 0 },
+        clear_color: if sky_enabled {
+            ClearColorConfig::None
+        } else {
+            ClearColorConfig::Default
+        },
+        ..default()
+    }
+}
+
+/// Spawns the second, sky-only camera at a fixed sky-zone position (its rotation is copied from
+/// the main camera every frame by [`sky_follow`]). Shared by the map viewer and `--play`.
+pub(crate) fn spawn_sky_camera(commands: &mut Commands, position: Vec3) {
+    commands.spawn((
+        Camera3d::default(),
+        Camera {
+            order: 0,
+            clear_color: ClearColorConfig::Default,
+            ..default()
+        },
+        RenderLayers::layer(SKY_LAYER),
+        Transform::from_translation(position),
+        SkyCamera { position },
+    ));
+}
+
 /// Imports `--map` from `--game-dir` (read-only). Shared with the `--play` prototype.
 pub(crate) fn load_scene(opts: &Options) -> Result<WorldScene, String> {
     let game_dir = opts
@@ -164,7 +211,7 @@ pub(crate) fn spawn_scene_geometry(
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
     scene: &WorldScene,
-) {
+) -> Vec<Entity> {
     let image_handles: Vec<Handle<Image>> = scene
         .textures
         .iter()
@@ -211,20 +258,25 @@ pub(crate) fn spawn_scene_geometry(
         mat_handles.push(mat);
     }
     let sky_zone_set: HashSet<u32> = scene.sky_zones.iter().copied().collect();
+    let mut entities = Vec::with_capacity(scene.objects.len());
     for o in &scene.objects {
         let transform = transform_from(&o.transform);
         // Sky-zone geometry goes on the sky-only layer; everything else (including terrain)
         // stays on the main layer, so neither camera draws the other view's geometry.
         let is_sky = o.zone.is_some_and(|z| sky_zone_set.contains(&z));
         let layer = if is_sky { SKY_LAYER } else { MAIN_LAYER };
-        commands.spawn((
-            Mesh3d(mesh_handles[o.mesh].clone()),
-            MeshMaterial3d(mat_handles[o.mesh].clone()),
-            RenderLayers::layer(layer),
-            transform,
-            Name::new(o.path.clone()),
-        ));
+        let entity = commands
+            .spawn((
+                Mesh3d(mesh_handles[o.mesh].clone()),
+                MeshMaterial3d(mat_handles[o.mesh].clone()),
+                RenderLayers::layer(layer),
+                transform,
+                Name::new(o.path.clone()),
+            ))
+            .id();
+        entities.push(entity);
     }
+    entities
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -248,7 +300,7 @@ fn setup(
     };
     let load_time = started.elapsed();
 
-    spawn_scene_geometry(
+    let _geometry = spawn_scene_geometry(
         &mut commands,
         &mut meshes,
         &mut materials,
@@ -308,25 +360,11 @@ fn setup(
     // main camera then does not clear colour (the sky shows through) but still clears depth
     // (its `Camera3d` default), so playable geometry is drawn on top of the sky.
     // `XIII_VIEWER_NO_SKY` disables the sky camera for before/after comparison captures.
-    let sky_position = scene
-        .sky_zones
-        .first()
-        .and_then(|z| scene.zones.get(*z as usize))
-        .and_then(|z| z.location)
-        .map(Vec3::from_array);
-    let sky_enabled = sky_position.is_some() && std::env::var_os("XIII_VIEWER_NO_SKY").is_none();
-    let main_camera = Camera {
-        order: if sky_enabled { 1 } else { 0 },
-        clear_color: if sky_enabled {
-            ClearColorConfig::None
-        } else {
-            ClearColorConfig::Default
-        },
-        ..default()
-    };
+    let sky_position = scene_sky_position(&scene);
+    let sky_enabled = sky_camera_enabled(&sky_position);
     commands.spawn((
         Camera3d::default(),
-        main_camera,
+        main_camera_config(sky_enabled),
         RenderLayers::layer(MAIN_LAYER),
         Transform::from_translation(pos).with_rotation(Quat::from_euler(
             EulerRot::YXZ,
@@ -341,19 +379,7 @@ fn setup(
         },
     ));
     if sky_enabled && let Some(sky_position) = sky_position {
-        commands.spawn((
-            Camera3d::default(),
-            Camera {
-                order: 0,
-                clear_color: ClearColorConfig::Default,
-                ..default()
-            },
-            RenderLayers::layer(SKY_LAYER),
-            Transform::from_translation(sky_position),
-            SkyCamera {
-                position: sky_position,
-            },
-        ));
+        spawn_sky_camera(&mut commands, sky_position);
     }
 
     let mut lines = Vec::new();
@@ -519,11 +545,13 @@ fn fly_move(
 /// Keeps the sky camera at its fixed `SkyZoneInfo` position with the main camera's rotation
 /// (UE2 renders the sky from the zone's location with the player view direction, no parallax;
 /// the decoded `SkyZoneInfo` has no parallax property).
-fn sky_follow(
-    main: Query<&Transform, (With<FlyCam>, Without<SkyCamera>)>,
-    mut sky: Query<(&mut Transform, &SkyCamera), Without<FlyCam>>,
+pub(crate) fn sky_follow(
+    main: Query<&Transform, (With<Camera3d>, Without<SkyCamera>)>,
+    mut sky: Query<(&mut Transform, &SkyCamera)>,
 ) {
-    let Ok(main) = main.single() else { return };
+    let Some(main) = main.iter().next() else {
+        return;
+    };
     for (mut t, cam) in &mut sky {
         t.translation = cam.position;
         t.rotation = main.rotation;

@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use xiii_script::TraceKind;
 use xiii_script::natives::{CallStats, native_catalog};
 use xiii_tool::script_cmd::{coverage_report, disassemble, load_install, package_coverage};
-use xiii_tool::script_run::{RunConfig, load_with_map, run_touch_chain};
+use xiii_tool::script_run::{RunConfig, run_touch_chain};
+use xiii_world::runtime::load_with_map;
 
 fn env_root(var: &str) -> Option<PathBuf> {
     match std::env::var_os(var) {
