@@ -105,6 +105,14 @@ pub mod property_flags {
     pub const RETURN_PARM: u32 = 0x0000_0400;
     /// `coerce` parameter.
     pub const COERCE_PARM: u32 = 0x0000_0800;
+    /// `localized` property. **XIII deviation**: stock UE2 uses `CPF_Localized = 0x2000`, but
+    /// XIII reorders the property flags (measured on the GOG corpus): the known localized
+    /// properties `XIIIGameInfo.GameName` (`0x00408000`), `XIIIMover.LockedMessage`
+    /// (`0x00408001`) and `Plage01CahuteKeyPick.PickupMessage` (`0x00408001`) share bit
+    /// `0x400000`, while non-localized properties (`Actor.Location` `0x23`, `Pawn.Health`
+    /// `0x10021`, `Actor.Tag` `0x1`) do not; the engine-internal properties that carry stock
+    /// `0x2000` (`Actor.Leaves`, `Actor.Touching`, `LevelInfo.XLevel`) are **not** localized.
+    pub const LOCALIZED: u32 = 0x0040_0000;
 }
 
 /// `UField` header.
@@ -154,6 +162,13 @@ impl Function {
     /// True for `native` functions.
     pub fn is_native(&self) -> bool {
         self.flags & function_flags::NATIVE != 0
+    }
+
+    /// True for `static` functions. A static function runs on a class, not an instance, so the
+    /// VM must run it even when the class-default object it is dispatched on is outside the
+    /// executed scope (see `Vm::invoke`).
+    pub fn is_static(&self) -> bool {
+        self.flags & function_flags::STATIC != 0
     }
 }
 
