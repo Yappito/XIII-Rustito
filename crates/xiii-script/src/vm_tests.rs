@@ -495,7 +495,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 187);
+    assert_eq!(defs.len(), 224);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -857,6 +857,53 @@ fn spawn_set() -> ScriptSet {
     let mut set = ScriptSet::new();
     set.add(p);
     set
+}
+
+/// Native class default: `Camera` is a native class whose `bOnlySpectator` is not in the
+/// serialized defaults block. `GameInfo.StartMatch` restarts every non-spectator
+/// `PlayerController` with no pawn, so every placed camera would spawn a spurious
+/// `XIIIPlayerPawn`; the VM must supply the native default. A sibling class with the same
+/// property keeps the zero default (the shim is keyed to the camera lineage).
+#[test]
+fn camera_native_default_makes_it_a_spectator() {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let controller = b.reserve(0, 0, "PlayerController");
+    let camera = b.reserve(0, 0, "Camera");
+    let other = b.reserve(0, 0, "NotACamera");
+    let spectator = b.reserve(IMP_BOOLPROP, controller, "bOnlySpectator");
+    let is_player = b.reserve(IMP_BOOLPROP, controller, "bIsPlayer");
+    b.prop(spectator, is_player, 0);
+    b.prop(is_player, 0, 0);
+    b.class(object, 0, 0, 0);
+    b.class(controller, object, spectator, 0);
+    b.class(camera, controller, 0, 0);
+    b.class(other, controller, 0, 0);
+    let pkg = ScriptPackage::load(
+        "Test",
+        b.build(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(pkg.errors.is_empty(), "{:?}", pkg.errors);
+    let mut set = ScriptSet::new();
+    set.add(pkg);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let cam = GlobalRef {
+        package: 0,
+        export: set.packages[0].export_by_path("Camera").unwrap(),
+    };
+    let other = GlobalRef {
+        package: 0,
+        export: set.packages[0].export_by_path("NotACamera").unwrap(),
+    };
+    let cam_layout = vm.class_layout(cam).unwrap();
+    let other_layout = vm.class_layout(other).unwrap();
+    let get =
+        |l: &crate::vm::ClassLayout, n: &str| l.defaults[l.slot_by_name(n).unwrap().base].clone();
+    assert_eq!(get(&cam_layout, "bOnlySpectator"), Value::Bool(true));
+    assert_eq!(get(&other_layout, "bOnlySpectator"), Value::Bool(false));
 }
 
 fn sg(set: &ScriptSet, path: &str) -> GlobalRef {
@@ -4523,6 +4570,182 @@ fn pick_start_point_prefers_a_patrol_point_then_falls_back() {
     );
 }
 
+// ---------------------------------------------------------------------------------------
+// Canvas draw-command recording (item10)
+
+/// A one-class package with a `Canvas` carrying the draw properties the natives use.
+fn canvas_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let canvas = b.reserve(0, 0, "Canvas");
+    let curx = b.reserve(IMP_FLOATPROP, canvas, "CurX");
+    let cury = b.reserve(IMP_FLOATPROP, canvas, "CurY");
+    let orgx = b.reserve(IMP_FLOATPROP, canvas, "OrgX");
+    let orgy = b.reserve(IMP_FLOATPROP, canvas, "OrgY");
+    let clipx = b.reserve(IMP_FLOATPROP, canvas, "ClipX");
+    let clipy = b.reserve(IMP_FLOATPROP, canvas, "ClipY");
+    let drawcolor = b.reserve(IMP_FLOATPROP, canvas, "DrawColor");
+    let font = b.reserve(IMP_NAMEPROP, canvas, "Font");
+    let style = b.reserve(IMP_INTPROP, canvas, "Style");
+    b.prop(curx, cury, 0);
+    b.prop(cury, orgx, 0);
+    b.prop(orgx, orgy, 0);
+    b.prop(orgy, clipx, 0);
+    b.prop(clipx, clipy, 0);
+    b.prop(clipy, drawcolor, 0);
+    b.prop(drawcolor, font, 0);
+    b.prop(font, style, 0);
+    b.prop(style, 0, 0);
+    b.class(object, 0, 0);
+    b.class(canvas, object, curx);
+    b.build()
+}
+
+/// A 4-unit-wide, 6-unit-tall monospace "font".
+struct TinyFonts;
+impl crate::canvas::CanvasFonts for TinyFonts {
+    fn measure(&self, font: &str, text: &str) -> Option<(f32, f32)> {
+        (font == "Tiny").then(|| (text.chars().count() as f32 * 4.0, 6.0))
+    }
+}
+
+/// Synthetic Canvas natives: cursor movement, text measurement with a tiny font, clip capture,
+/// and the null-material tile -> rect path.
+#[test]
+fn canvas_natives_record_commands_with_cursor_measurement_and_clip() {
+    let set = set_of(canvas_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let canvas = vm.spawn(g(&set, "Canvas"), "Canvas0").unwrap();
+    vm.set_canvas_fonts(Box::new(TinyFonts));
+    assert!(vm.set_property(canvas, "ClipX", 0, Value::Float(320.0)));
+    assert!(vm.set_property(canvas, "ClipY", 0, Value::Float(200.0)));
+    assert!(vm.set_property(canvas, "Font", 0, Value::Name("Tiny".into())));
+    vm.set_property(
+        canvas,
+        "DrawColor",
+        0,
+        Value::Struct(vec![
+            ("b".into(), Value::Byte(10)),
+            ("g".into(), Value::Byte(20)),
+            ("r".into(), Value::Byte(30)),
+            ("a".into(), Value::Byte(255)),
+        ]),
+    );
+    vm.set_property(canvas, "Style", 0, Value::Byte(5));
+
+    // Cursor movement then text at the pen.
+    call_native(
+        &mut vm,
+        "Engine.Canvas.SetPos",
+        canvas,
+        &[],
+        &mut [Value::Float(10.0), Value::Float(20.0)],
+    );
+    call_native(
+        &mut vm,
+        "Engine.Canvas.DrawText",
+        canvas,
+        &[],
+        &mut [Value::Str("abcd".into()), Value::Bool(false)],
+    );
+    // StrLen writes both out floats.
+    let mut args = [
+        Value::Str("abcd".into()),
+        Value::Float(0.0),
+        Value::Float(0.0),
+    ];
+    call_native(
+        &mut vm,
+        "Engine.Canvas.StrLen",
+        canvas,
+        &[false, true, true],
+        &mut args,
+    );
+    assert_eq!(args[1], Value::Float(16.0));
+    assert_eq!(args[2], Value::Float(6.0));
+
+    let cmds = vm.drain_canvas();
+    match cmds.as_slice() {
+        [
+            crate::canvas::DrawCommand::Text {
+                text,
+                x,
+                y,
+                font,
+                color,
+                clip,
+                style,
+                clipped,
+                ..
+            },
+        ] => {
+            assert_eq!(text, "abcd");
+            assert_eq!((*x, *y), (10.0, 20.0));
+            assert_eq!(font.as_deref(), Some("Tiny"));
+            assert_eq!(*color, [30, 20, 10, 255]);
+            assert_eq!(*clip, [320.0, 200.0]);
+            assert_eq!(*style, 5);
+            assert!(!clipped);
+        }
+        other => panic!("{other:?}"),
+    }
+    // Cursor advanced by the measured width and stayed on the same line (CR=false).
+    assert_eq!(vm.get_property(canvas, "CurX"), Some(&Value::Float(26.0)));
+    assert_eq!(vm.get_property(canvas, "CurY"), Some(&Value::Float(20.0)));
+
+    // A null-material tile becomes a Rect and advances CurX by XL.
+    call_native(
+        &mut vm,
+        "Engine.Canvas.SetPos",
+        canvas,
+        &[],
+        &mut [Value::Float(0.0), Value::Float(0.0)],
+    );
+    call_native(
+        &mut vm,
+        "Engine.Canvas.DrawTile",
+        canvas,
+        &[],
+        &mut [
+            Value::Object(None),
+            Value::Float(8.0),
+            Value::Float(4.0),
+            Value::Float(0.0),
+            Value::Float(0.0),
+            Value::Float(1.0),
+            Value::Float(1.0),
+        ],
+    );
+    let cmds = vm.drain_canvas();
+    assert!(
+        matches!(
+            cmds.as_slice(),
+            [crate::canvas::DrawCommand::Rect {
+                xl: 8.0,
+                yl: 4.0,
+                ..
+            }]
+        ),
+        "{cmds:?}"
+    );
+    assert_eq!(vm.get_property(canvas, "CurX"), Some(&Value::Float(8.0)));
+    // A missing font records a visible note instead of silently measuring zero.
+    vm.set_property(canvas, "Font", 0, Value::Object(None));
+    let mut args = [Value::Str("x".into()), Value::Float(9.0), Value::Float(9.0)];
+    call_native(
+        &mut vm,
+        "Engine.Canvas.StrLen",
+        canvas,
+        &[false, true, true],
+        &mut args,
+    );
+    assert!(
+        vm.trace
+            .iter()
+            .any(|t| matches!(&t.kind, TraceKind::Note(n) if n.contains("no decoded font")))
+    );
+}
+
 /// A synthetic package with an `ExtRef.GetExt` function whose body is an `ObjectConst` into an
 /// external import `Ext.Snd` of class `Engine.Sound` (the package `Ext` is never loaded as a
 /// script package).
@@ -4824,4 +5047,316 @@ fn external_reference_to_a_registered_missing_export_is_an_explicit_error() {
         }
         other => panic!("expected UnsupportedValue, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// item3j: campaign missing natives
+
+fn vec_result(o: NativeOutcome) -> [f32; 3] {
+    match o {
+        NativeOutcome::Value(Value::Vector(v)) => v,
+        other => panic!("expected vector, got {other:?}"),
+    }
+}
+
+#[test]
+fn campaign_operator_natives_match_ue2_semantics() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Object"), "O").unwrap();
+
+    let mut a = [Value::Vector([2.0, 3.0, 4.0]), Value::Float(2.0)];
+    assert_eq!(
+        vec_result(call_native(
+            &mut vm,
+            "Object.Multiply_VectorFloat",
+            o,
+            &[false, false],
+            &mut a
+        )),
+        [4.0, 6.0, 8.0]
+    );
+    // A zero scale is a real value, not an "omitted" marker.
+    let mut a = [Value::Vector([1.0, -2.0, 3.0]), Value::Float(0.0)];
+    assert_eq!(
+        vec_result(call_native(
+            &mut vm,
+            "Object.Multiply_VectorFloat",
+            o,
+            &[false, false],
+            &mut a
+        )),
+        [0.0, 0.0, 0.0]
+    );
+
+    let mut a = [
+        Value::Vector([1.0, 2.0, 3.0]),
+        Value::Vector([1.0, 2.0, 3.0]),
+    ];
+    assert!(bool_result(call_native(
+        &mut vm,
+        "Object.EqualEqual_VectorVector",
+        o,
+        &[false, false],
+        &mut a
+    )));
+    let mut a = [
+        Value::Vector([1.0, 2.0, 3.0]),
+        Value::Vector([1.0, 2.0, 4.0]),
+    ];
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "Object.EqualEqual_VectorVector",
+        o,
+        &[false, false],
+        &mut a
+    )));
+}
+
+#[test]
+fn set_bone_scale_per_axis_defaults_omitted_axes_to_one() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    // `SetBoneScalePerAxis(16, 0.5, nothing, nothing, 'X Blink')` (xidcine.Cine2.CineInit.Timer).
+    let mut args = [
+        Value::Int(16),
+        Value::Float(0.5),
+        Value::Float(0.0),
+        Value::Float(0.0),
+        Value::Name("X Blink".into()),
+    ];
+    call_native(
+        &mut vm,
+        "Actor.SetBoneScalePerAxis",
+        a,
+        &[false, false, true, true, false],
+        &mut args,
+    );
+    let bs = vm.bone_state(a).expect("bone state");
+    assert_eq!(bs.scales.len(), 1);
+    assert_eq!(bs.scales[0].slot, 16);
+    assert_eq!(bs.scales[0].scale, [0.5, 1.0, 1.0]);
+    assert_eq!(bs.scales[0].bone, "X Blink");
+}
+
+#[test]
+fn voice_and_onomatopoeia_natives_emit_presentation_events() {
+    use crate::events::PresentationEvent;
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    call_native(&mut vm, "Actor.StopVoice", a, &[], &mut []);
+    // A null `Sound` does not play.
+    let mut args = [Value::Object(None), Value::Int(1), Value::Int(2)];
+    call_native(
+        &mut vm,
+        "Actor.PlaySndPNJOno",
+        a,
+        &[false, false, false],
+        &mut args,
+    );
+    // A real sound object plays, carrying CodeMesh/Timbre.
+    let mut args = [
+        Value::Object(Some(ObjRef::Instance(a))),
+        Value::Int(3),
+        Value::Int(4),
+    ];
+    call_native(
+        &mut vm,
+        "Actor.PlaySndPNJOno",
+        a,
+        &[false, false, false],
+        &mut args,
+    );
+    let mut args = [Value::Object(Some(ObjRef::Instance(a)))];
+    call_native(&mut vm, "Actor.StopSound", a, &[false], &mut args);
+
+    let events = vm.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, PresentationEvent::StopVoice { .. }))
+    );
+    let pnjo: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, PresentationEvent::PlaySndPNJOno { .. }))
+        .collect();
+    assert_eq!(pnjo.len(), 1, "null Sound must not emit: {events:?}");
+    match pnjo[0] {
+        PresentationEvent::PlaySndPNJOno {
+            code_mesh, timbre, ..
+        } => {
+            assert_eq!((*code_mesh, *timbre), (3, 4));
+        }
+        _ => unreachable!(),
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, PresentationEvent::StopSound { .. }))
+    );
+}
+
+#[test]
+fn console_command_implements_campaign_commands_and_logs_unknown() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let c = vm.spawn(sg(&set, "Actor"), "PC").unwrap();
+    let mut a = [Value::Str("GETPING".into())];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "PlayerController.ConsoleCommand",
+            c,
+            &[false],
+            &mut a
+        )),
+        "0"
+    );
+    let before = vm.trace.len();
+    let mut a = [Value::Str("MadeUpCommand 1 2".into())];
+    assert_eq!(
+        str_result(call_native(
+            &mut vm,
+            "PlayerController.ConsoleCommand",
+            c,
+            &[false],
+            &mut a
+        )),
+        ""
+    );
+    assert!(
+        vm.trace.len() > before,
+        "an unknown console command must be logged"
+    );
+}
+
+#[test]
+fn auto_position_snaps_to_the_floor_and_adds_altitude() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    // The synthetic Actor has no `fAltitude`, so the altitude is 0; the trace result is the test.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([-1000.0, -1000.0, 100.0], [1000.0, 1000.0, 110.0]),
+    ));
+    let a = spawn_at(&mut vm, &set, "Actor", "Pos", [0.0, 0.0, 500.0]);
+    call_native(&mut vm, "PositionInfo.AutoPosition", a, &[], &mut []);
+    let z = vm.vector_prop(a, "Location").unwrap()[2];
+    assert!((z - 100.0).abs() < 1.0, "Location.z {z} not on the floor");
+}
+
+#[test]
+fn find_best_path_toward_returns_true_and_fills_route_cache() {
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let _ = spawn_at(&mut vm, &set, "Actor", "Nav0", [0.0, 0.0, 0.0]);
+    let n1 = spawn_at(&mut vm, &set, "Actor", "Nav1", [500.0, 0.0, 0.0]);
+    let _ = spawn_at(&mut vm, &set, "Actor", "Nav2", [1000.0, 0.0, 0.0]);
+    let (ctrl, _pawn) = nav_actor_pair(&mut vm, &set, 40.0, 80.0, 100.0);
+    vm.set_navigation(Box::new(MockNav::line()));
+    let target = spawn_at(&mut vm, &set, "Actor", "T", [1000.0, 0.0, 0.0]);
+    let mut args = [
+        Value::Object(Some(ObjRef::Instance(target))),
+        Value::Float(70.0),
+        Value::Float(160.0),
+    ];
+    assert!(bool_result(call_native(
+        &mut vm,
+        "IAController.FindBestPathToward",
+        ctrl,
+        &[false, false, false],
+        &mut args
+    )));
+    // RouteCache drops the node the pawn stands on, so the first move target is Nav1.
+    assert_eq!(
+        route_cache_elem(&vm, ctrl, 0),
+        Value::Object(Some(ObjRef::Instance(n1)))
+    );
+    // Desired None -> false, no path.
+    let mut args = [Value::Object(None), Value::Float(70.0), Value::Float(160.0)];
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "IAController.FindBestPathToward",
+        ctrl,
+        &[false, false, false],
+        &mut args
+    )));
+}
+
+/// A minimal `PlayerController`/`Pawn` tree for the `PlayerCanSeeMe` line-of-sight test.
+fn vision_fixture() -> Vec<u8> {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pc = b.reserve(0, 0, "PlayerController");
+    let pawn_cls = b.reserve(0, 0, "Pawn");
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let eye = b.reserve(IMP_FLOATPROP, actor, "BaseEyeHeight");
+    let pawn_prop = b.reserve(IMP_OBJECTPROP, pc, "Pawn");
+    let vector_extra = compact(IMP_STRUCT);
+    let object_extra = compact(0);
+    b.prop_with(location, eye, 0, &vector_extra);
+    b.prop(eye, 0, 0);
+    b.prop_with(pawn_prop, 0, 0, &object_extra);
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, location, 0);
+    b.class(pc, actor, pawn_prop, 0);
+    b.class(pawn_cls, actor, 0, 0);
+    b.build()
+}
+
+#[test]
+fn player_can_see_me_uses_a_player_line_of_sight() {
+    let pkg = ScriptPackage::load(
+        "Test",
+        vision_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(pkg.errors.is_empty(), "{:?}", pkg.errors);
+    let mut set = ScriptSet::new();
+    set.add(pkg);
+    let g = |path: &str| GlobalRef {
+        package: 0,
+        export: set.packages[0].export_by_path(path).unwrap(),
+    };
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let target = vm.spawn(g("Actor"), "Target").unwrap();
+    vm.set_property(target, "Location", 0, Value::Vector([500.0, 0.0, 100.0]));
+    let pc = vm.spawn(g("PlayerController"), "PC").unwrap();
+    let pawn = vm.spawn(g("Pawn"), "P").unwrap();
+    vm.set_property(pawn, "Location", 0, Value::Vector([0.0, 0.0, 100.0]));
+    vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(60.0));
+    vm.set_property(pc, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+
+    assert!(bool_result(call_native(
+        &mut vm,
+        "Actor.PlayerCanSeeMe",
+        target,
+        &[],
+        &mut []
+    )));
+    // A wall between the eye and the target blocks the view.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([250.0, -100.0, 0.0], [260.0, 100.0, 200.0]),
+    ));
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "Actor.PlayerCanSeeMe",
+        target,
+        &[],
+        &mut []
+    )));
+    // No possessed pawn -> no viewer.
+    vm.set_property(pc, "Pawn", 0, Value::Object(None));
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "Actor.PlayerCanSeeMe",
+        target,
+        &[],
+        &mut []
+    )));
 }

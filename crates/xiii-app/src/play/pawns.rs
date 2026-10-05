@@ -165,15 +165,10 @@ pub(crate) struct Selection {
     pub attachments: Vec<String>,
 }
 
-/// Builds the pure [`ActorView`] of `id` from the VM's public, read-only API. `player_class` is
-/// the short class name of the host player pawn: every actor of that class (the pawn itself and
-/// any duplicate the script path spawned) is hidden first-person.
-fn actor_view(
-    vm: &Vm<'_>,
-    id: ObjectId,
-    player: ObjectId,
-    player_class: Option<&str>,
-) -> ActorView {
+/// Builds the pure [`ActorView`] of `id` from the VM's public, read-only API. `player` is the
+/// host player pawn id: exactly that actor is hidden first-person (a duplicate pawn the script
+/// happened to spawn is still rendered, so a regression is visible rather than masked).
+fn actor_view(vm: &Vm<'_>, id: ObjectId, player: ObjectId) -> ActorView {
     let o = &vm.objects[id as usize];
     let hidden = matches!(vm.get_property(id, "bHidden"), Some(Value::Bool(true)));
     let draw_type = match vm.get_property(id, "DrawType") {
@@ -195,11 +190,10 @@ fn actor_view(
         Some(_) => MeshKind::Other,
         None => MeshKind::None,
     };
-    let is_player = id == player || player_class.is_some_and(|c| !c.is_empty() && vm.is_a(id, c));
     ActorView {
         is_actor: o.is_actor,
         deleted: o.deleted,
-        is_player,
+        is_player: id == player,
         is_class_default: o.name.starts_with("Default__"),
         hidden,
         draw_type,
@@ -208,20 +202,12 @@ fn actor_view(
     }
 }
 
-/// Short (`Engine.Actor` -> `Actor`) class name of `id`, when the class is resolvable.
-fn class_short_name(vm: &Vm<'_>, id: ObjectId) -> Option<String> {
-    let o = vm.objects.get(id as usize)?;
-    let path = vm.set().path(o.class);
-    Some(path.rsplit('.').next().unwrap_or(path.as_str()).to_owned())
-}
-
 /// Selects every renderable pawn from the VM (`session.player` is the player pawn id).
 pub(crate) fn select(vm: &Vm<'_>, player: ObjectId) -> Selection {
     let mut out = Selection::default();
-    let player_class = class_short_name(vm, player);
     for i in 0..vm.objects.len() {
         let id = i as ObjectId;
-        let view = actor_view(vm, id, player, player_class.as_deref());
+        let view = actor_view(vm, id, player);
         // An actor with no mesh is not interesting for this scan; only count the meaningful
         // skip reasons so the counters are readable (every map has hundreds of mesh-less actors).
         if view.mesh == MeshKind::None {
@@ -412,7 +398,7 @@ pub(crate) fn setup_pawns(
             current: Vec::new(),
         });
         if let Some(bs) = vm.bone_state(src.id)
-            && (bs.spine.is_some() || !bs.directions.is_empty())
+            && (bs.spine.is_some() || !bs.directions.is_empty() || !bs.scales.is_empty())
         {
             scene.bone_controls_not_applied += 1;
         }

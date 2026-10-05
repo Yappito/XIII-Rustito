@@ -21,6 +21,7 @@ use xiii_package::{Limits, ObjectRef, PropertyBlock, PropertyValue, RawReason, S
 
 use crate::animation::{AnimationData, SeqInfo};
 use crate::bytecode::{Call, Context, Script, Token, TokenKind, opcode_name};
+use crate::canvas::CanvasState;
 use crate::events::{PresentationEvent, SoundEvent};
 use crate::linker::{GlobalRef, ScriptSet};
 use crate::navigation::{
@@ -291,6 +292,31 @@ pub const RUNTIME_SPAWN_LIFECYCLE: &[&str] = &[
 /// check never fires on retail data (documented in the report).
 const CLASS_FLAG_ABSTRACT: u16 = 0x0001;
 
+/// Native (C++) class default value that the serialized `defaultproperties` block cannot carry.
+///
+/// The VM reconstructs defaults from the tagged-property block of each `Core.Class` export; a
+/// property whose value is set only in the native class constructor keeps its zero value. The
+/// one case the corpus needs is `Engine.Camera` (`class Camera extends PlayerController native`,
+/// measured 8 serialized editor-placement defaults, none of them `bOnlySpectator`).
+///
+/// Decoded evidence that this default is required for correct single-player startup:
+/// `Engine.GameInfo.PostLogin` calls `StartMatch` when `bWaitingToStartMatch`, and
+/// `Engine.GameInfo.StartMatch` calls `RestartPlayer(P)` for every `Level.ControllerList` entry
+/// with `P.IsA('PlayerController') && P.Pawn == None && !PlayerController(P).bOnlySpectator`.
+/// `PlayerController.Possess` early-returns on `bOnlySpectator` ("This controller is not allowed
+/// to possess pawns", PlayerController.uc). The maps place 11 hidden `Engine.Camera` cutscene
+/// controllers (`Camera.ScriptText`: "A camera, used in UnrealEd"); without this native default
+/// each of them spawns a spurious `XIIIPlayerPawn` at the PlayerStart after login.
+///
+/// Keyed by lowercase short class name (matched anywhere in the class chain) and lowercase
+/// property name. Returns `None` when there is no native default to apply.
+fn native_class_default(class: &str, prop: &str) -> Option<Value> {
+    match (class, prop) {
+        ("camera", "bonlyspectator") => Some(Value::Bool(true)),
+        _ => None,
+    }
+}
+
 /// Latent action of a state frame.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Latent {
@@ -461,13 +487,31 @@ pub struct BoneDirection {
     pub alpha: f32,
 }
 
-/// Per-actor bone-control state set by `Pawn.SpineYawControl` / `Actor.SetBoneDirection`.
+/// `Actor.SetBoneScalePerAxis(int Slot, float X, float Y, float Z, name BoneName)`.
+///
+/// The engine forwards the request to the skeletal-mesh instance's bone controller
+/// (`?SetBoneScale@USkeletalMeshInstance`). The headless VM stores the request per actor in call
+/// order; no skeletal transform is evaluated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoneScale {
+    /// Bone-controller slot.
+    pub slot: i32,
+    /// Per-axis scale (X, Y, Z); omitted optional axes default to 1.0 in the engine.
+    pub scale: [f32; 3],
+    /// Target bone.
+    pub bone: String,
+}
+
+/// Per-actor bone-control state set by `Pawn.SpineYawControl` / `Actor.SetBoneDirection` /
+/// `Actor.SetBoneScalePerAxis`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BoneState {
     /// Latest `Pawn.SpineYawControl` parameters, if the native ran.
     pub spine: Option<SpineControl>,
     /// `Actor.SetBoneDirection` requests, in call order.
     pub directions: Vec<BoneDirection>,
+    /// `Actor.SetBoneScalePerAxis` requests, in call order.
+    pub scales: Vec<BoneScale>,
 }
 
 /// Read-only view of one animation channel, for a host renderer that samples the decoded
@@ -998,6 +1042,9 @@ pub struct Vm<'s> {
     /// (UE2 `ALevelInfo::GetAddressURL` formats the URL host and port as `%s:%i`). Empty until
     /// the runtime configures it.
     address_url: String,
+    /// Script-drawn `Canvas` command buffer plus the host font provider. Drained by the host
+    /// after each `HUD.PostRender` call ([`Vm::drain_canvas`]).
+    pub canvas: CanvasState,
     /// Interned object references into packages outside the loaded script set.
     externals: std::cell::RefCell<ExternalTable>,
 }
@@ -1038,8 +1085,24 @@ impl<'s> Vm<'s> {
             local_url: String::new(),
             url_options: String::new(),
             address_url: String::new(),
+            canvas: CanvasState::default(),
             externals: std::cell::RefCell::new(ExternalTable::default()),
         }
+    }
+
+    /// Installs the host font-metrics provider used by `Canvas.StrLen`/`TextSize`.
+    pub fn set_canvas_fonts(&mut self, fonts: Box<dyn crate::canvas::CanvasFonts>) {
+        self.canvas.set_fonts(fonts);
+    }
+
+    /// Draw commands recorded since the last [`Vm::drain_canvas`].
+    pub fn canvas_commands(&self) -> &[crate::canvas::DrawCommand] {
+        self.canvas.commands()
+    }
+
+    /// Removes and returns the recorded `Canvas` draw commands (one HUD frame).
+    pub fn drain_canvas(&mut self) -> Vec<crate::canvas::DrawCommand> {
+        self.canvas.drain()
     }
 
     /// The script set.
@@ -1503,6 +1566,21 @@ impl<'s> Vm<'s> {
         for c in chain.iter().rev() {
             if let Some(ScriptObject::Class(cl)) = self.set.object(*c) {
                 self.apply_block(c.package, &cl.defaults, &layout, &mut defaults);
+            }
+        }
+        // Native defaults not present in the serialized class blocks (see native_class_default).
+        // The table only lists properties that no class in the matching lineage serializes, so
+        // applying it after the serialized blocks cannot hide an authored value.
+        for slot in &layout.slots {
+            if slot.dim == 0 {
+                continue;
+            }
+            if let Some(v) = layout
+                .chain_names
+                .iter()
+                .find_map(|n| native_class_default(n, &slot.name))
+            {
+                defaults[slot.base] = v;
             }
         }
         layout.defaults = defaults;
@@ -2023,6 +2101,19 @@ impl<'s> Vm<'s> {
                 trans,
                 alpha,
             });
+        }
+    }
+
+    /// `Actor.SetBoneScalePerAxis`: record the request for the renderer.
+    pub(crate) fn add_bone_scale(
+        &mut self,
+        id: ObjectId,
+        slot: i32,
+        scale: [f32; 3],
+        bone: String,
+    ) {
+        if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone.scales.push(BoneScale { slot, scale, bone });
         }
     }
 

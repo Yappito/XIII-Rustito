@@ -338,6 +338,14 @@ impl Session {
         &self.vm
     }
 
+    /// Mutable access to the script VM for the host HUD refresh (`hud.rs`): create the `Canvas`,
+    /// set its clip, call `HUD.PostRender` and drain the recorded draw commands. The fixed-step
+    /// movement/VM ordering still owns every simulation field; this only drives the per-frame
+    /// presentation call.
+    pub fn vm_mut(&mut self) -> &mut Vm<'static> {
+        &mut self.vm
+    }
+
     /// Live actors still in the executed scope.
     pub fn active_actors(&self) -> usize {
         self.vm
@@ -354,6 +362,22 @@ impl Session {
             .iter()
             .filter(|o| o.is_actor && !o.deleted)
             .count()
+    }
+
+    /// Every live, placed (`Default__`-excluded) actor whose class is (or derives from)
+    /// `XIIIPlayerPawn`. A correct single-player login creates exactly one; more means the login
+    /// path spawned duplicates. Used by the duplicate-pawn regression test and the reports.
+    pub fn player_pawn_actors(&self) -> Vec<(ObjectId, String)> {
+        (0..self.vm.objects.len())
+            .filter(|&i| {
+                let o = &self.vm.objects[i];
+                o.is_actor
+                    && !o.deleted
+                    && !o.name.starts_with("Default__")
+                    && self.vm.is_a(i as ObjectId, "XIIIPlayerPawn")
+            })
+            .map(|i| (i as ObjectId, self.vm.objects[i].name.clone()))
+            .collect()
     }
 
     /// Current dispatcher state name (`Fin` when the trigger chain completed).
@@ -858,5 +882,37 @@ mod tests {
             "player only {dist:.1} UU outside the door plane (need >= {:.0})",
             2.0 * UNREAL_UNITS_PER_METER
         );
+    }
+
+    /// Opt-in corpus regression (item3j Part A): the script login leaves **exactly one**
+    /// `XIIIPlayerPawn`. Before the fix, `GameInfo.PostLogin` -> `StartMatch` restarted every
+    /// placed `Engine.Camera` `PlayerController` (no pawn, not a spectator) and spawned 11 extra
+    /// pawns at the PlayerStart on each map. Checked at open and after 120 fixed ticks.
+    #[test]
+    fn opt_in_single_player_login_spawns_one_player_pawn() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        for map in ["Plage00", "Plage01"] {
+            let mut session = Session::open(&game_dir, map).expect("open session");
+            let at_open = session.player_pawn_actors();
+            assert_eq!(
+                at_open.len(),
+                1,
+                "{map}: expected one XIIIPlayerPawn at login, got {at_open:?}"
+            );
+            for _ in 0..120 {
+                let loc = session.player_location().unwrap_or([0.0; 3]);
+                session.step(1.0 / 60.0, loc, 0.0, [0.0; 3]);
+            }
+            let after = session.player_pawn_actors();
+            assert_eq!(
+                after.len(),
+                1,
+                "{map}: expected one XIIIPlayerPawn after 120 ticks, got {after:?}"
+            );
+            println!("[dupe test] {map}: one player pawn {:?}", after[0].1);
+        }
     }
 }

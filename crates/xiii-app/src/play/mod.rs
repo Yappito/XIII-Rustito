@@ -9,6 +9,7 @@
 //! `--play-script <file>`. Both drive the same [`sim::PlayerSim`] in `FixedUpdate` at 60 Hz.
 //! Fixed 60 Hz is a **hypothesis** (UE2 used variable ticks); see [`FIXED_HZ`].
 
+pub mod hud;
 pub mod movers;
 pub mod pawns;
 pub mod script;
@@ -129,6 +130,8 @@ impl Plugin for PlayPlugin {
                 viewer::sky_follow,
                 viewer::animate_uv,
                 pawns::update_pawns,
+                hud::refresh,
+                hud::draw,
                 overlay,
                 unattended,
             )
@@ -354,6 +357,16 @@ fn setup_inner(
         "[play] login path: script={} bootstrap={}",
         session.login_script, session.login_bootstrap
     );
+    let pawns_now = session.player_pawn_actors();
+    println!(
+        "[play] player pawns: {} live XIIIPlayerPawn actor(s): {}",
+        pawns_now.len(),
+        pawns_now
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     for b in &session.blocked {
         println!("[play]   script path blocked: {b}");
     }
@@ -538,6 +551,9 @@ fn setup_inner(
         println!("[play] pawn mesh failed: {f}");
     }
     commands.insert_resource(pawn_scene);
+    // Script-drawn HUD: decode the fonts, create the Canvas and install the VM font provider.
+    let hud_runtime = hud::setup(session, game_dir.as_path(), images)?;
+    commands.insert_resource(hud_runtime);
     commands.insert_resource(ParamsRes(params));
     commands.insert_resource(SimRes(sim));
     commands.insert_resource(WorldRes {
@@ -764,6 +780,7 @@ fn overlay(
     sim: Res<SimRes>,
     session: NonSend<Result<session::Session, String>>,
     pawns: Option<Res<pawns::PawnScene>>,
+    hud: Option<Res<hud::HudRuntime>>,
     mut text: Query<&mut Text, With<PlayOverlay>>,
 ) {
     let Ok(mut text) = text.single_mut() else {
@@ -818,12 +835,33 @@ fn overlay(
         Some(p) => format!("pawns rendered 0 ({} meshes)", p.models),
         None => "pawns unavailable".to_owned(),
     };
+    let hud_line = match hud.as_deref() {
+        Some(h) => {
+            let name = match &*session {
+                Ok(s) => h.hud_name(s.vm()),
+                Err(_) => None,
+            }
+            .unwrap_or_else(|| "-".to_owned());
+            format!(
+                "HUD {} ({}) | PostRender frames {} commands {} glyphs {} | missing tile materials {} | {}",
+                name,
+                if h.hud.is_some() { "found" } else { "absent" },
+                h.frames,
+                h.total_commands,
+                h.glyphs_drawn,
+                h.missing_materials.len(),
+                h.error.as_deref().unwrap_or("ok")
+            )
+        }
+        None => "HUD unavailable".to_owned(),
+    };
     text.0 = format!(
         "XIII play prototype (NOT a playable mission; no weapons, no full AI)\n\
          map {} | pos ({:.1}, {:.1}, {:.1}) UU | vel ({:.1}, {:.1}, {:.1}) UU/s | state {}\n\
          floor normal ({:.2}, {:.2}, {:.2}) | last contact: {}\n\
          {}\n\
          {pawns_line}\n\
+         {hud_line}\n\
          WASD move | mouse look | Space jump | Shift walk | Esc quit",
         cfg.options.map.as_deref().unwrap_or("?"),
         s.location[0],
@@ -1077,6 +1115,16 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
     println!(
         "[play] login path: script={} bootstrap={}",
         session.login_script, session.login_bootstrap
+    );
+    let pawns_now = session.player_pawn_actors();
+    println!(
+        "[play] player pawns: {} live XIIIPlayerPawn actor(s): {}",
+        pawns_now.len(),
+        pawns_now
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     println!(
         "[play] player {} | controller {} | GameInfo {}",
@@ -1349,6 +1397,118 @@ mod tests {
             s.dispatcher_state(),
             s.active_actors(),
             s.suspended.len()
+        );
+    }
+
+    /// A synthetic `CanvasFonts` provider: 4 units per character, 8 tall.
+    struct DummyFonts;
+    impl xiii_script::canvas::CanvasFonts for DummyFonts {
+        fn measure(&self, font: &str, text: &str) -> Option<(f32, f32)> {
+            (font.eq_ignore_ascii_case("Dummy")).then(|| (text.chars().count() as f32 * 4.0, 8.0))
+        }
+    }
+
+    /// Opt-in corpus test (requirement 5): the real Plage00 `XIIIBaseHud.PostRender(Canvas)`
+    /// runs through the VM against a host-created `Engine.Canvas`, does not suspend the HUD and
+    /// records at least one draw command. No Bevy assets are needed: the font provider is the
+    /// synthetic one above, so the test covers the script + native path only.
+    #[test]
+    fn opt_in_plage00_hud_postrender_records_commands() {
+        use xiii_script::Value;
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = session::Session::open(&game_dir, "Plage00").expect("open Plage00");
+        assert_eq!(session.login_script, 1, "script login must create the HUD");
+        let controller = session.controller;
+
+        // Host-side Canvas (the same setup `hud::setup` performs), minus the Bevy textures.
+        let canvas_class =
+            xiii_world::runtime::resolve_class_path(session.vm().set(), "Engine.Canvas")
+                .expect("Engine.Canvas class");
+        let canvas = session
+            .vm_mut()
+            .spawn(canvas_class, "TestCanvas")
+            .expect("spawn Canvas");
+        let vm = session.vm_mut();
+        vm.set_property(
+            canvas,
+            "DrawColor",
+            0,
+            Value::Struct(vec![
+                ("b".to_owned(), Value::Byte(255)),
+                ("g".to_owned(), Value::Byte(255)),
+                ("r".to_owned(), Value::Byte(255)),
+                ("a".to_owned(), Value::Byte(255)),
+            ]),
+        );
+        vm.set_property(canvas, "ClipX", 0, Value::Float(1280.0));
+        vm.set_property(canvas, "ClipY", 0, Value::Float(720.0));
+        vm.set_property(canvas, "Style", 0, Value::Byte(1));
+        vm.set_property(canvas, "Font", 0, Value::Name("Dummy".to_owned()));
+        vm.set_canvas_fonts(Box::new(DummyFonts));
+
+        // The HUD is the controller's `myHUD` (or the first live HUD actor).
+        let hud = {
+            let vm = session.vm();
+            controller
+                .and_then(|c| match vm.get_property(c, "myHUD") {
+                    Some(Value::Object(Some(xiii_script::ObjRef::Instance(p)))) => Some(*p),
+                    _ => None,
+                })
+                .or_else(|| hud::find_hud(vm))
+        }
+        .expect("Plage00 has a live HUD");
+        // Host font bridge (as `hud::setup` does): assign the synthetic font to the HUD's own
+        // font properties.
+        for prop in ["SmallFont", "MedFont", "BigFont", "LargeFont"] {
+            session
+                .vm_mut()
+                .set_property(hud, prop, 0, Value::Name("Dummy".to_owned()));
+        }
+        let vm = session.vm_mut();
+        let arg = Value::Object(Some(xiii_script::ObjRef::Instance(canvas)));
+        match vm.send_event(hud, "PostRender", vec![arg]) {
+            Ok(_) => {}
+            Err(e) => panic!("HUD.PostRender failed: {e}"),
+        }
+        let commands = session.vm_mut().drain_canvas();
+        let hud_class = session
+            .vm()
+            .set()
+            .path(session.vm().objects[hud as usize].class);
+        assert!(
+            session.vm().objects[hud as usize].active,
+            "the HUD must not be suspended by PostRender"
+        );
+        println!(
+            "[play test] Plage00 HUD.PostRender: class {hud_class}, {} draw command(s)",
+            commands.len()
+        );
+        for c in commands.iter().take(6) {
+            println!("[play test]   {c:?}");
+        }
+        println!(
+            "[play test]   HUD widgets: HudMsg={:?} HudWnd={:?} DrawnWeapon={:?}",
+            session.vm().get_property(hud, "HudMsg"),
+            session.vm().get_property(hud, "HudWnd"),
+            session.vm().get_property(hud, "DrawnWeapon"),
+        );
+        // Survey of the Canvas/HUD natives this PostRender path called (requirement 1).
+        let vm = session.vm();
+        let mut used: Vec<(&String, &(Option<u16>, u64))> = vm
+            .natives_used
+            .iter()
+            .filter(|(p, _)| p.starts_with("Canvas.") || p.starts_with("HUD."))
+            .collect();
+        used.sort_by(|a, b| a.0.cmp(b.0));
+        for (path, (idx, count)) in used {
+            println!("[play test]   native {path} index={idx:?} calls={count}");
+        }
+        assert!(
+            !commands.is_empty(),
+            "Plage00 HUD.PostRender produced no draw commands"
         );
     }
 }

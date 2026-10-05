@@ -5,6 +5,7 @@
 //! `xiii_package::Package` and an export; they never touch the filesystem.
 
 pub mod common;
+pub mod font;
 pub mod model;
 pub mod skeletal;
 pub mod static_mesh;

@@ -654,6 +654,9 @@ fn event_kind(e: &PresentationEvent) -> &'static str {
         PresentationEvent::ProjectorAttach { .. } => "ProjectorAttach",
         PresentationEvent::ProjectorDetach { .. } => "ProjectorDetach",
         PresentationEvent::ProjectorAbandon { .. } => "ProjectorAbandon",
+        PresentationEvent::StopVoice { .. } => "StopVoice",
+        PresentationEvent::StopSound { .. } => "StopSound",
+        PresentationEvent::PlaySndPNJOno { .. } => "PlaySndPNJOno",
     }
 }
 
