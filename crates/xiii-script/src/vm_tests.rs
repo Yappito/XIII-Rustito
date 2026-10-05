@@ -84,6 +84,18 @@ impl B {
         self.set(r, p);
     }
 
+    /// Property with a trailing type-specific reference (e.g. `ObjectProperty.PropertyClass`).
+    fn prop_with(&mut self, r: i32, next: i32, flags: u32, extra: &[u8]) {
+        let mut p = compact(0);
+        p.extend(compact(0));
+        p.extend(compact(next));
+        p.extend(1i16.to_le_bytes());
+        p.extend(flags.to_le_bytes());
+        p.extend(compact(0));
+        p.extend(extra);
+        self.set(r, p);
+    }
+
     fn header(
         &self,
         sup: i32,
@@ -167,6 +179,7 @@ impl B {
             (core, class, -1, self.name("IntProperty")),
             (core, class, -1, self.name("FloatProperty")),
             (core, class, -1, self.name("NameProperty")),
+            (core, class, -1, self.name("ObjectProperty")),
         ];
         let names: Vec<&str> = self.names.iter().map(String::as_str).collect();
         build_package(&names, &imports, &self.exports)
@@ -452,7 +465,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 100);
+    assert_eq!(defs.len(), 160);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -3014,4 +3027,297 @@ fn vector_rotator_operators_match_the_basis() {
     let world = rotate(&mut vm, "Object.GreaterGreater_VectorRotator", v, r);
     let back = rotate(&mut vm, "Object.LessLess_VectorRotator", world, r);
     assert!(close(back, v), "{back:?}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Possession and presentation-event fixtures
+// ---------------------------------------------------------------------------------------
+
+fn push_iv(code: &mut Vec<u8>, r: i32) {
+    code.push(0x01);
+    code.extend(compact(r));
+}
+
+fn push_lv(code: &mut Vec<u8>, i: i32) {
+    code.push(0x00);
+    code.extend(compact(i));
+}
+
+/// Synthetic possession fixture: a `Controller` with a `Pawn` link and an `Init` state, and a
+/// `Pawn` with `Controller`/`ControllerClass` links whose `PostBeginPlay` spawns and possesses.
+fn possession_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let controller = b.reserve(0, 0, "Controller");
+    let pawn = b.reserve(0, 0, "Pawn");
+
+    let c_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
+    let p_controller = b.reserve(IMP_OBJECTPROP, pawn, "Controller");
+    let p_ctrlclass = b.reserve(IMP_OBJECTPROP, pawn, "ControllerClass");
+    let possess = b.reserve(IMP_FUNCTION, controller, "Possess");
+    let pbp = b.reserve(IMP_FUNCTION, pawn, "PostBeginPlay");
+    let init = b.reserve(IMP_STATE, controller, "Init");
+    let a_pawn = b.reserve(IMP_OBJECTPROP, possess, "aPawn");
+    // Native declarations so the bytecode's native indices resolve (their bodies are in the VM).
+    let ne_oo = b.reserve(IMP_FUNCTION, object, "NotEqual_ObjectObject");
+    let gts = b.reserve(IMP_FUNCTION, object, "GotoState");
+    let spawn = b.reserve(IMP_FUNCTION, actor, "Spawn");
+    let ne_a = b.reserve(IMP_OBJECTPROP, ne_oo, "A");
+    let ne_b = b.reserve(IMP_OBJECTPROP, ne_oo, "B");
+    let gts_state = b.reserve(IMP_NAMEPROP, gts, "NewState");
+    let spawn_class = b.reserve(IMP_OBJECTPROP, spawn, "SpawnClass");
+
+    // Controller children: Pawn (link) -> Possess (function) -> Init (state).
+    b.prop_with(c_pawn, possess, 0, &compact(0));
+    b.func(possess, init, a_pawn, &[], 0, 0, ff::DEFINED);
+    b.state(init, 0, &[], 0, 0);
+    // Pawn children: Controller -> ControllerClass -> PostBeginPlay.
+    b.prop_with(p_controller, p_ctrlclass, 0, &compact(0));
+    b.prop_with(p_ctrlclass, pbp, 0, &compact(0));
+    b.prop_with(a_pawn, 0, pf::PARM, &compact(0));
+    // Object children: NotEqual_ObjectObject -> GotoState; Actor children: Spawn.
+    b.func(ne_oo, gts, ne_a, &[], 0, 119, ff::FINAL | ff::NATIVE);
+    b.func(gts, 0, gts_state, &[], 0, 113, ff::FINAL | ff::NATIVE);
+    b.func(spawn, 0, spawn_class, &[], 0, 278, ff::FINAL | ff::NATIVE);
+    b.prop_with(ne_a, ne_b, pf::PARM, &compact(0));
+    b.prop_with(ne_b, 0, pf::PARM, &compact(0));
+    b.prop(gts_state, 0, pf::PARM);
+    b.prop_with(spawn_class, 0, pf::PARM, &compact(0));
+
+    let possess_name = b.name("Possess");
+    let init_name = b.name("Init");
+
+    // Controller.Possess(aPawn): self.Pawn = aPawn; aPawn.Controller = self; GotoState('Init').
+    let mut code = Vec::new();
+    code.push(0x0F); // Let
+    push_iv(&mut code, c_pawn);
+    push_lv(&mut code, a_pawn);
+    code.push(0x0F); // Let
+    code.push(0x19); // Context aPawn
+    push_lv(&mut code, a_pawn);
+    code.extend([0, 0, 0]); // Context Skip (u16) + Size (u8), unused by the VM
+    push_iv(&mut code, p_controller);
+    code.push(0x17); // Self
+    code.push(0x71); // GotoState (native 113)
+    code.push(0x21); // NameConst
+    code.extend(compact(init_name));
+    code.push(0x16); // EndFunctionParms
+    code.push(0x04); // Return
+    code.push(0x0B); // Nothing
+    b.func(possess, init, a_pawn, &code, 36, 0, ff::DEFINED);
+
+    // Pawn.PostBeginPlay(): if (ControllerClass != None) Controller = Spawn(ControllerClass);
+    //                        if (Controller != None) Controller.Possess(self);
+    let mut code = Vec::new();
+    code.push(0x07); // JumpIfNot skip1
+    code.extend(25u16.to_le_bytes());
+    code.push(0x77); // != (native 119)
+    push_iv(&mut code, p_ctrlclass);
+    code.push(0x2A); // NoObject
+    code.push(0x16); // EndFunctionParms
+    code.push(0x0F); // Let
+    push_iv(&mut code, p_controller);
+    code.push(0x61); // Spawn (native 278)
+    code.push(0x16);
+    push_iv(&mut code, p_ctrlclass);
+    code.push(0x16);
+    code.push(0x07); // JumpIfNot skip2
+    code.extend(52u16.to_le_bytes());
+    code.push(0x77);
+    push_iv(&mut code, p_controller);
+    code.push(0x2A);
+    code.push(0x16);
+    code.push(0x19); // Context Controller
+    push_iv(&mut code, p_controller);
+    code.extend([0, 0, 0]); // Context Skip + Size
+    code.push(0x1B); // VirtualFunction Possess
+    code.extend(compact(possess_name));
+    code.push(0x17); // Self
+    code.push(0x16); // EndFunctionParms
+    code.push(0x04); // Return
+    code.push(0x0B); // Nothing
+    b.func(pbp, 0, 0, &code, 54, 0, ff::DEFINED);
+
+    b.class(object, 0, ne_oo);
+    b.class(actor, object, spawn);
+    b.class(controller, actor, c_pawn);
+    b.class(pawn, actor, p_controller);
+    b.build()
+}
+
+/// Synthetic presentation fixture: the `Actor` presentation natives with their decoded
+/// signatures (`PlaySound`/`PlayMusic` take a Sound plus five optional ints;
+/// `ReplaceATextureByAnOther` takes two Texture objects).
+fn presentation_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let play_sound = b.reserve(IMP_FUNCTION, actor, "PlaySound");
+    let play_music = b.reserve(IMP_FUNCTION, actor, "PlayMusic");
+    let replace = b.reserve(IMP_FUNCTION, actor, "ReplaceATextureByAnOther");
+
+    let sound = b.reserve(IMP_OBJECTPROP, play_sound, "Sound");
+    let p1 = b.reserve(IMP_INTPROP, play_sound, "Param1");
+    let p2 = b.reserve(IMP_INTPROP, play_sound, "Param2");
+    let p3 = b.reserve(IMP_INTPROP, play_sound, "Param3");
+    let p4 = b.reserve(IMP_INTPROP, play_sound, "Param4");
+    let p5 = b.reserve(IMP_INTPROP, play_sound, "Param5");
+    let msound = b.reserve(IMP_OBJECTPROP, play_music, "Sound");
+    let src = b.reserve(IMP_OBJECTPROP, replace, "SrcTexture");
+    let dst = b.reserve(IMP_OBJECTPROP, replace, "DestTexture");
+
+    b.func(
+        play_sound,
+        play_music,
+        sound,
+        &[],
+        0,
+        264,
+        ff::FINAL | ff::NATIVE,
+    );
+    b.func(
+        play_music,
+        replace,
+        msound,
+        &[],
+        0,
+        358,
+        ff::FINAL | ff::NATIVE,
+    );
+    b.func(replace, 0, src, &[], 0, 0, ff::FINAL | ff::NATIVE);
+    b.prop_with(sound, p1, pf::PARM, &compact(0));
+    b.prop(p1, p2, pf::PARM);
+    b.prop(p2, p3, pf::PARM);
+    b.prop(p3, p4, pf::PARM);
+    b.prop(p4, p5, pf::PARM);
+    b.prop(p5, 0, 0);
+    b.prop_with(msound, 0, pf::PARM, &compact(0));
+    b.prop_with(src, dst, pf::PARM, &compact(0));
+    b.prop_with(dst, 0, pf::PARM, &compact(0));
+    b.class(object, 0, 0);
+    b.class(actor, object, play_sound);
+    b.build()
+}
+
+#[test]
+fn possession_links_pawn_and_controller_and_enters_initial_state() {
+    let set = set_of(possession_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pawn = vm.spawn(g(&set, "Pawn"), "P").unwrap();
+    vm.set_active(pawn, true);
+    vm.set_property(
+        pawn,
+        "ControllerClass",
+        0,
+        Value::Object(Some(ObjRef::Static(g(&set, "Controller")))),
+    );
+    vm.send_event(pawn, "PostBeginPlay", Vec::new()).unwrap();
+    let controller = vm
+        .obj_prop(pawn, "Controller")
+        .expect("a controller was spawned");
+    assert!(vm.is_a(controller, "Controller"));
+    // Both directions of the link.
+    assert_eq!(vm.obj_prop(controller, "Pawn"), Some(pawn));
+    assert_eq!(vm.obj_prop(pawn, "Controller"), Some(controller));
+    // The controller entered its (only) state through `Possess`.
+    assert_eq!(vm.state_name(controller).as_deref(), Some("Init"));
+    assert!(vm.trace.iter().any(|e| matches!(
+        &e.kind,
+        TraceKind::Spawned { class, .. } if class.ends_with("Controller")
+    )));
+}
+
+#[test]
+fn pawn_without_controller_class_stays_uncontrolled() {
+    let set = set_of(possession_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pawn = vm.spawn(g(&set, "Pawn"), "P").unwrap();
+    vm.set_active(pawn, true);
+    vm.send_event(pawn, "PostBeginPlay", Vec::new()).unwrap();
+    assert_eq!(
+        vm.get_property(pawn, "Controller"),
+        Some(&Value::Object(None))
+    );
+    assert!(
+        !vm.trace
+            .iter()
+            .any(|e| matches!(&e.kind, TraceKind::Spawned { .. }))
+    );
+}
+
+#[test]
+fn play_sound_and_music_emit_one_event_with_decoded_arguments() {
+    use crate::events::PresentationEvent;
+    let set = set_of(presentation_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(g(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    let sound = ObjRef::Static(g(&set, "Object"));
+    vm.call_function(
+        g(&set, "Actor.PlaySound"),
+        a,
+        vec![
+            Value::Object(Some(sound)),
+            Value::Int(3),
+            Value::Int(80),
+            Value::Int(7),
+            Value::Int(2),
+            Value::Int(9),
+        ],
+    )
+    .unwrap();
+    let events = vm.drain_events();
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        PresentationEvent::PlaySound(e) => {
+            assert_eq!(e.actor, "A");
+            assert_eq!(e.sound.as_deref(), Some("Test.Object"));
+            assert_eq!(
+                (e.slot, e.volume, e.radius, e.pitch, e.param5),
+                (Some(3), Some(80), Some(7), Some(2), Some(9))
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // `drain_events` empties the queue.
+    assert!(vm.drain_events().is_empty());
+    vm.call_function(g(&set, "Actor.PlayMusic"), a, vec![Value::Object(None)])
+        .unwrap();
+    let events = vm.drain_events();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], PresentationEvent::PlayMusic(_)));
+}
+
+#[test]
+fn replace_texture_emits_the_event() {
+    use crate::events::PresentationEvent;
+    let set = set_of(presentation_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(g(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    let src = ObjRef::Static(g(&set, "Object"));
+    let dst = ObjRef::Static(g(&set, "Actor"));
+    vm.call_function(
+        g(&set, "Actor.ReplaceATextureByAnOther"),
+        a,
+        vec![Value::Object(Some(src)), Value::Object(Some(dst))],
+    )
+    .unwrap();
+    let events = vm.drain_events();
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        PresentationEvent::ReplaceTexture {
+            actor,
+            source,
+            destination,
+            ..
+        } => {
+            assert_eq!(actor, "A");
+            assert_eq!(source.as_deref(), Some("Test.Object"));
+            assert_eq!(destination.as_deref(), Some("Test.Actor"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(vm.drain_events().is_empty());
 }

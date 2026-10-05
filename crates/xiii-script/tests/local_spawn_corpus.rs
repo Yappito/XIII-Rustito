@@ -92,6 +92,13 @@ fn gog_plage00_begin_play_gets_past_actor_spawn() {
     let map = set.add(map_pkg);
 
     let mut vm = Vm::new(&set, VmLimits::default());
+    // Survey mode: with possession enabled the soldiers' controllers run game AI (missing
+    // natives are counted, not fatal). Diagnostic providers let movement/animation proceed.
+    vm.survey = true;
+    vm.set_physics(Box::new(xiii_script::physics::FlatPhysics::new(0.0)));
+    vm.set_animation_data(Box::new(xiii_script::animation::FixedAnimation::new(
+        30, 30.0,
+    )));
     let actors = vm.load_level(map, &Limits::default()).expect("load level");
     assert_eq!(actors.len(), 371);
 
@@ -176,20 +183,26 @@ fn gog_plage00_begin_play_gets_past_actor_spawn() {
     );
     let dispatcher = vm.find_object("XIIIDispatcher0").expect("dispatcher");
     assert_eq!(vm.state_name(dispatcher).as_deref(), Some("Fin"));
-    assert!(
-        vm.missing_natives.is_empty(),
-        "unimplemented: {:?}",
-        vm.missing_natives
-    );
+    // Possession now runs the soldiers' `PostBeginPlay`, which spawns an `IAController` per
+    // soldier (item3e). The AI natives inside its `Init` state remain unimplemented and are
+    // counted by survey mode; that must not stop the touched dispatcher chain above.
+    let controllers = vm
+        .trace
+        .iter()
+        .filter(|e| matches!(&e.kind, TraceKind::Spawned { class, .. } if class.ends_with("IAController")))
+        .count();
+    assert_eq!(controllers, 2, "one controller per active soldier");
     assert!(
         vm.trace
             .iter()
             .all(|e| !matches!(&e.kind, TraceKind::SpawnRefused { .. }))
     );
     println!(
-        "Plage00 --begin-play: {} trace records, {} spawned classes, dispatcher ended in Fin",
+        "Plage00 --begin-play: {} trace records, {} spawned classes, {} controllers, dispatcher ended in Fin, {} missing natives",
         vm.trace.len(),
-        spawned_classes.len()
+        spawned_classes.len(),
+        controllers,
+        vm.missing_natives.len()
     );
 }
 

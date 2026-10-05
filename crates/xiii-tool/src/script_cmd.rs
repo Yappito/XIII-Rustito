@@ -45,7 +45,7 @@ xiii-tool script: compiled UnrealScript (M2c)
       DLL ?exec symbol cross-reference (default dll dir: <root>/system).
       Exits 1 if any reflected export fails to decode.
   xiii-tool script run --game-dir <root> [--map Plage00] [--touch TouchTrigger2]
-                       [--ticks 60] [--dt 0.0333] [--touch-tick 1] [--trace]
+                       [--ticks 60] [--dt 0.0333] [--touch-tick 1] [--trace] [--events]
                        [--active TouchTrigger,XIIIDispatcher] [--no-natives] [--budget N]
                        [--begin-play] [--game-class Package.Class] [--survey]
                        [--physics map|flat:<z>] [--anim map|fixed:<frames>,<rate>]
@@ -74,6 +74,11 @@ xiii-tool script: compiled UnrealScript (M2c)
       --survey is DIAGNOSTIC ONLY: it continues past unimplemented natives,
       counts each distinct one with its first-hit location, and never reports the
       run as success.
+      --events drains and prints the VM's outbound presentation events, grouped
+      by tick: PlaySound, PlayMusic, PlayRolloffSound, ReplaceATextureByAnOther,
+      RefreshDisplaying, SetInjuredEffect and projector attach/detach/abandon.
+      Each event carries the actor and the decoded arguments; the VM itself plays
+      no audio and draws nothing.
       Exits 1 on a script error (printed with its script stack).";
 
 const GAME_PACKAGES: &[&str] = &["xidmaps", "xiii", "xidcine"];
