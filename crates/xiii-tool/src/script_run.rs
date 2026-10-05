@@ -699,7 +699,10 @@ mod local_tests {
 
     /// The Plage00 dispatcher chain with real map physics and decoded animation creates one
     /// controller per active soldier and still reaches `Fin`. Possession then runs the soldiers'
-    /// game AI, which stops at the first unimplemented AI native (reported, not stubbed).
+    /// game AI. All the XIDPawn AI natives on this path are implemented (`item3g`); the run now
+    /// advances into a weapon switch and stops at the animation provider's unknown `Select`
+    /// sequence for the Beretta (a data/provider gap, *not* a missing native). The assertion below
+    /// is that no unimplemented native remains on the executed path.
     #[test]
     fn gog_plage00_map_providers_chain_ends_in_fin() {
         let Some(path) = gog_root() else {
@@ -738,10 +741,10 @@ mod local_tests {
             .filter(|e| matches!(&e.kind, TraceKind::Spawned { class, .. } if class.ends_with("IAController")))
             .count();
         assert_eq!(controllers, 2, "one controller per active soldier");
-        // The run stops at the first unimplemented AI native (not a decode/provider error).
+        // No unimplemented native may reach execution now (this is the item3g acceptance point).
         if let Some(e) = &report.error {
             assert!(
-                matches!(e.kind, xiii_script::VmErrorKind::UnimplementedNative { .. }),
+                !matches!(e.kind, xiii_script::VmErrorKind::UnimplementedNative { .. }),
                 "{e}"
             );
         }

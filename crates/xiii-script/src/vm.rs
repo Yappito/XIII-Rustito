@@ -24,7 +24,7 @@ use crate::bytecode::{Call, Context, Script, Token, TokenKind, opcode_name};
 use crate::events::{PresentationEvent, SoundEvent};
 use crate::linker::{GlobalRef, ScriptSet};
 use crate::navigation::{
-    NavEdgeInfo, NavPointInfo, NavigationData, find_path, move_step, nearest_point,
+    NavEdgeInfo, NavPointInfo, NavigationData, find_path, move_step, nearest_point, point_fits,
 };
 use crate::physics::WorldPhysics;
 use crate::reflect::{Property, PropertyKind, ScriptObject, function_flags, property_flags};
@@ -407,6 +407,46 @@ pub(crate) struct AnimBlendParams {
     pub(crate) out_time: f32,
     /// Bone filter (`None` = `BoneName` was omitted or `None`).
     pub(crate) bone_name: Option<String>,
+}
+
+/// `Pawn.SpineYawControl(bool IsControlled, int MaxValue, float RotationSpeed)` parameters.
+///
+/// The engine sets a bit in the pawn's native flags word and stores the two values for the
+/// skeletal-mesh bone controller. The headless VM keeps the same parameters per actor; no
+/// skeletal pose is computed (the native is registered `Partial` for that reason).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpineControl {
+    /// `IsControlled`: the spine yaw controller is active.
+    pub is_controlled: bool,
+    /// `MaxValue`: maximum controller value (engine units).
+    pub max_value: i32,
+    /// `RotationSpeed`: seconds-ish rate passed through unchanged.
+    pub rotation_speed: f32,
+}
+
+/// `Actor.SetBoneDirection(name BoneName, rotator BoneTurn, vector BoneTrans, float Alpha)`.
+///
+/// The engine forwards the request to the skeletal-mesh instance's bone controller. The headless
+/// VM stores the request per actor in call order; no skeletal transform is evaluated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoneDirection {
+    /// Target bone.
+    pub bone: String,
+    /// Bone rotation offset.
+    pub turn: [i32; 3],
+    /// Bone translation offset.
+    pub trans: [f32; 3],
+    /// Blend alpha.
+    pub alpha: f32,
+}
+
+/// Per-actor bone-control state set by `Pawn.SpineYawControl` / `Actor.SetBoneDirection`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BoneState {
+    /// Latest `Pawn.SpineYawControl` parameters, if the native ran.
+    pub spine: Option<SpineControl>,
+    /// `Actor.SetBoneDirection` requests, in call order.
+    pub directions: Vec<BoneDirection>,
 }
 
 /// One trace record.
@@ -802,6 +842,8 @@ pub struct Instance {
     timer: Option<Timer>,
     /// Animation channels (actor animation natives).
     pub(crate) anim: AnimState,
+    /// Bone-control parameters (skeletal natives); no skeletal pose yet.
+    pub bone: BoneState,
 }
 
 #[derive(Debug, Clone)]
@@ -1641,6 +1683,7 @@ impl<'s> Vm<'s> {
             export: None,
             timer: None,
             anim: AnimState::default(),
+            bone: BoneState::default(),
         });
         Ok(id)
     }
@@ -1713,7 +1756,8 @@ impl<'s> Vm<'s> {
         o.props.get(s.base)
     }
 
-    /// Reads a property by name and array element (`get_property` is element 0).
+    /// Reads element `elem` of a fixed-array property by name (`None` when the property is
+    /// absent or `elem` is outside the declared dimension).
     pub fn get_property_elem(&self, id: ObjectId, name: &str, elem: usize) -> Option<&Value> {
         let o = self.objects.get(id as usize)?;
         let s = o.layout.slot_by_name(name)?;
@@ -1721,6 +1765,54 @@ impl<'s> Vm<'s> {
             return None;
         }
         o.props.get(s.base + elem)
+    }
+
+    /// Per-actor bone-control state (`Pawn.SpineYawControl` / `Actor.SetBoneDirection`).
+    pub fn bone_state(&self, id: ObjectId) -> Option<&BoneState> {
+        self.objects.get(id as usize).map(|o| &o.bone)
+    }
+
+    /// `Pawn.SpineYawControl`: store the parameters for the renderer.
+    pub(crate) fn set_spine_control(
+        &mut self,
+        id: ObjectId,
+        is_controlled: bool,
+        max_value: i32,
+        rotation_speed: f32,
+    ) {
+        if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone.spine = Some(SpineControl {
+                is_controlled,
+                max_value,
+                rotation_speed,
+            });
+        }
+    }
+
+    /// `Actor.SetBoneDirection`: record the request for the renderer.
+    pub(crate) fn add_bone_direction(
+        &mut self,
+        id: ObjectId,
+        bone: String,
+        turn: [i32; 3],
+        trans: [f32; 3],
+        alpha: f32,
+    ) {
+        if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone.directions.push(BoneDirection {
+                bone,
+                turn,
+                trans,
+                alpha,
+            });
+        }
+    }
+
+    /// Clears the per-actor bone-control state (used by `IAController.HalteAuFeu`).
+    pub(crate) fn reset_bone_state(&mut self, id: ObjectId) {
+        if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone = BoneState::default();
+        }
     }
 
     /// Writes a property by name and element.
@@ -4741,6 +4833,34 @@ impl<'s> Vm<'s> {
     pub(crate) fn nav_point_actor(&self, id: u32) -> Option<ObjectId> {
         let p = self.nav_points()?.get(id as usize)?;
         self.find_object(&p.actor)
+    }
+
+    /// Nearest navigation point actor to `from` whose collision fits the pawn's size, optionally
+    /// restricted to an actor class name. Returns `None` when no provider is installed or no
+    /// point survives the fit/class test.
+    pub(crate) fn nav_nearest_point_actor(
+        &self,
+        from: [f32; 3],
+        radius: f32,
+        height: f32,
+        class: Option<&str>,
+    ) -> Option<ObjectId> {
+        let points = self.nav_points()?;
+        let mut order: Vec<(f32, u32)> = points
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| point_fits(p, radius, height))
+            .map(|(i, p)| (horizontal_distance(from, p.location), i as u32))
+            .collect();
+        order.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, i) in order {
+            if let Some(a) = self.nav_point_actor(i)
+                && class.is_none_or(|c| self.is_a(a, c))
+            {
+                return Some(a);
+            }
+        }
+        None
     }
 
     /// Half-extents of `pawn` (its collision cylinder) used for edge/arrival tests.
