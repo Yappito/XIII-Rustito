@@ -249,6 +249,69 @@ fn local_plage00_music_and_ambients_resolve_and_stream() {
     }
 }
 
+/// Opt-in item6e (requirement 2): the corpus-wide unresolved set is stable and each remaining
+/// path's reason is what the HX data supports. This pins the measured state so a parser change
+/// cannot silently reclassify (or force-resolve) the 195 objects.
+#[test]
+fn local_unresolved_sound_counts_and_reasons_are_stable() {
+    let Ok(root) = std::env::var("XIII_GOG_DIR") else {
+        println!("SKIPPED: XIII_GOG_DIR not set");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let lib = xiii_audio::SoundLibrary::scan(&root);
+    let s = lib.resolution_summary();
+    let unresolved = lib.unresolved_paths();
+    let by_reason: BTreeMap<&str, usize> =
+        unresolved.iter().fold(BTreeMap::new(), |mut m, (_, r)| {
+            *m.entry(*r).or_default() += 1;
+            m
+        });
+    println!(
+        "resolution: {} sounds, {} resolved (resource_ref {}, name_match {}), unresolved {} {:?}; \
+         resource_missing {} resource_no_wave {}",
+        s.sounds,
+        s.resolved,
+        s.resource_ref,
+        s.name_match,
+        s.failed,
+        by_reason,
+        s.resource_missing,
+        s.resource_no_wave
+    );
+    assert_eq!(s.sounds, 5892, "Sound object count");
+    // The item6e investigation found no additional resolvable objects; these are the measured
+    // 137 absent-pair + 58 no-wave-via-links cases.
+    assert_eq!(s.resource_missing, 137, "absent_resource_pair count");
+    assert_eq!(s.resource_no_wave, 58, "no_wave_via_links count");
+    assert_eq!(unresolved.len(), 195, "total unresolved");
+    assert_eq!(by_reason.get("absent_resource_pair").copied(), Some(137));
+    assert_eq!(by_reason.get("no_wave_via_links").copied(), Some(58));
+
+    // Representative paths: the pair is truly absent from all banks (music banks not shipped).
+    let reason_of = |needle: &str| {
+        unresolved
+            .iter()
+            .find(|(path, _)| path.contains(needle))
+            .map(|(_, r)| *r)
+            .unwrap_or_else(|| {
+                panic!("no unresolved path containing {needle}; list: {unresolved:?}")
+            })
+    };
+    assert_eq!(
+        reason_of("music__hual04b.hual04b__hmusicinit"),
+        "absent_resource_pair",
+        "Hual04b's music bank is not shipped"
+    );
+    assert_eq!(
+        reason_of("ambient.wind1"),
+        "absent_resource_pair",
+        "Wind1's resource pair is in no shipped bank"
+    );
+    // A control-node program (empty index link list) is no-wave.
+    assert_eq!(reason_of("items.chaisepick"), "no_wave_via_links");
+}
+
 /// Opt-in item6c: the event-shaped `Guns__9mmSelWp.9mmSelWp__h9mmSelWp` Sound resolves through
 /// its native-tail HX resource reference to decoded PCM (the item6 name rule does not match it).
 #[test]

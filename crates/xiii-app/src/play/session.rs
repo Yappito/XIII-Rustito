@@ -85,6 +85,24 @@ pub struct Session {
     /// Number of `localized` class-default values filled from the `.int` files while building
     /// the level's class layouts.
     pub localized_overrides: u64,
+    /// Host per-bone hit-zone provider installed on the VM (item14b). The shared table is
+    /// refreshed each fixed step from every live pawn's decoded skeleton and its VM animation.
+    pub hit_zones: xiii_world::hitbox::PosedHitZones,
+    /// One posed mesh per live pawn with a decoded `SkeletalMesh` (shared per mesh path).
+    hitbox_meshes: Vec<(ObjectId, Rc<xiii_world::hitbox::HitBoxMesh>)>,
+    /// Hit boxes dropped at decode because their bone index is outside the skeleton.
+    pub hitbox_dropped: usize,
+    /// Pawn meshes that failed to decode for hit boxes: `(actor, mesh, error)`.
+    pub hitbox_errors: Vec<String>,
+    /// AI perception events dispatched by the host sight bridge (item14b): `(time, controller,
+    /// event)`, oldest first (bounded). `SeePlayer`/`EnemyNotVisible` only.
+    pub perception_log: VecDeque<(f64, String, String)>,
+    /// Next VM time at which the host AI fire bridge may fire each controlled weapon. The engine
+    /// fires from `AWeapon::Tick` (native); the VM has no weapon tick, so the host re-issues the
+    /// weapon's class `Fire` while the controller requests fire, throttled per weapon.
+    ai_fire_at: std::collections::HashMap<ObjectId, f64>,
+    /// AI shots the host fire bridge issued: `(time, soldier, weapon)`.
+    pub ai_shots: VecDeque<(f64, String, String)>,
     /// Fixed steps run.
     pub tick_count: u64,
     /// Set once the end-game has stopped the active cutscene controllers (item15 bridge): the
@@ -341,6 +359,15 @@ impl Session {
             }
         }
 
+        // item14b: decode the hit boxes of every live pawn's `SkeletalMesh` (once per mesh path)
+        // and install the host hit-zone provider. This is host-side and works headless, so both
+        // `--play` and `--play-script` classify bullet hits against the posed body, not the
+        // collision cylinder. A mesh that fails to decode is reported; the affected actor keeps
+        // the cylinder fallback (never a silent success).
+        let (hitbox_meshes, hitbox_dropped, hitbox_errors, hit_zones) =
+            build_hit_boxes(&vm, game_dir);
+        vm.set_hit_zones(Box::new(hit_zones.clone()));
+
         let mut session = Session {
             vm,
             player,
@@ -364,6 +391,13 @@ impl Session {
             dispatcher,
             localization_language,
             localized_overrides: 0,
+            hit_zones,
+            hitbox_meshes,
+            hitbox_dropped,
+            hitbox_errors,
+            perception_log: VecDeque::new(),
+            ai_fire_at: std::collections::HashMap::new(),
+            ai_shots: VecDeque::new(),
             tick_count: 0,
             cine_stopped: false,
         };
@@ -371,7 +405,160 @@ impl Session {
         session.suspended.dedup();
         session.drain_events();
         session.update_touches();
+        session.update_hit_boxes();
         Ok(session)
+    }
+
+    /// Rebuilds the shared posed hit-box table from every cached pawn's VM animation state. The
+    /// provider reads it during `Actor.Trace`; the boxes are the decoded per-bone volumes
+    /// (`xiii_world::hitbox`) at the same pose the renderer draws.
+    pub fn update_hit_boxes(&self) {
+        let handle = self.hit_zones.handle();
+        let mut table = handle.borrow_mut();
+        table.clear();
+        for (id, mesh) in &self.hitbox_meshes {
+            let anim = self.vm.actor_animation(*id);
+            let clip = anim.as_ref().and_then(|a| {
+                let ch = a
+                    .channels
+                    .iter()
+                    .filter(|c| c.active)
+                    .min_by_key(|c| c.channel)
+                    .or_else(|| a.channels.iter().min_by_key(|c| c.channel))?;
+                let set = mesh.anims.as_ref()?;
+                let clip = set.clip(&ch.sequence)?;
+                Some((clip, ch.frame, ch.looping))
+            });
+            let loc = self.vm.vector_prop(*id, "Location").unwrap_or([0.0; 3]);
+            let rot = self.vm.rotation_prop(*id).unwrap_or([0; 3]);
+            let boxes = xiii_world::hitbox::world_boxes(mesh, loc, rot, clip);
+            table.insert(*id, boxes);
+        }
+    }
+
+    /// item14b host AI fire bridge (labelled). The engine fires an AI weapon from its native
+    /// `AWeapon::Tick` while the controller's `bTire` is set. The VM has no weapon tick and
+    /// `XIIIWeapon.Active`'s `Fire` shadow is empty, so `IAController.Timer`'s
+    /// `pawn.weapon.fire(1.0)` resolves to nothing. This re-issues the weapon's **class**
+    /// `Fire(1.0)` (the same resolution the player's fire path uses, item14) for every live
+    /// `IAController` whose `bTire` is set and whose pawn is alive, throttled by the pawn's
+    /// `OffsetTimeBetweenShots`. It is not the engine's native tick and is reported per shot.
+    fn ai_fire(&mut self) {
+        let now = self.vm.time;
+        let mut candidates: Vec<(ObjectId, ObjectId, ObjectId, Option<ObjectId>)> = Vec::new();
+        for i in 0..self.vm.objects.len() {
+            let ctrl = i as ObjectId;
+            let o = &self.vm.objects[i];
+            if !o.is_actor
+                || o.deleted
+                || !o.active
+                || !self.vm.is_a(ctrl, "iacontroller")
+                || !matches!(self.vm.get_property(ctrl, "bTire"), Some(Value::Bool(true)))
+            {
+                continue;
+            }
+            let Some(pawn) = instance_prop(&self.vm, ctrl, "Pawn") else {
+                continue;
+            };
+            if matches!(
+                self.vm.get_property(pawn, "bIsDead"),
+                Some(Value::Bool(true))
+            ) {
+                continue;
+            }
+            let Some(weapon) = instance_prop(&self.vm, pawn, "Weapon") else {
+                continue;
+            };
+            let enemy = instance_prop(&self.vm, ctrl, "Enemy");
+            candidates.push((ctrl, pawn, weapon, enemy));
+        }
+        for (ctrl, pawn, weapon, enemy) in candidates {
+            let due = self.ai_fire_at.get(&weapon).copied().unwrap_or(0.0);
+            if now < due {
+                continue;
+            }
+            let gap = match self.vm.get_property(pawn, "OffsetTimeBetweenShots") {
+                Some(Value::Float(f)) if *f > 0.0 => f64::from(*f),
+                _ => 0.4,
+            };
+            self.ai_fire_at.insert(weapon, now + gap);
+            let soldier = self.vm.objects[pawn as usize].name.clone();
+            let weapon_name = self.vm.objects[weapon as usize].name.clone();
+            // Engine `AIController`-native focus: turn the pawn and its controller toward the
+            // enemy and keep the weapon at the eye (the host owns no AI rotation code otherwise).
+            let pl = self.vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+            if let Some(enemy) = enemy {
+                let el = self.vm.vector_prop(enemy, "Location").unwrap_or(pl);
+                let d = [el[0] - pl[0], el[1] - pl[1], el[2] - pl[2]];
+                let horiz = (d[0] * d[0] + d[1] * d[1]).sqrt();
+                let yaw = d[1].atan2(d[0]);
+                let pitch = d[2].atan2(horiz.max(1e-6));
+                let rot = [
+                    (pitch / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN).round() as i32,
+                    (yaw / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN).round() as i32,
+                    0,
+                ];
+                let _ = self
+                    .vm
+                    .set_property(ctrl, "Rotation", 0, Value::Rotator(rot));
+                let _ = self
+                    .vm
+                    .set_property(pawn, "Rotation", 0, Value::Rotator(rot));
+            }
+            let eye = match self.vm.get_property(pawn, "EyeHeight") {
+                Some(Value::Float(h)) => *h,
+                _ => match self.vm.get_property(pawn, "BaseEyeHeight") {
+                    Some(Value::Float(h)) => *h,
+                    _ => 0.0,
+                },
+            };
+            let _ = self.vm.set_property(
+                weapon,
+                "Location",
+                0,
+                Value::Vector([pl[0], pl[1], pl[2] + eye]),
+            );
+            match self.vm.class_function(weapon, "Fire") {
+                Some(f) => match self.vm.call_function(f, weapon, vec![Value::Float(1.0)]) {
+                    Ok(_) => {
+                        println!("[play] AI t={now:.3}s {soldier} fires {weapon_name}");
+                        self.ai_shots.push_back((now, soldier, weapon_name));
+                    }
+                    Err(e) => {
+                        self.record_failure(&soldier, &e);
+                    }
+                },
+                None => {
+                    let _ = ctrl;
+                    self.blocked.push(format!(
+                        "AI fire: {soldier} {weapon_name} has no class Fire"
+                    ));
+                }
+            }
+        }
+        while self.ai_shots.len() > 128 {
+            self.ai_shots.pop_front();
+        }
+    }
+
+    /// Pawn hit-box summary line for the startup report: how many pawns have a posed skeleton,
+    /// how many boxes, and any decode failures.
+    pub fn hitbox_summary(&self) -> String {
+        let mut boxes = 0usize;
+        for (_, m) in &self.hitbox_meshes {
+            boxes += m.boxes.len();
+        }
+        format!(
+            "{} pawn(s) with decoded hit boxes, {} box(es), {} dropped (bone out of range){}",
+            self.hitbox_meshes.len(),
+            boxes,
+            self.hitbox_dropped,
+            if self.hitbox_errors.is_empty() {
+                String::new()
+            } else {
+                format!("; failures: {}", self.hitbox_errors.join(", "))
+            }
+        )
     }
 
     /// One fixed step, in the documented order: write the player pawn state (owned by the
@@ -391,6 +578,9 @@ impl Session {
         modes: &PlayerVMModes,
     ) {
         self.moved.clear();
+        // Refresh the posed hit boxes before the VM traces (host `fire` and any script trace in
+        // this tick see the current body pose).
+        self.update_hit_boxes();
         let profiling = self.vm.native_profile().enabled;
         let t0 = Instant::now();
         let _ = self
@@ -485,6 +675,23 @@ impl Session {
         for (id, e) in self.vm.tick_suspending(dt) {
             self.suspend(id, &e);
         }
+        // item14b: drive the engine's own AI perception. The host performs the sight test (range /
+        // facing / line of sight) and dispatches `SeePlayer`/`EnemyNotVisible`; the soldier's own
+        // `IAController` states react (acquire, turn, fire). Run after the VM tick so the
+        // controller state machine has advanced this step.
+        let mut perception = Vec::new();
+        self.vm.update_ai_perception(self.player, &mut perception);
+        for (controller, event) in perception {
+            let t = self.vm.time;
+            println!("[play] AI t={t:.3}s {controller}: {event}");
+            self.perception_log.push_back((t, controller, event));
+        }
+        while self.perception_log.len() > 128 {
+            self.perception_log.pop_front();
+        }
+        // The engine fires AI weapons from the native weapon tick; the host bridge re-issues the
+        // weapon's class `Fire` while the controller requests fire (see [`Session::ai_fire`]).
+        self.ai_fire();
         self.tick_count += 1;
         let t0 = Instant::now();
         self.drain_events();
@@ -886,27 +1093,35 @@ impl Session {
     /// `Fire(1.0)` (`XIIIPlayerController.Fire` -> `Pawn.Weapon.Fire`), or the weapon directly
     /// when the pawn has no controller. The weapon runs its own `ServerFire` ->
     /// `TraceFire`/`ProjectileFire` -> `ProcessTraceHit` -> `TakeDamage` chain (item14).
-    pub fn fire(&mut self, yaw: f32) -> FireOutcome {
+    pub fn fire(&mut self, yaw: f32, pitch: f32) -> FireOutcome {
         let Some(weapon) = self.player_weapon() else {
             return FireOutcome::NoWeapon;
         };
-        // The host owns the player yaw; the VM's controller state code does not sync it, so
-        // re-assert it here where the script reads `GetViewRotation` (item14).
+        // The host owns the player view (yaw and pitch); the VM's controller state code does not
+        // sync it, so re-assert it here where the script reads `GetViewRotation` (item14). The
+        // pitch matters for item14b: a level shot at eye height only ever hits the head box, so
+        // the per-bone hit zones cannot be demonstrated (or used) without a vertical aim.
+        let pitch_units = (pitch / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN).round() as i32;
         let yaw_units = (yaw / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN).round() as i32;
         let _ = self.vm.set_property(
             self.player,
             "Rotation",
             0,
-            Value::Rotator([0, yaw_units, 0]),
+            Value::Rotator([pitch_units, yaw_units, 0]),
         );
         if let Some(ctrl) = self.controller {
-            let _ = self
-                .vm
-                .set_property(ctrl, "Rotation", 0, Value::Rotator([0, yaw_units, 0]));
+            let _ = self.vm.set_property(
+                ctrl,
+                "Rotation",
+                0,
+                Value::Rotator([pitch_units, yaw_units, 0]),
+            );
             // `XIIIPlayerController.AdjustAim` returns `OldAdjustAim`/`AdjustedAimForFiring` for
             // an instant-hit weapon; the engine refreshes those from the view each frame, which
             // the headless VM does not. Feed the host view direction (item14).
-            let dir = Value::Vector([yaw.cos(), yaw.sin(), 0.0]);
+            let (sp, cp) = pitch.sin_cos();
+            let (sy, cy) = yaw.sin_cos();
+            let dir = Value::Vector([cp * cy, cp * sy, sp]);
             let _ = self.vm.set_property(ctrl, "OldAdjustAim", 0, dir.clone());
             let _ = self.vm.set_property(ctrl, "AdjustedAimForFiring", 0, dir);
             self.vm.set_property(ctrl, "bFire", 0, Value::Byte(1));
@@ -988,6 +1203,39 @@ impl Session {
         Ok(format!(
             "granted {name} ({class_path}); GiveTo {give:?}, GiveAmmo {give_ammo:?}, BringUp {bring:?}"
         ))
+    }
+
+    /// Equips the best weapon the player already carries in the game's own `Inventory` chain,
+    /// through the game's own `Weapon.BringUp` -> `Instigator.ChangedWeapon()` path (item14b).
+    /// This is the normal weapon-switch action; it never spawns or grants a weapon. Used after
+    /// walking onto a map weapon pickup. Returns the equipped weapon name, or an error naming the
+    /// reason (no weapon carried, or the script raised).
+    pub fn equip_inventory_weapon(&mut self) -> Result<String, String> {
+        let mut cur = self.inventory_head(self.player);
+        let mut best: Option<ObjectId> = None;
+        let mut guard = 0;
+        while let Some(id) = cur {
+            guard += 1;
+            if guard > 256 {
+                break;
+            }
+            if self.vm.is_a(id, "weapon") {
+                // Prefer a real gun over the starting `Fists`.
+                if best.is_none() || !self.vm.is_a(id, "fists") {
+                    best = Some(id);
+                }
+            }
+            cur = self.inventory_head(id);
+        }
+        let Some(weapon) = best else {
+            return Err("no weapon in the inventory chain".to_owned());
+        };
+        let name = self.vm.objects[weapon as usize].name.clone();
+        // `Weapon.BringUp` sets `Instigator.PendingWeapon` and calls `ChangedWeapon`.
+        match self.vm.send_event(weapon, "BringUp", Vec::new()) {
+            Ok(_) => Ok(name),
+            Err(e) => Err(format!("{name} BringUp: {e}")),
+        }
     }
 
     /// The player weapon's first-person mesh path: the decoded `MeshName` string
@@ -1217,6 +1465,70 @@ fn find_player_start(vm: &Vm) -> Option<([f32; 3], [i32; 3])> {
     None
 }
 
+/// Decodes the hit boxes of every live pawn's `SkeletalMesh` (once per mesh path) and builds the
+/// host hit-zone provider (item14b). Returns `(actor, shared mesh)` pairs, the number of boxes
+/// dropped because their bone index is outside the skeleton, decode failures and the provider.
+#[allow(clippy::type_complexity)]
+fn build_hit_boxes(
+    vm: &Vm<'static>,
+    game_dir: &Path,
+) -> (
+    Vec<(ObjectId, Rc<xiii_world::hitbox::HitBoxMesh>)>,
+    usize,
+    Vec<String>,
+    xiii_world::hitbox::PosedHitZones,
+) {
+    let mut meshes: Vec<(ObjectId, Rc<xiii_world::hitbox::HitBoxMesh>)> = Vec::new();
+    let mut dropped = 0usize;
+    let mut errors = Vec::new();
+    let mut cache = match xiii_world::PackageCache::open(game_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            errors.push(format!("package cache: {e}"));
+            return (
+                meshes,
+                dropped,
+                errors,
+                xiii_world::hitbox::PosedHitZones::new(),
+            );
+        }
+    };
+    let mut decoded: std::collections::HashMap<
+        String,
+        Result<Rc<xiii_world::hitbox::HitBoxMesh>, String>,
+    > = std::collections::HashMap::new();
+    for i in 0..vm.objects.len() {
+        let id = i as ObjectId;
+        let o = &vm.objects[i];
+        if !o.is_actor || o.deleted || o.name.starts_with("Default__") {
+            continue;
+        }
+        let Some((path, class)) = vm.mesh_object(id) else {
+            continue;
+        };
+        if !class
+            .rsplit('.')
+            .next()
+            .is_some_and(|s| s.eq_ignore_ascii_case("SkeletalMesh"))
+        {
+            continue;
+        }
+        let entry = decoded
+            .entry(path.clone())
+            .or_insert_with(|| xiii_world::hitbox::load_mesh(&mut cache, &path).map(Rc::new))
+            .clone();
+        match entry {
+            Ok(m) => {
+                dropped += m.dropped_boxes;
+                meshes.push((id, m));
+            }
+            Err(e) => errors.push(format!("{} {}: {e}", o.name, path)),
+        }
+    }
+    let provider = xiii_world::hitbox::PosedHitZones::new();
+    (meshes, dropped, errors, provider)
+}
+
 /// Live instance held by the object property `name` of `id`.
 fn instance_prop(vm: &Vm, id: ObjectId, name: &str) -> Option<ObjectId> {
     match vm.get_property(id, name) {
@@ -1375,6 +1687,61 @@ mod tests {
         );
     }
 
+    /// Opt-in corpus (item14b requirement 2): the map's real `XIII.BerettaPick` (`BerettaPick0`)
+    /// sits at `(-737.654,-511.886,1262.99)` UU, ~3.4 m from `PlayerStart0`, but the player
+    /// spawns **inside the Plage01 hut** and every direct walk from the spawn / an open-side
+    /// harness teleport stops at hut geometry (`x=-657` from +X, no movement from -X/-Y) more
+    /// than 64 UU short of the pickup's touch radius. The pickup is therefore **not reachable
+    /// early by walking**; the item14b demonstration keeps the labelled `weapon XIII.Beretta`
+    /// grant for the synthetic zone test, and the real pickup chain itself is exercised by the
+    /// `opt_in_plage01_key_pickup_without_host_grant_opens_porte6` test on the same map. This
+    /// test records the measured block (it asserts the negative, so a future reachability fix
+    /// fails it visibly).
+    #[test]
+    fn opt_in_plage01_beretta_pickup_is_not_reachable_early() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let script = script::Script::parse(
+            "t=0.00 teleport -637.654 -511.886 1265.0\n\
+             t=0.10 goto -737.654 -511.886\n\
+             t=4.00 forward 0\n",
+        )
+        .unwrap();
+        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 6.0)
+            .expect("run Plage01 Beretta walk");
+        let s = &outcome.session;
+        let (_, _, pos, _) = outcome.trace.last().expect("trace sample");
+        let pick = s
+            .vm()
+            .find_object("BerettaPick0")
+            .and_then(|p| s.vm().vector_prop(p, "Location"))
+            .expect("Plage01 has BerettaPick0");
+        let d = ((pos[0] - pick[0]).powi(2) + (pos[1] - pick[1]).powi(2)).sqrt();
+        println!(
+            "[beretta test] player end ({:.1},{:.1}), BerettaPick0 ({:.1},{:.1}), horizontal gap {d:.1} UU",
+            pos[0], pos[1], pick[0], pick[1]
+        );
+        assert!(
+            d > 64.0,
+            "the Beretta is now reachable early ({d:.1} UU): update the item14b demonstration to walk to it"
+        );
+        assert!(
+            !s.inventory_items()
+                .iter()
+                .any(|(_, c)| c.to_ascii_lowercase().contains("beretta")),
+            "the Beretta was picked up without a reachable walk"
+        );
+    }
+
     /// Opt-in corpus regression (item3j Part A): the script login leaves **exactly one**
     /// `XIIIPlayerPawn`. Before the fix, `GameInfo.PostLogin` -> `StartMatch` restarted every
     /// placed `Engine.Camera` `PlayerController` (no pawn, not a spectator) and spawned 11 extra
@@ -1439,6 +1806,233 @@ mod tests {
             h1 < h0,
             "the VM's fall damage did not reduce Health ({h0} -> {h1}); first error: {:?}",
             session.first_error()
+        );
+    }
+
+    /// Opt-in corpus (item14b requirement 4): a soldier that is in its own active state
+    /// (`Base01` `BaseSoldier17`, order `Tenir`) detects the player through the host sight bridge
+    /// (`SeePlayer`), runs its own `Tenir -> Acquisition -> Attaque` states, turns toward the
+    /// player, fires its M16 and the player's `Health` drops. Base01 is used because every
+    /// campaign soldier on an active order carries its real weapon there; Plage00/01 soldiers are
+    /// ordered to the scripted `faction` (stasis) state and never fight.
+    #[test]
+    fn opt_in_base01_soldier_fights_back() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Base01").expect("open Base01");
+        let soldier = session
+            .vm()
+            .find_object("BaseSoldier17")
+            .expect("BaseSoldier17");
+        let sloc = session
+            .vm()
+            .vector_prop(soldier, "Location")
+            .expect("soldier location");
+        // Warm the soldier to `Tenir` (its `Init` runs, it receives a weapon) for 6 s.
+        let ploc0 = session.player_location().unwrap_or([0.0; 3]);
+        for _ in 0..360 {
+            session.step(1.0 / 60.0, ploc0, 0.0, [0.0; 3], &PlayerVMModes::default());
+        }
+        let ctrl = instance_prop(session.vm(), soldier, "Controller").expect("controller");
+        let warm_state = session.vm().state_name(ctrl);
+        assert_eq!(
+            warm_state.as_deref(),
+            Some("Tenir"),
+            "BaseSoldier17 did not reach Tenir (state {warm_state:?})"
+        );
+        // Put the player in front of the soldier, in the open, facing it.
+        let srot = session.vm().rotation_prop(soldier).unwrap_or([0; 3]);
+        let k = std::f32::consts::TAU / 65536.0;
+        let (sp, cp) = ((srot[0] as f32) * k).sin_cos();
+        let (sy, cy) = ((srot[1] as f32) * k).sin_cos();
+        let fwd = [cp * cy, cp * sy, sp];
+        let ploc = [
+            sloc[0] + fwd[0] * 70.0,
+            sloc[1] + fwd[1] * 70.0,
+            sloc[2] + 20.0,
+        ];
+        let yaw_to_soldier = (-fwd[1]).atan2(-fwd[0]);
+        let hp0 = session.player_health().expect("player health");
+        let mut first_attack = None;
+        let mut hp_low = hp0;
+        for t in 0..420u32 {
+            session.step(
+                1.0 / 60.0,
+                ploc,
+                yaw_to_soldier,
+                [0.0; 3],
+                &PlayerVMModes::default(),
+            );
+            let st = session.vm().state_name(ctrl);
+            if first_attack.is_none() && st.as_deref() == Some("Attaque") {
+                first_attack = Some(t as f32 / 60.0);
+            }
+            if let Some(h) = session.player_health() {
+                hp_low = hp_low.min(h);
+            }
+        }
+        let hp1 = session.player_health().expect("player health");
+        println!("[ai test] perception: {:?}", session.perception_log);
+        println!(
+            "[ai test] {} AI shots, first at {:?}",
+            session.ai_shots.len(),
+            session.ai_shots.front()
+        );
+        println!(
+            "[ai test] player Health {hp0} -> {hp1} (low {hp_low}), first Attaque at {first_attack:?}s"
+        );
+        // The soldier's own state machine acquired the enemy.
+        assert!(
+            session
+                .perception_log
+                .iter()
+                .any(|(_, c, e)| c == "IAController1" && e == "SeePlayer"),
+            "the sight bridge did not dispatch SeePlayer to IAController1"
+        );
+        assert!(
+            first_attack.is_some(),
+            "the soldier never entered Attaque (perception {:?})",
+            session.perception_log
+        );
+        assert!(
+            !session.ai_shots.is_empty(),
+            "the soldier never fired its weapon"
+        );
+        // The game's own damage chain reduced the player's Health.
+        assert!(
+            hp1 < hp0,
+            "the soldier's fire did not reduce the player's Health ({hp0} -> {hp1}); first error {:?}",
+            session.first_error()
+        );
+    }
+
+    /// Opt-in corpus (item14b requirement 1): the per-bone hit boxes are posed from the soldier's
+    /// own decoded skeleton and hit by the game's own trace/damage chain. Aiming at the head,
+    /// chest and below gives three different `GetLastTraceBone` names and the script's
+    /// per-zone damage. The Beretta is granted directly here (the real map pickup is exercised by
+    /// the `--play-script` demonstration); this test is the labelled synthetic case.
+    #[test]
+    fn opt_in_plage01_hit_zones_head_chest_legs() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Plage01").expect("open Plage01");
+        let soldier = session
+            .vm()
+            .find_object("BaseSoldier6")
+            .expect("Plage01 has BaseSoldier6");
+        let sloc = session
+            .vm()
+            .vector_prop(soldier, "Location")
+            .expect("soldier location");
+        let report = session.hitbox_summary();
+        println!("[hitbox test] {report}");
+        assert!(
+            report.contains("X") || report.contains("box"),
+            "no hit boxes: {report}"
+        );
+        // Labelled synthetic arm: the real pickup chain is demonstrated in `--play-script`.
+        session.grant_weapon("XIII.Beretta").expect("grant Beretta");
+        if let Some(w) = session.player_weapon() {
+            println!(
+                "[hitbox test] weapon firing sounds: hFireSound={:?} hAltFireSound={:?}",
+                session.vm().get_property(w, "hFireSound"),
+                session.vm().get_property(w, "hAltFireSound"),
+            );
+        }
+        let player = session.player;
+        let dist = 160.0f32;
+        let ploc = [sloc[0], sloc[1] - dist, sloc[2]];
+        session
+            .vm_mut()
+            .set_property(player, "Location", 0, Value::Vector(ploc));
+        session
+            .vm_mut()
+            .set_property(player, "BaseEyeHeight", 0, Value::Float(60.0));
+        session
+            .vm_mut()
+            .set_property(player, "EyeHeight", 0, Value::Float(60.0));
+        let yaw = std::f32::consts::FRAC_PI_2; // +Y, toward the soldier
+        let eye_z = ploc[2] + 60.0;
+        // From the measured MiocheM boxes: the Spine1 box is large (half 38) and overlaps the
+        // lower head, so a head shot must aim near the top of the head to clear the torso first.
+        let targets = [
+            ("head", sloc[2] + 74.0f32),
+            ("chest", sloc[2] + 31.3),
+            ("below", sloc[2] - 90.0),
+        ];
+        session.update_hit_boxes();
+        if let Some(boxes) = session.hit_zones.boxes_for(soldier) {
+            for b in &boxes {
+                println!(
+                    "[hitbox test] box {:>10} c ({:8.1},{:8.1},{:8.1}) half {:?}",
+                    b.bone, b.center[0], b.center[1], b.center[2], b.half
+                );
+            }
+        }
+        println!(
+            "[hitbox test] soldier health {:?}",
+            session.actor_health(soldier)
+        );
+        let mut results = Vec::new();
+        for (label, tz) in targets {
+            session.update_hit_boxes();
+            let pitch = ((tz - eye_z) / dist).atan();
+            let start = [ploc[0], ploc[1], eye_z];
+            // Keep the weapon at the eye, as `Session::step` does, so the script's damage
+            // falloff measures the muzzle-to-hit distance, not the stale spawn point.
+            if let Some(w) = session.player_weapon() {
+                session
+                    .vm_mut()
+                    .set_property(w, "Location", 0, Value::Vector(start));
+            }
+            let h0 = session.actor_health(soldier);
+            let outcome = session.fire(yaw, pitch);
+            let bone = session.vm().last_trace_bone().to_owned();
+            let h1 = session.actor_health(soldier);
+            let damage = match (h0, h1) {
+                (Some(a), Some(b)) => format!("{:.0}", a - b),
+                _ => "?".to_owned(),
+            };
+            println!(
+                "[hitbox test] {label}: pitch {pitch:+.1} deg -> {outcome:?}, bone '{bone}', damage {damage}"
+            );
+            results.push((label, bone, damage));
+        }
+        let fired_events = session.vm_mut().drain_events();
+        for e in &fired_events {
+            if let PresentationEvent::PlaySound(s) = e {
+                println!(
+                    "[hitbox test] PlaySound actor={} sound={:?}",
+                    s.actor, s.sound
+                );
+            }
+        }
+        let bones: Vec<&str> = results.iter().map(|(_, b, _)| b.as_str()).collect();
+        assert_eq!(
+            results[0].1, "X Head",
+            "head shot classified as '{}'",
+            results[0].1
+        );
+        assert_eq!(
+            results[1].1, "X Spine1",
+            "chest shot classified as '{}'",
+            results[1].1
+        );
+        assert_eq!(
+            results[2].1, "X Spine",
+            "below shot classified as '{}'",
+            results[2].1
+        );
+        // The script applies the head-shot factor; the head damage must exceed the chest damage.
+        let head_d: f32 = results[0].2.parse().unwrap();
+        let chest_d: f32 = results[1].2.parse().unwrap();
+        assert!(
+            head_d > chest_d,
+            "head damage {head_d} is not greater than chest damage {chest_d} ({bones:?})"
         );
     }
 }

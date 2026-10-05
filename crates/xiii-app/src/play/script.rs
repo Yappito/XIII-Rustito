@@ -78,6 +78,9 @@ pub enum Command {
     /// the same game function the goal trigger calls, so `TestGoalComplete`/`DoTravel`/`EndGame`/
     /// `ServerTravel` all run through the game's code. Labelled a bridge in the report.
     SetGoal(i32),
+    /// Equip the best weapon the player already carries in the game's own inventory chain (the
+    /// `BringUp`/`ChangedWeapon` path), e.g. after walking onto a map weapon pickup (item14b).
+    Equip,
 }
 
 /// A parsed input script, time-ordered.
@@ -171,6 +174,7 @@ impl Script {
                         .map_err(|_| format!("line {n}: bad objective number"))?;
                     Command::SetGoal(n)
                 }
+                "equip" | "select" => Command::Equip,
                 other => return Err(format!("line {n}: unknown command {other:?}")),
             };
             events.push(Event { t, command });
@@ -211,6 +215,8 @@ pub struct Drive {
     jump_pending: bool,
     use_pending: bool,
     fire_pending: bool,
+    /// `equip` requested (edge-triggered) and not yet applied by the host.
+    equip_pending: bool,
     /// Weapons requested (`weapon <Package.Class>`) and not yet applied by the host.
     weapons: Vec<String>,
     /// Active `goto` waypoint (Unreal units), if any.
@@ -234,6 +240,7 @@ impl Drive {
             jump_pending: false,
             use_pending: false,
             fire_pending: false,
+            equip_pending: false,
             weapons: Vec::new(),
             goto: None,
             waiting_travel: false,
@@ -261,6 +268,11 @@ impl Drive {
     /// Releases a `wait_travel` block (the host observed the travel request).
     pub fn notify_travel(&mut self) {
         self.waiting_travel = false;
+    }
+
+    /// Takes the pending `equip` request (edge-triggered).
+    pub fn take_equip(&mut self) -> bool {
+        std::mem::take(&mut self.equip_pending)
     }
 
     /// Applies every event due at or before `elapsed` and returns this tick's input.
@@ -297,6 +309,7 @@ impl Drive {
                     self.cursor += 1;
                     break;
                 }
+                Command::Equip => self.equip_pending = true,
             }
             self.cursor += 1;
         }

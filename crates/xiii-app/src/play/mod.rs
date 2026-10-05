@@ -11,6 +11,7 @@
 
 pub mod cartoon;
 pub mod cinematics;
+pub mod footsteps;
 pub mod hud;
 pub mod movement_modes;
 pub mod movers;
@@ -29,6 +30,7 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::ecs::system::{NonSend, NonSendMut};
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::mesh::skinning::SkinnedMeshInverseBindposes;
+use bevy::pbr::decal::ForwardDecalMaterial;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
 use bevy::time::Fixed;
@@ -93,6 +95,12 @@ struct ScriptRes {
     drive: Option<script::Drive>,
 }
 
+/// Player footstep cadence for `--play` (surface lookup table + accumulator). See
+/// [`footsteps`] for the evidence (notify-driven in the original; synthesised here because the
+/// player pawn has no third-person animation).
+#[derive(Resource)]
+struct FootstepRes(footsteps::FootstepDriver);
+
 #[derive(Resource)]
 struct TraceState {
     tick: u64,
@@ -122,6 +130,22 @@ struct ParticleTriggerCursor {
     trace_len: usize,
 }
 
+/// Bevy light entities driven by live VM light actors: map-placed `TriggerLight`/
+/// `ScriptedLight`/`MovableLight` and runtime-spawned lights such as the Beretta's
+/// `XIII.MuzzleLight`. The VM owns the actors; this host map only mirrors them.
+#[derive(Resource, Default)]
+struct RuntimeLights {
+    entities: HashMap<xiii_script::ObjectId, Entity>,
+    /// Lights mirrored on the last sync (diagnostic overlay).
+    active: usize,
+    /// Total lights spawned since startup (diagnostic overlay).
+    spawned: u64,
+    /// Live VM actors of class `MuzzleLight` seen on the last sync (diagnostic overlay).
+    muzzle_actors: usize,
+    /// Live VM actors whose class name contains `Attach` (diagnostic overlay).
+    attach_actors: usize,
+}
+
 impl Plugin for PlayPlugin {
     fn build(&self, app: &mut App) {
         // Load the script session before the window opens. `Session` holds `Rc`-based VM state
@@ -148,10 +172,13 @@ impl Plugin for PlayPlugin {
         .init_resource::<RenderSync>()
         .init_resource::<weapons::WeaponView>()
         .init_resource::<ParticleTriggerCursor>()
+        .init_resource::<RuntimeLights>()
         .add_plugins(viewer::particles::ParticlePlugin)
         .init_resource::<cinematics::CinematicState>()
         .init_resource::<cartoon::CartoonState>()
         .init_resource::<cartoon::CartoonRenderTarget>()
+        .init_resource::<viewer::decals::RuntimeProjectorDecals>()
+        .insert_resource(viewer::fog::FogDisabled(viewer::fog::fog_disabled()))
         .add_systems(Startup, setup)
         .add_systems(FixedUpdate, (fixed_step, travel).chain())
         .add_systems(
@@ -165,7 +192,10 @@ impl Plugin for PlayPlugin {
                 cinematics::draw,
                 viewer::sky_follow,
                 viewer::animate_uv,
+                viewer::fog::update_fog,
+                viewer::decals::update_runtime_projectors,
                 sync_particle_triggers,
+                sync_vm_lights,
                 pawns::update_pawns,
                 weapons::update_weapon_view,
                 hud::refresh,
@@ -364,6 +394,7 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
+    mut decal_materials: ResMut<Assets<ForwardDecalMaterial<StandardMaterial>>>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let session = match session.as_mut() {
@@ -383,6 +414,7 @@ fn setup(
         &mut materials,
         &mut images,
         &mut bindposes,
+        &mut decal_materials,
         false,
     ) {
         Ok(()) => {}
@@ -403,6 +435,7 @@ fn setup_inner(
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
     bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
+    decal_materials: &mut Assets<ForwardDecalMaterial<StandardMaterial>>,
     // True when this is a level-transition reload: the input-script cursor and the travel
     // timing in `TraceState` must survive, so they are not re-inserted.
     resetting: bool,
@@ -456,6 +489,10 @@ fn setup_inner(
         "[play] login path: script={} bootstrap={}",
         session.login_script, session.login_bootstrap
     );
+    println!("[play] hit boxes: {}", session.hitbox_summary());
+    for e in &session.hitbox_errors {
+        println!("[play]   hit-box mesh failed: {e}");
+    }
     println!(
         "[play] localisation: language={} localized class-default overrides={}",
         session.localization_language, session.localized_overrides
@@ -536,7 +573,7 @@ fn setup_inner(
 
     // Render entities per map actor for the one-way sync of VM-moved actors. The scene object
     // path starts with the map export name (`Actor -> Package.Mesh`).
-    let geometry = viewer::spawn_scene_geometry(
+    let (geometry, image_handles) = viewer::spawn_scene_geometry(
         commands,
         meshes,
         materials,
@@ -544,6 +581,7 @@ fn setup_inner(
         &scene,
         opts.lighting == crate::cli::Lighting::Baked,
         opts.particles == crate::cli::Particles::All,
+        true,
     );
     for (o, entity) in scene.objects.iter().zip(&geometry) {
         let actor = o
@@ -553,6 +591,26 @@ fn setup_inner(
             .to_owned();
         sync.entities.entry(actor).or_default().push(*entity);
     }
+    // Fog table (per-zone, camera-selected each frame) and the static map projectors' decals.
+    let projection_assets =
+        viewer::decals::setup_projector_assets(images, &image_handles, &scene, decal_materials);
+    let decals_spawned = viewer::decals::spawn_static_projectors(
+        commands,
+        &scene,
+        &projection_assets,
+        decal_materials,
+    );
+    commands.insert_resource(projection_assets);
+    commands.insert_resource(viewer::decals::GroundQuery::from_scene(&scene));
+    commands.insert_resource(viewer::fog::FogContext::new(&scene));
+    println!(
+        "[play] fog: {} zones ({} fogged, {} from class default, {} disabled by map); projectors: {} static ({decals_spawned} decals)",
+        scene.fog.params.len(),
+        scene.fog.params.iter().filter(|p| p.is_fogged()).count(),
+        scene.fog.from_class_default,
+        scene.fog.disabled_by_map,
+        scene.projectors.len(),
+    );
     let scene_tris: usize = scene
         .objects
         .iter()
@@ -569,15 +627,29 @@ fn setup_inner(
     let eye = to_bevy_position(sim.eye_location(&params));
     let sky_position = viewer::scene_sky_position(&scene);
     let sky_enabled = viewer::sky_camera_enabled(&sky_position);
+    let start_params = scene
+        .fog
+        .params_at(eye, viewer::scene_sky_zone(&scene))
+        .cloned()
+        .unwrap_or_else(xiii_world::fog::FogParams::none);
     commands.spawn((
         Camera3d::default(),
         viewer::main_camera_config(sky_enabled),
         RenderLayers::layer(viewer::MAIN_LAYER),
+        bevy::core_pipeline::prepass::DepthPrepass,
+        viewer::fog::distance_fog(&start_params),
+        viewer::lights::receiver_ambient_if_enabled().unwrap_or_else(|| {
+            viewer::fog::ambient_light(&start_params).unwrap_or_else(|| AmbientLight {
+                color: Color::NONE,
+                brightness: 0.0,
+                ..default()
+            })
+        }),
         Transform::from_translation(Vec3::from_array(eye)),
         PlayCam,
     ));
     if sky_enabled && let Some(p) = sky_position {
-        viewer::spawn_sky_camera(commands, p);
+        viewer::spawn_sky_camera(commands, p, viewer::scene_sky_zone(&scene));
         println!(
             "[play] sky camera at ({:.1}, {:.1}, {:.1}) m from the map's sky zone",
             p.x, p.y, p.z
@@ -673,6 +745,8 @@ fn setup_inner(
     commands.insert_resource(ParamsRes(params));
     commands.insert_resource(MotionRes(motion));
     commands.insert_resource(SimRes(sim));
+    commands.insert_resource(footsteps::SurfaceSounds::from_scene(&scene));
+    commands.insert_resource(FootstepRes(footsteps::FootstepDriver::new()));
     commands.insert_resource(WorldRes {
         world,
         sources,
@@ -810,9 +884,13 @@ fn fixed_step(
     mut session: NonSendMut<Result<session::Session, String>>,
     sync: Res<RenderSync>,
     motion: Res<MotionRes>,
+    mut footsteps: ResMut<FootstepRes>,
+    surfaces: Res<footsteps::SurfaceSounds>,
+    cfg: Res<PlayConfig>,
     mut transforms: Query<&mut Transform>,
     mut perf: ResMut<crate::perf::Perf>,
 ) {
+    let audio_enabled = cfg.options.audio == crate::cli::Audio::On;
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
@@ -826,17 +904,23 @@ fn fixed_step(
         Ok(sess) => cinematics::input_suppressed(sess),
         Err(_) => false,
     };
-    let (input, weapons, goals) = if suppressed {
-        (Input::default(), Vec::new(), Vec::new())
+    let (input, weapons, goals, equip) = if suppressed {
+        (Input::default(), Vec::new(), Vec::new(), false)
     } else {
         match script.drive.as_mut() {
             Some(drive) => {
                 let input = drive.advance(elapsed, &mut sim.0);
                 let weapons = drive.take_weapons();
                 let goals = drive.take_goals();
-                (input, weapons, goals)
+                let equip = drive.take_equip();
+                (input, weapons, goals, equip)
             }
-            None => (read_keyboard(&keys, &buttons), Vec::new(), Vec::new()),
+            None => (
+                read_keyboard(&keys, &buttons),
+                Vec::new(),
+                Vec::new(),
+                false,
+            ),
         }
     };
     let use_action = input.use_action;
@@ -856,6 +940,22 @@ fn fixed_step(
         );
     }
     perf.span("player_sim", t0);
+    // Player footsteps: the original fires the `PlayFootStep` notify from the third-person walk
+    // animation, which `--play` does not render, so the host synthesises it from the same
+    // surface lookup the script would read from `LastCollidedMaterial`. Emit only when audio is
+    // enabled; the queue is drained by the audio plugin.
+    if audio_enabled
+        && let Some(step) =
+            footsteps
+                .0
+                .advance(dt, &sim.0, &params.0, &world.world, &surfaces, input.walk)
+    {
+        crate::audio::queue_request(crate::audio::SoundRequest::footstep(
+            state.tick as f64 * f64::from(DT),
+            "XIIIPlayerPawn".to_owned(),
+            step.sound,
+        ));
+    }
     if let Ok(sess) = session.as_mut() {
         let t0 = Instant::now();
         let modes = session::PlayerVMModes {
@@ -881,7 +981,30 @@ fn fixed_step(
         perf.span("mover_collision", t0);
         for path in &weapons {
             match sess.grant_weapon(path) {
-                Ok(msg) => println!("[play] weapon {msg}"),
+                Ok(msg) => {
+                    println!("[play] weapon {msg}");
+                    // The diagnostic grant wires `Pawn.Weapon` directly instead of going
+                    // through `Pawn.ChangedWeapon`, so the weapon's third-person attachment
+                    // (`XIII.BerettaAttach` -> `MFSmallAttach` -> `XIII.MuzzleLight`) is never
+                    // spawned. Run the game's own `Inventory.AttachToPawn` so the muzzle light
+                    // exists; the spawn happens before any later native in the function, so a
+                    // failure to attach is reported, not fatal (item5h host bridge).
+                    if let Some(weapon) = sess.player_weapon() {
+                        let pawn = sess.player;
+                        let arg = Value::Object(Some(xiii_script::ObjRef::Instance(pawn)));
+                        let vm = sess.vm_mut();
+                        match vm.class_function(weapon, "AttachToPawn") {
+                            Some(f) => {
+                                if let Err(e) = vm.call_function(f, weapon, vec![arg]) {
+                                    println!("[play] weapon AttachToPawn partial: {e}");
+                                } else {
+                                    println!("[play] weapon attachment spawned via AttachToPawn");
+                                }
+                            }
+                            None => println!("[play] weapon has no AttachToPawn function"),
+                        }
+                    }
+                }
                 Err(e) => println!("[play] weapon grant failed {path}: {e}"),
             }
         }
@@ -890,12 +1013,18 @@ fn fixed_step(
                 println!("[play] set_goal {n} failed: {e}");
             }
         }
+        if equip {
+            match sess.equip_inventory_weapon() {
+                Ok(msg) => println!("[play] equip {msg}"),
+                Err(e) => println!("[play] equip failed: {e}"),
+            }
+        }
         if use_action {
             perform_use(sess, &wr.world, &wr.sources, &sim.0, &params.0);
         }
         if fire {
-            match sess.fire(sim.0.yaw) {
-                session::FireOutcome::Fired => {}
+            match sess.fire(sim.0.yaw, sim.0.pitch) {
+                session::FireOutcome::Fired => flash_muzzle_light(sess, &sim.0, &params.0),
                 other => println!("[play] fire: {other:?}"),
             }
         }
@@ -923,6 +1052,63 @@ fn fixed_step(
         if let Ok(sess) = session.as_ref() {
             println!("[play] {}", format_vm_trace(sess));
         }
+    }
+}
+
+/// Presentation bridge for the player's muzzle flash light (item5h).
+///
+/// The retail chain is `Weapon.IncrementFlashCount` -> `WeaponAttachment(ThirdPersonActor)
+/// .ThirdPersonEffects` -> `MuzzleAttach` (spawns `MFSmallAttach`) -> `MuzzleFlashAttachment
+/// .Visible.Tick` -> `XIII.MuzzleLight.Flash`. The diagnostic weapon grant wires `Pawn.Weapon`
+/// directly, so the third-person attachment has to be created by the host (see the grant above),
+/// and the VM's `WeaponAttachment(...)` cast does not reach it on the fire path. This bridge
+/// therefore runs the game's own `MFSmallAttach` spawn (`ThirdPersonEffects`) once and then calls
+/// the game's own `XIII.MuzzleLight.Flash` at the muzzle position from
+/// `MuzzleFlashAttachment.Visible.Tick` (`Instigator.Location + EyePosition + ViewRotation*70`).
+/// The light itself is a real VM actor the renderer then follows; no light value is forged.
+fn flash_muzzle_light(sess: &mut session::Session, sim: &PlayerSim, params: &PlayerParams) {
+    let Some(weapon) = sess.player_weapon() else {
+        return;
+    };
+    let object_prop = |vm: &xiii_script::Vm<'_>, id, name: &str| match vm.get_property(id, name) {
+        Some(Value::Object(Some(xiii_script::ObjRef::Instance(i)))) => Some(*i),
+        _ => None,
+    };
+    let vm = sess.vm_mut();
+    let Some(attachment) = object_prop(vm, weapon, "ThirdPersonActor") else {
+        println!("[play] muzzle: no third-person attachment");
+        return;
+    };
+    // The attachment exists (host-created at grant); run the game's MuzzleAttach once so its
+    // MuzzleFlash sub-attachment (and its MuzzleLight) exists.
+    if object_prop(vm, attachment, "MuzzleFlash").is_none() {
+        match vm.class_function(attachment, "ThirdPersonEffects") {
+            Some(f) => {
+                if let Err(e) = vm.call_function(f, attachment, vec![]) {
+                    println!("[play] muzzle ThirdPersonEffects: {e}");
+                }
+            }
+            None => println!("[play] muzzle: no ThirdPersonEffects function"),
+        }
+    }
+    let Some(muzzle_flash) = object_prop(vm, attachment, "MuzzleFlash") else {
+        println!("[play] muzzle: no MuzzleFlash after ThirdPersonEffects");
+        return;
+    };
+    let Some(light) = object_prop(vm, muzzle_flash, "MFLight") else {
+        println!("[play] muzzle: MuzzleFlash has no MFLight");
+        return;
+    };
+    let eye = sim.eye_location(params);
+    let (sy, cy) = sim.yaw.sin_cos();
+    let (sp, cp) = sim.pitch.sin_cos();
+    let muzzle = [
+        eye[0] + cy * cp * 70.0,
+        eye[1] + sy * cp * 70.0,
+        eye[2] + sp * 70.0,
+    ];
+    if let Some(f) = vm.class_function(light, "Flash") {
+        let _ = vm.call_function(f, light, vec![Value::Vector(muzzle)]);
     }
 }
 
@@ -983,6 +1169,86 @@ fn sync_particle_triggers(
             }
         }
     }
+}
+
+/// Mirrors the VM's live light actors to Bevy `PointLight` entities. Map-placed dynamic lights
+/// (`TriggerLight`, `ScriptedLight`, `MovableLight`) and runtime lights (`XIII.MuzzleLight`) are
+/// all found by class, so a muzzle flash and a scripted flicker use the same path. A light the
+/// script turns off (`LightType == LT_None`) or that is despawned loses its entity, so it cannot
+/// keep lighting the scene.
+fn sync_vm_lights(
+    mut commands: Commands,
+    session: NonSend<Result<session::Session, String>>,
+    mut state: ResMut<RuntimeLights>,
+    mut lights: Query<(&mut PointLight, &mut Transform)>,
+) {
+    let Ok(sess) = session.as_ref() else {
+        return;
+    };
+    if viewer::lights::lights_disabled() {
+        for (_, entity) in state.entities.drain() {
+            commands.entity(entity).despawn();
+        }
+        state.active = 0;
+        return;
+    }
+    let vm = sess.vm();
+    let time = sess.vm_time() as f32;
+    let mut seen: std::collections::HashSet<xiii_script::ObjectId> =
+        std::collections::HashSet::new();
+    let mut muzzle_actors = 0usize;
+    let mut attach_actors = 0usize;
+    for i in 0..vm.objects.len() {
+        let id = i as xiii_script::ObjectId;
+        if !vm.objects[i].deleted {
+            if vm.is_a(id, "MuzzleLight") {
+                muzzle_actors += 1;
+            }
+            if vm.is_a(id, "MuzzleFlashAttachment") {
+                attach_actors += 1;
+            }
+        }
+        let Some(light) = viewer::lights::scene_light_from_vm(vm, id) else {
+            continue;
+        };
+        if !light.render_dynamic() {
+            continue;
+        }
+        seen.insert(id);
+        let point = viewer::lights::point_light_for(&light, time);
+        let position = Vec3::from_array(light.transform.translation);
+        match state.entities.get(&id).copied() {
+            Some(entity) => {
+                if let Ok((mut point_light, mut transform)) = lights.get_mut(entity) {
+                    *point_light = point;
+                    transform.translation = position;
+                }
+            }
+            None => {
+                let entity = commands
+                    .spawn((
+                        point,
+                        Transform::from_translation(position),
+                        RenderLayers::layer(viewer::MAIN_LAYER),
+                        Name::new(format!("vmlight {}", light.path)),
+                    ))
+                    .id();
+                state.entities.insert(id, entity);
+                state.spawned += 1;
+            }
+        }
+    }
+    state.entities.retain(|id, entity| {
+        if seen.contains(id) {
+            true
+        } else {
+            commands.entity(*entity).despawn();
+            false
+        }
+    });
+    state.active = state.entities.len();
+    state.muzzle_actors = muzzle_actors;
+    state.attach_actors = attach_actors;
 }
 
 /// One VM status line: time, active/suspended counts, dispatcher state, player VM position,
@@ -1068,7 +1334,10 @@ fn overlay(
     session: NonSend<Result<session::Session, String>>,
     pawns: Option<Res<pawns::PawnScene>>,
     hud: Option<Res<hud::HudRuntime>>,
+    projector_decals: Option<Res<viewer::decals::RuntimeProjectorDecals>>,
+    fog_ctx: Option<Res<viewer::fog::FogContext>>,
     weapon_view: Option<Res<weapons::WeaponView>>,
+    runtime_lights: Option<Res<RuntimeLights>>,
     mut perf: ResMut<crate::perf::Perf>,
     mut text: Query<&mut Text, With<PlayOverlay>>,
 ) {
@@ -1145,6 +1414,22 @@ fn overlay(
         }
         None => "HUD unavailable".to_owned(),
     };
+    let projectors_line = {
+        let (runtime, grounded) = projector_decals
+            .as_deref()
+            .map_or((0, 0), |d| (d.active.len(), d.grounded));
+        let counts = fog_ctx.as_deref().map_or_else(
+            || "fog unavailable".to_owned(),
+            |c| {
+                format!(
+                    "fog zones {} (fogged {})",
+                    c.fog.params.len(),
+                    c.fog.params.iter().filter(|p| p.is_fogged()).count()
+                )
+            },
+        );
+        format!("{counts} | runtime projector decals {runtime} (grounded {grounded})")
+    };
     let combat_line = match &*session {
         Ok(s) => {
             let health = s
@@ -1163,6 +1448,13 @@ fn overlay(
         }
         Err(_) => "combat unavailable".to_owned(),
     };
+    let lights_line = match runtime_lights.as_deref() {
+        Some(l) => format!(
+            "dynamic lights {} ({} spawned, {} MuzzleLight, {} Attach actors)",
+            l.active, l.spawned, l.muzzle_actors, l.attach_actors
+        ),
+        None => "dynamic lights unavailable".to_owned(),
+    };
     text.0 = format!(
         "XIII play prototype (NOT a playable mission; no weapons, no full AI)\n\
          map {} | pos ({:.1}, {:.1}, {:.1}) UU | vel ({:.1}, {:.1}, {:.1}) UU/s | state {}\n\
@@ -1170,7 +1462,9 @@ fn overlay(
          {combat_line}\n\
          {}\n\
          {pawns_line}\n\
+         {lights_line}\n\
          {hud_line}\n\
+         {projectors_line}\n\
          WASD move | mouse look | Space jump | Shift walk | C crouch | Left mouse fire | E use | Esc quit",
         cfg.options.map.as_deref().unwrap_or("?"),
         s.location[0],
@@ -1307,6 +1601,7 @@ fn travel(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
+    mut decal_materials: ResMut<Assets<ForwardDecalMaterial<StandardMaterial>>>,
     // Every rendered/UI entity of the current map. The `Or` filter is what distinguishes our
     // content from Bevy resource entities (which are stored as entities and must not be
     // despawned) and from the window entity.
@@ -1372,6 +1667,7 @@ fn travel(
         &mut materials,
         &mut images,
         &mut bindposes,
+        &mut decal_materials,
         true,
     ) {
         Ok(()) => {}
@@ -1435,6 +1731,9 @@ pub(crate) struct ScriptOutcome {
     pub final_map: String,
     /// One entry per level transition, in order (empty when the run did not travel).
     pub travel: Vec<TravelHop>,
+    /// Host-synthesised footsteps in order:
+    /// `(seconds, XIIIFootStepSound wrapper path, floor material path)`.
+    pub footsteps: Vec<(f32, String, Option<String>)>,
 }
 
 /// One level transition observed in a headless run.
@@ -1550,12 +1849,18 @@ pub(crate) fn run_script(
     let mut trace = Vec::new();
     let mut travel = Vec::new();
     let mut runtime = open_map_runtime(game_dir, map, scene, params)?;
+    // Player footsteps (item6e): the same notify-free synthesis `fixed_step` uses, so the
+    // headless path reports and can play them. Rebuilt for each map after a level transition.
+    let mut surfaces = footsteps::SurfaceSounds::from_scene(scene);
+    let mut step_driver = footsteps::FootstepDriver::new();
+    let mut footstep_log: Vec<(f32, String, Option<String>)> = Vec::new();
     let mut tick = 0u64;
     while tick < ticks {
         let elapsed = tick as f32 * DT;
         let input = drive.advance(elapsed, &mut runtime.sim);
         let weapons = drive.take_weapons();
         let goals = drive.take_goals();
+        let equip = drive.take_equip();
         let fired = input.fire;
         if runtime.volumes.is_empty() {
             runtime
@@ -1570,6 +1875,18 @@ pub(crate) fn run_script(
                 &runtime.sources,
                 &runtime.volumes,
             );
+        }
+        // The headless driver only records footsteps; playback belongs to the windowed
+        // `fixed_step` path (this function opens no audio device).
+        if let Some(step) = step_driver.advance(
+            DT,
+            &runtime.sim,
+            params,
+            &runtime.world,
+            &surfaces,
+            input.walk,
+        ) {
+            footstep_log.push((elapsed, step.sound, step.material));
         }
         let modes = session::PlayerVMModes {
             crouched: runtime.sim.crouched,
@@ -1598,6 +1915,12 @@ pub(crate) fn run_script(
                 println!("[play] set_goal {n} failed: {e}");
             }
         }
+        if equip {
+            match runtime.session.equip_inventory_weapon() {
+                Ok(msg) => println!("[play] equip {msg}"),
+                Err(e) => println!("[play] equip failed: {e}"),
+            }
+        }
         if input.use_action {
             perform_use(
                 &mut runtime.session,
@@ -1608,7 +1931,7 @@ pub(crate) fn run_script(
             );
         }
         if fired {
-            match runtime.session.fire(runtime.sim.yaw) {
+            match runtime.session.fire(runtime.sim.yaw, runtime.sim.pitch) {
                 session::FireOutcome::Fired => {
                     println!(
                         "[play] fire [{elapsed:.3}s] player {} bone {} | {}",
@@ -1669,6 +1992,9 @@ pub(crate) fn run_script(
             let next_scene = viewer::load_scene(&opts)?;
             let t0 = Instant::now();
             runtime = open_map_runtime(game_dir, &plan.map, &next_scene, params)?;
+            // Rebuild the footstep surface map and driver for the next map.
+            surfaces = footsteps::SurfaceSounds::from_scene(&next_scene);
+            step_driver = footsteps::FootstepDriver::new();
             println!(
                 "[play] travel complete: {} -> {} in {:.2}s ({} objects)",
                 travel.last().map(|h| h.from.as_str()).unwrap_or("-"),
@@ -1692,6 +2018,7 @@ pub(crate) fn run_script(
         trace,
         final_map: runtime.name,
         travel,
+        footsteps: footstep_log,
     })
 }
 
@@ -1813,6 +2140,10 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
         "[play] login path: script={} bootstrap={}",
         session.login_script, session.login_bootstrap
     );
+    println!("[play] hit boxes: {}", session.hitbox_summary());
+    for e in &session.hitbox_errors {
+        println!("[play]   hit-box mesh failed: {e}");
+    }
     println!(
         "[play] localisation: language={} localized class-default overrides={}",
         session.localization_language, session.localized_overrides
@@ -1888,6 +2219,34 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
     }
     if let Some(first) = session.first_error() {
         println!("[play] first script error: {first}");
+    }
+    // Footstep summary and the full ordered list (requirement 3: count and names on Plage01).
+    let mut by_sound: std::collections::BTreeMap<String, (usize, Option<String>)> =
+        std::collections::BTreeMap::new();
+    for (_, s, mat) in &outcome.footsteps {
+        let e = by_sound.entry(s.clone()).or_insert((0, mat.clone()));
+        e.0 += 1;
+        if e.1.is_none() {
+            e.1.clone_from(mat);
+        }
+    }
+    println!(
+        "[play] footsteps: {} emitted: {}",
+        outcome.footsteps.len(),
+        by_sound
+            .iter()
+            .map(|(s, (n, mat))| match mat {
+                Some(m) => format!("{n}x {s} [{m}]"),
+                None => format!("{n}x {s} [material path unknown]"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for (t, s, mat) in &outcome.footsteps {
+        match mat {
+            Some(m) => println!("[play]   footstep [{t:.3}s] {s} [{m}]"),
+            None => println!("[play]   footstep [{t:.3}s] {s}"),
+        }
     }
     println!(
         "[play] headless scripted VM run finished in {:.2}s wall time, {} ticks, {} trace samples",
@@ -1994,6 +2353,71 @@ mod tests {
         assert_eq!(sim.location, [4.0, 5.0, 6.0]);
         // Bad arity is rejected.
         assert!(script::Script::parse("t=0.0 teleport 1 2\n").is_err());
+    }
+
+    /// Opt-in corpus test (item6e requirement 3): a scripted shuttle walk on Plage01 emits
+    /// footsteps whose names come from the floor's `XIIIFootStepSound` material properties. The
+    /// start is on the hut interior floor (the script login spawn), whose texture carries
+    /// `XIIIPlage.PLmeub05` -> `XIIIsound.Footsteps__XIIIFSBoi.…`.
+    #[test]
+    fn opt_in_plage01_scripted_walk_plays_surface_footsteps() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let script = script::Script::parse(
+            "t=0.0 forward 1\nt=1.5 forward -1\nt=3.0 forward 1\nt=4.5 forward -1\nt=6.0 forward 1\nt=7.5 forward -1\nt=9.0 forward 0\n",
+        )
+        .unwrap();
+        let outcome = run_script(
+            &game_dir,
+            "Plage01",
+            &script,
+            &resolved.params,
+            &scene,
+            10.0,
+        )
+        .expect("run Plage01 shuttle walk");
+        assert!(
+            !outcome.footsteps.is_empty(),
+            "a 9 s scripted walk on Plage01 must emit footsteps"
+        );
+        // Every footstep names a real `XIIIFootStepSound` wrapper and a floor material path.
+        for (t, sound, material) in &outcome.footsteps {
+            assert!(
+                sound.to_ascii_lowercase().contains("footsteps__xiiifs"),
+                "footstep [{t:.3}s] sound {sound} is not a player footstep wrapper"
+            );
+            assert!(
+                material.is_some(),
+                "footstep [{t:.3}s] {sound} has no floor material path"
+            );
+        }
+        let mut names: Vec<&str> = outcome
+            .footsteps
+            .iter()
+            .map(|(_, s, _)| s.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        println!(
+            "[steps test] Plage01 {} footsteps, {} distinct: {:?}; materials {:?}",
+            outcome.footsteps.len(),
+            names.len(),
+            names,
+            outcome
+                .footsteps
+                .iter()
+                .filter_map(|(_, _, m)| m.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        );
     }
 
     /// Opt-in corpus test (requirement 6): the Plage01 script run opens the locked hut door
@@ -2511,12 +2935,16 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        // BaseSoldier6 is at (1802.4, -12832.0, 1070.8). Place the player 40 UU in +X facing -X
-        // and fire headshots; the battle is entirely script-driven.
+        // BaseSoldier6 is at (1802.4, -12832.0, 1070.8). Place the player 160 UU in -Y facing +Y
+        // (yaw 90) and aim at the top of the head (pitch +5 deg). With the decoded per-bone hit
+        // boxes (item14b) the large `X Spine1` box overlaps the lower head, so a point-blank
+        // horizontal shot is a chest hit; the head needs the ray to clear the torso first. The
+        // battle is entirely script-driven (no host damage).
         let script = script::Script::parse(
             "t=0.00 weapon XIII.Beretta\n\
-             t=0.20 teleport 1842.4 -12832.0 1070.8\n\
-             t=0.20 yaw 180\n\
+             t=0.20 teleport 1802.4131 -12992.034 1070.843\n\
+             t=0.20 yaw 90\n\
+             t=0.20 pitch 5\n\
              t=0.30 fire\nt=0.90 fire\nt=1.50 fire\nt=2.10 fire\nt=2.70 fire\nt=3.30 fire\n\
              t=3.90 fire\nt=4.50 fire\nt=5.10 fire\nt=5.70 fire\nt=6.30 fire\n",
         )

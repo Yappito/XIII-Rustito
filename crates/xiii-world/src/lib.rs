@@ -23,17 +23,22 @@ use std::sync::Arc;
 
 pub mod animation;
 pub mod audio;
+pub mod fog;
+pub mod hitbox;
+pub mod lights;
 pub mod materials;
 pub mod movement_volumes;
 pub mod nav_provider;
 pub mod navigation;
 pub mod particles;
 pub mod physics;
+pub mod projectors;
 pub mod reach;
 pub mod runtime;
 pub mod zones;
 
 use materials::{BlendMode, MaterialNode, NodeKey, ResolvedMaterial, UvOp};
+use projectors::ProjectorDef;
 use xiii_decode::common::{
     BevyTransform, Mat3, Props, actor_to_bevy_pre_pivot, to_bevy_direction, to_bevy_position,
 };
@@ -149,6 +154,11 @@ pub struct WorldScene {
     /// triangles), the BSP its node polygons without `PF_NotSolid`/portal flags (invisible walls
     /// included), the terrain its visible quads.
     pub collision_triangles: Vec<([[f32; 3]; 3], u32)>,
+    /// Resolved surface material index (into [`WorldScene::materials`]) per
+    /// [`WorldScene::collision_triangles`] entry. `None` for geometry with no per-triangle
+    /// material (terrain heightfield, degenerate slots). Static-mesh and BSP triangles carry the
+    /// material of their source surface, so the host can read a floor's footstep sound.
+    pub collision_materials: Vec<Option<usize>>,
     /// Indices into [`WorldScene::collision_triangles`] selected for extent (box) queries.
     pub collision_box: Vec<u32>,
     /// Indices into [`WorldScene::collision_triangles`] selected for zero-extent (line/ray)
@@ -160,8 +170,16 @@ pub struct WorldScene {
     pub zones: Vec<zones::SceneZone>,
     /// Indices into [`WorldScene::zones`] of the sky zones (`is_sky`), in increasing order.
     pub sky_zones: Vec<u32>,
+    /// Per-zone distance fog and ambient light, resolved map-property-first.
+    pub fog: fog::SceneFog,
+    /// Static `Projector`/`ShadowProjector` actors placed in the map (Bevy-space poses).
+    pub projectors: Vec<projectors::ProjectorPose>,
     /// Decoded particle emitter systems placed in the map (see [`particles`]).
     pub particle_systems: Vec<particles::ParticleSystem>,
+    /// Every map-placed `Light`-subclass actor and its decoded UE2 light properties (see
+    /// [`lights`]). Baked/non-emitting lights are included for diagnostics; use
+    /// [`lights::SceneLight::render_dynamic`] to select the runtime ones.
+    pub lights: Vec<lights::SceneLight>,
 }
 
 impl WorldScene {
@@ -173,17 +191,22 @@ impl WorldScene {
     }
 
     /// Adds `tris` under an existing source id to the selected soups. Triangles selected by both
-    /// kinds are stored once in the shared pool. Counts `collision.triangles` per unique entry.
+    /// kinds are stored once in the shared pool. `materials`, when given, is a parallel list of
+    /// resolved material indices. Counts `collision.triangles` per unique entry.
     fn add_collision_tris(
         &mut self,
         id: u32,
         tris: impl IntoIterator<Item = [[f32; 3]; 3]>,
+        materials: Option<Vec<Option<usize>>>,
         to_box: bool,
         to_line: bool,
     ) {
+        let mut materials = materials.map(|m| m.into_iter());
         for t in tris {
             let index = self.collision_triangles.len() as u32;
             self.collision_triangles.push((t, id));
+            let material = materials.as_mut().and_then(|it| it.next()).flatten();
+            self.collision_materials.push(material);
             if to_box {
                 self.collision_box.push(index);
             }
@@ -194,17 +217,26 @@ impl WorldScene {
         }
     }
 
-    /// Adds one source's triangles to both soups (BSP, terrain: one geometry for every query).
-    fn add_collision(&mut self, source: String, tris: impl IntoIterator<Item = [[f32; 3]; 3]>) {
-        let id = self.new_collision_source(source);
-        self.add_collision_tris(id, tris, true, true);
-    }
-
     /// Extent (box) query `(triangle, source id)` entries.
     pub fn box_collision(&self) -> impl Iterator<Item = ([[f32; 3]; 3], u32)> + '_ {
         self.collision_box
             .iter()
             .map(|&i| self.collision_triangles[i as usize])
+    }
+
+    /// Resolved surface material (index into [`WorldScene::materials`]) of the box-query
+    /// triangle at `index` in the shared collision pool, else `None` (terrain, missing slot).
+    pub fn collision_material(&self, index: u32) -> Option<&ResolvedMaterial> {
+        self.collision_materials
+            .get(index as usize)
+            .copied()
+            .flatten()
+            .and_then(|m| self.materials.get(m))
+    }
+
+    /// Player footstep wrapper `Sound` path of a box-query collision triangle, else `None`.
+    pub fn footstep_sound(&self, index: u32) -> Option<&str> {
+        self.collision_material(index)?.footstep_sound.as_deref()
     }
 
     /// Zero-extent (line/ray) query `(triangle, source id)` entries.
@@ -379,6 +411,10 @@ struct MeshSections {
     collision_box: Arc<Vec<[[f32; 3]; 3]>>,
     /// Triangles of `line_set` (Bevy space, unscaled).
     collision_line: Arc<Vec<[[f32; 3]; 3]>>,
+    /// Resolved surface material index per `collision_box` triangle (parallel array).
+    box_materials: Arc<Vec<Option<usize>>>,
+    /// Resolved surface material index per `collision_line` triangle (parallel array).
+    line_materials: Arc<Vec<Option<usize>>>,
     /// Collision triangles of the box set whose material slot has `EnableCollision` = false. UE2
     /// would not block the player with these; they are counted (not silently kept or dropped).
     collision_slot_disabled: usize,
@@ -421,10 +457,22 @@ impl Importer<'_> {
                 AlphaKind::Mask => Some(BlendMode::Masked(0.5)),
                 AlphaKind::Blend => Some(BlendMode::Alpha),
             };
+            let props = pkg
+                .package
+                .read_object_properties(&pkg.data, idx, &Limits::default())
+                .map_err(|e| format!("{class_full} properties: {e}"))?;
+            let p = Props::new(&pkg.package, &props);
             Ok(MaterialNode {
                 class,
                 texture: Some(t),
                 texture_alpha,
+                footstep_sound: p
+                    .object("XIIIFootStepSound")
+                    .and_then(|r| self.footstep_sound(pkg, r)),
+                footstep_sound_ai: p
+                    .object("FootstepSound")
+                    .and_then(|r| self.footstep_sound(pkg, r)),
+                noise_loudness: p.float("NoiseLoudness"),
                 ..Default::default()
             })
         } else {
@@ -447,11 +495,28 @@ impl Importer<'_> {
         self.node_for(&pkg, key.1).ok()
     }
 
+    /// Dotted path of a `Sound` reference in a material property block (`XIIIFootStepSound` /
+    /// `FootstepSound`). A null or unresolvable reference is `None` (the surface simply has no
+    /// footstep wrapper); the path is kept exactly as the referencing package spells it.
+    fn footstep_sound(&mut self, from: &Arc<Loaded>, r: ObjectRef) -> Option<String> {
+        if r.is_null() {
+            return None;
+        }
+        from.package.object_path(r).map(str::to_owned)
+    }
+
     /// Builds a [`MaterialNode`] from a decoded property block. Object links are resolved
     /// against `pkg` so the graph walker only ever sees [`NodeKey`]s.
     fn build_node(&mut self, pkg: &Arc<Loaded>, class: &str, p: &Props) -> MaterialNode {
         let mut n = MaterialNode {
             class: class.to_owned(),
+            footstep_sound: p
+                .object("XIIIFootStepSound")
+                .and_then(|r| self.footstep_sound(pkg, r)),
+            footstep_sound_ai: p
+                .object("FootstepSound")
+                .and_then(|r| self.footstep_sound(pkg, r)),
+            noise_loudness: p.float("NoiseLoudness"),
             ..Default::default()
         };
         match class.to_ascii_lowercase().as_str() {
@@ -637,10 +702,15 @@ impl Importer<'_> {
         if let Some(&idx) = self.resolved.get(&start) {
             return (self.slot_for(idx), idx);
         }
-        let resolved = {
+        let material_path = from.package.object_path(r).map(str::to_owned);
+        let mut resolved = {
             let mut lookup = |k: &NodeKey| self.node_for_key(k);
             materials::resolve(Some(start.clone()), &mut lookup)
         };
+        // Record the root's own dotted path for diagnostics. If the root is itself a texture,
+        // the walker's first node already carried its sound; otherwise the resolver inherited it
+        // from the carrier material inward.
+        resolved.material_path = material_path;
         let idx = self.push_material(resolved);
         self.resolved.insert(start, idx);
         self.count_material(idx, what);
@@ -820,25 +890,66 @@ impl Importer<'_> {
                 let line_fallback = use_line && !simplified_present;
                 let box_set = usize::from(use_box && simplified_present);
                 let line_set = usize::from(use_line && simplified_present);
-                let convert = |cs: &xiii_decode::static_mesh::CollisionSet| -> Vec<[[f32; 3]; 3]> {
-                    cs.triangles
-                        .iter()
-                        .map(|t| {
-                            t.vertices
-                                .map(|v| to_bevy_position(cs.vertices[v as usize]))
-                        })
-                        .collect()
-                };
-                // Share the converted triangles when both query kinds select the same set.
-                let (collision_box, collision_line) = if box_set == line_set {
-                    let shared = Arc::new(convert(&m.collision[box_set]));
-                    (shared.clone(), shared)
-                } else {
+                // Resolve the material slots referenced by this mesh's render sections and
+                // collision triangles (shared `Materials` array). Only used slots are resolved,
+                // so the material counters are unchanged from the render-only path; the resolved
+                // index is threaded onto each collision triangle for the host's footstep lookup.
+                let mut used_slots: std::collections::BTreeSet<usize> = m
+                    .sections
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.num_faces > 0)
+                    .map(|(si, _)| si)
+                    .collect();
+                for cs in [box_set, line_set] {
+                    for t in &m.collision[cs].triangles {
+                        if let Ok(si) = usize::try_from(t.material) {
+                            used_slots.insert(si);
+                        }
+                    }
+                }
+                let mut mat_idx: Vec<Option<usize>> = vec![None; m.materials.len()];
+                for si in used_slots {
+                    if let Some(mm) = m.materials.get(si) {
+                        mat_idx[si] = Some(self.material(&pkg, mm.material, "mesh").1);
+                    }
+                }
+                let convert = |cs: &xiii_decode::static_mesh::CollisionSet| {
                     (
-                        Arc::new(convert(&m.collision[box_set])),
-                        Arc::new(convert(&m.collision[line_set])),
+                        cs.triangles
+                            .iter()
+                            .map(|t| {
+                                t.vertices
+                                    .map(|v| to_bevy_position(cs.vertices[v as usize]))
+                            })
+                            .collect::<Vec<[[f32; 3]; 3]>>(),
+                        cs.triangles
+                            .iter()
+                            .map(|t| {
+                                usize::try_from(t.material)
+                                    .ok()
+                                    .and_then(|si| mat_idx.get(si).copied().flatten())
+                            })
+                            .collect::<Vec<Option<usize>>>(),
                     )
                 };
+                // Share the converted triangles when both query kinds select the same set.
+                let (collision_box, collision_line, box_materials, line_materials) =
+                    if box_set == line_set {
+                        let (tris, mats) = convert(&m.collision[box_set]);
+                        let shared = Arc::new(tris);
+                        let shared_m = Arc::new(mats);
+                        (shared.clone(), shared, shared_m.clone(), shared_m)
+                    } else {
+                        let (box_tris, box_mats) = convert(&m.collision[box_set]);
+                        let (line_tris, line_mats) = convert(&m.collision[line_set]);
+                        (
+                            Arc::new(box_tris),
+                            Arc::new(line_tris),
+                            Arc::new(box_mats),
+                            Arc::new(line_mats),
+                        )
+                    };
                 // Collision triangles of the box (movement) set whose material slot has
                 // EnableCollision = false: under UE2 these do not block the player. Counted,
                 // not filtered (evidence only).
@@ -857,8 +968,8 @@ impl Importer<'_> {
                     if s.num_faces == 0 {
                         continue;
                     }
-                    let (material, material_index) = match m.materials.get(si) {
-                        Some(mm) => self.material(&pkg, mm.material, "mesh"),
+                    let (material, material_index) = match mat_idx.get(si).copied().flatten() {
+                        Some(index) => (self.slot_for(index), index),
                         None => {
                             self.scene.count("skip.mesh.section_without_material", 1);
                             let idx = self.push_material(ResolvedMaterial::default());
@@ -891,6 +1002,8 @@ impl Importer<'_> {
                     line_fallback,
                     collision_box,
                     collision_line,
+                    box_materials,
+                    line_materials,
                     collision_slot_disabled,
                 })
             }
@@ -1380,6 +1493,52 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
     im.scene
         .count("actor.player_starts", actors.player_starts.len());
 
+    // Per-zone distance fog/ambient: map property first, then the inherited class default. The
+    // table is resolved once at import so `--play`/the viewer only classify a point per frame.
+    im.scene.fog = fog::SceneFog::build(
+        &map_pkg.package,
+        &map_pkg.data,
+        &im.scene.zones,
+        level.as_ref(),
+        Some(&mut defaults),
+    );
+    im.scene.count(
+        "zones.fog.fogged",
+        im.scene.fog.params.iter().filter(|p| p.is_fogged()).count(),
+    );
+    im.scene.count("zones.fog.unfogged", im.scene.fog.unfogged);
+    im.scene.count(
+        "zones.fog.from_class_default",
+        im.scene.fog.from_class_default,
+    );
+    im.scene
+        .count("zones.fog.disabled_by_map", im.scene.fog.disabled_by_map);
+
+    // Static map-placed projector actors (a projected light or a baked blob shadow). Resolve
+    // each `ProjTexture` through the normal material graph so the renderer gets a texture handle.
+    im.scene.projectors = projectors::map_projectors(&map_pkg.package, &map_pkg.data, &actors);
+    for i in 0..im.scene.projectors.len() {
+        let Some(r) = im.scene.projectors[i].def.texture_object else {
+            continue;
+        };
+        let (slot, index) = im.material(&map_pkg, r, "projector");
+        if let MaterialSlot::Texture(_) = slot {
+            im.scene.projectors[i].def.material_index = Some(index);
+        } else {
+            im.scene.count("skip.projector.texture_unresolved", 1);
+        }
+    }
+    im.scene
+        .count("projectors.map_placed", im.scene.projectors.len());
+    im.scene.count(
+        "projectors.map_placed_shadow",
+        im.scene
+            .projectors
+            .iter()
+            .filter(|p| ProjectorDef::is_shadow_class(&p.def.class_path))
+            .count(),
+    );
+
     for a in &actors.static_mesh_actors {
         let class_short = a.class.rsplit('.').next().unwrap_or("").to_owned();
         if class_short.ends_with("Emitter") {
@@ -1531,18 +1690,36 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                             .collision_box
                             .iter()
                             .map(|t| t.map(|v| apply_transform(&transform, v)));
-                        im.scene.add_collision_tris(id, tris, true, true);
+                        im.scene.add_collision_tris(
+                            id,
+                            tris,
+                            Some((*converted.box_materials).clone()),
+                            true,
+                            true,
+                        );
                     } else {
                         let box_tris = converted
                             .collision_box
                             .iter()
                             .map(|t| t.map(|v| apply_transform(&transform, v)));
-                        im.scene.add_collision_tris(id, box_tris, true, false);
+                        im.scene.add_collision_tris(
+                            id,
+                            box_tris,
+                            Some((*converted.box_materials).clone()),
+                            true,
+                            false,
+                        );
                         let line_tris = converted
                             .collision_line
                             .iter()
                             .map(|t| t.map(|v| apply_transform(&transform, v)));
-                        im.scene.add_collision_tris(id, line_tris, false, true);
+                        im.scene.add_collision_tris(
+                            id,
+                            line_tris,
+                            Some((*converted.line_materials).clone()),
+                            false,
+                            true,
+                        );
                     }
                 }
             }
@@ -1556,6 +1733,7 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
     import_bsp(&mut im, &map_pkg);
     import_terrain(&mut im, &map_pkg);
     particles::import_particles(&mut im, &map_pkg, &mut defaults);
+    lights::import_lights(&mut im, &map_pkg, &mut defaults);
     // Per-zone object counts (static-mesh actors, BSP groups), after every object exists.
     let mut counts = vec![0usize; im.scene.zones.len()];
     let mut unzoned = 0usize;
@@ -1667,16 +1845,40 @@ fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
         return;
     };
     let zone_map = zones::ZoneMap::new(&m);
+    // The `FBspVertexStream` (`Model::vertex_stream`) is validated and measured here, but its
+    // 4-byte field is **not** used as BSP lighting: on every inspected map it is white at
+    // polygon corners and transparent-black (A=0) only at collinear (T-junction) vertices, so
+    // modulating by it blackens T-junction vertices (measured; see the item5e report). BSP
+    // lighting must come from the lightmap texels, which are not decoded yet. The stream is
+    // still decoded and cross-checked because it is the renderer's vertex data.
+    let bsp_stream_valid = m.vertex_stream_matches_points();
+    if bsp_stream_valid {
+        im.scene.count("lighting.bsp.stream_validated", 1);
+        im.scene
+            .count("lighting.bsp.vertices", m.vertex_stream.len());
+        for v in &m.vertex_stream {
+            match v.flags_or_color {
+                [255, 255, 255, 255] => im.scene.count("lighting.bsp.color_white", 1),
+                [0, 0, 0, 0] => im.scene.count("lighting.bsp.color_black", 1),
+                _ => im.scene.count("lighting.bsp.color_other", 1),
+            }
+        }
+    } else if !m.vertex_stream.is_empty() {
+        im.scene.count("lighting.bsp.stream_rejected", 1);
+    }
     // Group triangles per (surface material, BSP zone). Keying by zone keeps every object in
     // exactly one render layer (sky vs playable); a mesh never spans two zones.
     let mut groups: BTreeMap<(i64, Option<u32>), (MaterialSlot, SceneMesh)> = BTreeMap::new();
-    let mut bsp_collision = Vec::new();
+    // Collision triangles with the resolved material of their BSP surface, so the host can read
+    // the floor's footstep sound. The material resolution is cached by `Importer::material`.
+    let mut bsp_collision: Vec<([[f32; 3]; 3], Option<usize>)> = Vec::new();
     for poly in m.polygons() {
         let surf = m.surfs[poly.surf];
         if surf.poly_flags & (poly_flags::NOT_SOLID | poly_flags::PORTAL) == 0 {
             let v: Vec<[f32; 3]> = poly.vertices.iter().map(|&p| to_bevy_position(p)).collect();
+            let material = Some(im.material(map_pkg, surf.material, "bsp").1);
             for k in 1..v.len() - 1 {
-                bsp_collision.push([v[0], v[k], v[k + 1]]);
+                bsp_collision.push(([v[0], v[k], v[k + 1]], material));
             }
         } else {
             im.scene.count("note.collision.bsp_non_solid_polygons", 1);
@@ -1756,13 +1958,15 @@ fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
         }
         im.scene.count("bsp.polygons", 1);
     }
-    im.scene.add_collision(
-        format!(
-            "{} (BSP)",
-            p.object_path(ObjectRef::Export(idx as u32)).unwrap_or("?")
-        ),
-        bsp_collision,
-    );
+    // Each BSP triangle carries its surface material. Stored as (tri, material) pairs under one
+    // shared source id, so the source-material table stays unused here (per-triangle wins).
+    let bsp_id = im.scene.new_collision_source(format!(
+        "{} (BSP)",
+        p.object_path(ObjectRef::Export(idx as u32)).unwrap_or("?")
+    ));
+    let (tris, mats): (Vec<[[f32; 3]; 3]>, Vec<Option<usize>>) = bsp_collision.into_iter().unzip();
+    im.scene
+        .add_collision_tris(bsp_id, tris, Some(mats), true, true);
     for ((_, zone), (_, mesh)) in groups {
         let label = mesh.label.clone();
         im.scene.meshes.push(mesh);
@@ -1845,6 +2049,28 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 t.vertices.len() - base.positions.len(),
             );
         }
+        // Terrain surface sounds: `TerrainInfo` carries `XIIIFootStepSound`/`FootstepSound`/
+        // `NoiseLoudness` directly (measured: Plage00 `TerrainInfo1.XIIIFootStepSound =
+        // Sound'XIIIsound.Footsteps__XIIIFSSab.XIIIFSSab__hXIIIFootSabPN'`). The footstep under the
+        // player on a heightfield is therefore uniform for the terrain region.
+        let (terrain_footstep, terrain_footstep_ai, terrain_noise) =
+            match p.read_object_properties(&map_pkg.data, i, &Limits::default()) {
+                Ok(props) => {
+                    let pv = Props::new(p, &props);
+                    let sound = |name: &str| {
+                        pv.object(name)
+                            .filter(|r| !r.is_null())
+                            .and_then(|r| p.object_path(r))
+                            .map(str::to_owned)
+                    };
+                    (
+                        sound("XIIIFootStepSound"),
+                        sound("FootstepSound"),
+                        pv.float("NoiseLoudness"),
+                    )
+                }
+                Err(_) => (None, None, None),
+            };
         let composite = composite_terrain_texture(im, map_pkg, &t, base);
         let (material, material_index) = match composite {
             Some(img) => {
@@ -1857,6 +2083,10 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 let base = im.scene.textures.len() - 1;
                 let idx = im.push_material(ResolvedMaterial {
                     base: Some(base),
+                    footstep_sound: terrain_footstep.clone(),
+                    footstep_sound_ai: terrain_footstep_ai.clone(),
+                    noise_loudness: terrain_noise,
+                    material_path: Some(path.clone()),
                     ..Default::default()
                 });
                 (MaterialSlot::Texture(base), idx)
@@ -1864,6 +2094,10 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
             None => {
                 let idx = im.push_material(ResolvedMaterial {
                     unsupported: vec!["terrain.layers".into()],
+                    footstep_sound: terrain_footstep.clone(),
+                    footstep_sound_ai: terrain_footstep_ai.clone(),
+                    noise_loudness: terrain_noise,
+                    material_path: Some(path.clone()),
                     ..Default::default()
                 });
                 (MaterialSlot::Missing("terrain layers".into()), idx)
@@ -1903,8 +2137,16 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
             .iter()
             .map(|tri| tri.map(|i| to_bevy_position(base.positions[i as usize])))
             .collect();
-        im.scene
-            .add_collision(format!("{path} (terrain)"), terrain_tris);
+        // Every terrain triangle carries the terrain's material index (its footstep sound).
+        let terrain_id = im.scene.new_collision_source(format!("{path} (terrain)"));
+        let n = terrain_tris.len();
+        im.scene.add_collision_tris(
+            terrain_id,
+            terrain_tris,
+            Some(vec![Some(material_index); n]),
+            true,
+            true,
+        );
         let positions: Vec<[f32; 3]> = base
             .positions
             .iter()
@@ -2522,6 +2764,107 @@ mod local_tests {
         }
     }
 
+    /// Opt-in: every campaign map's zone fog records resolve to metres and at least one fogged
+    /// zone exists on every map. Prints the per-map counts (foggy maps are those with a sky-high
+    /// `DistanceFogEnd`).
+    #[test]
+    fn gog_campaign_zone_fog_survey() {
+        let Some(path) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let install =
+            xiii_install::Installation::open(&path, &xiii_install::OpenOptions::default())
+                .expect("open install");
+        let mut maps: Vec<String> = install
+            .packages()
+            .filter(|e| e.kind == xiii_install::PackageKind::Map)
+            .map(|e| e.name.clone())
+            .collect();
+        maps.sort_by_key(|a| a.to_ascii_lowercase());
+        let maps: Vec<String> = maps
+            .into_iter()
+            .filter(|m| {
+                let s = m.to_ascii_lowercase();
+                !["dm_", "ctf_", "sb_"].iter().any(|p| s.starts_with(p))
+                    && !matches!(
+                        s.as_str(),
+                        "entry" | "empty" | "mapmenu" | "mapcredits" | "credits" | "dm_testpath"
+                    )
+            })
+            .collect();
+        assert!(
+            !maps.is_empty(),
+            "campaign maps must be discovered from {path:?}"
+        );
+        let mut cache = PackageCache::open(&path).expect("open install");
+        let mut with_fog = 0usize;
+        for map in &maps {
+            let scene = import_map(&mut cache, map).expect("import");
+            assert!(!scene.fog.params.is_empty(), "{map}: no zone fog records");
+            let fogged = scene.fog.params.iter().filter(|p| p.is_fogged()).count();
+            if fogged > 0 {
+                with_fog += 1;
+            }
+        }
+        println!(
+            "[fog] campaign: {} maps, {} with a fogged zone",
+            maps.len(),
+            with_fog
+        );
+        assert!(
+            with_fog * 2 >= maps.len(),
+            "only {with_fog} of {} maps have a fogged zone",
+            maps.len()
+        );
+    }
+
+    /// Opt-in: SPADS01's single map-placed `Engine.Projector` decodes with the tagged values
+    /// (the only placed map projector in the 35-map campaign) and its `ProjTexture` resolves to a
+    /// material with a base texture.
+    #[test]
+    fn gog_spads01_map_projector_decodes() {
+        let Some(path) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        let scene = import_map(&mut cache, "SPADS01").expect("import SPADS01");
+        assert_eq!(
+            scene.projectors.len(),
+            1,
+            "SPADS01 must have exactly one map projector: {:?}",
+            scene.projectors
+        );
+        let p = &scene.projectors[0];
+        assert!(!projectors::ProjectorDef::is_shadow_class(
+            &p.def.class_path
+        ));
+        assert_eq!(p.def.fov, 20);
+        assert_eq!(p.def.max_trace_distance, 2500);
+        assert!(!p.def.b_project_bsp && !p.def.b_project_terrain);
+        assert!(p.def.b_clip_bsp && p.def.b_project_on_unlit);
+        assert!((p.def.draw_scale - 0.5).abs() < 1e-6);
+        assert_eq!(
+            p.def.texture_path.as_deref(),
+            Some("XIIIspads.spaproj_alpha")
+        );
+        let idx = p.def.material_index.expect("ProjTexture resolved");
+        assert!(
+            scene.materials[idx].base.is_some(),
+            "projector material has no base texture"
+        );
+        println!(
+            "[projector] SPADS01 {} fov {} maxtrace {} blend {:?} texture {:?} @ {:?}",
+            p.name,
+            p.def.fov,
+            p.def.max_trace_distance,
+            p.def.blend,
+            p.def.texture_path,
+            p.position
+        );
+    }
+
     /// `XIII_GOG_DIR` resolved against the workspace root, or `None` in CI.
     fn opt_in_root() -> Option<std::path::PathBuf> {
         let root = std::env::var_os("XIII_GOG_DIR")?;
@@ -2956,6 +3299,56 @@ mod local_tests {
                 get("lighting.instances.decoded"),
                 get("lighting.colors.rgba"),
                 get("lighting.terrain.colors"),
+            );
+        }
+    }
+
+    /// Opt-in BSP vertex-stream invariants: the level model's `FBspVertexStream` is present
+    /// and position-validated on every referenced node vertex, the 4-byte field is counted,
+    /// and BSP scene objects deliberately carry **no** baked colours (the field is not a light
+    /// term; see the item5e report). On Plage00/Plage01 the stream is exact; Banque01's variant
+    /// tail is decoded by the corrected `LightMapBits` element array.
+    #[test]
+    fn opt_in_bsp_vertex_colors() {
+        let Some(path) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        for map in ["Plage00", "Plage01", "Banque01"] {
+            let scene = import_map(&mut cache, map).expect("import");
+            let get = |k: &str| scene.counters.get(k).copied().unwrap_or(0);
+            assert_eq!(
+                get("lighting.bsp.stream_rejected"),
+                0,
+                "{map}: BSP stream present but not position-validated"
+            );
+            assert_eq!(get("lighting.bsp.stream_validated"), 1, "{map}");
+            let vertices = get("lighting.bsp.vertices");
+            assert!(vertices > 0, "{map}");
+            assert_eq!(
+                get("lighting.bsp.color_white")
+                    + get("lighting.bsp.color_black")
+                    + get("lighting.bsp.color_other"),
+                vertices,
+                "{map}: colour classification does not cover the stream"
+            );
+            // The 4-byte field is not applied as BSP lighting.
+            for o in &scene.objects {
+                if o.path.contains(" BSP ") {
+                    assert!(
+                        o.colors.is_none(),
+                        "{map}: BSP object {} must not carry baked colours",
+                        o.path
+                    );
+                }
+            }
+            println!(
+                "[bsp-stream] {map}: vertices {} white {} black {} other {}",
+                vertices,
+                get("lighting.bsp.color_white"),
+                get("lighting.bsp.color_black"),
+                get("lighting.bsp.color_other"),
             );
         }
     }

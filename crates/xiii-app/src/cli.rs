@@ -16,6 +16,8 @@ pub enum Mode {
     Skinned,
     /// First-person movement prototype: `--play` + `--map` + `--game-dir`.
     Play,
+    /// Front-end menu (`item16`): `--menu` + `--game-dir`, optional `--menu-script`.
+    Menu,
 }
 
 /// Viewer baked-lighting mode.
@@ -67,6 +69,8 @@ pub struct Options {
     pub lighting: Lighting,
     /// Play prototype: deterministic input script (headless without `--screenshot`).
     pub play_script: Option<PathBuf>,
+    /// Front-end menu: deterministic input script selecting entries (`--menu-script`).
+    pub menu_script: Option<PathBuf>,
     /// `--play` sound playback (`--audio off|on`, default on).
     pub audio: Audio,
     /// Particle level-start state (`--particles default|all`, default default).
@@ -128,6 +132,7 @@ impl Default for Options {
             reach_test: false,
             lighting: Lighting::default(),
             play_script: None,
+            menu_script: None,
             audio: Audio::default(),
             particles: Particles::default(),
             perf: false,
@@ -145,6 +150,8 @@ xiii-app --map NAME --game-dir DIR [--view x,y,z,yaw,pitch] [--dump]
 xiii-app --map NAME --game-dir DIR --collision-test
 xiii-app --map NAME --game-dir DIR --play [--play-script FILE] [--audio off|on]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH]
+xiii-app --menu --game-dir DIR [--menu-script FILE]
+         [--exit-after-secs S] [--screenshot PATH] [--size WxH]
 xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH]
 
@@ -157,6 +164,15 @@ xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
   --particles MODE     Particle level-start state: `default` honours the level-start state
                        (triggered emitters start inactive); `all` forces every emitter on
                        (inspection). Default `default`.
+  --menu               Front-end menu: load the entry map and run the game's menu classes
+                       (`XIDInterf.XIIIRootWindow` / `XIIIMenu`) through the VM, draw them
+                       through the Canvas path. Requires --game-dir.
+  --menu-script FILE   Deterministic menu input script (headless without --screenshot).
+                       Lines: `t=<secs> key <up|down|left|right|enter|escape>` |
+                       `focus N` | `click N` | `open Package.Class` |
+                       `newgame` (focus + Enter on the New game entry).
+                       Selecting New game reaches the game's ClientTravel to Plage00 request;
+                       the host then starts --play on the requested map.
    --play-script FILE   Drive --play from a text input script; headless without --screenshot.
                         Lines: `t=<secs> forward|back|right|left V | walk on/off | crouch on/off |
                         jump | yaw DEG | turn DEG | pitch DEG | use | teleport X Y Z` (teleport
@@ -241,6 +257,13 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
                 opts.play_script = Some(PathBuf::from(value("--play-script")?));
                 if opts.mode == Mode::Smoke {
                     opts.mode = Mode::Play;
+                }
+            }
+            "--menu" => opts.mode = Mode::Menu,
+            "--menu-script" => {
+                opts.menu_script = Some(PathBuf::from(value("--menu-script")?));
+                if opts.mode == Mode::Smoke {
+                    opts.mode = Mode::Menu;
                 }
             }
             "--audio" => {
@@ -415,6 +438,20 @@ mod tests {
         assert_eq!(p(&["--anim", "Walk"]).unwrap().mode, Mode::Smoke);
         assert!(p(&["--frame", "-1"]).is_err());
         assert!(p(&["--frame", "x"]).is_err());
+    }
+
+    #[test]
+    fn parses_menu_flags() {
+        let o = p(&["--menu", "--game-dir", "G"]).unwrap();
+        assert_eq!(o.mode, Mode::Menu);
+        assert!(o.menu_script.is_none());
+        let o = p(&["--menu-script", "s.txt"]).unwrap();
+        assert_eq!(o.mode, Mode::Menu);
+        assert_eq!(
+            o.menu_script.as_deref(),
+            Some(std::path::Path::new("s.txt"))
+        );
+        assert!(p(&["--menu-script"]).is_err());
     }
 
     #[test]

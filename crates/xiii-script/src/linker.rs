@@ -131,8 +131,13 @@ pub struct ExternalPackage {
     /// Parsed tables when the installation contains and parses the package; `None` when the
     /// import names a package the installation does not contain (an explicit unresolved error).
     pub package: Option<Package>,
-    /// Lowercase object path -> export index, for the lazy verification lookup.
+    /// Lowercase full object path -> export index, for the lazy verification lookup.
     paths: HashMap<String, u32>,
+    /// Lowercase leaf object name -> export index, `None` when two exports share the leaf.
+    /// UE2 `DynamicLoadObject` resolves a bare `Package.Name` by the object's name (ignoring its
+    /// group outer), so a texture stored as `interface_home.continue01gris` is found as
+    /// `XIIIMenuStart.continue01gris`.
+    leaves: HashMap<String, Option<u32>>,
 }
 
 /// Result of lazily resolving a `Package.Object.Path` reference into an external package.
@@ -223,9 +228,15 @@ impl ScriptSet {
     ) -> Result<(), PackageError> {
         let package = Package::parse(data, limits)?;
         let mut paths = HashMap::new();
+        let mut leaves: HashMap<String, Option<u32>> = HashMap::new();
         for i in 0..package.exports().len() {
             if let Some(p) = package.object_path(ObjectRef::Export(i as u32)) {
                 paths.entry(p.to_ascii_lowercase()).or_insert(i as u32);
+                let leaf = p.rsplit('.').next().unwrap_or(p).to_ascii_lowercase();
+                leaves
+                    .entry(leaf)
+                    .and_modify(|e| *e = None)
+                    .or_insert(Some(i as u32));
             }
         }
         self.externals.insert(
@@ -233,6 +244,7 @@ impl ScriptSet {
             ExternalPackage {
                 package: Some(package),
                 paths,
+                leaves,
             },
         );
         Ok(())
@@ -246,6 +258,7 @@ impl ScriptSet {
             .or_insert(ExternalPackage {
                 package: None,
                 paths: HashMap::new(),
+                leaves: HashMap::new(),
             });
     }
 
@@ -266,8 +279,19 @@ impl ScriptSet {
         let Some(package) = &entry.package else {
             return ExternalLookup::MissingPackage;
         };
-        match entry.paths.get(&object.to_ascii_lowercase()) {
-            Some(&export) => ExternalLookup::Found(
+        let object = object.to_ascii_lowercase();
+        // Exact full path first; for a bare name (no group dot) fall back to UE2's
+        // `StaticFindObject`-by-name behaviour, which ignores the group outer. Ambiguous leaves
+        // are not guessed.
+        let export = entry.paths.get(&object).copied().or_else(|| {
+            if object.contains('.') {
+                None
+            } else {
+                entry.leaves.get(&object).copied().flatten()
+            }
+        });
+        match export {
+            Some(export) => ExternalLookup::Found(
                 package
                     .export_class_path(export as usize)
                     .unwrap_or("?")
