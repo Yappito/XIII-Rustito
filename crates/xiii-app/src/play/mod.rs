@@ -504,6 +504,7 @@ fn fixed_step(
         .step(dt, &world.world, &params.0, input, &world.sources);
     if let Ok(sess) = session.as_mut() {
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity);
+        crate::audio::pump(sess.events.iter());
         for (name, delta) in &sess.moved {
             let Some(entities) = sync.entities.get(name) else {
                 continue;

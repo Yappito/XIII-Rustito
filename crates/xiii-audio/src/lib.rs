@@ -21,10 +21,12 @@
 pub mod adpcm;
 pub mod error;
 pub mod hx;
+pub mod library;
 pub mod wav;
 
 pub use error::{AudioError, AudioErrorKind, Result};
 pub use hx::{Codec, DataLocation, HxBank, HxEntry, HxKind, HxLimits, Span, WaveResource};
+pub use library::{BankEntryRef, LibraryStats, ResolveFailure, SoundLibrary};
 pub use wav::write_wav;
 
 /// Decoded PCM16 audio, interleaved by channel.
