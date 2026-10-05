@@ -9,6 +9,7 @@
 //! - `forward <v>` / `back <v>`: set the forward axis (`back` negates `v`).
 //! - `right <v>` / `left <v>`: set the strafe axis (`left` negates `v`).
 //! - `walk <0|1|on|off>`: set the Shift walk modifier.
+//! - `crouch <0|1|on|off>`: hold the crouch key (XIII `C=Duck`).
 //! - `jump`: request one jump (edge-triggered, consumed by the next tick).
 //! - `yaw <degrees>`: set absolute yaw (Unreal convention: 0 = +X, positive toward +Y).
 //! - `turn <degrees>`: add to yaw.
@@ -29,7 +30,7 @@ use std::path::Path;
 use crate::play::sim::{Input, PlayerSim};
 
 /// One parsed command.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Event {
     /// Trigger time in seconds.
     pub t: f32,
@@ -38,7 +39,7 @@ pub struct Event {
 }
 
 /// A parsed script command.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// Forward axis value.
     Forward(f32),
@@ -46,6 +47,8 @@ pub enum Command {
     Right(f32),
     /// Walk modifier.
     Walk(bool),
+    /// Crouch held.
+    Crouch(bool),
     /// Jump once.
     Jump,
     /// Absolute yaw in degrees.
@@ -60,6 +63,12 @@ pub enum Command {
     Goto([f32; 3]),
     /// Request one use/interact action (edge-triggered; the VM `Grab`/use chain).
     Use,
+    /// Request one fire action (edge-triggered; routed to the player's weapon, item14).
+    Fire,
+    /// Grant the player the named `Package.Class` weapon (item14 diagnostic bootstrap; the
+    /// gameplay maps start the player with `XIII.Fists`, so a demonstration weapon is granted
+    /// through the game's own `Weapon.GiveTo`/`BringUp`).
+    Weapon(String),
 }
 
 /// A parsed input script, time-ordered.
@@ -110,6 +119,12 @@ impl Script {
                         .ok_or_else(|| format!("line {n}: walk needs a value"))?;
                     Command::Walk(matches!(v, "1" | "on" | "true" | "yes"))
                 }
+                "crouch" | "duck" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: crouch needs a value"))?;
+                    Command::Crouch(matches!(v, "1" | "on" | "true" | "yes"))
+                }
                 "jump" => Command::Jump,
                 "yaw" => Command::Yaw(num(&mut it)?),
                 "turn" => Command::Turn(num(&mut it)?),
@@ -128,6 +143,16 @@ impl Script {
                     Command::Goto([x, y, z])
                 }
                 "use" | "grab" | "interact" => Command::Use,
+                "fire" | "shoot" => Command::Fire,
+                "weapon" | "grant" => {
+                    let path = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: weapon needs a Package.Class"))?;
+                    if !path.contains('.') {
+                        return Err(format!("line {n}: weapon {path:?} must be Package.Class"));
+                    }
+                    Command::Weapon(path.to_owned())
+                }
                 other => return Err(format!("line {n}: unknown command {other:?}")),
             };
             events.push(Event { t, command });
@@ -156,8 +181,12 @@ pub struct Drive {
     forward: f32,
     right: f32,
     walk: bool,
+    crouch: bool,
     jump_pending: bool,
     use_pending: bool,
+    fire_pending: bool,
+    /// Weapons requested (`weapon <Package.Class>`) and not yet applied by the host.
+    weapons: Vec<String>,
     /// Active `goto` waypoint (Unreal units), if any.
     goto: Option<[f32; 3]>,
 }
@@ -171,10 +200,19 @@ impl Drive {
             forward: 0.0,
             right: 0.0,
             walk: false,
+            crouch: false,
             jump_pending: false,
             use_pending: false,
+            fire_pending: false,
+            weapons: Vec::new(),
             goto: None,
         }
+    }
+
+    /// Drains the `weapon` commands due so far (the host grants them through the VM). Kept out of
+    /// [`Input`] because it is not a per-tick axis and carries a class path.
+    pub fn take_weapons(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.weapons)
     }
 
     /// Applies every event due at or before `elapsed` and returns this tick's input.
@@ -182,22 +220,25 @@ impl Drive {
     /// Yaw/pitch commands are applied directly to `sim` (they are orientation, not an axis).
     pub fn advance(&mut self, elapsed: f32, sim: &mut PlayerSim) -> Input {
         while self.cursor < self.events.len() && self.events[self.cursor].t <= elapsed + 1e-6 {
-            match self.events[self.cursor].command {
-                Command::Forward(v) => self.forward = v,
-                Command::Right(v) => self.right = v,
-                Command::Walk(v) => self.walk = v,
+            match &self.events[self.cursor].command {
+                &Command::Forward(v) => self.forward = v,
+                &Command::Right(v) => self.right = v,
+                &Command::Walk(v) => self.walk = v,
+                &Command::Crouch(v) => self.crouch = v,
                 Command::Jump => self.jump_pending = true,
-                Command::Yaw(deg) => sim.yaw = deg.to_radians(),
-                Command::Turn(deg) => sim.yaw += deg.to_radians(),
-                Command::Pitch(deg) => sim.pitch = deg.to_radians(),
-                Command::Teleport(p) => {
+                &Command::Yaw(deg) => sim.yaw = deg.to_radians(),
+                &Command::Turn(deg) => sim.yaw += deg.to_radians(),
+                &Command::Pitch(deg) => sim.pitch = deg.to_radians(),
+                &Command::Teleport(p) => {
                     sim.location = p;
                     sim.velocity = [0.0; 3];
                     sim.grounded = false;
                     self.goto = None;
                 }
-                Command::Goto(p) => self.goto = Some(p),
+                &Command::Goto(p) => self.goto = Some(p),
                 Command::Use => self.use_pending = true,
+                Command::Fire => self.fire_pending = true,
+                Command::Weapon(path) => self.weapons.push(path.clone()),
             }
             self.cursor += 1;
         }
@@ -219,12 +260,15 @@ impl Drive {
         }
         let jump = std::mem::take(&mut self.jump_pending);
         let use_action = std::mem::take(&mut self.use_pending);
+        let fire = std::mem::take(&mut self.fire_pending);
         Input {
             forward: self.forward,
             right: self.right,
             jump,
             walk: self.walk,
             use_action,
+            fire,
+            crouch: self.crouch,
         }
     }
 }
@@ -287,5 +331,20 @@ mod tests {
         let s = Script::parse("\n# nothing\n").unwrap();
         assert!(s.events.is_empty());
         assert_eq!(s.last_time(), 0.0);
+    }
+
+    #[test]
+    fn crouch_command_holds_and_releases() {
+        let s = Script::parse("t=0.0 crouch on\nt=1.0 duck off\n").unwrap();
+        let mut sim = PlayerSim::new([0.0; 3], 0.0);
+        let mut d = Drive::new(&s);
+        assert!(d.advance(0.0, &mut sim).crouch);
+        assert!(
+            d.advance(0.5, &mut sim).crouch,
+            "crouch is held, not a one-shot"
+        );
+        assert!(!d.advance(1.0, &mut sim).crouch);
+        // A missing/odd value is rejected.
+        assert!(Script::parse("t=0.0 crouch\n").is_err());
     }
 }

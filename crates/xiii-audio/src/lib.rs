@@ -19,11 +19,14 @@
 #![warn(missing_docs)]
 
 pub mod adpcm;
+pub mod attenuation;
 pub mod error;
 pub mod hx;
 pub mod library;
+pub mod stream;
 pub mod wav;
 
+pub use attenuation::Attenuation;
 pub use error::{AudioError, AudioErrorKind, Result};
 pub use hx::{
     Codec, Cuuid, DataLocation, HxBank, HxEntry, HxKind, HxLimits, SoundRef, Span, WaveResource,
@@ -32,6 +35,7 @@ pub use library::{
     BankEntryRef, LibraryStats, ResolutionRule, ResolutionSummary, ResolveFailure, ResolvedSound,
     SoundLibrary,
 };
+pub use stream::{SampleChunk, WaveStream, decode_stream, entry_region, stream_entry};
 pub use wav::write_wav;
 
 /// Decoded PCM16 audio, interleaved by channel.
@@ -95,6 +99,41 @@ pub fn decode_pcm16(data: &[u8], channels: u16, sample_rate: u32) -> Result<PcmA
         channels,
         sample_rate,
         samples,
+    })
+}
+
+/// Metadata of one wave entry: codec, channels, sample rate and where the samples live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaveSpec {
+    /// Codec of the sample bytes.
+    pub codec: Codec,
+    /// Channel count.
+    pub channels: u16,
+    /// Sample rate in Hz.
+    pub sample_rate: u32,
+    /// Where the sample bytes live (in this bank or a sibling `.hsc`).
+    pub data: DataLocation,
+}
+
+/// Looks up one wave entry of a parsed bank and returns its decoder metadata.
+pub fn entry_spec(bank: &HxBank, entry_index: usize) -> Result<WaveSpec> {
+    let entry = bank.entries.get(entry_index).ok_or_else(|| {
+        AudioError::new(
+            AudioErrorKind::NoSuchEntry,
+            format!("entry {entry_index} of {}", bank.entries.len()),
+        )
+    })?;
+    let wave = entry.as_wave().ok_or_else(|| {
+        AudioError::new(
+            AudioErrorKind::NoSuchEntry,
+            format!("entry {entry_index} is {} not a wave", entry.class_name()),
+        )
+    })?;
+    Ok(WaveSpec {
+        codec: wave.codec,
+        channels: wave.channels,
+        sample_rate: wave.sample_rate,
+        data: wave.data.clone(),
     })
 }
 

@@ -7,6 +7,7 @@
 //! overlay shows the object path under the crosshair and every import counter, including
 //! skipped/failed categories. This is an importer diagnostic, not a playable mission.
 
+pub mod particles;
 pub mod skinned;
 
 use std::collections::HashSet;
@@ -121,6 +122,7 @@ impl Plugin for ViewerPlugin {
         })
         .init_resource::<ShotFlag>()
         .init_resource::<PickData>()
+        .add_plugins(particles::ParticlePlugin)
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -222,13 +224,16 @@ pub(crate) fn animate_uv(
     time: Res<Time>,
     animated: Query<&AnimatedUv>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut perf: ResMut<crate::perf::Perf>,
 ) {
+    let t0 = Instant::now();
     let t = time.elapsed_secs();
     for a in &animated {
         if let Some(mut mat) = materials.get_mut(&a.material) {
             mat.uv_transform = uv_affine(&a.ops, t);
         }
     }
+    perf.span("animate_uv", t0);
 }
 
 fn image_from(t: &xiii_world::SceneTexture) -> Image {
@@ -355,6 +360,7 @@ pub(crate) fn spawn_scene_geometry(
     images: &mut Assets<Image>,
     scene: &WorldScene,
     baked: bool,
+    force_particles: bool,
 ) -> Vec<Entity> {
     let image_handles: Vec<Handle<Image>> = scene
         .textures
@@ -428,6 +434,15 @@ pub(crate) fn spawn_scene_geometry(
         }
         entities.push(entity);
     }
+    particles::spawn_particles(
+        commands,
+        meshes,
+        materials,
+        images,
+        &image_handles,
+        scene,
+        force_particles,
+    );
     entities
 }
 
@@ -458,14 +473,27 @@ fn setup(
     } else {
         0
     };
-    let _geometry = spawn_scene_geometry(
+    let geometry = spawn_scene_geometry(
         &mut commands,
         &mut meshes,
         &mut materials,
         &mut images,
         &scene,
         baked,
+        cfg.options.particles == crate::cli::Particles::All,
     );
+    let scene_tris: usize = scene
+        .objects
+        .iter()
+        .map(|o| scene.meshes[o.mesh].indices.len() / 3)
+        .sum();
+    commands.insert_resource(crate::perf::RenderStats::new(
+        scene.objects.len(),
+        geometry.len(),
+        meshes.len(),
+        materials.len(),
+        scene_tris,
+    ));
     for o in &scene.objects {
         // CPU triangles for picking.
         let transform = transform_from(&o.transform);
@@ -768,7 +796,13 @@ fn ray_tri(o: Vec3, d: Vec3, t: &[Vec3; 3]) -> Option<f32> {
     (dist > 0.0).then_some(dist)
 }
 
-fn pick(data: Res<PickData>, mut state: ResMut<RunState>, cams: Query<&Transform, With<FlyCam>>) {
+fn pick(
+    data: Res<PickData>,
+    mut state: ResMut<RunState>,
+    cams: Query<&Transform, With<FlyCam>>,
+    mut perf: ResMut<crate::perf::Perf>,
+) {
+    let t0 = Instant::now();
     state.frame += 1;
     if state.frame % 6 != 1 {
         return;
@@ -795,6 +829,7 @@ fn pick(data: Res<PickData>, mut state: ResMut<RunState>, cams: Query<&Transform
         Some((dist, path)) => format!("{path} @ {dist:.1} m"),
         None => "-".into(),
     };
+    perf.span("pick", t0);
 }
 
 fn overlay(
@@ -802,8 +837,11 @@ fn overlay(
     state: Res<RunState>,
     cams: Query<&Transform, With<FlyCam>>,
     sky_cams: Query<&SkyCamera>,
+    emitters: Query<&particles::ParticleEmitterRender>,
+    mut perf: ResMut<crate::perf::Perf>,
     mut text: Query<&mut Text, With<OverlayText>>,
 ) {
+    let t0 = Instant::now();
     let (Some(summary), Ok(mut text)) = (summary, text.single_mut()) else {
         return;
     };
@@ -819,8 +857,14 @@ fn overlay(
         })
         .unwrap_or_default();
     let mut s = format!(
-        "{}\ncamera {:.1} {:.1} {:.1} m{sky} | problems (skip./fail. counters): {}\ncrosshair: {}\n",
-        summary.title, cam.x, cam.y, cam.z, summary.problems, state.picked
+        "{}\ncamera {:.1} {:.1} {:.1} m{sky} | problems (skip./fail. counters): {} | live particles {}\ncrosshair: {}\n",
+        summary.title,
+        cam.x,
+        cam.y,
+        cam.z,
+        summary.problems,
+        particles::live_particle_count(&emitters),
+        state.picked
     );
     for l in &summary.lines {
         s.push_str(l);
@@ -828,6 +872,7 @@ fn overlay(
     }
     s.push_str("WASD/QE move, Shift fast, RMB look, Esc quit. Baked vertex lighting modulates the texture (--lighting off to compare); magenta = unresolved material.");
     text.0 = s;
+    perf.span("overlay", t0);
 }
 
 fn unattended(
@@ -835,6 +880,7 @@ fn unattended(
     cfg: Res<ViewerConfig>,
     mut state: ResMut<RunState>,
     flag: Res<ShotFlag>,
+    mut perf: ResMut<crate::perf::Perf>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let Some(secs) = cfg.options.exit_after_secs else {
@@ -876,6 +922,7 @@ fn unattended(
         }
     );
     println!("[viewer] crosshair at exit: {}", state.picked);
+    perf.request_final();
     exit.write(AppExit::Success);
 }
 

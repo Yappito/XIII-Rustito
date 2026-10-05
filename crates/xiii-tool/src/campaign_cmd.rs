@@ -38,7 +38,7 @@ const SURVEY_DT: f32 = 1.0 / 30.0;
 
 /// Usage text for `xiii-tool campaign`.
 pub const USAGE: &str = "\
-xiii-tool campaign <game-dir> [--maps a,b,..] [--json <out>] [--md <out>]
+xiii-tool campaign (<game-dir> | --root-env <VAR>) [--maps a,b,..] [--json <out>] [--md <out>]
     Headless sweep of the whole campaign. Finds the campaign order from each map's
     MapInfo.NextMapLevelWithUnr link (falling back to every non-multiplayer map), then
     per map, isolated: imports it (counters/time), builds the box and line collision
@@ -46,6 +46,9 @@ xiii-tool campaign <game-dir> [--maps a,b,..] [--json <out>] [--md <out>]
     the script level-start lifecycle with ALL actors active in --survey mode against the
     real physics/animation/navigation providers. A panic or error in one map is recorded
     and the sweep continues.
+    --root-env <VAR>  take the installation root from environment variable VAR, so a
+                      protected path never has to be typed on the command line
+                      (e.g. --root-env XIII_STEAM_DIR). Cannot be combined with <game-dir>.
     --maps a,b,..  explicit map list (case-insensitive), overriding discovery.
     --json <out>   write a metadata-only JSON report (refused inside <game-dir>).
     --md <out>     write the Markdown summary (refused inside <game-dir>).
@@ -654,6 +657,8 @@ fn event_kind(e: &PresentationEvent) -> &'static str {
         PresentationEvent::StopVoice { .. } => "StopVoice",
         PresentationEvent::StopSound { .. } => "StopSound",
         PresentationEvent::PlaySndPNJOno { .. } => "PlaySndPNJOno",
+        PresentationEvent::Dialogue(_) => "Dialogue",
+        PresentationEvent::RenderTarget(_) => "RenderTargetMaterial.Update",
     }
 }
 
@@ -774,6 +779,29 @@ fn kind_from_display(s: &str) -> String {
         .to_owned()
 }
 
+/// `(representative cause, script site)` from a suspended actor's error text. The display is
+/// `script error: Kind { .. }\n  at Package.Class.Function [Actor] code 0x..`; the site is the
+/// `Package.Class.Function` token after the first `at `.
+fn suspension_location(error: &str) -> (String, String) {
+    let mut lines = error.lines();
+    let cause = lines.next().unwrap_or(error).trim().to_owned();
+    let site = lines
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("at "))
+        .map(|rest| rest.split_whitespace().next().unwrap_or(rest).to_owned())
+        .unwrap_or_else(|| "-".to_owned());
+    (cause, site)
+}
+
+/// Actor class (`Package.Class`) from a `Package.Class.Function[.State]` site.
+fn class_from_site(site: &str) -> String {
+    let mut parts = site.split('.');
+    match (parts.next(), parts.next()) {
+        (Some(pkg), Some(class)) => format!("{pkg}.{class}"),
+        _ => "-".to_owned(),
+    }
+}
+
 /// The `VmErrorKind` variant name (`UnimplementedNative`, `NoPhysicsProvider`, ...).
 pub fn error_kind_name(k: &VmErrorKind) -> String {
     let name = match k {
@@ -795,6 +823,7 @@ pub fn error_kind_name(k: &VmErrorKind) -> String {
         VmErrorKind::NoPhysicsProvider { .. } => "NoPhysicsProvider",
         VmErrorKind::NoAnimationProvider { .. } => "NoAnimationProvider",
         VmErrorKind::NoNavProvider { .. } => "NoNavProvider",
+        VmErrorKind::NoLocalizationProvider { .. } => "NoLocalizationProvider",
         VmErrorKind::UnknownAnimation { .. } => "UnknownAnimation",
         VmErrorKind::AnimationDataError { .. } => "AnimationDataError",
         VmErrorKind::NewOnActor { .. } => "NewOnActor",
@@ -838,6 +867,25 @@ pub struct CounterRank {
     pub count: usize,
 }
 
+/// One campaign-wide suspension cause: an error kind at a script location.
+#[derive(Debug, Clone)]
+pub struct SuspensionRank {
+    /// Error kind name (`UnsupportedValue`, `TypeMismatch`, ...).
+    pub kind: String,
+    /// Representative error summary (first line, map-specific object name kept).
+    pub cause: String,
+    /// Script location that suspended (`Package.Class.Function`), or `-`.
+    pub site: String,
+    /// Actor class derived from `site` (`Package.Class`), or `-`.
+    pub actor_class: String,
+    /// Number of maps that hit it.
+    pub maps: usize,
+    /// Total suspended occurrences across the campaign.
+    pub count: usize,
+    /// First map (in sweep order) that hit it.
+    pub first_map: String,
+}
+
 /// Campaign-wide aggregates.
 #[derive(Debug, Clone, Default)]
 pub struct Aggregate {
@@ -853,6 +901,8 @@ pub struct Aggregate {
     pub total_ms: f64,
     /// Missing-native ranking by (maps, hits).
     pub missing_rank: Vec<MissingRank>,
+    /// Campaign-wide suspension causes, by (maps, count).
+    pub suspension_rank: Vec<SuspensionRank>,
     /// Import problem counters by total count.
     pub import_rank: Vec<CounterRank>,
     /// Maps sorted by total measured time (slowest first).
@@ -862,6 +912,9 @@ pub struct Aggregate {
 /// Per-native aggregation tuple: maps that hit it, total hits, first map, first site, index.
 type MissingAcc = (BTreeSet<String>, u64, String, String, Option<u16>);
 
+/// Per-suspension aggregation tuple: maps that hit it, occurrences, first map, cause.
+type SuspensionAcc = (BTreeSet<String>, usize, String, String);
+
 /// Builds the aggregate from per-map results.
 pub fn aggregate(results: &[MapResult]) -> Aggregate {
     let mut a = Aggregate {
@@ -870,6 +923,8 @@ pub fn aggregate(results: &[MapResult]) -> Aggregate {
     };
     // Missing natives: path -> (set of maps, hits, first map, first site, index).
     let mut missing: BTreeMap<String, MissingAcc> = BTreeMap::new();
+    // Suspensions: (kind, site) -> (set of maps, count, first map, representative cause).
+    let mut suspensions: BTreeMap<(String, String), SuspensionAcc> = BTreeMap::new();
     let mut counters: BTreeMap<String, (BTreeSet<String>, usize)> = BTreeMap::new();
     for m in results {
         a.total_ms += m.total_ms;
@@ -902,6 +957,14 @@ pub fn aggregate(results: &[MapResult]) -> Aggregate {
                     e.3 = n.first_site.clone();
                 }
             }
+            for a in &s.suspended {
+                let (cause, site) = suspension_location(&a.error);
+                let e = suspensions
+                    .entry((a.kind.clone(), site))
+                    .or_insert_with(|| (BTreeSet::new(), 0, m.map.clone(), cause));
+                e.0.insert(m.map.clone());
+                e.1 += 1;
+            }
         }
     }
     a.missing_rank = missing
@@ -922,6 +985,26 @@ pub fn aggregate(results: &[MapResult]) -> Aggregate {
             .cmp(&x.maps)
             .then(y.hits.cmp(&x.hits))
             .then(x.path.cmp(&y.path))
+    });
+    a.suspension_rank = suspensions
+        .into_iter()
+        .map(
+            |((kind, site), (maps, count, first_map, cause))| SuspensionRank {
+                kind,
+                cause,
+                actor_class: class_from_site(&site),
+                site,
+                maps: maps.len(),
+                count,
+                first_map,
+            },
+        )
+        .collect();
+    a.suspension_rank.sort_by(|x, y| {
+        y.maps
+            .cmp(&x.maps)
+            .then(y.count.cmp(&x.count))
+            .then(x.site.cmp(&y.site))
     });
     a.import_rank = counters
         .into_iter()
@@ -1018,6 +1101,10 @@ impl Aggregate {
             "missing_native_ranking": self.missing_rank.iter().map(|m| json!({
                 "path": m.path, "index": opt_index(m.index), "maps": m.maps, "hits": m.hits,
                 "first_map": m.first_map, "first_site": m.first_site,
+            })).collect::<Vec<_>>(),
+            "suspension_ranking": self.suspension_rank.iter().map(|s| json!({
+                "kind": s.kind, "cause": s.cause, "site": s.site, "actor_class": s.actor_class,
+                "maps": s.maps, "count": s.count, "first_map": s.first_map,
             })).collect::<Vec<_>>(),
             "import_problem_ranking": self.import_rank.iter().map(|c| json!({
                 "key": c.key, "maps": c.maps, "count": c.count,
@@ -1141,6 +1228,34 @@ pub fn report_markdown(r: &CampaignReport) -> String {
         }
         let _ = writeln!(out);
     }
+    let _ = writeln!(
+        out,
+        "## Campaign-wide suspension causes (top 20, by maps then count)"
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "| # | kind | actor class | site | maps | count | first map | cause |"
+    );
+    let _ = writeln!(out, "|---:|---|---|---|---:|---:|---|---|");
+    if r.aggregate.suspension_rank.is_empty() {
+        let _ = writeln!(out, "| — | none |  |  |  |  |  |  |");
+    }
+    for (i, s) in r.aggregate.suspension_rank.iter().take(20).enumerate() {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            i + 1,
+            s.kind,
+            s.actor_class,
+            s.site,
+            s.maps,
+            s.count,
+            s.first_map,
+            s.cause.replace('|', "\\|")
+        );
+    }
+    let _ = writeln!(out);
     let _ = writeln!(out, "## Campaign-wide missing natives (by maps, then hits)");
     let _ = writeln!(out);
     let _ = writeln!(out, "| # | native | index | maps | hits | first site |");
@@ -1189,6 +1304,7 @@ pub fn report_markdown(r: &CampaignReport) -> String {
 
 struct Cli {
     root: Option<PathBuf>,
+    root_env: Option<String>,
     maps: Option<String>,
     json: Option<PathBuf>,
     md: Option<PathBuf>,
@@ -1197,6 +1313,7 @@ struct Cli {
 fn parse_cli(args: &[String]) -> Result<Cli, String> {
     let mut c = Cli {
         root: None,
+        root_env: None,
         maps: None,
         json: None,
         md: None,
@@ -1209,6 +1326,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 .ok_or_else(|| format!("{what} needs a value"))
         };
         match a.as_str() {
+            "--root-env" => c.root_env = Some(val("--root-env")?),
             "--maps" => c.maps = Some(val("--maps")?),
             "--json" => c.json = Some(PathBuf::from(val("--json")?)),
             "--md" => c.md = Some(PathBuf::from(val("--md")?)),
@@ -1217,10 +1335,30 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             s => return Err(format!("unexpected argument '{s}'")),
         }
     }
-    if c.root.is_none() {
-        return Err("campaign needs an installation root".into());
+    if c.root.is_some() && c.root_env.is_some() {
+        return Err("campaign takes either an installation root or --root-env, not both".into());
+    }
+    if c.root.is_none() && c.root_env.is_none() {
+        return Err("campaign needs an installation root or --root-env <VAR>".into());
     }
     Ok(c)
+}
+
+/// Resolves the root from `--root-env <VAR>`: the variable must exist and be non-empty.
+/// The value is never echoed; only the variable name is reported on error.
+fn root_from_env(var: &str) -> Result<PathBuf, String> {
+    root_from_env_value(var, std::env::var_os(var))
+}
+
+/// Pure core of [`root_from_env`]; the lookup is injected so the failure modes are testable
+/// without mutating the process environment (forbidden here).
+fn root_from_env_value(var: &str, value: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
+    match value {
+        Some(v) if !v.is_empty() => Ok(PathBuf::from(v)),
+        _ => Err(format!(
+            "environment variable {var} is not set (or empty); campaign --root-env needs it"
+        )),
+    }
 }
 
 /// `xiii-tool campaign ...`.
@@ -1229,7 +1367,14 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
         Ok(c) => c,
         Err(e) => return usage_error(&e),
     };
-    let root = cli.root.expect("checked");
+    let root = match (cli.root, cli.root_env) {
+        (Some(root), _) => root,
+        (None, Some(var)) => match root_from_env(&var) {
+            Ok(root) => root,
+            Err(e) => return usage_error(&e),
+        },
+        (None, None) => return usage_error("campaign needs an installation root or --root-env"),
+    };
     if !root.is_dir() {
         return usage_error(&format!("{} is not a directory", root.display()));
     }
@@ -1332,6 +1477,25 @@ mod tests {
             "UnimplementedNative"
         );
         assert_eq!(kind_from_display("no prefix Other(\"x\")"), "no");
+    }
+
+    #[test]
+    fn suspension_location_parses_cause_site_and_actor_class() {
+        let err = "script error: UnsupportedValue { desc: \"context on uninstantiated object \
+                   Plage01.SpriteEmitter135\" }\n  at xidcine.TrigerredEmitter.PostBeginPlay \
+                   [TrigerredEmitter0] code 0x0017\n";
+        let (cause, site) = suspension_location(err);
+        assert!(cause.starts_with("script error: UnsupportedValue"));
+        assert_eq!(site, "xidcine.TrigerredEmitter.PostBeginPlay");
+        assert_eq!(class_from_site(&site), "xidcine.TrigerredEmitter");
+        // A state function keeps the class prefix.
+        assert_eq!(
+            class_from_site("xiii.XIIICorpseStaticMesh.Dead.BeginState"),
+            "xiii.XIIICorpseStaticMesh"
+        );
+        // An error with no stack yields a `-` site.
+        let (_, site) = suspension_location("script error: Other(\"x\")");
+        assert_eq!(site, "-");
     }
 
     /// A chain builder: the campaign is a linked list; a repeated link must terminate.
@@ -1492,6 +1656,79 @@ mod tests {
             "Actor.Spawn"
         );
         assert_eq!(v["maps"][0]["import"]["fail"], 1);
+    }
+
+    /// `--root-env` is the alternative to a positional root; the two are mutually exclusive and
+    /// one of them is required. The variable's value is never part of the parsed CLI.
+    #[test]
+    fn parse_cli_root_selection() {
+        let c = parse_cli(&["--root-env".into(), "XIII_STEAM_DIR".into()]).expect("root-env alone");
+        assert_eq!(c.root, None);
+        assert_eq!(c.root_env.as_deref(), Some("XIII_STEAM_DIR"));
+
+        let c = parse_cli(&["G".into(), "--maps".into(), "A,B".into()])
+            .expect("positional root with maps");
+        assert_eq!(c.root, Some(PathBuf::from("G")));
+        assert_eq!(c.root_env, None);
+        assert_eq!(c.maps.as_deref(), Some("A,B"));
+
+        assert!(parse_cli(&[]).is_err(), "no root is an error");
+        assert!(
+            parse_cli(&["G".into(), "--root-env".into(), "XIII_STEAM_DIR".into()]).is_err(),
+            "root and --root-env together is an error"
+        );
+    }
+
+    /// An unset (or empty) variable must be a usage error, not a silent empty path.
+    #[test]
+    fn root_from_env_value_unset_and_empty_are_errors() {
+        assert!(root_from_env_value("X", None).is_err());
+        assert!(root_from_env_value("X", Some(std::ffi::OsString::new())).is_err());
+        assert_eq!(
+            root_from_env_value("X", Some(std::ffi::OsString::from("some/root"))).expect("set"),
+            PathBuf::from("some/root")
+        );
+    }
+
+    /// Reads a variable that exists in every process: the success path of [`root_from_env`].
+    #[test]
+    fn root_from_env_reads_an_existing_variable() {
+        let var = "PATH";
+        let expected = std::env::var_os(var).expect("PATH is set on every supported platform");
+        assert_eq!(root_from_env(var).expect("PATH"), PathBuf::from(expected));
+    }
+
+    /// Opt-in: the whole discovered Steam campaign sweep completes with zero panics. Every map is
+    /// imported and script-surveyed in isolation; a panic in any map fails this test (the same
+    /// condition the `xiii-tool campaign --root-env XIII_STEAM_DIR` acceptance run reports).
+    #[test]
+    fn opt_in_steam_campaign_sweep_has_no_panics() {
+        let Some(root) = std::env::var_os("XIII_STEAM_DIR") else {
+            println!("SKIPPED: set XIII_STEAM_DIR to the Steam installation root to run this test");
+            return;
+        };
+        let path = std::path::PathBuf::from(&root);
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = if path.is_relative() {
+            ws.join(path)
+        } else {
+            path
+        };
+        let discovery = discover_maps(&path, None).expect("discover Steam maps");
+        assert!(!discovery.maps.is_empty(), "no Steam maps discovered");
+        let mut panics = Vec::new();
+        for map in &discovery.maps {
+            let r = run_one(&path, map);
+            if r.status == MapStatus::Panic {
+                eprintln!("PANIC on {map}: {:?}", r.error);
+                panics.push(map.clone());
+            }
+        }
+        assert!(panics.is_empty(), "Steam campaign panicked on {panics:?}");
+        println!(
+            "steam campaign sweep: {} maps, 0 panics",
+            discovery.maps.len()
+        );
     }
 
     /// Opt-in corpus test: sweep two real maps. Prints `SKIPPED` without `XIII_GOG_DIR`.

@@ -22,9 +22,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 pub mod animation;
+pub mod audio;
 pub mod materials;
+pub mod movement_volumes;
 pub mod nav_provider;
 pub mod navigation;
+pub mod particles;
 pub mod physics;
 pub mod reach;
 pub mod runtime;
@@ -157,6 +160,8 @@ pub struct WorldScene {
     pub zones: Vec<zones::SceneZone>,
     /// Indices into [`WorldScene::zones`] of the sky zones (`is_sky`), in increasing order.
     pub sky_zones: Vec<u32>,
+    /// Decoded particle emitter systems placed in the map (see [`particles`]).
+    pub particle_systems: Vec<particles::ParticleSystem>,
 }
 
 impl WorldScene {
@@ -379,7 +384,7 @@ struct MeshSections {
     collision_slot_disabled: usize,
 }
 
-struct Importer<'a> {
+pub(crate) struct Importer<'a> {
     cache: &'a mut PackageCache,
     scene: WorldScene,
     textures: HashMap<ObjectKey, Result<usize, String>>,
@@ -1007,7 +1012,7 @@ impl ClassDefaults {
     }
 
     /// Resolved layout of a class path (`Package.Class` as written in the map), cached.
-    fn layout(&mut self, class_path: &str) -> Result<SharedLayout, String> {
+    pub fn layout(&mut self, class_path: &str) -> Result<SharedLayout, String> {
         let key = class_path.to_ascii_lowercase();
         if let Some(l) = self.layouts.get(&key) {
             return Ok(l.clone());
@@ -1039,6 +1044,24 @@ impl ClassDefaults {
     pub fn is_navigation_point(&mut self, class_path: &str) -> Result<bool, String> {
         let l = self.layout(class_path)?;
         Ok(l.chain_names.iter().any(|n| n == "navigationpoint"))
+    }
+
+    /// Lowercase class names of `class_path`'s inheritance chain, most derived first.
+    pub fn class_chain(&mut self, class_path: &str) -> Result<Vec<String>, String> {
+        Ok(self.layout(class_path)?.chain_names.clone())
+    }
+
+    /// Resolved inherited bool default of a property, or `None` when the property is absent
+    /// from the class chain (or is not a bool).
+    pub fn bool_default(&mut self, class_path: &str, name: &str) -> Result<Option<bool>, String> {
+        let l = self.layout(class_path)?;
+        let Some(s) = l.slot_by_name(name) else {
+            return Ok(None);
+        };
+        Ok(match l.defaults.get(s.base) {
+            Some(xiii_script::Value::Bool(v)) => Some(*v),
+            _ => None,
+        })
     }
 
     /// Resolved inherited float default of a property, or `None` when the property is absent
@@ -1532,6 +1555,7 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
 
     import_bsp(&mut im, &map_pkg);
     import_terrain(&mut im, &map_pkg);
+    particles::import_particles(&mut im, &map_pkg, &mut defaults);
     // Per-zone object counts (static-mesh actors, BSP groups), after every object exists.
     let mut counts = vec![0usize; im.scene.zones.len()];
     let mut unzoned = 0usize;
@@ -2116,6 +2140,113 @@ mod local_tests {
         } else {
             Some(path)
         }
+    }
+
+    /// Resolves `XIII_STEAM_DIR`; the patched Steam root maps live in `Maps/BaseSP`, so this also
+    /// exercises profile-aware map/package resolution rather than the GOG layout.
+    fn steam_root() -> Option<std::path::PathBuf> {
+        let root = std::env::var_os("XIII_STEAM_DIR")?;
+        let path = std::path::PathBuf::from(&root);
+        if path.is_relative() {
+            Some(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join(path),
+            )
+        } else {
+            Some(path)
+        }
+    }
+
+    /// Opt-in: the two opening Steam maps import with zero `fail.*` counters and the same decoded
+    /// counts as GOG (all 64 maps are byte-identical). `PackageCache::open` uses the Steam
+    /// `Maps/BaseSP` profile, so this fails if the map search paths or case handling regress.
+    #[test]
+    fn steam_opening_maps_import_without_failures() {
+        let Some(path) = steam_root() else {
+            println!("SKIPPED: set XIII_STEAM_DIR to the Steam installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        for (map, actors, bsp_polys) in [("Plage00", 156, 344), ("Plage01", 133, 338)] {
+            let scene = import_map(&mut cache, map).expect("import");
+            let get = |k: &str| scene.counters.get(k).copied().unwrap_or(0);
+            assert_eq!(get("actor.static_mesh (StaticMeshActor)"), actors, "{map}");
+            assert_eq!(get("bsp.polygons"), bsp_polys, "{map}");
+            assert_eq!(get("terrain.infos"), 1, "{map}");
+            assert!(scene.player_start.is_some(), "{map}");
+            let fails: Vec<_> = scene
+                .counters
+                .keys()
+                .filter(|k| k.starts_with("fail."))
+                .collect();
+            assert!(fails.is_empty(), "{map}: {fails:?} {:?}", scene.examples);
+            let missing = scene
+                .meshes
+                .iter()
+                .filter(|m| matches!(m.material, MaterialSlot::Missing(_)))
+                .count();
+            assert_eq!(
+                missing, 0,
+                "{map}: unresolved materials {:?}",
+                scene.examples
+            );
+        }
+    }
+
+    /// Opt-in: every code package the Steam ini's `EditPackages=` names resolves and loads from
+    /// this one root, and each `*Plus` package is present next to its base (no implicit mixing).
+    #[test]
+    fn steam_code_packages_load_in_ini_order_without_mixing() {
+        let Some(path) = steam_root() else {
+            println!("SKIPPED: set XIII_STEAM_DIR to the Steam installation root to run this test");
+            return;
+        };
+        let install =
+            xiii_install::Installation::open(&path, &xiii_install::OpenOptions::default())
+                .expect("open install");
+        let entries = install.code_packages_in_load_order();
+        let pos = |n: &str| entries.iter().position(|e| e.name.eq_ignore_ascii_case(n));
+        for (base, plus) in [
+            ("XIII", "XIIIPlus"),
+            ("XIIIPersos", "XIIIPersosPlus"),
+            ("XIIIMP", "XIIIMPPlus"),
+            ("XIDInterf", "XIDInterfPlus"),
+            ("Engine", "EnginePlus"),
+            ("IpDrv", "IpDrvPlus"),
+        ] {
+            let (b, p) = (pos(base), pos(plus));
+            assert!(
+                b.is_some() && p.is_some(),
+                "{base}/{plus} indexed: {entries:?}"
+            );
+            assert!(b < p, "{base} must load before {plus}");
+        }
+        assert_eq!(entries.len(), 33, "Steam has 33 .u packages");
+        for e in &entries {
+            assert_eq!(e.kind, xiii_install::PackageKind::Code);
+            assert!(
+                e.path.starts_with(install.root()),
+                "{} escaped root",
+                e.relative
+            );
+        }
+        // Maps live under the split Steam roots and resolve case-insensitively; the patch's
+        // added packages are visible only through this root.
+        let map = install
+            .resolve_map("Plage00")
+            .expect("Plage00 under Maps/BaseSP");
+        assert_eq!(map.entry.relative, "Maps/BaseSP/Plage00.unr");
+        assert_eq!(
+            install
+                .resolve_map("plage01")
+                .expect("case-insensitive")
+                .entry
+                .relative,
+            "Maps/BaseSP/Plage01.unr"
+        );
+        assert!(install.resolve_package("XIIIPlus").is_ok());
+        assert!(install.resolve_package("XIIIMPGame").is_ok());
     }
 
     #[test]

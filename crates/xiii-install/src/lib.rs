@@ -454,6 +454,47 @@ impl Installation {
         self.index.len()
     }
 
+    /// Indexed code packages ordered the way this installation's own ini tells the engine to
+    /// load them: every `[Editor.EditorEngine] EditPackages=` name in file order, then any
+    /// indexed `.u` the ini does not name, by relative path.
+    ///
+    /// In the patched Steam install the patch lists each `*Plus` package directly after its base
+    /// (`EditPackages=XIIIPersos` then `EditPackages=XIIIPersosPlus`, `XIII` then `XIIIPlus`,
+    /// ...), so the returned order is base-then-plus, as the patch intends. Only this root's
+    /// index is used, so two installations never mix. Package names are matched case-insensitively.
+    pub fn code_packages_in_load_order(&self) -> Vec<PackageEntry> {
+        let mut code: Vec<&PackageEntry> = self
+            .packages()
+            .filter(|e| e.kind == PackageKind::Code)
+            .collect();
+        code.sort_by(|a, b| {
+            a.relative
+                .to_ascii_lowercase()
+                .cmp(&b.relative.to_ascii_lowercase())
+        });
+        let by_key: BTreeMap<&str, &PackageEntry> =
+            code.iter().map(|e| (e.key.as_str(), *e)).collect();
+
+        let mut out = Vec::with_capacity(code.len());
+        let mut used: BTreeSet<String> = BTreeSet::new();
+        for ev in &self.ini {
+            for name in &ev.fields.edit_packages {
+                let key = stem(name).to_ascii_lowercase();
+                if let Some(e) = by_key.get(key.as_str()).copied()
+                    && used.insert(key)
+                {
+                    out.push(e.clone());
+                }
+            }
+        }
+        for e in code {
+            if used.insert(e.key.clone()) {
+                out.push(e.clone());
+            }
+        }
+        out
+    }
+
     /// Logical names with more than one candidate file.
     pub fn conflicts(&self) -> impl Iterator<Item = (&str, &[PackageEntry])> {
         self.index

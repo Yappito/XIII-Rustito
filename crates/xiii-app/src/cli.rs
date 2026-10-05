@@ -69,6 +69,14 @@ pub struct Options {
     pub play_script: Option<PathBuf>,
     /// `--play` sound playback (`--audio off|on`, default on).
     pub audio: Audio,
+    /// Particle level-start state (`--particles default|all`, default default).
+    pub particles: Particles,
+    /// Print a per-system performance table every [`Options::perf_interval`] seconds and at exit.
+    pub perf: bool,
+    /// Seconds between `--perf` tables (default 5; the final table is always printed).
+    pub perf_interval: f32,
+    /// `--perf`: also time individual VM natives (adds overhead; top 10 reported).
+    pub perf_natives: bool,
 }
 
 /// Audio playback toggle for `--play`.
@@ -79,6 +87,16 @@ pub enum Audio {
     /// Resolve sound events from the installation and play them (default).
     #[default]
     On,
+}
+
+/// Particle level-start state handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Particles {
+    /// Honour the level-start state: triggered emitters (`TrigerredEmitter`, ...) start inactive.
+    #[default]
+    Default,
+    /// Force every emitter active (inspection of triggered effects).
+    All,
 }
 
 impl Options {
@@ -111,6 +129,10 @@ impl Default for Options {
             lighting: Lighting::default(),
             play_script: None,
             audio: Audio::default(),
+            particles: Particles::default(),
+            perf: false,
+            perf_interval: 5.0,
+            perf_natives: false,
         }
     }
 }
@@ -132,10 +154,13 @@ xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
   --play               First-person movement prototype (NOT gameplay) on --map.
   --audio off|on       Play resolved VM sound/music events (default on); `off` resolves
                        and plays nothing (still counts events in the overlay).
-  --play-script FILE   Drive --play from a text input script; headless without --screenshot.
-                       Lines: `t=<secs> forward|back|right|left V | walk on/off | jump |
-                       yaw DEG | turn DEG | pitch DEG | use | teleport X Y Z` (teleport places
-                       the box centre at Unreal-unit X,Y,Z; use is the door/mover interact key).
+  --particles MODE     Particle level-start state: `default` honours the level-start state
+                       (triggered emitters start inactive); `all` forces every emitter on
+                       (inspection). Default `default`.
+   --play-script FILE   Drive --play from a text input script; headless without --screenshot.
+                        Lines: `t=<secs> forward|back|right|left V | walk on/off | crouch on/off |
+                        jump | yaw DEG | turn DEG | pitch DEG | use | teleport X Y Z` (teleport
+                        places the box centre at Unreal-unit X,Y,Z; use is the door/mover key).
   --model PKG.MESH     Skinned-character viewer: decode a SkeletalMesh; several comma-
                        separated entries are placed side by side.
   --anim SEQ           Skinned viewer: play MeshAnimation sequence SEQ (default bind pose).
@@ -151,6 +176,9 @@ xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
   --exit-after-secs S  Exit cleanly after S seconds and print a report.
   --screenshot PATH    Save a PNG of the window during an unattended run.
   --no-vsync           Use AutoNoVsync present mode.
+  --perf               Print a per-system frame-time/CPU table every 5 s and at exit.
+  --perf-interval S    Seconds between --perf tables (default 5).
+  --perf-natives       --perf: also time individual VM natives (adds overhead).
   --size WxH           Initial logical window size (default 1280x720).
   -h, --help           Print this help.
 
@@ -185,6 +213,29 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
             }
             "--screenshot" => opts.screenshot = Some(PathBuf::from(value("--screenshot")?)),
             "--no-vsync" => opts.no_vsync = true,
+            "--perf" => {
+                opts.perf = true;
+                if opts.mode == Mode::Smoke {
+                    opts.mode = Mode::Viewer;
+                }
+            }
+            "--perf-natives" => {
+                opts.perf = true;
+                opts.perf_natives = true;
+                if opts.mode == Mode::Smoke {
+                    opts.mode = Mode::Viewer;
+                }
+            }
+            "--perf-interval" => {
+                let v = value("--perf-interval")?;
+                let s: f32 = v
+                    .parse()
+                    .map_err(|_| format!("invalid --perf-interval {v:?}"))?;
+                if !(s.is_finite() && s > 0.0) {
+                    return Err("--perf-interval must be a positive number".into());
+                }
+                opts.perf_interval = s;
+            }
             "--play" => opts.mode = Mode::Play,
             "--play-script" => {
                 opts.play_script = Some(PathBuf::from(value("--play-script")?));
@@ -199,6 +250,18 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
                     "on" => Audio::On,
                     other => {
                         return Err(format!("invalid --audio {other:?}, expected off|on"));
+                    }
+                };
+            }
+            "--particles" => {
+                let v = value("--particles")?;
+                opts.particles = match v.to_ascii_lowercase().as_str() {
+                    "default" => Particles::Default,
+                    "all" => Particles::All,
+                    other => {
+                        return Err(format!(
+                            "invalid --particles {other:?}, expected default|all"
+                        ));
                     }
                 };
             }
@@ -317,6 +380,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_particles_flag() {
+        assert_eq!(p(&[]).unwrap().particles, Particles::Default);
+        assert_eq!(
+            p(&["--particles", "all"]).unwrap().particles,
+            Particles::All
+        );
+        assert_eq!(
+            p(&["--particles", "Default"]).unwrap().particles,
+            Particles::Default
+        );
+        assert!(p(&["--particles", "maybe"]).is_err());
+        assert!(p(&["--particles"]).is_err());
+    }
+
+    #[test]
     fn parses_skinned_flags() {
         let o = p(&[
             "--model",
@@ -337,6 +415,20 @@ mod tests {
         assert_eq!(p(&["--anim", "Walk"]).unwrap().mode, Mode::Smoke);
         assert!(p(&["--frame", "-1"]).is_err());
         assert!(p(&["--frame", "x"]).is_err());
+    }
+
+    #[test]
+    fn parses_perf_flags() {
+        let o = p(&["--map", "Plage00", "--perf"]).unwrap();
+        assert!(o.perf);
+        assert!(!o.perf_natives);
+        assert_eq!(o.perf_interval, 5.0);
+        let o = p(&["--play", "--perf-natives", "--perf-interval", "2.5"]).unwrap();
+        assert!(o.perf && o.perf_natives);
+        assert_eq!(o.perf_interval, 2.5);
+        assert_eq!(o.mode, Mode::Play);
+        assert!(p(&["--perf-interval", "0"]).is_err());
+        assert!(p(&["--perf-interval"]).is_err());
     }
 
     #[test]

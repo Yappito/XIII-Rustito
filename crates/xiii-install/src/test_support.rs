@@ -65,16 +65,21 @@ impl Drop for TempTree {
 }
 
 pub const GOG_DEFAULT_INI: &str = "[Core.System]\r\nSavePath=..\\Save\r\nCachePath=..\\Cache\r\n\
-Paths=..\\System\\*.u\r\nPaths=..\\MapsUser\\*.unr\r\nPaths=..\\Maps\\*.unr\r\n\
-Paths=..\\Sounds\\*.uax\r\nPaths=..\\Music\\*.umx\r\n;;;Paths=..\\StaticMeshes\\*.usx\r\n\
-Paths=..\\Animations\\*.ukx\r\nPlateForm=0\r\nSpecificPackage=XIIIPersos.u\r\n\
-SpecificPackage=GUI.u\r\n\r\n[Engine.GameEngine]\r\nCacheSizeMegs=1\r\n";
+    Paths=..\\System\\*.u\r\nPaths=..\\MapsUser\\*.unr\r\nPaths=..\\Maps\\*.unr\r\n\
+    Paths=..\\Sounds\\*.uax\r\nPaths=..\\Music\\*.umx\r\n;;;Paths=..\\StaticMeshes\\*.usx\r\n\
+    Paths=..\\Animations\\*.ukx\r\nPlateForm=0\r\nSpecificPackage=XIIIPersos.u\r\n\
+    SpecificPackage=GUI.u\r\n\r\n[Engine.GameEngine]\r\nCacheSizeMegs=1\r\n\
+    ServerPackages=GamePlay\r\nServerPackages=XIII\r\n\r\n[Editor.EditorEngine]\r\n\
+    EditPackages=Core\r\nEditPackages=Engine\r\nEditPackages=XIII\r\n";
 
 pub const STEAM_DEFAULT_INI: &str = "[Core.System]\r\nPaths=..\\System\\*.u\r\n\
-Paths=..\\Skins\\*.u\r\nPaths=..\\Maps\\*.unr\r\nPaths=..\\Maps\\BaseSP\\*.unr\r\n\
-Paths=..\\Maps\\BaseMP\\*.unr\r\nPaths=..\\Sounds\\*.uax\r\nPaths=..\\Music\\*.umx\r\n\
-Paths=..\\Textures\\*.utx\r\nPaths=..\\StaticMeshes\\*.usx\r\nPaths=..\\Animations\\*.ukx\r\n\
-SpecificPackage=XIIIPersos.u\r\nSpecificPackage=GUI.u\r\n";
+    Paths=..\\Skins\\*.u\r\nPaths=..\\Maps\\*.unr\r\nPaths=..\\Maps\\BaseSP\\*.unr\r\n\
+    Paths=..\\Maps\\BaseMP\\*.unr\r\nPaths=..\\Sounds\\*.uax\r\nPaths=..\\Music\\*.umx\r\n\
+    Paths=..\\Textures\\*.utx\r\nPaths=..\\StaticMeshes\\*.usx\r\nPaths=..\\Animations\\*.ukx\r\n\
+    SpecificPackage=XIIIPersos.u\r\nSpecificPackage=GUI.u\r\n\r\n[Engine.GameEngine]\r\n\
+    ServerPackages=GamePlay\r\nServerPackages=XIII\r\nServerPackages=XIIIMPPlus\r\n\r\n\
+    [Editor.EditorEngine]\r\nEditPackages=Core\r\nEditPackages=Engine\r\nEditPackages=XIII\r\n\
+    EditPackages=XIIIPlus\r\nEditPackages=XIIIPersos\r\n";
 
 /// Miniature of the measured GOG layout (spellings copied from the inventory).
 pub fn gog_tree() -> TempTree {

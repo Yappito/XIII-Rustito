@@ -7,7 +7,8 @@ Read-only installation resolver. An `Installation` is one root. The crate valida
 - `Installation::open(root, &OpenOptions)` returns `Result<Installation, OpenError>`.
 - `resolve_package(name)`, `resolve_map(name)` and `resolve_package_of_kind(name, kind)` return `Result<ResolvedPackage, ResolveError>`. A name may carry a known extension, for example `Plage00.unr`.
 - `profile()` and `detection()` return the profile with its evidence and any `unknown_reasons`. The crate also exposes `inventory()`, `search_roots()`, `packages()`, `conflicts()` and `diagnostics()`.
-- `ini_evidence()` and `specific_packages()` report `[Core.System]` `Paths=`, `SpecificPackage=` and `PlateForm=` from `Default.ini`/`XIII.ini`. These values are evidence only and never change resolution.
+- `ini_evidence()` and `specific_packages()` report `[Core.System]` `Paths=`, `SpecificPackage=` and `PlateForm=`, plus `[Editor.EditorEngine] EditPackages=` and `[Engine.GameEngine] ServerPackages=`, from `Default.ini`/`XIII.ini`. These values are evidence only and never change name resolution; `EditPackages=` additionally defines the code-package load order through `code_packages_in_load_order()`.
+- `code_packages_in_load_order()` returns the indexed `.u` packages in the order the installation's own `EditPackages=` list gives (then any unnamed code package by relative path). In the patched Steam install this is base-then-`*Plus` (for example `XIII` then `XIIIPlus`). Only the one root's index is used.
 - `discover_candidates()` and `discover_candidates_in(&DiscoveryRoots)` are best-effort and have no side effects. They read Steam `libraryfolders.vdf` plus `appmanifest_1170760.acf`, and find `XIII*` folders under GOG parents taken from `ProgramFiles*`, `SystemDrive` and `HOME`. They do not read the registry, hardcode drive letters or open any candidate.
 
 ## Validation
@@ -62,7 +63,9 @@ Some directories are deliberately not indexed:
 
 UE2 package names share one namespace. If two indexed files have the same lowercase stem, in any directories and with any extensions, the result is a `DuplicateLogicalPackage` warning. Every lookup of that name then fails with `ResolveError::Ambiguous`, even with a kind filter. No ordering rule picks a winner.
 
-Measured result: **no duplicate stems exist in either install**, including across `system`/`system/PC` and across extensions. GOG has 196 packages with 196 logical names, and Steam has 213 with 213. So no precedence rule is needed or implemented. Do not read `SpecificPackage=` as "subdirectory overrides root".
+Measured result: **no duplicate stems exist in either install**, including across `system`/`system/PC` and across extensions. GOG has 196 packages with 196 logical names, and Steam has 213 with 213. So no name-collision precedence rule is needed or implemented; do not read `SpecificPackage=` as "subdirectory overrides root".
+
+Package **load order** is a separate question, answered from the ini rather than by guessing a winner. The patched Steam `Default.ini` [Editor.EditorEngine] `EditPackages=` lines 276-305 (and GOG `system/Default.ini` lines 265-284) list each `*Plus` package directly after its base: `EditPackages=XIIIPersos` (line 288) then `EditPackages=XIIIPersosPlus` (289), `EditPackages=XIII` (291) then `EditPackages=XIIIPlus` (292), and so on. `[Engine.GameEngine] ServerPackages=` lines 90-93 add `XIIIMPPlus` after `XIIIMP`. `code_packages_in_load_order()` follows `EditPackages=`: measured, the named `*Plus` packages load after their base (`XIII`/`XIIIPlus`, `XIIIPersos`/`XIIIPersosPlus`, `XIIIMP`/`XIIIMPPlus`, `XIDInterf`/`XIDInterfPlus`, `IpDrv`/`IpDrvPlus`). The three Steam packages the ini does not name (`EnginePlus`, `FragFace`, `MightyFists`) are appended by relative path, after the named ones.
 
 ## Tests
 
