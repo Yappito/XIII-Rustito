@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 
-use xiii_collision::{CollisionWorld, MoveParams, Vec3};
+use xiii_collision::{CollisionWorld, MoveParams, Vec3, WalkParams, walk_move};
 use xiii_decode::common::{UNREAL_UNITS_PER_METER, actor_to_bevy};
 use xiii_decode::model::level;
 use xiii_decode::skeletal::validate::bounds;
@@ -18,9 +18,18 @@ use xiii_script::{
     ObjRef, ScriptLimits, ScriptObject, ScriptPackage, ScriptSet, Value, Vm, VmLimits,
 };
 
-use crate::viewer::load::{PackageCache, WorldScene};
+use xiii_world::{PackageCache, WorldScene};
 
 const PLAYER_PAWN_FALLBACK: &str = "XIII.XIIIPlayerPawn";
+
+/// UE2 `MINFLOORZ`: a surface is walkable (a floor) when its unit normal's up component is
+/// at least this. Hypothesis for XIII, same as upstream UE2.
+const MINFLOORZ: f32 = 0.7;
+
+/// Upstream UE2 `MAXSTEPHEIGHT` in Unreal units. Used because the decoded XIII class
+/// defaults contain no step-height property (see [`report_step_height_evidence`]); it is the
+/// documented upstream hypothesis for XIII, not a measured XIII value.
+const MAXSTEPHEIGHT_UU: f32 = 35.0;
 
 /// Entry point for `--collision-test`.
 pub fn run(map: &str, game_dir: &std::path::Path) -> bevy::app::AppExit {
@@ -41,7 +50,7 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
     let mut cache = PackageCache::open(game_dir)?;
     let map_pkg = cache.map(map)?;
     let actors = level::scan_level(&map_pkg.package, &map_pkg.data);
-    let scene = crate::viewer::load::import_map(&mut cache, map)?;
+    let scene = xiii_world::import_map(&mut cache, map)?;
     println!(
         "[collision-test] {map}: imported in {:.2}s ({} collision triangles, {} sources)",
         import_started.elapsed().as_secs_f32(),
@@ -189,7 +198,7 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
 
     // Effective placement of the PlayerStart (map property vs class default) and the map's
     // own CollisionHeight override when present.
-    let mut class_defaults = crate::viewer::load::ClassDefaults::open(game_dir)?;
+    let mut class_defaults = xiii_world::ClassDefaults::open(game_dir)?;
     if let Some(ps) = actors.player_starts.first() {
         match class_defaults.resolve(&ps.class, ps) {
             Ok((eff, src)) => {
@@ -325,23 +334,29 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
         spawn.floor
     );
 
-    // ---- Case 1: walk from the real PlayerStart, re-aiming at the door centre every step --
-    let params = MoveParams {
+    // ---- UE2 step-height evidence (before using the upstream constant) -------------------
+    report_step_height_evidence(&set);
+
+    // Walk parameters. The doorway harness uses UE2's MAXSTEPHEIGHT (35 UU, upstream
+    // constant) converted with the coordinate policy, and MINFLOORZ 0.7.
+    let walk_params = WalkParams {
         skin: 0.001,
         max_iterations: 4,
-        max_step_height: 0.0,
+        max_step_height: MAXSTEPHEIGHT_UU / UNREAL_UNITS_PER_METER,
+        min_floor_z: MINFLOORZ,
     };
     let step = 0.05f32;
 
+    // ---- Case 1: UE2-style walk from the real PlayerStart, re-aiming every step ----------
     let walk_started = Instant::now();
-    let closed = walk_toward(
+    let closed = walk_toward_walk(
         &world,
         spawn.position,
         door_center,
         half,
         step,
         1200,
-        &params,
+        &walk_params,
     );
     let closed_time = walk_started.elapsed();
     let closed_past = past_plane(closed.position, door_center, closed.last_heading);
@@ -354,9 +369,11 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
     let closed_past_ok = closed_past >= 1.0;
     let closed_ok = closed_blocked_by_door && !closed_past_ok;
     println!(
-        "[collision-test] PlayerStart case closed: {} blocked={} last_source={:?} past_door_plane={:.2} m steps={} ({:.0} ms)",
+        "[collision-test] PlayerStart case closed (walk_move, max_step_height {:.1} UU): {} blocked={} falling={} last_source={:?} past_door_plane={:.2} m steps={} ({:.0} ms)",
+        MAXSTEPHEIGHT_UU,
         pass_fail(closed_ok),
         closed.blocked,
+        closed.falling,
         closed_door,
         closed_past,
         closed.steps,
@@ -371,14 +388,14 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
     );
 
     let walk_started = Instant::now();
-    let open = walk_toward(
+    let open = walk_toward_walk(
         &without_door,
         spawn.position,
         door_center,
         half,
         step,
         1200,
-        &params,
+        &walk_params,
     );
     let open_time = walk_started.elapsed();
     let open_past = past_plane(open.position, door_center, open.last_heading);
@@ -387,9 +404,10 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
         .last_source
         .map(|s| scene.collision_sources[s as usize].clone());
     println!(
-        "[collision-test] PlayerStart case open: {} blocked={} last_source={:?} past_door_plane={:.2} m steps={} ({:.0} ms)",
+        "[collision-test] PlayerStart case open (walk_move): {} blocked={} falling={} last_source={:?} past_door_plane={:.2} m steps={} ({:.0} ms)",
         pass_fail(open_ok),
         open.blocked,
+        open.falling,
         open_block,
         open_past,
         open.steps,
@@ -403,34 +421,28 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
         half,
     );
 
-    // ---- Extra case (labelled, not the acceptance case): pawn step-up ---------------------
-    // UE2 pawns step up over small floor rises natively; move_slide exposes that as
-    // max_step_height. The main cases above use 0 (fixed by the previous task). This extra
-    // run repeats the PlayerStart walk with a small step-up to separate "mis-placement" from
-    // "flat primitive without step-up". 0.08 m = 4.0 UU: above the observed deck-slat contact
-    // (1.8 UU) and the NavPoint placement residuals (+0.5..+4 UU); it is NOT measured from
-    // the game (no MaxStepHeight property exists in the corpus classes).
-    let step_up = MoveParams {
+    // Old walker kept as a labelled diagnostic (the previous task's flat `move_slide`).
+    let slide_params = MoveParams {
         skin: 0.001,
         max_iterations: 4,
-        max_step_height: 0.08,
+        max_step_height: 0.0,
     };
-    let step_closed = walk_toward(
+    let diag = walk_toward(
         &world,
         spawn.position,
         door_center,
         half,
         step,
         1200,
-        &step_up,
+        Mover::Slide(&slide_params),
     );
-    let step_past = past_plane(step_closed.position, door_center, step_closed.last_heading);
-    let step_src = step_closed
+    let diag_past = past_plane(diag.position, door_center, diag.last_heading);
+    let diag_src = diag
         .last_source
         .map(|s| scene.collision_sources[s as usize].clone());
     println!(
-        "[collision-test] PlayerStart with step-up 0.08m (extra case): blocked={} last_source={:?} past_door_plane={:.2} m steps={}",
-        step_closed.blocked, step_src, step_past, step_closed.steps
+        "[collision-test] PlayerStart move_slide diagnostic (old walker, max_step_height=0): blocked={} last_source={:?} past_door_plane={:.2} m steps={}",
+        diag.blocked, diag_src, diag_past, diag.steps
     );
 
     // ---- Case 2: aligned door case, 2 m in front of the leaf along its normal -------------
@@ -462,7 +474,7 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
         half,
         step,
         1200,
-        &params,
+        Mover::Slide(&slide_params),
     );
     let a_closed_time = walk_started.elapsed();
     let a_closed_past = past_plane(a_closed.position, door_center, door_normal);
@@ -498,7 +510,7 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
         half,
         step,
         1200,
-        &params,
+        Mover::Slide(&slide_params),
     );
     let a_open_time = walk_started.elapsed();
     let a_open_past = past_plane(a_open.position, door_center, door_normal);
@@ -1095,14 +1107,38 @@ fn place_spawn(world: &CollisionWorld, player_start: Vec3, half: Vec3) -> Result
 struct Walk {
     position: Vec3,
     blocked: bool,
+    falling: bool,
     steps: usize,
     last_source: Option<u32>,
     last_heading: Vec3,
     contacts: Vec<xiii_collision::MoveContact>,
 }
 
-/// Walks `max_steps` of `step` metres along a fixed `heading` with
-/// [`xiii_collision::move_slide`], stopping after several steps without progress.
+/// Which movement primitive the walk loop uses: the old flat `move_slide` or the UE2-style
+/// `walk_move` (step-up / floor-follow).
+#[derive(Clone, Copy)]
+enum Mover<'a> {
+    Slide(&'a MoveParams),
+    Walk(&'a WalkParams),
+}
+
+impl Mover<'_> {
+    fn step(
+        &self,
+        world: &CollisionWorld,
+        pos: Vec3,
+        delta: Vec3,
+        half: Vec3,
+    ) -> xiii_collision::MoveResult {
+        match self {
+            Mover::Slide(p) => xiii_collision::move_slide(world, pos, delta, half, p),
+            Mover::Walk(p) => walk_move(world, pos, delta, half, p),
+        }
+    }
+}
+
+/// Walks `max_steps` of `step` metres along a fixed `heading`, stopping after several steps
+/// without progress.
 #[allow(clippy::too_many_arguments)]
 fn walk(
     world: &CollisionWorld,
@@ -1111,9 +1147,9 @@ fn walk(
     half: Vec3,
     step: f32,
     max_steps: usize,
-    params: &MoveParams,
+    mover: Mover<'_>,
 ) -> Walk {
-    walk_inner(world, start, heading, None, half, step, max_steps, params)
+    walk_inner(world, start, heading, None, half, step, max_steps, mover)
 }
 
 /// Walks toward `target`, re-aiming the heading (horizontal) at `target` on every step.
@@ -1124,7 +1160,7 @@ fn walk_toward(
     half: Vec3,
     step: f32,
     max_steps: usize,
-    params: &MoveParams,
+    mover: Mover<'_>,
 ) -> Walk {
     let heading = heading_xz(start, target);
     walk_inner(
@@ -1135,7 +1171,29 @@ fn walk_toward(
         half,
         step,
         max_steps,
-        params,
+        mover,
+    )
+}
+
+/// Walks toward `target` with the UE2-style [`xiii_collision::walk_move`].
+#[allow(clippy::too_many_arguments)]
+fn walk_toward_walk(
+    world: &CollisionWorld,
+    start: Vec3,
+    target: Vec3,
+    half: Vec3,
+    step: f32,
+    max_steps: usize,
+    params: &WalkParams,
+) -> Walk {
+    walk_toward(
+        world,
+        start,
+        target,
+        half,
+        step,
+        max_steps,
+        Mover::Walk(params),
     )
 }
 
@@ -1148,11 +1206,12 @@ fn walk_inner(
     half: Vec3,
     step: f32,
     max_steps: usize,
-    params: &MoveParams,
+    mover: Mover<'_>,
 ) -> Walk {
     let mut pos = start;
     let mut heading = heading;
     let mut blocked = false;
+    let mut falling = false;
     let mut last_source = None;
     let mut contacts = Vec::new();
     let mut stuck = 0;
@@ -1166,7 +1225,8 @@ fn walk_inner(
             }
         }
         let delta = scale(heading, step);
-        let r = xiii_collision::move_slide(world, pos, delta, half, params);
+        let r = mover.step(world, pos, delta, half);
+        falling = r.falling;
         let before = pos;
         pos = r.position;
         if r.blocked
@@ -1196,10 +1256,50 @@ fn walk_inner(
     Walk {
         position: pos,
         blocked,
+        falling,
         steps: used,
         last_source,
         last_heading: heading,
         contacts,
+    }
+}
+
+/// Scans every decoded class default for a property name containing "step" and reports it.
+/// The doorway harness uses the upstream UE2 `MAXSTEPHEIGHT` only if there is no XIII
+/// evidence; this makes that decision visible rather than assumed.
+fn report_step_height_evidence(set: &ScriptSet) {
+    let mut classes = 0usize;
+    let mut hits: Vec<String> = Vec::new();
+    for pkg in &set.packages {
+        for (idx, obj) in &pkg.objects {
+            let xiii_script::ScriptObject::Class(cl) = obj else {
+                continue;
+            };
+            classes += 1;
+            for prop in &cl.defaults.properties {
+                let name = pkg.package.property_name(prop);
+                if name.to_ascii_lowercase().contains("step") {
+                    let path = pkg
+                        .package
+                        .object_path(xiii_package::ObjectRef::Export(*idx))
+                        .unwrap_or("?");
+                    hits.push(format!("{}.{}", pkg.name, path));
+                }
+            }
+        }
+    }
+    hits.sort();
+    hits.dedup();
+    if hits.is_empty() {
+        println!(
+            "[collision-test] step-height evidence: {classes} class defaults scanned, no property name contains 'step'; using upstream UE2 MAXSTEPHEIGHT = {MAXSTEPHEIGHT_UU} UU (hypothesis)"
+        );
+    } else {
+        println!(
+            "[collision-test] step-height evidence: {classes} class defaults scanned; property names containing 'step' ({}) {}",
+            hits.len(),
+            hits.join(", ")
+        );
     }
 }
 
@@ -1344,12 +1444,12 @@ fn map_has_porte6(actors: &level::LevelActors) -> bool {
 /// box, its world bbox after the transform, and the heights of its walkable surfaces nearby.
 fn report_static_mesh_actor(
     scene: &WorldScene,
-    class_defaults: &mut crate::viewer::load::ClassDefaults,
+    class_defaults: &mut xiii_world::ClassDefaults,
     a: &level::ActorPlacement,
     player_start: Vec3,
 ) {
     let prefix = format!("{} -> ", a.path);
-    let objs: Vec<&crate::viewer::load::SceneObject> = scene
+    let objs: Vec<&xiii_world::SceneObject> = scene
         .objects
         .iter()
         .filter(|o| o.path.starts_with(&prefix))
@@ -1395,7 +1495,7 @@ fn report_static_mesh_actor(
     );
     // Local/world bounds of the mesh (all placed sections share one transform; bounds of the
     // union over sections).
-    let ident = |m: &crate::viewer::load::SceneMesh| {
+    let ident = |m: &xiii_world::SceneMesh| {
         let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
         for p in &m.positions {
             for k in 0..3 {
@@ -1411,7 +1511,7 @@ fn report_static_mesh_actor(
     for o in &objs {
         let (lo, hi) = ident(&scene.meshes[o.mesh]);
         for p in [&lo, &hi] {
-            let w = crate::viewer::load::apply_transform_pub(&t, *p);
+            let w = xiii_world::apply_transform_pub(&t, *p);
             for k in 0..3 {
                 world_lo[k] = world_lo[k].min(w[k]);
                 world_hi[k] = world_hi[k].max(w[k]);
@@ -1457,7 +1557,7 @@ fn report_static_mesh_actor(
     for o in &objs {
         let (lo, hi) = ident(&scene.meshes[o.mesh]);
         for p in [&lo, &hi] {
-            let w = crate::viewer::load::apply_transform_pub(&legacy, *p);
+            let w = xiii_world::apply_transform_pub(&legacy, *p);
             for k in 0..3 {
                 legacy_lo[k] = legacy_lo[k].min(w[k]);
                 legacy_hi[k] = legacy_hi[k].max(w[k]);

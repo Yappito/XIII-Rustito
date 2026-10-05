@@ -1,7 +1,9 @@
-//! CPU-side world import for the diagnostic map viewer. No Bevy types: this module turns a
-//! map from an owned installation into converted (Bevy-space) meshes, RGBA textures and
-//! object records, and counts everything it could not import. Nothing falls back silently:
-//! every skipped actor/material/surface increments a named counter that the overlay shows.
+//! Bevy-free world import and the Unreal-space physics adapter.
+//!
+//! This crate turns a map from an owned installation into converted (Bevy-space) meshes, RGBA
+//! textures, object records and a collision triangle soup, and counts everything it could not
+//! import. Nothing falls back silently: every skipped actor/material/surface increments a
+//! named counter.
 //!
 //! Actor placement uses **effective** values: the map's tagged property if present, else the
 //! inherited class default resolved read-only through `xiii_script` (`Vm::class_layout`), else
@@ -9,9 +11,17 @@
 //! PrePivot 0). The source of every field is counted as `placement.<field>.<source>` and
 //! `actor.player_start.<field>.<source>`. `PrePivot` is applied before scale/rotation (see
 //! `xiii_decode::common::actor_to_bevy_pre_pivot`).
+//!
+//! [`physics::WorldPhysicsAdapter`] implements `xiii_script::physics::WorldPhysics` on top of
+//! the imported collision, converting between Unreal axes/units (Z up) and the Bevy collision
+//! space (Y up, metres) with the single coordinate policy in `xiii_decode::common`.
+
+#![warn(missing_docs)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+
+pub mod physics;
 
 use xiii_decode::common::{
     BevyTransform, Mat3, actor_to_bevy_pre_pivot, to_bevy_direction, to_bevy_position,
@@ -477,10 +487,15 @@ impl Importer<'_> {
 /// documented `Engine.Actor` default. Sources are counted per field.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ResolvedPlacement {
+    /// Effective location in Unreal units.
     pub location: [f32; 3],
+    /// Effective rotation rotator `(pitch, yaw, roll)`.
     pub rotation: [i32; 3],
+    /// Effective uniform `DrawScale`.
     pub draw_scale: f32,
+    /// Effective per-axis `DrawScale3D`.
     pub draw_scale_3d: [f32; 3],
+    /// Effective `PrePivot` (Unreal units, mesh space).
     pub pre_pivot: [f32; 3],
 }
 

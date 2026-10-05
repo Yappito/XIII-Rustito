@@ -4,8 +4,6 @@
 //! overlay shows the object path under the crosshair and every import counter, including
 //! skipped/failed categories. This is an importer diagnostic, not a playable mission.
 
-pub mod load;
-
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -19,7 +17,7 @@ use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_dis
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::cli::Options;
-use load::{AlphaKind, MaterialSlot, WorldScene};
+use xiii_world::{AlphaKind, MaterialSlot, WorldScene};
 
 /// Viewer plugin.
 pub struct ViewerPlugin {
@@ -99,7 +97,7 @@ impl Plugin for ViewerPlugin {
     }
 }
 
-fn image_from(t: &load::SceneTexture) -> Image {
+fn image_from(t: &xiii_world::SceneTexture) -> Image {
     let mut img = Image::new(
         Extent3d {
             width: t.image.width,
@@ -120,7 +118,7 @@ fn image_from(t: &load::SceneTexture) -> Image {
 }
 
 fn transform_from(t: &xiii_decode::common::BevyTransform) -> Transform {
-    let m = Mat3::from_cols_array(&load::to_cols(&t.rotation));
+    let m = Mat3::from_cols_array(&xiii_world::to_cols(&t.rotation));
     Transform {
         translation: Vec3::from_array(t.translation),
         rotation: Quat::from_mat3(&m),
@@ -134,8 +132,8 @@ fn load_scene(opts: &Options) -> Result<WorldScene, String> {
         .clone()
         .ok_or("--game-dir is required for --map")?;
     let map = opts.map.clone().ok_or("--map is required")?;
-    let mut cache = load::PackageCache::open(&game_dir)?;
-    load::import_map(&mut cache, &map)
+    let mut cache = xiii_world::PackageCache::open(&game_dir)?;
+    xiii_world::import_map(&mut cache, &map)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -254,7 +252,7 @@ fn setup(
             v[4].to_radians(),
         ),
         (None, Some((p, rot))) => {
-            let (yaw, pitch) = load::rotator_to_yaw_pitch(rot);
+            let (yaw, pitch) = xiii_world::rotator_to_yaw_pitch(rot);
             (Vec3::from_array(p) + Vec3::Y * 1.2, yaw, pitch)
         }
         (None, None) => (Vec3::new(0.0, 5.0, 0.0), 0.0, 0.0),

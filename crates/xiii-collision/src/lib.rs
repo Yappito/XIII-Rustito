@@ -18,9 +18,11 @@
 
 mod bvh;
 mod sweep;
+mod walk;
 
 pub use bvh::{Aabb, Bvh};
 pub use sweep::{SweepHit, SweepParams, sweep_aabb};
+pub use walk::{WalkParams, walk_move};
 
 /// A triangle in Bevy space (metres).
 pub type Triangle = [[f32; 3]; 3];
@@ -220,8 +222,12 @@ pub struct MoveResult {
     pub contacts: Vec<MoveContact>,
     /// Iterations actually used.
     pub iterations: u32,
-    /// Whether the result rests on the floor (final downward probe hit).
+    /// Whether the result rests on a walkable floor (final downward probe).
     pub on_floor: bool,
+    /// Set by [`walk_move`] when the post-move floor follow found no walkable floor below:
+    /// the pawn is airborne (or over a non-walkable surface). Always `false` for
+    /// [`move_slide`].
+    pub falling: bool,
 }
 
 impl MoveResult {
@@ -363,6 +369,7 @@ pub fn move_slide(
         contacts,
         iterations,
         on_floor,
+        falling: false,
     }
 }
 

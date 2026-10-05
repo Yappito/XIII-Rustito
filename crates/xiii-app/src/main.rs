@@ -87,10 +87,10 @@ fn dump(opts: &cli::Options) -> AppExit {
         return AppExit::error();
     };
     let started = std::time::Instant::now();
-    let result = viewer::load::PackageCache::open(dir).and_then(|mut c| {
+    let result = xiii_world::PackageCache::open(dir).and_then(|mut c| {
         let map_pkg = c.map(map)?;
         let actors = xiii_decode::model::level::scan_level(&map_pkg.package, &map_pkg.data);
-        let scene = viewer::load::import_map(&mut c, map)?;
+        let scene = xiii_world::import_map(&mut c, map)?;
         print_placement_stats(map, &actors, &scene);
         Ok(scene)
     });
@@ -125,8 +125,8 @@ fn dump(opts: &cli::Options) -> AppExit {
                 for o in &scene.objects {
                     let m = &scene.meshes[o.mesh];
                     let tex = match &m.material {
-                        viewer::load::MaterialSlot::Texture(t) => scene.textures[*t].label.clone(),
-                        viewer::load::MaterialSlot::Missing(e) => format!("<missing: {e}>"),
+                        xiii_world::MaterialSlot::Texture(t) => scene.textures[*t].label.clone(),
+                        xiii_world::MaterialSlot::Missing(e) => format!("<missing: {e}>"),
                     };
                     if o.path.to_ascii_lowercase().contains(f)
                         || tex.to_ascii_lowercase().contains(f)
@@ -187,7 +187,7 @@ fn dump(opts: &cli::Options) -> AppExit {
 fn print_placement_stats(
     map: &str,
     actors: &xiii_decode::model::level::LevelActors,
-    scene: &viewer::load::WorldScene,
+    scene: &xiii_world::WorldScene,
 ) {
     let mut with_pivot = 0usize;
     let mut with_ds = 0usize;

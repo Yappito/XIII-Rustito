@@ -32,7 +32,8 @@ per-triangle facing, so:
 | `sweep(start, end, half_extents)` | Continuous swept AABB. `SweepHit { t in [0,1], unit normal toward the box, triangle, source, start_penetrating }`. |
 | `ray(start, end)` | Nearest hit along a segment, both sides, via Möller-Trumbore over BVH candidates; result-equivalent to the viewer's per-triangle `ray_triangle`. (The swept SAT is not used for zero extent: at an exact point its edge-axis cross products can be near-degenerate and reject a coplanar triangle.) |
 | `overlap_aabb(center, half_extents)` / `overlaps_aabb` | Static SAT overlap list / boolean. |
-| `move_slide(start, delta, half_extents, &MoveParams)` | Sweep, back off by `skin`, slide along the hit plane, up to `max_iterations`; optional three-sweep step-up of `max_step_height`. Returns final position, `blocked`, ordered `MoveContact`s, `iterations`, `on_floor`. |
+| `move_slide(start, delta, half_extents, &MoveParams)` | Sweep, back off by `skin`, slide along the hit plane, up to `max_iterations`; optional three-sweep step-up of `max_step_height`. Returns final position, `blocked`, ordered `MoveContact`s, `iterations`, `on_floor`, `falling` (always `false`). |
+| `walk_move(start, delta, half_extents, &WalkParams)` | UE2-style walking: on a blocking hit whose surface is **not walkable** (normal up component below `min_floor_z`), step up by `max_step_height`, forward, then down; otherwise slide as `move_slide`. Afterwards floor-follow down by `max_step_height` and snap to a walkable floor, else report `falling`. |
 
 Start-overlap is reported as a `t = 0` hit with `start_penetrating = true` and never panics.
 By default, a triangle already touching at `t = 0` is skipped **only when the motion does not
@@ -51,9 +52,22 @@ brute-force oracle over 500 random queries on a 400-triangle soup.
 ## Approximations (not fidelity claims)
 
 `move_slide` is a simple approximation of `UPawn::physWalking` / `stepUp`: one swept AABB
-against two-sided triangles, an empirical 1 mm skin, and a step-up heuristic. It is fit for a
-doorway pass/block test; it does not reproduce UE2's cylinder/contact ordering, penetration
-resolution, or per-step friction/acceleration.
+against two-sided triangles, an empirical 1 mm skin, and a step-up heuristic gated on a
+near-vertical contact normal (`|n_y| < 0.3`). A near-horizontal small floor rise reported
+through a near-horizontal contact therefore never triggers it.
+
+`walk_move` is a closer (still approximate) `UPawn::physWalking`:
+
+1. sweep the full delta; on no hit, move and finish;
+2. on a hit, back off by `skin`; if the surface is not walkable (its up component is below
+   `min_floor_z`), try step-up — sweep up by `max_step_height`, forward by the remaining
+   travel, then down by `max_step_height` + epsilon, accepting only a walkable landing;
+   otherwise slide along the hit plane exactly as `move_slide`;
+3. after the move, floor-follow: sweep down by `max_step_height` and snap to a walkable floor,
+   else set `falling` (no gravity is applied; the caller stops and reports).
+
+Both retain UE2's extent-box primitive and the empirical 1 mm skin; neither reproduces UE2's
+cylinder/contact ordering, penetration resolution, or per-step friction/acceleration.
 
 ## Tests (synthetic geometry only, no game data)
 
@@ -64,3 +78,8 @@ parallel does not; a resting box moving down is blocked at `t=0`; 1000 shallow-a
 steps never reach the far side of a wall; a zero-extent downward ray onto a coplanar floor
 hits; start-overlap and zero-length sweeps; degenerate triangles dropped; BVH equals brute
 force on a randomized soup.
+
+`walk_move`: over a 1.8 cm plank edge; up a 14-degree ramp; a step just below the limit passes
+and just above is blocked; walking off a ledge reports `falling`; a corridor floor of 0.5 m
+tiles with randomized sub-2 mm seams never sticks or falls through (deterministic LCG); 1000
+small steps into a wall never tunnel through it.
