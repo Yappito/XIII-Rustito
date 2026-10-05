@@ -8,9 +8,38 @@
 //! The adapter is deliberately not wired into the VM (`xiii-tool`) yet; it is unit-tested
 //! with a synthetic soup and, opt-in, against the imported Plage01 map.
 
-use xiii_collision::{CollisionWorld, Triangle, Vec3 as BevyVec3};
-use xiii_decode::common::{UNREAL_UNITS_PER_METER, to_bevy_position, to_bevy_scale};
+use std::collections::HashMap;
+
+use xiii_collision::{CollisionWorld, MovingObject, Triangle, Vec3 as BevyVec3};
+use xiii_decode::common::{
+    UNREAL_UNITS_PER_METER, to_bevy_direction, to_bevy_position, to_bevy_scale,
+};
 use xiii_script::physics::{MoveOutcome, WorldHit, WorldPhysics};
+
+/// Rotation-matrix rows in Bevy space of an Unreal rotator (roll X / pitch Y / yaw Z), the
+/// axis-permutation conjugate `P R P^-1` of `FRotationMatrix`. Shared by the moving-brush
+/// collision in `xiii-app`.
+pub fn rotation_rows(rot: [i32; 3]) -> [[f32; 3]; 3] {
+    let to_rad = |u: i32| (u as f32) * std::f32::consts::TAU / 65536.0;
+    let (p, y, rl) = (to_rad(rot[0]), to_rad(rot[1]), to_rad(rot[2]));
+    let (sp, cp) = (p.sin(), p.cos());
+    let (sy, cy) = (y.sin(), y.cos());
+    let (sr, cr) = (rl.sin(), rl.cos());
+    let bx = [cp * cy, cp * sy, sp];
+    let by = [sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp];
+    let bz = [-(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp];
+    let cb = [
+        to_bevy_direction(bx),
+        to_bevy_direction(by),
+        to_bevy_direction(bz),
+    ];
+    let col = [cb[1], cb[2], [-cb[0][0], -cb[0][1], -cb[0][2]]];
+    [
+        [col[0][0], col[1][0], col[2][0]],
+        [col[0][1], col[1][1], col[2][1]],
+        [col[0][2], col[1][2], col[2][2]],
+    ]
+}
 
 /// Converts a Bevy-space position (metres) back into Unreal space: the inverse of
 /// `xiii_decode::common::to_bevy_position`, using the same scale constant.
@@ -41,6 +70,9 @@ pub fn unreal_extent_to_bevy(e: [f32; 3]) -> BevyVec3 {
 pub struct WorldPhysicsAdapter {
     box_world: CollisionWorld,
     line_world: CollisionWorld,
+    /// Per registered mover: `(box moving-object index, line moving-object index)`.
+    movers: Vec<(usize, usize)>,
+    mover_by_name: HashMap<String, usize>,
 }
 
 impl WorldPhysicsAdapter {
@@ -53,7 +85,14 @@ impl WorldPhysicsAdapter {
         Self {
             box_world: CollisionWorld::new(box_entries),
             line_world: CollisionWorld::new(line_entries),
+            movers: Vec::new(),
+            mover_by_name: HashMap::new(),
         }
+    }
+
+    /// Number of movers registered with [`WorldPhysics::register_mover`].
+    pub fn mover_count(&self) -> usize {
+        self.movers.len()
     }
 
     /// Builds the adapter from an imported world's query-specific collision soups.
@@ -131,6 +170,50 @@ impl WorldPhysics for WorldPhysicsAdapter {
             self.box_world.overlaps_aabb(center, half)
         };
         !overlaps
+    }
+
+    fn register_mover(
+        &mut self,
+        actor: &str,
+        source: u32,
+        triangles: &[[[f32; 3]; 3]],
+        origin: [f32; 3],
+        rotation: [i32; 3],
+    ) {
+        if triangles.is_empty() {
+            return;
+        }
+        let bevy: Vec<Triangle> = triangles.iter().map(|t| t.map(to_bevy_position)).collect();
+        let center = to_bevy_position(origin);
+        let rows = rotation_rows(rotation);
+        let box_index = self
+            .box_world
+            .add_moving(MovingObject::from_world_triangles(
+                bevy.clone(),
+                source,
+                center,
+                rows,
+            ));
+        let line_index = self
+            .line_world
+            .add_moving(MovingObject::from_world_triangles(
+                bevy, source, center, rows,
+            ));
+        self.mover_by_name
+            .insert(actor.to_ascii_lowercase(), self.movers.len());
+        self.movers.push((box_index, line_index));
+    }
+
+    fn set_mover(&mut self, actor: &str, location: [f32; 3], rotation: [i32; 3]) {
+        let Some(&i) = self.mover_by_name.get(&actor.to_ascii_lowercase()) else {
+            return;
+        };
+        let center = to_bevy_position(location);
+        let rows = rotation_rows(rotation);
+        let (box_index, line_index) = self.movers[i];
+        self.box_world.set_moving_transform(box_index, center, rows);
+        self.line_world
+            .set_moving_transform(line_index, center, rows);
     }
 }
 
@@ -295,6 +378,42 @@ mod tests {
         // The line world is the short one; the box world the tall one (diagnostics).
         assert_eq!(p.line_world().triangle_count(), 2);
         assert_eq!(p.box_world().triangle_count(), 2);
+    }
+
+    #[test]
+    fn registered_mover_blocks_then_moving_it_clears_a_trace() {
+        // Empty static soup: the only geometry is the registered mover.
+        let mut p = WorldPhysicsAdapter::from_entries(
+            Vec::<(Triangle, u32)>::new(),
+            Vec::<(Triangle, u32)>::new(),
+        );
+        // A vertical wall in Unreal at X=0, registered as a mover `Door`.
+        let wall_u: Vec<[[f32; 3]; 3]> = vec![
+            [
+                [0.0, -100.0, -100.0],
+                [0.0, 100.0, -100.0],
+                [0.0, 100.0, 100.0],
+            ],
+            [
+                [0.0, -100.0, -100.0],
+                [0.0, 100.0, 100.0],
+                [0.0, -100.0, 100.0],
+            ],
+        ];
+        p.register_mover("Door", 7, &wall_u, [0.0, 0.0, 0.0], [0, 0, 0]);
+        assert_eq!(p.mover_count(), 1);
+        let start = [-200.0, 0.0, 0.0];
+        let end = [200.0, 0.0, 0.0];
+        let hit = p
+            .trace(start, end, [0.0; 3])
+            .expect("the registered mover must block a zero-extent trace");
+        assert!(hit.time < 1.0, "{hit:?}");
+        // A box query sees it too.
+        assert!(!p.point_free([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]));
+        // Move it away: both queries clear.
+        p.set_mover("Door", [100_000.0, 0.0, 0.0], [0, 0, 0]);
+        assert!(p.trace(start, end, [0.0; 3]).is_none());
+        assert!(p.point_free([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]));
     }
 
     #[test]

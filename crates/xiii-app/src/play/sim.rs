@@ -79,6 +79,9 @@ pub struct Input {
     pub jump: bool,
     /// Walk modifier (Shift): scale `GroundSpeed` by `walking_pct`.
     pub walk: bool,
+    /// A use/interact action was requested this tick (edge-triggered; `E`). Not consumed by
+    /// [`PlayerSim::step`]; the host performs the use against the VM.
+    pub use_action: bool,
 }
 
 /// The simulated player.

@@ -4,12 +4,12 @@ Updated: **2026-10-05 (second session)**. Research phase (2026-10-04), M0, M1 an
 
 ## Next session: start here
 
-State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `148a4bb` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
+State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `c2244a4` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
 ### How the user wants work organized
 
 - The coordinating Claude session **oversees and reviews**; it keeps its own context small and delegates implementation.
-- Delegation uses the **opencode CLI**, currently **`opencode-go/deepseek-v4.1-flash`** (OpenCode Go provider, added by the user after the Ollama Cloud Pro 5-hour limit was hit; `ollama-cloud/*` models also work when that quota is available, and the user briefly preferred `glm-5.3-flash`, which exists on both providers). **On a usage-limit error, ask the user before switching provider/subscription.** If opencode is unavailable, fall back to Claude sub-agents.
+- Delegation uses the **opencode CLI**, currently **`opencode-go/deepseek-v4.1-flash`** (OpenCode Go provider, added by the user after the Ollama Cloud Pro 5-hour limit was hit; `ollama-cloud/*` models also work when that quota is available, and the user briefly preferred `glm-5.3-flash`, which exists on both providers). Up to six sessions ran in parallel (three on `opencode-go/deepseek-v4.1-flash`, three on `ollama-cloud/deepseek-v4.1-flash` once that quota reset). **On a usage-limit error, ask the user before switching provider/subscription.** If opencode is unavailable, fall back to Claude sub-agents.
 - Claude writes one spec per task under git-ignored `local/tasks/`, runs opencode headless, reviews (diff, fmt/clippy/full tests incl. opt-in corpus, screenshots, semantics against UE2), sends corrections in the same session, then commits and pushes verified work to `origin/main` (commit messages end with the session's Co-Authored-By line). Ask before other outward-facing actions.
 - Report honestly: a map viewer is not a playable mission, a headless trace is not gameplay.
 - Credentials: the user enters API keys themselves (`opencode auth login`). Never enter a key yourself, even if pasted in chat; give the user the command instead.
@@ -26,15 +26,20 @@ State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XII
 ### Environment notes
 
 - cargo/rustc in `C:\Users\ZoliBen\.cargo\bin` (Git Bash: `export PATH="$HOME/.cargo/bin:$PATH"`). Rust 1.99.0 pinned, MSVC 14.44. No `gh` CLI.
-- Full verification (about 2-4 minutes warm): `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && XIII_GOG_DIR=P:/AI/XIII/XIII_Game XIII_STEAM_DIR="P:/SteamLibrary/steamapps/common/XIII - Classic" cargo test --workspace`. Last result (`148a4bb`): **205 passed, 0 failed**. Use absolute paths: some older opt-in tests resolve relative `XIII_GOG_DIR` against the crate directory.
-- Viewer: `cargo run -p xiii-app --release -- --map Plage01 --game-dir XIII_Game` (`--exit-after-secs N --screenshot <png>`, `--dump`, `--collision-test`).
+- Full verification (about 2-4 minutes warm): `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && XIII_GOG_DIR=P:/AI/XIII/XIII_Game XIII_STEAM_DIR="P:/SteamLibrary/steamapps/common/XIII - Classic" cargo test --workspace`. Last result (`c2244a4`): **351 passed, 0 failed**. Use absolute paths: some older opt-in tests resolve relative `XIII_GOG_DIR` against the crate directory.
+- Viewer: `cargo run -p xiii-app --release -- --map Plage01 --game-dir XIII_Game` (`--exit-after-secs N --screenshot <png>`, `--dump`, `--collision-test`, `--reach-test`, `--lighting off|baked`). Character: `--model xiiipersos.XIIIM --anim Walk`. Movement + VM prototype: `--play --map Plage01 [--play-script <file>]` (E = use). Headless VM: `xiii-tool script run --game-dir XIII_Game --map Plage00 --begin-play --physics map --anim map --nav map --events`.
+- Disassembler (user-approved): `llvm-objdump` from `rustup component add llvm-tools`, at `C:/Users/ZoliBen/.rustup/toolchains/1.99.0-x86_64-pc-windows-msvc/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-objdump.exe`. DLLs are read only; disassembly output stays in git-ignored `local/re/`, never committed or pasted into code.
+- Launch parallel opencode runs a few seconds apart: simultaneous starts fail with `database is locked`.
 - Reports and screenshots of each task: `local/reports/` (git-ignored; proprietary-derived outputs never committed).
 
 ### In flight when this was written
 
-- `item1d-world-walker` (main tree): extract the Bevy-free `xiii-world` crate from `xiii-app/src/viewer/load.rs`, a `WorldPhysics` adapter (Unreal space) on `xiii-collision`, and UE2-style `walk_move` (step-up at `MAXSTEPHEIGHT` 35 UU, floor-follow, `MINFLOORZ` 0.7) so the PlayerStart doorway case can pass. Spec `local/tasks/item1d-world-crate-walker.md`.
-- `item3c-new-anim` (worktree `local/wt/item3`): `New` opcode, animation natives through an `AnimationData` provider trait, `SetViewTarget`, next survey ranking. Spec in that worktree's `local/tasks/`.
-- `item6-audio` (worktree `local/wt/audio`): `xiii-audio` crate, HX `.hxc`/`.hsc` parsing, one codec decode, `.uax` linkage. Spec `local/tasks/item6-audio-spike.md`.
+- `item5c-materials` (worktree `local/wt/viewer`, OpenCode Go): UE2 material graph (Shader/FinalBlend/Combiner/modifiers) in the viewer.
+- `item3h-login` (worktree `local/wt/item3`, OpenCode Go): `LevelInfo.GetLocalURL`, script-path player login (`GameInfo.Login` -> `RestartPlayer`), the `Select` animation on a mesh-less actor.
+- `item5d-lightmaps` (worktree `local/wt/bsp`, Ollama Cloud): BSP Model tail (lightmaps etc.) from `UModel::Serialize` disassembly.
+- `item9-campaign` (worktree `local/wt/sweep`, Ollama Cloud): `xiii-tool campaign` whole-campaign headless sweep and ranking.
+- `item6b-audio-play` (worktree `local/wt/audio`, Ollama Cloud): Bevy playback of VM sound/music events via `xiii-audio`.
+- Specs are in each worktree's `local/tasks/` (copies in `P:/AI/XIII/local/tasks/`); logs in `P:/AI/XIII/local/logs/`.
 
 ## User intent
 
@@ -69,9 +74,11 @@ Implementation started on 2026-10-04. M0 and M1 are complete; first passes of al
 | `crates/xiii-install` | Read-only installation open/profile detection/case-insensitive logical index (no deps) | Done for GOG + patched Steam; no precedence rule needed (no duplicates found) |
 | `crates/xiii-decode` | Payload decoders to normalized assets (textures, palettes, static meshes, BSP Model/Polys, terrain, skeletal meshes, animation) and the single Unreal-to-Bevy coordinate policy (`common.rs`) | M2a/M2b first pass; see below |
 | `crates/xiii-script` | UStruct/UClass/UFunction/UState/UProperty reflection, bytecode decoder/disassembler, native catalog, `class_defaults()`, minimal VM + native registry | M2c first pass; see below |
-| `crates/xiii-collision` | Dependency-free collision: BVH, SAT swept AABB (two-sided; start contact skipped only when not moving into it), ray, overlap, `move_slide` (approximation) | Added 2026-10-05 (second session) |
+| `crates/xiii-collision` | Dependency-free collision: BVH, SAT swept AABB, ray, overlap, `walk_move` (UE2-style step-up/floor-follow), moving objects (movers) | Working |
+| `crates/xiii-world` | Bevy-free world import (scene, placement from class defaults, box/line collision soups, zones/sky, navigation/ReachSpecs, baked vertex lighting) and runtime (script/map loading, physics/animation/navigation providers, begin-play) | Working |
+| `crates/xiii-audio` | Dependency-free HX `.hxc`/`.hsc` parser, PCM16 + Ubisoft ADPCM decoders, WAV writer | Spike done |
 | `crates/xiii-tool` | CLI: `inspect`, `corpus`, `props`, `coverage`, `deps`, `world-coverage` (+ world dump commands), `anim coverage/list/validate/render/export`, `script classes/functions/disasm/natives/coverage/run` | Working |
-| `crates/xiii-app` | Bevy 0.19.1 runtime: M0 smoke test (default) and diagnostic map viewer (`--map Plage00 --game-dir <root>`) | Working natively |
+| `crates/xiii-app` | Bevy 0.19.1 runtime: smoke test, map viewer (sky camera, baked lighting), skinned character viewer, headless collision/reach tests, `--play` movement + VM prototype | Working natively; prototype, not gameplay |
 
 Each crate has a README with verified layouts, evidence and rationale.
 
@@ -130,6 +137,16 @@ Per-task reports with all numbers and commands: `local/reports/item1-collision.m
 - Plage00 all-classes survey: 3 missing natives left (`LinkSkelAnim`, `LoopAnim`, `SetViewTarget`), then the `New` opcode (in flight: item3c). The Plage00 dispatcher chain with soldiers active runs to `Fin` past `Actor.Spawn`.
 - Semantics references: UE2 conventions; `dpjudas/SurrealEngine@380f525` (UE1 reimplementation) consulted for Move/Trace return conventions, no code copied.
 
+### Later 2026-10-05 results (OpenCode Go + Ollama Cloud delegates) — measured, not playable
+
+- **Scale:** `UNREAL_UNITS_PER_METER` = **90** (estimate approved by the user; evidence: pawn 150 UU, XIIIM 160.3 UU, door 208 UU). Harness distances are in UU so tests are scale-independent.
+- **Collision validated against the map's own navigation:** ReachSpecs are a native `PathList` tail on NavigationPoints (`compact count + {Start, End, u16 R, u16 H, u32 reachFlags, u16 Distance}`; 993 edges exact). `--reach-test` over every eligible walk edge: Plage00 12/12, Plage01 294/302, Banque01 631/658. StaticMesh collision per UE2 defaults: box queries use simplified set 1 (`UseSimpleBoxCollision` default true; the corpus sets it false on 167 meshes, never true), line queries per-polygon unless `UseSimpleLineCollision` (set true on 418).
+- **Rendering:** GPU-skinned decoded characters (`--model`), CPU/GPU error <= 1.3e-4 UU; UE2 skybox via a second camera at the `SkyZoneInfo`; baked per-vertex lighting from `Engine.StaticMeshInstance` (14,542/14,542 exact; BGRA) and terrain colours. BSP lightmaps still undecoded.
+- **Script VM toward M3:** real map physics/animation/navigation providers; AI controller possession (soldiers get `IAController`, enter `Init`, request decoded `WaitNeutre`); presentation event queue (PlaySound/PlayMusic/texture swaps); UE2 pathing natives over ReachSpecs (Dijkstra, latent MoveTo/MoveToward); seven XIII AI natives from `XIDPawn.dll` disassembly (`Partial` where engine state is unnamed; the report has an inconsistent +0x3B0 Pawn/BaseS label in `HalteAuFeu`); movers (`PHYS_MovingBrush` interpolation, `FinishInterpolation`). Plage00 soldiers reach `Patrouille`.
+- **`--play` prototype:** first-person movement at decoded `XIIIPlayerPawn` speeds (60 Hz fixed step, gravity from `PhysicsVolume`), the VM running all map actors (failing actors suspended, not crashing), ownership rule (host owns the player pawn's movement fields; the VM owns everything else). On Plage01 the player opens `Porte6` through the game's `Grab` -> `Locked.Trigger` -> `DoOpen` chain and leaves the hut. **Shortcuts still in place:** the player pawn is host-spawned (script login blocked by `GetLocalURL`; item3h), the door key is host-granted (pickup/inventory natives missing), object references into packages outside the script set read as `None` (loses sound paths; needs an external-reference value).
+- **Audio:** all 59 HX banks parse with 0 unparsed bytes; 28,631/28,631 waves decode (PCM16 + 6-bit Ubisoft ADPCM); `.uax` Sound -> HX entry by name (4,027/5,892).
+- Per-task reports with commands and numbers: `P:/AI/XIII/local/reports/item*.md` and the worktrees' `local/reports/`.
+
 ### Verified results
 
 | Check | Result |
@@ -184,16 +201,16 @@ Native Windows reports an RTX 4090. Rust/Cargo were not found on the inspected W
 
 ## Exact next work
 
-M0/M1 done; M2a/b/c first passes done; second 2026-10-05 session closed most of the M2a exit and grew the VM toward M3 (see above). Remaining work, in priority order:
+Priorities after the in-flight tasks land (review each against UE2 semantics, not just green tests):
 
-1. **Finish the M2a exit:** review/land `item1d` (`xiii-world` crate, `WorldPhysics` adapter, `walk_move`); the PlayerStart doorway case must pass legitimately or be explained. Then wire the real map physics into `xiii-tool script run` (`--physics map`) so `Move`/`Trace` run against Plage00/01 collision. Decide the units-per-metre constant (estimate ~85-105 UU/m vs current 50; needs a user/coordinator decision or original-engine captures). Sky zone handling in the viewer using the decoded zones.
-2. **Animation in the runtime:** land `item3c` (`New`, animation natives via `AnimationData`, `SetViewTarget`); then implement `AnimationData` from decoded MeshAnimation (`xiii-decode`), upload a skinned mesh + clip into Bevy in the viewer, place map Pawns with their meshes; compare frames against original-game captures.
-3. **Native layer growth (M3):** continue the survey ranking after item3c in campaign-dependency order (AI/pathing next); timers; integrate the VM with the Bevy fixed-step schedule, one authoritative owner per field (VM owns script state; physics owns positions via the provider).
-4. **Original-engine reference captures** (needs the user / an isolated writable copy): opening map order, movement speed/scale, event timing for the Plage00 dispatcher chain. This would also settle the scale constant.
-5. **Materials:** skybox from the sky zone, translucency/modulation, SinusModifier, vertex lighting (BSP lightmap arrays still undecoded), then the comic outline treatment.
-6. **Audio:** land `item6` (HX bank parsing/decoding spike), then Bevy playback and `.uax` sound-object mapping.
+1. **Remove the `--play` shortcuts:** script-path player login (item3h), pickup/inventory natives (`PickupQuery`, `AddInventory`, `HandlePickup`, `ChangedWeapon`) so the Plage01 key is picked up for real, and an external object-reference value so `Sound` references into `XIIIsound.uax` survive into presentation events (needed by item6b audio).
+2. **Campaign sweep (item9) results drive the next native/import work** across all maps, in campaign order.
+3. **Soldier behaviour:** AI states beyond `Patrouille` (perception, combat), weapons, damage; render map pawns with skinned meshes driven by VM animation state in `--play`.
+4. **Rendering fidelity:** materials (item5c), BSP lightmaps (item5d), then the comic outline treatment; original-engine captures for comparison when the user can provide them.
+5. **Remaining collision failures:** Plage01 8 and Banque01 27 reach failures (step/overhang/AABB-corner groups); cylinder vs box for pawns.
+6. **Audio playback (item6b)**, then music/ambient zones.
 
-Do not stop at a generic Bevy FPS sample. Do not report playable progress from the map viewer or the headless VM trace.
+Do not report playable progress from the viewer, the `--play` prototype or headless traces until the shortcuts above are gone and a mission can be completed by the game's own logic.
 
 ## Validation completed
 

@@ -145,6 +145,20 @@ fn name(vm: &Vm<'_>, a: &[Value], i: usize) -> VmResult<String> {
     }
 }
 
+fn byte(vm: &Vm<'_>, a: &[Value], i: usize) -> VmResult<u8> {
+    match a.get(i) {
+        Some(Value::Byte(v)) => Ok(*v),
+        Some(Value::Int(v)) => u8::try_from(*v).map_err(|_| {
+            vm.err(VmErrorKind::TypeMismatch {
+                expected: "byte 0..255",
+                found: "int",
+            })
+        }),
+        Some(v) => Err(type_err(vm, "byte", v)),
+        None => Err(vm.err(VmErrorKind::Other("missing argument".into()))),
+    }
+}
+
 fn string(vm: &Vm<'_>, a: &[Value], i: usize) -> VmResult<String> {
     match a.get(i) {
         Some(Value::Str(v)) => Ok(v.clone()),
@@ -535,14 +549,57 @@ fn class_ref(vm: &Vm<'_>, a: &[Value], i: usize) -> VmResult<Option<GlobalRef>> 
     }
 }
 
+/// Native engine-class base relationships for `DynamicLoadObject`'s requested-class check.
+///
+/// The decoded packages carry no `Core.Class` export for the engine mesh classes (measured:
+/// `engine.u` exports `Actor`, `Texture`, `LevelInfo`, `MeshSkinList`, ... but **not**
+/// `Mesh`/`SkeletalMesh`/`StaticMesh`), so their inheritance is not available from the corpus.
+/// These are the UE2 `Engine` relationships needed by the retail
+/// call sites: `Weapon.PostBeginPlay` loads a `SkeletalMesh` with `class'Engine.Mesh'`
+/// (`XIII_Game/system/engine.u`, `Weapon.PostBeginPlay` token `DynamicLoadObject(MeshName,
+/// class'Engine.Mesh')`), and `USkeletalMesh`/`UStaticMesh` derive from `UMesh` upstream.
+/// `(subclass, base)`, lowercase leaf names.
+const NATIVE_CLASS_BASES: &[(&str, &str)] = &[
+    ("skeletalmesh", "mesh"),
+    ("staticmesh", "mesh"),
+    ("mesh", "primitive"),
+    ("skeletalmeshinstance", "meshinstance"),
+    ("staticmeshinstance", "meshinstance"),
+    ("meshinstance", "primitive"),
+];
+
+/// True when native class `actual` is `requested` or derives from it under
+/// [`NATIVE_CLASS_BASES`]. Both are `Package.Object` paths or bare leaf names; only the leaf is
+/// compared. The walk is bounded so an accidental cycle cannot loop.
+pub(crate) fn native_class_is_a(actual: &str, requested: &str) -> bool {
+    let leaf = |p: &str| p.rsplit('.').next().unwrap_or(p).to_ascii_lowercase();
+    let actual = leaf(actual);
+    let requested = leaf(requested);
+    if actual == requested {
+        return true;
+    }
+    let mut cur = actual.as_str();
+    for _ in 0..16 {
+        let Some((_, base)) = NATIVE_CLASS_BASES.iter().find(|(sub, _)| *sub == cur) else {
+            return false;
+        };
+        if *base == requested {
+            return true;
+        }
+        cur = base;
+    }
+    false
+}
+
 fn dynamic_load_object(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let name = match a.first() {
         Some(Value::Str(s)) | Some(Value::Name(s)) => s.clone(),
         _ => return val(Value::Object(None)),
     };
     // UE2 `execDynamicLoadObject`: resolve the name, then require the loaded object's class to
-    // be `ObjectClass` (a subclass), else the load fails (NULL). This matters because e.g.
-    // `DynamicLoadObject(MeshName, class'Engine.Mesh')` must not return a non-Mesh object.
+    // be `ObjectClass` or a subclass, else the load fails (NULL). This matters because e.g.
+    // `DynamicLoadObject(MeshName, class'Engine.Mesh')` must accept a `SkeletalMesh` (the
+    // retail `Weapon.PostBeginPlay` path) but must not return a non-Mesh object.
     let requested = match a.get(1) {
         Some(Value::NativeClass(n)) => Some(n.clone()),
         Some(Value::Object(Some(ObjRef::Instance(i)))) => {
@@ -554,14 +611,11 @@ fn dynamic_load_object(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmRes
     match vm.find_loaded_object(&name) {
         Some(g) => {
             if let Some(req) = &requested {
-                // The VM has no runtime class hierarchy for arbitrary natives; compare the
-                // object's decoded class name against the requested one (leaf name). This
-                // rejects a Texture when `class'Engine.Mesh'` was requested.
+                // The VM has no runtime class hierarchy for arbitrary natives; the small
+                // native table above covers the engine mesh classes, and everything else is an
+                // exact leaf match.
                 let actual = vm.class_path_of(g);
-                let ok = actual.as_deref().is_some_and(|a| {
-                    let leaf = |p: &str| p.rsplit('.').next().unwrap_or(p).to_ascii_lowercase();
-                    leaf(a) == leaf(req)
-                });
+                let ok = actual.as_deref().is_some_and(|a| native_class_is_a(a, req));
                 if !ok {
                     vm.note(TraceKind::Note(format!(
                         "DynamicLoadObject: {name} is not a {req} (class {})",
@@ -829,6 +883,34 @@ fn all_actors(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<Nativ
     Ok(NativeOutcome::Iterate(items))
 }
 
+/// `Actor.CollidingActors` (native 321): actors of `BaseClass` near the caller. **Partial**: the
+/// VM uses the same distance filter as `RadiusActors` (its collision cylinders are not swept);
+/// `XIIIMover.Timer` re-checks `FastTrace`/vision on each result, so this is sufficient for the
+/// door-warning timer and keeps a mover from being suspended on its own timer.
+fn colliding_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let base = match object(vm, a, 0)? {
+        Some(ObjRef::Static(g)) => Some(g),
+        None => None,
+        Some(ObjRef::Instance(_)) => {
+            return Err(vm.err(VmErrorKind::Other(
+                "CollidingActors base class is an instance".into(),
+            )));
+        }
+    };
+    let radius = float(vm, a, 2)?;
+    let loc = if c.omitted(3) {
+        vm.vector_prop(c.this, "Location").unwrap_or([0.0; 3])
+    } else {
+        vector2(vm, a, 3)?
+    };
+    let items = vm
+        .radius_actors(base, radius, loc)
+        .into_iter()
+        .map(|i| Value::Object(Some(ObjRef::Instance(i))))
+        .collect();
+    Ok(NativeOutcome::Iterate(items))
+}
+
 fn radius_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let base = match object(vm, a, 0)? {
         Some(ObjRef::Static(g)) => Some(g),
@@ -929,6 +1011,28 @@ fn set_timer(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Native
     let rate = float(vm, a, 0)?;
     let repeat = boolean(vm, a, 1)?;
     vm.set_timer(c.this, rate, repeat);
+    val(Value::Void)
+}
+
+/// `Actor.FinishInterpolation` (native 301): latent; suspends the state code of a `Mover` until
+/// its `bInterpolating` flag clears. The per-tick `PHYS_MovingBrush` advance that clears it is
+/// [`crate::vm::Vm::advance_interpolation`]. Evidence: every `Engine.Mover` open/close state
+/// (`OpenTimedMover`, `TriggerToggle`, `TriggerControl`, `BumpOpenTimed`, `BumpButton`,
+/// `TriggerPound`) calls it immediately after `DoOpen`/`DoClose` and expects to resume when the
+/// brush reaches its key; the Plage01 item8a run stopped at this native (#301).
+fn finish_interpolation(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    if !c.in_state_code {
+        return Err(vm.err(VmErrorKind::LatentOutsideState {
+            path: c.path.clone(),
+        }));
+    }
+    vm.pending_latent = Some(Latent::Interp {
+        started: vm.time_now(),
+    });
     val(Value::Void)
 }
 
@@ -1074,6 +1178,231 @@ fn finish_rotation(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult
             vm.objects[c.this as usize].name, yaw
         )));
     }
+    val(Value::Void)
+}
+
+/// `IAController.AllianceLevel(Pawn Newenemy) -> int`.
+///
+/// Disassembly evidence (XIDPawn.dll): `?execAllianceLevel@AIAController` (RVA 0x19E0) reads the
+/// single `Newenemy` object parameter and calls `?AllianceLevel@AIAController` (RVA 0x1920). That
+/// function returns -1 when `Newenemy` is the controller's `XIII` (`this+0x3A8`) or when `BaseS`
+/// (`this+0x3B0`) is null; otherwise it scans four `BaseS.InitialAlliances` entries (stride 8 at
+/// `BaseS+0x530`, `(FName, float)`) and returns `InitialAlliances[i].AllianceLevel` (truncated)
+/// when `InitialAlliances[i].AllianceName == Newenemy.Alliance` (`Newenemy+0x3BC`) and
+/// `Newenemy.Alliance != 'None'`; no match returns 0. The property names are calibrated by the
+/// script `IAController.SwitchToEnemy`, which implements the same algorithm symbolically.
+///
+/// The engine also returns 1 when a `Level` flag word at `Level+0x380` has bit 0x100 set. The
+/// decoded reflection does not serialize property offsets, so that anonymous bool is not
+/// reproduced (documented `Partial`).
+fn alliance_level(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let Some(newenemy) = instance_arg(vm, a, 0)? else {
+        return val(Value::Int(-1));
+    };
+    if vm.obj_prop(c.this, "XIII") == Some(newenemy) {
+        return val(Value::Int(-1));
+    }
+    let Some(base_s) = vm.obj_prop(c.this, "BaseS") else {
+        return val(Value::Int(-1));
+    };
+    let ne_alliance = match vm.get_property(newenemy, "Alliance") {
+        Some(Value::Name(n)) => n.clone(),
+        _ => "None".to_owned(),
+    };
+    if ne_alliance.eq_ignore_ascii_case("None") {
+        return val(Value::Int(0));
+    }
+    for i in 0..4 {
+        let Some(element) = vm.get_property_elem(base_s, "InitialAlliances", i) else {
+            continue;
+        };
+        let Value::Struct(fields) = element else {
+            continue;
+        };
+        let mut name = None;
+        let mut level = None;
+        for (n, v) in fields {
+            if n.eq_ignore_ascii_case("alliancename") {
+                name = Some(v.clone());
+            } else if n.eq_ignore_ascii_case("alliancelevel") {
+                level = Some(v.clone());
+            }
+        }
+        if let Some(Value::Name(n)) = name
+            && n.eq_ignore_ascii_case(&ne_alliance)
+        {
+            // The native loads the stored float and runs `_ftol` (truncation toward zero).
+            let level = match level {
+                Some(Value::Float(f)) => f as i32,
+                _ => 0,
+            };
+            return val(Value::Int(level));
+        }
+    }
+    val(Value::Int(0))
+}
+
+/// `IAController.HalteAuFeu()`.
+///
+/// Disassembly evidence (XIDPawn.dll `?execHalteAuFeu@AIAController` RVA 0x1F00): no pawn means
+/// return; otherwise the controller clears native flag words at `+0x2C` (bits 0x180000), `+0x212`
+/// (byte) and `+0x514` (bit 2), drops the four pointers at `+0x48..+0x54`, and clears bit 0x10000
+/// of the pawn flags (`Pawn+0x1F8`); if the pawn's mesh (`Pawn+0x138`) is a `SkeletalMesh` it
+/// then resets the mesh instance's bone/aim controllers. The flag words' property names are not
+/// serialized in the decoded reflection, so only the bone-control reset (and a visible trace
+/// note) is reproduced; the engine flag cleanup is not modelled (documented `Partial`).
+fn halte_au_feu(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    if let Some(pawn) = vm.obj_prop(c.this, "Pawn") {
+        vm.reset_bone_state(pawn);
+        vm.note(TraceKind::Note(format!(
+            "HalteAuFeu {}: bone-control reset (Partial: anonymous flag words +0x2C/+0x212/+0x514 not modelled)",
+            vm.objects[c.this as usize].name
+        )));
+    }
+    val(Value::Void)
+}
+
+/// `IAController.NearWall(float walldist) -> bool`.
+///
+/// Disassembly evidence (XIDPawn.dll `?execNearWall@AIAController` RVA 0x2E00): with no pawn it
+/// returns false; it builds a point at the top of the pawn (`Pawn.Location + (0,0,h)`), derives a
+/// direction from the controller's rotation via `FGlobalMath` and probes the world with
+/// `ULevel`'s line-check, storing a push-back vector and returning true when geometry is hit
+/// close by. The exact multi-trace/projection sequence is not reproduced; the model here is a
+/// single forward world line trace of length `walldist` at the top of the pawn (documented
+/// `Partial`).
+fn near_wall(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let walldist = float(vm, a, 0)?;
+    if !vm.physics_ready("IAController.NearWall", None, c.this, Value::Bool(false))? {
+        return val(Value::Bool(false));
+    }
+    let Some(pawn) = vm.obj_prop(c.this, "Pawn") else {
+        return val(Value::Bool(false));
+    };
+    let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+    let rot = match vm.get_property(pawn, "Rotation") {
+        Some(Value::Rotator(r)) => *r,
+        _ => [0, 0, 0],
+    };
+    let forward = rotator_basis(rot).0;
+    let start = [
+        loc[0],
+        loc[1],
+        loc[2] + vm.f32_prop(pawn, "CollisionHeight"),
+    ];
+    let end = [
+        start[0] + forward[0] * walldist,
+        start[1] + forward[1] * walldist,
+        start[2] + forward[2] * walldist,
+    ];
+    let hit = vm
+        .physics
+        .as_mut()
+        .and_then(|p| p.trace(start, end, [0.0; 3]));
+    val(Value::Bool(hit.is_some()))
+}
+
+/// `IAController.TestDirection(float mindist, float dist, vector Dir, out vector pick) -> bool`.
+///
+/// Disassembly evidence (XIDPawn.dll `?execTestDirection@AIAController` RVA 0x36D0): it scales
+/// `Dir` by `dist`, line-checks from the pawn toward the far point (and a second, adjusted trace
+/// on a hit), writes the resulting point to `pick`, and returns whether `pick` is at least
+/// `mindist` from the pawn. The model here is one line trace from the top of the pawn toward
+/// `Dir * dist`, with `pick` = the hit location or the clear end point (documented `Partial`).
+fn test_direction(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let mindist = float(vm, a, 0)?;
+    let dist = float(vm, a, 1)?;
+    let dir = vector2(vm, a, 2)?;
+    if !vm.physics_ready(
+        "IAController.TestDirection",
+        None,
+        c.this,
+        Value::Bool(false),
+    )? {
+        return val(Value::Bool(false));
+    }
+    let Some(pawn) = vm.obj_prop(c.this, "Pawn") else {
+        return val(Value::Bool(false));
+    };
+    let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+    let start = [
+        loc[0],
+        loc[1],
+        loc[2] + vm.f32_prop(pawn, "CollisionHeight"),
+    ];
+    let end = [
+        start[0] + dir[0] * dist,
+        start[1] + dir[1] * dist,
+        start[2] + dir[2] * dist,
+    ];
+    let hit = vm
+        .physics
+        .as_mut()
+        .and_then(|p| p.trace(start, end, [0.0; 3]));
+    let pick = hit.map_or(end, |h| h.location);
+    if a.len() > 3 {
+        a[3] = Value::Vector(pick);
+    }
+    let d = [pick[0] - loc[0], pick[1] - loc[1], pick[2] - loc[2]];
+    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    val(Value::Bool(d2 >= mindist * mindist))
+}
+
+/// `IAController.PickStartPoint() -> PatrolPoint`.
+///
+/// Disassembly evidence (XIDPawn.dll `?execPickStartPoint@AIAController` RVA 0x3B80): with no
+/// `BaseS` it returns null; otherwise it scans a level/`Game` list of points matching a route
+/// field (`candidate+0x268 == BaseS+0x574`, then a fallback `candidate+0x268 == None`), keeps the
+/// nearest that `Pawn.actorReachable(...)` accepts, and returns it. The list and route field names
+/// are not in the decoded reflection, so this returns the nearest decoded navigation point that
+/// fits the pawn (falling back to `StartSpot`); `None` when neither is available (documented
+/// `Partial`).
+fn pick_start_point(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let Some(pawn) = vm.obj_prop(c.this, "Pawn") else {
+        return val(Value::Object(None));
+    };
+    let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+    let radius = vm.f32_prop(pawn, "CollisionRadius");
+    let height = vm.f32_prop(pawn, "CollisionHeight");
+    // The script follows `DestNavPoint.NextPatrolPoint`, so prefer an actual `PatrolPoint`.
+    if let Some(id) = vm.nav_nearest_point_actor(loc, radius, height, Some("PatrolPoint")) {
+        return val(Value::Object(Some(ObjRef::Instance(id))));
+    }
+    if let Some(id) = vm.nav_nearest_point_actor(loc, radius, height, None) {
+        return val(Value::Object(Some(ObjRef::Instance(id))));
+    }
+    if let Some(spot) = vm.obj_prop(c.this, "StartSpot") {
+        return val(Value::Object(Some(ObjRef::Instance(spot))));
+    }
+    val(Value::Object(None))
+}
+
+/// `Pawn.SpineYawControl(bool IsControlled, int MaxValue, float RotationSpeed)`.
+///
+/// Disassembly evidence (Engine.dll `?execSpineYawControl@APawn` RVA 0xAFD00): it sets/clears bit
+/// 0x80 of the pawn's native flags word at `+0x1F8` from `IsControlled`, stores `MaxValue` at
+/// `+0x208` and `RotationSpeed` at `+0x210`. The headless VM keeps the same parameters per actor
+/// for the renderer; no skeletal pose is computed (documented `Partial`).
+fn spine_yaw_control(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let is_controlled = boolean(vm, a, 0)?;
+    let max_value = int(vm, a, 1)?;
+    let rotation_speed = float(vm, a, 2)?;
+    vm.set_spine_control(c.this, is_controlled, max_value, rotation_speed);
+    val(Value::Void)
+}
+
+/// `Actor.SetBoneDirection(name BoneName, rotator BoneTurn, vector BoneTrans, float Alpha)`.
+///
+/// Disassembly evidence (Engine.dll `?execSetBoneDirection@AActor` RVA 0xE2680, forwarding to
+/// `?SetBoneDirection@USkeletalMeshInstance` RVA 0xED5C0): it applies a bone-controller request on
+/// the actor's skeletal mesh. The headless VM records the request per actor for the renderer; no
+/// skeletal transform is evaluated (documented `Partial`).
+fn set_bone_direction(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let bone = name(vm, a, 0)?;
+    let turn = rotator2(vm, a, 1)?;
+    let trans = vector2(vm, a, 2)?;
+    let alpha = float(vm, a, 3)?;
+    vm.add_bone_direction(c.this, bone, turn, trans, alpha);
     val(Value::Void)
 }
 
@@ -1378,6 +1707,30 @@ fn set_view_target(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<
     val(Value::Void)
 }
 
+/// `Actor.MakeNoise`: UE2 notifies nearby AI (`Pawn.HearNoise`) of a noise at the actor's
+/// location. The VM has no AI hearing/perception model, so the call is accepted and discarded
+/// (registered `Partial` with that reason; `GameInfo.PlayTeleportEffect` calls it on the
+/// player-login path).
+fn make_noise(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    let _ = vm;
+    val(Value::Void)
+}
+
+/// `Canvas.MakeColor`: UE2 packs the four bytes into the `Color` struct (A defaults to 255 when
+/// omitted). `PlayerController.ClearProgressMessages` calls it on the login/PostLogin path.
+fn make_color(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let r = byte(vm, a, 0)?;
+    let g = byte(vm, a, 1)?;
+    let b = byte(vm, a, 2)?;
+    let alpha = if c.omitted(3) { 255 } else { byte(vm, a, 3)? };
+    val(Value::Struct(vec![
+        ("r".into(), Value::Byte(r)),
+        ("g".into(), Value::Byte(g)),
+        ("b".into(), Value::Byte(b)),
+        ("a".into(), Value::Byte(alpha)),
+    ]))
+}
+
 fn play_sound(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     vm.emit_sound(false, c.this, a, &c.omitted);
     val(Value::Void)
@@ -1486,6 +1839,60 @@ fn find_inventory_type(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmRes
             break;
         }
         if vm.is_child_of_class(vm.objects[id as usize].class, desired) {
+            return val(Value::Object(Some(ObjRef::Instance(id))));
+        }
+        cur = prop_object(vm, id, "Inventory");
+    }
+    val(Value::Object(None))
+}
+
+/// `Object.Cross_VectorVector` (native 220): `A x B` (UE1 `FVector` cross product). Needed by
+/// `XIIIPorte.PlayerTriggerToggle.PlayerTrigger` and `Mover.EncroachingOn` to pick the swing side.
+fn cross_vv(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let x = vector2(vm, a, 0)?;
+    let y = vector2(vm, a, 1)?;
+    val(Value::Vector([
+        x[1] * y[2] - x[2] * y[1],
+        x[2] * y[0] - x[0] * y[2],
+        x[0] * y[1] - x[1] * y[0],
+    ]))
+}
+
+/// `Actor.GetBoundingBox` (native 419): the actor's collision extent as a `Box` struct. XIII's
+/// `XIIIPorte.PlayerTriggerToggle.BeginState` uses it to compute the door direction. **Partial**:
+/// the VM has no mesh/pre-pivot bounds, so the box is the collision cylinder's extent centred on
+/// `Location`; a door whose mesh centre is offset from its origin therefore reads a zero
+/// direction (documented, not hidden).
+fn get_bounding_box(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    let loc = vm.vector_prop(c.this, "Location").unwrap_or([0.0; 3]);
+    let r = vm.f32_prop(c.this, "CollisionRadius");
+    let h = vm.f32_prop(c.this, "CollisionHeight");
+    val(Value::Struct(vec![
+        (
+            "min".into(),
+            Value::Vector([loc[0] - r, loc[1] - r, loc[2] - h]),
+        ),
+        (
+            "max".into(),
+            Value::Vector([loc[0] + r, loc[1] + r, loc[2] + h]),
+        ),
+    ]))
+}
+
+fn find_inventory_kind(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    // UE2 `APawn::FindInventoryKind`: walks the `Inventory` -> `Inventory` chain and returns the
+    // first item whose class chain contains `DesiredClassName`. Declaration measured from
+    // engine.u (`engine.Pawn.FindInventoryKind [native f1000] (name, out Inventory)`); needed by
+    // `XIIIPorte.Locked.Trigger`'s `FindInventoryKind('PickLockSkill')` test.
+    let desired = name(vm, a, 0)?;
+    let mut cur = prop_object(vm, c.this, "Inventory");
+    let mut guard = 0;
+    while let Some(id) = cur {
+        guard += 1;
+        if guard > 65_536 {
+            break;
+        }
+        if vm.is_a(id, &desired) {
             return val(Value::Object(Some(ObjRef::Instance(id))));
         }
         cur = prop_object(vm, id, "Inventory");
@@ -1657,6 +2064,22 @@ fn inc_alerte(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<Nativ
 
 fn dec_alerte(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
     Ok(adjust_counter(vm, c, "NbAlerte", -1))
+}
+
+/// `LevelInfo.GetLocalURL`: the local URL the runtime loaded the map with (`<Map>?<options>`).
+/// The string is runtime configuration (`Vm::set_local_url`); the engine reads it from
+/// `ULevel::URL` (UE2 `ALevelInfo::GetLocalURL`). `XIIIPlayerController.SetInitialState` uses
+/// `Left(GetLocalURL(), 7) ~= "mapmenu"` to detect the menu map.
+fn get_local_url(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Str(vm.local_url().to_owned()))
+}
+
+/// `LevelInfo.GetAddressURL`: the `Host:Port` address form of the loaded URL, runtime-configured
+/// (`Vm::set_address_url`). Engine.dll `?execGetAddressURL@ALevelInfo` formats the URL host and
+/// port with the literal `%s:%i`; for the GOG single-player install `[URL] Host=` is empty and
+/// `Port=7777`, so the runtime supplies `:7777`.
+fn get_address_url(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Str(vm.address_url().to_owned()))
 }
 
 fn noop(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -2575,16 +2998,45 @@ fn builtin_defs() -> Vec<NativeDef> {
             )
         },
         def(
+            "Engine.LevelInfo.GetLocalURL",
+            "native(0) simulated native function string GetLocalURL()",
+            "engine.u LevelInfo.GetLocalURL decoded (return string); returns the runtime-configured local URL `<Map>?<options>` (Vm::set_local_url; UE2 ALevelInfo::GetLocalURL reads ULevel::URL)",
+            get_local_url,
+        ),
+        def(
+            "Engine.LevelInfo.GetAddressURL",
+            "native(0) simulated native function string GetAddressURL()",
+            "engine.u LevelInfo.GetAddressURL decoded (return string); returns the runtime-configured `Host:Port` (Vm::set_address_url); Engine.dll ?execGetAddressURL@ALevelInfo formats it with the literal `%s:%i`",
+            get_address_url,
+        ),
+        def(
             "Engine.Actor.PlayRolloffSound",
             "native(350) final static function PlayRolloffSound(object<Sound> Sound, object<Actor> RollOffActor, optional int Param1, optional int Param2, optional int Param3, optional int Param4, optional int Param5)",
             "engine.u Actor.PlayRolloffSound decoded (Sound, RollOffActor + five optional ints, void); emits PresentationEvent::PlayRolloffSound",
             play_rolloff_sound,
         ),
+        NativeDef {
+            status: NativeStatus::Partial(
+                "no AI hearing/perception model: the call is accepted and discarded, AI `HearNoise` is not invoked",
+            ),
+            ..def(
+                "Engine.Actor.MakeNoise",
+                "native(512) final native static function MakeNoise(float Loudness)",
+                "engine.u Actor.MakeNoise decoded (float Loudness; native 512); UE2 notifies nearby AI; Engine.dll ?execMakeNoise@AActor",
+                make_noise,
+            )
+        },
         def(
             "Engine.Actor.SetBase",
             "native(298) final static function SetBase(object<Actor> NewBase, optional vector NewFloor)",
             "engine.u Actor.SetBase decoded (NewBase, optional NewFloor, void); sets Base and Floor; no attachment transform (headless)",
             set_base,
+        ),
+        def(
+            "Engine.Canvas.MakeColor",
+            "native(274) final static function Color MakeColor(byte R, byte G, byte B, optional byte A)",
+            "engine.u Canvas.MakeColor decoded (three/four bytes -> Color struct; A defaults to 255); UE2 FColor constructor; called by PlayerController.ClearProgressMessages",
+            make_color,
         ),
         def(
             "Engine.Actor.SetRelativeLocation",
@@ -3000,6 +3452,137 @@ fn builtin_defs() -> Vec<NativeDef> {
             "native(508) final latent function FinishRotation()",
             "engine.u Controller.FinishRotation decoded (void, latent); UE2 AController::FinishRotation waits for the pawn to face FocalPoint; Engine.dll ?execFinishRotation@AController",
             finish_rotation,
+        )
+    });
+    // ---- item8b movers/doors: kept in their own block so a parallel AI-native edit merges
+    // without touching these entries. -----------------------------------------------------------
+    v.push(def(
+        "Engine.Actor.FinishInterpolation",
+        "native(301) final latent function FinishInterpolation()",
+        "engine.u Actor.FinishInterpolation decoded (void, latent); every engine.Mover open/close \
+         state calls it after DoOpen/DoClose and resumes when the brush reaches its key; the \
+         per-tick PHYS_MovingBrush advance is Vm::advance_interpolation; \
+         Engine.dll ?execFinishInterpolation@AActor",
+        finish_interpolation,
+    ));
+    v.push(def(
+        "Engine.Pawn.FindInventoryKind",
+        "native(0) final function Inventory FindInventoryKind(name DesiredClassName)",
+        "engine.u Pawn.FindInventoryKind decoded (name, out Inventory); UE2 walks the Inventory \
+         chain and returns the first item whose class chain contains the name. Needed by \
+         XIIIPorte.Locked.Trigger's FindInventoryKind('PickLockSkill') gate",
+        find_inventory_kind,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "the VM has no mesh/pre-pivot bounds; the returned Box is the collision cylinder \
+             extent centred on Location, so an offset mesh centre reads as zero",
+        ),
+        ..def(
+            "Engine.Actor.GetBoundingBox",
+            "native(419) final function Box GetBoundingBox()",
+            "engine.u Actor.GetBoundingBox decoded (Box, return); XIIIPorte.PlayerTriggerToggle.\
+             BeginState computes DoorDirection from it",
+            get_bounding_box,
+        )
+    });
+    v.push(def(
+        "Object.Cross_VectorVector",
+        "native(220) final operator vector Cross(vector A, vector B)",
+        "core.u Object.Cross_VectorVector decoded; UE1 FVector cross product (A x B)",
+        cross_vv,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "uses the RadiusActors distance filter, not a swept collision-cylinder test; the \
+             mover timer re-checks FastTrace/vision on each result",
+        ),
+        ..def(
+            "Engine.Actor.CollidingActors",
+            "native(321) final iterator function CollidingActors(class<Actor> BaseClass, out Actor Actor, float Radius, optional vector Loc)",
+            "engine.u Actor.CollidingActors decoded; UE2 returns actors whose collision cylinder \
+             overlaps the caller's within Radius. Needed by XIIIMover.Timer (the door warning \
+             scan) so a mover is not suspended on its own timer",
+            colliding_actors,
+        )
+    });
+    // XIII AI natives (xidpawn.u, implemented in XIDPawn.dll). Semantics from the export
+    // disassembly; each entry cites its RVA and the report with the evidence.
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "the engine's anonymous Level early-out bool at Level+0x380 bit 0x100 is not named in the decoded reflection and is not modelled; the InitialAlliances table lookup is reproduced",
+        ),
+        ..def(
+            "IAController.AllianceLevel",
+            "native(0) function int AllianceLevel(Pawn Newenemy)",
+            "XIDPawn.dll ?execAllianceLevel@AIAController RVA 0x19E0 -> ?AllianceLevel@AIAController RVA 0x1920 (returns -1 for self.XIII / null BaseS, else BaseS.InitialAlliances[i].AllianceLevel); see local/reports/item3g-xiii-ai-natives-re.md",
+            alliance_level,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "bone-control + animation reset only; the engine's anonymous controller flag words/pointers (+0x2C/+0x212/+0x514/+0x48..+0x54) are not named in the decoded reflection and are not modelled",
+        ),
+        ..def(
+            "IAController.HalteAuFeu",
+            "native(0) function HalteAuFeu()",
+            "XIDPawn.dll ?execHalteAuFeu@AIAController RVA 0x1F00 (no pawn = return; clears controller flag words, drops four pointers, clears Pawn+0x1F8 bit 0x10000, resets the skeletal-mesh bone controllers); see local/reports/item3g-xiii-ai-natives-re.md",
+            halte_au_feu,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "single forward world line trace of length walldist from the top of the pawn; the engine's multi-trace projection and push-back vector are not reproduced",
+        ),
+        ..def(
+            "IAController.NearWall",
+            "native(0) function bool NearWall(float walldist)",
+            "XIDPawn.dll ?execNearWall@AIAController RVA 0x2E00 (probes the world ahead of the pawn and returns whether geometry is close); see local/reports/item3g-xiii-ai-natives-re.md",
+            near_wall,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "one line trace from the pawn toward Dir*dist; pick = hit location or the clear end point, and the result is |pick - Pawn.Location| >= mindist; the engine's second adjusted trace is not reproduced",
+        ),
+        ..def(
+            "IAController.TestDirection",
+            "native(0) function bool TestDirection(float mindist, float dist, Vector Dir, out Vector pick)",
+            "XIDPawn.dll ?execTestDirection@AIAController RVA 0x36D0 (line-checks Dir*dist, writes pick, tests the mindist clearance); see local/reports/item3g-xiii-ai-natives-re.md",
+            test_direction,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "nearest decoded navigation point that fits the pawn (fallback Controller.StartSpot); the engine's patrol-list/route-field search is not reproduced",
+        ),
+        ..def(
+            "IAController.PickStartPoint",
+            "native(0) function PatrolPoint PickStartPoint()",
+            "XIDPawn.dll ?execPickStartPoint@AIAController RVA 0x3B80 (scans a level/Game point list for the nearest reachable point on the soldier's route); see local/reports/item3g-xiii-ai-natives-re.md",
+            pick_start_point,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "parameters are stored per actor for the renderer; no skeletal bone control is evaluated",
+        ),
+        ..def(
+            "Engine.Pawn.SpineYawControl",
+            "native(0) function SpineYawControl(bool IsControlled, int MaxValue, float RotationSpeed)",
+            "Engine.dll ?execSpineYawControl@APawn RVA 0xAFD00 (sets Pawn+0x1F8 bit 0x80 and stores MaxValue+0x208 / RotationSpeed+0x210); see local/reports/item3g-xiii-ai-natives-re.md",
+            spine_yaw_control,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "the request is recorded per actor for the renderer; no skeletal transform is evaluated",
+        ),
+        ..def(
+            "Engine.Actor.SetBoneDirection",
+            "native(399) final static function SetBoneDirection(name BoneName, rotator BoneTurn, vector BoneTrans, float Alpha)",
+            "Engine.dll ?execSetBoneDirection@AActor RVA 0xE2680 -> ?SetBoneDirection@USkeletalMeshInstance RVA 0xED5C0 (applies a bone-controller request); see local/reports/item3g-xiii-ai-natives-re.md",
+            set_bone_direction,
         )
     });
     // Paths are matched without the package ("Class.Function"): strip it.
