@@ -11,6 +11,7 @@
 
 pub mod animation;
 pub mod bytecode;
+pub mod canvas;
 pub mod disasm;
 mod error;
 pub mod events;

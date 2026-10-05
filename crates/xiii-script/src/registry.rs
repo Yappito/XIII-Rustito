@@ -3585,6 +3585,9 @@ fn builtin_defs() -> Vec<NativeDef> {
             set_bone_direction,
         )
     });
+    // Canvas draw-recording natives (`crates/xiii-script/src/canvas.rs`). Kept in one block so a
+    // parallel edit to the registry stays out of the way.
+    v.extend(crate::canvas::canvas_defs());
     // Paths are matched without the package ("Class.Function"): strip it.
     for d in &mut v {
         if let Some(rest) = d.path.strip_prefix("Engine.") {

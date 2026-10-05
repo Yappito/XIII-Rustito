@@ -342,6 +342,14 @@ impl Session {
         &self.vm
     }
 
+    /// Mutable access to the script VM for the host HUD refresh (`hud.rs`): create the `Canvas`,
+    /// set its clip, call `HUD.PostRender` and drain the recorded draw commands. The fixed-step
+    /// movement/VM ordering still owns every simulation field; this only drives the per-frame
+    /// presentation call.
+    pub fn vm_mut(&mut self) -> &mut Vm<'static> {
+        &mut self.vm
+    }
+
     /// Live actors still in the executed scope.
     pub fn active_actors(&self) -> usize {
         self.vm
