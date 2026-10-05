@@ -16,6 +16,7 @@ mod error;
 pub mod events;
 pub mod linker;
 pub mod natives;
+pub mod navigation;
 pub mod pe;
 pub mod physics;
 mod reader;
@@ -29,6 +30,9 @@ pub use bytecode::{Call, Label, Script, ScriptLimits, Token, TokenKind, decode_s
 pub use error::{Result, ScriptError, ScriptErrorKind};
 pub use events::{PresentationEvent, SoundEvent};
 pub use linker::{GlobalRef, ScriptPackage, ScriptSet};
+pub use navigation::{
+    EmptyNavigation, NavEdgeInfo, NavPointInfo, NavigationData, find_path, move_step, nearest_point,
+};
 pub use physics::{MoveOutcome, WorldHit, WorldPhysics};
 pub use reader::{Reader, Tables};
 pub use reflect::{

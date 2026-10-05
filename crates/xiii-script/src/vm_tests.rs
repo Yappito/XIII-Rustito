@@ -465,7 +465,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 160);
+    assert_eq!(defs.len(), 171);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -570,6 +570,19 @@ impl SpawnB {
     fn prop_array(&mut self, r: i32, next: i32, flags: u32, inner: i32) {
         let extra = compact(inner);
         self.prop_with(r, next, flags, &extra);
+    }
+
+    /// `ArrayProperty` with an explicit static `ArrayDim` (the payload's i16 field).
+    fn prop_array_dim(&mut self, r: i32, next: i32, flags: u32, inner: i32, dim: i16) {
+        let extra = compact(inner);
+        let mut p = compact(0);
+        p.extend(compact(0));
+        p.extend(compact(next));
+        p.extend(dim.to_le_bytes());
+        p.extend(flags.to_le_bytes());
+        p.extend(compact(0));
+        p.extend(extra);
+        self.set(r, p);
     }
 
     fn header(
@@ -1722,6 +1735,121 @@ fn pg(set: &ScriptSet, path: &str) -> GlobalRef {
     GlobalRef {
         package: 0,
         export: set.packages[0].export_by_path(path).expect(path),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Navigation / Controller pathing
+
+use crate::navigation::{NavEdgeInfo, NavPointInfo, NavigationData, reach_flags};
+
+/// `Object`/`Actor`/`Pawn`/`Controller` fixture for the pathing natives. `Actor` carries
+/// `Location`/`Rotation`/`CollisionRadius`/`CollisionHeight`; `Pawn` adds `GroundSpeed` and
+/// `BaseEyeHeight`; `Controller` adds `Pawn`, `Destination`, `FocalPoint`, `MoveTarget`,
+/// `RouteDist` and a `RouteCache[16]` object array (the real engine.u `ArrayDim` is 16).
+fn nav_fixture() -> Vec<u8> {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let controller = b.reserve(0, 0, "Controller");
+    let pawn = b.reserve(0, 0, "Pawn");
+
+    let object_extra = compact(0);
+    let vector_extra = compact(IMP_STRUCT);
+    let rotator_extra = compact(IMP_STRUCT - 1);
+
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let rotation = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
+    let radius = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
+    let height = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
+    let ground = b.reserve(IMP_FLOATPROP, pawn, "GroundSpeed");
+    let eye = b.reserve(IMP_FLOATPROP, pawn, "BaseEyeHeight");
+
+    let c_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
+    let dest = b.reserve(IMP_STRUCTPROP, controller, "Destination");
+    let focal = b.reserve(IMP_STRUCTPROP, controller, "FocalPoint");
+    let move_target = b.reserve(IMP_OBJECTPROP, controller, "MoveTarget");
+    let route_dist = b.reserve(IMP_FLOATPROP, controller, "RouteDist");
+    let route_cache = b.reserve(IMP_ARRAYPROP, controller, "RouteCache");
+    let route_template = b.reserve(IMP_OBJECTPROP, route_cache, "RouteCache");
+
+    b.prop_with(location, rotation, 0, &vector_extra);
+    b.prop_with(rotation, radius, 0, &rotator_extra);
+    b.prop(radius, height, 0);
+    b.prop_with(c_pawn, dest, 0, &object_extra);
+    b.prop_with(dest, focal, 0, &vector_extra);
+    b.prop_with(focal, move_target, 0, &vector_extra);
+    b.prop_with(move_target, route_dist, 0, &object_extra);
+    b.prop(route_dist, route_cache, 0);
+    b.prop_array_dim(route_cache, 0, 0, route_template, 16);
+    b.prop_with(route_template, 0, 0, &object_extra);
+    b.prop(ground, eye, 0);
+
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, location, 0);
+    b.class(controller, actor, c_pawn, 0);
+    b.class(pawn, actor, ground, 0);
+    b.build()
+}
+
+fn nav_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Test",
+        nav_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+/// Test navigation graph: Nav0 -500-> Nav1 -500-> Nav2, in Unreal space.
+struct MockNav {
+    points: Vec<NavPointInfo>,
+    edges: Vec<NavEdgeInfo>,
+}
+
+impl MockNav {
+    fn line() -> Self {
+        let p = |actor: &str, x: f32| NavPointInfo {
+            actor: actor.into(),
+            location: [x, 0.0, 0.0],
+            collision_radius: 120.0,
+            collision_height: 120.0,
+        };
+        Self {
+            points: vec![p("Nav0", 0.0), p("Nav1", 500.0), p("Nav2", 1000.0)],
+            edges: vec![
+                NavEdgeInfo {
+                    start: 0,
+                    end: 1,
+                    collision_radius: 120,
+                    collision_height: 120,
+                    reach_flags: reach_flags::WALK,
+                    distance: 500,
+                },
+                NavEdgeInfo {
+                    start: 1,
+                    end: 2,
+                    collision_radius: 120,
+                    collision_height: 120,
+                    reach_flags: reach_flags::WALK,
+                    distance: 500,
+                },
+            ],
+        }
+    }
+}
+
+impl NavigationData for MockNav {
+    fn points(&self) -> &[NavPointInfo] {
+        &self.points
+    }
+    fn edges(&self) -> &[NavEdgeInfo] {
+        &self.edges
     }
 }
 
@@ -3320,4 +3448,348 @@ fn replace_texture_emits_the_event() {
         other => panic!("{other:?}"),
     }
     assert!(vm.drain_events().is_empty());
+}
+
+// ---------------------------------------------------------------------------------------
+// Controller pathing natives over the decoded navigation graph
+
+fn call_native_stateful(
+    vm: &mut Vm<'_>,
+    path: &str,
+    this: ObjectId,
+    omitted: &[bool],
+    args: &mut [Value],
+) -> NativeOutcome {
+    let def = native(path);
+    let mut c = ctx(this, omitted, path);
+    c.in_state_code = true;
+    (def.f)(vm, &c, args).expect("native")
+}
+
+fn spawn_at(vm: &mut Vm<'_>, set: &ScriptSet, class: &str, name: &str, loc: [f32; 3]) -> ObjectId {
+    let id = vm.spawn(pg(set, class), name).unwrap();
+    vm.set_property(id, "Location", 0, Value::Vector(loc));
+    id
+}
+
+/// A pawn + controller wired together, with the given collision size and speed.
+fn nav_actor_pair(
+    vm: &mut Vm<'_>,
+    set: &ScriptSet,
+    radius: f32,
+    height: f32,
+    speed: f32,
+) -> (ObjectId, ObjectId) {
+    let pawn = spawn_at(vm, set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    vm.set_property(pawn, "CollisionRadius", 0, Value::Float(radius));
+    vm.set_property(pawn, "CollisionHeight", 0, Value::Float(height));
+    vm.set_property(pawn, "GroundSpeed", 0, Value::Float(speed));
+    let ctrl = vm.spawn(pg(set, "Controller"), "C").unwrap();
+    vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    (ctrl, pawn)
+}
+
+fn route_cache_elem(vm: &Vm<'_>, ctrl: ObjectId, i: usize) -> Value {
+    let base = vm.objects[ctrl as usize]
+        .layout
+        .slot_by_name("RouteCache")
+        .expect("RouteCache")
+        .base;
+    vm.objects[ctrl as usize].props[base + i].clone()
+}
+
+#[test]
+fn find_path_toward_returns_first_node_and_fills_route_cache() {
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let n0 = spawn_at(&mut vm, &set, "Actor", "Nav0", [0.0, 0.0, 0.0]);
+    let n1 = spawn_at(&mut vm, &set, "Actor", "Nav1", [500.0, 0.0, 0.0]);
+    let n2 = spawn_at(&mut vm, &set, "Actor", "Nav2", [1000.0, 0.0, 0.0]);
+    let (ctrl, _pawn) = nav_actor_pair(&mut vm, &set, 40.0, 80.0, 100.0);
+    vm.set_navigation(Box::new(MockNav::line()));
+    let target = spawn_at(&mut vm, &set, "Actor", "T", [1000.0, 0.0, 0.0]);
+
+    let mut args = [
+        Value::Object(Some(ObjRef::Instance(target))),
+        Value::Bool(false),
+    ];
+    let out = call_native(
+        &mut vm,
+        "Engine.Controller.FindPathToward",
+        ctrl,
+        &[false, false],
+        &mut args,
+    );
+    // The path is Nav0, Nav1, Nav2; RouteCache drops the node the pawn stands on, so the first
+    // move target is Nav1.
+    assert_eq!(
+        out,
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(n1))))
+    );
+    assert_eq!(
+        route_cache_elem(&vm, ctrl, 0),
+        Value::Object(Some(ObjRef::Instance(n1)))
+    );
+    assert_eq!(
+        route_cache_elem(&vm, ctrl, 1),
+        Value::Object(Some(ObjRef::Instance(n2)))
+    );
+    assert_eq!(route_cache_elem(&vm, ctrl, 2), Value::Object(None));
+    match vm.get_property(ctrl, "RouteDist") {
+        Some(Value::Float(d)) => assert!((*d - 1000.0).abs() < 1.0, "RouteDist {d}"),
+        other => panic!("RouteDist {other:?}"),
+    }
+    // Nav0 is only referenced through the graph; keep the id used so the test reads naturally.
+    assert!(vm.vector_prop(n0, "Location").is_some());
+}
+
+#[test]
+fn find_path_to_unreachable_clears_route_cache_and_returns_none() {
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let _ = spawn_at(&mut vm, &set, "Actor", "Nav0", [0.0, 0.0, 0.0]);
+    let _ = spawn_at(&mut vm, &set, "Actor", "Nav1", [500.0, 0.0, 0.0]);
+    let _ = spawn_at(&mut vm, &set, "Actor", "Nav2", [1000.0, 0.0, 0.0]);
+    let (ctrl, _pawn) = nav_actor_pair(&mut vm, &set, 40.0, 80.0, 100.0);
+    // Only 0 -> 1 exists; the nearest node to the target (Nav2) is unreachable.
+    let mut nav = MockNav::line();
+    nav.edges.truncate(1);
+    vm.set_navigation(Box::new(nav));
+
+    let mut args = [Value::Vector([1000.0, 0.0, 0.0]), Value::Bool(false)];
+    let out = call_native(
+        &mut vm,
+        "Engine.Controller.FindPathTo",
+        ctrl,
+        &[false, false],
+        &mut args,
+    );
+    assert_eq!(out, NativeOutcome::Value(Value::Object(None)));
+    assert_eq!(route_cache_elem(&vm, ctrl, 0), Value::Object(None));
+    assert_eq!(vm.get_property(ctrl, "RouteDist"), Some(&Value::Float(0.0)));
+}
+
+#[test]
+fn a_pawn_too_big_for_the_reach_spec_finds_no_path() {
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let _ = spawn_at(&mut vm, &set, "Actor", "Nav0", [0.0, 0.0, 0.0]);
+    let _ = spawn_at(&mut vm, &set, "Actor", "Nav1", [500.0, 0.0, 0.0]);
+    let _ = spawn_at(&mut vm, &set, "Actor", "Nav2", [1000.0, 0.0, 0.0]);
+    // Pawn radius 80 > the reach spec's 20: the edge is not traversable.
+    let (ctrl, _pawn) = nav_actor_pair(&mut vm, &set, 80.0, 80.0, 100.0);
+    let mut nav = MockNav::line();
+    nav.edges[0].collision_radius = 20;
+    vm.set_navigation(Box::new(nav));
+    let target = spawn_at(&mut vm, &set, "Actor", "T", [1000.0, 0.0, 0.0]);
+
+    let mut args = [
+        Value::Object(Some(ObjRef::Instance(target))),
+        Value::Bool(false),
+    ];
+    let out = call_native(
+        &mut vm,
+        "Engine.Controller.FindPathToward",
+        ctrl,
+        &[false, false],
+        &mut args,
+    );
+    assert_eq!(out, NativeOutcome::Value(Value::Object(None)));
+}
+
+#[test]
+fn pathing_without_a_nav_provider_fails_and_survey_counts_it() {
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let (ctrl, _pawn) = nav_actor_pair(&mut vm, &set, 40.0, 80.0, 100.0);
+    let target = spawn_at(&mut vm, &set, "Actor", "T", [1000.0, 0.0, 0.0]);
+    let mut args = [
+        Value::Object(Some(ObjRef::Instance(target))),
+        Value::Bool(false),
+    ];
+    let e = try_native(
+        &mut vm,
+        "Engine.Controller.FindPathToward",
+        ctrl,
+        &[false, false],
+        &mut args,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&e.kind, VmErrorKind::NoNavProvider { native } if native == "Controller.FindPathToward"),
+        "{e}"
+    );
+    // Survey mode counts it instead.
+    vm.survey = true;
+    let r = try_native(
+        &mut vm,
+        "Engine.Controller.FindPathToward",
+        ctrl,
+        &[false, false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Object(None)));
+    assert!(vm.missing_natives.contains_key("Controller.FindPathToward"));
+}
+
+#[test]
+fn move_to_sets_destination_and_latent_then_completes_at_ground_speed() {
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let (ctrl, pawn) = nav_actor_pair(&mut vm, &set, 1.0, 40.0, 100.0);
+
+    let mut args = [Value::Vector([300.0, 0.0, 0.0])];
+    let out = call_native_stateful(
+        &mut vm,
+        "Engine.Controller.MoveTo",
+        ctrl,
+        &[false, true, true],
+        &mut args,
+    );
+    assert_eq!(out, NativeOutcome::Value(Value::Void));
+    assert_eq!(
+        vm.get_property(ctrl, "Destination"),
+        Some(&Value::Vector([300.0, 0.0, 0.0]))
+    );
+    match &vm.pending_latent {
+        Some(crate::vm::Latent::Move { destination, .. }) => {
+            assert_eq!(*destination, [300.0, 0.0, 0.0]);
+        }
+        other => panic!("no Move latent: {other:?}"),
+    }
+    // 300 UU at the pawn's GroundSpeed of 100 UU/s, dt 0.1 -> exactly 30 ticks.
+    let mut ticks = 0;
+    loop {
+        let arrived = vm
+            .move_pawn_step(pawn, [300.0, 0.0, 0.0], 0.0, 0.1)
+            .unwrap();
+        ticks += 1;
+        if arrived {
+            break;
+        }
+        assert!(ticks <= 31, "did not arrive");
+    }
+    assert_eq!(ticks, 30);
+    assert_eq!(vm.vector_prop(pawn, "Location"), Some([300.0, 0.0, 0.0]));
+}
+
+#[test]
+fn move_toward_sets_move_target_and_destination() {
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let (ctrl, pawn) = nav_actor_pair(&mut vm, &set, 1.0, 40.0, 100.0);
+    let target = spawn_at(&mut vm, &set, "Actor", "T", [250.0, 0.0, 0.0]);
+
+    let mut args = [Value::Object(Some(ObjRef::Instance(target)))];
+    let out = call_native_stateful(
+        &mut vm,
+        "Engine.Controller.MoveToward",
+        ctrl,
+        &[false, true, true, true],
+        &mut args,
+    );
+    assert_eq!(out, NativeOutcome::Value(Value::Void));
+    assert_eq!(
+        vm.get_property(ctrl, "MoveTarget"),
+        Some(&Value::Object(Some(ObjRef::Instance(target))))
+    );
+    assert_eq!(
+        vm.get_property(ctrl, "Destination"),
+        Some(&Value::Vector([250.0, 0.0, 0.0]))
+    );
+    // MoveToward completes after the expected number of ticks at GroundSpeed: 250 UU at
+    // 100 UU/s with dt 0.1 -> exactly 25 steps.
+    let mut ticks = 0;
+    loop {
+        let arrived = vm
+            .move_pawn_step(pawn, [250.0, 0.0, 0.0], 0.0, 0.1)
+            .unwrap();
+        ticks += 1;
+        if arrived {
+            break;
+        }
+        assert!(ticks <= 26, "MoveToward did not arrive");
+    }
+    assert_eq!(ticks, 25);
+    assert_eq!(vm.vector_prop(pawn, "Location"), Some([250.0, 0.0, 0.0]));
+}
+
+#[test]
+fn line_of_sight_to_uses_the_pawn_eyes_and_reports_the_blocking_wall() {
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    // A thin wall between the two pawns at x = 50.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([50.0, -10.0, -10.0], [51.0, 10.0, 200.0]),
+    ));
+    let (ctrl, pawn) = nav_actor_pair(&mut vm, &set, 10.0, 40.0, 100.0);
+    vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(20.0));
+    let other = spawn_at(&mut vm, &set, "Pawn", "Other", [100.0, 0.0, 0.0]);
+    vm.set_property(other, "BaseEyeHeight", 0, Value::Float(20.0));
+
+    let mut args = [Value::Object(Some(ObjRef::Instance(other)))];
+    let blocked = call_native(
+        &mut vm,
+        "Engine.Controller.LineOfSightTo",
+        ctrl,
+        &[false],
+        &mut args,
+    );
+    assert_eq!(blocked, NativeOutcome::Value(Value::Bool(false)));
+
+    // No wall: clear line of sight.
+    let mut vm2 = Vm::new(&set, VmLimits::default());
+    vm2.set_physics(Box::new(MockWorld::new()));
+    let (ctrl2, pawn2) = nav_actor_pair(&mut vm2, &set, 10.0, 40.0, 100.0);
+    vm2.set_property(pawn2, "BaseEyeHeight", 0, Value::Float(20.0));
+    let other2 = spawn_at(&mut vm2, &set, "Pawn", "Other", [100.0, 0.0, 0.0]);
+    vm2.set_property(other2, "BaseEyeHeight", 0, Value::Float(20.0));
+    let mut args2 = [Value::Object(Some(ObjRef::Instance(other2)))];
+    let clear = call_native(
+        &mut vm2,
+        "Engine.Controller.LineOfSightTo",
+        ctrl2,
+        &[false],
+        &mut args2,
+    );
+    assert_eq!(clear, NativeOutcome::Value(Value::Bool(true)));
+}
+
+#[test]
+fn vrand_is_a_unit_vector() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(sg(&set, "Object"), "O").unwrap();
+    let mut args = [];
+    let out = call_native(&mut vm, "Object.VRand", o, &[], &mut args);
+    let NativeOutcome::Value(Value::Vector(v)) = out else {
+        panic!("{out:?}");
+    };
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    assert!((len - 1.0).abs() < 1e-4, "len {len}");
+}
+
+#[test]
+fn move_to_outside_state_code_is_rejected() {
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let (ctrl, _pawn) = nav_actor_pair(&mut vm, &set, 10.0, 40.0, 100.0);
+    // `ctx` sets in_state_code = false.
+    let mut args = [Value::Vector([100.0, 0.0, 0.0])];
+    let e = try_native(
+        &mut vm,
+        "Engine.Controller.MoveTo",
+        ctrl,
+        &[false, true, true],
+        &mut args,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&e.kind, VmErrorKind::LatentOutsideState { path } if path == "Controller.MoveTo"),
+        "{e}"
+    );
 }
