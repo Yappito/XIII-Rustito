@@ -954,6 +954,9 @@ struct Timer {
     repeat: bool,
 }
 
+/// Event dispatched by timer slot 0/1/2 (UE2 `SetTimer`, `SetTimer2`, `Controller.SetTimer3`).
+const TIMER_EVENTS: [&str; 3] = ["Timer", "Timer2", "Timer3"];
+
 /// An interpreter object.
 #[derive(Debug)]
 pub struct Instance {
@@ -977,7 +980,8 @@ pub struct Instance {
     pub deleted: bool,
     /// Map export it was loaded from.
     pub export: Option<GlobalRef>,
-    timer: Option<Timer>,
+    /// The three UE2 actor timers (`Timer`, `Timer2`, `Timer3`), independently scheduled.
+    timers: [Option<Timer>; 3],
     /// Animation channels (actor animation natives).
     pub(crate) anim: AnimState,
     /// Bone-control parameters (skeletal natives); no skeletal pose yet.
@@ -1163,6 +1167,10 @@ pub struct Vm<'s> {
     pub(crate) external_data: Option<Box<dyn ExternalObjectData>>,
     /// Optional per-native/section timing (`--perf-natives`).
     profile: NativeProfile,
+    /// Edge state of the host-driven AI perception (`item14b`): `controller -> player visible`.
+    /// Set by [`Vm::update_ai_perception`] so `SeePlayer`/`EnemyNotVisible` fire only on change,
+    /// as the engine's sight counter does, instead of restarting an AI state every tick.
+    ai_visible: HashMap<ObjectId, bool>,
 }
 
 fn lower(s: &str) -> String {
@@ -1212,6 +1220,7 @@ impl<'s> Vm<'s> {
             localization_misses: 0,
             external_data: None,
             profile: NativeProfile::default(),
+            ai_visible: HashMap::new(),
         }
     }
 
@@ -2256,7 +2265,7 @@ impl<'s> Vm<'s> {
             is_actor,
             deleted: false,
             export: None,
-            timer: None,
+            timers: [None, None, None],
             anim: AnimState::default(),
             bone: BoneState::default(),
         });
@@ -2791,28 +2800,29 @@ impl<'s> Vm<'s> {
             if !self.objects[id as usize].active {
                 continue;
             }
-            let mut fire = false;
-            if let Some(t) = self.objects[id as usize].timer.as_mut() {
-                t.remaining -= dt;
-                if t.remaining <= 0.0 {
-                    fire = true;
-                    if t.repeat {
-                        t.remaining += t.rate;
+            for (slot, event) in TIMER_EVENTS.iter().enumerate() {
+                let mut fire = false;
+                if let Some(t) = self.objects[id as usize].timers[slot].as_mut() {
+                    t.remaining -= dt;
+                    if t.remaining <= 0.0 {
+                        fire = true;
+                        if t.repeat {
+                            t.remaining += t.rate;
+                        }
                     }
                 }
-            }
-            if fire {
-                if !self.objects[id as usize]
-                    .timer
-                    .as_ref()
-                    .is_some_and(|t| t.repeat)
-                {
-                    self.objects[id as usize].timer = None;
-                }
-                let actor = self.objects[id as usize].name.clone();
-                self.note(TraceKind::Timer { actor });
-                if let Some(f) = self.find_function(id, "Timer", true) {
-                    self.call_values(f, id, Vec::new())?;
+                if fire {
+                    if !self.objects[id as usize].timers[slot]
+                        .as_ref()
+                        .is_some_and(|t| t.repeat)
+                    {
+                        self.objects[id as usize].timers[slot] = None;
+                    }
+                    let actor = self.objects[id as usize].name.clone();
+                    self.note(TraceKind::Timer { actor });
+                    if let Some(f) = self.find_function(id, event, true) {
+                        self.call_values(f, id, Vec::new())?;
+                    }
                 }
             }
         }
@@ -2865,31 +2875,32 @@ impl<'s> Vm<'s> {
             if !self.objects[id as usize].active {
                 continue;
             }
-            let mut fire = false;
-            if let Some(t) = self.objects[id as usize].timer.as_mut() {
-                t.remaining -= dt;
-                if t.remaining <= 0.0 {
-                    fire = true;
-                    if t.repeat {
-                        t.remaining += t.rate;
+            for (slot, event) in TIMER_EVENTS.iter().enumerate() {
+                let mut fire = false;
+                if let Some(t) = self.objects[id as usize].timers[slot].as_mut() {
+                    t.remaining -= dt;
+                    if t.remaining <= 0.0 {
+                        fire = true;
+                        if t.repeat {
+                            t.remaining += t.rate;
+                        }
                     }
                 }
-            }
-            if fire {
-                if !self.objects[id as usize]
-                    .timer
-                    .as_ref()
-                    .is_some_and(|t| t.repeat)
-                {
-                    self.objects[id as usize].timer = None;
-                }
-                let actor = self.objects[id as usize].name.clone();
-                self.note(TraceKind::Timer { actor });
-                if let Some(f) = self.find_function(id, "Timer", true)
-                    && let Err(e) = self.call_values(f, id, Vec::new())
-                {
-                    let suspended = self.suspend_for_error(id, &e);
-                    errors.push((suspended, e));
+                if fire {
+                    if !self.objects[id as usize].timers[slot]
+                        .as_ref()
+                        .is_some_and(|t| t.repeat)
+                    {
+                        self.objects[id as usize].timers[slot] = None;
+                    }
+                    let actor = self.objects[id as usize].name.clone();
+                    self.note(TraceKind::Timer { actor });
+                    if let Some(f) = self.find_function(id, event, true)
+                        && let Err(e) = self.call_values(f, id, Vec::new())
+                    {
+                        let suspended = self.suspend_for_error(id, &e);
+                        errors.push((suspended, e));
+                    }
                 }
             }
         }
@@ -4833,7 +4844,25 @@ impl<'s> Vm<'s> {
     }
 
     pub(crate) fn set_timer(&mut self, id: ObjectId, rate: f32, repeat: bool) {
-        self.objects[id as usize].timer = (rate > 0.0).then_some(Timer {
+        self.set_timer_named(id, rate, repeat, "Timer");
+    }
+
+    /// `SetTimer2`/`Controller.SetTimer3`: a timer that dispatches `Timer2`/`Timer3` instead of
+    /// `Timer`. UE2 keeps the three timers independent; the VM keeps one active slot per actor
+    /// (the AI states use them one at a time; a second `SetTimer*` replaces the first, as
+    /// `AActor::execSetTimer` does for its own slot).
+    pub(crate) fn set_timer_named(
+        &mut self,
+        id: ObjectId,
+        rate: f32,
+        repeat: bool,
+        name: &'static str,
+    ) {
+        let slot = TIMER_EVENTS
+            .iter()
+            .position(|e| e.eq_ignore_ascii_case(name))
+            .unwrap_or(0);
+        self.objects[id as usize].timers[slot] = (rate > 0.0).then_some(Timer {
             rate,
             remaining: rate,
             repeat,
@@ -5267,7 +5296,7 @@ impl<'s> Vm<'s> {
         self.objects[id as usize].active = false;
         self.objects[id as usize].state = None;
         self.objects[id as usize].state_code = None;
-        self.objects[id as usize].timer = None;
+        self.objects[id as usize].timers = [None, None, None];
         self.objects[id as usize].generation += 1;
         if let Some(f) = self.find_function(id, "Destroyed", true) {
             self.call_values(f, id, Vec::new())?;
@@ -5746,16 +5775,29 @@ impl<'s> Vm<'s> {
         };
         // item14: record the hit zone for `Actor.GetLastTraceBone` (`XIIIPawn.LastBoneHit`).
         // A world/LevelInfo hit is not a pawn, so the bone stays `None`.
+        //
+        // item14b: when the installed provider holds the target's posed decoded skeleton, the
+        // bullet ray is intersected with the per-bone hit boxes (`ray_bone`) and the nearest box's
+        // bone name wins; otherwise the collision-cylinder classification is the fallback. The
+        // ray is the exact trace segment, not the hit point, because a body's boxes can be
+        // smaller than the cylinder.
         self.last_trace_bone = match out.0 {
-            Some(b) if !self.is_a(b, "levelinfo") => {
-                let (center, radius, half_height) = self.actor_cylinder(b);
-                match &self.hit_zones {
-                    Some(z) => z.bone_at(center, radius, half_height, out.1),
-                    None => {
-                        crate::physics::CylinderZones.bone_at(center, radius, half_height, out.1)
+            Some(b) if !self.is_a(b, "levelinfo") => self
+                .hit_zones
+                .as_ref()
+                .and_then(|z| z.ray_bone(b, start, end))
+                .unwrap_or_else(|| {
+                    let (center, radius, half_height) = self.actor_cylinder(b);
+                    match &self.hit_zones {
+                        Some(z) => z.bone_at(center, radius, half_height, out.1),
+                        None => crate::physics::CylinderZones.bone_at(
+                            center,
+                            radius,
+                            half_height,
+                            out.1,
+                        ),
                     }
-                }
-            }
+                }),
             _ => "None".to_owned(),
         };
         Ok(out)
@@ -5968,6 +6010,103 @@ impl<'s> Vm<'s> {
         let l = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
         let eye = self.f32_prop(id, "BaseEyeHeight");
         [l[0], l[1], l[2] + eye]
+    }
+
+    /// Host-driven engine perception (`item14b`): for every live `IAController`, test whether its
+    /// pawn can see the player (range, facing cone, clear world line of sight) and dispatch the
+    /// engine's own `SeePlayer` / `EnemyNotVisible` events only when visibility changes, as the
+    /// engine's sight counter does. This is the native half of perception (the sight test and the
+    /// event dispatch); the AI's own states decide what to do with the event. Appends
+    /// `(controller, event)` to `out` for the host timeline. Never a silent success: an event call
+    /// that raises is reported in `out` as `event: error`.
+    pub fn update_ai_perception(&mut self, player: ObjectId, out: &mut Vec<(String, String)>) {
+        if self.objects.get(player as usize).is_none_or(|o| o.deleted) {
+            return;
+        }
+        let player_dead = self.bool_prop(player, "bIsDead");
+        let controllers: Vec<ObjectId> = self
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(i, o)| {
+                o.is_actor && !o.deleted && o.active && self.is_a(*i as ObjectId, "iacontroller")
+            })
+            .map(|(i, _)| i as ObjectId)
+            .collect();
+        for ctrl in controllers {
+            let Some(pawn) = self.obj_prop(ctrl, "Pawn") else {
+                continue;
+            };
+            if pawn == player || self.bool_prop(pawn, "bIsDead") {
+                continue;
+            }
+            let visible = !player_dead && self.ai_sight(ctrl, pawn, player);
+            let was = self.ai_visible.get(&ctrl).copied().unwrap_or(false);
+            self.ai_visible.insert(ctrl, visible);
+            let name = self.objects[ctrl as usize].name.clone();
+            // The engine's sight counter calls `SeePlayer` repeatedly while the player stays
+            // visible (the base handler only reacts until `EnemyAcquired` disables the event), and
+            // `EnemyNotVisible` once when sight is lost. The host only logs a transition.
+            if visible {
+                let args = vec![Value::Object(Some(ObjRef::Instance(player)))];
+                let res = self.send_event(ctrl, "SeePlayer", args);
+                if !was {
+                    match res {
+                        Ok(_) => out.push((name, "SeePlayer".to_owned())),
+                        Err(e) => out.push((name.clone(), format!("SeePlayer: {e}"))),
+                    }
+                }
+            } else if was {
+                match self.send_event(ctrl, "EnemyNotVisible", Vec::new()) {
+                    Ok(_) => out.push((name, "EnemyNotVisible".to_owned())),
+                    Err(e) => out.push((name, format!("EnemyNotVisible: {e}"))),
+                }
+            }
+        }
+    }
+
+    /// Sight test for [`Vm::update_ai_perception`]: range (`Pawn.SightRadius`), facing cone
+    /// (`Pawn.PeripheralVision`, cos of the half-angle after the pawn's `Init` conversion) and a
+    /// clear world trace between the eyes (`Controller.LineOfSightTo`). Actor occlusion is not
+    /// modelled, matching the existing `LineOfSightTo` native.
+    fn ai_sight(&mut self, ctrl: ObjectId, pawn: ObjectId, player: ObjectId) -> bool {
+        let eye = self.eye_location(pawn);
+        let target = self.eye_location(player);
+        let d = [target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]];
+        let dist2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        let mut sight = self.f32_prop(pawn, "SightRadius");
+        if sight <= 0.0 {
+            sight = 5000.0;
+        }
+        if dist2 > sight * sight {
+            return false;
+        }
+        let dot = {
+            let rot = self.rotation_prop(pawn).unwrap_or([0; 3]);
+            let k = std::f32::consts::TAU / 65536.0;
+            let (sp, cp) = ((rot[0] as f32) * k).sin_cos();
+            let (sy, cy) = ((rot[1] as f32) * k).sin_cos();
+            let f = [cp * cy, cp * sy, sp];
+            let n = dist2.sqrt();
+            if n > 1e-6 {
+                (f[0] * d[0] + f[1] * d[1] + f[2] * d[2]) / n
+            } else {
+                1.0
+            }
+        };
+        let mut cone = self.f32_prop(pawn, "PeripheralVision");
+        if !(-1.0001..=1.0001).contains(&cone) {
+            // Raw degrees (Init not run): the scripts convert with cos(deg * 0.00873).
+            cone = (cone * 0.00873).cos();
+        }
+        if cone > 0.9999 {
+            // A raw 0 degrees (or an unset value) means "in front", not a full sphere.
+            cone = 0.0;
+        }
+        if dot < cone {
+            return false;
+        }
+        self.nav_line_of_sight_to(ctrl, player).unwrap_or(false)
     }
 
     /// `Controller.pointReachable`: the point is directly reachable (clear pawn trace) and a

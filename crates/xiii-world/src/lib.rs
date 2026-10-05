@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 pub mod animation;
 pub mod audio;
+pub mod hitbox;
 pub mod materials;
 pub mod movement_volumes;
 pub mod nav_provider;

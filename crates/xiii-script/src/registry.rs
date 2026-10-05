@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::events::PresentationEvent;
+use crate::events::{PresentationEvent, SoundEvent};
 use crate::linker::GlobalRef;
 use crate::value::{ObjRef, ObjectId, Value};
 use crate::vm::{Latent, TraceKind, Vm, VmErrorKind, VmResult};
@@ -1097,7 +1097,19 @@ fn vrand(vm: &mut Vm<'_>, _c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOu
 /// the same timer semantics are used (hypothesis for XIII; the second timer's role is not
 /// established without DLL disassembly).
 fn set_timer2(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
-    set_timer(vm, c, a)
+    let rate = float(vm, a, 0)?;
+    let repeat = boolean(vm, a, 1)?;
+    vm.set_timer_named(c.this, rate, repeat, "Timer2");
+    val(Value::Void)
+}
+
+/// `Controller.SetTimer3(float NewTimerRate, bool bLoop)`: like `SetTimer` but dispatches the
+/// `Timer3` event. Used by `IAController.Attaque` (enemy-position refresh) and other combat states.
+fn set_timer3(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let rate = float(vm, a, 0)?;
+    let repeat = boolean(vm, a, 1)?;
+    vm.set_timer_named(c.this, rate, repeat, "Timer3");
+    val(Value::Void)
 }
 
 fn object_out(id: Option<ObjectId>) -> Value {
@@ -1183,6 +1195,30 @@ fn line_of_sight_to(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult
         return val(Value::Bool(false));
     };
     val(Value::Bool(vm.nav_line_of_sight_to(c.this, other)?))
+}
+
+/// `Controller.CanSee(Pawn Other) -> bool` (native 533): UE2 `AController::execCanSee` forwards to
+/// `LineOfSightTo(Other)`. Implemented as the same world line trace between the two eyes (no actor
+/// occlusion, the `LineOfSightTo` convention).
+fn controller_can_see(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let Some(other) = instance_arg(vm, a, 0)? else {
+        return val(Value::Bool(false));
+    };
+    val(Value::Bool(vm.nav_line_of_sight_to(c.this, other)?))
+}
+
+/// `Pawn.PressingFire() -> bool` (native 0): UE2 `APawn::execPressingFire` returns the pawn's
+/// `bFire` (the held fire button published by its controller). Falls back to the controller's
+/// `bFire` and then the instigator's, since the weapon path calls it on the firing pawn.
+fn pawn_pressing_fire(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let fire = vm.bool_prop(c.this, "bFire")
+        || vm
+            .obj_prop(c.this, "Controller")
+            .is_some_and(|ctrl| vm.bool_prop(ctrl, "bFire"))
+        || vm
+            .obj_prop(c.this, "Instigator")
+            .is_some_and(|inst| vm.bool_prop(inst, "bFire"));
+    val(Value::Bool(fire))
 }
 
 /// `Actor.PlayerCanSeeMe() -> bool`.
@@ -1527,6 +1563,137 @@ fn pick_start_point(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResul
         return val(Value::Object(Some(ObjRef::Instance(spot))));
     }
     val(Value::Object(None))
+}
+
+/// `LevelInfo.IncAttaque()` (native 589, static).
+///
+/// Decoded declaration: `native(589) final native static function IncAttaque()` (engine.u,
+/// 1-byte body). `IAController.s_incattaque` calls `self.Level.IncAttaque()` on entering
+/// `Attaque.BeginState`; the engine increments the level's attack/alarm counter that
+/// `GenAlerte`/`ChercheAlarme` read. The headless VM has no alarm network, so the call is
+/// recorded as a visible trace note (never a silent success) and returns.
+fn level_info_inc_attaque(
+    vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    vm.note(TraceKind::Note(
+        "LevelInfo.IncAttaque (native 589): level attack counter; the VM has no alarm network"
+            .into(),
+    ));
+    val(Value::Void)
+}
+
+/// `IAController.DirectionDuTir() -> vector`.
+///
+/// Disassembly evidence (XIDPawn.dll `?execDirectionDuTir@AIAController` RVA 0x2070): with no pawn
+/// it returns `vect(0,0,0)`; otherwise it builds the shooting direction from the pawn's rotation
+/// and `Enemy`. The model here is the unit vector from the pawn to `Enemy.Location`, falling back
+/// to the pawn's forward axis when there is no enemy (documented `Partial`: dispersion and the
+/// aim offset are not reproduced).
+fn direction_du_tir(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let Some(pawn) = vm.obj_prop(c.this, "Pawn") else {
+        return val(Value::Vector([0.0; 3]));
+    };
+    if let Some(enemy) = vm.obj_prop(c.this, "Enemy") {
+        let l = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let e = vm.vector_prop(enemy, "Location").unwrap_or(l);
+        let d = [e[0] - l[0], e[1] - l[1], e[2] - l[2]];
+        let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if n > 1e-6 {
+            return val(Value::Vector([d[0] / n, d[1] / n, d[2] / n]));
+        }
+    }
+    let rot = match vm.get_property(pawn, "Rotation") {
+        Some(Value::Rotator(r)) => *r,
+        _ => [0; 3],
+    };
+    val(Value::Vector(rotator_basis(rot).0))
+}
+
+/// `IAController.LigneVisee(vector TraceEnd, vector TraceStart) -> bool`.
+///
+/// Disassembly evidence (XIDPawn.dll `?execLigneVisee@AIAController` RVA 0x2B10): line-checks the
+/// segment between the two points and returns whether it is clear. The VM uses its world-only
+/// `Actor.FastTrace` (no actor occlusion, the same convention as `Controller.LineOfSightTo`);
+/// `TraceStart` omitted defaults to the pawn's eye.
+fn ligne_visee(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let end = vector2(vm, a, 0)?;
+    let start = if c.omitted(1) {
+        match vm.obj_prop(c.this, "Pawn") {
+            Some(pawn) => {
+                let l = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+                [l[0], l[1], l[2] + vm.f32_prop(pawn, "CollisionHeight")]
+            }
+            None => return val(Value::Bool(false)),
+        }
+    } else {
+        vector2(vm, a, 1)?
+    };
+    if !vm.physics_ready("IAController.LigneVisee", None, c.this, Value::Bool(false))? {
+        return val(Value::Bool(false));
+    }
+    val(Value::Bool(vm.vm_fast_trace(start, end)?))
+}
+
+/// `IAController.PseudoSteering() -> vector`.
+///
+/// Disassembly evidence (XIDPawn.dll `?execPseudoSteering@AIAController` RVA 0x3230): the combat
+/// steering vector used by `Attaque.UpdateTactics`. The exact steering field is not named in the
+/// decoded reflection; the VM returns `vect(0,0,0)` ("no steering") with a visible note
+/// (documented `Partial`).
+fn pseudo_steering(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    vm.note(TraceKind::Note(format!(
+        "IAController.PseudoSteering on {}: no steering modelled (0,0,0)",
+        vm.objects[c.this as usize].name
+    )));
+    val(Value::Vector([0.0; 3]))
+}
+
+/// `IAController.LineOfFireObstacle() -> int`.
+///
+/// Disassembly evidence (XIDPawn.dll `?execLineOfFireObstacle@AIAController` RVA 0x40D0): returns
+/// an obstacle classification for the current firing line. The VM's trace has no actor/material
+/// obstacle classification, so it returns `0` (no obstacle) with a visible note.
+fn line_of_fire_obstacle(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    vm.note(TraceKind::Note(format!(
+        "IAController.LineOfFireObstacle on {}: returns 0 (no obstacle classification)",
+        vm.objects[c.this as usize].name
+    )));
+    val(Value::Int(0))
+}
+
+/// `IAController.FindBestPathTo(vector desti) -> bool`.
+///
+/// Disassembly evidence (XIDPawn.dll `?execFindBestPathTo@AIAController` RVA 0x3A90): runs the
+/// engine A* from the controller pawn to `desti` and fills `RouteCache`. The VM reuses the decoded
+/// ReachSpec path (`Vm::nav_find_path_to`, which also fills `RouteCache`/`RouteDist`) and returns
+/// whether a path was found (documented `Partial`).
+fn find_best_path_to(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let goal = vector2(vm, a, 0)?;
+    let first = vm.nav_find_path_to(c.this, goal)?;
+    val(Value::Bool(first.is_some()))
+}
+
+/// `IAController.FindNewStakeOutDir()`.
+///
+/// Disassembly evidence (XIDPawn.dll `?execFindNewStakeOutDir@AIAController` RVA 0x3EA0): chooses a
+/// new stake-out direction. The stake-out network is not decoded; the call is recorded as a
+/// visible trace note and returns.
+fn find_new_stake_out_dir(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    vm.note(TraceKind::Note(format!(
+        "IAController.FindNewStakeOutDir on {}: no stake-out network modelled",
+        vm.objects[c.this as usize].name
+    )));
+    val(Value::Void)
 }
 
 /// `Pawn.SpineYawControl(bool IsControlled, int MaxValue, float RotationSpeed)`.
@@ -1925,8 +2092,18 @@ fn ia_controller_set_enemy(
     c: &NativeCtx,
     a: &mut [Value],
 ) -> VmResult<NativeOutcome> {
-    let enemy = object(vm, a, 0)?;
-    vm.set_property(c.this, "Enemy", 0, Value::Object(enemy));
+    let new_value = Value::Object(object(vm, a, 0)?);
+    let old = vm.get_property(c.this, "Enemy").cloned();
+    vm.set_property(c.this, "Enemy", 0, new_value.clone());
+    // The engine's `AAIController::SetEnemy` raises the `EnemyAcquired` event when the enemy
+    // changes (XIDPawn.dll exports `?eventEnemyAcquired@AIAController`); the XIII states use it to
+    // leave the neutral states (`Patrouille`/`Tenir` -> `acquisition`). Without this the AI sets
+    // `Enemy` and never reacts.
+    let changed = matches!(new_value, Value::Object(Some(ObjRef::Instance(_))))
+        && old.as_ref() != Some(&new_value);
+    if changed {
+        vm.send_event(c.this, "EnemyAcquired", Vec::new())?;
+    }
     val(Value::Bool(true))
 }
 
@@ -1976,10 +2153,52 @@ fn refresh_lighting(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult
     val(Value::Void)
 }
 
-/// item14 `Weapon.PlayFiringSound`: the engine-side firing sound. The VM has no per-weapon
-/// firing-sound mapping (HX resolution is host-side), so the call is accepted and discarded;
-/// `Beretta.PlayFiring` calls it on every shot.
-fn play_firing_sound(_vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+/// item14b `Weapon.PlayFiringSound`: the engine-side firing sound. The decoded
+/// `Weapon` class carries `hFireSound` (normal), `hAltFireSound` (silencer/alt) and `bUseSilencer`;
+/// the `bHasSilencer` argument chosen by `HasSilencer()` in `Beretta.PlayFiring` selects between
+/// them (name-table evidence: `hFireSound` 12x in engine.u, `hAltFireSound` 8x; `Beretta.PlayFiring`
+/// calls `PlayFiringSound(HasSilencer())`). The native emits a `PlaySound` presentation event whose
+/// `actor` is the weapon's `Instigator` (the pawn) so a soldier's gunfire is positional in the
+/// host; the HX wave is resolved from `hFireSound` by the host audio library. When neither
+/// property holds a `Sound`, the call appends a visible trace note instead of silently succeeding.
+fn play_firing_sound(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let silencer = matches!(a.first(), Some(Value::Bool(true)));
+    let primary = if silencer {
+        "hAltFireSound"
+    } else {
+        "hFireSound"
+    };
+    let secondary = if silencer {
+        "hFireSound"
+    } else {
+        "hAltFireSound"
+    };
+    let sound = vm
+        .get_property(c.this, primary)
+        .and_then(|v| vm.obj_path(v))
+        .or_else(|| {
+            vm.get_property(c.this, secondary)
+                .and_then(|v| vm.obj_path(v))
+        });
+    let speaker = vm.obj_prop(c.this, "Instigator").unwrap_or(c.this);
+    let actor = vm.objects[speaker as usize].name.clone();
+    if sound.is_none() {
+        let weapon = vm.objects[c.this as usize].name.clone();
+        vm.note(TraceKind::Note(format!(
+            "PlayFiringSound: {weapon} has no {primary}/{secondary} Sound"
+        )));
+    }
+    vm.emit_event(PresentationEvent::PlaySound(SoundEvent {
+        actor,
+        sound,
+        rolloff_actor: None,
+        slot: None,
+        volume: None,
+        radius: None,
+        pitch: None,
+        param5: None,
+        time: vm.time,
+    }));
     val(Value::Void)
 }
 
@@ -3955,13 +4174,28 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "same timer semantics as SetTimer; the second timer's role is not established without DLL disassembly",
+            "dispatches the `Timer2` event; UE2 keeps the three timers independent, the VM keeps \
+             one active slot per actor (a later SetTimer* replaces it)",
         ),
         ..def(
             "Engine.Actor.SetTimer2",
             "native(363) final function SetTimer2(float NewTimerRate, bool bLoop)",
-            "engine.u Actor.SetTimer2 decoded (float, bool; identical declaration to SetTimer); Engine.dll ?execSetTimer2@AActor",
+            "engine.u Actor.SetTimer2 decoded (float, bool; identical declaration to SetTimer, but \
+             fires the Timer2 event); Engine.dll ?execSetTimer2@AActor",
             set_timer2,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "dispatches the `Timer3` event; UE2 keeps the three timers independent, the VM keeps \
+             one active slot per actor (a later SetTimer* replaces it)",
+        ),
+        ..def(
+            "Controller.SetTimer3",
+            "native(0) final function SetTimer3(float NewTimerRate, bool bLoop)",
+            "engine.u Controller.SetTimer3 decoded (float, bool; fires the Timer3 event); \
+             IAController.Attaque uses it for the enemy-position refresh",
+            set_timer3,
         )
     });
     v.push(NativeDef {
@@ -4172,6 +4406,101 @@ fn builtin_defs() -> Vec<NativeDef> {
             pick_start_point,
         )
     });
+    // item14b: the combat-state AI natives. `incattaque` is the first native the attacked
+    // soldier's `Attaque.BeginState` calls; the rest are used by the attack/steering states.
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no alarm network: the level attack counter is not modelled; the call is recorded as a \
+             visible trace note and the state continues",
+        ),
+        ..def(
+            "Engine.LevelInfo.IncAttaque",
+            "native(589) final native static function IncAttaque()",
+            "engine.u LevelInfo.IncAttaque decoded (native 589, 1-byte body); \
+             IAController.s_incattaque calls self.Level.IncAttaque() on Attaque.BeginState",
+            level_info_inc_attaque,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "unit vector from the pawn to Enemy.Location (pawn forward fallback); dispersion/aim \
+             offset not reproduced",
+        ),
+        ..def(
+            "IAController.DirectionDuTir",
+            "native(0) function vector DirectionDuTir()",
+            "XIDPawn.dll ?execDirectionDuTir@AIAController RVA 0x2070; IAController.NotifyFiring \
+             stores it in DirectionTir",
+            direction_du_tir,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "world-only line check between the points (same convention as \
+             Controller.LineOfSightTo); actor occlusion not modelled",
+        ),
+        ..def(
+            "IAController.LigneVisee",
+            "native(0) function bool LigneVisee(vector TraceEnd, vector TraceStart)",
+            "XIDPawn.dll ?execLigneVisee@AIAController RVA 0x2B10; IAController.Attaque.EnemyNotVisible \
+             uses it to choose TacticalMove vs temporise",
+            ligne_visee,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial("returns vect(0,0,0) (no steering) with a visible note"),
+        ..def(
+            "IAController.PseudoSteering",
+            "native(0) function vector PseudoSteering()",
+            "XIDPawn.dll ?execPseudoSteering@AIAController RVA 0x3230 (combat movement steering)",
+            pseudo_steering,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial("returns 0 (no obstacle classification modelled)"),
+        ..def(
+            "IAController.LineOfFireObstacle",
+            "native(0) function int LineOfFireObstacle()",
+            "XIDPawn.dll ?execLineOfFireObstacle@AIAController RVA 0x40D0 (obstacle along the firing line)",
+            line_of_fire_obstacle,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "reuses the decoded ReachSpec path (Vm::nav_find_path_to) and fills RouteCache; the \
+             engine's A* goal margins are not reproduced",
+        ),
+        ..def(
+            "IAController.FindBestPathTo",
+            "native(0) function bool FindBestPathTo(vector desti)",
+            "XIDPawn.dll ?execFindBestPathTo@AIAController RVA 0x3A90; IAController.Tenir.BackToFormation \
+             and Attaque.Trigger use it",
+            find_best_path_to,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial("no stake-out network modelled; recorded as a visible note"),
+        ..def(
+            "IAController.FindNewStakeOutDir",
+            "native(0) function FindNewStakeOutDir()",
+            "XIDPawn.dll ?execFindNewStakeOutDir@AIAController RVA 0x3EA0",
+            find_new_stake_out_dir,
+        )
+    });
+    v.push(def(
+        "Engine.Controller.CanSee",
+        "native(533) final function bool CanSee(Pawn Other)",
+        "engine.u Controller.CanSee decoded (533, object Other, return bool); UE2 forwards to \
+         LineOfSightTo; used by the behaviour scripts to check a clear line to the enemy",
+        controller_can_see,
+    ));
+    v.push(def(
+        "Engine.Pawn.PressingFire",
+        "native(0) final simulated native function bool PressingFire()",
+        "engine.u Pawn.PressingFire decoded (native 0, return bool); returns the pawn's held fire \
+         button (`bFire`); the melee/weapon fire animation path calls it",
+        pawn_pressing_fire,
+    ));
     v.push(NativeDef {
         status: NativeStatus::Partial(
             "parameters are stored per actor for the renderer; no skeletal bone control is evaluated",
@@ -4317,14 +4646,18 @@ fn builtin_defs() -> Vec<NativeDef> {
     ));
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "accepted and discarded: the VM has no per-weapon firing-sound mapping (host HX audio \
-             resolves sounds); the shot itself continues",
+            "emits PlaySound from the weapon's hFireSound/hAltFireSound selected by bHasSilencer; \
+             the host resolves the HX wave and plays it. The decoded XIII weapons set neither \
+             property in their class defaults, so the event may carry no sound (recorded as a \
+             trace note, never a silent success)",
         ),
         ..def(
             "Engine.Weapon.PlayFiringSound",
             "native(0) native function PlayFiringSound(bool bHasSilencer)",
             "engine.u Weapon.PlayFiringSound decoded (bool bHasSilencer, native); \
-             Beretta.PlayFiring calls it on every shot; Engine.dll ?execPlayFiringSound@AWeapon",
+             Beretta.PlayFiring calls PlayFiringSound(HasSilencer()) on every shot; the decoded \
+             Weapon defaults are hFireSound/hAltFireSound/bUseSilencer; Engine.dll \
+             ?execPlayFiringSound@AWeapon",
             play_firing_sound,
         )
     });
@@ -4348,14 +4681,16 @@ fn builtin_defs() -> Vec<NativeDef> {
     ));
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "stores Enemy on the controller; the XIDPawn native's BaseS bookkeeping and the \
-             engine's sight-state side effects are not modelled",
+            "stores Enemy and raises EnemyAcquired when it changes; the XIDPawn native's BaseS/\
+             GenAlerte bookkeeping and sight-counter side effects are not modelled",
         ),
         ..def(
             "IAController.SetEnemy",
             "native(0) function bool SetEnemy(Pawn Newenemy)",
             "xidpawn.u IAController.SetEnemy decoded (Pawn, return bool); IAController.SeePlayer/\
-             SeeEnemy set the current target through it; XIDPawn.dll ?execSetEnemy@AIAController",
+             SeeEnemy set the current target through it; XIDPawn.dll ?execSetEnemy@AIAController \
+             calls ?eventEnemyAcquired@AIAController, which the neutral states use to enter \
+             acquisition",
             ia_controller_set_enemy,
         )
     });
