@@ -22,8 +22,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 pub mod animation;
+pub mod nav_provider;
 pub mod navigation;
 pub mod physics;
+pub mod runtime;
 pub mod zones;
 
 use xiii_decode::common::{

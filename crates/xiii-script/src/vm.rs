@@ -23,6 +23,9 @@ use crate::animation::{AnimationData, SeqInfo};
 use crate::bytecode::{Call, Context, Script, Token, TokenKind, opcode_name};
 use crate::events::{PresentationEvent, SoundEvent};
 use crate::linker::{GlobalRef, ScriptSet};
+use crate::navigation::{
+    NavEdgeInfo, NavPointInfo, NavigationData, find_path, move_step, nearest_point,
+};
 use crate::physics::WorldPhysics;
 use crate::reflect::{Property, PropertyKind, ScriptObject, function_flags, property_flags};
 use crate::registry::{NativeCtx, NativeDef, NativeOutcome, Registry};
@@ -152,6 +155,12 @@ pub enum VmErrorKind {
     /// A native needing sequence data ran without an animation provider set
     /// (with [`Vm::set_animation_data`]); never silently succeeds.
     NoAnimationProvider {
+        /// `Class.Function` of the native that needed it.
+        native: String,
+    },
+    /// A pathing native needing the decoded navigation graph ran without a navigation provider
+    /// set (with [`Vm::set_navigation`]); never silently succeeds.
+    NoNavProvider {
         /// `Class.Function` of the native that needed it.
         native: String,
     },
@@ -300,6 +309,22 @@ pub enum Latent {
         channel: u8,
         /// VM time when it started.
         started: f64,
+    },
+    /// `Controller.MoveTo`/`MoveToward`: latent horizontal movement of a pawn toward a point.
+    Move {
+        /// Pawn being moved.
+        pawn: ObjectId,
+        /// Destination in Unreal units (Z is left to world collision).
+        destination: [f32; 3],
+        /// Speed in Unreal units/second (`0` = the pawn's `GroundSpeed`).
+        speed: f32,
+        /// Remaining time budget in seconds; the latent ends when it drops below half a tick
+        /// even if the pawn is blocked (upstream `MoveTo`'s `MoveTimer` fail-safe).
+        remaining: f32,
+        /// VM time when it started.
+        started: f64,
+        /// Native that started the latent (`Controller.MoveTo` or `Controller.MoveToward`).
+        native: &'static str,
     },
 }
 
@@ -831,6 +856,9 @@ pub struct Vm<'s> {
     /// Animation-sequence provider (animation natives). `None` = every native that needs
     /// sequence data fails with [`VmErrorKind::NoAnimationProvider`].
     pub(crate) animation: Option<Box<dyn AnimationData>>,
+    /// Decoded navigation graph (pathing natives). `None` = every native that needs it fails
+    /// with [`VmErrorKind::NoNavProvider`].
+    pub(crate) navigation: Option<Box<dyn NavigationData>>,
     /// Outbound presentation events emitted by presentation natives (sound, texture, display,
     /// projectors). Drained with [`Vm::drain_events`].
     events: Vec<PresentationEvent>,
@@ -867,6 +895,7 @@ impl<'s> Vm<'s> {
             pending_latent: None,
             physics: None,
             animation: None,
+            navigation: None,
             events: Vec::new(),
         }
     }
@@ -901,6 +930,17 @@ impl<'s> Vm<'s> {
     /// True when an animation-sequence provider is available.
     pub fn has_animation_data(&self) -> bool {
         self.animation.is_some()
+    }
+
+    /// Sets the decoded navigation provider (pathing natives). Call before runs that need the
+    /// `ReachSpec` graph; without one those natives fail explicitly.
+    pub fn set_navigation(&mut self, provider: Box<dyn NavigationData>) {
+        self.navigation = Some(provider);
+    }
+
+    /// True when a navigation provider is available.
+    pub fn has_navigation(&self) -> bool {
+        self.navigation.is_some()
     }
 
     /// Physics natives check this before running: `Ok(true)` when a provider is present,
@@ -938,6 +978,26 @@ impl<'s> Vm<'s> {
         }
         if !self.survey {
             return Err(self.err(VmErrorKind::NoAnimationProvider {
+                native: native.to_owned(),
+            }));
+        }
+        self.survey_missing(native.to_owned(), index, this, &[], ret, false)?;
+        Ok(false)
+    }
+
+    /// Pathing natives check this before running, mirroring [`Vm::physics_ready`].
+    pub(crate) fn navigation_ready(
+        &mut self,
+        native: &str,
+        index: Option<u16>,
+        this: ObjectId,
+        ret: Value,
+    ) -> VmResult<bool> {
+        if self.navigation.is_some() {
+            return Ok(true);
+        }
+        if !self.survey {
+            return Err(self.err(VmErrorKind::NoNavProvider {
                 native: native.to_owned(),
             }));
         }
@@ -1945,6 +2005,87 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
+    /// Like [`Vm::tick`], but a failing actor is **suspended** (`active = false`) and the failure
+    /// is returned instead of aborting the whole world. The remaining actors still run their
+    /// timers, animation and state code in the same tick. The Bevy host uses this so one
+    /// unimplemented native cannot freeze the play window.
+    ///
+    /// The suspended actor is the **innermost object on the error stack** (the code that actually
+    /// failed), not necessarily the actor whose tick called it. This matters for trigger chains:
+    /// a triggered actor's failure must not suspend the triggerer. When the innermost object
+    /// cannot be resolved, the ticked actor is suspended instead. The returned vector is
+    /// `(suspended actor, error)` per failure, in processing order; the error is never silently
+    /// swallowed.
+    pub fn tick_suspending(&mut self, dt: f32) -> Vec<(ObjectId, VmError)> {
+        self.tick_count += 1;
+        self.time += f64::from(dt);
+        self.steps = 0;
+        let mut errors = Vec::new();
+        for id in 0..self.objects.len() as ObjectId {
+            if !self.objects[id as usize].active {
+                continue;
+            }
+            let mut fire = false;
+            if let Some(t) = self.objects[id as usize].timer.as_mut() {
+                t.remaining -= dt;
+                if t.remaining <= 0.0 {
+                    fire = true;
+                    if t.repeat {
+                        t.remaining += t.rate;
+                    }
+                }
+            }
+            if fire {
+                if !self.objects[id as usize]
+                    .timer
+                    .as_ref()
+                    .is_some_and(|t| t.repeat)
+                {
+                    self.objects[id as usize].timer = None;
+                }
+                let actor = self.objects[id as usize].name.clone();
+                self.note(TraceKind::Timer { actor });
+                if let Some(f) = self.find_function(id, "Timer", true)
+                    && let Err(e) = self.call_values(f, id, Vec::new())
+                {
+                    let suspended = self.suspend_for_error(id, &e);
+                    errors.push((suspended, e));
+                }
+            }
+        }
+        for id in 0..self.objects.len() as ObjectId {
+            if self.objects[id as usize].active
+                && let Err(e) = self.advance_animation(id, dt)
+            {
+                let suspended = self.suspend_for_error(id, &e);
+                errors.push((suspended, e));
+            }
+        }
+        for id in 0..self.objects.len() as ObjectId {
+            if self.objects[id as usize].active
+                && let Err(e) = self.process_state(id, dt)
+            {
+                let suspended = self.suspend_for_error(id, &e);
+                errors.push((suspended, e));
+            }
+        }
+        errors
+    }
+
+    /// Suspends the actor that should stop after a failing tick: the innermost object on the
+    /// error stack when it can be resolved, otherwise the actor being ticked. Returns the id.
+    fn suspend_for_error(&mut self, ticked: ObjectId, e: &VmError) -> ObjectId {
+        let id = e
+            .stack
+            .last()
+            .and_then(|s| self.find_live_object(&s.object))
+            .unwrap_or(ticked);
+        if let Some(o) = self.objects.get_mut(id as usize) {
+            o.active = false;
+        }
+        id
+    }
+
     // ------------------------------------------------------------------ state code
 
     pub(crate) fn do_goto_state(&mut self, id: ObjectId, state: &str, label: &str) -> VmResult<()> {
@@ -2067,6 +2208,41 @@ impl<'s> Vm<'s> {
                         started,
                     });
                 }
+                Some(Latent::Move {
+                    pawn,
+                    destination,
+                    speed,
+                    remaining,
+                    started,
+                    native,
+                }) => {
+                    // `Controller.MoveTo`/`MoveToward`: move the pawn each tick; resume when it
+                    // arrives or the budget runs out (upstream `MoveTimer`).
+                    let arrived = self.move_pawn_step(pawn, destination, speed, dt)?;
+                    let left = remaining - dt;
+                    if !arrived && left >= 0.5 * dt {
+                        if let Some(c) = self.objects[id as usize].state_code.as_mut() {
+                            c.latent = Some(Latent::Move {
+                                pawn,
+                                destination,
+                                speed,
+                                remaining: left,
+                                started,
+                                native,
+                            });
+                        }
+                        return Ok(());
+                    }
+                    if let Some(c) = self.objects[id as usize].state_code.as_mut() {
+                        c.latent = None;
+                    }
+                    let actor = self.objects[id as usize].name.clone();
+                    self.note(TraceKind::LatentResume {
+                        actor,
+                        native: native.into(),
+                        started,
+                    });
+                }
                 None => {}
             }
             let Some(h) = set.object(code.owner).and_then(ScriptObject::struct_header) else {
@@ -2106,6 +2282,26 @@ impl<'s> Vm<'s> {
                         }),
                         Latent::AnimEnd { .. } => {
                             self.note(TraceKind::AnimSuspend { actor, native })
+                        }
+                        Latent::Move {
+                            pawn,
+                            destination,
+                            speed,
+                            ..
+                        } => {
+                            let loc = self.vector_prop(*pawn, "Location").unwrap_or([0.0; 3]);
+                            let dx = destination[0] - loc[0];
+                            let dy = destination[1] - loc[1];
+                            let seconds = if *speed > 0.0 {
+                                (dx * dx + dy * dy).sqrt() / *speed
+                            } else {
+                                0.0
+                            };
+                            self.note(TraceKind::LatentStart {
+                                actor,
+                                native,
+                                seconds,
+                            })
                         }
                     }
                     if let Some(c) = self.objects[id as usize].state_code.as_mut() {
@@ -3780,7 +3976,8 @@ impl<'s> Vm<'s> {
         Ok(Some(id))
     }
 
-    pub(crate) fn vector_prop(&self, id: ObjectId, name: &str) -> Option<[f32; 3]> {
+    /// Vector property value, or `None` when the property is absent/another type.
+    pub fn vector_prop(&self, id: ObjectId, name: &str) -> Option<[f32; 3]> {
         match self.get_property(id, name)? {
             Value::Vector(v) => Some(*v),
             _ => None,
@@ -4143,6 +4340,15 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
+    /// Public wrapper for the engine's touch refresh after an **external** (host) move of `id`.
+    /// Uses `SetLocation` semantics (`skip_blocking = false`): a blocking actor does not suppress
+    /// the touch. The Bevy host calls this after writing the player pawn's `Location` from the
+    /// movement simulation, so walking into a trigger volume delivers the `Touch` the VM would
+    /// otherwise only deliver from a script `Move`/`SetLocation`.
+    pub fn refresh_touching_of(&mut self, id: ObjectId) -> VmResult<()> {
+        self.refresh_touching(id, false)
+    }
+
     /// Recomputes the touching relations of `id` after it moved or its collision changed:
     /// begins overlap with actors it now touches, ends overlap it no longer has. `skip_blocking`
     /// mirrors upstream `TryMove` (an actor cannot touch what blocks it); `SetLocation` does
@@ -4324,6 +4530,299 @@ impl<'s> Vm<'s> {
                 native: "Actor.FastTrace".into(),
             })),
         }
+    }
+
+    // ------------------------------------------------------------------ navigation / pathing
+
+    /// The navigation graph points, if a provider is installed.
+    pub(crate) fn nav_points(&self) -> Option<&[NavPointInfo]> {
+        self.navigation.as_deref().map(NavigationData::points)
+    }
+
+    /// The navigation graph edges, if a provider is installed.
+    pub(crate) fn nav_edges(&self) -> Option<&[NavEdgeInfo]> {
+        self.navigation.as_deref().map(NavigationData::edges)
+    }
+
+    /// Map instance of navigation point `id`, resolved through the point's script object path.
+    pub(crate) fn nav_point_actor(&self, id: u32) -> Option<ObjectId> {
+        let p = self.nav_points()?.get(id as usize)?;
+        self.find_object(&p.actor)
+    }
+
+    /// Half-extents of `pawn` (its collision cylinder) used for edge/arrival tests.
+    fn nav_pawn_size(&self, pawn: ObjectId) -> (f32, f32) {
+        (
+            self.f32_prop(pawn, "CollisionRadius"),
+            self.f32_prop(pawn, "CollisionHeight"),
+        )
+    }
+
+    /// Shortest path from `from` to `to` over the decoded graph for a pawn of the given size.
+    /// The pawn is never treated as a player (`R_PLAYERONLY` edges are skipped).
+    pub(crate) fn nav_path_between(
+        &self,
+        from: [f32; 3],
+        to: [f32; 3],
+        radius: f32,
+        height: f32,
+    ) -> Option<Vec<u32>> {
+        let points = self.nav_points()?;
+        let edges = self.nav_edges()?;
+        let start = nearest_point(points, from)?;
+        let goal = nearest_point(points, to)?;
+        find_path(points, edges, start, goal, radius, height, false)
+    }
+
+    /// Writes a path (as actor ids) into the controller's `RouteCache` array, clearing the rest
+    /// to `None` exactly like a fixed script array. Returns the first path actor.
+    pub(crate) fn nav_set_route(
+        &mut self,
+        controller: ObjectId,
+        path: &[ObjectId],
+    ) -> Option<ObjectId> {
+        let dim = self.objects[controller as usize]
+            .layout
+            .slot_by_name("RouteCache")
+            .map_or(0, |s| s.dim);
+        for i in 0..dim {
+            let v = path.get(i).map_or(Value::Object(None), |a| {
+                Value::Object(Some(ObjRef::Instance(*a)))
+            });
+            self.set_property(controller, "RouteCache", i, v);
+        }
+        path.first().copied()
+    }
+
+    /// Shared body of `Controller.FindPathToward` / `FindPathTo`: nearest start from the pawn and
+    /// nearest goal to `goal_location`, search, write `RouteCache` and `RouteDist`, and return the
+    /// first path actor (the goal's own actor when the goal is the start node).
+    pub(crate) fn nav_find_path_to(
+        &mut self,
+        controller: ObjectId,
+        goal_location: [f32; 3],
+    ) -> VmResult<Option<ObjectId>> {
+        if !self.navigation_ready(
+            "Controller.FindPathToward",
+            None,
+            controller,
+            Value::Object(None),
+        )? {
+            return Ok(None);
+        }
+        let pawn = self.obj_prop(controller, "Pawn");
+        let (from, radius, height) = match pawn {
+            Some(p) => {
+                let (r, h) = self.nav_pawn_size(p);
+                (self.vector_prop(p, "Location").unwrap_or([0.0; 3]), r, h)
+            }
+            None => ([0.0; 3], 0.0, 0.0),
+        };
+        let path = self.nav_path_between(from, goal_location, radius, height);
+        let (actors, dist) = match path {
+            Some(points) => {
+                let mut ids = Vec::with_capacity(points.len());
+                let mut dist = 0.0f32;
+                let mut prev: Option<[f32; 3]> = None;
+                for id in &points {
+                    if let Some(p) = self.nav_points().and_then(|p| p.get(*id as usize)) {
+                        if let Some(q) = prev {
+                            dist += horizontal_distance(q, p.location);
+                        }
+                        prev = Some(p.location);
+                    }
+                    if let Some(a) = self.nav_point_actor(*id) {
+                        ids.push(a);
+                    }
+                }
+                // RouteCache holds the path *after* the node the pawn is standing on.
+                let cache = if ids.len() > 1 {
+                    ids[1..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                (cache, dist)
+            }
+            None => (Vec::new(), 0.0),
+        };
+        let first = self.nav_set_route(controller, &actors);
+        self.set_property(controller, "RouteDist", 0, Value::Float(dist));
+        Ok(first)
+    }
+
+    /// `Controller.FindRandomDest`: a deterministic pseudo-random navigation point actor.
+    pub(crate) fn nav_find_random_dest(
+        &mut self,
+        controller: ObjectId,
+    ) -> VmResult<Option<ObjectId>> {
+        if !self.navigation_ready(
+            "Controller.FindRandomDest",
+            None,
+            controller,
+            Value::Object(None),
+        )? {
+            return Ok(None);
+        }
+        let n = self.nav_points().map_or(0, |p| p.len()) as u64;
+        if n == 0 {
+            return Ok(None);
+        }
+        let idx = (self.next_random() % n) as usize;
+        Ok(self.nav_point_actor(idx as u32))
+    }
+
+    /// `Controller.LineOfSightTo`: world line trace between the controller pawn's eye and
+    /// `other`'s eye. Actor occlusion is not modelled; the no-provider case fails explicitly.
+    pub(crate) fn nav_line_of_sight_to(
+        &mut self,
+        controller: ObjectId,
+        other: ObjectId,
+    ) -> VmResult<bool> {
+        if !self.physics_ready(
+            "Controller.LineOfSightTo",
+            Some(514),
+            controller,
+            Value::Bool(false),
+        )? {
+            return Ok(false);
+        }
+        let (Some(pawn), Some(other_pawn)) = (self.obj_prop(controller, "Pawn"), Some(other))
+        else {
+            return Ok(false);
+        };
+        let a = self.eye_location(pawn);
+        let b = self.eye_location(other_pawn);
+        let hit = self.physics.as_mut().and_then(|p| p.trace(a, b, [0.0; 3]));
+        Ok(hit.is_none())
+    }
+
+    /// `Actor.Location + Actor.BaseEyeHeight` (the eye point upstream traces between).
+    fn eye_location(&self, id: ObjectId) -> [f32; 3] {
+        let l = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
+        let eye = self.f32_prop(id, "BaseEyeHeight");
+        [l[0], l[1], l[2] + eye]
+    }
+
+    /// `Controller.pointReachable`: the point is directly reachable (clear pawn trace) and a
+    /// navigation neighbourhood exists near it.
+    pub(crate) fn nav_point_reachable(
+        &mut self,
+        controller: ObjectId,
+        point: [f32; 3],
+    ) -> VmResult<bool> {
+        if !self.physics_ready(
+            "Controller.pointReachable",
+            Some(521),
+            controller,
+            Value::Bool(false),
+        )? {
+            return Ok(false);
+        }
+        let Some(pawn) = self.obj_prop(controller, "Pawn") else {
+            return Ok(false);
+        };
+        let start = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let extent = self.actor_extent(pawn);
+        let clear = self
+            .physics
+            .as_mut()
+            .is_some_and(|p| p.trace(start, point, extent).is_none());
+        if !clear {
+            return Ok(false);
+        }
+        if self.nav_points().is_some() {
+            let (r, h) = self.nav_pawn_size(pawn);
+            Ok(self.nav_path_between(start, point, r, h).is_some())
+        } else {
+            Ok(true)
+        }
+    }
+
+    /// `Controller.actorReachable`: `pointReachable` on the actor's location.
+    pub(crate) fn nav_actor_reachable(
+        &mut self,
+        controller: ObjectId,
+        other: ObjectId,
+    ) -> VmResult<bool> {
+        let point = self.vector_prop(other, "Location").unwrap_or([0.0; 3]);
+        self.nav_point_reachable(controller, point)
+    }
+
+    /// Starts a latent `MoveTo`/`MoveToward`. Returns `false` when there is no pawn to move (the
+    /// native then returns `void` without suspending, like upstream on a controller without a
+    /// pawn). `native` is recorded in the latent for the trace.
+    pub(crate) fn start_move(
+        &mut self,
+        controller: ObjectId,
+        destination: [f32; 3],
+        speed: f32,
+        native: &'static str,
+        in_state: bool,
+    ) -> VmResult<bool> {
+        if !in_state {
+            return Err(self.err(VmErrorKind::LatentOutsideState {
+                path: native.into(),
+            }));
+        }
+        if !self.physics_ready(native, None, controller, Value::Void)? {
+            return Ok(false);
+        }
+        let pawn = self.obj_prop(controller, "Pawn");
+        let Some(pawn) = pawn else {
+            return Ok(false);
+        };
+        let loc = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let speed = if speed > 0.0 {
+            speed
+        } else {
+            self.f32_prop(pawn, "GroundSpeed")
+        };
+        let distance = horizontal_distance(loc, destination);
+        let travel = if speed > 0.0 { distance / speed } else { 0.0 };
+        // Upstream MoveTo's `MoveTimer` fail-safe: give the pawn twice the nominal travel time
+        // plus a second before the latent ends even if it is stuck.
+        let budget = travel * 2.0 + 1.0;
+        self.set_property(controller, "Destination", 0, Value::Vector(destination));
+        self.pending_latent = Some(Latent::Move {
+            pawn,
+            destination,
+            speed,
+            remaining: budget,
+            started: self.time,
+            native,
+        });
+        Ok(true)
+    }
+
+    /// One tick of a `Latent::Move`: move the pawn toward its destination using the world
+    /// provider, returning whether it arrived. Extracted so tests can step the movement without
+    /// a full state frame.
+    pub(crate) fn move_pawn_step(
+        &mut self,
+        pawn: ObjectId,
+        destination: [f32; 3],
+        speed: f32,
+        dt: f32,
+    ) -> VmResult<bool> {
+        let location = self.vector_prop(pawn, "Location").unwrap_or(destination);
+        let radius = self.f32_prop(pawn, "CollisionRadius");
+        let speed = if speed > 0.0 {
+            speed
+        } else {
+            self.f32_prop(pawn, "GroundSpeed")
+        };
+        let (next, arrived) = move_step(location, destination, speed, dt, radius);
+        if arrived && next == location {
+            return Ok(true);
+        }
+        let delta = [next[0] - location[0], next[1] - location[1], 0.0];
+        let extent = self.actor_extent(pawn);
+        let end = match self.physics.as_mut() {
+            Some(p) => p.move_box(location, delta, extent).end,
+            None => add3(location, delta),
+        };
+        self.set_property(pawn, "Location", 0, Value::Vector(end));
+        Ok(horizontal_distance(end, destination) <= radius)
     }
 
     /// `Actor.SetCollision`: omitted flags keep their current value; touching is recomputed.
@@ -4820,6 +5319,13 @@ fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
         a[1] + (b[1] - a[1]) * t,
         a[2] + (b[2] - a[2]) * t,
     ]
+}
+
+/// Horizontal (XY) distance between two Unreal points.
+fn horizontal_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    (dx * dx + dy * dy).sqrt()
 }
 
 /// True when a cylinder `(loc, radius, half_height)` overlaps another cylinder, including the

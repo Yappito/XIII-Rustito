@@ -463,3 +463,39 @@ fn gog_plage00_all_classes_survey_with_diagnostic_providers() {
             .join(", ")
     );
 }
+
+/// Opt-in evidence for item3f: the real `Engine.Controller` class layout's `RouteCache` static
+/// dimension, which the navigation natives fill. Prints the dim so the report can quote it
+/// rather than guess.
+#[test]
+fn gog_engine_controller_route_cache_dim() {
+    let Some(root) = std::env::var_os("XIII_GOG_DIR") else {
+        println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let root = if root.is_relative() {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(&root)
+    } else {
+        root
+    };
+    let mut set = ScriptSet::new();
+    for path in find_by_ext(&root, "u") {
+        let data = std::fs::read(&path).expect("read package");
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let pkg = ScriptPackage::load(&name, data, &ScriptLimits::default(), &Limits::default())
+            .expect("parse package");
+        set.add(pkg);
+    }
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let controller = find_class(&set, "engine", "Controller").expect("Engine.Controller");
+    let layout = vm.class_layout(controller).expect("layout");
+    let dim = layout.slot_by_name("RouteCache").map(|s| s.dim);
+    println!("Engine.Controller.RouteCache static dim: {dim:?}");
+    assert!(dim.is_some(), "Controller has a RouteCache slot");
+}

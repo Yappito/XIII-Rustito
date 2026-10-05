@@ -788,7 +788,10 @@ type Layout = std::rc::Rc<xiii_script::vm::ClassLayout>;
 /// Resolves the inherited default layout of `Package.Class` via `Vm::class_layout`.
 /// `package`/`class` are split on the first `.`; a bare class name resolves only when
 /// `default_package` is given.
-fn class_layout_of(
+///
+/// Public within the crate so the `--play` prototype resolves its parameters with the same
+/// inheritance walk `--collision-test` uses.
+pub(crate) fn class_layout_of(
     set: &ScriptSet,
     class_path: &str,
     default_package: Option<&str>,
@@ -817,7 +820,7 @@ fn class_layout_of(
 }
 
 /// Resolved float default (first array element) of a class layout.
-fn layout_float(layout: &Layout, name: &str) -> Result<f32, String> {
+pub(crate) fn layout_float(layout: &Layout, name: &str) -> Result<f32, String> {
     let class = layout
         .chain_names
         .first()
@@ -833,12 +836,12 @@ fn layout_float(layout: &Layout, name: &str) -> Result<f32, String> {
 }
 
 /// Resolved float default or `NaN` when absent (secondary calibration fields).
-fn layout_float_opt(layout: &Layout, name: &str) -> f32 {
+pub(crate) fn layout_float_opt(layout: &Layout, name: &str) -> f32 {
     layout_float(layout, name).unwrap_or(f32::NAN)
 }
 
 /// Resolved vector default of a class layout, if present and a vector.
-fn layout_vector(layout: &Layout, name: &str) -> Option<Vec3> {
+pub(crate) fn layout_vector(layout: &Layout, name: &str) -> Option<Vec3> {
     let slot = layout.slot_by_name(name)?;
     match layout.defaults.get(slot.base) {
         Some(Value::Vector(v)) => Some(*v),
@@ -853,6 +856,49 @@ fn layout_object(layout: &Layout, name: &str) -> Option<xiii_script::ObjRef> {
         Some(Value::Object(Some(r))) => Some(*r),
         _ => None,
     }
+}
+
+/// Resolved **class** reference default of a class layout (e.g. the player pawn's
+/// `ControllerClass`). Only static class references are returned.
+pub(crate) fn layout_class(layout: &Layout, name: &str) -> Option<xiii_script::GlobalRef> {
+    let slot = layout.slot_by_name(name)?;
+    match layout.defaults.get(slot.base) {
+        Some(Value::Object(Some(ObjRef::Static(g)))) => Some(*g),
+        _ => None,
+    }
+}
+
+/// A string/name default declared **directly** on `class_path` (not inherited): e.g. a
+/// GameInfo's `DefaultPlayerClassName` or `PlayerControllerClassName`. `Ok(None)` when the class
+/// exists but the property is absent; `Err` for a missing package/class or a non-string value.
+pub(crate) fn class_own_string_default(
+    set: &ScriptSet,
+    class_path: &str,
+    prop: &str,
+) -> Result<Option<String>, String> {
+    let (pkg, class) = class_path
+        .split_once('.')
+        .ok_or_else(|| format!("class {class_path:?} is not Package.Class"))?;
+    let pi = set
+        .package_index(pkg)
+        .ok_or_else(|| format!("package {pkg} not loaded"))?;
+    let p = &set.packages[pi];
+    let e = p
+        .export_by_path(class)
+        .ok_or_else(|| format!("class {class_path} not found in {pkg}"))?;
+    let Some(ScriptObject::Class(cl)) = p.objects.get(&e) else {
+        return Err(format!("{class_path} is not a decoded class"));
+    };
+    for pr in &cl.defaults.properties {
+        if p.package.property_name(pr).eq_ignore_ascii_case(prop) {
+            return Ok(match &pr.value {
+                PropertyValue::Str(s) => Some(s.clone()),
+                PropertyValue::Name(n) => Some(p.package.name(*n).to_owned()),
+                _ => None,
+            });
+        }
+    }
+    Ok(None)
 }
 
 /// Resolved inherited collision defaults of the player pawn class.

@@ -14,6 +14,8 @@ pub enum Mode {
     Viewer,
     /// Diagnostic skinned-character viewer (M2b): `--model` + `--game-dir`.
     Skinned,
+    /// First-person movement prototype: `--play` + `--map` + `--game-dir`.
+    Play,
 }
 
 /// Viewer baked-lighting mode.
@@ -63,6 +65,8 @@ pub struct Options {
     pub reach_test: bool,
     /// Baked vertex-colour modulation (`--lighting off|baked`).
     pub lighting: Lighting,
+    /// Play prototype: deterministic input script (headless without `--screenshot`).
+    pub play_script: Option<PathBuf>,
 }
 
 impl Options {
@@ -93,6 +97,7 @@ impl Default for Options {
             frame: None,
             reach_test: false,
             lighting: Lighting::default(),
+            play_script: None,
         }
     }
 }
@@ -103,12 +108,19 @@ xiii-app [--smoke] [--frames N] [--exit-after-secs S] [--screenshot PATH]
 xiii-app --map NAME --game-dir DIR [--view x,y,z,yaw,pitch] [--dump]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH] [--lighting off|baked]
 xiii-app --map NAME --game-dir DIR --collision-test
+xiii-app --map NAME --game-dir DIR --play [--play-script FILE]
+         [--exit-after-secs S] [--screenshot PATH] [--size WxH]
 xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH]
 
   --smoke              Run the native window/GPU/input/audio smoke scene (default).
   --map NAME           Diagnostic map viewer: import NAME (e.g. Plage00) from --game-dir.
   --game-dir DIR       Owned XIII installation (read-only).
+  --play               First-person movement prototype (NOT gameplay) on --map.
+  --play-script FILE   Drive --play from a text input script; headless without --screenshot.
+                       Lines: `t=<secs> forward|back|right|left V | walk on/off | jump |
+                       yaw DEG | turn DEG | pitch DEG | teleport X Y Z` (teleport places the
+                       box centre at Unreal-unit X,Y,Z).
   --model PKG.MESH     Skinned-character viewer: decode a SkeletalMesh; several comma-
                        separated entries are placed side by side.
   --anim SEQ           Skinned viewer: play MeshAnimation sequence SEQ (default bind pose).
@@ -158,9 +170,18 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
             }
             "--screenshot" => opts.screenshot = Some(PathBuf::from(value("--screenshot")?)),
             "--no-vsync" => opts.no_vsync = true,
+            "--play" => opts.mode = Mode::Play,
+            "--play-script" => {
+                opts.play_script = Some(PathBuf::from(value("--play-script")?));
+                if opts.mode == Mode::Smoke {
+                    opts.mode = Mode::Play;
+                }
+            }
             "--map" => {
                 opts.map = Some(value("--map")?);
-                opts.mode = Mode::Viewer;
+                if opts.mode == Mode::Smoke {
+                    opts.mode = Mode::Viewer;
+                }
             }
             "--game-dir" => opts.game_dir = Some(PathBuf::from(value("--game-dir")?)),
             "--dump" => opts.dump = true,

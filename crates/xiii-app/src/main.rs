@@ -5,6 +5,7 @@
 
 mod cli;
 mod collision;
+mod play;
 mod reach;
 mod smoke;
 mod viewer;
@@ -45,6 +46,11 @@ fn main() -> AppExit {
         return reach::run(map, dir);
     }
 
+    // `--play-script` without a screenshot is the headless deterministic mode (no window).
+    if opts.mode == cli::Mode::Play && opts.play_script.is_some() && opts.screenshot.is_none() {
+        return play::run_headless(&opts);
+    }
+
     if opts.unattended() {
         println!(
             "[app] unattended run: frames={:?} exit_after_secs={:?} screenshot={:?} size={}x{} no_vsync={}",
@@ -72,6 +78,9 @@ fn main() -> AppExit {
                 cli::Mode::Skinned => {
                     "XIII Classic runtime - skinned character viewer (diagnostic)".into()
                 }
+                cli::Mode::Play => {
+                    "XIII Classic runtime - movement prototype (NOT gameplay)".into()
+                }
             },
             resolution: (opts.width, opts.height).into(),
             present_mode,
@@ -89,6 +98,9 @@ fn main() -> AppExit {
         }
         cli::Mode::Skinned => {
             app.add_plugins(viewer::skinned::SkinnedPlugin { options: opts });
+        }
+        cli::Mode::Play => {
+            app.add_plugins(play::PlayPlugin { options: opts });
         }
     }
 

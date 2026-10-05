@@ -932,6 +932,151 @@ fn set_timer(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Native
     val(Value::Void)
 }
 
+/// `Object.VRand`: a unit vector with an approximately uniform direction (upstream uses the
+/// engine RNG; the VM's deterministic PRNG is used instead — the exact sequence is not
+/// reproduced).
+fn vrand(vm: &mut Vm<'_>, _c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let u1 = vm.rand_float().clamp(0.0, 1.0);
+    let u2 = vm.rand_float().clamp(0.0, 1.0);
+    let z = 2.0 * u1 - 1.0;
+    let r = (1.0 - z * z).max(0.0).sqrt();
+    let theta = std::f32::consts::TAU * u2;
+    val(Value::Vector([r * theta.cos(), r * theta.sin(), z]))
+}
+
+/// `Actor.SetTimer2`: the decoded declaration is identical to `SetTimer` (`float`, `bool`), so
+/// the same timer semantics are used (hypothesis for XIII; the second timer's role is not
+/// established without DLL disassembly).
+fn set_timer2(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    set_timer(vm, c, a)
+}
+
+fn object_out(id: Option<ObjectId>) -> Value {
+    match id {
+        Some(id) => Value::Object(Some(ObjRef::Instance(id))),
+        None => Value::Object(None),
+    }
+}
+
+fn find_path_toward(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    if !vm.navigation_ready(
+        "Controller.FindPathToward",
+        None,
+        c.this,
+        Value::Object(None),
+    )? {
+        return val(Value::Object(None));
+    }
+    let Some(target) = instance_arg(vm, a, 0)? else {
+        return val(Value::Object(None));
+    };
+    let goal = vm.vector_prop(target, "Location").unwrap_or([0.0; 3]);
+    val(object_out(vm.nav_find_path_to(c.this, goal)?))
+}
+
+fn find_path_to(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    if !vm.navigation_ready("Controller.FindPathTo", None, c.this, Value::Object(None))? {
+        return val(Value::Object(None));
+    }
+    let goal = vector2(vm, a, 0)?;
+    val(object_out(vm.nav_find_path_to(c.this, goal)?))
+}
+
+fn find_random_dest(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    if !vm.navigation_ready(
+        "Controller.FindRandomDest",
+        None,
+        c.this,
+        Value::Object(None),
+    )? {
+        return val(Value::Object(None));
+    }
+    val(object_out(vm.nav_find_random_dest(c.this)?))
+}
+
+fn point_reachable(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let point = vector2(vm, a, 0)?;
+    val(Value::Bool(vm.nav_point_reachable(c.this, point)?))
+}
+
+fn actor_reachable(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let Some(other) = instance_arg(vm, a, 0)? else {
+        return val(Value::Bool(false));
+    };
+    val(Value::Bool(vm.nav_actor_reachable(c.this, other)?))
+}
+
+fn line_of_sight_to(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let Some(other) = instance_arg(vm, a, 0)? else {
+        return val(Value::Bool(false));
+    };
+    val(Value::Bool(vm.nav_line_of_sight_to(c.this, other)?))
+}
+
+fn move_to(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let destination = vector2(vm, a, 0)?;
+    let speed = if c.omitted(2) { 0.0 } else { float(vm, a, 2)? };
+    vm.set_property(c.this, "MoveTarget", 0, Value::Object(None));
+    vm.start_move(
+        c.this,
+        destination,
+        speed,
+        "Controller.MoveTo",
+        c.in_state_code,
+    )?;
+    val(Value::Void)
+}
+
+fn move_toward(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let Some(target) = instance_arg(vm, a, 0)? else {
+        return val(Value::Void);
+    };
+    let speed = if c.omitted(2) { 0.0 } else { float(vm, a, 2)? };
+    let destination = vm.vector_prop(target, "Location").unwrap_or([0.0; 3]);
+    vm.set_property(
+        c.this,
+        "MoveTarget",
+        0,
+        Value::Object(Some(ObjRef::Instance(target))),
+    );
+    vm.start_move(
+        c.this,
+        destination,
+        speed,
+        "Controller.MoveToward",
+        c.in_state_code,
+    )?;
+    val(Value::Void)
+}
+
+/// `Controller.FinishRotation`: snap the pawn's yaw to face the controller's `FocalPoint`.
+///
+/// The engine suspends state code while it interpolates the rotation at `RotationRate.Yaw`. The
+/// headless VM has no per-tick rotation, so the snap is applied immediately (no latent). The
+/// decoded declaration is `final latent function FinishRotation()`.
+fn finish_rotation(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    if let (Some(pawn), Some(focal)) = (
+        vm.obj_prop(c.this, "Pawn"),
+        vm.vector_prop(c.this, "FocalPoint"),
+    ) {
+        let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        // UE2 rotator units: 65536 per full turn; yaw is the Z component.
+        let dx = focal[0] - loc[0];
+        let dy = focal[1] - loc[1];
+        let yaw = (dy.atan2(dx) * (65536.0 / std::f32::consts::TAU)) as i32;
+        let rot = match vm.get_property(pawn, "Rotation") {
+            Some(Value::Rotator(r)) => [r[0], r[1], yaw],
+            _ => [0, 0, yaw],
+        };
+        vm.set_property(pawn, "Rotation", 0, Value::Rotator(rot));
+        vm.note(crate::vm::TraceKind::Log(format!(
+            "FinishRotation: {} -> yaw {}",
+            vm.objects[c.this as usize].name, yaw
+        )));
+    }
+    val(Value::Void)
+}
+
 fn class_arg(vm: &Vm<'_>, a: &[Value], i: usize) -> VmResult<Option<GlobalRef>> {
     match a.get(i) {
         Some(Value::Object(Some(ObjRef::Static(g))))
@@ -2733,6 +2878,130 @@ fn builtin_defs() -> Vec<NativeDef> {
         "engine.u Projector.AbandonProjector decoded (optional float, void); emits PresentationEvent::ProjectorAbandon",
         abandon_projector,
     ));
+    // Pathing (Part item3f). The decoded declarations and indices come from the GOG engine.u;
+    // semantics follow UE2 `AController` (upstream) and are marked `Partial` where the headless
+    // VM cannot model the engine exactly. The navigation graph comes from `Vm::set_navigation`.
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "uniform direction from the VM's deterministic PRNG; the engine RNG sequence is not reproduced",
+        ),
+        ..def(
+            "Object.VRand",
+            "native(252) final static function vector VRand()",
+            "core.u Object.VRand decoded (return Vector); UE2: random unit vector; Core.dll ?execVRand@UObject",
+            vrand,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "same timer semantics as SetTimer; the second timer's role is not established without DLL disassembly",
+        ),
+        ..def(
+            "Engine.Actor.SetTimer2",
+            "native(363) final function SetTimer2(float NewTimerRate, bool bLoop)",
+            "engine.u Actor.SetTimer2 decoded (float, bool; identical declaration to SetTimer); Engine.dll ?execSetTimer2@AActor",
+            set_timer2,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "shortest path over decoded ReachSpecs filtered by the pawn's collision size and reach flags; the engine's path weighting is not reproduced",
+        ),
+        ..def(
+            "Engine.Controller.FindPathToward",
+            "native(517) final function Actor FindPathToward(actor anActor, bool bClearPaths)",
+            "engine.u Controller.FindPathToward decoded; UE2 AController::FindPathToward builds RouteCache and returns the first path node (navig provider via Vm::set_navigation); Engine.dll ?execFindPathToward@AController",
+            find_path_toward,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "shortest path over decoded ReachSpecs filtered by the pawn's collision size and reach flags; the engine's path weighting is not reproduced",
+        ),
+        ..def(
+            "Engine.Controller.FindPathTo",
+            "native(518) final function Actor FindPathTo(vector aPoint, bool bClearPaths)",
+            "engine.u Controller.FindPathTo decoded; UE2 AController::FindPathTo; Engine.dll ?execFindPathTo@AController",
+            find_path_to,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "picks a point with the VM's deterministic PRNG; the engine uses its own RNG",
+        ),
+        ..def(
+            "Engine.Controller.FindRandomDest",
+            "native(525) final function NavigationPoint FindRandomDest(bool bClearPaths)",
+            "engine.u Controller.FindRandomDest decoded; UE2 AController::FindRandomDest; Engine.dll ?execFindRandomDest@AController",
+            find_random_dest,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "clear pawn trace plus a decoded-graph path; the engine's point-reachability test is not reproduced exactly",
+        ),
+        ..def(
+            "Engine.Controller.pointReachable",
+            "native(521) final function bool pointReachable(vector aPoint)",
+            "engine.u Controller.pointReachable decoded; UE2 AController::pointReachable; Engine.dll ?execpointReachable@AController",
+            point_reachable,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "pointReachable on the actor's Location; ignores the actor's own collision volume",
+        ),
+        ..def(
+            "Engine.Controller.actorReachable",
+            "native(520) final function bool actorReachable(actor anActor)",
+            "engine.u Controller.actorReachable decoded; UE2 AController::actorReachable; Engine.dll ?execactorReachable@AController",
+            actor_reachable,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "world line trace between the pawn eyes; actor occlusion is not modelled",
+        ),
+        ..def(
+            "Engine.Controller.LineOfSightTo",
+            "native(514) final function bool LineOfSightTo(actor Other, return bool ReturnValue)",
+            "engine.u Controller.LineOfSightTo decoded; UE2 AController::LineOfSightTo traces eye-to-eye; Engine.dll ?execLineOfSightTo@AController",
+            line_of_sight_to,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "latent horizontal movement at GroundSpeed (or the Speed argument) using the physics move_box; no acceleration, path following or footstep/floor logic; ends on arrival or after a travel-time budget",
+        ),
+        ..def(
+            "Engine.Controller.MoveTo",
+            "native(500) final latent function MoveTo(vector NewDestination, optional actor ViewFocus, optional float Speed)",
+            "engine.u Controller.MoveTo decoded; UE2 AController::MoveTo (latent) sets Destination and moves the pawn; Engine.dll ?execMoveTo@AController",
+            move_to,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "latent horizontal movement toward the target's Location; same movement model as MoveTo",
+        ),
+        ..def(
+            "Engine.Controller.MoveToward",
+            "native(502) final latent function MoveToward(actor NewTarget, optional actor ViewFocus, optional float Speed, optional actor NextTarget)",
+            "engine.u Controller.MoveToward decoded; UE2 AController::MoveToward (latent); Engine.dll ?execMoveToward@AController",
+            move_toward,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "snaps the pawn yaw to FocalPoint immediately; the engine's per-tick rotation interpolation at RotationRate.Yaw is not modelled",
+        ),
+        ..def(
+            "Engine.Controller.FinishRotation",
+            "native(508) final latent function FinishRotation()",
+            "engine.u Controller.FinishRotation decoded (void, latent); UE2 AController::FinishRotation waits for the pawn to face FocalPoint; Engine.dll ?execFinishRotation@AController",
+            finish_rotation,
+        )
+    });
     // Paths are matched without the package ("Class.Function"): strip it.
     for d in &mut v {
         if let Some(rest) = d.path.strip_prefix("Engine.") {

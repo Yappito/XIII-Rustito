@@ -86,6 +86,42 @@ and the `placement.*` provenance counters. The sky zone is rendered by a second 
 baked lighting, and the sky uses the same unlit diagnostic materials as the rest of the
 import. This is an importer diagnostic, not a playable mode.
 
+## First-person movement prototype (`--play`, `--play-script`)
+
+```sh
+cargo run --release -p xiii-app -- --play --map Plage00 --game-dir ... \
+    --exit-after-secs 4 --screenshot out.png
+cargo run --release -p xiii-app -- --play --map Plage01 --game-dir ... \
+    --play-script script.txt --exit-after-secs 12 --screenshot walk.png
+# Headless (no window, no --screenshot):
+cargo run --release -p xiii-app -- --play --map Plage00 --game-dir ... --play-script script.txt
+```
+
+A **movement prototype**, not gameplay: no script VM, no weapons, no AI (stated in the window
+title and overlay). `src/play/` imports the map through `xiii-world`, builds the box-query
+collision soup (`--collision-test`/`--reach-test` use the same one), resolves the player
+parameters from the inherited class defaults of the pawn class (`Default.ini` -> GameInfo
+`DefaultPlayerClassName`, the same resolution as `--collision-test`) and spawns the extent box
+with the shared UE2 FindSpot raise-and-drop (`collision::place_spawn`).
+
+The simulation (`play/sim.rs`) runs in Bevy `FixedUpdate` at 60 Hz (**hypothesis**: UE2 used
+variable ticks) and keeps position/velocity in **Unreal units**; the box centre and step delta
+cross into the Bevy-space collision API through the single coordinate policy in
+`xiii_decode::common`. Grounded walking uses `xiii_collision::walk_move` (step-up at upstream
+`MAXSTEPHEIGHT` 35 UU, floor-follow at `MINFLOORZ` 0.7); falling applies the decoded
+`Engine.PhysicsVolume.Gravity` (0, 0, -950 UU/s^2) and `AirControl`; a jump sets `JumpZ`. The
+vertical step uses the average of the pre/post-gravity velocity so the discrete apex matches
+`JumpZ^2/(2g)` at the fixed step. Parameters printed at startup: CollisionRadius 34,
+CollisionHeight 75 (half), BaseEyeHeight 60, GroundSpeed 472, JumpZ 420, AccelRate 2048,
+AirControl 0.35, WalkingPct 0.5, MaxFallSpeed 1200. Controls: WASD, mouse look (cursor
+grabbed), Space jump, Shift walk (GroundSpeed x WalkingPct), Esc quit; the overlay shows
+position (UU), velocity, walking/falling state, floor normal and the last contact source.
+
+`--play-script FILE` drives the same `FixedUpdate` from a text script (`t=<secs> forward 1`,
+`jump`, `walk on`, `yaw DEG`, `turn DEG`, ...) and prints a trace every 30 ticks (0.5 s).
+Without `--screenshot` it runs headless (no window). Opt-in test (`XIII_GOG_DIR`): 2 s of
+forward input from the Plage00 PlayerStart stays on the floor and moves.
+
 ## Skinned-character viewer (M2b diagnostic)
 
 ```sh
