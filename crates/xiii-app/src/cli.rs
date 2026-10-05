@@ -41,6 +41,8 @@ pub struct Options {
     pub find: Option<String>,
     /// Run the headless doorway collision test on `--map` from `--game-dir`.
     pub collision_test: bool,
+    /// Run the headless ReachSpec navigation walk test on `--map` from `--game-dir`.
+    pub reach_test: bool,
 }
 
 impl Options {
@@ -66,6 +68,7 @@ impl Default for Options {
             dump: false,
             find: None,
             collision_test: false,
+            reach_test: false,
         }
     }
 }
@@ -83,6 +86,7 @@ xiii-app --map NAME --game-dir DIR --collision-test
   --view x,y,z,yaw,pitch  Viewer camera override (Bevy metres, degrees).
   --dump               Viewer: import, print counters, exit without a window.
   --collision-test     Headless swept-collision doorway test on --map (no window).
+  --reach-test         Headless ReachSpec navigation walk test on --map (no window).
   --find TEXT          With --dump: list objects whose path/texture contains TEXT.
   --frames N           Exit cleanly after N frames and print a report.
   --exit-after-secs S  Exit cleanly after S seconds and print a report.
@@ -129,6 +133,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
             "--game-dir" => opts.game_dir = Some(PathBuf::from(value("--game-dir")?)),
             "--dump" => opts.dump = true,
             "--collision-test" => opts.collision_test = true,
+            "--reach-test" => opts.reach_test = true,
             "--find" => opts.find = Some(value("--find")?.to_ascii_lowercase()),
             "--view" => {
                 let v = value("--view")?;
