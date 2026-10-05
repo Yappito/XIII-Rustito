@@ -40,7 +40,10 @@ pub use reflect::{
     class_defaults, read_script_object, script_class_kind,
 };
 pub use value::{ObjRef, ObjectId, Ty, Value};
-pub use vm::{TraceEvent, TraceKind, Vm, VmError, VmErrorKind, VmLimits};
+pub use vm::{
+    ActorAnimation, AnimChannelState, BoneDirection, BoneState, MoverState, SpineControl,
+    TraceEvent, TraceKind, Vm, VmError, VmErrorKind, VmLimits,
+};
 
 #[cfg(test)]
 mod tests;

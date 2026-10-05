@@ -10,6 +10,7 @@
 //! Fixed 60 Hz is a **hypothesis** (UE2 used variable ticks); see [`FIXED_HZ`].
 
 pub mod movers;
+pub mod pawns;
 pub mod script;
 pub mod session;
 pub mod sim;
@@ -21,6 +22,7 @@ use std::time::{Duration, Instant};
 use bevy::camera::visibility::RenderLayers;
 use bevy::ecs::system::{NonSend, NonSendMut};
 use bevy::input::mouse::AccumulatedMouseMotion;
+use bevy::mesh::skinning::SkinnedMeshInverseBindposes;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
 use bevy::time::Fixed;
@@ -125,6 +127,8 @@ impl Plugin for PlayPlugin {
                 mouse_look,
                 sync_camera,
                 viewer::sky_follow,
+                viewer::animate_uv,
+                pawns::update_pawns,
                 overlay,
                 unattended,
             )
@@ -279,6 +283,7 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let session = match session.as_mut() {
@@ -297,6 +302,7 @@ fn setup(
         &mut meshes,
         &mut materials,
         &mut images,
+        &mut bindposes,
     ) {
         Ok(()) => {}
         Err(e) => {
@@ -306,6 +312,7 @@ fn setup(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup_inner(
     commands: &mut Commands,
     opts: &Options,
@@ -314,6 +321,7 @@ fn setup_inner(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
+    bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
 ) -> Result<(), String> {
     let started = Instant::now();
     let game_dir = opts
@@ -470,6 +478,66 @@ fn setup_inner(
         Vec3::from_array(eye),
         yaw.to_degrees()
     );
+    // GPU-skinned map pawns, placed and posed from the VM every frame (player pawn excluded).
+    let pawn_scene = pawns::setup_pawns(
+        commands, session, &game_dir, meshes, materials, images, bindposes,
+    );
+    println!(
+        "[play] pawns: {} rendered from {} decoded mesh(es); skipped {:?}{}",
+        pawn_scene.instances.len(),
+        pawn_scene.models,
+        pawn_scene.skipped,
+        if pawn_scene.attachments.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; attachments not rendered: {}",
+                pawn_scene.attachments.join(", ")
+            )
+        }
+    );
+    if pawn_scene.bone_controls_not_applied > 0 {
+        println!(
+            "[play] pawns: {} carry item3g bone-controller state (SpineYawControl/SetBoneDirection) \
+             which is not applied to the pose",
+            pawn_scene.bone_controls_not_applied
+        );
+    }
+    for inst in &pawn_scene.instances {
+        let seq = session
+            .vm()
+            .actor_animation(inst.id)
+            .and_then(|a| {
+                a.channels
+                    .iter()
+                    .filter(|c| c.active)
+                    .min_by_key(|c| c.channel)
+                    .map(|c| c.sequence.clone())
+            })
+            .unwrap_or_else(|| "<bind>".to_owned());
+        let mesh = session
+            .vm()
+            .mesh_object(inst.id)
+            .map(|(p, _)| p)
+            .unwrap_or_else(|| "?".to_owned());
+        let loc = session
+            .vm()
+            .vector_prop(inst.id, "Location")
+            .map(|l| format!("({:.1}, {:.1}, {:.1})", l[0], l[1], l[2]))
+            .unwrap_or_else(|| "?".to_owned());
+        let class = session
+            .vm()
+            .set()
+            .path(session.vm().objects[inst.id as usize].class);
+        println!(
+            "[play]   pawn {} class {class} mesh {mesh} at {loc} UU, sequence {seq}",
+            inst.name
+        );
+    }
+    for f in &pawn_scene.failures {
+        println!("[play] pawn mesh failed: {f}");
+    }
+    commands.insert_resource(pawn_scene);
     commands.insert_resource(ParamsRes(params));
     commands.insert_resource(SimRes(sim));
     commands.insert_resource(WorldRes {
@@ -694,6 +762,7 @@ fn overlay(
     cfg: Res<PlayConfig>,
     sim: Res<SimRes>,
     session: NonSend<Result<session::Session, String>>,
+    pawns: Option<Res<pawns::PawnScene>>,
     mut text: Query<&mut Text, With<PlayOverlay>>,
 ) {
     let Ok(mut text) = text.single_mut() else {
@@ -722,11 +791,38 @@ fn overlay(
         ),
         Err(e) => format!("VM unavailable: {e}"),
     };
+    let pawns_line = match pawns.as_deref() {
+        Some(p) if !p.instances.is_empty() => {
+            let shown: Vec<String> = p
+                .instances
+                .iter()
+                .take(8)
+                .map(|i| {
+                    let seq = i
+                        .current
+                        .iter()
+                        .min_by_key(|(c, _, _)| *c)
+                        .map(|(_, s, _)| s.as_str())
+                        .unwrap_or("<bind>");
+                    format!("{}={}", i.name, seq)
+                })
+                .collect();
+            format!(
+                "pawns rendered {} ({} meshes) | {}",
+                p.instances.len(),
+                p.models,
+                shown.join(", ")
+            )
+        }
+        Some(p) => format!("pawns rendered 0 ({} meshes)", p.models),
+        None => "pawns unavailable".to_owned(),
+    };
     text.0 = format!(
         "XIII play prototype (NOT a playable mission; no weapons, no full AI)\n\
          map {} | pos ({:.1}, {:.1}, {:.1}) UU | vel ({:.1}, {:.1}, {:.1}) UU/s | state {}\n\
          floor normal ({:.2}, {:.2}, {:.2}) | last contact: {}\n\
          {}\n\
+         {pawns_line}\n\
          WASD move | mouse look | Space jump | Shift walk | Esc quit",
         cfg.options.map.as_deref().unwrap_or("?"),
         s.location[0],
@@ -973,6 +1069,10 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
     let outcome = run_script(&game_dir, &map, &script, &params, &scene, duration)?;
     let session = &outcome.session;
     println!("[play] {}", session.bootstrap_note);
+    match pawns::headless_report(session, &game_dir) {
+        Ok(line) => println!("[play] {line}"),
+        Err(e) => println!("[play] pawns headless report failed: {e}"),
+    }
     println!(
         "[play] login path: script={} bootstrap={}",
         session.login_script, session.login_bootstrap

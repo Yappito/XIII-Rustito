@@ -362,6 +362,8 @@ pub struct MoverState {
 /// Per-channel animation playback state owned by the VM.
 #[derive(Debug, Clone)]
 pub(crate) struct AnimChannel {
+    /// Sequence name this channel is playing.
+    pub(crate) sequence: String,
     /// Total frames.
     pub(crate) frames: u32,
     /// Playback rate (frames/second).
@@ -447,6 +449,37 @@ pub struct BoneState {
     pub spine: Option<SpineControl>,
     /// `Actor.SetBoneDirection` requests, in call order.
     pub directions: Vec<BoneDirection>,
+}
+
+/// Read-only view of one animation channel, for a host renderer that samples the decoded
+/// `MeshAnimation` at the VM's own playback position. Frames are in animation frames (the
+/// provider's unit), matching `Actor.AnimFrame`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnimChannelState {
+    /// `Channel` argument the sequence was started on.
+    pub channel: u8,
+    /// Sequence name the channel is playing.
+    pub sequence: String,
+    /// Current position in frames.
+    pub frame: f32,
+    /// Playback rate (frames/second).
+    pub rate: f32,
+    /// Total frames of the sequence.
+    pub frames: u32,
+    /// Whether the sequence loops (no `AnimEnd`).
+    pub looping: bool,
+    /// Still advancing (false once a non-looping sequence ended).
+    pub active: bool,
+}
+
+/// Read-only per-actor animation view for the host: the candidate animation sources (the
+/// `LinkSkelAnim` links then the `Mesh`) and every channel, ordered by channel index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActorAnimation {
+    /// Animation-source object paths, in the order the VM tries them.
+    pub sources: Vec<String>,
+    /// Channels, ordered by channel index.
+    pub channels: Vec<AnimChannelState>,
 }
 
 /// One trace record.
@@ -1814,6 +1847,54 @@ impl<'s> Vm<'s> {
     /// Per-actor bone-control state (`Pawn.SpineYawControl` / `Actor.SetBoneDirection`).
     pub fn bone_state(&self, id: ObjectId) -> Option<&BoneState> {
         self.objects.get(id as usize).map(|o| &o.bone)
+    }
+
+    /// The actor's `Mesh` object as `(object path, class path)`, when it is set and non-null.
+    /// The class path is e.g. `Engine.SkeletalMesh`; a host renderer uses it to decide whether
+    /// it can decode the object. Both an exported (static) and a dynamically constructed
+    /// (instance) `Mesh` are handled.
+    pub fn mesh_object(&self, id: ObjectId) -> Option<(String, String)> {
+        let r = match self.get_property(id, "Mesh") {
+            Some(Value::Object(Some(r))) => *r,
+            _ => return None,
+        };
+        let path = self.ref_path(&r);
+        if path.is_empty() {
+            return None;
+        }
+        let class = match r {
+            ObjRef::Static(g) => self.class_path_of(g)?,
+            ObjRef::Instance(i) => {
+                let o = self.objects.get(i as usize)?;
+                self.set.path(o.class)
+            }
+        };
+        Some((path, class))
+    }
+
+    /// Read-only animation state of `id`: candidate sources and every channel. `None` when the
+    /// object is not live; an object with no channels yields empty channels (the host samples the
+    /// bind pose). This is the whole API a host renderer needs; it does not mutate the VM.
+    pub fn actor_animation(&self, id: ObjectId) -> Option<ActorAnimation> {
+        let o = self.objects.get(id as usize)?;
+        let channels = o
+            .anim
+            .channels
+            .iter()
+            .map(|(&channel, c)| AnimChannelState {
+                channel,
+                sequence: c.sequence.clone(),
+                frame: c.frame,
+                rate: c.rate,
+                frames: c.frames,
+                looping: c.looping,
+                active: c.active,
+            })
+            .collect();
+        Some(ActorAnimation {
+            sources: self.animation_sources(id),
+            channels,
+        })
     }
 
     /// `Pawn.SpineYawControl`: store the parameters for the renderer.
@@ -5382,6 +5463,7 @@ impl<'s> Vm<'s> {
         self.objects[id as usize].anim.channels.insert(
             channel,
             AnimChannel {
+                sequence: sequence.to_owned(),
                 frames: info.frames,
                 rate,
                 frame: 0.0,

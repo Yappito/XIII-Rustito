@@ -2856,6 +2856,35 @@ fn play_anim_fires_anim_end_once_at_the_right_tick() {
 }
 
 #[test]
+fn actor_animation_view_reports_sequence_frame_and_looping() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(4, 1.0)));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    play_anim(&mut vm, a, "Walk", 1.0, 0);
+    let view = vm.actor_animation(a).expect("live actor");
+    assert_eq!(view.channels.len(), 1);
+    let ch = &view.channels[0];
+    assert_eq!(ch.channel, 0);
+    assert_eq!(ch.sequence, "Walk");
+    assert_eq!(ch.frames, 4);
+    assert_eq!(ch.rate, 1.0);
+    assert!(!ch.looping);
+    assert!(ch.active);
+    // The reported frame follows the VM's own playback position.
+    vm.tick(0.5).unwrap();
+    let view = vm.actor_animation(a).expect("live actor");
+    assert_eq!(view.channels[0].frame, 0.5);
+    // An actor with no animation yields a view with no channels (the host uses the bind pose).
+    let b = vm.spawn(sg(&set, "Actor"), "B").unwrap();
+    let view = vm.actor_animation(b).expect("live actor");
+    assert!(view.channels.is_empty());
+    // The `Mesh` accessor is `None` when the actor has no mesh.
+    assert_eq!(vm.mesh_object(a), None);
+}
+
+#[test]
 fn loop_anim_loops_without_anim_end_and_reports_is_animating() {
     let set = anim_set();
     let mut vm = Vm::new(&set, VmLimits::default());
