@@ -1077,6 +1077,231 @@ fn finish_rotation(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult
     val(Value::Void)
 }
 
+/// `IAController.AllianceLevel(Pawn Newenemy) -> int`.
+///
+/// Disassembly evidence (XIDPawn.dll): `?execAllianceLevel@AIAController` (RVA 0x19E0) reads the
+/// single `Newenemy` object parameter and calls `?AllianceLevel@AIAController` (RVA 0x1920). That
+/// function returns -1 when `Newenemy` is the controller's `XIII` (`this+0x3A8`) or when `BaseS`
+/// (`this+0x3B0`) is null; otherwise it scans four `BaseS.InitialAlliances` entries (stride 8 at
+/// `BaseS+0x530`, `(FName, float)`) and returns `InitialAlliances[i].AllianceLevel` (truncated)
+/// when `InitialAlliances[i].AllianceName == Newenemy.Alliance` (`Newenemy+0x3BC`) and
+/// `Newenemy.Alliance != 'None'`; no match returns 0. The property names are calibrated by the
+/// script `IAController.SwitchToEnemy`, which implements the same algorithm symbolically.
+///
+/// The engine also returns 1 when a `Level` flag word at `Level+0x380` has bit 0x100 set. The
+/// decoded reflection does not serialize property offsets, so that anonymous bool is not
+/// reproduced (documented `Partial`).
+fn alliance_level(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let Some(newenemy) = instance_arg(vm, a, 0)? else {
+        return val(Value::Int(-1));
+    };
+    if vm.obj_prop(c.this, "XIII") == Some(newenemy) {
+        return val(Value::Int(-1));
+    }
+    let Some(base_s) = vm.obj_prop(c.this, "BaseS") else {
+        return val(Value::Int(-1));
+    };
+    let ne_alliance = match vm.get_property(newenemy, "Alliance") {
+        Some(Value::Name(n)) => n.clone(),
+        _ => "None".to_owned(),
+    };
+    if ne_alliance.eq_ignore_ascii_case("None") {
+        return val(Value::Int(0));
+    }
+    for i in 0..4 {
+        let Some(element) = vm.get_property_elem(base_s, "InitialAlliances", i) else {
+            continue;
+        };
+        let Value::Struct(fields) = element else {
+            continue;
+        };
+        let mut name = None;
+        let mut level = None;
+        for (n, v) in fields {
+            if n.eq_ignore_ascii_case("alliancename") {
+                name = Some(v.clone());
+            } else if n.eq_ignore_ascii_case("alliancelevel") {
+                level = Some(v.clone());
+            }
+        }
+        if let Some(Value::Name(n)) = name
+            && n.eq_ignore_ascii_case(&ne_alliance)
+        {
+            // The native loads the stored float and runs `_ftol` (truncation toward zero).
+            let level = match level {
+                Some(Value::Float(f)) => f as i32,
+                _ => 0,
+            };
+            return val(Value::Int(level));
+        }
+    }
+    val(Value::Int(0))
+}
+
+/// `IAController.HalteAuFeu()`.
+///
+/// Disassembly evidence (XIDPawn.dll `?execHalteAuFeu@AIAController` RVA 0x1F00): no pawn means
+/// return; otherwise the controller clears native flag words at `+0x2C` (bits 0x180000), `+0x212`
+/// (byte) and `+0x514` (bit 2), drops the four pointers at `+0x48..+0x54`, and clears bit 0x10000
+/// of the pawn flags (`Pawn+0x1F8`); if the pawn's mesh (`Pawn+0x138`) is a `SkeletalMesh` it
+/// then resets the mesh instance's bone/aim controllers. The flag words' property names are not
+/// serialized in the decoded reflection, so only the bone-control reset (and a visible trace
+/// note) is reproduced; the engine flag cleanup is not modelled (documented `Partial`).
+fn halte_au_feu(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    if let Some(pawn) = vm.obj_prop(c.this, "Pawn") {
+        vm.reset_bone_state(pawn);
+        vm.note(TraceKind::Note(format!(
+            "HalteAuFeu {}: bone-control reset (Partial: anonymous flag words +0x2C/+0x212/+0x514 not modelled)",
+            vm.objects[c.this as usize].name
+        )));
+    }
+    val(Value::Void)
+}
+
+/// `IAController.NearWall(float walldist) -> bool`.
+///
+/// Disassembly evidence (XIDPawn.dll `?execNearWall@AIAController` RVA 0x2E00): with no pawn it
+/// returns false; it builds a point at the top of the pawn (`Pawn.Location + (0,0,h)`), derives a
+/// direction from the controller's rotation via `FGlobalMath` and probes the world with
+/// `ULevel`'s line-check, storing a push-back vector and returning true when geometry is hit
+/// close by. The exact multi-trace/projection sequence is not reproduced; the model here is a
+/// single forward world line trace of length `walldist` at the top of the pawn (documented
+/// `Partial`).
+fn near_wall(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let walldist = float(vm, a, 0)?;
+    if !vm.physics_ready("IAController.NearWall", None, c.this, Value::Bool(false))? {
+        return val(Value::Bool(false));
+    }
+    let Some(pawn) = vm.obj_prop(c.this, "Pawn") else {
+        return val(Value::Bool(false));
+    };
+    let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+    let rot = match vm.get_property(pawn, "Rotation") {
+        Some(Value::Rotator(r)) => *r,
+        _ => [0, 0, 0],
+    };
+    let forward = rotator_basis(rot).0;
+    let start = [
+        loc[0],
+        loc[1],
+        loc[2] + vm.f32_prop(pawn, "CollisionHeight"),
+    ];
+    let end = [
+        start[0] + forward[0] * walldist,
+        start[1] + forward[1] * walldist,
+        start[2] + forward[2] * walldist,
+    ];
+    let hit = vm
+        .physics
+        .as_mut()
+        .and_then(|p| p.trace(start, end, [0.0; 3]));
+    val(Value::Bool(hit.is_some()))
+}
+
+/// `IAController.TestDirection(float mindist, float dist, vector Dir, out vector pick) -> bool`.
+///
+/// Disassembly evidence (XIDPawn.dll `?execTestDirection@AIAController` RVA 0x36D0): it scales
+/// `Dir` by `dist`, line-checks from the pawn toward the far point (and a second, adjusted trace
+/// on a hit), writes the resulting point to `pick`, and returns whether `pick` is at least
+/// `mindist` from the pawn. The model here is one line trace from the top of the pawn toward
+/// `Dir * dist`, with `pick` = the hit location or the clear end point (documented `Partial`).
+fn test_direction(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let mindist = float(vm, a, 0)?;
+    let dist = float(vm, a, 1)?;
+    let dir = vector2(vm, a, 2)?;
+    if !vm.physics_ready(
+        "IAController.TestDirection",
+        None,
+        c.this,
+        Value::Bool(false),
+    )? {
+        return val(Value::Bool(false));
+    }
+    let Some(pawn) = vm.obj_prop(c.this, "Pawn") else {
+        return val(Value::Bool(false));
+    };
+    let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+    let start = [
+        loc[0],
+        loc[1],
+        loc[2] + vm.f32_prop(pawn, "CollisionHeight"),
+    ];
+    let end = [
+        start[0] + dir[0] * dist,
+        start[1] + dir[1] * dist,
+        start[2] + dir[2] * dist,
+    ];
+    let hit = vm
+        .physics
+        .as_mut()
+        .and_then(|p| p.trace(start, end, [0.0; 3]));
+    let pick = hit.map_or(end, |h| h.location);
+    if a.len() > 3 {
+        a[3] = Value::Vector(pick);
+    }
+    let d = [pick[0] - loc[0], pick[1] - loc[1], pick[2] - loc[2]];
+    let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    val(Value::Bool(d2 >= mindist * mindist))
+}
+
+/// `IAController.PickStartPoint() -> PatrolPoint`.
+///
+/// Disassembly evidence (XIDPawn.dll `?execPickStartPoint@AIAController` RVA 0x3B80): with no
+/// `BaseS` it returns null; otherwise it scans a level/`Game` list of points matching a route
+/// field (`candidate+0x268 == BaseS+0x574`, then a fallback `candidate+0x268 == None`), keeps the
+/// nearest that `Pawn.actorReachable(...)` accepts, and returns it. The list and route field names
+/// are not in the decoded reflection, so this returns the nearest decoded navigation point that
+/// fits the pawn (falling back to `StartSpot`); `None` when neither is available (documented
+/// `Partial`).
+fn pick_start_point(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let Some(pawn) = vm.obj_prop(c.this, "Pawn") else {
+        return val(Value::Object(None));
+    };
+    let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+    let radius = vm.f32_prop(pawn, "CollisionRadius");
+    let height = vm.f32_prop(pawn, "CollisionHeight");
+    // The script follows `DestNavPoint.NextPatrolPoint`, so prefer an actual `PatrolPoint`.
+    if let Some(id) = vm.nav_nearest_point_actor(loc, radius, height, Some("PatrolPoint")) {
+        return val(Value::Object(Some(ObjRef::Instance(id))));
+    }
+    if let Some(id) = vm.nav_nearest_point_actor(loc, radius, height, None) {
+        return val(Value::Object(Some(ObjRef::Instance(id))));
+    }
+    if let Some(spot) = vm.obj_prop(c.this, "StartSpot") {
+        return val(Value::Object(Some(ObjRef::Instance(spot))));
+    }
+    val(Value::Object(None))
+}
+
+/// `Pawn.SpineYawControl(bool IsControlled, int MaxValue, float RotationSpeed)`.
+///
+/// Disassembly evidence (Engine.dll `?execSpineYawControl@APawn` RVA 0xAFD00): it sets/clears bit
+/// 0x80 of the pawn's native flags word at `+0x1F8` from `IsControlled`, stores `MaxValue` at
+/// `+0x208` and `RotationSpeed` at `+0x210`. The headless VM keeps the same parameters per actor
+/// for the renderer; no skeletal pose is computed (documented `Partial`).
+fn spine_yaw_control(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let is_controlled = boolean(vm, a, 0)?;
+    let max_value = int(vm, a, 1)?;
+    let rotation_speed = float(vm, a, 2)?;
+    vm.set_spine_control(c.this, is_controlled, max_value, rotation_speed);
+    val(Value::Void)
+}
+
+/// `Actor.SetBoneDirection(name BoneName, rotator BoneTurn, vector BoneTrans, float Alpha)`.
+///
+/// Disassembly evidence (Engine.dll `?execSetBoneDirection@AActor` RVA 0xE2680, forwarding to
+/// `?SetBoneDirection@USkeletalMeshInstance` RVA 0xED5C0): it applies a bone-controller request on
+/// the actor's skeletal mesh. The headless VM records the request per actor for the renderer; no
+/// skeletal transform is evaluated (documented `Partial`).
+fn set_bone_direction(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let bone = name(vm, a, 0)?;
+    let turn = rotator2(vm, a, 1)?;
+    let trans = vector2(vm, a, 2)?;
+    let alpha = float(vm, a, 3)?;
+    vm.add_bone_direction(c.this, bone, turn, trans, alpha);
+    val(Value::Void)
+}
+
 fn class_arg(vm: &Vm<'_>, a: &[Value], i: usize) -> VmResult<Option<GlobalRef>> {
     match a.get(i) {
         Some(Value::Object(Some(ObjRef::Static(g))))
@@ -3000,6 +3225,85 @@ fn builtin_defs() -> Vec<NativeDef> {
             "native(508) final latent function FinishRotation()",
             "engine.u Controller.FinishRotation decoded (void, latent); UE2 AController::FinishRotation waits for the pawn to face FocalPoint; Engine.dll ?execFinishRotation@AController",
             finish_rotation,
+        )
+    });
+    // XIII AI natives (xidpawn.u, implemented in XIDPawn.dll). Semantics from the export
+    // disassembly; each entry cites its RVA and the report with the evidence.
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "the engine's anonymous Level early-out bool at Level+0x380 bit 0x100 is not named in the decoded reflection and is not modelled; the InitialAlliances table lookup is reproduced",
+        ),
+        ..def(
+            "IAController.AllianceLevel",
+            "native(0) function int AllianceLevel(Pawn Newenemy)",
+            "XIDPawn.dll ?execAllianceLevel@AIAController RVA 0x19E0 -> ?AllianceLevel@AIAController RVA 0x1920 (returns -1 for self.XIII / null BaseS, else BaseS.InitialAlliances[i].AllianceLevel); see local/reports/item3g-xiii-ai-natives-re.md",
+            alliance_level,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "bone-control + animation reset only; the engine's anonymous controller flag words/pointers (+0x2C/+0x212/+0x514/+0x48..+0x54) are not named in the decoded reflection and are not modelled",
+        ),
+        ..def(
+            "IAController.HalteAuFeu",
+            "native(0) function HalteAuFeu()",
+            "XIDPawn.dll ?execHalteAuFeu@AIAController RVA 0x1F00 (no pawn = return; clears controller flag words, drops four pointers, clears Pawn+0x1F8 bit 0x10000, resets the skeletal-mesh bone controllers); see local/reports/item3g-xiii-ai-natives-re.md",
+            halte_au_feu,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "single forward world line trace of length walldist from the top of the pawn; the engine's multi-trace projection and push-back vector are not reproduced",
+        ),
+        ..def(
+            "IAController.NearWall",
+            "native(0) function bool NearWall(float walldist)",
+            "XIDPawn.dll ?execNearWall@AIAController RVA 0x2E00 (probes the world ahead of the pawn and returns whether geometry is close); see local/reports/item3g-xiii-ai-natives-re.md",
+            near_wall,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "one line trace from the pawn toward Dir*dist; pick = hit location or the clear end point, and the result is |pick - Pawn.Location| >= mindist; the engine's second adjusted trace is not reproduced",
+        ),
+        ..def(
+            "IAController.TestDirection",
+            "native(0) function bool TestDirection(float mindist, float dist, Vector Dir, out Vector pick)",
+            "XIDPawn.dll ?execTestDirection@AIAController RVA 0x36D0 (line-checks Dir*dist, writes pick, tests the mindist clearance); see local/reports/item3g-xiii-ai-natives-re.md",
+            test_direction,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "nearest decoded navigation point that fits the pawn (fallback Controller.StartSpot); the engine's patrol-list/route-field search is not reproduced",
+        ),
+        ..def(
+            "IAController.PickStartPoint",
+            "native(0) function PatrolPoint PickStartPoint()",
+            "XIDPawn.dll ?execPickStartPoint@AIAController RVA 0x3B80 (scans a level/Game point list for the nearest reachable point on the soldier's route); see local/reports/item3g-xiii-ai-natives-re.md",
+            pick_start_point,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "parameters are stored per actor for the renderer; no skeletal bone control is evaluated",
+        ),
+        ..def(
+            "Engine.Pawn.SpineYawControl",
+            "native(0) function SpineYawControl(bool IsControlled, int MaxValue, float RotationSpeed)",
+            "Engine.dll ?execSpineYawControl@APawn RVA 0xAFD00 (sets Pawn+0x1F8 bit 0x80 and stores MaxValue+0x208 / RotationSpeed+0x210); see local/reports/item3g-xiii-ai-natives-re.md",
+            spine_yaw_control,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "the request is recorded per actor for the renderer; no skeletal transform is evaluated",
+        ),
+        ..def(
+            "Engine.Actor.SetBoneDirection",
+            "native(399) final static function SetBoneDirection(name BoneName, rotator BoneTurn, vector BoneTrans, float Alpha)",
+            "Engine.dll ?execSetBoneDirection@AActor RVA 0xE2680 -> ?SetBoneDirection@USkeletalMeshInstance RVA 0xED5C0 (applies a bone-controller request); see local/reports/item3g-xiii-ai-natives-re.md",
+            set_bone_direction,
         )
     });
     // Paths are matched without the package ("Class.Function"): strip it.

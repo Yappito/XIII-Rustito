@@ -465,7 +465,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 171);
+    assert_eq!(defs.len(), 178);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -487,6 +487,8 @@ const IMP_OBJECTPROP: i32 = -7;
 const IMP_BOOLPROP: i32 = -8;
 const IMP_STRUCTPROP: i32 = -9;
 const IMP_STRUCT: i32 = -10;
+/// `Core.Struct` import (appended after `ArrayProperty`; used by the AI fixture).
+const IMP_STRUCT_CLASS: i32 = -13;
 
 /// Builds a package with an `Object` base and an `Actor`/`Child`/`AbstractChild` tree for
 /// spawn and lifecycle tests.
@@ -647,6 +649,15 @@ impl SpawnB {
         self.set(r, p);
     }
 
+    /// A `Core.Struct` with the given first `children` property.
+    fn strukt(&mut self, r: i32, children: i32) {
+        let friendly = self.exports[(r - 1) as usize].name;
+        // Leading `UObject` tagged-property terminator, as for properties.
+        let mut p = compact(0);
+        p.extend(self.header(0, 0, children, friendly, &[], 0));
+        self.set(r, p);
+    }
+
     /// A `Core.Class` whose tagged defaults set one int property to `default_value`.
     fn class_with_int_default(
         &mut self,
@@ -709,6 +720,7 @@ impl SpawnB {
             (core, class, -1, self.name("Vector")),
             (core, class, -1, self.name("Rotator")),
             (core, class, -1, self.name("ArrayProperty")),
+            (core, class, -1, self.name("Struct")),
         ];
         let names: Vec<&str> = self.names.iter().map(String::as_str).collect();
         build_package(&names, &imports, &self.exports)
@@ -1806,6 +1818,82 @@ fn nav_set() -> ScriptSet {
     set
 }
 
+/// Fixture for the XIII AI natives (`item3g`): `Object/Actor/Pawn/Controller/IAController`, a
+/// `PatrolPoint` class, and an `AllianceEntry` struct (`AllianceName` name, `AllianceLevel` float)
+/// backing `Pawn.InitialAlliances[4]`.
+fn ai_fixture() -> Vec<u8> {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "Controller");
+    let ia_controller = b.reserve(0, 0, "IAController");
+    let patrol = b.reserve(0, 0, "PatrolPoint");
+
+    let object_extra = compact(0);
+    let vector_extra = compact(IMP_STRUCT);
+    let rotator_extra = compact(IMP_STRUCT - 1);
+
+    let alliance_entry = b.reserve(IMP_STRUCT_CLASS, 0, "AllianceEntry");
+    let entry_name = b.reserve(IMP_NAMEPROP, alliance_entry, "AllianceName");
+    let entry_level = b.reserve(IMP_FLOATPROP, alliance_entry, "AllianceLevel");
+    b.prop(entry_name, entry_level, 0);
+    b.prop(entry_level, 0, 0);
+    b.strukt(alliance_entry, entry_name);
+
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let rotation = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
+    let radius = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
+    let height = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
+
+    let ground = b.reserve(IMP_FLOATPROP, pawn, "GroundSpeed");
+    let eye = b.reserve(IMP_FLOATPROP, pawn, "BaseEyeHeight");
+    let alliance = b.reserve(IMP_NAMEPROP, pawn, "Alliance");
+    let initial_alliances = b.reserve(IMP_STRUCTPROP, pawn, "InitialAlliances");
+
+    let c_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
+    let c_xiii = b.reserve(IMP_OBJECTPROP, controller, "XIII");
+    let c_base = b.reserve(IMP_OBJECTPROP, controller, "BaseS");
+    let c_start = b.reserve(IMP_OBJECTPROP, controller, "StartSpot");
+    let c_dest = b.reserve(IMP_STRUCTPROP, controller, "Destination");
+
+    b.prop_with(location, rotation, 0, &vector_extra);
+    b.prop_with(rotation, radius, 0, &rotator_extra);
+    b.prop(radius, height, 0);
+    b.prop(height, 0, 0);
+    b.prop(ground, eye, 0);
+    b.prop(eye, alliance, 0);
+    b.prop(alliance, initial_alliances, 0);
+    b.prop_array_dim(initial_alliances, 0, 0, alliance_entry, 4);
+    b.prop_with(c_pawn, c_xiii, 0, &object_extra);
+    b.prop_with(c_xiii, c_base, 0, &object_extra);
+    b.prop_with(c_base, c_start, 0, &object_extra);
+    b.prop_with(c_start, c_dest, 0, &object_extra);
+    b.prop_with(c_dest, 0, 0, &vector_extra);
+
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, location, 0);
+    b.class(pawn, actor, ground, 0);
+    b.class(controller, actor, c_pawn, 0);
+    b.class(ia_controller, controller, 0, 0);
+    b.class(patrol, actor, 0, 0);
+    b.build()
+}
+
+fn ai_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Test",
+        ai_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
 /// Test navigation graph: Nav0 -500-> Nav1 -500-> Nav2, in Unreal space.
 struct MockNav {
     points: Vec<NavPointInfo>,
@@ -1840,6 +1928,14 @@ impl MockNav {
                     distance: 500,
                 },
             ],
+        }
+    }
+
+    /// A graph with the given points and no edges.
+    fn with_points(points: Vec<NavPointInfo>) -> Self {
+        Self {
+            points,
+            edges: Vec::new(),
         }
     }
 }
@@ -3820,5 +3916,295 @@ fn move_to_outside_state_code_is_rejected() {
     assert!(
         matches!(&e.kind, VmErrorKind::LatentOutsideState { path } if path == "Controller.MoveTo"),
         "{e}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// XIII AI natives (item3g)
+
+fn alliance_entry(name: &str, level: f32) -> Value {
+    Value::Struct(vec![
+        ("alliancename".to_owned(), Value::Name(name.to_owned())),
+        ("alliancelevel".to_owned(), Value::Float(level)),
+    ])
+}
+
+/// Calls `IAController.AllianceLevel` on `ctrl` with `enemy`.
+fn alliance_level(vm: &mut Vm<'_>, ctrl: ObjectId, enemy: Option<ObjectId>) -> i32 {
+    let mut args = [match enemy {
+        Some(e) => Value::Object(Some(ObjRef::Instance(e))),
+        None => Value::Object(None),
+    }];
+    match call_native(vm, "IAController.AllianceLevel", ctrl, &[false], &mut args) {
+        NativeOutcome::Value(Value::Int(v)) => v,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn alliance_level_table_and_guards() {
+    let set = ai_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let ctrl = vm.spawn(pg(&set, "IAController"), "C").unwrap();
+    let base = spawn_at(&mut vm, &set, "Pawn", "Base", [0.0, 0.0, 0.0]);
+    let xiii = spawn_at(&mut vm, &set, "Pawn", "XIII", [0.0, 0.0, 0.0]);
+    vm.set_property(base, "Alliance", 0, Value::Name("NMI".into()));
+    for (i, e) in [
+        alliance_entry("Player", -1.0),
+        alliance_entry("NMI", 1.0),
+        alliance_entry("Civil", 0.0),
+        alliance_entry("Faction", 0.5),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(vm.set_property(base, "InitialAlliances", i, e), "slot {i}");
+    }
+    vm.set_property(
+        ctrl,
+        "BaseS",
+        0,
+        Value::Object(Some(ObjRef::Instance(base))),
+    );
+    vm.set_property(ctrl, "XIII", 0, Value::Object(Some(ObjRef::Instance(xiii))));
+
+    // The controller's own XIII is always an enemy.
+    assert_eq!(alliance_level(&mut vm, ctrl, Some(xiii)), -1);
+    // A null argument (missing BaseS check cannot help) returns -1 via the XIII comparison
+    // only when XIII is null; here it takes the null-arg path.
+    assert_eq!(alliance_level(&mut vm, ctrl, None), -1);
+
+    // Matching `NMI` -> the stored level.
+    let nmi = spawn_at(&mut vm, &set, "Pawn", "NmiFriend", [0.0, 0.0, 0.0]);
+    vm.set_property(nmi, "Alliance", 0, Value::Name("NMI".into()));
+    assert_eq!(alliance_level(&mut vm, ctrl, Some(nmi)), 1);
+
+    // `Faction` at 0.5 is truncated toward zero.
+    let faction = spawn_at(&mut vm, &set, "Pawn", "FactionPal", [0.0, 0.0, 0.0]);
+    vm.set_property(faction, "Alliance", 0, Value::Name("Faction".into()));
+    assert_eq!(alliance_level(&mut vm, ctrl, Some(faction)), 0);
+
+    // `None` alliance never matches even when an entry is named `None` (engine guard).
+    let none = spawn_at(&mut vm, &set, "Pawn", "NoAlliance", [0.0, 0.0, 0.0]);
+    vm.set_property(none, "Alliance", 0, Value::Name("None".into()));
+    assert_eq!(alliance_level(&mut vm, ctrl, Some(none)), 0);
+
+    // Unmatched alliance -> neutral 0.
+    let other = spawn_at(&mut vm, &set, "Pawn", "Stranger", [0.0, 0.0, 0.0]);
+    vm.set_property(other, "Alliance", 0, Value::Name("Zorg".into()));
+    assert_eq!(alliance_level(&mut vm, ctrl, Some(other)), 0);
+
+    // A controller with no BaseS returns -1 (engine early-out).
+    let lonely = vm.spawn(pg(&set, "IAController"), "Lonely").unwrap();
+    assert_eq!(alliance_level(&mut vm, lonely, Some(nmi)), -1);
+}
+
+#[test]
+fn spine_control_and_bone_direction_are_stored_per_actor() {
+    let set = ai_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pawn = spawn_at(&mut vm, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    let mut args = [Value::Bool(true), Value::Int(2000), Value::Float(0.9)];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Engine.Pawn.SpineYawControl",
+            pawn,
+            &[false, false, false],
+            &mut args
+        ),
+        NativeOutcome::Value(Value::Void)
+    );
+    let mut args = [
+        Value::Name("X Spine".into()),
+        Value::Rotator([10, 20, 30]),
+        Value::Vector([1.0, 2.0, 3.0]),
+        Value::Float(0.5),
+    ];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Engine.Actor.SetBoneDirection",
+            pawn,
+            &[false, false, false, false],
+            &mut args
+        ),
+        NativeOutcome::Value(Value::Void)
+    );
+    let state = vm.bone_state(pawn).expect("bone state");
+    assert_eq!(
+        state.spine,
+        Some(crate::vm::SpineControl {
+            is_controlled: true,
+            max_value: 2000,
+            rotation_speed: 0.9
+        })
+    );
+    assert_eq!(state.directions.len(), 1);
+    assert_eq!(state.directions[0].bone, "X Spine");
+    assert_eq!(state.directions[0].turn, [10, 20, 30]);
+    assert_eq!(state.directions[0].trans, [1.0, 2.0, 3.0]);
+    assert_eq!(state.directions[0].alpha, 0.5);
+}
+
+#[test]
+fn halte_au_feu_clears_the_pawn_bone_state() {
+    let set = ai_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let ctrl = vm.spawn(pg(&set, "IAController"), "C").unwrap();
+    let pawn = spawn_at(&mut vm, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    vm.set_spine_control(pawn, true, 100, 1.0);
+    vm.add_bone_direction(pawn, "X Spine".into(), [0, 0, 0], [0.0; 3], 0.0);
+    let mut args: [Value; 0] = [];
+    assert_eq!(
+        call_native(&mut vm, "IAController.HalteAuFeu", ctrl, &[], &mut args),
+        NativeOutcome::Value(Value::Void)
+    );
+    let state = vm.bone_state(pawn).expect("bone state");
+    assert!(state.spine.is_none());
+    assert!(state.directions.is_empty());
+    // A controller with no pawn is a no-op.
+    let lonely = vm.spawn(pg(&set, "IAController"), "Lonely").unwrap();
+    let mut args: [Value; 0] = [];
+    assert_eq!(
+        call_native(&mut vm, "IAController.HalteAuFeu", lonely, &[], &mut args),
+        NativeOutcome::Value(Value::Void)
+    );
+}
+
+#[test]
+fn near_wall_traces_forward_from_the_pawn_top() {
+    let set = ai_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let ctrl = vm.spawn(pg(&set, "IAController"), "C").unwrap();
+    let pawn = spawn_at(&mut vm, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    vm.set_property(pawn, "CollisionHeight", 0, Value::Float(80.0));
+    vm.set_property(pawn, "Rotation", 0, Value::Rotator([0, 0, 0]));
+    vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([200.0, -50.0, 0.0], [220.0, 50.0, 200.0]),
+    ));
+    // Facing +X; the wall is at x=200.
+    let mut args = [Value::Float(300.0)];
+    assert_eq!(
+        call_native(&mut vm, "IAController.NearWall", ctrl, &[false], &mut args),
+        NativeOutcome::Value(Value::Bool(true))
+    );
+    let mut args = [Value::Float(100.0)];
+    assert_eq!(
+        call_native(&mut vm, "IAController.NearWall", ctrl, &[false], &mut args),
+        NativeOutcome::Value(Value::Bool(false))
+    );
+}
+
+#[test]
+fn test_direction_traces_and_reports_mindist_clearance() {
+    let set = ai_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let ctrl = vm.spawn(pg(&set, "IAController"), "C").unwrap();
+    let pawn = spawn_at(&mut vm, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    vm.set_property(pawn, "CollisionHeight", 0, Value::Float(80.0));
+    vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    vm.set_physics(Box::new(MockWorld::new()));
+    // Clear 300 UU to +X: pick = the end point, 300 UU from the pawn.
+    let mut args = [
+        Value::Float(150.0),
+        Value::Float(300.0),
+        Value::Vector([1.0, 0.0, 0.0]),
+        Value::Vector([0.0; 3]),
+    ];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "IAController.TestDirection",
+            ctrl,
+            &[false, false, false, true],
+            &mut args
+        ),
+        NativeOutcome::Value(Value::Bool(true))
+    );
+    assert_eq!(args[3], Value::Vector([300.0, 0.0, 80.0]));
+
+    // A wall at x=100: the pick is the hit, closer than mindist=150 -> false.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([100.0, -50.0, 0.0], [120.0, 50.0, 200.0]),
+    ));
+    let mut args = [
+        Value::Float(150.0),
+        Value::Float(300.0),
+        Value::Vector([1.0, 0.0, 0.0]),
+        Value::Vector([0.0; 3]),
+    ];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "IAController.TestDirection",
+            ctrl,
+            &[false, false, false, true],
+            &mut args
+        ),
+        NativeOutcome::Value(Value::Bool(false))
+    );
+    match args[3] {
+        Value::Vector([x, _, _]) => assert!(x <= 120.0, "pick {x}"),
+        ref other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn pick_start_point_prefers_a_patrol_point_then_falls_back() {
+    let set = ai_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let ctrl = vm.spawn(pg(&set, "IAController"), "C").unwrap();
+    let pawn = spawn_at(&mut vm, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    let _nav = spawn_at(&mut vm, &set, "Actor", "Nav0", [0.0, 0.0, 0.0]);
+    let patrol = spawn_at(&mut vm, &set, "PatrolPoint", "PP0", [400.0, 0.0, 0.0]);
+    vm.set_navigation(Box::new(MockNav::with_points(vec![
+        NavPointInfo {
+            actor: "Nav0".into(),
+            location: [0.0, 0.0, 0.0],
+            collision_radius: 120.0,
+            collision_height: 120.0,
+        },
+        NavPointInfo {
+            actor: "PP0".into(),
+            location: [400.0, 0.0, 0.0],
+            collision_radius: 120.0,
+            collision_height: 120.0,
+        },
+    ])));
+    let mut args: [Value; 0] = [];
+    assert_eq!(
+        call_native(&mut vm, "IAController.PickStartPoint", ctrl, &[], &mut args),
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(patrol))))
+    );
+
+    // No PatrolPoint: the nearest navigation point is used.
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let ctrl = vm.spawn(pg(&set, "IAController"), "C").unwrap();
+    let pawn = spawn_at(&mut vm, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    let near = spawn_at(&mut vm, &set, "Actor", "Nav0", [0.0, 0.0, 0.0]);
+    let _far = spawn_at(&mut vm, &set, "Actor", "Nav1", [900.0, 0.0, 0.0]);
+    vm.set_navigation(Box::new(MockNav::with_points(vec![
+        NavPointInfo {
+            actor: "Nav0".into(),
+            location: [0.0, 0.0, 0.0],
+            collision_radius: 120.0,
+            collision_height: 120.0,
+        },
+        NavPointInfo {
+            actor: "Nav1".into(),
+            location: [900.0, 0.0, 0.0],
+            collision_radius: 120.0,
+            collision_height: 120.0,
+        },
+    ])));
+    let mut args: [Value; 0] = [];
+    assert_eq!(
+        call_native(&mut vm, "IAController.PickStartPoint", ctrl, &[], &mut args),
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(near))))
     );
 }
