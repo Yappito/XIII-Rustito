@@ -19,7 +19,9 @@ use std::time::Instant;
 
 use xiii_package::Limits;
 use xiii_script::vm::MoverState;
-use xiii_script::{ObjRef, ObjectId, PresentationEvent, ScriptSet, Value, Vm, VmError, VmLimits};
+use xiii_script::{
+    DialogueEvent, ObjRef, ObjectId, PresentationEvent, ScriptSet, Value, Vm, VmError, VmLimits,
+};
 use xiii_world::runtime::{self, ProviderSpec};
 
 use crate::collision;
@@ -62,6 +64,11 @@ pub struct Session {
     last_synced: Vec<Option<[f32; 3]>>,
     /// Presentation events, most recent last (bounded).
     pub events: VecDeque<(f64, PresentationEvent)>,
+    /// `PlayStrVoice` dialogue events, most recent last (bounded). `dialogue_total` is the
+    /// cumulative count so a consumer can detect new entries after the bounded window wraps.
+    pub dialogues: VecDeque<(f64, DialogueEvent)>,
+    /// Cumulative number of dialogue events emitted.
+    pub dialogue_total: u64,
     /// `Touch` events involving the player, most recent last (bounded).
     pub touches: VecDeque<(f64, String)>,
     player_touching: Vec<ObjectId>,
@@ -69,8 +76,44 @@ pub struct Session {
     pub moved: Vec<MovedActor>,
     /// `XIIIDispatcher0`, if the map has one (the trigger chain's end state).
     pub dispatcher: Option<ObjectId>,
+    /// Active language code of the install's localisation files (`int`, `frt`, ...).
+    pub localization_language: String,
+    /// Number of `localized` class-default values filled from the `.int` files while building
+    /// the level's class layouts.
+    pub localized_overrides: u64,
     /// Fixed steps run.
     pub tick_count: u64,
+}
+
+/// Host-owned player movement fields published to the VM pawn each fixed tick (item7b).
+///
+/// The simulation owns the values; the VM reads them in the pawn's own code (`Landed`,
+/// `TakeFallingDamage`, states). `landed_velocity_z` is `Some` on the tick the player touches
+/// down, so `Pawn.Landed(HitNormal)` sees the impact velocity in `Pawn.Velocity.Z`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerVMModes {
+    /// `bIsCrouched` / `bWantsToCrouch`.
+    pub crouched: bool,
+    /// `bUnderWater`.
+    pub in_water: bool,
+    /// UE2 `EPhysics` byte (`PHYS_Walking`, `PHYS_Falling`, `PHYS_Swimming`, `PHYS_Ladder`).
+    pub physics: u8,
+    /// Downward velocity (Unreal units/s) at the landing, when the player landed this tick.
+    pub landed_velocity_z: Option<f32>,
+    /// Floor normal (Unreal axes) for the `Landed(HitNormal)` argument.
+    pub floor_normal: [f32; 3],
+}
+
+impl Default for PlayerVMModes {
+    fn default() -> Self {
+        Self {
+            crouched: false,
+            in_water: false,
+            physics: crate::play::sim::PHYS_WALKING,
+            landed_velocity_z: None,
+            floor_normal: [0.0, 0.0, 1.0],
+        }
+    }
 }
 
 /// Outcome of a host use action on a mover/door.
@@ -107,6 +150,14 @@ impl Session {
         let (set, map_idx) = runtime::load_with_map(game_dir, map)?;
         let set: &'static ScriptSet = Box::leak(Box::new(set));
         let mut vm = Vm::new(set, VmLimits::default());
+
+        // Install the install's localisation files before the first class layout is built, so
+        // `localized` class defaults (for example `Plage01CahuteKeyPick.PickupMessage`) are
+        // filled from the active-language `.int` as the game's classes load them.
+        let localization_language = runtime::configure_localization(&mut vm, game_dir)?;
+        // Decoded `USize`/`VSize` for textures in non-script packages (the HUD widgets read the
+        // HUD's `FondMsg` texture size while drawing).
+        runtime::configure_external_objects(&mut vm, game_dir);
 
         let anim_log = Rc::new(RefCell::new(Vec::new()));
         let providers = runtime::build_map_providers(
@@ -295,12 +346,17 @@ impl Session {
             first_error: None,
             last_synced,
             events: VecDeque::new(),
+            dialogues: VecDeque::new(),
+            dialogue_total: 0,
             touches: VecDeque::new(),
             player_touching: Vec::new(),
             moved: Vec::new(),
             dispatcher,
+            localization_language,
+            localized_overrides: 0,
             tick_count: 0,
         };
+        session.localized_overrides = session.vm.localized_overrides;
         session.suspended.dedup();
         session.drain_events();
         session.update_touches();
@@ -310,16 +366,36 @@ impl Session {
     /// One fixed step, in the documented order: write the player pawn state (owned by the
     /// movement simulation) into the VM, refresh its touches, tick the VM tolerantly, drain the
     /// presentation events and record the actors the VM moved.
-    pub fn step(&mut self, dt: f32, location: [f32; 3], yaw: f32, velocity: [f32; 3]) {
+    ///
+    /// `modes` carries the movement-mode fields the host owns (crouch/water/physics and, on the
+    /// landing tick, the impact velocity). When the player landed, the pawn's own
+    /// `Landed(HitNormal)` event runs through the VM (`XIIIPawn.Landed` ->
+    /// `TakeFallingDamage` -> `TakeDamage`), so falling damage is computed by the game's code.
+    pub fn step(
+        &mut self,
+        dt: f32,
+        location: [f32; 3],
+        yaw: f32,
+        velocity: [f32; 3],
+        modes: &PlayerVMModes,
+    ) {
         self.moved.clear();
         let profiling = self.vm.native_profile().enabled;
         let t0 = Instant::now();
         let _ = self
             .vm
             .set_property(self.player, "Location", 0, Value::Vector(location));
-        let _ = self
-            .vm
-            .set_property(self.player, "Velocity", 0, Value::Vector(velocity));
+        // On the landing tick, publish the impact velocity so `TakeFallingDamage` reads it.
+        let published_velocity = match modes.landed_velocity_z {
+            Some(vz) => [velocity[0], velocity[1], vz],
+            None => velocity,
+        };
+        let _ = self.vm.set_property(
+            self.player,
+            "Velocity",
+            0,
+            Value::Vector(published_velocity),
+        );
         let yaw_units = (yaw / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN).round() as i32;
         let _ = self.vm.set_property(
             self.player,
@@ -355,6 +431,21 @@ impl Session {
                 Value::Vector([location[0], location[1], location[2] + eye]),
             );
         }
+        let _ = self
+            .vm
+            .set_property(self.player, "bIsCrouched", 0, Value::Bool(modes.crouched));
+        let _ = self.vm.set_property(
+            self.player,
+            "bWantsToCrouch",
+            0,
+            Value::Bool(modes.crouched),
+        );
+        let _ = self
+            .vm
+            .set_property(self.player, "bUnderWater", 0, Value::Bool(modes.in_water));
+        let _ = self
+            .vm
+            .set_property(self.player, "Physics", 0, Value::Byte(modes.physics));
         if profiling {
             self.vm.native_profile_mut().player_write_micros += t0.elapsed().as_micros() as u64;
         }
@@ -370,6 +461,15 @@ impl Session {
             self.vm.native_profile_mut().touch_micros += t0.elapsed().as_micros() as u64;
         }
         self.drain_events();
+
+        // The pawn's own landing path (fall damage is the game's code, not the host's).
+        if modes.landed_velocity_z.is_some() {
+            let arg = Value::Vector(modes.floor_normal);
+            if let Err(e) = self.vm.send_event(self.player, "Landed", vec![arg]) {
+                self.record_failure("Landed", &e);
+            }
+            self.drain_events();
+        }
 
         for (id, e) in self.vm.tick_suspending(dt) {
             self.suspend(id, &e);
@@ -515,6 +615,14 @@ impl Session {
     /// Current player `Location` (UU).
     pub fn player_location(&self) -> Option<[f32; 3]> {
         self.vm.vector_prop(self.player, "Location")
+    }
+
+    /// Current player pawn `Physics` byte (`PHYS_*`).
+    pub fn player_physics(&self) -> Option<u8> {
+        match self.vm.get_property(self.player, "Physics") {
+            Some(Value::Byte(p)) => Some(*p),
+            _ => None,
+        }
     }
 
     /// Live item in `id`'s `Inventory` chain, if the property is an object reference.
@@ -849,11 +957,35 @@ impl Session {
     fn drain_events(&mut self) {
         for ev in self.vm.drain_events() {
             let t = self.vm.time;
+            if let PresentationEvent::Dialogue(d) = &ev {
+                self.dialogue_total += 1;
+                self.dialogues.push_back((t, d.clone()));
+            }
             self.events.push_back((t, ev));
         }
         while self.events.len() > 64 {
             self.events.pop_front();
         }
+        while self.dialogues.len() > 64 {
+            self.dialogues.pop_front();
+        }
+    }
+
+    /// Dialogue events emitted since `seen` (a cumulative count). Returns the events in order;
+    /// advances `seen` to [`Session::dialogue_total`]. Newest entries survive the bounded window.
+    pub fn new_dialogues(&self, seen: &mut u64) -> Vec<&DialogueEvent> {
+        if *seen >= self.dialogue_total {
+            return Vec::new();
+        }
+        let new = (self.dialogue_total - *seen).min(self.dialogues.len() as u64) as usize;
+        *seen = self.dialogue_total;
+        self.dialogues
+            .iter()
+            .rev()
+            .take(new)
+            .rev()
+            .map(|(_, d)| d)
+            .collect()
     }
 
     fn update_touches(&mut self) {
@@ -1134,7 +1266,7 @@ mod tests {
             );
             for _ in 0..120 {
                 let loc = session.player_location().unwrap_or([0.0; 3]);
-                session.step(1.0 / 60.0, loc, 0.0, [0.0; 3]);
+                session.step(1.0 / 60.0, loc, 0.0, [0.0; 3], &PlayerVMModes::default());
             }
             let after = session.player_pawn_actors();
             assert_eq!(
@@ -1144,5 +1276,40 @@ mod tests {
             );
             println!("[dupe test] {map}: one player pawn {:?}", after[0].1);
         }
+    }
+
+    /// Opt-in: falling damage comes from the pawn's own VM code. A published impact velocity
+    /// runs `XIIIPawn.Landed` -> `TakeFallingDamage` -> `TakeDamage`; the resulting `Health`
+    /// read back from the VM must be lower. A failure is never silent: the pawn's `Landed`
+    /// error (if any) is recorded and printed.
+    #[test]
+    fn opt_in_banque01_falling_damage_through_vm() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Banque01").expect("open Banque01");
+        let h0 = session.player_health();
+        let loc = session.player_location().expect("player location");
+        // Land from a terminal fall: the game decides the damage.
+        let modes = PlayerVMModes {
+            landed_velocity_z: Some(-1500.0),
+            floor_normal: [0.0, 0.0, 1.0],
+            ..Default::default()
+        };
+        session.step(1.0 / 60.0, loc, 0.0, [0.0, 0.0, 0.0], &modes);
+        let h1 = session.player_health();
+        println!(
+            "[fall test] Banque01 Health {h0:?} -> {h1:?}; Landed error: {}",
+            session.first_error().unwrap_or("none")
+        );
+        let (Some(h0), Some(h1)) = (h0, h1) else {
+            panic!("the pawn has no health property");
+        };
+        assert!(
+            h1 < h0,
+            "the VM's fall damage did not reduce Health ({h0} -> {h1}); first error: {:?}",
+            session.first_error()
+        );
     }
 }

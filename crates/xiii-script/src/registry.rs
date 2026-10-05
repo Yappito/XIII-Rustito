@@ -529,6 +529,29 @@ fn caps_s(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOut
     val(Value::Str(string(vm, a, 0)?.to_ascii_uppercase()))
 }
 
+/// `Object.Localize(string SectionName, string KeyName, string PackageName)` (native 199).
+///
+/// Measured (`Core.dll` `?execLocalize@UObject` RVA `0x1DD40` -> `Localize` RVA `0x281A0`): the
+/// engine looks the key up in the package's active-language `.int`, falling back as configured,
+/// and on a miss returns the literal `"<?%s?%s.%s.%s?>"` formatted with the active language,
+/// package, section and key (observed format bytes at `0x10179574`), logging
+/// `"No localization for ..."`. The host provider owns the file lookup and fallback; the VM
+/// builds the placeholder from the provider's language. Without a provider the call fails
+/// explicitly.
+fn localize_native(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let section = string(vm, a, 0)?;
+    let key = string(vm, a, 1)?;
+    let package = string(vm, a, 2)?;
+    let value = vm
+        .localize_or_placeholder(&package, &section, &key)
+        .ok_or_else(|| {
+            vm.err(VmErrorKind::NoLocalizationProvider {
+                native: "Object.Localize".to_owned(),
+            })
+        })?;
+    val(Value::Str(value))
+}
+
 fn class_is_child_of(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let test = class_ref(vm, a, 0)?;
     let parent = class_ref(vm, a, 1)?;
@@ -775,6 +798,15 @@ fn mul_vf(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOut
     val(Value::Vector([v[0] * s, v[1] * s, v[2] * s]))
 }
 
+/// `Object.Divide_VectorFloat` (214): componentwise `vector / float` (UE2
+/// `operator/(FVector, FLOAT)`). Division by zero yields IEEE infinities/NaN, as in UE2 (not
+/// silently clamped).
+fn div_vf(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let v = vector2(vm, a, 0)?;
+    let s = float(vm, a, 1)?;
+    val(Value::Vector([v[0] / s, v[1] / s, v[2] / s]))
+}
+
 /// `Object.EqualEqual_VectorVector` (217): exact componentwise equality (UE2 `FVector::operator==`).
 fn eq_vv(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let (x, y) = (vector2(vm, a, 0)?, vector2(vm, a, 1)?);
@@ -806,7 +838,7 @@ fn normal_v(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeO
 
 /// Unreal rotator (`pitch, yaw, roll`; 65536 per turn) as its orthonormal basis axes
 /// (X forward, Y right, Z up), matching `FRotationMatrix`.
-fn rotator_basis(r: [i32; 3]) -> ([f32; 3], [f32; 3], [f32; 3]) {
+pub(crate) fn rotator_basis(r: [i32; 3]) -> ([f32; 3], [f32; 3], [f32; 3]) {
     let to_rad = |u: i32| (u as f32) * std::f32::consts::TAU / 65536.0;
     let (p, y, rl) = (to_rad(r[0]), to_rad(r[1]), to_rad(r[2]));
     let (sp, cp) = (p.sin(), p.cos());
@@ -1933,39 +1965,6 @@ fn play_snd_death_ono(_vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmRes
     val(Value::Void)
 }
 
-/// item14 `Object.Divide_VectorFloat`: the UE2 `vector / float` operator, used by
-/// `XIIIPawn.TakeDamage` (`DeathMomentum = Momentum / Mass`).
-fn div_vf(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let v = vector2(vm, a, 0)?;
-    let f = float(vm, a, 1)?;
-    val(Value::Vector([v[0] / f, v[1] / f, v[2] / f]))
-}
-
-/// item14 `Object.Or_IntInt`: the UE2 bitwise integer OR, used by
-/// `XIIIWeapon.RealTraceFire` to combine the `AdditionalTraceType` bits (16384 | 65536).
-fn or_int(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let (x, y) = (int(vm, a, 0)?, int(vm, a, 1)?);
-    val(Value::Int(x | y))
-}
-
-/// item14 `Object.GetAxes`: the UE2 `(rotator -> forward/right/up)` basis used by
-/// `XIIIWeapon.RealTraceFire` to build the trace direction. Shares [`rotator_basis`] with the
-/// `<<`/`>>` vector-rotator operators.
-fn get_axes(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let r = rotator2(vm, a, 0)?;
-    let (x, y, z) = rotator_basis(r);
-    if a.len() > 1 {
-        a[1] = Value::Vector(x);
-    }
-    if a.len() > 2 {
-        a[2] = Value::Vector(y);
-    }
-    if a.len() > 3 {
-        a[3] = Value::Vector(z);
-    }
-    val(Value::Void)
-}
-
 /// item14 `Weapon.PlayFiringSound`: the engine-side firing sound. The VM has no per-weapon
 /// firing-sound mapping (HX resolution is host-side), so the call is accepted and discarded;
 /// `Beretta.PlayFiring` calls it on every shot.
@@ -2054,6 +2053,88 @@ fn make_color(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nativ
         ("b".into(), Value::Byte(b)),
         ("a".into(), Value::Byte(alpha)),
     ]))
+}
+
+/// The named byte members of a `Color` struct value.
+fn color_fields(vm: &Vm<'_>, a: &[Value], i: usize) -> VmResult<Vec<(String, Value)>> {
+    match a.get(i) {
+        Some(Value::Struct(f)) if f.len() == 4 => Ok(f.clone()),
+        Some(v) => Err(type_err(vm, "struct<Color>", v)),
+        None => Err(vm.err(VmErrorKind::Other("missing Color argument".into()))),
+    }
+}
+
+fn color_channel(fields: &[(String, Value)], name: &str) -> i32 {
+    fields
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .and_then(|(_, v)| match v {
+            Value::Byte(b) => Some(i32::from(*b)),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn clamp_byte(v: i32) -> Value {
+    Value::Byte(v.clamp(0, 255) as u8)
+}
+
+/// A `Color` rebuilt in the component order of the first operand, from `(b, g, r, a)`.
+fn color_from_bgra(order: &[(String, Value)], bgra: [i32; 4]) -> Value {
+    let pick = |name: &str| match name.to_ascii_lowercase().as_str() {
+        "b" => clamp_byte(bgra[0]),
+        "g" => clamp_byte(bgra[1]),
+        "r" => clamp_byte(bgra[2]),
+        "a" => clamp_byte(bgra[3]),
+        _ => Value::Byte(0),
+    };
+    Value::Struct(order.iter().map(|(k, _)| (k.clone(), pick(k))).collect())
+}
+
+/// `Actor.Multiply_ColorFloat(Color A, float B)` (native 552): componentwise `A * B`, truncated
+/// and clamped to `[0,255]` (UE2 `FColor` scalar multiply). Called by the HUD widget draw path
+/// (`XIIIBaseHud`/`HudState.DrawStt`).
+fn multiply_color_float(
+    vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let fields = color_fields(vm, a, 0)?;
+    let f = float(vm, a, 1)?;
+    let m = |name: &str| (color_channel(&fields, name) as f32 * f) as i32;
+    val(color_from_bgra(&fields, [m("b"), m("g"), m("r"), m("a")]))
+}
+
+/// `Actor.Multiply_FloatColor(float A, Color B)` (native 550): the reversed operand order.
+fn multiply_float_color(
+    vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let fields = color_fields(vm, a, 1)?;
+    let f = float(vm, a, 0)?;
+    let m = |name: &str| (color_channel(&fields, name) as f32 * f) as i32;
+    val(color_from_bgra(&fields, [m("b"), m("g"), m("r"), m("a")]))
+}
+
+/// `Actor.Add_ColorColor(Color A, Color B)` (native 551): componentwise sum, clamped.
+fn add_color_color(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let x = color_fields(vm, a, 0)?;
+    let y = color_fields(vm, a, 1)?;
+    let s = |name: &str| color_channel(&x, name) + color_channel(&y, name);
+    val(color_from_bgra(&x, [s("b"), s("g"), s("r"), s("a")]))
+}
+
+/// `Actor.Subtract_ColorColor(Color A, Color B)` (native 549): componentwise difference, clamped.
+fn subtract_color_color(
+    vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let x = color_fields(vm, a, 0)?;
+    let y = color_fields(vm, a, 1)?;
+    let d = |name: &str| color_channel(&x, name) - color_channel(&y, name);
+    val(color_from_bgra(&x, [d("b"), d("g"), d("r"), d("a")]))
 }
 
 fn play_sound(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -2281,6 +2362,11 @@ fn get_bounding_box(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult
             "max".into(),
             Value::Vector([loc[0] + r, loc[1] + r, loc[2] + h]),
         ),
+        // UE2 `FBox` also carries `IsValid` (a byte; `AActor::GetBoundingBox` constructs the box
+        // valid). Script reads it as `cast<byte->int>(Box.IsValid)` before using the bounds
+        // (`xidcine.BreakableMover.ComputeDispersal` 0x0012, `xidmaps.Map06_HualparBase.StartSnow`
+        // 0x0077); omitting it made those reads fail with "no struct member isvalid".
+        ("isvalid".into(), Value::Byte(1)),
     ]))
 }
 
@@ -2619,6 +2705,89 @@ fn def(
     }
 }
 
+/// `Object.GetAxes` (native 229): fill the rotator's orthonormal basis into the out params
+/// X (forward), Y (right), Z (up), the same `FRotationMatrix` basis as `vector >> rotator`.
+/// Decoded call site `engine.Pawn.TossWeapon` 0x0014.
+fn get_axes(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let r = rotator2(vm, a, 0)?;
+    let (x, y, z) = rotator_basis(r);
+    if a.len() >= 4 {
+        a[1] = Value::Vector(x);
+        a[2] = Value::Vector(y);
+        a[3] = Value::Vector(z);
+    }
+    val(Value::Void)
+}
+
+/// `Actor.StopAnimating` (native 417): stop the actor's animation (all channels).
+fn stop_animating(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    vm.stop_animating(c.this);
+    val(Value::Void)
+}
+
+/// Records a `LevelInfo` snow-particle native call as a visible trace note. XIII drives its
+/// snow through the `RndCubeSpr` particle system (`xidmaps.Map06_HualparBase.StartSnow`); this
+/// runtime has no particle renderer, so the request is recorded rather than silently accepted.
+fn snow_note(vm: &mut Vm<'_>, name: &str, a: &[Value]) {
+    let args: Vec<String> = a.iter().map(|v| vm.value_text(v)).collect();
+    vm.note(crate::vm::TraceKind::Log(format!(
+        "LevelInfo.{name}({}): recorded; no particle subsystem",
+        args.join(", ")
+    )));
+}
+
+fn init_rnd_cube_spr(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    snow_note(vm, "InitRndCubeSpr", a);
+    val(Value::Void)
+}
+
+fn set_rnd_cube_spr_size(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    snow_note(vm, "SetRndCubeSprSize", a);
+    val(Value::Void)
+}
+
+fn set_rnd_cube_spr_speed(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    snow_note(vm, "SetRndCubeSprSpeed", a);
+    val(Value::Void)
+}
+
+fn add_rnd_cube_spr_exclude(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    snow_note(vm, "AddRndCubeSprExclude", a);
+    val(Value::Void)
+}
+
+fn set_rnd_cube_spr_state(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    snow_note(vm, "SetRndCubeSprState", a);
+    val(Value::Void)
+}
+
+fn change_rnd_cube_spr_prop(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    snow_note(vm, "ChangeRndCubeSprProp", a);
+    // No particle system to change: report that the change was not applied (never a silent
+    // success).
+    val(Value::Bool(false))
+}
+
 fn builtin_defs() -> Vec<NativeDef> {
     let mut v = vec![
         def(
@@ -2879,6 +3048,12 @@ fn builtin_defs() -> Vec<NativeDef> {
             class_is_child_of,
         ),
         def(
+            "Object.Localize",
+            "native(199) final native static function string Localize(string SectionName, string KeyName, string PackageName)",
+            "Core.dll ?execLocalize@UObject RVA 0x1DD40 -> ?Localize RVA 0x281A0; miss placeholder \"<?%s?%s.%s.%s?>\" at VA 0x10179574",
+            localize_native,
+        ),
+        def(
             "Object.ComplementEqual_StrStr",
             "native(124) final operator bool ~=(string, string)",
             "UnrealScript `~=` is case-insensitive equality (appStricmp==0), same result as string ==; Core.dll operator thunk",
@@ -3133,6 +3308,12 @@ fn builtin_defs() -> Vec<NativeDef> {
             "native(212) final operator vector *(vector, float)",
             UE2_OP,
             mul_vf,
+        ),
+        def(
+            "Object.Divide_VectorFloat",
+            "native(214) final operator vector /(vector, float)",
+            UE2_OP,
+            div_vf,
         ),
         def(
             "Object.EqualEqual_VectorVector",
@@ -4099,27 +4280,6 @@ fn builtin_defs() -> Vec<NativeDef> {
         )
     });
     v.push(def(
-        "Object.Divide_VectorFloat",
-        "native(214) final operator vector /(vector A, float B)",
-        "core.u Object.Divide_VectorFloat decoded (vector / float); XIIIPawn.TakeDamage computes \
-         DeathMomentum = Momentum / Mass",
-        div_vf,
-    ));
-    v.push(def(
-        "Object.Or_IntInt",
-        "native(158) final operator int |(int, int)",
-        "core.u Object.Or_IntInt decoded (bitwise OR); XIIIWeapon.RealTraceFire combines the \
-         AdditionalTraceType bits 16384 | 65536",
-        or_int,
-    ));
-    v.push(def(
-        "Object.GetAxes",
-        "native(229) final static function GetAxes(rotator A, out vector X, out vector Y, out vector Z)",
-        "core.u Object.GetAxes decoded (rotator + three out vectors); UE1 FRotationMatrix basis; \
-         XIIIWeapon.RealTraceFire uses it for the trace direction and projectile aim",
-        get_axes,
-    ));
-    v.push(def(
         "Object.SubtractSubtract_Byte",
         "native(140) final native operator static function byte --(byte A)",
         "core.u Object.SubtractSubtract_Byte decoded (byte A, return byte); XIIIWeapon.LoneFire \
@@ -4233,9 +4393,102 @@ fn builtin_defs() -> Vec<NativeDef> {
             pawn_calc_draw_offset,
         )
     });
+    // `Color` operators (native 549-552). The HUD widget draw path (`HudState.DrawStt` ->
+    // `XIIIBaseHud.DrawHUD`) multiplies/tints colors; before these the HUD `PostRender`
+    // suspended on `Actor.Multiply_ColorFloat`. UE2 `FColor` scalar/vector arithmetic
+    // (truncate then clamp to 0..255).
+    v.push(def(
+        "Engine.Actor.Multiply_ColorFloat",
+        "native(552) final native operator static function Color Multiply_ColorFloat(struct<Color> A, float B)",
+        "engine.u Actor.Multiply_ColorFloat decoded; UE2 FColor::operator*(float), componentwise, clamped",
+        multiply_color_float,
+    ));
+    v.push(def(
+        "Engine.Actor.Multiply_FloatColor",
+        "native(550) final native operator static function Color Multiply_FloatColor(float A, struct<Color> B)",
+        "engine.u Actor.Multiply_FloatColor decoded; UE2 FColor::operator*(float) operand order, clamped",
+        multiply_float_color,
+    ));
+    v.push(def(
+        "Engine.Actor.Add_ColorColor",
+        "native(551) final native operator static function Color Add_ColorColor(struct<Color> A, struct<Color> B)",
+        "engine.u Actor.Add_ColorColor decoded; UE2 FColor::operator+(FColor), componentwise, clamped",
+        add_color_color,
+    ));
+    v.push(def(
+        "Engine.Actor.Subtract_ColorColor",
+        "native(549) final native operator static function Color Subtract_ColorColor(struct<Color> A, struct<Color> B)",
+        "engine.u Actor.Subtract_ColorColor decoded; UE2 FColor::operator-(FColor), componentwise, clamped",
+        subtract_color_color,
+    ));
+    // Campaign-suspension fixes (item3n): natives reached by the campaign survey after the VM
+    // fixes. Kept in one block so parallel registry edits stay out of the way.
+    v.push(def(
+        "Object.GetAxes",
+        "native(229) final native static function GetAxes(rotator A, out vector X, out vector Y, out vector Z)",
+        "core.u Object.GetAxes decoded; UE2 FRotationMatrix basis (X forward, Y right, Z up); engine.Pawn.TossWeapon 0x0014",
+        get_axes,
+    ));
+    v.push(def(
+        "Engine.Actor.StopAnimating",
+        "native(417) final function StopAnimating()",
+        "engine.u Actor.StopAnimating decoded; engine.Inventory.DropFrom 0x003A stops the dropped item's animation",
+        stop_animating,
+    ));
+    let snow_natives: [(&'static str, &'static str, NativeFn); 6] = [
+        (
+            "LevelInfo.InitRndCubeSpr",
+            "native(0) simulated function InitRndCubeSpr(object<Texture> Texture, int MaxNbrSpr, float PropSprUsed, float Distance)",
+            init_rnd_cube_spr,
+        ),
+        (
+            "LevelInfo.SetRndCubeSprSize",
+            "native(0) simulated function SetRndCubeSprSize(float NewSpriteSize, float NewSpriteSizeMax, bool IsMask)",
+            set_rnd_cube_spr_size,
+        ),
+        (
+            "LevelInfo.SetRndCubeSprSpeed",
+            "native(0) simulated function SetRndCubeSprSpeed(vector Speed, float RandomSpeed, float RandomAcc)",
+            set_rnd_cube_spr_speed,
+        ),
+        (
+            "LevelInfo.AddRndCubeSprExclude",
+            "native(0) simulated function AddRndCubeSprExclude(vector Min, vector Max)",
+            add_rnd_cube_spr_exclude,
+        ),
+        (
+            "LevelInfo.SetRndCubeSprState",
+            "native(0) simulated function SetRndCubeSprState(bool Activate)",
+            set_rnd_cube_spr_state,
+        ),
+        (
+            "LevelInfo.ChangeRndCubeSprProp",
+            "native(0) simulated function bool ChangeRndCubeSprProp(float Proportion, float FadeSpeed, float NbrSprFadePerLoop)",
+            change_rnd_cube_spr_prop,
+        ),
+    ];
+    for (path, sig, f) in snow_natives {
+        v.push(NativeDef {
+            status: NativeStatus::Partial(
+                "no particle subsystem: the call is recorded in the trace and never silently accepted",
+            ),
+            ..def(
+                path,
+                sig,
+                "engine.u LevelInfo.RndCubeSpr* decoded; xidmaps.Map06_HualparBase.StartSnow calls them",
+                f,
+            )
+        });
+    }
     // Canvas draw-recording natives (`crates/xiii-script/src/canvas.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::canvas::canvas_defs());
+    // Cinematic/dialogue natives (`crates/xiii-script/src/cinematics.rs`). Kept in one block so a
+    // parallel edit to the registry stays out of the way.
+    v.extend(crate::cinematics::cinematic_defs());
+    // Cartoon-panel natives (`crates/xiii-script/src/cartoon.rs`). Kept in one block so a
+    // parallel edit to the registry stays out of the way.
+    v.extend(crate::cartoon::cartoon_defs());
     // Paths are matched without the package ("Class.Function"): strip it.
     for d in &mut v {
         if let Some(rest) = d.path.strip_prefix("Engine.") {

@@ -9,6 +9,7 @@
 //! - `forward <v>` / `back <v>`: set the forward axis (`back` negates `v`).
 //! - `right <v>` / `left <v>`: set the strafe axis (`left` negates `v`).
 //! - `walk <0|1|on|off>`: set the Shift walk modifier.
+//! - `crouch <0|1|on|off>`: hold the crouch key (XIII `C=Duck`).
 //! - `jump`: request one jump (edge-triggered, consumed by the next tick).
 //! - `yaw <degrees>`: set absolute yaw (Unreal convention: 0 = +X, positive toward +Y).
 //! - `turn <degrees>`: add to yaw.
@@ -46,6 +47,8 @@ pub enum Command {
     Right(f32),
     /// Walk modifier.
     Walk(bool),
+    /// Crouch held.
+    Crouch(bool),
     /// Jump once.
     Jump,
     /// Absolute yaw in degrees.
@@ -116,6 +119,12 @@ impl Script {
                         .ok_or_else(|| format!("line {n}: walk needs a value"))?;
                     Command::Walk(matches!(v, "1" | "on" | "true" | "yes"))
                 }
+                "crouch" | "duck" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: crouch needs a value"))?;
+                    Command::Crouch(matches!(v, "1" | "on" | "true" | "yes"))
+                }
                 "jump" => Command::Jump,
                 "yaw" => Command::Yaw(num(&mut it)?),
                 "turn" => Command::Turn(num(&mut it)?),
@@ -172,6 +181,7 @@ pub struct Drive {
     forward: f32,
     right: f32,
     walk: bool,
+    crouch: bool,
     jump_pending: bool,
     use_pending: bool,
     fire_pending: bool,
@@ -190,6 +200,7 @@ impl Drive {
             forward: 0.0,
             right: 0.0,
             walk: false,
+            crouch: false,
             jump_pending: false,
             use_pending: false,
             fire_pending: false,
@@ -213,6 +224,7 @@ impl Drive {
                 &Command::Forward(v) => self.forward = v,
                 &Command::Right(v) => self.right = v,
                 &Command::Walk(v) => self.walk = v,
+                &Command::Crouch(v) => self.crouch = v,
                 Command::Jump => self.jump_pending = true,
                 &Command::Yaw(deg) => sim.yaw = deg.to_radians(),
                 &Command::Turn(deg) => sim.yaw += deg.to_radians(),
@@ -256,6 +268,7 @@ impl Drive {
             walk: self.walk,
             use_action,
             fire,
+            crouch: self.crouch,
         }
     }
 }
@@ -318,5 +331,20 @@ mod tests {
         let s = Script::parse("\n# nothing\n").unwrap();
         assert!(s.events.is_empty());
         assert_eq!(s.last_time(), 0.0);
+    }
+
+    #[test]
+    fn crouch_command_holds_and_releases() {
+        let s = Script::parse("t=0.0 crouch on\nt=1.0 duck off\n").unwrap();
+        let mut sim = PlayerSim::new([0.0; 3], 0.0);
+        let mut d = Drive::new(&s);
+        assert!(d.advance(0.0, &mut sim).crouch);
+        assert!(
+            d.advance(0.5, &mut sim).crouch,
+            "crouch is held, not a one-shot"
+        );
+        assert!(!d.advance(1.0, &mut sim).crouch);
+        // A missing/odd value is rejected.
+        assert!(Script::parse("t=0.0 crouch\n").is_err());
     }
 }

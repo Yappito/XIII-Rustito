@@ -69,6 +69,8 @@ pub struct Options {
     pub play_script: Option<PathBuf>,
     /// `--play` sound playback (`--audio off|on`, default on).
     pub audio: Audio,
+    /// Particle level-start state (`--particles default|all`, default default).
+    pub particles: Particles,
     /// Print a per-system performance table every [`Options::perf_interval`] seconds and at exit.
     pub perf: bool,
     /// Seconds between `--perf` tables (default 5; the final table is always printed).
@@ -85,6 +87,16 @@ pub enum Audio {
     /// Resolve sound events from the installation and play them (default).
     #[default]
     On,
+}
+
+/// Particle level-start state handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Particles {
+    /// Honour the level-start state: triggered emitters (`TrigerredEmitter`, ...) start inactive.
+    #[default]
+    Default,
+    /// Force every emitter active (inspection of triggered effects).
+    All,
 }
 
 impl Options {
@@ -117,6 +129,7 @@ impl Default for Options {
             lighting: Lighting::default(),
             play_script: None,
             audio: Audio::default(),
+            particles: Particles::default(),
             perf: false,
             perf_interval: 5.0,
             perf_natives: false,
@@ -141,10 +154,13 @@ xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
   --play               First-person movement prototype (NOT gameplay) on --map.
   --audio off|on       Play resolved VM sound/music events (default on); `off` resolves
                        and plays nothing (still counts events in the overlay).
-  --play-script FILE   Drive --play from a text input script; headless without --screenshot.
-                       Lines: `t=<secs> forward|back|right|left V | walk on/off | jump |
-                       yaw DEG | turn DEG | pitch DEG | use | teleport X Y Z` (teleport places
-                       the box centre at Unreal-unit X,Y,Z; use is the door/mover interact key).
+  --particles MODE     Particle level-start state: `default` honours the level-start state
+                       (triggered emitters start inactive); `all` forces every emitter on
+                       (inspection). Default `default`.
+   --play-script FILE   Drive --play from a text input script; headless without --screenshot.
+                        Lines: `t=<secs> forward|back|right|left V | walk on/off | crouch on/off |
+                        jump | yaw DEG | turn DEG | pitch DEG | use | teleport X Y Z` (teleport
+                        places the box centre at Unreal-unit X,Y,Z; use is the door/mover key).
   --model PKG.MESH     Skinned-character viewer: decode a SkeletalMesh; several comma-
                        separated entries are placed side by side.
   --anim SEQ           Skinned viewer: play MeshAnimation sequence SEQ (default bind pose).
@@ -234,6 +250,18 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
                     "on" => Audio::On,
                     other => {
                         return Err(format!("invalid --audio {other:?}, expected off|on"));
+                    }
+                };
+            }
+            "--particles" => {
+                let v = value("--particles")?;
+                opts.particles = match v.to_ascii_lowercase().as_str() {
+                    "default" => Particles::Default,
+                    "all" => Particles::All,
+                    other => {
+                        return Err(format!(
+                            "invalid --particles {other:?}, expected default|all"
+                        ));
                     }
                 };
             }
@@ -349,6 +377,21 @@ mod tests {
         assert_eq!(p(&["--audio", "ON"]).unwrap().audio, Audio::On);
         assert!(p(&["--audio", "maybe"]).is_err());
         assert!(p(&["--audio"]).is_err());
+    }
+
+    #[test]
+    fn parses_particles_flag() {
+        assert_eq!(p(&[]).unwrap().particles, Particles::Default);
+        assert_eq!(
+            p(&["--particles", "all"]).unwrap().particles,
+            Particles::All
+        );
+        assert_eq!(
+            p(&["--particles", "Default"]).unwrap().particles,
+            Particles::Default
+        );
+        assert!(p(&["--particles", "maybe"]).is_err());
+        assert!(p(&["--particles"]).is_err());
     }
 
     #[test]
