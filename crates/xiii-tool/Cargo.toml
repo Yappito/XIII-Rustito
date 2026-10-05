@@ -20,6 +20,7 @@ xiii-decode.workspace = true
 xiii-install.workspace = true
 xiii-script.workspace = true
 xiii-audio.workspace = true
+xiii-collision.workspace = true
 xiii-world.workspace = true
 serde_json.workspace = true
 

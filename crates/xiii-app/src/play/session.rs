@@ -332,6 +332,12 @@ impl Session {
         self.vm.time
     }
 
+    /// Read-only access to the script VM for host-side queries (the `--play` pawn renderer reads
+    /// actor locations, rotations, meshes and animation channels; it never mutates the VM).
+    pub fn vm(&self) -> &Vm<'static> {
+        &self.vm
+    }
+
     /// Live actors still in the executed scope.
     pub fn active_actors(&self) -> usize {
         self.vm

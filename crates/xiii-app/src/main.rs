@@ -3,6 +3,7 @@
 //! Today this only hosts the M0 smoke test (`--smoke`, default). Real modes
 //! that import from an owned installation will be added as sibling plugins.
 
+mod audio;
 mod cli;
 mod collision;
 mod play;
@@ -100,7 +101,10 @@ fn main() -> AppExit {
             app.add_plugins(viewer::skinned::SkinnedPlugin { options: opts });
         }
         cli::Mode::Play => {
-            app.add_plugins(play::PlayPlugin { options: opts });
+            app.add_plugins(play::PlayPlugin {
+                options: opts.clone(),
+            });
+            app.add_plugins(audio::AudioFxPlugin { options: opts });
         }
     }
 

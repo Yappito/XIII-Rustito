@@ -11,20 +11,25 @@ pub mod skinned;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::RenderLayers;
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::input::mouse::AccumulatedMouseMotion;
+use bevy::math::Affine2;
 use bevy::mesh::Indices;
 use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, PrimitiveTopology, TextureDimension, TextureFormat};
+use bevy::render::render_resource::{
+    Extent3d, Face, PrimitiveTopology, TextureDimension, TextureFormat,
+};
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::cli::{Lighting, Options};
-use xiii_world::{AlphaKind, MaterialSlot, WorldScene};
+use xiii_world::WorldScene;
+use xiii_world::materials::{BlendMode, ResolvedMaterial, UvOp};
 
 /// Render layer of the playable zones (drawn by the main camera).
 pub(crate) const MAIN_LAYER: usize = 0;
@@ -92,6 +97,14 @@ struct RunState {
 #[derive(Resource, Default)]
 struct ShotFlag(bool);
 
+/// Animated texture-coordinate transform for one material handle (the transform itself lives in
+/// [`StandardMaterial::uv_transform`] and is recomputed each frame from `ops` and elapsed time).
+#[derive(Component)]
+pub(crate) struct AnimatedUv {
+    material: Handle<StandardMaterial>,
+    ops: Arc<[UvOp]>,
+}
+
 impl Plugin for ViewerPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(ViewerConfig {
@@ -111,8 +124,110 @@ impl Plugin for ViewerPlugin {
         .add_systems(Startup, setup)
         .add_systems(
             Update,
-            (fly_look, fly_move, sky_follow, pick, overlay, unattended).chain(),
+            (
+                fly_look, fly_move, sky_follow, animate_uv, pick, overlay, unattended,
+            )
+                .chain(),
         );
+    }
+}
+
+/// Composes the UV transform chain at time `t` seconds. The composition order (outer op times
+/// the accumulated inner transform) is a **hypothesis**: the exact UE2 texture-matrix order is
+/// not verified, and almost every surface material has a single operation.
+fn uv_affine(ops: &[UvOp], t: f32) -> Affine2 {
+    let tau = std::f32::consts::TAU;
+    let mut out = Affine2::IDENTITY;
+    for op in ops {
+        let m = match *op {
+            UvOp::Pan { speed_u, speed_v } => {
+                Affine2::from_translation(Vec2::new(speed_u * t, speed_v * t))
+            }
+            UvOp::Rotate {
+                base,
+                rate,
+                center_u,
+                center_v,
+            } => {
+                let angle = base + rate * t;
+                Affine2::from_translation(Vec2::new(center_u, center_v))
+                    * Affine2::from_angle(angle)
+                    * Affine2::from_translation(Vec2::new(-center_u, -center_v))
+            }
+            UvOp::Scale { scale_u, scale_v } => Affine2::from_scale(Vec2::new(scale_u, scale_v)),
+            UvOp::OscillatePan {
+                amplitude_u,
+                amplitude_v,
+                rate_u,
+                rate_v,
+                phase_u,
+                phase_v,
+            } => Affine2::from_translation(Vec2::new(
+                amplitude_u * (tau * rate_u * t + phase_u).sin(),
+                amplitude_v * (tau * rate_v * t + phase_v).sin(),
+            )),
+            UvOp::OscillateScale {
+                amplitude_u,
+                amplitude_v,
+                rate_u,
+                rate_v,
+                phase_u,
+                phase_v,
+            } => Affine2::from_scale(Vec2::new(
+                1.0 + amplitude_u * (tau * rate_u * t + phase_u).sin(),
+                1.0 + amplitude_v * (tau * rate_v * t + phase_v).sin(),
+            )),
+        };
+        out = m * out;
+    }
+    out
+}
+
+/// Maps a resolved blend to Bevy's [`AlphaMode`]. `Darken` and `Invisible` have no exact Bevy
+/// equivalent; `Darken` uses multiply, `Invisible` is approximated by a fully transparent blend.
+fn alpha_mode(blend: BlendMode) -> AlphaMode {
+    match blend {
+        BlendMode::Opaque | BlendMode::Unsupported => AlphaMode::Opaque,
+        BlendMode::Masked(t) => AlphaMode::Mask(t),
+        BlendMode::Alpha | BlendMode::Invisible => AlphaMode::Blend,
+        BlendMode::Additive => AlphaMode::Add,
+        BlendMode::Modulate | BlendMode::Darken => AlphaMode::Multiply,
+    }
+}
+
+/// Builds the unlit diagnostic material for a resolved material. Baked vertex colours still
+/// modulate the texture; this only adds blend, two-sidedness and the initial UV transform.
+fn standard_material(resolved: &ResolvedMaterial, texture: Handle<Image>) -> StandardMaterial {
+    let base_color = resolved
+        .color_tint
+        .map_or(Color::WHITE, |c| Color::linear_rgba(c[0], c[1], c[2], c[3]));
+    StandardMaterial {
+        base_color,
+        base_color_texture: Some(texture),
+        unlit: true,
+        alpha_mode: alpha_mode(resolved.blend),
+        cull_mode: if resolved.two_sided {
+            None
+        } else {
+            Some(Face::Back)
+        },
+        uv_transform: uv_affine(&resolved.uv_transform, 0.0),
+        ..default()
+    }
+}
+
+/// Recomputes every animated material's `uv_transform` from the elapsed time. Shared by the map
+/// viewer and `--play` (so animated material chains move in both).
+pub(crate) fn animate_uv(
+    time: Res<Time>,
+    animated: Query<&AnimatedUv>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let t = time.elapsed_secs();
+    for a in &animated {
+        if let Some(mut mat) = materials.get_mut(&a.material) {
+            mat.uv_transform = uv_affine(&a.ops, t);
+        }
     }
 }
 
@@ -251,6 +366,8 @@ pub(crate) fn spawn_scene_geometry(
         unlit: true,
         ..default()
     });
+    // One material per distinct resolved material (not per texture): blend, two-sidedness and
+    // UV animation are properties of the material object, not of the image alone.
     let mut material_cache: std::collections::HashMap<usize, Handle<StandardMaterial>> =
         Default::default();
     let mut mesh_handles = Vec::with_capacity(scene.meshes.len());
@@ -265,24 +382,15 @@ pub(crate) fn spawn_scene_geometry(
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, m.uvs.clone());
         mesh.insert_indices(Indices::U32(m.indices.clone()));
         mesh_handles.push(meshes.add(mesh));
-        let mat = match &m.material {
-            MaterialSlot::Texture(t) => material_cache
-                .entry(*t)
+        let resolved = &scene.materials[m.material_index];
+        let mat = match resolved.base {
+            Some(t) => material_cache
+                .entry(m.material_index)
                 .or_insert_with(|| {
-                    let tex = &scene.textures[*t];
-                    materials.add(StandardMaterial {
-                        base_color_texture: Some(image_handles[*t].clone()),
-                        unlit: true,
-                        alpha_mode: match tex.alpha {
-                            AlphaKind::Opaque => AlphaMode::Opaque,
-                            AlphaKind::Mask => AlphaMode::Mask(0.5),
-                            AlphaKind::Blend => AlphaMode::Blend,
-                        },
-                        ..default()
-                    })
+                    materials.add(standard_material(resolved, image_handles[t].clone()))
                 })
                 .clone(),
-            MaterialSlot::Missing(_) => missing.clone(),
+            None => missing.clone(),
         };
         mat_handles.push(mat);
     }
@@ -309,6 +417,15 @@ pub(crate) fn spawn_scene_geometry(
                 Name::new(o.path.clone()),
             ))
             .id();
+        // Animated UV transforms are per material object, not per image; several entities may
+        // share the same handle (the update system recomputes the same value for each).
+        let ops = &scene.materials[scene.meshes[o.mesh].material_index].uv_transform;
+        if !ops.is_empty() {
+            commands.entity(entity).insert(AnimatedUv {
+                material: mat_handles[o.mesh].clone(),
+                ops: Arc::from(ops.clone()),
+            });
+        }
         entities.push(entity);
     }
     entities
@@ -442,6 +559,20 @@ fn setup(
         "lighting {} | placed objects with baked vertex colours {}",
         if baked { "baked" } else { "off" },
         baked_objects
+    ));
+    let two_sided = scene.materials.iter().filter(|m| m.two_sided).count();
+    let uv_animated = scene
+        .materials
+        .iter()
+        .filter(|m| !m.uv_transform.is_empty())
+        .count();
+    let unsupported: usize = scene.materials.iter().map(|m| m.unsupported.len()).sum();
+    lines.push(format!(
+        "materials {} | two-sided {} | uv-animated {} | unsupported features {}",
+        scene.materials.len(),
+        two_sided,
+        uv_animated,
+        unsupported
     ));
     for (k, v) in &scene.counters {
         lines.push(format!("{v:>6} {k}"));
@@ -746,4 +877,61 @@ fn unattended(
     );
     println!("[viewer] crosshair at exit: {}", state.picked);
     exit.write(AppExit::Success);
+}
+
+#[cfg(test)]
+mod uv_tests {
+    use super::uv_affine;
+    use bevy::prelude::Vec2;
+    use xiii_world::materials::UvOp;
+
+    #[test]
+    fn pan_is_zero_at_t_zero_and_speed_times_t_after() {
+        let ops = [UvOp::Pan {
+            speed_u: 0.5,
+            speed_v: -0.25,
+        }];
+        let p0 = uv_affine(&ops, 0.0).transform_point2(Vec2::new(0.3, 0.4));
+        assert!((p0 - Vec2::new(0.3, 0.4)).length() < 1e-6);
+        let p1 = uv_affine(&ops, 2.0).transform_point2(Vec2::new(0.0, 0.0));
+        assert!((p1 - Vec2::new(1.0, -0.5)).length() < 1e-5, "{p1:?}");
+    }
+
+    #[test]
+    fn rotation_keeps_the_pivot_fixed() {
+        let ops = [UvOp::Rotate {
+            base: 0.0,
+            rate: 1.0,
+            center_u: 0.5,
+            center_v: 0.5,
+        }];
+        let c = uv_affine(&ops, 1.7).transform_point2(Vec2::new(0.5, 0.5));
+        assert!((c - Vec2::new(0.5, 0.5)).length() < 1e-5, "{c:?}");
+    }
+
+    #[test]
+    fn oscillating_scale_is_identity_at_zero_phase_and_t_zero() {
+        let ops = [UvOp::OscillateScale {
+            amplitude_u: 0.2,
+            amplitude_v: 0.3,
+            rate_u: 0.5,
+            rate_v: 0.5,
+            phase_u: 0.0,
+            phase_v: 0.0,
+        }];
+        let p = uv_affine(&ops, 0.0).transform_point2(Vec2::new(0.25, 0.25));
+        assert!((p - Vec2::new(0.25, 0.25)).length() < 1e-6, "{p:?}");
+        // A quarter period of a sine is the positive amplitude peak.
+        let q = uv_affine(&ops, 0.5).transform_point2(Vec2::new(1.0, 1.0));
+        assert!(
+            (q.x - 1.2).abs() < 1e-4 && (q.y - 1.3).abs() < 1e-4,
+            "{q:?}"
+        );
+    }
+
+    #[test]
+    fn empty_chain_is_identity() {
+        let p = uv_affine(&[], 12.0).transform_point2(Vec2::new(0.7, 0.1));
+        assert!((p - Vec2::new(0.7, 0.1)).length() < 1e-6);
+    }
 }

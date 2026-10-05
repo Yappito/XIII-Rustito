@@ -14,6 +14,7 @@ xiii-install.workspace = true
 xiii-decode.workspace = true
 xiii-script.workspace = true
 xiii-collision.workspace = true
+xiii-audio.workspace = true
 xiii-world.workspace = true
 
 [lints]
