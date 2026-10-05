@@ -470,6 +470,250 @@ fn bvh_matches_brute_force_on_random_soup() {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// walk_move (UE2-style walking)
+// ---------------------------------------------------------------------------------------
+
+fn big_floor(y: f32) -> Vec<Triangle> {
+    quad(
+        [-60.0, y, -60.0],
+        [60.0, y, -60.0],
+        [60.0, y, 60.0],
+        [-60.0, y, 60.0],
+    )
+}
+
+/// Walks an extent box toward +X by `step` for `steps` calls of `walk_move`, returning the
+/// last result and whether `falling` was ever reported.
+fn walk_plus_x(
+    world: &CollisionWorld,
+    start: Vec3,
+    half: Vec3,
+    step: f32,
+    steps: usize,
+    params: &WalkParams,
+) -> (MoveResult, bool) {
+    let mut pos = start;
+    let mut fell = false;
+    let mut last = walk_move(world, pos, [step, 0.0, 0.0], half, params);
+    for _ in 0..steps {
+        last = walk_move(world, pos, [step, 0.0, 0.0], half, params);
+        pos = last.position;
+        fell |= last.falling;
+    }
+    (last, fell)
+}
+
+fn walk_params(max_step_height: f32) -> WalkParams {
+    WalkParams {
+        skin: 0.001,
+        max_iterations: 4,
+        max_step_height,
+        min_floor_z: 0.7,
+    }
+}
+
+#[test]
+fn walk_over_low_plank_edge_passes() {
+    // Lower floor at y=0, a 1.8 cm raised deck from x=0, and its 1.8 cm vertical face.
+    let mut tris: Vec<(Triangle, u32)> = big_floor(0.0).into_iter().map(|t| (t, 1)).collect();
+    tris.extend(
+        quad(
+            [0.0, 0.018, -1.0],
+            [5.0, 0.018, -1.0],
+            [5.0, 0.018, 1.0],
+            [0.0, 0.018, 1.0],
+        )
+        .into_iter()
+        .map(|t| (t, 2)),
+    );
+    tris.extend(
+        quad(
+            [0.0, 0.0, -1.0],
+            [0.0, 0.018, -1.0],
+            [0.0, 0.018, 1.0],
+            [0.0, 0.0, 1.0],
+        )
+        .into_iter()
+        .map(|t| (t, 2)),
+    );
+    let w = world(tris);
+    let half = [0.3, 0.5, 0.3];
+    let (last, _) = walk_plus_x(&w, [-1.0, 0.5, 0.0], half, 0.05, 40, &walk_params(0.25));
+    assert!(
+        last.position[0] > 0.5,
+        "crossed the plank: {:?}",
+        last.position
+    );
+    assert!(
+        (last.position[1] - (0.018 + 0.5)).abs() < 0.01,
+        "stood on the deck: {:?}",
+        last.position
+    );
+}
+
+#[test]
+fn walk_up_a_14_degree_ramp_passes() {
+    // Lower floor for x<0 and a 14-degree surface rising from (0, 0).
+    let slope = 14.0f32.to_radians().tan();
+    let mut tris: Vec<(Triangle, u32)> = quad(
+        [-5.0, 0.0, -1.0],
+        [0.0, 0.0, -1.0],
+        [0.0, 0.0, 1.0],
+        [-5.0, 0.0, 1.0],
+    )
+    .into_iter()
+    .map(|t| (t, 1))
+    .collect();
+    tris.extend(
+        quad(
+            [0.0, 0.0, -1.0],
+            [20.0, 20.0 * slope, -1.0],
+            [20.0, 20.0 * slope, 1.0],
+            [0.0, 0.0, 1.0],
+        )
+        .into_iter()
+        .map(|t| (t, 2)),
+    );
+    let w = world(tris);
+    let half = [0.3, 0.5, 0.3];
+    let (last, fell) = walk_plus_x(&w, [-1.0, 0.5, 0.0], half, 0.05, 300, &walk_params(0.25));
+    assert!(
+        last.position[0] > 1.0,
+        "climbed the ramp: {:?}",
+        last.position
+    );
+    assert!(
+        last.position[1] > 0.6,
+        "gained height on the ramp: {:?}",
+        last.position
+    );
+    assert!(!fell, "never fell off the ramp");
+}
+
+#[test]
+fn walk_step_below_max_height_passes_above_is_blocked() {
+    let half = [0.3, 0.5, 0.3];
+    let build = |h: f32| {
+        let mut tris: Vec<(Triangle, u32)> = floor_y(0.0).into_iter().map(|t| (t, 1)).collect();
+        tris.extend(box_tris([0.0, 0.0, -1.0], [1.0, h, 1.0], 2));
+        world(tris)
+    };
+    // Just below the 0.25 m limit: step up onto it.
+    let below = build(0.2);
+    let (last, _) = walk_plus_x(&below, [-0.5, 0.5, 0.0], half, 0.05, 30, &walk_params(0.25));
+    assert!(last.position[0] > 0.0, "climbed: {:?}", last.position);
+    assert!(
+        (last.position[1] - (0.2 + 0.5)).abs() < 0.02,
+        "on top: {:?}",
+        last.position
+    );
+    // Just above the limit: blocked at the face, still on the lower floor.
+    let above = build(0.3);
+    let (last, _) = walk_plus_x(&above, [-0.5, 0.5, 0.0], half, 0.05, 30, &walk_params(0.25));
+    assert!(last.position[0] < 0.0, "did not climb: {:?}", last.position);
+    assert!(
+        (last.position[1] - 0.5).abs() < 1e-3,
+        "stayed on the floor: {:?}",
+        last.position
+    );
+}
+
+#[test]
+fn walking_off_a_ledge_reports_falling() {
+    // Floor only for x <= 0. The box walks +X off the edge; there is nothing below.
+    let tris: Vec<(Triangle, u32)> = quad(
+        [-5.0, 0.0, -1.0],
+        [0.0, 0.0, -1.0],
+        [0.0, 0.0, 1.0],
+        [-5.0, 0.0, 1.0],
+    )
+    .into_iter()
+    .map(|t| (t, 1))
+    .collect();
+    let w = world(tris);
+    let half = [0.3, 0.5, 0.3];
+    let (last, fell) = walk_plus_x(&w, [-0.5, 0.5, 0.0], half, 0.05, 60, &walk_params(0.25));
+    assert!(fell, "walking off the ledge must report falling");
+    assert!(last.position[0] > 0.3, "{:?}", last.position);
+    assert!(
+        last.falling,
+        "the last result is airborne: {:?}",
+        last.position
+    );
+}
+
+#[test]
+fn coplanar_corridor_floor_with_tiny_seams_never_sticks() {
+    // A floor of 0.5 m tiles, each at a random height within 2 mm. The box must keep moving
+    // and never fall through a seam.
+    let mut rng = Lcg(0x0bad_c0de_1234_5678);
+    let mut tris: Vec<(Triangle, u32)> = Vec::new();
+    let mut x = -2.0f32;
+    while x < 12.0 {
+        let y0 = rng.range(0.0, 0.002);
+        let y1 = rng.range(0.0, 0.002);
+        tris.extend(
+            quad(
+                [x, y0, -1.0],
+                [x + 0.5, y1, -1.0],
+                [x + 0.5, y1, 1.0],
+                [x, y0, 1.0],
+            )
+            .into_iter()
+            .map(|t| (t, 1)),
+        );
+        x += 0.5;
+    }
+    let w = world(tris);
+    let half = [0.3, 0.5, 0.3];
+    let start = [0.0, 0.5, 0.0];
+    let mut pos = start;
+    let mut fell = false;
+    for _ in 0..200 {
+        let r = walk_move(&w, pos, [0.05, 0.0, 0.0], half, &walk_params(0.25));
+        assert!(!r.falling, "fell through a seam at {pos:?}");
+        assert!(
+            r.position[0] >= pos[0] - 1e-4,
+            "went backwards at {pos:?} -> {:?}",
+            r.position
+        );
+        pos = r.position;
+        fell |= r.falling;
+    }
+    assert!(!fell);
+    assert!(pos[0] > 9.0, "walked along the floor: {pos:?}");
+}
+
+#[test]
+fn walk_does_not_tunnel_through_a_wall_after_1000_steps() {
+    let mut tris: Vec<(Triangle, u32)> = big_floor(0.0).into_iter().map(|t| (t, 1)).collect();
+    tris.extend(
+        quad(
+            [0.0, -50.0, -50.0],
+            [0.0, 50.0, -50.0],
+            [0.0, 50.0, 50.0],
+            [0.0, -50.0, 50.0],
+        )
+        .into_iter()
+        .map(|t| (t, 2)),
+    );
+    let w = world(tris);
+    let half = [0.3, 0.5, 0.3];
+    let params = walk_params(0.25);
+    let mut pos = [-0.5, 0.5, 0.0];
+    for _ in 0..1000 {
+        let r = walk_move(&w, pos, [0.01, 0.0, 0.05], half, &params);
+        pos = r.position;
+        assert!(
+            pos[0] <= -0.29,
+            "box crossed to the far side of the wall: x={}",
+            pos[0]
+        );
+    }
+    assert!(pos[2] > 10.0, "slid along the wall, z={}", pos[2]);
+}
+
 #[test]
 fn downward_ray_onto_floor_hits() {
     // Regression: a zero-extent ray straight down onto a coplanar floor must hit; the swept

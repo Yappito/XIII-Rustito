@@ -87,8 +87,13 @@ fn dump(opts: &cli::Options) -> AppExit {
         return AppExit::error();
     };
     let started = std::time::Instant::now();
-    let result = viewer::load::PackageCache::open(dir)
-        .and_then(|mut c| viewer::load::import_map(&mut c, map));
+    let result = xiii_world::PackageCache::open(dir).and_then(|mut c| {
+        let map_pkg = c.map(map)?;
+        let actors = xiii_decode::model::level::scan_level(&map_pkg.package, &map_pkg.data);
+        let scene = xiii_world::import_map(&mut c, map)?;
+        print_placement_stats(map, &actors, &scene);
+        Ok(scene)
+    });
     match result {
         Ok(scene) => {
             let tris: usize = scene
@@ -120,8 +125,8 @@ fn dump(opts: &cli::Options) -> AppExit {
                 for o in &scene.objects {
                     let m = &scene.meshes[o.mesh];
                     let tex = match &m.material {
-                        viewer::load::MaterialSlot::Texture(t) => scene.textures[*t].label.clone(),
-                        viewer::load::MaterialSlot::Missing(e) => format!("<missing: {e}>"),
+                        xiii_world::MaterialSlot::Texture(t) => scene.textures[*t].label.clone(),
+                        xiii_world::MaterialSlot::Missing(e) => format!("<missing: {e}>"),
                     };
                     if o.path.to_ascii_lowercase().contains(f)
                         || tex.to_ascii_lowercase().contains(f)
@@ -172,5 +177,58 @@ fn dump(opts: &cli::Options) -> AppExit {
             eprintln!("error: {e}");
             AppExit::error()
         }
+    }
+}
+
+/// Per-map placement statistics for the placement task report: how many placed actors have
+/// non-default PrePivot / DrawScale / DrawScale3D **from the map properties** (the class-default
+/// fallbacks are counted separately as `placement.<field>.class_default` scene counters), and
+/// the top placed actors by `|PrePivot|`.
+fn print_placement_stats(
+    map: &str,
+    actors: &xiii_decode::model::level::LevelActors,
+    scene: &xiii_world::WorldScene,
+) {
+    let mut with_pivot = 0usize;
+    let mut with_ds = 0usize;
+    let mut with_ds3 = 0usize;
+    let mut top: Vec<(f32, String, [f32; 3])> = Vec::new();
+    let mut with_pivot_prop = 0usize;
+    for a in &actors.all_located {
+        if let Some(v) = a.pre_pivot {
+            with_pivot_prop += 1;
+            let m = v.iter().fold(0.0f32, |s, x| s + x.abs());
+            if m > 1e-6 {
+                top.push((m, a.path.clone(), v));
+            }
+        }
+        // Map-only non-default values (absence of the property is not a non-default value).
+        if a.draw_scale.is_some_and(|v| (v - 1.0).abs() > 1e-6) {
+            with_ds += 1;
+        }
+        if a.draw_scale_3d
+            .is_some_and(|v| v.iter().any(|x| (x - 1.0).abs() > 1e-6))
+        {
+            with_ds3 += 1;
+        }
+    }
+    for o in &scene.objects {
+        if let Some(p) = o.placement
+            && p.pre_pivot.iter().any(|v| v.abs() > 1e-6)
+        {
+            with_pivot += 1;
+        }
+    }
+    top.sort_by(|a, b| b.0.total_cmp(&a.0));
+    println!(
+        "[dump] placement stats {map}: map actors with a Location {}; map DrawScale non-default {with_ds}, map DrawScale3D non-default {with_ds3}, map PrePivot property present {with_pivot_prop}; placed objects with effective non-default PrePivot {with_pivot}",
+        actors.all_located.len()
+    );
+    println!(
+        "[dump]   top {} by |PrePivot| (map values, all actor classes):",
+        top.len().min(20)
+    );
+    for (m, path, v) in top.iter().take(20) {
+        println!("[dump]   |PrePivot| {m:9.2} UU  {v:?}  {path}");
     }
 }

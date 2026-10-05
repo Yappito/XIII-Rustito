@@ -6,6 +6,7 @@ members = [
     "crates/xiii-decode",
     "crates/xiii-script",
     "crates/xiii-collision",
+    "crates/xiii-world",
     "crates/xiii-tool",
     "crates/xiii-app",
 ]
@@ -23,6 +24,7 @@ xiii-install = { path = "crates/xiii-install" }
 xiii-decode = { path = "crates/xiii-decode" }
 xiii-script = { path = "crates/xiii-script" }
 xiii-collision = { path = "crates/xiii-collision" }
+xiii-world = { path = "crates/xiii-world" }
 # Exact pin; used by xiii-tool for --json output and inventory comparison.
 serde_json = "=1.0.151"
 # Exact pin; feature names verified against the bevy 0.19.1 crate manifest.
