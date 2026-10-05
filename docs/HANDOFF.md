@@ -1,6 +1,40 @@
 # Handoff for the next implementation agent
 
-Updated: **2026-10-04**. Prepared for the user's planned Opus 5.5 continuation.
+Updated: **2026-10-05**. Research phase (2026-10-04) plus the first implementation sessions (M0, M1, M2 first passes) are complete. The next session should start with **"Next session: start here"** below.
+
+## Next session: start here
+
+State at the end of the 2026-10-05 session: everything is committed and pushed (`main` at `7da4862` or later on `git@github.com:Yappito/XIII-Rustito.git`). The working tree was clean apart from this handoff update. Results are in "Implementation status", the priority list is in "Exact next work".
+
+### How the user wants work organized
+
+- The coordinating Claude session **oversees and reviews**. It avoids bloating its own context: it delegates implementation and does not read large files or transcripts itself.
+- **New preference (2026-10-05):** use **opencode CLI with `ollama-cloud/deepseek-v4.1-flash`** for the grunt work. Claude writes task specs, runs opencode headless, then reviews the result with git diff, fmt/clippy/tests, corpus checks and screenshots, sends corrections, and commits only verified work. Keep reverse-engineering judgement calls and final verification on the Claude side. If opencode is unavailable, fall back to Claude sub-agents (the Agent tool), as used so far.
+- The user is fine with commits and pushes to `origin/main` after the checks pass. Commit messages end with the Co-Authored-By line from the session's attribution reminder. Ask before other outward-facing actions.
+- Ask the user when a decision is genuinely theirs. Report honestly: a map viewer is not a playable mission, and a headless trace is not gameplay.
+
+### opencode setup status
+
+- Installed with `winget install SST.opencode` (v1.18.33). Executable: `%LOCALAPPDATA%\Microsoft\WinGet\Packages\SST.opencode_Microsoft.Winget.Source_8wekyb3d8bbwe\opencode.exe`. That folder is on the **user** PATH, but processes started before the install (Claude Desktop and its terminals) don't see it until restarted. Use the full path when in doubt.
+- `opencode models` lists `ollama-cloud/deepseek-v4.1-flash` (also `deepseek-v4-pro`, `kimi-k2.7-code`, `glm-5.3`, ...).
+- **Credentials:** the user enters the Ollama Cloud key themselves with `opencode auth login` (provider "Ollama Cloud"). Never ask for the key in chat, and never write it into repo files. When this handoff was written, the login had been explained but not yet confirmed. Check with `opencode auth list`, or by running a trivial `opencode run` against the model.
+- **Not done yet:**
+  1. Smoke-test: `opencode run -m ollama-cloud/deepseek-v4.1-flash "<trivial task>"` in `P:\AI\XIII`. Confirm it can read `AGENTS.md`, edit a file and run `cargo`.
+  2. Add a project `opencode.json` with permission guardrails. Verify the permission syntax against the installed version's schema (`https://opencode.ai/config.json`, or `opencode debug config`) before relying on it. It should deny edits under `XIII_Game/**` and outside the repo, deny `git push`, `git commit`, `winget`/`npm install`/`cargo install`, and anything touching the Steam install. Allow cargo, git status/diff, and reads.
+  3. Planned workflow: one spec file per task under git-ignored `local/tasks/` (exact files and ownership, tests to add, acceptance commands, prohibitions such as no proprietary bytes in fixtures and no edits to the game dirs). Run `opencode run -m ollama-cloud/deepseek-v4.1-flash --file local/tasks/<task>.md "Implement the attached spec"`, or put the spec in the message. Use `--continue` / `--session <id>` for corrections. Check the real flags with `opencode run --help`. Use a per-task `CARGO_TARGET_DIR` if tasks run in parallel.
+
+### Environment notes for the next session
+
+- cargo/rustc are in `C:\Users\ZoliBen\.cargo\bin`. Git Bash: `export PATH="$HOME/.cargo/bin:$PATH"`. Rust 1.99.0 is pinned. MSVC 14.44 Build Tools are installed. No `gh` CLI.
+- Full verification (about 2 minutes warm):
+  `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && XIII_GOG_DIR=P:/AI/XIII/XIII_Game XIII_STEAM_DIR="P:/SteamLibrary/steamapps/common/XIII - Classic" cargo test --workspace`. Last result: 153 passed, 0 failed.
+- Viewer: `cargo run -p xiii-app --release -- --map Plage01 --game-dir P:/AI/XIII/XIII_Game` (add `--exit-after-secs N --screenshot <png>` for unattended checks). Smoke test: `cargo run -p xiii-app`.
+- Scratch outputs (screenshots, traces, disassembly) went to the session scratchpad, which is temporary. Re-create them under git-ignored `local/` if needed. Proprietary-derived outputs must never be committed.
+- Bash heredocs containing long Python can trip the tool's quoting. Write scripts to a file first, then run them.
+
+### Immediate next task
+
+Start item 1 of "Exact next work" (close the M2a exit): a collision capsule/cylinder sweep, the Plage01 `Porte6` doorway test, and scale calibration from Pawn collision defaults. In parallel, candidates are item 3 (`Actor.Spawn` and the actor lifecycle in `xiii-script`) and item 2 (skinned character in the viewer). These touch disjoint crates except `xiii-app`, so don't run items 1 and 2 concurrently in `xiii-app`.
 
 ## User intent
 
