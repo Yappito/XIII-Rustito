@@ -495,7 +495,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 197);
+    assert_eq!(defs.len(), 224);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -4567,6 +4567,182 @@ fn pick_start_point_prefers_a_patrol_point_then_falls_back() {
     assert_eq!(
         call_native(&mut vm, "IAController.PickStartPoint", ctrl, &[], &mut args),
         NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(near))))
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Canvas draw-command recording (item10)
+
+/// A one-class package with a `Canvas` carrying the draw properties the natives use.
+fn canvas_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let canvas = b.reserve(0, 0, "Canvas");
+    let curx = b.reserve(IMP_FLOATPROP, canvas, "CurX");
+    let cury = b.reserve(IMP_FLOATPROP, canvas, "CurY");
+    let orgx = b.reserve(IMP_FLOATPROP, canvas, "OrgX");
+    let orgy = b.reserve(IMP_FLOATPROP, canvas, "OrgY");
+    let clipx = b.reserve(IMP_FLOATPROP, canvas, "ClipX");
+    let clipy = b.reserve(IMP_FLOATPROP, canvas, "ClipY");
+    let drawcolor = b.reserve(IMP_FLOATPROP, canvas, "DrawColor");
+    let font = b.reserve(IMP_NAMEPROP, canvas, "Font");
+    let style = b.reserve(IMP_INTPROP, canvas, "Style");
+    b.prop(curx, cury, 0);
+    b.prop(cury, orgx, 0);
+    b.prop(orgx, orgy, 0);
+    b.prop(orgy, clipx, 0);
+    b.prop(clipx, clipy, 0);
+    b.prop(clipy, drawcolor, 0);
+    b.prop(drawcolor, font, 0);
+    b.prop(font, style, 0);
+    b.prop(style, 0, 0);
+    b.class(object, 0, 0);
+    b.class(canvas, object, curx);
+    b.build()
+}
+
+/// A 4-unit-wide, 6-unit-tall monospace "font".
+struct TinyFonts;
+impl crate::canvas::CanvasFonts for TinyFonts {
+    fn measure(&self, font: &str, text: &str) -> Option<(f32, f32)> {
+        (font == "Tiny").then(|| (text.chars().count() as f32 * 4.0, 6.0))
+    }
+}
+
+/// Synthetic Canvas natives: cursor movement, text measurement with a tiny font, clip capture,
+/// and the null-material tile -> rect path.
+#[test]
+fn canvas_natives_record_commands_with_cursor_measurement_and_clip() {
+    let set = set_of(canvas_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let canvas = vm.spawn(g(&set, "Canvas"), "Canvas0").unwrap();
+    vm.set_canvas_fonts(Box::new(TinyFonts));
+    assert!(vm.set_property(canvas, "ClipX", 0, Value::Float(320.0)));
+    assert!(vm.set_property(canvas, "ClipY", 0, Value::Float(200.0)));
+    assert!(vm.set_property(canvas, "Font", 0, Value::Name("Tiny".into())));
+    vm.set_property(
+        canvas,
+        "DrawColor",
+        0,
+        Value::Struct(vec![
+            ("b".into(), Value::Byte(10)),
+            ("g".into(), Value::Byte(20)),
+            ("r".into(), Value::Byte(30)),
+            ("a".into(), Value::Byte(255)),
+        ]),
+    );
+    vm.set_property(canvas, "Style", 0, Value::Byte(5));
+
+    // Cursor movement then text at the pen.
+    call_native(
+        &mut vm,
+        "Engine.Canvas.SetPos",
+        canvas,
+        &[],
+        &mut [Value::Float(10.0), Value::Float(20.0)],
+    );
+    call_native(
+        &mut vm,
+        "Engine.Canvas.DrawText",
+        canvas,
+        &[],
+        &mut [Value::Str("abcd".into()), Value::Bool(false)],
+    );
+    // StrLen writes both out floats.
+    let mut args = [
+        Value::Str("abcd".into()),
+        Value::Float(0.0),
+        Value::Float(0.0),
+    ];
+    call_native(
+        &mut vm,
+        "Engine.Canvas.StrLen",
+        canvas,
+        &[false, true, true],
+        &mut args,
+    );
+    assert_eq!(args[1], Value::Float(16.0));
+    assert_eq!(args[2], Value::Float(6.0));
+
+    let cmds = vm.drain_canvas();
+    match cmds.as_slice() {
+        [
+            crate::canvas::DrawCommand::Text {
+                text,
+                x,
+                y,
+                font,
+                color,
+                clip,
+                style,
+                clipped,
+                ..
+            },
+        ] => {
+            assert_eq!(text, "abcd");
+            assert_eq!((*x, *y), (10.0, 20.0));
+            assert_eq!(font.as_deref(), Some("Tiny"));
+            assert_eq!(*color, [30, 20, 10, 255]);
+            assert_eq!(*clip, [320.0, 200.0]);
+            assert_eq!(*style, 5);
+            assert!(!clipped);
+        }
+        other => panic!("{other:?}"),
+    }
+    // Cursor advanced by the measured width and stayed on the same line (CR=false).
+    assert_eq!(vm.get_property(canvas, "CurX"), Some(&Value::Float(26.0)));
+    assert_eq!(vm.get_property(canvas, "CurY"), Some(&Value::Float(20.0)));
+
+    // A null-material tile becomes a Rect and advances CurX by XL.
+    call_native(
+        &mut vm,
+        "Engine.Canvas.SetPos",
+        canvas,
+        &[],
+        &mut [Value::Float(0.0), Value::Float(0.0)],
+    );
+    call_native(
+        &mut vm,
+        "Engine.Canvas.DrawTile",
+        canvas,
+        &[],
+        &mut [
+            Value::Object(None),
+            Value::Float(8.0),
+            Value::Float(4.0),
+            Value::Float(0.0),
+            Value::Float(0.0),
+            Value::Float(1.0),
+            Value::Float(1.0),
+        ],
+    );
+    let cmds = vm.drain_canvas();
+    assert!(
+        matches!(
+            cmds.as_slice(),
+            [crate::canvas::DrawCommand::Rect {
+                xl: 8.0,
+                yl: 4.0,
+                ..
+            }]
+        ),
+        "{cmds:?}"
+    );
+    assert_eq!(vm.get_property(canvas, "CurX"), Some(&Value::Float(8.0)));
+    // A missing font records a visible note instead of silently measuring zero.
+    vm.set_property(canvas, "Font", 0, Value::Object(None));
+    let mut args = [Value::Str("x".into()), Value::Float(9.0), Value::Float(9.0)];
+    call_native(
+        &mut vm,
+        "Engine.Canvas.StrLen",
+        canvas,
+        &[false, true, true],
+        &mut args,
+    );
+    assert!(
+        vm.trace
+            .iter()
+            .any(|t| matches!(&t.kind, TraceKind::Note(n) if n.contains("no decoded font")))
     );
 }
 

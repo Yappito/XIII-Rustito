@@ -21,6 +21,7 @@ use xiii_package::{Limits, ObjectRef, PropertyBlock, PropertyValue, RawReason, S
 
 use crate::animation::{AnimationData, SeqInfo};
 use crate::bytecode::{Call, Context, Script, Token, TokenKind, opcode_name};
+use crate::canvas::CanvasState;
 use crate::events::{PresentationEvent, SoundEvent};
 use crate::linker::{GlobalRef, ScriptSet};
 use crate::navigation::{
@@ -1041,6 +1042,9 @@ pub struct Vm<'s> {
     /// (UE2 `ALevelInfo::GetAddressURL` formats the URL host and port as `%s:%i`). Empty until
     /// the runtime configures it.
     address_url: String,
+    /// Script-drawn `Canvas` command buffer plus the host font provider. Drained by the host
+    /// after each `HUD.PostRender` call ([`Vm::drain_canvas`]).
+    pub canvas: CanvasState,
     /// Interned object references into packages outside the loaded script set.
     externals: std::cell::RefCell<ExternalTable>,
 }
@@ -1081,8 +1085,24 @@ impl<'s> Vm<'s> {
             local_url: String::new(),
             url_options: String::new(),
             address_url: String::new(),
+            canvas: CanvasState::default(),
             externals: std::cell::RefCell::new(ExternalTable::default()),
         }
+    }
+
+    /// Installs the host font-metrics provider used by `Canvas.StrLen`/`TextSize`.
+    pub fn set_canvas_fonts(&mut self, fonts: Box<dyn crate::canvas::CanvasFonts>) {
+        self.canvas.set_fonts(fonts);
+    }
+
+    /// Draw commands recorded since the last [`Vm::drain_canvas`].
+    pub fn canvas_commands(&self) -> &[crate::canvas::DrawCommand] {
+        self.canvas.commands()
+    }
+
+    /// Removes and returns the recorded `Canvas` draw commands (one HUD frame).
+    pub fn drain_canvas(&mut self) -> Vec<crate::canvas::DrawCommand> {
+        self.canvas.drain()
     }
 
     /// The script set.
