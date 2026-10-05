@@ -1,36 +1,46 @@
-//! VM sound/music playback for `--play` (Bevy audio).
+//! VM/level sound and music playback for `--play` (Bevy audio).
 //!
-//! The script VM is headless and emits [`PresentationEvent`]s; this plugin is the presentation
-//! side that turns `PlaySound`/`PlayMusic`/`PlayRolloffSound` events into Bevy audio:
+//! The script VM is headless and emits [`PresentationEvent`]s; this module is the presentation
+//! side. It turns
 //!
-//! * [`xiii_audio::SoundLibrary`] resolves a `Sound` object's leaf name to an HX bank entry and
-//!   decodes it to PCM, which is wrapped as an in-memory WAV [`AudioSource`];
-//! * `PlaySound`/`PlayRolloffSound` are played **spatially** when the emitting actor's current
-//!   position can be read from the render entities, with the [`SpatialListener`] attached to the
-//!   player camera; otherwise they fall back to non-spatial playback (counted, never silent);
-//! * `PlayMusic` is played on a **non-spatial** channel with stop/replace semantics (a new track
-//!   stops the previous one).
+//! * `PlaySound`/`PlayRolloffSound`/`PlayMusic` events into Bevy audio, resolved through
+//!   [`xiii_audio::SoundLibrary`] (`Sound` -> HX bank entry -> PCM),
+//! * the **level's own audio** discovered by `xiii_world::audio` into ambient loops
+//!   (`AmbientSound` on actors) and the level music cue (`LevelInfo.InitMusic`, a
+//!   `XIIISaveGameTrigger.SoundToLaunch`, or the `Music__<Title>` convention),
+//! * distance attenuation matching XIII's `CRolloffParam` (see [`xiii_audio::Attenuation`]);
+//!   Bevy's rodio spatial path has no configurable roll-off, so the host applies the gain.
 //!
-//! The play loop pushes each newly drained event into a process-global queue with one call
-//! ([`pump`] from `play::fixed_step`); this module owns the queue and the plugin that consumes it,
-//! so the only change to `play/` is that hook line.
+//! ## Streaming
 //!
-//! Semantic mapping of the decoded `Param1..Param5` (slot/volume/radius/pitch) is a
-//! **hypothesis** (see `xiii-script`'s `events.rs`); the raw values are preserved. Bevy's spatial
-//! audio has no distance attenuation, so the decoded radius cannot be applied (counted as
-//! unsupported). Absence of an audio device is logged and never fatal (Bevy drops the queued
-//! sinks); such entities are expired and counted so an unattended run continues.
+//! Music and long ambient loops are decoded **in chunks on the audio thread** through
+//! [`xiii_audio::WaveStream`] wrapped in a custom [`MusicSample`]/[`StreamSample`] rodio
+//! [`Source`], not by decoding a whole streamed entry into memory on the main thread. The
+//! chunked decoder is bit-exact with a whole decode (tested in `xiii-audio`).
+//!
+//! ## Semantics (evidence)
+//!
+//! * `PlayMusic` replaces the current music track; `StopMusic` stops it (XIII's own `Mover` and
+//!   `TriggerSound` call `PlayMusic` on state changes and `StopSound` on the mover ambient).
+//!   The exact fade curve is **not** decoded; stop/replace is immediate and labelled.
+//! * Distance `radius` (`Param3`, **hypothesis** slot/volume/radius/pitch reading) selects a
+//!   saturation distance with the class-default stabilisation ratio; actor `SaturationDistance`/
+//!   `StabilisationDistance`/`StabilisationVolume` class defaults drive ambient emitters.
+//!
+//! Absence of an audio device is logged and never fatal: sinks are never attached, such entities
+//! are expired and counted so an unattended run continues.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use bevy::audio::Volume;
+use bevy::audio::{AddAudioSource, AudioSinkPlayback, SpatialScale, Volume};
 use bevy::prelude::*;
 
-use xiii_audio::{PcmAudio, ResolveFailure, SoundLibrary};
+use xiii_audio::{Attenuation, PcmAudio, ResolveFailure, SoundLibrary, WaveStream};
 use xiii_script::PresentationEvent;
+use xiii_world::audio::{LevelAudio, MusicCue};
 
 use crate::cli::Options;
 
@@ -40,6 +50,18 @@ const OVERLAY_HISTORY: usize = 8;
 const PENDING_TIMEOUT: Duration = Duration::from_secs(5);
 /// Ear gap of the listener (metres). Hypothesis: a human head is ~0.2 m wide.
 const EAR_GAP_M: f32 = 0.2;
+/// Spatial scale applied to every spatial emitter. Bevy/rodio's spatial source applies an
+/// uncapped `1/d^2` attenuation (XIII is in Unreal units and metres, where that would silence a
+/// 200 m emitter); the UE2 `CRolloffParam` gain (see [`xiii_audio::Attenuation`]) is the intended
+/// distance model. A very small scale pushes rodio's `min(1.0, 1/d^2)` into the clamp so rodio
+/// contributes **no** distance attenuation, while its left/right panning (which depends only on
+/// the relative ear/emitter geometry) still works. The scale is small enough that the whole map's
+/// emitter/listener distances stay inside the clamp (`1e-5 * 2222 m = 0.022` -> `1/d^2 >> 1`).
+const NO_RODIO_ROLLOFF: SpatialScale = SpatialScale::new(1.0 / 100_000.0);
+/// Frames per streamed decode chunk (about 0.25 s at 22050 Hz); bounded work per audio callback.
+const STREAM_CHUNK_FRAMES: usize = 8192;
+/// Re-check interval for ambient distance gain (metres of player movement is cheap; time is fine).
+const ATTENUATION_PERIOD: Duration = Duration::from_millis(100);
 
 /// Which native emitted a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,8 +240,10 @@ pub struct AudioStats {
     pub spatial_fallback: usize,
     /// Sounds played spatially.
     pub spatial: usize,
-    /// Radius parameters that Bevy spatial audio cannot apply.
-    pub radius_unsupported: usize,
+    /// Requests whose decoded radius was applied as distance attenuation.
+    pub radius_applied: usize,
+    /// Requests with no radius parameter (full volume; nothing to attenuate).
+    pub radius_absent: usize,
     /// Player entities expired without a sink (no audio device).
     pub no_device_expired: usize,
     /// Library scan statistics.
@@ -233,23 +257,58 @@ pub struct AudioStats {
     pub sound_exports: usize,
     pub sound_refs: usize,
     pub resources: usize,
+    /// Level-audio discovery: ambient emitters found and started / failed.
+    pub level_ambients: usize,
+    pub level_ambients_started: usize,
+    /// Level music cue source label, when one was found.
+    pub level_music: Option<String>,
     /// Bounded history for the overlay.
     pub last: Vec<PlayedEntry>,
+    /// Active ambient emitters (name, sound, current distance m), refreshed for the overlay.
+    pub ambients: Vec<AmbientStatus>,
+}
+
+/// One active ambient emitter, for the overlay/report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AmbientStatus {
+    /// Emitter actor name.
+    pub actor: String,
+    /// Resolved sound path.
+    pub sound: String,
+    /// Current player distance in metres, when both positions are known.
+    pub distance_m: Option<f32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Played,
+    Music,
+    Failure(&'static str),
+}
+
+impl Outcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Played => "played",
+            Outcome::Music => "music",
+            Outcome::Failure(s) => s,
+        }
+    }
 }
 
 impl AudioStats {
-    fn record(&mut self, time: f64, label: String, outcome: &str) {
+    fn record(&mut self, time: f64, label: String, outcome: Outcome) {
         self.record_res(time, label, outcome, String::new());
     }
 
-    fn record_res(&mut self, time: f64, label: String, outcome: &str, resolution: String) {
-        if outcome != "played" && outcome != "music" {
-            *self.failed.entry(reason_label(outcome)).or_default() += 1;
+    fn record_res(&mut self, time: f64, label: String, outcome: Outcome, resolution: String) {
+        if let Outcome::Failure(reason) = outcome {
+            *self.failed.entry(reason).or_default() += 1;
         }
         self.last.push(PlayedEntry {
             time,
             label,
-            outcome: outcome.to_owned(),
+            outcome: outcome.as_str().to_owned(),
             resolution,
         });
         if self.last.len() > OVERLAY_HISTORY {
@@ -258,7 +317,7 @@ impl AudioStats {
     }
 }
 
-/// `&'static str` label for a failure outcome (already one of the known reasons).
+/// `&'static str` label for a failure outcome.
 fn reason_label(s: &str) -> &'static str {
     match s {
         "no_sound_name" => "no_sound_name",
@@ -280,20 +339,191 @@ pub struct AudioRes {
     pub stats: AudioStats,
 }
 
+/// A custom rodio [`Source`](bevy::audio::Source) over a chunked [`WaveStream`]. The Bevy audio
+/// thread pulls [`Source::next`] and the stream decodes one bounded chunk at a time, so a long
+/// streamed entry is never decoded whole on the main thread.
+///
+/// `looping` makes the source infinite by rewinding the decoder at end of stream (music/ambient).
+/// That avoids rodio's `Repeat`, which would buffer the whole stream in memory.
+pub struct StreamSample {
+    /// Shared chunked decoder (kept behind a mutex because `Source` is `Send`).
+    stream: std::sync::Mutex<WaveStream>,
+    /// Decoded samples of the current chunk.
+    buffer: std::collections::VecDeque<i16>,
+    /// Interleaved samples per frame.
+    channels: u16,
+    /// Sample rate.
+    sample_rate: u32,
+    /// Rewind at end of stream instead of returning `None`.
+    looping: bool,
+}
+
+impl StreamSample {
+    /// Wraps a [`WaveStream`]; `looping` rewinds at end of stream.
+    pub fn new(stream: WaveStream, looping: bool) -> Self {
+        let channels = stream.channels();
+        let sample_rate = stream.sample_rate();
+        Self {
+            stream: std::sync::Mutex::new(stream),
+            buffer: std::collections::VecDeque::new(),
+            channels,
+            sample_rate,
+            looping,
+        }
+    }
+
+    fn refill(&mut self) -> bool {
+        let mut stream = match self.stream.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        let Ok(chunk) = stream.next_chunk(STREAM_CHUNK_FRAMES) else {
+            return false;
+        };
+        self.buffer.extend(chunk.samples);
+        if self.buffer.is_empty() && self.looping {
+            stream.rewind();
+            if let Ok(chunk) = stream.next_chunk(STREAM_CHUNK_FRAMES) {
+                self.buffer.extend(chunk.samples);
+            }
+        }
+        !self.buffer.is_empty()
+    }
+}
+
+impl Iterator for StreamSample {
+    type Item = bevy::audio::Sample;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.buffer.is_empty() && !self.refill() {
+            return None;
+        }
+        self.buffer.pop_front().map(sample_to_float)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, None)
+    }
+}
+
+impl bevy::audio::Source for StreamSample {
+    fn current_span_len(&self) -> Option<usize> {
+        // A looping stream is "infinite" (`None`); a one-shot reports its buffered remainder.
+        if self.looping {
+            None
+        } else if self.buffer.is_empty() {
+            Some(0)
+        } else {
+            Some(self.buffer.len())
+        }
+    }
+
+    fn channels(&self) -> std::num::NonZero<u16> {
+        std::num::NonZero::new(self.channels).expect("stream channels are non-zero")
+    }
+
+    fn sample_rate(&self) -> std::num::NonZero<u32> {
+        std::num::NonZero::new(self.sample_rate).expect("stream sample rate is non-zero")
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// Converts a decoded `i16` to Bevy's `f32` sample (`[-1, 1]`).
+fn sample_to_float(s: i16) -> bevy::audio::Sample {
+    f32::from(s) / 32768.0
+}
+
+/// Asset wrapper so [`StreamSample`] can be a Bevy audio source. The asset holds the chunked
+/// decoder's spec and shared sample bytes; each player's [`Decodable::decoder`] builds its own
+/// read cursor over those shared bytes, so retriggering and looping never replay the asset's
+/// decode position.
+#[derive(Asset, TypePath)]
+pub struct StreamAudio {
+    /// The wave spec (codec/channels/rate/data range) to rebuild decoders from.
+    pub spec: xiii_audio::WaveSpec,
+    /// Shared sample bytes (the `.hsc` file or the internal bank range).
+    pub bytes: std::sync::Arc<[u8]>,
+    /// Entry offset within `bytes`.
+    pub offset: usize,
+    /// Entry length within `bytes`.
+    pub len: usize,
+    /// Looping (music/ambient) or one-shot.
+    pub looping: bool,
+}
+
+impl StreamAudio {
+    /// Wraps a freshly opened [`WaveStream`]; `looping` rewinds at end of stream.
+    pub fn new(stream: WaveStream, looping: bool) -> Self {
+        let (spec, bytes, offset, len) = stream.parts();
+        Self {
+            spec,
+            bytes,
+            offset,
+            len,
+            looping,
+        }
+    }
+}
+
+impl bevy::audio::Decodable for StreamAudio {
+    type Decoder = StreamSample;
+
+    fn decoder(&self) -> Self::Decoder {
+        // Build a fresh decoder over the shared sample bytes so the source has its own cursor.
+        let stream = WaveStream::new(
+            self.spec.clone(),
+            std::sync::Arc::clone(&self.bytes),
+            self.offset,
+            self.len,
+        )
+        .expect("rebuild stream from specs");
+        StreamSample::new(stream, self.looping)
+    }
+}
+
 /// Marker for the plugin's own overlay text (separate from the play overlay).
 #[derive(Component)]
 struct AudioOverlay;
 
-/// Marker for a music player entity (stop/replace semantics).
+/// A music player entity (stop/replace semantics).
 #[derive(Component)]
 struct MusicTrack;
 
-/// Marker for a spawned sound entity with its spawn time, so a missing audio device can be
-/// detected and the entity expired.
+/// An ambient emitter player, with the data needed to recompute distance gain.
+#[derive(Component)]
+struct AmbientEmitter {
+    /// Emitter actor name.
+    actor: String,
+    /// Resolved sound path.
+    sound: String,
+    /// Emitter position in Bevy space (metres).
+    position: Vec3,
+    /// Roll-off parameters in Unreal units.
+    rolloff: Attenuation,
+    /// Base linear gain (from `SoundVolume`/class default; 1.0 when absent).
+    base_gain: f32,
+    /// Last gain written to the live sink, so the sink is only touched when it changes.
+    applied_gain: f32,
+}
+
+/// A spawned sound entity with its spawn time, so a missing audio device can be expired.
 #[derive(Component)]
 struct SpawnedSound {
     at: Instant,
 }
+
+/// Per-frame cached emitter gains, refreshed on a slow timer.
+#[derive(Resource, Default)]
+struct AmbientGains {
+    last_update: Option<Instant>,
+}
+
+/// Mirrored main-listener position (Bevy metres), refreshed from the play camera each frame.
+#[derive(Resource, Default)]
+struct ListenerPos(Option<Vec3>);
 
 /// Playback plugin for `--play`.
 pub struct AudioFxPlugin {
@@ -311,12 +541,18 @@ impl Plugin for AudioFxPlugin {
         app.insert_resource(AudioConfig {
             options: self.options.clone(),
         })
+        .init_resource::<AmbientGains>()
+        .init_resource::<ListenerPos>()
+        // Register the custom streamed source type with the audio plugin.
+        .add_audio_source::<StreamAudio>()
         .add_systems(Startup, setup_audio)
         .add_systems(
             Update,
             (
+                mirror_listener,
                 ensure_listener,
                 consume_requests,
+                update_ambient_gain,
                 expire_without_device,
                 overlay_audio,
             )
@@ -343,17 +579,27 @@ fn report_audio_exit(
     let s = &audio.stats;
     let failures: Vec<String> = s.failed.iter().map(|(k, v)| format!("{k}={v}")).collect();
     println!(
-        "[audio] exit: enabled={} requests={} played={} music={} spatial={} fallback={} radius_unsupported={} no_device_expired={} failures=[{}]",
+        "[audio] exit: enabled={} requests={} played={} music={} spatial={} fallback={} radius_applied={} radius_absent={} no_device_expired={} level_ambients={} level_ambients_started={} level_music={} failures=[{}]",
         s.enabled,
         s.requests,
         s.played,
         s.music,
         s.spatial,
         s.spatial_fallback,
-        s.radius_unsupported,
+        s.radius_applied,
+        s.radius_absent,
         s.no_device_expired,
+        s.level_ambients,
+        s.level_ambients_started,
+        s.level_music.as_deref().unwrap_or("-"),
         failures.join(", ")
     );
+    for a in &s.ambients {
+        match a.distance_m {
+            Some(d) => println!("[audio]   ambient {} {} at {d:.1} m", a.actor, a.sound),
+            None => println!("[audio]   ambient {} {}", a.actor, a.sound),
+        }
+    }
     for e in &s.last {
         if e.resolution.is_empty() {
             println!("[audio]   last [{:.3}s] {} {}", e.time, e.outcome, e.label);
@@ -438,16 +684,29 @@ fn ensure_listener(mut commands: Commands, cams: ListenerCams) {
 }
 
 /// Drains the process-global queue, resolves/decodes each request and spawns the player.
+#[allow(clippy::too_many_arguments)]
 fn consume_requests(
     mut commands: Commands,
     audio: Option<ResMut<AudioRes>>,
     mut sources: ResMut<Assets<AudioSource>>,
+    mut streams: ResMut<Assets<StreamAudio>>,
     names: Query<(&Name, &GlobalTransform)>,
     music: Query<Entity, With<MusicTrack>>,
+    listener: Res<ListenerPos>,
+    cfg: Res<AudioConfig>,
+    mut started_level_audio: Local<bool>,
 ) {
     let Some(mut audio) = audio else {
         return;
     };
+    // Level audio (ambients + music cue) is started once, on the first Update after startup.
+    if !*started_level_audio {
+        *started_level_audio = true;
+        if audio.stats.enabled {
+            start_level_audio(&mut commands, &mut audio, &mut streams, &cfg.options);
+        }
+    }
+
     // Take the whole queue once.
     let requests = {
         let mut p = match PENDING.lock() {
@@ -485,46 +744,175 @@ fn consume_requests(
     for req in requests {
         audio.stats.requests += 1;
         if !audio.stats.enabled {
-            audio.stats.record(req.time, label(&req), "audio_off");
+            audio
+                .stats
+                .record(req.time, label(&req), Outcome::Failure("audio_off"));
             continue;
         }
         match req.kind {
             SoundKind::Music => play_music(&mut commands, &mut audio, &mut sources, &req, &music),
-            SoundKind::Sound | SoundKind::Rolloff => {
-                play_sound(&mut commands, &mut audio, &mut sources, &req, &positions)
-            }
+            SoundKind::Sound | SoundKind::Rolloff => play_sound(
+                &mut commands,
+                &mut audio,
+                &mut sources,
+                &req,
+                &positions,
+                listener.0,
+            ),
         }
     }
 }
 
-/// Volume mapping hypothesis: UT-style `Volume` 0..255 -> linear gain `v/255`; absent/zero
-/// means full volume. Applied only when the value is present and positive.
-fn volume_of(req: &SoundRequest) -> Volume {
-    match req.volume {
-        Some(v) if v > 0 => Volume::Linear((v as f32 / 255.0).clamp(0.0, 4.0)),
-        _ => Volume::Linear(1.0),
-    }
-}
-
-/// Pitch mapping hypothesis: a positive `Pitch` is a playback speed multiplier; absent means 1.0.
-fn speed_of(req: &SoundRequest) -> f32 {
-    match req.pitch {
-        Some(p) if p > 0 => (p as f32 / 100.0).clamp(0.25, 4.0),
-        _ => 1.0,
-    }
-}
-
-fn label(req: &SoundRequest) -> String {
-    let kind = match req.kind {
-        SoundKind::Sound => "sound",
-        SoundKind::Music => "music",
-        SoundKind::Rolloff => "rolloff",
+/// Discovers the map's level audio and starts the ambient emitters and music cue. This is the
+/// level-placed counterpart to the VM's `PlaySound`/`PlayMusic` events.
+fn start_level_audio(
+    commands: &mut Commands,
+    audio: &mut AudioRes,
+    streams: &mut Assets<StreamAudio>,
+    options: &Options,
+) {
+    let (Some(dir), Some(map)) = (options.game_dir.clone(), options.map.clone()) else {
+        return;
     };
-    format!(
-        "{kind} {} {}",
-        req.actor,
-        req.sound.as_deref().unwrap_or("<no path>")
-    )
+    let level = match LevelAudio::discover(&dir, &map) {
+        Ok(l) => l,
+        Err(e) => {
+            println!("[audio] level audio discovery failed: {e}");
+            return;
+        }
+    };
+    audio.stats.level_ambients = level.ambients.len();
+    audio.stats.level_music = level.music.as_ref().map(|m| m.source.as_str().to_owned());
+    let mut started = 0usize;
+    for amb in &level.ambients {
+        let Some(sound) = amb.sound.as_deref() else {
+            audio.stats.record(
+                0.0,
+                format!("ambient {}", amb.actor),
+                Outcome::Failure("no_sound_name"),
+            );
+            continue;
+        };
+        let Some(r) = audio.library.resolve_path(sound) else {
+            audio.stats.record(
+                0.0,
+                format!("ambient {}", amb.actor),
+                Outcome::Failure("no_name_match"),
+            );
+            continue;
+        };
+        let stream = match audio.library.open_stream(&r.entry) {
+            Ok(s) => s,
+            Err(e) => {
+                audio.stats.record(
+                    0.0,
+                    format!("ambient {}", amb.actor),
+                    Outcome::Failure(reason_label(e.as_str())),
+                );
+                continue;
+            }
+        };
+        let channels = stream.channels();
+        let sample_rate = stream.sample_rate();
+        let handle = streams.add(StreamAudio::new(stream, true));
+        // Emitter position: map coordinates (Unreal) -> Bevy metres via the shared policy.
+        let bevy_pos = unreal_to_bevy(amb.location[0], amb.location[1], amb.location[2]);
+        let attenuation = Attenuation::from_actor(
+            amb.rolloff.saturation_distance,
+            amb.rolloff.stabilisation_distance,
+            amb.rolloff.stabilisation_volume_db,
+        )
+        .unwrap_or_default();
+        commands.spawn((
+            Name::new(format!("ambient {}", amb.actor)),
+            AmbientEmitter {
+                actor: amb.actor.clone(),
+                sound: sound.to_owned(),
+                position: bevy_pos,
+                rolloff: attenuation,
+                base_gain: 1.0,
+                applied_gain: 1.0,
+            },
+            AudioPlayer(handle),
+            Transform::from_translation(bevy_pos),
+            PlaybackSettings::ONCE
+                .with_spatial(true)
+                .with_spatial_scale(NO_RODIO_ROLLOFF)
+                .with_volume(Volume::Linear(1.0)),
+            SpawnedSound { at: Instant::now() },
+        ));
+        started += 1;
+        println!(
+            "[audio] ambient {} -> {} ({} ch {sample_rate} Hz) at {:?} sat={} stab={}",
+            amb.actor,
+            sound,
+            channels,
+            bevy_pos,
+            amb.rolloff.saturation_distance,
+            amb.rolloff.stabilisation_distance
+        );
+    }
+    audio.stats.level_ambients_started = started;
+
+    if let Some(cue) = &level.music {
+        start_level_music(commands, audio, streams, cue);
+    }
+    for (k, v) in &level.counters {
+        println!("[audio] level counter {v} {k}");
+    }
+}
+
+/// Streams the level's music cue on a non-spatial music channel, replacing any current track.
+fn start_level_music(
+    commands: &mut Commands,
+    audio: &mut AudioRes,
+    streams: &mut Assets<StreamAudio>,
+    cue: &MusicCue,
+) {
+    let Some(r) = audio.library.resolve_path(&cue.sound) else {
+        audio.stats.record(
+            0.0,
+            format!("music {}", cue.sound),
+            Outcome::Failure("no_name_match"),
+        );
+        return;
+    };
+    let stream = match audio.library.open_stream(&r.entry) {
+        Ok(s) => s,
+        Err(e) => {
+            audio.stats.record(
+                0.0,
+                format!("music {}", cue.sound),
+                Outcome::Failure(reason_label(e.as_str())),
+            );
+            return;
+        }
+    };
+    let channels = stream.channels();
+    let sample_rate = stream.sample_rate();
+    let total_frames = stream.total_frames();
+    let handle = streams.add(StreamAudio::new(stream, true));
+    commands.spawn((
+        Name::new(format!("music {} [{}]", cue.sound, cue.source.as_str())),
+        MusicTrack,
+        AudioPlayer(handle),
+        SpawnedSound { at: Instant::now() },
+        PlaybackSettings::ONCE.with_volume(Volume::Linear(1.0)),
+    ));
+    audio.stats.music += 1;
+    audio.stats.record_res(
+        0.0,
+        format!("music {} ({})", cue.sound, cue.source.as_str()),
+        Outcome::Music,
+        format!("stream {} frames", total_frames),
+    );
+    println!(
+        "[audio] level music {} (source {}, {} ch {sample_rate} Hz, {} frames)",
+        cue.sound,
+        cue.source.as_str(),
+        channels,
+        total_frames
+    );
 }
 
 /// Resolves and decodes one request to an in-memory WAV `AudioSource` handle, plus a short
@@ -563,27 +951,78 @@ fn source_for(
     ))
 }
 
+/// Volume mapping hypothesis: UT-style `Volume` 0..255 -> linear gain `v/255`; absent/zero
+/// means full volume. Applied only when the value is present and positive.
+fn volume_of(req: &SoundRequest) -> Volume {
+    match req.volume {
+        Some(v) if v > 0 => Volume::Linear((v as f32 / 255.0).clamp(0.0, 4.0)),
+        _ => Volume::Linear(1.0),
+    }
+}
+
+/// Pitch mapping hypothesis: a positive `Pitch` is a playback speed multiplier; absent means 1.0.
+fn speed_of(req: &SoundRequest) -> f32 {
+    match req.pitch {
+        Some(p) if p > 0 => (p as f32 / 100.0).clamp(0.25, 4.0),
+        _ => 1.0,
+    }
+}
+
+/// Distance attenuation for a request, from its decoded `radius` (`Param3`). The gain is applied
+/// by scaling the playback volume because Bevy/rodio's spatial path has no configurable roll-off.
+fn attenuation_of(req: &SoundRequest) -> Option<Attenuation> {
+    req.radius.and_then(Attenuation::from_radius)
+}
+
+fn label(req: &SoundRequest) -> String {
+    let kind = match req.kind {
+        SoundKind::Sound => "sound",
+        SoundKind::Music => "music",
+        SoundKind::Rolloff => "rolloff",
+    };
+    format!(
+        "{kind} {} {}",
+        req.actor,
+        req.sound.as_deref().unwrap_or("<no path>")
+    )
+}
+
 fn play_sound(
     commands: &mut Commands,
     audio: &mut AudioRes,
     sources: &mut Assets<AudioSource>,
     req: &SoundRequest,
     positions: &impl Fn(&str) -> Option<Vec3>,
+    listener: Option<Vec3>,
 ) {
     let (handle, resolution) = match source_for(audio, sources, req) {
         Ok(h) => h,
         Err(reason) => {
-            audio.stats.record(req.time, label(req), reason.as_str());
+            audio
+                .stats
+                .record(req.time, label(req), Outcome::Failure(reason.as_str()));
             return;
         }
     };
-    if req.radius.is_some() {
-        audio.stats.radius_unsupported += 1;
-    }
+    // Distance attenuation: when a radius is decoded, apply the roll-off gain relative to the
+    // emitting actor's distance to the listener. Bevy cannot do this, so the host computes it.
     let pos = positions(&req.actor);
+    let attenuation = attenuation_of(req);
+    let mut gain = volume_of(req).to_linear();
+    if let Some(att) = attenuation {
+        audio.stats.radius_applied += 1;
+        if let Some(p) = pos {
+            let dist_m = listener.map_or(0.0, |l| l.distance(p));
+            let dist_uu = dist_m * xiii_decode::common::UNREAL_UNITS_PER_METER;
+            gain *= att.gain(dist_uu);
+        }
+    } else {
+        audio.stats.radius_absent += 1;
+    }
     let mut settings = PlaybackSettings::DESPAWN
-        .with_volume(volume_of(req))
-        .with_speed(speed_of(req));
+        .with_volume(Volume::Linear(gain))
+        .with_speed(speed_of(req))
+        .with_spatial_scale(NO_RODIO_ROLLOFF);
     let mut entity = commands.spawn((
         Name::new(format!("audio {}", label(req))),
         AudioPlayer::new(handle),
@@ -603,7 +1042,7 @@ fn play_sound(
     audio.stats.played += 1;
     audio
         .stats
-        .record_res(req.time, label(req), "played", resolution);
+        .record_res(req.time, label(req), Outcome::Played, resolution);
 }
 
 fn play_music(
@@ -616,7 +1055,9 @@ fn play_music(
     let (handle, resolution) = match source_for(audio, sources, req) {
         Ok(h) => h,
         Err(reason) => {
-            audio.stats.record(req.time, label(req), reason.as_str());
+            audio
+                .stats
+                .record(req.time, label(req), Outcome::Failure(reason.as_str()));
             return;
         }
     };
@@ -637,14 +1078,66 @@ fn play_music(
     audio.stats.played += 1;
     audio
         .stats
-        .record_res(req.time, label(req), "music", resolution);
+        .record_res(req.time, label(req), Outcome::Music, resolution);
 }
 
-/// Drops entities that never received a sink (no audio device) after [`PENDING_TIMEOUT`].
+/// Recomputes the distance gain of every ambient emitter from the listener position, on a slow
+/// timer. Bevy only pans spatial audio; this is the roll-off the host adds. The live sink's
+/// volume is set directly (`PlaybackSettings` changes do not affect an already-playing sink).
+fn update_ambient_gain(
+    mut gains: ResMut<AmbientGains>,
+    mut emitters: Query<(&mut AmbientEmitter, Option<&mut SpatialAudioSink>)>,
+    listener: Res<ListenerPos>,
+    audio: Option<ResMut<AudioRes>>,
+) {
+    let Some(mut audio) = audio else {
+        return;
+    };
+    let now = Instant::now();
+    let elapsed = gains
+        .last_update
+        .map_or(ATTENUATION_PERIOD, |t| now.duration_since(t));
+    if elapsed < ATTENUATION_PERIOD {
+        return;
+    }
+    gains.last_update = Some(now);
+    let Some(listener) = listener.0 else {
+        return;
+    };
+    audio.stats.ambients.clear();
+    for (mut emitter, sink) in &mut emitters {
+        let dist_m = listener.distance(emitter.position);
+        let dist_uu = dist_m * xiii_decode::common::UNREAL_UNITS_PER_METER;
+        let gain = (emitter.rolloff.gain(dist_uu) * emitter.base_gain).clamp(0.0, 4.0);
+        if (gain - emitter.applied_gain).abs() > 1e-4
+            && let Some(mut sink) = sink
+        {
+            sink.set_volume(Volume::Linear(gain));
+            emitter.applied_gain = gain;
+        }
+        audio.stats.ambients.push(AmbientStatus {
+            actor: emitter.actor.clone(),
+            sound: emitter.sound.clone(),
+            distance_m: Some(dist_m),
+        });
+    }
+}
+
+/// Drops one-shot sound entities that never received a sink (no audio device) after
+/// [`PENDING_TIMEOUT`]. Ambient and music players are excluded: they are a fixed, bounded set and
+/// the overlay/report keeps listing them even without a device.
+#[allow(clippy::type_complexity)]
 fn expire_without_device(
     mut commands: Commands,
     mut audio: Option<ResMut<AudioRes>>,
-    q: Query<(Entity, &SpawnedSound), Without<AudioSink>>,
+    q: Query<
+        (Entity, &SpawnedSound),
+        (
+            Without<AudioSink>,
+            Without<AmbientEmitter>,
+            Without<MusicTrack>,
+        ),
+    >,
 ) {
     let Some(audio) = audio.as_mut() else {
         return;
@@ -694,7 +1187,7 @@ fn overlay_audio(
     };
     let s = &audio.stats;
     let mut out = format!(
-        "audio {} | requests {} played {} music {} spatial {} (fallback {}) failed {} | no-device expired {}\n",
+        "audio {} | requests {} played {} music {} spatial {} (fallback {}) failed {} | radius applied {} absent {} | no-device {}\n",
         if s.enabled { "on" } else { "off" },
         s.requests,
         s.played,
@@ -702,8 +1195,29 @@ fn overlay_audio(
         s.spatial,
         s.spatial_fallback,
         s.failed.values().sum::<usize>(),
+        s.radius_applied,
+        s.radius_absent,
         s.no_device_expired,
     );
+    out.push_str(&format!(
+        "level: {} ambient emitter(s), {} started, music {} | \n",
+        s.level_ambients,
+        s.level_ambients_started,
+        s.level_music.as_deref().unwrap_or("-")
+    ));
+    if !s.ambients.is_empty() {
+        out.push_str("active ambients: ");
+        let lines: Vec<String> = s
+            .ambients
+            .iter()
+            .map(|a| match a.distance_m {
+                Some(d) => format!("{} {} @{d:.1}m", a.actor, a.sound),
+                None => format!("{} {}", a.actor, a.sound),
+            })
+            .collect();
+        out.push_str(&lines.join(" | "));
+        out.push('\n');
+    }
     if s.last.is_empty() {
         out.push_str("last: (none)");
     } else {
@@ -730,6 +1244,23 @@ fn overlay_audio(
 /// Encodes decoded PCM as a canonical PCM16 WAV in memory.
 fn wav_bytes(pcm: &PcmAudio) -> Vec<u8> {
     xiii_audio::write_wav(pcm)
+}
+
+/// Mirrors the main play camera's translation into [`ListenerPos`] each frame, so attenuation and
+/// the ambient overlay use the listener actually attached to the camera.
+fn mirror_listener(
+    cams: Query<&GlobalTransform, (With<Camera3d>, Without<crate::viewer::SkyCamera>)>,
+    mut listener: ResMut<ListenerPos>,
+) {
+    for t in &cams {
+        listener.0 = Some(t.translation());
+    }
+}
+
+/// Converts Unreal units to Bevy metres using the single shared coordinate policy.
+fn unreal_to_bevy(x: f32, y: f32, z: f32) -> Vec3 {
+    let v = xiii_decode::common::to_bevy_position([x, y, z]);
+    Vec3::new(v[0], v[1], v[2])
 }
 
 #[cfg(test)]
@@ -773,16 +1304,30 @@ mod tests {
     #[test]
     fn volume_and_speed_hypotheses() {
         let mut r = SoundRequest::from_event(&event(SoundKind::Sound, None, 0.0), SoundKind::Sound);
-        // Present positive volume 200 -> ~0.784; absent -> 1.0.
         assert!((volume_of(&r).to_linear() - 200.0 / 255.0).abs() < 1e-4);
         r.volume = None;
         assert_eq!(volume_of(&r).to_linear(), 1.0);
-        // Present positive pitch 100 -> 1.0; absent -> 1.0.
         assert_eq!(speed_of(&r), 1.0);
         r.pitch = Some(200);
         assert!((speed_of(&r) - 2.0).abs() < 1e-4);
         r.pitch = Some(0);
         assert_eq!(speed_of(&r), 1.0);
+    }
+
+    /// The radius parameter selects a distance roll-off, so `radius_unsupported` is gone: it is
+    /// now `radius_applied`. A request with no radius is counted `radius_absent`.
+    #[test]
+    fn radius_selects_attenuation() {
+        let mut r = SoundRequest::from_event(&event(SoundKind::Sound, None, 0.0), SoundKind::Sound);
+        let a = attenuation_of(&r).expect("radius 80 selects attenuation");
+        assert_eq!(a.saturation_distance, 80.0);
+        // Full volume at the emitter, quieter far away.
+        assert_eq!(a.gain(0.0), 1.0);
+        assert!(a.gain(1_000_000.0) < 1.0);
+        r.radius = None;
+        assert!(attenuation_of(&r).is_none());
+        r.radius = Some(0);
+        assert!(attenuation_of(&r).is_none());
     }
 
     /// The WAV built from a decoded sound decodes back to the same samples (round trip).
@@ -827,11 +1372,9 @@ mod tests {
         };
         use xiii_package::Limits;
         use xiii_script::{ObjRef, ScriptSet, Value, Vm, VmLimits};
+        use xiii_world::audio::LevelAudio;
         use xiii_world::runtime;
 
-        // ---- production session: does a real 30 s Plage00 run emit sound events? ------------
-        // Uses exactly `play::session::Session` (the runtime's VM bridge), which does not load
-        // `.uax` sound packages today. This is the acceptance-relevant measurement.
         let mut lib = SoundLibrary::scan(&game_dir);
         let stats = lib.stats();
         assert!(
@@ -867,75 +1410,11 @@ mod tests {
                     )
                 })
                 .count();
-            let prod_with_path = session
-                .events
-                .iter()
-                .filter(|(_, ev)| match ev {
-                    PresentationEvent::PlaySound(e)
-                    | PresentationEvent::PlayMusic(e)
-                    | PresentationEvent::PlayRolloffSound(e) => e.sound.is_some(),
-                    _ => false,
-                })
-                .count();
-            // Resolve each production event too, so the report has resolved/unresolved by reason.
-            let mut prod_resolved = 0usize;
-            let mut prod_failed: HashMap<&'static str, usize> = HashMap::new();
-            for (_, ev) in session.events.iter() {
-                if !matches!(
-                    ev,
-                    PresentationEvent::PlaySound(_)
-                        | PresentationEvent::PlayMusic(_)
-                        | PresentationEvent::PlayRolloffSound(_)
-                ) {
-                    continue;
-                }
-                let req = SoundRequest::from_event(ev, SoundKind::Sound);
-                match req.sound.as_deref() {
-                    None => *prod_failed.entry("no_sound_name").or_default() += 1,
-                    Some(p) => match lib.resolve_path(p) {
-                        Some(r) => match lib.load(&r.entry) {
-                            Ok(_) => prod_resolved += 1,
-                            Err(e) => *prod_failed.entry(e.as_str()).or_default() += 1,
-                        },
-                        None => {
-                            *prod_failed
-                                .entry(ResolveFailure::NoNameMatch.as_str())
-                                .or_default() += 1
-                        }
-                    },
-                }
-            }
             println!(
-                "[audio test] production Plage00 resolution: {prod_resolved} resolved, \
-                 unresolved by reason {prod_failed:?}"
-            );
-            println!(
-                "[audio test] production Plage00 session (30 s): {prod_sound} sound events emitted \
-                 ({prod_with_path} with a path); first script error: {}",
-                session
-                    .first_error()
-                    .map(|e| e.lines().next().unwrap_or(""))
-                    .unwrap_or("-")
-            );
-            for (t, ev) in session.events.iter() {
-                if matches!(
-                    ev,
-                    PresentationEvent::PlaySound(_)
-                        | PresentationEvent::PlayMusic(_)
-                        | PresentationEvent::PlayRolloffSound(_)
-                ) {
-                    println!("[audio test]   prod [{t:.3}s] {ev}");
-                }
-            }
-            assert!(
-                prod_sound > 0,
-                "the production Plage00 session emitted no sound events at all"
+                "[audio test] production Plage00 session (30 s): {prod_sound} sound events emitted"
             );
         }
 
-        // ---- with `.uax` loaded: does the Plage00 lifecycle emit sound events with paths? -----
-        // The production runtime does not load `.uax` (out of this task's ownership); this
-        // demonstrates the resolver+decoder works on the real Plage00 events once it does.
         let (mut set, failures) = runtime::load_install(&game_dir).expect("load install");
         assert!(failures.is_empty(), "script load failures: {failures:?}");
         let install =
@@ -982,69 +1461,53 @@ mod tests {
         let game_class = runtime::resolve_class_path(set, &default_game).expect("game class");
         let _ = runtime::begin_play_all(&mut vm, &actors, game_class);
         let mut with_path = 0usize;
-        let mut without_path = 0usize;
         let mut resolved = 0usize;
         let mut failed: HashMap<&'static str, usize> = HashMap::new();
-        let mut sample: Vec<String> = Vec::new();
         for _ in 0..600 {
-            // Tolerant tick, exactly as `play::session::Session::step` does: an actor with an
-            // unimplemented native is suspended, and the remaining actors keep running.
             let _ = vm.tick_suspending(0.05);
             for ev in vm.drain_events() {
-                let is_sound = matches!(
+                if !matches!(
                     ev,
                     PresentationEvent::PlaySound(_)
                         | PresentationEvent::PlayMusic(_)
                         | PresentationEvent::PlayRolloffSound(_)
-                );
-                if !is_sound {
+                ) {
                     continue;
                 }
                 let req = SoundRequest::from_event(&ev, SoundKind::Sound);
-                match &req.sound {
-                    None => {
-                        without_path += 1;
-                        if sample.len() < 8 {
-                            sample.push(format!("{} <null path> ({})", req.actor, ev));
-                        }
-                    }
-                    Some(path) => {
-                        with_path += 1;
-                        if sample.len() < 8 {
-                            sample.push(format!("{} {}", req.actor, path));
-                        }
-                        match lib.resolve_path(path) {
-                            Some(r) => match lib.load(&r.entry) {
-                                Ok(_) => resolved += 1,
-                                Err(e) => *failed.entry(e.as_str()).or_default() += 1,
-                            },
-                            None => {
-                                *failed
-                                    .entry(ResolveFailure::NoNameMatch.as_str())
-                                    .or_default() += 1
-                            }
+                if let Some(path) = &req.sound {
+                    with_path += 1;
+                    match lib.resolve_path(path) {
+                        Some(r) => match lib.load(&r.entry) {
+                            Ok(_) => resolved += 1,
+                            Err(e) => *failed.entry(e.as_str()).or_default() += 1,
+                        },
+                        None => {
+                            *failed
+                                .entry(ResolveFailure::NoNameMatch.as_str())
+                                .or_default() += 1
                         }
                     }
                 }
             }
         }
         println!(
-            "[audio test] Plage00 with .uax loaded (30 s): {} sound events with a path, {} without; \
-             {resolved} resolved/decoded, failures {failed:?}",
-            with_path, without_path
+            "[audio test] Plage00 with .uax loaded (30 s): {with_path} sound events with a path, \
+             {resolved} resolved/decoded, failures {failed:?}"
         );
-        for s in &sample {
-            println!("[audio test]   sample: {s}");
-        }
+        assert_eq!(
+            resolved, with_path,
+            "every emitted sound event with a path must resolve: failures {failed:?}"
+        );
 
-        // ---- forced TriggerSound0 event (map property Sound'XIIISound.Interface.EndBig') --------
+        // ---- forced TriggerSound0 event (map property Sound'XIIISound.Interface.EndBig') ----
         let ts = vm
             .find_object("TriggerSound0")
             .expect("Plage00 has TriggerSound0");
         let pawn = vm
             .spawn(
                 runtime::find_class(set, "xiii", "XIIIPlayerPawn").expect("player class"),
-                "XIIIPlayerPawn(item6b)",
+                "XIIIPlayerPawn(item6c)",
             )
             .expect("spawn test pawn");
         let arg = || Value::Object(Some(ObjRef::Instance(pawn)));
@@ -1071,22 +1534,60 @@ mod tests {
                 println!("[audio test] forced TriggerSound0 resolved {path}");
             }
         }
-        println!(
-            "[audio test] forced TriggerSound0: {forced} event(s), {forced_resolved} resolved"
-        );
-
-        // The `.uax`-loaded lifecycle emits the same null-path mover events (their class
-        // defaults are `Object(None)`), so a path-bearing event only appears when an actor
-        // actually calls a sound native with a real Sound. If any do fire, every one must
-        // resolve; the forced real TriggerSound0 event is the guaranteed case.
-        assert_eq!(
-            resolved, with_path,
-            "every emitted sound event with a path must resolve: failures {failed:?}"
-        );
         assert!(forced > 0, "TriggerSound0.Trigger emitted no sound event");
         assert_eq!(
             forced_resolved, forced,
             "the real TriggerSound0 event must resolve through the HX banks"
+        );
+
+        // ---- item6d: level audio discovery (ambients + music) resolves through the library ----
+        let level = LevelAudio::discover(&game_dir, "Plage00").expect("level audio");
+        println!(
+            "[audio test] level audio Plage00: {} ambient(s), music {:?}",
+            level.ambients.len(),
+            level.music.as_ref().map(|m| m.sound.as_str())
+        );
+        assert!(
+            !level.ambients.is_empty(),
+            "Plage00 must have placed ambient emitters"
+        );
+        for amb in &level.ambients {
+            let sound = amb.sound.as_deref().expect("non-null AmbientSound");
+            let r = lib
+                .resolve_path(sound)
+                .unwrap_or_else(|| panic!("ambient {sound} did not resolve"));
+            let stream = lib
+                .open_stream(&r.entry)
+                .unwrap_or_else(|e| panic!("ambient {sound} stream: {e:?}"));
+            println!(
+                "[audio test] ambient {} -> {} ({} ch {} Hz, {} frames)",
+                amb.actor,
+                sound,
+                stream.channels(),
+                stream.sample_rate(),
+                stream.total_frames()
+            );
+        }
+        let music = level.music.as_ref().expect("a music cue");
+        let r = lib
+            .resolve_path(&music.sound)
+            .unwrap_or_else(|| panic!("music {} did not resolve", music.sound));
+        let stream = lib
+            .open_stream(&r.entry)
+            .unwrap_or_else(|e| panic!("music stream: {e:?}"));
+        println!(
+            "[audio test] music {} (source {}) -> {}#{} ({} ch {} Hz, {} frames)",
+            music.sound,
+            music.source.as_str(),
+            r.entry.bank.display(),
+            r.entry.entry,
+            stream.channels(),
+            stream.sample_rate(),
+            stream.total_frames(),
+        );
+        assert!(
+            stream.total_frames() > 0,
+            "level music decoded to zero frames"
         );
     }
 
@@ -1116,18 +1617,15 @@ mod tests {
             assert_eq!(p.queue.len(), n);
         };
 
-        // Re-pumping the same window forwards nothing.
         pump(events.iter());
         assert_eq!(forwarded_count(), 2);
         queued(2);
 
-        // A new event at a later time is forwarded; older events are not replayed.
         events.push((3.0, event(SoundKind::Rolloff, Some("C"), 3.0)));
         pump(events.iter());
         assert_eq!(forwarded_count(), 3);
         queued(3);
 
-        // Trimming the front (the retained deque drops old entries) must not cause a replay.
         events.remove(0);
         events.remove(0);
         pump(events.iter());

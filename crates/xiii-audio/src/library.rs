@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use crate::error::AudioErrorKind;
 use crate::hx::{Codec, Cuuid, DataLocation, HxKind, HxLimits, SoundRef, WaveResource};
-use crate::{PcmAudio, decode_entry, hx};
+use crate::{PcmAudio, WaveSpec, WaveStream, decode_entry, hx};
 
 /// One named bank entry: a `WavRes` name resolved to its wave record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +152,10 @@ pub struct LibraryStats {
     /// Distinct HX resource pairs indexed from the banks.
     pub resources: usize,
 }
+
+/// The pieces needed to build (and re-build) a chunked decoder over one bank entry: the wave
+/// spec, the shared sample bytes and the entry's `(offset, len)` within them.
+pub type StreamParts = (WaveSpec, Arc<[u8]>, usize, usize);
 
 /// A location of one resource pair inside a bank: `(bank path, entry index)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -590,6 +594,51 @@ impl SoundLibrary {
             }
         }
         false
+    }
+
+    /// Opens a **chunked** decoder over a resolved bank entry, so long streamed music can be
+    /// decoded frame-by-frame on the caller's thread. Internal entries read only the entry's own
+    /// byte range; external entries read the sibling `.hsc` file once (shared by the stream).
+    /// A missing stream is [`ResolveFailure::StreamMissing`].
+    pub fn open_stream(&self, r: &BankEntryRef) -> std::result::Result<WaveStream, ResolveFailure> {
+        let (spec, bytes, offset, len) = self.stream_parts(r)?;
+        WaveStream::new(spec, bytes, offset, len).map_err(|_| ResolveFailure::DecodeFailed)
+    }
+
+    /// The pieces a caller needs to build (and re-build) a chunked decoder: the wave spec, the
+    /// shared sample bytes and the entry's `(offset, len)` within them. Internal entries keep
+    /// only the entry's own byte range; external entries return the whole shared `.hsc` file.
+    pub fn stream_parts(
+        &self,
+        r: &BankEntryRef,
+    ) -> std::result::Result<StreamParts, ResolveFailure> {
+        let bytes = std::fs::read(&r.bank).map_err(|_| ResolveFailure::DecodeFailed)?;
+        let bank = hx::parse_bank(&bytes, &HxLimits::default())
+            .map_err(|_| ResolveFailure::DecodeFailed)?;
+        let spec = crate::entry_spec(&bank, r.entry).map_err(|_| ResolveFailure::DecodeFailed)?;
+        let (offset, len) = crate::entry_region(&spec).ok_or(ResolveFailure::DecodeFailed)?;
+        match spec.data {
+            DataLocation::Internal(_) => {
+                let end = offset
+                    .checked_add(len)
+                    .ok_or(ResolveFailure::DecodeFailed)?;
+                let region = bytes.get(offset..end).ok_or(ResolveFailure::DecodeFailed)?;
+                let shared: Arc<[u8]> = Arc::from(region.to_vec());
+                Ok((spec, shared, 0, len))
+            }
+            DataLocation::External { .. } => {
+                let wave = bank
+                    .entries
+                    .get(r.entry)
+                    .and_then(|e| e.as_wave())
+                    .ok_or(ResolveFailure::DecodeFailed)?;
+                let stream = self
+                    .read_stream(&r.bank, wave)
+                    .ok_or(ResolveFailure::StreamMissing)?;
+                let shared: Arc<[u8]> = Arc::from(stream);
+                Ok((spec, shared, offset, len))
+            }
+        }
     }
 
     /// Loads (and caches) the decoded PCM of a resolved bank entry. External `.hsc` streams are
