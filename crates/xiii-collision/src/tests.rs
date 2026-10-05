@@ -374,6 +374,27 @@ fn degenerate_triangles_are_dropped() {
     assert_eq!(w.degenerate_count(), 3);
 }
 
+/// `origin` maps a retained triangle back to its position in the input sequence even when
+/// earlier entries were dropped as degenerate (so a caller can look up per-input data, e.g. a
+/// floor triangle's surface material).
+#[test]
+fn origin_maps_retained_triangles_to_input_positions() {
+    let entries: Vec<(Triangle, u32)> = vec![
+        // A degenerate triangle first, so retained index 0 has input origin 1.
+        ([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], 10),
+        ([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], 11),
+        ([[1.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 0.0, 1.0]], 12),
+        ([[0.0; 3]; 3], 13), // degenerate (point)
+    ];
+    let w = world(entries);
+    assert_eq!(w.triangle_count(), 2);
+    // Retained 0 is input 1, retained 1 is input 2; the degenerate inputs 0 and 3 are dropped.
+    assert_eq!(w.origin(0), 1);
+    assert_eq!(w.origin(1), 2);
+    assert_eq!(w.source(0), 11);
+    assert_eq!(w.source(1), 12);
+}
+
 /// Simple deterministic LCG (no `rand` crate).
 struct Lcg(u64);
 

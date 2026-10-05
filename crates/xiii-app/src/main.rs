@@ -6,6 +6,7 @@
 mod audio;
 mod cli;
 mod collision;
+mod menu;
 mod perf;
 mod play;
 mod reach;
@@ -53,6 +54,31 @@ fn main() -> AppExit {
         return play::run_headless(&opts);
     }
 
+    // `--menu` runs the front-end. When the game's own New game path reaches
+    // `PlayerController.ClientTravel`, the host performs the travel step: it starts `--play`
+    // on the requested map.
+    if opts.mode == cli::Mode::Menu {
+        if opts.unattended() {
+            println!(
+                "[app] unattended menu run: exit_after_secs={:?} screenshot={:?} size={}x{}",
+                opts.exit_after_secs, opts.screenshot, opts.width, opts.height
+            );
+        }
+        let menu_exit = menu::build_menu_app(opts.clone()).run();
+        if let Some(req) = menu::take_travel_request() {
+            // The game's own `PlayerController.ClientTravel` asked for a map. Bevy/winit only
+            // allows one event loop per process, so the host travel step starts `--play` as a
+            // child process (the same binary) and waits for it. This is a labelled host action,
+            // not script.
+            println!(
+                "[app] host travel step: the menu requested map {}; starting --play --map {}",
+                req.map, req.map
+            );
+            return run_play_travel_step(&opts, &req.map);
+        }
+        return menu_exit;
+    }
+
     if opts.unattended() {
         println!(
             "[app] unattended run: frames={:?} exit_after_secs={:?} screenshot={:?} size={}x{} no_vsync={}",
@@ -65,6 +91,51 @@ fn main() -> AppExit {
         );
     }
 
+    build_app(opts).run()
+}
+
+/// Host travel step: launches this binary in `--play` mode on the map the menu's own
+/// `ClientTravel` requested, forwarding the unattended flags, and returns the child's exit
+/// status. A separate process is required because Bevy/winit builds its event loop once.
+fn run_play_travel_step(opts: &cli::Options, map: &str) -> AppExit {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[app] travel step: cannot locate the executable: {e}");
+            return AppExit::error();
+        }
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--play").arg("--map").arg(map);
+    if let Some(dir) = &opts.game_dir {
+        cmd.arg("--game-dir").arg(dir);
+    }
+    if let Some(secs) = opts.exit_after_secs {
+        cmd.arg("--exit-after-secs").arg(secs.to_string());
+    }
+    if let Some(p) = &opts.screenshot {
+        cmd.arg("--screenshot").arg(p);
+    }
+    cmd.arg("--size")
+        .arg(format!("{}x{}", opts.width, opts.height));
+    if opts.no_vsync {
+        cmd.arg("--no-vsync");
+    }
+    match cmd.status() {
+        Ok(s) if s.success() => AppExit::Success,
+        Ok(s) => {
+            eprintln!("[app] travel step: --play exited with {s}");
+            AppExit::error()
+        }
+        Err(e) => {
+            eprintln!("[app] travel step: failed to start --play: {e}");
+            AppExit::error()
+        }
+    }
+}
+
+/// Builds the non-menu [`App`] for the parsed mode (smoke/viewer/skinned/play).
+fn build_app(opts: cli::Options) -> App {
     let present_mode = if opts.no_vsync {
         PresentMode::AutoNoVsync
     } else {
@@ -90,6 +161,7 @@ fn main() -> AppExit {
                 cli::Mode::Play => {
                     "XIII Classic runtime - movement prototype (NOT gameplay)".into()
                 }
+                cli::Mode::Menu => "XIII Classic runtime - front-end menu (item16)".into(),
             },
             resolution: (opts.width, opts.height).into(),
             present_mode,
@@ -114,9 +186,13 @@ fn main() -> AppExit {
             });
             app.add_plugins(audio::AudioFxPlugin { options: opts });
         }
+        cli::Mode::Menu => {
+            // Handled before `build_app`; a menu App is built by `menu::build_menu_app`.
+            app.add_plugins(menu::MenuPlugin { options: opts });
+        }
     }
 
-    app.run()
+    app
 }
 
 /// `--map ... --dump`: import without a window and print the counters.
