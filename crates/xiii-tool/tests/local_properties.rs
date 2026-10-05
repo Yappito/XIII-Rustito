@@ -34,13 +34,16 @@ fn gog_property_blocks_decode_outside_class_payloads() {
     let t = coverage::totals(&cov);
     assert_eq!(t.exports, 141_959);
     assert_eq!(t.attempted, 141_939);
-    // Only UClass payloads (native class data first) fail as leading property blocks.
+    // Every export decodes, including Core.Class defaults (located after the native
+    // UField/UStruct/UState/UClass data by xiii-script).
     for (class, s) in &cov.classes {
-        if class != "Core.Class" {
-            assert_eq!(s.failed, 0, "{class}: {:?}", s.first_error);
-        }
+        assert_eq!(s.failed, 0, "{class}: {:?}", s.first_error);
     }
-    assert_eq!(cov.classes["Core.Class"].failed, 1441);
+    let classes = &cov.classes["Core.Class"];
+    assert_eq!(
+        (classes.attempted, classes.ok, classes.tail_zero),
+        (1444, 1444, 1444)
+    );
     assert_eq!(t.ok_with_anomalies, 0, "{:?}", cov.anomaly_examples);
     assert!(cov.anomalies.is_empty());
     // Measured encoding facts.
@@ -52,9 +55,12 @@ fn gog_property_blocks_decode_outside_class_payloads() {
     assert_eq!(cov.frame_node_null, 0);
     assert_eq!(cov.frame_node_set, cov.frame_node_is_state);
     assert_eq!(cov.frame_offsets.keys().copied().collect::<Vec<_>>(), [-1]);
-    assert_eq!(cov.array_index_two_byte, 0);
+    // Two-byte array indices occur only in class defaults (static arrays up to index 254).
+    assert_eq!(cov.array_index_two_byte, 130);
+    assert_eq!(cov.array_index_four_byte, 0);
+    assert_eq!(cov.array_index_max, 254);
     println!(
-        "GOG: {} exports attempted, {} decoded, {} Core.Class failures, {} empty tails",
+        "GOG: {} exports attempted, {} decoded, {} failures, {} empty tails",
         t.attempted,
         t.decoded(),
         t.failed,

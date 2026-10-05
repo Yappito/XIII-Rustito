@@ -2,28 +2,64 @@
   "anomalies": {},
   "anomaly_examples": [],
   "array_index": {
-    "above_127": 0,
+    "above_127": 130,
     "above_16383": 0,
-    "max": 15,
-    "nonzero": 10115
+    "max": 254,
+    "nonzero": 12138
   },
-  "array_properties": 12061,
+  "array_properties": 12175,
   "bool_declared_sizes": {
-    "0": 309816
+    "0": 311087
   },
   "bools": {
-    "false": 103963,
-    "true": 205853
+    "false": 104305,
+    "true": 206782
   },
   "class_categories": {
-    "partly-failing": 1,
     "props+tail": 62,
-    "props-only": 301
+    "props-only": 302
   },
-  "class_payloads_parsing_as_property_blocks": [
-    "system/PC/xiiipersosG.u JonesMaj: 0 properties, 1 of 83 bytes",
-    "system/PC/xiiipersosG.u Mig: 0 properties, 1 of 83 bytes",
-    "system/core.u Object: 0 properties, 1 of 74 bytes"
+  "class_defaults_examples": [
+    "system/PC/XIIIMP.u XIIIMPSabotageStorage: 4 default properties, block ends at payload end (123 bytes)",
+    "system/PC/XIIIMP.u XIIIMPFlag: 22 default properties, block ends at payload end (1361 bytes)",
+    "system/PC/XIIIMP.u TeamBotController: 1 default properties, block ends at payload end (832 bytes)",
+    "system/PC/XIIIMP.u XIIIMPPlayerPawn: 8 default properties, block ends at payload end (615 bytes)",
+    "system/PC/XIIIMP.u BotController: 11 default properties, block ends at payload end (3754 bytes)",
+    "system/PC/XIIIMP.u AttackPathNode: 1 default properties, block ends at payload end (95 bytes)",
+    "system/PC/XIIIMP.u SabotageBotController: 8 default properties, block ends at payload end (3676 bytes)",
+    "system/PC/XIIIMP.u TheDuck: 9 default properties, block ends at payload end (280 bytes)",
+    "system/PC/XIIIMP.u MPBombingBase: 13 default properties, block ends at payload end (226 bytes)",
+    "system/PC/XIIIMP.u DefensePathNode: 1 default properties, block ends at payload end (95 bytes)",
+    "system/PC/XIIIMP.u XIIIMPDuckGameInfo: 2 default properties, block ends at payload end (270 bytes)",
+    "system/PC/XIIIMP.u XIIIMPHud: 65 default properties, block ends at payload end (3371 bytes)",
+    "system/PC/XIIIMP.u GuardPathNode: 1 default properties, block ends at payload end (96 bytes)",
+    "system/PC/XIIIMP.u CTFBotController: 1 default properties, block ends at payload end (2333 bytes)",
+    "system/PC/XIIIMP.u MarioSuperBonus: 0 default properties, block ends at payload end (150 bytes)",
+    "system/PC/XIIIMP.u MarioMutator: 4 default properties, block ends at payload end (410 bytes)",
+    "system/PC/XIIIMP.u GroupPathNode: 0 default properties, block ends at payload end (92 bytes)",
+    "system/PC/XIIIMP.u GrenadPathNode: 2 default properties, block ends at payload end (103 bytes)",
+    "system/PC/XIIIMP.u SnipePathNode: 1 default properties, block ends at payload end (96 bytes)",
+    "system/PC/XIIIMP.u XIIIMPDuckController: 4 default properties, block ends at payload end (739 bytes)",
+    "system/PC/XIIIMP.u TacticalPathNode: 0 default properties, block ends at payload end (92 bytes)",
+    "system/PC/XIIIMP.u XIIIMPTeamStorage: 0 default properties, block ends at payload end (94 bytes)",
+    "system/PC/XIIIMP.u MPBomb: 27 default properties, block ends at payload end (946 bytes)",
+    "system/PC/XIIIMP.u JumpPathNode: 3 default properties, block ends at payload end (110 bytes)",
+    "system/PC/XIIIMP.u XIIIMPScoreBoard: 37 default properties, block ends at payload end (2231 bytes)",
+    "system/PC/XIIIMP.u XIIIMPBombPick: 8 default properties, block ends at payload end (282 bytes)",
+    "system/PC/XIIIMP.u XIIIMPPlayerController: 2 default properties, block ends at payload end (990 bytes)",
+    "system/PC/XIIIMP.u BotPlayer: 6 default properties, block ends at payload end (273 bytes)",
+    "system/PC/XIIIMP.u XIIIMPMutator: 1 default properties, block ends at payload end (451 bytes)",
+    "system/PC/XIIIMP.u XIIIMPGameInfo: 62 default properties, block ends at payload end (4201 bytes)",
+    "system/PC/XIIIMP.u XIIIMPCTFMessage: 11 default properties, block ends at payload end (539 bytes)",
+    "system/PC/XIIIMP.u XIIIBombHud: 10 default properties, block ends at payload end (1658 bytes)",
+    "system/PC/XIIIMP.u XIIIMPFlagBase: 8 default properties, block ends at payload end (161 bytes)",
+    "system/PC/XIIIMP.u XIIIMPCTFStorage: 0 default properties, block ends at payload end (94 bytes)",
+    "system/PC/XIIIMP.u CatchableDuckBotController: 0 default properties, block ends at payload end (781 bytes)",
+    "system/PC/XIIIMP.u flashbang: 25 default properties, block ends at payload end (647 bytes)",
+    "system/PC/XIIIMP.u SafePathNode: 1 default properties, block ends at payload end (96 bytes)",
+    "system/PC/XIIIMP.u FlashBangBot: 23 default properties, block ends at payload end (365 bytes)",
+    "system/PC/XIIIMP.u XIIIMPDuckMessage: 7 default properties, block ends at payload end (277 bytes)",
+    "system/PC/XIIIMP.u SpawnEmitter: 2 default properties, block ends at payload end (107 bytes)"
   ],
   "classes": {
     "Core.ArrayProperty": {
@@ -85,24 +121,21 @@
     },
     "Core.Class": {
       "attempted": 1444,
-      "category": "partly-failing",
-      "consumed_bytes": 3,
-      "error_kinds": {
-        "InvalidPropertyType": 897,
-        "NameIndexOutOfRange": 544
-      },
+      "category": "props-only",
+      "consumed_bytes": 510499,
+      "error_kinds": {},
       "exports": 1464,
-      "failed": 1441,
-      "first_error": "system/PC/XIIIMP.u XIIIMPSabotageStorage: payload[2].property.info at offset 39519 (0x9a5f): invalid property type 0 (payload+0)",
+      "failed": 0,
+      "first_error": null,
       "has_stack": 0,
-      "ok": 3,
+      "ok": 1444,
       "ok_with_anomalies": 0,
       "payload_bytes": 510499,
-      "properties": 0,
-      "tail_bytes": 237,
-      "tail_max": 82,
-      "tail_mean": 79.0,
-      "tail_zero": 0,
+      "properties": 9572,
+      "tail_bytes": 0,
+      "tail_max": 0,
+      "tail_mean": 0.0,
+      "tail_zero": 1444,
       "zero_size": 20
     },
     "Core.ClassProperty": {
@@ -6948,64 +6981,67 @@
   },
   "content_policy": "metadata only: class/struct/property names, counts, sizes, offsets and error kinds; no property values",
   "decoded_structs": {
-    "Color": 985,
-    "Plane": 87,
+    "Color": 1195,
+    "Plane": 89,
     "PointRegion": 58381,
-    "Range": 1807,
-    "RangeVector": 4181,
-    "Rotator": 31007,
-    "Scale": 14208,
-    "Vector": 114422
+    "Range": 1812,
+    "RangeVector": 4183,
+    "Rotator": 31080,
+    "Scale": 14211,
+    "Vector": 114727
   },
   "label": "gog XIII_Game 2026-10-04",
   "notes": [
-    "Every export payload is attempted as [state frame if RF_HasStack] + tagged-property block from payload offset 0.",
-    "Core.Class payloads start with native UField/UStruct/UState/UClass data and the class defaults follow it, so a leading property block is not expected there; the entries in class_payloads_parsing_as_property_blocks are coincidences (the first compact index, the SuperField reference, equals the index of a 'None' name entry).",
+    "Every non-class export payload is attempted as [state frame if RF_HasStack] + tagged-property block from payload offset 0.",
+    "Core.Class payloads start with native UField/UStruct/UState/UClass data (decoded by crates/xiii-script, XIII v100/licensee-58 layout); the class defaults are the tagged-property block after it and must end exactly at the payload end. For classes, consumed = whole payload.",
     "tail = payload bytes after the property block (class-native data, not decoded here)."
   ],
   "object_refs": {
-    "export": 172499,
-    "import": 30496,
-    "null": 1109
+    "export": 173040,
+    "import": 31564,
+    "null": 1145
   },
   "package_errors": [],
   "packages": 196,
   "property_types": {
-    "ArrayProperty": 12061,
-    "BoolProperty": 309816,
-    "ByteProperty": 92581,
-    "FloatProperty": 170834,
-    "IntProperty": 31254,
-    "NameProperty": 87207,
-    "ObjectProperty": 204104,
-    "StrProperty": 1232,
-    "StructProperty": 229705
+    "ArrayProperty": 12175,
+    "BoolProperty": 311087,
+    "ByteProperty": 93082,
+    "FloatProperty": 172162,
+    "IntProperty": 31882,
+    "NameProperty": 87411,
+    "ObjectProperty": 205749,
+    "StrProperty": 4492,
+    "StructProperty": 230326
   },
   "raw_structs_by_size": {
     "C_FireSprites": {
-      "48": 27
+      "48": 28
     },
     "C_MeshParticles": {
-      "59": 92,
+      "59": 93,
       "60": 92,
-      "61": 29
+      "61": 33
     },
     "C_OnomatopSprites": {
-      "43": 58
+      "43": 59
     },
     "C_SmokeSprites": {
-      "48": 78
+      "48": 79
     },
     "FlashEffectStruct": {
-      "41": 13
+      "41": 14
+    },
+    "GameServerFilter": {
+      "6": 1
     },
     "InitialAllianceInfo": {
       "5": 105,
-      "6": 173
+      "6": 177
     },
     "InventoryItem": {
       "5": 629,
-      "6": 923
+      "6": 926
     },
     "Matrix": {
       "64": 190
@@ -7026,14 +7062,14 @@
       "25": 1,
       "3": 1,
       "37": 2,
-      "5": 777,
+      "5": 778,
       "6": 191,
       "7": 26,
       "8": 22,
       "9": 11
     },
     "SImpact": {
-      "20": 17,
+      "20": 18,
       "21": 103,
       "22": 2
     },
@@ -7044,35 +7080,38 @@
     },
     "structFlash": {
       "3": 12
+    },
+    "structInterpol": {
+      "31": 2
     }
   },
   "size_codes": {
     "ArrayProperty:0": 11,
     "ArrayProperty:1": 191,
-    "ArrayProperty:2": 475,
-    "ArrayProperty:3": 66,
+    "ArrayProperty:2": 476,
+    "ArrayProperty:3": 67,
     "ArrayProperty:4": 65,
-    "ArrayProperty:5": 10969,
-    "ArrayProperty:6": 284,
-    "BoolProperty:5": 309816,
-    "ByteProperty:0": 92581,
-    "FloatProperty:2": 170834,
-    "IntProperty:2": 31254,
-    "NameProperty:0": 46206,
-    "NameProperty:1": 41001,
-    "ObjectProperty:0": 130956,
-    "ObjectProperty:1": 73148,
-    "StrProperty:0": 186,
-    "StrProperty:2": 108,
-    "StrProperty:3": 73,
-    "StrProperty:4": 16,
-    "StrProperty:5": 838,
+    "ArrayProperty:5": 11073,
+    "ArrayProperty:6": 292,
+    "BoolProperty:5": 311087,
+    "ByteProperty:0": 93082,
+    "FloatProperty:2": 172162,
+    "IntProperty:2": 31882,
+    "NameProperty:0": 46226,
+    "NameProperty:1": 41185,
+    "ObjectProperty:0": 131032,
+    "ObjectProperty:1": 74717,
+    "StrProperty:0": 187,
+    "StrProperty:2": 152,
+    "StrProperty:3": 171,
+    "StrProperty:4": 81,
+    "StrProperty:5": 3890,
     "StrProperty:6": 11,
     "StructProperty:1": 892,
-    "StructProperty:2": 985,
-    "StructProperty:3": 145472,
-    "StructProperty:4": 87,
-    "StructProperty:5": 82269
+    "StructProperty:2": 1195,
+    "StructProperty:3": 145850,
+    "StructProperty:4": 89,
+    "StructProperty:5": 82300
   },
   "state_frames": {
     "byte_lengths": {
@@ -7090,34 +7129,31 @@
     }
   },
   "terminators": {
-    "first_none_name": 107840,
-    "later_duplicate_none_name": 32658
+    "first_none_name": 107837,
+    "later_duplicate_none_name": 34102
   },
   "tool": "xiii-tool 0.1.0 coverage",
   "totals": {
     "attempted": 141939,
-    "category": "partly-failing",
-    "consumed_bytes": 8385706,
-    "error_kinds": {
-      "InvalidPropertyType": 897,
-      "NameIndexOutOfRange": 544
-    },
+    "category": "props+tail",
+    "consumed_bytes": 8896202,
+    "error_kinds": {},
     "exports": 141959,
-    "failed": 1441,
+    "failed": 0,
     "first_error": null,
     "has_stack": 58479,
-    "ok": 140498,
+    "ok": 141939,
     "ok_with_anomalies": 0,
     "payload_bytes": 375027560,
-    "properties": 1138794,
-    "tail_bytes": 366131595,
+    "properties": 1148366,
+    "tail_bytes": 366131358,
     "tail_max": 1737390,
-    "tail_mean": 2606.0,
-    "tail_zero": 49183,
+    "tail_mean": 2579.5,
+    "tail_zero": 50627,
     "zero_size": 20
   },
   "unknown_structs_parsing_as_tagged_blocks": {
-    "no": 4627,
+    "no": 4648,
     "yes": 0
   }
 }

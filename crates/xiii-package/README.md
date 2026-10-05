@@ -56,7 +56,8 @@ Tables, as in `tools/probe_install.py`:
 API: `Package::export_payload(data, i)`, `Package::read_object_properties(data, i, &limits)`
 -> `ObjectProperties { state_frame, block: PropertyBlock { properties, span, terminator },
 payload }` with `consumed()` / `tail()`, and `Package::read_property_block(data, start, end,
-&limits)` for blocks that do not start the payload (e.g. class defaults, not yet located).
+&limits)` for blocks that do not start the payload (e.g. class defaults; `crates/xiii-script`
+locates them after the native UClass data and exposes `class_defaults()`).
 `data` must be the parsed buffer (its length is checked). Structural failures are
 `PackageError`s with `Table::Payload`, the export index, a field such as `property.size`
 and the absolute offset. Value-level problems keep a bounded raw span:
@@ -96,6 +97,13 @@ frame layout follows UELib for version 100 (u64 probe mask below 691, u32 latent
 566, no state stack below 189) and was confirmed on the corpus.
 
 ### Evidence (measured 2026-10-04, `xiii-tool coverage XIII_Game`)
+
+**Update 2026-10-05:** `xiii-tool coverage` now decodes `Core.Class` exports through
+`xiii-script` (native UField/UStruct/UState/UClass data first, then the defaults block, which
+must end at the payload end): GOG **141 939 / 141 939** exports decode (1 444 / 1 444 classes),
+Steam 149 847 / 149 847, 0 anomalous values. Class defaults are the only place where two-byte
+array indices occur (130, max index 254). `docs/evidence/property-coverage-gog.json` was
+regenerated; the list below is the original 2026-10-04 measurement.
 
 Report: `docs/evidence/property-coverage-gog.json` (metadata only: class/struct names, counts,
 sizes, error kinds; no property values). The Steam copy (213 packages) shows the same pattern:

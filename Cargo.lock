@@ -4912,6 +4912,16 @@ name = "xiii-app"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "xiii-decode",
+ "xiii-install",
+ "xiii-package",
+]
+
+[[package]]
+name = "xiii-decode"
+version = "0.1.0"
+dependencies = [
+ "xiii-package",
 ]
 
 [[package]]
@@ -4923,11 +4933,21 @@ name = "xiii-package"
 version = "0.1.0"
 
 [[package]]
+name = "xiii-script"
+version = "0.1.0"
+dependencies = [
+ "xiii-package",
+]
+
+[[package]]
 name = "xiii-tool"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "xiii-decode",
+ "xiii-install",
  "xiii-package",
+ "xiii-script",
 ]
 
 [[package]]

@@ -1,0 +1,2792 @@
+//! Minimal UnrealScript interpreter (M2c second half).
+//!
+//! Interprets the decoded token trees of a [`ScriptSet`] directly. Objects have a class
+//! layout (slots for every property of the class chain, static arrays expanded), defaults
+//! from the class-default blocks and instance values from map exports. Functions run on the
+//! Rust stack with a depth cap; state code runs in a per-object resumable state frame with
+//! latent actions (`Sleep`). A fixed-step [`Vm::tick`] drives timers and state code with a
+//! per-tick step budget.
+//!
+//! No filesystem access and no engine dependency: the caller loads packages into the set and
+//! decides which actors are *active* (executed). Script calls into inactive actors are
+//! recorded as [`TraceKind::Deferred`] and not executed (an error if the call needs a return
+//! value). Unsupported tokens, unimplemented natives, budget overruns and bad values fail with
+//! [`VmError`] carrying a script stack trace. Nothing is stubbed silently.
+
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::rc::Rc;
+
+use xiii_package::{Limits, ObjectRef, PropertyBlock, PropertyValue, StructValue};
+
+use crate::bytecode::{Call, Script, Token, TokenKind, opcode_name};
+use crate::linker::{GlobalRef, ScriptSet};
+use crate::reflect::{Property, PropertyKind, ScriptObject, function_flags, property_flags};
+use crate::registry::{NativeCtx, NativeDef, NativeOutcome, Registry};
+use crate::value::{ObjRef, ObjectId, Ty, Value};
+
+/// Interpreter limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmLimits {
+    /// Statements + calls executed per tick (or per external call) before failing.
+    pub max_steps: u64,
+    /// Maximum script call depth.
+    pub max_call_depth: usize,
+    /// Maximum struct nesting when building types.
+    pub max_type_depth: u32,
+}
+
+impl Default for VmLimits {
+    fn default() -> Self {
+        Self {
+            max_steps: 1_000_000,
+            max_call_depth: 250,
+            max_type_depth: 16,
+        }
+    }
+}
+
+/// What went wrong while executing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VmErrorKind {
+    /// A decoded token the interpreter does not implement.
+    UnsupportedToken {
+        /// Opcode.
+        opcode: u8,
+        /// Mnemonic.
+        name: &'static str,
+    },
+    /// A native function without an implementation in the registry.
+    UnimplementedNative {
+        /// `Class.Function` of the declaration.
+        path: String,
+        /// Native index, if called by index.
+        index: Option<u16>,
+    },
+    /// A native index with no declaring function.
+    UnregisteredNative {
+        /// Index.
+        index: u16,
+    },
+    /// A native index declared by several functions that the argument count cannot separate.
+    AmbiguousNative {
+        /// Index.
+        index: u16,
+        /// Candidate paths.
+        candidates: Vec<String>,
+    },
+    /// Step budget exhausted (runaway loop).
+    BudgetExceeded {
+        /// Limit.
+        limit: u64,
+    },
+    /// Call depth limit hit.
+    CallDepthExceeded {
+        /// Limit.
+        limit: usize,
+    },
+    /// A reference that does not resolve to a loaded object.
+    Unresolved {
+        /// Description.
+        what: String,
+    },
+    /// Operand of the wrong type.
+    TypeMismatch {
+        /// Expected type.
+        expected: &'static str,
+        /// Found type.
+        found: &'static str,
+    },
+    /// Array index out of range.
+    ArrayIndex {
+        /// Index.
+        index: i64,
+        /// Length.
+        len: usize,
+    },
+    /// Jump target that is not a statement start.
+    BadJumpTarget {
+        /// Memory offset.
+        offset: u32,
+    },
+    /// Reading a value the loader could not convert.
+    UnsupportedValue {
+        /// Description.
+        desc: String,
+    },
+    /// An expression used as an assignment target that cannot be one.
+    NotAPlace {
+        /// Opcode.
+        opcode: u8,
+    },
+    /// A latent native outside state code.
+    LatentOutsideState {
+        /// Native path.
+        path: String,
+    },
+    /// A call into an inactive actor that needs a return value.
+    DeferredWithReturnValue {
+        /// Target object.
+        target: String,
+        /// Function.
+        function: String,
+    },
+    /// `assert` failed.
+    AssertionFailed {
+        /// Source line.
+        line: u16,
+    },
+    /// State code ran past its last statement.
+    StateCodeEnded,
+    /// Virtual/global call with no matching function.
+    NoSuchFunction {
+        /// Object.
+        object: String,
+        /// Function name.
+        name: String,
+    },
+    /// Division by zero.
+    DivisionByZero,
+    /// Anything else (description).
+    Other(String),
+}
+
+/// One stack-trace entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackEntry {
+    /// `Package.Class.Function` (or state).
+    pub function: String,
+    /// Object executing it.
+    pub object: String,
+    /// Memory offset of the current statement.
+    pub offset: u32,
+}
+
+/// Interpreter failure with a script stack trace (innermost last).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VmError {
+    /// Failure.
+    pub kind: VmErrorKind,
+    /// Script stack at the failure.
+    pub stack: Vec<StackEntry>,
+}
+
+impl fmt::Display for VmError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "script error: {:?}", self.kind)?;
+        for e in self.stack.iter().rev() {
+            writeln!(
+                f,
+                "  at {} [{}] code 0x{:04X}",
+                e.function, e.object, e.offset
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for VmError {}
+
+/// Result alias.
+pub type VmResult<T> = Result<T, VmError>;
+
+/// Latent action of a state frame.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Latent {
+    /// `Actor.Sleep`: remaining seconds.
+    Sleep {
+        /// Requested seconds.
+        seconds: f32,
+        /// Remaining seconds.
+        remaining: f32,
+        /// VM time when it started.
+        started: f64,
+    },
+}
+
+/// One trace record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceEvent {
+    /// Tick number (0 = before the first tick).
+    pub tick: u64,
+    /// VM time in seconds.
+    pub time: f64,
+    /// What happened.
+    pub kind: TraceKind,
+}
+
+/// Trace record kinds.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TraceKind {
+    /// Engine/harness-delivered event or a script call into another object's script.
+    Event {
+        /// Target object.
+        target: String,
+        /// Function path.
+        function: String,
+        /// Argument values.
+        args: Vec<String>,
+    },
+    /// Native call.
+    Native {
+        /// `Class.Function`.
+        path: String,
+        /// Index if called by index.
+        index: Option<u16>,
+        /// Object.
+        this: String,
+        /// Arguments.
+        args: Vec<String>,
+        /// Result.
+        result: String,
+    },
+    /// State transition.
+    StateChange {
+        /// Object.
+        actor: String,
+        /// Old state.
+        from: Option<String>,
+        /// New state.
+        to: Option<String>,
+        /// Label where state code resumes (none: no state code).
+        label: Option<String>,
+    },
+    /// `GotoState` to a state the class does not have.
+    StateNotFound {
+        /// Object.
+        actor: String,
+        /// Requested state.
+        state: String,
+    },
+    /// Latent action started.
+    LatentStart {
+        /// Object.
+        actor: String,
+        /// Native.
+        native: String,
+        /// Seconds.
+        seconds: f32,
+    },
+    /// Latent action finished; state code resumes.
+    LatentResume {
+        /// Object.
+        actor: String,
+        /// Native.
+        native: String,
+        /// When it started.
+        started: f64,
+    },
+    /// Iterator results.
+    Iterator {
+        /// Native.
+        native: String,
+        /// Objects produced.
+        found: Vec<String>,
+    },
+    /// Call into an inactive (out-of-scope) actor, not executed.
+    Deferred {
+        /// Target object.
+        target: String,
+        /// Target class.
+        class: String,
+        /// Function path.
+        function: String,
+    },
+    /// Event dropped because the probe is disabled.
+    ProbeDisabled {
+        /// Object.
+        actor: String,
+        /// Probe name.
+        probe: String,
+    },
+    /// Event with no handler in the class.
+    NoHandler {
+        /// Object.
+        actor: String,
+        /// Event name.
+        event: String,
+    },
+    /// Member access through `None` (UE2 logs and yields zero).
+    AccessedNone {
+        /// Function.
+        function: String,
+        /// Code offset.
+        offset: u32,
+    },
+    /// State code reached `stop`.
+    StateStop {
+        /// Object.
+        actor: String,
+    },
+    /// Script `Log`.
+    Log(String),
+    /// Timer fired.
+    Timer {
+        /// Object.
+        actor: String,
+    },
+    /// Harness note.
+    Note(String),
+}
+
+impl fmt::Display for TraceEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[t{:>3} {:>7.3}s] ", self.tick, self.time)?;
+        match &self.kind {
+            TraceKind::Event {
+                target,
+                function,
+                args,
+            } => write!(f, "EVENT    {target}.{function}({})", args.join(", ")),
+            TraceKind::Native {
+                path,
+                index,
+                this,
+                args,
+                result,
+            } => {
+                let idx = index.map(|i| format!("#{i} ")).unwrap_or_default();
+                write!(
+                    f,
+                    "NATIVE   {idx}{path}({}) on {this} -> {result}",
+                    args.join(", ")
+                )
+            }
+            TraceKind::StateChange {
+                actor,
+                from,
+                to,
+                label,
+            } => write!(
+                f,
+                "STATE    {actor}: {} -> {} (code at {})",
+                from.as_deref().unwrap_or("<none>"),
+                to.as_deref().unwrap_or("<none>"),
+                label.as_deref().unwrap_or("<none>")
+            ),
+            TraceKind::StateNotFound { actor, state } => {
+                write!(
+                    f,
+                    "STATE    {actor}: GotoState('{state}') not found, unchanged"
+                )
+            }
+            TraceKind::LatentStart {
+                actor,
+                native,
+                seconds,
+            } => write!(
+                f,
+                "LATENT   {actor}: {native}({seconds:?}) suspends state code"
+            ),
+            TraceKind::LatentResume {
+                actor,
+                native,
+                started,
+            } => write!(
+                f,
+                "RESUME   {actor}: {native} started at {started:.3}s finished"
+            ),
+            TraceKind::Iterator { native, found } => {
+                write!(f, "ITER     {native} -> [{}]", found.join(", "))
+            }
+            TraceKind::Deferred {
+                target,
+                class,
+                function,
+            } => write!(
+                f,
+                "DEFERRED {target} ({class}).{function}: actor not in the executed scope (unsupported, not run)"
+            ),
+            TraceKind::ProbeDisabled { actor, probe } => {
+                write!(f, "PROBE    {actor}.{probe} disabled, event dropped")
+            }
+            TraceKind::NoHandler { actor, event } => {
+                write!(f, "EVENT    {actor}.{event}: no handler")
+            }
+            TraceKind::AccessedNone { function, offset } => {
+                write!(f, "WARN     accessed None in {function} at 0x{offset:04X}")
+            }
+            TraceKind::StateStop { actor } => write!(f, "STOP     {actor}: state code stopped"),
+            TraceKind::Log(s) => write!(f, "LOG      {s}"),
+            TraceKind::Timer { actor } => write!(f, "TIMER    {actor}.Timer"),
+            TraceKind::Note(s) => write!(f, "NOTE     {s}"),
+        }
+    }
+}
+
+/// One property slot of a class or function layout.
+#[derive(Debug, Clone)]
+pub struct Slot {
+    /// Property object.
+    pub prop: GlobalRef,
+    /// Lowercase name.
+    pub name: String,
+    /// Type.
+    pub ty: Ty,
+    /// Static array dimension.
+    pub dim: usize,
+    /// First slot index.
+    pub base: usize,
+    /// Property flags.
+    pub flags: u32,
+}
+
+/// Slots of a class chain plus defaults.
+#[derive(Debug)]
+pub struct ClassLayout {
+    /// Class.
+    pub class: GlobalRef,
+    /// Class chain, most derived first.
+    pub chain: Vec<GlobalRef>,
+    /// Lowercase class names of the chain.
+    pub chain_names: Vec<String>,
+    /// Slots.
+    pub slots: Vec<Slot>,
+    by_prop: HashMap<GlobalRef, usize>,
+    by_name: HashMap<String, usize>,
+    /// Total values.
+    pub size: usize,
+    /// Default values (class-default blocks applied root to leaf).
+    pub defaults: Vec<Value>,
+}
+
+impl ClassLayout {
+    /// Slot by lowercase property name.
+    pub fn slot_by_name(&self, name: &str) -> Option<&Slot> {
+        self.by_name
+            .get(&name.to_ascii_lowercase())
+            .map(|i| &self.slots[*i])
+    }
+}
+
+#[derive(Debug)]
+struct ParamInfo {
+    slot: usize,
+    out: bool,
+    ty: Ty,
+}
+
+#[derive(Debug)]
+struct FuncLayout {
+    slots: Vec<Slot>,
+    by_prop: HashMap<GlobalRef, usize>,
+    params: Vec<ParamInfo>,
+    ret: Option<(usize, Ty)>,
+    size: usize,
+}
+
+#[derive(Debug, Clone)]
+struct StateCode {
+    /// Script holding the code (the state or a super state with the label).
+    owner: GlobalRef,
+    /// Statement index.
+    pc: usize,
+    latent: Option<Latent>,
+}
+
+#[derive(Debug, Clone)]
+struct Timer {
+    rate: f32,
+    remaining: f32,
+    repeat: bool,
+}
+
+/// An interpreter object.
+#[derive(Debug)]
+pub struct Instance {
+    /// Class.
+    pub class: GlobalRef,
+    /// Display name.
+    pub name: String,
+    /// Property values.
+    pub props: Vec<Value>,
+    layout: Rc<ClassLayout>,
+    /// Current state.
+    pub state: Option<GlobalRef>,
+    state_code: Option<StateCode>,
+    generation: u64,
+    disabled: HashSet<String>,
+    /// Executed by the VM (in scope).
+    pub active: bool,
+    /// Derives from `Actor`.
+    pub is_actor: bool,
+    /// Map export it was loaded from.
+    pub export: Option<GlobalRef>,
+    timer: Option<Timer>,
+}
+
+#[derive(Debug, Clone)]
+enum Place {
+    Local(usize),
+    Slot(ObjectId, usize),
+    Elem(Box<Place>, usize),
+    Member(Box<Place>, String),
+}
+
+struct IterState {
+    items: Vec<Value>,
+    idx: usize,
+    place: Option<Place>,
+    body: usize,
+}
+
+struct Frame<'s> {
+    pkg: usize,
+    this: ObjectId,
+    locals: Vec<Value>,
+    layout: Option<Rc<FuncLayout>>,
+    script: &'s Script,
+    map: Rc<HashMap<u32, usize>>,
+    iters: Vec<IterState>,
+    state_of: Option<ObjectId>,
+    pending_latent: Option<(Latent, String)>,
+}
+
+enum Flow {
+    Next,
+    Goto(usize),
+    Return(Value),
+    Stop,
+    Latent,
+}
+
+enum Exit {
+    Return(Value),
+    End,
+    Stop,
+    Latent(usize),
+    Restart,
+}
+
+/// The interpreter.
+pub struct Vm<'s> {
+    set: &'s ScriptSet,
+    /// Objects.
+    pub objects: Vec<Instance>,
+    by_export: HashMap<GlobalRef, ObjectId>,
+    layouts: HashMap<GlobalRef, Rc<ClassLayout>>,
+    func_layouts: HashMap<GlobalRef, Rc<FuncLayout>>,
+    stmt_maps: HashMap<GlobalRef, Rc<HashMap<u32, usize>>>,
+    default_objects: HashMap<GlobalRef, ObjectId>,
+    registry: Registry,
+    /// Trace records.
+    pub trace: Vec<TraceEvent>,
+    /// Record native calls in the trace.
+    pub trace_natives: bool,
+    stack: Vec<StackEntry>,
+    /// Ticks run.
+    pub tick_count: u64,
+    /// VM time in seconds.
+    pub time: f64,
+    steps: u64,
+    limits: VmLimits,
+    /// Properties the loader could not place (name not in layout, bad index).
+    pub load_warnings: Vec<String>,
+    /// Native functions called (path -> (index, count)).
+    pub natives_used: std::collections::BTreeMap<String, (Option<u16>, u64)>,
+    pub(crate) pending_latent: Option<Latent>,
+}
+
+fn lower(s: &str) -> String {
+    s.to_ascii_lowercase()
+}
+
+impl<'s> Vm<'s> {
+    /// New VM over a loaded set with the built-in native registry.
+    pub fn new(set: &'s ScriptSet, limits: VmLimits) -> Self {
+        Self {
+            set,
+            objects: Vec::new(),
+            by_export: HashMap::new(),
+            layouts: HashMap::new(),
+            func_layouts: HashMap::new(),
+            stmt_maps: HashMap::new(),
+            default_objects: HashMap::new(),
+            registry: Registry::builtin(),
+            trace: Vec::new(),
+            trace_natives: true,
+            stack: Vec::new(),
+            tick_count: 0,
+            time: 0.0,
+            steps: 0,
+            limits,
+            load_warnings: Vec::new(),
+            natives_used: Default::default(),
+            pending_latent: None,
+        }
+    }
+
+    /// The script set.
+    pub fn set(&self) -> &'s ScriptSet {
+        self.set
+    }
+
+    /// Native registry.
+    pub fn registry(&self) -> &Registry {
+        &self.registry
+    }
+
+    // ------------------------------------------------------------------ errors and trace
+
+    pub(crate) fn err(&self, kind: VmErrorKind) -> VmError {
+        VmError {
+            kind,
+            stack: self.stack.clone(),
+        }
+    }
+
+    /// Appends a trace record at the current tick/time.
+    pub fn note(&mut self, kind: TraceKind) {
+        self.trace.push(TraceEvent {
+            tick: self.tick_count,
+            time: self.time,
+            kind,
+        });
+    }
+
+    fn step(&mut self) -> VmResult<()> {
+        self.steps += 1;
+        if self.steps > self.limits.max_steps {
+            return Err(self.err(VmErrorKind::BudgetExceeded {
+                limit: self.limits.max_steps,
+            }));
+        }
+        Ok(())
+    }
+
+    /// Display label of an object reference.
+    pub fn obj_label(&self, r: &ObjRef) -> String {
+        match r {
+            ObjRef::Instance(i) => self
+                .objects
+                .get(*i as usize)
+                .map_or_else(|| format!("obj#{i}"), |o| o.name.clone()),
+            ObjRef::Static(g) => self.set.path(*g),
+        }
+    }
+
+    /// Display text of a value (objects by name).
+    pub fn value_text(&self, v: &Value) -> String {
+        match v {
+            Value::Object(Some(r)) => self.obj_label(r),
+            other => other.to_string(),
+        }
+    }
+
+    /// Short `Class.Function` path of an export (package omitted).
+    pub fn short_path(&self, g: GlobalRef) -> String {
+        let p = &self.set.packages[g.package];
+        p.package
+            .object_path(ObjectRef::Export(g.export))
+            .unwrap_or("?")
+            .to_owned()
+    }
+
+    fn object_name(&self, g: GlobalRef) -> &'s str {
+        self.set.packages[g.package].ref_name(ObjectRef::Export(g.export))
+    }
+
+    // ------------------------------------------------------------------ layouts
+
+    fn struct_header(&self, g: GlobalRef) -> Option<&'s crate::reflect::StructHeader> {
+        self.set.object(g)?.struct_header()
+    }
+
+    fn child_props(&self, owner: GlobalRef) -> Vec<(GlobalRef, &'s Property)> {
+        let mut out = Vec::new();
+        let set = self.set;
+        let Some(h) = self.struct_header(owner) else {
+            return out;
+        };
+        let p = &set.packages[owner.package];
+        let mut child = h.children;
+        let mut guard = 0;
+        while let ObjectRef::Export(e) = child {
+            guard += 1;
+            if guard > 65_536 {
+                break;
+            }
+            let Some(obj) = p.objects.get(&e) else { break };
+            if let ScriptObject::Property(prop) = obj {
+                out.push((
+                    GlobalRef {
+                        package: owner.package,
+                        export: e,
+                    },
+                    prop,
+                ));
+            }
+            child = obj.field().next;
+        }
+        out
+    }
+
+    fn ty_of(&self, pkg: usize, kind: &PropertyKind, depth: u32) -> Ty {
+        match kind {
+            PropertyKind::Byte { .. } => Ty::Byte,
+            PropertyKind::Int => Ty::Int,
+            PropertyKind::Bool => Ty::Bool,
+            PropertyKind::Float => Ty::Float,
+            PropertyKind::Object { .. } | PropertyKind::Class { .. } => Ty::Object,
+            PropertyKind::Name => Ty::Name,
+            PropertyKind::Str => Ty::Str,
+            PropertyKind::Delegate { .. } => Ty::Delegate,
+            PropertyKind::Array { inner } => {
+                let inner_ty = self
+                    .set
+                    .resolve(pkg, *inner)
+                    .and_then(|g| match self.set.object(g) {
+                        Some(ScriptObject::Property(p)) => {
+                            Some(self.ty_of(g.package, &p.kind, depth + 1))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(Ty::Int);
+                Ty::Array(Box::new(inner_ty))
+            }
+            PropertyKind::Struct { strukt } => {
+                let Some(g) = self.set.resolve(pkg, *strukt) else {
+                    return Ty::Struct(Vec::new());
+                };
+                let name = lower(self.object_name(g));
+                match name.as_str() {
+                    "vector" => Ty::Vector,
+                    "rotator" => Ty::Rotator,
+                    _ if depth >= self.limits.max_type_depth => Ty::Struct(Vec::new()),
+                    _ => {
+                        let mut members = Vec::new();
+                        for (pg, p) in self.child_props(g) {
+                            let t = self.ty_of(pg.package, &p.kind, depth + 1);
+                            members.push((lower(self.object_name(pg)), t));
+                        }
+                        Ty::Struct(members)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Class chain of a class (most derived first).
+    pub fn class_chain(&self, class: GlobalRef) -> Vec<GlobalRef> {
+        let mut out = vec![class];
+        let mut cur = class;
+        while out.len() < 256 {
+            let Some(h) = self.struct_header(cur) else {
+                break;
+            };
+            match self.set.resolve(cur.package, h.field.super_field) {
+                Some(s) => {
+                    out.push(s);
+                    cur = s;
+                }
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// Layout (and defaults) of a class.
+    pub fn class_layout(&mut self, class: GlobalRef) -> VmResult<Rc<ClassLayout>> {
+        if let Some(l) = self.layouts.get(&class) {
+            return Ok(l.clone());
+        }
+        if !matches!(self.set.object(class), Some(ScriptObject::Class(_))) {
+            return Err(self.err(VmErrorKind::Unresolved {
+                what: format!("{} is not a decoded class", self.set.path(class)),
+            }));
+        }
+        let chain = self.class_chain(class);
+        let mut slots = Vec::new();
+        let mut by_prop = HashMap::new();
+        let mut by_name = HashMap::new();
+        let mut size = 0;
+        for c in chain.iter().rev() {
+            for (pg, p) in self.child_props(*c) {
+                let ty = self.ty_of(pg.package, &p.kind, 0);
+                let dim = usize::try_from(p.array_dim.max(1)).unwrap_or(1);
+                let name = lower(self.object_name(pg));
+                by_prop.insert(pg, slots.len());
+                by_name.insert(name.clone(), slots.len());
+                slots.push(Slot {
+                    prop: pg,
+                    name,
+                    ty,
+                    dim,
+                    base: size,
+                    flags: p.flags,
+                });
+                size += dim;
+            }
+        }
+        let mut defaults = Vec::with_capacity(size);
+        for s in &slots {
+            for _ in 0..s.dim {
+                defaults.push(s.ty.zero());
+            }
+        }
+        let chain_names = chain.iter().map(|g| lower(self.object_name(*g))).collect();
+        let mut layout = ClassLayout {
+            class,
+            chain: chain.clone(),
+            chain_names,
+            slots,
+            by_prop,
+            by_name,
+            size,
+            defaults: Vec::new(),
+        };
+        for c in chain.iter().rev() {
+            if let Some(ScriptObject::Class(cl)) = self.set.object(*c) {
+                self.apply_block(c.package, &cl.defaults, &layout, &mut defaults);
+            }
+        }
+        layout.defaults = defaults;
+        let rc = Rc::new(layout);
+        self.layouts.insert(class, rc.clone());
+        Ok(rc)
+    }
+
+    fn func_layout(&mut self, func: GlobalRef) -> Rc<FuncLayout> {
+        if let Some(l) = self.func_layouts.get(&func) {
+            return l.clone();
+        }
+        let mut slots = Vec::new();
+        let mut by_prop = HashMap::new();
+        let mut params = Vec::new();
+        let mut ret = None;
+        let mut size = 0;
+        for (pg, p) in self.child_props(func) {
+            let ty = self.ty_of(pg.package, &p.kind, 0);
+            let dim = usize::try_from(p.array_dim.max(1)).unwrap_or(1);
+            by_prop.insert(pg, slots.len());
+            if p.flags & property_flags::RETURN_PARM != 0 {
+                ret = Some((size, ty.clone()));
+            } else if p.flags & property_flags::PARM != 0 {
+                params.push(ParamInfo {
+                    slot: size,
+                    out: p.flags & property_flags::OUT_PARM != 0,
+                    ty: ty.clone(),
+                });
+            }
+            slots.push(Slot {
+                prop: pg,
+                name: lower(self.object_name(pg)),
+                ty,
+                dim,
+                base: size,
+                flags: p.flags,
+            });
+            size += dim;
+        }
+        let l = Rc::new(FuncLayout {
+            slots,
+            by_prop,
+            params,
+            ret,
+            size,
+        });
+        self.func_layouts.insert(func, l.clone());
+        l
+    }
+
+    fn stmt_map(&mut self, owner: GlobalRef, script: &Script) -> Rc<HashMap<u32, usize>> {
+        if let Some(m) = self.stmt_maps.get(&owner) {
+            return m.clone();
+        }
+        let m: HashMap<u32, usize> = script
+            .statements
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.offset, i))
+            .collect();
+        let rc = Rc::new(m);
+        self.stmt_maps.insert(owner, rc.clone());
+        rc
+    }
+
+    // ------------------------------------------------------------------ loading
+
+    fn resolve_value_ref(&self, pkg: usize, r: ObjectRef) -> Value {
+        if r.is_null() {
+            return Value::Object(None);
+        }
+        match self.set.resolve(pkg, r) {
+            Some(g) => match self.by_export.get(&g) {
+                Some(id) => Value::Object(Some(ObjRef::Instance(*id))),
+                None => Value::Object(Some(ObjRef::Static(g))),
+            },
+            None => Value::Unsupported(format!(
+                "unresolved reference {}",
+                self.set.packages[pkg].ref_path(r)
+            )),
+        }
+    }
+
+    fn tagged_value(&self, pkg: usize, q: &xiii_package::Property, ty: &Ty) -> Value {
+        let p = &self.set.packages[pkg];
+        match (&q.value, ty) {
+            (PropertyValue::Int(v), Ty::Int) => Value::Int(*v),
+            (PropertyValue::Float(v), Ty::Float) => Value::Float(*v),
+            (PropertyValue::Bool(v), Ty::Bool) => Value::Bool(*v),
+            (PropertyValue::Byte(v), Ty::Byte) => Value::Byte(*v),
+            (PropertyValue::Name(n), Ty::Name) => Value::Name(p.package.name(*n).to_owned()),
+            (PropertyValue::Str(s), Ty::Str) => Value::Str(s.clone()),
+            (PropertyValue::Object(r) | PropertyValue::Class(r), Ty::Object) => {
+                self.resolve_value_ref(pkg, *r)
+            }
+            (PropertyValue::Struct(StructValue::Vector(v)), Ty::Vector) => Value::Vector(*v),
+            (PropertyValue::Struct(StructValue::Rotator(v)), Ty::Rotator) => Value::Rotator(*v),
+            (PropertyValue::Array { count, elements }, Ty::Array(inner)) => {
+                self.decode_array(pkg, *count, *elements, inner)
+            }
+            (v, t) => Value::Unsupported(format!("{v:?} as {t:?}")),
+        }
+    }
+
+    fn decode_array(&self, pkg: usize, count: u32, span: xiii_package::Span, inner: &Ty) -> Value {
+        let p = &self.set.packages[pkg];
+        let tables = crate::reader::Tables::of(&p.package);
+        let Ok(mut r) = crate::reader::Reader::new(&p.data, span.start, span.end, tables) else {
+            return Value::Unsupported("array span".into());
+        };
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let v = match inner {
+                Ty::Int => r.i32().map(Value::Int),
+                Ty::Float => r.f32().map(Value::Float),
+                Ty::Byte => r.u8().map(Value::Byte),
+                Ty::Name => r.name().map(|n| Value::Name(p.name_text(n).to_owned())),
+                Ty::Object => r.object().map(|o| self.resolve_value_ref(pkg, o)),
+                t => return Value::Unsupported(format!("array of {t:?}")),
+            };
+            match v {
+                Ok(v) => out.push(v),
+                Err(e) => return Value::Unsupported(format!("array element: {e}")),
+            }
+        }
+        if r.remaining() != 0 {
+            return Value::Unsupported("array trailing bytes".into());
+        }
+        Value::Array(out)
+    }
+
+    fn apply_block(
+        &mut self,
+        pkg: usize,
+        block: &PropertyBlock,
+        layout: &ClassLayout,
+        values: &mut [Value],
+    ) {
+        let p = &self.set.packages[pkg];
+        for q in &block.properties {
+            let name = p.package.property_name(q);
+            let Some(slot) = layout.slot_by_name(name) else {
+                self.load_warnings.push(format!(
+                    "{}: property {name} not in class layout",
+                    self.set.path(layout.class)
+                ));
+                continue;
+            };
+            let idx = q.array_index as usize;
+            if idx >= slot.dim {
+                self.load_warnings
+                    .push(format!("{name}[{idx}] outside dimension {}", slot.dim));
+                continue;
+            }
+            values[slot.base + idx] = self.tagged_value(pkg, q, &slot.ty);
+        }
+    }
+
+    /// Creates an instance of a class with its defaults.
+    pub fn spawn(&mut self, class: GlobalRef, name: &str) -> VmResult<ObjectId> {
+        let layout = self.class_layout(class)?;
+        let is_actor = layout.chain_names.iter().any(|n| n == "actor");
+        let id = self.objects.len() as ObjectId;
+        self.objects.push(Instance {
+            class,
+            name: name.to_owned(),
+            props: layout.defaults.clone(),
+            layout,
+            state: None,
+            state_code: None,
+            generation: 0,
+            disabled: HashSet::new(),
+            active: false,
+            is_actor,
+            export: None,
+            timer: None,
+        });
+        Ok(id)
+    }
+
+    /// Instantiates every actor export of a loaded map package (two passes: create, then
+    /// apply the map's tagged properties). Returns the created ids in export order.
+    pub fn load_level(&mut self, map: usize, limits: &Limits) -> VmResult<Vec<ObjectId>> {
+        let set = self.set;
+        let p = &set.packages[map];
+        let mut created = Vec::new();
+        for (i, e) in p.package.exports().iter().enumerate() {
+            let Some(class) = set.resolve(map, e.class) else {
+                continue;
+            };
+            if !matches!(set.object(class), Some(ScriptObject::Class(_))) {
+                continue;
+            }
+            let layout = self.class_layout(class)?;
+            if !layout.chain_names.iter().any(|n| n == "actor") || e.serial_size == 0 {
+                continue;
+            }
+            let name = p.ref_name(ObjectRef::Export(i as u32)).to_owned();
+            let id = self.spawn(class, &name)?;
+            let g = GlobalRef {
+                package: map,
+                export: i as u32,
+            };
+            self.objects[id as usize].export = Some(g);
+            self.by_export.insert(g, id);
+            created.push(id);
+        }
+        for &id in &created {
+            let g = self.objects[id as usize].export.expect("set above");
+            let props = p
+                .package
+                .read_object_properties(&p.data, g.export as usize, limits)
+                .map_err(|e| {
+                    self.err(VmErrorKind::Other(format!(
+                        "map properties of {}: {e}",
+                        self.objects[id as usize].name
+                    )))
+                })?;
+            let layout = self.objects[id as usize].layout.clone();
+            let mut values = std::mem::take(&mut self.objects[id as usize].props);
+            self.apply_block(map, &props.block, &layout, &mut values);
+            self.objects[id as usize].props = values;
+        }
+        Ok(created)
+    }
+
+    /// Object id by display name (case-insensitive).
+    pub fn find_object(&self, name: &str) -> Option<ObjectId> {
+        self.objects
+            .iter()
+            .position(|o| o.name.eq_ignore_ascii_case(name))
+            .map(|i| i as ObjectId)
+    }
+
+    /// Marks an object as executed (in scope).
+    pub fn set_active(&mut self, id: ObjectId, active: bool) {
+        if let Some(o) = self.objects.get_mut(id as usize) {
+            o.active = active;
+        }
+    }
+
+    /// Reads a property by name (first element).
+    pub fn get_property(&self, id: ObjectId, name: &str) -> Option<&Value> {
+        let o = self.objects.get(id as usize)?;
+        let s = o.layout.slot_by_name(name)?;
+        o.props.get(s.base)
+    }
+
+    /// Writes a property by name and element.
+    pub fn set_property(&mut self, id: ObjectId, name: &str, elem: usize, v: Value) -> bool {
+        let Some(o) = self.objects.get_mut(id as usize) else {
+            return false;
+        };
+        let Some(s) = o.layout.slot_by_name(name) else {
+            return false;
+        };
+        if elem >= s.dim {
+            return false;
+        }
+        let i = s.base + elem;
+        o.props[i] = v;
+        true
+    }
+
+    /// Name of the current state.
+    pub fn state_name(&self, id: ObjectId) -> Option<String> {
+        self.objects
+            .get(id as usize)?
+            .state
+            .map(|g| self.object_name(g).to_owned())
+    }
+
+    fn default_object(&mut self, class: GlobalRef) -> VmResult<ObjectId> {
+        if let Some(id) = self.default_objects.get(&class) {
+            return Ok(*id);
+        }
+        let name = format!("Default__{}", self.object_name(class));
+        let id = self.spawn(class, &name)?;
+        self.default_objects.insert(class, id);
+        Ok(id)
+    }
+
+    // ------------------------------------------------------------------ class queries
+
+    /// True when `id`'s class chain contains a class named `name`.
+    pub fn is_a(&self, id: ObjectId, name: &str) -> bool {
+        self.objects.get(id as usize).is_some_and(|o| {
+            o.layout
+                .chain_names
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(name))
+        })
+    }
+
+    fn is_child_of(&self, class: GlobalRef, base: GlobalRef) -> bool {
+        self.class_chain(class).contains(&base)
+    }
+
+    fn find_function_in(&self, scope: GlobalRef, name: &str) -> Option<GlobalRef> {
+        let p = &self.set.packages[scope.package];
+        let h = self.struct_header(scope)?;
+        let mut child = h.children;
+        let mut guard = 0;
+        while let ObjectRef::Export(e) = child {
+            guard += 1;
+            if guard > 65_536 {
+                return None;
+            }
+            let obj = p.objects.get(&e)?;
+            if matches!(obj, ScriptObject::Function(_))
+                && p.ref_name(child).eq_ignore_ascii_case(name)
+            {
+                return Some(GlobalRef {
+                    package: scope.package,
+                    export: e,
+                });
+            }
+            child = obj.field().next;
+        }
+        None
+    }
+
+    /// Virtual lookup: current state (and its super states), then the class chain.
+    fn find_function(&self, id: ObjectId, name: &str, use_state: bool) -> Option<GlobalRef> {
+        let o = &self.objects[id as usize];
+        if use_state {
+            let mut st = o.state;
+            let mut guard = 0;
+            while let Some(s) = st {
+                guard += 1;
+                if guard > 64 {
+                    break;
+                }
+                if let Some(f) = self.find_function_in(s, name) {
+                    return Some(f);
+                }
+                st = self
+                    .struct_header(s)
+                    .and_then(|h| self.set.resolve(s.package, h.field.super_field));
+            }
+        }
+        o.layout
+            .chain
+            .iter()
+            .find_map(|c| self.find_function_in(*c, name))
+    }
+
+    fn find_state(&self, id: ObjectId, name: &str) -> Option<GlobalRef> {
+        let o = &self.objects[id as usize];
+        let auto = name.eq_ignore_ascii_case("Auto");
+        for c in &o.layout.chain {
+            let p = &self.set.packages[c.package];
+            let Some(h) = self.struct_header(*c) else {
+                continue;
+            };
+            let mut child = h.children;
+            let mut guard = 0;
+            while let ObjectRef::Export(e) = child {
+                guard += 1;
+                if guard > 65_536 {
+                    break;
+                }
+                let Some(obj) = p.objects.get(&e) else { break };
+                if let ScriptObject::State(s) = obj {
+                    let hit = if auto {
+                        s.state.state_flags & 2 != 0
+                    } else {
+                        p.ref_name(child).eq_ignore_ascii_case(name)
+                    };
+                    if hit {
+                        return Some(GlobalRef {
+                            package: c.package,
+                            export: e,
+                        });
+                    }
+                }
+                child = obj.field().next;
+            }
+        }
+        None
+    }
+
+    fn find_label(&self, state: GlobalRef, label: &str) -> Option<(GlobalRef, u32)> {
+        let mut st = Some(state);
+        let mut guard = 0;
+        while let Some(s) = st {
+            guard += 1;
+            if guard > 64 {
+                return None;
+            }
+            let h = self.struct_header(s)?;
+            let p = &self.set.packages[s.package];
+            for l in h.script.labels() {
+                if p.name_text(l.name).eq_ignore_ascii_case(label) {
+                    return Some((s, l.offset));
+                }
+            }
+            st = self.set.resolve(s.package, h.field.super_field);
+        }
+        None
+    }
+
+    // ------------------------------------------------------------------ public execution
+
+    /// Calls a script event on an object as the engine would (honours `Disable`). Returns
+    /// `Ok(None)` when the probe is disabled or the class has no handler.
+    pub fn send_event(
+        &mut self,
+        id: ObjectId,
+        event: &str,
+        args: Vec<Value>,
+    ) -> VmResult<Option<Value>> {
+        self.steps = 0;
+        let actor = self.objects[id as usize].name.clone();
+        if self.objects[id as usize].disabled.contains(&lower(event)) {
+            self.note(TraceKind::ProbeDisabled {
+                actor,
+                probe: event.to_owned(),
+            });
+            return Ok(None);
+        }
+        let Some(f) = self.find_function(id, event, true) else {
+            self.note(TraceKind::NoHandler {
+                actor,
+                event: event.to_owned(),
+            });
+            return Ok(None);
+        };
+        let texts = args.iter().map(|a| self.value_text(a)).collect();
+        self.note(TraceKind::Event {
+            target: actor,
+            function: self.short_path(f),
+            args: texts,
+        });
+        self.call_values(f, id, args).map(Some)
+    }
+
+    /// Calls a function by global reference with argument values (no out parameters).
+    pub fn call_function(
+        &mut self,
+        func: GlobalRef,
+        this: ObjectId,
+        args: Vec<Value>,
+    ) -> VmResult<Value> {
+        self.steps = 0;
+        self.call_values(func, this, args)
+    }
+
+    /// `GotoState` from outside script (harness/tests).
+    pub fn goto_state(&mut self, id: ObjectId, state: &str, label: Option<&str>) -> VmResult<()> {
+        self.steps = 0;
+        self.do_goto_state(id, state, label.unwrap_or("Begin"))
+    }
+
+    /// One fixed step: timers, then state code of every active object (in id order).
+    pub fn tick(&mut self, dt: f32) -> VmResult<()> {
+        self.tick_count += 1;
+        self.time += f64::from(dt);
+        self.steps = 0;
+        for id in 0..self.objects.len() as ObjectId {
+            if !self.objects[id as usize].active {
+                continue;
+            }
+            let mut fire = false;
+            if let Some(t) = self.objects[id as usize].timer.as_mut() {
+                t.remaining -= dt;
+                if t.remaining <= 0.0 {
+                    fire = true;
+                    if t.repeat {
+                        t.remaining += t.rate;
+                    }
+                }
+            }
+            if fire {
+                if !self.objects[id as usize]
+                    .timer
+                    .as_ref()
+                    .is_some_and(|t| t.repeat)
+                {
+                    self.objects[id as usize].timer = None;
+                }
+                let actor = self.objects[id as usize].name.clone();
+                self.note(TraceKind::Timer { actor });
+                if let Some(f) = self.find_function(id, "Timer", true) {
+                    self.call_values(f, id, Vec::new())?;
+                }
+            }
+        }
+        for id in 0..self.objects.len() as ObjectId {
+            if self.objects[id as usize].active {
+                self.process_state(id, dt)?;
+            }
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ state code
+
+    pub(crate) fn do_goto_state(&mut self, id: ObjectId, state: &str, label: &str) -> VmResult<()> {
+        let actor = self.objects[id as usize].name.clone();
+        let new_state = if state.eq_ignore_ascii_case("None") {
+            None
+        } else {
+            match self.find_state(id, state) {
+                Some(s) => Some(s),
+                None => {
+                    self.note(TraceKind::StateNotFound {
+                        actor,
+                        state: state.to_owned(),
+                    });
+                    return Ok(());
+                }
+            }
+        };
+        let old = self.objects[id as usize].state;
+        if old != new_state
+            && old.is_some()
+            && let Some(f) = self.find_function(id, "EndState", true)
+        {
+            self.call_values(f, id, Vec::new())?;
+        }
+        let code = match new_state {
+            Some(s) => match self.find_label(s, label) {
+                Some((owner, offset)) => {
+                    let script = &self.struct_header(owner).expect("state").script;
+                    let map = self.stmt_map(owner, script);
+                    let pc = *map
+                        .get(&offset)
+                        .ok_or_else(|| self.err(VmErrorKind::BadJumpTarget { offset }))?;
+                    Some(StateCode {
+                        owner,
+                        pc,
+                        latent: None,
+                    })
+                }
+                None => None,
+            },
+            None => None,
+        };
+        let has_code = code.is_some();
+        {
+            let o = &mut self.objects[id as usize];
+            o.state = new_state;
+            o.state_code = code;
+            o.generation += 1;
+        }
+        self.note(TraceKind::StateChange {
+            actor,
+            from: old.map(|g| self.object_name(g).to_owned()),
+            to: new_state.map(|g| self.object_name(g).to_owned()),
+            label: has_code.then(|| label.to_owned()),
+        });
+        if old != new_state
+            && new_state.is_some()
+            && let Some(f) = self.find_function(id, "BeginState", true)
+        {
+            self.call_values(f, id, Vec::new())?;
+        }
+        Ok(())
+    }
+
+    fn process_state(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
+        let set = self.set;
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            if rounds > 10_000 {
+                return Err(self.err(VmErrorKind::BudgetExceeded {
+                    limit: self.limits.max_steps,
+                }));
+            }
+            let Some(code) = self.objects[id as usize].state_code.clone() else {
+                return Ok(());
+            };
+            if let Some(Latent::Sleep {
+                seconds,
+                remaining,
+                started,
+            }) = code.latent
+            {
+                // UE2 AActor::execPollSleep: finished once the remaining time drops below
+                // half a tick.
+                let left = remaining - dt;
+                if left >= 0.5 * dt {
+                    if let Some(c) = self.objects[id as usize].state_code.as_mut() {
+                        c.latent = Some(Latent::Sleep {
+                            seconds,
+                            remaining: left,
+                            started,
+                        });
+                    }
+                    return Ok(());
+                }
+                if let Some(c) = self.objects[id as usize].state_code.as_mut() {
+                    c.latent = None;
+                }
+                let actor = self.objects[id as usize].name.clone();
+                self.note(TraceKind::LatentResume {
+                    actor,
+                    native: "Actor.Sleep".into(),
+                    started,
+                });
+            }
+            let Some(h) = set.object(code.owner).and_then(ScriptObject::struct_header) else {
+                return Err(self.err(VmErrorKind::Unresolved {
+                    what: "state code owner".into(),
+                }));
+            };
+            let map = self.stmt_map(code.owner, &h.script);
+            let start_gen = self.objects[id as usize].generation;
+            let mut frame = Frame {
+                pkg: code.owner.package,
+                this: id,
+                locals: Vec::new(),
+                layout: None,
+                script: &h.script,
+                map,
+                iters: Vec::new(),
+                state_of: Some(id),
+                pending_latent: None,
+            };
+            self.stack.push(StackEntry {
+                function: self.set.path(code.owner),
+                object: self.objects[id as usize].name.clone(),
+                offset: 0,
+            });
+            let exit = self.run(&mut frame, code.pc, Some(start_gen));
+            self.stack.pop();
+            match exit? {
+                Exit::Latent(next) => {
+                    let (latent, native) = frame.pending_latent.take().expect("latent set");
+                    let actor = self.objects[id as usize].name.clone();
+                    let Latent::Sleep { seconds, .. } = latent;
+                    self.note(TraceKind::LatentStart {
+                        actor,
+                        native,
+                        seconds,
+                    });
+                    if let Some(c) = self.objects[id as usize].state_code.as_mut() {
+                        c.pc = next;
+                        c.latent = Some(latent);
+                    }
+                    return Ok(());
+                }
+                Exit::Stop => {
+                    self.objects[id as usize].state_code = None;
+                    let actor = self.objects[id as usize].name.clone();
+                    self.note(TraceKind::StateStop { actor });
+                    return Ok(());
+                }
+                Exit::Restart => continue,
+                Exit::End | Exit::Return(_) => {
+                    return Err(self.err(VmErrorKind::StateCodeEnded));
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ calls
+
+    fn call_values(
+        &mut self,
+        func: GlobalRef,
+        this: ObjectId,
+        args: Vec<Value>,
+    ) -> VmResult<Value> {
+        let set = self.set;
+        let Some(ScriptObject::Function(f)) = set.object(func) else {
+            return Err(self.err(VmErrorKind::Unresolved {
+                what: format!("{} is not a function", set.path(func)),
+            }));
+        };
+        if f.is_native() {
+            let mut a = args;
+            return self
+                .invoke_native(func, None, this, &mut a, false)
+                .and_then(|o| match o {
+                    NativeOutcome::Value(v) => Ok(v),
+                    _ => Err(self.err(VmErrorKind::Other(
+                        "latent/iterator native called outside script".into(),
+                    ))),
+                });
+        }
+        let layout = self.func_layout(func);
+        let mut locals = Vec::with_capacity(layout.size);
+        for s in &layout.slots {
+            for _ in 0..s.dim {
+                locals.push(s.ty.zero());
+            }
+        }
+        for (i, v) in args.into_iter().enumerate() {
+            if let Some(p) = layout.params.get(i) {
+                locals[p.slot] = v;
+            }
+        }
+        let (v, _) = self.run_function(func, this, locals, layout)?;
+        Ok(v)
+    }
+
+    fn run_function(
+        &mut self,
+        func: GlobalRef,
+        this: ObjectId,
+        locals: Vec<Value>,
+        layout: Rc<FuncLayout>,
+    ) -> VmResult<(Value, Vec<Value>)> {
+        let set = self.set;
+        if self.stack.len() >= self.limits.max_call_depth {
+            return Err(self.err(VmErrorKind::CallDepthExceeded {
+                limit: self.limits.max_call_depth,
+            }));
+        }
+        self.step()?;
+        let h = set
+            .object(func)
+            .and_then(ScriptObject::struct_header)
+            .expect("function");
+        let map = self.stmt_map(func, &h.script);
+        let mut frame = Frame {
+            pkg: func.package,
+            this,
+            locals,
+            layout: Some(layout.clone()),
+            script: &h.script,
+            map,
+            iters: Vec::new(),
+            state_of: None,
+            pending_latent: None,
+        };
+        self.stack.push(StackEntry {
+            function: set.path(func),
+            object: self.objects[this as usize].name.clone(),
+            offset: 0,
+        });
+        let exit = self.run(&mut frame, 0, None);
+        let result = match exit {
+            Ok(Exit::Return(v)) => Ok(v),
+            Ok(Exit::End) => Ok(match &layout.ret {
+                Some((slot, _)) => frame.locals[*slot].clone(),
+                None => Value::Void,
+            }),
+            Ok(Exit::Latent(_)) => Err(self.err(VmErrorKind::LatentOutsideState {
+                path: frame
+                    .pending_latent
+                    .as_ref()
+                    .map_or_else(String::new, |l| l.1.clone()),
+            })),
+            Ok(Exit::Stop | Exit::Restart) => Ok(Value::Void),
+            Err(e) => Err(e),
+        };
+        self.stack.pop();
+        result.map(|v| (v, frame.locals))
+    }
+
+    /// Calls a script or native function from a call token. `target` receives the call.
+    fn invoke(
+        &mut self,
+        frame: &mut Frame<'s>,
+        func: GlobalRef,
+        call: &Call,
+        target: ObjectId,
+        index: Option<u16>,
+    ) -> VmResult<Value> {
+        let set = self.set;
+        let Some(ScriptObject::Function(f)) = set.object(func) else {
+            return Err(self.err(VmErrorKind::Unresolved {
+                what: format!("{} is not a function", set.path(func)),
+            }));
+        };
+        if f.is_native() {
+            return match self.native_from_tokens(frame, func, call, target, index)? {
+                NativeOutcome::Value(v) => Ok(v),
+                NativeOutcome::Iterate(_) => Err(self.err(VmErrorKind::Other(
+                    "iterator native outside a foreach".into(),
+                ))),
+            };
+        }
+        let layout = self.func_layout(func);
+        if !self.objects[target as usize].active {
+            let o = &self.objects[target as usize];
+            let (tname, class) = (o.name.clone(), set.path(o.class));
+            if layout.ret.is_some() {
+                return Err(self.err(VmErrorKind::DeferredWithReturnValue {
+                    target: tname,
+                    function: set.path(func),
+                }));
+            }
+            // Arguments are still evaluated (side effects, Accessed None) as in a real call.
+            for a in &call.args {
+                self.eval(frame, a)?;
+            }
+            self.note(TraceKind::Deferred {
+                target: tname,
+                class,
+                function: self.short_path(func),
+            });
+            return Ok(Value::Void);
+        }
+        let mut locals = Vec::with_capacity(layout.size);
+        for s in &layout.slots {
+            for _ in 0..s.dim {
+                locals.push(s.ty.zero());
+            }
+        }
+        let mut outs = Vec::new();
+        for (i, p) in layout.params.iter().enumerate() {
+            let tok = call.args.get(i);
+            match tok {
+                None => {}
+                Some(t) if matches!(t.kind, TokenKind::Nothing) => {}
+                Some(t) if p.out => {
+                    let place = self.place(frame, t, frame.this)?;
+                    if let Some(pl) = &place {
+                        locals[p.slot] = self.read(frame, pl)?;
+                    }
+                    outs.push((p.slot, place));
+                }
+                Some(t) => locals[p.slot] = self.eval(frame, t)?,
+            }
+        }
+        if target != frame.this {
+            let texts = layout
+                .params
+                .iter()
+                .map(|p| self.value_text(&locals[p.slot]))
+                .collect();
+            self.note(TraceKind::Event {
+                target: self.objects[target as usize].name.clone(),
+                function: self.short_path(func),
+                args: texts,
+            });
+        }
+        let (v, final_locals) = self.run_function(func, target, locals, layout)?;
+        for (slot, place) in outs {
+            if let Some(pl) = place {
+                self.write(frame, &pl, final_locals[slot].clone())?;
+            }
+        }
+        Ok(v)
+    }
+
+    fn resolve_native_index(&self, index: u16, nargs: usize) -> VmResult<GlobalRef> {
+        let cands = self.set.native_functions(index);
+        match cands {
+            [] => Err(self.err(VmErrorKind::UnregisteredNative { index })),
+            [one] => Ok(*one),
+            many => {
+                // Duplicate declarations (e.g. 203, 472-476 in this build): pick the one whose
+                // parameter count accepts the argument count.
+                let fits: Vec<GlobalRef> = many
+                    .iter()
+                    .copied()
+                    .filter(|g| {
+                        let set = self.set;
+                        let Some(ScriptObject::Function(_)) = set.object(*g) else {
+                            return false;
+                        };
+                        let params = crate::natives::function_params(
+                            set,
+                            *g,
+                            match set.object(*g) {
+                                Some(ScriptObject::Function(f)) => f,
+                                _ => unreachable!(),
+                            },
+                        );
+                        let total = params.iter().filter(|p| !p.is_return()).count();
+                        let required = params
+                            .iter()
+                            .filter(|p| {
+                                !p.is_return() && p.flags & property_flags::OPTIONAL_PARM == 0
+                            })
+                            .count();
+                        nargs >= required && nargs <= total
+                    })
+                    .collect();
+                match fits.as_slice() {
+                    [one] => Ok(*one),
+                    _ => Err(self.err(VmErrorKind::AmbiguousNative {
+                        index,
+                        candidates: many.iter().map(|g| self.set.path(*g)).collect(),
+                    })),
+                }
+            }
+        }
+    }
+
+    fn native_def(&self, func: GlobalRef, index: Option<u16>) -> VmResult<&NativeDef> {
+        let key = lower(&self.short_path(func));
+        self.registry.get(&key).ok_or_else(|| {
+            self.err(VmErrorKind::UnimplementedNative {
+                path: self.short_path(func),
+                index,
+            })
+        })
+    }
+
+    fn native_from_tokens(
+        &mut self,
+        frame: &mut Frame<'s>,
+        func: GlobalRef,
+        call: &Call,
+        target: ObjectId,
+        index: Option<u16>,
+    ) -> VmResult<NativeOutcome> {
+        let def = self.native_def(func, index)?;
+        let short = def.short_circuit;
+        let layout = self.func_layout(func);
+        let mut args = Vec::with_capacity(layout.params.len());
+        let mut places = Vec::with_capacity(layout.params.len());
+        for (i, p) in layout.params.iter().enumerate() {
+            let tok = call.args.get(i);
+            if i == 1
+                && let Some(stop) = short
+                && args.first() == Some(&Value::Bool(stop))
+            {
+                // UE2 `&&` / `||`: the right operand (wrapped in Skip) is not evaluated.
+                let mut a = vec![Value::Bool(stop)];
+                let r = self.finish_native(
+                    func,
+                    index,
+                    target,
+                    &mut a,
+                    frame.state_of.is_some(),
+                    Some(Value::Bool(stop)),
+                )?;
+                return Ok(r);
+            }
+            match tok {
+                None => {
+                    args.push(p.ty.zero());
+                    places.push(None);
+                }
+                Some(t) if matches!(t.kind, TokenKind::Nothing) => {
+                    args.push(p.ty.zero());
+                    places.push(None);
+                }
+                Some(t) if p.out => {
+                    let place = self.place(frame, t, frame.this)?;
+                    let v = match &place {
+                        Some(pl) => self.read(frame, pl)?,
+                        None => p.ty.zero(),
+                    };
+                    args.push(v);
+                    places.push(place);
+                }
+                Some(t) => {
+                    args.push(self.eval(frame, t)?);
+                    places.push(None);
+                }
+            }
+        }
+        let in_state = frame.state_of == Some(target);
+        let outcome = self.finish_native(func, index, target, &mut args, in_state, None)?;
+        for (i, p) in layout.params.iter().enumerate() {
+            if p.out
+                && let Some(Some(pl)) = places.get(i)
+                && !matches!(outcome, NativeOutcome::Iterate(_))
+            {
+                self.write(frame, pl, args[i].clone())?;
+            }
+        }
+        if let NativeOutcome::Iterate(items) = outcome {
+            // The out parameter receives each item; remember its place for the loop.
+            let place = layout
+                .params
+                .iter()
+                .enumerate()
+                .find(|(_, p)| p.out)
+                .and_then(|(i, _)| places.get(i).cloned().flatten());
+            frame.iters.push(IterState {
+                items: items.clone(),
+                idx: 0,
+                place,
+                body: 0,
+            });
+            return Ok(NativeOutcome::Iterate(items));
+        }
+        if let Some(latent) = self.take_latent() {
+            if !in_state {
+                return Err(self.err(VmErrorKind::LatentOutsideState {
+                    path: self.short_path(func),
+                }));
+            }
+            frame.pending_latent = Some((latent, self.short_path(func)));
+        }
+        Ok(outcome)
+    }
+
+    fn take_latent(&mut self) -> Option<Latent> {
+        self.pending_latent.take()
+    }
+
+    fn invoke_native(
+        &mut self,
+        func: GlobalRef,
+        index: Option<u16>,
+        this: ObjectId,
+        args: &mut [Value],
+        in_state: bool,
+    ) -> VmResult<NativeOutcome> {
+        self.finish_native(func, index, this, args, in_state, None)
+    }
+
+    fn finish_native(
+        &mut self,
+        func: GlobalRef,
+        index: Option<u16>,
+        this: ObjectId,
+        args: &mut [Value],
+        in_state: bool,
+        preset: Option<Value>,
+    ) -> VmResult<NativeOutcome> {
+        self.step()?;
+        let path = self.short_path(func);
+        let f = self.native_def(func, index)?.f;
+        let declared = match self.set.object(func) {
+            Some(ScriptObject::Function(fun)) if fun.native_index != 0 => Some(fun.native_index),
+            _ => index,
+        };
+        let e = self
+            .natives_used
+            .entry(path.clone())
+            .or_insert((declared, 0));
+        e.1 += 1;
+        let before: Vec<String> = if self.trace_natives {
+            args.iter().map(|a| self.value_text(a)).collect()
+        } else {
+            Vec::new()
+        };
+        let outcome = match preset {
+            Some(v) => NativeOutcome::Value(v),
+            None => {
+                let ctx = NativeCtx {
+                    this,
+                    in_state_code: in_state,
+                    path: path.clone(),
+                };
+                f(self, &ctx, args)?
+            }
+        };
+        if self.trace_natives {
+            let result = match &outcome {
+                NativeOutcome::Value(Value::Void) => "void".to_owned(),
+                NativeOutcome::Value(v) => self.value_text(v),
+                NativeOutcome::Iterate(items) => format!("{} items", items.len()),
+            };
+            self.note(TraceKind::Native {
+                path,
+                index: declared,
+                this: self.objects[this as usize].name.clone(),
+                args: before,
+                result,
+            });
+        }
+        Ok(outcome)
+    }
+
+    // ------------------------------------------------------------------ statements
+
+    fn goto_offset(&self, frame: &Frame<'s>, offset: u32) -> VmResult<usize> {
+        frame
+            .map
+            .get(&offset)
+            .copied()
+            .ok_or_else(|| self.err(VmErrorKind::BadJumpTarget { offset }))
+    }
+
+    fn run(
+        &mut self,
+        frame: &mut Frame<'s>,
+        start: usize,
+        state_gen: Option<u64>,
+    ) -> VmResult<Exit> {
+        let script = frame.script;
+        let mut pc = start;
+        loop {
+            let Some(stmt) = script.statements.get(pc) else {
+                return Ok(Exit::End);
+            };
+            self.step()?;
+            if let Some(top) = self.stack.last_mut() {
+                top.offset = stmt.offset;
+            }
+            let flow = self.exec(frame, stmt, pc)?;
+            if let Some(start_gen) = state_gen
+                && self.objects[frame.this as usize].generation != start_gen
+            {
+                // GotoState/goto from inside state code: continue with the new code.
+                return Ok(Exit::Restart);
+            }
+            match flow {
+                Flow::Next => pc += 1,
+                Flow::Goto(i) => pc = i,
+                Flow::Return(v) => return Ok(Exit::Return(v)),
+                Flow::Stop => return Ok(Exit::Stop),
+                Flow::Latent => return Ok(Exit::Latent(pc + 1)),
+            }
+        }
+    }
+
+    fn exec(&mut self, frame: &mut Frame<'s>, t: &Token, pc: usize) -> VmResult<Flow> {
+        use TokenKind as K;
+        let flow = match &t.kind {
+            K::Jump { target } => Flow::Goto(self.goto_offset(frame, u32::from(*target))?),
+            K::JumpIfNot { target, cond } => {
+                let c = self.eval(frame, cond)?;
+                if self.truthy(&c)? {
+                    Flow::Next
+                } else {
+                    Flow::Goto(self.goto_offset(frame, u32::from(*target))?)
+                }
+            }
+            K::Return(e) => {
+                let v = match e.kind {
+                    K::Nothing => match frame.layout.as_ref().and_then(|l| l.ret.clone()) {
+                        Some((slot, _)) => frame.locals[slot].clone(),
+                        None => Value::Void,
+                    },
+                    _ => self.eval(frame, e)?,
+                };
+                Flow::Return(v)
+            }
+            K::Stop => Flow::Stop,
+            K::Nothing | K::LabelTable { .. } => Flow::Next,
+            K::Case { .. } => Flow::Next, // fall-through: UE2 skips the case expression
+            K::Switch { expr, .. } => {
+                let v = self.eval(frame, expr)?;
+                let mut idx = pc + 1;
+                loop {
+                    let Some(s) = frame.script.statements.get(idx) else {
+                        return Err(self.err(VmErrorKind::Other("switch without cases".into())));
+                    };
+                    match &s.kind {
+                        K::Case { value: None, .. } => break Flow::Goto(idx + 1),
+                        K::Case {
+                            target,
+                            value: Some(cv),
+                        } => {
+                            let c = self.eval(frame, cv)?;
+                            if values_equal(&v, &c) {
+                                break Flow::Goto(idx + 1);
+                            }
+                            idx = self.goto_offset(frame, u32::from(*target))?;
+                        }
+                        _ => break Flow::Goto(idx),
+                    }
+                }
+            }
+            K::Assert { line, cond } => {
+                let c = self.eval(frame, cond)?;
+                if !self.truthy(&c)? {
+                    return Err(self.err(VmErrorKind::AssertionFailed { line: *line }));
+                }
+                Flow::Next
+            }
+            K::Iterator { expr, end } => {
+                let (func, call, index) = match &expr.kind {
+                    K::NativeCall { index, call } => (
+                        self.resolve_native_index(*index, call.args.len())?,
+                        call,
+                        Some(*index),
+                    ),
+                    K::FinalFunction { function, call } => (
+                        self.set.resolve(frame.pkg, *function).ok_or_else(|| {
+                            self.err(VmErrorKind::Unresolved {
+                                what: "iterator function".into(),
+                            })
+                        })?,
+                        call,
+                        None,
+                    ),
+                    _ => {
+                        return Err(self.err(VmErrorKind::UnsupportedToken {
+                            opcode: expr.opcode,
+                            name: "Iterator over a non-native call",
+                        }));
+                    }
+                };
+                let this = frame.this;
+                match self.native_from_tokens(frame, func, call, this, index)? {
+                    NativeOutcome::Iterate(items) => {
+                        let found = items.iter().map(|v| self.value_text(v)).collect();
+                        self.note(TraceKind::Iterator {
+                            native: self.short_path(func),
+                            found,
+                        });
+                        let st = frame.iters.last_mut().expect("pushed");
+                        st.body = pc + 1;
+                        if items.is_empty() {
+                            Flow::Goto(self.goto_offset(frame, u32::from(*end))?)
+                        } else {
+                            let place = st.place.clone();
+                            if let Some(pl) = place {
+                                self.write(frame, &pl, items[0].clone())?;
+                            }
+                            Flow::Next
+                        }
+                    }
+                    NativeOutcome::Value(_) => {
+                        return Err(self.err(VmErrorKind::Other(format!(
+                            "{} is not an iterator",
+                            self.short_path(func)
+                        ))));
+                    }
+                }
+            }
+            K::IteratorNext => {
+                let Some(st) = frame.iters.last_mut() else {
+                    return Err(
+                        self.err(VmErrorKind::Other("IteratorNext without iterator".into()))
+                    );
+                };
+                st.idx += 1;
+                if st.idx < st.items.len() {
+                    let (v, place, body) = (st.items[st.idx].clone(), st.place.clone(), st.body);
+                    if let Some(pl) = place {
+                        self.write(frame, &pl, v)?;
+                    }
+                    Flow::Goto(body)
+                } else {
+                    Flow::Next
+                }
+            }
+            K::IteratorPop => {
+                if frame.iters.pop().is_none() {
+                    return Err(self.err(VmErrorKind::Other("IteratorPop without iterator".into())));
+                }
+                Flow::Next
+            }
+            K::GotoLabel(e) => {
+                let v = self.eval(frame, e)?;
+                let Value::Name(label) = v else {
+                    return Err(self.type_err("name", &v));
+                };
+                let Some(id) = frame.state_of else {
+                    return Err(
+                        self.err(VmErrorKind::Other("goto label outside state code".into()))
+                    );
+                };
+                let state = self.objects[id as usize].state;
+                let found = state.and_then(|s| self.find_label(s, &label));
+                match found {
+                    Some((owner, offset)) => {
+                        let script = &self.struct_header(owner).expect("state").script;
+                        let map = self.stmt_map(owner, script);
+                        let pc2 = *map
+                            .get(&offset)
+                            .ok_or_else(|| self.err(VmErrorKind::BadJumpTarget { offset }))?;
+                        let o = &mut self.objects[id as usize];
+                        o.state_code = Some(StateCode {
+                            owner,
+                            pc: pc2,
+                            latent: None,
+                        });
+                        o.generation += 1;
+                    }
+                    None => {
+                        return Err(
+                            self.err(VmErrorKind::Other(format!("label '{label}' not found")))
+                        );
+                    }
+                }
+                Flow::Next
+            }
+            _ => {
+                self.eval(frame, t)?;
+                if frame.pending_latent.is_some() {
+                    Flow::Latent
+                } else {
+                    Flow::Next
+                }
+            }
+        };
+        Ok(flow)
+    }
+
+    // ------------------------------------------------------------------ expressions
+
+    fn type_err(&self, expected: &'static str, v: &Value) -> VmError {
+        self.err(VmErrorKind::TypeMismatch {
+            expected,
+            found: v.type_name(),
+        })
+    }
+
+    fn truthy(&self, v: &Value) -> VmResult<bool> {
+        match v {
+            Value::Bool(b) => Ok(*b),
+            other => Err(self.type_err("bool", other)),
+        }
+    }
+
+    fn eval(&mut self, frame: &mut Frame<'s>, t: &Token) -> VmResult<Value> {
+        let this = frame.this;
+        self.eval_in(frame, t, this)
+    }
+
+    fn accessed_none(&mut self) {
+        let (function, offset) = self
+            .stack
+            .last()
+            .map_or((String::new(), 0), |s| (s.function.clone(), s.offset));
+        self.note(TraceKind::AccessedNone { function, offset });
+    }
+
+    fn context_target(
+        &mut self,
+        frame: &mut Frame<'s>,
+        object: &Token,
+        target: ObjectId,
+    ) -> VmResult<Option<ObjectId>> {
+        let v = self.eval_in(frame, object, target)?;
+        match v {
+            Value::Object(Some(ObjRef::Instance(i))) => Ok(Some(i)),
+            Value::Object(Some(ObjRef::Static(g))) => {
+                if matches!(self.set.object(g), Some(ScriptObject::Class(_))) {
+                    Ok(Some(self.default_object(g)?))
+                } else {
+                    Err(self.err(VmErrorKind::UnsupportedValue {
+                        desc: format!("context on uninstantiated object {}", self.set.path(g)),
+                    }))
+                }
+            }
+            Value::Object(None) => Ok(None),
+            Value::Unsupported(d) => Err(self.err(VmErrorKind::UnsupportedValue { desc: d })),
+            other => Err(self.type_err("object", &other)),
+        }
+    }
+
+    fn zero_for(&mut self, frame: &Frame<'s>, t: &Token, target: ObjectId) -> Value {
+        use TokenKind as K;
+        let g = match &t.kind {
+            K::InstanceVariable(r) | K::DefaultVariable(r) | K::LocalVariable(r) => {
+                self.set.resolve(frame.pkg, *r)
+            }
+            K::BoolVariable(_) => return Value::Bool(false),
+            K::FinalFunction { function, .. } => {
+                let g = self.set.resolve(frame.pkg, *function);
+                return g.map_or(Value::Void, |g| {
+                    self.func_layout(g)
+                        .ret
+                        .as_ref()
+                        .map_or(Value::Void, |(_, ty)| ty.zero())
+                });
+            }
+            K::VirtualFunction { name, .. } => {
+                let n = self.set.packages[frame.pkg].name_text(*name).to_owned();
+                let g = self.find_function(target, &n, true);
+                return g.map_or(Value::Void, |g| {
+                    self.func_layout(g)
+                        .ret
+                        .as_ref()
+                        .map_or(Value::Void, |(_, ty)| ty.zero())
+                });
+            }
+            K::NativeCall { index, call } => {
+                return match self.resolve_native_index(*index, call.args.len()) {
+                    Ok(g) => self
+                        .func_layout(g)
+                        .ret
+                        .as_ref()
+                        .map_or(Value::Void, |(_, ty)| ty.zero()),
+                    Err(_) => Value::Void,
+                };
+            }
+            _ => None,
+        };
+        match g.and_then(|g| self.set.object(g)) {
+            Some(ScriptObject::Property(p)) => self.ty_of(frame.pkg, &p.kind, 0).zero(),
+            _ => Value::Void,
+        }
+    }
+
+    fn resolve_ref(&self, frame: &Frame<'s>, r: ObjectRef) -> VmResult<GlobalRef> {
+        self.set.resolve(frame.pkg, r).ok_or_else(|| {
+            self.err(VmErrorKind::Unresolved {
+                what: self.set.packages[frame.pkg].ref_path(r),
+            })
+        })
+    }
+
+    fn eval_in(&mut self, frame: &mut Frame<'s>, t: &Token, target: ObjectId) -> VmResult<Value> {
+        use TokenKind as K;
+        let v = match &t.kind {
+            K::LocalVariable(_)
+            | K::InstanceVariable(_)
+            | K::DefaultVariable(_)
+            | K::ArrayElement { .. }
+            | K::DynArrayElement { .. }
+            | K::StructMember { .. }
+            | K::BoolVariable(_) => match self.place(frame, t, target)? {
+                Some(p) => self.read(frame, &p)?,
+                None => self.zero_for(frame, t, target),
+            },
+            K::Context(c) => match self.context_target(frame, &c.object, target)? {
+                Some(obj) => self.eval_in(frame, &c.member, obj)?,
+                None => {
+                    self.accessed_none();
+                    self.zero_for(frame, &c.member, target)
+                }
+            },
+            K::ClassContext(c) => {
+                let v = self.eval_in(frame, &c.object, target)?;
+                let class = match v {
+                    Value::Object(Some(ObjRef::Static(g))) => Some(g),
+                    Value::Object(Some(ObjRef::Instance(i))) => {
+                        Some(self.objects[i as usize].class)
+                    }
+                    Value::Object(None) => None,
+                    other => return Err(self.type_err("class", &other)),
+                };
+                match class {
+                    Some(g) => {
+                        let d = self.default_object(g)?;
+                        self.eval_in(frame, &c.member, d)?
+                    }
+                    None => {
+                        self.accessed_none();
+                        self.zero_for(frame, &c.member, target)
+                    }
+                }
+            }
+            K::Let { lhs, rhs } | K::LetBool { lhs, rhs } => {
+                let place = self.place(frame, lhs, target)?;
+                let v = self.eval(frame, rhs)?;
+                match place {
+                    Some(p) => self.write(frame, &p, v)?,
+                    None => self.accessed_none(),
+                }
+                Value::Void
+            }
+            K::VirtualFunction { name, call } => {
+                let n = self.set.packages[frame.pkg].name_text(*name).to_owned();
+                let f = self.find_function(target, &n, true).ok_or_else(|| {
+                    self.err(VmErrorKind::NoSuchFunction {
+                        object: self.objects[target as usize].name.clone(),
+                        name: n.clone(),
+                    })
+                })?;
+                self.invoke(frame, f, call, target, None)?
+            }
+            K::GlobalFunction { name, call } => {
+                let n = self.set.packages[frame.pkg].name_text(*name).to_owned();
+                let f = self.find_function(target, &n, false).ok_or_else(|| {
+                    self.err(VmErrorKind::NoSuchFunction {
+                        object: self.objects[target as usize].name.clone(),
+                        name: n.clone(),
+                    })
+                })?;
+                self.invoke(frame, f, call, target, None)?
+            }
+            K::FinalFunction { function, call } => {
+                let f = self.resolve_ref(frame, *function)?;
+                self.invoke(frame, f, call, target, None)?
+            }
+            K::NativeCall { index, call } => {
+                let f = self.resolve_native_index(*index, call.args.len())?;
+                self.invoke(frame, f, call, target, Some(*index))?
+            }
+            K::IntConst(v) => Value::Int(*v),
+            K::IntConstByte(v) => Value::Int(i32::from(*v)),
+            K::IntZero => Value::Int(0),
+            K::IntOne => Value::Int(1),
+            K::FloatConst(v) => Value::Float(*v),
+            K::ByteConst(v) => Value::Byte(*v),
+            K::True => Value::Bool(true),
+            K::False => Value::Bool(false),
+            K::NoObject => Value::Object(None),
+            K::SelfRef => Value::Object(Some(ObjRef::Instance(frame.this))),
+            K::StringConst(b) => Value::Str(b.iter().map(|&c| char::from(c)).collect()),
+            K::UnicodeStringConst(u) => Value::Str(String::from_utf16_lossy(u)),
+            K::NameConst(n) => Value::Name(self.set.packages[frame.pkg].name_text(*n).to_owned()),
+            K::VectorConst(v) => Value::Vector(*v),
+            K::RotationConst(r) => Value::Rotator(*r),
+            K::ObjectConst(r) => {
+                let pkg = frame.pkg;
+                self.resolve_value_ref(pkg, *r)
+            }
+            K::Nothing => Value::Void,
+            K::Skip { expr, .. } => self.eval_in(frame, expr, target)?,
+            K::EatString(e) => {
+                self.eval(frame, e)?;
+                Value::Void
+            }
+            K::Conditional { cond, a, b, .. } => {
+                let c = self.eval(frame, cond)?;
+                if self.truthy(&c)? {
+                    self.eval(frame, a)?
+                } else {
+                    self.eval(frame, b)?
+                }
+            }
+            K::DynamicCast { class, expr } => {
+                let class = self.resolve_ref(frame, *class)?;
+                let v = self.eval(frame, expr)?;
+                match v {
+                    Value::Object(Some(ObjRef::Instance(i))) => {
+                        let c = self.objects[i as usize].class;
+                        if self.is_child_of(c, class) {
+                            Value::Object(Some(ObjRef::Instance(i)))
+                        } else {
+                            Value::Object(None)
+                        }
+                    }
+                    Value::Object(_) => Value::Object(None),
+                    other => return Err(self.type_err("object", &other)),
+                }
+            }
+            K::MetaCast { class, expr } => {
+                let class = self.resolve_ref(frame, *class)?;
+                let v = self.eval(frame, expr)?;
+                match v {
+                    Value::Object(Some(ObjRef::Static(g))) if self.is_child_of(g, class) => {
+                        Value::Object(Some(ObjRef::Static(g)))
+                    }
+                    Value::Object(_) => Value::Object(None),
+                    other => return Err(self.type_err("class", &other)),
+                }
+            }
+            K::PrimitiveCast { cast, expr } => {
+                let v = self.eval(frame, expr)?;
+                self.primitive_cast(*cast, v)?
+            }
+            K::DynArrayLength(e) => match self.eval_in(frame, e, target)? {
+                Value::Array(a) => Value::Int(a.len() as i32),
+                other => return Err(self.type_err("array", &other)),
+            },
+            K::DynArrayInsert {
+                array,
+                index,
+                count,
+            }
+            | K::DynArrayRemove {
+                array,
+                index,
+                count,
+            } => {
+                let place = self.place(frame, array, target)?;
+                let idx = self.int(frame, index)?;
+                let n = self.int(frame, count)?;
+                if let Some(pl) = place {
+                    let mut arr = match self.read(frame, &pl)? {
+                        Value::Array(a) => a,
+                        other => return Err(self.type_err("array", &other)),
+                    };
+                    let (i, n) = (idx.max(0) as usize, n.max(0) as usize);
+                    if t.opcode == 0x40 {
+                        if i > arr.len() {
+                            return Err(self.err(VmErrorKind::ArrayIndex {
+                                index: i as i64,
+                                len: arr.len(),
+                            }));
+                        }
+                        let zero = self.array_inner_zero(frame, array);
+                        for _ in 0..n {
+                            arr.insert(i, zero.clone());
+                        }
+                    } else {
+                        if i + n > arr.len() {
+                            return Err(self.err(VmErrorKind::ArrayIndex {
+                                index: (i + n) as i64,
+                                len: arr.len(),
+                            }));
+                        }
+                        arr.drain(i..i + n);
+                    }
+                    self.write(frame, &pl, Value::Array(arr))?;
+                }
+                Value::Void
+            }
+            K::StructCmpEq { a, b, .. } | K::StructCmpNe { a, b, .. } => {
+                let x = self.eval(frame, a)?;
+                let y = self.eval(frame, b)?;
+                Value::Bool(values_equal(&x, &y) == (t.opcode == 0x32))
+            }
+            _ => {
+                return Err(self.err(VmErrorKind::UnsupportedToken {
+                    opcode: t.opcode,
+                    name: opcode_name(t.opcode),
+                }));
+            }
+        };
+        if let Value::Unsupported(d) = &v {
+            return Err(self.err(VmErrorKind::UnsupportedValue { desc: d.clone() }));
+        }
+        Ok(v)
+    }
+
+    fn array_inner_zero(&mut self, frame: &Frame<'s>, array: &Token) -> Value {
+        match self.zero_for(frame, array, frame.this) {
+            Value::Array(_) => {}
+            _ => return Value::Int(0),
+        }
+        let g = match &array.kind {
+            TokenKind::InstanceVariable(r) | TokenKind::LocalVariable(r) => {
+                self.set.resolve(frame.pkg, *r)
+            }
+            _ => None,
+        };
+        if let Some(ScriptObject::Property(p)) = g.and_then(|g| self.set.object(g))
+            && let Ty::Array(inner) = self.ty_of(frame.pkg, &p.kind, 0)
+        {
+            return inner.zero();
+        }
+        Value::Int(0)
+    }
+
+    fn int(&mut self, frame: &mut Frame<'s>, t: &Token) -> VmResult<i32> {
+        match self.eval(frame, t)? {
+            Value::Int(i) => Ok(i),
+            Value::Byte(b) => Ok(i32::from(b)),
+            other => Err(self.type_err("int", &other)),
+        }
+    }
+
+    fn primitive_cast(&self, cast: u8, v: Value) -> VmResult<Value> {
+        // UE2 conversion codes (ECastToken), confirmed on corpus uses (0x3F int->float on
+        // ints, 0x44 float->int, 0x53/0x56/0x57 to string on int/object/name operands).
+        let bad = |s: &Self, v: &Value| s.type_err("castable value", v);
+        Ok(match (cast, &v) {
+            (0x3A, Value::Byte(b)) => Value::Int(i32::from(*b)),
+            (0x3B, Value::Byte(b)) => Value::Bool(*b != 0),
+            (0x3C, Value::Byte(b)) => Value::Float(f32::from(*b)),
+            (0x3D, Value::Int(i)) => Value::Byte(*i as u8),
+            (0x3E, Value::Int(i)) => Value::Bool(*i != 0),
+            (0x3F, Value::Int(i)) => Value::Float(*i as f32),
+            (0x40, Value::Bool(b)) => Value::Byte(u8::from(*b)),
+            (0x41, Value::Bool(b)) => Value::Int(i32::from(*b)),
+            (0x42, Value::Bool(b)) => Value::Float(if *b { 1.0 } else { 0.0 }),
+            (0x43, Value::Float(f)) => Value::Byte(*f as u8),
+            (0x44, Value::Float(f)) => Value::Int(*f as i32),
+            (0x45, Value::Float(f)) => Value::Bool(*f != 0.0),
+            (0x47, Value::Object(o)) => Value::Bool(o.is_some()),
+            (0x48, Value::Name(n)) => Value::Bool(!n.eq_ignore_ascii_case("None")),
+            (0x4A, Value::Str(s)) => Value::Int(s.trim().parse().unwrap_or(0)),
+            (0x4B, Value::Str(s)) => Value::Bool(
+                s.eq_ignore_ascii_case("true") || s.trim().parse::<i32>().is_ok_and(|i| i != 0),
+            ),
+            (0x4C, Value::Str(s)) => Value::Float(s.trim().parse().unwrap_or(0.0)),
+            (0x52, Value::Byte(b)) => Value::Str(b.to_string()),
+            (0x53, Value::Int(i)) => Value::Str(i.to_string()),
+            (0x54, Value::Bool(b)) => Value::Str(if *b { "True" } else { "False" }.into()),
+            (0x55, Value::Float(f)) => Value::Str(format!("{f:.2}")),
+            (0x56, Value::Object(None)) => Value::Str("None".into()),
+            (0x56, Value::Object(Some(r))) => Value::Str(self.obj_label(r)),
+            (0x57, Value::Name(n)) => Value::Str(n.clone()),
+            (c, _) if !(0x39..=0x59).contains(&c) => return Err(bad(self, &v)),
+            _ => {
+                return Err(self.err(VmErrorKind::Other(format!(
+                    "primitive cast 0x{cast:02X} on {} not implemented",
+                    v.type_name()
+                ))));
+            }
+        })
+    }
+
+    // ------------------------------------------------------------------ places
+
+    fn var_slot(
+        &mut self,
+        frame: &Frame<'s>,
+        r: ObjectRef,
+        target: ObjectId,
+        default: bool,
+    ) -> VmResult<Place> {
+        let g = self.resolve_ref(frame, r)?;
+        if let Some(l) = &frame.layout
+            && let Some(i) = l.by_prop.get(&g)
+        {
+            return Ok(Place::Local(l.slots[*i].base));
+        }
+        let obj = if default {
+            let class = self.objects[target as usize].class;
+            self.default_object(class)?
+        } else {
+            target
+        };
+        let layout = self.objects[obj as usize].layout.clone();
+        match layout.by_prop.get(&g) {
+            Some(i) => Ok(Place::Slot(obj, layout.slots[*i].base)),
+            None => Err(self.err(VmErrorKind::Unresolved {
+                what: format!(
+                    "property {} not in class {} of {}",
+                    self.set.path(g),
+                    self.set.path(layout.class),
+                    self.objects[obj as usize].name
+                ),
+            })),
+        }
+    }
+
+    fn slot_dim(&self, frame: &Frame<'s>, place: &Place) -> usize {
+        match place {
+            Place::Local(base) => frame
+                .layout
+                .as_ref()
+                .and_then(|l| l.slots.iter().find(|s| s.base == *base))
+                .map_or(1, |s| s.dim),
+            Place::Slot(obj, base) => self.objects[*obj as usize]
+                .layout
+                .slots
+                .iter()
+                .find(|s| s.base == *base)
+                .map_or(1, |s| s.dim),
+            _ => 1,
+        }
+    }
+
+    fn place(
+        &mut self,
+        frame: &mut Frame<'s>,
+        t: &Token,
+        target: ObjectId,
+    ) -> VmResult<Option<Place>> {
+        use TokenKind as K;
+        Ok(Some(match &t.kind {
+            K::LocalVariable(r) => self.var_slot(frame, *r, target, false)?,
+            K::InstanceVariable(r) => self.var_slot(frame, *r, target, false)?,
+            K::DefaultVariable(r) => self.var_slot(frame, *r, target, true)?,
+            K::BoolVariable(e) => return self.place(frame, e, target),
+            K::Context(c) => match self.context_target(frame, &c.object, target)? {
+                Some(obj) => return self.place(frame, &c.member, obj),
+                None => return Ok(None),
+            },
+            K::ArrayElement { index, array } => {
+                let i = self.int(frame, index)?;
+                let Some(base) = self.place(frame, array, target)? else {
+                    return Ok(None);
+                };
+                let dim = self.slot_dim(frame, &base);
+                if i < 0 || i as usize >= dim {
+                    return Err(self.err(VmErrorKind::ArrayIndex {
+                        index: i64::from(i),
+                        len: dim,
+                    }));
+                }
+                match base {
+                    Place::Local(b) => Place::Local(b + i as usize),
+                    Place::Slot(o, b) => Place::Slot(o, b + i as usize),
+                    _ => {
+                        return Err(self.err(VmErrorKind::NotAPlace { opcode: t.opcode }));
+                    }
+                }
+            }
+            K::DynArrayElement { index, array } => {
+                let i = self.int(frame, index)?;
+                let Some(base) = self.place(frame, array, target)? else {
+                    return Ok(None);
+                };
+                if i < 0 {
+                    return Err(self.err(VmErrorKind::ArrayIndex {
+                        index: i64::from(i),
+                        len: 0,
+                    }));
+                }
+                Place::Elem(Box::new(base), i as usize)
+            }
+            K::StructMember { property, expr } => {
+                let g = self.resolve_ref(frame, *property)?;
+                let name = lower(self.object_name(g));
+                let Some(base) = self.place(frame, expr, target)? else {
+                    return Ok(None);
+                };
+                Place::Member(Box::new(base), name)
+            }
+            _ => return Err(self.err(VmErrorKind::NotAPlace { opcode: t.opcode })),
+        }))
+    }
+
+    fn read(&self, frame: &Frame<'s>, p: &Place) -> VmResult<Value> {
+        let v = match p {
+            Place::Local(i) => frame.locals.get(*i).cloned(),
+            Place::Slot(o, i) => self.objects[*o as usize].props.get(*i).cloned(),
+            Place::Elem(base, i) => match self.read(frame, base)? {
+                Value::Array(a) => match a.get(*i) {
+                    Some(v) => Some(v.clone()),
+                    None => {
+                        return Err(self.err(VmErrorKind::ArrayIndex {
+                            index: *i as i64,
+                            len: a.len(),
+                        }));
+                    }
+                },
+                other => return Err(self.type_err("array", &other)),
+            },
+            Place::Member(base, m) => Some(
+                member_get(&self.read(frame, base)?, m)
+                    .ok_or_else(|| self.err(VmErrorKind::Other(format!("no struct member {m}"))))?,
+            ),
+        };
+        let v = v.ok_or_else(|| self.err(VmErrorKind::Other("bad slot".into())))?;
+        if let Value::Unsupported(d) = &v {
+            return Err(self.err(VmErrorKind::UnsupportedValue { desc: d.clone() }));
+        }
+        Ok(v)
+    }
+
+    fn write(&mut self, frame: &mut Frame<'s>, p: &Place, v: Value) -> VmResult<()> {
+        match p {
+            Place::Local(i) => {
+                let slot = frame
+                    .locals
+                    .get_mut(*i)
+                    .ok_or_else(|| self.err(VmErrorKind::Other("bad local".into())))?;
+                *slot = v;
+            }
+            Place::Slot(o, i) => {
+                let len = self.objects[*o as usize].props.len();
+                if *i >= len {
+                    return Err(self.err(VmErrorKind::Other("bad slot".into())));
+                }
+                self.objects[*o as usize].props[*i] = v;
+            }
+            Place::Elem(base, i) => {
+                let mut arr = match self.read(frame, base)? {
+                    Value::Array(a) => a,
+                    other => return Err(self.type_err("array", &other)),
+                };
+                if *i >= arr.len() {
+                    // UE2 grows a dynamic array on assignment past its end.
+                    let zero = match &v {
+                        Value::Int(_) => Value::Int(0),
+                        Value::Float(_) => Value::Float(0.0),
+                        Value::Object(_) => Value::Object(None),
+                        Value::Name(_) => Value::Name("None".into()),
+                        other => other.clone(),
+                    };
+                    arr.resize(*i + 1, zero);
+                }
+                arr[*i] = v;
+                self.write(frame, base, Value::Array(arr))?;
+            }
+            Place::Member(base, m) => {
+                let mut s = self.read(frame, base)?;
+                if !member_set(&mut s, m, v) {
+                    return Err(self.err(VmErrorKind::Other(format!("no struct member {m}"))));
+                }
+                self.write(frame, base, s)?;
+            }
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ helpers for natives
+
+    pub(crate) fn disable_probe(&mut self, id: ObjectId, probe: &str, disable: bool) {
+        let o = &mut self.objects[id as usize];
+        if disable {
+            o.disabled.insert(lower(probe));
+        } else {
+            o.disabled.remove(&lower(probe));
+        }
+    }
+
+    pub(crate) fn set_timer(&mut self, id: ObjectId, rate: f32, repeat: bool) {
+        self.objects[id as usize].timer = (rate > 0.0).then_some(Timer {
+            rate,
+            remaining: rate,
+            repeat,
+        });
+    }
+
+    /// Actors iterated by `DynamicActors` (non-static actors of a class with a tag), in
+    /// object order.
+    pub(crate) fn dynamic_actors(
+        &self,
+        base: Option<GlobalRef>,
+        tag: Option<&str>,
+    ) -> Vec<ObjectId> {
+        let mut out = Vec::new();
+        for (i, o) in self.objects.iter().enumerate() {
+            if !o.is_actor || o.name.starts_with("Default__") {
+                continue;
+            }
+            if let Some(b) = base
+                && !o.layout.chain.contains(&b)
+            {
+                continue;
+            }
+            // UE2 DynamicActors starts at the first non-static actor (bStatic actors first).
+            let is_static = o
+                .layout
+                .slot_by_name("bStatic")
+                .and_then(|s| o.props.get(s.base))
+                == Some(&Value::Bool(true));
+            if is_static {
+                continue;
+            }
+            if let Some(tag) = tag {
+                let t = o
+                    .layout
+                    .slot_by_name("Tag")
+                    .and_then(|s| o.props.get(s.base));
+                match t {
+                    Some(Value::Name(n)) if n.eq_ignore_ascii_case(tag) => {}
+                    _ => continue,
+                }
+            }
+            out.push(i as ObjectId);
+        }
+        out
+    }
+
+    pub(crate) fn time_now(&self) -> f64 {
+        self.time
+    }
+
+    /// Statistic: functions in the set flagged native (for reports).
+    pub fn is_native_function(&self, g: GlobalRef) -> bool {
+        matches!(self.set.object(g), Some(ScriptObject::Function(f)) if f.flags & function_flags::NATIVE != 0)
+    }
+}
+
+fn member_get(v: &Value, m: &str) -> Option<Value> {
+    match (v, m) {
+        (Value::Vector(a), "x") => Some(Value::Float(a[0])),
+        (Value::Vector(a), "y") => Some(Value::Float(a[1])),
+        (Value::Vector(a), "z") => Some(Value::Float(a[2])),
+        (Value::Rotator(a), "pitch") => Some(Value::Int(a[0])),
+        (Value::Rotator(a), "yaw") => Some(Value::Int(a[1])),
+        (Value::Rotator(a), "roll") => Some(Value::Int(a[2])),
+        (Value::Struct(ms), m) => ms.iter().find(|(n, _)| n == m).map(|(_, v)| v.clone()),
+        _ => None,
+    }
+}
+
+fn member_set(v: &mut Value, m: &str, x: Value) -> bool {
+    match (v, m, x) {
+        (Value::Vector(a), "x", Value::Float(f)) => a[0] = f,
+        (Value::Vector(a), "y", Value::Float(f)) => a[1] = f,
+        (Value::Vector(a), "z", Value::Float(f)) => a[2] = f,
+        (Value::Rotator(a), "pitch", Value::Int(i)) => a[0] = i,
+        (Value::Rotator(a), "yaw", Value::Int(i)) => a[1] = i,
+        (Value::Rotator(a), "roll", Value::Int(i)) => a[2] = i,
+        (Value::Struct(ms), m, x) => match ms.iter_mut().find(|(n, _)| n == m) {
+            Some(slot) => slot.1 = x,
+            None => return false,
+        },
+        _ => return false,
+    }
+    true
+}
+
+/// UnrealScript equality used by `switch` and struct comparisons (names case-insensitive).
+pub fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Name(x), Value::Name(y)) => x.eq_ignore_ascii_case(y),
+        (Value::Int(x), Value::Byte(y)) | (Value::Byte(y), Value::Int(x)) => *x == i32::from(*y),
+        _ => a == b,
+    }
+}

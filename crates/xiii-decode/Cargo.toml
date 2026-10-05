@@ -1,6 +1,6 @@
 [package]
-name = "xiii-app"
-description = "Bevy runtime for XIII Classic content imported from an owned installation"
+name = "xiii-decode"
+description = "Decoders for XIII object payloads (textures, static meshes, BSP, terrain, skeletal meshes, animation) into normalized assets"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,10 +8,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-bevy = { workspace = true }
 xiii-package.workspace = true
-xiii-install.workspace = true
-xiii-decode.workspace = true
 
 [lints]
 workspace = true

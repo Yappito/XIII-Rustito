@@ -6,6 +6,28 @@ input logging, a generated audio tone and an unattended report mode. It uses
 no game data. Real import-from-installation modes will be added beside
 `smoke::SmokePlugin` (selected in `main.rs` from `cli::Mode`).
 
+## Map viewer (M2a diagnostic)
+
+```sh
+cargo run --release -p xiii-app -- --map Plage00 --game-dir P:/AI/XIII/XIII_Game
+cargo run --release -p xiii-app -- --map Plage01 --game-dir ... --exit-after-secs 6 --screenshot out.png
+cargo run --release -p xiii-app -- --map Plage01 --game-dir ... --view -50.1,22.6,-45.8,157.5,0
+cargo run --release -p xiii-app -- --map Plage00 --game-dir ... --dump [--find closed]
+```
+
+`src/viewer/load.rs` imports the map without Bevy types, using `xiii-install` for read-only
+package resolution and `xiii-decode`. It places static-mesh actors (Location, Rotation,
+DrawScale x DrawScale3D; PrePivot ignored), the level BSP and the terrain heightfield, and bakes
+the terrain layers into one texture. Materials are followed through
+Shader/FinalBlend/Tex*/SinusModifier/Combiner down to a texture and drawn unlit with a
+`StandardMaterial`; unresolved materials are drawn magenta. Every skipped item is a `skip.*`,
+`fail.*` or `note.*` counter, shown in the overlay and printed. The crosshair reports the
+object path (CPU ray against the render triangles). The fly camera starts at the PlayerStart
+(or `--view x,y,z,yaw,pitch`, given in Bevy metres and degrees). `--dump` imports without a
+window and adds collision ray probes. Known gaps: no skybox (sky-backdrop BSP surfaces are
+skipped and counted), translucent/modulated sea materials render dark, and there is no vertex
+lighting. This is an importer diagnostic, not a playable mode.
+
 ## Run
 
 ```sh

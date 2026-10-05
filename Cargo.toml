@@ -1,6 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/xiii-package", "crates/xiii-install", "crates/xiii-tool", "crates/xiii-app"]
+members = [
+    "crates/xiii-package",
+    "crates/xiii-install",
+    "crates/xiii-decode",
+    "crates/xiii-script",
+    "crates/xiii-tool",
+    "crates/xiii-app",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +19,8 @@ license = "UNLICENSED"
 [workspace.dependencies]
 xiii-package = { path = "crates/xiii-package" }
 xiii-install = { path = "crates/xiii-install" }
+xiii-decode = { path = "crates/xiii-decode" }
+xiii-script = { path = "crates/xiii-script" }
 # Exact pin; used by xiii-tool for --json output and inventory comparison.
 serde_json = "=1.0.151"
 # Exact pin; feature names verified against the bevy 0.19.1 crate manifest.

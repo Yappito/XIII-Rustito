@@ -1,0 +1,3462 @@
+{
+  "game_packages": {
+    "xidcine": {
+      "distinct_native_indices": 165,
+      "distinct_virtual_names": 192,
+      "final_calls_to_native_functions": [
+        {
+          "count": 131,
+          "function": "xidcine.CineController2.GetFirstWord"
+        },
+        {
+          "count": 30,
+          "function": "xidcine.CineController2.FindAnActor"
+        },
+        {
+          "count": 20,
+          "function": "xidcine.CineController2.CharIsNum"
+        },
+        {
+          "count": 5,
+          "function": "engine.HUD.Draw3DLine"
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.RefreshDisplaying"
+        }
+      ],
+      "final_calls_to_script_functions": 41,
+      "final_calls_unresolved": 0,
+      "global_calls": 46,
+      "native_call_tokens": 4300,
+      "native_index_histogram": [
+        {
+          "count": 333,
+          "function": "core.Object.Multiply_FloatFloat",
+          "index": 171
+        },
+        {
+          "count": 294,
+          "function": "core.Object.NotEqual_ObjectObject",
+          "index": 119
+        },
+        {
+          "count": 187,
+          "function": "core.Object.GotoState",
+          "index": 113
+        },
+        {
+          "count": 164,
+          "function": "core.Object.AndAnd_BoolBool",
+          "index": 130
+        },
+        {
+          "count": 142,
+          "function": "core.Object.Subtract_IntInt",
+          "index": 147
+        },
+        {
+          "count": 139,
+          "function": "core.Object.Subtract_VectorVector",
+          "index": 216
+        },
+        {
+          "count": 138,
+          "function": "core.Object.Not_PreBool",
+          "index": 129
+        },
+        {
+          "count": 111,
+          "function": "core.Object.Add_VectorVector",
+          "index": 215
+        },
+        {
+          "count": 110,
+          "function": "core.Object.Add_FloatFloat",
+          "index": 174
+        },
+        {
+          "count": 90,
+          "function": "core.Object.Add_IntInt",
+          "index": 146
+        },
+        {
+          "count": 90,
+          "function": "core.Object.And_IntInt",
+          "index": 156
+        },
+        {
+          "count": 81,
+          "function": "core.Object.EqualEqual_IntInt",
+          "index": 154
+        },
+        {
+          "count": 77,
+          "function": "core.Object.Less_IntInt",
+          "index": 150
+        },
+        {
+          "count": 75,
+          "function": "core.Object.Subtract_FloatFloat",
+          "index": 175
+        },
+        {
+          "count": 73,
+          "function": "core.Object.Multiply_FloatVector",
+          "index": 213
+        },
+        {
+          "count": 66,
+          "function": "core.Object.EqualEqual_ObjectObject",
+          "index": 114
+        },
+        {
+          "count": 66,
+          "function": "engine.Actor.SetRotation",
+          "index": 299
+        },
+        {
+          "count": 65,
+          "function": "core.Object.Greater_FloatFloat",
+          "index": 177
+        },
+        {
+          "count": 64,
+          "function": "engine.Actor.SetTimer",
+          "index": 280
+        },
+        {
+          "count": 63,
+          "function": "core.Object.AddAdd_Int",
+          "index": 165
+        },
+        {
+          "count": 62,
+          "function": "core.Object.OrOr_BoolBool",
+          "index": 132
+        },
+        {
+          "count": 61,
+          "function": "core.Object.Less_FloatFloat",
+          "index": 176
+        },
+        {
+          "count": 61,
+          "function": "core.Object.Multiply_VectorFloat",
+          "index": 212
+        },
+        {
+          "count": 61,
+          "function": "engine.Actor.Destroy",
+          "index": 279
+        },
+        {
+          "count": 59,
+          "function": "core.Object.VSize",
+          "index": 225
+        },
+        {
+          "count": 58,
+          "function": "core.Object.Concat_StrStr",
+          "index": 112
+        },
+        {
+          "count": 58,
+          "function": "core.Object.Subtract_PreFloat",
+          "index": 169
+        },
+        {
+          "count": 50,
+          "function": "core.Object.Divide_FloatFloat",
+          "index": 172
+        },
+        {
+          "count": 50,
+          "function": "engine.Actor.SetLocation",
+          "index": 267
+        },
+        {
+          "count": 47,
+          "function": "core.Object.At_StrStr",
+          "index": 168
+        },
+        {
+          "count": 47,
+          "function": "core.Object.Normal",
+          "index": 226
+        },
+        {
+          "count": 47,
+          "function": "engine.Actor.Sleep",
+          "index": 256
+        },
+        {
+          "count": 42,
+          "function": "core.Object.AddEqual_FloatFloat",
+          "index": 184
+        },
+        {
+          "count": 42,
+          "function": "engine.Actor.Spawn",
+          "index": 278
+        },
+        {
+          "count": 41,
+          "function": "core.Object.Clamp",
+          "index": 251
+        },
+        {
+          "count": 41,
+          "function": "core.Object.IsA",
+          "index": 303
+        },
+        {
+          "count": 37,
+          "function": "core.Object.NotEqual_IntInt",
+          "index": 155
+        },
+        {
+          "count": 37,
+          "function": "core.Object.Log",
+          "index": 231
+        },
+        {
+          "count": 33,
+          "function": "engine.Actor.SetCollision",
+          "index": 262
+        },
+        {
+          "count": 32,
+          "function": "core.Object.EqualEqual_FloatFloat",
+          "index": 180
+        },
+        {
+          "count": 30,
+          "function": "core.Object.Multiply_IntInt",
+          "index": 144
+        },
+        {
+          "count": 30,
+          "function": "core.Object.Add_RotatorRotator",
+          "index": 316
+        },
+        {
+          "count": 29,
+          "function": "core.Object.FRand",
+          "index": 195
+        },
+        {
+          "count": 27,
+          "function": "core.Object.Disable",
+          "index": 118
+        },
+        {
+          "count": 24,
+          "function": "engine.Actor.LoopAnim",
+          "index": 260
+        },
+        {
+          "count": 24,
+          "function": "engine.Actor.SetPhysics",
+          "index": 3970
+        },
+        {
+          "count": 23,
+          "function": "engine.Actor.PlaySound",
+          "index": 264
+        },
+        {
+          "count": 23,
+          "function": "engine.Actor.SetBase",
+          "index": 298
+        },
+        {
+          "count": 22,
+          "function": "core.Object.AddAdd_PreInt",
+          "index": 163
+        },
+        {
+          "count": 22,
+          "function": "engine.Actor.AnimBlendToAlpha",
+          "index": 411
+        },
+        {
+          "count": 21,
+          "function": "core.Object.IsInState",
+          "index": 281
+        },
+        {
+          "count": 18,
+          "function": "core.Object.Max",
+          "index": 250
+        },
+        {
+          "count": 18,
+          "function": "engine.Actor.DynamicActors",
+          "index": 313
+        },
+        {
+          "count": 17,
+          "function": "core.Object.Or_IntInt",
+          "index": 158
+        },
+        {
+          "count": 17,
+          "function": "core.Object.NotEqual_FloatFloat",
+          "index": 181
+        },
+        {
+          "count": 16,
+          "function": "core.Object.Subtract_PreInt",
+          "index": 143
+        },
+        {
+          "count": 16,
+          "function": "engine.Actor.SetRelativeRotation",
+          "index": 421
+        },
+        {
+          "count": 15,
+          "function": "core.Object.FMin",
+          "index": 244
+        },
+        {
+          "count": 14,
+          "function": "core.Object.NotEqual_NameName",
+          "index": 255
+        },
+        {
+          "count": 13,
+          "function": "core.Object.EqualEqual_StrStr",
+          "index": 122
+        },
+        {
+          "count": 13,
+          "function": "core.Object.AddEqual_IntInt",
+          "index": 161
+        },
+        {
+          "count": 13,
+          "function": "core.Object.Dot_VectorVector",
+          "index": 219
+        },
+        {
+          "count": 13,
+          "function": "core.Object.Multiply_RotatorFloat",
+          "index": 287
+        },
+        {
+          "count": 12,
+          "function": "core.Object.NotEqual_StrStr",
+          "index": 123
+        },
+        {
+          "count": 12,
+          "function": "core.Object.ComplementEqual_StrStr",
+          "index": 124
+        },
+        {
+          "count": 12,
+          "function": "core.Object.GreaterEqual_IntInt",
+          "index": 153
+        },
+        {
+          "count": 12,
+          "function": "engine.Actor.AttachToBone",
+          "index": 404
+        },
+        {
+          "count": 12,
+          "function": "engine.Actor.GetBoneCoords",
+          "index": 410
+        },
+        {
+          "count": 12,
+          "function": "engine.Actor.SetRelativeLocation",
+          "index": 420
+        },
+        {
+          "count": 11,
+          "function": "core.Object.SubtractEqual_FloatFloat",
+          "index": 185
+        },
+        {
+          "count": 11,
+          "function": "core.Object.EqualEqual_NameName",
+          "index": 254
+        },
+        {
+          "count": 11,
+          "function": "engine.Actor.PlayAnim",
+          "index": 259
+        },
+        {
+          "count": 11,
+          "function": "core.Object.Subtract_RotatorRotator",
+          "index": 317
+        },
+        {
+          "count": 11,
+          "function": "engine.Actor.SetTimer2",
+          "index": 363
+        },
+        {
+          "count": 11,
+          "function": "engine.Actor.SetBoneRotation",
+          "index": 397
+        },
+        {
+          "count": 10,
+          "function": "core.Object.GreaterEqual_FloatFloat",
+          "index": 179
+        },
+        {
+          "count": 10,
+          "function": "engine.Controller.CanSee",
+          "index": 533
+        },
+        {
+          "count": 9,
+          "function": "core.Object.Greater_IntInt",
+          "index": 151
+        },
+        {
+          "count": 9,
+          "function": "core.Object.Cos",
+          "index": 188
+        },
+        {
+          "count": 8,
+          "function": "core.Object.Left",
+          "index": 128
+        },
+        {
+          "count": 8,
+          "function": "core.Object.Cross_VectorVector",
+          "index": 220
+        },
+        {
+          "count": 8,
+          "function": "core.Object.GetStateName",
+          "index": 284
+        },
+        {
+          "count": 8,
+          "function": "engine.Actor.AnimBlendParams",
+          "index": 412
+        },
+        {
+          "count": 7,
+          "function": "core.Object.Enable",
+          "index": 117
+        },
+        {
+          "count": 7,
+          "function": "core.Object.LessEqual_FloatFloat",
+          "index": 178
+        },
+        {
+          "count": 7,
+          "function": "core.Object.Abs",
+          "index": 186
+        },
+        {
+          "count": 7,
+          "function": "engine.Actor.SetCollisionSize",
+          "index": 283
+        },
+        {
+          "count": 7,
+          "function": "core.Object.Multiply_FloatRotator",
+          "index": 288
+        },
+        {
+          "count": 7,
+          "function": "engine.Actor.RadiusActors",
+          "index": 310
+        },
+        {
+          "count": 7,
+          "function": "engine.Actor.PlayMusic",
+          "index": 358
+        },
+        {
+          "count": 6,
+          "function": "core.Object.Mid",
+          "index": 127
+        },
+        {
+          "count": 6,
+          "function": "core.Object.Subtract_PreVector",
+          "index": 211
+        },
+        {
+          "count": 6,
+          "function": "core.Object.Lerp",
+          "index": 247
+        },
+        {
+          "count": 6,
+          "function": "core.Object.GreaterGreater_VectorRotator",
+          "index": 276
+        },
+        {
+          "count": 6,
+          "function": "engine.Actor.LinkSkelAnim",
+          "index": 413
+        },
+        {
+          "count": 5,
+          "function": "core.Object.SubtractEqual_IntInt",
+          "index": 162
+        },
+        {
+          "count": 5,
+          "function": "core.Object.SubtractSubtract_Int",
+          "index": 166
+        },
+        {
+          "count": 5,
+          "function": "core.Object.Sin",
+          "index": 187
+        },
+        {
+          "count": 5,
+          "function": "core.Object.AddEqual_VectorVector",
+          "index": 223
+        },
+        {
+          "count": 5,
+          "function": "core.Object.FMax",
+          "index": 245
+        },
+        {
+          "count": 5,
+          "function": "engine.Canvas.SetDrawColor",
+          "index": 273
+        },
+        {
+          "count": 5,
+          "function": "engine.Canvas.MakeColor",
+          "index": 274
+        },
+        {
+          "count": 5,
+          "function": "engine.Actor.StopVoice",
+          "index": 344
+        },
+        {
+          "count": 5,
+          "function": "engine.Actor.SetDrawScale3D",
+          "index": 423
+        },
+        {
+          "count": 4,
+          "function": "core.Object.InStr",
+          "index": 126
+        },
+        {
+          "count": 4,
+          "function": "core.Object.LessEqual_IntInt",
+          "index": 152
+        },
+        {
+          "count": 4,
+          "function": "core.Object.Sqrt",
+          "index": 193
+        },
+        {
+          "count": 4,
+          "function": "core.Object.FClamp",
+          "index": 246
+        },
+        {
+          "count": 4,
+          "function": "engine.Canvas.SetPos",
+          "index": 269
+        },
+        {
+          "count": 4,
+          "function": "core.Object.SubtractEqual_RotatorRotator",
+          "index": 319
+        },
+        {
+          "count": 4,
+          "function": "engine.Actor.SetBoneScalePerAxis",
+          "index": 400
+        },
+        {
+          "count": 4,
+          "function": "engine.Actor.SetDrawType",
+          "index": 422
+        },
+        {
+          "count": 3,
+          "function": "core.Object.MultiplyMultiply_FloatFloat",
+          "index": 170
+        },
+        {
+          "count": 3,
+          "function": "core.Object.OrthoRotation",
+          "index": 197
+        },
+        {
+          "count": 3,
+          "function": "core.Object.NotEqual_VectorVector",
+          "index": 218
+        },
+        {
+          "count": 3,
+          "function": "core.Object.GetAxes",
+          "index": 229
+        },
+        {
+          "count": 3,
+          "function": "core.Object.EqualEqual_BoolBool",
+          "index": 242
+        },
+        {
+          "count": 3,
+          "function": "core.Object.VRand",
+          "index": 252
+        },
+        {
+          "count": 3,
+          "function": "core.Object.LessLess_VectorRotator",
+          "index": 275
+        },
+        {
+          "count": 2,
+          "function": "core.Object.Percent_FloatFloat",
+          "index": 173
+        },
+        {
+          "count": 2,
+          "function": "core.Object.MultiplyEqual_FloatFloat",
+          "index": 182
+        },
+        {
+          "count": 2,
+          "function": "core.Object.EqualEqual_VectorVector",
+          "index": 217
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.FinishInterpolation",
+          "index": 301
+        },
+        {
+          "count": 2,
+          "function": "core.Object.AddEqual_RotatorRotator",
+          "index": 318
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.PlaySndDeathOno",
+          "index": 346
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.GetWaveDuration",
+          "index": 357
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.RefreshLighting",
+          "index": 389
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.SetBoneDirection",
+          "index": 399
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.SetBoneScale",
+          "index": 401
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.GetBoneRotation",
+          "index": 409
+        },
+        {
+          "count": 2,
+          "function": "engine.Canvas.DrawText",
+          "index": 465
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.MakeNoise",
+          "index": 512
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.PlayerCanSeeMe",
+          "index": 532
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.Multiply_FloatColor",
+          "index": 550
+        },
+        {
+          "count": 2,
+          "function": "engine.Trail.Init",
+          "index": 601
+        },
+        {
+          "count": 2,
+          "function": "engine.Trail.AddSection",
+          "index": 603
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Len",
+          "index": 125
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Divide_IntInt",
+          "index": 145
+        },
+        {
+          "count": 1,
+          "function": "core.Object.MultiplyEqual_IntFloat",
+          "index": 159
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Rand",
+          "index": 167
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Exp",
+          "index": 191
+        },
+        {
+          "count": 1,
+          "function": "core.Object.NotEqual_RotatorRotator | core.Object.ResetConfig",
+          "index": 203
+        },
+        {
+          "count": 1,
+          "function": "core.Object.DynamicLoadObject",
+          "index": 205
+        },
+        {
+          "count": 1,
+          "function": "core.Object.SubtractEqual_VectorVector",
+          "index": 224
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Right",
+          "index": 234
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Min",
+          "index": 249
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.StopSound",
+          "index": 265
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.Trace",
+          "index": 277
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Multiply_VectorVector",
+          "index": 296
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.PlaySndPNJOno",
+          "index": 347
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.PlaySndPNJStep",
+          "index": 349
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.PlayVoice",
+          "index": 353
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.PlayStrVoice",
+          "index": 354
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.WaveHasPosition",
+          "index": 356
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.GetAnimParams",
+          "index": 396
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.DetachFromBone",
+          "index": 403
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.GetBoundingBox",
+          "index": 419
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.SetDrawScale",
+          "index": 424
+        },
+        {
+          "count": 1,
+          "function": "engine.Canvas.StrLen",
+          "index": 464
+        },
+        {
+          "count": 1,
+          "function": "engine.Canvas.DrawTile",
+          "index": 466
+        },
+        {
+          "count": 1,
+          "function": "engine.PlayerController.SetViewTarget",
+          "index": 513
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.Add_ColorColor",
+          "index": 551
+        },
+        {
+          "count": 1,
+          "function": "engine.LevelInfo.DecAttaque",
+          "index": 588
+        },
+        {
+          "count": 1,
+          "function": "engine.LevelInfo.DecAlerte",
+          "index": 590
+        },
+        {
+          "count": 1,
+          "function": "engine.LevelInfo.DecAttente",
+          "index": 592
+        }
+      ],
+      "tokens": 36406,
+      "virtual_calls": 652
+    },
+    "xidmaps": {
+      "distinct_native_indices": 120,
+      "distinct_virtual_names": 77,
+      "final_calls_to_native_functions": [
+        {
+          "count": 2,
+          "function": "engine.Actor.ReplaceATextureByAnOther"
+        },
+        {
+          "count": 2,
+          "function": "engine.Controller.SetTimer3"
+        }
+      ],
+      "final_calls_to_script_functions": 77,
+      "final_calls_unresolved": 0,
+      "global_calls": 0,
+      "native_call_tokens": 1422,
+      "native_index_histogram": [
+        {
+          "count": 91,
+          "function": "core.Object.NotEqual_ObjectObject",
+          "index": 119
+        },
+        {
+          "count": 86,
+          "function": "core.Object.EqualEqual_IntInt",
+          "index": 154
+        },
+        {
+          "count": 65,
+          "function": "core.Object.Multiply_VectorFloat",
+          "index": 212
+        },
+        {
+          "count": 60,
+          "function": "core.Object.GotoState",
+          "index": 113
+        },
+        {
+          "count": 55,
+          "function": "core.Object.Add_VectorVector",
+          "index": 215
+        },
+        {
+          "count": 55,
+          "function": "core.Object.Subtract_VectorVector",
+          "index": 216
+        },
+        {
+          "count": 51,
+          "function": "core.Object.Multiply_FloatFloat",
+          "index": 171
+        },
+        {
+          "count": 43,
+          "function": "core.Object.Add_FloatFloat",
+          "index": 174
+        },
+        {
+          "count": 37,
+          "function": "core.Object.AddAdd_Int",
+          "index": 165
+        },
+        {
+          "count": 35,
+          "function": "core.Object.Not_PreBool",
+          "index": 129
+        },
+        {
+          "count": 34,
+          "function": "core.Object.Less_IntInt",
+          "index": 150
+        },
+        {
+          "count": 33,
+          "function": "core.Object.Subtract_FloatFloat",
+          "index": 175
+        },
+        {
+          "count": 32,
+          "function": "engine.Actor.Destroy",
+          "index": 279
+        },
+        {
+          "count": 31,
+          "function": "engine.Canvas.SetPos",
+          "index": 269
+        },
+        {
+          "count": 31,
+          "function": "engine.Actor.Spawn",
+          "index": 278
+        },
+        {
+          "count": 31,
+          "function": "engine.Canvas.DrawText",
+          "index": 465
+        },
+        {
+          "count": 29,
+          "function": "core.Object.AndAnd_BoolBool",
+          "index": 130
+        },
+        {
+          "count": 28,
+          "function": "core.Object.EqualEqual_ObjectObject",
+          "index": 114
+        },
+        {
+          "count": 26,
+          "function": "core.Object.Multiply_FloatVector",
+          "index": 213
+        },
+        {
+          "count": 25,
+          "function": "core.Object.Log",
+          "index": 231
+        },
+        {
+          "count": 23,
+          "function": "engine.Actor.SetTimer",
+          "index": 280
+        },
+        {
+          "count": 22,
+          "function": "core.Object.OrOr_BoolBool",
+          "index": 132
+        },
+        {
+          "count": 22,
+          "function": "engine.Canvas.SetDrawColor",
+          "index": 273
+        },
+        {
+          "count": 20,
+          "function": "engine.Actor.PlaySound",
+          "index": 264
+        },
+        {
+          "count": 18,
+          "function": "core.Object.Less_FloatFloat",
+          "index": 176
+        },
+        {
+          "count": 17,
+          "function": "core.Object.NotEqual_IntInt",
+          "index": 155
+        },
+        {
+          "count": 17,
+          "function": "core.Object.At_StrStr",
+          "index": 168
+        },
+        {
+          "count": 16,
+          "function": "core.Object.Concat_StrStr",
+          "index": 112
+        },
+        {
+          "count": 16,
+          "function": "engine.Actor.SetTimer2",
+          "index": 363
+        },
+        {
+          "count": 14,
+          "function": "core.Object.Greater_FloatFloat",
+          "index": 177
+        },
+        {
+          "count": 14,
+          "function": "core.Object.AddEqual_FloatFloat",
+          "index": 184
+        },
+        {
+          "count": 13,
+          "function": "core.Object.Normal",
+          "index": 226
+        },
+        {
+          "count": 12,
+          "function": "core.Object.Disable",
+          "index": 118
+        },
+        {
+          "count": 12,
+          "function": "core.Object.Subtract_IntInt",
+          "index": 147
+        },
+        {
+          "count": 11,
+          "function": "engine.Actor.SetLocation",
+          "index": 267
+        },
+        {
+          "count": 11,
+          "function": "engine.Actor.SetBase",
+          "index": 298
+        },
+        {
+          "count": 11,
+          "function": "engine.Actor.SetRotation",
+          "index": 299
+        },
+        {
+          "count": 11,
+          "function": "engine.Actor.SetRelativeLocation",
+          "index": 420
+        },
+        {
+          "count": 10,
+          "function": "core.Object.Divide_FloatFloat",
+          "index": 172
+        },
+        {
+          "count": 10,
+          "function": "core.Object.FRand",
+          "index": 195
+        },
+        {
+          "count": 10,
+          "function": "core.Object.Subtract_PreVector",
+          "index": 211
+        },
+        {
+          "count": 10,
+          "function": "engine.Actor.SetRelativeRotation",
+          "index": 421
+        },
+        {
+          "count": 10,
+          "function": "engine.Actor.SetDrawType",
+          "index": 422
+        },
+        {
+          "count": 8,
+          "function": "core.Object.Cos",
+          "index": 188
+        },
+        {
+          "count": 8,
+          "function": "core.Object.VSize",
+          "index": 225
+        },
+        {
+          "count": 7,
+          "function": "core.Object.Divide_VectorFloat",
+          "index": 214
+        },
+        {
+          "count": 7,
+          "function": "core.Object.Caps",
+          "index": 235
+        },
+        {
+          "count": 7,
+          "function": "engine.Actor.DynamicActors",
+          "index": 313
+        },
+        {
+          "count": 7,
+          "function": "engine.Actor.SetDrawScale",
+          "index": 424
+        },
+        {
+          "count": 6,
+          "function": "core.Object.Add_IntInt",
+          "index": 146
+        },
+        {
+          "count": 6,
+          "function": "engine.Actor.SetCollision",
+          "index": 262
+        },
+        {
+          "count": 5,
+          "function": "core.Object.LessEqual_IntInt",
+          "index": 152
+        },
+        {
+          "count": 5,
+          "function": "core.Object.EqualEqual_FloatFloat",
+          "index": 180
+        },
+        {
+          "count": 5,
+          "function": "core.Object.SubtractEqual_FloatFloat",
+          "index": 185
+        },
+        {
+          "count": 5,
+          "function": "core.Object.Dot_VectorVector",
+          "index": 219
+        },
+        {
+          "count": 5,
+          "function": "engine.Actor.Sleep",
+          "index": 256
+        },
+        {
+          "count": 5,
+          "function": "engine.Actor.AllActors",
+          "index": 304
+        },
+        {
+          "count": 4,
+          "function": "core.Object.Enable",
+          "index": 117
+        },
+        {
+          "count": 4,
+          "function": "core.Object.AddAdd_PreInt",
+          "index": 163
+        },
+        {
+          "count": 4,
+          "function": "core.Object.Sin",
+          "index": 187
+        },
+        {
+          "count": 4,
+          "function": "core.Object.GetAxes",
+          "index": 229
+        },
+        {
+          "count": 4,
+          "function": "core.Object.NotEqual_NameName",
+          "index": 255
+        },
+        {
+          "count": 4,
+          "function": "core.Object.Multiply_RotatorFloat",
+          "index": 287
+        },
+        {
+          "count": 4,
+          "function": "core.Object.Add_RotatorRotator",
+          "index": 316
+        },
+        {
+          "count": 4,
+          "function": "engine.Actor.PlayMusic",
+          "index": 358
+        },
+        {
+          "count": 4,
+          "function": "engine.Actor.GetBoundingBox",
+          "index": 419
+        },
+        {
+          "count": 3,
+          "function": "core.Object.Mid",
+          "index": 127
+        },
+        {
+          "count": 3,
+          "function": "core.Object.And_IntInt",
+          "index": 156
+        },
+        {
+          "count": 3,
+          "function": "core.Object.SubtractSubtract_Int",
+          "index": 166
+        },
+        {
+          "count": 3,
+          "function": "core.Object.MultiplyEqual_VectorFloat",
+          "index": 221
+        },
+        {
+          "count": 3,
+          "function": "core.Object.AddEqual_VectorVector",
+          "index": 223
+        },
+        {
+          "count": 3,
+          "function": "core.Object.GetStateName",
+          "index": 284
+        },
+        {
+          "count": 3,
+          "function": "core.Object.IsA",
+          "index": 303
+        },
+        {
+          "count": 3,
+          "function": "engine.Canvas.TextSize",
+          "index": 470
+        },
+        {
+          "count": 3,
+          "function": "engine.Actor.FastTrace",
+          "index": 548
+        },
+        {
+          "count": 2,
+          "function": "core.Object.EqualEqual_StrStr",
+          "index": 122
+        },
+        {
+          "count": 2,
+          "function": "core.Object.NotEqual_StrStr",
+          "index": 123
+        },
+        {
+          "count": 2,
+          "function": "core.Object.Greater_IntInt",
+          "index": 151
+        },
+        {
+          "count": 2,
+          "function": "core.Object.GreaterEqual_IntInt",
+          "index": 153
+        },
+        {
+          "count": 2,
+          "function": "core.Object.SubtractEqual_IntInt",
+          "index": 162
+        },
+        {
+          "count": 2,
+          "function": "core.Object.NotEqual_FloatFloat",
+          "index": 181
+        },
+        {
+          "count": 2,
+          "function": "core.Object.DynamicLoadObject",
+          "index": 205
+        },
+        {
+          "count": 2,
+          "function": "core.Object.Cross_VectorVector",
+          "index": 220
+        },
+        {
+          "count": 2,
+          "function": "core.Object.DivideEqual_VectorFloat",
+          "index": 222
+        },
+        {
+          "count": 2,
+          "function": "core.Object.Asc",
+          "index": 237
+        },
+        {
+          "count": 2,
+          "function": "core.Object.FMin",
+          "index": 244
+        },
+        {
+          "count": 2,
+          "function": "core.Object.FMax",
+          "index": 245
+        },
+        {
+          "count": 2,
+          "function": "core.Object.VRand",
+          "index": 252
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.PlayAnim",
+          "index": 259
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.DetachFromBone",
+          "index": 403
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.AttachToBone",
+          "index": 404
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.MakeNoise",
+          "index": 512
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.Multiply_ColorFloat",
+          "index": 552
+        },
+        {
+          "count": 2,
+          "function": "engine.Trail.AddSection",
+          "index": 603
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.SetPhysics",
+          "index": 3970
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Len",
+          "index": 125
+        },
+        {
+          "count": 1,
+          "function": "core.Object.InStr",
+          "index": 126
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Left",
+          "index": 128
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Divide_IntInt",
+          "index": 145
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Rand",
+          "index": 167
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Subtract_PreFloat",
+          "index": 169
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Percent_FloatFloat",
+          "index": 173
+        },
+        {
+          "count": 1,
+          "function": "core.Object.LessEqual_FloatFloat",
+          "index": 178
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Abs",
+          "index": 186
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Sqrt",
+          "index": 193
+        },
+        {
+          "count": 1,
+          "function": "core.Object.OrthoRotation",
+          "index": 197
+        },
+        {
+          "count": 1,
+          "function": "core.Object.SubtractEqual_VectorVector",
+          "index": 224
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Clamp",
+          "index": 251
+        },
+        {
+          "count": 1,
+          "function": "core.Object.EqualEqual_NameName",
+          "index": 254
+        },
+        {
+          "count": 1,
+          "function": "core.Object.LessLess_VectorRotator",
+          "index": 275
+        },
+        {
+          "count": 1,
+          "function": "core.Object.GreaterGreater_VectorRotator",
+          "index": 276
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.Trace",
+          "index": 277
+        },
+        {
+          "count": 1,
+          "function": "core.Object.IsInState",
+          "index": 281
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.SetCollisionSize",
+          "index": 283
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Multiply_FloatRotator",
+          "index": 288
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Subtract_RotatorRotator",
+          "index": 317
+        },
+        {
+          "count": 1,
+          "function": "core.Object.SubtractEqual_RotatorRotator",
+          "index": 319
+        },
+        {
+          "count": 1,
+          "function": "engine.PlayerController.SetViewTarget",
+          "index": 513
+        },
+        {
+          "count": 1,
+          "function": "engine.Controller.CanSee",
+          "index": 533
+        },
+        {
+          "count": 1,
+          "function": "engine.Trail.Init",
+          "index": 601
+        }
+      ],
+      "tokens": 12123,
+      "virtual_calls": 326
+    },
+    "xiii": {
+      "distinct_native_indices": 195,
+      "distinct_virtual_names": 513,
+      "final_calls_to_native_functions": [
+        {
+          "count": 28,
+          "function": "engine.Actor.ReplaceATextureByAnOther"
+        },
+        {
+          "count": 15,
+          "function": "engine.Pawn.PressingFire"
+        },
+        {
+          "count": 8,
+          "function": "engine.HUD.Draw3DLine"
+        },
+        {
+          "count": 4,
+          "function": "engine.Actor.IntersectWaterPlane"
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.KillAllSounds"
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.SaveAtCheckpoint"
+        },
+        {
+          "count": 1,
+          "function": "engine.Controller.SetTimer3"
+        },
+        {
+          "count": 1,
+          "function": "engine.HUD.DrawPlayerInfo"
+        },
+        {
+          "count": 1,
+          "function": "engine.XboxLiveManager.GetCurrentUser"
+        },
+        {
+          "count": 1,
+          "function": "engine.XboxLiveManager.IsLoggedIn"
+        }
+      ],
+      "final_calls_to_script_functions": 248,
+      "final_calls_unresolved": 0,
+      "global_calls": 28,
+      "native_call_tokens": 12582,
+      "native_index_histogram": [
+        {
+          "count": 1076,
+          "function": "core.Object.NotEqual_ObjectObject",
+          "index": 119
+        },
+        {
+          "count": 894,
+          "function": "core.Object.AndAnd_BoolBool",
+          "index": 130
+        },
+        {
+          "count": 849,
+          "function": "core.Object.Multiply_FloatFloat",
+          "index": 171
+        },
+        {
+          "count": 675,
+          "function": "core.Object.Concat_StrStr",
+          "index": 112
+        },
+        {
+          "count": 479,
+          "function": "core.Object.Subtract_FloatFloat",
+          "index": 175
+        },
+        {
+          "count": 471,
+          "function": "core.Object.Not_PreBool",
+          "index": 129
+        },
+        {
+          "count": 419,
+          "function": "core.Object.Add_FloatFloat",
+          "index": 174
+        },
+        {
+          "count": 392,
+          "function": "core.Object.EqualEqual_ObjectObject",
+          "index": 114
+        },
+        {
+          "count": 383,
+          "function": "core.Object.OrOr_BoolBool",
+          "index": 132
+        },
+        {
+          "count": 372,
+          "function": "core.Object.EqualEqual_IntInt",
+          "index": 154
+        },
+        {
+          "count": 305,
+          "function": "core.Object.Log",
+          "index": 231
+        },
+        {
+          "count": 261,
+          "function": "core.Object.At_StrStr",
+          "index": 168
+        },
+        {
+          "count": 259,
+          "function": "core.Object.GotoState",
+          "index": 113
+        },
+        {
+          "count": 244,
+          "function": "core.Object.Divide_FloatFloat",
+          "index": 172
+        },
+        {
+          "count": 240,
+          "function": "core.Object.Add_VectorVector",
+          "index": 215
+        },
+        {
+          "count": 228,
+          "function": "core.Object.Subtract_VectorVector",
+          "index": 216
+        },
+        {
+          "count": 205,
+          "function": "core.Object.Multiply_VectorFloat",
+          "index": 212
+        },
+        {
+          "count": 204,
+          "function": "engine.Actor.PlayAnim",
+          "index": 259
+        },
+        {
+          "count": 198,
+          "function": "core.Object.Greater_FloatFloat",
+          "index": 177
+        },
+        {
+          "count": 167,
+          "function": "engine.Actor.Spawn",
+          "index": 278
+        },
+        {
+          "count": 154,
+          "function": "core.Object.AddAdd_Int",
+          "index": 165
+        },
+        {
+          "count": 153,
+          "function": "engine.Actor.Destroy",
+          "index": 279
+        },
+        {
+          "count": 151,
+          "function": "core.Object.Greater_IntInt",
+          "index": 151
+        },
+        {
+          "count": 150,
+          "function": "core.Object.Less_IntInt",
+          "index": 150
+        },
+        {
+          "count": 145,
+          "function": "core.Object.Less_FloatFloat",
+          "index": 176
+        },
+        {
+          "count": 144,
+          "function": "engine.Canvas.SetPos",
+          "index": 269
+        },
+        {
+          "count": 127,
+          "function": "core.Object.Subtract_IntInt",
+          "index": 147
+        },
+        {
+          "count": 126,
+          "function": "engine.Actor.PlaySound",
+          "index": 264
+        },
+        {
+          "count": 117,
+          "function": "core.Object.Multiply_FloatVector",
+          "index": 213
+        },
+        {
+          "count": 111,
+          "function": "core.Object.VSize",
+          "index": 225
+        },
+        {
+          "count": 110,
+          "function": "core.Object.Add_IntInt",
+          "index": 146
+        },
+        {
+          "count": 106,
+          "function": "engine.Actor.SetTimer",
+          "index": 280
+        },
+        {
+          "count": 100,
+          "function": "core.Object.FRand",
+          "index": 195
+        },
+        {
+          "count": 95,
+          "function": "engine.Actor.PlayRolloffSound",
+          "index": 350
+        },
+        {
+          "count": 90,
+          "function": "core.Object.NotEqual_IntInt",
+          "index": 155
+        },
+        {
+          "count": 75,
+          "function": "engine.Canvas.DrawTile",
+          "index": 466
+        },
+        {
+          "count": 67,
+          "function": "engine.Canvas.MakeColor",
+          "index": 274
+        },
+        {
+          "count": 58,
+          "function": "core.Object.AddEqual_FloatFloat",
+          "index": 184
+        },
+        {
+          "count": 58,
+          "function": "core.Object.Normal",
+          "index": 226
+        },
+        {
+          "count": 53,
+          "function": "core.Object.EqualEqual_FloatFloat",
+          "index": 180
+        },
+        {
+          "count": 50,
+          "function": "engine.Actor.SetPhysics",
+          "index": 3970
+        },
+        {
+          "count": 44,
+          "function": "engine.Actor.SetRotation",
+          "index": 299
+        },
+        {
+          "count": 43,
+          "function": "core.Object.AddEqual_IntInt",
+          "index": 161
+        },
+        {
+          "count": 43,
+          "function": "engine.Canvas.DrawText",
+          "index": 465
+        },
+        {
+          "count": 42,
+          "function": "core.Object.GreaterEqual_IntInt",
+          "index": 153
+        },
+        {
+          "count": 41,
+          "function": "engine.Actor.SetLocation",
+          "index": 267
+        },
+        {
+          "count": 41,
+          "function": "core.Object.IsA",
+          "index": 303
+        },
+        {
+          "count": 40,
+          "function": "core.Object.Multiply_IntInt",
+          "index": 144
+        },
+        {
+          "count": 39,
+          "function": "core.Object.FMax",
+          "index": 245
+        },
+        {
+          "count": 39,
+          "function": "engine.Canvas.StrLen",
+          "index": 464
+        },
+        {
+          "count": 38,
+          "function": "engine.Canvas.SetDrawColor",
+          "index": 273
+        },
+        {
+          "count": 37,
+          "function": "core.Object.SubtractEqual_IntInt",
+          "index": 162
+        },
+        {
+          "count": 37,
+          "function": "engine.Actor.Trace",
+          "index": 277
+        },
+        {
+          "count": 36,
+          "function": "core.Object.Dot_VectorVector",
+          "index": 219
+        },
+        {
+          "count": 35,
+          "function": "engine.Actor.Multiply_ColorFloat",
+          "index": 552
+        },
+        {
+          "count": 34,
+          "function": "core.Object.Divide_IntInt",
+          "index": 145
+        },
+        {
+          "count": 34,
+          "function": "core.Object.LessEqual_FloatFloat",
+          "index": 178
+        },
+        {
+          "count": 33,
+          "function": "core.Object.LessEqual_IntInt",
+          "index": 152
+        },
+        {
+          "count": 33,
+          "function": "core.Object.SubtractEqual_FloatFloat",
+          "index": 185
+        },
+        {
+          "count": 32,
+          "function": "core.Object.Disable",
+          "index": 118
+        },
+        {
+          "count": 32,
+          "function": "core.Object.IsInState",
+          "index": 281
+        },
+        {
+          "count": 32,
+          "function": "engine.Actor.MakeNoise",
+          "index": 512
+        },
+        {
+          "count": 31,
+          "function": "engine.Actor.SetTimer2",
+          "index": 363
+        },
+        {
+          "count": 29,
+          "function": "core.Object.EqualEqual_StrStr",
+          "index": 122
+        },
+        {
+          "count": 29,
+          "function": "core.Object.MultiplyEqual_FloatFloat",
+          "index": 182
+        },
+        {
+          "count": 28,
+          "function": "core.Object.GetAxes",
+          "index": 229
+        },
+        {
+          "count": 27,
+          "function": "core.Object.InStr",
+          "index": 126
+        },
+        {
+          "count": 27,
+          "function": "core.Object.FMin",
+          "index": 244
+        },
+        {
+          "count": 27,
+          "function": "engine.Actor.SetDrawType",
+          "index": 422
+        },
+        {
+          "count": 25,
+          "function": "core.Object.Abs",
+          "index": 186
+        },
+        {
+          "count": 25,
+          "function": "core.Object.Subtract_PreVector",
+          "index": 211
+        },
+        {
+          "count": 25,
+          "function": "engine.Actor.SetCollision",
+          "index": 262
+        },
+        {
+          "count": 24,
+          "function": "core.Object.And_IntInt",
+          "index": 156
+        },
+        {
+          "count": 24,
+          "function": "core.Object.Min",
+          "index": 249
+        },
+        {
+          "count": 24,
+          "function": "core.Object.VRand",
+          "index": 252
+        },
+        {
+          "count": 23,
+          "function": "core.Object.Cross_VectorVector",
+          "index": 220
+        },
+        {
+          "count": 22,
+          "function": "core.Object.Left",
+          "index": 128
+        },
+        {
+          "count": 22,
+          "function": "core.Object.DynamicLoadObject",
+          "index": 205
+        },
+        {
+          "count": 21,
+          "function": "core.Object.GreaterEqual_FloatFloat",
+          "index": 179
+        },
+        {
+          "count": 21,
+          "function": "core.Object.EqualEqual_NameName",
+          "index": 254
+        },
+        {
+          "count": 20,
+          "function": "core.Object.NotEqual_StrStr",
+          "index": 123
+        },
+        {
+          "count": 20,
+          "function": "core.Object.NotEqual_FloatFloat",
+          "index": 181
+        },
+        {
+          "count": 19,
+          "function": "core.Object.Len",
+          "index": 125
+        },
+        {
+          "count": 19,
+          "function": "core.Object.Subtract_PreFloat",
+          "index": 169
+        },
+        {
+          "count": 19,
+          "function": "core.Object.AddEqual_VectorVector",
+          "index": 223
+        },
+        {
+          "count": 18,
+          "function": "core.Object.EqualEqual_VectorVector",
+          "index": 217
+        },
+        {
+          "count": 18,
+          "function": "core.Object.Caps",
+          "index": 235
+        },
+        {
+          "count": 18,
+          "function": "engine.Actor.AllActors",
+          "index": 304
+        },
+        {
+          "count": 17,
+          "function": "engine.Actor.StopSound",
+          "index": 265
+        },
+        {
+          "count": 17,
+          "function": "core.Object.GetStateName",
+          "index": 284
+        },
+        {
+          "count": 17,
+          "function": "engine.Actor.SetBase",
+          "index": 298
+        },
+        {
+          "count": 16,
+          "function": "core.Object.Right",
+          "index": 234
+        },
+        {
+          "count": 16,
+          "function": "core.Object.Max",
+          "index": 250
+        },
+        {
+          "count": 15,
+          "function": "core.Object.FClamp",
+          "index": 246
+        },
+        {
+          "count": 15,
+          "function": "engine.Actor.SetCollisionSize",
+          "index": 283
+        },
+        {
+          "count": 14,
+          "function": "core.Object.Divide_VectorFloat",
+          "index": 214
+        },
+        {
+          "count": 14,
+          "function": "engine.Actor.SetDrawScale3D",
+          "index": 423
+        },
+        {
+          "count": 14,
+          "function": "engine.Actor.FastTrace",
+          "index": 548
+        },
+        {
+          "count": 13,
+          "function": "core.Object.Enable",
+          "index": 117
+        },
+        {
+          "count": 13,
+          "function": "core.Object.Subtract_PreInt",
+          "index": 143
+        },
+        {
+          "count": 13,
+          "function": "core.Object.SubtractSubtract_Int",
+          "index": 166
+        },
+        {
+          "count": 12,
+          "function": "core.Object.Rand",
+          "index": 167
+        },
+        {
+          "count": 12,
+          "function": "core.Object.Sin",
+          "index": 187
+        },
+        {
+          "count": 12,
+          "function": "core.Object.NotEqual_VectorVector",
+          "index": 218
+        },
+        {
+          "count": 12,
+          "function": "core.Object.MultiplyEqual_VectorFloat",
+          "index": 221
+        },
+        {
+          "count": 12,
+          "function": "engine.Actor.Sleep",
+          "index": 256
+        },
+        {
+          "count": 12,
+          "function": "core.Object.LessLess_VectorRotator",
+          "index": 275
+        },
+        {
+          "count": 12,
+          "function": "engine.Actor.SetRelativeRotation",
+          "index": 421
+        },
+        {
+          "count": 12,
+          "function": "engine.Trail.Init",
+          "index": 601
+        },
+        {
+          "count": 11,
+          "function": "core.Object.Percent_FloatFloat",
+          "index": 173
+        },
+        {
+          "count": 11,
+          "function": "core.Object.Subtract_RotatorRotator",
+          "index": 317
+        },
+        {
+          "count": 11,
+          "function": "engine.Actor.AttachToBone",
+          "index": 404
+        },
+        {
+          "count": 10,
+          "function": "core.Object.SubtractEqual_VectorVector",
+          "index": 224
+        },
+        {
+          "count": 10,
+          "function": "engine.Actor.IsAnimating",
+          "index": 282
+        },
+        {
+          "count": 10,
+          "function": "engine.Actor.FinishInterpolation",
+          "index": 301
+        },
+        {
+          "count": 10,
+          "function": "engine.Actor.SetRelativeLocation",
+          "index": 420
+        },
+        {
+          "count": 9,
+          "function": "engine.Actor.DynamicActors",
+          "index": 313
+        },
+        {
+          "count": 9,
+          "function": "engine.Actor.GetLastTraceBone",
+          "index": 364
+        },
+        {
+          "count": 8,
+          "function": "core.Object.Or_IntInt",
+          "index": 158
+        },
+        {
+          "count": 8,
+          "function": "core.Object.OrthoRotation",
+          "index": 197
+        },
+        {
+          "count": 8,
+          "function": "engine.Actor.SetOwner",
+          "index": 272
+        },
+        {
+          "count": 7,
+          "function": "core.Object.NotEqual_NameName",
+          "index": 255
+        },
+        {
+          "count": 7,
+          "function": "engine.Actor.GetBoneCoords",
+          "index": 410
+        },
+        {
+          "count": 6,
+          "function": "core.Object.SubtractSubtract_Byte",
+          "index": 140
+        },
+        {
+          "count": 6,
+          "function": "core.Object.MultiplyEqual_IntFloat",
+          "index": 159
+        },
+        {
+          "count": 6,
+          "function": "engine.Actor.LoopAnim",
+          "index": 260
+        },
+        {
+          "count": 6,
+          "function": "core.Object.GreaterGreater_VectorRotator",
+          "index": 276
+        },
+        {
+          "count": 6,
+          "function": "engine.Actor.PlayMenu",
+          "index": 351
+        },
+        {
+          "count": 6,
+          "function": "engine.Actor.AnimBlendToAlpha",
+          "index": 411
+        },
+        {
+          "count": 6,
+          "function": "engine.Actor.AnimBlendParams",
+          "index": 412
+        },
+        {
+          "count": 6,
+          "function": "core.Object.SaveConfig",
+          "index": 536
+        },
+        {
+          "count": 5,
+          "function": "core.Object.ComplementEqual_StrStr",
+          "index": 124
+        },
+        {
+          "count": 5,
+          "function": "core.Object.Cos",
+          "index": 188
+        },
+        {
+          "count": 5,
+          "function": "core.Object.Warn",
+          "index": 232
+        },
+        {
+          "count": 5,
+          "function": "core.Object.Multiply_RotatorFloat",
+          "index": 287
+        },
+        {
+          "count": 5,
+          "function": "engine.Actor.TraceActors",
+          "index": 309
+        },
+        {
+          "count": 5,
+          "function": "core.Object.Add_RotatorRotator",
+          "index": 316
+        },
+        {
+          "count": 5,
+          "function": "engine.Actor.PlayMusic",
+          "index": 358
+        },
+        {
+          "count": 5,
+          "function": "engine.Actor.AnimIsInGroup",
+          "index": 395
+        },
+        {
+          "count": 5,
+          "function": "engine.Actor.SetDrawScale",
+          "index": 424
+        },
+        {
+          "count": 5,
+          "function": "engine.PlayerController.ViewShake",
+          "index": 496
+        },
+        {
+          "count": 5,
+          "function": "engine.PlayerController.GetDefaultURL",
+          "index": 510
+        },
+        {
+          "count": 5,
+          "function": "engine.PlayerController.SetViewTarget",
+          "index": 513
+        },
+        {
+          "count": 5,
+          "function": "engine.Trail.AddSection",
+          "index": 603
+        },
+        {
+          "count": 4,
+          "function": "core.Object.GreaterGreater_IntInt",
+          "index": 149
+        },
+        {
+          "count": 4,
+          "function": "core.Object.Sqrt",
+          "index": 193
+        },
+        {
+          "count": 4,
+          "function": "engine.Actor.SetBoneScale",
+          "index": 401
+        },
+        {
+          "count": 4,
+          "function": "engine.Actor.EnableChannelNotify",
+          "index": 415
+        },
+        {
+          "count": 4,
+          "function": "engine.Canvas.DrawPortal",
+          "index": 480
+        },
+        {
+          "count": 4,
+          "function": "engine.PlayerController.ViewFlash",
+          "index": 505
+        },
+        {
+          "count": 4,
+          "function": "engine.Controller.CanSee",
+          "index": 533
+        },
+        {
+          "count": 3,
+          "function": "core.Object.Mid",
+          "index": 127
+        },
+        {
+          "count": 3,
+          "function": "core.Object.NotEqual_BoolBool",
+          "index": 243
+        },
+        {
+          "count": 3,
+          "function": "core.Object.Clamp",
+          "index": 251
+        },
+        {
+          "count": 3,
+          "function": "engine.Actor.Move",
+          "index": 266
+        },
+        {
+          "count": 3,
+          "function": "engine.Actor.TweenAnim",
+          "index": 294
+        },
+        {
+          "count": 3,
+          "function": "engine.Actor.PlaySndXIIIStep",
+          "index": 348
+        },
+        {
+          "count": 3,
+          "function": "engine.Actor.RefreshLighting",
+          "index": 389
+        },
+        {
+          "count": 3,
+          "function": "engine.Actor.RecomputeBoundingVolume",
+          "index": 391
+        },
+        {
+          "count": 3,
+          "function": "engine.Actor.SetBoneDirection",
+          "index": 399
+        },
+        {
+          "count": 2,
+          "function": "core.Object.DivideEqual_VectorFloat",
+          "index": 222
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.RadiusActors",
+          "index": 310
+        },
+        {
+          "count": 2,
+          "function": "core.Object.AddEqual_RotatorRotator",
+          "index": 318
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.PlaySndPNJStep",
+          "index": 349
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.GetAnimParams",
+          "index": 396
+        },
+        {
+          "count": 2,
+          "function": "engine.Actor.GetBoneRotation",
+          "index": 409
+        },
+        {
+          "count": 2,
+          "function": "engine.PlayerController.AdjustAimForDisplay",
+          "index": 498
+        },
+        {
+          "count": 2,
+          "function": "engine.PlayerController.CheckBob",
+          "index": 504
+        },
+        {
+          "count": 2,
+          "function": "engine.LevelInfo.SetOnlyPostRender",
+          "index": 574
+        },
+        {
+          "count": 1,
+          "function": "core.Object.EqualEqual_RotatorRotator",
+          "index": 142
+        },
+        {
+          "count": 1,
+          "function": "core.Object.DivideEqual_IntFloat",
+          "index": 160
+        },
+        {
+          "count": 1,
+          "function": "core.Object.DivideEqual_FloatFloat",
+          "index": 183
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Tan",
+          "index": 189
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Normalize",
+          "index": 198
+        },
+        {
+          "count": 1,
+          "function": "core.Object.NotEqual_RotatorRotator | core.Object.ResetConfig",
+          "index": 203
+        },
+        {
+          "count": 1,
+          "function": "engine.Canvas.DrawCineFrame",
+          "index": 238
+        },
+        {
+          "count": 1,
+          "function": "core.Object.Multiply_FloatRotator",
+          "index": 288
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.TouchingActors",
+          "index": 307
+        },
+        {
+          "count": 1,
+          "function": "core.Object.SubtractEqual_RotatorRotator",
+          "index": 319
+        },
+        {
+          "count": 1,
+          "function": "core.Object.RotRand",
+          "index": 320
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.CollidingActors",
+          "index": 321
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.StopAllSounds",
+          "index": 342
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.StopVoice",
+          "index": 344
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.SetBoneRotation",
+          "index": 397
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.StopAnimating",
+          "index": 417
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.GetBoundingBox",
+          "index": 419
+        },
+        {
+          "count": 1,
+          "function": "engine.ScriptedTexture.TextSize | engine.VideoPlayer.GetStatus",
+          "index": 476
+        },
+        {
+          "count": 1,
+          "function": "engine.VideoPlayer.Stop",
+          "index": 482
+        },
+        {
+          "count": 1,
+          "function": "engine.VideoPlayer.Play",
+          "index": 483
+        },
+        {
+          "count": 1,
+          "function": "engine.VideoPlayer.Open",
+          "index": 484
+        },
+        {
+          "count": 1,
+          "function": "engine.PlayerController.CalcFirstPersonView",
+          "index": 497
+        },
+        {
+          "count": 1,
+          "function": "engine.Controller.LineOfSightTo",
+          "index": 514
+        },
+        {
+          "count": 1,
+          "function": "engine.Actor.PlayerCanSeeMe",
+          "index": 532
+        },
+        {
+          "count": 1,
+          "function": "engine.GameInfo.ParseKillMessage",
+          "index": 572
+        },
+        {
+          "count": 1,
+          "function": "xiii.BloodFlow.GrowBloodFlow",
+          "index": 604
+        }
+      ],
+      "tokens": 102761,
+      "virtual_calls": 2097
+    }
+  },
+  "label": "XIII_Game",
+  "method": "Every Core.Function/State/Class/Struct/Const/Enum/*Property export of every .u package decoded with the XIII v100/licensee-58 layout; bytecode decoded token by token until the in-memory script size is reached exactly; each payload must be consumed to its last byte. Metadata only: no bytecode bodies, strings or property values.",
+  "native_call_tokens": 56112,
+  "native_catalog": {
+    "bound_by_name": 476,
+    "by_package": {
+      "XIIIMP": {
+        "indexed": 15,
+        "natives": 19
+      },
+      "core": {
+        "indexed": 156,
+        "natives": 158
+      },
+      "editor": {
+        "indexed": 0,
+        "natives": 14
+      },
+      "engine": {
+        "indexed": 223,
+        "natives": 591
+      },
+      "gui": {
+        "indexed": 1,
+        "natives": 55
+      },
+      "ipdrv": {
+        "indexed": 22,
+        "natives": 27
+      },
+      "uweb": {
+        "indexed": 0,
+        "natives": 9
+      },
+      "xidcine": {
+        "indexed": 0,
+        "natives": 6
+      },
+      "xidpawn": {
+        "indexed": 0,
+        "natives": 14
+      },
+      "xiii": {
+        "indexed": 1,
+        "natives": 1
+      }
+    },
+    "distinct_native_indices": 412,
+    "dll_cross_reference": {
+      "exec_symbols": 1002,
+      "exec_symbols_by_dll": {
+        "Core.dll": 263,
+        "Editor.dll": 14,
+        "Engine.dll": 593,
+        "GUI.dll": 56,
+        "IpDrv.dll": 27,
+        "UWeb.dll": 9,
+        "XIDCine.dll": 6,
+        "XIDPawn.dll": 14,
+        "XIIIMP.dll": 19,
+        "Xiii.dll": 1
+      },
+      "natives_matched": 880,
+      "natives_unmatched": 14,
+      "natives_unmatched_operators": 9,
+      "symbols_without_script_function": 122,
+      "symbols_without_script_function_examples": [
+        "Actor.PollFinishAnim",
+        "Actor.PollFinishInterpolation",
+        "Actor.PollSleep",
+        "Controller.PollFinishRotation",
+        "Controller.PollMoveTo",
+        "Controller.PollMoveToward",
+        "Controller.PollWaitForLanding",
+        "GUIPage.PollSleep",
+        "Object.ArrayElement",
+        "Object.Assert",
+        "Object.At_StringString",
+        "Object.BoolToByte",
+        "Object.BoolToFloat",
+        "Object.BoolToInt",
+        "Object.BoolToString",
+        "Object.BoolVariable",
+        "Object.ByteConst",
+        "Object.ByteToBool",
+        "Object.ByteToFloat",
+        "Object.ByteToInt",
+        "Object.ByteToString",
+        "Object.Case",
+        "Object.ClassContext",
+        "Object.ComplementEqual_StringString",
+        "Object.Concat_StringString",
+        "Object.Context",
+        "Object.DebugInfo",
+        "Object.DefaultVariable",
+        "Object.DelegateFunction",
+        "Object.DelegateProperty",
+        "Object.DynArrayElement",
+        "Object.DynArrayInsert",
+        "Object.DynArrayLength",
+        "Object.DynArrayRemove",
+        "Object.DynamicCast",
+        "Object.EatString",
+        "Object.EndFunctionParms",
+        "Object.EqualEqual_StringString",
+        "Object.False",
+        "Object.FinalFunction"
+      ],
+      "unmatched_non_operator_examples": [
+        "engine.ScriptedTexture.DrawColoredText",
+        "engine.ScriptedTexture.DrawText",
+        "engine.ScriptedTexture.DrawTile",
+        "engine.ScriptedTexture.ReplaceTexture",
+        "engine.ScriptedTexture.TextSize"
+      ]
+    },
+    "duplicate_indices": [
+      {
+        "functions": [
+          "core.Object.NotEqual_RotatorRotator",
+          "core.Object.ResetConfig"
+        ],
+        "index": 203
+      },
+      {
+        "functions": [
+          "engine.ScriptedTexture.DrawText",
+          "engine.MatchMakingManager.Logout"
+        ],
+        "index": 472
+      },
+      {
+        "functions": [
+          "engine.MatchMakingManager.Login",
+          "engine.ScriptedTexture.DrawTile"
+        ],
+        "index": 473
+      },
+      {
+        "functions": [
+          "engine.MatchMakingManager.IsPlayerAccountCreated",
+          "engine.ScriptedTexture.DrawColoredText"
+        ],
+        "index": 474
+      },
+      {
+        "functions": [
+          "engine.MatchMakingManager.CreatePlayerAccount",
+          "engine.ScriptedTexture.ReplaceTexture"
+        ],
+        "index": 475
+      },
+      {
+        "functions": [
+          "engine.ScriptedTexture.TextSize",
+          "engine.VideoPlayer.GetStatus"
+        ],
+        "index": 476
+      }
+    ],
+    "events": 5,
+    "iterator": 15,
+    "latent": 8,
+    "native_functions": 894,
+    "operators": 104,
+    "with_native_index": 418
+  },
+  "native_indices_called_but_unregistered": [],
+  "opcode_histogram": [
+    {
+      "count": 36665,
+      "name": "LocalVariable",
+      "opcode": "0x00"
+    },
+    {
+      "count": 77576,
+      "name": "InstanceVariable",
+      "opcode": "0x01"
+    },
+    {
+      "count": 727,
+      "name": "DefaultVariable",
+      "opcode": "0x02"
+    },
+    {
+      "count": 9112,
+      "name": "Return",
+      "opcode": "0x04"
+    },
+    {
+      "count": 228,
+      "name": "Switch",
+      "opcode": "0x05"
+    },
+    {
+      "count": 5835,
+      "name": "Jump",
+      "opcode": "0x06"
+    },
+    {
+      "count": 13857,
+      "name": "JumpIfNot",
+      "opcode": "0x07"
+    },
+    {
+      "count": 576,
+      "name": "Stop",
+      "opcode": "0x08"
+    },
+    {
+      "count": 91,
+      "name": "Assert",
+      "opcode": "0x09"
+    },
+    {
+      "count": 1715,
+      "name": "Case",
+      "opcode": "0x0A"
+    },
+    {
+      "count": 8882,
+      "name": "Nothing",
+      "opcode": "0x0B"
+    },
+    {
+      "count": 223,
+      "name": "LabelTable",
+      "opcode": "0x0C"
+    },
+    {
+      "count": 120,
+      "name": "GotoLabel",
+      "opcode": "0x0D"
+    },
+    {
+      "count": 181,
+      "name": "EatString",
+      "opcode": "0x0E"
+    },
+    {
+      "count": 17226,
+      "name": "Let",
+      "opcode": "0x0F"
+    },
+    {
+      "count": 2369,
+      "name": "DynArrayElement",
+      "opcode": "0x10"
+    },
+    {
+      "count": 49,
+      "name": "New",
+      "opcode": "0x11"
+    },
+    {
+      "count": 414,
+      "name": "ClassContext",
+      "opcode": "0x12"
+    },
+    {
+      "count": 154,
+      "name": "MetaCast",
+      "opcode": "0x13"
+    },
+    {
+      "count": 4312,
+      "name": "LetBool",
+      "opcode": "0x14"
+    },
+    {
+      "count": 69368,
+      "name": "EndFunctionParms",
+      "opcode": "0x16"
+    },
+    {
+      "count": 1639,
+      "name": "Self",
+      "opcode": "0x17"
+    },
+    {
+      "count": 4381,
+      "name": "Skip",
+      "opcode": "0x18"
+    },
+    {
+      "count": 27443,
+      "name": "Context",
+      "opcode": "0x19"
+    },
+    {
+      "count": 4680,
+      "name": "ArrayElement",
+      "opcode": "0x1A"
+    },
+    {
+      "count": 10131,
+      "name": "VirtualFunction",
+      "opcode": "0x1B"
+    },
+    {
+      "count": 2972,
+      "name": "FinalFunction",
+      "opcode": "0x1C"
+    },
+    {
+      "count": 1795,
+      "name": "IntConst",
+      "opcode": "0x1D"
+    },
+    {
+      "count": 11992,
+      "name": "FloatConst",
+      "opcode": "0x1E"
+    },
+    {
+      "count": 6206,
+      "name": "StringConst",
+      "opcode": "0x1F"
+    },
+    {
+      "count": 1748,
+      "name": "ObjectConst",
+      "opcode": "0x20"
+    },
+    {
+      "count": 3241,
+      "name": "NameConst",
+      "opcode": "0x21"
+    },
+    {
+      "count": 71,
+      "name": "RotationConst",
+      "opcode": "0x22"
+    },
+    {
+      "count": 780,
+      "name": "VectorConst",
+      "opcode": "0x23"
+    },
+    {
+      "count": 2340,
+      "name": "ByteConst",
+      "opcode": "0x24"
+    },
+    {
+      "count": 4372,
+      "name": "IntZero",
+      "opcode": "0x25"
+    },
+    {
+      "count": 2919,
+      "name": "IntOne",
+      "opcode": "0x26"
+    },
+    {
+      "count": 3348,
+      "name": "True",
+      "opcode": "0x27"
+    },
+    {
+      "count": 4019,
+      "name": "False",
+      "opcode": "0x28"
+    },
+    {
+      "count": 1222,
+      "name": "NativeParm",
+      "opcode": "0x29"
+    },
+    {
+      "count": 4692,
+      "name": "NoObject",
+      "opcode": "0x2A"
+    },
+    {
+      "count": 9186,
+      "name": "IntConstByte",
+      "opcode": "0x2C"
+    },
+    {
+      "count": 9222,
+      "name": "BoolVariable",
+      "opcode": "0x2D"
+    },
+    {
+      "count": 3623,
+      "name": "DynamicCast",
+      "opcode": "0x2E"
+    },
+    {
+      "count": 186,
+      "name": "Iterator",
+      "opcode": "0x2F"
+    },
+    {
+      "count": 220,
+      "name": "IteratorPop",
+      "opcode": "0x30"
+    },
+    {
+      "count": 189,
+      "name": "IteratorNext",
+      "opcode": "0x31"
+    },
+    {
+      "count": 2,
+      "name": "StructCmpEq",
+      "opcode": "0x32"
+    },
+    {
+      "count": 1,
+      "name": "StructCmpNe",
+      "opcode": "0x33"
+    },
+    {
+      "count": 3305,
+      "name": "StructMember",
+      "opcode": "0x36"
+    },
+    {
+      "count": 965,
+      "name": "DynArrayLength",
+      "opcode": "0x37"
+    },
+    {
+      "count": 111,
+      "name": "GlobalFunction",
+      "opcode": "0x38"
+    },
+    {
+      "count": 12418,
+      "name": "PrimitiveCast",
+      "opcode": "0x39"
+    },
+    {
+      "count": 11,
+      "name": "DynArrayInsert",
+      "opcode": "0x40"
+    },
+    {
+      "count": 22,
+      "name": "DynArrayRemove",
+      "opcode": "0x41"
+    },
+    {
+      "count": 42,
+      "name": "DelegateFunction",
+      "opcode": "0x43"
+    },
+    {
+      "count": 94,
+      "name": "DelegateProperty",
+      "opcode": "0x44"
+    },
+    {
+      "count": 94,
+      "name": "LetDelegate",
+      "opcode": "0x45"
+    }
+  ],
+  "package_table_failures": [],
+  "packages": {
+    "XIIIMP": {
+      "attempted": {
+        "Class": 123,
+        "Const": 47,
+        "Enum": 2,
+        "Function": 740,
+        "Property": 2006,
+        "State": 74,
+        "Struct": 1
+      },
+      "class_defaults_exact": 123,
+      "code_file_bytes": 123464,
+      "code_memory_bytes": 164724,
+      "decoded": {
+        "Class": 123,
+        "Const": 47,
+        "Enum": 2,
+        "Function": 740,
+        "Property": 2006,
+        "State": 74,
+        "Struct": 1
+      },
+      "default_properties": 712,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 824,
+      "tokens": 55349
+    },
+    "core": {
+      "attempted": {
+        "Class": 7,
+        "Const": 8,
+        "Enum": 2,
+        "Function": 165,
+        "Property": 493,
+        "Struct": 12
+      },
+      "class_defaults_exact": 7,
+      "code_file_bytes": 1438,
+      "code_memory_bytes": 2122,
+      "decoded": {
+        "Class": 7,
+        "Const": 8,
+        "Enum": 2,
+        "Function": 165,
+        "Property": 493,
+        "Struct": 12
+      },
+      "default_properties": 16,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 165,
+      "tokens": 595
+    },
+    "editor": {
+      "attempted": {
+        "Class": 14,
+        "Const": 2,
+        "Enum": 1,
+        "Function": 36,
+        "Property": 295,
+        "Struct": 1
+      },
+      "class_defaults_exact": 14,
+      "code_file_bytes": 7763,
+      "code_memory_bytes": 12034,
+      "decoded": {
+        "Class": 14,
+        "Const": 2,
+        "Enum": 1,
+        "Function": 36,
+        "Property": 295,
+        "Struct": 1
+      },
+      "default_properties": 102,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 36,
+      "tokens": 4625
+    },
+    "engine": {
+      "attempted": {
+        "Class": 158,
+        "Const": 52,
+        "Enum": 59,
+        "Function": 1822,
+        "Property": 5606,
+        "State": 58,
+        "Struct": 32
+      },
+      "class_defaults_exact": 158,
+      "code_file_bytes": 102137,
+      "code_memory_bytes": 136118,
+      "decoded": {
+        "Class": 158,
+        "Const": 52,
+        "Enum": 59,
+        "Function": 1822,
+        "Property": 5606,
+        "State": 58,
+        "Struct": 32
+      },
+      "default_properties": 1066,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 1899,
+      "tokens": 47781
+    },
+    "gameplay": {
+      "attempted": {
+        "Class": 8,
+        "Function": 15,
+        "Property": 38,
+        "State": 6
+      },
+      "class_defaults_exact": 8,
+      "code_file_bytes": 941,
+      "code_memory_bytes": 1458,
+      "decoded": {
+        "Class": 8,
+        "Function": 15,
+        "Property": 38,
+        "State": 6
+      },
+      "default_properties": 36,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 21,
+      "tokens": 528
+    },
+    "gui": {
+      "attempted": {
+        "Class": 37,
+        "Const": 12,
+        "Enum": 10,
+        "Function": 251,
+        "Property": 746,
+        "Struct": 3
+      },
+      "class_defaults_exact": 37,
+      "code_file_bytes": 11831,
+      "code_memory_bytes": 16894,
+      "decoded": {
+        "Class": 37,
+        "Const": 12,
+        "Enum": 10,
+        "Function": 251,
+        "Property": 746,
+        "Struct": 3
+      },
+      "default_properties": 171,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 251,
+      "tokens": 6213
+    },
+    "ipdrv": {
+      "attempted": {
+        "Class": 9,
+        "Enum": 3,
+        "Function": 81,
+        "Property": 246,
+        "State": 2,
+        "Struct": 3
+      },
+      "class_defaults_exact": 9,
+      "code_file_bytes": 5275,
+      "code_memory_bytes": 7101,
+      "decoded": {
+        "Class": 9,
+        "Enum": 3,
+        "Function": 81,
+        "Property": 246,
+        "State": 2,
+        "Struct": 3
+      },
+      "default_properties": 14,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 83,
+      "tokens": 2098
+    },
+    "uweb": {
+      "attempted": {
+        "Class": 7,
+        "Enum": 1,
+        "Function": 41,
+        "Property": 98
+      },
+      "class_defaults_exact": 7,
+      "code_file_bytes": 4835,
+      "code_memory_bytes": 6280,
+      "decoded": {
+        "Class": 7,
+        "Enum": 1,
+        "Function": 41,
+        "Property": 98
+      },
+      "default_properties": 4,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 41,
+      "tokens": 1746
+    },
+    "xidcine": {
+      "attempted": {
+        "Class": 97,
+        "Const": 56,
+        "Enum": 6,
+        "Function": 587,
+        "Property": 1584,
+        "State": 119,
+        "Struct": 14
+      },
+      "class_defaults_exact": 97,
+      "code_file_bytes": 79299,
+      "code_memory_bytes": 107927,
+      "decoded": {
+        "Class": 97,
+        "Const": 56,
+        "Enum": 6,
+        "Function": 587,
+        "Property": 1584,
+        "State": 119,
+        "Struct": 14
+      },
+      "default_properties": 484,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 707,
+      "tokens": 36406
+    },
+    "xidinterf": {
+      "attempted": {
+        "Class": 114,
+        "Const": 42,
+        "Function": 820,
+        "Property": 5684,
+        "State": 39,
+        "Struct": 6
+      },
+      "class_defaults_exact": 114,
+      "code_file_bytes": 285619,
+      "code_memory_bytes": 388739,
+      "decoded": {
+        "Class": 114,
+        "Const": 42,
+        "Function": 820,
+        "Property": 5684,
+        "State": 39,
+        "Struct": 6
+      },
+      "default_properties": 2504,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 859,
+      "tokens": 129002
+    },
+    "xidmaps": {
+      "attempted": {
+        "Class": 133,
+        "Function": 198,
+        "Property": 651,
+        "State": 30
+      },
+      "class_defaults_exact": 133,
+      "code_file_bytes": 27247,
+      "code_memory_bytes": 37089,
+      "decoded": {
+        "Class": 133,
+        "Function": 198,
+        "Property": 651,
+        "State": 30
+      },
+      "default_properties": 463,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 228,
+      "tokens": 12123
+    },
+    "xidpawn": {
+      "attempted": {
+        "Class": 56,
+        "Enum": 4,
+        "Function": 589,
+        "Property": 1411,
+        "State": 76,
+        "Struct": 10
+      },
+      "class_defaults_exact": 56,
+      "code_file_bytes": 101099,
+      "code_memory_bytes": 138146,
+      "decoded": {
+        "Class": 56,
+        "Enum": 4,
+        "Function": 589,
+        "Property": 1411,
+        "State": 76,
+        "Struct": 10
+      },
+      "default_properties": 222,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 665,
+      "tokens": 46247
+    },
+    "xidspec": {
+      "attempted": {
+        "Class": 8
+      },
+      "class_defaults_exact": 8,
+      "code_file_bytes": 0,
+      "code_memory_bytes": 0,
+      "decoded": {
+        "Class": 8
+      },
+      "default_properties": 20,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 0,
+      "tokens": 0
+    },
+    "xiii": {
+      "attempted": {
+        "Class": 535,
+        "Const": 34,
+        "Enum": 16,
+        "Function": 1558,
+        "Property": 3774,
+        "State": 128,
+        "Struct": 10
+      },
+      "class_defaults_exact": 535,
+      "code_file_bytes": 229831,
+      "code_memory_bytes": 305630,
+      "decoded": {
+        "Class": 535,
+        "Const": 34,
+        "Enum": 16,
+        "Function": 1558,
+        "Property": 3774,
+        "State": 128,
+        "Struct": 10
+      },
+      "default_properties": 3758,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 1692,
+      "tokens": 102761
+    },
+    "xiiiarmes": {
+      "attempted": {
+        "Class": 39
+      },
+      "class_defaults_exact": 39,
+      "code_file_bytes": 0,
+      "code_memory_bytes": 0,
+      "decoded": {
+        "Class": 39
+      },
+      "default_properties": 0,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 0,
+      "tokens": 0
+    },
+    "xiiideco": {
+      "attempted": {
+        "Class": 19
+      },
+      "class_defaults_exact": 19,
+      "code_file_bytes": 0,
+      "code_memory_bytes": 0,
+      "decoded": {
+        "Class": 19
+      },
+      "default_properties": 0,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 0,
+      "tokens": 0
+    },
+    "xiiipersos": {
+      "attempted": {
+        "Class": 75
+      },
+      "class_defaults_exact": 75,
+      "code_file_bytes": 0,
+      "code_memory_bytes": 0,
+      "decoded": {
+        "Class": 75
+      },
+      "default_properties": 0,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 0,
+      "tokens": 0
+    },
+    "xiiipersosG": {
+      "attempted": {
+        "Class": 3
+      },
+      "class_defaults_exact": 3,
+      "code_file_bytes": 0,
+      "code_memory_bytes": 0,
+      "decoded": {
+        "Class": 3
+      },
+      "default_properties": 0,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 0,
+      "tokens": 0
+    },
+    "xiiivehicule": {
+      "attempted": {
+        "Class": 2
+      },
+      "class_defaults_exact": 2,
+      "code_file_bytes": 0,
+      "code_memory_bytes": 0,
+      "decoded": {
+        "Class": 2
+      },
+      "default_properties": 0,
+      "failures": 0,
+      "first_failures": [],
+      "licensee": 58,
+      "scripts_with_code": 0,
+      "tokens": 0
+    }
+  },
+  "packages_loaded": 19,
+  "references": {
+    "property_tags": "xiii-package (UModel a0bfb468 / UELib 3207a17e)",
+    "uelib": "EliotVU/Unreal-Library@3207a17e9b294be3d1bf26b18e07ccff7e1d4b0c (UStruct/UFunction/UState/UClass/UProperty and token deserializers)"
+  },
+  "schema": 1,
+  "tool": "xiii-tool script coverage (crates/xiii-script)",
+  "totals": {
+    "attempted": {
+      "Class": 1444,
+      "Const": 253,
+      "Enum": 104,
+      "Function": 6903,
+      "Property": 22632,
+      "State": 532,
+      "Struct": 92
+    },
+    "class_defaults_exact": 1444,
+    "code_file_bytes": 980779,
+    "code_memory_bytes": 1324262,
+    "decoded": {
+      "Class": 1444,
+      "Const": 253,
+      "Enum": 104,
+      "Function": 6903,
+      "Property": 22632,
+      "State": 532,
+      "Struct": 92
+    },
+    "default_properties": 9572,
+    "failures": 0,
+    "first_failures": [],
+    "scripts_with_code": 7471,
+    "tokens": 445474,
+    "unknown_tokens": 0
+  }
+}

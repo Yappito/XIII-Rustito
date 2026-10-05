@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+mod anim_cmd;
+
 use xiii_package::{Limits, Package};
 use xiii_tool::{corpus, coverage, deps, props, report};
 
@@ -44,6 +46,16 @@ USAGE:
       same path and class in its package, and count object-property references
       per package. Exits 1 if a package is missing or an import is unresolved.
 
+  xiii-tool anim <coverage|list|validate|render|export> ...
+      Skeletal meshes and animation (M2b): run 'xiii-tool anim' for details.
+
+  xiii-tool script <classes|functions|disasm|natives|coverage> ...
+      Compiled UnrealScript (M2c): run 'xiii-tool script' for details.
+
+  xiii-tool <world-coverage|texture|mesh|bsp|terrain> ...
+      World decoding (M2a): textures, static meshes, BSP, terrain. Run
+      'xiii-tool world-coverage --help' style commands without arguments for details.
+
 Exit codes: 0 success, 1 parse error or mismatch, 2 usage or I/O error.";
 
 /// Appends a line to a report buffer (formatting into a String cannot fail).
@@ -74,6 +86,11 @@ fn main() -> ExitCode {
         Some("props") => props_cmd(&args[1..]),
         Some("coverage") => coverage_cmd(&args[1..]),
         Some("deps") => deps_cmd(&args[1..]),
+        Some("anim") => anim_cmd::run(&args[1..]),
+        Some("script") => xiii_tool::script_cmd::run(&args[1..]),
+        Some(cmd) if xiii_tool::world_cmd::COMMANDS.contains(&cmd) => {
+            xiii_tool::world_cmd::run(cmd, &args[1..])
+        }
         Some("-h" | "--help" | "help") => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -566,7 +583,7 @@ fn coverage_cmd(args: &[String]) -> ExitCode {
     );
     outln!(
         out,
-        "Core.Class payloads whose first bytes happen to parse as a property block: {:?}",
+        "Core.Class defaults decoded after native class data (examples): {:?}",
         cov.class_payload_parsed
     );
     outln!(

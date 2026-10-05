@@ -1,6 +1,7 @@
 //! Property-block coverage over an installation (`xiii-tool coverage`).
 //!
 //! For every export of every package the state frame and tagged-property block are attempted
+//! (for `Core.Class` exports: the class defaults after the native class data, via `xiii-script`)
 //! and aggregated per class. Only metadata is collected (class/struct/property names, counts,
 //! sizes, offsets and error kinds); property values are never recorded.
 
@@ -11,8 +12,10 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 use xiii_package::{
-    Limits, ObjectRef, Package, PropertyType, PropertyValue, RF_HAS_STACK, RawReason,
+    Limits, ObjectProperties, ObjectRef, Package, PropertyType, PropertyValue, RF_HAS_STACK,
+    RawReason,
 };
+use xiii_script::{ScriptLimits, ScriptObject, read_script_object};
 
 use crate::corpus::tagged_files;
 use crate::props::{error_kind_key, raw_reason_key};
@@ -120,7 +123,7 @@ pub struct Coverage {
     pub bool_sizes: BTreeMap<u32, u64>,
     /// Decoded blocks terminated by the first `None` name entry / by a later duplicate.
     pub terminator_first_none: [u64; 2],
-    /// Class exports whose payload start happened to parse as a property block.
+    /// Examples of `Core.Class` defaults decoded after the native class data (xiii-script).
     pub class_payload_parsed: Vec<String>,
     /// State frames with a null / non-null node.
     pub frame_node_null: u64,
@@ -161,6 +164,40 @@ pub fn scan(root: &Path) -> io::Result<Coverage> {
     Ok(cov)
 }
 
+/// State frame and property block of an export. For `Core.Class` exports the defaults follow
+/// the native UField/UStruct/UState/UClass data, which `xiii-script` decodes first; the
+/// resulting block ends exactly at the payload end (consumed = whole payload).
+fn read_leading_properties(
+    p: &Package,
+    data: &[u8],
+    i: usize,
+    limits: &Limits,
+) -> Result<ObjectProperties, (String, String, Option<u64>)> {
+    let e = &p.exports()[i];
+    let is_class = p
+        .export_class_path(i)
+        .is_some_and(|c| c.eq_ignore_ascii_case("Core.Class"));
+    if !is_class {
+        return p
+            .read_object_properties(data, i, limits)
+            .map_err(|err| (error_kind_key(&err.kind), err.to_string(), err.offset));
+    }
+    match read_script_object(p, data, i, &ScriptLimits::default(), limits) {
+        Ok(ScriptObject::Class(c)) => Ok(ObjectProperties {
+            export: i as u32,
+            payload: e.serial_span().unwrap_or(c.defaults.span),
+            state_frame: c.state_frame,
+            block: c.defaults,
+        }),
+        Ok(_) => Err(("NotAClass".into(), "not a class".into(), None)),
+        Err(err) => Err((
+            format!("Script:{}", err.kind_key()),
+            err.to_string(),
+            err.offset.map(|o| o as u64),
+        )),
+    }
+}
+
 /// Adds one parsed package to the aggregate.
 pub fn add_package(cov: &mut Coverage, rel: &str, p: &Package, data: &[u8], limits: &Limits) {
     for (i, e) in p.exports().iter().enumerate() {
@@ -177,13 +214,12 @@ pub fn add_package(cov: &mut Coverage, rel: &str, p: &Package, data: &[u8], limi
         st.attempted += 1;
         st.payload_bytes += u64::from(e.serial_size);
         let path = p.object_path(ObjectRef::Export(i as u32)).unwrap_or("?");
-        match p.read_object_properties(data, i, limits) {
-            Err(err) => {
+        match read_leading_properties(p, data, i, limits) {
+            Err((kind_key, err, offset)) => {
                 st.failed += 1;
-                *st.error_kinds.entry(error_kind_key(&err.kind)).or_default() += 1;
+                *st.error_kinds.entry(kind_key).or_default() += 1;
                 if st.first_error.is_none() {
-                    let rel_off = err
-                        .offset
+                    let rel_off = offset
                         .map(|o| {
                             format!(
                                 " (payload+{})",
@@ -210,9 +246,8 @@ pub fn add_package(cov: &mut Coverage, rel: &str, p: &Package, data: &[u8], limi
                 cov.terminator_first_none[usize::from(!is_first)] += 1;
                 if e.class.is_null() && cov.class_payload_parsed.len() < MAX_EXAMPLES {
                     cov.class_payload_parsed.push(format!(
-                        "{rel} {path}: {} properties, {} of {} bytes",
+                        "{rel} {path}: {} default properties, block ends at payload end ({} bytes)",
                         o.block.properties.len(),
-                        o.consumed(),
                         o.payload.len()
                     ));
                 }
@@ -391,8 +426,8 @@ pub fn to_json(cov: &Coverage, label: &str) -> Value {
         "tool": concat!("xiii-tool ", env!("CARGO_PKG_VERSION"), " coverage"),
         "content_policy": "metadata only: class/struct/property names, counts, sizes, offsets and error kinds; no property values",
         "notes": [
-            "Every export payload is attempted as [state frame if RF_HasStack] + tagged-property block from payload offset 0.",
-            "Core.Class payloads start with native UField/UStruct/UState/UClass data and the class defaults follow it, so a leading property block is not expected there; the entries in class_payloads_parsing_as_property_blocks are coincidences (the first compact index, the SuperField reference, equals the index of a 'None' name entry).",
+            "Every non-class export payload is attempted as [state frame if RF_HasStack] + tagged-property block from payload offset 0.",
+            "Core.Class payloads start with native UField/UStruct/UState/UClass data (decoded by crates/xiii-script, XIII v100/licensee-58 layout); the class defaults are the tagged-property block after it and must end exactly at the payload end. For classes, consumed = whole payload.",
             "tail = payload bytes after the property block (class-native data, not decoded here)."
         ],
         "packages": cov.packages,
@@ -415,7 +450,7 @@ pub fn to_json(cov: &Coverage, label: &str) -> Value {
         },
         "bools": {"false": cov.bools[0], "true": cov.bools[1]},
         "bool_declared_sizes": cov.bool_sizes.iter().map(|(k, v)| (k.to_string(), *v)).collect::<BTreeMap<_, _>>(),
-        "class_payloads_parsing_as_property_blocks": cov.class_payload_parsed,
+        "class_defaults_examples": cov.class_payload_parsed,
         "terminators": {
             "first_none_name": cov.terminator_first_none[0],
             "later_duplicate_none_name": cov.terminator_first_none[1],
