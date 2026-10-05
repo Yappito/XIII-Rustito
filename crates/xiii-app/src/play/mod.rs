@@ -19,6 +19,7 @@ pub mod pawns;
 pub mod script;
 pub mod session;
 pub mod sim;
+pub mod voice;
 pub mod weapons;
 
 use std::collections::HashMap;
@@ -1373,6 +1374,16 @@ pub(crate) fn run_script(
 ) -> Result<ScriptOutcome, String> {
     let started = Instant::now();
     let mut session = session::Session::open(game_dir, map)?;
+    // The headless path has no Bevy audio resource; scan the same decoded HX library so
+    // `Actor.PlayStrVoice` takes the engine's voice-completion path (real wave length) instead of
+    // the script's `NoSound` fallback. Names the library cannot resolve keep returning `false`.
+    let voice_library = std::sync::Arc::new(std::sync::Mutex::new(xiii_audio::SoundLibrary::scan(
+        game_dir,
+    )));
+    let (voice_provider, voice_unresolved) = voice::LibraryVoiceDuration::new(voice_library);
+    session
+        .vm_mut()
+        .set_voice_duration(Box::new(voice_provider));
     session.register_movers(scene);
     let mover_states = session.mover_states();
     let (mut world, mover_collision) = movers::MoverCollision::build(scene, &mover_states);
@@ -1490,6 +1501,14 @@ pub(crate) fn run_script(
                 format_mover_trace(&session)
             );
         }
+    }
+    let unresolved = voice_unresolved.load(std::sync::atomic::Ordering::Relaxed);
+    if unresolved > 0 {
+        println!(
+            "[play] voice durations: {unresolved} name(s) unresolved (those lines use the script's NoSound fallback)"
+        );
+    } else {
+        println!("[play] voice durations: every requested name resolved from the HX library");
     }
     Ok(ScriptOutcome {
         session,

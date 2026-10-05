@@ -1844,4 +1844,57 @@ mod tests {
             save.actor, save.teleporter_name, save.description
         );
     }
+
+    /// Opt-in corpus probe (item3o requirement 2): the player message path through
+    /// `Engine.LocalMessage.ClientReceive` -> `XIIIBaseHud.LocalizedMessage` -> `HudMessage`
+    /// `SetUpLocalizedMessage` must not suspend. The item3m residual error
+    /// (`TypeMismatch expected "string", found "void"` at `SetUpLocalizedMessage` code 0x0077) is
+    /// not reproducible at HEAD; this drives the generic `AddHudMessage` branch (a message class
+    /// outside the four special-cased ones) for several switches and asserts each call returns
+    /// `Ok` and that a `HudMessage` is spawned on the HUD's `HudMsg`.
+    #[test]
+    fn opt_in_plage00_generic_hud_message_path_does_not_suspend() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00");
+        let pawn = session.player_pawn_actors()[0].0;
+        let mut errors = Vec::new();
+        {
+            let vm = session.vm_mut();
+            for path in [
+                "xiii.XIIIDeathMessage",
+                "xiii.XIIISoloMessage",
+                "engine.GameMessage",
+            ] {
+                let Some(class) = runtime::resolve_class_path(vm.set(), path) else {
+                    errors.push(format!("{path}: class not found"));
+                    continue;
+                };
+                for switch in 0..4 {
+                    let args = vec![
+                        Value::Object(Some(ObjRef::Static(class))),
+                        Value::Int(switch),
+                        Value::Object(None),
+                        Value::Object(None),
+                        Value::Object(None),
+                    ];
+                    if let Err(e) = vm.send_event(pawn, "ReceiveLocalizedMessage", args) {
+                        errors.push(format!("{path} switch={switch}: {e}"));
+                    }
+                }
+            }
+        }
+        assert!(errors.is_empty(), "message path suspended: {errors:?}");
+        let spawned = session
+            .vm()
+            .find_object("XIIIBaseHud")
+            .and_then(|hud| session.vm().get_property(hud, "HudMsg").cloned());
+        assert!(
+            matches!(spawned, Some(Value::Object(Some(ObjRef::Instance(_))))),
+            "no HudMessage was spawned through the generic path: {spawned:?}"
+        );
+        println!("[hud test] generic message path Ok; HudMsg={spawned:?}");
+    }
 }

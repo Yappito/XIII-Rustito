@@ -93,6 +93,9 @@ pub struct CinematicState {
     pub view_changes: u64,
     /// Total dialogue lines seen (for the report).
     pub lines: u64,
+    /// Shared counter of voice names the `VoiceDuration` provider could not resolve (set when the
+    /// provider is installed; those lines use the script's `NoSound` fallback).
+    pub voice_unresolved: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// Last `(view actor, source)` so a change is logged once.
     last_view: Option<(String, ViewSource)>,
     /// Last controller state used for suppression logging.
@@ -216,14 +219,28 @@ pub fn camera_transform(location: [f32; 3], rotation: [i32; 3]) -> (Vec3, Quat) 
 /// [`sync_camera`](super::sync_camera). `audio` is used (when present and enabled) to compute the
 /// real decoded length of a voice so the subtitle stays up as long as the wave.
 pub fn collect(
-    session: NonSend<Result<Session, String>>,
+    mut session: NonSendMut<Result<Session, String>>,
     mut state: ResMut<CinematicState>,
     mut audio: Option<ResMut<crate::audio::AudioRes>>,
 ) {
-    let session = match &*session {
+    let session = match &mut *session {
         Ok(session) => session,
         Err(_) => return,
     };
+    // Install the decoded voice-duration provider once the audio library exists, so
+    // `Actor.PlayStrVoice` takes the engine's voice-completion path (real wave length) instead of
+    // the script's `NoSound` fallback. The provider shares the same `SoundLibrary` the audio layer
+    // already scanned; unresolved names keep returning `false` and are counted.
+    if !session.vm().has_voice_duration()
+        && let Some(audio) = audio.as_mut()
+        && audio.stats.enabled
+    {
+        let (provider, unresolved) =
+            crate::play::voice::LibraryVoiceDuration::new(audio.library.clone());
+        session.vm_mut().set_voice_duration(Box::new(provider));
+        state.voice_unresolved = Some(unresolved);
+        println!("[cine] voice-duration provider installed from the decoded HX library");
+    }
     state.vm_time = session.vm_time();
 
     let mut seen = state.dialogues;
@@ -236,7 +253,7 @@ pub fn collect(
 
     for d in new {
         let duration = d.duration.or_else(|| {
-            let audio = audio.as_mut()?;
+            let audio = audio.as_ref()?;
             voice_duration(audio, &d.sound)
         });
         let text = d
@@ -308,12 +325,14 @@ pub fn collect(
 }
 
 /// Real decoded length of a voice name from the audio library, if available.
-fn voice_duration(audio: &mut crate::audio::AudioRes, sound: &str) -> Option<f32> {
+fn voice_duration(audio: &crate::audio::AudioRes, sound: &str) -> Option<f32> {
     if !audio.stats.enabled {
         return None;
     }
-    let resolved = audio.library.resolve_path(sound)?;
-    let pcm = audio.library.load(&resolved.entry).ok()?;
+    let library = audio.library.clone();
+    let mut library = library.lock().unwrap_or_else(|e| e.into_inner());
+    let resolved = library.resolve_path(sound)?;
+    let pcm = library.load(&resolved.entry).ok()?;
     let frames = pcm.samples.len() as f32 / f32::from(pcm.channels.max(1));
     (pcm.sample_rate > 0).then(|| frames / pcm.sample_rate as f32)
 }
@@ -388,6 +407,12 @@ pub fn report_exit(state: Res<CinematicState>, mut exiting: MessageReader<AppExi
         "[cine] exit: {} dialogue line(s), {} view change(s)",
         state.lines, state.view_changes
     );
+    if let Some(unresolved) = &state.voice_unresolved {
+        println!(
+            "[cine] voice durations: {} unresolved name(s)",
+            unresolved.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
     for line in &state.log {
         println!("[cine]   {line}");
     }
