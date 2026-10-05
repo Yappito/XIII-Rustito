@@ -19,7 +19,9 @@ use std::time::Instant;
 
 use xiii_package::Limits;
 use xiii_script::vm::MoverState;
-use xiii_script::{ObjRef, ObjectId, PresentationEvent, ScriptSet, Value, Vm, VmError, VmLimits};
+use xiii_script::{
+    DialogueEvent, ObjRef, ObjectId, PresentationEvent, ScriptSet, Value, Vm, VmError, VmLimits,
+};
 use xiii_world::runtime::{self, ProviderSpec};
 
 use crate::collision;
@@ -62,6 +64,11 @@ pub struct Session {
     last_synced: Vec<Option<[f32; 3]>>,
     /// Presentation events, most recent last (bounded).
     pub events: VecDeque<(f64, PresentationEvent)>,
+    /// `PlayStrVoice` dialogue events, most recent last (bounded). `dialogue_total` is the
+    /// cumulative count so a consumer can detect new entries after the bounded window wraps.
+    pub dialogues: VecDeque<(f64, DialogueEvent)>,
+    /// Cumulative number of dialogue events emitted.
+    pub dialogue_total: u64,
     /// `Touch` events involving the player, most recent last (bounded).
     pub touches: VecDeque<(f64, String)>,
     player_touching: Vec<ObjectId>,
@@ -69,6 +76,11 @@ pub struct Session {
     pub moved: Vec<MovedActor>,
     /// `XIIIDispatcher0`, if the map has one (the trigger chain's end state).
     pub dispatcher: Option<ObjectId>,
+    /// Active language code of the install's localisation files (`int`, `frt`, ...).
+    pub localization_language: String,
+    /// Number of `localized` class-default values filled from the `.int` files while building
+    /// the level's class layouts.
+    pub localized_overrides: u64,
     /// Fixed steps run.
     pub tick_count: u64,
 }
@@ -127,6 +139,14 @@ impl Session {
         let (set, map_idx) = runtime::load_with_map(game_dir, map)?;
         let set: &'static ScriptSet = Box::leak(Box::new(set));
         let mut vm = Vm::new(set, VmLimits::default());
+
+        // Install the install's localisation files before the first class layout is built, so
+        // `localized` class defaults (for example `Plage01CahuteKeyPick.PickupMessage`) are
+        // filled from the active-language `.int` as the game's classes load them.
+        let localization_language = runtime::configure_localization(&mut vm, game_dir)?;
+        // Decoded `USize`/`VSize` for textures in non-script packages (the HUD widgets read the
+        // HUD's `FondMsg` texture size while drawing).
+        runtime::configure_external_objects(&mut vm, game_dir);
 
         let anim_log = Rc::new(RefCell::new(Vec::new()));
         let providers = runtime::build_map_providers(
@@ -315,12 +335,17 @@ impl Session {
             first_error: None,
             last_synced,
             events: VecDeque::new(),
+            dialogues: VecDeque::new(),
+            dialogue_total: 0,
             touches: VecDeque::new(),
             player_touching: Vec::new(),
             moved: Vec::new(),
             dispatcher,
+            localization_language,
+            localized_overrides: 0,
             tick_count: 0,
         };
+        session.localized_overrides = session.vm.localized_overrides;
         session.suspended.dedup();
         session.drain_events();
         session.update_touches();
@@ -743,11 +768,35 @@ impl Session {
     fn drain_events(&mut self) {
         for ev in self.vm.drain_events() {
             let t = self.vm.time;
+            if let PresentationEvent::Dialogue(d) = &ev {
+                self.dialogue_total += 1;
+                self.dialogues.push_back((t, d.clone()));
+            }
             self.events.push_back((t, ev));
         }
         while self.events.len() > 64 {
             self.events.pop_front();
         }
+        while self.dialogues.len() > 64 {
+            self.dialogues.pop_front();
+        }
+    }
+
+    /// Dialogue events emitted since `seen` (a cumulative count). Returns the events in order;
+    /// advances `seen` to [`Session::dialogue_total`]. Newest entries survive the bounded window.
+    pub fn new_dialogues(&self, seen: &mut u64) -> Vec<&DialogueEvent> {
+        if *seen >= self.dialogue_total {
+            return Vec::new();
+        }
+        let new = (self.dialogue_total - *seen).min(self.dialogues.len() as u64) as usize;
+        *seen = self.dialogue_total;
+        self.dialogues
+            .iter()
+            .rev()
+            .take(new)
+            .rev()
+            .map(|(_, d)| d)
+            .collect()
     }
 
     fn update_touches(&mut self) {

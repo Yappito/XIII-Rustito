@@ -9,6 +9,7 @@
 //! `--play-script <file>`. Both drive the same [`sim::PlayerSim`] in `FixedUpdate` at 60 Hz.
 //! Fixed 60 Hz is a **hypothesis** (UE2 used variable ticks); see [`FIXED_HZ`].
 
+pub mod cinematics;
 pub mod hud;
 pub mod movement_modes;
 pub mod movers;
@@ -132,6 +133,7 @@ impl Plugin for PlayPlugin {
         .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
         .init_resource::<ShotFlag>()
         .init_resource::<RenderSync>()
+        .init_resource::<cinematics::CinematicState>()
         .add_systems(Startup, setup)
         .add_systems(FixedUpdate, fixed_step)
         .add_systems(
@@ -140,7 +142,9 @@ impl Plugin for PlayPlugin {
                 controls,
                 grab_cursor,
                 mouse_look,
+                cinematics::collect,
                 sync_camera,
+                cinematics::draw,
                 viewer::sky_follow,
                 viewer::animate_uv,
                 pawns::update_pawns,
@@ -150,7 +154,8 @@ impl Plugin for PlayPlugin {
                 unattended,
             )
                 .chain(),
-        );
+        )
+        .add_systems(Last, cinematics::report_exit);
     }
 }
 
@@ -424,6 +429,10 @@ fn setup_inner(
     println!(
         "[play] login path: script={} bootstrap={}",
         session.login_script, session.login_bootstrap
+    );
+    println!(
+        "[play] localisation: language={} localized class-default overrides={}",
+        session.localization_language, session.localized_overrides
     );
     let pawns_now = session.player_pawn_actors();
     println!(
@@ -764,9 +773,21 @@ fn fixed_step(
         return;
     }
     let elapsed = state.tick as f32 * DT;
-    let input = match script.drive.as_mut() {
-        Some(drive) => drive.advance(elapsed, &mut sim.0),
-        None => read_keyboard(&keys),
+    // Scripted cutscenes freeze the player (`CineController2.Interpret` FPC/FPL ->
+    // `NoControl`/`NoMove`, and `CameraView`/`PlayingVideo`). The host owns the player pawn's
+    // movement, so it must zero the movement input itself; the VM's state machine only sets the
+    // state. See `cinematics`.
+    let suppressed = match &*session {
+        Ok(sess) => cinematics::input_suppressed(sess),
+        Err(_) => false,
+    };
+    let input = if suppressed {
+        Input::default()
+    } else {
+        match script.drive.as_mut() {
+            Some(drive) => drive.advance(elapsed, &mut sim.0),
+            None => read_keyboard(&keys),
+        }
     };
     let use_action = input.use_action;
     let t0 = Instant::now();
@@ -896,12 +917,20 @@ fn mouse_look(
 fn sync_camera(
     sim: Res<SimRes>,
     params: Res<ParamsRes>,
+    cine: Res<cinematics::CinematicState>,
     mut cams: Query<&mut Transform, With<PlayCam>>,
 ) {
-    let eye = to_bevy_position(sim.0.eye_location(&params.0));
     for mut t in &mut cams {
-        t.translation = Vec3::from_array(eye);
-        t.rotation = Quat::from_euler(EulerRot::YXZ, -sim.0.yaw, sim.0.pitch, 0.0);
+        if let Some(v) = &cine.view {
+            // A script selected a cutscene camera (`CamView`/`ViewTarget`); render from it.
+            let (loc, rot) = cinematics::camera_transform(v.location, v.rotation);
+            t.translation = loc;
+            t.rotation = rot;
+        } else {
+            let eye = to_bevy_position(sim.0.eye_location(&params.0));
+            t.translation = Vec3::from_array(eye);
+            t.rotation = Quat::from_euler(EulerRot::YXZ, -sim.0.yaw, sim.0.pitch, 0.0);
+        }
     }
 }
 
@@ -1276,6 +1305,10 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
         "[play] login path: script={} bootstrap={}",
         session.login_script, session.login_bootstrap
     );
+    println!(
+        "[play] localisation: language={} localized class-default overrides={}",
+        session.localization_language, session.localized_overrides
+    );
     let pawns_now = session.player_pawn_actors();
     println!(
         "[play] player pawns: {} live XIIIPlayerPawn actor(s): {}",
@@ -1557,6 +1590,123 @@ mod tests {
             s.dispatcher_state(),
             s.active_actors(),
             s.suspended.len()
+        );
+    }
+
+    /// Opt-in corpus test (Part B): the level-start message/objective path creates real HUD
+    /// widget objects. Before the fixes the message widgets aborted (`DeferredWithReturnValue`
+    /// on `Message.static.GetString` and a `void` `default.Class`); now `ClientSetHUD` spawns
+    /// `XIIIBaseHud`, `MapInfo.Timer` runs `FirstFrame`, and the HUD message path completes.
+    #[test]
+    fn opt_in_plage00_hud_widgets_appear_after_level_start() {
+        const WIDGETS: [&str; 8] = [
+            "HudMsg",
+            "HudObjMsg",
+            "HudMPMsg",
+            "HudEndMsg",
+            "HudDlg",
+            "HudWnd",
+            "HudFoc",
+            "HudStt",
+        ];
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = session::Session::open(&game_dir, "Plage00").expect("open Plage00");
+        let hud = {
+            let vm = session.vm();
+            session
+                .controller
+                .and_then(|c| match vm.get_property(c, "myHUD") {
+                    Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(p)))) => {
+                        Some(*p)
+                    }
+                    _ => None,
+                })
+                .or_else(|| hud::find_hud(vm))
+                .expect("the script login must create a live HUD actor")
+        };
+        let mut found: Vec<(String, xiii_script::ObjectId)> = Vec::new();
+        for _ in 0..180 {
+            let loc = session.player_location().unwrap_or([0.0; 3]);
+            session.step(1.0 / 60.0, loc, 0.0, [0.0; 3]);
+        }
+        {
+            let vm = session.vm();
+            for name in WIDGETS {
+                if let Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(id)))) =
+                    vm.get_property(hud, name)
+                {
+                    let live = vm.objects.get(*id as usize).is_some_and(|o| !o.deleted);
+                    println!(
+                        "[play test] HUD widget {name} -> {}{}",
+                        vm.objects[*id as usize].name,
+                        if live { "" } else { " (deleted)" }
+                    );
+                    if live {
+                        found.push((name.to_owned(), *id));
+                    }
+                }
+            }
+        }
+        println!(
+            "[play test] HUD {} widgets live after 3s: {:?}",
+            found.len(),
+            found.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            !found.is_empty(),
+            "the HUD must create at least one widget after level start"
+        );
+        // The class-default object of the goal message must no longer be suspended by the
+        // static `GetString` call.
+        assert!(
+            !session
+                .suspended
+                .iter()
+                .any(|s| s == "Default__XIIIGoalMessage"),
+            "Default__XIIIGoalMessage must not be suspended: {:?}",
+            session.suspended
+        );
+
+        // Drive one `HUD.PostRender` with the live widgets and assert the retail draw commands
+        // (player info + the live widget) are recorded, using the synthetic font provider.
+        let canvas_class =
+            xiii_world::runtime::resolve_class_path(session.vm().set(), "Engine.Canvas")
+                .expect("Engine.Canvas class");
+        let canvas = session
+            .vm_mut()
+            .spawn(canvas_class, "WidgetTestCanvas")
+            .expect("spawn Canvas");
+        let vm = session.vm_mut();
+        vm.set_property(canvas, "ClipX", 0, xiii_script::Value::Float(1280.0));
+        vm.set_property(canvas, "ClipY", 0, xiii_script::Value::Float(720.0));
+        vm.set_property(canvas, "Style", 0, xiii_script::Value::Byte(1));
+        vm.set_property(
+            canvas,
+            "Font",
+            0,
+            xiii_script::Value::Name("Dummy".to_owned()),
+        );
+        vm.set_canvas_fonts(Box::new(DummyFonts));
+        let arg = xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(canvas)));
+        session
+            .vm_mut()
+            .send_event(hud, "PostRender", vec![arg])
+            .expect("HUD.PostRender with live widgets");
+        let commands = session.vm_mut().drain_canvas();
+        println!(
+            "[play test] HUD.PostRender after level start: {} draw command(s)",
+            commands.len()
+        );
+        for c in commands.iter().take(8) {
+            println!("[play test]   {c:?}");
+        }
+        assert!(
+            commands.len() >= 2,
+            "HUD.PostRender must draw more than the player-info line once widgets are live: {}",
+            commands.len()
         );
     }
 

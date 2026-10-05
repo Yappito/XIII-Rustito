@@ -24,7 +24,9 @@ use crate::animation::{AnimationData, SeqInfo};
 use crate::bytecode::{Call, Context, Script, Token, TokenKind, opcode_name};
 use crate::canvas::CanvasState;
 use crate::events::{PresentationEvent, SoundEvent};
+use crate::external::ExternalObjectData;
 use crate::linker::{GlobalRef, ScriptSet};
+use crate::localize::{LocalizationData, placeholder};
 use crate::navigation::{
     NavEdgeInfo, NavPointInfo, NavigationData, find_path, move_step, nearest_point, point_fits,
 };
@@ -163,6 +165,12 @@ pub enum VmErrorKind {
     /// A pathing native needing the decoded navigation graph ran without a navigation provider
     /// set (with [`Vm::set_navigation`]); never silently succeeds.
     NoNavProvider {
+        /// `Class.Function` of the native that needed it.
+        native: String,
+    },
+    /// `Object.Localize` ran without a localisation provider set (with
+    /// [`Vm::set_localization`]); never silently succeeds.
+    NoLocalizationProvider {
         /// `Class.Function` of the native that needed it.
         native: String,
     },
@@ -851,6 +859,10 @@ pub struct Slot {
     pub base: usize,
     /// Property flags.
     pub flags: u32,
+    /// Class that declares the property (for a class layout) or the function that declares the
+    /// parameter (for a function layout). Used to resolve `localized` class defaults from the
+    /// declaring class package's `.int`.
+    pub declaring: GlobalRef,
 }
 
 /// Slots of a class chain plus defaults.
@@ -1108,6 +1120,9 @@ pub struct Vm<'s> {
     /// Decoded navigation graph (pathing natives). `None` = every native that needs it fails
     /// with [`VmErrorKind::NoNavProvider`].
     pub(crate) navigation: Option<Box<dyn NavigationData>>,
+    /// Voice-wave duration provider (dialogue natives). `None` = `Actor.GetWaveDuration` reports
+    /// `0` with a visible note (the script then falls back to its own default wave length).
+    pub(crate) voice_duration: Option<Box<dyn crate::voice::VoiceDuration>>,
     /// Outbound presentation events emitted by presentation natives (sound, texture, display,
     /// projectors). Drained with [`Vm::drain_events`].
     events: Vec<PresentationEvent>,
@@ -1127,6 +1142,18 @@ pub struct Vm<'s> {
     pub canvas: CanvasState,
     /// Interned object references into packages outside the loaded script set.
     externals: std::cell::RefCell<ExternalTable>,
+    /// Host localisation provider (the install's active `.int`/language files). `None` = no
+    /// `Object.Localize` provider is installed and no `localized` class default is overridden;
+    /// `Object.Localize` then fails explicitly.
+    pub(crate) localization: Option<Box<dyn LocalizationData>>,
+    /// `localized` class-default values filled from the `.int` files while building layouts.
+    pub localized_overrides: u64,
+    /// `Object.Localize` lookups that found a key.
+    pub localization_hits: u64,
+    /// `Object.Localize` lookups that missed (the placeholder was returned and counted).
+    pub localization_misses: u64,
+    /// Host resolver for properties of objects in non-script packages (`Texture.USize`/`VSize`).
+    pub(crate) external_data: Option<Box<dyn ExternalObjectData>>,
     /// Optional per-native/section timing (`--perf-natives`).
     profile: NativeProfile,
 }
@@ -1163,12 +1190,18 @@ impl<'s> Vm<'s> {
             physics: None,
             animation: None,
             navigation: None,
+            voice_duration: None,
             events: Vec::new(),
             local_url: String::new(),
             url_options: String::new(),
             address_url: String::new(),
             canvas: CanvasState::default(),
             externals: std::cell::RefCell::new(ExternalTable::default()),
+            localization: None,
+            localized_overrides: 0,
+            localization_hits: 0,
+            localization_misses: 0,
+            external_data: None,
             profile: NativeProfile::default(),
         }
     }
@@ -1198,6 +1231,67 @@ impl<'s> Vm<'s> {
     /// Installs the host font-metrics provider used by `Canvas.StrLen`/`TextSize`.
     pub fn set_canvas_fonts(&mut self, fonts: Box<dyn crate::canvas::CanvasFonts>) {
         self.canvas.set_fonts(fonts);
+    }
+
+    /// Installs the host localisation provider (backed by `xiii-locale`). Call before loading
+    /// actors/layouts so `localized` class defaults are filled in: the VM has no filesystem and
+    /// cannot open `.int` files itself.
+    pub fn set_localization(&mut self, provider: Box<dyn LocalizationData>) {
+        self.localization = Some(provider);
+    }
+
+    /// True when a localisation provider is installed.
+    pub fn has_localization(&self) -> bool {
+        self.localization.is_some()
+    }
+
+    /// Installs the host resolver for properties of objects in non-script packages. Without it,
+    /// property access on such an object is an explicit `UnsupportedValue` error.
+    pub fn set_external_object_data(&mut self, provider: Box<dyn ExternalObjectData>) {
+        self.external_data = Some(provider);
+    }
+
+    /// `Localize(Section, Key, Package)` through the installed provider, or `None` when no
+    /// provider is installed or the key is absent. Counted in
+    /// [`Vm::localization_hits`]/[`Vm::localization_misses`].
+    pub fn localize(&mut self, package: &str, section: &str, key: &str) -> Option<String> {
+        let value = self
+            .localization
+            .as_ref()
+            .and_then(|l| l.get(package, section, key));
+        if value.is_some() {
+            self.localization_hits += 1;
+        } else {
+            self.localization_misses += 1;
+        }
+        value
+    }
+
+    /// Like [`Vm::localize`] but returns the UE2 placeholder
+    /// (`<?language?Package.Section.Key?>`) on a miss, the way `Object.Localize` returns it.
+    /// Without a provider the lookup is an explicit `None` (the caller decides), never a
+    /// silently empty string.
+    pub fn localize_or_placeholder(
+        &mut self,
+        package: &str,
+        section: &str,
+        key: &str,
+    ) -> Option<String> {
+        let lookup = self
+            .localization
+            .as_ref()
+            .map(|l| (l.language().to_owned(), l.get(package, section, key)));
+        let (language, value) = lookup?;
+        match value {
+            Some(v) => {
+                self.localization_hits += 1;
+                Some(v)
+            }
+            None => {
+                self.localization_misses += 1;
+                Some(placeholder(&language, package, section, key))
+            }
+        }
     }
 
     /// Draw commands recorded since the last [`Vm::drain_canvas`].
@@ -1267,6 +1361,24 @@ impl<'s> Vm<'s> {
     /// True when a navigation provider is available.
     pub fn has_navigation(&self) -> bool {
         self.navigation.is_some()
+    }
+
+    /// Sets the voice-wave duration provider (dialogue natives). Call before runs that need a
+    /// real subtitle lifetime; without one `Actor.GetWaveDuration` reports `0` (visible).
+    pub fn set_voice_duration(&mut self, provider: Box<dyn crate::voice::VoiceDuration>) {
+        self.voice_duration = Some(provider);
+    }
+
+    /// True when a voice-duration provider is available.
+    pub fn has_voice_duration(&self) -> bool {
+        self.voice_duration.is_some()
+    }
+
+    /// Duration of a script `SoundName` from the host provider, `None` when unavailable.
+    pub fn voice_duration(&self, sound_name: &str) -> Option<f32> {
+        self.voice_duration
+            .as_ref()
+            .and_then(|p| p.duration(sound_name))
     }
 
     /// Configures the map's local URL (`<Map>?<options>`, the `url_options` being the
@@ -1647,6 +1759,7 @@ impl<'s> Vm<'s> {
                     dim,
                     base: size,
                     flags: p.flags,
+                    declaring: *c,
                 });
                 size += dim;
             }
@@ -1699,6 +1812,57 @@ impl<'s> Vm<'s> {
                 defaults[slot.base] = v;
             }
         }
+        // `localized` class defaults come from the class package's `.int` file: section = class
+        // name, key = property name (array elements as `Property[i]`, per UE2
+        // `UObject::LoadLocalizedProperty`). The class being laid out is tried first (the
+        // shipped `.int` files carry the text under the subclass section, for example
+        // `[Plage01CahuteKeyPick] PickupMessage=`), then the class that declares the property
+        // (`[Pickup]`). Applied last, so a shipped `.int` value wins over the serialized
+        // placeholder; a missing key leaves the serialized value in place.
+        let layout_pkg = self.set.packages[class.package].name.clone();
+        let layout_class = self.object_name(class).to_owned();
+        let localized: Vec<(usize, usize, String, String, GlobalRef)> = layout
+            .slots
+            .iter()
+            // Localisation is a string-property feature (`localized` is always a string upstream);
+            // a non-string slot with a stray flag bit is left alone rather than typed as text.
+            .filter(|s| {
+                s.flags & property_flags::LOCALIZED != 0 && s.dim > 0 && matches!(s.ty, Ty::Str)
+            })
+            .map(|s| {
+                (
+                    s.base,
+                    s.dim,
+                    layout_pkg.clone(),
+                    s.name.clone(),
+                    s.declaring,
+                )
+            })
+            .collect();
+        for (base, dim, package, name, declaring) in localized {
+            let declaring_pkg = self.set.packages[declaring.package].name.clone();
+            let declaring_class = self.object_name(declaring).to_owned();
+            for elem in 0..dim {
+                let key = if dim > 1 {
+                    format!("{name}[{elem}]")
+                } else {
+                    name.clone()
+                };
+                let value = self
+                    .localization
+                    .as_ref()
+                    .and_then(|l| l.get(&package, &layout_class, &key))
+                    .or_else(|| {
+                        self.localization
+                            .as_ref()
+                            .and_then(|l| l.get(&declaring_pkg, &declaring_class, &key))
+                    });
+                if let Some(v) = value {
+                    defaults[base + elem] = Value::Str(v);
+                    self.localized_overrides += 1;
+                }
+            }
+        }
         layout.defaults = defaults;
         let rc = Rc::new(layout);
         self.layouts.insert(class, rc.clone());
@@ -1734,6 +1898,7 @@ impl<'s> Vm<'s> {
                 dim,
                 base: size,
                 flags: p.flags,
+                declaring: func,
             });
             size += dim;
         }
@@ -1900,6 +2065,19 @@ impl<'s> Vm<'s> {
             }
             (PropertyValue::Struct(StructValue::Vector(v)), Ty::Vector) => Value::Vector(*v),
             (PropertyValue::Struct(StructValue::Rotator(v)), Ty::Rotator) => Value::Rotator(*v),
+            // A serialized `Color` default (4 bytes, stored order) decoded into the named struct
+            // members the script accesses (`b`,`g`,`r`,`a`). Measured: `Default__.XIIIGoalMessage`
+            // `DrawColor = (250,230,230,200)` reaches `LocalMessage.GetColor` as a `struct<Color>`;
+            // without this arm the HUD message widgets aborted on the default.
+            (PropertyValue::Struct(StructValue::Color(c)), Ty::Struct(members))
+                if members.len() == 4 =>
+            {
+                let mut fields = Vec::with_capacity(4);
+                for (i, (name, _)) in members.iter().enumerate() {
+                    fields.push((name.clone(), Value::Byte(c[i])));
+                }
+                Value::Struct(fields)
+            }
             (PropertyValue::Array { count, elements }, Ty::Array(inner)) => {
                 self.decode_array(pkg, *count, *elements, inner)
             }
@@ -2030,10 +2208,20 @@ impl<'s> Vm<'s> {
         let layout = self.class_layout(class)?;
         let is_actor = layout.chain_names.iter().any(|n| n == "actor");
         let id = self.objects.len() as ObjectId;
+        let mut props = layout.defaults.clone();
+        // UE2 `Object.Class` is a native property that always answers the object's UClass; it is
+        // not a serialized default. Scripts read `default.Class` / `self.Class` to identify a
+        // class (for example `LocalMessage.ClientReceive` passes `default.Class` to the HUD, and
+        // `XIIISaveMessage.GetString` returns `default.CheckpointReached`). Without this, an
+        // object's `Class` default stayed `None` and static dispatch from it returned `Void`,
+        // suspending the HUD message widgets.
+        if let Some(slot) = layout.slot_by_name("class") {
+            props[slot.base] = Value::Object(Some(ObjRef::Static(class)));
+        }
         self.objects.push(Instance {
             class,
             name: name.to_owned(),
-            props: layout.defaults.clone(),
+            props,
             layout,
             state: None,
             state_code: None,
@@ -3089,7 +3277,12 @@ impl<'s> Vm<'s> {
             };
         }
         let layout = self.func_layout(func);
-        if !self.objects[target as usize].active {
+        // A `static` script function dispatches on the class default object, which is never part
+        // of the executed scope. UE2 runs statics regardless of instance scope (e.g.
+        // `LocalMessage.GetString` called by `HudObjectifMessage.SetUpLocalizedMessage`,
+        // `Message.static.GetString`), so they must not be deferred like instance methods on a
+        // suspended actor. Non-static calls on an inactive target keep the DEFERRED behaviour.
+        if !self.objects[target as usize].active && !f.is_static() {
             let o = &self.objects[target as usize];
             let (tname, class) = (o.name.clone(), set.path(o.class));
             if layout.ret.is_some() {
@@ -3728,6 +3921,12 @@ impl<'s> Vm<'s> {
         target: ObjectId,
     ) -> VmResult<Option<ObjectId>> {
         let v = self.eval_in(frame, object, target)?;
+        self.context_value(v)
+    }
+
+    /// Target object from an already-evaluated context object expression. `None` = UE2
+    /// Accessed-None (a null/deleted/native-only object).
+    fn context_value(&mut self, v: Value) -> VmResult<Option<ObjectId>> {
         match v {
             Value::Object(Some(ObjRef::Instance(i))) if self.objects[i as usize].deleted => {
                 Ok(None)
@@ -3760,6 +3959,22 @@ impl<'s> Vm<'s> {
             Value::Unsupported(d) => Err(self.err(VmErrorKind::UnsupportedValue { desc: d })),
             other => Err(self.type_err("object", &other)),
         }
+    }
+
+    /// A property of a non-script object through the host [`ExternalObjectData`] provider. The
+    /// member must be a plain variable (`Texture.USize`); `None` when there is no provider, the
+    /// member is not a variable, or the host does not know the property.
+    fn external_member(&self, frame: &Frame<'s>, member: &Token, id: u32) -> Option<Value> {
+        use TokenKind as K;
+        let name = match &member.kind {
+            K::InstanceVariable(r) | K::DefaultVariable(r) | K::LocalVariable(r) => self
+                .set
+                .resolve(frame.pkg, *r)
+                .map(|g| self.object_name(g).to_ascii_lowercase()),
+            _ => None,
+        }?;
+        let path = self.external_object(id)?.path.clone();
+        self.external_data.as_ref()?.property(&path, &name)
     }
 
     fn zero_for(&mut self, frame: &Frame<'s>, t: &Token, target: ObjectId) -> Value {
@@ -3930,13 +4145,34 @@ impl<'s> Vm<'s> {
                 }
                 v
             }
-            K::Context(c) => match self.context_target(frame, &c.object, target)? {
-                Some(obj) => self.eval_in(frame, &c.member, obj)?,
-                None => {
-                    self.accessed_none();
-                    self.zero_of_context(frame, c, target)
+            K::Context(c) => {
+                let v = self.eval_in(frame, &c.object, target)?;
+                if let Value::Object(Some(ObjRef::External(id))) = &v {
+                    // A property of an object in a non-script package. The host provider answers
+                    // known native properties (for example `Texture.USize`/`VSize`, read by
+                    // `HudState.DrawStt`); anything else stays the explicit error below.
+                    match self.external_member(frame, &c.member, *id) {
+                        Some(value) => value,
+                        None => {
+                            return Err(self.err(VmErrorKind::UnsupportedValue {
+                                desc: format!(
+                                    "property access on external object {}",
+                                    self.external_path(&ObjRef::External(*id))
+                                        .unwrap_or_else(|| format!("external#{id}"))
+                                ),
+                            }));
+                        }
+                    }
+                } else {
+                    match self.context_value(v)? {
+                        Some(obj) => self.eval_in(frame, &c.member, obj)?,
+                        None => {
+                            self.accessed_none();
+                            self.zero_of_context(frame, c, target)
+                        }
+                    }
                 }
-            },
+            }
             K::ClassContext(c) => {
                 let v = self.eval_in(frame, &c.object, target)?;
                 let class = match v {
@@ -6525,6 +6761,10 @@ mod stack_name_tests {
                 dim: 1,
                 base,
                 flags: 0,
+                declaring: GlobalRef {
+                    package: 0,
+                    export: 0,
+                },
             });
         }
         let size = slots.len();

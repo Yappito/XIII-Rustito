@@ -657,6 +657,7 @@ fn event_kind(e: &PresentationEvent) -> &'static str {
         PresentationEvent::StopVoice { .. } => "StopVoice",
         PresentationEvent::StopSound { .. } => "StopSound",
         PresentationEvent::PlaySndPNJOno { .. } => "PlaySndPNJOno",
+        PresentationEvent::Dialogue(_) => "Dialogue",
     }
 }
 
@@ -798,6 +799,7 @@ pub fn error_kind_name(k: &VmErrorKind) -> String {
         VmErrorKind::NoPhysicsProvider { .. } => "NoPhysicsProvider",
         VmErrorKind::NoAnimationProvider { .. } => "NoAnimationProvider",
         VmErrorKind::NoNavProvider { .. } => "NoNavProvider",
+        VmErrorKind::NoLocalizationProvider { .. } => "NoLocalizationProvider",
         VmErrorKind::UnknownAnimation { .. } => "UnknownAnimation",
         VmErrorKind::AnimationDataError { .. } => "AnimationDataError",
         VmErrorKind::NewOnActor { .. } => "NewOnActor",
