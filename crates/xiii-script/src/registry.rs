@@ -713,6 +713,142 @@ fn destroy(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOu
     val(Value::Bool(r))
 }
 
+fn actor_move(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let delta = vector2(vm, a, 0)?;
+    if vm.bool_prop(c.this, "bCollideWorld")
+        && !vm.physics_ready("Actor.Move", Some(266), c.this, Value::Bool(false))?
+    {
+        return val(Value::Bool(false));
+    }
+    let moved = vm.vm_move(c.this, delta)?;
+    val(Value::Bool(moved))
+}
+
+fn actor_set_location(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let location = vector2(vm, a, 0)?;
+    let check_world =
+        vm.bool_prop(c.this, "bCollideWorld") || vm.bool_prop(c.this, "bCollideWhenPlacing");
+    if check_world
+        && !vm.physics_ready("Actor.SetLocation", Some(267), c.this, Value::Bool(false))?
+    {
+        return val(Value::Bool(false));
+    }
+    let ok = vm.vm_set_location(c.this, location)?;
+    val(Value::Bool(ok))
+}
+
+fn actor_trace(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    // Params: 0 HitLocation(out), 1 HitNormal(out), 2 TraceEnd, 3 TraceStart, 4 bTraceActors,
+    // 5 Extent, 6 Material(out), 7 AdditionalTraceType, 8 DiscardedHitMask(out).
+    let end = vector2(vm, a, 2)?;
+    let start = if c.omitted(3) {
+        vm.vector_prop(c.this, "Location").unwrap_or([0.0; 3])
+    } else {
+        vector2(vm, a, 3)?
+    };
+    let b_trace_actors = if c.omitted(4) {
+        // UT99 227 `Actor.uc` documents `optional bool bTraceActors // = bCollideActors`.
+        vm.bool_prop(c.this, "bCollideActors")
+    } else {
+        boolean(vm, a, 4)?
+    };
+    let extent = if c.omitted(5) {
+        [0.0; 3]
+    } else {
+        vector2(vm, a, 5)?
+    };
+    if !vm.physics_ready("Actor.Trace", Some(277), c.this, Value::Object(None))? {
+        return val(Value::Object(None));
+    }
+    let (hit_actor, hit_location, hit_normal) =
+        vm.vm_trace(c.this, start, end, b_trace_actors, extent)?;
+    a[0] = Value::Vector(hit_location);
+    a[1] = Value::Vector(hit_normal);
+    if a.len() > 6 && !c.omitted(6) {
+        // Material: the VM has no material objects; upstream fills the hit surface material.
+        a[6] = Value::Object(None);
+    }
+    if a.len() > 8 && !c.omitted(8) {
+        // DiscardedHitMask: no discarded-hit filtering is modelled.
+        a[8] = Value::Int(0);
+    }
+    val(match hit_actor {
+        Some(id) => Value::Object(Some(ObjRef::Instance(id))),
+        None => Value::Object(None),
+    })
+}
+
+fn actor_fast_trace(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    // Params: 0 TraceEnd, 1 TraceStart, 2 AdditionalTraceType, 3 DiscardedHitMask(out).
+    let end = vector2(vm, a, 0)?;
+    let start = if c.omitted(1) {
+        vm.vector_prop(c.this, "Location").unwrap_or([0.0; 3])
+    } else {
+        vector2(vm, a, 1)?
+    };
+    if !vm.physics_ready("Actor.FastTrace", Some(548), c.this, Value::Bool(false))? {
+        return val(Value::Bool(false));
+    }
+    if a.len() > 3 && !c.omitted(3) {
+        a[3] = Value::Int(0);
+    }
+    val(Value::Bool(vm.vm_fast_trace(start, end)?))
+}
+
+fn actor_set_collision(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let col = if c.omitted(0) {
+        None
+    } else {
+        Some(boolean(vm, a, 0)?)
+    };
+    let block_actors = if c.omitted(1) {
+        None
+    } else {
+        Some(boolean(vm, a, 1)?)
+    };
+    let block_players = if c.omitted(2) {
+        None
+    } else {
+        Some(boolean(vm, a, 2)?)
+    };
+    vm.vm_set_collision(c.this, col, block_actors, block_players)?;
+    val(Value::Void)
+}
+
+fn actor_set_collision_size(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let radius = float(vm, a, 0)?;
+    let height = float(vm, a, 1)?;
+    let ok = vm.vm_set_collision_size(c.this, radius, height)?;
+    val(Value::Bool(ok))
+}
+
+fn actor_touching_actors(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let base = match object(vm, a, 0)? {
+        Some(ObjRef::Static(g)) => Some(g),
+        None => None,
+        Some(ObjRef::Instance(_)) => {
+            return Err(vm.err(VmErrorKind::Other(
+                "TouchingActors base class is an instance".into(),
+            )));
+        }
+    };
+    let items = vm
+        .touching_list(c.this)
+        .into_iter()
+        .filter(|id| base.is_none_or(|b| vm.objects[*id as usize].layout.chain.contains(&b)))
+        .map(|i| Value::Object(Some(ObjRef::Instance(i))))
+        .collect();
+    Ok(NativeOutcome::Iterate(items))
+}
+
 fn noop(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
     let _ = vm;
     val(Value::Void)
@@ -1310,6 +1446,73 @@ fn builtin_defs() -> Vec<NativeDef> {
             "engine.u Actor.Destroy decoded; UE2 AActor::execDestroy (Destroyed event, bDeleteMe, references become None); Engine.dll ?execDestroy@AActor",
             destroy,
         ),
+        NativeDef {
+            status: NativeStatus::Partial(
+                "world move via the physics provider (move_box, no sliding); actor blocking is a cylinder-sweep stop; no Bump/EncroachingOn events; player/projectile bBlockPlayers pairing is inferred from class names (XIII has no bIsPlayerPawn field)",
+            ),
+            ..def(
+                "Engine.Actor.Move",
+                "native(266) final function bool Move(vector Delta)",
+                "engine.u Actor.Move decoded (Delta, bool); UE2 ULevel::MoveActor / SurrealEngine UActor::Move=TryMove(delta).Fraction==1.0 (true when the full delta was applied); Engine.dll ?execMove@AActor",
+                actor_move,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial(
+                "world placement via provider point_free (only when bCollideWorld||bCollideWhenPlacing) and a blocking-actor cylinder encroachment refusal; no FindSpot search; touch updates unconditional (upstream gates them on Level.bBegunPlay)",
+            ),
+            ..def(
+                "Engine.Actor.SetLocation",
+                "native(267) final function bool SetLocation(vector NewLocation)",
+                "engine.u Actor.SetLocation decoded (NewLocation, bool); UE1/UE2 AActor::SetLocation via CheckLocation plus touch updates (SurrealEngine UActor::SetLocation); Engine.dll ?execSetLocation@AActor",
+                actor_set_location,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial(
+                "actor hits use ray-vs-grown-cylinder, owned actors are skipped; Material out-param is None and DiscardedHitMask 0 (no material/hit-mask model); AdditionalTraceType and mover brush geometry are not modelled; world hits return the map LevelInfo (upstream)",
+            ),
+            ..def(
+                "Engine.Actor.Trace",
+                "native(277) final function Actor Trace(out vector HitLocation, out vector HitNormal, vector TraceEnd, optional vector TraceStart, optional bool bTraceActors, optional vector Extent, optional out object<Material> Material, optional int AdditionalTraceType, optional out int DiscardedHitMask)",
+                "engine.u Actor.Trace decoded params; UE1 227 // = Location / = bCollideActors / extent defaults and LevelInfo-for-world-hit (SurrealEngine UActor::Trace / CollisionSystem::TraceFirstHit); Engine.dll ?execTrace@AActor",
+                actor_trace,
+            )
+        },
+        def(
+            "Engine.Actor.FastTrace",
+            "native(548) final function bool FastTrace(vector TraceEnd, optional vector TraceStart, optional int AdditionalTraceType, optional out int DiscardedHitMask)",
+            "engine.u Actor.FastTrace decoded; UE1 227 'returns true if did not hit world geometry' (actors ignored); SurrealEngine UActor::FastTrace = !TraceAnyHit(.., traceActors=false, traceWorld=true); Engine.dll ?execFastTrace@AActor",
+            actor_fast_trace,
+        ),
+        def(
+            "Engine.Actor.SetCollision",
+            "native(262) final function SetCollision(optional bool NewColActors, optional bool NewBlockActors, optional bool NewBlockPlayers)",
+            "engine.u Actor.SetCollision decoded (all optional); omitted flags keep their current value and touching is recomputed (SurrealEngine NActor::SetCollision); Engine.dll ?execSetCollision@AActor",
+            actor_set_collision,
+        ),
+        NativeDef {
+            status: NativeStatus::Partial(
+                "always returns true; the UT469 optional bCheckEncroachment flag is absent from XIII's decoded declaration, so an internal encroachment check is not modelled",
+            ),
+            ..def(
+                "Engine.Actor.SetCollisionSize",
+                "native(283) final function bool SetCollisionSize(float NewRadius, float NewHeight)",
+                "engine.u Actor.SetCollisionSize decoded (NewRadius, NewHeight, bool); updates the cylinder and recomputes touching; Engine.dll ?execSetCollisionSize@AActor",
+                actor_set_collision_size,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial(
+                "iterates the VM-maintained Touching array; XIII's Touching is a dynamic array (decoded ArrayProperty with a template element), unlike UE1/UT's fixed 4-slot engine array",
+            ),
+            ..def(
+                "Engine.Actor.TouchingActors",
+                "native(307) final iterator function TouchingActors(class<Actor> BaseClass, out Actor Actor)",
+                "engine.u Actor.TouchingActors decoded; UE1 227 'returns all actors touching the current actor'; Engine.dll ?execTouchingActors@AActor",
+                actor_touching_actors,
+            )
+        },
         def(
             "Engine.Pawn.AddPawnToList",
             "native(0) final native function AddPawnToList()",

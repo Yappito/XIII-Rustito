@@ -192,3 +192,142 @@ fn gog_plage00_begin_play_gets_past_actor_spawn() {
         spawned_classes.len()
     );
 }
+
+/// Opt-in corpus test: the same opening chain with the diagnostic flat-floor physics provider
+/// must not leave `Actor.Move`/`Trace`/`SetLocation`/`FastTrace` in the survey's missing list,
+/// and reports what is still missing.
+#[test]
+fn gog_plage00_flat_physics_survey_has_no_movement_missing() {
+    let Some(root) = std::env::var_os("XIII_GOG_DIR") else {
+        println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let root = if root.is_relative() {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(&root)
+    } else {
+        root
+    };
+    let mut set = ScriptSet::new();
+    for path in find_by_ext(&root, "u") {
+        let data = std::fs::read(&path).expect("read package");
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let pkg = ScriptPackage::load(&name, data, &ScriptLimits::default(), &Limits::default())
+            .expect("parse package");
+        set.add(pkg);
+    }
+    let map_path = find_by_ext(&root, "unr")
+        .into_iter()
+        .find(|p| {
+            p.file_stem()
+                .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("Plage00"))
+        })
+        .expect("Plage00 map");
+    let map_data = std::fs::read(&map_path).expect("read map");
+    let map_pkg = ScriptPackage::load(
+        "Plage00",
+        map_data,
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("parse map");
+    let map = set.add(map_pkg);
+
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.survey = true;
+    vm.set_physics(Box::new(xiii_script::physics::FlatPhysics::new(0.0)));
+    let actors = vm.load_level(map, &Limits::default()).expect("load level");
+
+    let mut active: Vec<ObjectId> = Vec::new();
+    for &id in &actors {
+        let o = &vm.objects[id as usize];
+        let class_name = set.packages[o.class.package]
+            .ref_name(ObjectRef::Export(o.class.export))
+            .to_owned();
+        let name = o.name.clone();
+        if [
+            "TouchTrigger2",
+            "XIIIDispatcher0",
+            "BaseSoldier14",
+            "BaseSoldier15",
+        ]
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case(&class_name) || a.eq_ignore_ascii_case(&name))
+            && !active.contains(&id)
+        {
+            active.push(id);
+        }
+    }
+    for &id in &active {
+        vm.set_active(id, true);
+    }
+    assert!(active.len() >= 4);
+
+    let default_game = std::fs::read_to_string(root.join("system/Default.ini"))
+        .ok()
+        .and_then(|t| {
+            t.lines().find_map(|l| {
+                let l = l.trim();
+                l.strip_prefix("DefaultGame=").map(str::to_owned)
+            })
+        })
+        .expect("DefaultGame in Default.ini");
+    let game_class = default_game
+        .split_once('.')
+        .and_then(|(pkg, class)| find_class(&set, pkg, class))
+        .expect("GameInfo class");
+
+    // Survey mode continues past whatever is still unimplemented.
+    let _ = vm.begin_play_with_game_info(&active, game_class);
+    let touched = vm.find_object("TouchTrigger2").expect("TouchTrigger2");
+    let player = vm
+        .spawn(
+            find_class(&set, "xiii", "XIIIPlayerPawn").unwrap(),
+            "synthetic",
+        )
+        .unwrap();
+    let arg = Value::Object(Some(ObjRef::Instance(player)));
+    let _ = vm.send_event(touched, "Touch", vec![arg]);
+    for _ in 0..60 {
+        let _ = vm.tick(1.0 / 30.0);
+    }
+
+    let movement = [
+        "Actor.Move",
+        "Actor.MoveSmooth",
+        "Actor.SetLocation",
+        "Actor.SetCollision",
+        "Actor.SetCollisionSize",
+        "Actor.Trace",
+        "Actor.FastTrace",
+    ];
+    let missing_movement: Vec<String> = vm
+        .missing_natives
+        .keys()
+        .filter(|k| movement.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    assert!(
+        missing_movement.is_empty(),
+        "movement/trace natives still missing: {missing_movement:?}"
+    );
+    let mut rest: Vec<(&String, u64)> = vm
+        .missing_natives
+        .iter()
+        .map(|(k, m)| (k, m.calls))
+        .collect();
+    rest.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    println!(
+        "Plage00 flat-physics survey: no movement/trace natives missing; next missing: {}",
+        rest.iter()
+            .take(12)
+            .map(|(k, c)| format!("{k} x{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}

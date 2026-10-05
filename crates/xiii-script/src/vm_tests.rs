@@ -453,7 +453,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 79);
+    assert_eq!(defs.len(), 86);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -554,6 +554,12 @@ impl SpawnB {
         self.set(r, p);
     }
 
+    /// Dynamic `ArrayProperty` whose element template is the export `inner`.
+    fn prop_array(&mut self, r: i32, next: i32, flags: u32, inner: i32) {
+        let extra = compact(inner);
+        self.prop_with(r, next, flags, &extra);
+    }
+
     fn header(
         &self,
         sup: i32,
@@ -632,6 +638,7 @@ impl SpawnB {
             (core, class, -1, self.name("StructProperty")),
             (core, class, -1, self.name("Vector")),
             (core, class, -1, self.name("Rotator")),
+            (core, class, -1, self.name("ArrayProperty")),
         ];
         let names: Vec<&str> = self.names.iter().map(String::as_str).collect();
         build_package(&names, &imports, &self.exports)
@@ -962,6 +969,7 @@ fn destroy_during_own_execution_does_not_panic() {
 // Native semantics corrections: optional args, strings, PRNG, lists
 
 use crate::registry::{NativeCtx, NativeDef, NativeOutcome, Registry};
+use crate::vm::VmResult;
 
 fn native(path: &str) -> NativeDef {
     // Registry keys are "Class.Function"; only the `Engine.` package prefix is stripped on
@@ -1516,4 +1524,713 @@ fn survey_counts_missing_natives_without_aborting() {
             index: Some(150)
         }
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// World physics bridge: Move/SetLocation/Trace/FastTrace/SetCollision(Size) + touching
+
+use crate::physics::{MoveOutcome, WorldHit, WorldPhysics};
+
+const IMP_ARRAYPROP: i32 = -12;
+
+/// `Object`/`Actor`/`Child`/`LevelInfo` fixture with collision fields, a dynamic `Touching`
+/// array and `Touch`/`UnTouch` counters.
+fn phys_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let child = b.reserve(0, 0, "Child");
+    let levelinfo = b.reserve(0, 0, "LevelInfo");
+
+    let add = b.reserve(IMP_FUNCTION, object, "Add_IntInt");
+    let add_a = b.reserve(IMP_INTPROP, add, "A");
+    let add_b = b.reserve(IMP_INTPROP, add, "B");
+    let add_r = b.reserve(IMP_INTPROP, add, "ReturnValue");
+    b.prop(add_a, add_b, PARM);
+    b.prop(add_b, add_r, PARM);
+    b.prop(add_r, 0, PARM | RETURN_PARM);
+    b.func(
+        add,
+        0,
+        add_a,
+        &[],
+        0,
+        146,
+        FINAL | NATIVE | OPERATOR | STATIC,
+    );
+
+    let object_extra = compact(0);
+    let vector_extra = compact(IMP_STRUCT);
+    let rotator_extra = compact(IMP_STRUCT - 1);
+
+    // Touch/UnTouch handlers first (their refs go into the property chain).
+    let touch_fn = b.reserve(IMP_FUNCTION, actor, "Touch");
+    let touch_other = b.reserve(IMP_OBJECTPROP, touch_fn, "Other");
+    let untouch_fn = b.reserve(IMP_FUNCTION, actor, "UnTouch");
+    let untouch_other = b.reserve(IMP_OBJECTPROP, untouch_fn, "Other");
+
+    let owner = b.reserve(IMP_OBJECTPROP, actor, "Owner");
+    let level = b.reserve(IMP_OBJECTPROP, actor, "Level");
+    let base = b.reserve(IMP_OBJECTPROP, actor, "Base");
+    let tag = b.reserve(IMP_NAMEPROP, actor, "Tag");
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let rotation = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
+    let radius = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
+    let height = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
+    let collide_actors = b.reserve(IMP_BOOLPROP, actor, "bCollideActors");
+    let collide_world = b.reserve(IMP_BOOLPROP, actor, "bCollideWorld");
+    let collide_placing = b.reserve(IMP_BOOLPROP, actor, "bCollideWhenPlacing");
+    let block_actors = b.reserve(IMP_BOOLPROP, actor, "bBlockActors");
+    let block_players = b.reserve(IMP_BOOLPROP, actor, "bBlockPlayers");
+    let block_zero = b.reserve(IMP_BOOLPROP, actor, "bBlockZeroExtentTraces");
+    let block_nonzero = b.reserve(IMP_BOOLPROP, actor, "bBlockNonZeroExtentTraces");
+    let movable = b.reserve(IMP_BOOLPROP, actor, "bMovable");
+    let bstatic = b.reserve(IMP_BOOLPROP, actor, "bStatic");
+    let touches = b.reserve(IMP_INTPROP, actor, "Touches");
+    let untouches = b.reserve(IMP_INTPROP, actor, "UnTouches");
+    let touching = b.reserve(IMP_ARRAYPROP, actor, "Touching");
+    let touching_template = b.reserve(IMP_OBJECTPROP, touching, "Touching");
+
+    b.prop_with(owner, level, 0, &object_extra);
+    b.prop_with(level, base, 0, &object_extra);
+    b.prop_with(base, tag, 0, &object_extra);
+    b.prop(tag, location, 0);
+    b.prop_with(location, rotation, 0, &vector_extra);
+    b.prop_with(rotation, radius, 0, &rotator_extra);
+    b.prop(radius, height, 0);
+    b.prop(height, collide_actors, 0);
+    b.prop(collide_actors, collide_world, 0);
+    b.prop(collide_world, collide_placing, 0);
+    b.prop(collide_placing, block_actors, 0);
+    b.prop(block_actors, block_players, 0);
+    b.prop(block_players, block_zero, 0);
+    b.prop(block_zero, block_nonzero, 0);
+    b.prop(block_nonzero, movable, 0);
+    b.prop(movable, bstatic, 0);
+    b.prop(bstatic, touches, 0);
+    b.prop(touches, untouches, 0);
+    b.prop(untouches, touching, 0);
+    b.prop_with(touching_template, 0, 0, &object_extra);
+    b.prop_array(touching, touch_fn, 0, touching_template);
+
+    let tc = touches as u8;
+    let touch_code = vec![0x0F, 0x01, tc, 0x92, 0x00, tc, 0x26, 0x16, 0x04, 0x0B];
+    b.prop_with(touch_other, 0, PARM, &object_extra);
+    b.func(
+        touch_fn,
+        untouch_fn,
+        touch_other,
+        &touch_code,
+        0x10,
+        0,
+        DEFINED,
+    );
+    let uc = untouches as u8;
+    let untouch_code = vec![0x0F, 0x01, uc, 0x92, 0x00, uc, 0x26, 0x16, 0x04, 0x0B];
+    b.prop_with(untouch_other, 0, PARM, &object_extra);
+    b.func(
+        untouch_fn,
+        0,
+        untouch_other,
+        &untouch_code,
+        0x10,
+        0,
+        DEFINED,
+    );
+
+    b.class(object, 0, add, 0);
+    b.class(actor, object, owner, 0);
+    b.class(child, actor, 0, 0);
+    b.class(levelinfo, actor, 0, 0);
+    b.build()
+}
+
+fn phys_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Test",
+        phys_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+fn pg(set: &ScriptSet, path: &str) -> GlobalRef {
+    GlobalRef {
+        package: 0,
+        export: set.packages[0].export_by_path(path).expect(path),
+    }
+}
+
+/// Test provider: static axis-aligned walls (min, max) in Unreal coordinates.
+struct MockWorld {
+    walls: Vec<([f32; 3], [f32; 3])>,
+    blocked_point: bool,
+}
+
+impl MockWorld {
+    fn new() -> Self {
+        Self {
+            walls: Vec::new(),
+            blocked_point: false,
+        }
+    }
+
+    fn with_wall(mut self, min: [f32; 3], max: [f32; 3]) -> Self {
+        self.walls.push((min, max));
+        self
+    }
+}
+
+impl WorldPhysics for MockWorld {
+    fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
+        let d = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+        let mut best: Option<(f32, [f32; 3])> = None;
+        for &(mn, mx) in &self.walls {
+            if let Some((t, n)) = swept_aabb(start, d, extent, mn, mx)
+                && best.is_none_or(|(bt, _)| t < bt)
+            {
+                best = Some((t, n));
+            }
+        }
+        best.map(|(t, n)| WorldHit {
+            location: [
+                start[0] + d[0] * t,
+                start[1] + d[1] * t,
+                start[2] + d[2] * t,
+            ],
+            normal: n,
+            time: t,
+        })
+    }
+
+    fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        let end = [
+            start[0] + delta[0],
+            start[1] + delta[1],
+            start[2] + delta[2],
+        ];
+        match self.trace(start, end, extent) {
+            Some(hit) => MoveOutcome {
+                end: [
+                    start[0] + delta[0] * hit.time,
+                    start[1] + delta[1] * hit.time,
+                    start[2] + delta[2] * hit.time,
+                ],
+                hit: Some(hit),
+            },
+            None => MoveOutcome { end, hit: None },
+        }
+    }
+
+    fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool {
+        if self.blocked_point {
+            return false;
+        }
+        !self
+            .walls
+            .iter()
+            .any(|&(mn, mx)| aabb_overlaps(location, extent, mn, mx))
+    }
+}
+
+fn aabb_overlaps(c: [f32; 3], e: [f32; 3], mn: [f32; 3], mx: [f32; 3]) -> bool {
+    (0..3).all(|i| c[i] + e[i] > mn[i] && c[i] - e[i] < mx[i])
+}
+
+/// Swept AABB vs static AABB; returns `(fraction, normal)`.
+fn swept_aabb(
+    start: [f32; 3],
+    d: [f32; 3],
+    e: [f32; 3],
+    mn: [f32; 3],
+    mx: [f32; 3],
+) -> Option<(f32, [f32; 3])> {
+    let mut t_enter = 0.0f32;
+    let mut t_exit = 1.0f32;
+    let mut axis = 0usize;
+    for i in 0..3 {
+        let smin = start[i] - e[i];
+        let smax = start[i] + e[i];
+        if d[i].abs() < 1e-9 {
+            if smax <= mn[i] || smin >= mx[i] {
+                return None;
+            }
+        } else {
+            let mut t1 = (mn[i] - smax) / d[i];
+            let mut t2 = (mx[i] - smin) / d[i];
+            if t1 > t2 {
+                std::mem::swap(&mut t1, &mut t2);
+            }
+            if t1 > t_enter {
+                t_enter = t1;
+                axis = i;
+            }
+            if t2 < t_exit {
+                t_exit = t2;
+            }
+            if t_enter > t_exit {
+                return None;
+            }
+        }
+    }
+    if t_enter > 1.0 {
+        return None;
+    }
+    let sign = if d[axis] > 0.0 {
+        -1.0
+    } else if d[axis] < 0.0 {
+        1.0
+    } else {
+        0.0
+    };
+    let mut n = [0.0; 3];
+    n[axis] = sign;
+    Some((t_enter.max(0.0), n))
+}
+
+fn try_native(
+    vm: &mut Vm<'_>,
+    path: &str,
+    this: ObjectId,
+    omitted: &[bool],
+    args: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let def = native(path);
+    (def.f)(vm, &ctx(this, omitted, path), args)
+}
+
+fn phys_actor(vm: &mut Vm<'_>, set: &ScriptSet, name: &str, loc: [f32; 3]) -> ObjectId {
+    let id = vm.spawn(pg(set, "Actor"), name).unwrap();
+    vm.set_property(id, "Location", 0, Value::Vector(loc));
+    id
+}
+
+fn set_collision_fields(vm: &mut Vm<'_>, id: ObjectId, colliding: bool, blocking: bool) {
+    vm.set_property(id, "bCollideActors", 0, Value::Bool(colliding));
+    vm.set_property(id, "bCollideWorld", 0, Value::Bool(true));
+    vm.set_property(id, "bBlockActors", 0, Value::Bool(blocking));
+    vm.set_property(id, "bBlockPlayers", 0, Value::Bool(blocking));
+    vm.set_property(id, "bBlockNonZeroExtentTraces", 0, Value::Bool(blocking));
+    vm.set_property(id, "bBlockZeroExtentTraces", 0, Value::Bool(blocking));
+    vm.set_property(id, "bMovable", 0, Value::Bool(true));
+    vm.set_property(id, "CollisionRadius", 0, Value::Float(10.0));
+    vm.set_property(id, "CollisionHeight", 0, Value::Float(10.0));
+}
+
+#[test]
+fn move_into_wall_stops_at_hit_and_bcollideworld_false_ignores_it() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([100.0, -1000.0, -1000.0], [200.0, 1000.0, 1000.0]),
+    ));
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, false, false);
+
+    let mut args = [Value::Vector([100.0, 0.0, 0.0])];
+    let moved = match try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap() {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(!moved, "blocked by the wall");
+    assert_eq!(
+        vm.get_property(a, "Location"),
+        Some(&Value::Vector([90.0, 0.0, 0.0]))
+    );
+
+    // bCollideWorld = false: the wall is ignored.
+    vm.set_property(a, "bCollideWorld", 0, Value::Bool(false));
+    let mut args = [Value::Vector([100.0, 0.0, 0.0])];
+    let moved = match try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap() {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(moved);
+    assert_eq!(
+        vm.get_property(a, "Location"),
+        Some(&Value::Vector([190.0, 0.0, 0.0]))
+    );
+}
+
+#[test]
+fn move_without_provider_fails_and_survey_counts_it() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, false, false);
+    for path in [
+        "Engine.Actor.Move",
+        "Engine.Actor.SetLocation",
+        "Engine.Actor.Trace",
+        "Engine.Actor.FastTrace",
+    ] {
+        let (mut args, omitted): (Vec<Value>, Vec<bool>) = match path {
+            "Engine.Actor.Trace" => (
+                vec![Value::Vector([0.0; 3]); 9],
+                vec![false, false, false, true, true, true, true, true, true],
+            ),
+            "Engine.Actor.FastTrace" => (
+                vec![Value::Vector([1.0, 0.0, 0.0]), Value::Vector([0.0; 3])],
+                vec![false, true, true, true],
+            ),
+            _ => (vec![Value::Vector([1.0, 0.0, 0.0])], vec![false]),
+        };
+        let e = try_native(&mut vm, path, a, &omitted, &mut args).unwrap_err();
+        assert!(
+            matches!(&e.kind, VmErrorKind::NoPhysicsProvider { native } if native == path.trim_start_matches("Engine.")),
+            "{path}: {e}"
+        );
+    }
+    // Survey mode: counted like a missing native and the run continues.
+    vm.survey = true;
+    let mut args = [Value::Vector([1.0, 0.0, 0.0])];
+    let r = try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Bool(false)));
+    let m = vm.missing_natives.get("Actor.Move").expect("counted");
+    assert_eq!(m.index, Some(266));
+    assert_eq!(m.calls, 1);
+}
+
+#[test]
+fn move_into_cylinder_touches_both_sides_and_leaving_untouches() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    let b = phys_actor(&mut vm, &set, "B", [50.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, true, false);
+    set_collision_fields(&mut vm, b, true, false);
+
+    let mut args = [Value::Vector([50.0, 0.0, 0.0])];
+    try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    assert_eq!(vm.get_property(a, "Touches"), Some(&Value::Int(1)));
+    assert_eq!(
+        vm.get_property(b, "Touches"),
+        Some(&Value::Int(1)),
+        "both sides"
+    );
+    assert_eq!(vm.touching_list(a), vec![b]);
+    assert_eq!(vm.touching_list(b), vec![a]);
+
+    // Moving while still overlapping must not touch again.
+    let mut args = [Value::Vector([1.0, 0.0, 0.0])];
+    try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    assert_eq!(vm.get_property(a, "Touches"), Some(&Value::Int(1)));
+    assert_eq!(vm.get_property(b, "Touches"), Some(&Value::Int(1)));
+
+    // Leaving the cylinder sends UnTouch to both and clears both arrays.
+    let mut args = [Value::Vector([100.0, 0.0, 0.0])];
+    try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    assert_eq!(vm.get_property(a, "UnTouches"), Some(&Value::Int(1)));
+    assert_eq!(vm.get_property(b, "UnTouches"), Some(&Value::Int(1)));
+    assert!(vm.touching_list(a).is_empty());
+    assert!(vm.touching_list(b).is_empty());
+}
+
+#[test]
+fn exact_contact_boundary_overlaps() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    let b = phys_actor(&mut vm, &set, "B", [20.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, true, false);
+    set_collision_fields(&mut vm, b, true, false);
+    // Zero delta still recomputes touching; distance == r1+r2 counts as overlap in XIII's
+    // decoded comparison (`VSize <= r1+r2`).
+    let mut args = [Value::Vector([0.0, 0.0, 0.0])];
+    try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    assert_eq!(vm.get_property(a, "Touches"), Some(&Value::Int(1)));
+    assert_eq!(vm.get_property(b, "Touches"), Some(&Value::Int(1)));
+}
+
+#[test]
+fn set_collision_false_ends_touching() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    let b = phys_actor(&mut vm, &set, "B", [5.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, true, false);
+    set_collision_fields(&mut vm, b, true, false);
+    let mut args = [Value::Vector([0.0, 0.0, 0.0])];
+    try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    assert_eq!(vm.touching_list(a), vec![b]);
+
+    let mut args = [Value::Bool(false), Value::Bool(false), Value::Bool(false)];
+    try_native(
+        &mut vm,
+        "Engine.Actor.SetCollision",
+        a,
+        &[false, false, false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(vm.get_property(a, "UnTouches"), Some(&Value::Int(1)));
+    assert_eq!(vm.get_property(b, "UnTouches"), Some(&Value::Int(1)));
+    assert!(vm.touching_list(a).is_empty());
+}
+
+#[test]
+fn set_collision_omitted_arguments_keep_current_values() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, true, true);
+    let mut args = [Value::Bool(false), Value::Bool(false), Value::Bool(false)];
+    try_native(
+        &mut vm,
+        "Engine.Actor.SetCollision",
+        a,
+        &[true, true, true],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(
+        vm.get_property(a, "bCollideActors"),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(vm.get_property(a, "bBlockActors"), Some(&Value::Bool(true)));
+
+    let mut args = [Value::Bool(false), Value::Bool(false), Value::Bool(false)];
+    try_native(
+        &mut vm,
+        "Engine.Actor.SetCollision",
+        a,
+        &[false, true, true],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(
+        vm.get_property(a, "bCollideActors"),
+        Some(&Value::Bool(false))
+    );
+    assert_eq!(vm.get_property(a, "bBlockActors"), Some(&Value::Bool(true)));
+}
+
+#[test]
+fn blocking_actor_stops_the_move_and_is_not_touched() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    let b = phys_actor(&mut vm, &set, "B", [50.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, true, true);
+    set_collision_fields(&mut vm, b, true, true);
+
+    let mut args = [Value::Vector([50.0, 0.0, 0.0])];
+    let moved = match try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap() {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(!moved);
+    // Stops exactly at contact (distance == r1 + r2), never past it.
+    match vm.get_property(a, "Location") {
+        Some(Value::Vector(v)) => assert!((v[0] - 30.0).abs() < 1e-3, "{v:?}"),
+        other => panic!("{other:?}"),
+    }
+    // An actor cannot touch what blocks it (upstream TryMove).
+    assert_eq!(vm.get_property(a, "Touches"), Some(&Value::Int(0)));
+    assert_eq!(vm.get_property(b, "Touches"), Some(&Value::Int(0)));
+}
+
+#[test]
+fn trace_hits_nearer_of_world_and_actor_and_fasttrace_ignores_actors() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([100.0, -100.0, -100.0], [200.0, 100.0, 100.0]),
+    ));
+    let _li = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    let b = phys_actor(&mut vm, &set, "B", [40.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, b, true, false);
+
+    // Actor closer than the wall -> the actor is returned.
+    let mut args = vec![
+        Value::Vector([0.0; 3]),
+        Value::Vector([0.0; 3]),
+        Value::Vector([200.0, 0.0, 0.0]),
+        Value::Vector([0.0; 3]),
+        Value::Bool(true),
+        Value::Vector([0.0; 3]),
+        Value::Object(None),
+        Value::Int(0),
+        Value::Int(0),
+    ];
+    let out = try_native(
+        &mut vm,
+        "Engine.Actor.Trace",
+        tracer,
+        &[false, false, false, false, false, true, true, true, true],
+        &mut args,
+    )
+    .unwrap();
+    match out {
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(i)))) => assert_eq!(i, b),
+        other => panic!("{other:?}"),
+    }
+    match &args[0] {
+        Value::Vector(v) => assert!((v[0] - 30.0).abs() < 0.01, "{v:?}"),
+        other => panic!("{other:?}"),
+    }
+
+    // Actor beyond the wall -> the world hit returns the map LevelInfo.
+    vm.set_property(b, "Location", 0, Value::Vector([150.0, 0.0, 0.0]));
+    let mut args = vec![
+        Value::Vector([0.0; 3]),
+        Value::Vector([0.0; 3]),
+        Value::Vector([200.0, 0.0, 0.0]),
+        Value::Vector([0.0; 3]),
+        Value::Bool(true),
+        Value::Vector([0.0; 3]),
+        Value::Object(None),
+        Value::Int(0),
+        Value::Int(0),
+    ];
+    let out = try_native(
+        &mut vm,
+        "Engine.Actor.Trace",
+        tracer,
+        &[false, false, false, false, false, true, true, true, true],
+        &mut args,
+    )
+    .unwrap();
+    let li = vm.find_level_info().unwrap();
+    match out {
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(i)))) => assert_eq!(i, li),
+        other => panic!("{other:?}"),
+    }
+
+    // FastTrace is world-only: the actor between start and end does not block it.
+    vm.set_property(b, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    let mut args = [Value::Vector([60.0, 0.0, 0.0]), Value::Vector([0.0; 3])];
+    let clear = match try_native(
+        &mut vm,
+        "Engine.Actor.FastTrace",
+        tracer,
+        &[false, false, true, true],
+        &mut args,
+    )
+    .unwrap()
+    {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(clear, "world-only FastTrace ignores the actor");
+    // ... but the wall blocks it.
+    let mut args = [Value::Vector([200.0, 0.0, 0.0]), Value::Vector([0.0; 3])];
+    let clear = match try_native(
+        &mut vm,
+        "Engine.Actor.FastTrace",
+        tracer,
+        &[false, false, true, true],
+        &mut args,
+    )
+    .unwrap()
+    {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(!clear);
+}
+
+#[test]
+fn set_location_refuses_encroachment_and_moves_when_free() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([40.0, -5.0, -5.0], [60.0, 5.0, 5.0]),
+    ));
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    let b = phys_actor(&mut vm, &set, "B", [500.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, true, false);
+    set_collision_fields(&mut vm, b, true, false);
+    // Both sides block: B blocks the destination.
+    vm.set_property(a, "bBlockActors", 0, Value::Bool(true));
+    vm.set_property(b, "bBlockActors", 0, Value::Bool(true));
+    vm.set_property(b, "bBlockNonZeroExtentTraces", 0, Value::Bool(true));
+    let mut args = [Value::Vector([500.0, 5.0, 0.0])];
+    let ok = match try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap()
+    {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(!ok, "encroached by a blocking actor");
+    assert_eq!(
+        vm.get_property(a, "Location"),
+        Some(&Value::Vector([0.0, 0.0, 0.0]))
+    );
+
+    // World-blocked destination is refused.
+    let mut args = [Value::Vector([50.0, 0.0, 0.0])];
+    let ok = match try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap()
+    {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(!ok, "destination inside the wall");
+    assert_eq!(
+        vm.get_property(a, "Location"),
+        Some(&Value::Vector([0.0, 0.0, 0.0]))
+    );
+
+    // A free destination moves and touches an actor already there.
+    let c = phys_actor(&mut vm, &set, "C", [0.0, 100.0, 0.0]);
+    set_collision_fields(&mut vm, c, true, false);
+    let mut args = [Value::Vector([0.0, 100.0, 0.0])];
+    let ok = match try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap()
+    {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(ok);
+    assert_eq!(
+        vm.get_property(a, "Location"),
+        Some(&Value::Vector([0.0, 100.0, 0.0]))
+    );
+    assert_eq!(vm.get_property(a, "Touches"), Some(&Value::Int(1)));
+    assert_eq!(vm.get_property(c, "Touches"), Some(&Value::Int(1)));
+}
+
+#[test]
+fn touching_actors_iterator_filters_by_base_class() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, a, true, false);
+    let b = vm.spawn(pg(&set, "Child"), "B").unwrap();
+    vm.set_property(b, "Location", 0, Value::Vector([5.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, b, true, false);
+    let c = phys_actor(&mut vm, &set, "C", [0.0, 5.0, 0.0]);
+    set_collision_fields(&mut vm, c, true, false);
+    let mut args = [Value::Vector([0.0, 0.0, 0.0])];
+    try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    assert_eq!(vm.touching_list(a).len(), 2);
+
+    let base = Value::Object(Some(ObjRef::Static(pg(&set, "Child"))));
+    let mut args = [base.clone(), Value::Object(None)];
+    let items = match try_native(
+        &mut vm,
+        "Engine.Actor.TouchingActors",
+        a,
+        &[false, false],
+        &mut args,
+    )
+    .unwrap()
+    {
+        NativeOutcome::Iterate(items) => items,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0], Value::Object(Some(ObjRef::Instance(b))));
 }

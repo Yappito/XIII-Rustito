@@ -14,6 +14,7 @@ use std::process::ExitCode;
 
 use xiii_package::Limits;
 use xiii_script::linker::GlobalRef;
+use xiii_script::physics::FlatPhysics;
 use xiii_script::registry::NativeStatus;
 use xiii_script::{
     ObjRef, ScriptLimits, ScriptPackage, ScriptSet, TraceEvent, TraceKind, Value, Vm, VmError,
@@ -49,6 +50,8 @@ pub struct RunConfig {
     pub default_game: Option<String>,
     /// Diagnostic survey: continue past unimplemented natives, counting them.
     pub survey: bool,
+    /// Diagnostic physics provider: `flat:<z>` installs an infinite floor at Unreal Z.
+    pub physics_flat_z: Option<f32>,
 }
 
 impl Default for RunConfig {
@@ -67,6 +70,7 @@ impl Default for RunConfig {
             game_class: None,
             default_game: None,
             survey: false,
+            physics_flat_z: None,
         }
     }
 }
@@ -111,6 +115,12 @@ pub struct RunReport {
 pub fn run_touch_chain(set: &ScriptSet, map: usize, cfg: &RunConfig) -> Result<RunReport, String> {
     let mut vm = Vm::new(set, cfg.limits);
     vm.survey = cfg.survey;
+    if let Some(z) = cfg.physics_flat_z {
+        vm.set_physics(Box::new(FlatPhysics::new(z)));
+        vm.note(TraceKind::Note(format!(
+            "diagnostic physics (flat floor at Unreal Z={z}), not the map"
+        )));
+    }
     let actors = vm
         .load_level(map, &Limits::default())
         .map_err(|e| e.to_string())?;
@@ -337,6 +347,12 @@ pub fn load_with_map(root: &Path, map: &str) -> Result<(ScriptSet, usize), Strin
     Ok((set, idx))
 }
 
+/// Parses a `--physics` value. Only `flat:<unreal_z>` is supported (diagnostic provider).
+pub fn parse_physics(spec: &str) -> Option<f32> {
+    let z = spec.strip_prefix("flat:")?;
+    z.trim().parse::<f32>().ok()
+}
+
 /// `xiii-tool script run ...`.
 pub fn run_cmd(args: &[String]) -> ExitCode {
     let mut cfg = RunConfig::default();
@@ -370,6 +386,19 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
             "--begin-play" => cfg.begin_play = true,
             "--game-class" => cfg.game_class = val(),
             "--survey" => cfg.survey = true,
+            "--physics" => {
+                let v = val().unwrap_or_default();
+                match parse_physics(&v) {
+                    Some(z) => cfg.physics_flat_z = Some(z),
+                    None => {
+                        eprintln!(
+                            "error: invalid --physics '{v}'; expected flat:<unreal_z>\n\n{}",
+                            crate::script_cmd::USAGE
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             "--trace" => show_trace = true,
             "--no-natives" => natives = false,
             other => {
