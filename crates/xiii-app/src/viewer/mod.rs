@@ -131,7 +131,8 @@ fn transform_from(t: &xiii_decode::common::BevyTransform) -> Transform {
     }
 }
 
-fn load_scene(opts: &Options) -> Result<WorldScene, String> {
+/// Imports `--map` from `--game-dir` (read-only). Shared with the `--play` prototype.
+pub(crate) fn load_scene(opts: &Options) -> Result<WorldScene, String> {
     let game_dir = opts
         .game_dir
         .clone()
@@ -141,27 +142,15 @@ fn load_scene(opts: &Options) -> Result<WorldScene, String> {
     xiii_world::import_map(&mut cache, &map)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn setup(
-    mut commands: Commands,
-    cfg: Res<ViewerConfig>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-    mut pick: ResMut<PickData>,
-    mut exit: MessageWriter<AppExit>,
+/// Builds and spawns every imported mesh with its unlit diagnostic material. Shared by the map
+/// viewer and the `--play` prototype so the two scene-building paths cannot drift.
+pub(crate) fn spawn_scene_geometry(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    scene: &WorldScene,
 ) {
-    let started = Instant::now();
-    let scene = match load_scene(&cfg.options) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[viewer] import failed: {e}");
-            exit.write(AppExit::error());
-            return;
-        }
-    };
-    let load_time = started.elapsed();
-
     let image_handles: Vec<Handle<Image>> = scene
         .textures
         .iter()
@@ -215,7 +204,40 @@ fn setup(
             transform,
             Name::new(o.path.clone()),
         ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn setup(
+    mut commands: Commands,
+    cfg: Res<ViewerConfig>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut pick: ResMut<PickData>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let started = Instant::now();
+    let scene = match load_scene(&cfg.options) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[viewer] import failed: {e}");
+            exit.write(AppExit::error());
+            return;
+        }
+    };
+    let load_time = started.elapsed();
+
+    spawn_scene_geometry(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &mut images,
+        &scene,
+    );
+    for o in &scene.objects {
         // CPU triangles for picking.
+        let transform = transform_from(&o.transform);
         let m = &scene.meshes[o.mesh];
         let mat = transform.to_matrix();
         let world: Vec<Vec3> = m

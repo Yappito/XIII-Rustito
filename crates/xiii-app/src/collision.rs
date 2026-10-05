@@ -788,7 +788,10 @@ type Layout = std::rc::Rc<xiii_script::vm::ClassLayout>;
 /// Resolves the inherited default layout of `Package.Class` via `Vm::class_layout`.
 /// `package`/`class` are split on the first `.`; a bare class name resolves only when
 /// `default_package` is given.
-fn class_layout_of(
+///
+/// Public within the crate so the `--play` prototype resolves its parameters with the same
+/// inheritance walk `--collision-test` uses.
+pub(crate) fn class_layout_of(
     set: &ScriptSet,
     class_path: &str,
     default_package: Option<&str>,
@@ -817,7 +820,7 @@ fn class_layout_of(
 }
 
 /// Resolved float default (first array element) of a class layout.
-fn layout_float(layout: &Layout, name: &str) -> Result<f32, String> {
+pub(crate) fn layout_float(layout: &Layout, name: &str) -> Result<f32, String> {
     let class = layout
         .chain_names
         .first()
@@ -833,12 +836,12 @@ fn layout_float(layout: &Layout, name: &str) -> Result<f32, String> {
 }
 
 /// Resolved float default or `NaN` when absent (secondary calibration fields).
-fn layout_float_opt(layout: &Layout, name: &str) -> f32 {
+pub(crate) fn layout_float_opt(layout: &Layout, name: &str) -> f32 {
     layout_float(layout, name).unwrap_or(f32::NAN)
 }
 
 /// Resolved vector default of a class layout, if present and a vector.
-fn layout_vector(layout: &Layout, name: &str) -> Option<Vec3> {
+pub(crate) fn layout_vector(layout: &Layout, name: &str) -> Option<Vec3> {
     let slot = layout.slot_by_name(name)?;
     match layout.defaults.get(slot.base) {
         Some(Value::Vector(v)) => Some(*v),
