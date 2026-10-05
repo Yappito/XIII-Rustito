@@ -2094,6 +2094,113 @@ mod local_tests {
         }
     }
 
+    /// Resolves `XIII_STEAM_DIR`; the patched Steam root maps live in `Maps/BaseSP`, so this also
+    /// exercises profile-aware map/package resolution rather than the GOG layout.
+    fn steam_root() -> Option<std::path::PathBuf> {
+        let root = std::env::var_os("XIII_STEAM_DIR")?;
+        let path = std::path::PathBuf::from(&root);
+        if path.is_relative() {
+            Some(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join(path),
+            )
+        } else {
+            Some(path)
+        }
+    }
+
+    /// Opt-in: the two opening Steam maps import with zero `fail.*` counters and the same decoded
+    /// counts as GOG (all 64 maps are byte-identical). `PackageCache::open` uses the Steam
+    /// `Maps/BaseSP` profile, so this fails if the map search paths or case handling regress.
+    #[test]
+    fn steam_opening_maps_import_without_failures() {
+        let Some(path) = steam_root() else {
+            println!("SKIPPED: set XIII_STEAM_DIR to the Steam installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        for (map, actors, bsp_polys) in [("Plage00", 156, 344), ("Plage01", 133, 338)] {
+            let scene = import_map(&mut cache, map).expect("import");
+            let get = |k: &str| scene.counters.get(k).copied().unwrap_or(0);
+            assert_eq!(get("actor.static_mesh (StaticMeshActor)"), actors, "{map}");
+            assert_eq!(get("bsp.polygons"), bsp_polys, "{map}");
+            assert_eq!(get("terrain.infos"), 1, "{map}");
+            assert!(scene.player_start.is_some(), "{map}");
+            let fails: Vec<_> = scene
+                .counters
+                .keys()
+                .filter(|k| k.starts_with("fail."))
+                .collect();
+            assert!(fails.is_empty(), "{map}: {fails:?} {:?}", scene.examples);
+            let missing = scene
+                .meshes
+                .iter()
+                .filter(|m| matches!(m.material, MaterialSlot::Missing(_)))
+                .count();
+            assert_eq!(
+                missing, 0,
+                "{map}: unresolved materials {:?}",
+                scene.examples
+            );
+        }
+    }
+
+    /// Opt-in: every code package the Steam ini's `EditPackages=` names resolves and loads from
+    /// this one root, and each `*Plus` package is present next to its base (no implicit mixing).
+    #[test]
+    fn steam_code_packages_load_in_ini_order_without_mixing() {
+        let Some(path) = steam_root() else {
+            println!("SKIPPED: set XIII_STEAM_DIR to the Steam installation root to run this test");
+            return;
+        };
+        let install =
+            xiii_install::Installation::open(&path, &xiii_install::OpenOptions::default())
+                .expect("open install");
+        let entries = install.code_packages_in_load_order();
+        let pos = |n: &str| entries.iter().position(|e| e.name.eq_ignore_ascii_case(n));
+        for (base, plus) in [
+            ("XIII", "XIIIPlus"),
+            ("XIIIPersos", "XIIIPersosPlus"),
+            ("XIIIMP", "XIIIMPPlus"),
+            ("XIDInterf", "XIDInterfPlus"),
+            ("Engine", "EnginePlus"),
+            ("IpDrv", "IpDrvPlus"),
+        ] {
+            let (b, p) = (pos(base), pos(plus));
+            assert!(
+                b.is_some() && p.is_some(),
+                "{base}/{plus} indexed: {entries:?}"
+            );
+            assert!(b < p, "{base} must load before {plus}");
+        }
+        assert_eq!(entries.len(), 33, "Steam has 33 .u packages");
+        for e in &entries {
+            assert_eq!(e.kind, xiii_install::PackageKind::Code);
+            assert!(
+                e.path.starts_with(install.root()),
+                "{} escaped root",
+                e.relative
+            );
+        }
+        // Maps live under the split Steam roots and resolve case-insensitively; the patch's
+        // added packages are visible only through this root.
+        let map = install
+            .resolve_map("Plage00")
+            .expect("Plage00 under Maps/BaseSP");
+        assert_eq!(map.entry.relative, "Maps/BaseSP/Plage00.unr");
+        assert_eq!(
+            install
+                .resolve_map("plage01")
+                .expect("case-insensitive")
+                .entry
+                .relative,
+            "Maps/BaseSP/Plage01.unr"
+        );
+        assert!(install.resolve_package("XIIIPlus").is_ok());
+        assert!(install.resolve_package("XIIIMPGame").is_ok());
+    }
+
     #[test]
     fn gog_opening_maps_import_without_failures() {
         let Some(path) = gog_root() else {
