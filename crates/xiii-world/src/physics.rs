@@ -33,30 +33,42 @@ pub fn unreal_extent_to_bevy(e: [f32; 3]) -> BevyVec3 {
     [p[0] * s, p[1] * s, p[2] * s]
 }
 
-/// A [`WorldPhysics`] provider backed by a [`CollisionWorld`] of imported triangles.
+/// A [`WorldPhysics`] provider backed by the imported collision triangles.
 ///
-/// The provider is stateless across queries; it holds the triangle soup and the broad phase.
+/// The provider is stateless across queries. It holds two soups: extent (box) queries use the
+/// mesh's `UseSimpleBoxCollision` selection, zero-extent (line/ray) queries its
+/// `UseSimpleLineCollision` selection (see [`crate::WorldScene`]).
 pub struct WorldPhysicsAdapter {
-    world: CollisionWorld,
+    box_world: CollisionWorld,
+    line_world: CollisionWorld,
 }
 
 impl WorldPhysicsAdapter {
-    /// Builds the adapter from decoded map collision `(triangle, source id)` pairs in Bevy
-    /// space (metres), exactly as [`crate::WorldScene::collision`] stores them.
-    pub fn from_entries(entries: impl IntoIterator<Item = (Triangle, u32)>) -> Self {
+    /// Builds the adapter from the extent-query and zero-extent-query `(triangle, source id)`
+    /// pairs in Bevy space (metres) produced by the importer.
+    pub fn from_entries(
+        box_entries: impl IntoIterator<Item = (Triangle, u32)>,
+        line_entries: impl IntoIterator<Item = (Triangle, u32)>,
+    ) -> Self {
         Self {
-            world: CollisionWorld::new(entries),
+            box_world: CollisionWorld::new(box_entries),
+            line_world: CollisionWorld::new(line_entries),
         }
     }
 
-    /// Builds the adapter from an imported world's collision soup.
+    /// Builds the adapter from an imported world's query-specific collision soups.
     pub fn from_scene(scene: &crate::WorldScene) -> Self {
-        Self::from_entries(scene.collision.iter().map(|(t, s)| (*t, *s)))
+        Self::from_entries(scene.box_collision(), scene.line_collision())
     }
 
-    /// The underlying collision world (for diagnostics and tests).
-    pub fn world(&self) -> &CollisionWorld {
-        &self.world
+    /// The extent-query (box) collision world (for diagnostics and tests).
+    pub fn box_world(&self) -> &CollisionWorld {
+        &self.box_world
+    }
+
+    /// The zero-extent-query (line) collision world (for diagnostics and tests).
+    pub fn line_world(&self) -> &CollisionWorld {
+        &self.line_world
     }
 
     /// Shared implementation of [`WorldPhysics::trace`] and [`WorldPhysics::move_box`]: a
@@ -67,9 +79,9 @@ impl WorldPhysicsAdapter {
         let half = unreal_extent_to_bevy(extent);
         let zero = half.iter().all(|x| x.abs() < 1e-9);
         let hit = if zero {
-            self.world.ray(s, e)
+            self.line_world.ray(s, e)
         } else {
-            self.world.sweep(s, e, half)
+            self.box_world.sweep(s, e, half)
         }?;
         let t = hit.t;
         let point = [
@@ -112,7 +124,13 @@ impl WorldPhysics for WorldPhysicsAdapter {
     fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool {
         let center = to_bevy_position(location);
         let half = unreal_extent_to_bevy(extent);
-        !self.world.overlaps_aabb(center, half)
+        let zero = half.iter().all(|x| x.abs() < 1e-9);
+        let overlaps = if zero {
+            self.line_world.overlaps_aabb(center, half)
+        } else {
+            self.box_world.overlaps_aabb(center, half)
+        };
+        !overlaps
     }
 }
 
@@ -176,7 +194,7 @@ mod tests {
 
     #[test]
     fn trace_down_hits_floor_at_expected_unreal_height() {
-        let mut p = WorldPhysicsAdapter::from_entries(tiny_soup());
+        let mut p = WorldPhysicsAdapter::from_entries(tiny_soup(), tiny_soup());
         // Bevy floor y=0 => Unreal z=0. Start Bevy y=4 m and go to y=-1 m.
         let start = u([0.0, 4.0, 0.0]);
         let end = u([0.0, -1.0, 0.0]);
@@ -189,7 +207,7 @@ mod tests {
 
     #[test]
     fn trace_with_extent_stops_at_wall() {
-        let mut p = WorldPhysicsAdapter::from_entries(tiny_soup());
+        let mut p = WorldPhysicsAdapter::from_entries(tiny_soup(), tiny_soup());
         // Move a 0.1 m half-extent box from Bevy x=-4 to x=-6 into the wall at x=-5.
         let start = u([-4.0, 0.25, 0.0]);
         let end = u([-6.0, 0.25, 0.0]);
@@ -207,7 +225,7 @@ mod tests {
 
     #[test]
     fn move_box_stops_at_first_block_and_ticks_leave_free_space() {
-        let mut p = WorldPhysicsAdapter::from_entries(tiny_soup());
+        let mut p = WorldPhysicsAdapter::from_entries(tiny_soup(), tiny_soup());
         let start = u([-4.0, 0.25, 0.0]);
         let delta = u([-2.0, 0.0, 0.0]);
         let out = p.move_box(start, delta, [10.0, 10.0, 10.0]);
@@ -235,6 +253,48 @@ mod tests {
         // Point-free: in the air above the floor yes, inside the wall no.
         assert!(p.point_free(u([0.0, 4.0, 0.0]), [10.0, 10.0, 10.0]));
         assert!(!p.point_free(u([-5.0, 0.25, 0.0]), [10.0, 10.0, 10.0]));
+    }
+
+    #[test]
+    fn extent_uses_box_soup_and_zero_extent_uses_line_soup() {
+        // Two walls at Bevy x = -5: the box soup has a tall one (y in [0,2]), the line soup a
+        // short one (y in [0,0.5]). A query at y = 1.0 distinguishes them.
+        let box_soup = vec![
+            (
+                [[-5.0, 0.0, -1.0], [-5.0, 2.0, -1.0], [-5.0, 2.0, 1.0]],
+                0u32,
+            ),
+            (
+                [[-5.0, 0.0, -1.0], [-5.0, 2.0, 1.0], [-5.0, 0.0, 1.0]],
+                0u32,
+            ),
+        ];
+        let line_soup = vec![
+            (
+                [[-5.0, 0.0, -1.0], [-5.0, 0.5, -1.0], [-5.0, 0.5, 1.0]],
+                1u32,
+            ),
+            (
+                [[-5.0, 0.0, -1.0], [-5.0, 0.5, 1.0], [-5.0, 0.0, 1.0]],
+                1u32,
+            ),
+        ];
+        let mut p = WorldPhysicsAdapter::from_entries(box_soup, line_soup);
+        let start = u([-4.0, 1.0, 0.0]);
+        let end = u([-6.0, 1.0, 0.0]);
+        // Zero extent: the short line wall does not reach y = 1.0, and there is no floor.
+        assert!(
+            p.trace(start, end, [0.0; 3]).is_none(),
+            "a zero-extent query must not see the box soup's tall wall"
+        );
+        // Extent trace: the tall box wall blocks.
+        let hit = p
+            .trace(start, end, [0.1 * UNREAL_UNITS_PER_METER; 3])
+            .expect("an extent query must see the box soup's tall wall");
+        assert!(hit.time < 1.0, "{hit:?}");
+        // The line world is the short one; the box world the tall one (diagnostics).
+        assert_eq!(p.line_world().triangle_count(), 2);
+        assert_eq!(p.box_world().triangle_count(), 2);
     }
 
     #[test]

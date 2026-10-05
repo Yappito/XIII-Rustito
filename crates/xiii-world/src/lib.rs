@@ -25,16 +25,17 @@ pub mod animation;
 pub mod nav_provider;
 pub mod navigation;
 pub mod physics;
+pub mod zones;
 
 use xiii_decode::common::{
-    BevyTransform, Mat3, actor_to_bevy_pre_pivot, to_bevy_direction, to_bevy_position,
+    BevyTransform, Mat3, Props, actor_to_bevy_pre_pivot, to_bevy_direction, to_bevy_position,
 };
 use xiii_decode::model::{self, level, poly_flags};
 use xiii_decode::static_mesh::decode_static_mesh;
 use xiii_decode::terrain;
 use xiii_decode::texture::{RgbaImage, Texture, TextureFormat, decode_texture};
 use xiii_install::{Installation, OpenOptions};
-use xiii_package::{Limits, ObjectRef, Package, PropertyValue};
+use xiii_package::{Limits, ObjectRef, Package, PropertyValue, StructValue};
 use xiii_script::{ScriptLimits, ScriptPackage, ScriptSet, Vm, VmLimits};
 
 /// Parsed package bytes.
@@ -105,6 +106,9 @@ pub struct SceneObject {
     pub path: String,
     /// Resolved effective placement values (map + class-default + engine-default fallbacks).
     pub placement: Option<ResolvedPlacement>,
+    /// BSP zone this object belongs to (classified from its location / polygon centroid).
+    /// `None` for geometry with no zone assignment (e.g. terrain); the main view draws it.
+    pub zone: Option<u32>,
 }
 
 /// Imported world.
@@ -122,29 +126,82 @@ pub struct WorldScene {
     pub counters: BTreeMap<String, usize>,
     /// First examples per failure category.
     pub examples: BTreeMap<String, String>,
-    /// Collision triangles in Bevy space with an index into `collision_sources`.
-    /// Static meshes contribute their decoded collision set 0 (not render triangles), the
-    /// BSP its node polygons without `PF_NotSolid`/portal flags (invisible walls included),
-    /// the terrain its visible quads.
-    pub collision: Vec<([[f32; 3]; 3], u32)>,
-    /// Source object path per collision index.
+    /// Collision triangles in Bevy space (metres) shared by the two query soups, each with its
+    /// source id (an index into [`WorldScene::collision_sources`]). A triangle selected by both
+    /// an extent query and a zero-extent query is stored once and referenced by both index
+    /// lists. Static meshes contribute the set chosen by their collision flags (not render
+    /// triangles), the BSP its node polygons without `PF_NotSolid`/portal flags (invisible walls
+    /// included), the terrain its visible quads.
+    pub collision_triangles: Vec<([[f32; 3]; 3], u32)>,
+    /// Indices into [`WorldScene::collision_triangles`] selected for extent (box) queries.
+    pub collision_box: Vec<u32>,
+    /// Indices into [`WorldScene::collision_triangles`] selected for zero-extent (line/ray)
+    /// queries.
+    pub collision_line: Vec<u32>,
+    /// Source object path per collision source id (shared by both soups).
     pub collision_sources: Vec<String>,
+    /// BSP zones of the level: actor metadata, sky flag and per-zone geometry counts.
+    pub zones: Vec<zones::SceneZone>,
+    /// Indices into [`WorldScene::zones`] of the sky zones (`is_sky`), in increasing order.
+    pub sky_zones: Vec<u32>,
 }
 
 impl WorldScene {
-    fn add_collision(&mut self, source: String, tris: impl IntoIterator<Item = [[f32; 3]; 3]>) {
+    /// Reserves a source path id (shared by both soups).
+    fn new_collision_source(&mut self, source: String) -> u32 {
         let id = self.collision_sources.len() as u32;
         self.collision_sources.push(source);
-        let before = self.collision.len();
-        self.collision.extend(tris.into_iter().map(|t| (t, id)));
-        let n = self.collision.len() - before;
-        self.count("collision.triangles", n);
+        id
     }
 
-    /// Nearest collision hit along a ray (Bevy space): distance and source path.
+    /// Adds `tris` under an existing source id to the selected soups. Triangles selected by both
+    /// kinds are stored once in the shared pool. Counts `collision.triangles` per unique entry.
+    fn add_collision_tris(
+        &mut self,
+        id: u32,
+        tris: impl IntoIterator<Item = [[f32; 3]; 3]>,
+        to_box: bool,
+        to_line: bool,
+    ) {
+        for t in tris {
+            let index = self.collision_triangles.len() as u32;
+            self.collision_triangles.push((t, id));
+            if to_box {
+                self.collision_box.push(index);
+            }
+            if to_line {
+                self.collision_line.push(index);
+            }
+            self.count("collision.triangles", 1);
+        }
+    }
+
+    /// Adds one source's triangles to both soups (BSP, terrain: one geometry for every query).
+    fn add_collision(&mut self, source: String, tris: impl IntoIterator<Item = [[f32; 3]; 3]>) {
+        let id = self.new_collision_source(source);
+        self.add_collision_tris(id, tris, true, true);
+    }
+
+    /// Extent (box) query `(triangle, source id)` entries.
+    pub fn box_collision(&self) -> impl Iterator<Item = ([[f32; 3]; 3], u32)> + '_ {
+        self.collision_box
+            .iter()
+            .map(|&i| self.collision_triangles[i as usize])
+    }
+
+    /// Zero-extent (line/ray) query `(triangle, source id)` entries.
+    pub fn line_collision(&self) -> impl Iterator<Item = ([[f32; 3]; 3], u32)> + '_ {
+        self.collision_line
+            .iter()
+            .map(|&i| self.collision_triangles[i as usize])
+    }
+
+    /// Nearest zero-extent (line) collision hit along a ray (Bevy space): distance and source
+    /// path. The viewer's crosshair / `--dump` probes use this.
     pub fn ray_collision(&self, origin: [f32; 3], dir: [f32; 3]) -> Option<(f32, &str)> {
         let mut best: Option<(f32, u32)> = None;
-        for (t, src) in &self.collision {
+        for &i in &self.collision_line {
+            let (t, src) = &self.collision_triangles[i as usize];
             if let Some(d) = ray_triangle(origin, dir, t)
                 && best.is_none_or(|(b, _)| d < b)
             {
@@ -284,13 +341,25 @@ const MATERIAL_LINKS: &[(&str, &[&str])] = &[
 
 /// (lower-case package name, export index).
 type ObjectKey = (String, usize);
-/// Converted static mesh: (scene mesh index, label) per section and local collision
-/// triangles (Bevy space, unscaled).
+/// Converted static mesh: (scene mesh index, label) per section and the local collision
+/// triangles (Bevy space, unscaled) chosen for each query kind.
 #[derive(Clone)]
 struct MeshSections {
     sections: Vec<(usize, String)>,
-    collision: Arc<Vec<[[f32; 3]; 3]>>,
-    /// Collision triangles of set 0 whose material slot has `EnableCollision` = false. UE2
+    /// Collision set chosen for extent (box) queries (0 = per-triangle, 1 = simplified).
+    box_set: u8,
+    /// Collision set chosen for zero-extent (line/ray) queries.
+    line_set: u8,
+    /// True when the box flag requested the simplified set but the mesh has none (fell back).
+    box_fallback: bool,
+    /// True when the line flag requested the simplified set but the mesh has none (fell back).
+    line_fallback: bool,
+    /// Triangles of `box_set` (Bevy space, unscaled). Shared with `collision_line` when both
+    /// queries select the same set.
+    collision_box: Arc<Vec<[[f32; 3]; 3]>>,
+    /// Triangles of `line_set` (Bevy space, unscaled).
+    collision_line: Arc<Vec<[[f32; 3]; 3]>>,
+    /// Collision triangles of the box set whose material slot has `EnableCollision` = false. UE2
     /// would not block the player with these; they are counted (not silently kept or dropped).
     collision_slot_disabled: usize,
 }
@@ -425,61 +494,52 @@ impl Importer<'_> {
                     .first()
                     .map(|s| s.uvs.clone())
                     .unwrap_or_else(|| vec![[0.0; 2]; m.vertices.len()]);
-                // UE2 `UStaticMesh.UseSimpleLineCollision` selects the simplified collision
-                // set for line checks/traces; when the mesh sets it, the per-triangle set 0 is
-                // not what the engine collides with. Some meshes (e.g.
-                // `Staticbanque.bankesca2`) carry an empty set 0 and only the simplified set.
-                // The property is the mesh's own tagged value; absent ⇒ set 0 as before.
-                let simple = mesh_uses_simple_line_collision(&pkg, idx);
-                let cs_index = if simple && !m.collision[1].triangles.is_empty() {
-                    1
-                } else {
-                    0
-                };
-                if simple {
-                    if cs_index == 1 {
-                        self.scene.count("collision.static_mesh.simple_line_set", 1);
-                        self.scene
-                            .examples
-                            .entry("collision.static_mesh.simple_line_set".to_owned())
-                            .or_insert_with(|| {
-                                format!(
-                                    "{label}: {} simplified triangles",
-                                    m.collision[1].triangles.len()
-                                )
-                            });
-                    } else {
-                        self.scene
-                            .count("note.collision.static_mesh.simple_line_empty", 1);
-                    }
-                } else if m.collision[0].triangles.is_empty()
-                    && !m.collision[1].triangles.is_empty()
-                {
-                    // Not selected by the engine property; imported as no collision.
-                    let key = "note.collision.static_mesh.empty_set0";
-                    self.scene.count(key, 1);
+                // UE2 picks a collision representation per query kind (Epic UDN
+                // `Two/StaticMeshCollisionReference`: "Non-Zero Extent Traces (ie Pawn Movement)"
+                // use the collision model when the Box flag is set, "Zero Extent Traces (ie
+                // Weapon Fire)" when the Line flag is set). The class default row for a Type 1
+                // (kDOP/triangle) collision model is `Karma=true, Box=true, Line=false`, and a
+                // mesh only serializes a flag that differs from that default. The simplified
+                // model is used only when it exists; otherwise the per-triangle set (0) is used
+                // ("Material Collision" in the reference). No fallback to render geometry.
+                let (use_line, use_box, karma_tagged) = mesh_collision_flags(&pkg, idx);
+                if karma_tagged {
+                    self.scene
+                        .count("note.collision.static_mesh.karma_collision", 1);
                     self.scene
                         .examples
-                        .entry(key.to_owned())
-                        .or_insert_with(|| {
-                            format!(
-                                "{label}: set 0 empty, {} simplified triangles",
-                                m.collision[1].triangles.len()
-                            )
-                        });
+                        .entry("note.collision.static_mesh.karma_collision".to_owned())
+                        .or_insert_with(|| format!("{label}: UseSimpleKarmaCollision set"));
                 }
-                let cs = &m.collision[cs_index];
-                let collision: Vec<[[f32; 3]; 3]> = cs
-                    .triangles
-                    .iter()
-                    .map(|t| {
-                        t.vertices
-                            .map(|v| to_bevy_position(cs.vertices[v as usize]))
-                    })
-                    .collect();
-                // Collision triangles whose material slot has EnableCollision = false: under
-                // UE2 these do not block the player. Counted, not filtered (evidence only).
-                let collision_slot_disabled = cs
+                let simplified_present = !m.collision[1].triangles.is_empty();
+                // A flag that requests the simplified model but has none falls back to set 0.
+                let box_fallback = use_box && !simplified_present;
+                let line_fallback = use_line && !simplified_present;
+                let box_set = usize::from(use_box && simplified_present);
+                let line_set = usize::from(use_line && simplified_present);
+                let convert = |cs: &xiii_decode::static_mesh::CollisionSet| -> Vec<[[f32; 3]; 3]> {
+                    cs.triangles
+                        .iter()
+                        .map(|t| {
+                            t.vertices
+                                .map(|v| to_bevy_position(cs.vertices[v as usize]))
+                        })
+                        .collect()
+                };
+                // Share the converted triangles when both query kinds select the same set.
+                let (collision_box, collision_line) = if box_set == line_set {
+                    let shared = Arc::new(convert(&m.collision[box_set]));
+                    (shared.clone(), shared)
+                } else {
+                    (
+                        Arc::new(convert(&m.collision[box_set])),
+                        Arc::new(convert(&m.collision[line_set])),
+                    )
+                };
+                // Collision triangles of the box (movement) set whose material slot has
+                // EnableCollision = false: under UE2 these do not block the player. Counted,
+                // not filtered (evidence only).
+                let collision_slot_disabled = m.collision[box_set]
                     .triangles
                     .iter()
                     .filter(|t| {
@@ -519,7 +579,12 @@ impl Importer<'_> {
                 }
                 Ok(MeshSections {
                     sections: out,
-                    collision: Arc::new(collision),
+                    box_set: box_set as u8,
+                    line_set: line_set as u8,
+                    box_fallback,
+                    line_fallback,
+                    collision_box,
+                    collision_line,
                     collision_slot_disabled,
                 })
             }
@@ -814,19 +879,33 @@ fn identity() -> BevyTransform {
     }
 }
 
-/// True when a static mesh's own `UseSimpleLineCollision` tagged property is set. When set,
-/// UE2 traces against the simplified collision set instead of the per-triangle set 0. An
-/// absent or undecodable property returns `false` (the per-triangle default).
-fn mesh_uses_simple_line_collision(pkg: &Loaded, idx: usize) -> bool {
+/// The mesh's effective simplified-collision flags `(UseSimpleLineCollision, UseSimpleBoxCollision,
+/// UseSimpleKarmaCollision)`.
+///
+/// `Engine.StaticMesh` is native-only, so an absent tagged property takes the C++ constructor
+/// value. Epic's UE2 UDN reference `Two/StaticMeshCollisionReference`
+/// (`udn.epicgames.com/Two/StaticMeshCollisionReference.html`, archived 2007-04-30) marks the
+/// class default row as `Karma=true, Box=true, Line=false`: non-zero-extent traces (pawn
+/// movement) use a Type 1 collision model by default, zero-extent traces (weapon fire) do not.
+/// This is corroborated in the corpus: 167 meshes tag `UseSimpleBoxCollision=false` and none tag
+/// it `true`; many tag `UseSimpleLineCollision=true` and none tag it `false` — Unreal only
+/// serializes a property that differs from the class default (measured, `xiii-tool props`).
+///
+/// The third value is whether `UseSimpleKarmaCollision` is explicitly tagged; this runtime does
+/// not model Karma, so the documented `true` default is not applied.
+fn mesh_collision_flags(pkg: &Loaded, idx: usize) -> (bool, bool, bool) {
     let Ok(props) = pkg
         .package
         .read_object_properties(&pkg.data, idx, &Limits::default())
     else {
-        return false;
+        return (false, true, false);
     };
-    xiii_decode::common::Props::new(&pkg.package, &props)
-        .bool("UseSimpleLineCollision")
-        .unwrap_or(false)
+    let p = xiii_decode::common::Props::new(&pkg.package, &props);
+    (
+        p.bool("UseSimpleLineCollision").unwrap_or(false),
+        p.bool("UseSimpleBoxCollision").unwrap_or(true),
+        p.bool("UseSimpleKarmaCollision").unwrap_or(false),
+    )
 }
 
 /// Imports a map: static-mesh actors, the level BSP and terrain.
@@ -847,6 +926,57 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
     let actors = level::scan_level(&map_pkg.package, &map_pkg.data);
     im.scene
         .count("actor.property_failures", actors.failures.len());
+    // Decode the level BSP once, before placing actors: its node/leaf zone tables are needed
+    // for both the static-mesh actor zones and the BSP polygon zones.
+    let level = match model::find_level_model(&map_pkg.package, &map_pkg.data) {
+        Ok(idx) => match model::decode_model(&map_pkg.package, &map_pkg.data, idx) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                im.scene.fail("fail.bsp.decode", e.to_string());
+                None
+            }
+        },
+        Err(e) => {
+            im.scene.fail("fail.bsp.level_model", e.to_string());
+            None
+        }
+    };
+    if let Some(m) = &level {
+        if m.report.unsupported_tail.is_some() {
+            im.scene.count(
+                "note.bsp.model_tail_not_decoded (zones/lightmaps/leaves)",
+                1,
+            );
+        }
+        im.scene.zones = zones::scene_zones(&map_pkg.package, &map_pkg.data, m);
+        im.scene.sky_zones = im
+            .scene
+            .zones
+            .iter()
+            .filter(|z| z.is_sky)
+            .map(|z| z.index)
+            .collect();
+        im.scene.count("zones.total", im.scene.zones.len());
+        im.scene.count("zones.sky", im.scene.sky_zones.len());
+        // A sky zone without a readable Location cannot be rendered by the sky camera; count
+        // it (never drop it silently). Null-actor non-sky zones are expected to have none.
+        let missing_sky_location = im
+            .scene
+            .zones
+            .iter()
+            .filter(|z| z.is_sky && z.location.is_none())
+            .count();
+        if missing_sky_location > 0 {
+            im.scene
+                .count("note.zones.sky_zone_without_location", missing_sky_location);
+        }
+    }
+    let level_model = level.as_ref();
+    let zone_map = level_model.map(zones::ZoneMap::new);
+    if let Some(zm) = &zone_map {
+        im.scene
+            .count("zones.leaf_conflicts", zm.leaf_conflicts() as usize);
+    }
     let mut defaults =
         ClassDefaults::open(&root).map_err(|e| format!("loading class defaults: {e}"))?;
     if let Some(ps) = actors.player_starts.first() {
@@ -892,6 +1022,22 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
             let name = source_name(source_index(s));
             im.scene.count(&format!("placement.{field}.{name}"), 1);
         }
+        // Primary method: BSP point classification. Fallback for actors whose location is not
+        // covered by the leaf/zone table: the engine-computed `Region.ZoneNumber` (the game's
+        // own leaf->zone mapping), counted so the fallback is never silent.
+        let zone = zone_for_location(zone_map.as_ref(), level_model, eff.location)
+            .filter(|z| (*z as usize) < im.scene.zones.len());
+        let zone = match zone {
+            Some(z) => Some(z),
+            None => {
+                let z = region_zone(&map_pkg.package, &map_pkg.data, a.export)
+                    .filter(|z| (*z as usize) < im.scene.zones.len());
+                if z.is_some() {
+                    im.scene.count("zones.actor_region_fallback", 1);
+                }
+                z
+            }
+        };
         match im.static_mesh(&map_pkg, r) {
             Ok(converted) => {
                 im.scene
@@ -927,7 +1073,38 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                         transform,
                         path: format!("{} -> {label}", a.path),
                         placement: Some(eff),
+                        zone,
                     });
+                }
+                // Per-query-kind evidence: which collision set the rule chose, whether the flag
+                // requested the simplified model but the mesh had none (fallback to set 0), and
+                // whether the chosen set is empty (contributes nothing, listed).
+                for (kind, set, fallback, tris) in [
+                    (
+                        "box",
+                        converted.box_set,
+                        converted.box_fallback,
+                        &converted.collision_box,
+                    ),
+                    (
+                        "line",
+                        converted.line_set,
+                        converted.line_fallback,
+                        &converted.collision_line,
+                    ),
+                ] {
+                    im.scene.count(&format!("collision.{kind}.set{set}"), 1);
+                    if fallback {
+                        im.scene
+                            .count(&format!("collision.{kind}.simple_missing_fallback"), 1);
+                    }
+                    if tris.is_empty() {
+                        let key = format!("collision.{kind}.empty");
+                        im.scene.count(&key, 1);
+                        im.scene.examples.entry(key).or_insert_with(|| {
+                            format!("{}: chosen set {set} has 0 triangles", a.path)
+                        });
+                    }
                 }
                 // Collision: explicit bCollideActors/bBlockPlayers = false excludes the actor.
                 let [collide, _, block_players] = a.collision_flags;
@@ -946,13 +1123,28 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                             )
                         });
                 } else {
-                    let tris: Vec<[[f32; 3]; 3]> = converted
-                        .collision
-                        .iter()
-                        .map(|t| t.map(|v| apply_transform(&transform, v)))
-                        .collect();
-                    im.scene
-                        .add_collision(format!("{} -> {label0}", a.path), tris);
+                    let id = im
+                        .scene
+                        .new_collision_source(format!("{} -> {label0}", a.path));
+                    if converted.box_set == converted.line_set {
+                        // One geometry for both query kinds: stored once, referenced by both.
+                        let tris = converted
+                            .collision_box
+                            .iter()
+                            .map(|t| t.map(|v| apply_transform(&transform, v)));
+                        im.scene.add_collision_tris(id, tris, true, true);
+                    } else {
+                        let box_tris = converted
+                            .collision_box
+                            .iter()
+                            .map(|t| t.map(|v| apply_transform(&transform, v)));
+                        im.scene.add_collision_tris(id, box_tris, true, false);
+                        let line_tris = converted
+                            .collision_line
+                            .iter()
+                            .map(|t| t.map(|v| apply_transform(&transform, v)));
+                        im.scene.add_collision_tris(id, line_tris, false, true);
+                    }
                 }
             }
             Err(e) => im.scene.fail(
@@ -964,6 +1156,34 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
 
     import_bsp(&mut im, &map_pkg);
     import_terrain(&mut im, &map_pkg);
+    // Per-zone object counts (static-mesh actors, BSP groups), after every object exists.
+    let mut counts = vec![0usize; im.scene.zones.len()];
+    let mut unzoned = 0usize;
+    let mut unzoned_example: Option<String> = None;
+    for o in &im.scene.objects {
+        match o.zone {
+            Some(z) if (z as usize) < counts.len() => counts[z as usize] += 1,
+            // Terrain and any actor the BSP and `Region` fallback could not place.
+            _ => {
+                unzoned += 1;
+                if unzoned_example.is_none() {
+                    unzoned_example = Some(o.path.clone());
+                }
+            }
+        }
+    }
+    im.scene.count("zones.objects_without_zone", unzoned);
+    if let Some(e) = unzoned_example {
+        im.scene
+            .examples
+            .entry("zones.objects_without_zone".to_owned())
+            .or_insert(e);
+    }
+    for (z, c) in counts.into_iter().enumerate() {
+        if let Some(zone) = im.scene.zones.get_mut(z) {
+            zone.object_count = c;
+        }
+    }
     Ok(im.scene)
 }
 
@@ -1000,6 +1220,33 @@ fn count_placement_sources(
     }
 }
 
+/// BSP zone of an actor's **effective** location (source Unreal units), or `None` when the
+/// level model is unavailable or the location falls outside the leaf/zone table.
+fn zone_for_location(
+    zone_map: Option<&zones::ZoneMap>,
+    model: Option<&model::Model>,
+    location: [f32; 3],
+) -> Option<u32> {
+    let (map, model) = (zone_map?, model?);
+    map.zone_of_point(&model.nodes, location).map(u32::from)
+}
+
+/// Engine-computed zone of an actor export: its `Region.ZoneNumber`. Used only as a fallback
+/// when the BSP point classification finds no zone. Mesh actors the engine left outside the
+/// tree store `iLeaf = -1, ZoneNumber = 0` (the outer/void zone), so `iLeaf` is not required.
+fn region_zone(package: &Package, data: &[u8], export: usize) -> Option<u32> {
+    let props = package
+        .read_object_properties(data, export, &Limits::default())
+        .ok()?;
+    let p = Props::new(package, &props);
+    match p.get("Region").map(|x| &x.value) {
+        Some(PropertyValue::Struct(StructValue::PointRegion { zone_number, .. })) => {
+            Some(u32::from(*zone_number))
+        }
+        _ => None,
+    }
+}
+
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
@@ -1010,22 +1257,19 @@ fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 
 fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
     let p = &map_pkg.package;
-    let idx = match model::find_level_model(p, &map_pkg.data) {
-        Ok(i) => i,
-        Err(e) => return im.scene.fail("fail.bsp.level_model", e.to_string()),
+    // The level model was already decoded (and any failure counted) at the top of
+    // [`import_map`] for actor-zone classification; decode it again here so this function
+    // keeps its original signature (the collision accumulation is edited in parallel).
+    let Ok(idx) = model::find_level_model(p, &map_pkg.data) else {
+        return;
     };
-    let m = match model::decode_model(p, &map_pkg.data, idx) {
-        Ok(m) => m,
-        Err(e) => return im.scene.fail("fail.bsp.decode", e.to_string()),
+    let Ok(m) = model::decode_model(p, &map_pkg.data, idx) else {
+        return;
     };
-    if m.report.unsupported_tail.is_some() {
-        im.scene.count(
-            "note.bsp.model_tail_not_decoded (zones/lightmaps/leaves)",
-            1,
-        );
-    }
-    // Group triangles per surface material.
-    let mut groups: BTreeMap<i64, (MaterialSlot, SceneMesh)> = BTreeMap::new();
+    let zone_map = zones::ZoneMap::new(&m);
+    // Group triangles per (surface material, BSP zone). Keying by zone keeps every object in
+    // exactly one render layer (sky vs playable); a mesh never spans two zones.
+    let mut groups: BTreeMap<(i64, Option<u32>), (MaterialSlot, SceneMesh)> = BTreeMap::new();
     let mut bsp_collision = Vec::new();
     for poly in m.polygons() {
         let surf = m.surfs[poly.surf];
@@ -1048,11 +1292,28 @@ fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
             continue;
         }
         if surf.poly_flags & poly_flags::FAKE_BACKDROP != 0 {
-            im.scene
-                .count("skip.bsp.sky_backdrop_polygons (skybox not rendered)", 1);
+            im.scene.count(
+                "skip.bsp.sky_backdrop_polygons (backdrop: sky camera shows through)",
+                1,
+            );
             continue;
         }
-        let key = i64::from(surf.material.raw());
+        // Polygon zone: BSP centroid classification, else the node's own positive-side zone
+        // (`BspNode::zone[1]`; the two agree on every polygon of the corpus, but the direct
+        // field always exists even when the centroid traversal lands in a zone-less leaf).
+        let zone = zone_map
+            .zone_of_polygon(&m.nodes, &poly)
+            .or_else(|| {
+                let z = usize::from(m.nodes[poly.node].zone[1]);
+                (z < im.scene.zones.len()).then_some(z as u8)
+            })
+            .map(u32::from);
+        if let Some(z) = zone
+            && let Some(sc) = im.scene.zones.get_mut(z as usize)
+        {
+            sc.polygon_count += 1;
+        }
+        let key = (i64::from(surf.material.raw()), zone);
         if let std::collections::btree_map::Entry::Vacant(slot) = groups.entry(key) {
             let material = im.material(map_pkg, surf.material, "bsp");
             slot.insert((
@@ -1101,7 +1362,7 @@ fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
         ),
         bsp_collision,
     );
-    for (_, (_, mesh)) in groups {
+    for ((_, zone), (_, mesh)) in groups {
         let label = mesh.label.clone();
         im.scene.meshes.push(mesh);
         im.scene.objects.push(SceneObject {
@@ -1112,6 +1373,7 @@ fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 p.object_path(ObjectRef::Export(idx as u32)).unwrap_or("?")
             ),
             placement: None,
+            zone,
         });
     }
 }
@@ -1198,6 +1460,7 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
             transform: identity(),
             path,
             placement: None,
+            zone: None,
         });
         im.scene.count("terrain.infos", 1);
     }
@@ -1397,20 +1660,27 @@ mod tests {
 mod local_tests {
     use super::*;
 
+    /// Resolves `XIII_GOG_DIR`, treating a relative value as workspace-relative so the
+    /// acceptance command `XIII_GOG_DIR=XIII_Game cargo test` works from the crate directory.
+    fn gog_root() -> Option<std::path::PathBuf> {
+        let root = std::env::var_os("XIII_GOG_DIR")?;
+        let path = std::path::PathBuf::from(&root);
+        if path.is_relative() {
+            Some(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join(path),
+            )
+        } else {
+            Some(path)
+        }
+    }
+
     #[test]
     fn gog_opening_maps_import_without_failures() {
-        let Some(root) = std::env::var_os("XIII_GOG_DIR") else {
+        let Some(path) = gog_root() else {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
-        };
-        // A relative value is resolved against the workspace root, so the acceptance command
-        // `XIII_GOG_DIR=XIII_Game cargo test` works from anywhere (test CWD is the crate dir).
-        let path = std::path::PathBuf::from(&root);
-        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let path = if path.is_relative() {
-            ws.join(path)
-        } else {
-            path
         };
         let mut cache = PackageCache::open(&path).expect("open install");
         for (map, actors, bsp_polys) in [("Plage00", 156, 344), ("Plage01", 133, 338)] {
@@ -1439,6 +1709,134 @@ mod local_tests {
         }
     }
 
+    /// Extra corpus case (beyond the spec): BSP point classification against the
+    /// engine-computed `Region.iLeaf` of every placed Plage00 actor. Confirms the measured
+    /// swapped leaf-slot pairing documented in [`zones`]: the swapped pairing matches almost
+    /// every actor, the unswapped pairing almost none. The few mismatches are editor-set or
+    /// orphan actors (`Camera`, `PhysicsVolume`, an unused `SkyZoneInfo5`).
+    #[test]
+    fn gog_bsp_point_classification_matches_engine_region() {
+        let Some(path) = gog_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        let map_pkg = cache.map("Plage00").expect("map");
+        let idx = model::find_level_model(&map_pkg.package, &map_pkg.data).expect("level model");
+        let m = model::decode_model(&map_pkg.package, &map_pkg.data, idx).expect("decode");
+        let zm = zones::ZoneMap::new(&m);
+        let actors = level::scan_level(&map_pkg.package, &map_pkg.data);
+        let mut region_actors = 0usize;
+        let mut swapped = 0usize;
+        let mut unswapped = 0usize;
+        for a in &actors.all_located {
+            let Some(loc) = a.location else { continue };
+            let Ok(props) =
+                map_pkg
+                    .package
+                    .read_object_properties(&map_pkg.data, a.export, &Limits::default())
+            else {
+                continue;
+            };
+            let p = xiii_decode::common::Props::new(&map_pkg.package, &props);
+            let Some(PropertyValue::Struct(xiii_package::StructValue::PointRegion {
+                leaf, ..
+            })) = p.get("Region").map(|x| &x.value)
+            else {
+                continue;
+            };
+            if *leaf < 0 {
+                continue;
+            }
+            region_actors += 1;
+            // Swapped pairing (what `zones::ZoneMap` implements): positive side -> leaf[1].
+            if zm.leaf_of_point(&m.nodes, loc) == Some(*leaf as usize) {
+                swapped += 1;
+            }
+            // Unswapped pairing, kept here as the counter-hypothesis: positive side -> leaf[0].
+            let mut i = zm.root();
+            let mut unswapped_leaf = None;
+            for _ in 0..=m.nodes.len() {
+                let Some(n) = m.nodes.get(i) else { break };
+                let d =
+                    n.plane[0] * loc[0] + n.plane[1] * loc[1] + n.plane[2] * loc[2] - n.plane[3];
+                let (child, slot) = if d >= 0.0 {
+                    (n.front, n.leaf[0])
+                } else {
+                    (n.back, n.leaf[1])
+                };
+                if child < 0 {
+                    unswapped_leaf = (slot >= 0).then_some(slot as usize);
+                    break;
+                }
+                i = child as usize;
+            }
+            if unswapped_leaf == Some(*leaf as usize) {
+                unswapped += 1;
+            }
+        }
+        assert!(
+            region_actors >= 300,
+            "expected >=300 Plage00 actors with a Region, got {region_actors}"
+        );
+        assert!(
+            swapped * 100 >= region_actors * 95,
+            "swapped pairing matched {swapped} of {region_actors}"
+        );
+        assert!(
+            unswapped * 100 <= region_actors * 5,
+            "unswapped pairing matched {unswapped} of {region_actors}"
+        );
+        println!(
+            "[zones] Plage00 Region cross-check: swapped {swapped}, unswapped {unswapped}, actors {region_actors}"
+        );
+    }
+
+    /// The opening campaign maps each have exactly one sky zone (`Engine.SkyZoneInfo`) with a
+    /// decoded location and a non-zero count of imported sky-zone geometry.
+    #[test]
+    fn gog_plage_maps_have_one_sky_zone_with_geometry() {
+        let Some(path) = gog_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        for map in ["Plage00", "Plage01"] {
+            let scene = import_map(&mut cache, map).expect("import");
+            let sky: Vec<&zones::SceneZone> = scene.zones.iter().filter(|z| z.is_sky).collect();
+            assert_eq!(
+                sky.len(),
+                1,
+                "{map}: expected exactly one sky zone, got {:?}",
+                scene.zones
+            );
+            let sky = sky[0];
+            assert!(
+                sky.actor_class
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case("Engine.SkyZoneInfo")),
+                "{map}: sky zone actor class {:?}",
+                sky.actor_class
+            );
+            assert!(sky.location.is_some(), "{map}: sky zone has no Location");
+            assert_eq!(scene.sky_zones, vec![sky.index], "{map}");
+            assert!(
+                sky.polygon_count > 0,
+                "{map}: no sky-zone polygons (zone {} {})",
+                sky.index,
+                sky.actor_path.as_deref().unwrap_or("?")
+            );
+            println!(
+                "[zones] {map}: sky zone {} {} -> {} polygons, {} objects, bevy location {:?}",
+                sky.index,
+                sky.actor_path.as_deref().unwrap_or("?"),
+                sky.polygon_count,
+                sky.object_count,
+                sky.location
+            );
+        }
+    }
+
     /// `XIII_GOG_DIR` resolved against the workspace root, or `None` in CI.
     fn opt_in_root() -> Option<std::path::PathBuf> {
         let root = std::env::var_os("XIII_GOG_DIR")?;
@@ -1451,6 +1849,252 @@ mod local_tests {
         })
     }
 
+    /// Opt-in corpus guard and evidence table for the static-mesh collision flags. Prints the
+    /// per-mesh table (used by `local/reports/item1g-*.txt`) and asserts the measured structural
+    /// facts: `UseSimpleBoxCollision`/`UseSimpleKarmaCollision` are never set in this corpus, so
+    /// the box soup is always the per-triangle set 0 while `UseSimpleLineCollision` selects the
+    /// simplified set for the line soup.
+    #[test]
+    fn opt_in_collision_flag_corpus_evidence() {
+        let Some(path) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        // ---- meshes used by placed actors on the three maps ----
+        let mut cache = PackageCache::open(&path).expect("open install");
+        let mut used: BTreeMap<String, (bool, bool, bool, usize, usize, usize)> = BTreeMap::new();
+        for map in ["Plage00", "Plage01", "Banque01"] {
+            let map_pkg = cache.map(map).expect("map");
+            let actors = level::scan_level(&map_pkg.package, &map_pkg.data);
+            let mut per_map: BTreeMap<String, (bool, bool, bool, usize, usize, usize)> =
+                BTreeMap::new();
+            for a in &actors.static_mesh_actors {
+                let class_short = a.class.rsplit('.').next().unwrap_or("");
+                if class_short.ends_with("Emitter") || a.hidden {
+                    continue;
+                }
+                if a.draw_type.is_some_and(|dt| dt != 8) {
+                    continue;
+                }
+                let Some(r) = a.static_mesh else { continue };
+                let Ok((pkg, idx)) = cache.resolve(&map_pkg, r) else {
+                    continue;
+                };
+                let Ok(props) = pkg.package.read_object_properties(
+                    &pkg.data,
+                    idx,
+                    &xiii_package::Limits::default(),
+                ) else {
+                    continue;
+                };
+                let p = xiii_decode::common::Props::new(&pkg.package, &props);
+                let label = format!(
+                    "{}.{}",
+                    pkg.name,
+                    pkg.package
+                        .object_path(ObjectRef::Export(idx as u32))
+                        .unwrap_or("?")
+                );
+                let Ok(m) = decode_static_mesh(&pkg.package, &pkg.data, idx) else {
+                    continue;
+                };
+                let rec = (
+                    p.bool("UseSimpleLineCollision").unwrap_or(false),
+                    p.bool("UseSimpleBoxCollision").unwrap_or(false),
+                    p.bool("UseSimpleKarmaCollision").unwrap_or(false),
+                    m.collision[0].triangles.len(),
+                    m.collision[1].triangles.len(),
+                    m.indices.len() / 3,
+                );
+                per_map.entry(label.clone()).or_insert(rec);
+                used.entry(label).or_insert(rec);
+            }
+            let (mut l, mut b, mut k, mut s0, mut s1, mut r) = (0, 0, 0, 0, 0, 0);
+            for v in per_map.values() {
+                l += v.0 as usize;
+                b += v.1 as usize;
+                k += v.2 as usize;
+                s0 += v.3;
+                s1 += v.4;
+                r += v.5;
+            }
+            println!(
+                "[evidence] {map}: unique meshes {} line_flag {} box_flag {} karma_flag {} set0_tris {} set1_tris {} render_tris {}",
+                per_map.len(),
+                l,
+                b,
+                k,
+                s0,
+                s1,
+                r
+            );
+            for (label, v) in &per_map {
+                println!(
+                    "[evidence]   {map} {label}: line={} box={} karma={} set0={} set1={} render={}",
+                    v.0, v.1, v.2, v.3, v.4, v.5
+                );
+            }
+        }
+        let (mut l, mut b, mut k, mut s0, mut s1, mut r) = (0, 0, 0, 0, 0, 0);
+        for v in used.values() {
+            l += v.0 as usize;
+            b += v.1 as usize;
+            k += v.2 as usize;
+            s0 += v.3;
+            s1 += v.4;
+            r += v.5;
+        }
+        println!(
+            "[evidence] three-map union: unique meshes {} line_flag {} box_flag {} karma_flag {} set0_tris {} set1_tris {} render_tris {}",
+            used.len(),
+            l,
+            b,
+            k,
+            s0,
+            s1,
+            r
+        );
+        assert!(
+            !used.is_empty(),
+            "no placed static meshes on the three maps"
+        );
+        assert_eq!(
+            b, 0,
+            "UseSimpleBoxCollision must be unset on the three maps"
+        );
+        assert_eq!(
+            k, 0,
+            "UseSimpleKarmaCollision must be unset on the three maps"
+        );
+        assert!(
+            l > 0,
+            "UseSimpleLineCollision must be set on the three maps"
+        );
+
+        // ---- corpus-wide totals over every .usx package ----
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("usx")) {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&path, &mut files);
+        let (mut meshes, mut decode_fail, mut pkg_fail) = (0usize, 0usize, 0usize);
+        let (mut cl, mut cb, mut ck) = (0usize, 0usize, 0usize);
+        // Property-presence evidence: Unreal only serializes a property that differs from the
+        // class default, so a tagged `false` proves the default was `true` and vice versa. A
+        // tagged `true` is exactly `cl`/`cb` (an untagged property reads as `false`).
+        let (mut box_false_present, mut line_false_present) = (0usize, 0usize);
+        let (mut c0, mut c1, mut cr) = (0usize, 0usize, 0usize);
+        let (mut e0, mut e1, mut both, mut neither) = (0usize, 0usize, 0usize, 0usize);
+        for f in &files {
+            let Ok(data) = std::fs::read(f) else {
+                pkg_fail += 1;
+                continue;
+            };
+            let Ok(package) = xiii_package::Package::parse(&data, &xiii_package::Limits::default())
+            else {
+                pkg_fail += 1;
+                continue;
+            };
+            for i in 0..package.exports().len() {
+                if !package.export_class_path(i).is_some_and(|c| {
+                    c.eq_ignore_ascii_case(xiii_decode::static_mesh::STATIC_MESH_CLASS)
+                }) {
+                    continue;
+                }
+                meshes += 1;
+                let Ok(m) = decode_static_mesh(&package, &data, i) else {
+                    decode_fail += 1;
+                    continue;
+                };
+                let (f_l, f_b, f_k, presence) = package
+                    .read_object_properties(&data, i, &xiii_package::Limits::default())
+                    .map(|props| {
+                        let p = xiii_decode::common::Props::new(&package, &props);
+                        (
+                            p.bool("UseSimpleLineCollision").unwrap_or(false),
+                            p.bool("UseSimpleBoxCollision").unwrap_or(false),
+                            p.bool("UseSimpleKarmaCollision").unwrap_or(false),
+                            (
+                                p.get("UseSimpleLineCollision").is_some(),
+                                p.get("UseSimpleBoxCollision").is_some(),
+                            ),
+                        )
+                    })
+                    .unwrap_or((false, false, false, (false, false)));
+                cl += f_l as usize;
+                cb += f_b as usize;
+                ck += f_k as usize;
+                if presence.0 && !f_l {
+                    line_false_present += 1;
+                }
+                if presence.1 && !f_b {
+                    box_false_present += 1;
+                }
+                let n0 = m.collision[0].triangles.len();
+                let n1 = m.collision[1].triangles.len();
+                c0 += n0;
+                c1 += n1;
+                cr += m.indices.len() / 3;
+                match (n0 > 0, n1 > 0) {
+                    (true, true) => both += 1,
+                    (true, false) => e0 += 1,
+                    (false, true) => e1 += 1,
+                    (false, false) => neither += 1,
+                }
+            }
+        }
+        println!(
+            "[evidence] corpus: usx files {} pkg_fail {} static_meshes {} decode_fail {}; line_flag_true {} (tagged_false {}) box_flag_true {} (tagged_false {}) karma_flag_true {}; set0_tris {} set1_tris {} render_tris {}; sets(d0,1,both,none) ({e0},{e1},{both},{neither})",
+            files.len(),
+            pkg_fail,
+            meshes,
+            decode_fail,
+            cl,
+            line_false_present,
+            cb,
+            box_false_present,
+            ck,
+            c0,
+            c1,
+            cr
+        );
+        assert_eq!(pkg_fail, 0, "a .usx package failed to parse");
+        assert_eq!(decode_fail, 0, "a static mesh failed to decode");
+        // No mesh tags a box/line flag equal to its default; the tagged `false` values prove the
+        // box default is `true` and the tagged `true` values prove the line default is `false`.
+        assert_eq!(cb, 0, "no mesh must tag UseSimpleBoxCollision=true");
+        assert!(
+            box_false_present > 0,
+            "meshes tagging UseSimpleBoxCollision=false must exist (proves the default is true)"
+        );
+        assert_eq!(
+            line_false_present, 0,
+            "no mesh must tag UseSimpleLineCollision=false"
+        );
+        assert!(
+            cl > 0,
+            "UseSimpleLineCollision=true must be tagged somewhere in the corpus"
+        );
+        assert_eq!(
+            ck, 0,
+            "UseSimpleKarmaCollision must be untagged corpus-wide"
+        );
+        assert!(
+            e1 > 0,
+            "there must be meshes whose set 0 is empty and set 1 non-empty"
+        );
+    }
+
     #[test]
     fn banque01_staircase_simple_collision_is_imported() {
         let Some(path) = opt_in_root() else {
@@ -1458,9 +2102,9 @@ mod local_tests {
             return;
         };
         // `Staticbanque.bankesca2` sets `UseSimpleLineCollision=true` and has an empty
-        // per-triangle collision set 0 but 20 simplified triangles in set 1. The importer must
-        // use set 1 for it; otherwise the mesh contributes no collision and the PathNodes
-        // based on the staircases float ~1000 UU above the atrium floor.
+        // per-triangle collision set 0 but 20 simplified triangles in set 1. Under the corrected
+        // rule the line flag selects set 1, and the box flag's documented default (`true`) also
+        // selects set 1, so the staircase is in both soups and the extent walker can spawn on it.
         let mut cache = PackageCache::open(&path).expect("open install");
         let scene = import_map(&mut cache, "Banque01").expect("import Banque01");
         let stair_contributors = scene
@@ -1472,12 +2116,25 @@ mod local_tests {
             stair_contributors > 0,
             "no source contains 'bankesca2'; staircase collision was skipped"
         );
+        let in_soup = |indices: &[u32]| {
+            indices.iter().any(|&i| {
+                scene.collision_sources[scene.collision_triangles[i as usize].1 as usize]
+                    .contains("bankesca2")
+            })
+        };
+        assert!(
+            in_soup(&scene.collision_box),
+            "the box soup must contain bankesca2 (box default true selects set 1)"
+        );
+        assert!(
+            in_soup(&scene.collision_line),
+            "the line soup must contain bankesca2 (UseSimpleLineCollision selects set 1)"
+        );
         // PathNode119 (export 95) is based on StaticMeshActor707 -> bankesca2 at Unreal
-        // (78.0159, -4080.3564, 1076.8217). A downward ray must find the stair floor within the
-        // 3 m FindSpot drop that `--reach-test` uses.
+        // (78.0159, -4080.3564, 1076.8217). A downward ray against the box (extent) soup must
+        // find the stair floor within the 3 m FindSpot drop that `--reach-test` uses.
         let node = to_bevy_position([78.0159, -4080.3564, 1076.8217]);
-        let world =
-            xiii_collision::CollisionWorld::new(scene.collision.iter().map(|(t, s)| (*t, *s)));
+        let world = xiii_collision::CollisionWorld::new(scene.box_collision());
         let hit = world
             .ray(node, [node[0], node[1] - 3.0, node[2]])
             .expect("the staircase floor must be within 3 m below PathNode119");

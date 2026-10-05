@@ -9,10 +9,12 @@
 
 pub mod skinned;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bevy::asset::RenderAssetUsages;
+use bevy::camera::visibility::RenderLayers;
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::mesh::Indices;
@@ -23,6 +25,11 @@ use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use crate::cli::Options;
 use xiii_world::{AlphaKind, MaterialSlot, WorldScene};
+
+/// Render layer of the playable zones (drawn by the main camera).
+const MAIN_LAYER: usize = 0;
+/// Render layer of the sky zone (drawn only by the second, sky camera).
+const SKY_LAYER: usize = 1;
 
 /// Viewer plugin.
 pub struct ViewerPlugin {
@@ -65,6 +72,13 @@ struct FlyCam {
 #[derive(Component)]
 struct OverlayText;
 
+/// Second camera that renders the sky zone. Its translation is fixed at the `SkyZoneInfo`
+/// location; `sky_follow` copies the main camera's rotation every frame.
+#[derive(Component)]
+struct SkyCamera {
+    position: Vec3,
+}
+
 #[derive(Resource)]
 struct RunState {
     start: Instant,
@@ -97,7 +111,7 @@ impl Plugin for ViewerPlugin {
         .add_systems(Startup, setup)
         .add_systems(
             Update,
-            (fly_look, fly_move, pick, overlay, unattended).chain(),
+            (fly_look, fly_move, sky_follow, pick, overlay, unattended).chain(),
         );
     }
 }
@@ -207,11 +221,17 @@ fn setup(
         };
         mat_handles.push(mat);
     }
+    let sky_zone_set: HashSet<u32> = scene.sky_zones.iter().copied().collect();
     for o in &scene.objects {
         let transform = transform_from(&o.transform);
+        // Sky-zone geometry goes on the sky-only layer; everything else (including terrain)
+        // stays on the main layer, so neither camera draws the other view's geometry.
+        let is_sky = o.zone.is_some_and(|z| sky_zone_set.contains(&z));
+        let layer = if is_sky { SKY_LAYER } else { MAIN_LAYER };
         commands.spawn((
             Mesh3d(mesh_handles[o.mesh].clone()),
             MeshMaterial3d(mat_handles[o.mesh].clone()),
+            RenderLayers::layer(layer),
             transform,
             Name::new(o.path.clone()),
         ));
@@ -262,8 +282,30 @@ fn setup(
         }
         (None, None) => (Vec3::new(0.0, 5.0, 0.0), 0.0, 0.0),
     };
+    // Sky zone: a second camera at the SkyZoneInfo location, sharing the main rotation. The
+    // main camera then does not clear colour (the sky shows through) but still clears depth
+    // (its `Camera3d` default), so playable geometry is drawn on top of the sky.
+    // `XIII_VIEWER_NO_SKY` disables the sky camera for before/after comparison captures.
+    let sky_position = scene
+        .sky_zones
+        .first()
+        .and_then(|z| scene.zones.get(*z as usize))
+        .and_then(|z| z.location)
+        .map(Vec3::from_array);
+    let sky_enabled = sky_position.is_some() && std::env::var_os("XIII_VIEWER_NO_SKY").is_none();
+    let main_camera = Camera {
+        order: if sky_enabled { 1 } else { 0 },
+        clear_color: if sky_enabled {
+            ClearColorConfig::None
+        } else {
+            ClearColorConfig::Default
+        },
+        ..default()
+    };
     commands.spawn((
         Camera3d::default(),
+        main_camera,
+        RenderLayers::layer(MAIN_LAYER),
         Transform::from_translation(pos).with_rotation(Quat::from_euler(
             EulerRot::YXZ,
             yaw,
@@ -276,6 +318,21 @@ fn setup(
             speed: 8.0,
         },
     ));
+    if sky_enabled && let Some(sky_position) = sky_position {
+        commands.spawn((
+            Camera3d::default(),
+            Camera {
+                order: 0,
+                clear_color: ClearColorConfig::Default,
+                ..default()
+            },
+            RenderLayers::layer(SKY_LAYER),
+            Transform::from_translation(sky_position),
+            SkyCamera {
+                position: sky_position,
+            },
+        ));
+    }
 
     let mut lines = Vec::new();
     let tris: usize = scene
@@ -293,6 +350,25 @@ fn setup(
     ));
     for (k, v) in &scene.counters {
         lines.push(format!("{v:>6} {k}"));
+    }
+    for z in &scene.zones {
+        lines.push(format!(
+            "zone {} {} {} | polygons {} objects {}{}",
+            z.index,
+            if z.is_sky { "SKY" } else { "playable" },
+            z.actor_path.as_deref().unwrap_or("(none)"),
+            z.polygon_count,
+            z.object_count,
+            z.location
+                .map(|l| format!(" @ ({:.1}, {:.1}, {:.1}) m", l[0], l[1], l[2]))
+                .unwrap_or_default()
+        ));
+    }
+    if let Some(p) = sky_position {
+        lines.push(format!(
+            "sky camera at ({:.1}, {:.1}, {:.1}) m",
+            p.x, p.y, p.z
+        ));
     }
     println!("[viewer] map {:?}", cfg.options.map);
     for l in &lines {
@@ -418,6 +494,20 @@ fn fly_move(
     }
 }
 
+/// Keeps the sky camera at its fixed `SkyZoneInfo` position with the main camera's rotation
+/// (UE2 renders the sky from the zone's location with the player view direction, no parallax;
+/// the decoded `SkyZoneInfo` has no parallax property).
+fn sky_follow(
+    main: Query<&Transform, (With<FlyCam>, Without<SkyCamera>)>,
+    mut sky: Query<(&mut Transform, &SkyCamera), Without<FlyCam>>,
+) {
+    let Ok(main) = main.single() else { return };
+    for (mut t, cam) in &mut sky {
+        t.translation = cam.position;
+        t.rotation = main.rotation;
+    }
+}
+
 fn ray_aabb(o: Vec3, d: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     let inv = d.recip();
     let t0 = (min - o) * inv;
@@ -483,14 +573,25 @@ fn overlay(
     summary: Option<Res<ImportSummary>>,
     state: Res<RunState>,
     cams: Query<&Transform, With<FlyCam>>,
+    sky_cams: Query<&SkyCamera>,
     mut text: Query<&mut Text, With<OverlayText>>,
 ) {
     let (Some(summary), Ok(mut text)) = (summary, text.single_mut()) else {
         return;
     };
     let cam = cams.single().map(|t| t.translation).unwrap_or_default();
+    let sky = sky_cams
+        .iter()
+        .next()
+        .map(|c| {
+            format!(
+                " | sky camera {:.1} {:.1} {:.1} m",
+                c.position.x, c.position.y, c.position.z
+            )
+        })
+        .unwrap_or_default();
     let mut s = format!(
-        "{}\ncamera {:.1} {:.1} {:.1} m | problems (skip./fail. counters): {}\ncrosshair: {}\n",
+        "{}\ncamera {:.1} {:.1} {:.1} m{sky} | problems (skip./fail. counters): {}\ncrosshair: {}\n",
         summary.title, cam.x, cam.y, cam.z, summary.problems, state.picked
     );
     for l in &summary.lines {
