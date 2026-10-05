@@ -15,6 +15,7 @@ pub mod pawns;
 pub mod script;
 pub mod session;
 pub mod sim;
+pub mod weapons;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -54,7 +55,7 @@ pub struct PlayPlugin {
 }
 
 #[derive(Resource)]
-struct PlayConfig {
+pub(crate) struct PlayConfig {
     options: Options,
 }
 
@@ -97,7 +98,7 @@ struct TraceState {
 struct ShotFlag(bool);
 
 #[derive(Component)]
-struct PlayCam;
+pub(crate) struct PlayCam;
 
 #[derive(Component)]
 struct PlayOverlay;
@@ -126,6 +127,7 @@ impl Plugin for PlayPlugin {
         .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
         .init_resource::<ShotFlag>()
         .init_resource::<RenderSync>()
+        .init_resource::<weapons::WeaponView>()
         .add_systems(Startup, setup)
         .add_systems(FixedUpdate, fixed_step)
         .add_systems(
@@ -138,6 +140,7 @@ impl Plugin for PlayPlugin {
                 viewer::sky_follow,
                 viewer::animate_uv,
                 pawns::update_pawns,
+                weapons::update_weapon_view,
                 hud::refresh,
                 hud::draw,
                 overlay,
@@ -597,7 +600,7 @@ fn setup_inner(
     Ok(())
 }
 
-fn read_keyboard(keys: &ButtonInput<KeyCode>) -> Input {
+fn read_keyboard(keys: &ButtonInput<KeyCode>, buttons: &ButtonInput<MouseButton>) -> Input {
     let mut forward = 0.0;
     if keys.pressed(KeyCode::KeyW) {
         forward += 1.0;
@@ -618,6 +621,7 @@ fn read_keyboard(keys: &ButtonInput<KeyCode>) -> Input {
         jump: keys.just_pressed(KeyCode::Space),
         walk: keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]),
         use_action: keys.just_pressed(KeyCode::KeyE),
+        fire: buttons.just_pressed(MouseButton::Left),
     }
 }
 
@@ -687,6 +691,7 @@ fn fixed_step(
     params: Res<ParamsRes>,
     mut world: ResMut<WorldRes>,
     keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
     mut script: ResMut<ScriptRes>,
     mut state: ResMut<TraceState>,
     mut session: NonSendMut<Result<session::Session, String>>,
@@ -699,11 +704,16 @@ fn fixed_step(
         return;
     }
     let elapsed = state.tick as f32 * DT;
-    let input = match script.drive.as_mut() {
-        Some(drive) => drive.advance(elapsed, &mut sim.0),
-        None => read_keyboard(&keys),
+    let (input, weapons) = match script.drive.as_mut() {
+        Some(drive) => {
+            let input = drive.advance(elapsed, &mut sim.0);
+            let weapons = drive.take_weapons();
+            (input, weapons)
+        }
+        None => (read_keyboard(&keys, &buttons), Vec::new()),
     };
     let use_action = input.use_action;
+    let fire = input.fire;
     let t0 = Instant::now();
     sim.0
         .step(dt, &world.world, &params.0, input, &world.sources);
@@ -724,8 +734,20 @@ fn fixed_step(
         let t0 = Instant::now();
         wr.movers.update(&mut wr.world, &mover_states);
         perf.span("mover_collision", t0);
+        for path in &weapons {
+            match sess.grant_weapon(path) {
+                Ok(msg) => println!("[play] weapon {msg}"),
+                Err(e) => println!("[play] weapon grant failed {path}: {e}"),
+            }
+        }
         if use_action {
             perform_use(sess, &wr.world, &wr.sources, &sim.0, &params.0);
+        }
+        if fire {
+            match sess.fire(sim.0.yaw) {
+                session::FireOutcome::Fired => {}
+                other => println!("[play] fire: {other:?}"),
+            }
         }
         let t0 = Instant::now();
         crate::audio::pump(sess.events.iter());
@@ -816,12 +838,14 @@ fn sync_camera(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn overlay(
     cfg: Res<PlayConfig>,
     sim: Res<SimRes>,
     session: NonSend<Result<session::Session, String>>,
     pawns: Option<Res<pawns::PawnScene>>,
     hud: Option<Res<hud::HudRuntime>>,
+    weapon_view: Option<Res<weapons::WeaponView>>,
     mut perf: ResMut<crate::perf::Perf>,
     mut text: Query<&mut Text, With<PlayOverlay>>,
 ) {
@@ -898,14 +922,33 @@ fn overlay(
         }
         None => "HUD unavailable".to_owned(),
     };
+    let combat_line = match &*session {
+        Ok(s) => {
+            let health = s
+                .player_health()
+                .map(|h| format!("{h:.0}"))
+                .unwrap_or_else(|| "-".to_owned());
+            let weapon = s
+                .player_weapon()
+                .map(|w| s.vm().objects[w as usize].name.clone())
+                .unwrap_or_else(|| "none".to_owned());
+            let view = weapon_view
+                .as_deref()
+                .map(weapons::overlay_line)
+                .unwrap_or_else(|| "weapon view unavailable".to_owned());
+            format!("player health {health} | weapon {weapon} | {view}")
+        }
+        Err(_) => "combat unavailable".to_owned(),
+    };
     text.0 = format!(
         "XIII play prototype (NOT a playable mission; no weapons, no full AI)\n\
          map {} | pos ({:.1}, {:.1}, {:.1}) UU | vel ({:.1}, {:.1}, {:.1}) UU/s | state {}\n\
          floor normal ({:.2}, {:.2}, {:.2}) | last contact: {}\n\
+         {combat_line}\n\
          {}\n\
          {pawns_line}\n\
          {hud_line}\n\
-         WASD move | mouse look | Space jump | Shift walk | Esc quit",
+         WASD move | mouse look | Space jump | Shift walk | Left mouse fire | E use | Esc quit",
         cfg.options.map.as_deref().unwrap_or("?"),
         s.location[0],
         s.location[1],
@@ -1071,12 +1114,36 @@ pub(crate) fn run_script(
     for tick in 0..ticks {
         let elapsed = tick as f32 * DT;
         let input = drive.advance(elapsed, &mut sim);
+        let weapons = drive.take_weapons();
+        let fired = input.fire;
         sim.step(DT, &world, params, input, sources);
         session.step(DT, sim.location, sim.yaw, sim.velocity);
         let states = session.mover_states();
         mover_collision.update(&mut world, &states);
+        for path in &weapons {
+            match session.grant_weapon(path) {
+                Ok(msg) => println!("[play] weapon {msg}"),
+                Err(e) => println!("[play] weapon grant failed {path}: {e}"),
+            }
+        }
         if input.use_action {
             perform_use(&mut session, &world, sources, &sim, params);
+        }
+        if fired {
+            match session.fire(sim.yaw) {
+                session::FireOutcome::Fired => {
+                    println!(
+                        "[play] fire [{elapsed:.3}s] player {} bone {} | {}",
+                        session
+                            .player_health()
+                            .map(|h| format!("{h:.0} hp"))
+                            .unwrap_or_else(|| "? hp".to_owned()),
+                        session.vm().last_trace_bone(),
+                        combat_snapshot(&session)
+                    );
+                }
+                other => println!("[play] fire [{elapsed:.3}s]: {other:?}"),
+            }
         }
         if tick.is_multiple_of(TRACE_EVERY) || tick + 1 == ticks {
             trace.push((tick, elapsed, sim.location, sim.velocity));
@@ -1094,6 +1161,41 @@ pub(crate) fn run_script(
         wall_secs: started.elapsed().as_secs_f32(),
         trace,
     })
+}
+
+/// One compact line per live soldier with its `Health`/`bIsDead`, plus the player.
+fn combat_snapshot(sess: &session::Session) -> String {
+    let vm = sess.vm();
+    let mut parts = Vec::new();
+    for (i, o) in vm.objects.iter().enumerate() {
+        if !o.is_actor || o.deleted || o.name.starts_with("Default__") {
+            continue;
+        }
+        let id = i as xiii_script::ObjectId;
+        if !vm.is_a(id, "basesoldier") {
+            continue;
+        }
+        let hp = sess
+            .actor_health(id)
+            .map(|h| format!("{h:.0}"))
+            .unwrap_or_else(|| "?".to_owned());
+        let bone = match vm.get_property(id, "LastBoneHit") {
+            Some(xiii_script::Value::Name(n)) if !n.eq_ignore_ascii_case("None") => {
+                format!(" bone={n}")
+            }
+            _ => String::new(),
+        };
+        parts.push(format!(
+            "{} {hp} hp{}{bone}",
+            o.name,
+            if sess.actor_is_dead(id) { " DEAD" } else { "" }
+        ));
+    }
+    if parts.is_empty() {
+        "no soldiers".to_owned()
+    } else {
+        parts.join(", ")
+    }
 }
 
 /// One compact entry per mover that is currently interpolating:
@@ -1178,6 +1280,23 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
         session.player_name,
         session.controller.is_some(),
         session.game_info.is_some()
+    );
+    println!(
+        "[play] combat: player {} hp{} | weapon {} | {}",
+        session
+            .player_health()
+            .map(|h| format!("{h:.0}"))
+            .unwrap_or_else(|| "?".to_owned()),
+        if session.actor_is_dead(session.player) {
+            " DEAD"
+        } else {
+            ""
+        },
+        session
+            .player_weapon()
+            .map(|w| session.vm().objects[w as usize].name.clone())
+            .unwrap_or_else(|| "none".to_owned()),
+        combat_snapshot(session)
     );
     for b in &session.blocked {
         println!("[play]   script path blocked: {b}");
@@ -1556,6 +1675,59 @@ mod tests {
         assert!(
             !commands.is_empty(),
             "Plage00 HUD.PostRender produced no draw commands"
+        );
+    }
+
+    /// Opt-in corpus fight (item14): on Plage01 the player's granted Beretta fires through the
+    /// game's own `XIIIWeapon.Fire` -> `RealTraceFire` -> `XIIIBulletsAmmo.ProcessTraceHit` ->
+    /// `XIIIPawn.TakeDamage` chain and kills `BaseSoldier6`. No host damage is applied: only the
+    /// script `Fire` entry and the host view direction are supplied. The soldier's `Health` must
+    /// fall and `bIsDead` become true.
+    #[test]
+    fn opt_in_plage01_player_fires_and_kills_soldier() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        // BaseSoldier6 is at (1802.4, -12832.0, 1070.8). Place the player 40 UU in +X facing -X
+        // and fire headshots; the battle is entirely script-driven.
+        let script = script::Script::parse(
+            "t=0.00 weapon XIII.Beretta\n\
+             t=0.20 teleport 1842.4 -12832.0 1070.8\n\
+             t=0.20 yaw 180\n\
+             t=0.30 fire\nt=0.90 fire\nt=1.50 fire\nt=2.10 fire\nt=2.70 fire\nt=3.30 fire\n\
+             t=3.90 fire\nt=4.50 fire\nt=5.10 fire\nt=5.70 fire\nt=6.30 fire\n",
+        )
+        .unwrap();
+        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 8.0)
+            .expect("run Plage01 fight");
+        let s = &outcome.session;
+        let soldier = (0..s.vm().objects.len())
+            .find(|&i| {
+                s.vm().objects[i].is_actor
+                    && !s.vm().objects[i].deleted
+                    && s.vm().objects[i].name.eq_ignore_ascii_case("BaseSoldier6")
+            })
+            .expect("Plage01 has a live BaseSoldier6")
+            as xiii_script::ObjectId;
+        let health = s.actor_health(soldier);
+        let dead = s.actor_is_dead(soldier);
+        let weapon = s.player_weapon();
+        println!(
+            "[fight test] player weapon {:?}, BaseSoldier6 health {health:?} dead={dead}",
+            weapon.map(|w| s.vm().objects[w as usize].name.clone())
+        );
+        assert!(weapon.is_some(), "the player must hold the granted weapon");
+        assert!(
+            dead || health.is_some_and(|h| h <= 0.0),
+            "BaseSoldier6 did not die: health {health:?}, dead {dead}"
         );
     }
 }

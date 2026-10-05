@@ -495,7 +495,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 224);
+    assert_eq!(defs.len(), 240);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -5359,4 +5359,198 @@ fn player_can_see_me_uses_a_player_line_of_sight() {
         &[],
         &mut []
     )));
+}
+
+// ---------------------------------------------------------------------------------------
+// item14: synthetic combat tests (no proprietary data)
+
+/// Synthetic package with `Object` <- `Actor` carrying the collision fields the actor trace
+/// reads (`Location`, `CollisionRadius`, `CollisionHeight`, `bBlockZeroExtentTraces`). The two
+/// integer native operators declared under `Object` are the registry's real indices (147 `-`,
+/// 152 `<=`).
+fn damage_package() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let native_op = ff::FINAL | ff::NATIVE | ff::OPERATOR | ff::STATIC;
+    // Native integer operators.
+    let sub = b.reserve(IMP_FUNCTION, object, "Subtract_IntInt");
+    let le = b.reserve(IMP_FUNCTION, object, "LessEqual_IntInt");
+    let sub_a = b.reserve(IMP_INTPROP, sub, "A");
+    let sub_b = b.reserve(IMP_INTPROP, sub, "B");
+    let sub_r = b.reserve(IMP_INTPROP, sub, "ReturnValue");
+    b.prop(sub_a, sub_b, pf::PARM);
+    b.prop(sub_b, sub_r, pf::PARM);
+    b.prop(sub_r, 0, pf::PARM | pf::RETURN_PARM);
+    b.func(sub, le, sub_a, &[], 0, 147, native_op);
+    let le_a = b.reserve(IMP_INTPROP, le, "A");
+    let le_b = b.reserve(IMP_INTPROP, le, "B");
+    let le_r = b.reserve(IMP_INTPROP, le, "ReturnValue");
+    b.prop(le_a, le_b, pf::PARM);
+    b.prop(le_b, le_r, pf::PARM);
+    b.prop(le_r, 0, pf::PARM | pf::RETURN_PARM);
+    b.func(le, 0, le_a, &[], 0, 152, native_op);
+    // Pawn: Health, bIsDead, Deaths, TakeDamage(int).
+    let health = b.reserve(IMP_INTPROP, pawn, "Health");
+    let dead = b.reserve(B_BOOLPROP, pawn, "bIsDead");
+    let deaths = b.reserve(IMP_INTPROP, pawn, "Deaths");
+    let take = b.reserve(IMP_FUNCTION, pawn, "TakeDamage");
+    let damage = b.reserve(IMP_INTPROP, take, "Damage");
+    b.prop(health, dead, 0);
+    b.prop(dead, deaths, 0);
+    b.prop(deaths, take, 0);
+    b.prop(damage, 0, pf::PARM);
+    let (h, dm, dd, deaths_f) = (health as u8, damage as u8, dead as u8, deaths as u8);
+    #[rustfmt::skip]
+    let take_code: Vec<u8> = vec![
+        0x0F, 0x01, h, 0x93, 0x01, h, 0x01, dm, 0x16,       // Health = Health - Damage
+        0x07, 0x2B, 0x00, 0x98, 0x01, h, 0x25, 0x16,       // if !(Health <= 0) goto 0x2B
+        0x0F, 0x01, dd, 0x27,                                // bIsDead = true
+        0x0F, 0x01, deaths_f, 0x26,                          // Deaths = 1
+        0x04, 0x0B,                                          // return
+    ];
+    // 45 is the decoded script's UE memory size (`ScriptSize`), not its byte length: every
+    // `object()`/`name()` operand counts 4 memory bytes (1 in the file), so the 6 instance
+    // variable operands add 18 to the 27 bytes.
+    b.func(take, 0, damage, &take_code, 45, 0, ff::DEFINED);
+    b.class(object, 0, sub);
+    b.class(actor, object, 0);
+    b.class(pawn, actor, health);
+    b.build()
+}
+
+#[test]
+fn synthetic_take_damage_reduces_health_and_dies_at_or_below_zero() {
+    let set = set_of(damage_package());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let p = vm.spawn(g(&set, "Pawn"), "P").unwrap();
+    vm.set_property(p, "Health", 0, Value::Int(50));
+    let take = g(&set, "Pawn.TakeDamage");
+    // Non-lethal: health drops, the death flag and the counter stay clear.
+    vm.call_function(take, p, vec![Value::Int(20)]).unwrap();
+    assert_eq!(vm.get_property(p, "Health"), Some(&Value::Int(30)));
+    assert_eq!(vm.get_property(p, "bIsDead"), Some(&Value::Bool(false)));
+    assert_eq!(vm.get_property(p, "Deaths"), Some(&Value::Int(0)));
+    // Exactly zero is a death (`<= 0`).
+    vm.call_function(take, p, vec![Value::Int(30)]).unwrap();
+    assert_eq!(vm.get_property(p, "Health"), Some(&Value::Int(0)));
+    assert_eq!(vm.get_property(p, "bIsDead"), Some(&Value::Bool(true)));
+    assert_eq!(vm.get_property(p, "Deaths"), Some(&Value::Int(1)));
+    // Beyond zero: health goes negative, the death counter does not double.
+    vm.call_function(take, p, vec![Value::Int(10)]).unwrap();
+    assert_eq!(vm.get_property(p, "Health"), Some(&Value::Int(-10)));
+    assert_eq!(vm.get_property(p, "Deaths"), Some(&Value::Int(1)));
+}
+
+/// Synthetic package with an `Actor` carrying the collision fields the actor trace reads.
+fn trace_package() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let vector = b.reserve(IMP_CORE, 0, "Vector");
+    let rotator = b.reserve(IMP_CORE, 0, "Rotator");
+    let loc = b.reserve(B_STRUCTPROP, actor, "Location");
+    let rot = b.reserve(B_STRUCTPROP, actor, "Rotation");
+    let radius = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
+    let height = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
+    let collide = b.reserve(B_BOOLPROP, actor, "bCollideActors");
+    let bzero = b.reserve(B_BOOLPROP, actor, "bBlockZeroExtentTraces");
+    let bnz = b.reserve(B_BOOLPROP, actor, "bBlockNonZeroExtentTraces");
+    b.prop_with(loc, rot, 0, &compact(vector));
+    b.prop_with(rot, radius, 0, &compact(rotator));
+    b.prop(radius, height, 0);
+    b.prop(height, collide, 0);
+    b.prop(collide, bzero, 0);
+    b.prop(bzero, bnz, 0);
+    b.prop(bnz, 0, 0);
+    b.class(object, 0, 0);
+    b.class(actor, object, loc);
+    b.build()
+}
+
+fn trace_args() -> Vec<Value> {
+    vec![
+        Value::Vector([0.0; 3]),           // HitLocation (out)
+        Value::Vector([0.0; 3]),           // HitNormal (out)
+        Value::Vector([1000.0, 0.0, 0.0]), // TraceEnd
+        Value::Vector([0.0; 3]),           // TraceStart
+        Value::Bool(true),                 // bTraceActors
+        Value::Vector([0.0; 3]),           // Extent (line)
+    ]
+}
+
+#[test]
+fn synthetic_trace_hits_the_nearest_pawn_before_world_geometry() {
+    let set = set_of(trace_package());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    // A world wall beyond both actors: the nearest actor must win.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([900.0, -100.0, -100.0], [950.0, 100.0, 100.0]),
+    ));
+    let near = vm.spawn(g(&set, "Actor"), "Near").unwrap();
+    let far = vm.spawn(g(&set, "Actor"), "Far").unwrap();
+    // The tracer is a third actor off the ray: `Actor.Trace` skips its own object.
+    let shooter = vm.spawn(g(&set, "Actor"), "Shooter").unwrap();
+    vm.set_active(shooter, true);
+    for (id, x) in [(near, 100.0), (far, 300.0)] {
+        vm.set_property(id, "Location", 0, Value::Vector([x, 0.0, 0.0]));
+        vm.set_property(id, "CollisionRadius", 0, Value::Float(40.0));
+        vm.set_property(id, "CollisionHeight", 0, Value::Float(40.0));
+        vm.set_property(id, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+        vm.set_active(id, true);
+    }
+    let mut args = trace_args();
+    let hit = call_native(
+        &mut vm,
+        "Actor.Trace",
+        shooter,
+        &[false, false, false, false, false, false],
+        &mut args,
+    );
+    assert_eq!(
+        hit,
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(near)))),
+        "the trace must hit the nearest blocking actor"
+    );
+    // The hit point is on the near cylinder's -X face and the zone is a spine band.
+    match &args[0] {
+        Value::Vector(l) => assert!((l[0] - 60.0).abs() < 1.0, "hit at {l:?}"),
+        other => panic!("expected hit location, got {other:?}"),
+    }
+    assert_eq!(vm.last_trace_bone(), "X Spine1");
+    // `Actor.GetLastTraceBone` returns the recorded zone.
+    let bone = call_native(&mut vm, "Actor.GetLastTraceBone", near, &[], &mut []);
+    assert_eq!(bone, NativeOutcome::Value(Value::Name("X Spine1".into())));
+}
+
+#[test]
+fn synthetic_trace_world_geometry_closer_than_the_pawn_wins() {
+    let set = set_of(trace_package());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    // The wall sits between the start and the only actor.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([50.0, -100.0, -100.0], [60.0, 100.0, 100.0]),
+    ));
+    let a = vm.spawn(g(&set, "Actor"), "A").unwrap();
+    vm.set_property(a, "Location", 0, Value::Vector([300.0, 0.0, 0.0]));
+    vm.set_property(a, "CollisionRadius", 0, Value::Float(40.0));
+    vm.set_property(a, "CollisionHeight", 0, Value::Float(40.0));
+    vm.set_property(a, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    vm.set_active(a, true);
+    let mut args = trace_args();
+    let hit = call_native(
+        &mut vm,
+        "Actor.Trace",
+        a,
+        &[false, false, false, false, false, false],
+        &mut args,
+    );
+    // No LevelInfo in this fixture: a world hit returns Null.
+    assert_eq!(
+        hit,
+        NativeOutcome::Value(Value::Object(None)),
+        "the closer world wall must win over the pawn"
+    );
+    assert_eq!(vm.last_trace_bone(), "None");
 }

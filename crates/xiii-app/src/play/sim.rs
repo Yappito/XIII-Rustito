@@ -82,6 +82,9 @@ pub struct Input {
     /// A use/interact action was requested this tick (edge-triggered; `E`). Not consumed by
     /// [`PlayerSim::step`]; the host performs the use against the VM.
     pub use_action: bool,
+    /// A fire action was requested this tick (edge-triggered; left mouse / script `fire`). Not
+    /// consumed by [`PlayerSim::step`]; the host routes it to the player's weapon (item14).
+    pub fire: bool,
 }
 
 /// The simulated player.

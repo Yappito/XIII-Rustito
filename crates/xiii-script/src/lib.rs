@@ -34,7 +34,7 @@ pub use linker::{ExternalLookup, ExternalPackage, GlobalRef, ScriptPackage, Scri
 pub use navigation::{
     EmptyNavigation, NavEdgeInfo, NavPointInfo, NavigationData, find_path, move_step, nearest_point,
 };
-pub use physics::{MoveOutcome, WorldHit, WorldPhysics};
+pub use physics::{CylinderZones, HitZones, MoveOutcome, WorldHit, WorldPhysics};
 pub use reader::{Reader, Tables};
 pub use reflect::{
     Class, Function, Property, PropertyKind, ScriptClassKind, ScriptObject, State, StructHeader,

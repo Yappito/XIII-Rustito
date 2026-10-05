@@ -28,7 +28,7 @@ use crate::linker::{GlobalRef, ScriptSet};
 use crate::navigation::{
     NavEdgeInfo, NavPointInfo, NavigationData, find_path, move_step, nearest_point, point_fits,
 };
-use crate::physics::WorldPhysics;
+use crate::physics::{HitZones, WorldPhysics};
 use crate::reflect::{Property, PropertyKind, ScriptObject, function_flags, property_flags};
 use crate::registry::{NativeCtx, NativeDef, NativeOutcome, Registry};
 use crate::value::{ObjRef, ObjectId, Ty, Value};
@@ -1108,6 +1108,13 @@ pub struct Vm<'s> {
     /// Decoded navigation graph (pathing natives). `None` = every native that needs it fails
     /// with [`VmErrorKind::NoNavProvider`].
     pub(crate) navigation: Option<Box<dyn NavigationData>>,
+    /// Hit-zone provider for `Actor.GetLastTraceBone` (item14). `None` = the default
+    /// [`crate::physics::CylinderZones`] is used.
+    hit_zones: Option<Box<dyn HitZones>>,
+    /// Bone name recorded by the most recent `Actor.Trace` actor hit, returned by
+    /// `Actor.GetLastTraceBone` (`XIIIPawn.LastBoneHit`). `"None"` when the last trace hit world
+    /// geometry (or nothing).
+    last_trace_bone: String,
     /// Outbound presentation events emitted by presentation natives (sound, texture, display,
     /// projectors). Drained with [`Vm::drain_events`].
     events: Vec<PresentationEvent>,
@@ -1163,6 +1170,8 @@ impl<'s> Vm<'s> {
             physics: None,
             animation: None,
             navigation: None,
+            hit_zones: None,
+            last_trace_bone: "None".to_owned(),
             events: Vec::new(),
             local_url: String::new(),
             url_options: String::new(),
@@ -1267,6 +1276,18 @@ impl<'s> Vm<'s> {
     /// True when a navigation provider is available.
     pub fn has_navigation(&self) -> bool {
         self.navigation.is_some()
+    }
+
+    /// Installs a hit-zone provider for `Actor.GetLastTraceBone` (item14). Without one the
+    /// default [`crate::physics::CylinderZones`] classifies hits against the target cylinder.
+    pub fn set_hit_zones(&mut self, provider: Box<dyn HitZones>) {
+        self.hit_zones = Some(provider);
+    }
+
+    /// Bone name recorded by the most recent `Actor.Trace` actor hit (a name constant such as
+    /// `X Head`/`X Spine1`/`X Spine`, or `None`). Read by `Actor.GetLastTraceBone`.
+    pub fn last_trace_bone(&self) -> &str {
+        &self.last_trace_bone
     }
 
     /// Configures the map's local URL (`<Map>?<options>`, the `url_options` being the
@@ -2102,6 +2123,13 @@ impl<'s> Vm<'s> {
             .iter()
             .position(|o| !o.deleted && o.name.eq_ignore_ascii_case(name))
             .map(|i| i as ObjectId)
+    }
+
+    /// Class-level function by name, ignoring state shadowing. Host-driven verbs that the engine
+    /// resolves against the class (for example the player's `Fire` while a weapon state defines an
+    /// empty shadow) can call this instead of [`Vm::send_event`], which is state-aware.
+    pub fn class_function(&self, id: ObjectId, name: &str) -> Option<GlobalRef> {
+        self.find_function(id, name, false)
     }
 
     /// Marks an object as executed (in scope).
@@ -4213,6 +4241,17 @@ impl<'s> Vm<'s> {
                     pitch.sin(),
                 ])
             }
+            // UE2 `VectorToRotator` (ECastToken 0x50): direction vector to rotator
+            // (pitch/yaw from the components, roll 0), used by `XIIIPlayerController.AdjustAim`.
+            (0x50, Value::Vector(v)) => {
+                let wrap = |r: f32| {
+                    let u = (r / std::f32::consts::TAU * 65536.0).round() as i64;
+                    (u.rem_euclid(65536)) as i32
+                };
+                let yaw = v[1].atan2(v[0]);
+                let pitch = v[2].atan2((v[0] * v[0] + v[1] * v[1]).sqrt());
+                Value::Rotator([wrap(pitch), wrap(yaw), 0])
+            }
             (0x3A, Value::Byte(b)) => Value::Int(i32::from(*b)),
             (0x3B, Value::Byte(b)) => Value::Bool(*b != 0),
             (0x3C, Value::Byte(b)) => Value::Float(f32::from(*b)),
@@ -5321,8 +5360,24 @@ impl<'s> Vm<'s> {
         extent: [f32; 3],
     ) -> Option<(f32, ObjectId, [f32; 3])> {
         let mut best: Option<(f32, ObjectId, [f32; 3])> = None;
+        // UE2 selects actor hits by the trace extent: a zero-extent (line) trace needs
+        // `bBlockZeroExtentTraces`, a swept box needs `bBlockNonZeroExtentTraces`. A pawn may have
+        // `bCollideActors=false` yet still block hitscan traces (measured: `BaseSoldier6`), so the
+        // extent flag is the correct gate here.
+        let nonzero = extent[0] + extent[1] + extent[2] > 0.0;
         for b in 0..self.objects.len() as ObjectId {
-            if b == id || !self.is_live_actor(b) || !self.bool_prop(b, "bCollideActors") {
+            if b == id || !self.is_live_actor(b) {
+                continue;
+            }
+            let gate = if nonzero {
+                self.bool_prop(b, "bBlockNonZeroExtentTraces")
+            } else {
+                self.bool_prop(b, "bBlockZeroExtentTraces")
+            };
+            // The engine's actor-trace also reaches actors in the collision list (`bCollideActors`)
+            // even when they do not set the extent flag (a traced pawn may clear `bCollideActors`
+            // but still block a hitscan through `bBlockZeroExtentTraces`); accept either.
+            if !gate && !self.bool_prop(b, "bCollideActors") {
                 continue;
             }
             // Skip actors in the tracer's owner chain (upstream TraceFirstHit IsOwnedBy).
@@ -5372,11 +5427,26 @@ impl<'s> Vm<'s> {
         {
             best = Some((t, Some(b), n));
         }
-        Ok(match best {
+        let out = match best {
             Some((t, Some(b), n)) => (Some(b), lerp3(start, end, t), n),
             Some((t, None, n)) => (self.find_level_info(), lerp3(start, end, t), n),
             None => (None, end, [0.0, 0.0, 0.0]),
-        })
+        };
+        // item14: record the hit zone for `Actor.GetLastTraceBone` (`XIIIPawn.LastBoneHit`).
+        // A world/LevelInfo hit is not a pawn, so the bone stays `None`.
+        self.last_trace_bone = match out.0 {
+            Some(b) if !self.is_a(b, "levelinfo") => {
+                let (center, radius, half_height) = self.actor_cylinder(b);
+                match &self.hit_zones {
+                    Some(z) => z.bone_at(center, radius, half_height, out.1),
+                    None => {
+                        crate::physics::CylinderZones.bone_at(center, radius, half_height, out.1)
+                    }
+                }
+            }
+            _ => "None".to_owned(),
+        };
+        Ok(out)
     }
 
     /// `Actor.FastTrace`: world-only line trace; true when clear.

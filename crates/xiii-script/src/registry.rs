@@ -1858,6 +1858,189 @@ fn make_noise(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<Nativ
     val(Value::Void)
 }
 
+/// item14 `Actor.GetLastTraceBone`: the bone name chosen by the engine's last actor trace, read
+/// by `XIIIWeapon.RealTraceFire` into `XIIIPawn.LastBoneHit` and then by
+/// `XIIIPawn.GetDamageLocation` (head/spine classification). The VM records the zone in
+/// `Vm::vm_trace`; see [`crate::physics::HitZones`].
+fn get_last_trace_bone(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Name(vm.last_trace_bone().to_owned()))
+}
+
+/// item14 `Actor.IntersectWaterPlane`: UE2 returns the `PhysicsVolume` a segment crosses at a
+/// water plane, or `None`. XIII only uses it to route bullet impacts to a water volume; the VM
+/// does not model water volumes, so it returns `None` and writes the segment end into the `out`
+/// `Intersection` (the caller only dereferences the volume when non-null).
+fn intersect_water_plane(
+    _vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    if let Some(end) = a.get(1).and_then(|v| match v {
+        Value::Vector(v) => Some(*v),
+        _ => None,
+    }) && let Some(slot) = a.get_mut(2)
+    {
+        *slot = Value::Vector(end);
+    }
+    val(Value::Object(None))
+}
+
+/// item14 `IAController.SetEnemy`: stores `Enemy` on the controller (the XIDPawn native sets the
+/// controller's current target). Returns whether the target was accepted (always true here; the
+/// native's extra `BaseS` bookkeeping is not modelled).
+fn ia_controller_set_enemy(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let enemy = object(vm, a, 0)?;
+    vm.set_property(c.this, "Enemy", 0, Value::Object(enemy));
+    val(Value::Bool(true))
+}
+
+/// item14 `Object.SubtractSubtract_Byte`: the UE2 `--` pre-decrement on a byte value
+/// (`--ReloadCount` in `XIIIWeapon.LoneFire`); returns `A - 1` as a byte.
+fn dec_byte(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let b = byte(vm, a, 0)?;
+    val(Value::Byte(b.wrapping_sub(1)))
+}
+
+/// item14 `Object.AddAdd_Byte`: the UE2 `++` pre-increment on a byte value; returns `A + 1`.
+fn inc_byte(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let b = byte(vm, a, 0)?;
+    val(Value::Byte(b.wrapping_add(1)))
+}
+
+/// item14 `Object.Warn`: the UE2 warning log. The VM has no log sink; accepted and discarded
+/// (recorded as a `Note`). `XIIIPawn.TakeDamage` warns when a dead pawn is hit again.
+fn warn_log(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    if let Some(Value::Str(s)) = a.first() {
+        vm.note(TraceKind::Note(format!("Warn: {s}")));
+    }
+    val(Value::Void)
+}
+
+/// item14 `Object.Subtract_PreVector`: the UE2 unary `-` on a vector, used by
+/// `XIIIBulletsAmmo.ProcessTraceHit` when it aims spawned emitters.
+fn neg_vector(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let v = vector2(vm, a, 0)?;
+    val(Value::Vector([-v[0], -v[1], -v[2]]))
+}
+
+/// item14 `Actor.PlaySndDeathOno`: death onomatopoeia sound; accepted and discarded (the VM has
+/// no HX sound mapping). Called by `BaseSoldier.Died`.
+fn play_snd_death_ono(_vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Void)
+}
+
+/// item14 `Object.Divide_VectorFloat`: the UE2 `vector / float` operator, used by
+/// `XIIIPawn.TakeDamage` (`DeathMomentum = Momentum / Mass`).
+fn div_vf(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let v = vector2(vm, a, 0)?;
+    let f = float(vm, a, 1)?;
+    val(Value::Vector([v[0] / f, v[1] / f, v[2] / f]))
+}
+
+/// item14 `Object.Or_IntInt`: the UE2 bitwise integer OR, used by
+/// `XIIIWeapon.RealTraceFire` to combine the `AdditionalTraceType` bits (16384 | 65536).
+fn or_int(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let (x, y) = (int(vm, a, 0)?, int(vm, a, 1)?);
+    val(Value::Int(x | y))
+}
+
+/// item14 `Object.GetAxes`: the UE2 `(rotator -> forward/right/up)` basis used by
+/// `XIIIWeapon.RealTraceFire` to build the trace direction. Shares [`rotator_basis`] with the
+/// `<<`/`>>` vector-rotator operators.
+fn get_axes(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let r = rotator2(vm, a, 0)?;
+    let (x, y, z) = rotator_basis(r);
+    if a.len() > 1 {
+        a[1] = Value::Vector(x);
+    }
+    if a.len() > 2 {
+        a[2] = Value::Vector(y);
+    }
+    if a.len() > 3 {
+        a[3] = Value::Vector(z);
+    }
+    val(Value::Void)
+}
+
+/// item14 `Weapon.PlayFiringSound`: the engine-side firing sound. The VM has no per-weapon
+/// firing-sound mapping (HX resolution is host-side), so the call is accepted and discarded;
+/// `Beretta.PlayFiring` calls it on every shot.
+fn play_firing_sound(_vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Void)
+}
+
+/// item14 `Pawn.EyePosition`: the eye offset from the pawn `Location` (UE2 applies crouch/view
+/// height; the VM returns `EyeHeight` along +Z, falling back to `BaseEyeHeight`). Needed by
+/// `XIIIWeapon.RealTraceFire`'s trace start.
+fn pawn_eye_position(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let h = match vm.get_property(c.this, "EyeHeight") {
+        Some(Value::Float(f)) => *f,
+        _ => vm.f32_prop(c.this, "BaseEyeHeight"),
+    };
+    val(Value::Vector([0.0, 0.0, h]))
+}
+
+/// item14 `Pawn.GetViewRotation`: the rotation the pawn looks along. UE2 returns the controller's
+/// rotation for a player-controlled pawn; the VM returns `Controller.Rotation` when present,
+/// else the pawn's own `Rotation`.
+fn pawn_get_view_rotation(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let rot = vm
+        .obj_prop(c.this, "Controller")
+        .and_then(|ctrl| match vm.get_property(ctrl, "Rotation") {
+            Some(Value::Rotator(r)) => Some(*r),
+            _ => None,
+        })
+        .or_else(|| match vm.get_property(c.this, "Rotation") {
+            Some(Value::Rotator(r)) => Some(*r),
+            _ => None,
+        })
+        .unwrap_or([0; 3]);
+    val(Value::Rotator(rot))
+}
+
+/// item14 `Weapon.GetFireStart`: the muzzle position for the hitscan. The VM returns the
+/// instigator's eye (Location + `EyePosition`); the decoded muzzle offsets are not applied.
+fn weapon_get_fire_start(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let Some(pawn) = vm.obj_prop(c.this, "Instigator") else {
+        return val(Value::Vector([0.0; 3]));
+    };
+    let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+    let eye = match vm.get_property(pawn, "EyeHeight") {
+        Some(Value::Float(f)) => *f,
+        _ => vm.f32_prop(pawn, "BaseEyeHeight"),
+    };
+    val(Value::Vector([loc[0], loc[1], loc[2] + eye]))
+}
+
+/// item14 `Pawn.CalcDrawOffset`: the first-person draw offset of an inventory item. The VM
+/// returns the item's `PlayerViewOffset` (the scripts carry the value; the host uses it for
+/// presentation), never an error, so `Weapon.BringUp`'s `Active.BeginState` can run.
+fn pawn_calc_draw_offset(
+    vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let off = object(vm, a, 0)?
+        .and_then(|r| match r {
+            ObjRef::Instance(i) => vm.vector_prop(i, "PlayerViewOffset"),
+            _ => None,
+        })
+        .unwrap_or([0.0; 3]);
+    val(Value::Vector(off))
+}
+
 /// `Canvas.MakeColor`: UE2 packs the four bytes into the `Color` struct (A defaults to 255 when
 /// omitted). `PlayerController.ClearProgressMessages` calls it on the login/PostLogin path.
 fn make_color(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -3882,6 +4065,174 @@ fn builtin_defs() -> Vec<NativeDef> {
         "engine.u PlayerController.ConsoleCommand decoded; Engine.dll ?execConsoleCommand@APlayerController RVA 0x698F0; implements the campaign commands GETPING and Get GameInfo GoreLevel, logs the rest",
         console_command,
     ));
+    // ---- item14 combat natives: firing/trace/damage entry points. Kept in their own block so
+    // parallel edits merge cleanly. ------------------------------------------------
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no log sink: the message is recorded as a VM trace Note and discarded",
+        ),
+        ..def(
+            "Object.Warn",
+            "native(232) final static function Warn(coerce string S)",
+            "core.u Object.Warn decoded (string, void); XIIIPawn.TakeDamage warns when a dead pawn \
+             is hit again",
+            warn_log,
+        )
+    });
+    v.push(def(
+        "Object.Subtract_PreVector",
+        "native(211) final preoperator vector -(vector A)",
+        "core.u Object.Subtract_PreVector decoded (unary vector negation); \
+         XIIIBulletsAmmo.ProcessTraceHit uses -HitNormal for spawned emitters",
+        neg_vector,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "accepted and discarded: the VM has no HX sound mapping for the death onomatopoeia",
+        ),
+        ..def(
+            "Engine.Actor.PlaySndDeathOno",
+            "native(346) final native static function PlaySndDeathOno(object<DeathOno> Sound, int CodeMesh, int Timbre)",
+            "engine.u Actor.PlaySndDeathOno decoded (Sound, CodeMesh, Timbre); BaseSoldier.Died \
+             calls it after Super.Died; Engine.dll ?execPlaySndDeathOno@AActor",
+            play_snd_death_ono,
+        )
+    });
+    v.push(def(
+        "Object.Divide_VectorFloat",
+        "native(214) final operator vector /(vector A, float B)",
+        "core.u Object.Divide_VectorFloat decoded (vector / float); XIIIPawn.TakeDamage computes \
+         DeathMomentum = Momentum / Mass",
+        div_vf,
+    ));
+    v.push(def(
+        "Object.Or_IntInt",
+        "native(158) final operator int |(int, int)",
+        "core.u Object.Or_IntInt decoded (bitwise OR); XIIIWeapon.RealTraceFire combines the \
+         AdditionalTraceType bits 16384 | 65536",
+        or_int,
+    ));
+    v.push(def(
+        "Object.GetAxes",
+        "native(229) final static function GetAxes(rotator A, out vector X, out vector Y, out vector Z)",
+        "core.u Object.GetAxes decoded (rotator + three out vectors); UE1 FRotationMatrix basis; \
+         XIIIWeapon.RealTraceFire uses it for the trace direction and projectile aim",
+        get_axes,
+    ));
+    v.push(def(
+        "Object.SubtractSubtract_Byte",
+        "native(140) final native operator static function byte --(byte A)",
+        "core.u Object.SubtractSubtract_Byte decoded (byte A, return byte); XIIIWeapon.LoneFire \
+         decrements ReloadCount through it",
+        dec_byte,
+    ));
+    v.push(def(
+        "Object.AddAdd_Byte",
+        "native(139) final native operator static function byte ++(byte A)",
+        "core.u Object.AddAdd_Byte decoded (byte A, return byte); the byte pre-increment \
+         counterpart used by the weapon/ammo scripts",
+        inc_byte,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "accepted and discarded: the VM has no per-weapon firing-sound mapping (host HX audio \
+             resolves sounds); the shot itself continues",
+        ),
+        ..def(
+            "Engine.Weapon.PlayFiringSound",
+            "native(0) native function PlayFiringSound(bool bHasSilencer)",
+            "engine.u Weapon.PlayFiringSound decoded (bool bHasSilencer, native); \
+             Beretta.PlayFiring calls it on every shot; Engine.dll ?execPlayFiringSound@AWeapon",
+            play_firing_sound,
+        )
+    });
+    v.push(def(
+        "Engine.Actor.IntersectWaterPlane",
+        "native(0) final native static function Actor IntersectWaterPlane(Vector Start, Vector End, out Vector Intersection)",
+        "engine.u Actor.IntersectWaterPlane decoded (Start, End, out Intersection, return Actor); \
+         XIIIWeapon.RealTraceFire calls it on every shot to route a water impact to a \
+         PhysicsVolume. The VM has no water volumes, so it returns None (the caller dereferences \
+         the volume only when non-null); Engine.dll ?execIntersectWaterPlane@AActor",
+        intersect_water_plane,
+    ));
+    v.push(def(
+        "Engine.Actor.GetLastTraceBone",
+        "native(364) final native static function name GetLastTraceBone()",
+        "engine.u Actor.GetLastTraceBone decoded (return name); XIIIWeapon.RealTraceFire stores it \
+         into XIIIPawn.LastBoneHit and XIIIPawn.GetDamageLocation reads 'X Head'/'X Spine1' from \
+         it; Vm::vm_trace records the actor hit zone (the default model is the collision \
+         cylinder; see xiii_script::physics::HitZones); Engine.dll ?execGetLastTraceBone@AActor",
+        get_last_trace_bone,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "stores Enemy on the controller; the XIDPawn native's BaseS bookkeeping and the \
+             engine's sight-state side effects are not modelled",
+        ),
+        ..def(
+            "IAController.SetEnemy",
+            "native(0) function bool SetEnemy(Pawn Newenemy)",
+            "xidpawn.u IAController.SetEnemy decoded (Pawn, return bool); IAController.SeePlayer/\
+             SeeEnemy set the current target through it; XIDPawn.dll ?execSetEnemy@AIAController",
+            ia_controller_set_enemy,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "returns EyeHeight/BaseEyeHeight along +Z; crouch and view-height interpolation are \
+             not modelled",
+        ),
+        ..def(
+            "Engine.Pawn.EyePosition",
+            "native(0) native function Vector EyePosition()",
+            "engine.u Pawn.EyePosition decoded (return Vector, native); XIIIPawn overrides it; \
+             XIIIWeapon.RealTraceFire adds it to Instigator.Location for the trace start; \
+             Engine.dll ?execEyePosition@APawn",
+            pawn_eye_position,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "returns the controller's Rotation when set, else the pawn's Rotation; the native's \
+             cloud/rotation blending is not modelled",
+        ),
+        ..def(
+            "Engine.Pawn.GetViewRotation",
+            "native(0) simulated native function Rotator GetViewRotation()",
+            "engine.u Pawn.GetViewRotation decoded (return Rotator, native); \
+             XIIIWeapon.RealTraceFire passes it to Object.GetAxes; Engine.dll \
+             ?execGetViewRotation@APawn",
+            pawn_get_view_rotation,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "returns the instigator's eye (Location + EyePosition); the decoded muzzle offset is \
+             not applied",
+        ),
+        ..def(
+            "Engine.Weapon.GetFireStart",
+            "native(0) native function Vector GetFireStart(Vector X, Vector Y, Vector Z)",
+            "engine.u Weapon.GetFireStart decoded (X,Y,Z, return Vector, native); \
+             XIIIWeapon.RealTraceFire uses it as StartTrace for WHand != 0/4; Engine.dll \
+             ?execGetFireStart@AWeapon",
+            weapon_get_fire_start,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "returns Inv.PlayerViewOffset; the engine combines it with the mesh eye offset and \
+             view bob",
+        ),
+        ..def(
+            "Engine.Pawn.CalcDrawOffset",
+            "native(0) simulated native function Vector CalcDrawOffset(object<Inventory> Inv)",
+            "engine.u Pawn.CalcDrawOffset decoded (Inventory, return Vector, native); \
+             XIIIWeapon.Active.BeginState calls it to place the first-person weapon; Engine.dll \
+             ?execCalcDrawOffset@APawn",
+            pawn_calc_draw_offset,
+        )
+    });
     // Canvas draw-recording natives (`crates/xiii-script/src/canvas.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::canvas::canvas_defs());

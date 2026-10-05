@@ -88,6 +88,17 @@ pub enum UseOutcome {
     Error(String),
 }
 
+/// Outcome of a host fire action (item14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FireOutcome {
+    /// The player's weapon ran its own `Fire` path (trace/projectile/damage by script).
+    Fired,
+    /// The player pawn has no `Weapon`: nothing to fire.
+    NoWeapon,
+    /// The script raised on the fire path (the error carries the VM stack).
+    Error(String),
+}
+
 impl Session {
     /// Loads the map's script set, builds and installs the real map providers, activates every
     /// map actor, runs the level start tolerantly and creates the player pawn (script path when
@@ -316,6 +327,34 @@ impl Session {
             0,
             Value::Rotator([0, yaw_units, 0]),
         );
+        // The engine tracks the look direction on the `PlayerController` (`Pawn.GetViewRotation`
+        // returns `Controller.Rotation` for a player pawn); the host owns the player's yaw, so
+        // write it to the controller too. Without this `XIIIWeapon.RealTraceFire` traces along the
+        // controller default rotation (item14).
+        if let Some(ctrl) = self.controller {
+            let _ = self
+                .vm
+                .set_property(ctrl, "Rotation", 0, Value::Rotator([0, yaw_units, 0]));
+        }
+        // The host owns the player's movement; keep the held weapon at the eye so the script's
+        // damage falloff (`XIIIBulletsAmmo.ProcessTraceHit` measures `HitLocation - W.Location`)
+        // sees the muzzle distance, not the weapon's stale spawn position. The engine's
+        // `XIIIWeapon.Active.BeginState` does `SetLocation(Instigator.Location + CalcDrawOffset)`.
+        if let Some(weapon) = self.player_weapon() {
+            let eye = match self.vm.get_property(self.player, "EyeHeight") {
+                Some(Value::Float(h)) => *h,
+                _ => match self.vm.get_property(self.player, "BaseEyeHeight") {
+                    Some(Value::Float(h)) => *h,
+                    _ => 0.0,
+                },
+            };
+            let _ = self.vm.set_property(
+                weapon,
+                "Location",
+                0,
+                Value::Vector([location[0], location[1], location[2] + eye]),
+            );
+        }
         if profiling {
             self.vm.native_profile_mut().player_write_micros += t0.elapsed().as_micros() as u64;
         }
@@ -647,6 +686,164 @@ impl Session {
     /// First failure formatted with its stack, if any.
     pub fn first_error(&self) -> Option<&str> {
         self.first_error.as_deref()
+    }
+
+    /// The player pawn's current `Weapon` object, if any.
+    pub fn player_weapon(&self) -> Option<ObjectId> {
+        instance_prop(&self.vm, self.player, "Weapon")
+    }
+
+    /// `Fire` on the player's weapon through the game's own entry point: the controller's exec
+    /// `Fire(1.0)` (`XIIIPlayerController.Fire` -> `Pawn.Weapon.Fire`), or the weapon directly
+    /// when the pawn has no controller. The weapon runs its own `ServerFire` ->
+    /// `TraceFire`/`ProjectileFire` -> `ProcessTraceHit` -> `TakeDamage` chain (item14).
+    pub fn fire(&mut self, yaw: f32) -> FireOutcome {
+        let Some(weapon) = self.player_weapon() else {
+            return FireOutcome::NoWeapon;
+        };
+        // The host owns the player yaw; the VM's controller state code does not sync it, so
+        // re-assert it here where the script reads `GetViewRotation` (item14).
+        let yaw_units = (yaw / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN).round() as i32;
+        let _ = self.vm.set_property(
+            self.player,
+            "Rotation",
+            0,
+            Value::Rotator([0, yaw_units, 0]),
+        );
+        if let Some(ctrl) = self.controller {
+            let _ = self
+                .vm
+                .set_property(ctrl, "Rotation", 0, Value::Rotator([0, yaw_units, 0]));
+            // `XIIIPlayerController.AdjustAim` returns `OldAdjustAim`/`AdjustedAimForFiring` for
+            // an instant-hit weapon; the engine refreshes those from the view each frame, which
+            // the headless VM does not. Feed the host view direction (item14).
+            let dir = Value::Vector([yaw.cos(), yaw.sin(), 0.0]);
+            let _ = self.vm.set_property(ctrl, "OldAdjustAim", 0, dir.clone());
+            let _ = self.vm.set_property(ctrl, "AdjustedAimForFiring", 0, dir);
+            self.vm.set_property(ctrl, "bFire", 0, Value::Byte(1));
+            self.vm.set_property(ctrl, "bWeaponMode", 0, Value::Byte(1));
+        }
+        let target = self
+            .controller
+            .filter(|c| self.vm.objects.get(*c as usize).is_some_and(|o| !o.deleted));
+        let target = target.unwrap_or(weapon);
+        // `XIIIWeapon`'s `Active` state defines an empty `Fire` shadow, so the state-aware virtual
+        // call from `PlayerController.Fire` is a no-op while the weapon is idle. The engine
+        // resolves `Pawn.Weapon.Fire` against the class once the state stops shadowing (e.g. the
+        // `Idle` state's own `Fire(0.0)` poll); resolve the class `Fire` explicitly.
+        let r = match self.vm.class_function(weapon, "Fire") {
+            Some(f) => self
+                .vm
+                .call_function(f, weapon, vec![Value::Float(1.0)])
+                .map(Some),
+            None => self.vm.send_event(target, "Fire", vec![Value::Float(1.0)]),
+        };
+        match r {
+            Ok(_) => FireOutcome::Fired,
+            Err(e) => FireOutcome::Error(e.to_string()),
+        }
+    }
+
+    /// Diagnostic weapon bootstrap for `--play-script` (item14): spawn `class_path`, run the
+    /// game's own `Weapon.GiveTo`/`BringUp`, and wire the player's `Weapon`/`PendingWeapon` so the
+    /// normal fire path works. The campaign maps start the player with `XIII.Fists`; the real
+    /// pickup/equip chain (`Pickup.Touch` -> `Pawn.AddInventory` -> `ChangedWeapon`) needs a walk
+    /// to a map pickup, which the deterministic demonstration does not include. This grant is
+    /// reported, never silent, and the firing/damage/death behaviour is still the game's scripts.
+    pub fn grant_weapon(&mut self, class_path: &str) -> Result<String, String> {
+        let class = runtime::resolve_class_path(self.vm.set(), class_path)
+            .ok_or_else(|| format!("weapon class {class_path} is not loaded"))?;
+        let pawn = self.player;
+        // `spawn_actor` runs the weapon's own PreBeginPlay/BeginPlay/PostBeginPlay lifecycle.
+        let loc = self.vm.vector_prop(pawn, "Location");
+        let id = self
+            .vm
+            .spawn_actor(pawn, Some(class), Some(pawn), None, loc, None)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("spawning {class_path} returned None"))?;
+        let p = Value::Object(Some(ObjRef::Instance(pawn)));
+        // The normal path sets these in `Inventory.GiveTo`/`ChangedWeapon`; wire them explicitly.
+        self.vm.set_property(id, "Instigator", 0, p.clone());
+        self.vm.set_property(id, "Owner", 0, p.clone());
+        // The game's own GiveTo adds the weapon to the inventory chain and creates its ammo.
+        let give = self.vm.send_event(id, "GiveTo", vec![p.clone()]);
+        self.vm
+            .set_property(pawn, "Weapon", 0, Value::Object(Some(ObjRef::Instance(id))));
+        self.vm.set_property(
+            pawn,
+            "PendingWeapon",
+            0,
+            Value::Object(Some(ObjRef::Instance(id))),
+        );
+        // `Weapon.GiveTo` normally runs `GiveAmmo` + `AmmoType.AddAmmo(ReloadCount)`; the HUD
+        // notification inside GiveTo is a deferred message native, so run the ammo half here.
+        let give_ammo = self.vm.send_event(id, "GiveAmmo", vec![p.clone()]);
+        if let Some(ammo) = instance_prop(&self.vm, id, "AmmoType") {
+            let amount = match self.vm.get_property(id, "ReloadCount") {
+                Some(Value::Int(n)) if *n > 0 => *n,
+                _ => 13,
+            };
+            self.vm
+                .set_property(ammo, "AmmoAmount", 0, Value::Int(amount));
+            self.vm
+                .set_property(ammo, "MaxAmmo", 0, Value::Int(amount.max(50)));
+        }
+        let bring = self.vm.send_event(id, "BringUp", vec![]);
+        let name = self.vm.objects[id as usize].name.clone();
+        if let Err(e) = &give {
+            // Not fatal: the explicit wiring above still arms the weapon, and `GiveAmmo` above
+            // creates the ammo. Reported so a real regression is visible.
+            self.blocked
+                .push(format!("grant_weapon {name} GiveTo: {e}"));
+        }
+        Ok(format!(
+            "granted {name} ({class_path}); GiveTo {give:?}, GiveAmmo {give_ammo:?}, BringUp {bring:?}"
+        ))
+    }
+
+    /// The player weapon's first-person mesh path: the decoded `MeshName` string
+    /// (`XIIIWeapon`/`Weapon` load `Mesh` from it in `PostBeginPlay`), falling back to the
+    /// resolved `Mesh` object path.
+    pub fn weapon_mesh_name(&self, weapon: ObjectId) -> Option<String> {
+        if let Some(Value::Str(s)) | Some(Value::Name(s)) = self.vm.get_property(weapon, "MeshName")
+            && !s.is_empty()
+        {
+            return Some(s.clone());
+        }
+        self.vm.mesh_object(weapon).map(|(p, _)| p)
+    }
+
+    /// A vector property of a weapon (`PlayerViewOffset`, `FPMFRelativeLoc`).
+    pub fn weapon_vector(&self, weapon: ObjectId, name: &str) -> Option<[f32; 3]> {
+        self.vm.vector_prop(weapon, name)
+    }
+
+    /// A float property of a weapon (`DrawScale`).
+    pub fn weapon_float(&self, weapon: ObjectId, name: &str) -> Option<f32> {
+        match self.vm.get_property(weapon, name) {
+            Some(Value::Float(v)) => Some(*v),
+            Some(Value::Int(v)) => Some(*v as f32),
+            _ => None,
+        }
+    }
+
+    /// Current `Health` of `id` (int or float), if present.
+    pub fn actor_health(&self, id: ObjectId) -> Option<f32> {
+        match self.vm.get_property(id, "Health") {
+            Some(Value::Int(h)) => Some(*h as f32),
+            Some(Value::Float(h)) => Some(*h),
+            _ => None,
+        }
+    }
+
+    /// The player pawn's current `Health`, if present.
+    pub fn player_health(&self) -> Option<f32> {
+        self.actor_health(self.player)
+    }
+
+    /// `bIsDead` on `id` (the `XIIIPawn.Died` flag), if present.
+    pub fn actor_is_dead(&self, id: ObjectId) -> bool {
+        matches!(self.vm.get_property(id, "bIsDead"), Some(Value::Bool(true)))
     }
 
     fn drain_events(&mut self) {
