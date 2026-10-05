@@ -67,6 +67,18 @@ pub struct Options {
     pub lighting: Lighting,
     /// Play prototype: deterministic input script (headless without `--screenshot`).
     pub play_script: Option<PathBuf>,
+    /// `--play` sound playback (`--audio off|on`, default on).
+    pub audio: Audio,
+}
+
+/// Audio playback toggle for `--play`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Audio {
+    /// Do not resolve or play VM sound/music events.
+    Off,
+    /// Resolve sound events from the installation and play them (default).
+    #[default]
+    On,
 }
 
 impl Options {
@@ -98,6 +110,7 @@ impl Default for Options {
             reach_test: false,
             lighting: Lighting::default(),
             play_script: None,
+            audio: Audio::default(),
         }
     }
 }
@@ -108,7 +121,7 @@ xiii-app [--smoke] [--frames N] [--exit-after-secs S] [--screenshot PATH]
 xiii-app --map NAME --game-dir DIR [--view x,y,z,yaw,pitch] [--dump]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH] [--lighting off|baked]
 xiii-app --map NAME --game-dir DIR --collision-test
-xiii-app --map NAME --game-dir DIR --play [--play-script FILE]
+xiii-app --map NAME --game-dir DIR --play [--play-script FILE] [--audio off|on]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH]
 xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH]
@@ -117,10 +130,12 @@ xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
   --map NAME           Diagnostic map viewer: import NAME (e.g. Plage00) from --game-dir.
   --game-dir DIR       Owned XIII installation (read-only).
   --play               First-person movement prototype (NOT gameplay) on --map.
+  --audio off|on       Play resolved VM sound/music events (default on); `off` resolves
+                       and plays nothing (still counts events in the overlay).
   --play-script FILE   Drive --play from a text input script; headless without --screenshot.
                        Lines: `t=<secs> forward|back|right|left V | walk on/off | jump |
-                       yaw DEG | turn DEG | pitch DEG | teleport X Y Z` (teleport places the
-                       box centre at Unreal-unit X,Y,Z).
+                       yaw DEG | turn DEG | pitch DEG | use | teleport X Y Z` (teleport places
+                       the box centre at Unreal-unit X,Y,Z; use is the door/mover interact key).
   --model PKG.MESH     Skinned-character viewer: decode a SkeletalMesh; several comma-
                        separated entries are placed side by side.
   --anim SEQ           Skinned viewer: play MeshAnimation sequence SEQ (default bind pose).
@@ -176,6 +191,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
                 if opts.mode == Mode::Smoke {
                     opts.mode = Mode::Play;
                 }
+            }
+            "--audio" => {
+                let v = value("--audio")?;
+                opts.audio = match v.to_ascii_lowercase().as_str() {
+                    "off" => Audio::Off,
+                    "on" => Audio::On,
+                    other => {
+                        return Err(format!("invalid --audio {other:?}, expected off|on"));
+                    }
+                };
             }
             "--map" => {
                 opts.map = Some(value("--map")?);
@@ -280,6 +305,15 @@ mod tests {
         assert!(p(&["--size", "800"]).is_err());
         assert!(p(&["--bogus"]).is_err());
         assert!(p(&["--view", "1,2,3"]).is_err());
+    }
+
+    #[test]
+    fn parses_audio_flag() {
+        assert_eq!(p(&[]).unwrap().audio, Audio::On);
+        assert_eq!(p(&["--audio", "off"]).unwrap().audio, Audio::Off);
+        assert_eq!(p(&["--audio", "ON"]).unwrap().audio, Audio::On);
+        assert!(p(&["--audio", "maybe"]).is_err());
+        assert!(p(&["--audio"]).is_err());
     }
 
     #[test]

@@ -58,6 +58,13 @@ USAGE:
   xiii-tool script <classes|functions|disasm|natives|coverage> ...
       Compiled UnrealScript (M2c): run 'xiii-tool script' for details.
 
+  xiii-tool campaign <game-dir> [--maps a,b,..] [--json <out>] [--md <out>]
+      Headless whole-campaign sweep: per map (isolated), import counters/time,
+      box/line collision soup sizes and BVH build time, navigation decode, the
+      ReachSpec reach-walk, and the script level-start lifecycle with all actors
+      active in survey mode against the real map providers. Writes a metadata-only
+      JSON report and a Markdown summary. Run 'xiii-tool campaign' for details.
+
   xiii-tool <world-coverage|texture|mesh|bsp|zones|terrain> ...
       World decoding (M2a): textures, static meshes, BSP, terrain. Run
       'xiii-tool world-coverage --help' style commands without arguments for details.
@@ -92,6 +99,7 @@ fn main() -> ExitCode {
         Some("props") => props_cmd(&args[1..]),
         Some("coverage") => coverage_cmd(&args[1..]),
         Some("deps") => deps_cmd(&args[1..]),
+        Some("campaign") => xiii_tool::campaign_cmd::run_cmd(&args[1..]),
         Some("anim") => anim_cmd::run(&args[1..]),
         Some("audio") => audio_cmd::run(&args[1..]),
         Some("script") => xiii_tool::script_cmd::run(&args[1..]),

@@ -248,14 +248,14 @@ pub(crate) fn max_error_uu(a: &[Vec3], b: &[Vec3]) -> f32 {
 // Loading
 // ---------------------------------------------------------------------------------------
 
-/// One decoded character before it is uploaded.
+/// One decoded character before it is uploaded. Shared with the `--play` pawn renderer.
 pub(crate) struct LoadedModel {
-    label: String,
-    loaded: Arc<Loaded>,
-    skeleton: Skeleton,
-    decoded: DecodedMesh,
-    anims: Option<AnimSet>,
-    anim_label: Option<String>,
+    pub(crate) label: String,
+    pub(crate) loaded: Arc<Loaded>,
+    pub(crate) skeleton: Skeleton,
+    pub(crate) decoded: DecodedMesh,
+    pub(crate) anims: Option<AnimSet>,
+    pub(crate) anim_label: Option<String>,
 }
 
 fn find_export(p: &xiii_package::Package, name: &str, class: &str) -> Option<usize> {
@@ -354,11 +354,18 @@ const MATERIAL_LINKS: &[(&str, &[&str])] = &[
 /// `(image, has_alpha)` or the failure reason, keyed by lower-case package name + export.
 type TextureEntry = Result<(Handle<Image>, bool), String>;
 
-struct TextureResolver {
+pub(crate) struct TextureResolver {
     cache: HashMap<(String, usize), TextureEntry>,
 }
 
 impl TextureResolver {
+    /// Empty resolver (shared by the `--model` viewer and the `--play` pawn renderer).
+    pub(crate) fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+        }
+    }
+
     fn resolve(
         &mut self,
         cache: &mut PackageCache,
@@ -532,6 +539,123 @@ fn build_mesh(decoded: &DecodedMesh, indices: Vec<u32>) -> Mesh {
 }
 
 // ---------------------------------------------------------------------------------------
+// Shared skinning assets / entities (used by the `--model` viewer and `--play` pawns)
+// ---------------------------------------------------------------------------------------
+
+/// GPU assets shared by every instance of one decoded skeletal mesh: one mesh+material per
+/// section and the inverse-bind matrices. Meshes and materials are asset handles, so a single
+/// set can be referenced by many placed instances (e.g. all soldiers share `XIIIPersos.XIIIM`).
+pub(crate) struct SkinnedAssets {
+    /// `(mesh, material)` per decoded section.
+    pub(crate) sections: Vec<(Handle<Mesh>, Handle<StandardMaterial>)>,
+    /// Inverse-bind matrices for the skeleton (shared by every instance).
+    pub(crate) inverse_bindposes: Handle<SkinnedMeshInverseBindposes>,
+}
+
+/// Entities of one placed instance: the root (moved by the host) and one entity per skeleton
+/// bone (parented exactly as the decoded hierarchy). The caller may add components (e.g. the
+/// `--model` viewer's `BoneJoint`) to the returned joint entities.
+pub(crate) struct SkinnedEntities {
+    /// Root entity (owns the actor placement transform).
+    pub(crate) root: Entity,
+    /// One entity per skeleton bone, in skeleton order.
+    pub(crate) joints: Vec<Entity>,
+}
+
+/// Builds the [shared skinning assets](SkinnedAssets) of one decoded model. The material
+/// resolver and counters are passed in so a caller that places many instances (pawns) can share
+/// the texture cache and report one material summary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_skinned_assets(
+    cache: &mut PackageCache,
+    from: &Arc<Loaded>,
+    decoded: &DecodedMesh,
+    skeleton: &Skeleton,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+    bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
+    resolver: &mut TextureResolver,
+    counters: &mut BTreeMap<String, usize>,
+) -> SkinnedAssets {
+    let inverse_bindposes = bindposes.add(SkinnedMeshInverseBindposes::from(
+        bevy_inverse_bindposes(skeleton),
+    ));
+    let mats = material_handles(cache, from, decoded, materials, images, resolver, counters);
+    let mut sections = Vec::with_capacity(decoded.sections.len());
+    for section in &decoded.sections {
+        let start = section.first_index as usize;
+        let end = start + section.index_count as usize;
+        let indices = decoded.indices.get(start..end).unwrap_or_default().to_vec();
+        let mesh = meshes.add(build_mesh(decoded, indices));
+        let mat = mats
+            .get(usize::from(section.material))
+            .cloned()
+            .unwrap_or_else(|| {
+                materials.add(StandardMaterial {
+                    base_color: Color::srgb(1.0, 0.0, 1.0),
+                    unlit: true,
+                    ..default()
+                })
+            });
+        sections.push((mesh, mat));
+    }
+    SkinnedAssets {
+        sections,
+        inverse_bindposes,
+    }
+}
+
+/// Spawns one placed instance of a decoded model: the root at `root_transform`, one bone entity
+/// per skeleton bone (parented as decoded) and one mesh entity per section, all sharing the
+/// `assets`. The Unreal -> Bevy coordinate policy is *not* applied here; the caller owns the
+/// root transform and passes the pose as already-converted Bevy locals.
+pub(crate) fn spawn_skinned_entities(
+    commands: &mut Commands,
+    skeleton: &Skeleton,
+    assets: &SkinnedAssets,
+    root_transform: Transform,
+    name: String,
+) -> SkinnedEntities {
+    let root = commands
+        .spawn((
+            root_transform,
+            Visibility::default(),
+            Name::new(name.clone()),
+        ))
+        .id();
+    let mut joints = Vec::with_capacity(skeleton.bones.len());
+    for bone in &skeleton.bones {
+        let parent = bone.parent.map_or(root, |p| joints[p]);
+        let e = commands
+            .spawn((
+                Transform::default(),
+                Visibility::default(),
+                ChildOf(parent),
+                Name::new(bone.name.clone()),
+            ))
+            .id();
+        joints.push(e);
+    }
+    for (si, (mesh, mat)) in assets.sections.iter().enumerate() {
+        commands.spawn((
+            Mesh3d(mesh.clone()),
+            MeshMaterial3d(mat.clone()),
+            SkinnedMesh {
+                inverse_bindposes: assets.inverse_bindposes.clone(),
+                joints: joints.clone(),
+            },
+            Transform::default(),
+            Visibility::default(),
+            NoFrustumCulling,
+            ChildOf(root),
+            Name::new(format!("{name}#{si}")),
+        ));
+    }
+    SkinnedEntities { root, joints }
+}
+
+// ---------------------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------------------
 
@@ -624,82 +748,38 @@ fn setup(
             .map(|s| s.bone_map(&m.skeleton))
             .unwrap_or_default();
         let offset = (ci as f32 - (models.len() as f32 - 1.0) * 0.5) * spacing;
-        // Mesh orientation: the decoded RotOrigin turns the authored mesh forward onto the
-        // policy's forward (source +X). Applied at the skeleton root only.
-        let root = commands
-            .spawn((
-                Transform {
-                    translation: Vec3::new(offset, 0.0, 0.0),
-                    rotation: bevy_rot_origin(m.decoded.rot_origin),
-                    scale: Vec3::ONE,
-                },
-                Visibility::default(),
-                Name::new(m.label.clone()),
-            ))
-            .id();
-        let mut joints = Vec::with_capacity(m.skeleton.bones.len());
-        for (bi, bone) in m.skeleton.bones.iter().enumerate() {
-            let parent = bone.parent.map_or(root, |p| joints[p]);
-            let e = commands
-                .spawn((
-                    Transform::default(),
-                    Visibility::default(),
-                    ChildOf(parent),
-                    BoneJoint {
-                        character: ci,
-                        bone: bi,
-                    },
-                    Name::new(bone.name.clone()),
-                ))
-                .id();
-            joints.push(e);
-        }
-
-        let ibp = bindposes.add(SkinnedMeshInverseBindposes::from(bevy_inverse_bindposes(
-            &m.skeleton,
-        )));
-        let mats = material_handles(
+        let assets = build_skinned_assets(
             &mut cache,
             &m.loaded,
             &m.decoded,
+            &m.skeleton,
+            &mut meshes,
             &mut materials,
             &mut images,
+            &mut bindposes,
             &mut resolver,
             &mut material_counters,
         );
-        for (si, section) in m.decoded.sections.iter().enumerate() {
-            let start = section.first_index as usize;
-            let end = start + section.index_count as usize;
-            let indices = m
-                .decoded
-                .indices
-                .get(start..end)
-                .unwrap_or_default()
-                .to_vec();
-            commands.spawn((
-                Mesh3d(meshes.add(build_mesh(&m.decoded, indices))),
-                MeshMaterial3d(
-                    mats.get(usize::from(section.material))
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            materials.add(StandardMaterial {
-                                base_color: Color::srgb(1.0, 0.0, 1.0),
-                                unlit: true,
-                                ..default()
-                            })
-                        }),
-                ),
-                SkinnedMesh {
-                    inverse_bindposes: ibp.clone(),
-                    joints: joints.clone(),
-                },
-                Transform::default(),
-                Visibility::default(),
-                NoFrustumCulling,
-                ChildOf(root),
-                Name::new(format!("{}#{}", m.label, si)),
-            ));
+        // Mesh orientation: the decoded RotOrigin turns the authored mesh forward onto the
+        // policy's forward (source +X). Applied at the skeleton root only.
+        let spawned = spawn_skinned_entities(
+            &mut commands,
+            &m.skeleton,
+            &assets,
+            Transform {
+                translation: Vec3::new(offset, 0.0, 0.0),
+                rotation: bevy_rot_origin(m.decoded.rot_origin),
+                scale: Vec3::ONE,
+            },
+            m.label.clone(),
+        );
+        for (bi, &e) in spawned.joints.iter().enumerate() {
+            commands.entity(e).insert(BoneJoint {
+                character: ci,
+                bone: bi,
+            });
         }
+
         print_model_diagnostics(m, clip);
         let h = diagnostics_height(m);
         max_height = max_height.max(h);

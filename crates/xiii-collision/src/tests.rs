@@ -901,3 +901,126 @@ fn downward_ray_onto_floor_hits() {
         .expect("downward sweep must hit the floor");
     assert!(hit.normal[1] > 0.9, "normal={:?}", hit.normal);
 }
+
+// ---- moving (dynamic) collision objects ---------------------------------------------------
+
+/// Identity rotation rows.
+const ID: [Vec3; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+#[test]
+fn moving_wall_blocks_then_unblocks_a_sweep() {
+    // No static geometry: the only obstacle is the moving wall at x = 0.
+    let mut w = CollisionWorld::new(std::iter::empty());
+    let tris: Vec<Triangle> = wall_x(0.0);
+    let idx = w.add_moving(MovingObject::from_world_triangles(tris, 7, [0.0; 3], ID));
+    assert_eq!(w.moving_count(), 1);
+    assert_eq!(w.moving(idx).unwrap().source(), 7);
+
+    let start = [-2.0, 0.0, 0.0];
+    let end = [2.0, 0.0, 0.0];
+    let half = [0.1, 0.1, 0.1];
+    let hit = w
+        .sweep(start, end, half)
+        .expect("the closed moving wall must block the sweep");
+    assert_eq!(hit.source, 7, "the hit must name the moving object");
+    assert!((hit.t - 0.475).abs() < 0.02, "t={}", hit.t);
+    assert!(w.ray(start, end).is_some(), "ray must see the moving wall");
+
+    // Slide the wall far away: the sweep is now clear and the moving object still exists.
+    assert!(w.set_moving_transform(idx, [100.0, 0.0, 0.0], ID));
+    assert!(
+        w.sweep(start, end, half).is_none(),
+        "an unblocked sweep must pass after the wall moves away"
+    );
+    assert!(w.ray(start, end).is_none());
+    assert!(!w.overlaps_aabb([0.0, 0.0, 0.0], [0.1; 3]));
+    assert!(w.overlaps_aabb([100.0, 0.0, 0.0], [0.1; 3]));
+}
+
+#[test]
+fn a_door_rotating_open_clears_a_doorway() {
+    // Static wall in the x = 0 plane, y in [0,2], with a doorway gap for z in [-1, 1]; the
+    // door leaf is a dynamic box hinged at (0, 0, -1) that fills the gap when closed.
+    let mut entries: Vec<(Triangle, u32)> = Vec::new();
+    entries.extend(
+        quad(
+            [0.0, 0.0, -5.0],
+            [0.0, 2.0, -5.0],
+            [0.0, 2.0, -1.0],
+            [0.0, 0.0, -1.0],
+        )
+        .into_iter()
+        .map(|t| (t, 1)),
+    );
+    entries.extend(
+        quad(
+            [0.0, 0.0, 1.0],
+            [0.0, 2.0, 1.0],
+            [0.0, 2.0, 5.0],
+            [0.0, 0.0, 5.0],
+        )
+        .into_iter()
+        .map(|t| (t, 1)),
+    );
+    let mut w = CollisionWorld::new(entries);
+    let hinge = [0.0, 0.0, -1.0];
+    // Door leaf closed in world space: a box x in [-0.1,0.1], y in [0,2], z in [-1,1].
+    let leaf_world: Vec<Triangle> = box_tris([-0.1, 0.0, -1.0], [0.1, 2.0, 1.0], 9)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+    let idx = w.add_moving(MovingObject::from_world_triangles(leaf_world, 9, hinge, ID));
+
+    let start = [-3.0, 1.0, 0.0];
+    let end = [3.0, 1.0, 0.0];
+    let half = [0.05, 0.05, 0.3];
+    let hit = w
+        .sweep(start, end, half)
+        .expect("the closed door must block the doorway");
+    assert_eq!(
+        hit.source, 9,
+        "the door leaf hit must name the moving object"
+    );
+
+    // Rotate 90 degrees about the vertical (Y) axis: rows of R = [[0,0,1],[0,1,0],[-1,0,0]].
+    let r90: [Vec3; 3] = [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]];
+    w.set_moving_transform(idx, hinge, r90);
+    assert!(
+        w.sweep(start, end, half).is_none(),
+        "an open door must clear the doorway"
+    );
+    // The open leaf now lies along +x at z ~ -1, off the doorway line (z = 0).
+    assert!(w.overlaps_aabb([1.0, 1.0, -1.0], [0.3; 3]));
+    assert!(!w.overlaps_aabb([0.0, 1.0, 0.0], [0.05; 3]));
+}
+
+#[test]
+fn walking_into_a_moving_wall_is_blocked_and_clears_when_it_moves() {
+    // `walk_move` must consult the dynamic set through its internal `sweep_aabb`.
+    let mut w = CollisionWorld::new(floor_y(0.0).into_iter().map(|t| (t, 1)));
+    let idx = w.add_moving(MovingObject::from_world_triangles(
+        wall_x(0.5),
+        4,
+        [0.0; 3],
+        ID,
+    ));
+    let params = WalkParams {
+        max_step_height: 0.4,
+        ..Default::default()
+    };
+    let start = [0.0, 0.5, 0.0];
+    let blocked = walk_move(&w, start, [2.0, 0.0, 0.0], [0.1; 3], &params);
+    assert!(blocked.blocked, "the wall must block the walker");
+    assert!(
+        blocked.position[0] < 0.5,
+        "the walker stopped before the wall: {:?}",
+        blocked.position
+    );
+    w.set_moving_transform(idx, [50.0, 0.0, 0.0], ID);
+    let clear = walk_move(&w, start, [2.0, 0.0, 0.0], [0.1; 3], &params);
+    assert!(
+        clear.position[0] > 1.0,
+        "the walker must pass after the wall moves: {:?}",
+        clear.position
+    );
+}

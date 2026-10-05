@@ -63,6 +63,10 @@ pub struct RunConfig {
     pub anim_map: bool,
     /// Real navigation: decode the map's `ReachSpec` graph and install the provider.
     pub nav_map: bool,
+    /// Runtime-owned local URL (`<Map>?<options>`) returned by `LevelInfo.GetLocalURL`.
+    pub local_url: String,
+    /// Options tail of [`RunConfig::local_url`], passed to `GameInfo.InitGame`/`Login`.
+    pub url_options: String,
 }
 
 impl Default for RunConfig {
@@ -86,6 +90,8 @@ impl Default for RunConfig {
             anim_fixed: None,
             anim_map: false,
             nav_map: false,
+            local_url: String::new(),
+            url_options: String::new(),
         }
     }
 }
@@ -150,6 +156,9 @@ pub fn run_touch_chain_with_providers(
 ) -> Result<RunReport, String> {
     let mut vm = Vm::new(set, cfg.limits);
     vm.survey = cfg.survey;
+    // The runtime owns the single-player URL (`xiii-world::runtime`); install it before any
+    // level start so `LevelInfo.GetLocalURL` and `GameInfo.InitGame`/`Login` see it.
+    vm.set_local_url(cfg.local_url.clone(), cfg.url_options.clone());
     if let Some(provider) = map_physics {
         vm.set_physics(provider);
         vm.note(TraceKind::Note(
@@ -515,6 +524,7 @@ pub fn run_cmd(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     cfg.default_game = runtime::default_game_from_ini(&root);
+    (cfg.local_url, cfg.url_options) = runtime::single_player_url(&root, &map);
     if cfg.survey {
         eprintln!(
             "warning: --survey is diagnostic only: unimplemented natives are counted and \
