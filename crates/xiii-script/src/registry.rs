@@ -798,6 +798,15 @@ fn mul_vf(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOut
     val(Value::Vector([v[0] * s, v[1] * s, v[2] * s]))
 }
 
+/// `Object.Divide_VectorFloat` (214): componentwise `vector / float` (UE2
+/// `operator/(FVector, FLOAT)`). Division by zero yields IEEE infinities/NaN, as in UE2 (not
+/// silently clamped).
+fn div_vf(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let v = vector2(vm, a, 0)?;
+    let s = float(vm, a, 1)?;
+    val(Value::Vector([v[0] / s, v[1] / s, v[2] / s]))
+}
+
 /// `Object.EqualEqual_VectorVector` (217): exact componentwise equality (UE2 `FVector::operator==`).
 fn eq_vv(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let (x, y) = (vector2(vm, a, 0)?, vector2(vm, a, 1)?);
@@ -3149,6 +3158,12 @@ fn builtin_defs() -> Vec<NativeDef> {
             "native(212) final operator vector *(vector, float)",
             UE2_OP,
             mul_vf,
+        ),
+        def(
+            "Object.Divide_VectorFloat",
+            "native(214) final operator vector /(vector, float)",
+            UE2_OP,
+            div_vf,
         ),
         def(
             "Object.EqualEqual_VectorVector",

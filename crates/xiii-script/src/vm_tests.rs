@@ -502,7 +502,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 240);
+    assert_eq!(defs.len(), 241);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -5094,6 +5094,30 @@ fn campaign_operator_natives_match_ue2_semantics() {
             &mut a
         )),
         [0.0, 0.0, 0.0]
+    );
+
+    let mut a = [Value::Vector([2.0, 4.0, 6.0]), Value::Float(2.0)];
+    assert_eq!(
+        vec_result(call_native(
+            &mut vm,
+            "Object.Divide_VectorFloat",
+            o,
+            &[false, false],
+            &mut a
+        )),
+        [1.0, 2.0, 3.0]
+    );
+    // UE2 does not guard division by zero: IEEE infinity, not a silent clamp.
+    let mut a = [Value::Vector([1.0, 1.0, 1.0]), Value::Float(0.0)];
+    assert!(
+        vec_result(call_native(
+            &mut vm,
+            "Object.Divide_VectorFloat",
+            o,
+            &[false, false],
+            &mut a
+        ))[0]
+            .is_infinite()
     );
 
     let mut a = [
