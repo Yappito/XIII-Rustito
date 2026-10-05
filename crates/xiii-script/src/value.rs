@@ -14,6 +14,12 @@ pub enum ObjRef {
     Instance(ObjectId),
     /// A package object that is not instantiated (class, function, texture, ...).
     Static(GlobalRef),
+    /// An object in a package outside the loaded script set (e.g. a `Sound` in a `.uax`, a
+    /// `Texture` in a `.utx`). The VM interns the full object path and the class recorded in the
+    /// referencing package's import table; see [`crate::vm::Vm::external_object`]. Equality is by
+    /// path (the interning table deduplicates paths), and the value keeps the reference instead of
+    /// collapsing to `None` (the pre-item3i behaviour).
+    External(u32),
 }
 
 /// A script value. `Unsupported` holds values the loader could not convert (unknown struct
@@ -145,6 +151,7 @@ impl fmt::Display for Value {
             Value::Object(Some(ObjRef::Static(g))) => {
                 write!(f, "static#{}:{}", g.package, g.export)
             }
+            Value::Object(Some(ObjRef::External(i))) => write!(f, "external#{i}"),
             Value::NativeClass(n) => write!(f, "class'{n}'"),
             Value::Vector([x, y, z]) => write!(f, "vect({x:?},{y:?},{z:?})"),
             Value::Rotator([p, y, r]) => write!(f, "rot({p},{y},{r})"),

@@ -1274,13 +1274,29 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        // Item3i: the door key is no longer host-granted. The pawn walks onto the hut key
+        // through the game's own pickup chain (autopilot `goto` + jumps; approached from the
+        // key's open -Y side), then walks to `Porte6` and uses the carried key.
         let script = script::Script::parse(
-            "t=0.0 turn 2\nt=0.0 forward 1\nt=1.6 turn -45\nt=2.3 forward 0\nt=2.6 use\nt=3.6 use\nt=3.8 forward 1\n",
+            "t=0.00 teleport -491.8 -414.1 1265.0\n\
+             t=0.10 goto -491.84 -314.14\nt=0.30 jump\nt=0.80 jump\nt=1.30 jump\nt=1.80 jump\n\
+             t=2.30 jump\nt=2.80 forward 0\n\
+             t=3.20 teleport -742.1444 -808.429 1311.0449\n\
+             t=3.20 yaw 312.891\nt=3.20 turn 2\nt=3.20 forward 1\n\
+             t=4.80 turn -45\nt=5.50 forward 0\nt=5.80 use\nt=6.80 use\nt=7.00 forward 1\n\
+             t=8.00 forward 0\n",
         )
         .unwrap();
-        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 8.0)
+        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 9.0)
             .expect("run Plage01 door walk");
         let s = &outcome.session;
+        assert!(
+            s.inventory_items()
+                .iter()
+                .any(|(_, c)| c.eq_ignore_ascii_case("xidmaps.Plage01CahuteKey")),
+            "the carried key must come from the pickup chain, not a host grant: {:?}",
+            s.inventory_items()
+        );
         let door = s
             .mover_states()
             .into_iter()

@@ -865,7 +865,7 @@ fn all_actors(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<Nativ
     let base = match object(vm, a, 0)? {
         Some(ObjRef::Static(g)) => Some(g),
         None => None,
-        Some(ObjRef::Instance(_)) => {
+        Some(ObjRef::Instance(_)) | Some(ObjRef::External(_)) => {
             return Err(vm.err(VmErrorKind::Other(
                 "AllActors base class is an instance".into(),
             )));
@@ -891,7 +891,7 @@ fn colliding_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult
     let base = match object(vm, a, 0)? {
         Some(ObjRef::Static(g)) => Some(g),
         None => None,
-        Some(ObjRef::Instance(_)) => {
+        Some(ObjRef::Instance(_)) | Some(ObjRef::External(_)) => {
             return Err(vm.err(VmErrorKind::Other(
                 "CollidingActors base class is an instance".into(),
             )));
@@ -915,7 +915,7 @@ fn radius_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Na
     let base = match object(vm, a, 0)? {
         Some(ObjRef::Static(g)) => Some(g),
         None => None,
-        Some(ObjRef::Instance(_)) => {
+        Some(ObjRef::Instance(_)) | Some(ObjRef::External(_)) => {
             return Err(vm.err(VmErrorKind::Other(
                 "RadiusActors base class is an instance".into(),
             )));
@@ -1597,7 +1597,7 @@ fn actor_touching_actors(
     let base = match object(vm, a, 0)? {
         Some(ObjRef::Static(g)) => Some(g),
         None => None,
-        Some(ObjRef::Instance(_)) => {
+        Some(ObjRef::Instance(_)) | Some(ObjRef::External(_)) => {
             return Err(vm.err(VmErrorKind::Other(
                 "TouchingActors base class is an instance".into(),
             )));
@@ -2178,7 +2178,7 @@ fn dynamic_actors(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<N
     let base = match object(vm, a, 0)? {
         Some(ObjRef::Static(g)) => Some(g),
         None => None,
-        Some(ObjRef::Instance(_)) => {
+        Some(ObjRef::Instance(_)) | Some(ObjRef::External(_)) => {
             return Err(vm.err(VmErrorKind::Other(
                 "DynamicActors base class is an instance".into(),
             )));

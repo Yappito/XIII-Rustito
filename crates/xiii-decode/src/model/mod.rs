@@ -33,10 +33,20 @@
 //! `Visibility` (u64) and `LastRenderTime` (f32) are forced by the record size, but their
 //! semantics are **not** verified (Visibility is not itself a `NumZones`-bit bitmask).
 //!
-//! What follows the `Polys` reference (lightmaps, light bits, bounds, leaf hulls, leaves,
-//! lights, RootOutside/Linked and the large lightmap byte region) is **not** decoded and is
-//! reported as an explicit unsupported tail (`model.lightmaps_and_after`). Zone records do not
-//! have a uniform size, which is why earlier revisions stopped at `NumZones`.
+//! The tail after `Polys` was decoded from `UModel::Serialize` in `Engine.dll` (RVA 0x9C240)
+//! and cross-checked on the GOG corpus: `LightMap` (`TArray<FLightMapIndex>`), a second
+//! per-lightmap byte array, `Bounds` (`TArray<FBox>`, 25 B), `LeafHulls` (`TArray<i32>`),
+//! `Leaves` (`TArray<FConvexVolumeLeaf>`), `Lights` (`TArray<ref>`), `RootOutside`, `Linked`,
+//! `MoverLink` and the 32-byte `FBspVertexStream` plus its revision. For 6,396 of the 7,194
+//! Models the payload is consumed exactly to the byte. The remaining build variants (all
+//! seven `Engine.Model` brushes with a non-empty `LightMap` array in the map packages, plus a
+//! few others) use a different lightmap-record layout; those keep the decoded prefix and
+//! report the remainder as the explicit label `model.after_linked`.
+//!
+//! The lightmap texels themselves are **not** decoded: the `LightMap` array is empty in
+//! 7,192 of 7,194 Models and the meaning of `FLightMapIndex.DataOffset` relative to the
+//! texture data is not established. Zone records do not have a uniform size, which is why
+//! earlier revisions stopped at `NumZones`.
 //!
 //! `Polys` is decoded completely: `i32 Num, i32 Max`, then per polygon: compact vertex
 //! count, Base, Normal, TextureU, TextureV, vertices, u32 PolyFlags, compact Actor, compact
@@ -49,8 +59,8 @@ use std::fmt::Write as _;
 use xiii_package::{ObjectRef, Package, PropertyValue};
 
 use crate::common::{
-    DecodeError, DecodeErrorKind, DecodeResult, PayloadReader, PayloadReport, PrimitiveHeader,
-    read_properties,
+    BoundingBox, DecodeError, DecodeErrorKind, DecodeResult, PayloadReader, PayloadReport,
+    PrimitiveHeader, read_properties,
 };
 
 /// Class path of BSP models.
@@ -195,8 +205,67 @@ pub struct Model {
     pub zones: Vec<Zone>,
     /// `Polys` object reference stored after the zone records.
     pub polys: Option<ObjectRef>,
+    /// Per-surface lightmap indices (`FLightMapIndex`), decoded after `Polys`.
+    pub light_maps: Vec<LightMapIndex>,
+    /// Per-surface light bits, one byte per node reference (`TArray<u8>`).
+    pub light_bits: Vec<u8>,
+    /// Node bounds (`FBox`, 25 bytes each).
+    pub bounds: Vec<BoundingBox>,
+    /// `LeafHulls` (`TArray<i32>`).
+    pub leaf_hulls: Vec<i32>,
+    /// Per-leaf convex-volume records (`FConvexVolumeLeaf`).
+    pub leaves: Vec<ConvexVolumeLeaf>,
+    /// `Lights` actor references.
+    pub lights: Vec<ObjectRef>,
+    /// `RootOutside` flag serialized after `Lights`.
+    pub root_outside: i32,
+    /// `Linked` flag serialized after `Lights`.
+    pub linked: i32,
+    /// `MoverLink` (third i32 after `Lights`).
+    pub mover_link: i32,
+    /// BSP vertex stream (`TArray<FBspVertex>`, 32 bytes each): position, normal, two UV pairs.
+    pub vertex_stream: Vec<[f32; 8]>,
+    /// Revision i32 that follows the vertex stream.
+    pub vertex_stream_revision: i32,
     /// Byte accounting (with the unsupported tail).
     pub report: PayloadReport,
+}
+
+/// One `FLightMapIndex` entry (`TArray<FLightMapIndex>` after `Polys`).
+///
+/// The engine stores each entry as a fixed 178-byte record (verified on the 13 GOG Models with
+/// a non-empty array; see the task report). The field names follow the upstream `FLightMapIndex`
+/// (`DataOffset`, `PanX/Y/Z`, `UClamp`, `VClamp`, `UScale`, `VScale`, `LightActors`) plus the
+/// matrices and per-bitmap fields the XIII build serializes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LightMapIndex {
+    /// First i32 field (upstream `DataOffset`); meaning not established.
+    pub data_offset: i32,
+    /// Second i32 field (upstream `PanX`); meaning not established.
+    pub pan: f32,
+    /// First 4x4 matrix (world to lightmap), row-major.
+    pub matrix_a: [f32; 16],
+    /// Second 4x4 matrix, row-major.
+    pub matrix_b: [f32; 16],
+    /// Nine i32 fields (counts and the `UClamp`/`VClamp` group); one is always 0x01000000.
+    pub ints: [i32; 9],
+    /// Two bytes (0xac/0xad); value 1 and 0 in the inspected records.
+    pub unknown: [u8; 2],
+    /// Four trailing compact indices; meanings not established.
+    pub tail_indices: [i32; 4],
+}
+
+/// One `FConvexVolumeLeaf` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvexVolumeLeaf {
+    /// Zone index.
+    pub zone: i32,
+    /// Permeating flag.
+    pub permeating: i32,
+    /// Volumetric flag.
+    pub volumetric: i32,
+    /// Visible-zone bitmask.
+    pub visible_zones: u64,
 }
 
 /// Polygon from `Engine.Polys`.
@@ -267,17 +336,65 @@ fn ref_text(package: &Package, r: Option<ObjectRef>) -> String {
     }
 }
 
-/// Decodes a Model up to and including the `Polys` reference; the rest (lightmaps, bounds,
-/// leaves, and the large lightmap byte region) is reported as an unsupported tail.
+/// Decodes a Model including the lightmap/lights tail; any bytes after `Linked` that the
+/// serializer writes for this build but whose layout is not established remain an explicit,
+/// labelled unsupported tail.
 pub fn decode_model(package: &Package, data: &[u8], export: usize) -> DecodeResult<Model> {
     let props = read_properties(package, data, export, MODEL_CLASS)?;
     let ctx = |e: DecodeError| e.in_export(package, export);
     let mut r = PayloadReader::after_properties(data, &props).map_err(ctx)?;
-    let m = decode_model_body(package, &mut r).map_err(ctx)?;
+    let mut m = decode_model_body(package, &mut r).map_err(ctx)?;
+    // The tail is decoded best-effort: a build variant whose element layout differs keeps the
+    // decoded prefix and reports the remainder as a labelled unsupported tail rather than
+    // failing the whole export.
+    let tail_start = r.pos();
+    match decode_model_tail(package, &mut r) {
+        Ok(t) => {
+            m.light_maps = t.light_maps;
+            m.light_bits = t.light_bits;
+            m.bounds = t.bounds;
+            m.leaf_hulls = t.leaf_hulls;
+            m.leaves = t.leaves;
+            m.lights = t.lights;
+            m.root_outside = t.root_outside;
+            m.linked = t.linked;
+            m.mover_link = t.mover_link;
+            m.vertex_stream = t.vertex_stream;
+            m.vertex_stream_revision = t.vertex_stream_revision;
+        }
+        // A build variant whose tail layout differs surfaces as a count that does not fit, an
+        // out-of-range reference, or a compact index that overflows (`BadCount`/`Invalid`/
+        // package `CompactIndexOverflow`); those keep the decoded prefix and become the
+        // labelled unsupported tail. Any other package failure (e.g. a genuine EOF) is a real
+        // error and is propagated rather than hidden.
+        Err(e) if is_tail_variant(&e) => {
+            r.seek(tail_start).map_err(ctx)?;
+        }
+        Err(e) => return Err(ctx(e)),
+    }
     let report = r
-        .finish_with_unsupported_tail("model.lightmaps_and_after", props.block.span.end)
+        .finish_with_unsupported_tail("model.after_linked", props.block.span.end)
         .map_err(ctx)?;
     Ok(Model { report, ..m })
+}
+
+/// True when a tail error indicates a build variant whose element layout is not established
+/// (a count that cannot fit, an out-of-range reference, an overflowing compact index, or a
+/// tail that runs past the export's declared serialized size). The caller keeps the decoded
+/// prefix and reports the remainder as an explicit labelled unsupported tail, so no bytes are
+/// silently dropped. Other package failures (e.g. a malformed compact index stream at a known
+/// offset) are propagated.
+fn is_tail_variant(e: &DecodeError) -> bool {
+    match &e.kind {
+        DecodeErrorKind::BadCount { .. } | DecodeErrorKind::Invalid(_) => true,
+        DecodeErrorKind::Package(p) => matches!(
+            p.kind,
+            xiii_package::ErrorKind::CompactIndexOverflow
+                | xiii_package::ErrorKind::CompactIndexOutOfRange { .. }
+                | xiii_package::ErrorKind::UnexpectedEof { .. }
+        ),
+        _ => false,
+    }
 }
 
 fn decode_model_body(package: &Package, r: &mut PayloadReader<'_>) -> DecodeResult<Model> {
@@ -430,12 +547,168 @@ fn decode_model_body(package: &Package, r: &mut PayloadReader<'_>) -> DecodeResu
         reserved,
         zones,
         polys,
+        light_maps: Vec::new(),
+        light_bits: Vec::new(),
+        bounds: Vec::new(),
+        leaf_hulls: Vec::new(),
+        leaves: Vec::new(),
+        lights: Vec::new(),
+        root_outside: 0,
+        linked: 0,
+        mover_link: 0,
+        vertex_stream: Vec::new(),
+        vertex_stream_revision: 0,
         report: PayloadReport {
             payload: r.payload(),
             properties_end: 0,
             unknown: Vec::new(),
             unsupported_tail: None,
         },
+    })
+}
+
+/// Reads the `FLightMapIndex` array that follows `Polys`.
+///
+/// Each record is a fixed 178 bytes in this build (licensee 58, package version 100): an i32
+/// `DataOffset`, three `f32` (`Pan`), two 4x4 `f32` matrices, two unknown bytes, nine `i32`,
+/// and four trailing compact indices. The size is verified byte-exactly on all 13 GOG Models
+/// with a non-empty array.
+fn decode_light_maps(r: &mut PayloadReader<'_>) -> DecodeResult<Vec<LightMapIndex>> {
+    let n = r
+        .count("light_maps", 1)
+        .map_err(|e| e.in_field("light_maps"))?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let data_offset = r.i32().map_err(|e| e.in_field("light_maps.data_offset"))?;
+        let pan = r.f32().map_err(|e| e.in_field("light_maps.pan"))?;
+        let mut matrix_a = [0.0f32; 16];
+        for v in &mut matrix_a {
+            *v = r.f32().map_err(|e| e.in_field("light_maps.matrix_a"))?;
+        }
+        let mut matrix_b = [0.0f32; 16];
+        for v in &mut matrix_b {
+            *v = r.f32().map_err(|e| e.in_field("light_maps.matrix_b"))?;
+        }
+        let mut ints = [0i32; 9];
+        for v in &mut ints {
+            *v = r.i32().map_err(|e| e.in_field("light_maps.ints"))?;
+        }
+        let unknown = [r.u8()?, r.u8()?];
+        let mut tail_indices = [0i32; 4];
+        for v in &mut tail_indices {
+            *v = r
+                .compact()
+                .map_err(|e| e.in_field("light_maps.tail_indices"))?;
+        }
+        out.push(LightMapIndex {
+            data_offset,
+            pan,
+            matrix_a,
+            matrix_b,
+            ints,
+            unknown,
+            tail_indices,
+        });
+    }
+    Ok(out)
+}
+
+/// Decoded tail fields (after `Polys`).
+struct ModelTail {
+    light_maps: Vec<LightMapIndex>,
+    light_bits: Vec<u8>,
+    bounds: Vec<BoundingBox>,
+    leaf_hulls: Vec<i32>,
+    leaves: Vec<ConvexVolumeLeaf>,
+    lights: Vec<ObjectRef>,
+    root_outside: i32,
+    linked: i32,
+    mover_link: i32,
+    vertex_stream: Vec<[f32; 8]>,
+    vertex_stream_revision: i32,
+}
+
+/// Reads the tail after `Polys`: `LightMap`, `LightBits`, `Bounds`, `LeafHulls`, `Leaves`,
+/// `Lights`, `RootOutside`, `Linked`, `MoverLink` and the `FBspVertexStream`. Field order and
+/// element sizes are taken from `UModel::Serialize` in `Engine.dll` (RVA 0x9C240) and verified
+/// against the GOG Models; see the report. `RootOutside`/`Linked` and the vertex stream are
+/// proven by the 6,396 Models whose whole payload is consumed exactly.
+fn decode_model_tail(package: &Package, r: &mut PayloadReader<'_>) -> DecodeResult<ModelTail> {
+    let light_maps = decode_light_maps(r)?;
+    // Second array after LightMap (edi+0xbc). Its per-element record is 15 bytes for this
+    // build (two raw bytes, one compact index, then three i32); it is empty in the 6,396
+    // Models whose tail decodes end-to-end. Kept as raw bytes because the meaning is not
+    // established.
+    let light_bits = {
+        let n = r
+            .count("light_bits", 1)
+            .map_err(|e| e.in_field("light_bits"))?;
+        r.bytes(n).map_err(|e| e.in_field("light_bits"))?.to_vec()
+    };
+    let bounds = r.array("bounds", 25, |r| r.bbox())?;
+    let leaf_hulls = r.array("leaf_hulls", 4, |r| r.i32())?;
+    let leaves = {
+        let n = r.count("leaves", 1).map_err(|e| e.in_field("leaves"))?;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(ConvexVolumeLeaf {
+                zone: r.compact().map_err(|e| e.in_field("leaves.zone"))?,
+                permeating: r.compact().map_err(|e| e.in_field("leaves.permeating"))?,
+                volumetric: r.compact().map_err(|e| e.in_field("leaves.volumetric"))?,
+                visible_zones: r.u64().map_err(|e| e.in_field("leaves.visible_zones"))?,
+            });
+        }
+        out
+    };
+    let lights = {
+        let n = r.count("lights", 1).map_err(|e| e.in_field("lights"))?;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(r.object_ref(package).map_err(|e| e.in_field("lights"))?);
+        }
+        out
+    };
+    let root_outside = r.i32().map_err(|e| e.in_field("root_outside"))?;
+    let linked = r.i32().map_err(|e| e.in_field("linked"))?;
+    let mover_link = r.i32().map_err(|e| e.in_field("mover_link"))?;
+    // FBspVertexStream: `TArray<FBspVertex>` (32 bytes each) then a revision i32.
+    let vertex_stream = {
+        let n = r
+            .count("vertex_stream", 32)
+            .map_err(|e| e.in_field("vertex_stream"))?;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut v = [0.0f32; 8];
+            for f in &mut v {
+                *f = r.f32().map_err(|e| e.in_field("vertex_stream"))?;
+            }
+            out.push(v);
+        }
+        out
+    };
+    let vertex_stream_revision = r.i32().map_err(|e| e.in_field("vertex_stream_revision"))?;
+    // A final `TArray` count closes the payload; it is 0 on the models whose payload is
+    // consumed exactly. It is consumed when zero; a non-zero or unreadable count is left in
+    // place for the caller to report as an explicit unsupported tail (this build variant).
+    let before_final = r.pos();
+    match r.compact() {
+        Ok(0) => {}
+        _ => r
+            .seek(before_final)
+            .map_err(|e| e.in_field("vertex_stream_revision"))?,
+    }
+    Ok(ModelTail {
+        light_maps,
+        light_bits,
+        bounds,
+        leaf_hulls,
+        leaves,
+        lights,
+        root_outside,
+        linked,
+        mover_link,
+        vertex_stream,
+        vertex_stream_revision,
     })
 }
 
@@ -637,6 +910,13 @@ impl Model {
             ("zones", self.zones.len() as u64),
             ("zone_actors", zone_actors),
             ("polys_ref", u64::from(self.polys.is_some())),
+            ("light_maps", self.light_maps.len() as u64),
+            ("light_bits_bytes", self.light_bits.len() as u64),
+            ("bounds", self.bounds.len() as u64),
+            ("leaf_hulls", self.leaf_hulls.len() as u64),
+            ("leaves", self.leaves.len() as u64),
+            ("lights", self.lights.len() as u64),
+            ("vertex_stream", self.vertex_stream.len() as u64),
             ("unsupported_tail_bytes", tail),
         ]
     }
@@ -818,6 +1098,23 @@ pub fn summary_text(package: &Package, export: usize, m: &Model) -> String {
     for (k, v) in &mats {
         let _ = writeln!(out, "    {v:>5} {k}");
     }
+    let _ = writeln!(
+        out,
+        "  lightmaps {} lightbits {} bounds {} leafhulls {} leaves {} lights {} vertexstream {} (rev {})",
+        m.light_maps.len(),
+        m.light_bits.len(),
+        m.bounds.len(),
+        m.leaf_hulls.len(),
+        m.leaves.len(),
+        m.lights.len(),
+        m.vertex_stream.len(),
+        m.vertex_stream_revision
+    );
+    let _ = writeln!(
+        out,
+        "  RootOutside {} Linked {} MoverLink {}",
+        m.root_outside, m.linked, m.mover_link
+    );
     let _ = writeln!(
         out,
         "  reserved {} polys {} zones:",
@@ -1005,8 +1302,9 @@ mod tests {
         assert_eq!(m.polygons()[0].vertices.len(), 3);
         assert_eq!(m.zones.len(), 0);
         assert_eq!(m.polys, None);
+        // The 3 bogus bytes do not form a decodable tail, so they stay an explicit tail.
         let (label, span) = m.report.unsupported_tail.unwrap();
-        assert_eq!((label, span.len()), ("model.lightmaps_and_after", 3));
+        assert_eq!((label, span.len()), ("model.after_linked", 3));
         // Node polygon is (0,0,0),(1,0,0),(0,1,0) with plane +Z: numerically along the plane.
         assert_eq!(m.winding_statistics(), (0, 1, 0));
         // A vert pool outside the verts array is rejected.
@@ -1015,6 +1313,57 @@ mod tests {
         let bytes = b.build();
         let p = parse(&bytes);
         assert!(decode_model(&p, &bytes, i).is_err());
+    }
+
+    /// Tail bytes after the `Polys` reference: empty LightMap/LightBits/Bounds/LeafHulls/
+    /// Leaves/Lights, RootOutside=0, Linked=1, MoverLink=0, one 32-byte vertex, revision 7.
+    fn model_tail_payload() -> Vec<u8> {
+        let mut b = Bytes::default().c(0).c(0).c(0).c(0).c(0).c(0);
+        b = b.i32(0).i32(1).i32(0);
+        b = b.c(1);
+        for v in 1..=8 {
+            b = b.f32(v as f32);
+        }
+        b = b.i32(7);
+        b.0
+    }
+
+    #[test]
+    fn synthetic_model_tail_decodes_exactly() {
+        let mut b = Builder::new();
+        let i = b.export("Model", "M", model_payload(0, &model_tail_payload()));
+        let bytes = b.build();
+        let p = parse(&bytes);
+        let m = decode_model(&p, &bytes, i).unwrap();
+        assert!(
+            m.report.unsupported_tail.is_none(),
+            "tail must consume exactly"
+        );
+        assert_eq!(m.root_outside, 0);
+        assert_eq!(m.linked, 1);
+        assert_eq!(m.mover_link, 0);
+        assert_eq!(m.vertex_stream.len(), 1);
+        assert_eq!(m.vertex_stream[0], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(m.vertex_stream_revision, 7);
+    }
+
+    #[test]
+    fn synthetic_model_tail_variant_falls_back_to_labelled_tail() {
+        // A Bounds count that cannot fit (0x7f = 127 elements x 25 B) must not fail the whole
+        // export: the prefix is kept and the remainder is an explicit unsupported tail.
+        let mut tail = vec![0u8]; // empty LightMap
+        tail.push(0); // empty LightBits
+        tail.push(0x7f); // 127 Bounds, far more than the remaining bytes
+        let mut b = Builder::new();
+        let i = b.export("Model", "M", model_payload(0, &tail));
+        let bytes = b.build();
+        let p = parse(&bytes);
+        let m = decode_model(&p, &bytes, i).unwrap();
+        assert!(m.vertex_stream.is_empty());
+        let (label, _) = m.report.unsupported_tail.unwrap();
+        assert_eq!(label, "model.after_linked");
+        // No bytes are dropped: the tail starts right after the Polys reference.
+        assert_eq!(m.report.unsupported_tail.unwrap().1.len(), tail.len());
     }
 
     #[test]
@@ -1196,6 +1545,130 @@ mod tests {
         b = b.v3([0.0; 3]).v3([1.0, 0.0, 0.0]).v3([0.0, 1.0, 0.0]);
         b = b.i32(0x1000).c(0).c(0).c(0).c(0).c(-1).raw(extra);
         b.0
+    }
+
+    #[test]
+    fn local_corpus_model_tail() {
+        let Some(dir) = std::env::var_os("XIII_GOG_DIR") else {
+            println!("SKIPPED: set XIII_GOG_DIR to run the model tail corpus test");
+            return;
+        };
+        let root = std::path::Path::new(&dir);
+        let mut files = Vec::new();
+        collect_tagged(root, &mut files);
+        files.sort();
+        let mut models = 0u64;
+        let mut with_lm = 0u64;
+        let mut lm_total = 0u64;
+        let mut leaves_total = 0u64;
+        let mut bounds_total = 0u64;
+        let mut lights_total = 0u64;
+        let mut vertex_total = 0u64;
+        for (rel, path) in &files {
+            let data = std::fs::read(path).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            let p = Package::parse(&data, &xiii_package::Limits::default())
+                .unwrap_or_else(|e| panic!("{rel}: {e}"));
+            for i in 0..p.exports().len() {
+                if p.exports()[i].serial_size == 0 {
+                    continue;
+                }
+                let Some(class) = p.export_class_path(i) else {
+                    continue;
+                };
+                if !class.eq_ignore_ascii_case(MODEL_CLASS) {
+                    continue;
+                }
+                let m = decode_model(&p, &data, i).unwrap_or_else(|e| panic!("{rel}: {e}"));
+                models += 1;
+                lm_total += m.light_maps.len() as u64;
+                leaves_total += m.leaves.len() as u64;
+                bounds_total += m.bounds.len() as u64;
+                lights_total += m.lights.len() as u64;
+                vertex_total += m.vertex_stream.len() as u64;
+                if !m.light_maps.is_empty() {
+                    with_lm += 1;
+                }
+                // Invariant: when the tail decoded (the model has at least one LightMap entry
+                // or no surface references one), a surface's iLightMap indexes the LightMaps.
+                // The 7 build-variant Models whose tail does not decode keep an empty array.
+                if !m.light_maps.is_empty() {
+                    for s in &m.surfs {
+                        if s.light_map >= 0 {
+                            assert!(
+                                (s.light_map as usize) < m.light_maps.len(),
+                                "{rel}: surf iLightMap {} >= {}",
+                                s.light_map,
+                                m.light_maps.len()
+                            );
+                        }
+                    }
+                }
+
+                // Invariant: leaf count equals max node leaf + 1 (Plage00/Plage01 measured 141
+                // = 140 + 1, 110 = 109 + 1). Only checked when the whole payload is consumed
+                // exactly (no unsupported tail), so a variant tail cannot trigger it.
+                if m.report.unsupported_tail.is_none()
+                    && let (Some(max_leaf), false) = (
+                        m.nodes.iter().flat_map(|n| n.leaf).max(),
+                        m.leaves.is_empty(),
+                    )
+                {
+                    assert_eq!(
+                        m.leaves.len(),
+                        (max_leaf + 1) as usize,
+                        "{rel}: leaves vs max leaf"
+                    );
+                }
+                // Invariants below only hold for the fully-consumed exports; variant tails are
+                // excluded so a misaligned fallback cannot trigger a false invariant failure.
+                if m.report.unsupported_tail.is_none() {
+                    // Every node collision bound indexes LeafHulls (upstream
+                    // `BspNode::GetCollisionBox` reads `LeafHulls[CollisionBound]`).
+                    if !m.leaf_hulls.is_empty() {
+                        for n in &m.nodes {
+                            if n.collision_bound >= 0 {
+                                assert!(
+                                    (n.collision_bound as usize) < m.leaf_hulls.len(),
+                                    "{rel}: node collision bound {} >= {}",
+                                    n.collision_bound,
+                                    m.leaf_hulls.len()
+                                );
+                            }
+                        }
+                    }
+                    // Every node render bound indexes Bounds.
+                    if !m.bounds.is_empty() {
+                        for n in &m.nodes {
+                            if n.render_bound >= 0 {
+                                assert!(
+                                    (n.render_bound as usize) < m.bounds.len(),
+                                    "{rel}: node render bound {} >= {}",
+                                    n.render_bound,
+                                    m.bounds.len()
+                                );
+                            }
+                        }
+                    }
+                }
+                // Invariant: every reference in the Lights array is either null or an export
+                // of this package (no imports in the corpus).
+                if m.report.unsupported_tail.is_none() {
+                    for l in &m.lights {
+                        assert!(
+                            matches!(l, ObjectRef::Null | ObjectRef::Export(_)),
+                            "{rel}: light reference {l:?} is not null or an export"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(models, 7194, "model count");
+        assert_eq!(with_lm, 8, "models with a decoded non-empty LightMap");
+        assert_eq!(lm_total, 235, "lightmap index count");
+        assert_eq!(leaves_total, 4951, "convex volume leaf count");
+        assert_eq!(bounds_total, 14866, "bounds count");
+        assert_eq!(lights_total, 7023, "light references");
+        assert_eq!(vertex_total, 119639, "vertex stream count");
     }
 
     #[test]

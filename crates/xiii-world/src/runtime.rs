@@ -12,6 +12,7 @@
 //! Nothing here opens a window or depends on Bevy. Installation files are read only.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -275,7 +276,44 @@ pub fn load_with_map(root: &Path, map: &str) -> Result<(ScriptSet, usize), Strin
     let pkg = ScriptPackage::load(map, data, &ScriptLimits::default(), &Limits::default())
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let idx = set.add(pkg);
+    register_external_packages(&mut set, root);
     Ok((set, idx))
+}
+
+/// Registers every non-script package imported by the loaded set as an external package, so an
+/// object reference into it (a `Sound` in a `.uax`, a `Texture` in a `.utx`, ...) can be verified
+/// and its class recorded. Best-effort:
+///
+/// - a package the installation does not contain is recorded as missing, so a reference into it
+///   is an explicit unresolved error (never `None`);
+/// - a package that resolves but fails to parse is left unknown (the VM keeps a lazy external
+///   object with the class from the referencing import table).
+///
+/// This never changes the loaded script packages and never fails.
+pub fn register_external_packages(set: &mut ScriptSet, root: &Path) {
+    let mut roots: BTreeSet<String> = BTreeSet::new();
+    for p in &set.packages {
+        for name in p.package.imported_packages() {
+            roots.insert(name.to_owned());
+        }
+    }
+    let Ok(install) = Installation::open(root, &OpenOptions::default()) else {
+        return;
+    };
+    for name in roots {
+        if set.package_index(&name).is_some() || set.has_external_package(&name) {
+            continue;
+        }
+        match install.resolve_package(&name) {
+            Ok(resolved) => {
+                if let Ok(data) = std::fs::read(resolved.path()) {
+                    let _ = set.add_external_package(&name, &data, &Limits::default());
+                }
+            }
+            Err(xiii_install::ResolveError::NotFound { .. }) => set.add_missing_external(&name),
+            Err(_) => {}
+        }
+    }
 }
 
 /// One animation lookup recorded for the report.
@@ -357,6 +395,11 @@ pub fn build_map_providers(
     let mut cache = PackageCache::open(root)?;
     let physics = if spec.physics {
         let scene = import_map(&mut cache, map)?;
+        // Line/ray queries include the static-mesh actors' collision (`WorldScene::line_collision`).
+        // `execFastTrace` sets trace flags `0x286` (measured, Engine.dll `?execFastTrace@AActor`
+        // RVA 0xE54F0) and calls `ULevel::SingleLineCheck` (RVA 0x8B680), which tests `TRACE_Level`
+        // (0x4) and the actors' world-geometry flags; excluding static meshes was **not** proven
+        // and would let every zero-extent trace pass through static-mesh walls.
         Some(Box::new(WorldPhysicsAdapter::from_scene(&scene)) as Box<dyn WorldPhysics>)
     } else {
         None

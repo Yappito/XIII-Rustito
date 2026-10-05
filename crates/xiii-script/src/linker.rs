@@ -71,6 +71,21 @@ impl ScriptPackage {
         self.paths.get(&path.to_ascii_lowercase()).copied()
     }
 
+    /// Class path (`Package.Class`) recorded for an import in this package's import table. This
+    /// is the class of the referenced object as the referencing package declares it (e.g.
+    /// `Engine.Sound` for a sound-object import in `xiii.u`). `None` for a non-import reference.
+    pub fn import_class_path(&self, r: ObjectRef) -> Option<String> {
+        let ObjectRef::Import(i) = r else {
+            return None;
+        };
+        let imp = self.package.imports().get(i as usize)?;
+        Some(format!(
+            "{}.{}",
+            self.package.name(imp.class_package),
+            self.package.name(imp.class_name)
+        ))
+    }
+
     /// Display path of a reference: exports as `Package.Path`, imports by their full path.
     pub fn ref_path(&self, r: ObjectRef) -> String {
         match r {
@@ -109,6 +124,31 @@ impl ScriptPackage {
     }
 }
 
+/// A package outside the loaded script set (e.g. a `.uax` sound package, `.utx` texture package)
+/// that the runtime registered so references into it can be verified and their class recorded.
+#[derive(Debug)]
+pub struct ExternalPackage {
+    /// Parsed tables when the installation contains and parses the package; `None` when the
+    /// import names a package the installation does not contain (an explicit unresolved error).
+    pub package: Option<Package>,
+    /// Lowercase object path -> export index, for the lazy verification lookup.
+    paths: HashMap<String, u32>,
+}
+
+/// Result of lazily resolving a `Package.Object.Path` reference into an external package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalLookup {
+    /// The package was not registered; the VM cannot verify the reference (it keeps the path as a
+    /// lazy external object).
+    Unknown,
+    /// Registered, but the installation has no such package.
+    MissingPackage,
+    /// Registered and the package has no such export.
+    MissingExport,
+    /// Registered and the export exists; its class path.
+    Found(String),
+}
+
 /// Global reference: package index in the set plus export index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GlobalRef {
@@ -125,6 +165,8 @@ pub struct ScriptSet {
     pub packages: Vec<ScriptPackage>,
     by_name: HashMap<String, usize>,
     natives: BTreeMap<u16, Vec<GlobalRef>>,
+    /// Non-script packages registered for external-reference verification (lowercase root name).
+    externals: HashMap<String, ExternalPackage>,
 }
 
 impl ScriptSet {
@@ -167,6 +209,72 @@ impl ScriptSet {
     /// All native indices with their functions.
     pub fn native_table(&self) -> &BTreeMap<u16, Vec<GlobalRef>> {
         &self.natives
+    }
+
+    /// Registers a non-script package (`.uax`, `.utx`, `.usx`, ...) from its bytes so object
+    /// references into it can be verified and their class recorded. Table-level parse failures
+    /// are returned; the caller decides whether that is fatal (the runtime keeps them
+    /// non-fatal and records the package as missing).
+    pub fn add_external_package(
+        &mut self,
+        name: &str,
+        data: &[u8],
+        limits: &Limits,
+    ) -> Result<(), PackageError> {
+        let package = Package::parse(data, limits)?;
+        let mut paths = HashMap::new();
+        for i in 0..package.exports().len() {
+            if let Some(p) = package.object_path(ObjectRef::Export(i as u32)) {
+                paths.entry(p.to_ascii_lowercase()).or_insert(i as u32);
+            }
+        }
+        self.externals.insert(
+            name.to_ascii_lowercase(),
+            ExternalPackage {
+                package: Some(package),
+                paths,
+            },
+        );
+        Ok(())
+    }
+
+    /// Records that an import references a package the installation does not contain, so a
+    /// reference into it is an explicit unresolved error (never `None`).
+    pub fn add_missing_external(&mut self, name: &str) {
+        self.externals
+            .entry(name.to_ascii_lowercase())
+            .or_insert(ExternalPackage {
+                package: None,
+                paths: HashMap::new(),
+            });
+    }
+
+    /// True when `name` (a package root) has been registered as external or missing.
+    pub fn has_external_package(&self, name: &str) -> bool {
+        self.externals.contains_key(&name.to_ascii_lowercase())
+    }
+
+    /// Lazily resolves a `Package.Object.Path` reference against the registered external
+    /// packages. `Unknown` when the package was never registered.
+    pub fn external_lookup(&self, path: &str) -> ExternalLookup {
+        let Some((root, object)) = path.split_once('.') else {
+            return ExternalLookup::Unknown;
+        };
+        let Some(entry) = self.externals.get(&root.to_ascii_lowercase()) else {
+            return ExternalLookup::Unknown;
+        };
+        let Some(package) = &entry.package else {
+            return ExternalLookup::MissingPackage;
+        };
+        match entry.paths.get(&object.to_ascii_lowercase()) {
+            Some(&export) => ExternalLookup::Found(
+                package
+                    .export_class_path(export as usize)
+                    .unwrap_or("?")
+                    .to_owned(),
+            ),
+            None => ExternalLookup::MissingExport,
+        }
     }
 
     /// Resolves a reference made inside package `from` to the export that defines it.

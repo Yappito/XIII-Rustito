@@ -69,9 +69,6 @@ pub struct Session {
     pub dispatcher: Option<ObjectId>,
     /// Fixed steps run.
     pub tick_count: u64,
-    /// Key inventory items the host spawned from touched `KeyPicks` actors (host shortcut; see
-    /// [`Session::grant_touched_key`]).
-    key_items: Vec<ObjectId>,
 }
 
 /// Outcome of a host use action on a mover/door.
@@ -289,7 +286,6 @@ impl Session {
             moved: Vec::new(),
             dispatcher,
             tick_count: 0,
-            key_items: Vec::new(),
         };
         session.suspended.dedup();
         session.drain_events();
@@ -439,6 +435,39 @@ impl Session {
         self.vm.vector_prop(self.player, "Location")
     }
 
+    /// Live item in `id`'s `Inventory` chain, if the property is an object reference.
+    fn inventory_head(&self, id: ObjectId) -> Option<ObjectId> {
+        match self.vm.get_property(id, "Inventory") {
+            Some(Value::Object(Some(ObjRef::Instance(i))))
+                if self.vm.objects.get(*i as usize).is_some_and(|o| !o.deleted) =>
+            {
+                Some(*i)
+            }
+            _ => None,
+        }
+    }
+
+    /// `(item name, class path)` of every item in the player pawn's `Inventory` chain
+    /// (`Inventory` links), in chain order. This reads the game's own inventory state, not a host
+    /// copy: the chain is built by `Pawn.AddInventory` from the real pickup flow. Used by the
+    /// opt-in corpus tests and the diagnostic report.
+    #[allow(dead_code)]
+    pub fn inventory_items(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut cur = self.inventory_head(self.player);
+        let mut guard = 0;
+        while let Some(id) = cur {
+            guard += 1;
+            if guard > 256 {
+                break;
+            }
+            let o = &self.vm.objects[id as usize];
+            out.push((o.name.clone(), self.vm.set().path(o.class)));
+            cur = self.inventory_head(id);
+        }
+        out
+    }
+
     /// Current player `Rotation` (Unreal rotator units), if the pawn has one.
     pub fn player_rotation(&self) -> Option<[i32; 3]> {
         match self.vm.get_property(self.player, "Rotation") {
@@ -484,79 +513,52 @@ impl Session {
         }
     }
 
-    /// True when the player has touched a live actor whose name contains `needle`
-    /// (case-insensitive). Recorded from the VM's own `Touch` updates.
-    pub fn player_touched(&self, needle: &str) -> bool {
-        let needle = needle.to_ascii_lowercase();
-        self.touches
-            .iter()
-            .any(|(_, a)| a.to_ascii_lowercase().contains(&needle))
-    }
-
-    /// Spawns (once) the inventory item carried by a `KeyPicks` actor the player has touched and
-    /// returns it. **Host shortcut**: the full `Pickup.Touch` -> `GiveTo` -> `Keys.Activate`
-    /// inventory flow is not implemented; the host spawns the pickup's own `InventoryType` (its
-    /// class default) and hands it to the door's own `Trigger`, so the door still validates the
-    /// key against its `UnlockItemCode`/`UnLockItemName`.
-    pub fn grant_touched_key(&mut self) -> Option<ObjectId> {
-        self.key_items
-            .retain(|k| self.vm.objects.get(*k as usize).is_some_and(|o| !o.deleted));
-        if let Some(&k) = self.key_items.first() {
-            return Some(k);
-        }
-        let mut class = None;
-        for (i, o) in self.vm.objects.iter().enumerate() {
-            if !o.is_actor || o.deleted || !self.vm.is_a(i as ObjectId, "keypicks") {
-                continue;
-            }
-            if !self.player_touched(&o.name) {
-                continue;
-            }
-            if let Some(Value::Object(Some(ObjRef::Static(g)))) =
-                self.vm.get_property(i as ObjectId, "InventoryType")
-            {
-                class = Some(*g);
+    /// The key item the player carries that unlocks `door`, found by walking the pawn's own
+    /// `Inventory` chain (built by `Pawn.AddInventory` from the real `Pickup.Touch` flow) and
+    /// matching the door's `UnlockItemCode`/`UnLockItemName` against the item's `KeyCodeName`/
+    /// `ItemName`. `None` when the player carries no matching key.
+    pub fn carried_key_for(&self, door: ObjectId) -> Option<ObjectId> {
+        let code = self.string_prop(door, "UnlockItemCode");
+        let name = self.string_prop(door, "UnLockItemName");
+        let mut cur = self.inventory_head(self.player);
+        let mut guard = 0;
+        while let Some(id) = cur {
+            guard += 1;
+            if guard > 256 {
                 break;
             }
+            if self.vm.is_a(id, "keys") {
+                let key_code = self.string_prop(id, "KeyCodeName");
+                let item_name = self.string_prop(id, "ItemName");
+                let code_match = code
+                    .as_deref()
+                    .zip(key_code.as_deref())
+                    .is_some_and(|(c, k)| c.eq_ignore_ascii_case(k));
+                let name_match = name
+                    .as_deref()
+                    .zip(item_name.as_deref())
+                    .is_some_and(|(n, i)| n.eq_ignore_ascii_case(i));
+                if code_match || name_match {
+                    return Some(id);
+                }
+            }
+            cur = self.inventory_head(id);
         }
-        let class = class?;
-        let id = self.vm.spawn(class, "HeldKey(play)").ok()?;
-        self.key_items.push(id);
-        Some(id)
+        None
     }
 
-    /// Host shortcut for a locked door when the key was not carried: spawns the `InventoryType`
-    /// class of the first live `KeyPicks` actor in the level and returns it, printing a clear
-    /// notice. **Deviation**: the `Pickup.Touch` -> `GiveTo` -> `Keys.Activate` inventory chain
-    /// needs natives that are out of this task's scope; the door still validates the key against
-    /// its own `UnlockItemCode`/`UnLockItemName`, so the unlock state machine is the game's.
-    fn grant_level_key(&mut self) -> Option<ObjectId> {
-        let mut class = None;
-        for (i, o) in self.vm.objects.iter().enumerate() {
-            if !o.is_actor || o.deleted || !self.vm.is_a(i as ObjectId, "keypicks") {
-                continue;
-            }
-            if let Some(Value::Object(Some(ObjRef::Static(g)))) =
-                self.vm.get_property(i as ObjectId, "InventoryType")
-            {
-                println!(
-                    "[play] host shortcut: granting key {} for a locked door \
-                     (Pickup/GiveTo inventory chain not implemented)",
-                    o.name
-                );
-                class = Some(*g);
-                break;
-            }
+    /// `string`/`name` property value as text (case preserved; names are case-insensitive).
+    fn string_prop(&self, id: ObjectId, name: &str) -> Option<String> {
+        match self.vm.get_property(id, name) {
+            Some(Value::Str(s)) | Some(Value::Name(s)) => Some(s.clone()),
+            _ => None,
         }
-        let class = class?;
-        let id = self.vm.spawn(class, "HeldKey(play)").ok()?;
-        self.key_items.push(id);
-        Some(id)
     }
 
     /// Host use action (`E` in `--play`, `use` in a script). Mirrors the tail of
     /// `XIIIPlayerController.Grab` for a mover target: a locked `XIIIPorte` is unlocked with the
-    /// key via its own `Trigger` (`TryPickLock`), any other state is opened via `PlayerTrigger`.
+    /// matching key the player **carries in the game's inventory** via its own `Trigger`
+    /// (`TryPickLock`), any other state is opened via `PlayerTrigger`. No host key grant.
     pub fn use_mover(&mut self, target_name: &str) -> UseOutcome {
         let Some(target) = self.vm.find_object(target_name) else {
             return UseOutcome::NotAMover;
@@ -567,10 +569,9 @@ impl Session {
         let pawn = self.player;
         let controller = self.controller.unwrap_or(pawn);
         if self.vm.is_in_state(target, "Locked") {
-            let key = self.grant_touched_key().or_else(|| self.grant_level_key());
-            let Some(key) = key else {
-                // No key available: run the door's own `Locked.PlayerTrigger` (plays the locked
-                // sound) and report Locked; this is visible, not a silent success.
+            let Some(key) = self.carried_key_for(target) else {
+                // No matching key carried: run the door's own `Locked.PlayerTrigger` (plays the
+                // locked sound) and report Locked; this is visible, not a silent success.
                 let args = vec![
                     Value::Object(Some(ObjRef::Instance(controller))),
                     Value::Object(Some(ObjRef::Instance(pawn))),
@@ -724,6 +725,9 @@ fn instance_prop(vm: &Vm, id: ObjectId, name: &str) -> Option<ObjectId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::Options;
+    use crate::play::{resolve_params, run_script, script, viewer};
+    use xiii_decode::common::UNREAL_UNITS_PER_METER;
 
     fn opt_in_root() -> Option<std::path::PathBuf> {
         let root = std::env::var_os("XIII_GOG_DIR")?;
@@ -787,6 +791,80 @@ mod tests {
             session.player_name,
             session.vm.set().path(session.vm.objects[pc as usize].class),
             pawn
+        );
+    }
+
+    /// Opt-in corpus test (Part B): on Plage01 the pawn **walks** onto the hut key (autopilot
+    /// `goto`, with jumps over the counter), the game's own `Pickup.Touch` -> `SpawnCopy`/
+    /// `GiveTo` -> `Pawn.AddInventory` chain puts `Plage01CahuteKey` in the pawn's inventory (no
+    /// host key grant), and the `E`/`use` action at `Porte6` unlocks and opens it with that
+    /// carried key.
+    ///
+    /// The pickup is reached from the key's open (-Y) side: the +Y/+X/-X approaches are blocked
+    /// by map collision (a wall at Y=-250 with a +Y normal, measured), and the full PlayerStart
+    /// path stops at the same wall even with jumps; the reach graph's last point is ~170 UU short
+    /// of the key. The final ~100 UU are walked and the counter edge is jumped. No teleport onto
+    /// the key.
+    #[test]
+    fn opt_in_plage01_key_pickup_without_host_grant_opens_porte6() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let script = script::Script::parse(
+            "t=0.00 teleport -491.8 -414.1 1265.0\n\
+             t=0.10 goto -491.84 -314.14\nt=0.30 jump\nt=0.80 jump\nt=1.30 jump\nt=1.80 jump\n\
+             t=2.30 jump\nt=2.80 forward 0\n\
+             t=3.20 teleport -742.1444 -808.429 1311.0449\n\
+             t=3.20 yaw 312.891\nt=3.20 turn 2\nt=3.20 forward 1\n\
+             t=4.80 turn -45\nt=5.50 forward 0\nt=5.80 use\nt=6.80 use\nt=7.00 forward 1\n\
+             t=8.00 forward 0\n",
+        )
+        .unwrap();
+        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 9.0)
+            .expect("run Plage01 key+door walk");
+        let s = &outcome.session;
+        let inv = s.inventory_items();
+        println!("[key test] inventory: {inv:?}");
+        assert!(
+            inv.iter()
+                .any(|(_, c)| c.eq_ignore_ascii_case("xidmaps.Plage01CahuteKey")),
+            "the hut key must be in the pawn's inventory through the real pickup chain: {inv:?}"
+        );
+        let door = s
+            .mover_states()
+            .into_iter()
+            .find(|m| m.name.eq_ignore_ascii_case("Porte6"))
+            .expect("Plage01 has a live Porte6");
+        assert_eq!(
+            door.key_num, 1,
+            "Porte6 did not reach its open key: {door:?}"
+        );
+        assert_ne!(
+            door.rotation, door.base_rot,
+            "Porte6 rotation did not change (the door did not swing)"
+        );
+        let (_, _, pos, _) = outcome.trace.last().expect("trace sample");
+        let pos = *pos;
+        let base = door.base_pos;
+        let yaw = door.base_rot[1] as f32 * std::f32::consts::TAU / 65536.0;
+        let fwd = [yaw.cos(), yaw.sin()];
+        let dist = (pos[0] - base[0]) * fwd[0] + (pos[1] - base[1]) * fwd[1];
+        println!(
+            "[key test] Porte6 key={} rot={:?} (base {:?}), player {:?} UU, {dist:.1} UU outside",
+            door.key_num, door.rotation, door.base_rot, pos
+        );
+        assert!(
+            dist >= 2.0 * UNREAL_UNITS_PER_METER,
+            "player only {dist:.1} UU outside the door plane (need >= {:.0})",
+            2.0 * UNREAL_UNITS_PER_METER
         );
     }
 }
