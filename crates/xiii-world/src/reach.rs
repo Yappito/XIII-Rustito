@@ -34,12 +34,14 @@ pub use crate::navigation::reach_flags;
 use crate::{ClassDefaults, PackageCache};
 
 /// UE2 `MINFLOORZ`: a surface is walkable (a floor) when its unit normal's up component is
-/// at least this. Hypothesis for XIII, same as upstream UE2.
+/// at least this. **Measured in XIII's `Engine.dll`** (item1j): `APawn::physWalking`
+/// (`0x103be05b`) and `APawn::stepUp` (`0x103baa96`) compare a floor normal's Z against the
+/// `.rdata` constant `0x10483428` = `0.7`.
 pub const MINFLOORZ: f32 = 0.7;
 
-/// Upstream UE2 `MAXSTEPHEIGHT` in Unreal units. Used because the decoded XIII class
-/// defaults contain no step-height property; it is the documented upstream hypothesis for
-/// XIII, not a measured XIII value.
+/// Upstream UE2 `MAXSTEPHEIGHT` in Unreal units. **Measured in XIII's `Engine.dll`** (item1j):
+/// `APawn::stepUp` (`0x103baa30`) multiplies the step vector by the `.rdata` constant
+/// `0x104829c4` = `35.0`. It is the fixed up-step magnitude, not a per-class default.
 pub const MAXSTEPHEIGHT_UU: f32 = 35.0;
 
 /// Movement skin in Unreal units (0.05 UU = 1 mm at 50 units/m).
@@ -330,7 +332,8 @@ pub fn analyze_with(
 
     let params = WalkParams {
         skin: SKIN_UU / UNREAL_UNITS_PER_METER,
-        max_iterations: 4,
+        // Measured `APawn::physWalking` sub-step bound (`Engine.dll` `0x103bde14`, `cmpl $0x8`).
+        max_iterations: 8,
         max_step_height: MAXSTEPHEIGHT_UU / UNREAL_UNITS_PER_METER,
         min_floor_z: MINFLOORZ,
     };
@@ -1029,11 +1032,14 @@ mod tests {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
         };
+        // Pass counts measured 2026-10-05 after item1j raised the walk sub-step bound to the
+        // engine's measured `physWalking` limit of 8 (`Engine.dll` 0x103bde14): Hual04c,
+        // Kello01a and PRock04a each gained one edge (433/1445/694); Hual01b is unchanged.
         for (map, min_pass, eligible) in [
             ("Hual01b", 726usize, 816usize),
-            ("Hual04c", 432usize, 437usize),
-            ("Kello01a", 1443usize, 1488usize),
-            ("PRock04a", 693usize, 721usize),
+            ("Hual04c", 433usize, 437usize),
+            ("Kello01a", 1445usize, 1488usize),
+            ("PRock04a", 694usize, 721usize),
         ] {
             let report = analyze(map, &path).expect("reach analyze");
             let missing_floor: usize = report
