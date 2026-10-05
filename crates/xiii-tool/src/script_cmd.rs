@@ -48,7 +48,7 @@ xiii-tool script: compiled UnrealScript (M2c)
                        [--ticks 60] [--dt 0.0333] [--touch-tick 1] [--trace]
                        [--active TouchTrigger,XIIIDispatcher] [--no-natives] [--budget N]
                        [--begin-play] [--game-class Package.Class] [--survey]
-                       [--physics flat:<z>]
+                       [--physics flat:<z>] [--anim fixed:<frames>,<rate>]
       Headless interpreter harness: load the map's actors, run PostBeginPlay and
       SetInitialState for the executed scope, deliver Touch(synthetic player) to
       the touched actor, tick at a fixed step and print the behaviour trace.
@@ -61,6 +61,11 @@ xiii-tool script: compiled UnrealScript (M2c)
       plane at Unreal Z=<z>, nothing else. That is NOT the map collision; output
       from this mode is labelled diagnostic physics, not the map. Without a
       provider, mover/trace natives fail explicitly with NoPhysicsProvider.
+      --anim fixed:<frames>,<rate> installs a diagnostic animation provider:
+      every sequence exists with that many frames and that rate, no notifies.
+      That is NOT the decoded MeshAnimation data; output from this mode is
+      labelled diagnostic animation, not the mesh. Without a provider,
+      animation natives that need sequence data fail with NoAnimationProvider.
       --survey is DIAGNOSTIC ONLY: it continues past unimplemented natives,
       counts each distinct one with its first-hit location, and never reports the
       run as success.

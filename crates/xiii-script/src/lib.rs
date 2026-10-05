@@ -9,6 +9,7 @@
 
 #![warn(missing_docs)]
 
+pub mod animation;
 pub mod bytecode;
 pub mod disasm;
 mod error;
@@ -22,6 +23,7 @@ pub mod registry;
 pub mod value;
 pub mod vm;
 
+pub use animation::{AnimationData, FixedAnimation, SeqInfo};
 pub use bytecode::{Call, Label, Script, ScriptLimits, Token, TokenKind, decode_script};
 pub use error::{Result, ScriptError, ScriptErrorKind};
 pub use linker::{GlobalRef, ScriptPackage, ScriptSet};

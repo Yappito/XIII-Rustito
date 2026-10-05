@@ -193,6 +193,7 @@ int2!(le_ii, |x, y| Value::Bool(x <= y));
 int2!(ge_ii, |x, y| Value::Bool(x >= y));
 int2!(eq_ii, |x, y| Value::Bool(x == y));
 int2!(ne_ii, |x, y| Value::Bool(x != y));
+int2!(and_ii, |x, y| Value::Int(x & y));
 float2!(add_ff, |x, y| Value::Float(x + y));
 float2!(sub_ff, |x, y| Value::Float(x - y));
 float2!(mul_ff, |x, y| Value::Float(x * y));
@@ -535,6 +536,58 @@ fn normal_v(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeO
     val(Value::Vector(r))
 }
 
+/// Unreal rotator (`pitch, yaw, roll`; 65536 per turn) as its orthonormal basis axes
+/// (X forward, Y right, Z up), matching `FRotationMatrix`.
+fn rotator_basis(r: [i32; 3]) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    let to_rad = |u: i32| (u as f32) * std::f32::consts::TAU / 65536.0;
+    let (p, y, rl) = (to_rad(r[0]), to_rad(r[1]), to_rad(r[2]));
+    let (sp, cp) = (p.sin(), p.cos());
+    let (sy, cy) = (y.sin(), y.cos());
+    let (sr, cr) = (rl.sin(), rl.cos());
+    (
+        [cp * cy, cp * sy, sp],
+        [sr * sp * cy - cr * sy, sr * sp * sy + cr * cy, -sr * cp],
+        [-(cr * sp * cy + sr * sy), cy * sr - cr * sp * sy, cr * cp],
+    )
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// `vector >> rotator` (276): rotate a local vector into world space (`FRotationMatrix`
+/// transform). Evidence: `xidcine.HelicoDeco.PostBeginPlay` uses it for part offsets.
+fn greater_greater_vr(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let v = vector2(vm, a, 0)?;
+    let r = rotator2(vm, a, 1)?;
+    let (x, y, z) = rotator_basis(r);
+    val(Value::Vector([
+        v[0] * x[0] + v[1] * y[0] + v[2] * z[0],
+        v[0] * x[1] + v[1] * y[1] + v[2] * z[1],
+        v[0] * x[2] + v[1] * y[2] + v[2] * z[2],
+    ]))
+}
+
+/// `vector << rotator` (275): rotate a world vector into local space (inverse transform).
+/// Evidence: `xidcine.HelicoDeco.PostBeginPlay` uses it to get a local position offset.
+fn less_less_vr(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let v = vector2(vm, a, 0)?;
+    let r = rotator2(vm, a, 1)?;
+    let (x, y, z) = rotator_basis(r);
+    val(Value::Vector([dot3(v, x), dot3(v, y), dot3(v, z)]))
+}
+
+fn set_physics(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let p = match a.first() {
+        Some(Value::Byte(b)) => *b,
+        Some(Value::Int(i)) => *i as u8,
+        Some(other) => return Err(type_err(vm, "byte", other)),
+        None => return Err(vm.err(VmErrorKind::Other("missing argument".into()))),
+    };
+    vm.set_property(c.this, "Physics", 0, Value::Byte(p));
+    val(Value::Void)
+}
+
 fn add_rr(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let (x, y) = (rotator2(vm, a, 0)?, rotator2(vm, a, 1)?);
     val(Value::Rotator([
@@ -569,6 +622,30 @@ fn all_actors(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<Nativ
     };
     let items = vm
         .all_actors(base, tag.as_deref())
+        .into_iter()
+        .map(|i| Value::Object(Some(ObjRef::Instance(i))))
+        .collect();
+    Ok(NativeOutcome::Iterate(items))
+}
+
+fn radius_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let base = match object(vm, a, 0)? {
+        Some(ObjRef::Static(g)) => Some(g),
+        None => None,
+        Some(ObjRef::Instance(_)) => {
+            return Err(vm.err(VmErrorKind::Other(
+                "RadiusActors base class is an instance".into(),
+            )));
+        }
+    };
+    let radius = float(vm, a, 2)?;
+    let loc = if c.omitted(3) {
+        vm.vector_prop(c.this, "Location").unwrap_or([0.0; 3])
+    } else {
+        vector2(vm, a, 3)?
+    };
+    let items = vm
+        .radius_actors(base, radius, loc)
         .into_iter()
         .map(|i| Value::Object(Some(ObjRef::Instance(i))))
         .collect();
@@ -849,6 +926,86 @@ fn actor_touching_actors(
     Ok(NativeOutcome::Iterate(items))
 }
 
+fn channel(vm: &Vm<'_>, a: &[Value], i: usize, omitted: bool) -> VmResult<u8> {
+    if omitted {
+        return Ok(0);
+    }
+    let c = int(vm, a, i)?;
+    u8::try_from(c).map_err(|_| {
+        vm.err(VmErrorKind::TypeMismatch {
+            expected: "channel 0..255",
+            found: "int",
+        })
+    })
+}
+
+fn link_skel_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let anim = object(vm, a, 0)?;
+    vm.link_skel_anim(c.this, anim);
+    val(Value::Void)
+}
+
+fn play_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    if !vm.animation_ready("Actor.PlayAnim", Some(259), c.this, Value::Void)? {
+        return val(Value::Void);
+    }
+    let seq = name(vm, a, 0)?;
+    let rate = if c.omitted(1) { 0.0 } else { float(vm, a, 1)? };
+    let tween = if c.omitted(2) { 0.0 } else { float(vm, a, 2)? };
+    let ch = channel(vm, a, 3, c.omitted(3))?;
+    vm.start_animation(c.this, &seq, rate, tween, ch, false)?;
+    val(Value::Void)
+}
+
+fn loop_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    if !vm.animation_ready("Actor.LoopAnim", Some(260), c.this, Value::Void)? {
+        return val(Value::Void);
+    }
+    let seq = name(vm, a, 0)?;
+    let rate = if c.omitted(1) { 0.0 } else { float(vm, a, 1)? };
+    let tween = if c.omitted(2) { 0.0 } else { float(vm, a, 2)? };
+    let ch = channel(vm, a, 3, c.omitted(3))?;
+    vm.start_animation(c.this, &seq, rate, tween, ch, true)?;
+    val(Value::Void)
+}
+
+fn tween_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    if !vm.animation_ready("Actor.TweenAnim", Some(294), c.this, Value::Void)? {
+        return val(Value::Void);
+    }
+    let seq = name(vm, a, 0)?;
+    let time = if c.omitted(1) { 0.0 } else { float(vm, a, 1)? };
+    let ch = channel(vm, a, 2, c.omitted(2))?;
+    vm.start_animation(c.this, &seq, 0.0, time, ch, false)?;
+    val(Value::Void)
+}
+
+fn is_animating(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let ch = channel(vm, a, 0, c.omitted(0))?;
+    val(Value::Bool(vm.anim_channel_active(c.this, ch)))
+}
+
+fn has_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    if !vm.animation_ready("Actor.HasAnim", Some(263), c.this, Value::Bool(false))? {
+        return val(Value::Bool(false));
+    }
+    let seq = name(vm, a, 0)?;
+    let r = vm.has_anim("Actor.HasAnim", c.this, &seq)?;
+    val(Value::Bool(r))
+}
+
+fn finish_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let ch = channel(vm, a, 0, c.omitted(0))?;
+    vm.finish_anim(c.this, ch, c.in_state_code)?;
+    val(Value::Void)
+}
+
+fn set_view_target(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let target = object(vm, a, 0)?;
+    vm.set_property(c.this, "ViewTarget", 0, Value::Object(target));
+    val(Value::Void)
+}
+
 fn noop(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
     let _ = vm;
     val(Value::Void)
@@ -1084,6 +1241,12 @@ fn builtin_defs() -> Vec<NativeDef> {
             "native(155) bool !=(int, int)",
             UE2_OP,
             ne_ii,
+        ),
+        def(
+            "Object.And_IntInt",
+            "native(156) final operator int &(int, int)",
+            "UE2 bitwise AND; Core.dll operator thunk",
+            and_ii,
         ),
         def(
             "Object.AddAdd_PreInt",
@@ -1340,6 +1503,24 @@ fn builtin_defs() -> Vec<NativeDef> {
             UE2_OP,
             sub_rr,
         ),
+        def(
+            "Object.GreaterGreater_VectorRotator",
+            "native(276) final operator vector >>(vector A, rotator B)",
+            "engine.xidcine.HelicoDeco.PostBeginPlay uses `Offset >> Rotation` for a local-to-world part offset; UE1 FRotationMatrix transform",
+            greater_greater_vr,
+        ),
+        def(
+            "Object.LessLess_VectorRotator",
+            "native(275) final operator vector <<(vector A, rotator B)",
+            "xidcine.HelicoDeco.PostBeginPlay uses `(Location-Linked.Location) << Rotation` for a world-to-local offset; UE1 inverse FRotationMatrix",
+            less_less_vr,
+        ),
+        def(
+            "Engine.Actor.SetPhysics",
+            "native(3970) final function SetPhysics(byte<EPhysics> newPhysics)",
+            "engine.u Actor.SetPhysics decoded; stores the EPhysics byte property (no native physics solver)",
+            set_physics,
+        ),
         NativeDef {
             status: NativeStatus::Partial(
                 "iterates the live map actors in object order; skips deleted actors and class-default objects. bStatic is *not* skipped, matching execAllActors (only DynamicActors skips static)",
@@ -1349,6 +1530,17 @@ fn builtin_defs() -> Vec<NativeDef> {
                 "native(304) final iterator function AllActors(class<Actor> BaseClass, out Actor Actor, optional name MatchTag)",
                 "UE2 AActor::execAllActors iterates every map actor of BaseClass including bStatic ones (only DynamicActors skips static); Engine.dll ?execAllActors@AActor",
                 all_actors,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial(
+                "iterates live actors within the radius of the caller's Location (or the optional Loc); excludes class-default objects, includes self; no visibility/line-of-sight test",
+            ),
+            ..def(
+                "Engine.Actor.RadiusActors",
+                "native(310) final iterator function RadiusActors(class<Actor> BaseClass, out Actor Actor, float Radius, optional vector Loc)",
+                "engine.u Actor.RadiusActors decoded (BaseClass, Actor, Radius, Loc); UE1 AActor::execRadiusActors distance test; Engine.dll ?execRadiusActors@AActor",
+                radius_actors,
             )
         },
         def(
@@ -1567,6 +1759,69 @@ fn builtin_defs() -> Vec<NativeDef> {
             log,
         )
     });
+    v.push(def(
+        "Engine.Actor.LinkSkelAnim",
+        "native(413) final function LinkSkelAnim(object<MeshAnimation> Anim)",
+        "engine.u Actor.LinkSkelAnim decoded; sets the actor MeshAnimation reference (the VM remembers its path for sequence lookups)",
+        link_skel_anim,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "sequence length/notify times come from the AnimationData provider; no skeletal evaluation; playback is frames/second and tween holds frame 0",
+        ),
+        ..def(
+            "Engine.Actor.PlayAnim",
+            "native(259) final function PlayAnim(name Sequence, float Rate, float TweenTime, int Channel)",
+            "engine.u Actor.PlayAnim decoded (Sequence, Rate, TweenTime, Channel); UE1 AActor::PlayAnim (non-looping); animation data via Vm::set_animation_data",
+            play_anim,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "sequence length/notify times come from the AnimationData provider; no skeletal evaluation; playback is frames/second and tween holds frame 0",
+        ),
+        ..def(
+            "Engine.Actor.LoopAnim",
+            "native(260) final function LoopAnim(name Sequence, float Rate, float TweenTime, int Channel)",
+            "engine.u Actor.LoopAnim decoded (Sequence, Rate, TweenTime, Channel); UE1 AActor::LoopAnim (loops, never fires AnimEnd)",
+            loop_anim,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "is PlayAnim with the sequence held at frame 0 until Time elapses; exact XIII tween blending is not modelled and needs the decoded mesh",
+        ),
+        ..def(
+            "Engine.Actor.TweenAnim",
+            "native(294) final function TweenAnim(name Sequence, float Time, int Channel)",
+            "engine.u Actor.TweenAnim decoded (Sequence, Time, Channel); UE1 AActor::TweenAnim tween-in",
+            tween_anim,
+        )
+    });
+    v.push(def(
+        "Engine.Actor.IsAnimating",
+        "native(282) final function bool IsAnimating(int Channel)",
+        "engine.u Actor.IsAnimating decoded (Channel, bool); true while the channel has an active sequence",
+        is_animating,
+    ));
+    v.push(def(
+        "Engine.Actor.HasAnim",
+        "native(263) final function bool HasAnim(name Sequence)",
+        "engine.u Actor.HasAnim decoded (Sequence, bool); asks the AnimationData provider for the linked mesh",
+        has_anim,
+    ));
+    v.push(def(
+        "Engine.Actor.FinishAnim",
+        "native(261) final latent function FinishAnim(int Channel)",
+        "engine.u Actor.FinishAnim decoded (Channel); latent: suspends state code until the channel reaches AnimEnd (immediate when not animating)",
+        finish_anim,
+    ));
+    v.push(def(
+        "Engine.PlayerController.SetViewTarget",
+        "native(513) final function SetViewTarget(object<Actor> NewViewTarget)",
+        "engine.u PlayerController.SetViewTarget decoded (NewViewTarget); sets ViewTarget (no camera/rendering)",
+        set_view_target,
+    ));
     // Paths are matched without the package ("Class.Function"): strip it.
     for d in &mut v {
         if let Some(rest) = d.path.strip_prefix("Engine.") {
