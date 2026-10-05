@@ -200,7 +200,7 @@ about Z).
 | Engine.Polys | 7,194 | 7,194 | 7,194 | 34,395 polygons |
 | Engine.TerrainSector | 2,208 | 2,208 | 2,208 | |
 | Engine.StaticMeshInstance | 14,542 | 14,542 | 14,542 | per placed static-mesh actor; colours + per-light vertex visibility |
-| Engine.Model | 7,194 | 7,194 | 6,396 | full payload decoded on 6,396; 4,452,699 B unsupported tail (`model.after_linked`) on the 798 build-variant Models |
+| Engine.Model | 7,194 | 7,194 | 6,396 | full payload decoded on 6,396; 1,343,450 B unsupported tail (`model.after_linked`) on the 798 build-variant Models; typed `FBspVertexStream` (+ per-vertex `FColor`) decoded on Plage00/Plage01/Banque01 |
 | Engine.TerrainInfo | 18 | 18 | 0 | sectors, vertices, sector grid; 2,052 B unsupported tail |
 
 Texture formats are taken from the game's own `Engine.ETextureFormat` enum in `engine.u`: P8,
@@ -278,8 +278,11 @@ What follows the `Polys` reference was decoded from `UModel::Serialize` in `Engi
 - `LightMap`: `TArray<FLightMapIndex>`. Each record is 178 bytes in this build (licensee 58,
   version 100): i32, i32, two 16-f32 matrices, nine i32, two bytes, then four compact indices.
   The array is empty in 7,183 of the 7,194 Models.
-- A second `TArray` record (two bytes, one compact index, three i32 per element). Empty in
-  every Model whose payload is consumed exactly.
+- A second `TArray` written by `0x103997a0`: each element is a `u16`, a nested `TArray<u8>`
+  (compact count + bytes), then three i32 (engine version > 0x5b). Empty on the 6,396 fully
+  consumed Models; `world-coverage` decodes 1,091 elements (91,905 nested bytes) corpus-wide
+  (the `Banque01` level model is the largest). Field meanings are not established
+  (`Model::light_bits`, `LightMapBits`).
 - `Bounds`: `TArray<FBox>` (25 bytes: min, max, IsValid byte).
 - `LeafHulls`: `TArray<i32>`.
 - `Leaves`: `TArray<FConvexVolumeLeaf>` (compact Zone/Permeating/Volumetric + u64
@@ -287,14 +290,27 @@ What follows the `Polys` reference was decoded from `UModel::Serialize` in `Engi
   payload is consumed.
 - `Lights`: `TArray<compact actor reference>`.
 - `RootOutside` i32, `Linked` i32, `MoverLink` i32.
-- `FBspVertexStream`: compact count then `count` records of 8 f32 (position, normal, two UV
-  pairs), then an i32 revision.
+- `FBspVertexStream`: compact count then `count` records of 32 bytes (one `FBspVertex`), then an
+  i32 revision. `FBspVertex` is `position` (3 f32), `color` (4 bytes, `FColor` memory order
+  `B,G,R,A`), `uv0` (2 f32) and `uv1` (2 f32) — established from the element writer
+  `0x10398160`, the array writers `0x1039bb30`/`0x10399830`, and `GetStride` 0x20 /
+  `GetComponents` (position, colour, two texcoords) in `Engine.dll`; see
+  `local/re/item5e_fbspvertex_disasm.txt`. The stream holds the node polygons' vertices in
+  **reverse** node order: for node-vertex `k` of node `n`,
+  `vertex_stream[n.first_vertex + (n.num_vertices - 1 - k)].position` equals
+  `points[verts[n.vert_pool + k].point]` (measured exact on Plage00 1,704/1,704, Plage01
+  2,627/2,627 within 0.2 UU, Banque01 8,782/8,784). The colour is a per-vertex `FColor` that is
+  almost always `FF FF FF FF` (white) or `00 00 00 00` (transparent black), with rare greys
+  (`FE FE FE FE` on `DM_LostTemple`); black entries occur at collinear (non-corner) vertices.
 
 For **6,396** of the 7,194 Models every payload byte is consumed exactly (`xiii-tool bsp`
-shows no unsupported tail). The remaining 798 exports use a build variant whose `LightMap`
-record layout differs (all seven `Engine.Model` brushes with a non-empty `LightMap` array on
-the maps, plus a few others); the decoder keeps the decoded prefix and reports the remainder
-as the explicit label `model.after_linked` (4,452,699 B corpus-wide, down from 9,496,581 B).
+shows no unsupported tail). The remaining 798 exports use a build variant whose post-`Polys`
+layout differs (all seven `Engine.Model` brushes with a non-empty `LightMap` array on the maps,
+plus a few others); the decoder keeps the decoded prefix and reports the remainder as the
+explicit label `model.after_linked` (1,343,450 B corpus-wide, down from 9,496,581 B). A decoded
+tail is trusted only when it consumes the payload exactly, or — for the `Banque01`-style variant
+— when its `FBspVertexStream` positions match `Points` for every referenced node vertex; a
+misaligned variant stream is rejected (`Model::vertex_stream_matches_points`).
 
 The lightmap **texels** are not decoded: the `LightMap` array is empty in 7,192 of 7,194
 Models and the meaning of `FLightMapIndex.DataOffset` relative to the texture data is not
@@ -389,6 +405,14 @@ placed actor on those three maps (0 mismatches, `opt_in_baked_lighting_invariant
 whose whole colour array is `[0,0,0,0]` (167 of 867) have no static lighting and are treated as
 unlit rather than modulated to black. The 4th byte is 255 on every baked vertex and 0 on the
 all-zero arrays.
+
+**BSP** surfaces are **not** lit by `Model::vertex_stream`: the stream's 4-byte component is
+decoded as `BspVertex::flags_or_color` and position-validated (`Model::vertex_stream_matches_points`),
+but it is white at polygon corners and transparent-black (A=0) only at collinear (T-junction)
+vertices, so modulating by it blackens those vertices — it is a flag/initialisation artefact,
+not a light term (rejected on review; see the item5e report). `xiii-world` counts the split
+(`lighting.bsp.color_white/black/other`) and leaves BSP `SceneObject::colors` as `None`. BSP
+lighting has to come from the lightmap **texels**, which are not decoded (next task).
 
 **Channel order and scale.** `FColor` on disk is the UE2/UE3 little-endian `G,B,R,A` memory
 layout (the `FColor` union is `struct { uint8 B, G, R, A; }` on little-endian platforms in the

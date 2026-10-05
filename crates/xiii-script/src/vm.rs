@@ -988,6 +988,9 @@ struct Timer {
     repeat: bool,
 }
 
+/// Event dispatched by timer slot 0/1/2 (UE2 `SetTimer`, `SetTimer2`, `Controller.SetTimer3`).
+const TIMER_EVENTS: [&str; 3] = ["Timer", "Timer2", "Timer3"];
+
 /// An interpreter object.
 #[derive(Debug)]
 pub struct Instance {
@@ -1011,7 +1014,8 @@ pub struct Instance {
     pub deleted: bool,
     /// Map export it was loaded from.
     pub export: Option<GlobalRef>,
-    timer: Option<Timer>,
+    /// The three UE2 actor timers (`Timer`, `Timer2`, `Timer3`), independently scheduled.
+    timers: [Option<Timer>; 3],
     /// Animation channels (actor animation natives).
     pub(crate) anim: AnimState,
     /// Bone-control parameters (skeletal natives); no skeletal pose yet.
@@ -1201,6 +1205,10 @@ pub struct Vm<'s> {
     pub(crate) external_data: Option<Box<dyn ExternalObjectData>>,
     /// Optional per-native/section timing (`--perf-natives`).
     profile: NativeProfile,
+    /// Edge state of the host-driven AI perception (`item14b`): `controller -> player visible`.
+    /// Set by [`Vm::update_ai_perception`] so `SeePlayer`/`EnemyNotVisible` fire only on change,
+    /// as the engine's sight counter does, instead of restarting an AI state every tick.
+    ai_visible: HashMap<ObjectId, bool>,
 }
 
 fn lower(s: &str) -> String {
@@ -1250,6 +1258,7 @@ impl<'s> Vm<'s> {
             localization_misses: 0,
             external_data: None,
             profile: NativeProfile::default(),
+            ai_visible: HashMap::new(),
         }
     }
 
@@ -2144,6 +2153,52 @@ impl<'s> Vm<'s> {
             (PropertyValue::Array { count, elements }, Ty::Array(inner)) => {
                 self.decode_array(pkg, *count, *elements, inner)
             }
+            // `FRange`/`FRangeVector` are decoded by the package reader as typed structs; map
+            // them into the script layout's `{min,max}` members. A class-default subobject
+            // template can carry them (e.g. `XIIIBreakingGlassEmitterA.StartSizeRange`), which
+            // is applied when the subobject is instantiated.
+            (PropertyValue::Struct(StructValue::Range(r)), Ty::Struct(members)) => {
+                let mut fields = Vec::with_capacity(members.len());
+                for (name, _) in members {
+                    let v = match name.to_ascii_lowercase().as_str() {
+                        "min" => r[0],
+                        "max" => r[1],
+                        _ => return Value::Unsupported(format!("range member {name}")),
+                    };
+                    fields.push((name.clone(), Value::Float(v)));
+                }
+                Value::Struct(fields)
+            }
+            (PropertyValue::Struct(StructValue::RangeVector(rv)), Ty::Struct(members)) => {
+                if members.len() != 3 {
+                    return Value::Unsupported(format!("range vector arity {}", members.len()));
+                }
+                let mut fields = Vec::with_capacity(3);
+                for (i, (name, ty)) in members.iter().enumerate() {
+                    let r = rv[i];
+                    let inner = match ty {
+                        Ty::Struct(inner) => {
+                            let mut sub = Vec::with_capacity(inner.len());
+                            for (n, _) in inner {
+                                let v = match n.to_ascii_lowercase().as_str() {
+                                    "min" => r[0],
+                                    "max" => r[1],
+                                    _ => {
+                                        return Value::Unsupported(format!(
+                                            "range vector member {n}"
+                                        ));
+                                    }
+                                };
+                                sub.push((n.clone(), Value::Float(v)));
+                            }
+                            Value::Struct(sub)
+                        }
+                        _ => return Value::Unsupported(format!("range vector member {name}")),
+                    };
+                    fields.push((name.clone(), inner));
+                }
+                Value::Struct(fields)
+            }
             // A struct the package reader kept raw (`RawReason::UnknownStruct`) can still be
             // decoded from its value span member-by-member when the script class layout gives
             // the member types (e.g. `BaseSoldier.InitialInventory[i]` = {Inventory, Count}).
@@ -2268,6 +2323,11 @@ impl<'s> Vm<'s> {
 
     /// Creates an instance of a class with its defaults.
     pub fn spawn(&mut self, class: GlobalRef, name: &str) -> VmResult<ObjectId> {
+        self.spawn_depth(class, name, 0)
+    }
+
+    /// [`Vm::spawn`] with a recursion guard for per-instance default subobjects.
+    fn spawn_depth(&mut self, class: GlobalRef, name: &str, depth: u8) -> VmResult<ObjectId> {
         let layout = self.class_layout(class)?;
         let is_actor = layout.chain_names.iter().any(|n| n == "actor");
         let id = self.objects.len() as ObjectId;
@@ -2294,11 +2354,138 @@ impl<'s> Vm<'s> {
             is_actor,
             deleted: false,
             export: None,
-            timer: None,
+            timers: [None, None, None],
             anim: AnimState::default(),
             bone: BoneState::default(),
         });
+        // UE2 gives every instance its own copy of the class-default subobjects (component
+        // objects) its default properties reference. The serialized class defaults hold `Static`
+        // references to those class-package exports, which have no VM instance of their own;
+        // expand them now so script property access through the reference resolves to an
+        // instance. Evidence: `xidcine.BreakableMover.InitializeEmitters` 0x006A writes
+        // `emit.Emitters[0].StartVelocityRange` on a `XIIIBreakingGlassEmitter` spawned from
+        // `Fragments_Type`, whose `Emitters[0]` is the class subobject
+        // `xidcine.XIIIBreakingGlassEmitter.XIIIBreakingGlassEmitterA`.
+        let mut values = std::mem::take(&mut self.objects[id as usize].props);
+        self.expand_default_subobjects(&mut values, id, depth)?;
+        self.objects[id as usize].props = values;
         Ok(id)
+    }
+
+    /// Depth guard for per-instance default-subobject expansion (a cyclic reference graph would
+    /// otherwise recurse forever; UE2's component chains are shallow).
+    const MAX_SUBOBJECT_DEPTH: u8 = 16;
+
+    /// Replaces every class-default-subobject reference in `values` with a fresh per-instance
+    /// copy whose `Outer` is `owner`. Arrays and struct fields are walked. See
+    /// [`Vm::class_subobject_class`].
+    fn expand_default_subobjects(
+        &mut self,
+        values: &mut [Value],
+        owner: ObjectId,
+        depth: u8,
+    ) -> VmResult<()> {
+        if depth >= Self::MAX_SUBOBJECT_DEPTH {
+            return Ok(());
+        }
+        for v in values.iter_mut() {
+            self.expand_default_value(v, owner, depth)?;
+        }
+        Ok(())
+    }
+
+    fn expand_default_value(&mut self, v: &mut Value, owner: ObjectId, depth: u8) -> VmResult<()> {
+        match v {
+            Value::Object(Some(ObjRef::Static(g))) => {
+                let Some(class) = self.class_subobject_class(*g) else {
+                    return Ok(());
+                };
+                let name = self.subobject_name(*g);
+                let sub = self.spawn_depth(class, &name, depth + 1)?;
+                self.set_property(
+                    sub,
+                    "Outer",
+                    0,
+                    Value::Object(Some(ObjRef::Instance(owner))),
+                );
+                // Apply the subobject export's own serialized template (its overridden values).
+                self.apply_export_properties(*g, sub)?;
+                // A template property may itself reference another class subobject.
+                let mut values = std::mem::take(&mut self.objects[sub as usize].props);
+                self.expand_default_subobjects(&mut values, sub, depth + 1)?;
+                self.objects[sub as usize].props = values;
+                *v = Value::Object(Some(ObjRef::Instance(sub)));
+            }
+            Value::Array(items) => {
+                for item in items.iter_mut() {
+                    self.expand_default_value(item, owner, depth)?;
+                }
+            }
+            Value::Struct(fields) => {
+                for (_, field) in fields.iter_mut() {
+                    self.expand_default_value(field, owner, depth)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Class of a class-default subobject export, or `None` when `g` is not one. A class
+    /// subobject's outer chain consists of exports and reaches a decoded `Core.Class` export
+    /// (e.g. `xidcine.XIIIBreakingGlassEmitter.XIIIBreakingGlassEmitterA`, whose outer is the
+    /// `XIIIBreakingGlassEmitter` class). A map export's outer is the map package import, so it
+    /// is never treated as a subobject.
+    fn class_subobject_class(&self, g: GlobalRef) -> Option<GlobalRef> {
+        let p = self.set.packages.get(g.package)?;
+        let e = p.package.exports().get(g.export as usize)?;
+        let mut outer = p.package.object_outer(ObjectRef::Export(g.export))?;
+        let mut steps = 0u32;
+        loop {
+            steps += 1;
+            if steps > 64 {
+                return None;
+            }
+            let ObjectRef::Export(oi) = outer else {
+                return None;
+            };
+            let owner = GlobalRef {
+                package: g.package,
+                export: oi,
+            };
+            if matches!(self.set.object(owner), Some(ScriptObject::Class(_))) {
+                return self.set.resolve(g.package, e.class);
+            }
+            outer = p.package.object_outer(ObjectRef::Export(oi))?;
+        }
+    }
+
+    /// Short unique name for a class-subobject instance (its export's own name).
+    fn subobject_name(&self, g: GlobalRef) -> String {
+        let short = self.set.packages[g.package].ref_name(ObjectRef::Export(g.export));
+        self.unique_name(short)
+    }
+
+    /// Applies an export's own tagged properties (a class-default subobject's serialized
+    /// template) to a freshly spawned instance, mirroring the map-property pass in
+    /// [`Vm::load_level`].
+    fn apply_export_properties(&mut self, g: GlobalRef, id: ObjectId) -> VmResult<()> {
+        let set = self.set;
+        let p = &set.packages[g.package];
+        let props = p
+            .package
+            .read_object_properties(&p.data, g.export as usize, &Limits::default())
+            .map_err(|e| {
+                self.err(VmErrorKind::Other(format!(
+                    "class subobject properties of {}: {e}",
+                    self.objects[id as usize].name
+                )))
+            })?;
+        let layout = self.objects[id as usize].layout.clone();
+        let mut values = std::mem::take(&mut self.objects[id as usize].props);
+        self.apply_block(g.package, &props.block, &layout, &mut values);
+        self.objects[id as usize].props = values;
+        Ok(())
     }
 
     /// Instantiates every script-class export of a loaded map package (two passes: create, then
@@ -2861,28 +3048,29 @@ impl<'s> Vm<'s> {
             if !self.objects[id as usize].active {
                 continue;
             }
-            let mut fire = false;
-            if let Some(t) = self.objects[id as usize].timer.as_mut() {
-                t.remaining -= dt;
-                if t.remaining <= 0.0 {
-                    fire = true;
-                    if t.repeat {
-                        t.remaining += t.rate;
+            for (slot, event) in TIMER_EVENTS.iter().enumerate() {
+                let mut fire = false;
+                if let Some(t) = self.objects[id as usize].timers[slot].as_mut() {
+                    t.remaining -= dt;
+                    if t.remaining <= 0.0 {
+                        fire = true;
+                        if t.repeat {
+                            t.remaining += t.rate;
+                        }
                     }
                 }
-            }
-            if fire {
-                if !self.objects[id as usize]
-                    .timer
-                    .as_ref()
-                    .is_some_and(|t| t.repeat)
-                {
-                    self.objects[id as usize].timer = None;
-                }
-                let actor = self.objects[id as usize].name.clone();
-                self.note(TraceKind::Timer { actor });
-                if let Some(f) = self.find_function(id, "Timer", true) {
-                    self.call_values(f, id, Vec::new())?;
+                if fire {
+                    if !self.objects[id as usize].timers[slot]
+                        .as_ref()
+                        .is_some_and(|t| t.repeat)
+                    {
+                        self.objects[id as usize].timers[slot] = None;
+                    }
+                    let actor = self.objects[id as usize].name.clone();
+                    self.note(TraceKind::Timer { actor });
+                    if let Some(f) = self.find_function(id, event, true) {
+                        self.call_values(f, id, Vec::new())?;
+                    }
                 }
             }
         }
@@ -2935,31 +3123,32 @@ impl<'s> Vm<'s> {
             if !self.objects[id as usize].active {
                 continue;
             }
-            let mut fire = false;
-            if let Some(t) = self.objects[id as usize].timer.as_mut() {
-                t.remaining -= dt;
-                if t.remaining <= 0.0 {
-                    fire = true;
-                    if t.repeat {
-                        t.remaining += t.rate;
+            for (slot, event) in TIMER_EVENTS.iter().enumerate() {
+                let mut fire = false;
+                if let Some(t) = self.objects[id as usize].timers[slot].as_mut() {
+                    t.remaining -= dt;
+                    if t.remaining <= 0.0 {
+                        fire = true;
+                        if t.repeat {
+                            t.remaining += t.rate;
+                        }
                     }
                 }
-            }
-            if fire {
-                if !self.objects[id as usize]
-                    .timer
-                    .as_ref()
-                    .is_some_and(|t| t.repeat)
-                {
-                    self.objects[id as usize].timer = None;
-                }
-                let actor = self.objects[id as usize].name.clone();
-                self.note(TraceKind::Timer { actor });
-                if let Some(f) = self.find_function(id, "Timer", true)
-                    && let Err(e) = self.call_values(f, id, Vec::new())
-                {
-                    let suspended = self.suspend_for_error(id, &e);
-                    errors.push((suspended, e));
+                if fire {
+                    if !self.objects[id as usize].timers[slot]
+                        .as_ref()
+                        .is_some_and(|t| t.repeat)
+                    {
+                        self.objects[id as usize].timers[slot] = None;
+                    }
+                    let actor = self.objects[id as usize].name.clone();
+                    self.note(TraceKind::Timer { actor });
+                    if let Some(f) = self.find_function(id, event, true)
+                        && let Err(e) = self.call_values(f, id, Vec::new())
+                    {
+                        let suspended = self.suspend_for_error(id, &e);
+                        errors.push((suspended, e));
+                    }
                 }
             }
         }
@@ -4943,7 +5132,25 @@ impl<'s> Vm<'s> {
     }
 
     pub(crate) fn set_timer(&mut self, id: ObjectId, rate: f32, repeat: bool) {
-        self.objects[id as usize].timer = (rate > 0.0).then_some(Timer {
+        self.set_timer_named(id, rate, repeat, "Timer");
+    }
+
+    /// `SetTimer2`/`Controller.SetTimer3`: a timer that dispatches `Timer2`/`Timer3` instead of
+    /// `Timer`. UE2 keeps the three timers independent; the VM keeps one active slot per actor
+    /// (the AI states use them one at a time; a second `SetTimer*` replaces the first, as
+    /// `AActor::execSetTimer` does for its own slot).
+    pub(crate) fn set_timer_named(
+        &mut self,
+        id: ObjectId,
+        rate: f32,
+        repeat: bool,
+        name: &'static str,
+    ) {
+        let slot = TIMER_EVENTS
+            .iter()
+            .position(|e| e.eq_ignore_ascii_case(name))
+            .unwrap_or(0);
+        self.objects[id as usize].timers[slot] = (rate > 0.0).then_some(Timer {
             rate,
             remaining: rate,
             repeat,
@@ -5377,7 +5584,7 @@ impl<'s> Vm<'s> {
         self.objects[id as usize].active = false;
         self.objects[id as usize].state = None;
         self.objects[id as usize].state_code = None;
-        self.objects[id as usize].timer = None;
+        self.objects[id as usize].timers = [None, None, None];
         self.objects[id as usize].generation += 1;
         if let Some(f) = self.find_function(id, "Destroyed", true) {
             self.call_values(f, id, Vec::new())?;
@@ -5856,16 +6063,29 @@ impl<'s> Vm<'s> {
         };
         // item14: record the hit zone for `Actor.GetLastTraceBone` (`XIIIPawn.LastBoneHit`).
         // A world/LevelInfo hit is not a pawn, so the bone stays `None`.
+        //
+        // item14b: when the installed provider holds the target's posed decoded skeleton, the
+        // bullet ray is intersected with the per-bone hit boxes (`ray_bone`) and the nearest box's
+        // bone name wins; otherwise the collision-cylinder classification is the fallback. The
+        // ray is the exact trace segment, not the hit point, because a body's boxes can be
+        // smaller than the cylinder.
         self.last_trace_bone = match out.0 {
-            Some(b) if !self.is_a(b, "levelinfo") => {
-                let (center, radius, half_height) = self.actor_cylinder(b);
-                match &self.hit_zones {
-                    Some(z) => z.bone_at(center, radius, half_height, out.1),
-                    None => {
-                        crate::physics::CylinderZones.bone_at(center, radius, half_height, out.1)
+            Some(b) if !self.is_a(b, "levelinfo") => self
+                .hit_zones
+                .as_ref()
+                .and_then(|z| z.ray_bone(b, start, end))
+                .unwrap_or_else(|| {
+                    let (center, radius, half_height) = self.actor_cylinder(b);
+                    match &self.hit_zones {
+                        Some(z) => z.bone_at(center, radius, half_height, out.1),
+                        None => crate::physics::CylinderZones.bone_at(
+                            center,
+                            radius,
+                            half_height,
+                            out.1,
+                        ),
                     }
-                }
-            }
+                }),
             _ => "None".to_owned(),
         };
         Ok(out)
@@ -6078,6 +6298,103 @@ impl<'s> Vm<'s> {
         let l = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
         let eye = self.f32_prop(id, "BaseEyeHeight");
         [l[0], l[1], l[2] + eye]
+    }
+
+    /// Host-driven engine perception (`item14b`): for every live `IAController`, test whether its
+    /// pawn can see the player (range, facing cone, clear world line of sight) and dispatch the
+    /// engine's own `SeePlayer` / `EnemyNotVisible` events only when visibility changes, as the
+    /// engine's sight counter does. This is the native half of perception (the sight test and the
+    /// event dispatch); the AI's own states decide what to do with the event. Appends
+    /// `(controller, event)` to `out` for the host timeline. Never a silent success: an event call
+    /// that raises is reported in `out` as `event: error`.
+    pub fn update_ai_perception(&mut self, player: ObjectId, out: &mut Vec<(String, String)>) {
+        if self.objects.get(player as usize).is_none_or(|o| o.deleted) {
+            return;
+        }
+        let player_dead = self.bool_prop(player, "bIsDead");
+        let controllers: Vec<ObjectId> = self
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(i, o)| {
+                o.is_actor && !o.deleted && o.active && self.is_a(*i as ObjectId, "iacontroller")
+            })
+            .map(|(i, _)| i as ObjectId)
+            .collect();
+        for ctrl in controllers {
+            let Some(pawn) = self.obj_prop(ctrl, "Pawn") else {
+                continue;
+            };
+            if pawn == player || self.bool_prop(pawn, "bIsDead") {
+                continue;
+            }
+            let visible = !player_dead && self.ai_sight(ctrl, pawn, player);
+            let was = self.ai_visible.get(&ctrl).copied().unwrap_or(false);
+            self.ai_visible.insert(ctrl, visible);
+            let name = self.objects[ctrl as usize].name.clone();
+            // The engine's sight counter calls `SeePlayer` repeatedly while the player stays
+            // visible (the base handler only reacts until `EnemyAcquired` disables the event), and
+            // `EnemyNotVisible` once when sight is lost. The host only logs a transition.
+            if visible {
+                let args = vec![Value::Object(Some(ObjRef::Instance(player)))];
+                let res = self.send_event(ctrl, "SeePlayer", args);
+                if !was {
+                    match res {
+                        Ok(_) => out.push((name, "SeePlayer".to_owned())),
+                        Err(e) => out.push((name.clone(), format!("SeePlayer: {e}"))),
+                    }
+                }
+            } else if was {
+                match self.send_event(ctrl, "EnemyNotVisible", Vec::new()) {
+                    Ok(_) => out.push((name, "EnemyNotVisible".to_owned())),
+                    Err(e) => out.push((name, format!("EnemyNotVisible: {e}"))),
+                }
+            }
+        }
+    }
+
+    /// Sight test for [`Vm::update_ai_perception`]: range (`Pawn.SightRadius`), facing cone
+    /// (`Pawn.PeripheralVision`, cos of the half-angle after the pawn's `Init` conversion) and a
+    /// clear world trace between the eyes (`Controller.LineOfSightTo`). Actor occlusion is not
+    /// modelled, matching the existing `LineOfSightTo` native.
+    fn ai_sight(&mut self, ctrl: ObjectId, pawn: ObjectId, player: ObjectId) -> bool {
+        let eye = self.eye_location(pawn);
+        let target = self.eye_location(player);
+        let d = [target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]];
+        let dist2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        let mut sight = self.f32_prop(pawn, "SightRadius");
+        if sight <= 0.0 {
+            sight = 5000.0;
+        }
+        if dist2 > sight * sight {
+            return false;
+        }
+        let dot = {
+            let rot = self.rotation_prop(pawn).unwrap_or([0; 3]);
+            let k = std::f32::consts::TAU / 65536.0;
+            let (sp, cp) = ((rot[0] as f32) * k).sin_cos();
+            let (sy, cy) = ((rot[1] as f32) * k).sin_cos();
+            let f = [cp * cy, cp * sy, sp];
+            let n = dist2.sqrt();
+            if n > 1e-6 {
+                (f[0] * d[0] + f[1] * d[1] + f[2] * d[2]) / n
+            } else {
+                1.0
+            }
+        };
+        let mut cone = self.f32_prop(pawn, "PeripheralVision");
+        if !(-1.0001..=1.0001).contains(&cone) {
+            // Raw degrees (Init not run): the scripts convert with cos(deg * 0.00873).
+            cone = (cone * 0.00873).cos();
+        }
+        if cone > 0.9999 {
+            // A raw 0 degrees (or an unset value) means "in front", not a full sphere.
+            cone = 0.0;
+        }
+        if dot < cone {
+            return false;
+        }
+        self.nav_line_of_sight_to(ctrl, player).unwrap_or(false)
     }
 
     /// `Controller.pointReachable`: the point is directly reachable (clear pawn trace) and a
@@ -6390,11 +6707,17 @@ impl<'s> Vm<'s> {
                 )));
                 return Ok(());
             }
+            // UE2 `AActor::PlayAnim`/`LoopAnim` look the sequence up in the mesh's animation
+            // set and simply play nothing when it is absent (no state failure). The shipped
+            // maps rely on this: `xidcine.Cine2.PostBeginPlay` calls `LoopAnim(DefaultAnim)`
+            // with `DefaultAnim` values ("Wait", "acqiesce") that no decoded source of the
+            // actor carries. A *decode* failure is still fatal (`AnimationDataError`), so a
+            // corrupt provider is never hidden; a genuinely unknown name is a visible no-op.
             let mesh = self.animation_sources(id).join(", ");
-            return Err(self.err(VmErrorKind::UnknownAnimation {
-                sequence: sequence.to_owned(),
-                mesh,
-            }));
+            self.note(TraceKind::Note(format!(
+                "Actor.PlayAnim('{sequence}') not in [{mesh}]: UE2 plays nothing (no-op)"
+            )));
+            return Ok(());
         };
         let rate = if rate > 0.0 { rate } else { info.rate };
         let mut notifies = info.notifies;

@@ -1,17 +1,34 @@
-//! UE2-style walking: floor following plus step-up on non-walkable obstacles.
+//! UE2-style walking: floor following plus step-up, verified against `Engine.dll` (item1j).
 //!
-//! [`walk_move`] is a documented **approximation** of `UPawn::physWalking` + `stepUp`, not a
-//! fidelity claim. It exists because [`crate::move_slide`]'s step-up is gated on a
+//! [`walk_move`] is a documented **approximation** of `APawn::physWalking` + `stepUp`, not a
+//! byte-fidelity claim. It exists because [`crate::move_slide`]'s step-up is gated on a
 //! near-vertical contact normal, so a small floor rise seen through a near-horizontal contact
 //! (for example a plank edge) never triggers it.
 //!
-//! The upstream UE2 `physWalking`/`stepUp` are native and their source is not public; the
-//! behaviour approximated here is (a) UT2004 `Pawn.uc` (the `MAXSTEPHEIGHT` constant and its
-//! use) together with the widely-mirrored UE3 `UCharacterMovementComponent::PhysWalking`
-//! step-up pipeline, and (b) the UE2 `MINFLOORZ` walkable threshold. The step is attempted on
-//! **any** blocked horizontal move, not only on a non-walkable hit (a walkable-normal hit
-//! while moving horizontally is the edge of a step the pawn is running into), and when the up
-//! sweep is blocked it lifts by the swept fraction (the hit time) rather than aborting.
+//! Evidence (**from source**, `llvm-objdump`, read-only; raw disassembly in `local/re/`):
+//! - `APawn::stepUp` (`Engine.dll` `0x103baa30`) multiplies the requested step vector by the
+//!   fixed up magnitude `35.0` (`0x104829c4`). It also compares the incoming check result's Z
+//!   against `0.08` (`0x1048341c`); *hypothesis* (not proven): that separates a near-vertical
+//!   wall from a walkable surface.
+//! - `APawn::physWalking` (`0x103bdac0`) iterates at most `8` move sub-steps (`cmpl $0x8`) and
+//!   uses the constants `0x10483420` (1.9) and `0x10483424` (2.4) beside its floor snap.
+//!   Walkability is `MINFLOORZ = 0.7` (`0x10483428`), tested against the **floor**
+//!   `FCheckResult.Normal.Z` from a separate downward check, not the horizontal blocking
+//!   contact.
+//! - `APawn::physWalking`/`stepUp` sweep with the pawn's extent box; `AActor::stepUp`
+//!   (`0x103bb0a0`) is the same shape without the ground logic.
+//! - `ULevel::MoveActor` (`0x1038a770`) moves the box, then checks blocking actors.
+//! - `ATerrainInfo::LineCheck` (`0x10409eb0`) clamps the ray to the base heightmap and indexes
+//!   `Vertices[HeightmapX*y + x]`; `UModel::LineCheck` (`0x10419b80`) is a BSP ray/segment with
+//!   extent; `UStaticMesh::LineCheck` (`0x10402e00`) dispatches to the per-polygon or simplified
+//!   box path. All are **line checks with extent**, not a swept box: the extent expands the
+//!   segment's endpoint box, it is not swept continuously.
+//!
+//! The step here is attempted on **any** blocked horizontal move (a walkable-normal hit while
+//! moving horizontally is the edge of a step the pawn is running into), and when the up sweep
+//! is blocked it lifts by the swept fraction (the hit time) rather than aborting. Gating the
+//! step on the horizontal contact normal instead was measured to regress campaign reach
+//! (item1j report, `local/reports/item1j-collision-primitive.md`).
 //!
 //! Per step:
 //! 1. Sweep the full delta. On no hit, move and finish.
@@ -96,11 +113,15 @@ pub fn walk_move(
             position: at,
         });
 
-        // Step-up on a blocked horizontal move. Unlike `move_slide`, this is not gated on the
-        // hit normal being near-vertical nor on it being non-walkable: a hit with a walkable
-        // normal while moving horizontally is the edge of a step the pawn is running into, and
-        // UE2 `physWalking` still tries `stepUp`. (Gating on non-walkability is what stalled
-        // the Plage01 near-horizontal rises.)
+        // Step-up on a blocked horizontal move. The engine gates this on the pawn's **floor**
+        // (`APawn::physWalking`, `Engine.dll` 0x103be058: `fcomps MINFLOORZ` on a *separate*
+        // downward `FCheckResult` normal, `jp` skips `stepUp` when that floor is unwalkable),
+        // not on the horizontal blocking contact's normal. Our `walk_move` does not run a
+        // separate floor probe inside the loop, so it approximates the engine by attempting the
+        // step on **any** horizontal block (the step's own down-sweep then requires a walkable
+        // landing, exactly as `stepUp` does). Gating on the horizontal contact normal instead
+        // was measured to regress campaign reach (item1j; see the report), because a vertical
+        // obstacle face is unwalkable even when the surface above it is a walkable step.
         if params.max_step_height > 1e-6
             && let Some(stepped) =
                 try_step_walk(world, pos, dir, travel, half_extents, params, &mut contacts)

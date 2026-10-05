@@ -939,6 +939,9 @@ impl ValueStats {
     }
 }
 
+/// One map material row: player footstep wrapper, AI footstep wrapper, noise loudness.
+type FootstepRow = (Option<String>, Option<String>, Option<f32>);
+
 fn material_survey_cmd(args: &[String]) -> ExitCode {
     let a = match parse_args(args, &["maps"]) {
         Ok(a) => a,
@@ -1049,6 +1052,60 @@ fn material_survey_cmd(args: &[String]) -> ExitCode {
                     "  {map}: {} materials | classes {classes:?} | blends {blends:?} | unsupported {unsupported:?}",
                     scene.materials.len()
                 );
+            }
+            Err(e) => {
+                let _ = writeln!(out, "  {map}: IMPORT FAILED: {e}");
+            }
+        }
+    }
+
+    // ---- footstep surfaces per map (item6e): which material plays which wrapper ----
+    let _ = writeln!(out, "== footstep surfaces per map ==");
+    for map in &maps {
+        match xiii_world::import_map(&mut cache, map) {
+            Ok(scene) => {
+                let mut rows: BTreeMap<String, FootstepRow> = BTreeMap::new();
+                for m in &scene.materials {
+                    let path = m
+                        .material_path
+                        .clone()
+                        .unwrap_or_else(|| "<no path>".to_owned());
+                    if m.footstep_sound.is_none() && m.footstep_sound_ai.is_none() {
+                        continue;
+                    }
+                    rows.entry(path).or_insert((
+                        m.footstep_sound.clone(),
+                        m.footstep_sound_ai.clone(),
+                        m.noise_loudness,
+                    ));
+                }
+                let total = scene.materials.len();
+                let box_steps = scene
+                    .collision_box
+                    .iter()
+                    .filter(|&&i| scene.footstep_sound(i).is_some())
+                    .count();
+                let box_material = scene
+                    .collision_box
+                    .iter()
+                    .filter(|&&i| scene.collision_material(i).is_some())
+                    .count();
+                let _ = writeln!(
+                    out,
+                    "  {map}: {} distinct material path(s) with a footstep wrapper of {total} resolved; \
+                     box collision {box_steps}/{} triangles have a surface footstep ({box_material} have a material)",
+                    rows.len(),
+                    scene.collision_box.len()
+                );
+                for (path, (player, ai, noise)) in &rows {
+                    let _ = writeln!(
+                        out,
+                        "    {path} -> player {} | ai {} | noise {}",
+                        player.as_deref().unwrap_or("-"),
+                        ai.as_deref().unwrap_or("-"),
+                        noise.map_or_else(|| "-".to_owned(), |n| n.to_string())
+                    );
+                }
             }
             Err(e) => {
                 let _ = writeln!(out, "  {map}: IMPORT FAILED: {e}");

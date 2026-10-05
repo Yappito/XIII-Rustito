@@ -72,6 +72,9 @@ pub enum SoundKind {
     Music,
     /// `Actor.PlayRolloffSound`.
     Rolloff,
+    /// Host-synthesised footstep from the floor's `XIIIFootStepSound` (the player path of
+    /// `XIIIPlayerPawn.PlayFootStep`; the pawn has no third-person animation to fire the notify).
+    Footstep,
 }
 
 /// One queued playback request, copied out of a [`PresentationEvent`] by [`pump`].
@@ -119,6 +122,23 @@ impl SoundRequest {
             param5: e.param5,
         }
     }
+
+    /// A host-synthesised footstep at VM time `time`, playing `sound` (a `XIIIFootStepSound`
+    /// path) on `actor`. Surface is already resolved by the caller.
+    pub fn footstep(time: f64, actor: String, sound: String) -> Self {
+        Self {
+            kind: SoundKind::Footstep,
+            time,
+            actor,
+            sound: Some(sound),
+            rolloff_actor: None,
+            slot: None,
+            volume: None,
+            radius: None,
+            pitch: None,
+            param5: None,
+        }
+    }
 }
 
 /// Process-global queue and event-cursor. The VM session is `!Send` and lives on the main
@@ -159,6 +179,8 @@ pub fn pump<'a>(events: impl Iterator<Item = &'a (f64, PresentationEvent)>) {
         PresentationEvent::PlayRolloffSound(_) => Some(SoundKind::Rolloff),
         _ => None,
     };
+    // Footstep requests are host-synthesised (queued separately by the footstep driver), so they
+    // are not part of the VM cursor bookkeeping.
     let retained_at_prev = items
         .iter()
         .filter(|(t, e)| *t == prev_time && sound_kind(e).is_some())
@@ -191,6 +213,17 @@ pub fn pump<'a>(events: impl Iterator<Item = &'a (f64, PresentationEvent)>) {
         .iter()
         .filter(|(t, e)| *t == newest && sound_kind(e).is_some())
         .count();
+}
+
+/// Queues one host-synthesised request (the player's footstep) ahead of the plugin, in addition
+/// to the VM presentation events [`pump`] forwards.
+pub fn queue_request(req: SoundRequest) {
+    let mut p = match PENDING.lock() {
+        Ok(p) => p,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    p.queue.push(req);
+    FORWARDED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Number of requests ever forwarded by [`pump`] (for tests).
@@ -240,6 +273,8 @@ pub struct AudioStats {
     pub spatial_fallback: usize,
     /// Sounds played spatially.
     pub spatial: usize,
+    /// Host-synthesised player footsteps emitted (the `--play` notify-free path).
+    pub footsteps: usize,
     /// Requests whose decoded radius was applied as distance attenuation.
     pub radius_applied: usize,
     /// Requests with no radius parameter (full volume; nothing to attenuate).
@@ -326,6 +361,8 @@ fn reason_label(s: &str) -> &'static str {
         "stream_missing" => "stream_missing",
         "audio_off" => "audio_off",
         "no_position" => "no_position",
+        "footstep_surface_missing" => "footstep_surface_missing",
+        "footstep_sound_unresolved" => "footstep_sound_unresolved",
         _ => "other",
     }
 }
@@ -579,11 +616,12 @@ fn report_audio_exit(
     let s = &audio.stats;
     let failures: Vec<String> = s.failed.iter().map(|(k, v)| format!("{k}={v}")).collect();
     println!(
-        "[audio] exit: enabled={} requests={} played={} music={} spatial={} fallback={} radius_applied={} radius_absent={} no_device_expired={} level_ambients={} level_ambients_started={} level_music={} failures=[{}]",
+        "[audio] exit: enabled={} requests={} played={} music={} steps={} spatial={} fallback={} radius_applied={} radius_absent={} no_device_expired={} level_ambients={} level_ambients_started={} level_music={} failures=[{}]",
         s.enabled,
         s.requests,
         s.played,
         s.music,
+        s.footsteps,
         s.spatial,
         s.spatial_fallback,
         s.radius_applied,
@@ -751,7 +789,7 @@ fn consume_requests(
         }
         match req.kind {
             SoundKind::Music => play_music(&mut commands, &mut audio, &mut sources, &req, &music),
-            SoundKind::Sound | SoundKind::Rolloff => play_sound(
+            SoundKind::Sound | SoundKind::Rolloff | SoundKind::Footstep => play_sound(
                 &mut commands,
                 &mut audio,
                 &mut sources,
@@ -979,6 +1017,7 @@ fn label(req: &SoundRequest) -> String {
         SoundKind::Sound => "sound",
         SoundKind::Music => "music",
         SoundKind::Rolloff => "rolloff",
+        SoundKind::Footstep => "footstep",
     };
     format!(
         "{kind} {} {}",
@@ -1008,6 +1047,9 @@ fn play_sound(
     // emitting actor's distance to the listener. Bevy cannot do this, so the host computes it.
     let pos = positions(&req.actor);
     let attenuation = attenuation_of(req);
+    if req.kind == SoundKind::Footstep {
+        audio.stats.footsteps += 1;
+    }
     let mut gain = volume_of(req).to_linear();
     if let Some(att) = attenuation {
         audio.stats.radius_applied += 1;
@@ -1187,11 +1229,12 @@ fn overlay_audio(
     };
     let s = &audio.stats;
     let mut out = format!(
-        "audio {} | requests {} played {} music {} spatial {} (fallback {}) failed {} | radius applied {} absent {} | no-device {}\n",
+        "audio {} | requests {} played {} music {} steps {} spatial {} (fallback {}) failed {} | radius applied {} absent {} | no-device {}\n",
         if s.enabled { "on" } else { "off" },
         s.requests,
         s.played,
         s.music,
+        s.footsteps,
         s.spatial,
         s.spatial_fallback,
         s.failed.values().sum::<usize>(),
@@ -1284,6 +1327,9 @@ mod tests {
             SoundKind::Sound => PresentationEvent::PlaySound(e),
             SoundKind::Music => PresentationEvent::PlayMusic(e),
             SoundKind::Rolloff => PresentationEvent::PlayRolloffSound(e),
+            // Footsteps are host-synthesised with `SoundRequest::footstep`, not built from an
+            // event; the test helper maps it to `PlaySound` for field coverage.
+            SoundKind::Footstep => PresentationEvent::PlaySound(e),
         }
     }
 
