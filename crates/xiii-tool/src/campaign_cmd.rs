@@ -658,6 +658,7 @@ fn event_kind(e: &PresentationEvent) -> &'static str {
         PresentationEvent::StopSound { .. } => "StopSound",
         PresentationEvent::PlaySndPNJOno { .. } => "PlaySndPNJOno",
         PresentationEvent::Dialogue(_) => "Dialogue",
+        PresentationEvent::RenderTarget(_) => "RenderTargetMaterial.Update",
     }
 }
 

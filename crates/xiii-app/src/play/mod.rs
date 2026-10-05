@@ -9,6 +9,7 @@
 //! `--play-script <file>`. Both drive the same [`sim::PlayerSim`] in `FixedUpdate` at 60 Hz.
 //! Fixed 60 Hz is a **hypothesis** (UE2 used variable ticks); see [`FIXED_HZ`].
 
+pub mod cartoon;
 pub mod cinematics;
 pub mod hud;
 pub mod movers;
@@ -128,6 +129,8 @@ impl Plugin for PlayPlugin {
         .init_resource::<ShotFlag>()
         .init_resource::<RenderSync>()
         .init_resource::<cinematics::CinematicState>()
+        .init_resource::<cartoon::CartoonState>()
+        .init_resource::<cartoon::CartoonRenderTarget>()
         .add_systems(Startup, setup)
         .add_systems(FixedUpdate, fixed_step)
         .add_systems(
@@ -143,13 +146,15 @@ impl Plugin for PlayPlugin {
                 viewer::animate_uv,
                 pawns::update_pawns,
                 hud::refresh,
+                cartoon::collect,
+                cartoon::sync_render_target,
                 hud::draw,
                 overlay,
                 unattended,
             )
                 .chain(),
         )
-        .add_systems(Last, cinematics::report_exit);
+        .add_systems(Last, (cinematics::report_exit, cartoon::report_exit));
     }
 }
 

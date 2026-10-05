@@ -495,7 +495,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 227);
+    assert_eq!(defs.len(), 237);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -5502,4 +5502,32 @@ fn dialogue_line_text_reads_nested_speaker_sentences() {
         crate::cinematics::line_text_from_values(0, &bad, &speakers),
         None
     );
+}
+
+/// UE2 `switch` and `==` on strings/names are case-insensitive (`appStricmp`); the cine
+/// interpreter switches on lowercase action words (`dial`) against `Dial` case values.
+#[test]
+fn values_equal_is_case_insensitive_for_strings_and_names() {
+    use crate::value::Value;
+    use crate::vm::values_equal;
+    assert!(values_equal(
+        &Value::Str("dial".into()),
+        &Value::Str("Dial".into())
+    ));
+    assert!(values_equal(
+        &Value::Str("Event".into()),
+        &Value::Str("event".into())
+    ));
+    assert!(!values_equal(
+        &Value::Str("dial".into()),
+        &Value::Str("dialman".into())
+    ));
+    assert!(values_equal(
+        &Value::Name("dial_debut".into()),
+        &Value::Name("DIAL_DEBUT".into())
+    ));
+    // An int/byte pair still compares by value, and unrelated values are not equal.
+    assert!(values_equal(&Value::Int(1), &Value::Byte(1)));
+    assert!(!values_equal(&Value::Int(1), &Value::Byte(2)));
+    assert!(!values_equal(&Value::Str("1".into()), &Value::Int(1)));
 }

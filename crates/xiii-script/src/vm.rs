@@ -1922,6 +1922,23 @@ impl<'s> Vm<'s> {
             }
             (PropertyValue::Struct(StructValue::Vector(v)), Ty::Vector) => Value::Vector(*v),
             (PropertyValue::Struct(StructValue::Rotator(v)), Ty::Rotator) => Value::Rotator(*v),
+            // The package reader stores a `Color` as four bytes (`b,g,r,a`); the script layout
+            // spells the member names, so map by name (a class default like
+            // `XIIIDialogMessage.MessageColor` is read as a `struct<Color>`).
+            (PropertyValue::Struct(StructValue::Color(c)), Ty::Struct(members)) => {
+                let mut fields = Vec::with_capacity(members.len());
+                for (name, _) in members {
+                    let byte = match name.to_ascii_lowercase().as_str() {
+                        "b" => c[0],
+                        "g" => c[1],
+                        "r" => c[2],
+                        "a" => c[3],
+                        _ => return Value::Unsupported(format!("color member {name}")),
+                    };
+                    fields.push((name.clone(), Value::Byte(byte)));
+                }
+                Value::Struct(fields)
+            }
             (PropertyValue::Array { count, elements }, Ty::Array(inner)) => {
                 self.decode_array(pkg, *count, *elements, inner)
             }
@@ -2622,6 +2639,11 @@ impl<'s> Vm<'s> {
                 self.process_state(id, dt)?;
             }
         }
+        for id in 0..self.objects.len() as ObjectId {
+            if self.objects[id as usize].active && self.objects[id as usize].is_actor {
+                self.dispatch_tick(id, dt)?;
+            }
+        }
         Ok(())
     }
 
@@ -2714,7 +2736,28 @@ impl<'s> Vm<'s> {
         if profiling {
             self.profile.state_micros += t0.elapsed().as_micros() as u64;
         }
+        for id in 0..self.objects.len() as ObjectId {
+            if self.objects[id as usize].active
+                && self.objects[id as usize].is_actor
+                && let Err(e) = self.dispatch_tick(id, dt)
+            {
+                let suspended = self.suspend_for_error(id, &e);
+                errors.push((suspended, e));
+            }
+        }
         errors
+    }
+
+    /// Fires the per-frame `Tick(DeltaTime)` event on one active actor. UE2's engine calls
+    /// `AActor::Tick` (the script `event Tick`) each frame; the VM runs state code latently but
+    /// must also dispatch `Tick` or per-frame script (the `CineController2` sequence interpreter,
+    /// `XIIIBaseHud.Tick`, pawn controllers) never runs. `Tick` is looked up in the actor's
+    /// current state first, then the class chain.
+    fn dispatch_tick(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
+        if let Some(f) = self.find_function(id, "Tick", true) {
+            self.call_values(f, id, vec![Value::Float(dt)])?;
+        }
+        Ok(())
     }
 
     /// Suspends the actor that should stop after a failing tick: the innermost object on the
@@ -3111,7 +3154,12 @@ impl<'s> Vm<'s> {
             };
         }
         let layout = self.func_layout(func);
-        if !self.objects[target as usize].active {
+        // A class-default object (`Default__Class`) is never `active`, but UE2 resolves and runs
+        // its functions (the HUD's `LocalizedMessage` calls `MessageClass.default.GetColor`). Only
+        // defer calls to *placed* actors outside the executed scope.
+        if !self.objects[target as usize].active
+            && !self.objects[target as usize].name.starts_with("Default__")
+        {
             let o = &self.objects[target as usize];
             let (tname, class) = (o.name.clone(), set.path(o.class));
             if layout.ret.is_some() {
@@ -4235,6 +4283,18 @@ impl<'s> Vm<'s> {
                     pitch.sin(),
                 ])
             }
+            // UE2 `VectorToRotator` (ECastToken 0x50): `FVector::Rotation()` (yaw from XY, pitch
+            // from Z, roll 0; rotator units, rounded).
+            (0x50, Value::Vector(v)) => {
+                let units = 65536.0 / std::f32::consts::TAU;
+                let yaw = v[1].atan2(v[0]);
+                let pitch = v[2].atan2((v[0] * v[0] + v[1] * v[1]).sqrt());
+                Value::Rotator([
+                    (pitch * units).round() as i32,
+                    (yaw * units).round() as i32,
+                    0,
+                ])
+            }
             (0x3A, Value::Byte(b)) => Value::Int(i32::from(*b)),
             (0x3B, Value::Byte(b)) => Value::Bool(*b != 0),
             (0x3C, Value::Byte(b)) => Value::Float(f32::from(*b)),
@@ -4263,7 +4323,10 @@ impl<'s> Vm<'s> {
             (0x56, Value::Object(Some(r))) => Value::Str(self.obj_label(r)),
             (0x56, Value::NativeClass(n)) => Value::Str(n.clone()),
             (0x57, Value::Name(n)) => Value::Str(n.clone()),
-            (c, _) if !(0x39..=0x59).contains(&c) => return Err(bad(self, &v)),
+            // UE2 `StringToName` (ECastToken 0x5A): intern the string as an FName. The cine
+            // interpreter casts the `GetFirstWord` action tag to `name` for StartDialogue.
+            (0x5A, Value::Str(s)) => Value::Name(s.clone()),
+            (c, _) if !(0x39..=0x5B).contains(&c) => return Err(bad(self, &v)),
             _ => {
                 return Err(self.err(VmErrorKind::Other(format!(
                     "primitive cast 0x{cast:02X} on {} not implemented",
@@ -6495,7 +6558,10 @@ fn member_get(v: &Value, m: &str) -> Option<Value> {
         (Value::Rotator(a), "pitch") => Some(Value::Int(a[0])),
         (Value::Rotator(a), "yaw") => Some(Value::Int(a[1])),
         (Value::Rotator(a), "roll") => Some(Value::Int(a[2])),
-        (Value::Struct(ms), m) => ms.iter().find(|(n, _)| n == m).map(|(_, v)| v.clone()),
+        (Value::Struct(ms), m) => ms
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(m))
+            .map(|(_, v)| v.clone()),
         _ => None,
     }
 }
@@ -6508,7 +6574,7 @@ fn member_set(v: &mut Value, m: &str, x: Value) -> bool {
         (Value::Rotator(a), "pitch", Value::Int(i)) => a[0] = i,
         (Value::Rotator(a), "yaw", Value::Int(i)) => a[1] = i,
         (Value::Rotator(a), "roll", Value::Int(i)) => a[2] = i,
-        (Value::Struct(ms), m, x) => match ms.iter_mut().find(|(n, _)| n == m) {
+        (Value::Struct(ms), m, x) => match ms.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(m)) {
             Some(slot) => slot.1 = x,
             None => return false,
         },
@@ -6517,10 +6583,14 @@ fn member_set(v: &mut Value, m: &str, x: Value) -> bool {
     true
 }
 
-/// UnrealScript equality used by `switch` and struct comparisons (names case-insensitive).
+/// UnrealScript equality used by `switch` and struct comparisons: `Name` and `string` compare
+/// case-insensitively (`appStricmp`/`FName`), the rest by Rust equality. The cine interpreter's
+/// `switch (GetFirstWord(Argument))` relies on this: the map scripts use lowercase action words
+/// (`dial`, `event`, `wait`) while the compiled `case` values are `Dial`/`Event`/`Wait`.
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Name(x), Value::Name(y)) => x.eq_ignore_ascii_case(y),
+        (Value::Str(x), Value::Str(y)) => x.eq_ignore_ascii_case(y),
         (Value::Int(x), Value::Byte(y)) | (Value::Byte(y), Value::Int(x)) => *x == i32::from(*y),
         _ => a == b,
     }

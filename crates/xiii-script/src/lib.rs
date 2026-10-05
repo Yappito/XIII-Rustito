@@ -12,6 +12,7 @@
 pub mod animation;
 pub mod bytecode;
 pub mod canvas;
+pub mod cartoon;
 pub mod cinematics;
 pub mod disasm;
 mod error;
@@ -31,7 +32,7 @@ pub mod voice;
 pub use animation::{AnimationData, FixedAnimation, SeqInfo};
 pub use bytecode::{Call, Label, Script, ScriptLimits, Token, TokenKind, decode_script};
 pub use error::{Result, ScriptError, ScriptErrorKind};
-pub use events::{DialogueEvent, PresentationEvent, SoundEvent};
+pub use events::{DialogueEvent, PresentationEvent, RenderTargetEvent, SoundEvent};
 pub use linker::{ExternalLookup, ExternalPackage, GlobalRef, ScriptPackage, ScriptSet};
 pub use navigation::{
     EmptyNavigation, NavEdgeInfo, NavPointInfo, NavigationData, find_path, move_step, nearest_point,

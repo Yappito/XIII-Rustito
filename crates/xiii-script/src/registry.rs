@@ -806,7 +806,7 @@ fn normal_v(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeO
 
 /// Unreal rotator (`pitch, yaw, roll`; 65536 per turn) as its orthonormal basis axes
 /// (X forward, Y right, Z up), matching `FRotationMatrix`.
-fn rotator_basis(r: [i32; 3]) -> ([f32; 3], [f32; 3], [f32; 3]) {
+pub(crate) fn rotator_basis(r: [i32; 3]) -> ([f32; 3], [f32; 3], [f32; 3]) {
     let to_rad = |u: i32| (u as f32) * std::f32::consts::TAU / 65536.0;
     let (p, y, rl) = (to_rad(r[0]), to_rad(r[1]), to_rad(r[2]));
     let (sp, cp) = (p.sin(), p.cos());
@@ -3888,6 +3888,9 @@ fn builtin_defs() -> Vec<NativeDef> {
     // Cinematic/dialogue natives (`crates/xiii-script/src/cinematics.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::cinematics::cinematic_defs());
+    // Cartoon-panel natives (`crates/xiii-script/src/cartoon.rs`). Kept in one block so a
+    // parallel edit to the registry stays out of the way.
+    v.extend(crate::cartoon::cartoon_defs());
     // Paths are matched without the package ("Class.Function"): strip it.
     for d in &mut v {
         if let Some(rest) = d.path.strip_prefix("Engine.") {

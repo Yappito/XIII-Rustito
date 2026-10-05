@@ -71,6 +71,34 @@ pub struct DialogueEvent {
     pub time: f64,
 }
 
+/// A render-to-texture camera request decoded from `RenderTargetMaterial.Update`.
+///
+/// The comic-panel HUD (`xiii.XIIIBaseHud.DrawCartoonWindowBis`) draws each panel with
+/// `Canvas.DrawTile(HUD.CWndMat, ...)`, where `CWndMat` is an `Engine.RenderTargetMaterial`
+/// whose `Update` native renders the current player view into the material. The host records
+/// the camera pose here so `--play` can render the same view to a texture for the panels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderTargetEvent {
+    /// The `RenderTargetMaterial` actor the native ran on.
+    pub actor: String,
+    /// Destination rect left in the render target.
+    pub x: i32,
+    /// Destination rect top in the render target.
+    pub y: i32,
+    /// Destination width in the render target.
+    pub width: i32,
+    /// Destination height in the render target.
+    pub height: i32,
+    /// Camera location (Unreal units).
+    pub cam_location: [f32; 3],
+    /// Camera rotation (Unreal rotator units).
+    pub cam_rotation: [i32; 3],
+    /// Vertical FOV in degrees.
+    pub fov: f32,
+    /// VM time in seconds when the native ran.
+    pub time: f64,
+}
+
 /// One outbound presentation command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PresentationEvent {
@@ -165,6 +193,8 @@ pub enum PresentationEvent {
     },
     /// `Actor.PlayStrVoice`: a named dialogue voice with its subtitle (see [`DialogueEvent`]).
     Dialogue(DialogueEvent),
+    /// `RenderTargetMaterial.Update`: render the camera pose into the panel material.
+    RenderTarget(RenderTargetEvent),
 }
 
 impl PresentationEvent {
@@ -182,6 +212,7 @@ impl PresentationEvent {
             | Self::StopSound { actor, .. }
             | Self::PlaySndPNJOno { actor, .. } => actor,
             Self::Dialogue(e) => &e.actor,
+            Self::RenderTarget(e) => &e.actor,
         }
     }
 
@@ -199,6 +230,7 @@ impl PresentationEvent {
             | Self::StopSound { time, .. }
             | Self::PlaySndPNJOno { time, .. } => *time,
             Self::Dialogue(e) => e.time,
+            Self::RenderTarget(e) => e.time,
         }
     }
 }
@@ -294,6 +326,22 @@ impl std::fmt::Display for PresentationEvent {
                 e.duration
                     .map_or_else(|| "-".to_owned(), |d| format!("{d:.3}")),
                 e.text.as_deref().unwrap_or("<none>")
+            ),
+            Self::RenderTarget(e) => write!(
+                f,
+                "RenderTargetMaterial.Update {} rect {}x{} at ({},{}) cam ({:.0},{:.0},{:.0}) rot ({},{},{}) fov {:.1}",
+                e.actor,
+                e.width,
+                e.height,
+                e.x,
+                e.y,
+                e.cam_location[0],
+                e.cam_location[1],
+                e.cam_location[2],
+                e.cam_rotation[0],
+                e.cam_rotation[1],
+                e.cam_rotation[2],
+                e.fov
             ),
         }
     }
