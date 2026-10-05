@@ -144,6 +144,16 @@ pub struct ResolvedMaterial {
     pub uv_transform: Vec<UvOp>,
     /// Optional colour multiply (RGBA, linear 0..=1).
     pub color_tint: Option<[f32; 4]>,
+    /// Dotted object path of the root material object (diagnostics/evidence).
+    pub material_path: Option<String>,
+    /// Player footstep wrapper `Sound` path (`XIIIFootStepSound`), as the material spells it.
+    /// `PlayFootStep`/`PlayLandSound` pass this to `PlaySound` when a player pawn walks on the
+    /// surface (`bReplaceHXScripts == false`, the PC path).
+    pub footstep_sound: Option<String>,
+    /// AI/PNJ footstep wrapper `Sound` path (`FootstepSound`).
+    pub footstep_sound_ai: Option<String>,
+    /// `NoiseLoudness` carried by the surface material (used by `MakeNoise`).
+    pub noise_loudness: Option<f32>,
     /// Material classes/features that were recognised but not modelled.
     pub unsupported: Vec<String>,
     /// Short class names visited from the surface material inward (diagnostics).
@@ -158,6 +168,10 @@ impl Default for ResolvedMaterial {
             two_sided: false,
             uv_transform: Vec::new(),
             color_tint: None,
+            material_path: None,
+            footstep_sound: None,
+            footstep_sound_ai: None,
+            noise_loudness: None,
             unsupported: Vec::new(),
             class_chain: Vec::new(),
         }
@@ -195,6 +209,12 @@ pub struct MaterialNode {
     pub uv_ops: Vec<UvOp>,
     /// Optional constant colour tint (`ColorModifier.Color`).
     pub color: Option<[f32; 4]>,
+    /// Player footstep wrapper `Sound` path (`XIIIFootStepSound`), as spelled by this node.
+    pub footstep_sound: Option<String>,
+    /// AI/PNJ footstep wrapper `Sound` path (`FootstepSound`).
+    pub footstep_sound_ai: Option<String>,
+    /// `NoiseLoudness` carried by this node.
+    pub noise_loudness: Option<f32>,
     /// Properties present here that are not modelled (diagnostics, one per property).
     pub ignored: Vec<String>,
 }
@@ -318,6 +338,18 @@ fn apply(
     stack: &mut Vec<NodeKey>,
     blend_set: &mut bool,
 ) {
+    // Footstep/noise data lives on the surface material itself (Texture/Shader/...) and is
+    // inherited by modifiers that embed it; the outermost carrier wins, matching the engine
+    // reading the property off the material the trace hit.
+    if out.footstep_sound.is_none() {
+        out.footstep_sound = node.footstep_sound.clone();
+    }
+    if out.footstep_sound_ai.is_none() {
+        out.footstep_sound_ai = node.footstep_sound_ai.clone();
+    }
+    if out.noise_loudness.is_none() {
+        out.noise_loudness = node.noise_loudness;
+    }
     match node.class.as_str() {
         "Texture" => {
             match node.texture {
@@ -505,6 +537,80 @@ mod tests {
             r.class_chain,
             ["FinalBlend", "Shader", "TexPanner", "Texture"]
         );
+    }
+
+    /// The footstep wrapper and noise loudness travel with the surface material; the outer
+    /// carrier wins when both it and the texture inside carry one, and a `Texture` inside a
+    /// `Shader` without its own sound does not erase the outer value.
+    #[test]
+    fn footstep_sound_and_noise_follow_the_surface_material() {
+        let mut lookup = graph(vec![
+            (
+                key("p", 0),
+                MaterialNode {
+                    class: "Shader".into(),
+                    diffuse: Some(key("p", 1)),
+                    footstep_sound: Some(
+                        "XIIIsound.Footsteps__XIIIFSMar.XIIIFSMar__hXIIIFootMar".into(),
+                    ),
+                    footstep_sound_ai: Some(
+                        "XIIIsound.Footsteps__PNJFSMar.PNJFSMar__hPNJFSMar".into(),
+                    ),
+                    noise_loudness: Some(0.4),
+                    ..Default::default()
+                },
+            ),
+            (
+                key("p", 1),
+                MaterialNode {
+                    class: "Texture".into(),
+                    texture: Some(9),
+                    footstep_sound: Some("inner".into()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let r = resolve(Some(key("p", 0)), &mut lookup);
+        assert_eq!(r.base, Some(9));
+        assert_eq!(
+            r.footstep_sound.as_deref(),
+            Some("XIIIsound.Footsteps__XIIIFSMar.XIIIFSMar__hXIIIFootMar"),
+            "the outer material's footstep sound must win"
+        );
+        assert_eq!(
+            r.footstep_sound_ai.as_deref(),
+            Some("XIIIsound.Footsteps__PNJFSMar.PNJFSMar__hPNJFSMar")
+        );
+        assert_eq!(r.noise_loudness, Some(0.4));
+    }
+
+    /// A modifier over a texture that carries the sound: the walker reaches the texture and
+    /// inherits its footstep wrapper (the common `FinalBlend`/`TexPanner` -> `Texture` case).
+    #[test]
+    fn footstep_sound_inherited_from_the_inner_texture() {
+        let mut lookup = graph(vec![
+            (
+                key("p", 0),
+                MaterialNode {
+                    class: "FinalBlend".into(),
+                    material: Some(key("p", 1)),
+                    ..Default::default()
+                },
+            ),
+            (
+                key("p", 1),
+                MaterialNode {
+                    class: "Texture".into(),
+                    texture: Some(3),
+                    footstep_sound: Some("XIII.Ft.Boi".into()),
+                    noise_loudness: Some(0.1),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let r = resolve(Some(key("p", 0)), &mut lookup);
+        assert_eq!(r.footstep_sound.as_deref(), Some("XIII.Ft.Boi"));
+        assert_eq!(r.noise_loudness, Some(0.1));
     }
 
     #[test]

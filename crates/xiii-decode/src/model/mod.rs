@@ -207,8 +207,9 @@ pub struct Model {
     pub polys: Option<ObjectRef>,
     /// Per-surface lightmap indices (`FLightMapIndex`), decoded after `Polys`.
     pub light_maps: Vec<LightMapIndex>,
-    /// Per-surface light bits, one byte per node reference (`TArray<u8>`).
-    pub light_bits: Vec<u8>,
+    /// Second lightmap-associated array: per-entry a `u16`, a nested byte array, then three
+    /// `i32`. Empty on the 6,396 Models whose tail decodes end-to-end.
+    pub light_bits: Vec<LightMapBits>,
     /// Node bounds (`FBox`, 25 bytes each).
     pub bounds: Vec<BoundingBox>,
     /// `LeafHulls` (`TArray<i32>`).
@@ -223,8 +224,8 @@ pub struct Model {
     pub linked: i32,
     /// `MoverLink` (third i32 after `Lights`).
     pub mover_link: i32,
-    /// BSP vertex stream (`TArray<FBspVertex>`, 32 bytes each): position, normal, two UV pairs.
-    pub vertex_stream: Vec<[f32; 8]>,
+    /// BSP vertex stream (`TArray<FBspVertex>`, 32 bytes each): position, colour, two UV pairs.
+    pub vertex_stream: Vec<BspVertex>,
     /// Revision i32 that follows the vertex stream.
     pub vertex_stream_revision: i32,
     /// Byte accounting (with the unsupported tail).
@@ -253,6 +254,59 @@ pub struct LightMapIndex {
     pub unknown: [u8; 2],
     /// Four trailing compact indices; meanings not established.
     pub tail_indices: [i32; 4],
+}
+
+/// One element of the second lightmap-associated array (`TArray` written by `0x103997a0`).
+///
+/// Layout for licensee 58 / package 100 / engine ver 100 (> 0x32, > 0x5b): a `u16`, a nested
+/// byte array, then two `i32` (the writer's `+0x10`, `+0x14`) and, above engine version 0x5b, a
+/// third `i32` (`+0x18`). The array is empty on every Model whose tail decodes end-to-end; only
+/// 5 Models (e.g. the `Banque01` level model) carry a non-empty one. Field meanings are not
+/// established; only the sizes are.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LightMapBits {
+    /// Raw `u16` field (first two bytes of the record).
+    pub flags: u16,
+    /// Nested byte array.
+    pub bytes: Vec<u8>,
+    /// First trailing `i32`.
+    pub a: i32,
+    /// Second trailing `i32`.
+    pub b: i32,
+    /// Third trailing `i32` (engine version > 0x5b).
+    pub c: i32,
+}
+
+/// One `FBspVertex` of [`Model::vertex_stream`] (32 bytes).
+///
+/// Layout from the element serializer `0x10398160`/`0x10398250` and the bulk stream writer
+/// `0x1039bb30`, and verified against the GOG bytes:
+/// `position: FVector (3 f32)`, a 4-byte component, `uv0: FVector2D (2 f32)`,
+/// `uv1: FVector2D (2 f32)`. `FBspVertexStream::GetComponents` reports position, one
+/// 4-byte component and two texture-coordinate components, matching this order. The byte-exact
+/// invariant on all fully-decoded Models (e.g. Plage00) is
+/// `vertex_stream[n.first_vertex + (n.num_vertices - 1 - k)].position ==
+/// points[verts[n.vert_pool + k].point]`, i.e. the stream is the node polygons' vertices in
+/// reverse order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BspVertex {
+    /// Position in source (Unreal) coordinates.
+    pub position: [f32; 3],
+    /// The 4-byte component at offset `0x0c`.
+    ///
+    /// The engine's `FVertexComponent` list types it as a colour and the bytes are stored in
+    /// the `FColor` memory order `B,G,R,A`, but the value is **not** a meaningful baked light
+    /// term in the corpus: measured over every position-validated stream it is
+    /// `FF FF FF FF` (white) at polygon corners and `00 00 00 00` (transparent black) at
+    /// collinear (T-junction) vertices, with a few near-white greys (`FE FE FE FE` on
+    /// `DM_LostTemple`). `world-coverage` counts the split as
+    /// `lighting.bsp.color_white/black/other`. Interpreting it as lighting is a hypothesis and
+    /// was rejected (it blackens T-junction vertices); the name stays neutral.
+    pub flags_or_color: [u8; 4],
+    /// First texture coordinate pair.
+    pub uv0: [f32; 2],
+    /// Second texture coordinate pair.
+    pub uv1: [f32; 2],
 }
 
 /// One `FConvexVolumeLeaf` entry.
@@ -350,6 +404,7 @@ pub fn decode_model(package: &Package, data: &[u8], export: usize) -> DecodeResu
     let tail_start = r.pos();
     match decode_model_tail(package, &mut r) {
         Ok(t) => {
+            let exact = r.remaining() == 0;
             m.light_maps = t.light_maps;
             m.light_bits = t.light_bits;
             m.bounds = t.bounds;
@@ -361,6 +416,26 @@ pub fn decode_model(package: &Package, data: &[u8], export: usize) -> DecodeResu
             m.mover_link = t.mover_link;
             m.vertex_stream = t.vertex_stream;
             m.vertex_stream_revision = t.vertex_stream_revision;
+            // The tail is trusted only when it consumes the payload exactly, or (for the
+            // `Banque01`-style variant whose record layout differs but whose vertex stream is
+            // otherwise sound) when the decoded stream's positions match `Points` for every
+            // referenced node vertex. Anything else is a build variant: the decoded prefix is
+            // kept and the whole remainder is reported as the labelled unsupported tail rather
+            // than decoding bogus lightmaps/streams.
+            if !exact && !m.vertex_stream_matches_points() {
+                m.light_maps.clear();
+                m.light_bits.clear();
+                m.bounds.clear();
+                m.leaf_hulls.clear();
+                m.leaves.clear();
+                m.lights.clear();
+                m.root_outside = 0;
+                m.linked = 0;
+                m.mover_link = 0;
+                m.vertex_stream.clear();
+                m.vertex_stream_revision = 0;
+                r.seek(tail_start).map_err(ctx)?;
+            }
         }
         // A build variant whose tail layout differs surfaces as a count that does not fit, an
         // out-of-range reference, or a compact index that overflows (`BadCount`/`Invalid`/
@@ -616,7 +691,7 @@ fn decode_light_maps(r: &mut PayloadReader<'_>) -> DecodeResult<Vec<LightMapInde
 /// Decoded tail fields (after `Polys`).
 struct ModelTail {
     light_maps: Vec<LightMapIndex>,
-    light_bits: Vec<u8>,
+    light_bits: Vec<LightMapBits>,
     bounds: Vec<BoundingBox>,
     leaf_hulls: Vec<i32>,
     leaves: Vec<ConvexVolumeLeaf>,
@@ -624,7 +699,7 @@ struct ModelTail {
     root_outside: i32,
     linked: i32,
     mover_link: i32,
-    vertex_stream: Vec<[f32; 8]>,
+    vertex_stream: Vec<BspVertex>,
     vertex_stream_revision: i32,
 }
 
@@ -635,15 +710,32 @@ struct ModelTail {
 /// proven by the 6,396 Models whose whole payload is consumed exactly.
 fn decode_model_tail(package: &Package, r: &mut PayloadReader<'_>) -> DecodeResult<ModelTail> {
     let light_maps = decode_light_maps(r)?;
-    // Second array after LightMap (edi+0xbc). Its per-element record is 15 bytes for this
-    // build (two raw bytes, one compact index, then three i32); it is empty in the 6,396
-    // Models whose tail decodes end-to-end. Kept as raw bytes because the meaning is not
-    // established.
+    // Second array after LightMap (edi+0xbc), writer `0x103997a0`. Each element is a `u16`, a
+    // nested byte array, then three i32 (engine ver > 0x5b). It is empty in the 6,396 Models
+    // whose tail decodes end-to-end; the `Banque01` level model (and 4 others) carry a
+    // non-empty one. The meanings of its fields are not established.
     let light_bits = {
         let n = r
-            .count("light_bits", 1)
+            .count("light_bits", 2 + 1 + 12)
             .map_err(|e| e.in_field("light_bits"))?;
-        r.bytes(n).map_err(|e| e.in_field("light_bits"))?.to_vec()
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let flags = r.u16().map_err(|e| e.in_field("light_bits.flags"))?;
+            let bytes = r
+                .array("light_bits.bytes", 1, |r| r.u8())
+                .map_err(|e| e.in_field("light_bits.bytes"))?;
+            let a = r.i32().map_err(|e| e.in_field("light_bits.a"))?;
+            let b = r.i32().map_err(|e| e.in_field("light_bits.b"))?;
+            let c = r.i32().map_err(|e| e.in_field("light_bits.c"))?;
+            out.push(LightMapBits {
+                flags,
+                bytes,
+                a,
+                b,
+                c,
+            });
+        }
+        out
     };
     let bounds = r.array("bounds", 25, |r| r.bbox())?;
     let leaf_hulls = r.array("leaf_hulls", 4, |r| r.i32())?;
@@ -678,11 +770,23 @@ fn decode_model_tail(package: &Package, r: &mut PayloadReader<'_>) -> DecodeResu
             .map_err(|e| e.in_field("vertex_stream"))?;
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
-            let mut v = [0.0f32; 8];
-            for f in &mut v {
-                *f = r.f32().map_err(|e| e.in_field("vertex_stream"))?;
-            }
-            out.push(v);
+            let position = r.vec3().map_err(|e| e.in_field("vertex_stream"))?;
+            let c = r.bytes(4).map_err(|e| e.in_field("vertex_stream"))?;
+            let flags_or_color = [c[0], c[1], c[2], c[3]];
+            let uv0 = [
+                r.f32().map_err(|e| e.in_field("vertex_stream"))?,
+                r.f32().map_err(|e| e.in_field("vertex_stream"))?,
+            ];
+            let uv1 = [
+                r.f32().map_err(|e| e.in_field("vertex_stream"))?,
+                r.f32().map_err(|e| e.in_field("vertex_stream"))?,
+            ];
+            out.push(BspVertex {
+                position,
+                flags_or_color,
+                uv0,
+                uv1,
+            });
         }
         out
     };
@@ -911,7 +1015,11 @@ impl Model {
             ("zone_actors", zone_actors),
             ("polys_ref", u64::from(self.polys.is_some())),
             ("light_maps", self.light_maps.len() as u64),
-            ("light_bits_bytes", self.light_bits.len() as u64),
+            ("light_bits", self.light_bits.len() as u64),
+            (
+                "light_bits_bytes",
+                self.light_bits.iter().map(|b| b.bytes.len() as u64).sum(),
+            ),
             ("bounds", self.bounds.len() as u64),
             ("leaf_hulls", self.leaf_hulls.len() as u64),
             ("leaves", self.leaves.len() as u64),
@@ -971,6 +1079,51 @@ impl Model {
             }
         }
         (out, conflicts)
+    }
+
+    /// Position of the stream vertex for node-vertex `k` of node `node`, when the stream is
+    /// present and the node's vertex range is in bounds. The stream stores node polygons in
+    /// reverse order: stream index `first_vertex + (num_vertices - 1 - k)`.
+    pub fn stream_vertex(&self, node: usize, k: usize) -> Option<&BspVertex> {
+        let n = self.nodes.get(node)?;
+        if k >= n.num_vertices as usize {
+            return None;
+        }
+        let idx = n.first_vertex as usize + (n.num_vertices as usize - 1 - k);
+        self.vertex_stream.get(idx)
+    }
+
+    /// True when the vertex stream is present and every referenced node-vertex position equals
+    /// the `Points` position of the vertex it belongs to (max axis error `< 0.2` source units).
+    /// This is the byte-exact invariant measured on the fully-decoded Models; a build variant
+    /// whose stream is misaligned (or empty) returns `false`, so its colours are never applied.
+    pub fn vertex_stream_matches_points(&self) -> bool {
+        if self.vertex_stream.is_empty() {
+            return false;
+        }
+        let mut referenced = 0usize;
+        for (ni, n) in self.nodes.iter().enumerate() {
+            if n.num_vertices == 0 {
+                continue;
+            }
+            for k in 0..n.num_vertices as usize {
+                let vi = n.vert_pool as usize + k;
+                let Some(v) = self.verts.get(vi) else {
+                    return false;
+                };
+                let Some(p) = self.points.get(v.point as usize) else {
+                    return false;
+                };
+                let Some(s) = self.stream_vertex(ni, k) else {
+                    return false;
+                };
+                if (0..3).any(|i| (s.position[i] - p[i]).abs() >= 0.2) {
+                    return false;
+                }
+                referenced += 1;
+            }
+        }
+        referenced == self.vertex_stream.len()
     }
 
     /// Winding of node polygons against their node plane in source coordinates:
@@ -1102,7 +1255,7 @@ pub fn summary_text(package: &Package, export: usize, m: &Model) -> String {
         out,
         "  lightmaps {} lightbits {} bounds {} leafhulls {} leaves {} lights {} vertexstream {} (rev {})",
         m.light_maps.len(),
-        m.light_bits.len(),
+        m.light_bits.iter().map(|b| b.bytes.len()).sum::<usize>(),
         m.bounds.len(),
         m.leaf_hulls.len(),
         m.leaves.len(),
@@ -1317,13 +1470,14 @@ mod tests {
 
     /// Tail bytes after the `Polys` reference: empty LightMap/LightBits/Bounds/LeafHulls/
     /// Leaves/Lights, RootOutside=0, Linked=1, MoverLink=0, one 32-byte vertex, revision 7.
+    /// The vertex is position (1,2,3), colour bytes 4,5,6,7, uv0 (8,9), uv1 (10,11).
     fn model_tail_payload() -> Vec<u8> {
         let mut b = Bytes::default().c(0).c(0).c(0).c(0).c(0).c(0);
         b = b.i32(0).i32(1).i32(0);
         b = b.c(1);
-        for v in 1..=8 {
-            b = b.f32(v as f32);
-        }
+        b = b.f32(1.0).f32(2.0).f32(3.0);
+        b = b.raw(&[4, 5, 6, 7]);
+        b = b.f32(8.0).f32(9.0).f32(10.0).f32(11.0);
         b = b.i32(7);
         b.0
     }
@@ -1343,7 +1497,11 @@ mod tests {
         assert_eq!(m.linked, 1);
         assert_eq!(m.mover_link, 0);
         assert_eq!(m.vertex_stream.len(), 1);
-        assert_eq!(m.vertex_stream[0], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let v = m.vertex_stream[0];
+        assert_eq!(v.position, [1.0, 2.0, 3.0]);
+        assert_eq!(v.flags_or_color, [4, 5, 6, 7]);
+        assert_eq!(v.uv0, [8.0, 9.0]);
+        assert_eq!(v.uv1, [10.0, 11.0]);
         assert_eq!(m.vertex_stream_revision, 7);
     }
 
@@ -1364,6 +1522,98 @@ mod tests {
         assert_eq!(label, "model.after_linked");
         // No bytes are dropped: the tail starts right after the Polys reference.
         assert_eq!(m.report.unsupported_tail.unwrap().1.len(), tail.len());
+    }
+
+    /// Tail bytes with a vertex stream of `positions` (each followed by a white colour and two
+    /// zero UV pairs), revision 9 and `trailing` bytes after the revision.
+    fn model_tail_stream(positions: &[[f32; 3]], trailing: &[u8]) -> Vec<u8> {
+        let mut b = Bytes::default().c(0).c(0).c(0).c(0).c(0).c(0);
+        b = b.i32(0).i32(0).i32(0);
+        b = b.c(positions.len() as i32);
+        for p in positions {
+            b = b
+                .f32(p[0])
+                .f32(p[1])
+                .f32(p[2])
+                .raw(&[255, 255, 255, 255])
+                .f32(0.0)
+                .f32(0.0)
+                .f32(0.0)
+                .f32(0.0);
+        }
+        b = b.i32(9);
+        b = b.raw(trailing);
+        b.0
+    }
+
+    #[test]
+    fn synthetic_model_variant_stream_accepted_when_positions_match() {
+        // The model's node has 3 vertices with Points (0,0,0), (1,0,0), (0,1,0); the stream
+        // stores them reversed, so it is [p2, p1, p0]. A trailing byte makes the tail
+        // non-exact; the stream must still be accepted because its positions match.
+        let positions = [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+        let tail = model_tail_stream(&positions, &[1]);
+        let mut b = Builder::new();
+        let i = b.export("Model", "M", model_payload(0, &tail));
+        let bytes = b.build();
+        let p = parse(&bytes);
+        let m = decode_model(&p, &bytes, i).unwrap();
+        assert_eq!(m.vertex_stream.len(), 3);
+        assert!(m.vertex_stream_matches_points());
+        let (label, span) = m.report.unsupported_tail.unwrap();
+        assert_eq!((label, span.len()), ("model.after_linked", 1));
+    }
+
+    #[test]
+    fn synthetic_model_variant_stream_rejected_when_positions_mismatch() {
+        // Same non-exact tail but the stream positions do not match `Points`: the whole tail
+        // must be reported unsupported and no bogus stream/colours kept.
+        let positions = [[9.0, 9.0, 9.0], [9.0, 9.0, 9.0], [9.0, 9.0, 9.0]];
+        let tail = model_tail_stream(&positions, &[1]);
+        let mut b = Builder::new();
+        let i = b.export("Model", "M", model_payload(0, &tail));
+        let bytes = b.build();
+        let p = parse(&bytes);
+        let m = decode_model(&p, &bytes, i).unwrap();
+        assert!(m.vertex_stream.is_empty());
+        assert!(!m.vertex_stream_matches_points());
+        let (label, span) = m.report.unsupported_tail.unwrap();
+        assert_eq!(label, "model.after_linked");
+        assert_eq!(span.len(), tail.len());
+    }
+
+    #[test]
+    fn synthetic_light_bits_element_decodes() {
+        // Empty LightMap, one LightBits element (`u16`, nested byte array, three i32), empty
+        // Bounds/LeafHulls/Leaves/Lights, no stream, so the tail consumes exactly.
+        let mut tail = vec![0u8]; // empty LightMap
+        tail.push(1); // one LightBits element
+        tail.extend_from_slice(&0x1234u16.to_le_bytes());
+        tail.push(2); // nested byte array count
+        tail.extend_from_slice(&[0x0f, 0xf0]);
+        tail.extend_from_slice(&(-1i32).to_le_bytes());
+        tail.extend_from_slice(&2i32.to_le_bytes());
+        tail.extend_from_slice(&3i32.to_le_bytes());
+        tail.extend_from_slice(&[0, 0, 0, 0]); // bounds/leaf_hulls/leaves/lights counts
+        tail.extend_from_slice(&[0; 12]); // root_outside/linked/mover_link
+        tail.push(0); // vertex stream count
+        tail.extend_from_slice(&0i32.to_le_bytes()); // revision
+        tail.push(0); // final compact
+        let mut b = Builder::new();
+        let i = b.export("Model", "M", model_payload(0, &tail));
+        let bytes = b.build();
+        let p = parse(&bytes);
+        let m = decode_model(&p, &bytes, i).unwrap();
+        assert!(
+            m.report.unsupported_tail.is_none(),
+            "tail must consume exactly"
+        );
+        assert_eq!(m.light_bits.len(), 1);
+        assert_eq!(m.light_bits[0].flags, 0x1234);
+        assert_eq!(m.light_bits[0].bytes, vec![0x0f, 0xf0]);
+        assert_eq!(m.light_bits[0].a, -1);
+        assert_eq!(m.light_bits[0].b, 2);
+        assert_eq!(m.light_bits[0].c, 3);
     }
 
     #[test]
@@ -1662,13 +1912,51 @@ mod tests {
                 }
             }
         }
+        println!(
+            "[model-tail] models {models} with_lm {with_lm} lm {lm_total} leaves {leaves_total} \
+             bounds {bounds_total} lights {lights_total} vertex {vertex_total}"
+        );
         assert_eq!(models, 7194, "model count");
-        assert_eq!(with_lm, 8, "models with a decoded non-empty LightMap");
-        assert_eq!(lm_total, 235, "lightmap index count");
-        assert_eq!(leaves_total, 4951, "convex volume leaf count");
-        assert_eq!(bounds_total, 14866, "bounds count");
-        assert_eq!(lights_total, 7023, "light references");
-        assert_eq!(vertex_total, 119639, "vertex stream count");
+        assert_eq!(with_lm, 13, "models with a decoded non-empty LightMap");
+        assert_eq!(lm_total, 325, "lightmap index count");
+        assert_eq!(leaves_total, 8197, "convex volume leaf count");
+        assert_eq!(bounds_total, 19834, "bounds count");
+        assert_eq!(lights_total, 6396, "light references");
+        assert_eq!(vertex_total, 198134, "vertex stream count");
+    }
+
+    /// Opt-in: the level model's `FBspVertexStream` on Plage00/Plage01/Banque01 is non-empty
+    /// and every referenced node vertex's stream position equals its `Points` position. This
+    /// is the mapping invariant the viewer's BSP baked colours rely on.
+    #[test]
+    fn local_corpus_bsp_vertex_stream_positions() {
+        let Some(dir) = std::env::var_os("XIII_GOG_DIR") else {
+            println!("SKIPPED: set XIII_GOG_DIR to run the BSP vertex stream corpus test");
+            return;
+        };
+        let root = std::path::Path::new(&dir);
+        let expected = [
+            ("Plage00", 1704usize),
+            ("Plage01", 2627),
+            ("Banque01", 8784),
+        ];
+        for (map, count) in expected {
+            let path = root.join("Maps").join(format!("{map}.unr"));
+            let data = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let p = Package::parse(&data, &xiii_package::Limits::default())
+                .unwrap_or_else(|e| panic!("{map}: {e}"));
+            let idx = find_level_model(&p, &data).unwrap_or_else(|e| panic!("{map}: {e}"));
+            let m = decode_model(&p, &data, idx).unwrap_or_else(|e| panic!("{map}: {e}"));
+            assert_eq!(m.vertex_stream.len(), count, "{map}: stream length");
+            assert!(
+                m.vertex_stream_matches_points(),
+                "{map}: stream positions do not match Points"
+            );
+            println!(
+                "[bsp-stream] {map}: {} stream vertices, positions validated",
+                m.vertex_stream.len()
+            );
+        }
     }
 
     #[test]
