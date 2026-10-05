@@ -145,6 +145,20 @@ fn name(vm: &Vm<'_>, a: &[Value], i: usize) -> VmResult<String> {
     }
 }
 
+fn byte(vm: &Vm<'_>, a: &[Value], i: usize) -> VmResult<u8> {
+    match a.get(i) {
+        Some(Value::Byte(v)) => Ok(*v),
+        Some(Value::Int(v)) => u8::try_from(*v).map_err(|_| {
+            vm.err(VmErrorKind::TypeMismatch {
+                expected: "byte 0..255",
+                found: "int",
+            })
+        }),
+        Some(v) => Err(type_err(vm, "byte", v)),
+        None => Err(vm.err(VmErrorKind::Other("missing argument".into()))),
+    }
+}
+
 fn string(vm: &Vm<'_>, a: &[Value], i: usize) -> VmResult<String> {
     match a.get(i) {
         Some(Value::Str(v)) => Ok(v.clone()),
@@ -535,14 +549,57 @@ fn class_ref(vm: &Vm<'_>, a: &[Value], i: usize) -> VmResult<Option<GlobalRef>> 
     }
 }
 
+/// Native engine-class base relationships for `DynamicLoadObject`'s requested-class check.
+///
+/// The decoded packages carry no `Core.Class` export for the engine mesh classes (measured:
+/// `engine.u` exports `Actor`, `Texture`, `LevelInfo`, `MeshSkinList`, ... but **not**
+/// `Mesh`/`SkeletalMesh`/`StaticMesh`), so their inheritance is not available from the corpus.
+/// These are the UE2 `Engine` relationships needed by the retail
+/// call sites: `Weapon.PostBeginPlay` loads a `SkeletalMesh` with `class'Engine.Mesh'`
+/// (`XIII_Game/system/engine.u`, `Weapon.PostBeginPlay` token `DynamicLoadObject(MeshName,
+/// class'Engine.Mesh')`), and `USkeletalMesh`/`UStaticMesh` derive from `UMesh` upstream.
+/// `(subclass, base)`, lowercase leaf names.
+const NATIVE_CLASS_BASES: &[(&str, &str)] = &[
+    ("skeletalmesh", "mesh"),
+    ("staticmesh", "mesh"),
+    ("mesh", "primitive"),
+    ("skeletalmeshinstance", "meshinstance"),
+    ("staticmeshinstance", "meshinstance"),
+    ("meshinstance", "primitive"),
+];
+
+/// True when native class `actual` is `requested` or derives from it under
+/// [`NATIVE_CLASS_BASES`]. Both are `Package.Object` paths or bare leaf names; only the leaf is
+/// compared. The walk is bounded so an accidental cycle cannot loop.
+pub(crate) fn native_class_is_a(actual: &str, requested: &str) -> bool {
+    let leaf = |p: &str| p.rsplit('.').next().unwrap_or(p).to_ascii_lowercase();
+    let actual = leaf(actual);
+    let requested = leaf(requested);
+    if actual == requested {
+        return true;
+    }
+    let mut cur = actual.as_str();
+    for _ in 0..16 {
+        let Some((_, base)) = NATIVE_CLASS_BASES.iter().find(|(sub, _)| *sub == cur) else {
+            return false;
+        };
+        if *base == requested {
+            return true;
+        }
+        cur = base;
+    }
+    false
+}
+
 fn dynamic_load_object(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let name = match a.first() {
         Some(Value::Str(s)) | Some(Value::Name(s)) => s.clone(),
         _ => return val(Value::Object(None)),
     };
     // UE2 `execDynamicLoadObject`: resolve the name, then require the loaded object's class to
-    // be `ObjectClass` (a subclass), else the load fails (NULL). This matters because e.g.
-    // `DynamicLoadObject(MeshName, class'Engine.Mesh')` must not return a non-Mesh object.
+    // be `ObjectClass` or a subclass, else the load fails (NULL). This matters because e.g.
+    // `DynamicLoadObject(MeshName, class'Engine.Mesh')` must accept a `SkeletalMesh` (the
+    // retail `Weapon.PostBeginPlay` path) but must not return a non-Mesh object.
     let requested = match a.get(1) {
         Some(Value::NativeClass(n)) => Some(n.clone()),
         Some(Value::Object(Some(ObjRef::Instance(i)))) => {
@@ -554,14 +611,11 @@ fn dynamic_load_object(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmRes
     match vm.find_loaded_object(&name) {
         Some(g) => {
             if let Some(req) = &requested {
-                // The VM has no runtime class hierarchy for arbitrary natives; compare the
-                // object's decoded class name against the requested one (leaf name). This
-                // rejects a Texture when `class'Engine.Mesh'` was requested.
+                // The VM has no runtime class hierarchy for arbitrary natives; the small
+                // native table above covers the engine mesh classes, and everything else is an
+                // exact leaf match.
                 let actual = vm.class_path_of(g);
-                let ok = actual.as_deref().is_some_and(|a| {
-                    let leaf = |p: &str| p.rsplit('.').next().unwrap_or(p).to_ascii_lowercase();
-                    leaf(a) == leaf(req)
-                });
+                let ok = actual.as_deref().is_some_and(|a| native_class_is_a(a, req));
                 if !ok {
                     vm.note(TraceKind::Note(format!(
                         "DynamicLoadObject: {name} is not a {req} (class {})",
@@ -829,6 +883,34 @@ fn all_actors(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<Nativ
     Ok(NativeOutcome::Iterate(items))
 }
 
+/// `Actor.CollidingActors` (native 321): actors of `BaseClass` near the caller. **Partial**: the
+/// VM uses the same distance filter as `RadiusActors` (its collision cylinders are not swept);
+/// `XIIIMover.Timer` re-checks `FastTrace`/vision on each result, so this is sufficient for the
+/// door-warning timer and keeps a mover from being suspended on its own timer.
+fn colliding_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let base = match object(vm, a, 0)? {
+        Some(ObjRef::Static(g)) => Some(g),
+        None => None,
+        Some(ObjRef::Instance(_)) => {
+            return Err(vm.err(VmErrorKind::Other(
+                "CollidingActors base class is an instance".into(),
+            )));
+        }
+    };
+    let radius = float(vm, a, 2)?;
+    let loc = if c.omitted(3) {
+        vm.vector_prop(c.this, "Location").unwrap_or([0.0; 3])
+    } else {
+        vector2(vm, a, 3)?
+    };
+    let items = vm
+        .radius_actors(base, radius, loc)
+        .into_iter()
+        .map(|i| Value::Object(Some(ObjRef::Instance(i))))
+        .collect();
+    Ok(NativeOutcome::Iterate(items))
+}
+
 fn radius_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let base = match object(vm, a, 0)? {
         Some(ObjRef::Static(g)) => Some(g),
@@ -929,6 +1011,28 @@ fn set_timer(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Native
     let rate = float(vm, a, 0)?;
     let repeat = boolean(vm, a, 1)?;
     vm.set_timer(c.this, rate, repeat);
+    val(Value::Void)
+}
+
+/// `Actor.FinishInterpolation` (native 301): latent; suspends the state code of a `Mover` until
+/// its `bInterpolating` flag clears. The per-tick `PHYS_MovingBrush` advance that clears it is
+/// [`crate::vm::Vm::advance_interpolation`]. Evidence: every `Engine.Mover` open/close state
+/// (`OpenTimedMover`, `TriggerToggle`, `TriggerControl`, `BumpOpenTimed`, `BumpButton`,
+/// `TriggerPound`) calls it immediately after `DoOpen`/`DoClose` and expects to resume when the
+/// brush reaches its key; the Plage01 item8a run stopped at this native (#301).
+fn finish_interpolation(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    if !c.in_state_code {
+        return Err(vm.err(VmErrorKind::LatentOutsideState {
+            path: c.path.clone(),
+        }));
+    }
+    vm.pending_latent = Some(Latent::Interp {
+        started: vm.time_now(),
+    });
     val(Value::Void)
 }
 
@@ -1603,6 +1707,30 @@ fn set_view_target(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<
     val(Value::Void)
 }
 
+/// `Actor.MakeNoise`: UE2 notifies nearby AI (`Pawn.HearNoise`) of a noise at the actor's
+/// location. The VM has no AI hearing/perception model, so the call is accepted and discarded
+/// (registered `Partial` with that reason; `GameInfo.PlayTeleportEffect` calls it on the
+/// player-login path).
+fn make_noise(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    let _ = vm;
+    val(Value::Void)
+}
+
+/// `Canvas.MakeColor`: UE2 packs the four bytes into the `Color` struct (A defaults to 255 when
+/// omitted). `PlayerController.ClearProgressMessages` calls it on the login/PostLogin path.
+fn make_color(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let r = byte(vm, a, 0)?;
+    let g = byte(vm, a, 1)?;
+    let b = byte(vm, a, 2)?;
+    let alpha = if c.omitted(3) { 255 } else { byte(vm, a, 3)? };
+    val(Value::Struct(vec![
+        ("r".into(), Value::Byte(r)),
+        ("g".into(), Value::Byte(g)),
+        ("b".into(), Value::Byte(b)),
+        ("a".into(), Value::Byte(alpha)),
+    ]))
+}
+
 fn play_sound(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     vm.emit_sound(false, c.this, a, &c.omitted);
     val(Value::Void)
@@ -1711,6 +1839,60 @@ fn find_inventory_type(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmRes
             break;
         }
         if vm.is_child_of_class(vm.objects[id as usize].class, desired) {
+            return val(Value::Object(Some(ObjRef::Instance(id))));
+        }
+        cur = prop_object(vm, id, "Inventory");
+    }
+    val(Value::Object(None))
+}
+
+/// `Object.Cross_VectorVector` (native 220): `A x B` (UE1 `FVector` cross product). Needed by
+/// `XIIIPorte.PlayerTriggerToggle.PlayerTrigger` and `Mover.EncroachingOn` to pick the swing side.
+fn cross_vv(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let x = vector2(vm, a, 0)?;
+    let y = vector2(vm, a, 1)?;
+    val(Value::Vector([
+        x[1] * y[2] - x[2] * y[1],
+        x[2] * y[0] - x[0] * y[2],
+        x[0] * y[1] - x[1] * y[0],
+    ]))
+}
+
+/// `Actor.GetBoundingBox` (native 419): the actor's collision extent as a `Box` struct. XIII's
+/// `XIIIPorte.PlayerTriggerToggle.BeginState` uses it to compute the door direction. **Partial**:
+/// the VM has no mesh/pre-pivot bounds, so the box is the collision cylinder's extent centred on
+/// `Location`; a door whose mesh centre is offset from its origin therefore reads a zero
+/// direction (documented, not hidden).
+fn get_bounding_box(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    let loc = vm.vector_prop(c.this, "Location").unwrap_or([0.0; 3]);
+    let r = vm.f32_prop(c.this, "CollisionRadius");
+    let h = vm.f32_prop(c.this, "CollisionHeight");
+    val(Value::Struct(vec![
+        (
+            "min".into(),
+            Value::Vector([loc[0] - r, loc[1] - r, loc[2] - h]),
+        ),
+        (
+            "max".into(),
+            Value::Vector([loc[0] + r, loc[1] + r, loc[2] + h]),
+        ),
+    ]))
+}
+
+fn find_inventory_kind(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    // UE2 `APawn::FindInventoryKind`: walks the `Inventory` -> `Inventory` chain and returns the
+    // first item whose class chain contains `DesiredClassName`. Declaration measured from
+    // engine.u (`engine.Pawn.FindInventoryKind [native f1000] (name, out Inventory)`); needed by
+    // `XIIIPorte.Locked.Trigger`'s `FindInventoryKind('PickLockSkill')` test.
+    let desired = name(vm, a, 0)?;
+    let mut cur = prop_object(vm, c.this, "Inventory");
+    let mut guard = 0;
+    while let Some(id) = cur {
+        guard += 1;
+        if guard > 65_536 {
+            break;
+        }
+        if vm.is_a(id, &desired) {
             return val(Value::Object(Some(ObjRef::Instance(id))));
         }
         cur = prop_object(vm, id, "Inventory");
@@ -1882,6 +2064,22 @@ fn inc_alerte(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<Nativ
 
 fn dec_alerte(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
     Ok(adjust_counter(vm, c, "NbAlerte", -1))
+}
+
+/// `LevelInfo.GetLocalURL`: the local URL the runtime loaded the map with (`<Map>?<options>`).
+/// The string is runtime configuration (`Vm::set_local_url`); the engine reads it from
+/// `ULevel::URL` (UE2 `ALevelInfo::GetLocalURL`). `XIIIPlayerController.SetInitialState` uses
+/// `Left(GetLocalURL(), 7) ~= "mapmenu"` to detect the menu map.
+fn get_local_url(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Str(vm.local_url().to_owned()))
+}
+
+/// `LevelInfo.GetAddressURL`: the `Host:Port` address form of the loaded URL, runtime-configured
+/// (`Vm::set_address_url`). Engine.dll `?execGetAddressURL@ALevelInfo` formats the URL host and
+/// port with the literal `%s:%i`; for the GOG single-player install `[URL] Host=` is empty and
+/// `Port=7777`, so the runtime supplies `:7777`.
+fn get_address_url(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Str(vm.address_url().to_owned()))
 }
 
 fn noop(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -2800,16 +2998,45 @@ fn builtin_defs() -> Vec<NativeDef> {
             )
         },
         def(
+            "Engine.LevelInfo.GetLocalURL",
+            "native(0) simulated native function string GetLocalURL()",
+            "engine.u LevelInfo.GetLocalURL decoded (return string); returns the runtime-configured local URL `<Map>?<options>` (Vm::set_local_url; UE2 ALevelInfo::GetLocalURL reads ULevel::URL)",
+            get_local_url,
+        ),
+        def(
+            "Engine.LevelInfo.GetAddressURL",
+            "native(0) simulated native function string GetAddressURL()",
+            "engine.u LevelInfo.GetAddressURL decoded (return string); returns the runtime-configured `Host:Port` (Vm::set_address_url); Engine.dll ?execGetAddressURL@ALevelInfo formats it with the literal `%s:%i`",
+            get_address_url,
+        ),
+        def(
             "Engine.Actor.PlayRolloffSound",
             "native(350) final static function PlayRolloffSound(object<Sound> Sound, object<Actor> RollOffActor, optional int Param1, optional int Param2, optional int Param3, optional int Param4, optional int Param5)",
             "engine.u Actor.PlayRolloffSound decoded (Sound, RollOffActor + five optional ints, void); emits PresentationEvent::PlayRolloffSound",
             play_rolloff_sound,
         ),
+        NativeDef {
+            status: NativeStatus::Partial(
+                "no AI hearing/perception model: the call is accepted and discarded, AI `HearNoise` is not invoked",
+            ),
+            ..def(
+                "Engine.Actor.MakeNoise",
+                "native(512) final native static function MakeNoise(float Loudness)",
+                "engine.u Actor.MakeNoise decoded (float Loudness; native 512); UE2 notifies nearby AI; Engine.dll ?execMakeNoise@AActor",
+                make_noise,
+            )
+        },
         def(
             "Engine.Actor.SetBase",
             "native(298) final static function SetBase(object<Actor> NewBase, optional vector NewFloor)",
             "engine.u Actor.SetBase decoded (NewBase, optional NewFloor, void); sets Base and Floor; no attachment transform (headless)",
             set_base,
+        ),
+        def(
+            "Engine.Canvas.MakeColor",
+            "native(274) final static function Color MakeColor(byte R, byte G, byte B, optional byte A)",
+            "engine.u Canvas.MakeColor decoded (three/four bytes -> Color struct; A defaults to 255); UE2 FColor constructor; called by PlayerController.ClearProgressMessages",
+            make_color,
         ),
         def(
             "Engine.Actor.SetRelativeLocation",
@@ -3225,6 +3452,58 @@ fn builtin_defs() -> Vec<NativeDef> {
             "native(508) final latent function FinishRotation()",
             "engine.u Controller.FinishRotation decoded (void, latent); UE2 AController::FinishRotation waits for the pawn to face FocalPoint; Engine.dll ?execFinishRotation@AController",
             finish_rotation,
+        )
+    });
+    // ---- item8b movers/doors: kept in their own block so a parallel AI-native edit merges
+    // without touching these entries. -----------------------------------------------------------
+    v.push(def(
+        "Engine.Actor.FinishInterpolation",
+        "native(301) final latent function FinishInterpolation()",
+        "engine.u Actor.FinishInterpolation decoded (void, latent); every engine.Mover open/close \
+         state calls it after DoOpen/DoClose and resumes when the brush reaches its key; the \
+         per-tick PHYS_MovingBrush advance is Vm::advance_interpolation; \
+         Engine.dll ?execFinishInterpolation@AActor",
+        finish_interpolation,
+    ));
+    v.push(def(
+        "Engine.Pawn.FindInventoryKind",
+        "native(0) final function Inventory FindInventoryKind(name DesiredClassName)",
+        "engine.u Pawn.FindInventoryKind decoded (name, out Inventory); UE2 walks the Inventory \
+         chain and returns the first item whose class chain contains the name. Needed by \
+         XIIIPorte.Locked.Trigger's FindInventoryKind('PickLockSkill') gate",
+        find_inventory_kind,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "the VM has no mesh/pre-pivot bounds; the returned Box is the collision cylinder \
+             extent centred on Location, so an offset mesh centre reads as zero",
+        ),
+        ..def(
+            "Engine.Actor.GetBoundingBox",
+            "native(419) final function Box GetBoundingBox()",
+            "engine.u Actor.GetBoundingBox decoded (Box, return); XIIIPorte.PlayerTriggerToggle.\
+             BeginState computes DoorDirection from it",
+            get_bounding_box,
+        )
+    });
+    v.push(def(
+        "Object.Cross_VectorVector",
+        "native(220) final operator vector Cross(vector A, vector B)",
+        "core.u Object.Cross_VectorVector decoded; UE1 FVector cross product (A x B)",
+        cross_vv,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "uses the RadiusActors distance filter, not a swept collision-cylinder test; the \
+             mover timer re-checks FastTrace/vision on each result",
+        ),
+        ..def(
+            "Engine.Actor.CollidingActors",
+            "native(321) final iterator function CollidingActors(class<Actor> BaseClass, out Actor Actor, float Radius, optional vector Loc)",
+            "engine.u Actor.CollidingActors decoded; UE2 returns actors whose collision cylinder \
+             overlaps the caller's within Radius. Needed by XIIIMover.Timer (the door warning \
+             scan) so a mover is not suspended on its own timer",
+            colliding_actors,
         )
     });
     // XIII AI natives (xidpawn.u, implemented in XIDPawn.dll). Semantics from the export

@@ -134,8 +134,8 @@ xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
                        and plays nothing (still counts events in the overlay).
   --play-script FILE   Drive --play from a text input script; headless without --screenshot.
                        Lines: `t=<secs> forward|back|right|left V | walk on/off | jump |
-                       yaw DEG | turn DEG | pitch DEG | teleport X Y Z` (teleport places the
-                       box centre at Unreal-unit X,Y,Z).
+                       yaw DEG | turn DEG | pitch DEG | use | teleport X Y Z` (teleport places
+                       the box centre at Unreal-unit X,Y,Z; use is the door/mover interact key).
   --model PKG.MESH     Skinned-character viewer: decode a SkeletalMesh; several comma-
                        separated entries are placed side by side.
   --anim SEQ           Skinned viewer: play MeshAnimation sequence SEQ (default bind pose).

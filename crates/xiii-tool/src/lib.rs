@@ -3,6 +3,7 @@
 //!
 //! Installation directories are only ever read. Nothing here writes files.
 
+pub mod campaign_cmd;
 pub mod corpus;
 pub mod coverage;
 pub mod deps;

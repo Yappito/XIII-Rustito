@@ -14,7 +14,7 @@ use xiii_decode::common::DecodeError;
 use xiii_decode::static_mesh::{STATIC_MESH_CLASS, decode_static_mesh};
 use xiii_decode::texture::{PALETTE_CLASS, TEXTURE_CLASS, decode_palette, decode_texture};
 use xiii_decode::{model, terrain};
-use xiii_package::{Limits, ObjectRef, Package};
+use xiii_package::{Limits, ObjectRef, Package, Property, PropertyValue};
 
 use crate::corpus::tagged_files;
 use crate::props::find_export;
@@ -27,6 +27,7 @@ pub const COMMANDS: &[&str] = &[
     "bsp",
     "zones",
     "terrain",
+    "material-survey",
 ];
 
 /// Usage text appended to the main help.
@@ -52,7 +53,12 @@ pub const USAGE: &str = "\
       from the nodes' iLeaf/iZone pairs) and the connectivity/visibility masks.
 
   xiii-tool terrain <map-file> --game-dir <install-root>
-      Decode TerrainInfo/TerrainSector exports and their heightmap.";
+      Decode TerrainInfo/TerrainSector exports and their heightmap.
+
+  xiii-tool material-survey <install-root> [--maps Plage00,Plage01,Banque01]
+      Count UE2 material classes referenced by placed geometry (BSP surfaces, static mesh
+      sections, terrain layers) per map and corpus-wide, and tabulate the tagged properties
+      in use per class with their value ranges. Also prints the reflected blend enums.";
 
 fn usage_error(msg: &str) -> ExitCode {
     eprintln!("error: {msg}\n\n{USAGE}");
@@ -76,6 +82,7 @@ pub fn run(cmd: &str, args: &[String]) -> ExitCode {
         "bsp" => bsp_cmd(args),
         "zones" => zones_cmd(args),
         "terrain" => terrain_cmd(args),
+        "material-survey" => material_survey_cmd(args),
         _ => usage_error(&format!("unknown command '{cmd}'")),
     }
 }
@@ -825,6 +832,262 @@ fn terrain_cmd(args: &[String]) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Material survey
+// ---------------------------------------------------------------------------------------
+
+/// UE2 material classes the survey recognises (the spec's list plus the base modifiers).
+const MATERIAL_CLASSES: &[&str] = &[
+    "Texture",
+    "Shader",
+    "Combiner",
+    "FinalBlend",
+    "TexPanner",
+    "TexRotator",
+    "TexScaler",
+    "TexOscillator",
+    "TexEnvMap",
+    "TexCoordSource",
+    "TexModifier",
+    "SinusModifier",
+    "ConstantColor",
+    "Cubemap",
+    "ColorModifier",
+];
+
+fn is_material_class(short: &str) -> bool {
+    MATERIAL_CLASSES
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(short))
+}
+
+/// Distinct-value cap so a property like `Diffuse` (hundreds of textures) stays readable.
+const VALUE_CAP: usize = 12;
+
+/// Observed values of one tagged property across the corpus.
+#[derive(Default, Clone)]
+struct ValueStats {
+    count: usize,
+    min: f32,
+    max: f32,
+    numeric: bool,
+    values: BTreeMap<String, usize>,
+    truncated: bool,
+}
+
+impl ValueStats {
+    fn observe(&mut self, v: f32) {
+        if !self.numeric {
+            self.min = v;
+            self.max = v;
+            self.numeric = true;
+        } else {
+            self.min = self.min.min(v);
+            self.max = self.max.max(v);
+        }
+    }
+
+    fn add(&mut self, package: &Package, prop: &Property) {
+        self.count += 1;
+        let key = match &prop.value {
+            PropertyValue::Float(f) => {
+                self.observe(*f);
+                return;
+            }
+            PropertyValue::Int(i) => {
+                self.observe(*i as f32);
+                return;
+            }
+            PropertyValue::Byte(b) => b.to_string(),
+            PropertyValue::Bool(b) => b.to_string(),
+            PropertyValue::Name(n) => package.name(*n).to_owned(),
+            PropertyValue::Object(r) | PropertyValue::Class(r) => {
+                crate::props::ref_text(package, *r)
+            }
+            // Struct/rotator/vector/array/raw values: use the normal property renderer so the
+            // value ranges are visible instead of a discriminant placeholder.
+            _ => crate::props::value_text(package, prop),
+        };
+        if self.values.contains_key(&key) {
+            *self.values.get_mut(&key).expect("present") += 1;
+        } else if self.values.len() < VALUE_CAP {
+            self.values.insert(key, 1);
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    fn render(&self) -> String {
+        if self.numeric {
+            format!("{} values, range {}..{}", self.count, self.min, self.max)
+        } else {
+            let mut s = format!("{} values {{", self.count);
+            for (i, (k, n)) in self.values.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                let _ = write!(s, "{k}: {n}");
+            }
+            if self.truncated {
+                s.push_str(", ...");
+            }
+            s.push('}');
+            s
+        }
+    }
+}
+
+fn material_survey_cmd(args: &[String]) -> ExitCode {
+    let a = match parse_args(args, &["maps"]) {
+        Ok(a) => a,
+        Err(e) => return usage_error(&e),
+    };
+    let Some(root) = a.positional.first().map(PathBuf::from) else {
+        return usage_error("material-survey needs an installation root");
+    };
+    let maps: Vec<String> = a
+        .options
+        .get("maps")
+        .map(|s| s.split(',').map(|x| x.trim().to_owned()).collect())
+        .unwrap_or_else(|| vec!["Plage00".into(), "Plage01".into(), "Banque01".into()]);
+    let mut out = String::new();
+
+    // ---- corpus-wide material export histogram and property values ----
+    let mut class_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut prop_stats: BTreeMap<(String, String), ValueStats> = BTreeMap::new();
+    let (mut files, mut exports, mut prop_failures) = (0usize, 0usize, 0usize);
+    let mut engine_path: Option<PathBuf> = None;
+    let tagged = match tagged_files(&root) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: cannot scan {}: {e}", root.display());
+            return ExitCode::from(2);
+        }
+    };
+    for (_rel, path) in &tagged {
+        if path
+            .file_stem()
+            .is_some_and(|s| s.eq_ignore_ascii_case("engine"))
+        {
+            engine_path = Some(path.clone());
+        }
+        let (data, package) = match load_package(path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        files += 1;
+        for i in 0..package.exports().len() {
+            if package.exports()[i].serial_size == 0 {
+                continue;
+            }
+            let class = package.export_class_path(i).unwrap_or("?");
+            let short = class.rsplit('.').next().unwrap_or("");
+            if !is_material_class(short) {
+                continue;
+            }
+            exports += 1;
+            *class_counts.entry(short.to_owned()).or_default() += 1;
+            match package.read_object_properties(&data, i, &Limits::default()) {
+                Ok(props) => {
+                    for prop in &props.block.properties {
+                        let name = package.property_name(prop);
+                        prop_stats
+                            .entry((short.to_owned(), name.to_owned()))
+                            .or_default()
+                            .add(&package, prop);
+                    }
+                }
+                Err(_) => prop_failures += 1,
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "material-survey: {} ({} packages, {} material exports, {} property-block failures)",
+        root.display(),
+        files,
+        exports,
+        prop_failures
+    );
+    let _ = writeln!(out, "== corpus material exports ==");
+    for (c, n) in &class_counts {
+        let _ = writeln!(out, "  {n:>6} {c}");
+    }
+    let _ = writeln!(out, "== property values per class ==");
+    for ((class, prop), stats) in &prop_stats {
+        let _ = writeln!(out, "  {class}.{prop}: {}", stats.render());
+    }
+
+    // ---- classes referenced by placed geometry, per map ----
+    let _ = writeln!(out, "== geometry material classes per map ==");
+    let mut cache = match xiii_world::PackageCache::open(&root) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: cannot open installation: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    for map in &maps {
+        match xiii_world::import_map(&mut cache, map) {
+            Ok(scene) => {
+                let mut classes: BTreeMap<String, usize> = BTreeMap::new();
+                let mut blends: BTreeMap<String, usize> = BTreeMap::new();
+                let mut unsupported: BTreeMap<String, usize> = BTreeMap::new();
+                for m in &scene.materials {
+                    for c in &m.class_chain {
+                        *classes.entry(c.clone()).or_default() += 1;
+                    }
+                    *blends.entry(m.blend.name().to_owned()).or_default() += 1;
+                    for u in &m.unsupported {
+                        *unsupported.entry(u.clone()).or_default() += 1;
+                    }
+                }
+                let _ = writeln!(
+                    out,
+                    "  {map}: {} materials | classes {classes:?} | blends {blends:?} | unsupported {unsupported:?}",
+                    scene.materials.len()
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(out, "  {map}: IMPORT FAILED: {e}");
+            }
+        }
+    }
+
+    // ---- reflected blend enums (the mapping source) ----
+    if let Some(path) = engine_path
+        && let Ok(data) = std::fs::read(&path)
+        && let Ok(pkg) = xiii_script::ScriptPackage::load(
+            "engine",
+            data,
+            &xiii_script::ScriptLimits::default(),
+            &Limits::default(),
+        )
+    {
+        let _ = writeln!(out, "== reflected enums ==");
+        for enum_path in [
+            "Shader.EOutputBlending",
+            "FinalBlend.EFrameBufferBlending",
+            "TexOscillator.ETexOscillationType",
+            "TexModifier.ETexCoordSrc",
+            "TexEnvMap.ETexEnvMapType",
+            "SinusModifier.ESinusAmplitudeFade",
+            "Combiner.EColorOperation",
+            "Combiner.EAlphaOperation",
+        ] {
+            let Some(e) = pkg.export_by_path(enum_path) else {
+                continue;
+            };
+            if let Some(xiii_script::ScriptObject::Enum(en)) = pkg.objects.get(&e) {
+                let names: Vec<&str> = en.names.iter().map(|&n| pkg.name_text(n)).collect();
+                let _ = writeln!(out, "  {enum_path} = {names:?}");
+            }
+        }
+    }
+    emit(&out);
+    ExitCode::SUCCESS
 }
 
 // ---------------------------------------------------------------------------------------

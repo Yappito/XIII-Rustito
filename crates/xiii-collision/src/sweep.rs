@@ -81,23 +81,37 @@ pub fn sweep_aabb(
     let mut best: Option<SweepHit> = None;
     world.for_each_candidate(query, |i| {
         let t = world.triangle(i);
-        if let Some(mut h) = sweep_triangle(start, d, half_extents, t, i, world.source(i)) {
-            if h.start_penetrating
-                && params.skip_start_penetration
-                && !start_drives_into(d, start, t)
-            {
-                return;
-            }
-            if h.t < 0.0 {
-                h.t = 0.0;
-                h.start_penetrating = true;
-            }
-            if best.is_none_or(|b| h.t < b.t) {
-                best = Some(h);
-            }
+        if let Some(h) = sweep_triangle(start, d, half_extents, t, i, world.source(i)) {
+            consider_sweep_hit(&mut best, h, params, d, start, t);
+        }
+    });
+    world.for_each_dynamic_candidate(query, |t, source, _idx| {
+        if let Some(h) = sweep_triangle(start, d, half_extents, &t, u32::MAX, source) {
+            consider_sweep_hit(&mut best, h, params, d, start, &t);
         }
     });
     best
+}
+
+/// Keeps a swept hit when it passes the start-penetration filter and is nearer than `best`.
+fn consider_sweep_hit(
+    best: &mut Option<SweepHit>,
+    mut h: SweepHit,
+    params: &SweepParams,
+    d: Vec3,
+    start: Vec3,
+    tri: &Triangle,
+) {
+    if h.start_penetrating && params.skip_start_penetration && !start_drives_into(d, start, tri) {
+        return;
+    }
+    if h.t < 0.0 {
+        h.t = 0.0;
+        h.start_penetrating = true;
+    }
+    if best.is_none_or(|b| h.t < b.t) {
+        *best = Some(h);
+    }
 }
 
 /// Whether a sweep that starts flush/inside a triangle drives into it: the motion along the

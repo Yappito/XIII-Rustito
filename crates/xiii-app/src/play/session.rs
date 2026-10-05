@@ -17,6 +17,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use xiii_package::Limits;
+use xiii_script::vm::MoverState;
 use xiii_script::{ObjRef, ObjectId, PresentationEvent, ScriptSet, Value, Vm, VmError, VmLimits};
 use xiii_world::runtime::{self, ProviderSpec};
 
@@ -45,6 +46,10 @@ pub struct Session {
     pub game_info: Option<ObjectId>,
     /// Human-readable description of how the player pawn was created.
     pub bootstrap_note: String,
+    /// 1 when the script login chain created the player pawn, 0 otherwise.
+    pub login_script: u32,
+    /// 1 when the explicit harness bootstrap created the player pawn, 0 otherwise.
+    pub login_bootstrap: u32,
     /// Script path attempts that failed before the bootstrap (native + stack).
     pub blocked: Vec<String>,
     /// Suspended actor names (unimplemented native or other code failure).
@@ -64,6 +69,24 @@ pub struct Session {
     pub dispatcher: Option<ObjectId>,
     /// Fixed steps run.
     pub tick_count: u64,
+    /// Key inventory items the host spawned from touched `KeyPicks` actors (host shortcut; see
+    /// [`Session::grant_touched_key`]).
+    key_items: Vec<ObjectId>,
+}
+
+/// Outcome of a host use action on a mover/door.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UseOutcome {
+    /// The named actor is not a live mover.
+    NotAMover,
+    /// A locked door with no available key (its own `Locked` behavior ran).
+    Locked,
+    /// A locked door was unlocked with a key (its state left `Locked`).
+    Unlocked,
+    /// An (unlocked) door was triggered to open/close.
+    Triggered,
+    /// The script raised on the transition.
+    Error(String),
 }
 
 impl Session {
@@ -101,6 +124,10 @@ impl Session {
             format!("DefaultGame {default_game} did not resolve to a loaded class")
         })?;
 
+        // The runtime owns the single-player URL; `LevelInfo.GetLocalURL` and
+        // `GameInfo.InitGame`/`Login` read it before any actor begins play.
+        runtime::configure_local_url(&mut vm, game_dir, map);
+
         let begin = runtime::begin_play_all(&mut vm, &actors, game_class);
         let mut blocked = begin
             .suspended
@@ -129,27 +156,41 @@ impl Session {
 
         let (start_loc, start_rot) = find_player_start(&vm).unwrap_or(([0.0; 3], [0; 3]));
 
-        // --- script path: GameInfo.Login -> (bLonePlayer skip) RestartPlayer ---------------
+        // --- script path: GameInfo.Login -> PostLogin -> RestartPlayer ---------------------
         let mut player: Option<ObjectId> = None;
         let mut controller: Option<ObjectId> = None;
+        let mut login_script = 0u32;
+        let mut login_bootstrap = 0u32;
         let script_note: String;
         if let Some(gi) = game_info {
-            let out = vec![Value::Str(String::new()); 3];
+            // UE2 `ULevel::SpawnPlayActor`: `GameInfo.Login(Portal, Options, Error)` with the
+            // map URL's options, then `GameInfo.PostLogin(NewPlayer)`. `XIIIGameInfo.Login`
+            // itself calls `RestartPlayer` when `Level.bLonePlayer` (the solo campaign); the
+            // explicit `RestartPlayer` below is only the non-solo/delayed fallback.
+            let out = vec![
+                Value::Str(String::new()),
+                Value::Str(vm.url_options().to_owned()),
+                Value::Str(String::new()),
+            ];
             match vm.send_event(gi, "Login", out) {
                 Ok(Some(Value::Object(Some(ObjRef::Instance(pc)))))
                     if vm.objects.get(pc as usize).is_some_and(|o| !o.deleted) =>
                 {
                     controller = Some(pc);
-                    // `XIIIGameInfo.Login` only calls RestartPlayer when `!Level.bLonePlayer`;
-                    // in the solo campaign it is skipped, so call it explicitly.
                     let arg = Value::Object(Some(ObjRef::Instance(pc)));
-                    match vm.send_event(gi, "RestartPlayer", vec![arg]) {
-                        Ok(_) => {
-                            if let Some(p) = instance_prop(&vm, pc, "Pawn") {
-                                player = Some(p);
-                            }
+                    if let Err(e) = vm.send_event(gi, "PostLogin", vec![arg]) {
+                        blocked.push(format!("GameInfo.PostLogin: {e}"));
+                    }
+                    player = instance_prop(&vm, pc, "Pawn");
+                    if player.is_none() {
+                        let arg = Value::Object(Some(ObjRef::Instance(pc)));
+                        match vm.send_event(gi, "RestartPlayer", vec![arg]) {
+                            Ok(_) => player = instance_prop(&vm, pc, "Pawn"),
+                            Err(e) => blocked.push(format!("GameInfo.RestartPlayer: {e}")),
                         }
-                        Err(e) => blocked.push(format!("GameInfo.RestartPlayer: {e}")),
+                    }
+                    if player.is_some() {
+                        login_script = 1;
                     }
                 }
                 Ok(other) => blocked.push(format!("GameInfo.Login returned {other:?}")),
@@ -163,7 +204,8 @@ impl Session {
         if let Some(p) = player {
             player_name = vm.objects[p as usize].name.clone();
             script_note = format!(
-                "player pawn {player_name} created by GameInfo.Login/RestartPlayer (script path)"
+                "player pawn {player_name} created by the script login chain \
+                 (GameInfo.Login/RestartPlayer; PostLogin attempted, login_script={login_script})"
             );
             // Keep any controller the script path produced (Login returned one in most cases).
             if controller.is_none() {
@@ -202,6 +244,7 @@ impl Session {
             }
             player_name = vm.objects[p as usize].name.clone();
             player = Some(p);
+            login_bootstrap = 1;
             let why = if blocked.is_empty() {
                 "Login/RestartPlayer returned no pawn".to_owned()
             } else {
@@ -234,6 +277,8 @@ impl Session {
             controller,
             game_info,
             bootstrap_note: script_note,
+            login_script,
+            login_bootstrap,
             blocked,
             suspended,
             first_error: None,
@@ -244,6 +289,7 @@ impl Session {
             moved: Vec::new(),
             dispatcher,
             tick_count: 0,
+            key_items: Vec::new(),
         };
         session.suspended.dedup();
         session.drain_events();
@@ -379,6 +425,167 @@ impl Session {
         self.vm.vector_prop(self.player, "Location")
     }
 
+    /// Current player `Rotation` (Unreal rotator units), if the pawn has one.
+    pub fn player_rotation(&self) -> Option<[i32; 3]> {
+        match self.vm.get_property(self.player, "Rotation") {
+            Some(Value::Rotator(r)) => Some(*r),
+            _ => None,
+        }
+    }
+
+    /// Every live mover actor with its current pose (for dynamic collision and the door trace).
+    pub fn mover_states(&self) -> Vec<MoverState> {
+        self.vm.mover_states()
+    }
+
+    /// Registers every live mover's box-collision triangles (world space at its `BasePos`/
+    /// `BaseRot`) with the VM's physics provider, so the VM's own `Move`/`Trace` consider the
+    /// moving brush. The map collision soup is read from `scene`; the host's player physics is
+    /// separate (`movers::MoverCollision`).
+    pub fn register_movers(&mut self, scene: &xiii_world::WorldScene) {
+        let movers = self.vm.mover_states();
+        for m in movers {
+            let mut triangles = Vec::new();
+            let mut source = 0u32;
+            for &i in &scene.collision_box {
+                let (tri, src) = scene.collision_triangles[i as usize];
+                let Some(actor) = scene
+                    .collision_sources
+                    .get(src as usize)
+                    .and_then(|p| p.split_once(" -> "))
+                    .map(|(a, _)| a)
+                else {
+                    continue;
+                };
+                if actor.eq_ignore_ascii_case(&m.name) {
+                    source = src;
+                    triangles.push(tri.map(xiii_world::physics::bevy_to_unreal_position));
+                }
+            }
+            if triangles.is_empty() {
+                continue;
+            }
+            self.vm
+                .register_mover(&m.name, source, &triangles, m.base_pos, m.base_rot);
+        }
+    }
+
+    /// True when the player has touched a live actor whose name contains `needle`
+    /// (case-insensitive). Recorded from the VM's own `Touch` updates.
+    pub fn player_touched(&self, needle: &str) -> bool {
+        let needle = needle.to_ascii_lowercase();
+        self.touches
+            .iter()
+            .any(|(_, a)| a.to_ascii_lowercase().contains(&needle))
+    }
+
+    /// Spawns (once) the inventory item carried by a `KeyPicks` actor the player has touched and
+    /// returns it. **Host shortcut**: the full `Pickup.Touch` -> `GiveTo` -> `Keys.Activate`
+    /// inventory flow is not implemented; the host spawns the pickup's own `InventoryType` (its
+    /// class default) and hands it to the door's own `Trigger`, so the door still validates the
+    /// key against its `UnlockItemCode`/`UnLockItemName`.
+    pub fn grant_touched_key(&mut self) -> Option<ObjectId> {
+        self.key_items
+            .retain(|k| self.vm.objects.get(*k as usize).is_some_and(|o| !o.deleted));
+        if let Some(&k) = self.key_items.first() {
+            return Some(k);
+        }
+        let mut class = None;
+        for (i, o) in self.vm.objects.iter().enumerate() {
+            if !o.is_actor || o.deleted || !self.vm.is_a(i as ObjectId, "keypicks") {
+                continue;
+            }
+            if !self.player_touched(&o.name) {
+                continue;
+            }
+            if let Some(Value::Object(Some(ObjRef::Static(g)))) =
+                self.vm.get_property(i as ObjectId, "InventoryType")
+            {
+                class = Some(*g);
+                break;
+            }
+        }
+        let class = class?;
+        let id = self.vm.spawn(class, "HeldKey(play)").ok()?;
+        self.key_items.push(id);
+        Some(id)
+    }
+
+    /// Host shortcut for a locked door when the key was not carried: spawns the `InventoryType`
+    /// class of the first live `KeyPicks` actor in the level and returns it, printing a clear
+    /// notice. **Deviation**: the `Pickup.Touch` -> `GiveTo` -> `Keys.Activate` inventory chain
+    /// needs natives that are out of this task's scope; the door still validates the key against
+    /// its own `UnlockItemCode`/`UnLockItemName`, so the unlock state machine is the game's.
+    fn grant_level_key(&mut self) -> Option<ObjectId> {
+        let mut class = None;
+        for (i, o) in self.vm.objects.iter().enumerate() {
+            if !o.is_actor || o.deleted || !self.vm.is_a(i as ObjectId, "keypicks") {
+                continue;
+            }
+            if let Some(Value::Object(Some(ObjRef::Static(g)))) =
+                self.vm.get_property(i as ObjectId, "InventoryType")
+            {
+                println!(
+                    "[play] host shortcut: granting key {} for a locked door \
+                     (Pickup/GiveTo inventory chain not implemented)",
+                    o.name
+                );
+                class = Some(*g);
+                break;
+            }
+        }
+        let class = class?;
+        let id = self.vm.spawn(class, "HeldKey(play)").ok()?;
+        self.key_items.push(id);
+        Some(id)
+    }
+
+    /// Host use action (`E` in `--play`, `use` in a script). Mirrors the tail of
+    /// `XIIIPlayerController.Grab` for a mover target: a locked `XIIIPorte` is unlocked with the
+    /// key via its own `Trigger` (`TryPickLock`), any other state is opened via `PlayerTrigger`.
+    pub fn use_mover(&mut self, target_name: &str) -> UseOutcome {
+        let Some(target) = self.vm.find_object(target_name) else {
+            return UseOutcome::NotAMover;
+        };
+        if !self.vm.is_mover(target) {
+            return UseOutcome::NotAMover;
+        }
+        let pawn = self.player;
+        let controller = self.controller.unwrap_or(pawn);
+        if self.vm.is_in_state(target, "Locked") {
+            let key = self.grant_touched_key().or_else(|| self.grant_level_key());
+            let Some(key) = key else {
+                // No key available: run the door's own `Locked.PlayerTrigger` (plays the locked
+                // sound) and report Locked; this is visible, not a silent success.
+                let args = vec![
+                    Value::Object(Some(ObjRef::Instance(controller))),
+                    Value::Object(Some(ObjRef::Instance(pawn))),
+                ];
+                if let Err(e) = self.vm.send_event(target, "PlayerTrigger", args) {
+                    return UseOutcome::Error(e.to_string());
+                }
+                return UseOutcome::Locked;
+            };
+            let args = vec![
+                Value::Object(Some(ObjRef::Instance(key))),
+                Value::Object(Some(ObjRef::Instance(pawn))),
+            ];
+            match self.vm.send_event(target, "Trigger", args) {
+                Ok(_) => UseOutcome::Unlocked,
+                Err(e) => UseOutcome::Error(e.to_string()),
+            }
+        } else {
+            let args = vec![
+                Value::Object(Some(ObjRef::Instance(controller))),
+                Value::Object(Some(ObjRef::Instance(pawn))),
+            ];
+            match self.vm.send_event(target, "PlayerTrigger", args) {
+                Ok(_) => UseOutcome::Triggered,
+                Err(e) => UseOutcome::Error(e.to_string()),
+            }
+        }
+    }
+
     /// First failure formatted with its stack, if any.
     pub fn first_error(&self) -> Option<&str> {
         self.first_error.as_deref()
@@ -497,5 +704,75 @@ fn instance_prop(vm: &Vm, id: ObjectId, name: &str) -> Option<ObjectId> {
             Some(*p)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opt_in_root() -> Option<std::path::PathBuf> {
+        let root = std::env::var_os("XIII_GOG_DIR")?;
+        let path = std::path::PathBuf::from(&root);
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        Some(if path.is_relative() {
+            ws.join(path)
+        } else {
+            path
+        })
+    }
+
+    /// Opt-in corpus test: the Plage00 single-player login runs through script
+    /// (`GameInfo.Login` -> `PostLogin` -> `RestartPlayer`) and creates the real
+    /// `XIIIPlayerController`/`XIIIPlayerPawn` at the map's PlayerStart; the explicit harness
+    /// bootstrap is NOT used. `LevelInfo.GetLocalURL` is on this path
+    /// (`XIIIPlayerController.SetInitialState`).
+    #[test]
+    fn opt_in_plage00_login_creates_script_controller_and_pawn() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let session = Session::open(&game_dir, "Plage00").expect("open Plage00 session");
+        println!("[login test] {}", session.bootstrap_note);
+        println!("[login test] blocked: {:?}", session.blocked);
+        assert_eq!(
+            session.login_script,
+            1,
+            "the script login path must create the pawn (blocked: {})",
+            session.blocked.join("; ")
+        );
+        assert_eq!(
+            session.login_bootstrap, 0,
+            "the explicit harness bootstrap must not run"
+        );
+        let pc = session.controller.expect("a script player controller");
+        assert!(
+            session.vm.is_a(pc, "XIIIPlayerController"),
+            "controller is {}",
+            session.vm.set().path(session.vm.objects[pc as usize].class)
+        );
+        assert!(
+            session.vm.is_a(session.player, "XIIIPlayerPawn"),
+            "pawn is {}",
+            session
+                .vm
+                .set()
+                .path(session.vm.objects[session.player as usize].class)
+        );
+        let (start, _) = find_player_start(&session.vm).expect("Plage00 has a PlayerStart");
+        let pawn = session
+            .player_location()
+            .expect("player pawn has a Location");
+        assert_eq!(
+            pawn, start,
+            "the pawn must spawn at the PlayerStart, not the bootstrap pose"
+        );
+        println!(
+            "[login test] path=script player={} controller={} at {:?} UU",
+            session.player_name,
+            session.vm.set().path(session.vm.objects[pc as usize].class),
+            pawn
+        );
     }
 }
