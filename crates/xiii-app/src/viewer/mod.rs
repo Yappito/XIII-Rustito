@@ -9,6 +9,7 @@
 
 pub mod decals;
 pub mod fog;
+pub mod lights;
 pub mod particles;
 pub mod skinned;
 
@@ -139,6 +140,7 @@ impl Plugin for ViewerPlugin {
                 fly_move,
                 sky_follow,
                 animate_uv,
+                lights::update_scene_lights,
                 fog::update_fog,
                 pick,
                 overlay,
@@ -271,7 +273,7 @@ fn image_from(t: &xiii_world::SceneTexture) -> Image {
     img
 }
 
-fn transform_from(t: &xiii_decode::common::BevyTransform) -> Transform {
+pub(crate) fn transform_from(t: &xiii_decode::common::BevyTransform) -> Transform {
     let m = Mat3::from_cols_array(&xiii_world::to_cols(&t.rotation));
     Transform {
         translation: Vec3::from_array(t.translation),
@@ -375,6 +377,7 @@ pub(crate) fn load_scene(opts: &Options) -> Result<WorldScene, String> {
 
 /// Builds and spawns every imported mesh with its unlit diagnostic material. Shared by the map
 /// viewer and the `--play` prototype so the two scene-building paths cannot drift.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_scene_geometry(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -383,12 +386,22 @@ pub(crate) fn spawn_scene_geometry(
     scene: &WorldScene,
     baked: bool,
     force_particles: bool,
+    force_lights: bool,
 ) -> (Vec<Entity>, Vec<Handle<Image>>) {
     let image_handles: Vec<Handle<Image>> = scene
         .textures
         .iter()
         .map(|t| images.add(image_from(t)))
         .collect();
+    // The additive light-receiver pass is spawned when dynamic lights can appear: always in
+    // `--play` (the VM can spawn lights), and in the viewer when the map has a drawable light.
+    let receivers = !lights::lights_disabled()
+        && (force_lights || scene.lights.iter().any(lights::is_render_dynamic));
+    let receiver_mats = if receivers {
+        lights::receiver_materials(materials, &image_handles, scene)
+    } else {
+        std::collections::HashMap::new()
+    };
     let missing = materials.add(StandardMaterial {
         base_color: Color::srgb(1.0, 0.0, 1.0),
         unlit: true,
@@ -454,6 +467,18 @@ pub(crate) fn spawn_scene_geometry(
                 ops: Arc::from(ops.clone()),
             });
         }
+        // Light-only additive receiver: the same (uncoloured) geometry with a lit white
+        // transparent material, so dynamic lights add to the baked unlit pass.
+        if let Some(recv_mat) = receiver_mats.get(&scene.meshes[o.mesh].material_index) {
+            commands.spawn((
+                Mesh3d(mesh_handles[o.mesh].clone()),
+                MeshMaterial3d(recv_mat.clone()),
+                RenderLayers::layer(layer),
+                transform,
+                lights::LightReceiver,
+                Name::new(format!("lightrecv {}", o.path)),
+            ));
+        }
         entities.push(entity);
     }
     particles::spawn_particles(
@@ -504,7 +529,12 @@ fn setup(
         &scene,
         baked,
         cfg.options.particles == crate::cli::Particles::All,
+        false,
     );
+    let dynamic_lights = lights::spawn_scene_lights(&mut commands, &scene);
+    commands.insert_resource(lights::LightRenderData {
+        lights: scene.lights.clone(),
+    });
     // Projector decals: one per static map-placed `Projector`/`ShadowProjector`.
     let projection_assets =
         decals::setup_projector_assets(&mut images, &image_handles, &scene, &mut decal_materials);
@@ -596,10 +626,12 @@ fn setup(
         RenderLayers::layer(MAIN_LAYER),
         DepthPrepass,
         fog::distance_fog(&start_params),
-        fog::ambient_light(&start_params).unwrap_or_else(|| AmbientLight {
-            color: Color::NONE,
-            brightness: 0.0,
-            ..default()
+        lights::receiver_ambient_if_enabled().unwrap_or_else(|| {
+            fog::ambient_light(&start_params).unwrap_or_else(|| AmbientLight {
+                color: Color::NONE,
+                brightness: 0.0,
+                ..default()
+            })
         }),
         Transform::from_translation(pos).with_rotation(Quat::from_euler(
             EulerRot::YXZ,
@@ -697,6 +729,16 @@ fn setup(
             .filter(|p| xiii_world::projectors::ProjectorDef::is_shadow_class(&p.def.class_path))
             .count(),
         decals_spawned,
+    ));
+    lines.push(format!(
+        "dynamic lights {} of {} map lights | light-only additive receiver pass {}",
+        dynamic_lights,
+        scene.lights.len(),
+        if lights::lights_disabled() {
+            "disabled (XIII_VIEWER_NO_LIGHTS)"
+        } else {
+            "enabled"
+        }
     ));
     if let Some(p) = sky_position {
         lines.push(format!(

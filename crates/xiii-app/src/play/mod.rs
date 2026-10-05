@@ -119,6 +119,22 @@ struct ParticleTriggerCursor {
     trace_len: usize,
 }
 
+/// Bevy light entities driven by live VM light actors: map-placed `TriggerLight`/
+/// `ScriptedLight`/`MovableLight` and runtime-spawned lights such as the Beretta's
+/// `XIII.MuzzleLight`. The VM owns the actors; this host map only mirrors them.
+#[derive(Resource, Default)]
+struct RuntimeLights {
+    entities: HashMap<xiii_script::ObjectId, Entity>,
+    /// Lights mirrored on the last sync (diagnostic overlay).
+    active: usize,
+    /// Total lights spawned since startup (diagnostic overlay).
+    spawned: u64,
+    /// Live VM actors of class `MuzzleLight` seen on the last sync (diagnostic overlay).
+    muzzle_actors: usize,
+    /// Live VM actors whose class name contains `Attach` (diagnostic overlay).
+    attach_actors: usize,
+}
+
 impl Plugin for PlayPlugin {
     fn build(&self, app: &mut App) {
         // Load the script session before the window opens. `Session` holds `Rc`-based VM state
@@ -145,6 +161,7 @@ impl Plugin for PlayPlugin {
         .init_resource::<RenderSync>()
         .init_resource::<weapons::WeaponView>()
         .init_resource::<ParticleTriggerCursor>()
+        .init_resource::<RuntimeLights>()
         .add_plugins(viewer::particles::ParticlePlugin)
         .init_resource::<cinematics::CinematicState>()
         .init_resource::<cartoon::CartoonState>()
@@ -167,6 +184,7 @@ impl Plugin for PlayPlugin {
                 viewer::fog::update_fog,
                 viewer::decals::update_runtime_projectors,
                 sync_particle_triggers,
+                sync_vm_lights,
                 pawns::update_pawns,
                 weapons::update_weapon_view,
                 hud::refresh,
@@ -544,6 +562,7 @@ fn setup_inner(
         &scene,
         opts.lighting == crate::cli::Lighting::Baked,
         opts.particles == crate::cli::Particles::All,
+        true,
     );
     for (o, entity) in scene.objects.iter().zip(&geometry) {
         let actor = o
@@ -600,10 +619,12 @@ fn setup_inner(
         RenderLayers::layer(viewer::MAIN_LAYER),
         bevy::core_pipeline::prepass::DepthPrepass,
         viewer::fog::distance_fog(&start_params),
-        viewer::fog::ambient_light(&start_params).unwrap_or_else(|| AmbientLight {
-            color: Color::NONE,
-            brightness: 0.0,
-            ..default()
+        viewer::lights::receiver_ambient_if_enabled().unwrap_or_else(|| {
+            viewer::fog::ambient_light(&start_params).unwrap_or_else(|| AmbientLight {
+                color: Color::NONE,
+                brightness: 0.0,
+                ..default()
+            })
         }),
         Transform::from_translation(Vec3::from_array(eye)),
         PlayCam,
@@ -896,7 +917,30 @@ fn fixed_step(
         perf.span("mover_collision", t0);
         for path in &weapons {
             match sess.grant_weapon(path) {
-                Ok(msg) => println!("[play] weapon {msg}"),
+                Ok(msg) => {
+                    println!("[play] weapon {msg}");
+                    // The diagnostic grant wires `Pawn.Weapon` directly instead of going
+                    // through `Pawn.ChangedWeapon`, so the weapon's third-person attachment
+                    // (`XIII.BerettaAttach` -> `MFSmallAttach` -> `XIII.MuzzleLight`) is never
+                    // spawned. Run the game's own `Inventory.AttachToPawn` so the muzzle light
+                    // exists; the spawn happens before any later native in the function, so a
+                    // failure to attach is reported, not fatal (item5h host bridge).
+                    if let Some(weapon) = sess.player_weapon() {
+                        let pawn = sess.player;
+                        let arg = Value::Object(Some(xiii_script::ObjRef::Instance(pawn)));
+                        let vm = sess.vm_mut();
+                        match vm.class_function(weapon, "AttachToPawn") {
+                            Some(f) => {
+                                if let Err(e) = vm.call_function(f, weapon, vec![arg]) {
+                                    println!("[play] weapon AttachToPawn partial: {e}");
+                                } else {
+                                    println!("[play] weapon attachment spawned via AttachToPawn");
+                                }
+                            }
+                            None => println!("[play] weapon has no AttachToPawn function"),
+                        }
+                    }
+                }
                 Err(e) => println!("[play] weapon grant failed {path}: {e}"),
             }
         }
@@ -905,7 +949,7 @@ fn fixed_step(
         }
         if fire {
             match sess.fire(sim.0.yaw) {
-                session::FireOutcome::Fired => {}
+                session::FireOutcome::Fired => flash_muzzle_light(sess, &sim.0, &params.0),
                 other => println!("[play] fire: {other:?}"),
             }
         }
@@ -933,6 +977,63 @@ fn fixed_step(
         if let Ok(sess) = session.as_ref() {
             println!("[play] {}", format_vm_trace(sess));
         }
+    }
+}
+
+/// Presentation bridge for the player's muzzle flash light (item5h).
+///
+/// The retail chain is `Weapon.IncrementFlashCount` -> `WeaponAttachment(ThirdPersonActor)
+/// .ThirdPersonEffects` -> `MuzzleAttach` (spawns `MFSmallAttach`) -> `MuzzleFlashAttachment
+/// .Visible.Tick` -> `XIII.MuzzleLight.Flash`. The diagnostic weapon grant wires `Pawn.Weapon`
+/// directly, so the third-person attachment has to be created by the host (see the grant above),
+/// and the VM's `WeaponAttachment(...)` cast does not reach it on the fire path. This bridge
+/// therefore runs the game's own `MFSmallAttach` spawn (`ThirdPersonEffects`) once and then calls
+/// the game's own `XIII.MuzzleLight.Flash` at the muzzle position from
+/// `MuzzleFlashAttachment.Visible.Tick` (`Instigator.Location + EyePosition + ViewRotation*70`).
+/// The light itself is a real VM actor the renderer then follows; no light value is forged.
+fn flash_muzzle_light(sess: &mut session::Session, sim: &PlayerSim, params: &PlayerParams) {
+    let Some(weapon) = sess.player_weapon() else {
+        return;
+    };
+    let object_prop = |vm: &xiii_script::Vm<'_>, id, name: &str| match vm.get_property(id, name) {
+        Some(Value::Object(Some(xiii_script::ObjRef::Instance(i)))) => Some(*i),
+        _ => None,
+    };
+    let vm = sess.vm_mut();
+    let Some(attachment) = object_prop(vm, weapon, "ThirdPersonActor") else {
+        println!("[play] muzzle: no third-person attachment");
+        return;
+    };
+    // The attachment exists (host-created at grant); run the game's MuzzleAttach once so its
+    // MuzzleFlash sub-attachment (and its MuzzleLight) exists.
+    if object_prop(vm, attachment, "MuzzleFlash").is_none() {
+        match vm.class_function(attachment, "ThirdPersonEffects") {
+            Some(f) => {
+                if let Err(e) = vm.call_function(f, attachment, vec![]) {
+                    println!("[play] muzzle ThirdPersonEffects: {e}");
+                }
+            }
+            None => println!("[play] muzzle: no ThirdPersonEffects function"),
+        }
+    }
+    let Some(muzzle_flash) = object_prop(vm, attachment, "MuzzleFlash") else {
+        println!("[play] muzzle: no MuzzleFlash after ThirdPersonEffects");
+        return;
+    };
+    let Some(light) = object_prop(vm, muzzle_flash, "MFLight") else {
+        println!("[play] muzzle: MuzzleFlash has no MFLight");
+        return;
+    };
+    let eye = sim.eye_location(params);
+    let (sy, cy) = sim.yaw.sin_cos();
+    let (sp, cp) = sim.pitch.sin_cos();
+    let muzzle = [
+        eye[0] + cy * cp * 70.0,
+        eye[1] + sy * cp * 70.0,
+        eye[2] + sp * 70.0,
+    ];
+    if let Some(f) = vm.class_function(light, "Flash") {
+        let _ = vm.call_function(f, light, vec![Value::Vector(muzzle)]);
     }
 }
 
@@ -993,6 +1094,86 @@ fn sync_particle_triggers(
             }
         }
     }
+}
+
+/// Mirrors the VM's live light actors to Bevy `PointLight` entities. Map-placed dynamic lights
+/// (`TriggerLight`, `ScriptedLight`, `MovableLight`) and runtime lights (`XIII.MuzzleLight`) are
+/// all found by class, so a muzzle flash and a scripted flicker use the same path. A light the
+/// script turns off (`LightType == LT_None`) or that is despawned loses its entity, so it cannot
+/// keep lighting the scene.
+fn sync_vm_lights(
+    mut commands: Commands,
+    session: NonSend<Result<session::Session, String>>,
+    mut state: ResMut<RuntimeLights>,
+    mut lights: Query<(&mut PointLight, &mut Transform)>,
+) {
+    let Ok(sess) = session.as_ref() else {
+        return;
+    };
+    if viewer::lights::lights_disabled() {
+        for (_, entity) in state.entities.drain() {
+            commands.entity(entity).despawn();
+        }
+        state.active = 0;
+        return;
+    }
+    let vm = sess.vm();
+    let time = sess.vm_time() as f32;
+    let mut seen: std::collections::HashSet<xiii_script::ObjectId> =
+        std::collections::HashSet::new();
+    let mut muzzle_actors = 0usize;
+    let mut attach_actors = 0usize;
+    for i in 0..vm.objects.len() {
+        let id = i as xiii_script::ObjectId;
+        if !vm.objects[i].deleted {
+            if vm.is_a(id, "MuzzleLight") {
+                muzzle_actors += 1;
+            }
+            if vm.is_a(id, "MuzzleFlashAttachment") {
+                attach_actors += 1;
+            }
+        }
+        let Some(light) = viewer::lights::scene_light_from_vm(vm, id) else {
+            continue;
+        };
+        if !light.render_dynamic() {
+            continue;
+        }
+        seen.insert(id);
+        let point = viewer::lights::point_light_for(&light, time);
+        let position = Vec3::from_array(light.transform.translation);
+        match state.entities.get(&id).copied() {
+            Some(entity) => {
+                if let Ok((mut point_light, mut transform)) = lights.get_mut(entity) {
+                    *point_light = point;
+                    transform.translation = position;
+                }
+            }
+            None => {
+                let entity = commands
+                    .spawn((
+                        point,
+                        Transform::from_translation(position),
+                        RenderLayers::layer(viewer::MAIN_LAYER),
+                        Name::new(format!("vmlight {}", light.path)),
+                    ))
+                    .id();
+                state.entities.insert(id, entity);
+                state.spawned += 1;
+            }
+        }
+    }
+    state.entities.retain(|id, entity| {
+        if seen.contains(id) {
+            true
+        } else {
+            commands.entity(*entity).despawn();
+            false
+        }
+    });
+    state.active = state.entities.len();
+    state.muzzle_actors = muzzle_actors;
+    state.attach_actors = attach_actors;
 }
 
 /// One VM status line: time, active/suspended counts, dispatcher state, player VM position,
@@ -1081,6 +1262,7 @@ fn overlay(
     projector_decals: Option<Res<viewer::decals::RuntimeProjectorDecals>>,
     fog_ctx: Option<Res<viewer::fog::FogContext>>,
     weapon_view: Option<Res<weapons::WeaponView>>,
+    runtime_lights: Option<Res<RuntimeLights>>,
     mut perf: ResMut<crate::perf::Perf>,
     mut text: Query<&mut Text, With<PlayOverlay>>,
 ) {
@@ -1191,6 +1373,13 @@ fn overlay(
         }
         Err(_) => "combat unavailable".to_owned(),
     };
+    let lights_line = match runtime_lights.as_deref() {
+        Some(l) => format!(
+            "dynamic lights {} ({} spawned, {} MuzzleLight, {} Attach actors)",
+            l.active, l.spawned, l.muzzle_actors, l.attach_actors
+        ),
+        None => "dynamic lights unavailable".to_owned(),
+    };
     text.0 = format!(
         "XIII play prototype (NOT a playable mission; no weapons, no full AI)\n\
          map {} | pos ({:.1}, {:.1}, {:.1}) UU | vel ({:.1}, {:.1}, {:.1}) UU/s | state {}\n\
@@ -1198,6 +1387,7 @@ fn overlay(
          {combat_line}\n\
          {}\n\
          {pawns_line}\n\
+         {lights_line}\n\
          {hud_line}\n\
          {projectors_line}\n\
          WASD move | mouse look | Space jump | Shift walk | C crouch | Left mouse fire | E use | Esc quit",
