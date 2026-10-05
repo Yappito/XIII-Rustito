@@ -99,10 +99,18 @@ pub fn spawn_particles(
                 texture_handle,
                 two_sided,
             ));
-            let mesh = meshes.add(Mesh::new(
+            // Start with the full (empty) attribute layout the per-frame rebuild uses: a mesh
+            // with no attributes has no valid vertex layout, which the depth prepass (needed by
+            // the projector decals) rejects as a pipeline validation error.
+            let mut empty = Mesh::new(
                 PrimitiveTopology::TriangleList,
                 RenderAssetUsages::RENDER_WORLD,
-            ));
+            );
+            empty.insert_attribute(Mesh::ATTRIBUTE_POSITION, Vec::<[f32; 3]>::new());
+            empty.insert_attribute(Mesh::ATTRIBUTE_NORMAL, Vec::<[f32; 3]>::new());
+            empty.insert_attribute(Mesh::ATTRIBUTE_UV_0, Vec::<[f32; 2]>::new());
+            empty.insert_attribute(Mesh::ATTRIBUTE_COLOR, Vec::<[f32; 4]>::new());
+            let mesh = meshes.add(empty);
             let mut sim = EmitterSim::new(si.wrapping_mul(97).wrapping_add(ei));
             sim.set_enabled(force_all || initially_enabled(system, desc));
             commands.spawn((
