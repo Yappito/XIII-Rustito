@@ -8,6 +8,9 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+# Workspace-internal only (not a new external crate): the resolution index reads `.uax`
+# package export tables and the `Sound` native tail. Flagged in the item6c report.
+xiii-package.workspace = true
 
 [lints]
 workspace = true

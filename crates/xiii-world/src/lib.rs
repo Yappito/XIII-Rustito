@@ -1777,7 +1777,13 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
             }
         };
         let Some(map_ref) = t.terrain_map else {
-            im.scene.fail("fail.terrain.no_heightmap", path);
+            if t.sectors.is_empty() && t.vertices.is_empty() {
+                // An empty `TerrainInfo` placeholder (no sectors, no vertices, no heightmap):
+                // nothing to draw or collide with. Counted as a note, not a decode failure.
+                im.scene.count("note.terrain.empty", 1);
+            } else {
+                im.scene.fail("fail.terrain.no_heightmap", path);
+            }
             continue;
         };
         let (w, h) = match im.cache.resolve(map_pkg, map_ref).and_then(|(pk, ix)| {
@@ -1789,15 +1795,25 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 continue;
             }
         };
-        let mesh = match t.mesh(w, h) {
+        let regions = match t.mesh(w, h) {
             Ok(m) => m,
             Err(e) => {
                 im.scene.fail("fail.terrain.mesh", e.to_string());
                 continue;
             }
         };
-        im.scene.count("terrain.hidden_quads", mesh.hidden_quads);
-        let composite = composite_terrain_texture(im, map_pkg, &t, &mesh);
+        // The base region drives the layer composite and the vertex colours; extra detail
+        // regions are added as their own geometry with the same material.
+        let base = &regions[0];
+        for region in &regions {
+            im.scene.count("terrain.hidden_quads", region.hidden_quads);
+        }
+        im.scene.count("terrain.regions", regions.len());
+        im.scene.count(
+            "terrain.region_extra_vertices",
+            t.vertices.len() - base.positions.len(),
+        );
+        let composite = composite_terrain_texture(im, map_pkg, &t, base);
         let (material, material_index) = match composite {
             Some(img) => {
                 im.scene.textures.push(SceneTexture {
@@ -1821,21 +1837,6 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 (MaterialSlot::Missing("terrain layers".into()), idx)
             }
         };
-        let terrain_tris: Vec<[[f32; 3]; 3]> = mesh
-            .indices
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|t| t.map(|i| to_bevy_position(mesh.positions[i as usize])))
-            .collect();
-        im.scene
-            .add_collision(format!("{path} (terrain)"), terrain_tris);
-        let positions: Vec<[f32; 3]> = mesh
-            .positions
-            .iter()
-            .map(|&v| to_bevy_position(v))
-            .collect();
-        let normals = grid_normals(&mesh.positions, w, h);
         let terrain_colors = match terrain::color_grid(p, &map_pkg.data, &t, w, h) {
             Ok(grid) => {
                 im.scene.count("lighting.terrain.colors", grid.colors.len());
@@ -1863,23 +1864,58 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 None
             }
         };
-        im.scene.meshes.push(SceneMesh {
-            label: format!("{path} heightfield"),
-            positions,
-            normals,
-            uvs: mesh.grid_uv.clone(),
-            indices: mesh.indices.clone(),
-            material,
-            material_index,
-        });
-        im.scene.objects.push(SceneObject {
-            mesh: im.scene.meshes.len() - 1,
-            transform: identity(),
-            path,
-            placement: None,
-            zone: None,
-            colors: terrain_colors,
-        });
+        for (ri, region) in regions.iter().enumerate() {
+            let terrain_tris: Vec<[[f32; 3]; 3]> = region
+                .indices
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|tri| tri.map(|i| to_bevy_position(region.positions[i as usize])))
+                .collect();
+            im.scene.add_collision(
+                if ri == 0 {
+                    format!("{path} (terrain)")
+                } else {
+                    format!("{path} (terrain region {ri})")
+                },
+                terrain_tris,
+            );
+            let positions: Vec<[f32; 3]> = region
+                .positions
+                .iter()
+                .map(|&v| to_bevy_position(v))
+                .collect();
+            let normals = grid_normals(&region.positions, region.width, region.height);
+            im.scene.meshes.push(SceneMesh {
+                label: if ri == 0 {
+                    format!("{path} heightfield")
+                } else {
+                    format!("{path} heightfield region {ri}")
+                },
+                positions,
+                normals,
+                uvs: region.grid_uv.clone(),
+                indices: region.indices.clone(),
+                material: material.clone(),
+                material_index,
+            });
+            im.scene.objects.push(SceneObject {
+                mesh: im.scene.meshes.len() - 1,
+                transform: identity(),
+                path: if ri == 0 {
+                    path.clone()
+                } else {
+                    format!("{path} region {ri}")
+                },
+                placement: None,
+                zone: None,
+                colors: if ri == 0 {
+                    terrain_colors.clone()
+                } else {
+                    None
+                },
+            });
+        }
         im.scene.count("terrain.infos", 1);
     }
 }

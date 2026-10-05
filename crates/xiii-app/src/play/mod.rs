@@ -365,6 +365,16 @@ fn setup_inner(
         "[play] login path: script={} bootstrap={}",
         session.login_script, session.login_bootstrap
     );
+    let pawns_now = session.player_pawn_actors();
+    println!(
+        "[play] player pawns: {} live XIIIPlayerPawn actor(s): {}",
+        pawns_now.len(),
+        pawns_now
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     for b in &session.blocked {
         println!("[play]   script path blocked: {b}");
     }
@@ -1152,6 +1162,16 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
     println!(
         "[play] login path: script={} bootstrap={}",
         session.login_script, session.login_bootstrap
+    );
+    let pawns_now = session.player_pawn_actors();
+    println!(
+        "[play] player pawns: {} live XIIIPlayerPawn actor(s): {}",
+        pawns_now.len(),
+        pawns_now
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     println!(
         "[play] player {} | controller {} | GameInfo {}",

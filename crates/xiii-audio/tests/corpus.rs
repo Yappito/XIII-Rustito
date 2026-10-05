@@ -178,25 +178,70 @@ fn local_sound_library_resolves_item6_traces() {
     ] {
         let r = lib
             .resolve_path(path)
-            .cloned()
             .unwrap_or_else(|| panic!("{path} did not resolve to a bank entry"));
         let leaf = xiii_audio::library::leaf(path).unwrap();
         assert!(leaf.eq_ignore_ascii_case(expect_named));
         let audio = lib
-            .load(&r)
+            .load(&r.entry)
             .unwrap_or_else(|e| panic!("{path}: decode failed: {e:?}"));
         assert!(audio.frames() > 0, "{path} decoded zero frames");
         println!(
-            "resolved {path} -> {}#{} {} {} ch {} Hz {} frames",
-            r.bank.display(),
-            r.entry,
-            r.codec.as_str(),
-            r.channels,
-            r.sample_rate,
-            audio.frames()
+            "resolved {path} -> {}#{} {} {} ch {} Hz {} frames (rule={}, candidates={})",
+            r.entry.bank.display(),
+            r.entry.entry,
+            r.entry.codec.as_str(),
+            r.entry.channels,
+            r.entry.sample_rate,
+            audio.frames(),
+            r.rule.as_str(),
+            r.candidates
         );
     }
 
     // An unknown name is counted, not silently ignored.
     assert!(lib.resolve_name("definitely_not_a_sound").is_none());
+}
+
+/// Opt-in item6c: the event-shaped `Guns__9mmSelWp.9mmSelWp__h9mmSelWp` Sound resolves through
+/// its native-tail HX resource reference to decoded PCM (the item6 name rule does not match it).
+#[test]
+fn local_9mmselwp_resource_reference_resolves() {
+    let Ok(root) = std::env::var("XIII_GOG_DIR") else {
+        println!("SKIPPED: XIII_GOG_DIR not set");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let mut lib = xiii_audio::SoundLibrary::scan(&root);
+
+    let path = "XIIIsound.Guns__9mmSelWp.9mmSelWp__h9mmSelWp";
+    // The name fallback must fail for this event-shaped path (why item6b reported no match).
+    assert!(
+        lib.resolve_by_name(path).is_none(),
+        "the event-shaped path has no leaf name match (name rule cannot resolve it)"
+    );
+    let r = lib
+        .resolve_path(path)
+        .unwrap_or_else(|| panic!("{path} did not resolve via its resource reference"));
+    assert_eq!(
+        r.rule,
+        xiii_audio::ResolutionRule::ResourceRef,
+        "resolved through the Sound native-tail resource reference"
+    );
+    let audio = lib
+        .load(&r.entry)
+        .unwrap_or_else(|e| panic!("{path}: decode failed: {e:?}"));
+    assert!(audio.frames() > 0, "{path} decoded zero frames");
+    println!(
+        "resolved {path} -> {}#{} {} {} ch {} Hz {} frames (rule={}, candidates={}, chosen={}, seed={:#x})",
+        r.entry.bank.display(),
+        r.entry.entry,
+        r.entry.codec.as_str(),
+        r.entry.channels,
+        r.entry.sample_rate,
+        audio.frames(),
+        r.rule.as_str(),
+        r.candidates,
+        r.chosen,
+        r.seed
+    );
 }

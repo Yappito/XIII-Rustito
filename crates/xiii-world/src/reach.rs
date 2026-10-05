@@ -1014,4 +1014,49 @@ mod tests {
             );
         }
     }
+
+    /// Regression guard for the maps whose terrain previously failed to decode (the vertex
+    /// array holds a base region plus a differently-spaced detail region; see
+    /// `xiii_decode::terrain::TerrainInfo::mesh`). Before the multi-region decode these maps had
+    /// no terrain collision and collapsed: Hual04c 47/437, Kello01a 299/1488, PRock04a 56/721
+    /// (item9 sweep). A drop below the measured values, or any missing-floor start node, is a
+    /// regression. Values measured 2026-10-05 on the GOG corpus.
+    #[test]
+    fn opt_in_reach_regression_multi_region_terrains() {
+        let Some(path) = opt_in_game_dir() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        for (map, min_pass, eligible) in [
+            ("Hual04c", 415usize, 437usize),
+            ("Kello01a", 1391usize, 1488usize),
+            ("PRock04a", 692usize, 721usize),
+        ] {
+            let report = analyze(map, &path).expect("reach analyze");
+            let missing_floor: usize = report
+                .groups
+                .iter()
+                .filter(|(cause, _)| cause.starts_with("missing floor"))
+                .map(|(_, n)| *n)
+                .sum();
+            println!(
+                "[reach-test regression] {map}: eligible {} passes {} (>= {min_pass}), missing-floor {missing_floor}",
+                report.eligible, report.passes
+            );
+            assert_eq!(
+                report.eligible, eligible,
+                "{map}: eligible edge count changed from the measured {eligible}"
+            );
+            assert!(
+                report.passes >= min_pass,
+                "{map}: pass count {} below measured {min_pass}",
+                report.passes
+            );
+            assert_eq!(
+                missing_floor, 0,
+                "{map}: terrain decoded but missing-floor start nodes appeared: {:?}",
+                report.groups
+            );
+        }
+    }
 }

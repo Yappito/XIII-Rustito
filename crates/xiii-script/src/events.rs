@@ -108,6 +108,35 @@ pub enum PresentationEvent {
         /// VM time.
         time: f64,
     },
+    /// `Actor.StopVoice`: stop the actor's current voice/dialogue playback.
+    StopVoice {
+        /// Object the native ran on.
+        actor: String,
+        /// VM time.
+        time: f64,
+    },
+    /// `Actor.StopSound`: stop one sound on the actor (`sound` is the decoded object path).
+    StopSound {
+        /// Object the native ran on.
+        actor: String,
+        /// Decoded `Sound` path, `None` for a null argument.
+        sound: Option<String>,
+        /// VM time.
+        time: f64,
+    },
+    /// `Actor.PlaySndPNJOno`: play an onomatopoeia sound (`SndOno`) with a mesh code and timbre.
+    PlaySndPNJOno {
+        /// Object the native ran on.
+        actor: String,
+        /// Decoded `SndOno` path, `None` for a null argument.
+        sound: Option<String>,
+        /// Decoded `CodeMesh`.
+        code_mesh: i32,
+        /// Decoded `Timbre`.
+        timbre: i32,
+        /// VM time.
+        time: f64,
+    },
 }
 
 impl PresentationEvent {
@@ -120,7 +149,10 @@ impl PresentationEvent {
             | Self::SetInjuredEffect { actor, .. }
             | Self::ProjectorAttach { actor, .. }
             | Self::ProjectorDetach { actor, .. }
-            | Self::ProjectorAbandon { actor, .. } => actor,
+            | Self::ProjectorAbandon { actor, .. }
+            | Self::StopVoice { actor, .. }
+            | Self::StopSound { actor, .. }
+            | Self::PlaySndPNJOno { actor, .. } => actor,
         }
     }
 
@@ -133,7 +165,10 @@ impl PresentationEvent {
             | Self::SetInjuredEffect { time, .. }
             | Self::ProjectorAttach { time, .. }
             | Self::ProjectorDetach { time, .. }
-            | Self::ProjectorAbandon { time, .. } => *time,
+            | Self::ProjectorAbandon { time, .. }
+            | Self::StopVoice { time, .. }
+            | Self::StopSound { time, .. }
+            | Self::PlaySndPNJOno { time, .. } => *time,
         }
     }
 }
@@ -205,6 +240,21 @@ impl std::fmt::Display for PresentationEvent {
             Self::ProjectorAbandon {
                 actor, lifetime, ..
             } => write!(f, "AbandonProjector {actor} lifetime={lifetime:?}"),
+            Self::StopVoice { actor, .. } => write!(f, "StopVoice {actor}"),
+            Self::StopSound { actor, sound, .. } => {
+                write!(f, "StopSound {actor} sound={}", path(sound))
+            }
+            Self::PlaySndPNJOno {
+                actor,
+                sound,
+                code_mesh,
+                timbre,
+                ..
+            } => write!(
+                f,
+                "PlaySndPNJOno {actor} sound={} codeMesh={code_mesh} timbre={timbre}",
+                path(sound)
+            ),
         }
     }
 }
