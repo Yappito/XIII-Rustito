@@ -1774,4 +1774,41 @@ mod tests {
             );
         }
     }
+
+    /// Opt-in: the three campaign suspensions fixed by item3p are gone. Amos01 and USA02 held
+    /// the two `xidcine.Cine2` unknown-animation suspensions and the USA02
+    /// `xidcine.BreakableMover` nested-subobject suspension; each must now survey with 0
+    /// suspended actors. Prints `SKIPPED` without `XIII_GOG_DIR`.
+    #[test]
+    fn opt_in_fixed_maps_have_no_suspensions() {
+        let Some(root) = std::env::var_os("XIII_GOG_DIR") else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let path = std::path::PathBuf::from(&root);
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = if path.is_relative() {
+            ws.join(path)
+        } else {
+            path
+        };
+        for map in ["Amos01", "USA02"] {
+            let r = run_one(&path, map);
+            let script = r.script.expect("script survey ran");
+            assert!(
+                script.suspended.is_empty(),
+                "{map}: still suspended: {:?}",
+                script
+                    .suspended
+                    .iter()
+                    .map(|s| (&s.actor, &s.kind))
+                    .collect::<Vec<_>>()
+            );
+            println!(
+                "item3p fixed-map test {map}: {} suspended, {} missing natives",
+                script.suspended.len(),
+                script.missing_natives.len(),
+            );
+        }
+    }
 }

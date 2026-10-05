@@ -2106,6 +2106,52 @@ impl<'s> Vm<'s> {
             (PropertyValue::Array { count, elements }, Ty::Array(inner)) => {
                 self.decode_array(pkg, *count, *elements, inner)
             }
+            // `FRange`/`FRangeVector` are decoded by the package reader as typed structs; map
+            // them into the script layout's `{min,max}` members. A class-default subobject
+            // template can carry them (e.g. `XIIIBreakingGlassEmitterA.StartSizeRange`), which
+            // is applied when the subobject is instantiated.
+            (PropertyValue::Struct(StructValue::Range(r)), Ty::Struct(members)) => {
+                let mut fields = Vec::with_capacity(members.len());
+                for (name, _) in members {
+                    let v = match name.to_ascii_lowercase().as_str() {
+                        "min" => r[0],
+                        "max" => r[1],
+                        _ => return Value::Unsupported(format!("range member {name}")),
+                    };
+                    fields.push((name.clone(), Value::Float(v)));
+                }
+                Value::Struct(fields)
+            }
+            (PropertyValue::Struct(StructValue::RangeVector(rv)), Ty::Struct(members)) => {
+                if members.len() != 3 {
+                    return Value::Unsupported(format!("range vector arity {}", members.len()));
+                }
+                let mut fields = Vec::with_capacity(3);
+                for (i, (name, ty)) in members.iter().enumerate() {
+                    let r = rv[i];
+                    let inner = match ty {
+                        Ty::Struct(inner) => {
+                            let mut sub = Vec::with_capacity(inner.len());
+                            for (n, _) in inner {
+                                let v = match n.to_ascii_lowercase().as_str() {
+                                    "min" => r[0],
+                                    "max" => r[1],
+                                    _ => {
+                                        return Value::Unsupported(format!(
+                                            "range vector member {n}"
+                                        ));
+                                    }
+                                };
+                                sub.push((n.clone(), Value::Float(v)));
+                            }
+                            Value::Struct(sub)
+                        }
+                        _ => return Value::Unsupported(format!("range vector member {name}")),
+                    };
+                    fields.push((name.clone(), inner));
+                }
+                Value::Struct(fields)
+            }
             // A struct the package reader kept raw (`RawReason::UnknownStruct`) can still be
             // decoded from its value span member-by-member when the script class layout gives
             // the member types (e.g. `BaseSoldier.InitialInventory[i]` = {Inventory, Count}).
@@ -2230,6 +2276,11 @@ impl<'s> Vm<'s> {
 
     /// Creates an instance of a class with its defaults.
     pub fn spawn(&mut self, class: GlobalRef, name: &str) -> VmResult<ObjectId> {
+        self.spawn_depth(class, name, 0)
+    }
+
+    /// [`Vm::spawn`] with a recursion guard for per-instance default subobjects.
+    fn spawn_depth(&mut self, class: GlobalRef, name: &str, depth: u8) -> VmResult<ObjectId> {
         let layout = self.class_layout(class)?;
         let is_actor = layout.chain_names.iter().any(|n| n == "actor");
         let id = self.objects.len() as ObjectId;
@@ -2260,7 +2311,134 @@ impl<'s> Vm<'s> {
             anim: AnimState::default(),
             bone: BoneState::default(),
         });
+        // UE2 gives every instance its own copy of the class-default subobjects (component
+        // objects) its default properties reference. The serialized class defaults hold `Static`
+        // references to those class-package exports, which have no VM instance of their own;
+        // expand them now so script property access through the reference resolves to an
+        // instance. Evidence: `xidcine.BreakableMover.InitializeEmitters` 0x006A writes
+        // `emit.Emitters[0].StartVelocityRange` on a `XIIIBreakingGlassEmitter` spawned from
+        // `Fragments_Type`, whose `Emitters[0]` is the class subobject
+        // `xidcine.XIIIBreakingGlassEmitter.XIIIBreakingGlassEmitterA`.
+        let mut values = std::mem::take(&mut self.objects[id as usize].props);
+        self.expand_default_subobjects(&mut values, id, depth)?;
+        self.objects[id as usize].props = values;
         Ok(id)
+    }
+
+    /// Depth guard for per-instance default-subobject expansion (a cyclic reference graph would
+    /// otherwise recurse forever; UE2's component chains are shallow).
+    const MAX_SUBOBJECT_DEPTH: u8 = 16;
+
+    /// Replaces every class-default-subobject reference in `values` with a fresh per-instance
+    /// copy whose `Outer` is `owner`. Arrays and struct fields are walked. See
+    /// [`Vm::class_subobject_class`].
+    fn expand_default_subobjects(
+        &mut self,
+        values: &mut [Value],
+        owner: ObjectId,
+        depth: u8,
+    ) -> VmResult<()> {
+        if depth >= Self::MAX_SUBOBJECT_DEPTH {
+            return Ok(());
+        }
+        for v in values.iter_mut() {
+            self.expand_default_value(v, owner, depth)?;
+        }
+        Ok(())
+    }
+
+    fn expand_default_value(&mut self, v: &mut Value, owner: ObjectId, depth: u8) -> VmResult<()> {
+        match v {
+            Value::Object(Some(ObjRef::Static(g))) => {
+                let Some(class) = self.class_subobject_class(*g) else {
+                    return Ok(());
+                };
+                let name = self.subobject_name(*g);
+                let sub = self.spawn_depth(class, &name, depth + 1)?;
+                self.set_property(
+                    sub,
+                    "Outer",
+                    0,
+                    Value::Object(Some(ObjRef::Instance(owner))),
+                );
+                // Apply the subobject export's own serialized template (its overridden values).
+                self.apply_export_properties(*g, sub)?;
+                // A template property may itself reference another class subobject.
+                let mut values = std::mem::take(&mut self.objects[sub as usize].props);
+                self.expand_default_subobjects(&mut values, sub, depth + 1)?;
+                self.objects[sub as usize].props = values;
+                *v = Value::Object(Some(ObjRef::Instance(sub)));
+            }
+            Value::Array(items) => {
+                for item in items.iter_mut() {
+                    self.expand_default_value(item, owner, depth)?;
+                }
+            }
+            Value::Struct(fields) => {
+                for (_, field) in fields.iter_mut() {
+                    self.expand_default_value(field, owner, depth)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Class of a class-default subobject export, or `None` when `g` is not one. A class
+    /// subobject's outer chain consists of exports and reaches a decoded `Core.Class` export
+    /// (e.g. `xidcine.XIIIBreakingGlassEmitter.XIIIBreakingGlassEmitterA`, whose outer is the
+    /// `XIIIBreakingGlassEmitter` class). A map export's outer is the map package import, so it
+    /// is never treated as a subobject.
+    fn class_subobject_class(&self, g: GlobalRef) -> Option<GlobalRef> {
+        let p = self.set.packages.get(g.package)?;
+        let e = p.package.exports().get(g.export as usize)?;
+        let mut outer = p.package.object_outer(ObjectRef::Export(g.export))?;
+        let mut steps = 0u32;
+        loop {
+            steps += 1;
+            if steps > 64 {
+                return None;
+            }
+            let ObjectRef::Export(oi) = outer else {
+                return None;
+            };
+            let owner = GlobalRef {
+                package: g.package,
+                export: oi,
+            };
+            if matches!(self.set.object(owner), Some(ScriptObject::Class(_))) {
+                return self.set.resolve(g.package, e.class);
+            }
+            outer = p.package.object_outer(ObjectRef::Export(oi))?;
+        }
+    }
+
+    /// Short unique name for a class-subobject instance (its export's own name).
+    fn subobject_name(&self, g: GlobalRef) -> String {
+        let short = self.set.packages[g.package].ref_name(ObjectRef::Export(g.export));
+        self.unique_name(short)
+    }
+
+    /// Applies an export's own tagged properties (a class-default subobject's serialized
+    /// template) to a freshly spawned instance, mirroring the map-property pass in
+    /// [`Vm::load_level`].
+    fn apply_export_properties(&mut self, g: GlobalRef, id: ObjectId) -> VmResult<()> {
+        let set = self.set;
+        let p = &set.packages[g.package];
+        let props = p
+            .package
+            .read_object_properties(&p.data, g.export as usize, &Limits::default())
+            .map_err(|e| {
+                self.err(VmErrorKind::Other(format!(
+                    "class subobject properties of {}: {e}",
+                    self.objects[id as usize].name
+                )))
+            })?;
+        let layout = self.objects[id as usize].layout.clone();
+        let mut values = std::mem::take(&mut self.objects[id as usize].props);
+        self.apply_block(g.package, &props.block, &layout, &mut values);
+        self.objects[id as usize].props = values;
+        Ok(())
     }
 
     /// Instantiates every script-class export of a loaded map package (two passes: create, then
@@ -6280,11 +6458,17 @@ impl<'s> Vm<'s> {
                 )));
                 return Ok(());
             }
+            // UE2 `AActor::PlayAnim`/`LoopAnim` look the sequence up in the mesh's animation
+            // set and simply play nothing when it is absent (no state failure). The shipped
+            // maps rely on this: `xidcine.Cine2.PostBeginPlay` calls `LoopAnim(DefaultAnim)`
+            // with `DefaultAnim` values ("Wait", "acqiesce") that no decoded source of the
+            // actor carries. A *decode* failure is still fatal (`AnimationDataError`), so a
+            // corrupt provider is never hidden; a genuinely unknown name is a visible no-op.
             let mesh = self.animation_sources(id).join(", ");
-            return Err(self.err(VmErrorKind::UnknownAnimation {
-                sequence: sequence.to_owned(),
-                mesh,
-            }));
+            self.note(TraceKind::Note(format!(
+                "Actor.PlayAnim('{sequence}') not in [{mesh}]: UE2 plays nothing (no-op)"
+            )));
+            return Ok(());
         };
         let rate = if rate > 0.0 { rate } else { info.rate };
         let mut notifies = info.notifies;

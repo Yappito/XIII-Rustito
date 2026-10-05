@@ -381,6 +381,14 @@ fn div_ff(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOut
     val(Value::Float(x / y))
 }
 
+/// `Object.MultiplyMultiply_FloatFloat` (170): `A ** B`, UE2 `appPow` (C `pow`). Decoded call
+/// site `xidcine.HelicoDeco.HelicoTick` 0x01FF (the exponential damping factor). A negative base
+/// with a non-integral exponent yields `NaN`, matching `pow` (never silently clamped).
+fn pow_ff(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let (x, y) = (float(vm, a, 0)?, float(vm, a, 1)?);
+    val(Value::Float(x.powf(y)))
+}
+
 fn not_b(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     val(Value::Bool(!boolean(vm, a, 0)?))
 }
@@ -904,6 +912,62 @@ fn sub_rr(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOut
         x[1].wrapping_sub(y[1]),
         x[2].wrapping_sub(y[2]),
     ]))
+}
+
+/// `Object.Multiply_RotatorFloat` (287): componentwise `rotator * float`. The decoded call
+/// site `xidcine.HelicoDeco.HelicoTick` 0x01F4 scales the helicopter's rotation by
+/// `1 - exp(-inertia * dt)`. Same conversion as the existing compound `*=` (`mul_eq_rf`):
+/// each component is multiplied in `f32` and truncated toward zero (hypothesis: UE2's
+/// `FRotator` scalar operator converts with a plain C cast; the compound operator in this
+/// registry already does this).
+fn mul_rf(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let x = rotator2(vm, a, 0)?;
+    let s = float(vm, a, 1)?;
+    val(Value::Rotator([
+        (x[0] as f32 * s) as i32,
+        (x[1] as f32 * s) as i32,
+        (x[2] as f32 * s) as i32,
+    ]))
+}
+
+/// `Object.Multiply_FloatRotator` (288): the reversed operand order of [`mul_rf`].
+fn mul_fr(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let s = float(vm, a, 0)?;
+    let x = rotator2(vm, a, 1)?;
+    val(Value::Rotator([
+        (x[0] as f32 * s) as i32,
+        (x[1] as f32 * s) as i32,
+        (x[2] as f32 * s) as i32,
+    ]))
+}
+
+/// `Object.Divide_RotatorFloat` (289): componentwise `rotator / float`; a zero divisor is an
+/// explicit error, matching the compound `div_eq_rf`.
+fn div_rf(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let x = rotator2(vm, a, 0)?;
+    let s = float(vm, a, 1)?;
+    if s == 0.0 {
+        return Err(vm.err(VmErrorKind::DivisionByZero));
+    }
+    val(Value::Rotator([
+        (x[0] as f32 / s) as i32,
+        (x[1] as f32 / s) as i32,
+        (x[2] as f32 / s) as i32,
+    ]))
+}
+
+/// `Object.EqualEqual_RotatorRotator` (142): exact componentwise equality. Decoded call site
+/// `xiii.MitraillTop.GoToWaitingPos.Tick` 0x0035 compares the remembered `OldRotation` with
+/// the current `Rotation` (UE2 `FRotator::operator==` compares the three integer components).
+fn eq_rr(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let (x, y) = (rotator2(vm, a, 0)?, rotator2(vm, a, 1)?);
+    val(Value::Bool(x == y))
+}
+
+/// `Object.NotEqual_RotatorRotator` (203): the negation of [`eq_rr`].
+fn ne_rr(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let (x, y) = (rotator2(vm, a, 0)?, rotator2(vm, a, 1)?);
+    val(Value::Bool(x != y))
 }
 
 fn all_actors(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -2747,6 +2811,18 @@ fn snow_note(vm: &mut Vm<'_>, name: &str, a: &[Value]) {
     )));
 }
 
+/// `ParticleEmitter.SetMaxParticles` (name-based native, index 0): a visible trace note. The
+/// runtime has no particle renderer, so the request is recorded rather than silently accepted
+/// or left as a missing native. Call site `xidcine.BreakableMover.InitializeEmitters` 0x0348
+/// (reached once the emitter subobject exists).
+fn set_max_particles(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let n = int(vm, a, 0)?;
+    vm.note(crate::vm::TraceKind::Note(format!(
+        "ParticleEmitter.SetMaxParticles({n}): recorded; no particle subsystem"
+    )));
+    val(Value::Void)
+}
+
 fn init_rnd_cube_spr(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     snow_note(vm, "InitRndCubeSpr", a);
     val(Value::Void)
@@ -4502,6 +4578,61 @@ fn builtin_defs() -> Vec<NativeDef> {
             )
         });
     }
+    // item3p: the missing rotator operators, reached by the campaign survey. `Multiply_RotatorFloat`
+    // (287, `xidcine.HelicoDeco.HelicoTick` 0x01F4) and `EqualEqual_RotatorRotator` (142,
+    // `xiii.MitraillTop.GoToWaitingPos.Tick` 0x0035) were the two highest-count unimplemented
+    // natives; the rest of the declared rotator operator family (288, 289, 203) is added so the
+    // set is complete, `MultiplyMultiply_FloatFloat` (170) is the next operator the campaign
+    // then reaches in `HelicoTick`, and `ParticleEmitter.SetMaxParticles` is a visible Partial
+    // (no particle renderer) reached once the BreakableMover emitter subobject exists. Kept in
+    // one block so parallel registry edits stay out of the way.
+    v.push(def(
+        "Object.Multiply_RotatorFloat",
+        "native(287) final operator rotator *(rotator A, float B)",
+        "core.u Object.Multiply_RotatorFloat decoded; componentwise rotator scale; xidcine.HelicoDeco.HelicoTick 0x01F4",
+        mul_rf,
+    ));
+    v.push(def(
+        "Object.Multiply_FloatRotator",
+        "native(288) final operator rotator *(float A, rotator B)",
+        "core.u Object.Multiply_FloatRotator decoded; reversed operand order of native 287",
+        mul_fr,
+    ));
+    v.push(def(
+        "Object.Divide_RotatorFloat",
+        "native(289) final operator rotator /(rotator A, float B)",
+        "core.u Object.Divide_RotatorFloat decoded; componentwise rotator division; a zero divisor errors",
+        div_rf,
+    ));
+    v.push(def(
+        "Object.EqualEqual_RotatorRotator",
+        "native(142) final operator bool ==(rotator A, rotator B)",
+        "core.u Object.EqualEqual_RotatorRotator decoded; exact componentwise equality; xiii.MitraillTop.GoToWaitingPos.Tick 0x0035",
+        eq_rr,
+    ));
+    v.push(def(
+        "Object.NotEqual_RotatorRotator",
+        "native(203) final operator bool !=(rotator A, rotator B)",
+        "core.u Object.NotEqual_RotatorRotator decoded; negation of native 142",
+        ne_rr,
+    ));
+    v.push(def(
+        "Object.MultiplyMultiply_FloatFloat",
+        "native(170) final operator float **(float A, float B)",
+        "core.u Object.MultiplyMultiply_FloatFloat decoded; UE2 appPow (C pow); xidcine.HelicoDeco.HelicoTick 0x01FF",
+        pow_ff,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no particle subsystem: the call is recorded in the trace and never silently accepted",
+        ),
+        ..def(
+            "Engine.ParticleEmitter.SetMaxParticles",
+            "native(0) final function SetMaxParticles(int NewMaxParticles)",
+            "engine.u ParticleEmitter.SetMaxParticles decoded; xidcine.BreakableMover.InitializeEmitters 0x0348 (reached once the emitter subobject exists)",
+            set_max_particles,
+        )
+    });
     // Canvas draw-recording natives (`crates/xiii-script/src/canvas.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::canvas::canvas_defs());
