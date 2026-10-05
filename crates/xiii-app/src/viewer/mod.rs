@@ -100,7 +100,7 @@ struct ShotFlag(bool);
 /// Animated texture-coordinate transform for one material handle (the transform itself lives in
 /// [`StandardMaterial::uv_transform`] and is recomputed each frame from `ops` and elapsed time).
 #[derive(Component)]
-struct AnimatedUv {
+pub(crate) struct AnimatedUv {
     material: Handle<StandardMaterial>,
     ops: Arc<[UvOp]>,
 }
@@ -216,8 +216,9 @@ fn standard_material(resolved: &ResolvedMaterial, texture: Handle<Image>) -> Sta
     }
 }
 
-/// Recomputes every animated material's `uv_transform` from the elapsed time.
-fn animate_uv(
+/// Recomputes every animated material's `uv_transform` from the elapsed time. Shared by the map
+/// viewer and `--play` (so animated material chains move in both).
+pub(crate) fn animate_uv(
     time: Res<Time>,
     animated: Query<&AnimatedUv>,
     mut materials: ResMut<Assets<StandardMaterial>>,

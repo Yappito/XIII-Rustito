@@ -200,7 +200,7 @@ about Z).
 | Engine.Polys | 7,194 | 7,194 | 7,194 | 34,395 polygons |
 | Engine.TerrainSector | 2,208 | 2,208 | 2,208 | |
 | Engine.StaticMeshInstance | 14,542 | 14,542 | 14,542 | per placed static-mesh actor; colours + per-light vertex visibility |
-| Engine.Model | 7,194 | 7,194 | 0 | prefix through zones and the `Polys` ref decoded; 9,496,581 B unsupported tail (lightmaps, bounds, leaves...) |
+| Engine.Model | 7,194 | 7,194 | 6,396 | full payload decoded on 6,396; 4,452,699 B unsupported tail (`model.after_linked`) on the 798 build-variant Models |
 | Engine.TerrainInfo | 18 | 18 | 0 | sectors, vertices, sector grid; 2,052 B unsupported tail |
 
 Texture formats are taken from the game's own `Engine.ETextureFormat` enum in `engine.u`: P8,
@@ -272,11 +272,36 @@ uninitialized memory.
 `Polys`: a compact object reference. It resolves to an `Engine.Polys` export in every one
 of the 7,194 GOG Models (null never occurs).
 
-What follows the `Polys` reference (LightMap, LightBits, Bounds, LeafHulls, Leaves, Lights,
-RootOutside/Linked and the large lightmap byte region) is **not** decoded and is the
-`model.lightmaps_and_after` unsupported tail. Leaf -> zone assignments can be derived exactly
-from the nodes' `iLeaf`/`iZone` pairs (0 conflicts over all 64 zoned maps); this is what
-`xiii-tool zones` uses. The level BSP is the only `Model` that no `Brush` property references.
+What follows the `Polys` reference was decoded from `UModel::Serialize` in `Engine.dll` (RVA
+0x9C240) and verified against the GOG bytes. Field order:
+
+- `LightMap`: `TArray<FLightMapIndex>`. Each record is 178 bytes in this build (licensee 58,
+  version 100): i32, i32, two 16-f32 matrices, nine i32, two bytes, then four compact indices.
+  The array is empty in 7,183 of the 7,194 Models.
+- A second `TArray` record (two bytes, one compact index, three i32 per element). Empty in
+  every Model whose payload is consumed exactly.
+- `Bounds`: `TArray<FBox>` (25 bytes: min, max, IsValid byte).
+- `LeafHulls`: `TArray<i32>`.
+- `Leaves`: `TArray<FConvexVolumeLeaf>` (compact Zone/Permeating/Volumetric + u64
+  VisibleZones). The count equals the maximum node `iLeaf` + 1 on the maps where the full
+  payload is consumed.
+- `Lights`: `TArray<compact actor reference>`.
+- `RootOutside` i32, `Linked` i32, `MoverLink` i32.
+- `FBspVertexStream`: compact count then `count` records of 8 f32 (position, normal, two UV
+  pairs), then an i32 revision.
+
+For **6,396** of the 7,194 Models every payload byte is consumed exactly (`xiii-tool bsp`
+shows no unsupported tail). The remaining 798 exports use a build variant whose `LightMap`
+record layout differs (all seven `Engine.Model` brushes with a non-empty `LightMap` array on
+the maps, plus a few others); the decoder keeps the decoded prefix and reports the remainder
+as the explicit label `model.after_linked` (4,452,699 B corpus-wide, down from 9,496,581 B).
+
+The lightmap **texels** are not decoded: the `LightMap` array is empty in 7,192 of 7,194
+Models and the meaning of `FLightMapIndex.DataOffset` relative to the texture data is not
+established, so `Model::lightmap_texels` is not implemented. Leaf -> zone assignments are
+derived exactly from the nodes' `iLeaf`/`iZone` pairs (0 conflicts over all 64 zoned maps);
+this is what `xiii-tool zones` uses. The level BSP is the only `Model` that no `Brush`
+property references.
 
 **Polys.** i32 Num, i32 Max, then per polygon: compact vertex count, Base, Normal, TextureU,
 TextureV, vertices, u32 PolyFlags, compact Actor, compact Material, compact ItemName, compact
@@ -400,7 +425,10 @@ flips the numeric orientation of triangles.
 - **BSP:** node planes and children; PolyFlags `PF_NotSolid` 0x8, `PF_Semisolid` 0x20,
   `PF_Invisible` 0x1 and portal 0x04000000; the node collision-bound index (meaning inferred).
   Zones (actor + connectivity/visibility) are decoded; leaf zones are derived from the nodes.
-  Lightmaps, bounds, hulls and the leaf array are in the undecoded tail.
+  `Bounds`, `LeafHulls` and the `Leaves` convex-volume array are decoded; the node
+  `iCollisionBound` indexes `LeafHulls` and `iRenderBound` indexes `Bounds` (both hold on the
+  fully-consumed Maps after a bug in the old node-field reading was ruled out). The lightmap
+  **texels** are not decoded (see the Model section).
 - **Terrain:** world-space vertices, quad visibility (holes; Plage01 has 33 hidden quads) and
   edge turns. The bit conventions follow UE2 naming and are not verified in play.
 - **Ray probes:** `xiii-app --dump` casts rays (not capsule sweeps) from the PlayerStart
@@ -410,8 +438,11 @@ flips the numeric orientation of triangles.
 
 ### Unknown / next
 
-- The Model tail after the `Polys` reference (lightmaps, light bits, bounds, leaf hulls, the
-  leaf array, lights) and the TerrainInfo tail.
+- The build variant of the 813 Models whose tail does not decode end-to-end (`model.after_linked`):
+  the `LightMap` record layout for the seven map `Engine.Model` brushes with a non-empty
+  `LightMap` array (and a few other exports) differs from the 178-byte form used elsewhere.
+- The lightmap texels (`FLightMapIndex.DataOffset` relative to the texture data) and the
+  TerrainInfo tail.
 - The meaning of the `reserved` zone-field u32, of `Zone.Visibility` and of
   `Zone.LastRenderTime`, and of the texture trailing bytes, the static-mesh unknown block and
   the node padding.
@@ -419,7 +450,6 @@ flips the numeric orientation of triangles.
 - Material semantics: Shader, FinalBlend and modifiers are only followed to a texture.
 - Sky-zone selection order and the meaning of the per-zone sky settings (`LinkToSkybox`).
 - Vertex lighting: static-mesh instance colours and terrain sector colours are decoded and
-  rendered; the BSP `LightMaps`/`LightBits` tail is still not decoded (the bytes after the
-  `Polys` reference do not start with the array count the UE2 `UModel` header order would
-  imply, and the stretch is not required).
+  rendered; the BSP `LightMaps`/`LightBits` **arrays** are decoded but the lightmap
+  **texels** are not (empty on all but 2 Maps).
 - A capsule sweep with the original movement rules.

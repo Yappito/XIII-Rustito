@@ -12,7 +12,6 @@ use std::time::Instant;
 use xiii_audio::hx::{Codec, DataLocation, HxBank, HxLimits};
 use xiii_audio::{decode_entry, hx, write_wav};
 use xiii_package::{Limits, ObjectRef, Package, PropertyValue};
-
 pub const USAGE: &str = "\
   xiii-tool audio coverage <install-root> [--json-out <file>]
       Parse every .hxc bank under <install-root>, decode every wave entry (PCM in
@@ -269,6 +268,9 @@ fn coverage(args: &[String]) -> ExitCode {
     let started = Instant::now();
     let scan = analyze(&root, true);
     let linkage = scan_linkage(&root, &scan.names);
+    let library = xiii_audio::SoundLibrary::scan(&root);
+    let lib_stats = library.stats();
+    let resolution = library.resolution_summary();
 
     let mut out = String::new();
     let total_decode: usize =
@@ -332,6 +334,71 @@ fn coverage(args: &[String]) -> ExitCode {
         scan.names.len(),
         linkage.matched_sounds
     );
+    let _ = writeln!(
+        out,
+        "sound resolution: {} Sound objects; name rule {}, resource reference {}, total resolved \
+         {} ({}%), unresolved {}",
+        resolution.sounds,
+        resolution.name_rule_only,
+        resolution.resource_ref,
+        resolution.resolved,
+        format_args!(
+            "{:.1}",
+            100.0 * resolution.resolved as f64 / resolution.sounds.max(1) as f64
+        ),
+        resolution.failed
+    );
+    let _ = writeln!(
+        out,
+        "  indexed: {} resource pairs from {} banks ({} parsed, {} failed); {} Sound refs from \
+         {} .uax ({} parsed)",
+        lib_stats.resources,
+        lib_stats.banks_seen,
+        lib_stats.banks_parsed,
+        lib_stats.banks_failed,
+        lib_stats.sound_refs,
+        lib_stats.uax_seen,
+        lib_stats.uax_parsed
+    );
+    let _ = writeln!(
+        out,
+        "  by rule: resolved via resource reference {}, via name-only fallback {}; unresolved \
+         {} (no resource ref {}, resource pair absent {}, no wave via links {})",
+        resolution.resource_ref,
+        resolution.name_match,
+        resolution.failed,
+        resolution.no_sound_ref,
+        resolution.resource_missing,
+        resolution.resource_no_wave
+    );
+    let unresolved = library.unresolved_paths();
+    let mut by_reason: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, r) in &unresolved {
+        *by_reason.entry(r).or_default() += 1;
+    }
+    let _ = writeln!(out, "  unresolved by reason: {by_reason:?}");
+    for reason in ["no_wave_via_links", "no_sound_ref", "absent_resource_pair"] {
+        let sample: Vec<&(String, &str)> = unresolved
+            .iter()
+            .filter(|(_, r)| *r == reason)
+            .take(6)
+            .collect();
+        for (path, _) in sample {
+            let _ = writeln!(out, "    {reason}: {path}");
+        }
+    }
+    let _ = writeln!(
+        out,
+        "  per-package (Sound objects: name rule [before] -> resolved [after]):"
+    );
+    for (pkg, r) in library.resolution_by_package() {
+        let pct = format!("{:.1}", 100.0 * r.resolved as f64 / r.sounds.max(1) as f64);
+        let _ = writeln!(
+            out,
+            "    {:<20} {} -> {} ({}%)  resource_ref {}, name_fallback {}, unresolved {}",
+            pkg, r.name_rule_only, r.resolved, pct, r.resource_ref, r.name_match, r.failed
+        );
+    }
 
     let failed = !scan.parse_errors.is_empty() || !scan.decode_fail.is_empty();
 
@@ -583,6 +650,8 @@ fn link(args: &[String]) -> ExitCode {
 
     let scan = analyze(&root, false);
     let linkage = scan_linkage(&root, &scan.names);
+    let library = xiii_audio::SoundLibrary::scan(&root);
+    let resolution = library.resolution_summary();
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -593,6 +662,20 @@ fn link(args: &[String]) -> ExitCode {
         linkage.steps,
         scan.names.len(),
         linkage.matched_sounds
+    );
+    let _ = writeln!(
+        out,
+        "sound resolution: name rule {} of {}; resource reference {}; total resolved {} \
+         ({}%), unresolved {}",
+        resolution.name_rule_only,
+        resolution.sounds,
+        resolution.resource_ref,
+        resolution.resolved,
+        format_args!(
+            "{:.1}",
+            100.0 * resolution.resolved as f64 / resolution.sounds.max(1) as f64
+        ),
+        resolution.failed
     );
 
     if let Some(target) = &sound {
@@ -614,12 +697,44 @@ fn link(args: &[String]) -> ExitCode {
         if matches.is_empty() {
             let _ = writeln!(out, "  no bank WavRes named '{target}'");
         }
+        // The full resolver (resource reference then name fallback).
+        match library.resolve_path(target) {
+            Some(r) => {
+                let _ = writeln!(
+                    out,
+                    "  resolver: rule={} bank={}#{} {} {} ch {} Hz candidates={} chosen={} seed={:#x}",
+                    r.rule.as_str(),
+                    r.entry.bank.display(),
+                    r.entry.entry,
+                    r.entry.codec.as_str(),
+                    r.entry.channels,
+                    r.entry.sample_rate,
+                    r.candidates,
+                    r.chosen,
+                    r.seed
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "  resolver: unresolved (no resource reference, no name match)"
+                );
+            }
+        }
         if let Some(wav) = &wav {
-            let Some(first) = matches.first() else {
+            let Some(r) = library.resolve_path(target) else {
                 eprintln!("error: no bank entry for '{target}'");
                 return ExitCode::from(1);
             };
-            match export_ref(first, wav) {
+            let first = HxRef {
+                bank: r.entry.bank.clone(),
+                entry: r.entry.entry,
+                codec: r.entry.codec,
+                channels: r.entry.channels,
+                sample_rate: r.entry.sample_rate,
+                external: r.entry.external,
+            };
+            match export_ref(&first, wav) {
                 Ok(()) => {
                     let _ = writeln!(out, "  wrote {}", wav.display());
                 }
@@ -630,14 +745,21 @@ fn link(args: &[String]) -> ExitCode {
             }
         }
     } else {
-        // Show the three traced chains: weapon, footstep (through a SndStep) and dialogue.
+        // Show the traced chains: weapon, dialogue (both Engine.Sound) and the item6c
+        // event-shaped reference that the name rule alone cannot resolve. The footstep step is
+        // traced through its `EndStep`/`LandSound` properties by `trace_export`.
         for (package_name, export_name, label) in [
             ("XIIISound.uax", "Guns.M16Fire1", "weapon"),
-            ("Footsteps.uax", "XIIIFSMar", "footstep step"),
             ("Plage00Voices.uax", "Plage00_XIIIa_00", "dialogue"),
+            (
+                "XIIISound.uax",
+                "Guns__9mmSelWp.9mmSelWp__h9mmSelWp",
+                "item6c event reference",
+            ),
+            ("Footsteps.uax", "XIIIFSMar", "footstep step"),
         ] {
             let _ = writeln!(out, "trace ({label}):");
-            trace_export(&root, package_name, export_name, &scan, &mut out);
+            trace_export(&root, package_name, export_name, &scan, &library, &mut out);
         }
     }
 
@@ -645,7 +767,14 @@ fn link(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn trace_export(root: &Path, package_name: &str, export_name: &str, scan: &Scan, out: &mut String) {
+fn trace_export(
+    root: &Path,
+    package_name: &str,
+    export_name: &str,
+    scan: &Scan,
+    library: &xiii_audio::SoundLibrary,
+    out: &mut String,
+) {
     let mut uaxs = Vec::new();
     walk_files(root, "uax", &mut uaxs);
     let Some(path) = uaxs.into_iter().find(|p| {
@@ -713,6 +842,30 @@ fn trace_export(root: &Path, package_name: &str, export_name: &str, scan: &Scan,
             }
             _ => {
                 let _ = writeln!(out, "    Sound leaf '{leaf}' -> no bank WavRes name match");
+            }
+        }
+        // The full resolver (resource reference then name fallback) applies to `Engine.Sound`.
+        if is_sound_class(class) {
+            let stem = package_name.rsplit_once('.').map_or(package_name, |p| p.0);
+            let full = format!("{stem}.{export_name}");
+            match library
+                .resolve_path(&full)
+                .or_else(|| library.resolve_path(export_name))
+            {
+                Some(r) => {
+                    let _ = writeln!(
+                        out,
+                        "    resolver: rule={} bank={}#{} candidates={} chosen={}",
+                        r.rule.as_str(),
+                        r.entry.bank.display(),
+                        r.entry.entry,
+                        r.candidates,
+                        r.chosen
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "    resolver: unresolved for '{export_name}'");
+                }
             }
         }
     }

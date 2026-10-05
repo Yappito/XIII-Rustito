@@ -9,7 +9,9 @@
 //! `--play-script <file>`. Both drive the same [`sim::PlayerSim`] in `FixedUpdate` at 60 Hz.
 //! Fixed 60 Hz is a **hypothesis** (UE2 used variable ticks); see [`FIXED_HZ`].
 
+pub mod hud;
 pub mod movers;
+pub mod pawns;
 pub mod script;
 pub mod session;
 pub mod sim;
@@ -21,6 +23,7 @@ use std::time::{Duration, Instant};
 use bevy::camera::visibility::RenderLayers;
 use bevy::ecs::system::{NonSend, NonSendMut};
 use bevy::input::mouse::AccumulatedMouseMotion;
+use bevy::mesh::skinning::SkinnedMeshInverseBindposes;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
 use bevy::time::Fixed;
@@ -125,6 +128,10 @@ impl Plugin for PlayPlugin {
                 mouse_look,
                 sync_camera,
                 viewer::sky_follow,
+                viewer::animate_uv,
+                pawns::update_pawns,
+                hud::refresh,
+                hud::draw,
                 overlay,
                 unattended,
             )
@@ -279,6 +286,7 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let session = match session.as_mut() {
@@ -297,6 +305,7 @@ fn setup(
         &mut meshes,
         &mut materials,
         &mut images,
+        &mut bindposes,
     ) {
         Ok(()) => {}
         Err(e) => {
@@ -306,6 +315,7 @@ fn setup(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup_inner(
     commands: &mut Commands,
     opts: &Options,
@@ -314,6 +324,7 @@ fn setup_inner(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
+    bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
 ) -> Result<(), String> {
     let started = Instant::now();
     let game_dir = opts
@@ -345,6 +356,16 @@ fn setup_inner(
     println!(
         "[play] login path: script={} bootstrap={}",
         session.login_script, session.login_bootstrap
+    );
+    let pawns_now = session.player_pawn_actors();
+    println!(
+        "[play] player pawns: {} live XIIIPlayerPawn actor(s): {}",
+        pawns_now.len(),
+        pawns_now
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     for b in &session.blocked {
         println!("[play]   script path blocked: {b}");
@@ -470,6 +491,69 @@ fn setup_inner(
         Vec3::from_array(eye),
         yaw.to_degrees()
     );
+    // GPU-skinned map pawns, placed and posed from the VM every frame (player pawn excluded).
+    let pawn_scene = pawns::setup_pawns(
+        commands, session, &game_dir, meshes, materials, images, bindposes,
+    );
+    println!(
+        "[play] pawns: {} rendered from {} decoded mesh(es); skipped {:?}{}",
+        pawn_scene.instances.len(),
+        pawn_scene.models,
+        pawn_scene.skipped,
+        if pawn_scene.attachments.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; attachments not rendered: {}",
+                pawn_scene.attachments.join(", ")
+            )
+        }
+    );
+    if pawn_scene.bone_controls_not_applied > 0 {
+        println!(
+            "[play] pawns: {} carry item3g bone-controller state (SpineYawControl/SetBoneDirection) \
+             which is not applied to the pose",
+            pawn_scene.bone_controls_not_applied
+        );
+    }
+    for inst in &pawn_scene.instances {
+        let seq = session
+            .vm()
+            .actor_animation(inst.id)
+            .and_then(|a| {
+                a.channels
+                    .iter()
+                    .filter(|c| c.active)
+                    .min_by_key(|c| c.channel)
+                    .map(|c| c.sequence.clone())
+            })
+            .unwrap_or_else(|| "<bind>".to_owned());
+        let mesh = session
+            .vm()
+            .mesh_object(inst.id)
+            .map(|(p, _)| p)
+            .unwrap_or_else(|| "?".to_owned());
+        let loc = session
+            .vm()
+            .vector_prop(inst.id, "Location")
+            .map(|l| format!("({:.1}, {:.1}, {:.1})", l[0], l[1], l[2]))
+            .unwrap_or_else(|| "?".to_owned());
+        let class = session
+            .vm()
+            .set()
+            .path(session.vm().objects[inst.id as usize].class);
+        println!(
+            "[play]   pawn {} class {class} mesh {mesh} at {loc} UU, sequence {seq}",
+            inst.name
+        );
+    }
+    for f in &pawn_scene.failures {
+        println!("[play] pawn mesh failed: {f}");
+    }
+    commands.insert_resource(pawn_scene);
+    // Script-drawn HUD: decode the fonts, create the Canvas and install the VM font provider.
+    let hud_runtime = hud::setup(session, game_dir.as_path(), images)?;
+    commands.insert_resource(hud_runtime);
     commands.insert_resource(ParamsRes(params));
     commands.insert_resource(SimRes(sim));
     commands.insert_resource(WorldRes {
@@ -607,6 +691,7 @@ fn fixed_step(
         if use_action {
             perform_use(sess, &wr.world, &wr.sources, &sim.0, &params.0);
         }
+        crate::audio::pump(sess.events.iter());
         for (name, delta) in &sess.moved {
             let Some(entities) = sync.entities.get(name) else {
                 continue;
@@ -694,6 +779,8 @@ fn overlay(
     cfg: Res<PlayConfig>,
     sim: Res<SimRes>,
     session: NonSend<Result<session::Session, String>>,
+    pawns: Option<Res<pawns::PawnScene>>,
+    hud: Option<Res<hud::HudRuntime>>,
     mut text: Query<&mut Text, With<PlayOverlay>>,
 ) {
     let Ok(mut text) = text.single_mut() else {
@@ -722,11 +809,59 @@ fn overlay(
         ),
         Err(e) => format!("VM unavailable: {e}"),
     };
+    let pawns_line = match pawns.as_deref() {
+        Some(p) if !p.instances.is_empty() => {
+            let shown: Vec<String> = p
+                .instances
+                .iter()
+                .take(8)
+                .map(|i| {
+                    let seq = i
+                        .current
+                        .iter()
+                        .min_by_key(|(c, _, _)| *c)
+                        .map(|(_, s, _)| s.as_str())
+                        .unwrap_or("<bind>");
+                    format!("{}={}", i.name, seq)
+                })
+                .collect();
+            format!(
+                "pawns rendered {} ({} meshes) | {}",
+                p.instances.len(),
+                p.models,
+                shown.join(", ")
+            )
+        }
+        Some(p) => format!("pawns rendered 0 ({} meshes)", p.models),
+        None => "pawns unavailable".to_owned(),
+    };
+    let hud_line = match hud.as_deref() {
+        Some(h) => {
+            let name = match &*session {
+                Ok(s) => h.hud_name(s.vm()),
+                Err(_) => None,
+            }
+            .unwrap_or_else(|| "-".to_owned());
+            format!(
+                "HUD {} ({}) | PostRender frames {} commands {} glyphs {} | missing tile materials {} | {}",
+                name,
+                if h.hud.is_some() { "found" } else { "absent" },
+                h.frames,
+                h.total_commands,
+                h.glyphs_drawn,
+                h.missing_materials.len(),
+                h.error.as_deref().unwrap_or("ok")
+            )
+        }
+        None => "HUD unavailable".to_owned(),
+    };
     text.0 = format!(
         "XIII play prototype (NOT a playable mission; no weapons, no full AI)\n\
          map {} | pos ({:.1}, {:.1}, {:.1}) UU | vel ({:.1}, {:.1}, {:.1}) UU/s | state {}\n\
          floor normal ({:.2}, {:.2}, {:.2}) | last contact: {}\n\
          {}\n\
+         {pawns_line}\n\
+         {hud_line}\n\
          WASD move | mouse look | Space jump | Shift walk | Esc quit",
         cfg.options.map.as_deref().unwrap_or("?"),
         s.location[0],
@@ -973,9 +1108,23 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
     let outcome = run_script(&game_dir, &map, &script, &params, &scene, duration)?;
     let session = &outcome.session;
     println!("[play] {}", session.bootstrap_note);
+    match pawns::headless_report(session, &game_dir) {
+        Ok(line) => println!("[play] {line}"),
+        Err(e) => println!("[play] pawns headless report failed: {e}"),
+    }
     println!(
         "[play] login path: script={} bootstrap={}",
         session.login_script, session.login_bootstrap
+    );
+    let pawns_now = session.player_pawn_actors();
+    println!(
+        "[play] player pawns: {} live XIIIPlayerPawn actor(s): {}",
+        pawns_now.len(),
+        pawns_now
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     println!(
         "[play] player {} | controller {} | GameInfo {}",
@@ -1145,13 +1294,29 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        // Item3i: the door key is no longer host-granted. The pawn walks onto the hut key
+        // through the game's own pickup chain (autopilot `goto` + jumps; approached from the
+        // key's open -Y side), then walks to `Porte6` and uses the carried key.
         let script = script::Script::parse(
-            "t=0.0 turn 2\nt=0.0 forward 1\nt=1.6 turn -45\nt=2.3 forward 0\nt=2.6 use\nt=3.6 use\nt=3.8 forward 1\n",
+            "t=0.00 teleport -491.8 -414.1 1265.0\n\
+             t=0.10 goto -491.84 -314.14\nt=0.30 jump\nt=0.80 jump\nt=1.30 jump\nt=1.80 jump\n\
+             t=2.30 jump\nt=2.80 forward 0\n\
+             t=3.20 teleport -742.1444 -808.429 1311.0449\n\
+             t=3.20 yaw 312.891\nt=3.20 turn 2\nt=3.20 forward 1\n\
+             t=4.80 turn -45\nt=5.50 forward 0\nt=5.80 use\nt=6.80 use\nt=7.00 forward 1\n\
+             t=8.00 forward 0\n",
         )
         .unwrap();
-        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 8.0)
+        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 9.0)
             .expect("run Plage01 door walk");
         let s = &outcome.session;
+        assert!(
+            s.inventory_items()
+                .iter()
+                .any(|(_, c)| c.eq_ignore_ascii_case("xidmaps.Plage01CahuteKey")),
+            "the carried key must come from the pickup chain, not a host grant: {:?}",
+            s.inventory_items()
+        );
         let door = s
             .mover_states()
             .into_iter()
@@ -1232,6 +1397,118 @@ mod tests {
             s.dispatcher_state(),
             s.active_actors(),
             s.suspended.len()
+        );
+    }
+
+    /// A synthetic `CanvasFonts` provider: 4 units per character, 8 tall.
+    struct DummyFonts;
+    impl xiii_script::canvas::CanvasFonts for DummyFonts {
+        fn measure(&self, font: &str, text: &str) -> Option<(f32, f32)> {
+            (font.eq_ignore_ascii_case("Dummy")).then(|| (text.chars().count() as f32 * 4.0, 8.0))
+        }
+    }
+
+    /// Opt-in corpus test (requirement 5): the real Plage00 `XIIIBaseHud.PostRender(Canvas)`
+    /// runs through the VM against a host-created `Engine.Canvas`, does not suspend the HUD and
+    /// records at least one draw command. No Bevy assets are needed: the font provider is the
+    /// synthetic one above, so the test covers the script + native path only.
+    #[test]
+    fn opt_in_plage00_hud_postrender_records_commands() {
+        use xiii_script::Value;
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = session::Session::open(&game_dir, "Plage00").expect("open Plage00");
+        assert_eq!(session.login_script, 1, "script login must create the HUD");
+        let controller = session.controller;
+
+        // Host-side Canvas (the same setup `hud::setup` performs), minus the Bevy textures.
+        let canvas_class =
+            xiii_world::runtime::resolve_class_path(session.vm().set(), "Engine.Canvas")
+                .expect("Engine.Canvas class");
+        let canvas = session
+            .vm_mut()
+            .spawn(canvas_class, "TestCanvas")
+            .expect("spawn Canvas");
+        let vm = session.vm_mut();
+        vm.set_property(
+            canvas,
+            "DrawColor",
+            0,
+            Value::Struct(vec![
+                ("b".to_owned(), Value::Byte(255)),
+                ("g".to_owned(), Value::Byte(255)),
+                ("r".to_owned(), Value::Byte(255)),
+                ("a".to_owned(), Value::Byte(255)),
+            ]),
+        );
+        vm.set_property(canvas, "ClipX", 0, Value::Float(1280.0));
+        vm.set_property(canvas, "ClipY", 0, Value::Float(720.0));
+        vm.set_property(canvas, "Style", 0, Value::Byte(1));
+        vm.set_property(canvas, "Font", 0, Value::Name("Dummy".to_owned()));
+        vm.set_canvas_fonts(Box::new(DummyFonts));
+
+        // The HUD is the controller's `myHUD` (or the first live HUD actor).
+        let hud = {
+            let vm = session.vm();
+            controller
+                .and_then(|c| match vm.get_property(c, "myHUD") {
+                    Some(Value::Object(Some(xiii_script::ObjRef::Instance(p)))) => Some(*p),
+                    _ => None,
+                })
+                .or_else(|| hud::find_hud(vm))
+        }
+        .expect("Plage00 has a live HUD");
+        // Host font bridge (as `hud::setup` does): assign the synthetic font to the HUD's own
+        // font properties.
+        for prop in ["SmallFont", "MedFont", "BigFont", "LargeFont"] {
+            session
+                .vm_mut()
+                .set_property(hud, prop, 0, Value::Name("Dummy".to_owned()));
+        }
+        let vm = session.vm_mut();
+        let arg = Value::Object(Some(xiii_script::ObjRef::Instance(canvas)));
+        match vm.send_event(hud, "PostRender", vec![arg]) {
+            Ok(_) => {}
+            Err(e) => panic!("HUD.PostRender failed: {e}"),
+        }
+        let commands = session.vm_mut().drain_canvas();
+        let hud_class = session
+            .vm()
+            .set()
+            .path(session.vm().objects[hud as usize].class);
+        assert!(
+            session.vm().objects[hud as usize].active,
+            "the HUD must not be suspended by PostRender"
+        );
+        println!(
+            "[play test] Plage00 HUD.PostRender: class {hud_class}, {} draw command(s)",
+            commands.len()
+        );
+        for c in commands.iter().take(6) {
+            println!("[play test]   {c:?}");
+        }
+        println!(
+            "[play test]   HUD widgets: HudMsg={:?} HudWnd={:?} DrawnWeapon={:?}",
+            session.vm().get_property(hud, "HudMsg"),
+            session.vm().get_property(hud, "HudWnd"),
+            session.vm().get_property(hud, "DrawnWeapon"),
+        );
+        // Survey of the Canvas/HUD natives this PostRender path called (requirement 1).
+        let vm = session.vm();
+        let mut used: Vec<(&String, &(Option<u16>, u64))> = vm
+            .natives_used
+            .iter()
+            .filter(|(p, _)| p.starts_with("Canvas.") || p.starts_with("HUD."))
+            .collect();
+        used.sort_by(|a, b| a.0.cmp(b.0));
+        for (path, (idx, count)) in used {
+            println!("[play test]   native {path} index={idx:?} calls={count}");
+        }
+        assert!(
+            !commands.is_empty(),
+            "Plage00 HUD.PostRender produced no draw commands"
         );
     }
 }

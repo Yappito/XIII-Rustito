@@ -4912,6 +4912,7 @@ name = "xiii-app"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "xiii-audio",
  "xiii-collision",
  "xiii-decode",
  "xiii-install",
@@ -4923,6 +4924,9 @@ dependencies = [
 [[package]]
 name = "xiii-audio"
 version = "0.1.0"
+dependencies = [
+ "xiii-package",
+]
 
 [[package]]
 name = "xiii-collision"
@@ -4938,6 +4942,13 @@ dependencies = [
 [[package]]
 name = "xiii-install"
 version = "0.1.0"
+
+[[package]]
+name = "xiii-locale"
+version = "0.1.0"
+dependencies = [
+ "xiii-install",
+]
 
 [[package]]
 name = "xiii-package"
@@ -4959,6 +4970,7 @@ dependencies = [
  "xiii-collision",
  "xiii-decode",
  "xiii-install",
+ "xiii-locale",
  "xiii-package",
  "xiii-script",
  "xiii-world",
