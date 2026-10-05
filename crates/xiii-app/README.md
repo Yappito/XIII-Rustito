@@ -16,6 +16,28 @@ cargo run --release -p xiii-app -- --map Plage00 --game-dir ... --dump [--find c
 cargo run --release -p xiii-app -- --map Plage01 --game-dir ... --collision-test
 ```
 
+### Sky zone (UE2 skybox)
+
+`xiii-world::zones` classifies every BSP polygon and static-mesh actor into a BSP zone: the
+tree root is found from the `front`/`back` references, a point is walked to a leaf by its
+`dot(n, p) = w` sign, and the leaf is mapped to a zone through `Model::leaf_zones`. The
+decoded `leaf` slots are paired **opposite** to `front`/`back` on this data (the positive side
+reads `leaf[1]`); an opt-in test cross-checks this against the engine-computed `Region.iLeaf`
+of 336 Plage00 actors (331 match swapped, 0 unswapped). A BSP polygon uses its centroid nudged
+along the node plane normal; terrain is left zone-less. The importer exposes one `SceneZone`
+per zone with the `SkyZoneInfo` actor path/class, its **Bevy-space location**, fog/ambient
+properties and per-zone polygon/object counts, plus `WorldScene::sky_zones`.
+
+The viewer draws the sky with a **second camera** (`order 0`) placed at the `SkyZoneInfo`
+location that copies the main camera's rotation each frame (`sky_follow`; no parallax — the
+decoded `SkyZoneInfo` has no parallax property). The main camera (`order 1`) does not clear
+colour and renders the playable zones on top; both cameras clear depth, so the world is not
+occluded by the sky. Geometry is split by `RenderLayers`: sky-zone objects on layer 1 (only
+the sky camera), everything else on layer 0 (only the main camera). Fake-backdrop BSP polygons
+stay undrawn (they are the window into the sky) and remain counted. The overlay lists every
+zone (id, SKY/playable, actor, polygons, objects, location) and the sky camera position.
+`XIII_VIEWER_NO_SKY=1` disables the sky camera for before/after comparison captures.
+
 ## Headless doorway collision test (`--collision-test`)
 
 `src/collision.rs` builds a `xiii-collision::CollisionWorld` from the imported map's
@@ -53,9 +75,10 @@ Shader/FinalBlend/Tex*/SinusModifier/Combiner down to a texture and drawn unlit 
 object path (CPU ray against the render triangles). The fly camera starts at the PlayerStart
 (or `--view x,y,z,yaw,pitch`, given in Bevy metres and degrees). `--dump` imports without a
 window, adds collision ray probes, per-map placement statistics (top-20 actors by `|PrePivot|`)
-and the `placement.*` provenance counters. Known gaps: no skybox (sky-backdrop BSP surfaces
-are skipped and counted), translucent/modulated sea materials render dark, and there is no
-vertex lighting. This is an importer diagnostic, not a playable mode.
+and the `placement.*` provenance counters. The sky zone is rendered by a second camera (see
+"Sky zone" above). Known gaps: translucent/modulated sea materials render dark, there is no
+vertex lighting, and the sky uses the same unlit diagnostic materials as the rest of the
+import. This is an importer diagnostic, not a playable mode.
 
 ## Skinned-character viewer (M2b diagnostic)
 

@@ -24,16 +24,17 @@ use std::sync::Arc;
 pub mod animation;
 pub mod navigation;
 pub mod physics;
+pub mod zones;
 
 use xiii_decode::common::{
-    BevyTransform, Mat3, actor_to_bevy_pre_pivot, to_bevy_direction, to_bevy_position,
+    BevyTransform, Mat3, Props, actor_to_bevy_pre_pivot, to_bevy_direction, to_bevy_position,
 };
 use xiii_decode::model::{self, level, poly_flags};
 use xiii_decode::static_mesh::decode_static_mesh;
 use xiii_decode::terrain;
 use xiii_decode::texture::{RgbaImage, Texture, TextureFormat, decode_texture};
 use xiii_install::{Installation, OpenOptions};
-use xiii_package::{Limits, ObjectRef, Package, PropertyValue};
+use xiii_package::{Limits, ObjectRef, Package, PropertyValue, StructValue};
 use xiii_script::{ScriptLimits, ScriptPackage, ScriptSet, Vm, VmLimits};
 
 /// Parsed package bytes.
@@ -104,6 +105,9 @@ pub struct SceneObject {
     pub path: String,
     /// Resolved effective placement values (map + class-default + engine-default fallbacks).
     pub placement: Option<ResolvedPlacement>,
+    /// BSP zone this object belongs to (classified from its location / polygon centroid).
+    /// `None` for geometry with no zone assignment (e.g. terrain); the main view draws it.
+    pub zone: Option<u32>,
 }
 
 /// Imported world.
@@ -128,6 +132,10 @@ pub struct WorldScene {
     pub collision: Vec<([[f32; 3]; 3], u32)>,
     /// Source object path per collision index.
     pub collision_sources: Vec<String>,
+    /// BSP zones of the level: actor metadata, sky flag and per-zone geometry counts.
+    pub zones: Vec<zones::SceneZone>,
+    /// Indices into [`WorldScene::zones`] of the sky zones (`is_sky`), in increasing order.
+    pub sky_zones: Vec<u32>,
 }
 
 impl WorldScene {
@@ -788,6 +796,57 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
     let actors = level::scan_level(&map_pkg.package, &map_pkg.data);
     im.scene
         .count("actor.property_failures", actors.failures.len());
+    // Decode the level BSP once, before placing actors: its node/leaf zone tables are needed
+    // for both the static-mesh actor zones and the BSP polygon zones.
+    let level = match model::find_level_model(&map_pkg.package, &map_pkg.data) {
+        Ok(idx) => match model::decode_model(&map_pkg.package, &map_pkg.data, idx) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                im.scene.fail("fail.bsp.decode", e.to_string());
+                None
+            }
+        },
+        Err(e) => {
+            im.scene.fail("fail.bsp.level_model", e.to_string());
+            None
+        }
+    };
+    if let Some(m) = &level {
+        if m.report.unsupported_tail.is_some() {
+            im.scene.count(
+                "note.bsp.model_tail_not_decoded (zones/lightmaps/leaves)",
+                1,
+            );
+        }
+        im.scene.zones = zones::scene_zones(&map_pkg.package, &map_pkg.data, m);
+        im.scene.sky_zones = im
+            .scene
+            .zones
+            .iter()
+            .filter(|z| z.is_sky)
+            .map(|z| z.index)
+            .collect();
+        im.scene.count("zones.total", im.scene.zones.len());
+        im.scene.count("zones.sky", im.scene.sky_zones.len());
+        // A sky zone without a readable Location cannot be rendered by the sky camera; count
+        // it (never drop it silently). Null-actor non-sky zones are expected to have none.
+        let missing_sky_location = im
+            .scene
+            .zones
+            .iter()
+            .filter(|z| z.is_sky && z.location.is_none())
+            .count();
+        if missing_sky_location > 0 {
+            im.scene
+                .count("note.zones.sky_zone_without_location", missing_sky_location);
+        }
+    }
+    let level_model = level.as_ref();
+    let zone_map = level_model.map(zones::ZoneMap::new);
+    if let Some(zm) = &zone_map {
+        im.scene
+            .count("zones.leaf_conflicts", zm.leaf_conflicts() as usize);
+    }
     let mut defaults =
         ClassDefaults::open(&root).map_err(|e| format!("loading class defaults: {e}"))?;
     if let Some(ps) = actors.player_starts.first() {
@@ -833,6 +892,22 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
             let name = source_name(source_index(s));
             im.scene.count(&format!("placement.{field}.{name}"), 1);
         }
+        // Primary method: BSP point classification. Fallback for actors whose location is not
+        // covered by the leaf/zone table: the engine-computed `Region.ZoneNumber` (the game's
+        // own leaf->zone mapping), counted so the fallback is never silent.
+        let zone = zone_for_location(zone_map.as_ref(), level_model, eff.location)
+            .filter(|z| (*z as usize) < im.scene.zones.len());
+        let zone = match zone {
+            Some(z) => Some(z),
+            None => {
+                let z = region_zone(&map_pkg.package, &map_pkg.data, a.export)
+                    .filter(|z| (*z as usize) < im.scene.zones.len());
+                if z.is_some() {
+                    im.scene.count("zones.actor_region_fallback", 1);
+                }
+                z
+            }
+        };
         match im.static_mesh(&map_pkg, r) {
             Ok(converted) => {
                 im.scene
@@ -868,6 +943,7 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                         transform,
                         path: format!("{} -> {label}", a.path),
                         placement: Some(eff),
+                        zone,
                     });
                 }
                 // Collision: explicit bCollideActors/bBlockPlayers = false excludes the actor.
@@ -905,6 +981,34 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
 
     import_bsp(&mut im, &map_pkg);
     import_terrain(&mut im, &map_pkg);
+    // Per-zone object counts (static-mesh actors, BSP groups), after every object exists.
+    let mut counts = vec![0usize; im.scene.zones.len()];
+    let mut unzoned = 0usize;
+    let mut unzoned_example: Option<String> = None;
+    for o in &im.scene.objects {
+        match o.zone {
+            Some(z) if (z as usize) < counts.len() => counts[z as usize] += 1,
+            // Terrain and any actor the BSP and `Region` fallback could not place.
+            _ => {
+                unzoned += 1;
+                if unzoned_example.is_none() {
+                    unzoned_example = Some(o.path.clone());
+                }
+            }
+        }
+    }
+    im.scene.count("zones.objects_without_zone", unzoned);
+    if let Some(e) = unzoned_example {
+        im.scene
+            .examples
+            .entry("zones.objects_without_zone".to_owned())
+            .or_insert(e);
+    }
+    for (z, c) in counts.into_iter().enumerate() {
+        if let Some(zone) = im.scene.zones.get_mut(z) {
+            zone.object_count = c;
+        }
+    }
     Ok(im.scene)
 }
 
@@ -941,6 +1045,33 @@ fn count_placement_sources(
     }
 }
 
+/// BSP zone of an actor's **effective** location (source Unreal units), or `None` when the
+/// level model is unavailable or the location falls outside the leaf/zone table.
+fn zone_for_location(
+    zone_map: Option<&zones::ZoneMap>,
+    model: Option<&model::Model>,
+    location: [f32; 3],
+) -> Option<u32> {
+    let (map, model) = (zone_map?, model?);
+    map.zone_of_point(&model.nodes, location).map(u32::from)
+}
+
+/// Engine-computed zone of an actor export: its `Region.ZoneNumber`. Used only as a fallback
+/// when the BSP point classification finds no zone. Mesh actors the engine left outside the
+/// tree store `iLeaf = -1, ZoneNumber = 0` (the outer/void zone), so `iLeaf` is not required.
+fn region_zone(package: &Package, data: &[u8], export: usize) -> Option<u32> {
+    let props = package
+        .read_object_properties(data, export, &Limits::default())
+        .ok()?;
+    let p = Props::new(package, &props);
+    match p.get("Region").map(|x| &x.value) {
+        Some(PropertyValue::Struct(StructValue::PointRegion { zone_number, .. })) => {
+            Some(u32::from(*zone_number))
+        }
+        _ => None,
+    }
+}
+
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
@@ -951,22 +1082,19 @@ fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 
 fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
     let p = &map_pkg.package;
-    let idx = match model::find_level_model(p, &map_pkg.data) {
-        Ok(i) => i,
-        Err(e) => return im.scene.fail("fail.bsp.level_model", e.to_string()),
+    // The level model was already decoded (and any failure counted) at the top of
+    // [`import_map`] for actor-zone classification; decode it again here so this function
+    // keeps its original signature (the collision accumulation is edited in parallel).
+    let Ok(idx) = model::find_level_model(p, &map_pkg.data) else {
+        return;
     };
-    let m = match model::decode_model(p, &map_pkg.data, idx) {
-        Ok(m) => m,
-        Err(e) => return im.scene.fail("fail.bsp.decode", e.to_string()),
+    let Ok(m) = model::decode_model(p, &map_pkg.data, idx) else {
+        return;
     };
-    if m.report.unsupported_tail.is_some() {
-        im.scene.count(
-            "note.bsp.model_tail_not_decoded (zones/lightmaps/leaves)",
-            1,
-        );
-    }
-    // Group triangles per surface material.
-    let mut groups: BTreeMap<i64, (MaterialSlot, SceneMesh)> = BTreeMap::new();
+    let zone_map = zones::ZoneMap::new(&m);
+    // Group triangles per (surface material, BSP zone). Keying by zone keeps every object in
+    // exactly one render layer (sky vs playable); a mesh never spans two zones.
+    let mut groups: BTreeMap<(i64, Option<u32>), (MaterialSlot, SceneMesh)> = BTreeMap::new();
     let mut bsp_collision = Vec::new();
     for poly in m.polygons() {
         let surf = m.surfs[poly.surf];
@@ -990,10 +1118,25 @@ fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
         }
         if surf.poly_flags & poly_flags::FAKE_BACKDROP != 0 {
             im.scene
-                .count("skip.bsp.sky_backdrop_polygons (skybox not rendered)", 1);
+                .count("skip.bsp.sky_backdrop_polygons (backdrop: sky camera shows through)", 1);
             continue;
         }
-        let key = i64::from(surf.material.raw());
+        // Polygon zone: BSP centroid classification, else the node's own positive-side zone
+        // (`BspNode::zone[1]`; the two agree on every polygon of the corpus, but the direct
+        // field always exists even when the centroid traversal lands in a zone-less leaf).
+        let zone = zone_map
+            .zone_of_polygon(&m.nodes, &poly)
+            .or_else(|| {
+                let z = usize::from(m.nodes[poly.node].zone[1]);
+                (z < im.scene.zones.len()).then_some(z as u8)
+            })
+            .map(u32::from);
+        if let Some(z) = zone
+            && let Some(sc) = im.scene.zones.get_mut(z as usize)
+        {
+            sc.polygon_count += 1;
+        }
+        let key = (i64::from(surf.material.raw()), zone);
         if let std::collections::btree_map::Entry::Vacant(slot) = groups.entry(key) {
             let material = im.material(map_pkg, surf.material, "bsp");
             slot.insert((
@@ -1042,7 +1185,7 @@ fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
         ),
         bsp_collision,
     );
-    for (_, (_, mesh)) in groups {
+    for ((_, zone), (_, mesh)) in groups {
         let label = mesh.label.clone();
         im.scene.meshes.push(mesh);
         im.scene.objects.push(SceneObject {
@@ -1053,6 +1196,7 @@ fn import_bsp(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
                 p.object_path(ObjectRef::Export(idx as u32)).unwrap_or("?")
             ),
             placement: None,
+            zone,
         });
     }
 }
@@ -1139,6 +1283,7 @@ fn import_terrain(im: &mut Importer<'_>, map_pkg: &Arc<Loaded>) {
             transform: identity(),
             path,
             placement: None,
+            zone: None,
         });
         im.scene.count("terrain.infos", 1);
     }
@@ -1338,20 +1483,27 @@ mod tests {
 mod local_tests {
     use super::*;
 
+    /// Resolves `XIII_GOG_DIR`, treating a relative value as workspace-relative so the
+    /// acceptance command `XIII_GOG_DIR=XIII_Game cargo test` works from the crate directory.
+    fn gog_root() -> Option<std::path::PathBuf> {
+        let root = std::env::var_os("XIII_GOG_DIR")?;
+        let path = std::path::PathBuf::from(&root);
+        if path.is_relative() {
+            Some(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../..")
+                    .join(path),
+            )
+        } else {
+            Some(path)
+        }
+    }
+
     #[test]
     fn gog_opening_maps_import_without_failures() {
-        let Some(root) = std::env::var_os("XIII_GOG_DIR") else {
+        let Some(path) = gog_root() else {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
-        };
-        // A relative value is resolved against the workspace root, so the acceptance command
-        // `XIII_GOG_DIR=XIII_Game cargo test` works from anywhere (test CWD is the crate dir).
-        let path = std::path::PathBuf::from(&root);
-        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let path = if path.is_relative() {
-            ws.join(path)
-        } else {
-            path
         };
         let mut cache = PackageCache::open(&path).expect("open install");
         for (map, actors, bsp_polys) in [("Plage00", 156, 344), ("Plage01", 133, 338)] {
@@ -1376,6 +1528,134 @@ mod local_tests {
                 missing, 0,
                 "{map}: unresolved materials {:?}",
                 scene.examples
+            );
+        }
+    }
+
+    /// Extra corpus case (beyond the spec): BSP point classification against the
+    /// engine-computed `Region.iLeaf` of every placed Plage00 actor. Confirms the measured
+    /// swapped leaf-slot pairing documented in [`zones`]: the swapped pairing matches almost
+    /// every actor, the unswapped pairing almost none. The few mismatches are editor-set or
+    /// orphan actors (`Camera`, `PhysicsVolume`, an unused `SkyZoneInfo5`).
+    #[test]
+    fn gog_bsp_point_classification_matches_engine_region() {
+        let Some(path) = gog_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        let map_pkg = cache.map("Plage00").expect("map");
+        let idx = model::find_level_model(&map_pkg.package, &map_pkg.data).expect("level model");
+        let m = model::decode_model(&map_pkg.package, &map_pkg.data, idx).expect("decode");
+        let zm = zones::ZoneMap::new(&m);
+        let actors = level::scan_level(&map_pkg.package, &map_pkg.data);
+        let mut region_actors = 0usize;
+        let mut swapped = 0usize;
+        let mut unswapped = 0usize;
+        for a in &actors.all_located {
+            let Some(loc) = a.location else { continue };
+            let Ok(props) =
+                map_pkg
+                    .package
+                    .read_object_properties(&map_pkg.data, a.export, &Limits::default())
+            else {
+                continue;
+            };
+            let p = xiii_decode::common::Props::new(&map_pkg.package, &props);
+            let Some(PropertyValue::Struct(xiii_package::StructValue::PointRegion {
+                leaf, ..
+            })) = p.get("Region").map(|x| &x.value)
+            else {
+                continue;
+            };
+            if *leaf < 0 {
+                continue;
+            }
+            region_actors += 1;
+            // Swapped pairing (what `zones::ZoneMap` implements): positive side -> leaf[1].
+            if zm.leaf_of_point(&m.nodes, loc) == Some(*leaf as usize) {
+                swapped += 1;
+            }
+            // Unswapped pairing, kept here as the counter-hypothesis: positive side -> leaf[0].
+            let mut i = zm.root();
+            let mut unswapped_leaf = None;
+            for _ in 0..=m.nodes.len() {
+                let Some(n) = m.nodes.get(i) else { break };
+                let d =
+                    n.plane[0] * loc[0] + n.plane[1] * loc[1] + n.plane[2] * loc[2] - n.plane[3];
+                let (child, slot) = if d >= 0.0 {
+                    (n.front, n.leaf[0])
+                } else {
+                    (n.back, n.leaf[1])
+                };
+                if child < 0 {
+                    unswapped_leaf = (slot >= 0).then_some(slot as usize);
+                    break;
+                }
+                i = child as usize;
+            }
+            if unswapped_leaf == Some(*leaf as usize) {
+                unswapped += 1;
+            }
+        }
+        assert!(
+            region_actors >= 300,
+            "expected >=300 Plage00 actors with a Region, got {region_actors}"
+        );
+        assert!(
+            swapped * 100 >= region_actors * 95,
+            "swapped pairing matched {swapped} of {region_actors}"
+        );
+        assert!(
+            unswapped * 100 <= region_actors * 5,
+            "unswapped pairing matched {unswapped} of {region_actors}"
+        );
+        println!(
+            "[zones] Plage00 Region cross-check: swapped {swapped}, unswapped {unswapped}, actors {region_actors}"
+        );
+    }
+
+    /// The opening campaign maps each have exactly one sky zone (`Engine.SkyZoneInfo`) with a
+    /// decoded location and a non-zero count of imported sky-zone geometry.
+    #[test]
+    fn gog_plage_maps_have_one_sky_zone_with_geometry() {
+        let Some(path) = gog_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        for map in ["Plage00", "Plage01"] {
+            let scene = import_map(&mut cache, map).expect("import");
+            let sky: Vec<&zones::SceneZone> = scene.zones.iter().filter(|z| z.is_sky).collect();
+            assert_eq!(
+                sky.len(),
+                1,
+                "{map}: expected exactly one sky zone, got {:?}",
+                scene.zones
+            );
+            let sky = sky[0];
+            assert!(
+                sky.actor_class
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case("Engine.SkyZoneInfo")),
+                "{map}: sky zone actor class {:?}",
+                sky.actor_class
+            );
+            assert!(sky.location.is_some(), "{map}: sky zone has no Location");
+            assert_eq!(scene.sky_zones, vec![sky.index], "{map}");
+            assert!(
+                sky.polygon_count > 0,
+                "{map}: no sky-zone polygons (zone {} {})",
+                sky.index,
+                sky.actor_path.as_deref().unwrap_or("?")
+            );
+            println!(
+                "[zones] {map}: sky zone {} {} -> {} polygons, {} objects, bevy location {:?}",
+                sky.index,
+                sky.actor_path.as_deref().unwrap_or("?"),
+                sky.polygon_count,
+                sky.object_count,
+                sky.location
             );
         }
     }
