@@ -45,6 +45,10 @@ pub struct Session {
     pub game_info: Option<ObjectId>,
     /// Human-readable description of how the player pawn was created.
     pub bootstrap_note: String,
+    /// 1 when the script login chain created the player pawn, 0 otherwise.
+    pub login_script: u32,
+    /// 1 when the explicit harness bootstrap created the player pawn, 0 otherwise.
+    pub login_bootstrap: u32,
     /// Script path attempts that failed before the bootstrap (native + stack).
     pub blocked: Vec<String>,
     /// Suspended actor names (unimplemented native or other code failure).
@@ -101,6 +105,10 @@ impl Session {
             format!("DefaultGame {default_game} did not resolve to a loaded class")
         })?;
 
+        // The runtime owns the single-player URL; `LevelInfo.GetLocalURL` and
+        // `GameInfo.InitGame`/`Login` read it before any actor begins play.
+        runtime::configure_local_url(&mut vm, game_dir, map);
+
         let begin = runtime::begin_play_all(&mut vm, &actors, game_class);
         let mut blocked = begin
             .suspended
@@ -129,27 +137,41 @@ impl Session {
 
         let (start_loc, start_rot) = find_player_start(&vm).unwrap_or(([0.0; 3], [0; 3]));
 
-        // --- script path: GameInfo.Login -> (bLonePlayer skip) RestartPlayer ---------------
+        // --- script path: GameInfo.Login -> PostLogin -> RestartPlayer ---------------------
         let mut player: Option<ObjectId> = None;
         let mut controller: Option<ObjectId> = None;
+        let mut login_script = 0u32;
+        let mut login_bootstrap = 0u32;
         let script_note: String;
         if let Some(gi) = game_info {
-            let out = vec![Value::Str(String::new()); 3];
+            // UE2 `ULevel::SpawnPlayActor`: `GameInfo.Login(Portal, Options, Error)` with the
+            // map URL's options, then `GameInfo.PostLogin(NewPlayer)`. `XIIIGameInfo.Login`
+            // itself calls `RestartPlayer` when `Level.bLonePlayer` (the solo campaign); the
+            // explicit `RestartPlayer` below is only the non-solo/delayed fallback.
+            let out = vec![
+                Value::Str(String::new()),
+                Value::Str(vm.url_options().to_owned()),
+                Value::Str(String::new()),
+            ];
             match vm.send_event(gi, "Login", out) {
                 Ok(Some(Value::Object(Some(ObjRef::Instance(pc)))))
                     if vm.objects.get(pc as usize).is_some_and(|o| !o.deleted) =>
                 {
                     controller = Some(pc);
-                    // `XIIIGameInfo.Login` only calls RestartPlayer when `!Level.bLonePlayer`;
-                    // in the solo campaign it is skipped, so call it explicitly.
                     let arg = Value::Object(Some(ObjRef::Instance(pc)));
-                    match vm.send_event(gi, "RestartPlayer", vec![arg]) {
-                        Ok(_) => {
-                            if let Some(p) = instance_prop(&vm, pc, "Pawn") {
-                                player = Some(p);
-                            }
+                    if let Err(e) = vm.send_event(gi, "PostLogin", vec![arg]) {
+                        blocked.push(format!("GameInfo.PostLogin: {e}"));
+                    }
+                    player = instance_prop(&vm, pc, "Pawn");
+                    if player.is_none() {
+                        let arg = Value::Object(Some(ObjRef::Instance(pc)));
+                        match vm.send_event(gi, "RestartPlayer", vec![arg]) {
+                            Ok(_) => player = instance_prop(&vm, pc, "Pawn"),
+                            Err(e) => blocked.push(format!("GameInfo.RestartPlayer: {e}")),
                         }
-                        Err(e) => blocked.push(format!("GameInfo.RestartPlayer: {e}")),
+                    }
+                    if player.is_some() {
+                        login_script = 1;
                     }
                 }
                 Ok(other) => blocked.push(format!("GameInfo.Login returned {other:?}")),
@@ -163,7 +185,8 @@ impl Session {
         if let Some(p) = player {
             player_name = vm.objects[p as usize].name.clone();
             script_note = format!(
-                "player pawn {player_name} created by GameInfo.Login/RestartPlayer (script path)"
+                "player pawn {player_name} created by the script login chain \
+                 (GameInfo.Login/RestartPlayer; PostLogin attempted, login_script={login_script})"
             );
             // Keep any controller the script path produced (Login returned one in most cases).
             if controller.is_none() {
@@ -202,6 +225,7 @@ impl Session {
             }
             player_name = vm.objects[p as usize].name.clone();
             player = Some(p);
+            login_bootstrap = 1;
             let why = if blocked.is_empty() {
                 "Login/RestartPlayer returned no pawn".to_owned()
             } else {
@@ -234,6 +258,8 @@ impl Session {
             controller,
             game_info,
             bootstrap_note: script_note,
+            login_script,
+            login_bootstrap,
             blocked,
             suspended,
             first_error: None,
@@ -379,6 +405,14 @@ impl Session {
         self.vm.vector_prop(self.player, "Location")
     }
 
+    /// Current player `Rotation` (Unreal rotator units), if the pawn has one.
+    pub fn player_rotation(&self) -> Option<[i32; 3]> {
+        match self.vm.get_property(self.player, "Rotation") {
+            Some(Value::Rotator(r)) => Some(*r),
+            _ => None,
+        }
+    }
+
     /// First failure formatted with its stack, if any.
     pub fn first_error(&self) -> Option<&str> {
         self.first_error.as_deref()
@@ -497,5 +531,75 @@ fn instance_prop(vm: &Vm, id: ObjectId, name: &str) -> Option<ObjectId> {
             Some(*p)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opt_in_root() -> Option<std::path::PathBuf> {
+        let root = std::env::var_os("XIII_GOG_DIR")?;
+        let path = std::path::PathBuf::from(&root);
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        Some(if path.is_relative() {
+            ws.join(path)
+        } else {
+            path
+        })
+    }
+
+    /// Opt-in corpus test: the Plage00 single-player login runs through script
+    /// (`GameInfo.Login` -> `PostLogin` -> `RestartPlayer`) and creates the real
+    /// `XIIIPlayerController`/`XIIIPlayerPawn` at the map's PlayerStart; the explicit harness
+    /// bootstrap is NOT used. `LevelInfo.GetLocalURL` is on this path
+    /// (`XIIIPlayerController.SetInitialState`).
+    #[test]
+    fn opt_in_plage00_login_creates_script_controller_and_pawn() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let session = Session::open(&game_dir, "Plage00").expect("open Plage00 session");
+        println!("[login test] {}", session.bootstrap_note);
+        println!("[login test] blocked: {:?}", session.blocked);
+        assert_eq!(
+            session.login_script,
+            1,
+            "the script login path must create the pawn (blocked: {})",
+            session.blocked.join("; ")
+        );
+        assert_eq!(
+            session.login_bootstrap, 0,
+            "the explicit harness bootstrap must not run"
+        );
+        let pc = session.controller.expect("a script player controller");
+        assert!(
+            session.vm.is_a(pc, "XIIIPlayerController"),
+            "controller is {}",
+            session.vm.set().path(session.vm.objects[pc as usize].class)
+        );
+        assert!(
+            session.vm.is_a(session.player, "XIIIPlayerPawn"),
+            "pawn is {}",
+            session
+                .vm
+                .set()
+                .path(session.vm.objects[session.player as usize].class)
+        );
+        let (start, _) = find_player_start(&session.vm).expect("Plage00 has a PlayerStart");
+        let pawn = session
+            .player_location()
+            .expect("player pawn has a Location");
+        assert_eq!(
+            pawn, start,
+            "the pawn must spawn at the PlayerStart, not the bootstrap pose"
+        );
+        println!(
+            "[login test] path=script player={} controller={} at {:?} UU",
+            session.player_name,
+            session.vm.set().path(session.vm.objects[pc as usize].class),
+            pawn
+        );
     }
 }

@@ -904,6 +904,17 @@ pub struct Vm<'s> {
     /// Outbound presentation events emitted by presentation natives (sound, texture, display,
     /// projectors). Drained with [`Vm::drain_events`].
     events: Vec<PresentationEvent>,
+    /// Local URL the runtime loaded this map with (`<Map>?<options>`), returned by
+    /// `LevelInfo.GetLocalURL` (UE2 `ALevelInfo::GetLocalURL`). The runtime owns the string;
+    /// empty until it is configured.
+    local_url: String,
+    /// Options string (the `?Key=Value` tail of the local URL) passed to `GameInfo.InitGame`
+    /// and `GameInfo.Login`, as the engine's `UGameEngine::LoadMap` does.
+    url_options: String,
+    /// `Host:Port` address form of the loaded URL, returned by `LevelInfo.GetAddressURL`
+    /// (UE2 `ALevelInfo::GetAddressURL` formats the URL host and port as `%s:%i`). Empty until
+    /// the runtime configures it.
+    address_url: String,
 }
 
 fn lower(s: &str) -> String {
@@ -939,6 +950,9 @@ impl<'s> Vm<'s> {
             animation: None,
             navigation: None,
             events: Vec::new(),
+            local_url: String::new(),
+            url_options: String::new(),
+            address_url: String::new(),
         }
     }
 
@@ -983,6 +997,36 @@ impl<'s> Vm<'s> {
     /// True when a navigation provider is available.
     pub fn has_navigation(&self) -> bool {
         self.navigation.is_some()
+    }
+
+    /// Configures the map's local URL (`<Map>?<options>`, the `url_options` being the
+    /// `?Key=Value` tail) and the options the engine passes to `GameInfo.InitGame`/`Login`.
+    /// The runtime owns these strings; the VM only stores and exposes them through
+    /// `LevelInfo.GetLocalURL` and the `InitGame` call.
+    pub fn set_local_url(&mut self, local_url: impl Into<String>, url_options: impl Into<String>) {
+        self.local_url = local_url.into();
+        self.url_options = url_options.into();
+    }
+
+    /// The configured local URL (empty until [`Vm::set_local_url`]).
+    pub fn local_url(&self) -> &str {
+        &self.local_url
+    }
+
+    /// The configured URL options (empty until [`Vm::set_local_url`]).
+    pub fn url_options(&self) -> &str {
+        &self.url_options
+    }
+
+    /// Configures the `Host:Port` address form returned by `LevelInfo.GetAddressURL`. The
+    /// runtime owns it (see `xiii_world::runtime::level_address`).
+    pub fn set_address_url(&mut self, address: impl Into<String>) {
+        self.address_url = address.into();
+    }
+
+    /// The configured address URL (empty until [`Vm::set_address_url`]).
+    pub fn address_url(&self) -> &str {
+        &self.address_url
     }
 
     /// Physics natives check this before running: `Ok(true)` when a provider is present,
@@ -4148,10 +4192,13 @@ impl<'s> Vm<'s> {
         // UE2 UGameEngine::InitGame spawns the GameInfo, then calls GameInfo.InitGame (which
         // builds GameInfo.BaseMutator and the other helpers) before any actor begins play.
         if let Some(f) = self.find_function(info, "InitGame", false) {
+            // UE2 `UGameEngine::LoadMap` passes the map URL's options string to
+            // `GameInfo.InitGame(Options, Error)`; the runtime owns it (`Vm::set_local_url`).
+            let options = self.url_options.clone();
             self.call_values(
                 f,
                 info,
-                vec![Value::Str(String::new()), Value::Str(String::new())],
+                vec![Value::Str(options), Value::Str(String::new())],
             )?;
         }
         // UE2 `UGameEngine::LoadMap` marks the level as "startup" before actors begin play:
@@ -5125,7 +5172,21 @@ impl<'s> Vm<'s> {
                 native: "Actor.PlayAnim".into(),
             }));
         }
+        // UE2 `AActor::PlayAnim` returns immediately when `Mesh == NULL` (Engine.dll
+        // `?PlayAnim@AActor` RVA 0xDF8B0: it tests the mesh pointer at `this+0x138` and jumps
+        // straight to the epilogue, logging, when it is null). An actor with no animation
+        // source therefore no-ops instead of failing. The diagnostic `FixedAnimation` provider
+        // still answers the empty source, so harness diagnostics are unaffected.
+        let mesh_less = self.animation_sources(id).is_empty();
         let Some(info) = self.sequence_info(id, sequence)? else {
+            if mesh_less {
+                let actor = self.objects[id as usize].name.clone();
+                self.note(TraceKind::Note(format!(
+                    "Actor.PlayAnim('{sequence}') on {actor}: no mesh, UE2 returns without \
+                     playing (no-op)"
+                )));
+                return Ok(());
+            }
             let mesh = self.animation_sources(id).join(", ");
             return Err(self.err(VmErrorKind::UnknownAnimation {
                 sequence: sequence.to_owned(),

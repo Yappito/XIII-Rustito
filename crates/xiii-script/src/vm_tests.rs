@@ -465,7 +465,7 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    assert_eq!(defs.len(), 178);
+    assert_eq!(defs.len(), 182);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -3093,6 +3093,94 @@ fn animation_sources_are_queried_linked_first_then_mesh() {
         sources[0].contains("Actor") && sources[1].contains("Object"),
         "{sources:?}"
     );
+}
+
+#[test]
+fn play_anim_on_a_mesh_less_actor_is_a_noop() {
+    // UE2 `AActor::PlayAnim` returns immediately when `Mesh == NULL` (Engine.dll
+    // `?PlayAnim@AActor` RVA 0xDF8B0 tests `this+0x138` and jumps to the epilogue), so an
+    // actor with no animation source must not error on `PlayAnim`.
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(RecordingAnim {
+        queried: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        answer: |_| Ok(None),
+    }));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    assert!(
+        vm.animation_sources(a).is_empty(),
+        "the fixture actor has no Mesh/link"
+    );
+    play_anim(&mut vm, a, "Select", 1.0, 0);
+    assert!(
+        !vm.anim_channel_active(a, 0),
+        "a mesh-less PlayAnim creates no channel"
+    );
+    assert!(
+        vm.trace
+            .iter()
+            .any(|e| matches!(&e.kind, TraceKind::Note(s) if s.contains("no mesh"))),
+        "the mesh-less no-op is reported, not silent"
+    );
+    // A linked animation makes the actor non-mesh-less: a missing sequence is then a real
+    // UnknownAnimation, not a no-op.
+    let mut args = [Value::Object(Some(ObjRef::Static(GlobalRef {
+        package: 0,
+        export: 0,
+    })))];
+    try_native(&mut vm, "Engine.Actor.LinkSkelAnim", a, &[false], &mut args).unwrap();
+    let mut args = [
+        Value::Name("Select".into()),
+        Value::Float(1.0),
+        Value::Float(0.0),
+        Value::Int(0),
+    ];
+    let e = try_native(
+        &mut vm,
+        "Engine.Actor.PlayAnim",
+        a,
+        &[false, false, false, false],
+        &mut args,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&e.kind, VmErrorKind::UnknownAnimation { sequence, .. } if sequence == "Select"),
+        "{e}"
+    );
+}
+
+#[test]
+fn dynamic_load_object_accepts_a_native_subclass_and_rejects_others() {
+    // Engine classes with no decoded `Core.Class` export (`Mesh`/`SkeletalMesh`) still need the
+    // subclass test: `Weapon.PostBeginPlay` loads a `SkeletalMesh` with `class'Engine.Mesh'`.
+    use crate::registry::native_class_is_a;
+    assert!(native_class_is_a("Engine.SkeletalMesh", "Mesh"));
+    assert!(native_class_is_a("Engine.StaticMesh", "Mesh"));
+    assert!(native_class_is_a("Engine.Mesh", "Engine.Mesh"));
+    // Unrelated classes and the reverse direction are still rejected.
+    assert!(!native_class_is_a("Engine.Texture", "Mesh"));
+    assert!(!native_class_is_a("Core.Class", "Mesh"));
+    assert!(!native_class_is_a("Engine.Mesh", "SkeletalMesh"));
+}
+
+#[test]
+fn levelinfo_get_local_url_returns_the_configured_url() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    let mut args = [];
+    let r = try_native(&mut vm, "Engine.LevelInfo.GetLocalURL", a, &[], &mut args).unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Str(String::new())));
+    let url = "Plage00?Name=XIII?Class=XIII.XIIIPlayerPawn?Team=255";
+    let opts = "?Name=XIII?Class=XIII.XIIIPlayerPawn?Team=255";
+    vm.set_local_url(url, opts);
+    let r = try_native(&mut vm, "Engine.LevelInfo.GetLocalURL", a, &[], &mut args).unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Str(url.to_owned())));
+    assert_eq!(vm.url_options(), opts);
+    // `GetAddressURL` is the separate runtime-configured `Host:Port`, not the local URL.
+    vm.set_address_url(":7777");
+    let r = try_native(&mut vm, "Engine.LevelInfo.GetAddressURL", a, &[], &mut args).unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Str(":7777".into())));
 }
 
 #[test]

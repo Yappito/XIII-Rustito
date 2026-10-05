@@ -337,6 +337,10 @@ fn setup_inner(
         session.active_actors(),
         session.bootstrap_note
     );
+    println!(
+        "[play] login path: script={} bootstrap={}",
+        session.login_script, session.login_bootstrap
+    );
     for b in &session.blocked {
         println!("[play]   script path blocked: {b}");
     }
@@ -352,8 +356,23 @@ fn setup_inner(
         spawn.raise * UNREAL_UNITS_PER_METER,
         (spawn.position[1] - spawn.floor) * UNREAL_UNITS_PER_METER
     );
-    let yaw = rot[1] as f32 * std::f32::consts::TAU / 65536.0;
-    let mut sim = PlayerSim::new(bevy_to_unreal_position(spawn.position), yaw);
+    // The host movement simulation owns the player pawn's `Location`/`Velocity`/`Rotation`.
+    // When the script login chain created the pawn, start the simulation at the pawn's actual
+    // spawn pose so the first host write does not teleport it; otherwise use the placed
+    // PlayerStart box centre.
+    let (start_center, start_rot) = match (session.login_script, session.player_location()) {
+        (1, Some(loc)) => {
+            let r = session.player_rotation().unwrap_or(rot);
+            println!(
+                "[play] attaching host movement to the script-created pawn {} at {:?} UU, rot {:?}",
+                session.player_name, loc, r
+            );
+            (loc, r)
+        }
+        _ => (bevy_to_unreal_position(spawn.position), rot),
+    };
+    let yaw = start_rot[1] as f32 * std::f32::consts::TAU / 65536.0;
+    let mut sim = PlayerSim::new(start_center, yaw);
     sim.grounded = true;
 
     // Optional deterministic script.
@@ -751,6 +770,18 @@ pub(crate) fn run_script(
 ) -> Result<ScriptOutcome, String> {
     let started = Instant::now();
     let mut session = session::Session::open(game_dir, map)?;
+    // Attach the host movement to the pawn the script login chain created (the host owns the
+    // pawn's movement fields; item8a ownership rule).
+    let (start_center, start_yaw) = match (session.login_script, session.player_location()) {
+        (1, Some(loc)) => {
+            let yaw = session
+                .player_rotation()
+                .map(|r| r[1] as f32 * std::f32::consts::TAU / 65536.0)
+                .unwrap_or(start_yaw);
+            (loc, yaw)
+        }
+        _ => (start_center, start_yaw),
+    };
     let mut sim = PlayerSim::new(start_center, start_yaw);
     sim.grounded = true;
     let ticks = (duration / DT).ceil() as u64;
@@ -826,6 +857,10 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
     )?;
     let session = &outcome.session;
     println!("[play] {}", session.bootstrap_note);
+    println!(
+        "[play] login path: script={} bootstrap={}",
+        session.login_script, session.login_bootstrap
+    );
     println!(
         "[play] player {} | controller {} | GameInfo {}",
         session.player_name,
