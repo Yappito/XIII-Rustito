@@ -829,6 +829,34 @@ fn all_actors(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<Nativ
     Ok(NativeOutcome::Iterate(items))
 }
 
+/// `Actor.CollidingActors` (native 321): actors of `BaseClass` near the caller. **Partial**: the
+/// VM uses the same distance filter as `RadiusActors` (its collision cylinders are not swept);
+/// `XIIIMover.Timer` re-checks `FastTrace`/vision on each result, so this is sufficient for the
+/// door-warning timer and keeps a mover from being suspended on its own timer.
+fn colliding_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let base = match object(vm, a, 0)? {
+        Some(ObjRef::Static(g)) => Some(g),
+        None => None,
+        Some(ObjRef::Instance(_)) => {
+            return Err(vm.err(VmErrorKind::Other(
+                "CollidingActors base class is an instance".into(),
+            )));
+        }
+    };
+    let radius = float(vm, a, 2)?;
+    let loc = if c.omitted(3) {
+        vm.vector_prop(c.this, "Location").unwrap_or([0.0; 3])
+    } else {
+        vector2(vm, a, 3)?
+    };
+    let items = vm
+        .radius_actors(base, radius, loc)
+        .into_iter()
+        .map(|i| Value::Object(Some(ObjRef::Instance(i))))
+        .collect();
+    Ok(NativeOutcome::Iterate(items))
+}
+
 fn radius_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let base = match object(vm, a, 0)? {
         Some(ObjRef::Static(g)) => Some(g),
@@ -929,6 +957,28 @@ fn set_timer(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Native
     let rate = float(vm, a, 0)?;
     let repeat = boolean(vm, a, 1)?;
     vm.set_timer(c.this, rate, repeat);
+    val(Value::Void)
+}
+
+/// `Actor.FinishInterpolation` (native 301): latent; suspends the state code of a `Mover` until
+/// its `bInterpolating` flag clears. The per-tick `PHYS_MovingBrush` advance that clears it is
+/// [`crate::vm::Vm::advance_interpolation`]. Evidence: every `Engine.Mover` open/close state
+/// (`OpenTimedMover`, `TriggerToggle`, `TriggerControl`, `BumpOpenTimed`, `BumpButton`,
+/// `TriggerPound`) calls it immediately after `DoOpen`/`DoClose` and expects to resume when the
+/// brush reaches its key; the Plage01 item8a run stopped at this native (#301).
+fn finish_interpolation(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    if !c.in_state_code {
+        return Err(vm.err(VmErrorKind::LatentOutsideState {
+            path: c.path.clone(),
+        }));
+    }
+    vm.pending_latent = Some(Latent::Interp {
+        started: vm.time_now(),
+    });
     val(Value::Void)
 }
 
@@ -1486,6 +1536,60 @@ fn find_inventory_type(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmRes
             break;
         }
         if vm.is_child_of_class(vm.objects[id as usize].class, desired) {
+            return val(Value::Object(Some(ObjRef::Instance(id))));
+        }
+        cur = prop_object(vm, id, "Inventory");
+    }
+    val(Value::Object(None))
+}
+
+/// `Object.Cross_VectorVector` (native 220): `A x B` (UE1 `FVector` cross product). Needed by
+/// `XIIIPorte.PlayerTriggerToggle.PlayerTrigger` and `Mover.EncroachingOn` to pick the swing side.
+fn cross_vv(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let x = vector2(vm, a, 0)?;
+    let y = vector2(vm, a, 1)?;
+    val(Value::Vector([
+        x[1] * y[2] - x[2] * y[1],
+        x[2] * y[0] - x[0] * y[2],
+        x[0] * y[1] - x[1] * y[0],
+    ]))
+}
+
+/// `Actor.GetBoundingBox` (native 419): the actor's collision extent as a `Box` struct. XIII's
+/// `XIIIPorte.PlayerTriggerToggle.BeginState` uses it to compute the door direction. **Partial**:
+/// the VM has no mesh/pre-pivot bounds, so the box is the collision cylinder's extent centred on
+/// `Location`; a door whose mesh centre is offset from its origin therefore reads a zero
+/// direction (documented, not hidden).
+fn get_bounding_box(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    let loc = vm.vector_prop(c.this, "Location").unwrap_or([0.0; 3]);
+    let r = vm.f32_prop(c.this, "CollisionRadius");
+    let h = vm.f32_prop(c.this, "CollisionHeight");
+    val(Value::Struct(vec![
+        (
+            "min".into(),
+            Value::Vector([loc[0] - r, loc[1] - r, loc[2] - h]),
+        ),
+        (
+            "max".into(),
+            Value::Vector([loc[0] + r, loc[1] + r, loc[2] + h]),
+        ),
+    ]))
+}
+
+fn find_inventory_kind(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    // UE2 `APawn::FindInventoryKind`: walks the `Inventory` -> `Inventory` chain and returns the
+    // first item whose class chain contains `DesiredClassName`. Declaration measured from
+    // engine.u (`engine.Pawn.FindInventoryKind [native f1000] (name, out Inventory)`); needed by
+    // `XIIIPorte.Locked.Trigger`'s `FindInventoryKind('PickLockSkill')` test.
+    let desired = name(vm, a, 0)?;
+    let mut cur = prop_object(vm, c.this, "Inventory");
+    let mut guard = 0;
+    while let Some(id) = cur {
+        guard += 1;
+        if guard > 65_536 {
+            break;
+        }
+        if vm.is_a(id, &desired) {
             return val(Value::Object(Some(ObjRef::Instance(id))));
         }
         cur = prop_object(vm, id, "Inventory");
@@ -3000,6 +3104,58 @@ fn builtin_defs() -> Vec<NativeDef> {
             "native(508) final latent function FinishRotation()",
             "engine.u Controller.FinishRotation decoded (void, latent); UE2 AController::FinishRotation waits for the pawn to face FocalPoint; Engine.dll ?execFinishRotation@AController",
             finish_rotation,
+        )
+    });
+    // ---- item8b movers/doors: kept in their own block so a parallel AI-native edit merges
+    // without touching these entries. -----------------------------------------------------------
+    v.push(def(
+        "Engine.Actor.FinishInterpolation",
+        "native(301) final latent function FinishInterpolation()",
+        "engine.u Actor.FinishInterpolation decoded (void, latent); every engine.Mover open/close \
+         state calls it after DoOpen/DoClose and resumes when the brush reaches its key; the \
+         per-tick PHYS_MovingBrush advance is Vm::advance_interpolation; \
+         Engine.dll ?execFinishInterpolation@AActor",
+        finish_interpolation,
+    ));
+    v.push(def(
+        "Engine.Pawn.FindInventoryKind",
+        "native(0) final function Inventory FindInventoryKind(name DesiredClassName)",
+        "engine.u Pawn.FindInventoryKind decoded (name, out Inventory); UE2 walks the Inventory \
+         chain and returns the first item whose class chain contains the name. Needed by \
+         XIIIPorte.Locked.Trigger's FindInventoryKind('PickLockSkill') gate",
+        find_inventory_kind,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "the VM has no mesh/pre-pivot bounds; the returned Box is the collision cylinder \
+             extent centred on Location, so an offset mesh centre reads as zero",
+        ),
+        ..def(
+            "Engine.Actor.GetBoundingBox",
+            "native(419) final function Box GetBoundingBox()",
+            "engine.u Actor.GetBoundingBox decoded (Box, return); XIIIPorte.PlayerTriggerToggle.\
+             BeginState computes DoorDirection from it",
+            get_bounding_box,
+        )
+    });
+    v.push(def(
+        "Object.Cross_VectorVector",
+        "native(220) final operator vector Cross(vector A, vector B)",
+        "core.u Object.Cross_VectorVector decoded; UE1 FVector cross product (A x B)",
+        cross_vv,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "uses the RadiusActors distance filter, not a swept collision-cylinder test; the \
+             mover timer re-checks FastTrace/vision on each result",
+        ),
+        ..def(
+            "Engine.Actor.CollidingActors",
+            "native(321) final iterator function CollidingActors(class<Actor> BaseClass, out Actor Actor, float Radius, optional vector Loc)",
+            "engine.u Actor.CollidingActors decoded; UE2 returns actors whose collision cylinder \
+             overlaps the caller's within Radius. Needed by XIIIMover.Timer (the door warning \
+             scan) so a mover is not suspended on its own timer",
+            colliding_actors,
         )
     });
     // Paths are matched without the package ("Class.Function"): strip it.

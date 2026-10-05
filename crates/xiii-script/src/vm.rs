@@ -326,6 +326,37 @@ pub enum Latent {
         /// Native that started the latent (`Controller.MoveTo` or `Controller.MoveToward`).
         native: &'static str,
     },
+    /// `Actor.FinishInterpolation`: suspend until the actor's `bInterpolating` clears. The
+    /// per-tick `PHYS_MovingBrush` advance that clears it lives in
+    /// [`Vm::advance_interpolation`] (a `Mover`'s `InterpolateTo` sets `bInterpolating`).
+    Interp {
+        /// VM time when it started.
+        started: f64,
+    },
+}
+
+/// Current state of a UE2 `Mover` (`PHYS_MovingBrush`) actor, for the host's dynamic collision
+/// and diagnostics. Unreal units/rotators, exactly as stored in the VM.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoverState {
+    /// Display name of the actor.
+    pub name: String,
+    /// Current `Location` (Unreal units).
+    pub location: [f32; 3],
+    /// Current `Rotation` (Unreal rotator units).
+    pub rotation: [i32; 3],
+    /// `BasePos` the keys are relative to (Unreal units).
+    pub base_pos: [f32; 3],
+    /// `BaseRot` the keys are relative to.
+    pub base_rot: [i32; 3],
+    /// Current key index.
+    pub key_num: u8,
+    /// Interpolation fraction `0..=1`.
+    pub phys_alpha: f32,
+    /// Interpolation rate (1/seconds).
+    pub phys_rate: f32,
+    /// True while a `PHYS_MovingBrush` interpolation is in progress.
+    pub interpolating: bool,
 }
 
 /// Per-channel animation playback state owned by the VM.
@@ -921,6 +952,22 @@ impl<'s> Vm<'s> {
         self.physics.is_some()
     }
 
+    /// Registers a mover's collision triangles (world space at its base pose, Unreal units) with
+    /// the installed physics provider so `Move`/`Trace` consider the moving brush. No-op without
+    /// a provider or when the provider ignores moving brushes.
+    pub fn register_mover(
+        &mut self,
+        actor: &str,
+        source: u32,
+        triangles: &[[[f32; 3]; 3]],
+        origin: [f32; 3],
+        rotation: [i32; 3],
+    ) {
+        if let Some(provider) = self.physics.as_mut() {
+            provider.register_mover(actor, source, triangles, origin, rotation);
+        }
+    }
+
     /// Sets the animation-sequence provider (animation natives). Call before runs that need
     /// sequence data; without one those natives fail explicitly.
     pub fn set_animation_data(&mut self, provider: Box<dyn AnimationData>) {
@@ -1399,11 +1446,28 @@ impl<'s> Vm<'s> {
                 // those names never have an export).
                 if meta_class_path(&path) || self.native_only_class(&path) {
                     Value::NativeClass(self.set.packages[pkg].ref_name(r).to_owned())
+                } else if !self.ref_package_loaded(&path) {
+                    // The referenced package is not among the loaded script packages: it is a
+                    // non-script asset package (e.g. a sound object in a `.uax`, which the
+                    // audio subsystem does not import). The engine would load the object; here
+                    // it is absent, so the reference is `None` rather than a decode failure.
+                    // This does not hide a decode error in a *loaded* package (that stays
+                    // `Unsupported` below).
+                    Value::Object(None)
                 } else {
                     Value::Unsupported(format!("unresolved reference {path}"))
                 }
             }
         }
+    }
+
+    /// True when the package named by a `Package.Object.Path` reference is one of the loaded
+    /// script packages.
+    fn ref_package_loaded(&self, path: &str) -> bool {
+        let Some((package, _)) = path.split_once('.') else {
+            return false;
+        };
+        self.set.package_index(package).is_some()
     }
 
     /// True when `Package.Object.Path` names a package that is loaded but has no such export
@@ -1647,6 +1711,16 @@ impl<'s> Vm<'s> {
         let o = self.objects.get(id as usize)?;
         let s = o.layout.slot_by_name(name)?;
         o.props.get(s.base)
+    }
+
+    /// Reads a property by name and array element (`get_property` is element 0).
+    pub fn get_property_elem(&self, id: ObjectId, name: &str, elem: usize) -> Option<&Value> {
+        let o = self.objects.get(id as usize)?;
+        let s = o.layout.slot_by_name(name)?;
+        if elem >= s.dim {
+            return None;
+        }
+        o.props.get(s.base + elem)
     }
 
     /// Writes a property by name and element.
@@ -1997,6 +2071,13 @@ impl<'s> Vm<'s> {
                 self.advance_animation(id, dt)?;
             }
         }
+        // Movers advance in the same pre-state slice (UE2 `physInterpolating` runs in Tick), so
+        // a `FinishInterpolation` waiter resumes in the tick its `bInterpolating` clears.
+        for id in 0..self.objects.len() as ObjectId {
+            if self.objects[id as usize].active {
+                self.advance_interpolation(id, dt)?;
+            }
+        }
         for id in 0..self.objects.len() as ObjectId {
             if self.objects[id as usize].active {
                 self.process_state(id, dt)?;
@@ -2056,6 +2137,14 @@ impl<'s> Vm<'s> {
         for id in 0..self.objects.len() as ObjectId {
             if self.objects[id as usize].active
                 && let Err(e) = self.advance_animation(id, dt)
+            {
+                let suspended = self.suspend_for_error(id, &e);
+                errors.push((suspended, e));
+            }
+        }
+        for id in 0..self.objects.len() as ObjectId {
+            if self.objects[id as usize].active
+                && let Err(e) = self.advance_interpolation(id, dt)
             {
                 let suspended = self.suspend_for_error(id, &e);
                 errors.push((suspended, e));
@@ -2193,6 +2282,22 @@ impl<'s> Vm<'s> {
                         started,
                     });
                 }
+                Some(Latent::Interp { started }) => {
+                    // `Actor.FinishInterpolation`: resume once `bInterpolating` has cleared
+                    // (advanced by `advance_interpolation` earlier this tick).
+                    if self.bool_prop(id, "bInterpolating") {
+                        return Ok(());
+                    }
+                    if let Some(c) = self.objects[id as usize].state_code.as_mut() {
+                        c.latent = None;
+                    }
+                    let actor = self.objects[id as usize].name.clone();
+                    self.note(TraceKind::LatentResume {
+                        actor,
+                        native: "Actor.FinishInterpolation".into(),
+                        started,
+                    });
+                }
                 Some(Latent::AnimEnd { channel, started }) => {
                     // `Actor.FinishAnim`: resume once the channel stops animating.
                     if self.anim_channel_active(id, channel) {
@@ -2283,6 +2388,11 @@ impl<'s> Vm<'s> {
                         Latent::AnimEnd { .. } => {
                             self.note(TraceKind::AnimSuspend { actor, native })
                         }
+                        Latent::Interp { .. } => self.note(TraceKind::LatentStart {
+                            actor,
+                            native,
+                            seconds: 0.0,
+                        }),
                         Latent::Move {
                             pawn,
                             destination,
@@ -3248,11 +3358,25 @@ impl<'s> Vm<'s> {
             | K::DefaultVariable(_)
             | K::ArrayElement { .. }
             | K::DynArrayElement { .. }
-            | K::StructMember { .. }
             | K::BoolVariable(_) => match self.place(frame, t, target)? {
                 Some(p) => self.read(frame, &p)?,
                 None => self.zero_for(frame, t, target),
             },
+            K::StructMember { property, expr } => {
+                // Read a struct member off any rvalue, not only a place: XIII's door code reads
+                // the `.Z` of a native `Cross(...)` result. `place` on the same token would try
+                // to use the native call as an lvalue and fail with `NotAPlace`.
+                let g = self.resolve_ref(frame, *property)?;
+                let name = lower(self.object_name(g));
+                let base = self.eval_in(frame, expr, target)?;
+                let v = member_get(&base, &name).ok_or_else(|| {
+                    self.err(VmErrorKind::Other(format!("no struct member {name}")))
+                })?;
+                if let Value::Unsupported(d) = &v {
+                    return Err(self.err(VmErrorKind::UnsupportedValue { desc: d.clone() }));
+                }
+                v
+            }
             K::Context(c) => match self.context_target(frame, &c.object, target)? {
                 Some(obj) => self.eval_in(frame, &c.member, obj)?,
                 None => {
@@ -3991,6 +4115,31 @@ impl<'s> Vm<'s> {
         }
     }
 
+    /// Vector property value at an array element (`None` when absent/another type).
+    fn vector_prop_elem(&self, id: ObjectId, name: &str, elem: usize) -> Option<[f32; 3]> {
+        match self.get_property_elem(id, name, elem)? {
+            Value::Vector(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Rotator property value at an array element (`None` when absent/another type).
+    fn rotator_prop_elem(&self, id: ObjectId, name: &str, elem: usize) -> Option<[i32; 3]> {
+        match self.get_property_elem(id, name, elem)? {
+            Value::Rotator(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Byte property value (`0` when absent; `Int` is accepted for a byte-typed slot).
+    fn byte_prop(&self, id: ObjectId, name: &str) -> u8 {
+        match self.get_property(id, name) {
+            Some(Value::Byte(b)) => *b,
+            Some(Value::Int(i)) => *i as u8,
+            _ => 0,
+        }
+    }
+
     fn run_lifecycle(&mut self, id: ObjectId, events: &[&str]) -> VmResult<()> {
         for ev in events {
             if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
@@ -3999,6 +4148,50 @@ impl<'s> Vm<'s> {
             self.send_event(id, ev, Vec::new())?;
         }
         Ok(())
+    }
+
+    /// Every live `Mover` actor with its current pose and interpolation state (for the host's
+    /// dynamic collision). Ordered by object id, so the result is deterministic.
+    pub fn mover_states(&self) -> Vec<MoverState> {
+        let mut out = Vec::new();
+        for (i, object) in self.objects.iter().enumerate() {
+            if let Some(mut s) = self.mover_state_of(i as ObjectId) {
+                s.name = object.name.clone();
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    /// A live `Mover` actor's state by display name (case-insensitive).
+    pub fn mover_state(&self, name: &str) -> Option<MoverState> {
+        let id = self.find_object(name)?;
+        let mut s = self.mover_state_of(id)?;
+        s.name = self.objects[id as usize].name.clone();
+        Some(s)
+    }
+
+    /// True when `id` is a live instance deriving from `Mover`.
+    pub fn is_mover(&self, id: ObjectId) -> bool {
+        self.is_live_actor(id) && self.is_a(id, "mover")
+    }
+
+    /// Pose/state of a mover actor without allocating its name.
+    fn mover_state_of(&self, id: ObjectId) -> Option<MoverState> {
+        if !self.is_live_actor(id) || !self.is_a(id, "mover") {
+            return None;
+        }
+        Some(MoverState {
+            name: String::new(),
+            location: self.vector_prop(id, "Location").unwrap_or([0.0; 3]),
+            rotation: self.rotator_prop(id, "Rotation").unwrap_or([0; 3]),
+            base_pos: self.vector_prop(id, "BasePos").unwrap_or([0.0; 3]),
+            base_rot: self.rotator_prop(id, "BaseRot").unwrap_or([0; 3]),
+            key_num: self.byte_prop(id, "KeyNum"),
+            phys_alpha: self.f32_prop(id, "PhysAlpha"),
+            phys_rate: self.f32_prop(id, "PhysRate"),
+            interpolating: self.bool_prop(id, "bInterpolating"),
+        })
     }
 
     /// First live `LevelInfo` instance, if the map has one (it is normally not in the executed
@@ -5079,6 +5272,92 @@ impl<'s> Vm<'s> {
     }
 
     /// Advances every channel of `id` by `dt` frames, firing notifies and `AnimEnd` once.
+    /// UE2 `AActor::physInterpolating`-style advance for a `Mover` with `bInterpolating` set:
+    /// `PhysAlpha += PhysRate * dt` and `Location`/`Rotation` interpolate from `OldPos`/`OldRot`
+    /// to `BasePos+KeyPos[KeyNum]`/`BaseRot+KeyRot[KeyNum]`. On `PhysAlpha >= 1` the actor snaps
+    /// to the key, `bInterpolating` clears and `KeyFrameReached` fires (which may chain the next
+    /// key for a multi-key mover). The latent `Actor.FinishInterpolation` then resumes.
+    ///
+    /// Evidence: `engine.Mover.InterpolateTo`/`KeyFrameReached`/`DoOpen` disassembly
+    /// (`native#301 engine.Actor.FinishInterpolation`, `native#3970 SetPhysics`); the per-tick
+    /// alpha/rate advance is the upstream UE2 `PHYS_MovingBrush` move
+    /// (`AActor::physInterpolating`), not a decoded DLL body (labelled a hypothesis).
+    fn advance_interpolation(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
+        if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
+            return Ok(());
+        }
+        if !self.bool_prop(id, "bInterpolating") {
+            return Ok(());
+        }
+        let rate = self.f32_prop(id, "PhysRate");
+        if rate <= 0.0 || !rate.is_finite() {
+            // The script sets `1/max(Seconds, 0.005)`, always positive; a non-positive rate
+            // cannot advance, so the mover is left suspended rather than silently snapped.
+            return Ok(());
+        }
+        let alpha = self.f32_prop(id, "PhysAlpha") + rate * dt;
+        let key_num = usize::from(self.byte_prop(id, "KeyNum"));
+        let old_pos = self
+            .vector_prop(id, "OldPos")
+            .or_else(|| self.vector_prop(id, "Location"))
+            .unwrap_or([0.0; 3]);
+        let old_rot = self
+            .rotator_prop(id, "OldRot")
+            .or_else(|| self.rotator_prop(id, "Rotation"))
+            .unwrap_or([0; 3]);
+        let base_pos = self.vector_prop(id, "BasePos").unwrap_or([0.0; 3]);
+        let base_rot = self.rotator_prop(id, "BaseRot").unwrap_or([0; 3]);
+        let key_pos = self
+            .vector_prop_elem(id, "KeyPos", key_num)
+            .unwrap_or([0.0; 3]);
+        let key_rot = self
+            .rotator_prop_elem(id, "KeyRot", key_num)
+            .unwrap_or([0; 3]);
+        let target_pos = add3(base_pos, key_pos);
+        let target_rot = [
+            base_rot[0].wrapping_add(key_rot[0]),
+            base_rot[1].wrapping_add(key_rot[1]),
+            base_rot[2].wrapping_add(key_rot[2]),
+        ];
+        if alpha >= 1.0 {
+            self.set_property(id, "PhysAlpha", 0, Value::Float(1.0));
+            self.set_property(id, "Location", 0, Value::Vector(target_pos));
+            self.set_property(id, "Rotation", 0, Value::Rotator(target_rot));
+            self.set_property(id, "bInterpolating", 0, Value::Bool(false));
+            // The engine fires `KeyFrameReached` when a brush finishes interpolating.
+            self.send_event(id, "KeyFrameReached", Vec::new())?;
+        } else {
+            self.set_property(id, "PhysAlpha", 0, Value::Float(alpha));
+            self.set_property(
+                id,
+                "Location",
+                0,
+                Value::Vector(lerp3(old_pos, target_pos, alpha)),
+            );
+            self.set_property(
+                id,
+                "Rotation",
+                0,
+                Value::Rotator(lerp_rotator(old_rot, target_rot, alpha)),
+            );
+        }
+        self.update_physics_mover(id);
+        Ok(())
+    }
+
+    /// Mirrors a mover's current pose into the world-physics provider (if one is installed) so
+    /// the VM's own `Move`/`Trace` see the moving brush. The default provider method is a no-op.
+    fn update_physics_mover(&mut self, id: ObjectId) {
+        let Some(name) = self.objects.get(id as usize).map(|o| o.name.clone()) else {
+            return;
+        };
+        let location = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
+        let rotation = self.rotator_prop(id, "Rotation").unwrap_or([0; 3]);
+        if let Some(p) = self.physics.as_mut() {
+            p.set_mover(&name, location, rotation);
+        }
+    }
+
     fn advance_animation(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
         if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
             return Ok(());
@@ -5319,6 +5598,20 @@ fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
         a[1] + (b[1] - a[1]) * t,
         a[2] + (b[2] - a[2]) * t,
     ]
+}
+
+/// Interpolates two Unreal rotators with the shortest arc on each axis. UE2 interpolates a
+/// mover's `Rotation` from `OldRot` to `BaseRot+KeyRot`; the per-axis wrap keeps a door's yaw
+/// crossing the 0/65535 boundary on the short side.
+fn lerp_rotator(a: [i32; 3], b: [i32; 3], t: f32) -> [i32; 3] {
+    std::array::from_fn(|i| {
+        let mut delta = (b[i].wrapping_sub(a[i]) as f32).rem_euclid(65536.0);
+        if delta > 32768.0 {
+            delta -= 65536.0;
+        }
+        let v = a[i] as f32 + delta * t;
+        (v.round() as i64).rem_euclid(65536) as i32
+    })
 }
 
 /// Horizontal (XY) distance between two Unreal points.

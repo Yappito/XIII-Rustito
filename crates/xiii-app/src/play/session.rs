@@ -17,6 +17,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use xiii_package::Limits;
+use xiii_script::vm::MoverState;
 use xiii_script::{ObjRef, ObjectId, PresentationEvent, ScriptSet, Value, Vm, VmError, VmLimits};
 use xiii_world::runtime::{self, ProviderSpec};
 
@@ -64,6 +65,24 @@ pub struct Session {
     pub dispatcher: Option<ObjectId>,
     /// Fixed steps run.
     pub tick_count: u64,
+    /// Key inventory items the host spawned from touched `KeyPicks` actors (host shortcut; see
+    /// [`Session::grant_touched_key`]).
+    key_items: Vec<ObjectId>,
+}
+
+/// Outcome of a host use action on a mover/door.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UseOutcome {
+    /// The named actor is not a live mover.
+    NotAMover,
+    /// A locked door with no available key (its own `Locked` behavior ran).
+    Locked,
+    /// A locked door was unlocked with a key (its state left `Locked`).
+    Unlocked,
+    /// An (unlocked) door was triggered to open/close.
+    Triggered,
+    /// The script raised on the transition.
+    Error(String),
 }
 
 impl Session {
@@ -244,6 +263,7 @@ impl Session {
             moved: Vec::new(),
             dispatcher,
             tick_count: 0,
+            key_items: Vec::new(),
         };
         session.suspended.dedup();
         session.drain_events();
@@ -377,6 +397,159 @@ impl Session {
     /// Current player `Location` (UU).
     pub fn player_location(&self) -> Option<[f32; 3]> {
         self.vm.vector_prop(self.player, "Location")
+    }
+
+    /// Every live mover actor with its current pose (for dynamic collision and the door trace).
+    pub fn mover_states(&self) -> Vec<MoverState> {
+        self.vm.mover_states()
+    }
+
+    /// Registers every live mover's box-collision triangles (world space at its `BasePos`/
+    /// `BaseRot`) with the VM's physics provider, so the VM's own `Move`/`Trace` consider the
+    /// moving brush. The map collision soup is read from `scene`; the host's player physics is
+    /// separate (`movers::MoverCollision`).
+    pub fn register_movers(&mut self, scene: &xiii_world::WorldScene) {
+        let movers = self.vm.mover_states();
+        for m in movers {
+            let mut triangles = Vec::new();
+            let mut source = 0u32;
+            for &i in &scene.collision_box {
+                let (tri, src) = scene.collision_triangles[i as usize];
+                let Some(actor) = scene
+                    .collision_sources
+                    .get(src as usize)
+                    .and_then(|p| p.split_once(" -> "))
+                    .map(|(a, _)| a)
+                else {
+                    continue;
+                };
+                if actor.eq_ignore_ascii_case(&m.name) {
+                    source = src;
+                    triangles.push(tri.map(xiii_world::physics::bevy_to_unreal_position));
+                }
+            }
+            if triangles.is_empty() {
+                continue;
+            }
+            self.vm
+                .register_mover(&m.name, source, &triangles, m.base_pos, m.base_rot);
+        }
+    }
+
+    /// True when the player has touched a live actor whose name contains `needle`
+    /// (case-insensitive). Recorded from the VM's own `Touch` updates.
+    pub fn player_touched(&self, needle: &str) -> bool {
+        let needle = needle.to_ascii_lowercase();
+        self.touches
+            .iter()
+            .any(|(_, a)| a.to_ascii_lowercase().contains(&needle))
+    }
+
+    /// Spawns (once) the inventory item carried by a `KeyPicks` actor the player has touched and
+    /// returns it. **Host shortcut**: the full `Pickup.Touch` -> `GiveTo` -> `Keys.Activate`
+    /// inventory flow is not implemented; the host spawns the pickup's own `InventoryType` (its
+    /// class default) and hands it to the door's own `Trigger`, so the door still validates the
+    /// key against its `UnlockItemCode`/`UnLockItemName`.
+    pub fn grant_touched_key(&mut self) -> Option<ObjectId> {
+        self.key_items
+            .retain(|k| self.vm.objects.get(*k as usize).is_some_and(|o| !o.deleted));
+        if let Some(&k) = self.key_items.first() {
+            return Some(k);
+        }
+        let mut class = None;
+        for (i, o) in self.vm.objects.iter().enumerate() {
+            if !o.is_actor || o.deleted || !self.vm.is_a(i as ObjectId, "keypicks") {
+                continue;
+            }
+            if !self.player_touched(&o.name) {
+                continue;
+            }
+            if let Some(Value::Object(Some(ObjRef::Static(g)))) =
+                self.vm.get_property(i as ObjectId, "InventoryType")
+            {
+                class = Some(*g);
+                break;
+            }
+        }
+        let class = class?;
+        let id = self.vm.spawn(class, "HeldKey(play)").ok()?;
+        self.key_items.push(id);
+        Some(id)
+    }
+
+    /// Host shortcut for a locked door when the key was not carried: spawns the `InventoryType`
+    /// class of the first live `KeyPicks` actor in the level and returns it, printing a clear
+    /// notice. **Deviation**: the `Pickup.Touch` -> `GiveTo` -> `Keys.Activate` inventory chain
+    /// needs natives that are out of this task's scope; the door still validates the key against
+    /// its own `UnlockItemCode`/`UnLockItemName`, so the unlock state machine is the game's.
+    fn grant_level_key(&mut self) -> Option<ObjectId> {
+        let mut class = None;
+        for (i, o) in self.vm.objects.iter().enumerate() {
+            if !o.is_actor || o.deleted || !self.vm.is_a(i as ObjectId, "keypicks") {
+                continue;
+            }
+            if let Some(Value::Object(Some(ObjRef::Static(g)))) =
+                self.vm.get_property(i as ObjectId, "InventoryType")
+            {
+                println!(
+                    "[play] host shortcut: granting key {} for a locked door \
+                     (Pickup/GiveTo inventory chain not implemented)",
+                    o.name
+                );
+                class = Some(*g);
+                break;
+            }
+        }
+        let class = class?;
+        let id = self.vm.spawn(class, "HeldKey(play)").ok()?;
+        self.key_items.push(id);
+        Some(id)
+    }
+
+    /// Host use action (`E` in `--play`, `use` in a script). Mirrors the tail of
+    /// `XIIIPlayerController.Grab` for a mover target: a locked `XIIIPorte` is unlocked with the
+    /// key via its own `Trigger` (`TryPickLock`), any other state is opened via `PlayerTrigger`.
+    pub fn use_mover(&mut self, target_name: &str) -> UseOutcome {
+        let Some(target) = self.vm.find_object(target_name) else {
+            return UseOutcome::NotAMover;
+        };
+        if !self.vm.is_mover(target) {
+            return UseOutcome::NotAMover;
+        }
+        let pawn = self.player;
+        let controller = self.controller.unwrap_or(pawn);
+        if self.vm.is_in_state(target, "Locked") {
+            let key = self.grant_touched_key().or_else(|| self.grant_level_key());
+            let Some(key) = key else {
+                // No key available: run the door's own `Locked.PlayerTrigger` (plays the locked
+                // sound) and report Locked; this is visible, not a silent success.
+                let args = vec![
+                    Value::Object(Some(ObjRef::Instance(controller))),
+                    Value::Object(Some(ObjRef::Instance(pawn))),
+                ];
+                if let Err(e) = self.vm.send_event(target, "PlayerTrigger", args) {
+                    return UseOutcome::Error(e.to_string());
+                }
+                return UseOutcome::Locked;
+            };
+            let args = vec![
+                Value::Object(Some(ObjRef::Instance(key))),
+                Value::Object(Some(ObjRef::Instance(pawn))),
+            ];
+            match self.vm.send_event(target, "Trigger", args) {
+                Ok(_) => UseOutcome::Unlocked,
+                Err(e) => UseOutcome::Error(e.to_string()),
+            }
+        } else {
+            let args = vec![
+                Value::Object(Some(ObjRef::Instance(controller))),
+                Value::Object(Some(ObjRef::Instance(pawn))),
+            ];
+            match self.vm.send_event(target, "PlayerTrigger", args) {
+                Ok(_) => UseOutcome::Triggered,
+                Err(e) => UseOutcome::Error(e.to_string()),
+            }
+        }
     }
 
     /// First failure formatted with its stack, if any.
