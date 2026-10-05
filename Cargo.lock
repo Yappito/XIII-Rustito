@@ -4912,6 +4912,7 @@ name = "xiii-app"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "xiii-audio",
  "xiii-collision",
  "xiii-decode",
  "xiii-install",

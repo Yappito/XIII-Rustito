@@ -675,6 +675,7 @@ fn fixed_step(
         if use_action {
             perform_use(sess, &wr.world, &wr.sources, &sim.0, &params.0);
         }
+        crate::audio::pump(sess.events.iter());
         for (name, delta) in &sess.moved {
             let Some(entities) = sync.entities.get(name) else {
                 continue;

@@ -151,3 +151,52 @@ fn local_hx_banks_parse_and_decode() {
         adpcm.sample_rate,
     );
 }
+
+/// Opt-in: the name-resolution library resolves the item6 trace sounds (weapon, footstep,
+/// dialogue) and the Plage00 `TriggerSound0` property to decoded PCM.
+#[test]
+fn local_sound_library_resolves_item6_traces() {
+    let Ok(root) = std::env::var("XIII_GOG_DIR") else {
+        println!("SKIPPED: XIII_GOG_DIR not set");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let mut lib = xiii_audio::SoundLibrary::scan(&root);
+    let stats = lib.stats();
+    assert!(
+        stats.banks_parsed > 0,
+        "no HX banks parsed under the install"
+    );
+    assert_eq!(stats.banks_failed, 0, "some banks failed to parse");
+
+    // Trace 1 (weapon), 2 (footstep), 3 (dialogue), and a real Plage00 event target.
+    for (path, expect_named) in [
+        ("XIIIsound.Guns.M16Fire1", "M16Fire1"),
+        ("XIIIsound.Footsteps.FtSkMar1", "FtSkMar1"),
+        ("Plage00Voices.Plage00_XIIIa_00", "Plage00_XIIIa_00"),
+        ("XIIIsound.Interface.EndBig", "EndBig"),
+    ] {
+        let r = lib
+            .resolve_path(path)
+            .cloned()
+            .unwrap_or_else(|| panic!("{path} did not resolve to a bank entry"));
+        let leaf = xiii_audio::library::leaf(path).unwrap();
+        assert!(leaf.eq_ignore_ascii_case(expect_named));
+        let audio = lib
+            .load(&r)
+            .unwrap_or_else(|e| panic!("{path}: decode failed: {e:?}"));
+        assert!(audio.frames() > 0, "{path} decoded zero frames");
+        println!(
+            "resolved {path} -> {}#{} {} {} ch {} Hz {} frames",
+            r.bank.display(),
+            r.entry,
+            r.codec.as_str(),
+            r.channels,
+            r.sample_rate,
+            audio.frames()
+        );
+    }
+
+    // An unknown name is counted, not silently ignored.
+    assert!(lib.resolve_name("definitely_not_a_sound").is_none());
+}
