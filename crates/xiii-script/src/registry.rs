@@ -1965,6 +1965,17 @@ fn play_snd_death_ono(_vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmRes
     val(Value::Void)
 }
 
+/// `Actor.RefreshLighting` (389): the engine recomputes the lighting affected by this actor
+/// (dynamic lights such as the muzzle flash). There is no script-visible result; the renderer
+/// does not draw dynamic lights yet, so the call is recorded as a visible trace note.
+fn refresh_lighting(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    let name = vm.objects[c.this as usize].name.clone();
+    vm.note(TraceKind::Note(format!(
+        "RefreshLighting on {name} (dynamic lights not rendered)"
+    )));
+    val(Value::Void)
+}
+
 /// item14 `Weapon.PlayFiringSound`: the engine-side firing sound. The VM has no per-weapon
 /// firing-sound mapping (HX resolution is host-side), so the call is accepted and discarded;
 /// `Beretta.PlayFiring` calls it on every shot.
@@ -4248,6 +4259,17 @@ fn builtin_defs() -> Vec<NativeDef> {
     ));
     // ---- item14 combat natives: firing/trace/damage entry points. Kept in their own block so
     // parallel edits merge cleanly. ------------------------------------------------
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "dynamic lights are not rendered yet: the refresh is recorded as a VM trace Note",
+        ),
+        ..def(
+            "Engine.Actor.RefreshLighting",
+            "native(389) final function RefreshLighting()",
+            "engine.u Actor.RefreshLighting decoded (void, no params); xiii.MuzzleLight.PostBeginPlay              calls it when the Beretta's muzzle flash spawns (XIIIWeapon.Fire -> PlayFiring ->              IncrementFlashCount -> ThirdPersonEffects -> MuzzleAttach); Engine.dll              ?execRefreshLighting@AActor (relights the actor's light). No script-visible result",
+            refresh_lighting,
+        )
+    });
     v.push(NativeDef {
         status: NativeStatus::Partial(
             "no log sink: the message is recorded as a VM trace Note and discarded",
