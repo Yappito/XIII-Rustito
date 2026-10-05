@@ -1,13 +1,25 @@
 //! Skeletal-animation bridge between the interpreter and decoded animation data.
 //!
 //! `xiii-script` stays dependency-free: the VM only knows a sequence's *length*, playback
-//! rate and notify times through this trait. The real XIV `MeshAnimation` decoder
-//! (`xiii-decode`) is deliberately **not** a dependency of this crate; a later task installs a
-//! provider that wraps it. Coordinates and frame units are the provider's business (the VM
+//! rate and notify times through this trait. The real XIII `MeshAnimation` decoder
+//! (`xiii-decode`) is deliberately **not** a dependency of this crate; the `MapAnimationProvider`
+//! in `xiii-world` wraps it. Coordinates and frame units are the provider's business (the VM
 //! plays in frames at `rate` frames per second).
 //!
-//! No provider installed: every native that actually needs sequence data fails with
-//! [`crate::vm::VmErrorKind::NoAnimationProvider`] — never a silent success.
+//! A lookup is addressed by an **animation source path** rather than a single `MeshAnimation`:
+//! in XIII an actor's animation comes from the `Mesh` (a `SkeletalMesh`, which carries a
+//! default `MeshAnimation` reference) and from any number of `Actor.LinkSkelAnim(MeshAnimation)`
+//! links. The VM passes each candidate source (linked animations in call order, then the
+//! `Mesh`) in turn; a provider resolves a `SkeletalMesh` source through its decoded default
+//! animation and interprets a `MeshAnimation` source directly. This is why the trait could not
+//! stay a one-object `sequence(mesh, seq)` lookup.
+//!
+//! The return value distinguishes the two failure modes required by the task:
+//! `Ok(None)` = the source or sequence is unknown (the VM decides, and reports it as
+//! [`crate::vm::VmErrorKind::UnknownAnimation`]); `Err` = a decode/lookup failure that must be
+//! reported explicitly and never silently treated as a missing sequence. No provider installed:
+//! every native that needs sequence data fails with
+//! [`crate::vm::VmErrorKind::NoAnimationProvider`].
 
 /// Data the VM needs about one animation sequence.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,16 +33,21 @@ pub struct SeqInfo {
 }
 
 /// Decoded animation data the VM queries. A provider may cache and is free to be strict about
-/// unknown meshes/sequences (`None` = unknown; the VM turns that into an explicit error).
+/// unknown sources/sequences (`Ok(None)` = unknown; the VM turns that into an explicit error).
 pub trait AnimationData {
-    /// Sequence data for `seq` on the mesh named `mesh` (the `Mesh` object's path), or `None`.
-    fn sequence(&mut self, mesh: &str, seq: &str) -> Option<SeqInfo>;
+    /// Sequence data for `seq` on animation source `source`.
+    ///
+    /// `source` is an object path from the actor's script state: a `Mesh` (`SkeletalMesh`,
+    /// resolved through its decoded default `MeshAnimation`) or a `LinkSkelAnim` `MeshAnimation`.
+    /// `Ok(None)` = the source or the sequence is unknown; `Err(message)` = a decode or
+    /// resolution failure that must be reported, never treated as an unknown sequence.
+    fn sequence(&mut self, source: &str, seq: &str) -> Result<Option<SeqInfo>, String>;
 }
 
 /// Diagnostic provider: **every** sequence exists with a fixed frame count and rate, and no
 /// notifies. It is not the game data; it exists so the headless harness and diagnostics can run
 /// past the animation natives (the harness labels its output "diagnostic animation, not the
-/// mesh"). The real decoded `MeshAnimation` provider belongs to a later task.
+/// mesh"). The real decoded `MeshAnimation` provider lives in `xiii-world`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FixedAnimation {
     /// Frame count reported for every sequence.
@@ -47,11 +64,11 @@ impl FixedAnimation {
 }
 
 impl AnimationData for FixedAnimation {
-    fn sequence(&mut self, _mesh: &str, _seq: &str) -> Option<SeqInfo> {
-        Some(SeqInfo {
+    fn sequence(&mut self, _source: &str, _seq: &str) -> Result<Option<SeqInfo>, String> {
+        Ok(Some(SeqInfo {
             frames: self.frames,
             rate: self.rate,
             notifies: Vec::new(),
-        })
+        }))
     }
 }

@@ -48,7 +48,7 @@ xiii-tool script: compiled UnrealScript (M2c)
                        [--ticks 60] [--dt 0.0333] [--touch-tick 1] [--trace]
                        [--active TouchTrigger,XIIIDispatcher] [--no-natives] [--budget N]
                        [--begin-play] [--game-class Package.Class] [--survey]
-                       [--physics flat:<z>] [--anim fixed:<frames>,<rate>]
+                       [--physics map|flat:<z>] [--anim map|fixed:<frames>,<rate>]
       Headless interpreter harness: load the map's actors, run PostBeginPlay and
       SetInitialState for the executed scope, deliver Touch(synthetic player) to
       the touched actor, tick at a fixed step and print the behaviour trace.
@@ -57,10 +57,15 @@ xiii-tool script: compiled UnrealScript (M2c)
       PostBeginPlay, PostNetBeginPlay, SetInitialState) and spawns a GameInfo;
       the class comes from [Engine.Engine] DefaultGame in Default.ini unless
       --game-class overrides it.
+      --physics map builds the map's decoded collision with xiii-world and
+      installs the real Unreal-space adapter (Move/Trace run against the map).
       --physics flat:<z> installs a diagnostic physics provider: an infinite floor
       plane at Unreal Z=<z>, nothing else. That is NOT the map collision; output
       from this mode is labelled diagnostic physics, not the map. Without a
       provider, mover/trace natives fail explicitly with NoPhysicsProvider.
+      --anim map installs the decoded MeshAnimation provider from xiii-world
+      (the actor's Mesh default animation and LinkSkelAnim links); the harness
+      prints every source/sequence lookup and its outcome.
       --anim fixed:<frames>,<rate> installs a diagnostic animation provider:
       every sequence exists with that many frames and that rate, no notifies.
       That is NOT the decoded MeshAnimation data; output from this mode is

@@ -4960,6 +4960,7 @@ dependencies = [
  "xiii-install",
  "xiii-package",
  "xiii-script",
+ "xiii-world",
 ]
 
 [[package]]
