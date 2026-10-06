@@ -613,6 +613,151 @@ fn read_quant(dll: &[u8], offset: usize) -> QuantTables {
     QuantTables { tables }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Bink Audio tables
+// ---------------------------------------------------------------------------------------------
+
+/// Number of critical-frequency entries the audio decoder scans (loop bound `0x19` at
+/// `0x3001b163` in the init routine `0x3001b0c0`).
+pub const AUDIO_CRITICAL_FREQS: usize = 25;
+
+/// Number of power-of-two exponent scales indexed by the 5-bit exponent of the packed 29-bit
+/// float (`fmul qword [8*e + table]` at `0x3001aebf`). Only exponents `0..=23` are backed by
+/// the table in the shipped DLL; the next 8-byte slots belong to an unrelated table.
+pub const AUDIO_EXPONENTS: usize = 24;
+
+/// The fixed tables of the Bink Audio (DCT) decoder, read from the installation's DLL.
+///
+/// In the shipped `binkw32.dll` they sit together in the `BINKDATA` section: the 16 RLE run
+/// multipliers (read by `movzx eax, byte [eax + rle]` at `0x3001abe6`), immediately followed by
+/// the 25 critical frequencies (`0x3001b133` / `0x3001b340`), one zero pad dword, and the
+/// 24 `f64` exponent scales (`0x3001aebf`, `0x3001af34`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioTables {
+    /// Run multipliers: a coefficient run flagged with the RLE bit covers `8 * rle[i]` values.
+    pub rle: [u8; 16],
+    /// Critical band edges in Hz, `freqs[0] == 0`, strictly increasing.
+    pub critical_freqs: [u32; AUDIO_CRITICAL_FREQS],
+    /// Scale for each exponent value of the packed 29-bit float (`2^(e - 23)` on the shipped DLL,
+    /// checked as an invariant).
+    pub exponent_scale: [f64; AUDIO_EXPONENTS],
+    /// Byte offset of the RLE table in the DLL file (diagnostics).
+    pub rle_offset: usize,
+    /// Size in bytes of the DLL the tables were read from.
+    pub dll_size: u64,
+    /// FNV-1a 64-bit hash of the DLL bytes (diagnostics only).
+    pub dll_fnv1a: u64,
+}
+
+impl AudioTables {
+    /// Reads and locates the audio tables from the `binkw32.dll` of an owned installation.
+    pub fn from_install(game_dir: &Path) -> Result<Self> {
+        let dll = find_binkw32(game_dir)?;
+        let bytes = std::fs::read(&dll).map_err(|e| {
+            VideoError::new(
+                VideoErrorKind::Io,
+                format!("cannot read {}: {e}", dll.display()),
+            )
+        })?;
+        Self::from_dll_bytes(&bytes)
+            .map_err(|e| VideoError::new(e.kind(), format!("{}: {}", dll.display(), e.message())))
+    }
+
+    /// Locates the audio tables in DLL bytes.
+    ///
+    /// Anchor: a run of [`AUDIO_EXPONENTS`] little-endian `f64` values where each entry is
+    /// exactly twice the previous one and the last is `1.0`. Relative to the anchor (layout of
+    /// the shipped DLL, see the struct docs) the critical-frequency table ends one zero dword
+    /// before it and the RLE table directly precedes the frequencies. Every table is checked:
+    /// frequencies start at 0, are strictly increasing and below 65536 (the sample rate is a
+    /// 16-bit header field); RLE multipliers are positive and strictly increasing; the pad
+    /// dword is zero. Exactly one location may match.
+    pub fn from_dll_bytes(dll: &[u8]) -> Result<Self> {
+        let exp_len = AUDIO_EXPONENTS * 8;
+        let freq_len = AUDIO_CRITICAL_FREQS * 4;
+        let lead = 16 + freq_len + 4; // rle + freqs + pad dword before the anchor
+        let mut found: Option<usize> = None;
+        let mut b = lead;
+        while b + exp_len <= dll.len() {
+            if read_f64(dll, b + exp_len - 8) == 1.0 && exponent_run_ok(dll, b) {
+                let rle_at = b - lead;
+                if audio_layout_ok(dll, rle_at) {
+                    if found.is_some() {
+                        return Err(VideoError::new(
+                            VideoErrorKind::BadTable,
+                            "more than one Bink Audio table block matched",
+                        ));
+                    }
+                    found = Some(rle_at);
+                }
+            }
+            b += 1;
+        }
+        let rle_at = found.ok_or_else(|| {
+            VideoError::new(
+                VideoErrorKind::TableNotFound,
+                "Bink Audio tables (RLE runs, critical frequencies, exponent scales) not found in binkw32.dll",
+            )
+        })?;
+        let mut rle = [0u8; 16];
+        rle.copy_from_slice(&dll[rle_at..rle_at + 16]);
+        let critical_freqs: [u32; AUDIO_CRITICAL_FREQS] =
+            std::array::from_fn(|i| read_u32(dll, rle_at + 16 + i * 4));
+        let exp_at = rle_at + lead;
+        let exponent_scale: [f64; AUDIO_EXPONENTS] =
+            std::array::from_fn(|i| read_f64(dll, exp_at + i * 8));
+        Ok(AudioTables {
+            rle,
+            critical_freqs,
+            exponent_scale,
+            rle_offset: rle_at,
+            dll_size: dll.len() as u64,
+            dll_fnv1a: fnv1a64(dll),
+        })
+    }
+}
+
+fn read_u32(d: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+}
+
+fn read_f64(d: &[u8], o: usize) -> f64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&d[o..o + 8]);
+    f64::from_le_bytes(b)
+}
+
+/// Each entry is exactly twice the previous one, positive and finite.
+fn exponent_run_ok(d: &[u8], at: usize) -> bool {
+    let mut prev = read_f64(d, at);
+    if !(prev.is_finite() && prev > 0.0) {
+        return false;
+    }
+    for i in 1..AUDIO_EXPONENTS {
+        let v = read_f64(d, at + i * 8);
+        if v != prev * 2.0 {
+            return false;
+        }
+        prev = v;
+    }
+    true
+}
+
+fn audio_layout_ok(d: &[u8], rle_at: usize) -> bool {
+    let rle = &d[rle_at..rle_at + 16];
+    if rle[0] == 0 || !rle.windows(2).all(|w| w[0] < w[1]) {
+        return false;
+    }
+    let f = |i: usize| read_u32(d, rle_at + 16 + i * 4);
+    if f(0) != 0 {
+        return false;
+    }
+    if !(1..AUDIO_CRITICAL_FREQS).all(|i| f(i) > f(i - 1) && f(i) < 65536) {
+        return false;
+    }
+    read_u32(d, rle_at + 16 + AUDIO_CRITICAL_FREQS * 4) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,5 +909,70 @@ mod tests {
         let (mut dll, _h, pat, _q) = plant();
         dll[pat - 8] = 1; // destroy the zero gap
         assert!(find_scan_from_patterns(&dll, pat).is_err());
+    }
+
+    /// Plants a Bink Audio table block (RLE runs, 25 frequencies, zero pad, 24 exponent scales)
+    /// with synthetic values at `at`.
+    fn plant_audio(dll: &mut [u8], at: usize) {
+        for i in 0..16 {
+            dll[at + i] = (i as u8 + 1) * 2;
+        }
+        for i in 0..AUDIO_CRITICAL_FREQS {
+            let f = (i as u32) * 700;
+            dll[at + 16 + i * 4..at + 20 + i * 4].copy_from_slice(&f.to_le_bytes());
+        }
+        let pad = at + 16 + AUDIO_CRITICAL_FREQS * 4;
+        dll[pad..pad + 4].fill(0);
+        for e in 0..AUDIO_EXPONENTS {
+            let v = 2f64.powi(e as i32 - 23);
+            dll[pad + 4 + e * 8..pad + 12 + e * 8].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn locates_planted_audio_tables() {
+        let mut dll = vec![0u8; 8192];
+        plant_audio(&mut dll, 1000);
+        let t = AudioTables::from_dll_bytes(&dll).unwrap();
+        assert_eq!(t.rle_offset, 1000);
+        assert_eq!(t.rle[0], 2);
+        assert_eq!(t.critical_freqs[24], 24 * 700);
+        assert_eq!(t.exponent_scale[23], 1.0);
+        assert_eq!(t.exponent_scale[0], 2f64.powi(-23));
+    }
+
+    #[test]
+    fn audio_tables_fail_their_invariants() {
+        // Missing entirely.
+        assert_eq!(
+            AudioTables::from_dll_bytes(&[0u8; 4096])
+                .unwrap_err()
+                .kind(),
+            VideoErrorKind::TableNotFound
+        );
+        // Frequencies not strictly increasing.
+        let mut dll = vec![0u8; 8192];
+        plant_audio(&mut dll, 1000);
+        dll[1000 + 16 + 5 * 4..1000 + 20 + 5 * 4].copy_from_slice(&1u32.to_le_bytes());
+        assert!(AudioTables::from_dll_bytes(&dll).is_err());
+        // An exponent entry that is not twice its predecessor.
+        let mut dll = vec![0u8; 8192];
+        plant_audio(&mut dll, 1000);
+        let exp_at = 1000 + 16 + AUDIO_CRITICAL_FREQS * 4 + 4;
+        dll[exp_at + 10 * 8..exp_at + 11 * 8].copy_from_slice(&3.0f64.to_le_bytes());
+        assert!(AudioTables::from_dll_bytes(&dll).is_err());
+        // Non-zero pad dword between the frequencies and the exponents.
+        let mut dll = vec![0u8; 8192];
+        plant_audio(&mut dll, 1000);
+        dll[exp_at - 4] = 1;
+        assert!(AudioTables::from_dll_bytes(&dll).is_err());
+        // Two matching blocks are ambiguous.
+        let mut dll = vec![0u8; 8192];
+        plant_audio(&mut dll, 1000);
+        plant_audio(&mut dll, 4000);
+        assert_eq!(
+            AudioTables::from_dll_bytes(&dll).unwrap_err().kind(),
+            VideoErrorKind::BadTable
+        );
     }
 }

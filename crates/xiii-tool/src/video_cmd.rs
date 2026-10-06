@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use xiii_video::container::BikFile;
-use xiii_video::{BinkTables, Decoder};
+use xiii_video::{AudioTables, BinkTables, Decoder};
 
 pub const USAGE: &str = "\
   xiii-tool video info <file.bik>
@@ -31,13 +31,25 @@ pub const USAGE: &str = "\
       installation.
 
   xiii-tool video validate <install-root> [--limit N] [--all] [--psnr-ref DIR]
+          [--audio-ref DIR]
       Read every Video/*.bik under the installation, load the DLL tables once and
       decode frames sequentially (all frames unless --limit N). Prints per-file
       decoded frames, errors, bit consumption, plane slack and decode fps. With
       --psnr-ref, DIR holds black-box oracle frames per file (<stem>.frames: frame
       numbers; <stem>.yuv: those frames as display-size yuv420p) and the sampled
       frames are compared (exact match or PSNR). Exits 1 on any decode error,
-      plane overrun, missing reference sample or missing table.
+      plane overrun, missing reference sample or missing table. Every audio track
+      is decoded over the same frame range (a.pkts/a.err columns); with
+      --audio-ref, DIR/<stem>.s16 holds the black-box oracle PCM of track 0
+      (interleaved s16le) and its SNR is printed. Audio errors fail the run.
+
+  xiii-tool video audio <file.bik> [--game-dir DIR] [--track N] [--frames N]
+          [--out FILE.wav] [--ref FILE.s16]
+      Decode one Bink Audio track (default 0) to 16-bit PCM using the tables in
+      the installation's binkw32.dll (the root is inferred from <root>/Video/).
+      --out writes a WAV (refused inside the installation); --ref compares with
+      a black-box oracle s16le file (SNR, max difference, differing samples in
+      and outside the block cross-fades).
 
 Run with no subcommand for this help.";
 
@@ -53,6 +65,7 @@ pub fn run(args: &[String]) -> ExitCode {
         Some("tables") => tables(&args[1..]),
         Some("frames") => frames(&args[1..]),
         Some("validate") => validate(&args[1..]),
+        Some("audio") => audio(&args[1..]),
         Some(other) => usage_error(&format!("unknown video command '{other}'")),
         None => {
             println!("USAGE:\n{USAGE}");
@@ -114,12 +127,14 @@ fn info(args: &[String]) -> ExitCode {
     for (i, t) in bik.audio.iter().enumerate() {
         let _ = writeln!(
             out,
-            "  track {i}: channels={} rate={} flags=0x{:04x} stereo={} dct={} id={}",
-            t.channels,
+            "  track {i}: channels={} rate={} flags=0x{:04x} stereo={} dct={} 16bit={} max_decoded_bytes={} id={}",
+            t.channels(),
             t.sample_rate,
             t.flags,
             t.stereo(),
             t.audio_dct(),
+            t.sixteen_bit(),
+            t.max_decoded_bytes,
             t.id
         );
     }
@@ -495,10 +510,12 @@ fn validate(args: &[String]) -> ExitCode {
     let mut root = None;
     let mut limit: Option<usize> = None;
     let mut psnr_ref: Option<PathBuf> = None;
+    let mut audio_ref: Option<PathBuf> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--psnr-ref" => psnr_ref = it.next().map(PathBuf::from),
+            "--audio-ref" => audio_ref = it.next().map(PathBuf::from),
             "--limit" => {
                 limit = it.next().and_then(|v| v.parse().ok());
                 if limit.is_none() {
@@ -530,6 +547,18 @@ fn validate(args: &[String]) -> ExitCode {
         tables.dll_size, tables.dll_fnv1a
     );
     let decoder = Decoder::new(tables);
+    let audio_tables = match AudioTables::from_install(&root) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    println!(
+        "audio tables: rle at file offset 0x{:x}, {} critical frequencies, exponent scales 2^-23..2^0",
+        audio_tables.rle_offset,
+        audio_tables.critical_freqs.len()
+    );
     let files = find_bik_files(&root);
     if files.is_empty() {
         eprintln!("error: no .bik files under {}", root.display());
@@ -538,11 +567,25 @@ fn validate(args: &[String]) -> ExitCode {
     let mut failures = 0usize;
     let mut total_frames = 0usize;
     let mut total_errors = 0usize;
+    let mut total_audio_packets = 0usize;
+    let mut total_audio_errors = 0usize;
     let mut block_types = [0u64; 10];
     let mut sub_types = [0u64; 10];
     println!(
-        "{:<8} {:>6} {:>7} {:>11} {:>5} {:>5} {:>5} {:>5} {:>6} {:>7}  per-sample result / note",
-        "file", "frames", "decoded", "bits", "slack", "ovrun", "stale", "noop", "fps", "exact",
+        "{:<8} {:>6} {:>7} {:>11} {:>5} {:>5} {:>5} {:>5} {:>6} {:>7} {:>6} {:>5} {:>6}  per-sample result / note",
+        "file",
+        "frames",
+        "decoded",
+        "bits",
+        "slack",
+        "ovrun",
+        "stale",
+        "noop",
+        "fps",
+        "exact",
+        "a.pkts",
+        "a.err",
+        "a.snr",
     );
     for path in &files {
         let data = match std::fs::read(path) {
@@ -602,6 +645,54 @@ fn validate(args: &[String]) -> ExitCode {
         if let Some(e) = &r.error {
             note.push_str(e);
         }
+        // Audio: every track over the same frame range; SNR of track 0 against the oracle.
+        let mut a_packets = 0usize;
+        let mut a_errors = 0usize;
+        let mut a_snr = String::from("-");
+        for t in 0..bik.audio.len() {
+            match xiii_video::audio::decode_track(&data, &bik, t, &audio_tables, Some(count)) {
+                Ok(d) => {
+                    a_packets += d.packets;
+                    a_errors += d.errors;
+                    if let Some(e) = &d.first_error {
+                        let _ = write!(note, " audio track {t}: {e}");
+                    }
+                    if t == 0
+                        && let Some(dir) = &audio_ref
+                    {
+                        match read_s16(&dir.join(format!("{}.s16", stem(path)))) {
+                            Ok(rf) => {
+                                let c = xiii_video::audio::compare_with_oracle(
+                                    &rf,
+                                    &d.pcm,
+                                    d.samples_per_block,
+                                    d.overlap,
+                                );
+                                a_snr = format!("{:.1}", c.snr_db);
+                                let _ = write!(
+                                    note,
+                                    " audio: max|d| {} (outside cross-fades {:.1} dB, max|d| {})",
+                                    c.max_diff, c.snr_body_db, c.max_diff_body
+                                );
+                            }
+                            Err(e) => {
+                                let _ = write!(note, " audio: no oracle reference ({e})");
+                                bad = true;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    a_errors += 1;
+                    let _ = write!(note, " audio track {t}: {e}");
+                }
+            }
+        }
+        if a_errors > 0 {
+            bad = true;
+        }
+        total_audio_packets += a_packets;
+        total_audio_errors += a_errors;
         if bad {
             failures += 1;
         }
@@ -611,7 +702,7 @@ fn validate(args: &[String]) -> ExitCode {
             r.samples.len()
         );
         println!(
-            "{:<8} {:>6} {:>7} {:>11} {:>5} {:>5} {:>5} {:>5} {:>6.0} {:>7}  {}",
+            "{:<8} {:>6} {:>7} {:>11} {:>5} {:>5} {:>5} {:>5} {:>6.0} {:>7} {:>6} {:>5} {:>6}  {}",
             stem(path),
             bik.frame_count(),
             r.decoded,
@@ -622,11 +713,10 @@ fn validate(args: &[String]) -> ExitCode {
             r.noop_blocks,
             r.decoded as f64 / secs.max(1e-9),
             exact,
-            if note.is_empty() {
-                "ok"
-            } else {
-                note.trim_end()
-            }
+            a_packets,
+            a_errors,
+            a_snr,
+            if note.is_empty() { "ok" } else { note.trim() }
         );
         if r.clamped_motion > 0 {
             println!(
@@ -637,7 +727,8 @@ fn validate(args: &[String]) -> ExitCode {
         }
     }
     println!(
-        "summary: {} files, {total_frames} frames decoded, {total_errors} files with errors",
+        "summary: {} files, {total_frames} frames decoded, {total_errors} files with errors; \
+         {total_audio_packets} audio packets (all tracks), {total_audio_errors} audio errors",
         files.len()
     );
     println!("block types 0..9: {block_types:?}");
@@ -646,7 +737,8 @@ fn validate(args: &[String]) -> ExitCode {
         "columns: slack = max unread bits in a size-delimited plane (<32 expected); ovrun = \
          frames with a plane read past its size word; stale = bundle reads past decoded data; \
          noop = blocks the shipped decoder skips; exact = sampled frames identical to the \
-         oracle / sampled frames"
+         oracle / sampled frames; a.pkts/a.err = audio packets decoded / failed over all \
+         tracks; a.snr = track 0 SNR in dB against <audio-ref>/<stem>.s16 (common length)"
     );
     if failures == 0 {
         println!("result: OK");
@@ -654,6 +746,169 @@ fn validate(args: &[String]) -> ExitCode {
     } else {
         println!("result: FAIL ({failures} file(s))");
         ExitCode::from(1)
+    }
+}
+
+// ------------------------------------------------------------------ Bink Audio
+
+/// Installation root for `<root>/Video/<file>.bik`, else `None`.
+fn install_root_of(file: &Path) -> Option<PathBuf> {
+    let video_dir = file.parent()?;
+    let name = video_dir
+        .file_name()?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    (name == "video").then(|| video_dir.parent().map(Path::to_path_buf))?
+}
+
+/// Reads an oracle reference as interleaved little-endian `i16`.
+fn read_s16(path: &Path) -> std::io::Result<Vec<i16>> {
+    let b = std::fs::read(path)?;
+    Ok(b.as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| i16::from_le_bytes(*c))
+        .collect())
+}
+
+fn audio(args: &[String]) -> ExitCode {
+    let mut file: Option<PathBuf> = None;
+    let mut game_dir: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut reference: Option<PathBuf> = None;
+    let mut track = 0usize;
+    let mut frames: Option<usize> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--game-dir" => game_dir = it.next().map(PathBuf::from),
+            "--out" => out = it.next().map(PathBuf::from),
+            "--ref" => reference = it.next().map(PathBuf::from),
+            "--track" => {
+                track = match it.next().and_then(|v| v.parse().ok()) {
+                    Some(v) => v,
+                    None => return usage_error("--track needs a number"),
+                };
+            }
+            "--frames" => {
+                frames = it.next().and_then(|v| v.parse().ok());
+                if frames.is_none() {
+                    return usage_error("--frames needs a number");
+                }
+            }
+            s if s.starts_with("--") => return usage_error(&format!("unknown option '{s}'")),
+            s if file.is_none() => file = Some(PathBuf::from(s)),
+            s => return usage_error(&format!("unexpected argument '{s}'")),
+        }
+    }
+    let Some(file) = file else {
+        return usage_error("video audio needs a .bik file");
+    };
+    let Some(game_dir) = game_dir.or_else(|| install_root_of(&file)) else {
+        return usage_error("video audio needs --game-dir (or a file inside <root>/Video)");
+    };
+    if let Some(o) = &out
+        && inside(o, &game_dir)
+    {
+        eprintln!(
+            "error: refusing to write inside the installation ({})",
+            o.display()
+        );
+        return ExitCode::from(2);
+    }
+    let data = match read_file(&file) {
+        Ok(d) => d,
+        Err(c) => return c,
+    };
+    let bik = match BikFile::parse(&data) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: {}: {e}", file.display());
+            return ExitCode::from(1);
+        }
+    };
+    let tables = match AudioTables::from_install(&game_dir) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let started = Instant::now();
+    let decoded = match xiii_video::audio::decode_track(&data, &bik, track, &tables, frames) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: {}: {e}", file.display());
+            return ExitCode::from(1);
+        }
+    };
+    let secs = started.elapsed().as_secs_f64();
+    let ch = usize::from(decoded.channels.max(1));
+    let duration = decoded.pcm.len() as f64 / ch as f64 / f64::from(decoded.sample_rate.max(1));
+    println!(
+        "track {track}: {} Hz x {} ch, {} packets, {} errors, {} samples ({:.3} s) decoded in {:.3}s ({:.0}x realtime)",
+        decoded.sample_rate,
+        decoded.channels,
+        decoded.packets,
+        decoded.errors,
+        decoded.pcm.len(),
+        duration,
+        secs,
+        duration / secs.max(1e-9)
+    );
+    let s = &decoded.stats;
+    println!(
+        "blocks {} clipped {} exponent_out_of_table {} trailing_bytes {}",
+        s.blocks, s.clipped, s.exponent_out_of_table, s.trailing_bytes
+    );
+    if let Some(e) = &decoded.first_error {
+        println!("first error: {e}");
+    }
+    if let Some(r) = &reference {
+        match read_s16(r) {
+            Ok(rf) => {
+                let c = xiii_video::audio::compare_with_oracle(
+                    &rf,
+                    &decoded.pcm,
+                    decoded.samples_per_block,
+                    decoded.overlap,
+                );
+                println!(
+                    "oracle {}: ref {} samples, ours {} (diff {}); compared {}: SNR {:.2} dB, max |diff| {}; outside cross-fades SNR {:.2} dB, max |diff| {}; differing samples {} in cross-fades, {} elsewhere",
+                    r.display(),
+                    rf.len(),
+                    decoded.pcm.len(),
+                    decoded.pcm.len() as i64 - rf.len() as i64,
+                    c.compared,
+                    c.snr_db,
+                    c.max_diff,
+                    c.snr_body_db,
+                    c.max_diff_body,
+                    c.differing_crossfade,
+                    c.differing_body
+                );
+            }
+            Err(e) => {
+                eprintln!("error: cannot read {}: {e}", r.display());
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if let Some(o) = &out {
+        if let Some(dir) = o.parent().filter(|d| !d.as_os_str().is_empty()) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let wav = xiii_video::audio::wav_bytes(&decoded.pcm, decoded.sample_rate, decoded.channels);
+        if let Err(e) = std::fs::write(o, wav) {
+            eprintln!("error: cannot write {}: {e}", o.display());
+            return ExitCode::from(2);
+        }
+        println!("wrote {}", o.display());
+    }
+    if decoded.errors > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

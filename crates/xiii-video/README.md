@@ -1,7 +1,7 @@
 # xiii-video
 
-Clean-room Rust reader and video decoder for the Bink 1 (revision `i`) cutscenes shipped with
-XIII Classic (2003). It never reads or links a Bink implementation; it reads the fixed decoder
+Clean-room Rust reader, video decoder and Bink Audio (DCT) decoder for the Bink 1 (revision `i`)
+cutscenes shipped with XIII Classic (2003). It never reads or links a Bink implementation; it reads the fixed decoder
 tables from the user's own installation at runtime by structural signature.
 
 **Status (measured, see `local/reports/item17b-bink-cleanroom.md`):** all 24,167 frames of the
@@ -33,6 +33,17 @@ disassembly of RAD's own library that ships with the game. The following sources
    fetched or paraphrased. (Incidental note from the first pass: unrelated web-search result
    excerpts displayed FFmpeg identifiers; they were not opened and nothing was taken from them.
    See the task report's compliance statement.)
+6. **Bink Audio (item17c)** was implemented *only* from the `binkw32.dll` disassembly (the
+   audio routines at `0x3001adf0..0x3001b470`, `BinkOpen`/`BinkOpenTrack`/`BinkGetTrackData`,
+   and the transform routines it calls) and from measurement against the FFmpeg binary run as a
+   black-box oracle (`ffmpeg -i X.bik -map 0:a:N -f s16le`). No prose page or Bink Audio source
+   was read for this, and no FFmpeg, OpenGothic or other decoder source was opened or fetched.
+   The transform is pinned down by what it computes (the definition is given under Bink Audio
+   below). The DLL routine has the structure of a general-purpose FFT/DCT package (twiddle and
+   cosine tables built on first use, `ip[0] = 0`). Its definition was taken as the standard
+   unnormalised DCT-III form, as a hypothesis from general knowledge, and then confirmed
+   numerically: it is the form that reaches > 100 dB against the oracle. No source of that
+   package was opened.
 
 ## Fixed tables read from `binkw32.dll`
 
@@ -83,3 +94,73 @@ the locator finds intra `q0[63]=25879`, inter `q0[63]=10289`, lookup widths
 `YuvFrame::to_rgba` converts to RGBA8 with ITU-R BT.601 limited range and nearest-sample chroma
 (labelled assumption matching how FFmpeg presents Bink; RAD's own blitters were not analysed);
 against FFmpeg's RGB PNGs this gives 47-50 dB, the residual being chroma interpolation only.
+
+## Bink Audio (DCT variant), `src/audio.rs`
+
+**Status (measured, see `local/reports/item17c-bink-audio.md`):** every audio packet of every
+track in the 18 cutscenes that have audio (100,190 packets: 4 single-track files plus 14 five-track files) decodes with
+0 errors. Against the FFmpeg black-box oracle (`-map 0:a:N -f s16le`), track 0 of every file
+reaches **85.8 to 92.4 dB SNR** with max |diff| 1 LSB (one exception: 186 LSB on one
+saturated sample of `Cine10`, explained below). Outside the block cross-fades the SNR is
+**102.5 to 105.3 dB**. Tracks 1 to 4 of `Cine02` measure 89.6 to 90.0 dB. Not bit-exact
+against FFmpeg, for two documented reasons:
+
+* **Cross-fade rounding.** The DLL blends 16-bit samples and floors (unsigned `div` of the
+  signed sum, `0x3001b40f`). FFmpeg rounds. About 98% of the differing samples are -1 LSB inside
+  the 128-frame cross-fades.
+* **Clip before blend.** The DLL saturates a block to 16 bits before cross-fading. FFmpeg blends
+  floats. On `Cine10` block 302 a pre-clip value of -33105.6 therefore gives a 186 LSB
+  difference, which is (-33105.6 + 32768) * 142 / 256 (measured).
+
+The remaining ~0.04% body differences are ±1 rounding from float precision (`f64` transform
+here vs the DLL's x87/`f32` and FFmpeg's float path). The decoded length also follows the DLL:
+each packet produces exactly its declared byte count. FFmpeg emits whole blocks, so its output is
+longer by the truncated tail (e.g. 1280 samples on `ubi.bik`).
+
+The **RDFT variant** (tracks without flag `0x1000`, or with `0x8000`) is not implemented and is
+reported as `Unsupported`, because no XIII file uses it.
+
+### Audio tables read from `binkw32.dll`
+
+`AudioTables::from_install(game_dir)` locates them as one block in `BINKDATA`. None of these
+values are in the repository.
+
+| Table | Location method | Invariant |
+|---|---|---|
+| Exponent scales (24 x `f64`) | anchor: 24 doubles, each exactly twice the previous, the last `1.0` (used at `0x3001aebf`) | doubling run |
+| Critical frequencies (25 x `u32`) | ends one zero dword before the anchor (`0x3001b133`, `0x3001b340`) | `f[0] == 0`, strictly increasing, below 65536; pad dword is zero |
+| RLE run multipliers (16 bytes) | directly before the frequencies (`0x3001abe6`) | positive, strictly increasing |
+
+There must be exactly one match. On the GOG DLL it is at file offset `0x44840`.
+
+### Decoding rules (addresses in `binkw32.dll`)
+
+* **Track header** (`container.rs`): `N` tracks are stored as three groups of `N` dwords (max
+  decoded bytes, `rate | flags << 16`, id), not as 12-byte records. Flag `0x2000` = stereo
+  (`0x30015afa`). `0x4000` = 16-bit output (`0x30015b76`). DCT variant = `0x1000` set and
+  `0x8000` clear (`BinkOpen` `0x30012fe5`).
+* **Setup** (`0x3001b0c0`): `N` = 2048 / 1024 / 512 for rates of at least 44100 Hz /
+  22050 Hz / below. Scale = `f32(2 / sqrt(N))`. Band count = the first critical frequency at or
+  above `(rate+1)/2` (max 25). Band edges = `max(1, f * (N/2) / ((rate+1)/2))`, closed by `N/2`.
+* **Packet** (`BinkGetTrackData` `0x30015c20`, `BinkDoFrame` `0x300141b4`): the leading
+  dword is the decoded byte count. Blocks are decoded until it is reached, and the last block's
+  output is truncated.
+* **Block** (`0x3001adf0`): LSB-first over dwords. The DCT variant skips 2 bits (`0x3001ae1b`).
+  Per channel:
+  * two packed 29-bit floats (5-bit exponent, 23-bit mantissa, sign at bit 28; `0x3001ae60`);
+  * one 8-bit quantiser per band, `q = 10^(i * 0.0664)` (`0x3001af50`, constant at `0x3004ff04`);
+  * coefficients 2..N (`0x3001ab00`): a flag bit chooses a run of `8 * rle[4 bits]` or 8
+    values, then a 4-bit width (0 = zero run), then per value its magnitude and, when non-zero,
+    a sign bit. The quantiser starts at 0.0 and changes when the index *equals* `2 * band[k]`
+    (zero runs catch up with `>`);
+  * inverse DCT `x[k] = sum a[j] cos(pi j (k + 1/2) / N)` (`ddct(N, +1)` at `0x300013d0`).
+
+  A block consumes whole dwords (`0x3001b098`).
+* **Output** (`0x3001aa20` / `0x3001a950`): `saturate(round_half_even(x * scale))`, with
+  channels interleaved. An out-of-range `fistp` gives -32768.
+* **Overlap** (`0x3001b3d7..0x3001b437`): the last `N*ch/16` interleaved samples are held back.
+  The next block's head becomes `(prev*(n-i) + cur*i) / n` (floor). The first block is not
+  cross-faded.
+
+The transform is evaluated in `f64` through a zero-padded complex FFT of length `2N`. Unit tests
+check it against the direct O(N²) definition.

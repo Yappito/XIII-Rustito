@@ -81,26 +81,45 @@ impl Header {
 }
 
 /// One audio track header entry.
+///
+/// The header stores the tracks' fields in three groups of `N` little-endian dwords each
+/// (measured on the 5-track XIII cutscenes: `N` x maximum decoded bytes, then `N` x
+/// `sample_rate | flags << 16`, then `N` x track id), not as one 12-byte record per track. The
+/// DLL keeps the second group as one dword per track (`[bink + 0x264]`, read by
+/// `BinkOpenTrack` at `0x30015acb`) and the first as the track's maximum size
+/// (`[bink + 0x260]`, `0x30015b95`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioTrack {
-    /// Channel count from the per-track field (`1` or `2`).
-    pub channels: u16,
+    /// Largest decoded packet in bytes (first header group; `BinkGetTrackMaxSize`).
+    pub max_decoded_bytes: u32,
     /// Sample rate in Hz.
     pub sample_rate: u16,
-    /// Raw flags word (bit 13 stereo, bit 12 DCT/FFT, bits 14/15 unknown).
+    /// Raw flags word (the high half of the second group's dword).
     pub flags: u16,
     /// Track id.
     pub id: u32,
 }
 
 impl AudioTrack {
-    /// True when the stereo flag is set.
+    /// True when the stereo flag (`0x2000`) is set (`shr 0x1d; and 1; inc` = channel count at
+    /// `0x30015afa`).
     pub fn stereo(&self) -> bool {
         self.flags & 0x2000 != 0
     }
-    /// True when the track uses the DCT (rather than FFT) Bink Audio algorithm.
+    /// Channel count derived from the stereo flag (1 or 2).
+    pub fn channels(&self) -> u16 {
+        if self.stereo() { 2 } else { 1 }
+    }
+    /// True when the decoded output is 16-bit (flag `0x4000`; `shr 0x1b; and 8; add 8` at
+    /// `0x30015b76` gives 8 or 16 bits per sample).
+    pub fn sixteen_bit(&self) -> bool {
+        self.flags & 0x4000 != 0
+    }
+    /// True when the track uses the DCT Bink Audio variant: flag `0x1000` set and `0x8000`
+    /// clear (`BinkOpen` at `0x30012fe5..0x30012ffa`). Every other combination selects the
+    /// RDFT variant.
     pub fn audio_dct(&self) -> bool {
-        self.flags & 0x1000 != 0
+        self.flags & 0x1000 != 0 && self.flags & 0x8000 == 0
     }
 }
 
@@ -122,8 +141,10 @@ pub struct AudioPacketRef {
     pub offset: u64,
     /// Packet payload length in bytes.
     pub size: u64,
-    /// Declared sample count.
-    pub samples: u32,
+    /// Declared decoded size of the packet in bytes of 16-bit PCM (all channels). The DLL
+    /// decodes blocks until this many bytes are produced, truncating the last block
+    /// (`BinkGetTrackData` at `0x30015c66..0x30015d09`, `BinkDoFrame` at `0x300141b4`).
+    pub decoded_bytes: u32,
 }
 
 /// A parsed Bink 1 file.
@@ -197,8 +218,8 @@ impl BikFile {
             ));
         }
 
-        // Audio headers: the XIII corpus uses 12 bytes per track. The wiki documents three
-        // per-track groups (unknown+channels, sample_rate+flags, id) which sum to 12 bytes.
+        // Audio headers: three groups of `n` dwords (see [`AudioTrack`]); 12 bytes per track in
+        // total, which is what places the frame-offset table.
         let n_audio = header.audio_tracks as usize;
         let audio_bytes = n_audio
             .checked_mul(12)
@@ -209,12 +230,14 @@ impl BikFile {
 
         let mut audio = Vec::with_capacity(n_audio);
         for t in 0..n_audio {
-            let o = 44 + t * 12;
+            let max_at = 44 + t * 4;
+            let fmt_at = 44 + n_audio * 4 + t * 4;
+            let id_at = 44 + n_audio * 8 + t * 4;
             audio.push(AudioTrack {
-                channels: u16_at(d, o + 2)?,
-                sample_rate: u16_at(d, o + 4)?,
-                flags: u16_at(d, o + 6)?,
-                id: u32_at(d, o + 8)?,
+                max_decoded_bytes: u32_at(d, max_at)?,
+                sample_rate: u16_at(d, fmt_at)?,
+                flags: u16_at(d, fmt_at + 2)?,
+                id: u32_at(d, id_at)?,
             });
         }
 
@@ -361,7 +384,7 @@ impl BikFile {
             packets.push(Some(AudioPacketRef {
                 offset: o as u64,
                 size: payload,
-                samples,
+                decoded_bytes: samples,
             }));
             o = o.saturating_add(payload as usize);
         }
@@ -487,7 +510,7 @@ mod tests {
         let bik = BikFile::parse(&d).unwrap();
         let p0 = bik.frame_packets(&d, 0).unwrap();
         let a = p0.audio[0].as_ref().unwrap();
-        assert_eq!((a.size, a.samples), (4, 99));
+        assert_eq!((a.size, a.decoded_bytes), (4, 99));
         assert_eq!(p0.video_size, 4);
         assert_eq!(d[p0.video_offset as usize], 0xA0);
         let p1 = bik.frame_packets(&d, 1).unwrap();
@@ -564,6 +587,38 @@ mod tests {
         assert_eq!(
             BikFile::parse(&d).unwrap_err().kind(),
             VideoErrorKind::BadValue
+        );
+    }
+
+    #[test]
+    fn audio_headers_are_grouped_per_field() {
+        // Two tracks: [max0, max1], [fmt0, fmt1], [id0, id1].
+        let mut d = synth(3, 2, 3);
+        let at = 44;
+        d[at..at + 4].copy_from_slice(&0x0002_1c00u32.to_le_bytes());
+        d[at + 4..at + 8].copy_from_slice(&0x0000_4000u32.to_le_bytes());
+        d[at + 8..at + 12].copy_from_slice(&(44100u32 | 0x7000 << 16).to_le_bytes());
+        d[at + 12..at + 16].copy_from_slice(&(22050u32 | 0x1000 << 16).to_le_bytes());
+        d[at + 16..at + 20].copy_from_slice(&7u32.to_le_bytes());
+        d[at + 20..at + 24].copy_from_slice(&9u32.to_le_bytes());
+        let f = BikFile::parse(&d).unwrap();
+        assert_eq!(f.audio.len(), 2);
+        let (a, b) = (&f.audio[0], &f.audio[1]);
+        assert_eq!(
+            (a.max_decoded_bytes, a.sample_rate, a.flags, a.id),
+            (0x21c00, 44100, 0x7000, 7)
+        );
+        assert_eq!(
+            (a.channels(), a.sixteen_bit(), a.audio_dct()),
+            (2, true, true)
+        );
+        assert_eq!(
+            (b.max_decoded_bytes, b.sample_rate, b.flags, b.id),
+            (0x4000, 22050, 0x1000, 9)
+        );
+        assert_eq!(
+            (b.channels(), b.sixteen_bit(), b.audio_dct()),
+            (1, false, true)
         );
     }
 }

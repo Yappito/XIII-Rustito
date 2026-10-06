@@ -62,9 +62,9 @@ USAGE:
       errors and warnings, or one Localize(Section, Key, Package) lookup. Run
       'xiii-tool locale' for details.
 
-  xiii-tool video <info|tables|frames|validate> ...
+  xiii-tool video <info|tables|frames|validate|audio> ...
       Clean-room Bink 1 cutscenes: container info, DLL table location, frame
-      export to PNG and corpus decode validation. Run 'xiii-tool video' for details.
+      export to PNG, Bink Audio decode to WAV and corpus validation. Run 'xiii-tool video' for details.
 
   xiii-tool script <classes|functions|disasm|natives|coverage> ...
       Compiled UnrealScript (M2c): run 'xiii-tool script' for details.

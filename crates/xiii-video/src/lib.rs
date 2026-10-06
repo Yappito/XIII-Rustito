@@ -1,4 +1,5 @@
-//! Clean-room Bink 1 (revision `i`) reader and video decoder for XIII Classic cutscenes.
+//! Clean-room Bink 1 (revision `i`) reader, video decoder and Bink Audio (DCT) decoder for XIII
+//! Classic cutscenes.
 //!
 //! The crate is dependency-free and never touches the network. It reads the fixed decoder
 //! tables from the user's own installation (`system/binkw32.dll`) at runtime, by structural
@@ -19,6 +20,7 @@
 
 #![warn(missing_docs)]
 
+pub mod audio;
 pub mod bitreader;
 pub mod container;
 pub mod decoder;
@@ -26,10 +28,11 @@ pub mod error;
 pub mod huffman;
 pub mod tables;
 
-pub use container::{BikFile, FramePackets, Header};
+pub use audio::{AudioDecodeStats, AudioDecoder, DecodedTrack};
+pub use container::{AudioTrack, BikFile, FramePackets, Header};
 pub use decoder::{Decoder, FrameStats, YuvFrame};
 pub use error::{Result, VideoError, VideoErrorKind};
-pub use tables::BinkTables;
+pub use tables::{AudioTables, BinkTables};
 
 impl FrameStats {
     /// Total bit capacity of the packet this statistics record belongs to.
