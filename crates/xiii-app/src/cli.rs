@@ -53,6 +53,8 @@ pub struct Options {
     pub game_dir: Option<PathBuf>,
     /// User-writable checkpoint directory; defaults to the platform application-data location.
     pub save_dir: Option<PathBuf>,
+    /// User menu configuration directory (installation remains read-only).
+    pub config_dir: Option<PathBuf>,
     /// Load this numbered save slot before starting play.
     pub load: Option<u32>,
     /// Viewer camera override: x, y, z (Bevy metres), yaw, pitch (degrees).
@@ -131,6 +133,7 @@ impl Default for Options {
             map: None,
             game_dir: None,
             save_dir: None,
+            config_dir: None,
             load: None,
             view: None,
             dump: false,
@@ -172,6 +175,7 @@ xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
   --smoke              Run the native window/GPU/input/audio smoke scene (default).
   --map NAME           Diagnostic map viewer: import NAME (e.g. Plage00) from --game-dir.
   --game-dir DIR       Owned XIII installation (read-only).
+  --config-dir DIR     User INI directory (default: app data/xiii-rustito/config).
   --save-dir DIR       User-writable checkpoint directory (default: app data/xiii-rustito/saves).
   --load SLOT          Restore a checkpoint save slot before starting --play.
   --play               First-person movement prototype (NOT gameplay) on --map.
@@ -283,6 +287,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
                 opts.video = Some(PathBuf::from(value("--video")?));
                 opts.mode = Mode::Video;
             }
+            "--config-dir" => opts.config_dir = Some(PathBuf::from(value("--config-dir")?)),
             "--menu" => opts.mode = Mode::Menu,
             "--menu-script" => {
                 opts.menu_script = Some(PathBuf::from(value("--menu-script")?));

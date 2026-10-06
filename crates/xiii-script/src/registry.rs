@@ -2570,6 +2570,10 @@ fn play_snd_pn_jo(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<N
 ///   `Level.Game.GoreLevel` as a decimal string (the parental-lock check).
 fn console_command(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let command = string(vm, a, 0)?;
+    if vm.canvas.menu.is_some() {
+        return crate::canvas::menu_console(vm, &command)
+            .map_err(|e| vm.err(VmErrorKind::Other(e)));
+    }
     let norm = command.trim().to_ascii_lowercase();
     let reply = match norm.as_str() {
         "getping" => "0".to_owned(),
@@ -5373,6 +5377,8 @@ fn builtin_defs() -> Vec<NativeDef> {
     // item16b GUI-frame natives (`GUIController.GetStyle`/`InitStateFrame`). New block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::canvas::item16b_defs());
+    // item16c: menu configuration, property text and host audio/video settings.
+    v.extend(crate::canvas::item16c_defs());
     // Cinematic/dialogue natives (`crates/xiii-script/src/cinematics.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::cinematics::cinematic_defs());

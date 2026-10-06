@@ -120,6 +120,8 @@ pub enum DrawCommand {
 pub struct CanvasState {
     commands: Vec<DrawCommand>,
     fonts: Option<Box<dyn CanvasFonts>>,
+    /// item16c host-owned menu configuration.
+    pub menu: Option<MenuSettings>,
 }
 
 impl CanvasState {
@@ -1329,5 +1331,496 @@ mod menu_tests {
             (r.map.as_str(), r.travel_type, r.items),
             ("banque01", 3, true)
         );
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// item16c: filesystem-free menu configuration and native engine services.
+
+/// Native menu settings. The application loads installation defaults plus a user INI, and
+/// flushes `save_requested` to the user directory. No native opens a file or executes a shell.
+#[derive(Debug, Clone, Default)]
+pub struct MenuSettings {
+    /// Case-insensitive (section, key) settings, including key bindings.
+    pub values: std::collections::BTreeMap<(String, String), String>,
+    /// SaveConfig requests a host flush; cleared only after a successful write.
+    pub save_requested: bool,
+    /// Live audio preview, in the retail master-volume units (dB).
+    pub master_db: f32,
+    /// Retail music selector: 0 off, 1 light, 2 normal.
+    pub music: i32,
+    /// Host-supported video modes, supplied before the page opens.
+    pub resolutions: Vec<(u32, u32)>,
+    /// StopMusic requests disposal of the current music voice.
+    pub stop_music: bool,
+}
+
+impl MenuSettings {
+    /// Case-insensitive lookup; Input is the engine console alias for Engine.Input.
+    pub fn get(&self, section: &str, key: &str) -> Option<&str> {
+        self.values
+            .get(&(config_section(section), key.to_ascii_lowercase()))
+            .map(String::as_str)
+    }
+
+    /// Sets one value without saving (the game's SaveConfig determines persistence).
+    pub fn set(&mut self, section: &str, key: &str, value: String) {
+        self.values
+            .insert((config_section(section), key.to_ascii_lowercase()), value);
+    }
+}
+
+fn config_section(section: &str) -> String {
+    let lower = section.to_ascii_lowercase();
+    match lower.as_str() {
+        "input" => "engine.input".into(),
+        "xiiimenuvideoclientwindow"
+        | "xiiimenuaudioclientwindow"
+        | "xiiimenucontrolswindow"
+        | "xiiimenuadvancedcontrolswindow" => format!("xidinterf.{lower}"),
+        "xiiiplayercontroller" => format!("xiii.{lower}"),
+        other => other.into(),
+    }
+}
+
+fn menu_error(vm: &Vm<'_>, message: impl Into<String>) -> crate::vm::VmError {
+    vm.err(VmErrorKind::Other(message.into()))
+}
+
+/// Parses scalar property text against its existing reflected type. Rejects non-finite floats,
+/// overflow and compound types rather than silently installing a wrongly typed value.
+pub fn parse_property_text(old: &Value, text: &str) -> Result<Value, String> {
+    let invalid = || format!("invalid {} property text {text:?}", old.type_name());
+    Ok(match old {
+        Value::Bool(_) => match text.to_ascii_lowercase().as_str() {
+            "true" | "1" => Value::Bool(true),
+            "false" | "0" => Value::Bool(false),
+            _ => return Err(invalid()),
+        },
+        Value::Byte(_) => {
+            let parsed = text
+                .parse::<u8>()
+                .ok()
+                .or_else(|| match text.to_ascii_lowercase().as_str() {
+                    "ct_strafelooksameaxis" => Some(0),
+                    "ct_strafelooknotsameaxis" => Some(1),
+                    _ => None,
+                })
+                .ok_or_else(invalid)?;
+            Value::Byte(parsed)
+        }
+        Value::Int(_) => Value::Int(text.parse().map_err(|_| invalid())?),
+        Value::Float(_) => {
+            let v: f32 = text.parse().map_err(|_| invalid())?;
+            if !v.is_finite() {
+                return Err(invalid());
+            }
+            Value::Float(v)
+        }
+        Value::Str(_) => Value::Str(text.to_owned()),
+        Value::Name(_) => Value::Name(text.to_owned()),
+        _ => return Err(invalid()),
+    })
+}
+
+/// Applies INI values for the spawned object's class before its script `Created` runs.
+/// The reflected slot remains the authority for the property's type; unsupported compound
+/// values are rejected instead of replaced with a guessed representation.
+pub fn apply_menu_config(vm: &mut Vm<'_>, object: crate::value::ObjectId) -> VmResult<()> {
+    let class = vm.set().path(vm.objects[object as usize].class);
+    let configured = vm
+        .canvas
+        .menu
+        .as_ref()
+        .ok_or_else(|| menu_error(vm, "menu config provider is unavailable"))?;
+    let entries: Vec<(String, String)> = configured
+        .values
+        .iter()
+        .filter(|((section, _), _)| section.eq_ignore_ascii_case(&class))
+        .map(|((_, key), value)| (key.clone(), value.clone()))
+        .collect();
+    for (key, text) in entries {
+        let Some(old) = vm.get_property(object, &key) else {
+            return Err(menu_error(
+                vm,
+                format!("config {class}.{key} has no reflected property"),
+            ));
+        };
+        let value = parse_property_text(old, &text).map_err(|e| menu_error(vm, e))?;
+        if !vm.set_property(object, &key, 0, value) {
+            return Err(menu_error(
+                vm,
+                format!("could not assign config {class}.{key}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn get_property_text(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let name = text(vm, a, 0)?;
+    let value = vm
+        .get_property(c.this, &name)
+        .ok_or_else(|| menu_error(vm, format!("GetPropertyText: unknown property {name}")))?;
+    val(Value::Str(vm.value_text(value)))
+}
+
+fn set_property_text(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let name = text(vm, a, 0)?;
+    let input = text(vm, a, 1)?;
+    let old = vm
+        .get_property(c.this, &name)
+        .ok_or_else(|| menu_error(vm, format!("SetPropertyText: unknown property {name}")))?;
+    let value = parse_property_text(old, &input).map_err(|e| menu_error(vm, e))?;
+    vm.set_property(c.this, &name, 0, value);
+    val(Value::Void)
+}
+
+fn save_config(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    // The retail video page stores these three User* properties, then SaveConfig. Other
+    // options use ConsoleCommand SET, which already updates the settings dictionary.
+    let class = vm.set().path(vm.objects[c.this as usize].class);
+    let mut entries = Vec::new();
+    for key in [
+        "UserBrightness",
+        "UserGamma",
+        "UserContrast",
+        "DecalX",
+        "DecalY",
+        "bUseRumble",
+        "iAutoAimMode",
+        "bInverseLook",
+        "fLookSpeed",
+        "UserPadConfig",
+        "ConfigType",
+    ] {
+        if let Some(value) = vm.get_property(c.this, key) {
+            entries.push((key, vm.value_text(value)));
+        }
+    }
+    let Some(settings) = vm.canvas.menu.as_mut() else {
+        return Err(menu_error(
+            vm,
+            "SaveConfig requires a host configuration provider",
+        ));
+    };
+    for (key, value) in entries {
+        settings.set(&class, key, value);
+    }
+    settings.save_requested = true;
+    val(Value::Void)
+}
+
+/// UE2 key names used by the retail PC key-binding pages (KEYNAME 0..254).
+pub fn menu_key_name(key: u8) -> String {
+    match key {
+        1 => "LeftMouse",
+        2 => "RightMouse",
+        4 => "MiddleMouse",
+        8 => "Backspace",
+        9 => "Tab",
+        13 => "Enter",
+        16 => "Shift",
+        17 => "Ctrl",
+        18 => "Alt",
+        19 => "Pause",
+        20 => "CapsLock",
+        27 => "Escape",
+        32 => "Space",
+        33 => "PageUp",
+        34 => "PageDown",
+        35 => "End",
+        36 => "Home",
+        37 => "Left",
+        38 => "Up",
+        39 => "Right",
+        40 => "Down",
+        45 => "Insert",
+        46 => "Delete",
+        236 => "MouseWheelUp",
+        237 => "MouseWheelDown",
+        48..=57 | 65..=90 => return char::from(key).to_string(),
+        112..=123 => return format!("F{}", key - 111),
+        _ => return String::new(),
+    }
+    .into()
+}
+
+fn ok(v: Value) -> Result<NativeOutcome, String> {
+    Ok(NativeOutcome::Value(v))
+}
+
+/// Handles the menu console subset. Unknown commands fail with the original script stack.
+/// Campaign ConsoleCommand retains its existing implementation when no menu provider exists.
+/// Errors are plain strings; the registry caller wraps them into a VM error after the settings
+/// borrow has ended.
+pub fn menu_console(vm: &mut Vm<'_>, command: &str) -> Result<NativeOutcome, String> {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    let verb = parts.first().copied().unwrap_or("").to_ascii_lowercase();
+    if command
+        .get(..6)
+        .is_some_and(|p| p.eq_ignore_ascii_case("SETRES"))
+    {
+        let resolution = &command[6..];
+        let resolution = resolution.trim();
+        let (w, h) = resolution
+            .split_once('x')
+            .ok_or_else(|| format!("malformed resolution {resolution:?}"))?;
+        let size = (
+            w.parse::<u32>().map_err(|_| "invalid resolution width")?,
+            h.parse::<u32>().map_err(|_| "invalid resolution height")?,
+        );
+        let settings = vm
+            .canvas
+            .menu
+            .as_mut()
+            .ok_or("menu console requires settings")?;
+        if !settings.resolutions.contains(&size) {
+            return Err(format!("unsupported resolution {resolution}"));
+        }
+        settings.set("port", "resolution", resolution.to_owned());
+        return ok(Value::Str(String::new()));
+    }
+    match (verb.as_str(), parts.as_slice()) {
+        ("toggleime", [_, "0"]) => ok(Value::Str(String::new())),
+        ("get", [_, section, key]) => {
+            let settings = vm
+                .canvas
+                .menu
+                .as_ref()
+                .ok_or("menu console requires settings")?;
+            let value = settings
+                .get(section, key)
+                .or_else(|| {
+                    (section.eq_ignore_ascii_case("gameinfo")
+                        && key.eq_ignore_ascii_case("difficulty"))
+                    .then_some("1")
+                })
+                .ok_or_else(|| format!("missing setting {section}.{key}"))?;
+            ok(Value::Str(value.to_owned()))
+        }
+        ("get", [_, property]) => {
+            let (section, key) = property
+                .rsplit_once('.')
+                .unwrap_or(("engine.client", property));
+            let value = vm
+                .canvas
+                .menu
+                .as_ref()
+                .ok_or("menu console requires settings")?
+                .get(section, key)
+                .ok_or_else(|| format!("missing setting {section}.{key}"))?;
+            ok(Value::Str(value.to_owned()))
+        }
+        ("set", [_, section, key, rest @ ..]) => {
+            vm.canvas
+                .menu
+                .as_mut()
+                .ok_or("menu console requires settings")?
+                .set(section, key, rest.join(" "));
+            ok(Value::Str(String::new()))
+        }
+        ("getcurrentres", [_]) => {
+            let res = vm
+                .canvas
+                .menu
+                .as_ref()
+                .ok_or("menu console requires settings")?
+                .get("port", "resolution")
+                .unwrap_or("1280x720");
+            ok(Value::Str(res.to_owned()))
+        }
+        ("setres", [_, res]) => {
+            let valid = res
+                .split_once('x')
+                .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)));
+            let known = vm
+                .canvas
+                .menu
+                .as_ref()
+                .ok_or("menu console requires settings")?
+                .resolutions
+                .contains(&valid.ok_or_else(|| format!("malformed resolution {res:?}"))?);
+            if !known {
+                return Err(format!("unsupported resolution {res}"));
+            }
+            vm.canvas
+                .menu
+                .as_mut()
+                .ok_or("menu console requires settings")?
+                .set("port", "resolution", (*res).to_owned());
+            ok(Value::Str(String::new()))
+        }
+        ("brightness" | "gamma" | "contrast", [_, v]) => {
+            let value: f32 = v.parse().map_err(|_| "invalid display value")?;
+            if !value.is_finite() || !(0.0..=2.0).contains(&value) {
+                return Err("display value outside supported range".into());
+            }
+            vm.canvas
+                .menu
+                .as_mut()
+                .ok_or("menu console requires settings")?
+                .set("engine.client", &verb, value.to_string());
+            ok(Value::Str(String::new()))
+        }
+        ("keyname", [_, n]) => {
+            let key = n.parse::<u8>().map_err(|_| "invalid KEYNAME index")?;
+            ok(Value::Str(menu_key_name(key)))
+        }
+        ("keybinding", [_, key]) => {
+            let binding = vm
+                .canvas
+                .menu
+                .as_ref()
+                .ok_or("menu console requires settings")?
+                .get("input", key)
+                .unwrap_or("");
+            ok(Value::Str(binding.to_owned()))
+        }
+        _ => Err(format!("unsupported menu ConsoleCommand {command:?}")),
+    }
+}
+
+fn set_volume(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let volume = float(vm, a, 0)?;
+    if !volume.is_finite() || !(-100.0..=0.0).contains(&volume) {
+        return Err(menu_error(vm, "SetVolume outside -100..0 dB"));
+    }
+    let Some(settings) = vm.canvas.menu.as_mut() else {
+        return Err(menu_error(vm, "SetVolume requires host mixer"));
+    };
+    settings.master_db = volume;
+    val(Value::Void)
+}
+
+fn set_music_slider(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let volume = float(vm, a, 0)?;
+    if !matches!(volume, 0.0 | 1.0 | 2.0) {
+        return Err(menu_error(vm, "invalid music selector"));
+    }
+    let Some(settings) = vm.canvas.menu.as_mut() else {
+        return Err(menu_error(vm, "SetMusicSliderPos requires host mixer"));
+    };
+    settings.music = volume as i32;
+    val(Value::Void)
+}
+
+fn stop_music(vm: &mut Vm<'_>, _c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let Some(settings) = vm.canvas.menu.as_mut() else {
+        return Err(menu_error(vm, "StopMusic requires host mixer"));
+    };
+    settings.stop_music = true;
+    val(Value::Void)
+}
+
+fn available_res(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let Some(settings) = vm.canvas.menu.as_ref() else {
+        return Err(menu_error(vm, "GetAvailableRes requires host modes"));
+    };
+    if a.is_empty() {
+        return Err(menu_error(vm, "GetAvailableRes missing output array"));
+    }
+    a[0] = Value::Array(
+        settings
+            .resolutions
+            .iter()
+            .map(|&(w, h)| {
+                Value::Struct(vec![
+                    ("PixelWidth".into(), Value::Int(w as i32)),
+                    ("PixelHeight".into(), Value::Int(h as i32)),
+                ])
+            })
+            .collect(),
+    );
+    val(Value::Void)
+}
+
+/// item16c registry contribution. Scoped semantics fail explicitly outside the menu host.
+pub fn item16c_defs() -> Vec<NativeDef> {
+    [
+        ("Object.SaveConfig", "native(536) final function SaveConfig()", save_config as crate::registry::NativeFn),
+        ("Object.GetPropertyText", "native(200) final native static function string GetPropertyText(string PropName)", get_property_text),
+        ("Object.SetPropertyText", "native(201) final native static function SetPropertyText(string PropName, string PropValue)", set_property_text),
+        ("Engine.Actor.SetVolume", "native(361) final function SetVolume(float Volume)", set_volume),
+        ("Engine.Actor.SetMusicSliderPos", "native(362) final function SetMusicSliderPos(int Pos)", set_music_slider),
+        ("Engine.Actor.StopMusic", "native(345) final function StopMusic()", stop_music),
+        ("Engine.LevelInfo.GetAvailableRes", "native(0) function GetAvailableRes(out array<VideoMode> Modes)", available_res),
+    ].into_iter().map(|(path,signature,f)| partial(
+        "item16c menu provider: scalar property text, menu settings and host modes; no filesystem or shell access",
+        path, signature, "retail Core/Engine declarations; XIDInterf XIIIMenuAudioClientWindow/InternalOnKeyEvent and XIIIMenuVideoClientWindow.Created", f
+    )).collect()
+}
+
+#[cfg(test)]
+mod item16c_tests {
+    use super::*;
+    use crate::linker::ScriptSet;
+    use crate::vm::VmLimits;
+
+    #[test]
+    fn property_text_round_trips_scalars_and_rejects_overflow_or_compounds() {
+        assert_eq!(
+            parse_property_text(&Value::Bool(false), "1"),
+            Ok(Value::Bool(true))
+        );
+        assert_eq!(
+            parse_property_text(&Value::Byte(0), "255"),
+            Ok(Value::Byte(255))
+        );
+        assert_eq!(
+            parse_property_text(&Value::Byte(0), "CT_StrafeLookNotSameAxis"),
+            Ok(Value::Byte(1))
+        );
+        assert!(parse_property_text(&Value::Byte(0), "256").is_err());
+        assert_eq!(
+            parse_property_text(&Value::Int(0), "-2147483648"),
+            Ok(Value::Int(i32::MIN))
+        );
+        assert!(parse_property_text(&Value::Int(0), "2147483648").is_err());
+        assert_eq!(
+            parse_property_text(&Value::Float(0.0), "0.25"),
+            Ok(Value::Float(0.25))
+        );
+        assert!(parse_property_text(&Value::Float(0.0), "NaN").is_err());
+        assert_eq!(
+            parse_property_text(&Value::Name("None".into()), "Walk"),
+            Ok(Value::Name("Walk".into()))
+        );
+        assert!(parse_property_text(&Value::Array(vec![]), "x").is_err());
+    }
+
+    #[test]
+    fn key_names_cover_boundary_codes_without_inventing_unknown_keys() {
+        assert_eq!(menu_key_name(65), "A");
+        assert_eq!(menu_key_name(112), "F1");
+        assert_eq!(menu_key_name(123), "F12");
+        assert!(menu_key_name(0).is_empty());
+        assert!(menu_key_name(254).is_empty());
+    }
+
+    #[test]
+    fn menu_console_reads_writes_and_rejects_unavailable_host_modes() {
+        let set = ScriptSet::new();
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let mut settings = MenuSettings {
+            resolutions: vec![(1280, 720)],
+            ..MenuSettings::default()
+        };
+        settings.set("HXAudio.HXAudioSubsystem", "MasterVolume", "0".into());
+        vm.canvas.menu = Some(settings);
+
+        menu_console(&mut vm, "SET HXAudio.HXAudioSubsystem MasterVolume -7")
+            .expect("SET updates the in-memory config overlay");
+        assert_eq!(
+            menu_console(&mut vm, "GET HXAudio.HXAudioSubsystem MasterVolume"),
+            Ok(NativeOutcome::Value(Value::Str("-7".into())))
+        );
+        menu_console(&mut vm, "SETRES1280x720").expect("supported mode accepted");
+        assert_eq!(
+            menu_console(&mut vm, "GETCURRENTRES"),
+            Ok(NativeOutcome::Value(Value::Str("1280x720".into())))
+        );
+        assert!(menu_console(&mut vm, "SETRES9999x9999").is_err());
+        assert!(menu_console(&mut vm, "SHELL something").is_err());
     }
 }

@@ -20,6 +20,8 @@
 //! so `VideoPlayer.*` is a labelled stub and the new-game `ClientTravel("Plage00")` request is
 //! recorded for the host travel step.
 
+mod config;
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -310,6 +312,7 @@ impl MenuScript {
 pub struct MenuSession {
     vm: Vm<'static>,
     save_dir: PathBuf,
+    config_path: PathBuf,
     root: ObjectId,
     page: ObjectId,
     canvas: ObjectId,
@@ -421,16 +424,30 @@ impl xiii_script::ExternalObjectData for MenuTextureData {
 impl MenuSession {
     /// Loads the script set and entry map, and spawns the root controller + main menu page. Fonts
     /// are loaded later (they need the Bevy `Assets<Image>`).
+    #[cfg(test)]
     fn open(
         game_dir: &Path,
         save_dir: PathBuf,
         script: Option<MenuScript>,
     ) -> Result<MenuSession, String> {
+        let dir = config::default_dir()?;
+        Self::open_configured(game_dir, save_dir, &dir, script)
+    }
+
+    fn open_configured(
+        game_dir: &Path,
+        save_dir: PathBuf,
+        config_dir: &Path,
+        script: Option<MenuScript>,
+    ) -> Result<MenuSession, String> {
+        let config_path = config::user_path(game_dir, config_dir)?;
+        let settings = config::load(game_dir, &config_path)?;
         // `[URL] LocalMap=mapmenu.unr` in Default.ini is the local front-end map. `[URL] Map`
         // names `Index.unr`, which is absent from this corpus; MapMenu is the installed one.
         let (set, map_idx) = runtime::load_with_map(game_dir, "MapMenu")?;
         let set: &'static ScriptSet = Box::leak(Box::new(set));
         let mut vm = Vm::new(set, VmLimits::default());
+        vm.canvas.menu = Some(settings);
         vm.set_save_slots(Box::new(MenuSaveSlots::open(save_dir.clone())?));
         runtime::configure_localization(&mut vm, game_dir)?;
         runtime::configure_external_objects(&mut vm, game_dir);
@@ -472,6 +489,11 @@ impl MenuSession {
         // decoded `Created`/`BeforePaint`/`DrawStretchedTexture` read from `myRoot`.
         vm.set_property(root, "GUIScale", 0, Value::Float(1.0));
         vm.set_property(root, "bMapMenu", 0, Value::Bool(true));
+        vm.set_property(root, "bMusicPlay", 0, Value::Bool(true));
+        vm.send_event(root, "LoadIngameMenu", vec![])
+            .map_err(|e| e.to_string())?;
+        vm.send_event(root, "LoadMainMenu", vec![])
+            .map_err(|e| e.to_string())?;
         vm.set_property(root, "CurrentPF", 0, Value::Int(0));
         vm.set_property(root, "fTextureScaleFactorForConsole", 0, Value::Float(1.0));
         vm.set_property(root, "GameResolution", 0, Value::Str(String::new()));
@@ -483,7 +505,8 @@ impl MenuSession {
         // the host travel step).
         if let (Some(player_cls), Some(pc_cls)) = (
             runtime::resolve_class_path(set, "Engine.Player"),
-            runtime::resolve_class_path(set, "Engine.PlayerController"),
+            runtime::resolve_class_path(set, "XIII.XIIIPlayerController")
+                .or_else(|| runtime::resolve_class_path(set, "Engine.PlayerController")),
         ) {
             let viewport = vm
                 .spawn(player_cls, "ViewportOwner(menu)")
@@ -493,6 +516,16 @@ impl MenuSession {
                 .spawn(pc_cls, "MenuPlayerController")
                 .map_err(|e| format!("creating PlayerController: {e}"))?;
             vm.set_active(pc, true);
+            xiii_script::canvas::apply_menu_config(&mut vm, pc).map_err(|e| e.to_string())?;
+            let level = vm
+                .objects
+                .iter()
+                .enumerate()
+                .find(|(id, o)| vm.is_a(*id as ObjectId, "LevelInfo") && !o.deleted)
+                .map(|(id, _)| id as ObjectId);
+            if let Some(level) = level {
+                vm.set_property(pc, "Level", 0, Value::Object(Some(ObjRef::Instance(level))));
+            }
             vm.set_property(
                 viewport,
                 "Actor",
@@ -539,6 +572,7 @@ impl MenuSession {
             .spawn(page_class, "XIIIMenu(menu)")
             .map_err(|e| format!("creating main menu: {e}"))?;
         vm.set_active(page, true);
+        xiii_script::canvas::apply_menu_config(&mut vm, page).map_err(|e| e.to_string())?;
         // Run the game's own page-open path. `XIIIWindow.InitComponent` assigns the
         // `__OnOpen__`/`__OnPreDraw__`/`__OnDraw__`/`__OnKeyEvent__` delegates, sets `myRoot`
         // and calls `Created` (which loads the panel textures with `DynamicLoadObject` and
@@ -557,6 +591,20 @@ impl MenuSession {
             log.push(format!("[menu] XIIIMenu.InitComponent: {e}"));
         }
 
+        vm.set_property(
+            root,
+            "ActivePage",
+            0,
+            Value::Object(Some(ObjRef::Instance(page))),
+        );
+        vm.set_property(
+            root,
+            "MenuStack",
+            0,
+            Value::Array(vec![Value::Object(Some(ObjRef::Instance(page)))]),
+        );
+        vm.send_event(page, "ShowWindow", vec![])
+            .map_err(|e| e.to_string())?;
         // Read the built controls for `--menu-script` target resolution and the report.
         let mut controls = Vec::new();
         let mut control_labels = Vec::new();
@@ -601,6 +649,7 @@ impl MenuSession {
         Ok(MenuSession {
             vm,
             save_dir,
+            config_path,
             root,
             page,
             canvas,
@@ -651,7 +700,33 @@ impl MenuSession {
             }
         }
         // The map actors are not begun; only the root/page state machines and timers need time.
-        let _ = self.vm.tick(dt);
+        if let Err(e) = self.vm.tick(dt) {
+            self.record_error(format!("menu tick: {e}"));
+        }
+        self.sync_page();
+        let events: Vec<_> = self
+            .vm
+            .drain_events()
+            .into_iter()
+            .map(|e| (self.elapsed as f64, e))
+            .collect();
+        crate::audio::pump(events.iter());
+        if let Some(settings) = self.vm.canvas.menu.as_mut()
+            && settings.save_requested
+        {
+            match config::save(&self.config_path, settings) {
+                Ok(()) => println!("[menu] saved {}", self.config_path.display()),
+                Err(e) => self.record_error(format!("saving configuration: {e}")),
+            }
+        }
+        if let Some(settings) = self.vm.canvas.menu.as_mut() {
+            crate::audio::set_menu_volume_db(settings.master_db);
+            crate::audio::set_menu_music_enabled(settings.music != 0);
+            if settings.stop_music {
+                crate::audio::stop_menu_music();
+                settings.stop_music = false;
+            }
+        }
         // `XIIIMenu.PlayingVideo.Tick` is a state event on a non-actor: `Vm::tick` dispatches
         // `Tick` only for actors, so drive it explicitly while the page thinks a video plays.
         if self.bool_prop(self.page, "bPlayingVideo")
@@ -777,14 +852,7 @@ impl MenuSession {
             }
             Action::Key(name) => {
                 let key = unreal_key(name).ok_or_else(|| format!("unknown key {name:?}"))?;
-                self.vm
-                    .send_event(
-                        self.page,
-                        "InternalOnKeyEvent",
-                        vec![Value::Byte(key), Value::Byte(1), Value::Float(0.0)],
-                    )
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
+                self.dispatch_key(key)
             }
             Action::Open(class_name) => self.open_page(class_name),
             Action::NewGame => {
@@ -814,6 +882,65 @@ impl MenuSession {
     /// Instantiates a decoded page class as the active page and runs its own `InitComponent`
     /// (the host bridge for the native `GUIController.OpenMenu` page stack). Used by
     /// `--menu-script open`.
+    fn record_error(&mut self, error: String) {
+        if !self.errors.contains(&error) {
+            eprintln!("[menu] {error}");
+            self.errors.push(error);
+        }
+    }
+
+    fn dispatch_key(&mut self, key: u8) -> Result<(), String> {
+        let args = vec![Value::Byte(key), Value::Byte(1), Value::Float(0.0)];
+        if let Some(Value::Object(Some(ObjRef::Instance(id)))) =
+            self.vm.get_property(self.page, "FocusedControl").cloned()
+        {
+            let result = self
+                .vm
+                .call_delegate(id, "__OnKeyEvent__Delegate", "OnKeyEvent", args.clone())
+                .map_err(|e| e.to_string())?;
+            if result == Value::Bool(true) {
+                return Ok(());
+            }
+        }
+        self.vm
+            .send_event(self.page, "InternalOnKeyEvent", args)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    fn sync_page(&mut self) {
+        let Some(Value::Object(Some(ObjRef::Instance(page)))) =
+            self.vm.get_property(self.root, "ActivePage").cloned()
+        else {
+            return;
+        };
+        if self.page == page {
+            return;
+        }
+        self.page = page;
+        self.slot_lines.clear();
+        self.controls.clear();
+        self.control_labels.clear();
+        if let Some(Value::Array(items)) = self.vm.get_property(page, "Controls") {
+            for (i, v) in items.iter().enumerate() {
+                if let Value::Object(Some(ObjRef::Instance(id))) = v {
+                    self.controls.push(*id);
+                    self.control_labels.push(if self.vm.is_a(page, "XIIIMenu") {
+                        XIIIMENU_LABELS.get(i).unwrap_or(&"control").to_string()
+                    } else {
+                        format!("control{i}")
+                    });
+                }
+            }
+        }
+        self.call(page, "ShowWindow", vec![]);
+        println!(
+            "[menu] active {}: {} controls",
+            self.vm.set().path(self.vm.objects[page as usize].class),
+            self.controls.len()
+        );
+    }
+
     fn open_page(&mut self, class_name: &str) -> Result<(), String> {
         let class = runtime::resolve_class_path(self.vm.set(), class_name)
             .ok_or_else(|| format!("page class {class_name} is not loaded"))?;
@@ -822,6 +949,26 @@ impl MenuSession {
             .spawn(class, "MenuPage(menu)")
             .map_err(|e| e.to_string())?;
         self.vm.set_active(page, true);
+        xiii_script::canvas::apply_menu_config(&mut self.vm, page).map_err(|e| e.to_string())?;
+        self.vm.set_property(
+            page,
+            "ParentPage",
+            0,
+            Value::Object(Some(ObjRef::Instance(self.page))),
+        );
+        let mut stack = match self.vm.get_property(self.root, "MenuStack").cloned() {
+            Some(Value::Array(a)) => a,
+            _ => vec![],
+        };
+        stack.push(Value::Object(Some(ObjRef::Instance(page))));
+        self.vm
+            .set_property(self.root, "MenuStack", 0, Value::Array(stack));
+        self.vm.set_property(
+            self.root,
+            "ActivePage",
+            0,
+            Value::Object(Some(ObjRef::Instance(page))),
+        );
         // The game's own page-open path: assigns the draw/key delegates, calls `Created`
         // (builds controls) and `FocusFirst` (activates the first control's highlight).
         if let Err(e) = self.vm.send_event(
@@ -885,6 +1032,7 @@ impl MenuSession {
             self.vm.state_name(page),
             self.vm.objects[page as usize].active
         );
+        self.call(page, "ShowWindow", vec![]);
         self.page = page;
         self.controls = controls;
         self.control_labels = labels;
@@ -913,6 +1061,12 @@ impl MenuSession {
             "OnPreDraw",
             vec![canvas.clone()],
         );
+        self.call_delegate(
+            self.page,
+            "__OnDraw__Delegate",
+            "OnDraw",
+            vec![canvas.clone()],
+        );
         let controls = self.controls.clone();
         for c in controls.iter().copied() {
             self.call_delegate(
@@ -925,12 +1079,7 @@ impl MenuSession {
         for c in controls.iter().copied() {
             self.call_delegate(c, "__OnDraw__Delegate", "OnDraw", vec![canvas.clone()]);
         }
-        self.call_delegate(
-            self.page,
-            "__OnDraw__Delegate",
-            "OnDraw",
-            vec![canvas.clone()],
-        );
+
         // `XIIIMenu.AfterPaint` is a plain virtual (no `__AfterPaint__` delegate): it draws the
         // focused control's onomatopoeia and its label (`Continue`, `Options`, ...). Called with
         // the page origin in place from the page's `__OnDraw__`.
@@ -1142,14 +1291,37 @@ impl Plugin for MenuPlugin {
         let t0 = Instant::now();
         let session = match &self.options.menu_script {
             Some(path) => match MenuScript::load(path) {
-                Ok(s) => save_dir(&self.options)
-                    .and_then(|dir| MenuSession::open(&game_dir, dir, Some(s))),
+                Ok(s) => save_dir(&self.options).and_then(|dir| {
+                    MenuSession::open_configured(
+                        &game_dir,
+                        dir,
+                        &self
+                            .options
+                            .config_dir
+                            .clone()
+                            .map(Ok)
+                            .unwrap_or_else(config::default_dir)?,
+                        Some(s),
+                    )
+                }),
                 Err(e) => {
                     eprintln!("[menu] input script {}: {e}", path.display());
                     Err(e)
                 }
             },
-            None => save_dir(&self.options).and_then(|dir| MenuSession::open(&game_dir, dir, None)),
+            None => save_dir(&self.options).and_then(|dir| {
+                MenuSession::open_configured(
+                    &game_dir,
+                    dir,
+                    &self
+                        .options
+                        .config_dir
+                        .clone()
+                        .map(Ok)
+                        .unwrap_or_else(config::default_dir)?,
+                    None,
+                )
+            }),
         };
         println!(
             "[menu] menu session open (MapMenu + XIDInterf.XIIIMenu): {:.2}s",
@@ -1170,6 +1342,8 @@ fn setup(
     mut commands: Commands,
     cfg: Res<MenuConfig>,
     mut session: NonSendMut<Result<MenuSession, String>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -1197,8 +1371,93 @@ fn setup(
     for l in &session.log {
         println!("{l}");
     }
-    // A camera is required for the Bevy UI overlay to render.
-    commands.spawn((Camera3d::default(), Transform::default()));
+    // Render the menu's entry map behind its script-drawn canvas panels. Prefer a map-placed
+    // CameraPoint (the front-end's cinematic camera actor) when the map contains one.
+    let mut backdrop_options = cfg.options.clone();
+    backdrop_options.map = Some("MapMenu".into());
+    let camera_transform = match crate::viewer::load_scene(&backdrop_options) {
+        Ok(scene) => {
+            let map_camera = session
+                .vm
+                .objects
+                .iter()
+                .enumerate()
+                .find_map(|(id, actor)| {
+                    let path = session.vm.set().path(actor.class);
+                    (path.to_ascii_lowercase().contains("camerapoint")
+                        && !actor.deleted
+                        && session.vm.is_a(id as ObjectId, "Actor"))
+                    .then_some((id as ObjectId, path))
+                });
+            if map_camera.is_none() {
+                let candidates: Vec<String> = session
+                    .vm
+                    .objects
+                    .iter()
+                    .filter_map(|actor| {
+                        let path = session.vm.set().path(actor.class);
+                        let lower = path.to_ascii_lowercase();
+                        (lower.contains("camera") || lower.contains("matinee")).then_some(path)
+                    })
+                    .collect();
+                println!(
+                    "[menu] MapMenu has no CameraPoint actor; camera/matinee candidates={candidates:?}; using PlayerStart fallback"
+                );
+            }
+            let camera = map_camera.and_then(|(id, path)| {
+                let location = match session.vm.get_property(id, "Location") {
+                    Some(Value::Vector(v)) => Some(*v),
+                    _ => None,
+                }?;
+                let rotation = match session.vm.get_property(id, "Rotation") {
+                    Some(Value::Rotator(r)) => Some(*r),
+                    _ => None,
+                }?;
+                let position = xiii_decode::common::to_bevy_position(location);
+                let matrix = xiii_decode::common::rotator_to_bevy_matrix(rotation);
+                println!("[menu] MapMenu camera anchor: {path} at {position:?}");
+                Some(
+                    Transform::from_translation(Vec3::from_array(position)).with_rotation(
+                        Quat::from_mat3(&bevy::math::Mat3::from_cols_array(&xiii_world::to_cols(
+                            &matrix,
+                        ))),
+                    ),
+                )
+            });
+            let camera = camera.unwrap_or_else(|| {
+                let target = scene.objects.iter().fold(Vec3::ZERO, |sum, object| {
+                    sum + Vec3::from_array(object.transform.translation)
+                }) / scene.objects.len().max(1) as f32;
+                scene
+                    .player_start
+                    .map(|(p, _)| {
+                        Transform::from_translation(Vec3::new(p[0], p[1], p[2]))
+                            .looking_at(target, Vec3::Y)
+                    })
+                    .unwrap_or_default()
+            });
+            let (geometry, _) = crate::viewer::spawn_scene_geometry(
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                &mut images,
+                &scene,
+                true,
+                false,
+                false,
+            );
+            println!(
+                "[menu] MapMenu backdrop: {} geometry entities",
+                geometry.len()
+            );
+            camera
+        }
+        Err(e) => {
+            eprintln!("[menu] MapMenu backdrop import failed: {e}");
+            Transform::default()
+        }
+    };
+    commands.spawn((Camera3d::default(), camera_transform));
     println!(
         "[menu] ready: {} control(s); input script {} action(s)",
         session.controls.len(),
@@ -1209,6 +1468,8 @@ fn setup(
 fn frame(
     time: Res<Time>,
     window: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
     mut session: NonSendMut<Result<MenuSession, String>>,
 ) {
     let Ok(session) = session.as_mut() else {
@@ -1223,6 +1484,35 @@ fn frame(
     session.advance(dt);
     session.refresh_commands();
     session.hover(cursor.map(|p| (p.x, p.y)));
+    for (key, code) in [
+        (KeyCode::ArrowUp, 38),
+        (KeyCode::ArrowDown, 40),
+        (KeyCode::ArrowLeft, 37),
+        (KeyCode::ArrowRight, 39),
+        (KeyCode::Enter, 13),
+        (KeyCode::Escape, 27),
+        (KeyCode::Backspace, 8),
+        (KeyCode::Space, 32),
+    ] {
+        if keys.just_pressed(key)
+            && let Err(e) = session.dispatch_key(code)
+        {
+            session.record_error(format!("key {key:?}: {e}"));
+        }
+    }
+    if mouse.just_pressed(MouseButton::Left)
+        && let Some(Value::Object(Some(ObjRef::Instance(control)))) = session
+            .vm
+            .get_property(session.page, "FocusedControl")
+            .cloned()
+        && let Err(e) = session.vm.send_event(
+            session.page,
+            "InternalOnClick",
+            vec![Value::Object(Some(ObjRef::Instance(control)))],
+        )
+    {
+        session.record_error(format!("menu click: {e}"));
+    }
 }
 
 fn draw(
@@ -1587,7 +1877,14 @@ pub fn build_menu_app(options: Options) -> App {
         shot_done: false,
         target_at: None,
     });
-    app.add_plugins(MenuPlugin { options });
+    app.add_plugins(MenuPlugin {
+        options: options.clone(),
+    });
+    let mut audio_options = options;
+    audio_options.map = Some("MapMenu".into());
+    app.add_plugins(crate::audio::AudioFxPlugin {
+        options: audio_options,
+    });
     app
 }
 
@@ -1947,6 +2244,52 @@ mod tests {
             "[menu test] control_rects={controls:?} caption_rects={captions:?} focused={}",
             session.control_labels[0]
         );
+    }
+
+    /// Opt-in corpus check for the retail audio page's master-volume persistence. It advances
+    /// focus from the music checkbox to the Sound Volume slider, moves it one step and presses
+    /// Enter through the page handler, then starts a fresh VM and reads the saved value.
+    #[test]
+    fn opt_in_audio_page_master_volume_survives_restart() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let base =
+            std::env::temp_dir().join(format!("xiii-menu-music-persist-{}", std::process::id()));
+        let config_dir = base.join("config");
+        let save_dir = base.join("saves");
+        let _ = std::fs::remove_dir_all(&base);
+        let mut session =
+            MenuSession::open_configured(&game_dir, save_dir.clone(), &config_dir, None)
+                .expect("open menu with disposable configuration");
+        let initial = session.vm.canvas.menu.as_ref().unwrap().master_db;
+        session
+            .open_page("XIDInterf.XIIIMenuAudioClientWindow")
+            .expect("open retail audio page");
+        session.dispatch_key(40).expect("focus Sound Volume slider");
+        session
+            .dispatch_key(37)
+            .expect("decrease Sound Volume slider one step from its upper endpoint");
+        session.dispatch_key(13).expect("apply audio page options");
+        session.advance(1.0 / 60.0);
+        let saved = config::load(
+            &game_dir,
+            &config::user_path(&game_dir, &config_dir).unwrap(),
+        )
+        .expect("read persisted settings");
+        assert_ne!(
+            saved.master_db, initial,
+            "the audio slider change must persist"
+        );
+
+        let restarted = MenuSession::open_configured(&game_dir, save_dir, &config_dir, None)
+            .expect("restart menu VM");
+        assert_eq!(
+            restarted.vm.canvas.menu.as_ref().unwrap().master_db,
+            saved.master_db
+        );
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

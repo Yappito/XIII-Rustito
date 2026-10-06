@@ -64,6 +64,26 @@ const STREAM_CHUNK_FRAMES: usize = 8192;
 /// Re-check interval for ambient distance gain (metres of player movement is cheap; time is fine).
 const ATTENUATION_PERIOD: Duration = Duration::from_millis(100);
 
+static MENU_MASTER_DB: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0.0f32.to_bits());
+static MENU_MUSIC_ENABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static MENU_STOP_MUSIC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Updates the menu mixer preview from the retail dB value.
+pub fn set_menu_volume_db(db: f32) {
+    MENU_MASTER_DB.store(db.to_bits(), Ordering::Relaxed);
+}
+
+/// Updates whether the retail menu music selector is enabled (zero is off).
+pub fn set_menu_music_enabled(enabled: bool) {
+    MENU_MUSIC_ENABLED.store(u64::from(enabled), Ordering::Relaxed);
+}
+
+/// Requests that current menu music stop on the audio system's next update.
+pub fn stop_menu_music() {
+    MENU_STOP_MUSIC.store(1, Ordering::Relaxed);
+}
+
 /// Which native emitted a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoundKind {
@@ -733,6 +753,7 @@ fn consume_requests(
     mut streams: ResMut<Assets<StreamAudio>>,
     names: Query<(&Name, &GlobalTransform)>,
     music: Query<Entity, With<MusicTrack>>,
+    mut music_sinks: Query<&mut AudioSink, With<MusicTrack>>,
     listener: Res<ListenerPos>,
     cfg: Res<AudioConfig>,
     mut started_level_audio: Local<bool>,
@@ -746,6 +767,21 @@ fn consume_requests(
         if audio.stats.enabled {
             start_level_audio(&mut commands, &mut audio, &mut streams, &cfg.options);
         }
+    }
+
+    if MENU_STOP_MUSIC.swap(0, Ordering::Relaxed) != 0 {
+        for entity in &music {
+            commands.entity(entity).despawn();
+        }
+    }
+    let gain = 10.0f32.powf(f32::from_bits(MENU_MASTER_DB.load(Ordering::Relaxed)) / 20.0);
+    let music_gain = if MENU_MUSIC_ENABLED.load(Ordering::Relaxed) == 0 {
+        0.0
+    } else {
+        gain
+    };
+    for mut sink in &mut music_sinks {
+        sink.set_volume(Volume::Linear(music_gain));
     }
 
     // Take the whole queue once.
@@ -1126,7 +1162,15 @@ fn play_music(
         AudioPlayer::new(handle),
         SpawnedSound { at: Instant::now() },
         PlaybackSettings::DESPAWN
-            .with_volume(volume_of(req))
+            .with_volume(Volume::Linear(
+                volume_of(req).to_linear()
+                    * 10.0f32.powf(f32::from_bits(MENU_MASTER_DB.load(Ordering::Relaxed)) / 20.0)
+                    * if MENU_MUSIC_ENABLED.load(Ordering::Relaxed) == 0 {
+                        0.0
+                    } else {
+                        1.0
+                    },
+            ))
             .with_speed(speed_of(req)),
     ));
     audio.stats.music += 1;
@@ -1208,10 +1252,14 @@ fn expire_without_device(
 
 fn overlay_audio(
     audio: Option<Res<AudioRes>>,
+    cfg: Res<AudioConfig>,
     mut text: Query<&mut Text, With<AudioOverlay>>,
     mut done: Local<bool>,
     mut commands: Commands,
 ) {
+    if cfg.options.mode == crate::cli::Mode::Menu {
+        return;
+    }
     let Some(audio) = audio else {
         return;
     };

@@ -528,7 +528,7 @@ fn registry_entries_are_documented() {
     // Partials and the visible Partial for `LevelInfo.DecAttaque` (588); item14c added four
     // trail/particle Partials (SpawnParticle is shared with item18); item20 adds ten decoded GUI
     // save-slot declarations. Must equal `Registry::builtin().defs().count()`.
-    assert_eq!(defs.len(), 319);
+    assert_eq!(defs.len(), 326);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
