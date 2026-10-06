@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::events::{PresentationEvent, SoundEvent};
+use crate::events::{PresentationEvent, SoundEvent, TravelRequest, TravelSource};
 use crate::linker::GlobalRef;
 use crate::value::{ObjRef, ObjectId, Value};
 use crate::vm::{Latent, TraceKind, Vm, VmErrorKind, VmResult};
@@ -389,10 +389,9 @@ fn pow_ff(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOut
     val(Value::Float(x.powf(y)))
 }
 
-/// `Object.Percent_FloatFloat` (173): `A % B`, UE2 `appFmod` (C `fmod`, remainder with the sign of
-/// the dividend). Decoded call site `xiii.m60.RumbleFX` 0x004E (`ReloadCount % 1`); a zero divisor
-/// yields `NaN` as C `fmod`, never a silent clamp. Before item14c this was unimplemented, so the
-/// M60's `IncrementFlashCount` -> `RumbleFX` raised and aborted the fire before `TraceFire`.
+/// `Object.Percent_FloatFloat` (173): `A % B`, UE2 `appFmod`/C `fmod` (remainder keeps the
+/// dividend's sign). Decoded call site `xiii.m60.RumbleFX` 0x004E (`ReloadCount % 1`), reached by
+/// the m60/kalash/m16 fire path. A zero divisor yields `NaN`, never a silent clamp.
 fn percent_ff(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let (x, y) = (float(vm, a, 0)?, float(vm, a, 1)?);
     val(Value::Float(x % y))
@@ -2571,6 +2570,89 @@ fn console_command(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<
     val(Value::Str(reply))
 }
 
+/// `PlayerController.ClientTravel(string URL, byte<ETravelType> TravelType, bool bItems) -> void`.
+///
+/// The engine's client-travel entry point. `XIIIGameInfo.ProcessServerTravel` (xiii.u) calls it
+/// for a network client (`Player != None`) and `LevelInfo.ServerTravel` reaches it in the
+/// standalone path through `Game.ProcessServerTravel`; the front-end menu reaches it too
+/// (`XIIIMenu.EndOfVideo`, item16). The VM never loads a map: it records a
+/// [`TravelRequest`](crate::events::TravelRequest) (the URL, the `ETravelType` byte and `bItems`)
+/// for the host to consume with [`Vm::take_travel_request`], **and** the item16 structured trace
+/// note (`canvas::format_travel_note`) that the `xiii-app --menu` host reads via
+/// `canvas::parse_travel_note`. This is the single registration for the native.
+fn client_travel(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let url = string(vm, a, 0)?;
+    let mode = byte(vm, a, 1)?;
+    let items = boolean(vm, a, 2)?;
+    vm.note(TraceKind::Note(crate::canvas::format_travel_note(
+        &url, mode, items,
+    )));
+    let actor = vm.objects[c.this as usize].name.clone();
+    let time = vm.time;
+    vm.request_travel(TravelRequest {
+        actor,
+        url,
+        mode,
+        items,
+        source: TravelSource::ClientTravel,
+        time,
+    });
+    val(Value::Void)
+}
+
+/// `PlayerController.GetDefaultURL(string Option) -> string` (native 510).
+///
+/// UE2 reads the option (`Skin`/`Face`/`Team`/`Name`/`Class`) from the player's stored
+/// connection defaults. The headless VM has no player profile; it returns the empty string and
+/// records a visible note. The standalone travel path does not reach this native
+/// (`XIIIGameInfo.ProcessServerTravel` only calls it when `Level.NetMode == 2`).
+fn get_default_url(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let option = string(vm, a, 0)?;
+    vm.note(TraceKind::Note(format!(
+        "GetDefaultURL({option:?}) has no player profile; returned an empty string"
+    )));
+    val(Value::Str(String::new()))
+}
+
+/// `PlayerController.CalcFirstPersonView(out Vector CameraLocation, out Rotator CameraRotation)`
+/// (native 497).
+///
+/// The first-person camera pose on the goal/end-game path: `MapInfo.DoTravel` ->
+/// `XIIIGameInfo.EndGame` -> `XIIIPlayerController.GameEnded.BeginState` -> `global.PlayerCalcView`
+/// -> `engine.PlayerController.PlayerCalcView` calls it. The headless VM has no renderer, so the
+/// pose is the host's first-person description: the pawn's eye position and the controller's
+/// rotation (falling back to the pawn's). Without it the end-game state suspends and the level
+/// cannot travel (item15).
+fn calc_first_person_view(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let pawn = vm.obj_prop(c.this, "Pawn").unwrap_or(c.this);
+    let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+    let eye = match vm.get_property(pawn, "EyeHeight") {
+        Some(Value::Float(h)) => *h,
+        _ => match vm.get_property(pawn, "BaseEyeHeight") {
+            Some(Value::Float(h)) => *h,
+            _ => 0.0,
+        },
+    };
+    let rot = match vm.get_property(c.this, "Rotation") {
+        Some(Value::Rotator(r)) => *r,
+        _ => match vm.get_property(pawn, "Rotation") {
+            Some(Value::Rotator(r)) => *r,
+            _ => [0; 3],
+        },
+    };
+    if let Some(slot) = a.get_mut(0) {
+        *slot = Value::Vector([loc[0], loc[1], loc[2] + eye]);
+    }
+    if let Some(slot) = a.get_mut(1) {
+        *slot = Value::Rotator(rot);
+    }
+    val(Value::Void)
+}
+
 fn replace_texture_by_another(
     vm: &mut Vm<'_>,
     c: &NativeCtx,
@@ -2654,9 +2736,14 @@ fn is_player_pawn(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<N
 }
 
 fn find_inventory_type(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
-    // UE2 `APawn::FindInventoryType`: walks `Inventory` -> `Inventory` (the item chain) and
-    // returns the first item whose class derives from `DesiredClass`. XIII's decoded signature
-    // has no `bExactClass` flag.
+    // `APawn::FindInventoryType(DesiredClass)`: walks `Inventory` -> `Inventory` and returns the
+    // first item of **exactly** `DesiredClass`. XIII's decoded one-argument signature has no
+    // `bExactClass` flag, and every decoded call site relies on exact matching (`XIIIGameInfo`
+    // finds `XIIIThingsToSave`/`XIIILeftHand`, `XIIIItems.Transfer` finds a duplicate of
+    // `self.Class`, `BaseSoldier` finds matching ammo). Treating it as an `IsA` subclass match was
+    // wrong and made `Plage01CahuteKey` (a `XIII.Keys` subclass) swallow the truck key in
+    // `XIIIItems.Transfer`'s duplicate branch, so the plage01 truck door could never be unlocked
+    // (measured: search left the player with no `Keys` and `use Porte1` stayed Locked).
     let desired = match object(vm, a, 0)? {
         Some(ObjRef::Static(g)) => g,
         _ => return val(Value::Object(None)),
@@ -2668,7 +2755,7 @@ fn find_inventory_type(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmRes
         if guard > 65_536 {
             break;
         }
-        if vm.is_child_of_class(vm.objects[id as usize].class, desired) {
+        if vm.objects[id as usize].class == desired {
             return val(Value::Object(Some(ObjRef::Instance(id))));
         }
         cur = prop_object(vm, id, "Inventory");
@@ -3092,6 +3179,81 @@ fn set_max_particles(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResul
     val(Value::Void)
 }
 
+/// item18: `ParticleEmitter.SpawnParticle(int Amount)`. The port has no particle subsystem (the
+/// renderer draws decoded emitters separately), so the spawn is recorded and discarded, like
+/// [`set_max_particles`]. Called by `xidcine.Shells.TriggerParticle` on the m60/kalash fire path;
+/// it must not suspend the weapon, and damage never depends on it.
+fn particle_spawn(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let n = int(vm, a, 0).unwrap_or(0);
+    vm.note(crate::vm::TraceKind::Note(format!(
+        "ParticleEmitter.SpawnParticle({n}): recorded; no particle subsystem"
+    )));
+    val(Value::Void)
+}
+
+/// item18: `Actor.KillAllSounds()` (native 0, name-based). No audio device; accepted and
+/// discarded like [`actor_stop_all_sounds`](crate::canvas). `XIII.XIIIPlayerController
+/// .PlayingVideo.BeginState` calls it before `VideoPlayer.Play`, so without it the level-end
+/// controller suspends and `PlayingVideo.PlayerTick` (the `ServerTravel`) never runs.
+fn kill_all_sounds(_vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Void)
+}
+
+/// item18: `Object.Normalize(Rotator) -> Rotator` (native 198). UE2 `Normalize` wraps each
+/// rotator component into `0..65535`. Reached by the HUD weapon draw
+/// (`XIIIWeapon.RenderOverlays`) while `--play` renders the first-person m60, which otherwise
+/// aborts `PostRender` every frame.
+fn normalize_rot(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let r = rotator2(vm, a, 0)?;
+    val(Value::Rotator([
+        r[0].rem_euclid(65536),
+        r[1].rem_euclid(65536),
+        r[2].rem_euclid(65536),
+    ]))
+}
+
+/// item18 natives: small VM gaps found while driving the Plage01 route (the m60/kalash/m16 fire
+/// path and the level-end `PlayingVideo` state). Kept in one labelled block so parallel registry
+/// edits stay out of the way.
+fn item18_defs() -> Vec<NativeDef> {
+    vec![
+        def(
+            "Object.Percent_FloatFloat",
+            "native(173) final native operator float %(float A, float B)",
+            "core.u Object.Percent_FloatFloat decoded; UE2 appFmod (C fmod); xiii.m60.RumbleFX 0x004E (ReloadCount % 1) on the fire path",
+            percent_ff,
+        ),
+        NativeDef {
+            status: NativeStatus::Partial(
+                "no particle subsystem: the spawn is accepted and recorded but no particle is simulated (presentational)",
+            ),
+            ..def(
+                "ParticleEmitter.SpawnParticle",
+                "native(0) native function SpawnParticle(int Amount)",
+                "engine.u ParticleEmitter.SpawnParticle; xidcine.Shells.TriggerParticle 0x006C on the m60/kalash fire path",
+                particle_spawn,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial(
+                "no audio device: the call is accepted and discarded (the VM has no mixer)",
+            ),
+            ..def(
+                "Actor.KillAllSounds",
+                "native(0) final native static function KillAllSounds()",
+                "engine.u Actor.KillAllSounds; xiii.XIIIPlayerController.PlayingVideo.BeginState 0x0000 before VideoPlayer.Play",
+                kill_all_sounds,
+            )
+        },
+        def(
+            "Object.Normalize",
+            "native(198) final native static function Rotator Normalize(Rotator Rot)",
+            "core.u Object.Normalize decoded; xiii.XIIIWeapon.RenderOverlays (m60 first-person draw) 0x0391",
+            normalize_rot,
+        ),
+    ]
+}
+
 fn init_rnd_cube_spr(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     snow_note(vm, "InitRndCubeSpr", a);
     val(Value::Void)
@@ -3175,16 +3337,6 @@ fn trail_add_section(_: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult
 /// `Trail.Reset` (name-based native, index 0): clear the trail's sections. No trail renderer
 /// exists, so there is nothing to clear; accepted and dropped so the attachment stays active.
 fn trail_reset(_: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
-    val(Value::Void)
-}
-
-/// `ParticleEmitter.SpawnParticle` (name-based native, index 0): emit `Amount` particles from the
-/// emitter's current state. The host renders particles from its own decoded emitter simulation
-/// (`viewer::particles`), not through this script native, so the call is accepted and dropped.
-/// Before item14c it suspended the weapon's `Shells` emitter on the fire path, which then made the
-/// deferred `Shells.TriggerParticle` error suspend `BerettaAttach` and silently stop the game's
-/// muzzle-flash chain.
-fn spawn_particle(_: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
     val(Value::Void)
 }
 
@@ -5007,6 +5159,37 @@ fn builtin_defs() -> Vec<NativeDef> {
             )
         });
     }
+    // Level-travel natives (item15). Kept in one block so parallel registry edits stay out of the
+    // way. `ClientTravel` is the engine entry point reached by `XIIIGameInfo.ProcessServerTravel`;
+    // it never loads a map, only records a host `TravelRequest`.
+    v.push(def(
+        "PlayerController.ClientTravel",
+        "native(0) net reliable native event static function ClientTravel(string URL, byte<ETravelType> TravelType, bool bItems)",
+        "engine.u PlayerController.ClientTravel decoded; xiii.u XIIIGameInfo.ProcessServerTravel 0x008F; records a TravelRequest for the host (the VM loads no map)",
+        client_travel,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no player profile in the headless VM; returns \"\" with a visible note (the standalone travel path does not reach it)",
+        ),
+        ..def(
+            "PlayerController.GetDefaultURL",
+            "native(510) final native static function string GetDefaultURL(string Option)",
+            "engine.u PlayerController.GetDefaultURL decoded (native 510); xiii.u XIIIGameInfo.ProcessServerTravel builds the URL options from it",
+            get_default_url,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no renderer: the first-person pose is the pawn eye position and the controller rotation (enough for the end-game camera hand-off; not a projection match)",
+        ),
+        ..def(
+            "PlayerController.CalcFirstPersonView",
+            "native(497) final native static function CalcFirstPersonView(out struct<Vector> CameraLocation, out struct<Rotator> CameraRotation)",
+            "engine.u PlayerController.CalcFirstPersonView decoded (native 497); reachable from XIIIGameInfo.EndGame -> GameEnded.BeginState -> global.PlayerCalcView on the level-complete path",
+            calc_first_person_view,
+        )
+    });
     // item3p: the missing rotator operators, reached by the campaign survey. `Multiply_RotatorFloat`
     // (287, `xidcine.HelicoDeco.HelicoTick` 0x01F4) and `EqualEqual_RotatorRotator` (142,
     // `xiii.MitraillTop.GoToWaitingPos.Tick` 0x0035) were the two highest-count unimplemented
@@ -5103,40 +5286,28 @@ fn builtin_defs() -> Vec<NativeDef> {
             trail_reset,
         )
     });
-    v.push(NativeDef {
-        status: NativeStatus::Partial(
-            "no VM particle subsystem: the host renders decoded emitters itself; the call is \
-             accepted and dropped",
-        ),
-        ..def(
-            "Engine.ParticleEmitter.SpawnParticle",
-            "native(0) function SpawnParticle(int Amount)",
-            "engine.u ParticleEmitter.SpawnParticle decoded (int, void); xiii.Shells.TriggerParticle \
-             0x006C calls it on the weapon attachment's shell emitter",
-            spawn_particle,
-        )
-    });
-    // item18 B11: the M60's fire path. `xiii.m60.RumbleFX` 0x004E evaluates `ReloadCount % 1`;
-    // the unimplemented `Percent_FloatFloat` raised inside `IncrementFlashCount`, aborting the
-    // fire before `TraceFire` (the soldier took no damage). `appFmod` semantics, never clamped.
-    v.push(def(
-        "Object.Percent_FloatFloat",
-        "native(173) final operator float %(float A, float B)",
-        "core.u Object.Percent_FloatFloat decoded; UE2 appFmod; xiii.m60.RumbleFX 0x004E",
-        percent_ff,
-    ));
     // Canvas draw-recording natives (`crates/xiii-script/src/canvas.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::canvas::canvas_defs());
     // item16 front-end menu natives (VideoPlayer, ClientTravel, menu sounds). Kept in the same
     // `canvas.rs` block so a parallel edit to the registry stays out of the way.
     v.extend(crate::canvas::menu_defs());
+    // item16b GUI-frame natives (`GUIController.GetStyle`/`InitStateFrame`). New block so a
+    // parallel edit to the registry stays out of the way.
+    v.extend(crate::canvas::item16b_defs());
     // Cinematic/dialogue natives (`crates/xiii-script/src/cinematics.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::cinematics::cinematic_defs());
     // Cartoon-panel natives (`crates/xiii-script/src/cartoon.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::cartoon::cartoon_defs());
+    // item18: small VM gaps found on the Plage01 route (float `%`, particle spawn Partial).
+    v.extend(item18_defs());
+    // Intro/checkpoint residual natives (`crates/xiii-script/src/residuals.rs`). Kept in one
+    // block so a parallel edit to the registry stays out of the way.
+    v.extend(crate::residuals::residual_defs());
+    // item20: decoded GUI save-slot APIs. Host directory integration is required to enable them.
+    v.extend(crate::item20::save_defs());
     // Paths are matched without the package ("Class.Function"): strip it.
     for d in &mut v {
         if let Some(rest) = d.path.strip_prefix("Engine.") {
@@ -5144,4 +5315,25 @@ fn builtin_defs() -> Vec<NativeDef> {
         }
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Item15/item16 merge guard: `Registry` is a `BTreeMap`, so a second registration of the same
+    /// `Class.Function` silently replaces the first. This checks the raw `builtin_defs()` list so a
+    /// duplicate (e.g. two `PlayerController.ClientTravel`) fails the build instead of silently
+    /// dropping one implementation.
+    #[test]
+    fn no_native_is_registered_twice() {
+        let mut seen: std::collections::BTreeMap<String, &'static str> =
+            std::collections::BTreeMap::new();
+        for d in builtin_defs() {
+            let key = d.path.to_ascii_lowercase();
+            if let Some(prev) = seen.insert(key, d.path) {
+                panic!("native {prev} is registered twice");
+            }
+        }
+    }
 }

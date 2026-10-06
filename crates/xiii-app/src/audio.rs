@@ -31,6 +31,7 @@
 //! are expired and counted so an unattended run continues.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -370,8 +371,10 @@ fn reason_label(s: &str) -> &'static str {
 /// Resource owning the resolver library and the stats.
 #[derive(Resource)]
 pub struct AudioRes {
-    /// Resolver library (empty when `--audio off`).
-    pub library: SoundLibrary,
+    /// Resolver library (empty when `--audio off`). Shared behind a mutex so the VM's
+    /// `VoiceDuration` provider (installed from this same library) can resolve/decode voice
+    /// lengths without a second HX scan.
+    pub library: Arc<Mutex<SoundLibrary>>,
     /// Playback statistics.
     pub stats: AudioStats,
 }
@@ -659,7 +662,7 @@ fn setup_audio(mut commands: Commands, cfg: Res<AudioConfig>) {
     };
     if !enabled {
         commands.insert_resource(AudioRes {
-            library: SoundLibrary::empty(),
+            library: Arc::new(Mutex::new(SoundLibrary::empty())),
             stats,
         });
         println!("[audio] disabled (--audio off): VM sound events are counted, not played");
@@ -667,15 +670,15 @@ fn setup_audio(mut commands: Commands, cfg: Res<AudioConfig>) {
     }
     let Some(dir) = cfg.options.game_dir.clone() else {
         commands.insert_resource(AudioRes {
-            library: SoundLibrary::empty(),
+            library: Arc::new(Mutex::new(SoundLibrary::empty())),
             stats,
         });
         println!("[audio] no --game-dir; sound playback disabled");
         return;
     };
     let started = Instant::now();
-    let library = SoundLibrary::scan(&dir);
-    let s = library.stats();
+    let library = Arc::new(Mutex::new(SoundLibrary::scan(&dir)));
+    let s = library.lock().map(|l| l.stats()).unwrap_or_default();
     let mut stats = stats;
     stats.banks_seen = s.banks_seen;
     stats.banks_parsed = s.banks_parsed;
@@ -831,23 +834,27 @@ fn start_level_audio(
             );
             continue;
         };
-        let Some(r) = audio.library.resolve_path(sound) else {
-            audio.stats.record(
-                0.0,
-                format!("ambient {}", amb.actor),
-                Outcome::Failure("no_name_match"),
-            );
-            continue;
-        };
-        let stream = match audio.library.open_stream(&r.entry) {
-            Ok(s) => s,
-            Err(e) => {
+        let stream = {
+            let library = audio.library.clone();
+            let library = library.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(r) = library.resolve_path(sound) else {
                 audio.stats.record(
                     0.0,
                     format!("ambient {}", amb.actor),
-                    Outcome::Failure(reason_label(e.as_str())),
+                    Outcome::Failure("no_name_match"),
                 );
                 continue;
+            };
+            match library.open_stream(&r.entry) {
+                Ok(s) => s,
+                Err(e) => {
+                    audio.stats.record(
+                        0.0,
+                        format!("ambient {}", amb.actor),
+                        Outcome::Failure(reason_label(e.as_str())),
+                    );
+                    continue;
+                }
             }
         };
         let channels = stream.channels();
@@ -907,23 +914,27 @@ fn start_level_music(
     streams: &mut Assets<StreamAudio>,
     cue: &MusicCue,
 ) {
-    let Some(r) = audio.library.resolve_path(&cue.sound) else {
-        audio.stats.record(
-            0.0,
-            format!("music {}", cue.sound),
-            Outcome::Failure("no_name_match"),
-        );
-        return;
-    };
-    let stream = match audio.library.open_stream(&r.entry) {
-        Ok(s) => s,
-        Err(e) => {
+    let stream = {
+        let library = audio.library.clone();
+        let library = library.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(r) = library.resolve_path(&cue.sound) else {
             audio.stats.record(
                 0.0,
                 format!("music {}", cue.sound),
-                Outcome::Failure(reason_label(e.as_str())),
+                Outcome::Failure("no_name_match"),
             );
             return;
+        };
+        match library.open_stream(&r.entry) {
+            Ok(s) => s,
+            Err(e) => {
+                audio.stats.record(
+                    0.0,
+                    format!("music {}", cue.sound),
+                    Outcome::Failure(reason_label(e.as_str())),
+                );
+                return;
+            }
         }
     };
     let channels = stream.channels();
@@ -963,10 +974,12 @@ fn source_for(
     let Some(path) = &req.sound else {
         return Err(ResolveFailure::NoSoundName);
     };
-    let Some(r) = audio.library.resolve_path(path) else {
+    let library = audio.library.clone();
+    let mut library = library.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(r) = library.resolve_path(path) else {
         return Err(ResolveFailure::NoNameMatch);
     };
-    let pcm = audio.library.load(&r.entry)?;
+    let pcm = library.load(&r.entry)?;
     let file = r
         .entry
         .bank

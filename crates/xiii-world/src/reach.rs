@@ -2,10 +2,10 @@
 //!
 //! Every `ReachSpec` edge of a map (decoded by [`crate::navigation`]) that requires walking and
 //! is wide/tall enough for the player class is walked with the UE2-style
-//! [`xiii_collision::walk_move`] (step-up at `MAXSTEPHEIGHT` 35 UU, floor-follow at `MINFLOORZ`
-//! 0.7). The player extent box is placed at the start node with the same `FindSpot`-style
-//! raise-and-drop used by the app's `--collision-test`, then the heading is re-aimed at the end
-//! node every step.
+//! [`xiii_collision::walk_move`] (walkable contact normal, step-up at `MAXSTEPHEIGHT` 35 UU,
+//! floor-follow at `MINFLOORZ` 0.7). The player extent box is placed at the start node with the
+//! ported `ULevel::FindSpot` ([`xiii_collision::find_spot`]), then the heading is re-aimed at the
+//! end node every step.
 //!
 //! This module is Bevy-free: it was moved out of `xiii-app/src/reach.rs` so the headless
 //! `xiii-tool` campaign sweep can call it. The app keeps the same `--reach-test` output by
@@ -51,6 +51,12 @@ pub const STEP_UU: f32 = 2.5;
 /// Spawn raise increment in Unreal units.
 const RAISE_INC_UU: f32 = 1.0;
 
+/// Failure group for an edge whose final blocker is a `Mover` (`Porte`/`XIIIMover`/...) at its
+/// authoring pose. The engine moves the brush before traversing; the static reach harness cannot,
+/// so this is a test-scope artefact, not a port bug. See [`mover_collision_sources`].
+pub const MOVER_BLOCKED_CAUSE: &str =
+    "mover/door closed (UE2 Mover at authoring pose; static reach harness cannot open it)";
+
 /// One failed edge with the numbers needed to explain it.
 #[derive(Debug, Clone)]
 pub struct Failure {
@@ -86,10 +92,15 @@ pub struct Failure {
     pub blocking_source: Option<String>,
     /// Last contact normal (Bevy space).
     pub contact_normal: Option<[f32; 3]>,
+    /// Vertices of the blocking triangle (Bevy space, metres), when a contact was recorded.
+    pub contact_triangle: Option<[[f32; 3]; 3]>,
     /// Last contact triangle centroid height above the box bottom (Unreal units).
     pub contact_height_above_bottom_uu: Option<f32>,
     /// Floor distance below the box centre at the stop (Unreal units).
     pub floor_below_center_uu: Option<f32>,
+    /// Up component of the nearest downward hit's normal at the stop (the floor probe's
+    /// walkability): `>= MINFLOORZ` means walkable.
+    pub floor_normal_y: Option<f32>,
     /// Ceiling distance above the box centre at the stop (Unreal units).
     pub ceiling_above_center_uu: Option<f32>,
     /// Extra note (e.g. the spawn-placement error).
@@ -135,6 +146,13 @@ pub struct ReachReport {
     pub collision_tris: usize,
     /// Edges whose start placement failed.
     pub spawn_failures: usize,
+    /// Failed edges whose last blocking triangle belongs to a UE2 `Mover` subclass (a door,
+    /// lift, table, ...). Movers change collision pose at runtime; the static harness imports
+    /// them at their authoring pose, so these edges are not walk-testable here (item1l).
+    pub mover_blocked: usize,
+    /// Walking edges excluded from `eligible` because they need a movement the harness does not
+    /// model (`R_JUMP`/`R_LADDER`/... or a `Ladder` endpoint). See [`is_pure_walk`].
+    pub movement_flagged: usize,
     /// Import + navigation decode time (seconds), as the app's header line reports it.
     pub import_secs: f32,
 }
@@ -238,6 +256,33 @@ fn walk_edge(
     }
 }
 
+/// Movement bits other than `R_WALK`: an edge that sets any of these requires flying, swimming,
+/// jumping, a door, special movement or a ladder. The walk harness models none of them, so such
+/// an edge is outside the walk test's scope (UE2 `EReachSpecFlags`, `UnPath.h`; item1l).
+pub const NON_WALK_MOVEMENT: u32 = reach_flags::FLY
+    | reach_flags::SWIM
+    | reach_flags::JUMP
+    | reach_flags::DOOR
+    | reach_flags::SPECIAL
+    | reach_flags::LADDER;
+
+/// True when an edge is a plain walk: `R_WALK` set and no other movement bit. `R_FORCED`,
+/// `R_PROSCRIBED` and `R_PLAYERONLY` are not movement requirements and do not disqualify it.
+pub fn is_pure_walk(flags: u32) -> bool {
+    flags & reach_flags::WALK != 0 && flags & NON_WALK_MOVEMENT == 0
+}
+
+/// True when a navigation-point class is a ladder (`Engine.Ladder` and subclasses). XIII does not
+/// set `R_LADDER` on its ladder edges (measured: the `USA01` `Engine.Ladder` edge has
+/// `reachFlags` 0x590001), so the class is the reliable signal.
+pub fn node_is_ladder(class: &str) -> bool {
+    class
+        .rsplit('.')
+        .next()
+        .unwrap_or(class)
+        .eq_ignore_ascii_case("ladder")
+}
+
 /// Heuristic cause for a failed stop, from the last contact normal and the clearance.
 fn classify(world: &CollisionWorld, walk: &EdgeWalk, box_height: f32) -> String {
     if walk.falling {
@@ -266,6 +311,21 @@ fn classify(world: &CollisionWorld, walk: &EdgeWalk, box_height: f32) -> String 
         };
     }
     "steep surface".to_owned()
+}
+
+/// Cause for a walk that did not reach: the mover/harness artefact when the final contact is on
+/// a moved brush, otherwise the geometric heuristic. Returns `(cause, on_mover)`.
+fn failure_cause(
+    world: &CollisionWorld,
+    walk: &EdgeWalk,
+    box_height: f32,
+    mover_sources: &[bool],
+) -> (String, bool) {
+    if stopped_on_mover(&walk.contacts, mover_sources) {
+        (MOVER_BLOCKED_CAUSE.to_owned(), true)
+    } else {
+        (classify(world, walk, box_height), false)
+    }
 }
 
 /// Imports a map, decodes its navigation and walks every eligible walking edge. Prints the
@@ -329,6 +389,9 @@ pub fn analyze_with(
 
     // `--reach-test` models the pawn's swept movement (extent queries), so it uses the box soup.
     let world = CollisionWorld::new(scene.box_collision());
+    // Which collision sources belong to movable brushes (`Mover` actors): a walk stopped only by
+    // one of those is not testable against static geometry (item1l).
+    let mover_sources = mover_collision_sources(game_dir, map, &scene.collision_sources)?;
 
     let params = WalkParams {
         skin: SKIN_UU / UNREAL_UNITS_PER_METER,
@@ -358,6 +421,8 @@ pub fn analyze_with(
         player_height,
         collision_tris: world.triangle_count(),
         spawn_failures: 0,
+        mover_blocked: 0,
+        movement_flagged: 0,
         import_secs,
     };
 
@@ -366,6 +431,14 @@ pub fn analyze_with(
             continue;
         }
         report.walking_edges += 1;
+        // `R_JUMP`/`R_LADDER`/... edges are only traversable with that movement; the walk harness
+        // has no jump/climb, so they are outside its scope (item1l). Ladder edges are also
+        // rejected by their endpoint class because XIII does not set `R_LADDER` on `Engine.Ladder`
+        // edges (measured: the one `Ladder` edge has `reachFlags` 0x590001).
+        if !is_pure_walk(edge.reach_flags) {
+            report.movement_flagged += 1;
+            continue;
+        }
         if f32::from(edge.collision_radius) < player_radius
             || f32::from(edge.collision_height) < player_height
         {
@@ -375,11 +448,15 @@ pub fn analyze_with(
             report.unresolved_end += 1;
             continue;
         };
-        report.eligible += 1;
-
         let start_idx = edge.start_point.unwrap_or(edge.owner);
         let start_pt = &nav.points[start_idx];
         let end_pt = &nav.points[end_idx];
+        if node_is_ladder(&start_pt.class) || node_is_ladder(&end_pt.class) {
+            report.movement_flagged += 1;
+            continue;
+        }
+        report.eligible += 1;
+
         let start = to_bevy_position(start_pt.location);
         let end = to_bevy_position(end_pt.location);
 
@@ -433,9 +510,11 @@ pub fn analyze_with(
                     blocked: false,
                     blocking_source: None,
                     contact_normal: None,
+                    contact_triangle: None,
                     contact_height_above_bottom_uu: None,
                     floor_below_center_uu: floor_below(&world, start)
                         .map(|(d, _)| d * UNREAL_UNITS_PER_METER),
+                    floor_normal_y: floor_below(&world, start).map(|(_, n)| n),
                     ceiling_above_center_uu: ceiling_above(&world, start)
                         .map(|(d, _)| d * UNREAL_UNITS_PER_METER),
                     note: Some(e),
@@ -459,7 +538,14 @@ pub fn analyze_with(
             continue;
         }
 
-        let cause = classify(&world, &walk, 2.0 * half[1]);
+        // A walk stopped by a `Mover` (door/lift/table/...) is a static-harness artefact, not a
+        // port bug: UE2 moves the brush (`PHYS_MovingBrush`) and the navigation network is
+        // traversed with the mover at its moved pose. Only the final blocker is inspected: if the
+        // walk had failed on static geometry first, that would be the last contact.
+        let (cause, on_mover) = failure_cause(&world, &walk, 2.0 * half[1], &mover_sources);
+        if on_mover {
+            report.mover_blocked += 1;
+        }
         *report.groups.entry(cause.clone()).or_default() += 1;
         let remaining_uu = dist_xz(walk.position, end) * UNREAL_UNITS_PER_METER;
         let blocking_source = walk
@@ -467,6 +553,7 @@ pub fn analyze_with(
             .last()
             .map(|c| scene.collision_sources[c.source as usize].clone());
         let contact_normal = walk.contacts.last().map(|c| c.normal);
+        let contact_triangle = walk.contacts.last().map(|c| *world.triangle(c.triangle));
         let contact_height_above_bottom_uu = walk.contacts.last().map(|c| {
             let tri = world.triangle(c.triangle);
             let centroid_y = (tri[0][1] + tri[1][1] + tri[2][1]) / 3.0;
@@ -474,6 +561,7 @@ pub fn analyze_with(
         });
         let floor_below_center_uu =
             floor_below(&world, walk.position).map(|(d, _)| d * UNREAL_UNITS_PER_METER);
+        let floor_normal_y = floor_below(&world, walk.position).map(|(_, n)| n);
         let ceiling_above_center_uu =
             ceiling_above(&world, walk.position).map(|(d, _)| d * UNREAL_UNITS_PER_METER);
         report.failures.push(Failure {
@@ -497,8 +585,10 @@ pub fn analyze_with(
             blocked: walk.blocked,
             blocking_source,
             contact_normal,
+            contact_triangle,
             contact_height_above_bottom_uu,
             floor_below_center_uu,
+            floor_normal_y,
             ceiling_above_center_uu,
             note: None,
         });
@@ -565,6 +655,61 @@ pub fn nav_diagnostics(nav: &Navigation) -> Vec<String> {
     out
 }
 
+/// One `bool` per collision source (index into `scene.collision_sources`): true when the source
+/// belongs to an actor whose class chain contains `Mover` (`Porte`/`XIIIPorte`, `XIIIMover`,
+/// `XIIIMovable`/`Movable`, `BreakableMover`, `LiftDoor`, ...). Evidence: the decoded script
+/// classes (`XIIIPorte super XIIIMover`, `XIIIMover super Mover`, `BreakableMover super
+/// XIIIMover`, ...; `xiii-tool script classes`) and `Engine.Mover`'s `PHYS_MovingBrush` physics.
+///
+/// Collision sources are `"{actor object path} -> {mesh label}"` (static-mesh actors), so the
+/// actor path prefix is matched against the map's `Mover`-subclass exports. Classes whose chain
+/// cannot be resolved (native-only classes) are skipped, not treated as movers.
+fn mover_collision_sources(
+    game_dir: &Path,
+    map: &str,
+    sources: &[String],
+) -> Result<Vec<bool>, String> {
+    let mut cache = PackageCache::open(game_dir)?;
+    let map_pkg = cache.map(map)?;
+    let mut defaults = ClassDefaults::open(game_dir)?;
+    let p = &map_pkg.package;
+    let mut movers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for i in 0..p.exports().len() {
+        let Some(class) = p.export_class_path(i) else {
+            continue;
+        };
+        let Ok(chain) = defaults.class_chain(class) else {
+            continue;
+        };
+        if chain.iter().any(|c| c == "mover")
+            && let Some(path) = p.object_path(xiii_package::ObjectRef::Export(i as u32))
+        {
+            movers.insert(path.to_owned());
+        }
+    }
+    Ok(sources
+        .iter()
+        .map(|s| collision_source_actor(s).is_some_and(|actor| movers.contains(actor)))
+        .collect())
+}
+
+/// Actor path of a static-mesh collision source (`"{actor} -> {mesh label}"`); `None` for BSP
+/// (`"ModelN (BSP)"`) and terrain (`"TerrainInfoN (terrain)"`) sources.
+fn collision_source_actor(source: &str) -> Option<&str> {
+    source.split_once(" -> ").map(|(actor, _)| actor)
+}
+
+/// True when the walk's **final** contact is on a mover collision source. Only the last contact
+/// matters: if the walk had first failed on static geometry, that would be the recorded stop.
+fn stopped_on_mover(contacts: &[MoveContact], mover_sources: &[bool]) -> bool {
+    contacts.last().is_some_and(|c| {
+        mover_sources
+            .get(c.source as usize)
+            .copied()
+            .unwrap_or(false)
+    })
+}
+
 // -------------------------------------------------------------------------------------------
 // Player class resolution and spawn placement (moved from `xiii-app/src/collision.rs` so the
 // Bevy-free tool can run the same walk). Behaviour is unchanged.
@@ -581,57 +726,33 @@ pub struct Spawn {
     pub raise: f32,
 }
 
-fn add(a: Vec3, b: Vec3) -> Vec3 {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-fn sub(a: Vec3, b: Vec3) -> Vec3 {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
-/// Places the player extent box at the PlayerStart, approximating UE2 spawn `FindSpot`:
-/// start with the box bottom at the PlayerStart; if it overlaps anything, raise it in small
-/// increments until free (cap `2*H`); then sweep straight down onto the floor.
+/// Places the player extent box at the navigation node with the ported **`ULevel::FindSpot`**
+/// (`xiii_collision::find_spot`, `Engine.dll` `0x1038a080`; item1k). If the box overlaps at the
+/// node it searches the engine's four corner offsets `(±0.5*Extent.X, ±0.5*Extent.Y)`,
+/// extrapolates a single free candidate, and then settles onto a walkable floor. The previous
+/// vertical raise (1 UU increments, cap `2*H`) is retained as the explicit embedded-box fallback
+/// when the corner search finds nothing.
+///
+/// `player_start` is the desired box **bottom** (the reach caller places the node there); the
+/// engine's `Location` is the box centre, so half the height is added.
 pub fn place_spawn(
     world: &CollisionWorld,
     player_start: Vec3,
     half: Vec3,
 ) -> Result<Spawn, String> {
-    // Start with the box bottom at the PlayerStart (UE2 spawns the pawn with its feet there).
-    let base_center = [player_start[0], player_start[1] + half[1], player_start[2]];
-    let cap = 2.0 * half[1];
-    let inc = RAISE_INC_UU / UNREAL_UNITS_PER_METER;
-    let mut y = base_center[1];
-    let mut raise = 0.0f32;
-    loop {
-        let center = [base_center[0], y, base_center[2]];
-        if world.overlap_aabb(center, half).is_empty() {
-            break;
-        }
-        if raise >= cap {
-            return Err(format!(
-                "spawn box still overlaps after raising {raise:.3} m (cap {cap:.3} m); no free spot at the PlayerStart"
-            ));
-        }
-        y += inc;
-        raise += inc;
-    }
-    let center = [base_center[0], y, base_center[2]];
-    // Sweep straight down from the free position onto the floor.
-    let target = [player_start[0], player_start[1] - 3.0, player_start[2]];
-    let hit = world
-        .sweep(center, target, half)
-        .ok_or_else(|| "no floor was found below the PlayerStart".to_string())?;
-    if hit.normal[1] <= 0.5 {
-        return Err(format!(
-            "drop to floor hit a non-floor surface (normal {:?})",
-            hit.normal
-        ));
-    }
-    let landed = add(center, scale(sub(target, center), hit.t));
+    let desired_center = [player_start[0], player_start[1] + half[1], player_start[2]];
+    let params = xiii_collision::FindSpotParams {
+        min_floor_z: MINFLOORZ,
+        drop: 3.0,
+        raise_step: RAISE_INC_UU / UNREAL_UNITS_PER_METER,
+        max_raise: 2.0 * half[1],
+    };
+    let spot = xiii_collision::find_spot(world, desired_center, half, &params)
+        .map_err(|e| e.to_string())?;
     Ok(Spawn {
-        position: landed,
-        floor: landed[1] - half[1],
-        raise,
+        position: spot.position,
+        floor: spot.floor,
+        raise: spot.position[1] - desired_center[1],
     })
 }
 
@@ -982,17 +1103,18 @@ mod tests {
 
     /// Regression guard: measured pass counts on the opening maps. `UseSimpleBoxCollision`
     /// defaults to true, so `bankesca2`'s staircase is in the box soup. A drop below either
-    /// measured value is a regression.
+    /// measured value is a regression. `mover-blocked` is the item1l count of edges whose only
+    /// blocker is a `Mover` subclass (door/lift); it is a classification guard, not a target.
     #[test]
     fn opt_in_reach_regression_plage00_plage01_banque01() {
         let Some(path) = opt_in_game_dir() else {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
         };
-        for (map, min_pass, want_missing_floor) in [
-            ("Plage00", 12usize, 0usize),
-            ("Plage01", 294usize, 0usize),
-            ("Banque01", 631usize, 0usize),
+        for (map, min_pass, want_missing_floor, want_mover, want_movement) in [
+            ("Plage00", 12usize, 0usize, 0usize, 0usize),
+            ("Plage01", 294usize, 0usize, 5usize, 0usize),
+            ("Banque01", 631usize, 0usize, 20usize, 0usize),
         ] {
             let report = analyze(map, &path).expect("reach analyze");
             let missing_floor: usize = report
@@ -1002,8 +1124,8 @@ mod tests {
                 .map(|(_, n)| *n)
                 .sum();
             println!(
-                "[reach-test regression] {map}: eligible {} passes {} (>= {min_pass}), missing-floor {missing_floor} (== {want_missing_floor})",
-                report.eligible, report.passes
+                "[reach-test regression] {map}: eligible {} passes {} (>= {min_pass}), missing-floor {missing_floor} (== {want_missing_floor}), mover-blocked {} (== {want_mover}), movement-flagged {} (== {want_movement})",
+                report.eligible, report.passes, report.mover_blocked, report.movement_flagged
             );
             assert!(
                 report.passes >= min_pass,
@@ -1015,6 +1137,16 @@ mod tests {
                 "{map}: missing-floor start nodes changed: {:?}",
                 report.groups
             );
+            assert_eq!(
+                report.mover_blocked, want_mover,
+                "{map}: mover/door-blocked count changed: {:?}",
+                report.groups
+            );
+            assert_eq!(
+                report.movement_flagged, want_movement,
+                "{map}: movement-flagged edge count changed: {}",
+                report.movement_flagged
+            );
         }
     }
 
@@ -1024,22 +1156,25 @@ mod tests {
     /// (`ATerrainInfo::LineCheck`/`Render` index it; `Engine.dll` 0x10409eb0/0x1040c0c0), so the
     /// importer now imports only region 0. Importing the trailing vertices as detail geometry
     /// had regressed Hual01b 729 -> 668 (item1h); with the base-only import Hual01b is 726.
-    /// A drop below the measured values, or any missing-floor start node, is a regression.
-    /// Values measured 2026-10-05 on the GOG corpus (item1i).
+    /// A drop below the measured pass count, or an increase in missing-floor start nodes above
+    /// the measured value, is a regression. Values measured 2026-10-05 on the GOG corpus after
+    /// item1k ported `ULevel::FindSpot` (reach 22353 -> 22504, walkable-ledge 136 -> 35). The
+    /// remaining missing-floor nodes are terrain slopes below `MINFLOORZ` 0.7 under the chosen
+    /// spot; item1k's report lists them. The values are measured, not targets. item1l excludes
+    /// `R_JUMP`/`Ladder` edges from `eligible` (Hual01b: 8 edges, 7 of them previously passing),
+    /// so Hual01b's measured values changed 816/760 -> 808/753; the other three maps are
+    /// unchanged.
     #[test]
     fn opt_in_reach_regression_multi_region_terrains() {
         let Some(path) = opt_in_game_dir() else {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
         };
-        // Pass counts measured 2026-10-05 after item1j raised the walk sub-step bound to the
-        // engine's measured `physWalking` limit of 8 (`Engine.dll` 0x103bde14): Hual04c,
-        // Kello01a and PRock04a each gained one edge (433/1445/694); Hual01b is unchanged.
-        for (map, min_pass, eligible) in [
-            ("Hual01b", 726usize, 816usize),
-            ("Hual04c", 433usize, 437usize),
-            ("Kello01a", 1445usize, 1488usize),
-            ("PRock04a", 694usize, 721usize),
+        for (map, min_pass, eligible, max_missing_floor, want_mover, want_movement) in [
+            ("Hual01b", 753usize, 808usize, 3usize, 2usize, 8usize),
+            ("Hual04c", 435usize, 437usize, 0usize, 0usize, 0usize),
+            ("Kello01a", 1459usize, 1488usize, 15usize, 0usize, 0usize),
+            ("PRock04a", 702usize, 721usize, 16usize, 0usize, 0usize),
         ] {
             let report = analyze(map, &path).expect("reach analyze");
             let missing_floor: usize = report
@@ -1049,8 +1184,8 @@ mod tests {
                 .map(|(_, n)| *n)
                 .sum();
             println!(
-                "[reach-test regression] {map}: eligible {} passes {} (>= {min_pass}), missing-floor {missing_floor}",
-                report.eligible, report.passes
+                "[reach-test regression] {map}: eligible {} passes {} (>= {min_pass}), missing-floor {missing_floor} (<= {max_missing_floor}), mover-blocked {} (== {want_mover}), movement-flagged {} (== {want_movement})",
+                report.eligible, report.passes, report.mover_blocked, report.movement_flagged
             );
             assert_eq!(
                 report.eligible, eligible,
@@ -1061,11 +1196,183 @@ mod tests {
                 "{map}: pass count {} below measured {min_pass}",
                 report.passes
             );
-            assert_eq!(
-                missing_floor, 0,
-                "{map}: terrain decoded but missing-floor start nodes appeared: {:?}",
+            assert!(
+                missing_floor <= max_missing_floor,
+                "{map}: missing-floor start nodes increased above the measured {max_missing_floor}: {:?}",
                 report.groups
             );
+            assert_eq!(
+                report.mover_blocked, want_mover,
+                "{map}: mover/door-blocked count changed: {:?}",
+                report.groups
+            );
+            assert_eq!(
+                report.movement_flagged, want_movement,
+                "{map}: movement-flagged edge count changed: {}",
+                report.movement_flagged
+            );
         }
+    }
+
+    /// Diagnostic dump for the item1l residual analysis: prints every reach failure of the maps
+    /// named in `XIII_DUMP_MAPS` (comma-separated) with the blocking primitive, surface normal,
+    /// triangle vertices and collision source. Opt-in: prints `SKIPPED` without the env var.
+    /// Never runs in the default suite, so it does not read game data unless asked.
+    #[test]
+    fn opt_in_dump_reach_failures() {
+        let Some(path) = opt_in_game_dir() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let Some(maps) = std::env::var_os("XIII_DUMP_MAPS") else {
+            println!("SKIPPED: set XIII_DUMP_MAPS=a,b,.. to dump reach failures");
+            return;
+        };
+        let maps = maps.to_string_lossy().into_owned();
+        for map in maps.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let report = analyze_with(map, &path, None, None).expect("reach analyze");
+            println!(
+                "DUMP {map}: eligible {} passes {} mover_blocked {} movement_flagged {} groups {:?}",
+                report.eligible,
+                report.passes,
+                report.mover_blocked,
+                report.movement_flagged,
+                report.groups
+            );
+            for f in &report.failures {
+                let names = reach_flags::names(f.flags).join("|");
+                let tri = f.contact_triangle.map_or_else(
+                    || "-".to_owned(),
+                    |t| {
+                        t.iter()
+                            .map(|v| {
+                                format!(
+                                    "({:.1},{:.1},{:.1})",
+                                    v[0] * UNREAL_UNITS_PER_METER,
+                                    v[1] * UNREAL_UNITS_PER_METER,
+                                    v[2] * UNREAL_UNITS_PER_METER
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    },
+                );
+                let n = f.contact_normal.map_or_else(
+                    || "-".to_owned(),
+                    |n| format!("({:.3},{:.3},{:.3})", n[0], n[1], n[2]),
+                );
+                println!(
+                    "  [{}] {} -> {} flags=0x{:x}({}) specR/H={}/{} d={} stop=({:.1},{:.1},{:.1}) rem={:.1} steps={}/{} fall={} block={} src={} n={} tri={} ch={:?} floor={:?} fn={:?} ceil={:?} note={:?}",
+                    f.cause,
+                    f.start,
+                    f.end,
+                    f.flags,
+                    names,
+                    f.spec_radius,
+                    f.spec_height,
+                    f.distance_uu,
+                    f.stop_uu[0],
+                    f.stop_uu[1],
+                    f.stop_uu[2],
+                    f.remaining_uu,
+                    f.steps,
+                    f.budget,
+                    f.falling,
+                    f.blocked,
+                    f.blocking_source.as_deref().unwrap_or("-"),
+                    n,
+                    tri,
+                    f.contact_height_above_bottom_uu,
+                    f.floor_below_center_uu,
+                    f.floor_normal_y,
+                    f.ceiling_above_center_uu,
+                    f.note.as_deref().unwrap_or("-"),
+                );
+            }
+        }
+    }
+
+    /// `collision_source_actor` extracts the actor path from a static-mesh collision source and
+    /// rejects BSP/terrain sources (which have no `" -> "`).
+    #[test]
+    fn collision_source_actor_shape() {
+        assert_eq!(
+            collision_source_actor("Porte6 -> StaticPlage2.Pl_porte01T"),
+            Some("Porte6")
+        );
+        assert_eq!(
+            collision_source_actor("StaticMeshActor1 -> Staticbanque.hall"),
+            Some("StaticMeshActor1")
+        );
+        assert_eq!(collision_source_actor("Model69 (BSP)"), None);
+        assert_eq!(collision_source_actor("TerrainInfo0 (terrain)"), None);
+    }
+
+    /// `R_WALK` alone is a pure walk; any other movement bit (`R_JUMP`, `R_LADDER`, ...) makes the
+    /// edge untestable by the harness. The unknown high bits XIII stores on its `Ladder` edge
+    /// (0x590001) do **not** set a movement bit, so the ladder class check is the signal for it.
+    #[test]
+    fn pure_walk_requires_no_other_movement() {
+        assert!(is_pure_walk(reach_flags::WALK));
+        assert!(is_pure_walk(
+            reach_flags::WALK | reach_flags::FORCED | reach_flags::PROSCRIBED
+        ));
+        assert!(!is_pure_walk(reach_flags::JUMP));
+        assert!(!is_pure_walk(reach_flags::WALK | reach_flags::JUMP));
+        assert!(!is_pure_walk(reach_flags::WALK | reach_flags::LADDER));
+        assert!(!is_pure_walk(reach_flags::WALK | reach_flags::DOOR));
+        assert!(!is_pure_walk(reach_flags::WALK | reach_flags::SWIM));
+        assert!(is_pure_walk(0x590001), "high unknown bits are not movement");
+        assert!(node_is_ladder("Engine.Ladder"));
+        assert!(node_is_ladder("XIDPawn.ladder"));
+        assert!(!node_is_ladder("Engine.PathNode"));
+        assert!(!node_is_ladder("XIDPawn.doorpoint"));
+    }
+
+    /// A walk whose final contact is on a `Mover` source is classified as the mover/harness
+    /// artefact (and counted), never as the geometric cause it would otherwise get: a moved
+    /// brush is not a static wall.
+    #[test]
+    fn stopped_on_mover_selects_the_mover_cause() {
+        let contact = |source: u32| MoveContact {
+            source,
+            triangle: 0,
+            t: 0.5,
+            normal: [1.0, 0.0, 0.0],
+            height: 0.0,
+            position: [0.0, 0.0, 0.0],
+        };
+        // A vertical wall (x-facing) that the geometric classifier would call "vertical wall".
+        let world = wall_world();
+        let edge = |contacts: Vec<MoveContact>| EdgeWalk {
+            position: [0.0, 1.0, 0.0],
+            steps: 5,
+            falling: false,
+            blocked: true,
+            contacts,
+            reached: false,
+        };
+        let (cause, on_mover) =
+            failure_cause(&world, &edge(vec![contact(1)]), 2.0, &[false, false]);
+        assert!(!on_mover, "a static contact must not be a mover case");
+        assert_eq!(cause, "vertical wall");
+        let (cause, on_mover) = failure_cause(&world, &edge(vec![contact(1)]), 2.0, &[false, true]);
+        assert!(
+            on_mover,
+            "a final contact on source 1 (a mover) is the mover case"
+        );
+        assert_eq!(cause, MOVER_BLOCKED_CAUSE);
+        // A static final contact stays a wall even when an earlier contact touched a mover.
+        let (cause, on_mover) = failure_cause(
+            &world,
+            &edge(vec![contact(1), contact(0)]),
+            2.0,
+            &[false, true],
+        );
+        assert!(!on_mover, "only the final contact decides");
+        assert_eq!(cause, "vertical wall");
+        // An out-of-range source cannot be a mover; no contact means no mover attribution.
+        assert!(!stopped_on_mover(&[contact(9)], &[false, true]));
+        assert!(!stopped_on_mover(&[], &[false, true]));
     }
 }

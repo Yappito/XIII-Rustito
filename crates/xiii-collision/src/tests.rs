@@ -307,6 +307,7 @@ fn start_overlap_is_reported_not_panicking() {
     // Box already spans the wall plane.
     let params = SweepParams {
         skip_start_penetration: false,
+        ..SweepParams::default()
     };
     let hit = sweep_aabb(
         &w,
@@ -340,6 +341,7 @@ fn zero_length_sweep_is_handled() {
     );
     let params = SweepParams {
         skip_start_penetration: false,
+        ..SweepParams::default()
     };
     let hit = sweep_aabb(
         &w,
@@ -986,6 +988,118 @@ fn downward_ray_onto_floor_hits() {
 
 /// Identity rotation rows.
 const ID: [Vec3; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+// ---- ULevel::FindSpot port (item1k) --------------------------------------------------------
+
+fn spot_params() -> FindSpotParams {
+    FindSpotParams {
+        min_floor_z: 0.7,
+        drop: 3.0,
+        raise_step: 0.0,
+        max_raise: 0.0,
+    }
+}
+
+#[test]
+fn find_spot_free_center_settles_on_floor() {
+    let w = world(floor_y(0.0).into_iter().map(|t| (t, 1)));
+    let spot = find_spot(&w, [0.0, 1.0, 0.0], [0.4, 0.4, 0.4], &spot_params())
+        .expect("free centre must place");
+    assert!(spot.free_corners.is_none(), "no search when already free");
+    assert!(
+        (spot.position[1] - 0.4).abs() < 1e-3,
+        "settled onto the floor: {:?}",
+        spot.position
+    );
+    assert!((spot.floor - 0.0).abs() < 1e-3);
+    assert!(spot.offset[0].abs() < 1e-4 && spot.offset[2].abs() < 1e-4);
+}
+
+#[test]
+fn find_spot_zero_extent_is_rejected() {
+    let w = world(floor_y(0.0).into_iter().map(|t| (t, 1)));
+    assert_eq!(
+        find_spot(&w, [0.0, 1.0, 0.0], [0.0, 0.4, 0.4], &spot_params()),
+        Err(FindSpotError::ZeroExtent)
+    );
+}
+
+#[test]
+fn find_spot_without_floor_is_no_floor() {
+    let w = world(std::iter::empty());
+    assert_eq!(
+        find_spot(&w, [0.0, 1.0, 0.0], [0.4, 0.4, 0.4], &spot_params()),
+        Err(FindSpotError::NoFloor)
+    );
+}
+
+/// Builds a 0.4 m overhang slab at `y` spanning the search area: every position at that height
+/// overlaps it, so the corner search finds nothing.
+fn slab(y: f32) -> Vec<(Triangle, u32)> {
+    quad(
+        [-5.0, y, -5.0],
+        [5.0, y, -5.0],
+        [5.0, y, 5.0],
+        [-5.0, y, 5.0],
+    )
+    .into_iter()
+    .map(|t| (t, 9))
+    .collect()
+}
+
+#[test]
+fn find_spot_embedded_raises_when_enabled() {
+    let mut entries = slab(1.0);
+    entries.extend(floor_y(0.0).into_iter().map(|t| (t, 1)));
+    let w = world(entries);
+    let params = FindSpotParams {
+        raise_step: 0.1,
+        max_raise: 2.0,
+        ..spot_params()
+    };
+    let spot = find_spot(&w, [0.0, 1.0, 0.0], [0.4, 0.4, 0.4], &params)
+        .expect("the vertical raise fallback must free the embedded box");
+    assert!(
+        spot.position[1] > 1.0,
+        "raised above the slab and settled: {:?}",
+        spot.position
+    );
+}
+
+#[test]
+fn find_spot_embedded_without_raise_is_no_free_spot() {
+    let mut entries = slab(1.0);
+    entries.extend(floor_y(0.0).into_iter().map(|t| (t, 1)));
+    let w = world(entries);
+    // The slab blocks the centre and all four corners; raising is disabled.
+    assert_eq!(
+        find_spot(&w, [0.0, 1.0, 0.0], [0.4, 0.4, 0.4], &spot_params()),
+        Err(FindSpotError::NoFreeSpot)
+    );
+}
+
+#[test]
+fn find_spot_single_free_corner_extrapolates() {
+    // Three small obstacles block the centre and the (−X,−Z), (+X,−Z) and (−X,+Z) corners;
+    // only (+X,+Z) is free, so FindSpot extrapolates to twice that offset.
+    let mut entries: Vec<(Triangle, u32)> = floor_y(0.0).into_iter().map(|t| (t, 1)).collect();
+    for (min, max) in [
+        ([-0.35, -1.0, -0.35], [-0.22, 1.0, -0.22]),
+        ([0.22, -1.0, -0.35], [0.35, 1.0, -0.22]),
+        ([-0.35, -1.0, 0.22], [-0.22, 1.0, 0.35]),
+    ] {
+        entries.extend(box_tris(min, max, 3));
+    }
+    let w = world(entries);
+    let spot = find_spot(&w, [0.0, 1.0, 0.0], [0.4, 0.4, 0.4], &spot_params())
+        .expect("one free corner must place");
+    assert_eq!(spot.free_corners, Some(1), "{spot:?}");
+    assert!(
+        (spot.offset[0] - 0.4).abs() < 1e-3 && (spot.offset[2] - 0.4).abs() < 1e-3,
+        "extrapolated to the doubled offset: {:?}",
+        spot.offset
+    );
+}
 
 #[test]
 fn moving_wall_blocks_then_unblocks_a_sweep() {

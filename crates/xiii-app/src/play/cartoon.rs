@@ -402,6 +402,14 @@ pub fn report_exit(
                     .map_or("-".to_owned(), |m| vm.objects[m as usize].name.clone()),
             );
         }
+        if let Some(c) = vm.find_object("Cine0")
+            && let Some(Value::Array(items)) = vm.get_property(c, "tabActions")
+            && let Some(ctrl) = vm.find_object("CineController21")
+            && let Some(Value::Int(idx)) = vm.get_property(ctrl, "ScriptedActionIndex")
+            && let Some(Value::Str(action)) = items.get((*idx).max(0) as usize)
+        {
+            println!("[cartoon] current cine action[{idx}] = {action}");
+        }
         if let Some(c) = vm.find_object("CineController21") {
             println!(
                 "[cartoon] sequence action index {} / {} (flagsPaused {:?})",
@@ -413,9 +421,25 @@ pub fn report_exit(
                     .map_or_else(|| "-".to_owned(), |v| format!("{v:?}")),
             );
         }
+        if !s.saves.is_empty() {
+            println!("[cartoon] checkpoint saves ({}):", s.save_total);
+            for (t, e) in &s.saves {
+                println!(
+                    "[cartoon]   [{t:.3}s] SaveAtCheckpoint {} teleporter={:?} description={:?}",
+                    e.actor, e.teleporter_name, e.description
+                );
+            }
+        }
         if let Some(e) = s.first_error() {
             for line in e.lines() {
                 println!("[cartoon] first script error: {line}");
+            }
+        }
+        if s.failures.len() > 1 {
+            println!("[cartoon] all suspensions ({}):", s.failures.len());
+            for (name, err) in &s.failures {
+                let first = err.lines().next().unwrap_or("<error>");
+                println!("[cartoon]   {name}: {first}");
             }
         }
         if !s.suspended.is_empty() {

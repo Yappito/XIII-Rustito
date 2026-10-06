@@ -4,12 +4,13 @@
 use xiii_package::Limits;
 
 use crate::bytecode::ScriptLimits;
+use crate::events::{PresentationEvent, TravelSource};
 use crate::linker::{GlobalRef, ScriptPackage, ScriptSet};
 use crate::localize::LocalizationData;
 use crate::reflect::function_flags as ff;
 use crate::reflect::property_flags as pf;
 use crate::tests::{Exp, build_package, compact};
-use crate::value::{ObjRef, ObjectId, Value};
+use crate::value::{Delegate, ObjRef, ObjectId, Value};
 use crate::vm::{Latent, TraceKind, Vm, VmErrorKind, VmLimits};
 
 struct B {
@@ -149,9 +150,22 @@ impl B {
     }
 
     fn state(&mut self, r: i32, next: i32, script: &[u8], mem: u32, labels_at: u16) {
+        self.state_children(r, next, 0, script, mem, labels_at);
+    }
+
+    /// A `Core.State` whose `children` point at a state-scoped function (item18 `PlayerTick`).
+    fn state_children(
+        &mut self,
+        r: i32,
+        next: i32,
+        children: i32,
+        script: &[u8],
+        mem: u32,
+        labels_at: u16,
+    ) {
         let friendly = self.exports[(r - 1) as usize].name;
         let mut p = compact(0);
-        p.extend(self.header(0, next, 0, friendly, script, mem));
+        p.extend(self.header(0, next, children, friendly, script, mem));
         p.extend(u64::MAX.to_le_bytes());
         p.extend(u64::MAX.to_le_bytes());
         p.extend(labels_at.to_le_bytes());
@@ -502,11 +516,17 @@ fn inactive_objects_do_not_run_state_code() {
 fn registry_entries_are_documented() {
     let r = crate::registry::Registry::builtin();
     let defs: Vec<_> = r.defs().collect();
-    // item14b added 10 AI natives (264 -> 274); item3p added the five missing rotator operators
-    // (142, 203, 287, 288, 289), the float power operator (170) and a visible Partial for
-    // `ParticleEmitter.SetMaxParticles` (274 -> 281); item16 added menu natives (281 -> 289);
-    // item14c added four trail/particle Partials and item18 added Percent_FloatFloat (289 -> 294).
-    assert_eq!(defs.len(), 294);
+    // Merged registry count. Contributions: item14b added 10 AI/perception natives; item3p added the
+    // five missing rotator operators (142, 203, 287, 288, 289), the float power operator (170) and
+    // a visible Partial for `ParticleEmitter.SetMaxParticles`; item16 added the menu natives
+    // (`VideoPlayer.*`, `Actor.*AllSounds`, `PlayerController.ClientTravel`); item15 added
+    // `PlayerController.GetDefaultURL` and `CalcFirstPersonView` (`ClientTravel` is shared with
+    // item16, registered once); item3o added `SaveAtCheckpoint`, `OrthoRotation` and three
+    // `SetBone*` Partials; item16b added `GUIController.GetStyle`/`InitStateFrame`; item18 added
+    // `%` (173), `Normalize` (198), `ParticleEmitter.SpawnParticle` and `Actor.KillAllSounds`;
+    // item14c added four trail/particle Partials (SpawnParticle is shared with item18); item20 adds
+    // ten decoded GUI save-slot declarations.
+    assert_eq!(crate::registry::Registry::builtin().defs().count(), 315);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -774,9 +794,22 @@ impl SpawnB {
     }
 
     fn state(&mut self, r: i32, next: i32, script: &[u8], mem: u32, labels_at: u16) {
+        self.state_children(r, next, 0, script, mem, labels_at);
+    }
+
+    /// A `Core.State` whose `children` point at a state-scoped function (item18 `PlayerTick`).
+    fn state_children(
+        &mut self,
+        r: i32,
+        next: i32,
+        children: i32,
+        script: &[u8],
+        mem: u32,
+        labels_at: u16,
+    ) {
         let friendly = self.exports[(r - 1) as usize].name;
         let mut p = compact(0);
-        p.extend(self.header(0, next, 0, friendly, script, mem));
+        p.extend(self.header(0, next, children, friendly, script, mem));
         p.extend(u64::MAX.to_le_bytes());
         p.extend(u64::MAX.to_le_bytes());
         p.extend(labels_at.to_le_bytes());
@@ -5572,6 +5605,46 @@ fn voice_and_onomatopoeia_natives_emit_presentation_events() {
 }
 
 #[test]
+fn client_travel_records_a_host_travel_request() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let c = vm
+        .spawn(sg(&set, "Actor"), "XIIIPlayerController0")
+        .unwrap();
+    let mut a = [
+        Value::Str("Plage01.unr".into()),
+        Value::Byte(2),
+        Value::Bool(true),
+    ];
+    let out = call_native(
+        &mut vm,
+        "PlayerController.ClientTravel",
+        c,
+        &[false, false, false],
+        &mut a,
+    );
+    assert!(matches!(out, NativeOutcome::Value(Value::Void)));
+    let req = vm.take_travel_request().expect("travel request");
+    assert_eq!(req.url, "Plage01.unr");
+    assert_eq!(req.mode, 2);
+    assert!(req.items);
+    assert_eq!(req.actor, "XIIIPlayerController0");
+    assert!(matches!(req.source, TravelSource::ClientTravel));
+    assert!(
+        vm.take_travel_request().is_none(),
+        "the request is consumed once"
+    );
+    // The request is also queued as a typed presentation event for `--events`/reporting.
+    let events = vm.drain_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, PresentationEvent::TravelRequest(_))),
+        "a TravelRequest presentation event must be queued: {events:?}"
+    );
+}
+
+#[test]
 fn console_command_implements_campaign_commands_and_logs_unknown() {
     let set = spawn_set();
     let mut vm = Vm::new(&set, VmLimits::default());
@@ -6713,4 +6786,142 @@ fn set_max_particles_records_and_does_not_fail() {
         &e.kind,
         TraceKind::Note(s) if s.contains("SetMaxParticles(12)") && s.contains("no particle subsystem")
     )));
+}
+
+#[test]
+fn video_player_status_times_a_host_registered_duration() {
+    let set = set_of(fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    // No open clip: finished.
+    assert_eq!(vm.video_status(), 0);
+    // A registered duration is timed from `Play`.
+    vm.set_video_duration("Cine01.bik", 10.0);
+    assert!(vm.video_open("cine01"));
+    vm.video_play();
+    assert_eq!(vm.video_status(), 1);
+    for _ in 0..99 {
+        vm.tick(0.1).unwrap();
+    }
+    assert_eq!(vm.video_status(), 1, "9.9 s < 10 s");
+    vm.tick(0.2).unwrap();
+    assert_eq!(vm.video_status(), 0, "10.1 s >= 10 s");
+    // An unknown clip reports finished immediately (the labelled Partial).
+    assert!(!vm.video_open("movie_without_header"));
+    vm.video_play();
+    assert_eq!(vm.video_status(), 0);
+    // A bad duration is rejected, so a corrupt header cannot stop the level end.
+    vm.set_video_duration("bad", f32::NAN);
+    assert!(!vm.video_open("bad"));
+}
+
+#[test]
+fn percent_float_float_matches_fmod() {
+    let set = set_of(fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(g(&set, "Object"), "O").unwrap();
+    let mut a = vec![Value::Float(7.5), Value::Float(2.0)];
+    let out = call_native(
+        &mut vm,
+        "Object.Percent_FloatFloat",
+        o,
+        &[false, false],
+        &mut a,
+    );
+    let NativeOutcome::Value(Value::Float(v)) = out else {
+        panic!("expected a float");
+    };
+    assert!((v - 1.5).abs() < 1e-6, "7.5 % 2.0 = {v}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Delegate opcodes: assignment (0x45/0x44), empty delegate (0x3F), call (0x43).
+
+/// Package with a delegate property `Handler`, the bound function `Target` (returns 42) and
+/// `Set` / `Clear` / `Fire` exercising `letdelegate`, `emptyd`, and the delegate call.
+fn delegate_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    // `Core.DelegateProperty` import (the property's class).
+    let delegate_class = b.add_external("Core", "Class", "DelegateProperty");
+    let handler = b.reserve(delegate_class, object, "Handler");
+    let target = b.reserve(IMP_FUNCTION, object, "Target");
+    let set = b.reserve(IMP_FUNCTION, object, "Set");
+    let fire = b.reserve(IMP_FUNCTION, object, "Fire");
+    let clear = b.reserve(IMP_FUNCTION, object, "Clear");
+    // Delegate property: `DelegateProperty.Function` ref is None (unused by the VM).
+    let extra = compact(0);
+    b.prop_with(handler, target, 0, &extra);
+    // `return 42`.
+    let target_code = [0x04, 0x1D, 42, 0, 0, 0];
+    b.func(target, set, 0, &target_code, 6, 0, ff::DEFINED);
+    // `self.Handler = delegateprop Target`.
+    let target_name = b.name("Target");
+    let mut set_code = vec![0x45, 0x01];
+    set_code.extend(compact(handler));
+    set_code.push(0x44);
+    set_code.extend(compact(target_name));
+    b.func(set, fire, 0, &set_code, 11, 0, ff::DEFINED);
+    // `self.Handler = emptydelegate`.
+    let mut clear_code = vec![0x45, 0x01];
+    clear_code.extend(compact(handler));
+    clear_code.push(0x3F);
+    b.func(clear, 0, 0, &clear_code, 7, 0, ff::DEFINED);
+    // `return self.delegate Handler:Target()` (the context supplies `self`).
+    let mut fire_code = vec![0x04, 0x19, 0x17, 0x00, 0x00, 0x00, 0x43];
+    fire_code.extend(compact(handler));
+    fire_code.extend(compact(target_name));
+    fire_code.push(0x16);
+    b.func(fire, clear, 0, &fire_code, 16, 0, ff::DEFINED);
+    b.class(object, 0, handler);
+    b.build()
+}
+
+#[test]
+fn delegate_assignment_calls_the_bound_function() {
+    let set = set_of(delegate_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(g(&set, "Object"), "D").unwrap();
+    vm.set_active(o, true);
+    vm.call_function(g(&set, "Object.Set"), o, vec![]).unwrap();
+    match vm.get_property(o, "Handler") {
+        Some(Value::Delegate(Some(d))) => {
+            assert_eq!(d.function, "Target");
+            assert_eq!(d.object, Some(ObjRef::Instance(o)));
+        }
+        other => panic!("Handler = {other:?}"),
+    }
+    let v = vm.call_function(g(&set, "Object.Fire"), o, vec![]).unwrap();
+    assert_eq!(v, Value::Int(42));
+}
+
+#[test]
+fn empty_delegate_falls_back_to_the_declared_function() {
+    let set = set_of(delegate_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(g(&set, "Object"), "D").unwrap();
+    vm.set_active(o, true);
+    vm.call_function(g(&set, "Object.Set"), o, vec![]).unwrap();
+    // Clearing the delegate must not leave a stale binding.
+    vm.call_function(g(&set, "Object.Clear"), o, vec![])
+        .unwrap();
+    assert_eq!(vm.get_property(o, "Handler"), Some(&Value::Delegate(None)));
+    // An unbound delegate call runs the declared function on the context.
+    let v = vm.call_function(g(&set, "Object.Fire"), o, vec![]).unwrap();
+    assert_eq!(v, Value::Int(42));
+}
+
+#[test]
+fn delegate_values_are_equatable_and_none_is_distinct() {
+    let d = Value::Delegate(Some(Delegate {
+        object: Some(ObjRef::Instance(3)),
+        function: "Target".into(),
+    }));
+    let same = Value::Delegate(Some(Delegate {
+        object: Some(ObjRef::Instance(3)),
+        function: "target".into(),
+    }));
+    // Case-sensitive function names: different spelling is a different delegate.
+    assert!(!crate::vm::values_equal(&d, &same));
+    assert!(crate::vm::values_equal(&d, &d.clone()));
+    assert!(!crate::vm::values_equal(&Value::Delegate(None), &d));
 }

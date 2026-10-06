@@ -19,12 +19,19 @@ pub struct SweepParams {
     /// blocks motion that drives into a surface it is already flush with. Set false to always
     /// report a `t = 0` `start_penetrating` hit (used by `ray`).
     pub skip_start_penetration: bool,
+    /// When `Some(z)`, a `t = 0` `start_penetrating` hit whose normal up-component is at least
+    /// `z` (a **walkable floor the box is resting on**) is always ignored. A box walking on a
+    /// slightly inclined floor grazes that floor on every horizontal sub-step; without this the
+    /// grazing `t = 0` contact is the nearest hit and hides the real obstacle behind it
+    /// (item1k: the walkable-ledge stall). `None` (default) keeps the plain behaviour.
+    pub ignore_resting_floor_z: Option<f32>,
 }
 
 impl Default for SweepParams {
     fn default() -> Self {
         Self {
             skip_start_penetration: true,
+            ignore_resting_floor_z: None,
         }
     }
 }
@@ -102,8 +109,17 @@ fn consider_sweep_hit(
     start: Vec3,
     tri: &Triangle,
 ) {
-    if h.start_penetrating && params.skip_start_penetration && !start_drives_into(d, start, tri) {
-        return;
+    if h.start_penetrating {
+        if params.skip_start_penetration && !start_drives_into(d, start, tri) {
+            return;
+        }
+        // A walkable floor the box is already touching never blocks: the box can walk along it
+        // (and must be free to reach whatever obstacle is behind the grazing contact).
+        if let Some(z) = params.ignore_resting_floor_z
+            && h.normal[1] >= z
+        {
+            return;
+        }
     }
     if h.t < 0.0 {
         h.t = 0.0;

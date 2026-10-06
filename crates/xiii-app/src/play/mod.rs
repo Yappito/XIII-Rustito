@@ -19,6 +19,8 @@ pub mod pawns;
 pub mod script;
 pub mod session;
 pub mod sim;
+pub mod travel;
+pub mod voice;
 pub mod weapons;
 
 use std::collections::HashMap;
@@ -33,7 +35,7 @@ use bevy::pbr::decal::ForwardDecalMaterial;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
 use bevy::time::Fixed;
-use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
+use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow, Window};
 
 use xiii_collision::CollisionWorld;
 use xiii_decode::common::{UNREAL_UNITS_PER_METER, to_bevy_direction, to_bevy_position};
@@ -103,11 +105,15 @@ struct FootstepRes(footsteps::FootstepDriver);
 #[derive(Resource)]
 struct TraceState {
     tick: u64,
+    saved_total: u64,
     start: Instant,
     exit_secs: Option<f32>,
     shot: u8,
     shot_done: bool,
     target_at: Option<Instant>,
+    /// Set when a level transition completed: the unattended run screenshots the new map a short
+    /// time later and exits, independent of the original budget.
+    post_travel_at: Option<Instant>,
 }
 
 #[derive(Resource, Default)]
@@ -147,8 +153,25 @@ impl Plugin for PlayPlugin {
         // Load the script session before the window opens. `Session` holds `Rc`-based VM state
         // (it is `!Send`), so it lives in a non-send resource on the main thread; a load failure
         // is stored and reported by `setup`, which exits with an error.
-        let game_dir = self.options.game_dir.clone().unwrap_or_default();
-        let map = self.options.map.clone().unwrap_or_default();
+        let mut options = self.options.clone();
+        if let Some(slot) = options.load {
+            match options
+                .save_dir
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(crate::save::default_save_dir)
+                .and_then(|dir| crate::save::read(&dir, slot))
+            {
+                Ok(saved) => {
+                    options.map = Some(saved.map);
+                }
+                Err(e) => {
+                    eprintln!("[save] load slot {slot} failed: {e}");
+                }
+            }
+        }
+        let game_dir = options.game_dir.clone().unwrap_or_default();
+        let map = options.map.clone().unwrap_or_default();
         let t0 = Instant::now();
         let mut session = session::Session::open(&game_dir, &map);
         println!(
@@ -156,54 +179,52 @@ impl Plugin for PlayPlugin {
             t0.elapsed().as_secs_f32()
         );
         if let Ok(s) = session.as_mut() {
-            s.enable_native_timers(self.options.perf_natives);
+            s.enable_native_timers(options.perf_natives);
         }
         app.insert_non_send(session);
-        app.insert_resource(PlayConfig {
-            options: self.options.clone(),
-        })
-        .insert_resource(ClearColor(Color::srgb(0.45, 0.62, 0.82)))
-        .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
-        .init_resource::<ShotFlag>()
-        .init_resource::<RenderSync>()
-        .init_resource::<weapons::WeaponView>()
-        .init_resource::<ParticleTriggerCursor>()
-        .init_resource::<RuntimeLights>()
-        .add_plugins(viewer::particles::ParticlePlugin)
-        .init_resource::<cinematics::CinematicState>()
-        .init_resource::<cartoon::CartoonState>()
-        .init_resource::<cartoon::CartoonRenderTarget>()
-        .init_resource::<viewer::decals::RuntimeProjectorDecals>()
-        .insert_resource(viewer::fog::FogDisabled(viewer::fog::fog_disabled()))
-        .add_systems(Startup, setup)
-        .add_systems(FixedUpdate, fixed_step)
-        .add_systems(
-            Update,
-            (
-                controls,
-                grab_cursor,
-                mouse_look,
-                cinematics::collect,
-                sync_camera,
-                cinematics::draw,
-                viewer::sky_follow,
-                viewer::animate_uv,
-                viewer::fog::update_fog,
-                viewer::decals::update_runtime_projectors,
-                sync_particle_triggers,
-                sync_vm_lights,
-                pawns::update_pawns,
-                weapons::update_weapon_view,
-                hud::refresh,
-                cartoon::collect,
-                cartoon::sync_render_target,
-                hud::draw,
-                overlay,
-                unattended,
+        app.insert_resource(PlayConfig { options })
+            .insert_resource(ClearColor(Color::srgb(0.45, 0.62, 0.82)))
+            .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
+            .init_resource::<ShotFlag>()
+            .init_resource::<RenderSync>()
+            .init_resource::<weapons::WeaponView>()
+            .init_resource::<ParticleTriggerCursor>()
+            .init_resource::<RuntimeLights>()
+            .add_plugins(viewer::particles::ParticlePlugin)
+            .init_resource::<cinematics::CinematicState>()
+            .init_resource::<cartoon::CartoonState>()
+            .init_resource::<cartoon::CartoonRenderTarget>()
+            .init_resource::<viewer::decals::RuntimeProjectorDecals>()
+            .insert_resource(viewer::fog::FogDisabled(viewer::fog::fog_disabled()))
+            .add_systems(Startup, setup)
+            .add_systems(FixedUpdate, (fixed_step, travel).chain())
+            .add_systems(
+                Update,
+                (
+                    controls,
+                    grab_cursor,
+                    mouse_look,
+                    cinematics::collect,
+                    sync_camera,
+                    cinematics::draw,
+                    viewer::sky_follow,
+                    viewer::animate_uv,
+                    viewer::fog::update_fog,
+                    viewer::decals::update_runtime_projectors,
+                    sync_particle_triggers,
+                    sync_vm_lights,
+                    pawns::update_pawns,
+                    weapons::update_weapon_view,
+                    hud::refresh,
+                    cartoon::collect,
+                    cartoon::sync_render_target,
+                    hud::draw,
+                    overlay,
+                    unattended,
+                )
+                    .chain(),
             )
-                .chain(),
-        )
-        .add_systems(Last, (cinematics::report_exit, cartoon::report_exit));
+            .add_systems(Last, (cinematics::report_exit, cartoon::report_exit));
     }
 }
 
@@ -411,6 +432,7 @@ fn setup(
         &mut images,
         &mut bindposes,
         &mut decal_materials,
+        false,
     ) {
         Ok(()) => {}
         Err(e) => {
@@ -431,6 +453,9 @@ fn setup_inner(
     images: &mut Assets<Image>,
     bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
     decal_materials: &mut Assets<ForwardDecalMaterial<StandardMaterial>>,
+    // True when this is a level-transition reload: the input-script cursor and the travel
+    // timing in `TraceState` must survive, so they are not re-inserted.
+    resetting: bool,
 ) -> Result<(), String> {
     let started = Instant::now();
     let game_dir = opts
@@ -489,6 +514,11 @@ fn setup_inner(
         "[play] localisation: language={} localized class-default overrides={}",
         session.localization_language, session.localized_overrides
     );
+    println!(
+        "[play] video clips: {} Bink header(s) read, {} timed (VideoPlayer.GetStatus uses the real duration)",
+        session.video_clips, session.video_timed
+    );
+    println!("[play] objectives: {}", session.objective_summary());
     let pawns_now = session.player_pawn_actors();
     println!(
         "[play] player pawns: {} live XIIIPlayerPawn actor(s): {}",
@@ -528,8 +558,8 @@ fn setup_inner(
     // comes from the host's FindSpot placement (the raw PlayerStart overlaps the floor) and the
     // facing from the pawn's script-set Rotation. The host writes the placed position back to
     // the VM on the first tick. Same rule as the scripted path in `run_script`.
-    let start_center = bevy_to_unreal_position(spawn.position);
-    let start_rot = match (session.login_script, session.player_rotation()) {
+    let mut start_center = bevy_to_unreal_position(spawn.position);
+    let mut start_rot = match (session.login_script, session.player_rotation()) {
         (1, Some(r)) => {
             println!(
                 "[play] attaching host movement to the script-created pawn {} (VM location {:?} UU, rot {:?})",
@@ -541,6 +571,24 @@ fn setup_inner(
         }
         _ => rot,
     };
+    if let Some(slot) = opts.load {
+        let dir = opts
+            .save_dir
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(crate::save::default_save_dir)?;
+        let saved = crate::save::read(&dir, slot)?;
+        start_center = session.restore_checkpoint(&saved)?;
+        start_rot = saved.rotation;
+        println!(
+            "[save] restored slot {slot}: map={} checkpoint={} health={} objectives={} inventory={}",
+            saved.map,
+            saved.checkpoint_number,
+            saved.health,
+            saved.objectives.len(),
+            saved.inventory.len()
+        );
+    }
     let yaw = start_rot[1] as f32 * std::f32::consts::TAU / 65536.0;
     let mut sim = PlayerSim::new(start_center, yaw);
     sim.grounded = true;
@@ -744,15 +792,32 @@ fn setup_inner(
         sources,
         movers: mover_collision,
     });
-    commands.insert_resource(ScriptRes { drive });
-    commands.insert_resource(TraceState {
-        tick: 0,
-        start: Instant::now(),
-        exit_secs,
-        shot: 0,
-        shot_done: false,
-        target_at: None,
-    });
+    if !resetting {
+        commands.insert_resource(ScriptRes { drive });
+        commands.insert_resource(TraceState {
+            tick: 0,
+            saved_total: 0,
+            start: Instant::now(),
+            exit_secs,
+            shot: 0,
+            shot_done: false,
+            target_at: None,
+            post_travel_at: None,
+        });
+    } else {
+        // The reload owns a fresh per-map runtime, but the input-script cursor (`ScriptRes`) and
+        // the unattended timer must survive; the screenshot step moves to a short post-travel
+        // tail.
+        let now = Instant::now();
+        commands.queue(move |world: &mut World| {
+            if let Some(mut st) = world.get_resource_mut::<TraceState>() {
+                st.post_travel_at = Some(now);
+                st.shot = 0;
+                st.shot_done = false;
+                st.target_at = None;
+            }
+        });
+    }
     println!(
         "[play] setup complete in {:.2}s",
         started.elapsed().as_secs_f32()
@@ -834,7 +899,9 @@ fn perform_use(
     let (origin, dir) = use_ray(sim, params);
     match ray_target(world, sources, origin, dir, USE_REACH_M) {
         Some(target) => {
-            let outcome = sess.use_mover(&target);
+            // A mover is used through its own lock/unlock/open chain; a dead pawn in front is
+            // searched (the engine `Grab` interaction). `use_target` tries both, in that order.
+            let outcome = sess.use_target(&target);
             println!("[play] use {target}: {outcome:?}");
         }
         None => println!("[play] use: nothing in reach"),
@@ -880,18 +947,40 @@ fn fixed_step(
         Ok(sess) => cinematics::input_suppressed(sess),
         Err(_) => false,
     };
-    let (input, weapons, equip) = if suppressed {
-        (Input::default(), Vec::new(), false)
-    } else {
-        match script.drive.as_mut() {
-            Some(drive) => {
-                let input = drive.advance(elapsed, &mut sim.0);
-                let weapons = drive.take_weapons();
-                let equip = drive.take_equip();
-                (input, weapons, equip)
-            }
-            None => (read_keyboard(&keys, &buttons), Vec::new(), false),
+    // Always advance the script so the `take_control` bridge can be read even while a cutscene
+    // suppresses input; the axis input and the other command queues are dropped when suppressed.
+    let (mut input, weapons, goals, equip, use_named, search) = match script.drive.as_mut() {
+        Some(drive) => {
+            let input = drive.advance(elapsed, &mut sim.0);
+            (
+                input,
+                drive.take_weapons(),
+                drive.take_goals(),
+                drive.take_equip(),
+                drive.take_use_named(),
+                drive.take_search(),
+            )
         }
+        None => (
+            read_keyboard(&keys, &buttons),
+            Vec::new(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+    };
+    let control = script
+        .drive
+        .as_mut()
+        .is_some_and(script::Drive::take_control);
+    if suppressed {
+        input = Input::default();
+    }
+    let (weapons, goals, equip, use_named, search) = if suppressed {
+        (Vec::new(), Vec::new(), false, Vec::new(), Vec::new())
+    } else {
+        (weapons, goals, equip, use_named, search)
     };
     let use_action = input.use_action;
     let fire = input.fire;
@@ -936,6 +1025,33 @@ fn fixed_step(
             floor_normal: sim.0.floor_normal,
         };
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
+        if sess.save_total > state.saved_total {
+            state.saved_total = sess.save_total;
+            if let Some((_, event)) = sess.saves.back() {
+                let map = cfg.options.map.as_deref().unwrap_or("Plage00");
+                let rot = sess.player_rotation().unwrap_or([0; 3]);
+                let data = sess.checkpoint_snapshot(map, event, sim.0.location, rot);
+                let save_dir = cfg
+                    .options
+                    .save_dir
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(crate::save::default_save_dir);
+                match save_dir.and_then(|dir| {
+                    let slot = (0..10)
+                        .find(|&n| !crate::save::exists(&dir, n))
+                        .unwrap_or(0);
+                    crate::save::write(&dir, slot, &data).map(|()| (dir, slot))
+                }) {
+                    Ok((dir, slot)) => println!(
+                        "[save] wrote slot {slot} ({}) to {}",
+                        event.description,
+                        dir.display()
+                    ),
+                    Err(e) => eprintln!("[save] checkpoint write failed: {e}"),
+                }
+            }
+        }
         perf.span("vm_step", t0);
         // The VM owns the mover poses; write them into the dynamic collision set so the next
         // player step collides with the moved brush.
@@ -955,14 +1071,33 @@ fn fixed_step(
                 Err(e) => println!("[play] weapon grant failed {path}: {e}"),
             }
         }
+        for n in &goals {
+            if let Err(e) = sess.set_goal(*n) {
+                println!("[play] set_goal {n} failed: {e}");
+            }
+        }
         if equip {
             match sess.equip_inventory_weapon() {
                 Ok(msg) => println!("[play] equip {msg}"),
                 Err(e) => println!("[play] equip failed: {e}"),
             }
         }
+        if control {
+            match sess.take_control() {
+                Ok(state) => println!("[play] take_control (host bridge): controller -> {state}"),
+                Err(e) => println!("[play] take_control failed: {e}"),
+            }
+        }
         if use_action {
             perform_use(sess, &wr.world, &wr.sources, &sim.0, &params.0);
+        }
+        for target in &use_named {
+            let outcome = sess.use_target(target);
+            println!("[play] use {target}: {outcome:?}");
+        }
+        for target in &search {
+            let outcome = sess.search_corpse(target);
+            println!("[play] search {target}: {outcome:?}");
         }
         if fire {
             match sess.fire(sim.0.yaw, sim.0.pitch) {
@@ -1149,12 +1284,13 @@ fn sync_vm_lights(
 /// event count and last player touch.
 fn format_vm_trace(sess: &session::Session) -> String {
     format!(
-        "vm t={:.3}s active={} suspended={} suspended_dropped={} dispatcher={} player={} health={} physics={} events={} last_touch={}",
+        "vm t={:.3}s active={} suspended={} suspended_dropped={} dispatcher={} ctrl={} player={} health={} physics={} events={} last_touch={} | {}",
         sess.vm_time(),
         sess.active_actors(),
         sess.suspended.len(),
         sess.vm().suspended_deferred_calls(),
         sess.dispatcher_state().unwrap_or_else(|| "-".to_owned()),
+        sess.player_controller_state(),
         sess.player_location()
             .map(|l| format!("({:.1},{:.1},{:.1})", l[0], l[1], l[2]))
             .unwrap_or_else(|| "-".to_owned()),
@@ -1166,6 +1302,7 @@ fn format_vm_trace(sess: &session::Session) -> String {
             .unwrap_or_else(|| "-".to_owned()),
         sess.total_events(),
         sess.last_touch().unwrap_or_else(|| "-".to_owned()),
+        sess.objective_summary(),
     )
 }
 
@@ -1388,6 +1525,44 @@ fn unattended(
     mut perf: ResMut<crate::perf::Perf>,
     mut exit: MessageWriter<AppExit>,
 ) {
+    // After a level transition the new map owns a short tail: screenshot it once the scene has
+    // settled, then exit, regardless of the original exit budget.
+    if let Some(at) = state.post_travel_at {
+        let since = at.elapsed().as_secs_f32();
+        if flag.0 {
+            state.shot_done = true;
+        }
+        if let Some(path) = &cfg.options.screenshot
+            && state.shot == 0
+            && since >= 2.0
+        {
+            let path: std::path::PathBuf = path.clone();
+            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            commands
+                .spawn(Screenshot::primary_window())
+                .observe(save_to_disk(path))
+                .observe(|_: On<ScreenshotCaptured>, mut f: ResMut<ShotFlag>| f.0 = true);
+            state.shot = 1;
+        }
+        if since >= 3.0 {
+            println!("[play] {}", format_trace(state.tick, since, &sim.0));
+            println!(
+                "[play] exit {:.1}s after travel, {} frames, screenshot {}",
+                since,
+                state.tick,
+                match (&cfg.options.screenshot, state.shot_done) {
+                    (Some(p), true) => format!("saved {}", p.display()),
+                    (Some(p), false) => format!("NOT confirmed {}", p.display()),
+                    (None, _) => "none".into(),
+                }
+            );
+            perf.request_final();
+            exit.write(AppExit::Success);
+        }
+        return;
+    }
     let Some(secs) = state.exit_secs else {
         return;
     };
@@ -1431,6 +1606,117 @@ fn unattended(
     exit.write(AppExit::Success);
 }
 
+/// Filter for the entities the travel reload despawns: rendered/UI content only, excluding Bevy
+/// resource entities (stored as entities) and the window.
+type MapSceneFilter = (
+    Without<Window>,
+    Or<(
+        With<Transform>,
+        With<Node>,
+        With<Text>,
+        With<Text2d>,
+        With<Camera3d>,
+    )>,
+);
+
+/// Level-transition host system (item15). When the game's own code requests travel, this tears
+/// down the current map (every entity except the window), opens a fresh script session for the
+/// requested map and rebuilds the scene through [`setup_inner`]. The input-script cursor and the
+/// travel timing survive the reload.
+#[allow(clippy::too_many_arguments)]
+fn travel(
+    mut commands: Commands,
+    mut cfg: ResMut<PlayConfig>,
+    mut session: NonSendMut<Result<session::Session, String>>,
+    mut sync: ResMut<RenderSync>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
+    mut decal_materials: ResMut<Assets<ForwardDecalMaterial<StandardMaterial>>>,
+    // Every rendered/UI entity of the current map. The `Or` filter is what distinguishes our
+    // content from Bevy resource entities (which are stored as entities and must not be
+    // despawned) and from the window entity.
+    entities: Query<Entity, MapSceneFilter>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let Ok(sess) = session.as_mut() else {
+        return;
+    };
+    let Some(req) = sess.take_travel_request() else {
+        return;
+    };
+    let plan = match travel::TravelPlan::from_request(&req) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[play] travel request invalid: {e}");
+            exit.write(AppExit::error());
+            return;
+        }
+    };
+    println!(
+        "[play] travel requested at t={:.3}s by {}: url={:?} mode={} items={} source={:?} -> map {} options {:?}",
+        req.time, req.actor, req.url, req.mode, req.items, req.source, plan.map, plan.options
+    );
+    let Some(game_dir) = cfg.options.game_dir.clone() else {
+        eprintln!("[play] travel without --game-dir");
+        exit.write(AppExit::error());
+        return;
+    };
+    let t0 = Instant::now();
+    // Tear down the current scene: every entity except the window(s). Cameras, lights, meshes,
+    // skinned pawns, HUD nodes and particle emitters are all respawned by `setup_inner`.
+    let mut removed = 0usize;
+    for e in &entities {
+        commands.entity(e).try_despawn();
+        removed += 1;
+    }
+    let new_session = match session::Session::open(&game_dir, &plan.map) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[play] travel load failed for {}: {e}", plan.map);
+            exit.write(AppExit::error());
+            return;
+        }
+    };
+    *session = Ok(new_session);
+    cfg.options.map = Some(plan.map.clone());
+    sync.entities.clear();
+    let s = match session.as_mut() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[play] travel session unavailable: {e}");
+            exit.write(AppExit::error());
+            return;
+        }
+    };
+    match setup_inner(
+        &mut commands,
+        &cfg.options,
+        s,
+        &mut sync,
+        &mut meshes,
+        &mut materials,
+        &mut images,
+        &mut bindposes,
+        &mut decal_materials,
+        true,
+    ) {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("[play] travel setup failed for {}: {e}", plan.map);
+            exit.write(AppExit::error());
+            return;
+        }
+    }
+    println!(
+        "[play] travel complete: -> {} ({} entities replaced) in {:.2}s",
+        plan.map,
+        removed,
+        t0.elapsed().as_secs_f32()
+    );
+}
+
 /// One trace line: `t` seconds, tick, Unreal position/velocity, state, floor normal, source.
 fn format_trace(tick: u64, t: f32, sim: &PlayerSim) -> String {
     format!(
@@ -1465,7 +1751,7 @@ pub fn run_headless(opts: &Options) -> AppExit {
 /// Outcome of a headless scripted run: the VM session (after the run), the movement trace and
 /// timing. Shared by `--play-script` and the opt-in walking-trigger corpus test.
 pub(crate) struct ScriptOutcome {
-    /// VM session after the run.
+    /// VM session after the run (the last map when the run travelled).
     pub session: session::Session,
     /// Fixed ticks run.
     pub ticks: u64,
@@ -1473,26 +1759,71 @@ pub(crate) struct ScriptOutcome {
     pub wall_secs: f32,
     /// Trace samples: `(tick, seconds, position UU, velocity UU/s)`.
     pub trace: Vec<(u64, f32, [f32; 3], [f32; 3])>,
+    /// Map stem active at the end of the run.
+    pub final_map: String,
+    /// One entry per level transition, in order (empty when the run did not travel).
+    pub travel: Vec<TravelHop>,
+    /// item18: each map the run passed through and its `MapInfo.Objectif[]` states as the run left
+    /// it (the final map's states are the last entry). Requirement 4's "objective states over
+    /// time" across a multi-map run.
+    pub map_objectives: Vec<(String, Vec<session::ObjectiveState>)>,
     /// Host-synthesised footsteps in order:
     /// `(seconds, XIIIFootStepSound wrapper path, floor material path)`.
     pub footsteps: Vec<(f32, String, Option<String>)>,
 }
 
-/// Opens a VM session and drives it with the movement simulation and an input script. No window
-/// is opened; the fixed-step order is the one `fixed_step` uses.
-///
-/// The collision world (static soup + the VM's mover actors as dynamic objects) is built here so
-/// the script can never diverge from the interactive path.
-pub(crate) fn run_script(
+/// One level transition observed in a headless run.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TravelHop {
+    /// Map stem travelled from.
+    pub from: String,
+    /// Map stem travelled to.
+    pub to: String,
+    /// Requested URL exactly as the script built it.
+    pub url: String,
+    /// UE2 `ETravelType` byte.
+    pub mode: u8,
+    /// `bItems`.
+    pub items: bool,
+    /// VM time (seconds) of the source map when the request was taken.
+    pub vm_time: f64,
+    /// Global tick at which the request was taken.
+    pub tick: u64,
+}
+
+/// Per-map headless runtime: session, collision world, movement volumes and the player sim.
+struct MapRuntime {
+    name: String,
+    session: session::Session,
+    world: CollisionWorld,
+    mover_collision: movers::MoverCollision,
+    volumes: movement_modes::VolumeMotion,
+    sim: PlayerSim,
+    sources: Vec<String>,
+    /// Shared counter of voice names this map's `VoiceDuration` provider could not resolve (the
+    /// provider is re-installed on every map open, including travel reloads).
+    voice_unresolved: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Opens a script session and builds the movement world for `map` from `scene` (the headless
+/// path). Prints the same mover/spawn/volume lines as the interactive setup.
+fn open_map_runtime(
     game_dir: &Path,
     map: &str,
-    script: &script::Script,
-    params: &PlayerParams,
     scene: &xiii_world::WorldScene,
-    duration: f32,
-) -> Result<ScriptOutcome, String> {
-    let started = Instant::now();
+    params: &PlayerParams,
+) -> Result<MapRuntime, String> {
     let mut session = session::Session::open(game_dir, map)?;
+    // The headless path has no Bevy audio resource; scan the same decoded HX library so
+    // `Actor.PlayStrVoice` takes the engine's voice-completion path (real wave length) instead of
+    // the script's `NoSound` fallback. Names the library cannot resolve keep returning `false`.
+    let voice_library = std::sync::Arc::new(std::sync::Mutex::new(xiii_audio::SoundLibrary::scan(
+        game_dir,
+    )));
+    let (voice_provider, voice_unresolved) = voice::LibraryVoiceDuration::new(voice_library);
+    session
+        .vm_mut()
+        .set_voice_duration(Box::new(voice_provider));
     session.register_movers(scene);
     let mover_states = session.mover_states();
     let (mut world, mover_collision) = movers::MoverCollision::build(scene, &mover_states);
@@ -1504,7 +1835,7 @@ pub(crate) fn run_script(
         world.triangle_count(),
         mover_collision.names().join(", ")
     );
-    let sources = &scene.collision_sources;
+    let sources = scene.collision_sources.clone();
     let (ps_bevy, rot) = scene.player_start.ok_or("map has no PlayerStart")?;
     let spawn = collision::place_spawn(&world, ps_bevy, params.half_extents_bevy())?;
     println!(
@@ -1515,8 +1846,7 @@ pub(crate) fn run_script(
     );
     // The script login chain (item3h) created the pawn at the PlayerStart; the host owns its
     // movement fields (item8a rule), so the position comes from the host's FindSpot placement
-    // (the raw PlayerStart overlaps the floor) and the facing from the pawn's script-set
-    // Rotation when the login path ran. The host writes the placed position back to the VM.
+    // and the facing from the pawn's script-set Rotation when the login path ran.
     let start_yaw = match (session.login_script, session.player_rotation()) {
         (1, Some(r)) => r[1] as f32 * std::f32::consts::TAU / 65536.0,
         _ => rot[1] as f32 * std::f32::consts::TAU / 65536.0,
@@ -1536,86 +1866,245 @@ pub(crate) fn run_script(
             movement_modes::VolumeMotion::default()
         }
     };
+    Ok(MapRuntime {
+        name: map.to_owned(),
+        session,
+        world,
+        mover_collision,
+        volumes,
+        sim,
+        sources,
+        voice_unresolved,
+    })
+}
+
+/// Opens a VM session and drives it with the movement simulation and an input script. No window
+/// is opened; the fixed-step order is the one `fixed_step` uses.
+///
+/// The collision world (static soup + the VM's mover actors as dynamic objects) is built here so
+/// the script can never diverge from the interactive path. When the game's own code requests
+/// level travel, the next map is imported and a fresh session is opened (the host owns the
+/// transition); the run continues on the new map until the duration is spent.
+pub(crate) fn run_script(
+    game_dir: &Path,
+    map: &str,
+    script: &script::Script,
+    params: &PlayerParams,
+    scene: &xiii_world::WorldScene,
+    duration: f32,
+) -> Result<ScriptOutcome, String> {
+    let started = Instant::now();
     let ticks = (duration / DT).ceil() as u64;
     let mut drive = script::Drive::new(script);
     let mut trace = Vec::new();
+    let mut travel = Vec::new();
+    let mut map_objectives = Vec::new();
+    let mut runtime = open_map_runtime(game_dir, map, scene, params)?;
+    // Accumulated unresolved voice names across maps (the provider is re-installed per map).
+    let mut voice_unresolved_total = 0u64;
     // Player footsteps (item6e): the same notify-free synthesis `fixed_step` uses, so the
-    // headless path reports and can play them.
-    let surfaces = footsteps::SurfaceSounds::from_scene(scene);
+    // headless path reports and can play them. Rebuilt for each map after a level transition.
+    let mut surfaces = footsteps::SurfaceSounds::from_scene(scene);
     let mut step_driver = footsteps::FootstepDriver::new();
     let mut footstep_log: Vec<(f32, String, Option<String>)> = Vec::new();
-    for tick in 0..ticks {
+    let mut tick = 0u64;
+    while tick < ticks {
         let elapsed = tick as f32 * DT;
-        let input = drive.advance(elapsed, &mut sim);
+        let input = drive.advance(elapsed, &mut runtime.sim);
         let weapons = drive.take_weapons();
+        let goals = drive.take_goals();
         let equip = drive.take_equip();
+        let use_named = drive.take_use_named();
+        let search = drive.take_search();
+        let control = drive.take_control();
         let fired = input.fire;
-        if volumes.is_empty() {
-            sim.step(DT, &world, params, input, sources);
+        if runtime.volumes.is_empty() {
+            runtime
+                .sim
+                .step(DT, &runtime.world, params, input, &runtime.sources);
         } else {
-            sim.step_with_modes(DT, &world, params, input, sources, &volumes);
+            runtime.sim.step_with_modes(
+                DT,
+                &runtime.world,
+                params,
+                input,
+                &runtime.sources,
+                &runtime.volumes,
+            );
         }
         // The headless driver only records footsteps; playback belongs to the windowed
         // `fixed_step` path (this function opens no audio device).
-        if let Some(step) = step_driver.advance(DT, &sim, params, &world, &surfaces, input.walk) {
+        if let Some(step) = step_driver.advance(
+            DT,
+            &runtime.sim,
+            params,
+            &runtime.world,
+            &surfaces,
+            input.walk,
+        ) {
             footstep_log.push((elapsed, step.sound, step.material));
         }
         let modes = session::PlayerVMModes {
-            crouched: sim.crouched,
-            in_water: sim.in_water,
-            physics: sim.physics,
-            landed_velocity_z: sim.landed.then_some(sim.land_velocity_z),
-            floor_normal: sim.floor_normal,
+            crouched: runtime.sim.crouched,
+            in_water: runtime.sim.in_water,
+            physics: runtime.sim.physics,
+            landed_velocity_z: runtime.sim.landed.then_some(runtime.sim.land_velocity_z),
+            floor_normal: runtime.sim.floor_normal,
         };
-        session.step(DT, sim.location, sim.yaw, sim.velocity, &modes);
-        let states = session.mover_states();
-        mover_collision.update(&mut world, &states);
+        runtime.session.step(
+            DT,
+            runtime.sim.location,
+            runtime.sim.yaw,
+            runtime.sim.velocity,
+            &modes,
+        );
+        let states = runtime.session.mover_states();
+        runtime.mover_collision.update(&mut runtime.world, &states);
         for path in &weapons {
-            match session.grant_weapon(path) {
+            match runtime.session.grant_weapon(path) {
                 Ok(msg) => println!("[play] weapon {msg}"),
                 Err(e) => println!("[play] weapon grant failed {path}: {e}"),
             }
         }
+        for n in &goals {
+            if let Err(e) = runtime.session.set_goal(*n) {
+                println!("[play] set_goal {n} failed: {e}");
+            }
+        }
         if equip {
-            match session.equip_inventory_weapon() {
+            match runtime.session.equip_inventory_weapon() {
                 Ok(msg) => println!("[play] equip {msg}"),
                 Err(e) => println!("[play] equip failed: {e}"),
             }
         }
+        if control {
+            match runtime.session.take_control() {
+                Ok(state) => println!("[play] take_control (host bridge): controller -> {state}"),
+                Err(e) => println!("[play] take_control failed: {e}"),
+            }
+        }
         if input.use_action {
-            perform_use(&mut session, &world, sources, &sim, params);
+            perform_use(
+                &mut runtime.session,
+                &runtime.world,
+                &runtime.sources,
+                &runtime.sim,
+                params,
+            );
+        }
+        for target in &use_named {
+            let outcome = runtime.session.use_target(target);
+            println!("[play] use {target}: {outcome:?}");
+        }
+        for target in &search {
+            let outcome = runtime.session.search_corpse(target);
+            println!("[play] search {target}: {outcome:?}");
         }
         if fired {
-            match session.fire(sim.yaw, sim.pitch) {
+            match runtime.session.fire(runtime.sim.yaw, runtime.sim.pitch) {
                 session::FireOutcome::Fired => {
                     println!(
                         "[play] fire [{elapsed:.3}s] player {} bone {} | {}",
-                        session
+                        runtime
+                            .session
                             .player_health()
                             .map(|h| format!("{h:.0} hp"))
                             .unwrap_or_else(|| "? hp".to_owned()),
-                        session.vm().last_trace_bone(),
-                        combat_snapshot(&session)
+                        runtime.session.vm().last_trace_bone(),
+                        combat_snapshot(&runtime.session)
                     );
                 }
                 other => println!("[play] fire [{elapsed:.3}s]: {other:?}"),
             }
         }
         if tick.is_multiple_of(TRACE_EVERY) || tick + 1 == ticks {
-            trace.push((tick, elapsed, sim.location, sim.velocity));
+            trace.push((tick, elapsed, runtime.sim.location, runtime.sim.velocity));
             println!(
                 "[play] {} | {} | {}",
-                format_trace(tick, elapsed, &sim),
-                format_vm_trace(&session),
-                format_mover_trace(&session)
+                format_trace(tick, elapsed, &runtime.sim),
+                format_vm_trace(&runtime.session),
+                format_mover_trace(&runtime.session)
             );
         }
+
+        // Level transition: the game's own goal/travel code requested it. The VM reported the
+        // URL; the host imports the next map and opens a fresh session.
+        if let Some(req) = runtime.session.take_travel_request() {
+            let plan = travel::TravelPlan::from_request(&req)?;
+            println!(
+                "[play] travel requested at t={:.3}s tick={} by {}: url={:?} mode={} items={} source={:?} -> map {} options {:?}",
+                req.time,
+                tick,
+                req.actor,
+                req.url,
+                req.mode,
+                req.items,
+                req.source,
+                plan.map,
+                plan.options
+            );
+            travel.push(TravelHop {
+                from: runtime.name.clone(),
+                to: plan.map.clone(),
+                url: req.url.clone(),
+                mode: req.mode,
+                items: req.items,
+                vm_time: req.time,
+                tick,
+            });
+            map_objectives.push((runtime.name.clone(), runtime.session.objective_states()));
+            // The script block (if any) is released; the next map starts a fresh run.
+            drive.notify_travel();
+            let opts = crate::cli::Options {
+                game_dir: Some(game_dir.to_path_buf()),
+                map: Some(plan.map.clone()),
+                ..Default::default()
+            };
+            let next_scene = viewer::load_scene(&opts)?;
+            let t0 = Instant::now();
+            voice_unresolved_total += runtime
+                .voice_unresolved
+                .load(std::sync::atomic::Ordering::Relaxed);
+            runtime = open_map_runtime(game_dir, &plan.map, &next_scene, params)?;
+            // Rebuild the footstep surface map and driver for the next map.
+            surfaces = footsteps::SurfaceSounds::from_scene(&next_scene);
+            step_driver = footsteps::FootstepDriver::new();
+            println!(
+                "[play] travel complete: {} -> {} in {:.2}s ({} objects)",
+                travel.last().map(|h| h.from.as_str()).unwrap_or("-"),
+                plan.map,
+                t0.elapsed().as_secs_f32(),
+                next_scene.objects.len()
+            );
+        }
+        tick += 1;
+    }
+    if drive.waiting_travel() && travel.is_empty() {
+        println!(
+            "[play] script is still waiting for travel after {:.1}s; no travel was requested",
+            duration
+        );
+    }
+    map_objectives.push((runtime.name.clone(), runtime.session.objective_states()));
+    let unresolved = voice_unresolved_total
+        + runtime
+            .voice_unresolved
+            .load(std::sync::atomic::Ordering::Relaxed);
+    if unresolved > 0 {
+        println!(
+            "[play] voice durations: {unresolved} name(s) unresolved (those lines use the script's NoSound fallback)"
+        );
+    } else {
+        println!("[play] voice durations: every requested name resolved from the HX library");
     }
     Ok(ScriptOutcome {
-        session,
+        session: runtime.session,
         ticks,
         wall_secs: started.elapsed().as_secs_f32(),
         trace,
+        final_map: runtime.name,
+        travel,
+        map_objectives,
         footsteps: footstep_log,
     })
 }
@@ -1708,11 +2197,53 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
     for l in &resolved.lines {
         println!("[play] {l}");
     }
-    let duration = opts
-        .exit_after_secs
-        .unwrap_or_else(|| script.last_time() + 2.0);
+    let duration = opts.exit_after_secs.unwrap_or_else(|| {
+        if script.has_wait_travel() {
+            // `wait_travel` scripts run until the game requests travel; give them a budget.
+            script.last_time() + 60.0
+        } else {
+            script.last_time() + 2.0
+        }
+    });
     let outcome = run_script(&game_dir, &map, &script, &params, &scene, duration)?;
     let session = &outcome.session;
+    println!(
+        "[play] travel: {} transition(s), final map {}",
+        outcome.travel.len(),
+        outcome.final_map
+    );
+    for hop in &outcome.travel {
+        println!(
+            "[play]   travel {} -> {} url={:?} mode={} items={} at t={:.3}s tick={}",
+            hop.from, hop.to, hop.url, hop.mode, hop.items, hop.vm_time, hop.tick
+        );
+    }
+    for (map, states) in &outcome.map_objectives {
+        println!(
+            "[play]   objectives as the run left {map}: {}",
+            states
+                .iter()
+                .map(|o| format!(
+                    "[{}{}{}] {}",
+                    o.index,
+                    if o.primary { " P" } else { " -" },
+                    if o.completed {
+                        " C"
+                    } else if o.anti_goal {
+                        " A"
+                    } else {
+                        " ."
+                    },
+                    if o.text.is_empty() {
+                        "<empty>"
+                    } else {
+                        o.text.as_str()
+                    }
+                ))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+    }
     println!("[play] {}", session.bootstrap_note);
     match pawns::headless_report(session, &game_dir) {
         Ok(line) => println!("[play] {line}"),
@@ -1730,6 +2261,11 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
         "[play] localisation: language={} localized class-default overrides={}",
         session.localization_language, session.localized_overrides
     );
+    println!(
+        "[play] video clips: {} Bink header(s) read, {} timed (VideoPlayer.GetStatus uses the real duration)",
+        session.video_clips, session.video_timed
+    );
+    println!("[play] objectives: {}", session.objective_summary());
     let pawns_now = session.player_pawn_actors();
     println!(
         "[play] player pawns: {} live XIIIPlayerPawn actor(s): {}",
@@ -1762,6 +2298,15 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
             .map(|w| session.vm().objects[w as usize].name.clone())
             .unwrap_or_else(|| "none".to_owned()),
         combat_snapshot(session)
+    );
+    println!(
+        "[play] player inventory: {}",
+        session
+            .inventory_items()
+            .iter()
+            .map(|(n, c)| format!("{n} [{c}]"))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     for b in &session.blocked {
         println!("[play]   script path blocked: {b}");
@@ -2069,6 +2614,260 @@ mod tests {
             dist >= 2.0 * UNREAL_UNITS_PER_METER,
             "player only {dist:.1} UU outside the door plane (need >= {:.0})",
             2.0 * UNREAL_UNITS_PER_METER
+        );
+    }
+
+    /// item18 opt-in corpus test: follow the decoded Plage01 route as far as the port supports it
+    /// and assert the measured objective states and the game's own level end. `take_control` is the
+    /// labelled host bridge for the stuck intro; `set_goal 91/92` are the labelled bridges for the
+    /// cutscene promotions; `teleport` is a diagnostic shortcut for the large beach distances. The
+    /// two player-driven completions (the `TouchTrigger9` walk, the corpse search + `Porte1`) run
+    /// through the game's own code. Asserts the same stages the report records.
+    #[test]
+    fn opt_in_plage01_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let script = script::Script::parse(
+            "t=0.00 take_control\n\
+             t=0.10 set_goal 91\n\
+             t=0.20 teleport -491.8 -414.1 1265.0\n\
+             t=0.30 goto -491.84 -314.14\n\
+             t=0.50 jump\nt=1.00 jump\nt=1.50 jump\nt=2.00 jump\nt=2.50 jump\nt=3.00 forward 0\n\
+             t=3.40 teleport -742.1444 -808.429 1311.0449\nt=3.40 yaw 312.891\nt=3.40 forward 1\n\
+             t=5.00 turn -45\nt=5.70 forward 0\nt=6.00 use\nt=7.00 forward 1\nt=8.00 forward 0\n\
+             t=8.50 teleport -307.0 -1500.0 1311.0\nt=8.50 yaw 90\nt=8.50 forward 1\nt=12.00 forward 0\n\
+             t=13.00 set_goal 92\nt=13.20 weapon XIII.m60\nt=14.00 equip\n\
+             t=15.00 teleport 1802.0 -12700.0 1100.0\nt=15.00 yaw 270\n\
+             t=15.10 fire\nt=15.30 fire\nt=15.50 fire\nt=15.70 fire\nt=15.90 fire\nt=16.10 fire\n\
+             t=16.30 fire\nt=16.50 fire\nt=16.70 fire\nt=16.90 fire\nt=17.10 fire\nt=17.30 fire\n\
+             t=17.50 fire\nt=17.70 fire\nt=17.90 fire\nt=18.10 fire\nt=18.30 fire\nt=18.50 fire\n\
+             t=19.00 search BaseSoldier6\n\
+             t=21.00 teleport 1215.0 -14000.0 1105.0\nt=21.00 yaw 270\n\
+             t=21.50 use Porte1\nt=22.50 use Porte1\n",
+        )
+        .unwrap();
+        let outcome = run_script(
+            &game_dir,
+            "Plage01",
+            &script,
+            &resolved.params,
+            &scene,
+            90.0,
+        )
+        .expect("run Plage01 route");
+        println!("[route] map objectives: {:?}", outcome.map_objectives);
+        println!(
+            "[route] travel: {:?}, final map {}",
+            outcome.travel, outcome.final_map
+        );
+        let (plage, states) = outcome
+            .map_objectives
+            .first()
+            .expect("Plage01 objective states");
+        assert_eq!(plage, "Plage01");
+        assert!(
+            states.len() >= 2,
+            "Plage01 MapInfo must expose its objectives: {states:?}"
+        );
+        assert!(
+            states[0].primary && states[0].completed,
+            "objective 0 (escape) must be promoted and completed: {:?}",
+            states[0]
+        );
+        assert!(
+            states[1].primary && states[1].completed,
+            "objective 1 (truck) must be promoted and completed: {:?}",
+            states[1]
+        );
+        // PlayerTick dispatch is what turns `PlayingVideo` into `ServerTravel`; the route reaches
+        // it because `PlayerTick` now runs and `VideoPlayer.GetStatus` times `Cine01`.
+        assert!(
+            !outcome.travel.is_empty(),
+            "the level must travel; blocked actors: {:?}",
+            outcome.session.suspended
+        );
+        assert_eq!(outcome.final_map, "banque01");
+        assert_eq!(outcome.travel[0].to, "banque01");
+    }
+
+    /// item18 opt-in VM/session test for the `PlayerTick` dispatch itself: putting the real
+    /// `XIIIPlayerController` into its `PlayingVideo` state and ticking once must run
+    /// `PlayingVideo.PlayerTick`, which calls `Level.ServerTravel(MapInfo.NextMapLevelWithUnr)`
+    /// when no `VideoPlayer` is held. Without the dispatch, the controller sits in `PlayingVideo`
+    /// forever and no request appears.
+    #[test]
+    fn opt_in_plage01_player_tick_reaches_server_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = session::Session::open(&game_dir, "Plage01").expect("open Plage01");
+        let ctrl = session.controller.expect("player controller");
+        session
+            .vm_mut()
+            .goto_state(ctrl, "PlayingVideo", None)
+            .expect("enter PlayingVideo");
+        assert_eq!(
+            session.vm().state_name(ctrl).as_deref(),
+            Some("PlayingVideo")
+        );
+        // Use the app's tolerant tick: an unrelated suspended save trigger
+        // (`XIIISaveGameTrigger.DoSave`'s undecoded save struct) must not abort the dispatch test.
+        let _ = session.vm_mut().tick_suspending(0.05);
+        let req = session.vm_mut().take_travel_request();
+        assert!(
+            req.as_ref()
+                .is_some_and(|r| r.url.eq_ignore_ascii_case("banque01.unr")),
+            "PlayingVideo.PlayerTick must request banque01; got {req:?}"
+        );
+    }
+
+    /// Opt-in diagnostic probe (item15 evidence): prints the map's `MapInfo.Objectif` struct
+    /// fields so the goal/primary/completed semantics are read from the decoded data, not guessed.
+    #[test]
+    fn opt_in_plage00_objectif_probe() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        for map in ["Plage00", "Plage01"] {
+            probe_objectifs(&game_dir, map);
+        }
+    }
+
+    fn probe_objectifs(game_dir: &std::path::Path, map: &str) {
+        let session = session::Session::open(game_dir, map).expect("open map");
+        let gi = session.game_info.expect("GameInfo");
+        let mi = match session.vm().get_property(gi, "MapInfo") {
+            Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => *id,
+            other => panic!("MapInfo is {other:?}"),
+        };
+        println!(
+            "[probe] {map} MapInfo {} next={:?} keepInventory={:?}",
+            session.vm().objects[mi as usize].name,
+            session.vm().get_property(mi, "NextMapLevelWithUnr"),
+            session.vm().get_property(mi, "NextMapKeepInventory"),
+        );
+        let mut n = 0;
+        while let Some(v) = session.vm().get_property_elem(mi, "Objectif", n) {
+            println!("[probe] {map} Objectif[{n}] = {v:?}");
+            n += 1;
+        }
+        println!("[probe] {map}: {n} objective(s)");
+    }
+
+    /// Opt-in corpus test (item15): Plage00's objective completes through the game's own
+    /// `XIIIGoalTrigger5` -> `MapInfo.SetGoalComplete` -> `DoTravel` -> `EndGame` ->
+    /// `GameEndedSuccess` -> `Level.ServerTravel(NextMapLevelWithUnr, true)` chain, the VM reports
+    /// a travel request, and the host loads the next map (Plage01) with a spawned player.
+    #[test]
+    fn opt_in_plage00_goal_trigger_requests_travel_to_plage01() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage00".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage00");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        // `XIDCine.BeachFinalFall0` (Event `objectif0`, Tag `Fall`) at (5504.6, -1360.3, 867)
+        // is the beach end trigger: `Engine.Trigger.Touch` fires `TriggerEvent('objectif0')`,
+        // which calls `XIIIGoalTrigger5.Trigger`. Teleport next to it and walk in, then wait for
+        // the game's own travel request.
+        let script = script::Script::parse(
+            "t=0.0 teleport 5420 -1360.3 880\nt=0.0 yaw 0\nt=0.0 forward 1\nt=2.0 forward 0\nt=2.0 wait_travel\n",
+        )
+        .unwrap();
+        let outcome = run_script(
+            &game_dir,
+            "Plage00",
+            &script,
+            &resolved.params,
+            &scene,
+            40.0,
+        )
+        .expect("run Plage00 goal walk");
+        println!(
+            "[probe] travel hops: {:?}, final map {}",
+            outcome.travel, outcome.final_map
+        );
+        assert!(
+            !outcome.travel.is_empty(),
+            "the goal trigger did not request travel; touches: {:?}, suspended: {:?}",
+            outcome.session.touches(),
+            outcome.session.suspended
+        );
+        assert_eq!(outcome.final_map, "Plage01");
+        assert_eq!(outcome.travel[0].to, "Plage01");
+        assert!(
+            outcome.session.player_location().is_some(),
+            "the next map must have a spawned player"
+        );
+    }
+
+    /// Opt-in corpus test (item15): the game's own level-complete chain requests travel when the
+    /// goal trigger's `Trigger` runs. This calls `XIIIGoalTrigger5.Trigger` directly (the event a
+    /// cutscene's `TriggerEvent('objectif0')` delivers), then asserts `MapInfo.SetGoalComplete` ->
+    /// `DoTravel` -> `EndGame` -> `GameEndedSuccess` -> `ServerTravel` reaches the VM travel
+    /// request. The walk-in test below exercises the same chain from a scripted walk.
+    #[test]
+    fn opt_in_plage00_goal_completion_chain_requests_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = session::Session::open(&game_dir, "Plage00").expect("open Plage00");
+        let gt5 = session
+            .vm()
+            .find_object("XIIIGoalTrigger5")
+            .expect("XIIIGoalTrigger5");
+        let beach = session
+            .vm()
+            .find_object("BeachFinalFall0")
+            .expect("BeachFinalFall0");
+        let pawn = session.player;
+        let args = vec![
+            xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(beach))),
+            xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(pawn))),
+        ];
+        session
+            .vm_mut()
+            .send_event(gt5, "Trigger", args)
+            .expect("XIIIGoalTrigger5.Trigger");
+        for _ in 0..300 {
+            let loc = session.player_location().unwrap_or([0.0; 3]);
+            session.step(
+                1.0 / 60.0,
+                loc,
+                0.0,
+                [0.0; 3],
+                &session::PlayerVMModes::default(),
+            );
+            if let Some(req) = session.take_travel_request() {
+                println!(
+                    "[probe] goal chain travel request from {:?}: {} -> {}",
+                    req.source, req.url, req.mode
+                );
+                assert_eq!(req.url, "Plage01.unr");
+                return;
+            }
+        }
+        panic!(
+            "goal chain did not request travel; suspended {:?}; first error {:?}",
+            session.suspended,
+            session.first_error()
         );
     }
 

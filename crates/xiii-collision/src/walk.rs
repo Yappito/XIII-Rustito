@@ -12,9 +12,13 @@
 //!   wall from a walkable surface.
 //! - `APawn::physWalking` (`0x103bdac0`) iterates at most `8` move sub-steps (`cmpl $0x8`) and
 //!   uses the constants `0x10483420` (1.9) and `0x10483424` (2.4) beside its floor snap.
-//!   Walkability is `MINFLOORZ = 0.7` (`0x10483428`), tested against the **floor**
-//!   `FCheckResult.Normal.Z` from a separate downward check, not the horizontal blocking
-//!   contact.
+//!   Walkability is `MINFLOORZ = 0.7` (`0x10483428`). item1k re-read the branch at `0x103be058`
+//!   (`fld Hit.Normal.Z`; `fcomp 0x10483428`; `fnstsw ax`; `test ah,0x5`; `jp 0x103be547`). The
+//!   parity test is taken when `Normal.Z > 0.7` (greater or unordered), so **a walkable contact
+//!   enters the `0x103be547` body and an unwalkable contact falls through to `0x103be06c`**.
+//!   Which body is the stair-step and which is the slope-walk is **hypothesis** (both rebuild a
+//!   delta from `Hit.Normal`/`MAXSTEPHEIGHT` and call the extent `Move`). `FCheckResult.Normal.Z`
+//!   is at struct offset `0x14` and `Time` at `0x24`.
 //! - `APawn::physWalking`/`stepUp` sweep with the pawn's extent box; `AActor::stepUp`
 //!   (`0x103bb0a0`) is the same shape without the ground logic.
 //! - `ULevel::MoveActor` (`0x1038a770`) moves the box, then checks blocking actors.
@@ -24,26 +28,42 @@
 //!   box path. All are **line checks with extent**, not a swept box: the extent expands the
 //!   segment's endpoint box, it is not swept continuously.
 //!
-//! The step here is attempted on **any** blocked horizontal move (a walkable-normal hit while
-//! moving horizontally is the edge of a step the pawn is running into), and when the up sweep
-//! is blocked it lifts by the swept fraction (the hit time) rather than aborting. Gating the
-//! step on the horizontal contact normal instead was measured to regress campaign reach
-//! (item1j report, `local/reports/item1j-collision-primitive.md`).
+//! Per sub-step. **Measured:** the branch at `0x103be058` keys on the horizontal `MoveActor`
+//! contact normal (a walkable contact enters `0x103be547`, an unwalkable one falls through to
+//! `0x103be06c`). **Approximated (hypothesis, chosen by measurement):** the floor gate, the
+//! resting-floor ignore and the down-sweep distance, itemised below.
 //!
-//! Per step:
 //! 1. Sweep the full delta. On no hit, move and finish.
-//! 2. On a hit, back off by `skin`. Try step-up: sweep up by `max_step_height` (or only as far
-//!    as the sweep allows), forward by the remaining travel, then down by `max_step_height`
-//!    plus a small epsilon; accept when the landing surface is a walkable floor.
-//! 3. Otherwise slide along the hit plane as [`crate::move_slide`] does.
+//! 2. On a hit, back off by `skin` and record the contact.
+//! 3. If a downward probe of `max_step_height * 37/35` finds a walkable floor, attempt the
+//!    three-sweep step-up (`try_step_walk`); otherwise slide. The `0x104831ac` = `37.0` UU
+//!    constant is **measured**, but no branch using its result to gate `stepUp` was located in
+//!    `APawn::physWalking`, so [`probe_floor`] and this gate are a **host approximation** (it
+//!    held reach and removed the walkable-ledge stalls), not a proven engine gate. The step's
+//!    up/forward sweeps ignore a resting walkable floor, and its down-sweep spans the raise plus
+//!    `max_step_height`; both are **host approximations** (labelled on [`try_step_walk`]) that
+//!    stop a grazing near-horizontal floor from defeating the step (item1k's walkable-ledge fix).
+//! 4. Otherwise slide the remainder along the contact plane, as `move_slide`.
+//!
+//! item1j measured that gating the step on the contact normal (step only on a walkable contact)
+//! regresses reach; item1k measured that *sliding* a walkable contact instead of stepping it
+//! regresses far more.
 //!
 //! After the move, floor-follow: sweep down by `max_step_height`; if a walkable floor is
 //! found, snap to it; otherwise report `falling`.
 
 use crate::{
-    CollisionWorld, DEFAULT_SKIN, MoveContact, MoveResult, SweepParams, Vec3, add, dot, length,
-    mul, sub, sweep_aabb,
+    CollisionWorld, DEFAULT_SKIN, MoveContact, MoveResult, SweepHit, SweepParams, Vec3, add, dot,
+    length, mul, sub, sweep_aabb,
 };
+
+/// The `37` UU probe distance relative to `max_step_height`. **Measured constant:** `.rdata`
+/// `0x104831ac` = `37.0` UU, multiplied by a ±1 sign at `0x103bdd51`; `APawn::stepUp` uses
+/// `MAXSTEPHEIGHT` = `35.0` UU (`0x104829c4`). `max_step_height` is the caller's 35 UU in
+/// metres, so `37/35` reproduces the 37 UU distance without hard-coding the project's 90 UU/m.
+/// **Hypothesis:** that the engine uses this value as a floor check whose result gates `stepUp`
+/// is not proven here (no such branch was located); see [`probe_floor`].
+pub const FLOOR_PROBE_RATIO: f32 = 37.0 / 35.0;
 
 /// Parameters for [`walk_move`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -56,7 +76,7 @@ pub struct WalkParams {
     /// floor-follow (the result then matches [`crate::move_slide`]'s floor probe).
     pub max_step_height: f32,
     /// A surface is walkable ("floor") when its unit normal's up component is at least this.
-    /// UE2's `MINFLOORZ`; the upstream constant is **0.7**.
+    /// UE2's `MINFLOORZ`, **measured in XIII's `Engine.dll`** (`0x10483428` = `0.7`).
     pub min_floor_z: f32,
 }
 
@@ -71,9 +91,10 @@ impl Default for WalkParams {
     }
 }
 
-/// Moves an extent box like [`crate::move_slide`], but with UE2-style step-up over
-/// non-walkable obstacles and floor following after the move. See the module documentation
-/// for the exact approximation.
+/// Moves an extent box like [`crate::move_slide`], but with a downward floor probe
+/// (**measurement-chosen approximation**, not a proven engine branch), a three-sweep step-up on
+/// a blocked move and floor following after the move. See the module documentation for the exact
+/// port, its approximations and its limits.
 pub fn walk_move(
     world: &CollisionWorld,
     start: Vec3,
@@ -113,16 +134,16 @@ pub fn walk_move(
             position: at,
         });
 
-        // Step-up on a blocked horizontal move. The engine gates this on the pawn's **floor**
-        // (`APawn::physWalking`, `Engine.dll` 0x103be058: `fcomps MINFLOORZ` on a *separate*
-        // downward `FCheckResult` normal, `jp` skips `stepUp` when that floor is unwalkable),
-        // not on the horizontal blocking contact's normal. Our `walk_move` does not run a
-        // separate floor probe inside the loop, so it approximates the engine by attempting the
-        // step on **any** horizontal block (the step's own down-sweep then requires a walkable
-        // landing, exactly as `stepUp` does). Gating on the horizontal contact normal instead
-        // was measured to regress campaign reach (item1j; see the report), because a vertical
-        // obstacle face is unwalkable even when the surface above it is a walkable step.
+        // Step-up on a blocked horizontal move, gated on a downward floor probe. **Host
+        // approximation (hypothesis):** `0x104831ac` = 37 UU is a measured constant, but no
+        // `physWalking` compare/branch uses its result to gate `stepUp`, so this gate is chosen
+        // by measurement (it held reach and removed the walkable-ledge stalls). Measured branch:
+        // `0x103be058` sends a walkable contact to `0x103be547` and an unwalkable one to
+        // `0x103be06c`; `try_step_walk` covers both by attempting on any block and requiring a
+        // walkable landing. (item1j measured a contact-normal gate to regress; item1k measured a
+        // pure walkable-slide to regress far more.)
         if params.max_step_height > 1e-6
+            && probe_floor(world, pos, half_extents, params).is_some()
             && let Some(stepped) =
                 try_step_walk(world, pos, dir, travel, half_extents, params, &mut contacts)
         {
@@ -175,6 +196,30 @@ pub fn walk_move(
     }
 }
 
+/// A downward floor probe used to gate [`try_step_walk`]: sweep straight down by
+/// `max_step_height * [`FLOOR_PROBE_RATIO`]` (the `0x104831ac` = 37 UU constant is **measured**)
+/// and return the hit when the surface is walkable (`MINFLOORZ`). **Approximation
+/// (hypothesis):** no branch using that 37 UU result to gate `stepUp` was located in
+/// `APawn::physWalking`; this gate is **chosen by measurement** (it holds reach and removes the
+/// walkable-ledge stalls), not a proven engine gate. `None` when step-up is disabled or no floor
+/// is under the pawn.
+fn probe_floor(
+    world: &CollisionWorld,
+    center: Vec3,
+    half_extents: Vec3,
+    params: &WalkParams,
+) -> Option<SweepHit> {
+    if params.max_step_height <= 1e-9 {
+        return None;
+    }
+    let down = add(
+        center,
+        [0.0, -(params.max_step_height * FLOOR_PROBE_RATIO), 0.0],
+    );
+    sweep_aabb(world, center, down, half_extents, &SweepParams::default())
+        .filter(|h| h.normal[1] >= params.min_floor_z)
+}
+
 /// Attempts the UE2 three-sweep step: up by `max_step_height`, forward by `travel`, then down
 /// by `max_step_height` plus epsilon. If the up sweep is blocked, only the swept fraction (the
 /// hit time) is available, so the step can still clear a low obstacle under a low ceiling.
@@ -190,11 +235,19 @@ fn try_step_walk(
     params: &WalkParams,
     contacts: &mut Vec<MoveContact>,
 ) -> Option<Vec3> {
+    // Host approximation (item1k): rising and moving forward must ignore a walkable floor the
+    // box is already touching, otherwise on a slightly inclined floor the grazing `t = 0`
+    // contact blocks the up-sweep and the whole step fails. The down-sweep keeps the default
+    // behaviour so it still finds the landing floor. This is not a proven engine rule.
+    let step_params = SweepParams {
+        ignore_resting_floor_z: Some(params.min_floor_z),
+        ..SweepParams::default()
+    };
     let up = [0.0, params.max_step_height, 0.0];
     let up_target = add(pos, up);
     // UE2 `stepUp` sweeps up by `MAXSTEPHEIGHT`; a blocked sweep lifts by the swept fraction
     // (hit time) and carries on, rather than failing outright.
-    let rise = match sweep_aabb(world, pos, up_target, half_extents, &SweepParams::default()) {
+    let rise = match sweep_aabb(world, pos, up_target, half_extents, &step_params) {
         Some(h) => {
             let available = h.t * params.max_step_height - params.skin;
             if available <= params.skin {
@@ -206,13 +259,7 @@ fn try_step_walk(
     };
     let raised = add(pos, [0.0, rise, 0.0]);
     let fwd_target = add(raised, mul(dir, travel.max(0.0)));
-    if let Some(h) = sweep_aabb(
-        world,
-        raised,
-        fwd_target,
-        half_extents,
-        &SweepParams::default(),
-    ) {
+    if let Some(h) = sweep_aabb(world, raised, fwd_target, half_extents, &step_params) {
         contacts.push(MoveContact {
             source: h.source,
             triangle: h.triangle,
@@ -223,7 +270,16 @@ fn try_step_walk(
         });
         return None;
     }
-    let down = [0.0, -(params.max_step_height + params.skin + 1e-4), 0.0];
+    // Host approximation (item1k): sweep down by the raise plus `max_step_height`, so the
+    // landing can be up to `max_step_height` below the raised point and the extra `rise` reaches
+    // a floor the box was floating above (a grazing walkable slope raises the box only by
+    // `rise`). The nearest hit is the landing, so a longer sweep never skips a higher step top.
+    // The engine's own down distance is not proven to include `rise`.
+    let down = [
+        0.0,
+        -(rise + params.max_step_height + params.skin + 1e-4),
+        0.0,
+    ];
     let down_target = add(fwd_target, down);
     let land = sweep_aabb(
         world,

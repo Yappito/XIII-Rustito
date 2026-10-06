@@ -200,7 +200,7 @@ about Z).
 | Engine.Polys | 7,194 | 7,194 | 7,194 | 34,395 polygons |
 | Engine.TerrainSector | 2,208 | 2,208 | 2,208 | |
 | Engine.StaticMeshInstance | 14,542 | 14,542 | 14,542 | per placed static-mesh actor; colours + per-light vertex visibility |
-| Engine.Model | 7,194 | 7,194 | 6,396 | full payload decoded on 6,396; 1,343,450 B unsupported tail (`model.after_linked`) on the 798 build-variant Models; typed `FBspVertexStream` (+ per-vertex `FColor`) decoded on Plage00/Plage01/Banque01 |
+| Engine.Model | 7,194 | 7,194 | 7,194 | full payload byte-exact on all (item1m tail fix); nested `FBspVertexStream` (798 streams / 217,972 vertices), `LightMap` indices (337 records on 15 Models), `Lights`/`LightData`/`ExtraWords` arrays decoded; lightmap texels not in the payload |
 | Engine.TerrainInfo | 18 | 18 | 0 | sectors, vertices, sector grid; 2,052 B unsupported tail |
 
 Texture formats are taken from the game's own `Engine.ETextureFormat` enum in `engine.u`: P8,
@@ -273,51 +273,80 @@ uninitialized memory.
 of the 7,194 GOG Models (null never occurs).
 
 What follows the `Polys` reference was decoded from `UModel::Serialize` in `Engine.dll` (RVA
-0x9C240) and verified against the GOG bytes. Field order:
+0x9C240, image base 0x10300000; the `FArchive` imports resolve to `Ver` 0x1046d0b8,
+`LicenseeVer` 0x1046d0cc, `ByteOrderSerialize` 0x1046d008, `operator<<(FCompactIndex)`
+0x1046d0c8, `IsLoading` 0x1046d1d0) and verified byte-exactly against all 7,194 GOG Models.
+Every listed address below is an absolute VA in `Engine.dll`. Field order:
 
-- `LightMap`: `TArray<FLightMapIndex>`. Each record is 178 bytes in this build (licensee 58,
-  version 100): i32, i32, two 16-f32 matrices, nine i32, two bytes, then four compact indices.
-  The array is empty in 7,183 of the 7,194 Models.
-- A second `TArray` written by `0x103997a0`: each element is a `u16`, a nested `TArray<u8>`
-  (compact count + bytes), then three i32 (engine version > 0x5b). Empty on the 6,396 fully
-  consumed Models; `world-coverage` decodes 1,091 elements (91,905 nested bytes) corpus-wide
-  (the `Banque01` level model is the largest). Field meanings are not established
+- `LightMap`: `TArray<FLightMapIndex>` (element writer `0x10397e60`, matrix writer
+  `0x10397c10`). Per record: i32 `DataOffset`, i32 (bit patterns are small integers 1..14; read
+  as f32 it would be a denormal), two 16-f32 matrices, **two bytes**, **nine f32**, then four
+  compact indices. The array is empty in 7,179 of the 7,194 Models; the 15 Models with a
+  non-empty array (level models and a few large brushes, e.g. `Sanc02b` 113, `Palace01` 52,
+  `Amos01` 40, `Banque01` 31) hold 337 records.
+- `LightBits`: a second `TArray` written by `0x103997a0`: each element is a `u16`, a nested
+  `TArray<u8>` (compact count + bytes), then three i32 (engine version > 0x5b). `world-coverage`
+  decodes 1,091 elements (91,905 nested bytes) corpus-wide. Field meanings are not established
   (`Model::light_bits`, `LightMapBits`).
-- `Bounds`: `TArray<FBox>` (25 bytes: min, max, IsValid byte).
-- `LeafHulls`: `TArray<i32>`.
+- `Bounds`: `TArray<FBox>` (25 bytes: min, max, IsValid byte; element writer `0x103013a0`).
+- `LeafHulls`: `TArray<i32>` (element writer `0x10398e80`).
 - `Leaves`: `TArray<FConvexVolumeLeaf>` (compact Zone/Permeating/Volumetric + u64
-  VisibleZones). The count equals the maximum node `iLeaf` + 1 on the maps where the full
-  payload is consumed.
-- `Lights`: `TArray<compact actor reference>`.
-- `RootOutside` i32, `Linked` i32, `MoverLink` i32.
-- `FBspVertexStream`: compact count then `count` records of 32 bytes (one `FBspVertex`), then an
-  i32 revision. `FBspVertex` is `position` (3 f32), `color` (4 bytes, `FColor` memory order
-  `B,G,R,A`), `uv0` (2 f32) and `uv1` (2 f32) — established from the element writer
-  `0x10398160`, the array writers `0x1039bb30`/`0x10399830`, and `GetStride` 0x20 /
+  VisibleZones; element writer `0x10397db0`). The count equals the maximum node `iLeaf` + 1 on
+  the maps where the full payload is consumed.
+- `RootOutside` i32, `Linked` i32, `MoverLink` i32 (raw 4-byte serializations at call sites
+  0x1039c46e/0x1039c47f/0x1039c49d). Measured over all 7,194 Models: `(RootOutside, Linked,
+  MoverLink)` is `(1, 1, 0)` on 5,026 and `(1, 0, 0)` on 2,104 brush Models, and `(0, 0, 0)` on
+  the 64 level Models of the zoned maps.
+- `VertexStreams`: `TArray<FBspVertexStream>` (writer `0x1039bb30`, field `+0x104`): a compact
+  stream count, then per stream a compact vertex count, `count` records of 32 bytes (one
+  `FBspVertex`) and a trailing i32. `FBspVertex` is `position` (3 f32), `color` (4 bytes,
+  `FColor` memory order `B,G,R,A`), `uv0` (2 f32) and `uv1` (2 f32) — established from the
+  element writer `0x10398160`, the stream writer `0x10399830`, and `GetStride` 0x20 /
   `GetComponents` (position, colour, two texcoords) in `Engine.dll`; see
-  `local/re/item5e_fbspvertex_disasm.txt`. The stream holds the node polygons' vertices in
-  **reverse** node order: for node-vertex `k` of node `n`,
+  `local/re/item5e_fbspvertex_disasm.txt`. The corpus has exactly one stream per Model with
+  vertices (798 streams corpus-wide; `Model::vertex_stream` is the flattened vertex list and
+  `Model::vertex_stream_revisions` one i32 per stream). The stream holds the node polygons'
+  vertices in **reverse** node order: for node-vertex `k` of node `n`,
   `vertex_stream[n.first_vertex + (n.num_vertices - 1 - k)].position` equals
   `points[verts[n.vert_pool + k].point]` (measured exact on Plage00 1,704/1,704, Plage01
   2,627/2,627 within 0.2 UU, Banque01 8,782/8,784). The colour is a per-vertex `FColor` that is
   almost always `FF FF FF FF` (white) or `00 00 00 00` (transparent black), with rare greys
   (`FE FE FE FE` on `DM_LostTemple`); black entries occur at collinear (non-corner) vertices.
+- `Lights` (field `+0xec`, writer `0x1039b370`): `TArray` of 24-byte in-memory records of which
+  only an object reference (in-memory `+0x14`) is serialized — the only object-reference array
+  in the tail, so it is kept as `Model::lights` (upstream `UModel::Lights`; the name is a
+  hypothesis, the layout is measured). 152 references corpus-wide, non-null on the models that
+  carry lightmaps.
+- `LightData` (field `+0x110`, writer `0x10398250`): `TArray` of 38-byte records: six f32
+  (in-memory `+0x10`..`+0x24`), nine bytes (`+0x32`..`+0x3a`), an i32 (`+0x3c`), one byte
+  (`+0x3b`). 9,847 records corpus-wide; the six f32 of the inspected records read as three
+  large values followed by 1.0, 0, 0. Semantics not established (`Model::light_data`).
+- `ExtraWords` (field `+0x11c`, writer `0x10398b70`): `TArray<u16>`; 85,241 words corpus-wide,
+  values are small indices with `0xffff` terminators (shape of hull/index chains). Semantics not
+  established (`Model::extra_words`).
+- `ExtraTail` (field `+0x128`): a final i32, 0 except on 14 Models (`Model::extra_tail`).
 
-For **6,396** of the 7,194 Models every payload byte is consumed exactly (`xiii-tool bsp`
-shows no unsupported tail). The remaining 798 exports use a build variant whose post-`Polys`
-layout differs (all seven `Engine.Model` brushes with a non-empty `LightMap` array on the maps,
-plus a few others); the decoder keeps the decoded prefix and reports the remainder as the
-explicit label `model.after_linked` (1,343,450 B corpus-wide, down from 9,496,581 B). A decoded
-tail is trusted only when it consumes the payload exactly, or — for the `Banque01`-style variant
-— when its `FBspVertexStream` positions match `Points` for every referenced node vertex; a
-misaligned variant stream is rejected (`Model::vertex_stream_matches_points`).
+All 7,194 Models consume their payload byte-exactly under this layout (`xiii-tool bsp` shows no
+unsupported tail). The earlier revision of this decoder reported a `model.after_linked`
+unsupported tail on 798 Models: it serialized a `Lights` array between `Leaves` and
+`RootOutside` (the engine writes `RootOutside` there) and read the vertex stream as a flat
+`TArray<FBspVertex>` (the engine nests it one level deeper, `TArray<FBspVertexStream>`). Both
+layouts happen to occupy the same number of bytes while every array is empty, which is why the
+6,396 array-less Models still decoded exactly; the `FLightMapIndex` field order (two bytes
+before the nine floats) was likewise off. The tail is still only trusted when it consumes the
+payload exactly, or — for a variant whose record layout differs — when its vertex stream
+positions match `Points` for every referenced node vertex; a misaligned stream is rejected
+(`Model::vertex_stream_matches_points`).
 
-The lightmap **texels** are not decoded: the `LightMap` array is empty in 7,192 of 7,194
-Models and the meaning of `FLightMapIndex.DataOffset` relative to the texture data is not
-established, so `Model::lightmap_texels` is not implemented. Leaf -> zone assignments are
-derived exactly from the nodes' `iLeaf`/`iZone` pairs (0 conflicts over all 64 zoned maps);
-this is what `xiii-tool zones` uses. The level BSP is the only `Model` that no `Brush`
-property references.
+The lightmap **texels** are not decoded and are not in the Model payload: the `LightMap` array
+is empty in 7,179 of 7,194 Models, the tail contains no large byte array, and where the texel
+buffer `FLightMapIndex.DataOffset` points into is not established. Measured on all 337 records:
+`DataOffset` never decreases within a Model (it indexes a shared buffer) and the four trailing
+compacts are `(u, v, max(8, next_pow2(u)), max(8, next_pow2(v)))` — texel dimensions and their
+power-of-two padded allocations (e.g. 126x62 -> 128x64). `Model::lightmap_texels` is therefore
+not implemented. Leaf -> zone assignments are derived exactly from the nodes' `iLeaf`/`iZone`
+pairs (0 conflicts over all 64 zoned maps); this is what `xiii-tool zones` uses. The level BSP
+is the only `Model` that no `Brush` property references.
 
 **Polys.** i32 Num, i32 Max, then per polygon: compact vertex count, Base, Normal, TextureU,
 TextureV, vertices, u32 PolyFlags, compact Actor, compact Material, compact ItemName, compact
@@ -428,8 +457,9 @@ original-engine capture exists to settle it, so the scale is recorded as a **hyp
 Terrain sector colours are assembled into one `width x height` grid per `TerrainInfo`
 (`terrain::color_grid`), placing each sector's `(QuadsX+1) x (QuadsY+1)` colours at its vertex
 `offset`. Adjacent sectors share a border row/column; a repeated cell is only a conflict when
-the colours disagree (0 on Plage00/Plage01). The BSP `LightMaps`/`LightBits` tail is still not
-decoded (see below).
+the colours disagree (0 on Plage00/Plage01). The BSP `LightMap` **indices** are decoded
+(item1m) but the lightmap texels are not in the Model payload and are not decoded (see the
+Model section).
 
 ### Coordinates and winding (`common`)
 
