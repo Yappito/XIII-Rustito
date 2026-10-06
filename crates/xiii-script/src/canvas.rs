@@ -17,7 +17,7 @@
 
 use crate::registry::{NativeCtx, NativeDef, NativeOutcome, NativeStatus};
 use crate::value::{ObjRef, Value};
-use crate::vm::{TraceKind, Vm, VmErrorKind, VmResult};
+use crate::vm::{TraceKind, VideoTiming, Vm, VmErrorKind, VmResult};
 
 /// Host font metrics used by `StrLen`/`TextSize`.
 pub trait CanvasFonts {
@@ -1090,39 +1090,68 @@ pub fn parse_travel_note(note: &str) -> Option<TravelRequest> {
 
 /// `Engine.VideoPlayer.Open(string Filename) -> bool` (native 484).
 ///
-/// Records the clip in the VM (`Vm::video_open`). No video decoder is linked, so nothing is
-/// displayed; if the host registered the Bink-header duration, `GetStatus` times the clip, else it
-/// reports finished immediately (the labelled Partial). The boolean is `true` whenever a duration
-/// is known, so the decoded `XIIIMenu`/`XIII` code proceeds either way.
+/// Records the clip in the VM (`Vm::video_open`). With the host decoder installed
+/// (`Vm::set_video_host`) the host decodes and will play the clip and `GetStatus` follows the
+/// host playback; otherwise a host-registered Bink-header duration lets `GetStatus` time the
+/// clip (labelled fallback), else it reports finished immediately (the labelled Partial). The
+/// boolean is `true` whenever the clip is timed, so the decoded `XIIIMenu`/`XIII` code proceeds
+/// either way.
 fn video_player_open(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let name = text(vm, a, 0).unwrap_or_default();
     let timed = vm.video_open(&name);
-    vm.note(TraceKind::Note(format!(
-        "item18 VideoPlayer.Open({name:?}) accepted (no Bink decoder; not played; {})",
-        if timed {
-            "duration known, GetStatus times it"
-        } else {
-            "no duration registered, GetStatus reports finished"
-        }
-    )));
+    let note = match (vm.video_timing(), vm.video_duration()) {
+        (Some(VideoTiming::Host), Some(d)) => format!(
+            "item21 VideoPlayer.Open({name:?}): host xiii-video decoder plays this clip \
+             ({d:.3}s); GetStatus follows the host playback"
+        ),
+        (Some(VideoTiming::Duration), Some(d)) if vm.has_video_host() => format!(
+            "item21 VideoPlayer.Open({name:?}): host could not decode the file; timed from the \
+             Bink-header duration {d:.3}s (labelled fallback)"
+        ),
+        (Some(VideoTiming::Duration), Some(d)) => format!(
+            "item18 VideoPlayer.Open({name:?}) accepted (no Bink decoder; not played; \
+             duration known ({d:.3}s), GetStatus times it)"
+        ),
+        _ if vm.has_video_host() => format!(
+            "item21 VideoPlayer.Open({name:?}): not decoded and no duration registered; \
+             GetStatus reports finished"
+        ),
+        _ => format!(
+            "item18 VideoPlayer.Open({name:?}) accepted (no Bink decoder; not played; {})",
+            if timed {
+                "duration known, GetStatus times it"
+            } else {
+                "no duration registered, GetStatus reports finished"
+            }
+        ),
+    };
+    vm.note(TraceKind::Note(note));
     val(Value::Bool(timed))
 }
 
-/// `Engine.VideoPlayer.Play()` (native 483): starts the clip clock (`Vm::video_play`).
+/// `Engine.VideoPlayer.Play()` (native 483): starts the clip (`Vm::video_play`). With the host
+/// decoder installed the host playback starts; otherwise only the clip clock starts.
 fn video_player_play(vm: &mut Vm<'_>, _c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let host = vm.has_video_host() && vm.video_timing() == Some(VideoTiming::Host);
     vm.video_play();
-    vm.note(TraceKind::Note(
-        "item18 VideoPlayer.Play() accepted (no Bink decoder; not played)".into(),
-    ));
+    vm.note(TraceKind::Note(if host {
+        "item21 VideoPlayer.Play(): host playback started".into()
+    } else {
+        "item18 VideoPlayer.Play() accepted (no Bink decoder; not played)".into()
+    }));
     val(Value::Void)
 }
 
-/// `Engine.VideoPlayer.Stop()` (native 482): clears the clip (`Vm::video_stop`).
+/// `Engine.VideoPlayer.Stop()` (native 482): clears the clip (`Vm::video_stop`); with the host
+/// decoder installed the host playback stops and the fullscreen overlay is torn down.
 fn video_player_stop(vm: &mut Vm<'_>, _c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let host = vm.has_video_host();
     vm.video_stop();
-    vm.note(TraceKind::Note(
-        "item18 VideoPlayer.Stop() accepted (no Bink decoder)".into(),
-    ));
+    vm.note(TraceKind::Note(if host {
+        "item21 VideoPlayer.Stop(): host playback stopped".into()
+    } else {
+        "item18 VideoPlayer.Stop() accepted (no Bink decoder)".into()
+    }));
     val(Value::Void)
 }
 
@@ -1171,31 +1200,31 @@ fn actor_resume_all_sounds(
 pub fn menu_defs() -> Vec<NativeDef> {
     let mut v: Vec<NativeDef> = Vec::new();
     v.push(partial(
-        "no Bink decoder linked (item17a): the clip is accepted but not displayed; a host-registered Bink-header duration lets GetStatus time it (item18), else it reports finished",
+        "with the host decoder installed the host decodes and plays the clip and GetStatus follows the host playback (item21); otherwise the clip is accepted but not displayed and a host-registered Bink-header duration lets GetStatus time it (item18), else it reports finished",
         "VideoPlayer.Open",
         "native(484) final native static function bool Open(string Filename)",
-        "engine.u VideoPlayer.Open decoded; XIIIMenu.InternalOnClick opens sVideo (default cine00); item18 times cine01 via the Bink header (frames/fps)",
+        "engine.u VideoPlayer.Open decoded; XIIIMenu.InternalOnClick opens sVideo (default cine00); XIIIPlayerController.GameEndedSuccess.Timer opens MapInfo.EndMapVideo (cine01)",
         video_player_open,
     ));
     v.push(partial(
-        "no Bink decoder linked (item17a): the clip is accepted but not displayed; GetStatus times the real duration (item18)",
+        "with the host decoder installed the host playback starts (item21); otherwise the clip is accepted but not displayed and GetStatus times the registered duration (item18)",
         "VideoPlayer.Play",
         "native(483) final native static function Play()",
-        "engine.u VideoPlayer.Play decoded; XIIIMenu.InternalOnClick calls it; item18 PlayingVideo.PlayerTick",
+        "engine.u VideoPlayer.Play decoded; XIIIMenu.InternalOnClick and XIIIPlayerController.PlayingVideo.BeginState call it",
         video_player_play,
     ));
     v.push(partial(
-        "no Bink decoder linked (item17a): the clip is accepted but not displayed (item18)",
+        "with the host decoder installed the host playback stops and the overlay is torn down (item21); otherwise the clip is cleared (item18)",
         "VideoPlayer.Stop",
         "native(482) final native static function Stop()",
-        "engine.u VideoPlayer.Stop decoded; XIIIMenu.InternalOnKeyEvent stops the video",
+        "engine.u VideoPlayer.Stop decoded; XIIIMenu.InternalOnKeyEvent (Enter/Escape while a video plays) stops the video",
         video_player_stop,
     ));
     v.push(partial(
-        "no Bink decoder linked (item17a): GetStatus reports the real Bink duration when the host registered it, else 0 (item18)",
+        "with the host decoder installed completion is the host playback's actual end and decode failures report the game's error status 2 (item21); otherwise GetStatus reports the real Bink duration when the host registered it, else 0 (item18)",
         "VideoPlayer.GetStatus",
         "native(476) final native static function int GetStatus()",
-        "engine.u VideoPlayer.GetStatus decoded; XIIIGameInfo EndMapVideo cine01 ends via PlayingVideo.PlayerTick; index 476 also names ScriptedTexture.TextSize, separated by argument count",
+        "engine.u VideoPlayer.GetStatus decoded; PlayingVideo.PlayerTick (xiii) and XIIIMenu.PlayingVideo.Tick poll it (1 playing, 0 end, 2 error); index 476 also names ScriptedTexture.TextSize, separated by argument count",
         video_player_get_status,
     ));
     // `Actor.PlayMenu` (native 351) is already registered by the cartoon-panel block

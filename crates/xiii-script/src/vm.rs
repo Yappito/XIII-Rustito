@@ -1016,6 +1016,15 @@ pub struct Instance {
     state_code: Option<StateCode>,
     generation: u64,
     disabled: HashSet<String>,
+    /// `Destroy` is running its `Destroyed` event right now (`bDeleteMe` is not set yet). The
+    /// engine sets this before the event: `ULevel::DestroyActor` clears the state and calls
+    /// `AActor::ProcessEvent` for `Destroyed` only while `!bDeleteMe`. `Vm::destroy` uses it to
+    /// make a nested `Destroy` a no-op (the engine returns 1 with `bDeleteMe` set by then) while
+    /// still keeping the actor readable/writable during its own `Destroyed`.
+    destroying: bool,
+    /// All probes of the actor were disabled (`AActor+0x34` bit 0x1, `bProbesDisabled`). Read from
+    /// the serialized property `bProbesDisabled` at spawn/layout time; `Disable`/`Enable` update it.
+    probes_disabled: bool,
     /// Executed by the VM (in scope).
     pub active: bool,
     /// Suspended after a script error (`active` was cleared by [`Vm::suspend_for_error`]). A
@@ -1244,23 +1253,65 @@ pub struct Vm<'s> {
     video_durations: HashMap<String, f32>,
     /// item18: the currently open `Engine.VideoPlayer` (`None` before `Open`).
     video: Option<VideoPlayback>,
+    /// item21: optional host playback provider (the Bevy runtime's `xiii-video` player). When
+    /// installed, `GetStatus` reports completion from the actual host playback instead of the
+    /// Bink-header duration timer.
+    video_host: Option<Box<dyn VideoPlayerHost>>,
+}
+
+/// item21: host-backed cutscene playback for `Engine.VideoPlayer`. The VM is filesystem-free and
+/// has no display or audio device; the host (the Bevy runtime) installs an implementation that
+/// decodes the clip with the clean-room `xiii-video` decoder and plays it fullscreen with its
+/// Bink Audio track. `Engine.VideoPlayer.GetStatus` then reports completion from the actual host
+/// playback, not a VM timer. The duration fallback ([`Vm::set_video_duration`]) stays for hosts
+/// that cannot decode a file (labelled at the native).
+pub trait VideoPlayerHost {
+    /// Opens the clip named `name` (lowercased file stem). `Some(duration)` when the host can
+    /// decode the file and will play it; `None` when it cannot (the caller falls back to a
+    /// registered duration, labelled).
+    fn open(&mut self, name: &str) -> Option<f32>;
+    /// Starts playback of the opened clip (`Engine.VideoPlayer.Play`).
+    fn play(&mut self);
+    /// Stops playback and releases the clip (`Engine.VideoPlayer.Stop`; the menu's
+    /// `InternalOnKeyEvent` calls it, the level-end `PlayingVideo` state never does).
+    fn stop(&mut self);
+    /// True once the host playback ran to its end (every decoded frame shown).
+    fn finished(&self) -> bool;
+    /// True when the host playback failed (frames could not be decoded);
+    /// `GetStatus` then reports the game's error status `2`.
+    fn errored(&self) -> bool;
+}
+
+/// item21: how the open clip is timed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoTiming {
+    /// The host decodes and plays the clip; completion follows the host playback.
+    Host,
+    /// The file could not be decoded (or no host is installed); the clip is timed from the
+    /// registered Bink-header duration instead (labelled at the native).
+    Duration,
+    /// Nothing times the clip; `GetStatus` reports finished immediately.
+    Untimed,
 }
 
 /// item18: host-driven `Engine.VideoPlayer` state.
 ///
-/// `Engine.VideoPlayer.Open(name)` records the clip and any host-registered duration;
-/// `Play` starts its clock at [`Vm::time`]; `GetStatus` returns `1` (playing) until the real
-/// duration elapses and `0` (finished) after. No decoder is linked, so this times the video
-/// without displaying it (the host labels that Partial). A clip whose Bink header could not be
-/// read has no duration and reports finished immediately, preserving the item16 menu behavior.
+/// `Engine.VideoPlayer.Open(name)` records the clip; `Play` starts it at [`Vm::time`];
+/// `GetStatus` returns `1` (playing) until the clip ends and `0` (finished) after. With a
+/// [`VideoPlayerHost`] installed the clip is decoded and played by the host and completion
+/// follows the host playback; otherwise the host-registered Bink-header duration times it
+/// (labelled Partial). A clip with no duration and no host reports finished immediately,
+/// preserving the item16 menu behavior.
 #[derive(Debug, Clone)]
 pub struct VideoPlayback {
     /// Lowercased file stem as passed to `Open` (directory and `.bik` stripped).
     pub name: String,
-    /// Decoded duration in seconds, when the host read the Bink header.
+    /// Decoded duration in seconds (from the host decoder or the Bink header).
     pub duration: Option<f32>,
     /// VM time at which `Play` was called (`None` before `Play`).
     pub started_at: Option<f64>,
+    /// item21: how this clip is timed.
+    pub timing: VideoTiming,
 }
 
 fn lower(s: &str) -> String {
@@ -1330,6 +1381,7 @@ impl<'s> Vm<'s> {
             suspended_deferred_calls: 0,
             video_durations: HashMap::new(),
             video: None,
+            video_host: None,
         }
     }
 
@@ -1729,46 +1781,98 @@ impl<'s> Vm<'s> {
         self.pending_travel.is_some()
     }
 
-    // ---------------------------------------------------------------- item18 VideoPlayer
+    // ---------------------------------------------------------------- item18/21 VideoPlayer
 
     /// Registers the real duration of a Bink clip (seconds), keyed by file stem. The host reads
     /// the Bink header because `xiii-script` has no filesystem access. A non-finite or negative
     /// duration is ignored (never stored) so `GetStatus` cannot be made to hang on bad data.
+    /// With a [`VideoPlayerHost`] installed this is only the labelled fallback for clips the
+    /// host cannot decode.
     pub fn set_video_duration(&mut self, name: &str, seconds: f32) {
         if seconds.is_finite() && seconds >= 0.0 {
             self.video_durations.insert(video_stem(name), seconds);
         }
     }
 
-    /// `Engine.VideoPlayer.Open(name)`: records the clip. Returns `true` when a duration is known
-    /// (the video will be timed) and `false` when it is not (the call is still accepted, and
-    /// `GetStatus` reports finished — the labelled Partial).
+    /// item21: installs the host playback provider. `Engine.VideoPlayer` clips are then decoded
+    /// and played by the host and `GetStatus` follows the host playback.
+    pub fn set_video_host(&mut self, host: Box<dyn VideoPlayerHost>) {
+        self.video_host = Some(host);
+    }
+
+    /// Whether a host playback provider is installed.
+    pub fn has_video_host(&self) -> bool {
+        self.video_host.is_some()
+    }
+
+    /// `Engine.VideoPlayer.Open(name)`: records the clip. Returns `true` when the clip is timed
+    /// (the host decodes it, or a Bink-header duration is registered as the labelled fallback)
+    /// and `false` when it is not (the call is still accepted, and `GetStatus` reports
+    /// finished — the labelled Partial). A new `Open` stops any clip the host is still playing.
     pub fn video_open(&mut self, name: &str) -> bool {
         let stem = video_stem(name);
-        let duration = self.video_durations.get(&stem).copied();
+        if self
+            .video
+            .as_ref()
+            .is_some_and(|v| v.timing == VideoTiming::Host)
+            && let Some(host) = self.video_host.as_mut()
+        {
+            host.stop();
+        }
+        let mut duration = None;
+        let mut timing = VideoTiming::Untimed;
+        if let Some(host) = self.video_host.as_mut()
+            && let Some(d) = host.open(&stem)
+        {
+            duration = Some(d);
+            timing = VideoTiming::Host;
+        }
+        if timing == VideoTiming::Untimed
+            && let Some(d) = self.video_durations.get(&stem).copied()
+        {
+            duration = Some(d);
+            timing = VideoTiming::Duration;
+        }
         self.video = Some(VideoPlayback {
             name: stem,
             duration,
             started_at: None,
+            timing,
         });
         duration.is_some()
     }
 
-    /// `Engine.VideoPlayer.Play()`: starts (or restarts) the clip clock.
+    /// `Engine.VideoPlayer.Play()`: starts (or restarts) the clip. With a host decoder the
+    /// host playback starts; completion then follows the host, not this timestamp.
     pub fn video_play(&mut self) {
-        if let Some(v) = self.video.as_mut() {
-            v.started_at = Some(self.time);
+        let host_played = match self.video.as_mut() {
+            Some(v) => {
+                v.started_at = Some(self.time);
+                v.timing == VideoTiming::Host
+            }
+            None => false,
+        };
+        if host_played && let Some(host) = self.video_host.as_mut() {
+            host.play();
         }
     }
 
-    /// `Engine.VideoPlayer.Stop()`: clears the clip.
+    /// `Engine.VideoPlayer.Stop()`: stops the host playback and clears the clip.
     pub fn video_stop(&mut self) {
+        if self.video.is_some()
+            && let Some(host) = self.video_host.as_mut()
+        {
+            host.stop();
+        }
         self.video = None;
     }
 
-    /// `Engine.VideoPlayer.GetStatus() -> int`: `1` while the clip is playing, `0` when it is
-    /// finished, not started, or has no known duration. The decoder is not linked, so nothing is
-    /// displayed; this only reports the clip's real timing.
+    /// `Engine.VideoPlayer.GetStatus() -> int`, the game's own status codes (decoded
+    /// `XIIIPlayerController.PlayingVideo.PlayerTick` switches on them): `1` while the clip
+    /// plays, `0` when it ended (or was never started / cannot be timed) and `2` when the host
+    /// playback failed ("Error playing video"). With a host decoder installed, completion is
+    /// the host playback's actual end; otherwise the registered Bink-header duration times the
+    /// clip from `Play`.
     pub fn video_status(&self) -> i32 {
         let Some(v) = self.video.as_ref() else {
             return 0;
@@ -1776,10 +1880,28 @@ impl<'s> Vm<'s> {
         let Some(started) = v.started_at else {
             return 0;
         };
-        match v.duration {
-            Some(d) if (self.time - started) < f64::from(d) => 1,
-            _ => 0,
+        match v.timing {
+            VideoTiming::Host => match self.video_host.as_ref() {
+                Some(h) if h.errored() => 2,
+                Some(h) if !h.finished() => 1,
+                _ => 0,
+            },
+            VideoTiming::Duration => match v.duration {
+                Some(d) if (self.time - started) < f64::from(d) => 1,
+                _ => 0,
+            },
+            VideoTiming::Untimed => 0,
         }
+    }
+
+    /// How the currently open clip is timed, if one is open (the native's trace label).
+    pub fn video_timing(&self) -> Option<VideoTiming> {
+        self.video.as_ref().map(|v| v.timing)
+    }
+
+    /// Duration of the currently open clip, if known (the native's trace label).
+    pub fn video_duration(&self) -> Option<f32> {
+        self.video.as_ref().and_then(|v| v.duration)
     }
 
     /// The current `Engine.VideoPlayer` clip stem, if one is open (diagnostics).
@@ -2540,6 +2662,12 @@ impl<'s> Vm<'s> {
         if let Some(slot) = layout.slot_by_name("class") {
             props[slot.base] = Value::Object(Some(ObjRef::Static(class)));
         }
+        // `Disable`/`Enable` set `bProbesDisabled`; the actor carries that flag from its class
+        // defaults at construction, so a `Disable` before the first `Tick` is already effective
+        // and `Enable` can clear it (Engine.dll `AActor+0x34` bit 0x1, `?execDisable@AActor`).
+        let probes_disabled = layout
+            .slot_by_name("bprobesdisabled")
+            .is_some_and(|s| matches!(props[s.base], Value::Bool(true)));
         self.objects.push(Instance {
             class,
             name: name.to_owned(),
@@ -2549,6 +2677,8 @@ impl<'s> Vm<'s> {
             state_code: None,
             generation: 0,
             disabled: HashSet::new(),
+            destroying: false,
+            probes_disabled,
             active: false,
             suspended: false,
             is_actor,
@@ -2779,6 +2909,19 @@ impl<'s> Vm<'s> {
         if let Some(o) = self.objects.get_mut(id as usize) {
             o.active = active;
         }
+    }
+
+    /// True when the actor's whole-probe-disable bit is set (`Disable('All')`/`bProbesDisabled`).
+    pub fn probes_disabled(&self, id: ObjectId) -> bool {
+        self.objects
+            .get(id as usize)
+            .is_some_and(|o| o.probes_disabled)
+    }
+
+    /// True while `[Vm::destroy]` is running this actor's `Destroyed` event (the engine has not
+    /// set `bDeleteMe` yet).
+    pub fn is_destroying(&self, id: ObjectId) -> bool {
+        self.objects.get(id as usize).is_some_and(|o| o.destroying)
     }
 
     /// Reads a property by name (first element).
@@ -3218,6 +3361,13 @@ impl<'s> Vm<'s> {
 
     /// Calls a script event on an object as the engine would (honours `Disable`). Returns
     /// `Ok(None)` when the probe is disabled or the class has no handler.
+    ///
+    /// A `bDeleteMe` actor receives no `ProcessEvent` at all: `Core.dll ?ProcessEvent@UObject`
+    /// (0x1011e880) calls the object's `IsPendingKill` vtable slot (`vtable+0x38`, 0x10101e60 for
+    /// `UObject`; `Engine.dll ?IsPendingKill@AActor` 0x10304b40 returns `AActor+0x2e & 1`, the
+    /// `bDeleteMe` byte) and returns without running the function when it is non-zero. A probe
+    /// disabled for this event, or a `Disable('All')` probe set (see [`Vm::disable_probe`]), also
+    /// drops the event visibly.
     pub fn send_event(
         &mut self,
         id: ObjectId,
@@ -3226,11 +3376,20 @@ impl<'s> Vm<'s> {
     ) -> VmResult<Option<Value>> {
         self.steps = 0;
         let actor = self.objects[id as usize].name.clone();
-        if self.objects[id as usize].disabled.contains(&lower(event)) {
+        if self.objects[id as usize].probes_disabled
+            || self.objects[id as usize].disabled.contains(&lower(event))
+        {
             self.note(TraceKind::ProbeDisabled {
                 actor,
                 probe: event.to_owned(),
             });
+            return Ok(None);
+        }
+        if self.objects[id as usize].deleted && !self.objects[id as usize].destroying {
+            // ProcessEvent on a bDeleteMe actor is a no-op (no handler even runs).
+            self.note(TraceKind::Note(format!(
+                "{actor}.{event}: skipped, actor has bDeleteMe (ProcessEvent drops deleted actors)"
+            )));
             return Ok(None);
         }
         let Some(f) = self.find_function(id, event, true) else {
@@ -4002,9 +4161,16 @@ impl<'s> Vm<'s> {
         // dispatches on the class default object; UE2 runs both regardless of instance scope
         // (`MessageClass.default.GetColor`, `Message.static.GetString`). Only non-static calls
         // on *placed* actors outside the executed scope are deferred.
+        // A call through a just-destroyed actor runs in the engine: `execFinalFunction`/
+        // `execVirtualFunction` reach `CallFunction` directly, which has no `bDeleteMe` guard (see
+        // `bypass_context_none`). The VM's `deleted`/`destroying` flags stand in for that, so such
+        // a call is never treated as an out-of-scope deferral.
+        let destroyed_target =
+            self.objects[target as usize].deleted || self.objects[target as usize].destroying;
         if !self.objects[target as usize].active
             && !self.objects[target as usize].name.starts_with("Default__")
             && !f.is_static()
+            && !destroyed_target
         {
             // item14c: a **suspended** actor (cleared by `suspend_for_error`) is not the same as
             // a placed actor outside the executed scope. Dropping its call silently would hide a
@@ -4649,41 +4815,30 @@ impl<'s> Vm<'s> {
         self.note(TraceKind::AccessedNone { function, offset });
     }
 
-    fn context_target(
-        &mut self,
-        frame: &mut Frame<'s>,
-        object: &Token,
-        target: ObjectId,
-    ) -> VmResult<Option<ObjectId>> {
-        let v = self.eval_in(frame, object, target)?;
-        self.context_value(v)
-    }
-
-    /// A destroyed actor whose plain variable `member` is read through a context expression
-    /// (`P.NextController`). UE2 keeps the actor's memory until reference cleanup: Core.dll
-    /// `UObject::execContext` (0x101173a0..0x1011740d) only reports Accessed None for a NULL
-    /// context (no bDeleteMe check), Engine.dll `ULevel::DestroyActor` only sets bDeleteMe
-    /// (`AActor+0x2c` bit 0x10000, at 0x1038965a), and `ULevel::CleanupDestroyed`
-    /// (0x10387ae0) nulls references only once at least 128 (0x80, at 0x10387b63) destroyed
-    /// actors are pending or on a forced cleanup. So a script that destroys the current node of
-    /// a list walk still reads its stale `NextController`/`NextPawn` (XIIIGameInfo.EndGame
-    /// +0x0322 `P = P.nextController` after `GotoState('GameEnded')` destroyed an AI
-    /// controller). Function calls through a destroyed context keep the VM's Accessed-None
-    /// behaviour (not modelled here).
-    fn destroyed_variable_context(&self, v: &Value, member: &Token) -> Option<ObjectId> {
+    /// Object id behind a context expression the VM would otherwise resolve to `None` because the
+    /// actor is destroyed, when the engine would not. Core.dll `UObject::execContext`
+    /// (`0x101173a0..0x1011740d`, the null check at `0x101173d3`) only reports Accessed None for a
+    /// NULL context; it does **not** test `bDeleteMe`.
+    ///
+    /// The engine's own bytecode paths are `execContext` (for `P.member`) and
+    /// `execVirtualFunction`/`execFinalFunction`, which call `UObject::CallFunction`; that runs the
+    /// body directly and never routes through `UObject::ProcessEvent`. So a plain variable read,
+    /// a write and a function call through a just-destroyed actor all still work in the engine;
+    /// `ProcessEvent` (the engine-delivered `event`/probe path, [Vm::send_event]) is what a
+    /// `bDeleteMe` actor skips. `ULevel::DestroyActor` runs `Destroyed` **before** setting
+    /// `bDeleteMe` (`0x1038965a`), and `ULevel::CleanupDestroyed` (`0x10387ae0`) only nulls
+    /// references once at least 128 (`0x80` at `0x10387b63`) destroyed actors are pending, so a
+    /// just-destroyed actor stays readable/writable — this is why `XIIIGameInfo.EndGame` +0x0322
+    /// `P = P.nextController` still walks a destroyed AI controller.
+    ///
+    /// The `member` operand is kept for the callers' clarity; the bypass is per-actor, so the same
+    /// rule applies to reads, writes and calls.
+    fn bypass_context_none(&self, v: &Value, _member: &Token) -> Option<ObjectId> {
         let Value::Object(Some(ObjRef::Instance(i))) = v else {
             return None;
         };
         let o = self.objects.get(*i as usize)?;
-        if !o.deleted || !o.is_actor {
-            return None;
-        }
-        let plain_variable = match &member.kind {
-            TokenKind::InstanceVariable(_) => true,
-            TokenKind::BoolVariable(e) => matches!(e.kind, TokenKind::InstanceVariable(_)),
-            _ => false,
-        };
-        plain_variable.then_some(*i)
+        (o.is_actor && (o.destroying || o.deleted)).then_some(*i)
     }
 
     /// Target object from an already-evaluated context object expression. `None` = UE2
@@ -4977,7 +5132,7 @@ impl<'s> Vm<'s> {
                             }));
                         }
                     }
-                } else if let Some(obj) = self.destroyed_variable_context(&v, &c.member) {
+                } else if let Some(obj) = self.bypass_context_none(&v, &c.member) {
                     self.eval_in(frame, &c.member, obj)?
                 } else {
                     match self.context_value(v)? {
@@ -5475,10 +5630,19 @@ impl<'s> Vm<'s> {
             K::InstanceVariable(r) => self.var_slot(frame, *r, target, false)?,
             K::DefaultVariable(r) => self.var_slot(frame, *r, target, true)?,
             K::BoolVariable(e) => return self.place(frame, e, target),
-            K::Context(c) => match self.context_target(frame, &c.object, target)? {
-                Some(obj) => return self.place(frame, &c.member, obj),
-                None => return Ok(None),
-            },
+            K::Context(c) => {
+                // Writes through a destroyed-but-uncleaned actor still land: `execContext` has no
+                // `bDeleteMe` test (see `bypass_context_none`), so `P.NextController = x` updates
+                // the stale memory the engine would update.
+                let v = self.eval_in(frame, &c.object, target)?;
+                if let Some(obj) = self.bypass_context_none(&v, &c.member) {
+                    return self.place(frame, &c.member, obj);
+                }
+                match self.context_value(v)? {
+                    Some(obj) => return self.place(frame, &c.member, obj),
+                    None => return Ok(None),
+                }
+            }
             K::ArrayElement { index, array } => {
                 let i = self.int(frame, index)?;
                 let Some(base) = self.place(frame, array, target)? else {
@@ -5688,6 +5852,14 @@ impl<'s> Vm<'s> {
     // ------------------------------------------------------------------ helpers for natives
 
     pub(crate) fn disable_probe(&mut self, id: ObjectId, probe: &str, disable: bool) {
+        // UE2 `Disable('All')` sets the actor-wide `bProbesDisabled` bit; a named probe is
+        // recorded in the actor's disabled-probe set (UE2 `FObject::DisableProbe`; not separately
+        // disassembled here). `Enable('All')` clears the bit. The VM keeps both: the whole-actor
+        // flag suppresses every event, so `Destroyed` is dropped too (the engine's probe check).
+        if probe.eq_ignore_ascii_case("all") {
+            self.objects[id as usize].probes_disabled = disable;
+            self.set_property(id, "bProbesDisabled", 0, Value::Bool(disable));
+        }
         let o = &mut self.objects[id as usize];
         if disable {
             o.disabled.insert(lower(probe));
@@ -6138,22 +6310,45 @@ impl<'s> Vm<'s> {
         settled
     }
 
-    /// `Actor.Destroy`: runs `Destroyed`, then marks the object deleted so later references act
-    /// as `None` and it leaves iterators. Idempotent; a nested `Destroy` during `Destroyed` is
-    /// ignored (the object is already marked), so it cannot recurse or panic.
+    /// `Actor.Destroy` in the engine's `ULevel::DestroyActor` order (`Engine.dll`
+    /// `?DestroyActor@ULevel` RVA 0x890e0): clear the actor's state and latent action, run the
+    /// `Destroyed` event, then set `bDeleteMe` and remove it from the level lists.
+    ///
+    /// `deleted` (the "acts as `None`" flag) is set **after** `Destroyed`, exactly as the engine
+    /// sets `bDeleteMe` after the event; `destroying` is the in-progress guard that makes a nested
+    /// `Destroy` from inside `Destroyed` a no-op (the engine's re-entry returns 1). A plain
+    /// variable read/write and a call through the actor still work during and after the event
+    /// (execContext/CallFunction have no delete gate; see `bypass_context_none`), while
+    /// `ProcessEvent`-delivered events stop once `deleted` is set.
     pub fn destroy(&mut self, id: ObjectId) -> VmResult<bool> {
-        if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
+        if self
+            .objects
+            .get(id as usize)
+            .is_none_or(|o| o.deleted || o.destroying)
+        {
             return Ok(true);
         }
-        self.objects[id as usize].deleted = true;
-        self.objects[id as usize].active = false;
+        // `ULevel::DestroyActor` clears the state (and its latent action) before `Destroyed`.
+        self.objects[id as usize].destroying = true;
         self.objects[id as usize].state = None;
         self.objects[id as usize].state_code = None;
-        self.objects[id as usize].timers = [None, None, None];
         self.objects[id as usize].generation += 1;
-        if let Some(f) = self.find_function(id, "Destroyed", true) {
-            self.call_values(f, id, Vec::new())?;
-        }
+        // A `bProbesDisabled` actor receives no `ProcessEvent`, so `Destroyed` never runs.
+        let event = if !self.objects[id as usize].probes_disabled {
+            self.find_function(id, "Destroyed", true)
+        } else {
+            None
+        };
+        let result = match event {
+            Some(f) => self.call_values(f, id, Vec::new()).map(|_| ()),
+            None => Ok(()),
+        };
+        // `bDeleteMe` is now set; the actor stops executing.
+        self.objects[id as usize].destroying = false;
+        self.objects[id as usize].deleted = true;
+        result?;
+        self.objects[id as usize].active = false;
+        self.objects[id as usize].timers = [None, None, None];
         // Leave a clean inventory chain. `Inventory.Destroyed` unlinks the item via
         // `Instigator/Owner.DeleteInventory`, but that call is on another actor and can be
         // deferred (out of the executed scope), leaving the destroyed item reachable from the
