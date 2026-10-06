@@ -2719,6 +2719,7 @@ fn nav_fixture() -> Vec<u8> {
     let rotation = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
     let radius = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
     let height = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
+    let physics = b.reserve(IMP_BYTEPROP, actor, "Physics");
     let ground = b.reserve(IMP_FLOATPROP, pawn, "GroundSpeed");
     let eye = b.reserve(IMP_FLOATPROP, pawn, "BaseEyeHeight");
 
@@ -2733,6 +2734,8 @@ fn nav_fixture() -> Vec<u8> {
     b.prop_with(location, rotation, 0, &vector_extra);
     b.prop_with(rotation, radius, 0, &rotator_extra);
     b.prop(radius, height, 0);
+    b.prop(height, physics, 0);
+    b.prop_with(physics, 0, 0, &compact(0));
     b.prop_with(c_pawn, dest, 0, &object_extra);
     b.prop_with(dest, focal, 0, &vector_extra);
     b.prop_with(focal, move_target, 0, &vector_extra);
@@ -5101,6 +5104,210 @@ fn move_to_sets_destination_and_latent_then_completes_at_ground_speed() {
     }
     assert_eq!(ticks, 30);
     assert_eq!(vm.vector_prop(pawn, "Location"), Some([300.0, 0.0, 0.0]));
+}
+
+/// Finite angled wall used to prove that a VM-driven PHYS_Walking pawn receives provider sliding.
+/// The wall lies on `normal·p = offset` and is bounded along its tangent, so its far end is
+/// traversable. Non-walking `move_box` deliberately stops at the first contact.
+struct AngledWallPhysics {
+    normal: [f32; 2],
+    tangent: [f32; 2],
+    offset: f32,
+    half_length: f32,
+}
+
+impl AngledWallPhysics {
+    fn hit(&self, start: [f32; 3], delta: [f32; 3], radius: f32) -> Option<(f32, [f32; 3])> {
+        let signed = start[0] * self.normal[0] + start[1] * self.normal[1];
+        let into = delta[0] * self.normal[0] + delta[1] * self.normal[1];
+        if signed > self.offset - radius || into <= 0.0 {
+            return None;
+        }
+        let time = (self.offset - radius - signed) / into;
+        if !(0.0..=1.0).contains(&time) {
+            return None;
+        }
+        let point = [start[0] + delta[0] * time, start[1] + delta[1] * time];
+        let along = point[0] * self.tangent[0] + point[1] * self.tangent[1];
+        (along.abs() <= self.half_length + radius)
+            .then_some((time, [self.normal[0], self.normal[1], 0.0]))
+    }
+
+    fn outcome(
+        &self,
+        start: [f32; 3],
+        delta: [f32; 3],
+        end: [f32; 3],
+        time: f32,
+        normal: [f32; 3],
+    ) -> MoveOutcome {
+        MoveOutcome {
+            end,
+            hit: Some(WorldHit {
+                location: [
+                    start[0] + delta[0] * time,
+                    start[1] + delta[1] * time,
+                    start[2] + delta[2] * time,
+                ],
+                normal,
+                time,
+            }),
+        }
+    }
+}
+
+impl WorldPhysics for AngledWallPhysics {
+    fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
+        let delta = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+        let (time, normal) = self.hit(start, delta, extent[0].max(extent[1]))?;
+        Some(WorldHit {
+            location: [
+                start[0] + delta[0] * time,
+                start[1] + delta[1] * time,
+                start[2] + delta[2] * time,
+            ],
+            normal,
+            time,
+        })
+    }
+
+    fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        let full_end = [
+            start[0] + delta[0],
+            start[1] + delta[1],
+            start[2] + delta[2],
+        ];
+        match self.hit(start, delta, extent[0].max(extent[1])) {
+            Some((t, n)) => self.outcome(
+                start,
+                delta,
+                [
+                    start[0] + delta[0] * t,
+                    start[1] + delta[1] * t,
+                    full_end[2],
+                ],
+                t,
+                n,
+            ),
+            None => MoveOutcome {
+                end: full_end,
+                hit: None,
+            },
+        }
+    }
+
+    fn walk_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        let radius = extent[0].max(extent[1]);
+        let full_end = [
+            start[0] + delta[0],
+            start[1] + delta[1],
+            start[2] + delta[2],
+        ];
+        let Some((time, normal)) = self.hit(start, delta, radius) else {
+            return MoveOutcome {
+                end: full_end,
+                hit: None,
+            };
+        };
+        let contact = [
+            start[0] + delta[0] * time,
+            start[1] + delta[1] * time,
+            full_end[2],
+        ];
+        let left = [(1.0 - time) * delta[0], (1.0 - time) * delta[1]];
+        let into = left[0] * normal[0] + left[1] * normal[1];
+        let slide = [left[0] - into * normal[0], left[1] - into * normal[1]];
+        self.outcome(
+            start,
+            delta,
+            [contact[0] + slide[0], contact[1] + slide[1], full_end[2]],
+            time,
+            normal,
+        )
+    }
+
+    fn point_free(&mut self, _location: [f32; 3], _extent: [f32; 3]) -> bool {
+        true
+    }
+}
+
+#[test]
+fn vm_walking_pawn_slides_along_finite_angled_wall_and_reaches_target() {
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(AngledWallPhysics {
+        normal: [0.9486833, 0.31622776],
+        tangent: [-0.31622776, 0.9486833],
+        offset: 50.0,
+        half_length: 30.0,
+    }));
+    let (ctrl, pawn) = nav_actor_pair(&mut vm, &set, 1.0, 2.0, 100.0);
+    vm.set_property(pawn, "Physics", 0, Value::Byte(1)); // PHYS_Walking
+    assert_eq!(vm.get_property(pawn, "Physics"), Some(&Value::Byte(1)));
+    let mut args = [Value::Vector([100.0, 0.0, 0.0])];
+    let _ = call_native_stateful(
+        &mut vm,
+        "Engine.Controller.MoveTo",
+        ctrl,
+        &[false, true, true],
+        &mut args,
+    );
+
+    let mut arrived = false;
+    for _ in 0..500 {
+        arrived = vm
+            .move_pawn_step(pawn, [100.0, 0.0, 0.0], 0.0, 0.1)
+            .unwrap();
+        if arrived {
+            break;
+        }
+    }
+    assert!(
+        arrived,
+        "VM walking pawn failed to route around the angled wall: {:?}",
+        vm.vector_prop(pawn, "Location")
+    );
+    let final_pos = vm.vector_prop(pawn, "Location").unwrap();
+    assert!((final_pos[0] - 100.0).abs() <= 1.0, "{final_pos:?}");
+    assert!(final_pos[1].abs() <= 1.0, "{final_pos:?}");
+}
+
+#[test]
+fn vm_nonwalking_pawn_keeps_direct_swept_move() {
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(AngledWallPhysics {
+        normal: [0.9486833, 0.31622776],
+        tangent: [-0.31622776, 0.9486833],
+        offset: 50.0,
+        half_length: 30.0,
+    }));
+    let (_ctrl, pawn) = nav_actor_pair(&mut vm, &set, 1.0, 2.0, 100.0);
+    vm.set_property(pawn, "Physics", 0, Value::Byte(0)); // PHYS_None
+    assert_eq!(vm.get_property(pawn, "Physics"), Some(&Value::Byte(0)));
+
+    let mut arrived = false;
+    for _ in 0..100 {
+        arrived = vm
+            .move_pawn_step(pawn, [100.0, 0.0, 0.0], 0.0, 0.1)
+            .unwrap();
+        if arrived {
+            break;
+        }
+    }
+    assert!(
+        !arrived,
+        "PHYS_None must not receive the PHYS_Walking slide"
+    );
+    let pos = vm.vector_prop(pawn, "Location").unwrap();
+    assert!(
+        pos[0] < 55.0,
+        "direct swept move should stop at the wall: {pos:?}"
+    );
+    assert!(
+        pos[1].abs() < 1.0,
+        "direct move must not slide along the wall: {pos:?}"
+    );
 }
 
 #[test]

@@ -1000,9 +1000,15 @@ struct Timer {
 
 /// Event dispatched by timer slot 0/1/2 (UE2 `SetTimer`, `SetTimer2`, `Controller.SetTimer3`).
 const TIMER_EVENTS: [&str; 3] = ["Timer", "Timer2", "Timer3"];
+/// UE2 `EPhysics::PHYS_Walking` (engine.u enum order; see `item7b-movement-modes.md`).
+const PHYS_WALKING: u8 = 1;
 
-fn cine_trace_enabled() -> bool {
-    std::env::var_os("XIII_CINE_TRACE").is_some_and(|v| v != "0" && !v.is_empty())
+fn vm_move_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("XIII_VM_MOVE_TRACE")
+            .is_some_and(|value| value != "0" && !value.is_empty())
+    })
 }
 
 /// An interpreter object.
@@ -3693,174 +3699,10 @@ impl<'s> Vm<'s> {
     /// `XIIIBaseHud.Tick`, pawn controllers) never runs. `Tick` is looked up in the actor's
     /// current state first, then the class chain.
     fn dispatch_tick(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
-        let trace_cine = cine_trace_enabled() && self.is_a(id, "CineController2");
-        let action_before =
-            trace_cine.then(|| match self.get_property(id, "ScriptedActionIndex") {
-                Some(Value::Int(index)) => Some(*index),
-                _ => None,
-            });
         if let Some(f) = self.find_function(id, "Tick", true) {
             self.call_values(f, id, vec![Value::Float(dt)])?;
         }
-        if trace_cine {
-            let action_after = match self.get_property(id, "ScriptedActionIndex") {
-                Some(Value::Int(index)) => Some(*index),
-                _ => None,
-            };
-            let phase = if action_before.flatten() != action_after {
-                "advance"
-            } else {
-                "blocked/current"
-            };
-            self.trace_cinematic_controller(id, phase);
-        }
         Ok(())
-    }
-
-    /// Temporary, opt-in diagnostic for the authored XIDCine action interpreter. Kept in the VM
-    /// so it observes the same actor state and decoded action table that `Interpret` consumes.
-    fn trace_cinematic_controller(&self, id: ObjectId, phase: &str) {
-        let obj = &self.objects[id as usize];
-        let action_index = match self.get_property(id, "ScriptedActionIndex") {
-            Some(Value::Int(i)) => *i,
-            _ => -1,
-        };
-        // CineController2 increments ScriptedActionIndex after Interpret. The preceding entry is
-        // the action just executed and, while paused, the action whose wait bit is still set.
-        let pawn = self.obj_prop(id, "MyPawn");
-        let controlled_pawn = self.obj_prop(id, "Pawn");
-        let tab = pawn.and_then(|p| match self.get_property(p, "CurrentTabActionIndex") {
-            Some(Value::Int(i)) => Some(*i),
-            _ => None,
-        });
-        let list = pawn.and_then(|p| {
-            let name = match tab.unwrap_or(0) {
-                2 => "tabActions2",
-                3 => "tabActions3",
-                _ => "tabActions",
-            };
-            match self.get_property(p, name) {
-                Some(Value::Array(items)) => Some(items),
-                _ => None,
-            }
-        });
-        let selected = action_index.saturating_sub(1);
-        let action = list
-            .and_then(|items| usize::try_from(selected).ok().and_then(|i| items.get(i)))
-            .map_or_else(
-                || "<action unavailable>".to_owned(),
-                |v| match v {
-                    Value::Str(s) | Value::Name(s) => s.clone(),
-                    _ => format!("{v}"),
-                },
-            );
-        let state = self.state_name(id).unwrap_or_else(|| "<no state>".into());
-        let flags = match self.get_property(id, "flagsPaused") {
-            Some(Value::Int(v)) => *v,
-            _ => 0,
-        };
-        let mut waits = Vec::new();
-        for (mask, label) in [
-            (1, "player"),
-            (2, "event"),
-            (4, "warning"),
-            (8, "speech/dial"),
-            (16, "move/sequence"),
-            (32, "see-player"),
-            (64, "seen-by-player"),
-            (128, "time"),
-            (256, "animation"),
-            (512, "not-seen-by-player"),
-            (1024, "player-away"),
-            (2048, "cadaver"),
-        ] {
-            if flags & mask != 0 {
-                waits.push(label.to_owned());
-            }
-        }
-        if flags & 2 != 0 {
-            waits.push(format!(
-                "event-name={}",
-                self.get_property(id, "Tag")
-                    .map_or_else(|| "<none>".into(), |v| format!("{v}"))
-            ));
-        }
-        if flags & 4 != 0 {
-            waits.push(format!(
-                "WarnMemory={:?} warning-jump={:?}",
-                self.get_property(id, "WarnMemory"),
-                self.get_property_elem(id, "nOnJump", 2)
-            ));
-        }
-        if flags & 16 != 0 {
-            waits.push(format!("bMoving={:?}", self.get_property(id, "bMoving")));
-        }
-        if flags & 256 != 0 {
-            waits.push(format!(
-                "bAnimOnce={:?} bSubAnim={:?}",
-                self.get_property(id, "bAnimOnce"),
-                self.get_property(id, "bSubAnim")
-            ));
-        }
-        if let Some(pawn) = pawn {
-            let location = self.vector_prop(pawn, "Location");
-            for property in ["Target", "NextTarget"] {
-                if let Some(target) = self.obj_prop(id, property) {
-                    let target_name = self.objects[target as usize].name.clone();
-                    let target_location = self.vector_prop(target, "Location");
-                    let distance = location.zip(target_location).map(|(from, to)| {
-                        let delta = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
-                        (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt()
-                    });
-                    waits.push(format!(
-                        "{property}={target_name}@{target_location:?} distance={distance:?}"
-                    ));
-                }
-            }
-            for (&channel, animation) in &self.objects[pawn as usize].anim.channels {
-                if animation.active {
-                    waits.push(format!(
-                        "channel{channel}={} frame={:.3}/{},rate={:.3}fps,loop={}",
-                        animation.sequence,
-                        animation.frame,
-                        animation.frames,
-                        animation.rate,
-                        animation.looping
-                    ));
-                }
-            }
-        }
-        if let Some(code) = obj.state_code.as_ref()
-            && let Some(latent) = &code.latent
-        {
-            waits.push(format!("latent={latent:?}"));
-        }
-        println!(
-            "[cine-trace] t={:.3}s tick={} phase={} actor={} pawn={} mypawn={} state={} label/tag={} action[{}]={:?} flagsPaused=0x{:X} wait={}",
-            self.time,
-            self.tick_count,
-            phase,
-            obj.name,
-            controlled_pawn.map_or_else(
-                || "<none>".into(),
-                |p| self.objects[p as usize].name.clone()
-            ),
-            pawn.map_or_else(
-                || "<none>".into(),
-                |p| self.objects[p as usize].name.clone()
-            ),
-            state,
-            self.get_property(id, "Tag")
-                .map_or_else(|| "<none>".into(), |v| format!("{v}")),
-            selected,
-            action,
-            flags,
-            if waits.is_empty() {
-                "<none>".into()
-            } else {
-                waits.join(",")
-            }
-        );
     }
 
     /// item18: per-frame `PlayerTick` dispatch to the local player controllers, after the actor
@@ -7497,22 +7339,42 @@ impl<'s> Vm<'s> {
         }
         let delta = [next[0] - location[0], next[1] - location[1], 0.0];
         let extent = self.actor_extent(pawn);
-        let outcome = self
-            .physics
-            .as_mut()
-            .map(|p| p.move_box(location, delta, extent));
-        let end = outcome.map_or_else(|| add3(location, delta), |o| o.end);
-        if cine_trace_enabled()
-            && self.objects[pawn as usize]
-                .name
-                .eq_ignore_ascii_case("Cine11")
-            && let Some(hit) = outcome.and_then(|o| o.hit)
+        // UE2 calls APawn::physWalking only for PHYS_Walking with world collision enabled.
+        // Controller.MoveTo can be
+        // requested for pawns in other physics modes (e.g. BaseSoldier defaults to PHYS_None),
+        // so do not apply walking step-up/floor-follow to them. Cine Steering also bypasses this
+        // path entirely while bCollideWorld is false (`collisionoff`).
+        let collides_world = match self.get_property(pawn, "bCollideWorld") {
+            Some(Value::Bool(enabled)) => *enabled,
+            // Native Actor default is bCollideWorld=true; small synthetic VM fixtures can omit
+            // the reflected slot while still modelling a walking Pawn.
+            _ => true,
+        };
+        let walking = self.byte_prop(pawn, "Physics") == PHYS_WALKING && collides_world;
+        let outcome = self.physics.as_mut().map(|p| {
+            if walking {
+                p.walk_box(location, delta, extent)
+            } else {
+                p.move_box(location, delta, extent)
+            }
+        });
+        if vm_move_trace_enabled()
+            && let Some(hit) = outcome.and_then(|outcome| outcome.hit)
         {
+            let object = &self.objects[pawn as usize];
+            let classname = self.set.path(object.class);
             println!(
-                "[cine-trace-block] t={:.3}s tick={} actor=Cine11 start={location:?} delta={delta:?} extent={extent:?} hit_time={:.6} hit_location={:?} normal={:?} end={end:?}",
-                self.time, self.tick_count, hit.time, hit.location, hit.normal
+                "[vm-pawn-move] pawn={} class={} Physics={} bCollideWorld={} walking={} from={location:?} delta={delta:?} extent={extent:?} hit_time={:.6} normal={:?}",
+                object.name,
+                classname,
+                self.byte_prop(pawn, "Physics"),
+                self.bool_prop(pawn, "bCollideWorld"),
+                walking,
+                hit.time,
+                hit.normal
             );
         }
+        let end = outcome.map_or_else(|| add3(location, delta), |o| o.end);
         self.set_property(pawn, "Location", 0, Value::Vector(end));
         Ok(horizontal_distance(end, destination) <= radius)
     }
