@@ -7538,6 +7538,128 @@ fn video_player_status_times_a_host_registered_duration() {
     assert!(!vm.video_open("bad"));
 }
 
+/// item21: a controllable host playback provider for the VM-state tests. The flags are shared
+/// through an `Rc` so a test can flip them after the VM owns the boxed provider.
+#[derive(Default)]
+struct FakeVideoHostState {
+    open_ok: std::cell::Cell<bool>,
+    finished: std::cell::Cell<bool>,
+    errored: std::cell::Cell<bool>,
+    plays: std::cell::Cell<u32>,
+    stops: std::cell::Cell<u32>,
+    last_open: std::cell::RefCell<Option<String>>,
+}
+
+#[derive(Clone, Default)]
+struct FakeVideoHost {
+    s: std::rc::Rc<FakeVideoHostState>,
+}
+
+impl crate::vm::VideoPlayerHost for FakeVideoHost {
+    fn open(&mut self, name: &str) -> Option<f32> {
+        *self.s.last_open.borrow_mut() = Some(name.to_owned());
+        self.s.open_ok.get().then_some(12.5)
+    }
+    fn play(&mut self) {
+        self.s.plays.set(self.s.plays.get() + 1);
+    }
+    fn stop(&mut self) {
+        self.s.stops.set(self.s.stops.get() + 1);
+    }
+    fn finished(&self) -> bool {
+        self.s.finished.get()
+    }
+    fn errored(&self) -> bool {
+        self.s.errored.get()
+    }
+}
+
+/// item21: with a host provider installed, `Open` decodes through the host, `GetStatus` reports
+/// `1` while the host playback runs, `0` at its actual end and `2` on playback failure; the
+/// registered duration is ignored for host-decoded clips.
+#[test]
+fn host_playback_drives_video_status() {
+    let set = set_of(fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let host = FakeVideoHost::default();
+    host.s.open_ok.set(true);
+    vm.set_video_host(Box::new(host.clone()));
+    vm.set_video_duration("cine01", 100.0); // must not matter for a host-decoded clip
+    assert!(vm.has_video_host());
+    assert!(vm.video_open("Cine01.bik"));
+    assert_eq!(host.s.last_open.borrow().as_deref(), Some("cine01"));
+    assert_eq!(vm.video_timing(), Some(crate::vm::VideoTiming::Host));
+    assert_eq!(vm.video_duration(), Some(12.5));
+    // Not started: status 0 even though the clip is open.
+    assert_eq!(vm.video_status(), 0);
+    vm.video_play();
+    assert_eq!(host.s.plays.get(), 1);
+    assert_eq!(vm.video_status(), 1);
+    // VM time passing the (irrelevant) registered duration changes nothing while playing.
+    vm.tick(200.0).unwrap();
+    assert_eq!(
+        vm.video_status(),
+        1,
+        "host playback, not VM time, ends the clip"
+    );
+    // The host playback ends: status 0 at the host's actual end.
+    host.s.finished.set(true);
+    assert_eq!(vm.video_status(), 0);
+    // Playback failure is the game's error status ("Error playing video").
+    host.s.finished.set(false);
+    host.s.errored.set(true);
+    assert_eq!(vm.video_status(), 2);
+    // Stop clears the clip and stops the host playback.
+    host.s.errored.set(false);
+    vm.video_stop();
+    assert_eq!(host.s.stops.get(), 1);
+    assert_eq!(vm.video_status(), 0);
+    assert_eq!(vm.video_name(), None);
+}
+
+/// item21: when the host cannot decode the file (`open` -> `None`) the registered Bink-header
+/// duration times the clip (labelled fallback); with neither, the clip is untimed and reports
+/// finished. A second `Open` stops the clip the host is still playing.
+#[test]
+fn host_open_failure_falls_back_and_reopen_stops() {
+    let set = set_of(fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let host = FakeVideoHost::default();
+    host.s.open_ok.set(true);
+    vm.set_video_host(Box::new(host.clone()));
+    vm.set_video_duration("other", 5.0);
+    // Host decode failure + registered duration: duration fallback, timed from Play.
+    host.s.open_ok.set(false);
+    assert!(vm.video_open("other"));
+    assert_eq!(vm.video_timing(), Some(crate::vm::VideoTiming::Duration));
+    vm.video_play();
+    assert_eq!(vm.video_status(), 1);
+    vm.tick(4.9).unwrap();
+    assert_eq!(vm.video_status(), 1);
+    vm.tick(0.2).unwrap();
+    assert_eq!(vm.video_status(), 0, "4.9 + 0.2 s >= 5 s");
+    // Neither: untimed, finished immediately, `Open` still returns false.
+    assert!(!vm.video_open("unknown"));
+    assert_eq!(vm.video_timing(), Some(crate::vm::VideoTiming::Untimed));
+    vm.video_play();
+    assert_eq!(vm.video_status(), 0);
+    // While the second clip is open, a third `Open` stops the host playback of the previous one.
+    host.s.open_ok.set(true);
+    assert!(vm.video_open("cine01"));
+    vm.video_play();
+    assert_eq!(
+        host.s.plays.get(),
+        1,
+        "only the host-decoded clip reaches host play (the fallback clip does not)"
+    );
+    assert!(vm.video_open("cine02"));
+    assert_eq!(host.s.stops.get(), 1, "re-opening must stop the prior clip");
+    // Play without an open clip never reaches the host.
+    vm.video_stop();
+    vm.video_play();
+    assert_eq!(host.s.plays.get(), 1);
+}
+
 #[test]
 fn percent_float_float_matches_fmod() {
     let set = set_of(fixture());
