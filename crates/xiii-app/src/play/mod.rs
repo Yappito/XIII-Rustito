@@ -239,7 +239,7 @@ impl Plugin for PlayPlugin {
                     viewer::fog::update_fog,
                     viewer::decals::update_runtime_projectors,
                     sync_particle_triggers,
-                    sync_vm_lights,
+                    (sync_vm_lights, viewer::lights::cull_receivers).chain(),
                     pawns::update_pawns,
                     weapons::update_weapon_view,
                     hud::refresh,

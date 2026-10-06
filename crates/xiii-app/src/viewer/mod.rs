@@ -43,6 +43,9 @@ pub(crate) const MAIN_LAYER: usize = 0;
 /// Render layer of the sky zone (drawn only by the second, sky camera).
 pub(crate) const SKY_LAYER: usize = 1;
 
+/// Hides time-varying diagnostic text and crosshair for deterministic screenshot comparisons.
+const ENV_NO_OVERLAY: &str = "XIII_VIEWER_NO_OVERLAY";
+
 /// Viewer plugin.
 pub struct ViewerPlugin {
     /// Parsed options (map, game dir, unattended settings).
@@ -142,6 +145,7 @@ impl Plugin for ViewerPlugin {
                 sky_follow,
                 animate_uv,
                 lights::update_scene_lights,
+                lights::cull_receivers,
                 fog::update_fog,
                 pick,
                 overlay,
@@ -245,7 +249,11 @@ pub(crate) fn animate_uv(
     mut perf: ResMut<crate::perf::Perf>,
 ) {
     let t0 = Instant::now();
-    let t = time.elapsed_secs();
+    let t = if std::env::var_os(lights::ENV_FREEZE_ANIMATION).is_some() {
+        0.0
+    } else {
+        time.elapsed_secs()
+    };
     for a in &animated {
         if let Some(mut mat) = materials.get_mut(&a.material) {
             mat.uv_transform = uv_affine(&a.ops, t);
@@ -472,12 +480,15 @@ pub(crate) fn spawn_scene_geometry(
         // Light-only additive receiver: the same (uncoloured) geometry with a lit white
         // transparent material, so dynamic lights add to the baked unlit pass.
         if let Some(recv_mat) = receiver_mats.get(&scene.meshes[o.mesh].material_index) {
+            let bounds = lights::receiver_bounds(&scene.meshes[o.mesh].positions, transform);
             commands.spawn((
                 Mesh3d(mesh_handles[o.mesh].clone()),
                 MeshMaterial3d(recv_mat.clone()),
                 RenderLayers::layer(layer),
                 transform,
                 lights::LightReceiver,
+                bounds,
+                Visibility::Visible,
                 Name::new(format!("lightrecv {}", o.path)),
             ));
         }
@@ -788,43 +799,45 @@ fn setup(
         lines,
     });
 
-    commands.spawn((
-        OverlayText,
-        Text::new("loading"),
-        TextFont {
-            font_size: FontSize::Px(13.0),
-            ..default()
-        },
-        TextColor(Color::srgb(0.95, 0.95, 0.85)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: px(6),
-            left: px(6),
-            padding: UiRect::all(px(5)),
-            ..default()
-        },
-        BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
-    ));
-    // Crosshair.
-    commands.spawn((
-        Text::new("+"),
-        TextFont {
-            font_size: FontSize::Px(22.0),
-            ..default()
-        },
-        TextColor(Color::srgb(1.0, 0.2, 0.2)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: percent(50),
-            left: percent(50),
-            margin: UiRect {
-                left: px(-6),
-                top: px(-13),
+    if std::env::var_os(ENV_NO_OVERLAY).is_none() {
+        commands.spawn((
+            OverlayText,
+            Text::new("loading"),
+            TextFont {
+                font_size: FontSize::Px(13.0),
                 ..default()
             },
-            ..default()
-        },
-    ));
+            TextColor(Color::srgb(0.95, 0.95, 0.85)),
+            Node {
+                position_type: PositionType::Absolute,
+                top: px(6),
+                left: px(6),
+                padding: UiRect::all(px(5)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+        ));
+        // Crosshair.
+        commands.spawn((
+            Text::new("+"),
+            TextFont {
+                font_size: FontSize::Px(22.0),
+                ..default()
+            },
+            TextColor(Color::srgb(1.0, 0.2, 0.2)),
+            Node {
+                position_type: PositionType::Absolute,
+                top: percent(50),
+                left: percent(50),
+                margin: UiRect {
+                    left: px(-6),
+                    top: px(-13),
+                    ..default()
+                },
+                ..default()
+            },
+        ));
+    }
 }
 
 fn fly_look(
