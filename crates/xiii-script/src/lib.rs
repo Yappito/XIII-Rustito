@@ -41,6 +41,7 @@ pub use events::{
     TravelRequest, TravelSource,
 };
 pub use external::ExternalObjectData;
+pub use item20::{SaveSlotInfo, SaveSlotProvider};
 pub use linker::{ExternalLookup, ExternalPackage, GlobalRef, ScriptPackage, ScriptSet};
 pub use localize::{LocalizationData, placeholder};
 pub use navigation::{

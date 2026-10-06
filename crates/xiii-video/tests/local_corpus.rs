@@ -246,3 +246,51 @@ fn gog_first_10_seconds_of_every_file_audio_decodes() {
     assert!(files >= 19, "expected 19 cutscenes, found {files}");
     println!("{files} files, {with_audio} with audio: first 10 s decode with 0 errors");
 }
+
+// ------------------------------------------------------------------ item17d track selection
+
+/// item17d: the cutscene audio-track selection the way the game does it.
+///
+/// The GOG install's `[Engine.Engine] Language=int` matches no dub prefix (ukt/frt/det/est/itt),
+/// so the game selects track 0. A five-track file (Cine00.bik) reports 5 tracks; the
+/// single-track Cine01.bik reports 1 (measured on this corpus; the task's "Cine01.bik reports 5
+/// tracks" premise is not met and is documented in the item17d report).
+#[test]
+fn gog_audio_track_selection() {
+    let Some(root) = dir("XIII_GOG_DIR") else {
+        println!("SKIPPED: XIII_GOG_DIR not set");
+        return;
+    };
+    let language = xiii_video::language_from_install(&root)
+        .unwrap_or_else(|| panic!("GOG install has no [Engine.Engine] Language= key"));
+    println!("GOG [Engine.Engine] Language={language}");
+    // The GOG install's `int` matches no dub prefix -> track 0, for any multi-track file.
+    assert_eq!(
+        xiii_video::select_audio_track_for(&language, 5),
+        0,
+        "GOG Language={language} should select track 0"
+    );
+
+    // A five-track file reports 5 tracks.
+    let data = std::fs::read(root.join("Video").join("Cine00.bik")).expect("read Cine00.bik");
+    let bik = xiii_video::container::BikFile::parse(&data).expect("parse Cine00.bik");
+    assert_eq!(
+        bik.audio.len(),
+        5,
+        "Cine00.bik should report 5 audio tracks"
+    );
+    println!(
+        "Cine00.bik: {} tracks, GOG selects track 0",
+        bik.audio.len()
+    );
+
+    // Cine01.bik is single-track in this corpus (measured), so it reports 1.
+    let data = std::fs::read(root.join("Video").join("Cine01.bik")).expect("read Cine01.bik");
+    let bik = xiii_video::container::BikFile::parse(&data).expect("parse Cine01.bik");
+    assert_eq!(
+        bik.audio.len(),
+        1,
+        "Cine01.bik reports 1 audio track in the GOG corpus"
+    );
+    println!("Cine01.bik: {} track, GOG selects track 0", bik.audio.len());
+}

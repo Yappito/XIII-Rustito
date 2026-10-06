@@ -27,12 +27,14 @@ pub mod decoder;
 pub mod error;
 pub mod huffman;
 pub mod tables;
+pub mod track;
 
 pub use audio::{AudioDecodeStats, AudioDecoder, DecodedTrack};
 pub use container::{AudioTrack, BikFile, FramePackets, Header};
 pub use decoder::{Decoder, FrameStats, YuvFrame};
 pub use error::{Result, VideoError, VideoErrorKind};
 pub use tables::{AudioTables, BinkTables};
+pub use track::{language_from_install, select_audio_track, select_audio_track_for};
 
 impl FrameStats {
     /// Total bit capacity of the packet this statistics record belongs to.

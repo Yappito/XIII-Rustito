@@ -272,6 +272,10 @@ pub struct CutscenePlayer {
     bik: BikFile,
     decoder: Decoder,
     audio: Option<AudioPlayback>,
+    /// Track selected by the retail game rule (or the standalone --video override), when the
+    /// file has an audio stream and audio is enabled.
+    selected_audio_track: Option<usize>,
+    audio_track_reason: Option<String>,
     prev: Option<YuvFrame>,
     next_frame: usize,
     image: Image,
@@ -303,15 +307,53 @@ pub struct FrameInfo {
     pub finished: bool,
 }
 
+/// Resolves the audio track exactly like the game's video player: an explicit standalone
+/// `--video-track` override wins; otherwise the installation's language prefix selects the
+/// track through `xiii-video`'s WinDrv-derived rule. `None` for `language_from_install` follows
+/// the retail fallback (track 0). The returned reason is included in the playback log.
+fn resolve_audio_track(
+    game_dir: &Path,
+    track_count: usize,
+    override_track: Option<u32>,
+) -> Result<(usize, String), String> {
+    if let Some(n) = override_track {
+        let track = n as usize;
+        if track >= track_count {
+            return Err(format!(
+                "--video-track {n} is out of range (the file has {track_count} audio track(s))"
+            ));
+        }
+        return Ok((track, format!("--video-track {n} override")));
+    }
+    match xiii_video::language_from_install(game_dir) {
+        Some(language) => {
+            let track = xiii_video::select_audio_track_for(&language, track_count);
+            Ok((
+                track,
+                format!("game rule: Language={language} selects track {track}"),
+            ))
+        }
+        None => {
+            let track = xiii_video::select_audio_track_for("int", track_count);
+            Ok((
+                track,
+                format!("no [Engine.Engine] Language= key; retail fallback selects track {track}"),
+            ))
+        }
+    }
+}
+
 impl CutscenePlayer {
     /// Reads and parses `file`, prepares the decoder and (when `audio_on` and the install
     /// provides the audio tables) audio track 0. An error here is returned, never swallowed:
     /// the caller labels the fallback.
     pub fn open(
+        game_dir: &Path,
         file: &Path,
         tables: &BinkTables,
         audio_tables: Option<&AudioTables>,
         audio_on: bool,
+        track_override: Option<u32>,
     ) -> Result<CutscenePlayer, String> {
         let data = std::fs::read(file).map_err(|e| format!("reading {}: {e}", file.display()))?;
         let bik = BikFile::parse(&data).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -328,14 +370,23 @@ impl CutscenePlayer {
             TextureFormat::Rgba8UnormSrgb,
             RenderAssetUsages::default(),
         );
-        let audio = if audio_on {
-            bik.audio.first().and_then(|track| match audio_tables {
-                None => None,
-                Some(tables) => match AudioDecoder::new(tables, track) {
+        let selected = if audio_on && !bik.audio.is_empty() {
+            Some(resolve_audio_track(
+                game_dir,
+                bik.audio.len(),
+                track_override,
+            )?)
+        } else {
+            None
+        };
+        let audio = match (selected.as_ref(), audio_tables) {
+            (Some((track, _reason)), Some(tables)) => {
+                let track_info = &bik.audio[*track];
+                match AudioDecoder::new(tables, track_info) {
                     Ok(decoder) => Some(AudioPlayback {
                         decoder,
                         shared: Arc::new(PcmShared::default()),
-                        track: 0,
+                        track: *track,
                         next_frame: 0,
                         queued: 0,
                         packets: 0,
@@ -345,19 +396,22 @@ impl CutscenePlayer {
                         drained: None,
                     }),
                     Err(e) => {
-                        eprintln!("[video] audio unavailable, using the wall clock: {e}");
+                        eprintln!(
+                            "[video] selected audio track {track} could not be decoded; using wall clock: {e}"
+                        );
                         None
                     }
-                },
-            })
-        } else {
-            None
+                }
+            }
+            _ => None,
         };
         Ok(CutscenePlayer {
             data,
             bik,
             decoder: Decoder::new(tables.clone()),
             audio,
+            selected_audio_track: selected.as_ref().map(|(track, _)| *track),
+            audio_track_reason: selected.map(|(_, reason)| reason),
             prev: None,
             next_frame: 0,
             image,
@@ -403,12 +457,23 @@ impl CutscenePlayer {
         }
     }
 
-    /// Audio track facts for the setup report: `(track count, sample rate, channels, block
-    /// samples per channel)`.
-    pub fn audio_track_info(&self) -> Option<(usize, u32, u16, usize)> {
+    /// Selected audio track and reason, with the file's track count.
+    pub fn audio_selection(&self) -> Option<(usize, usize, &str)> {
+        Some((
+            self.selected_audio_track?,
+            self.bik.audio.len(),
+            self.audio_track_reason.as_deref()?,
+        ))
+    }
+
+    /// Audio track facts for the setup report: `(selected track, track count, reason, sample
+    /// rate, channels, block samples per channel)`.
+    pub fn audio_track_info(&self) -> Option<(usize, usize, &str, u32, u16, usize)> {
         let a = self.audio.as_ref()?;
         Some((
+            self.selected_audio_track?,
             self.bik.audio.len(),
+            self.audio_track_reason.as_deref()?,
             a.decoder.sample_rate(),
             a.decoder.channels(),
             a.decoder.frame_len(),
@@ -787,10 +852,27 @@ impl VideoHostHandle {
         }
         let audio_on = inner.audio_on;
         let audio_tables = inner.audio_tables.clone();
-        match CutscenePlayer::open(&path, &tables, audio_tables.as_deref(), audio_on) {
+        match CutscenePlayer::open(
+            &inner.game_dir,
+            &path,
+            &tables,
+            audio_tables.as_deref(),
+            audio_on,
+            None,
+        ) {
             Ok(player) => {
                 let dur = player.duration_secs() as f32;
                 inner.host_opens += 1;
+                if let Some((track, count, reason)) = player.audio_selection() {
+                    match player.audio_track_info() {
+                        Some((_, _, _, rate, channels, block)) => println!(
+                            "[video] audio track {track} of {count} ({reason}): {rate} Hz x {channels} ch, DCT, block {block} samples/channel (clean-room Bink Audio)"
+                        ),
+                        None => println!(
+                            "[video] audio track {track} of {count} ({reason}); audio decoder unavailable, using wall clock"
+                        ),
+                    }
+                }
                 inner.note(format!(
                     "open {stem}: {}x{} {} frames ({:.3}s) from {}",
                     player.width(),
@@ -799,6 +881,9 @@ impl VideoHostHandle {
                     player.duration_secs(),
                     path.display()
                 ));
+                if let Some((track, count, reason)) = player.audio_selection() {
+                    inner.note(format!("audio track {track} of {count}: {reason}"));
+                }
                 inner.player = Some(player);
                 inner.generation = inner.generation.wrapping_add(1);
                 Some(dur)
@@ -1219,7 +1304,14 @@ fn setup(
     } else {
         None
     };
-    let mut player = match CutscenePlayer::open(&file, &tables, audio_tables.as_ref(), audio_on) {
+    let mut player = match CutscenePlayer::open(
+        &game_dir,
+        &file,
+        &tables,
+        audio_tables.as_ref(),
+        audio_on,
+        cfg.options.video_track,
+    ) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("[video] {e}");
@@ -1235,26 +1327,35 @@ fn setup(
         bik.frame_count(),
         bik.header.fps()
     );
-    match player.audio_track_info() {
-        Some((tracks, rate, channels, block)) => println!(
-            "[video] audio track 0 of {tracks}: {rate} Hz x {channels} ch, DCT, block {block} samples/channel (clean-room Bink Audio)"
+    match (player.audio_selection(), player.audio_track_info()) {
+        (Some((track, tracks, reason)), Some((_, _, _, rate, channels, block))) => println!(
+            "[video] audio track {track} of {tracks} ({reason}): {rate} Hz x {channels} ch, DCT, block {block} samples/channel (clean-room Bink Audio)"
         ),
-        None if audio_on => println!("[video] no audio track: wall clock"),
-        None => println!("[video] audio off (--audio off): wall clock"),
+        (Some((track, tracks, reason)), None) => println!(
+            "[video] audio track {track} of {tracks} ({reason}); decoder unavailable, using the wall clock"
+        ),
+        (None, _) if audio_on => println!("[video] no audio track: wall clock"),
+        (None, _) => println!("[video] audio off (--audio off): wall clock"),
     }
     // Playback starts with the scene (the clock the frames are due on); decode the first second
     // of audio now so the mixer has data when it starts pulling, then hand the stream to the
     // mixer as its own entity.
     player.play();
     player.advance_realtime();
+    let audio_track = player.audio_selection().map(|(track, _, _)| track);
     if let Some((rate, channels, shared)) = player.take_audio_start() {
+        let Some(audio_track) = audio_track else {
+            eprintln!("[video] audio source has no selected track");
+            commands.write_message(AppExit::error());
+            return;
+        };
         let asset = bink_audio.add(BinkAudio {
             shared,
             sample_rate: rate,
             channels,
         });
         commands.spawn((
-            Name::new("bink audio track 0"),
+            Name::new(format!("bink audio track {audio_track}")),
             AudioPlayer(asset),
             PlaybackSettings::ONCE,
         ));
@@ -1430,4 +1531,57 @@ fn unattended(
         ),
     }
     exit.write(AppExit::Success);
+}
+
+#[cfg(test)]
+mod track_tests {
+    use super::resolve_audio_track;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    fn install(ini: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "xiii-audio-track-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(root.join("System")).expect("create synthetic install dir");
+        std::fs::write(root.join("System/Default.ini"), ini).expect("write synthetic INI");
+        root
+    }
+
+    #[test]
+    fn shared_player_track_resolution_uses_install_language_and_one_track_rule() {
+        let root = install("[Engine.Engine]\nLanguage=FrT\n");
+        let (track, reason) = resolve_audio_track(&root, 5, None).expect("French track");
+        assert_eq!(track, 1);
+        assert!(reason.contains("Language=frt"));
+        let _ = std::fs::remove_dir_all(root);
+
+        let root = install("[Engine.Engine]\nLanguage=est\n");
+        let (track, _) = resolve_audio_track(&root, 1, None).expect("single-track fallback");
+        assert_eq!(track, 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn standalone_override_wins_and_rejects_out_of_range_track() {
+        let root = install("[Engine.Engine]\nLanguage=frt\n");
+        let (track, reason) = resolve_audio_track(&root, 5, Some(3)).expect("override track");
+        assert_eq!(track, 3);
+        assert!(reason.contains("--video-track 3 override"));
+        assert!(resolve_audio_track(&root, 3, Some(3)).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn absent_install_language_uses_retail_track_zero_fallback() {
+        let root = install("[Engine.Engine]\nRenderDevice=OpenGLDrv.OpenGLRenderDevice\n");
+        let (track, reason) = resolve_audio_track(&root, 5, None).expect("retail default track");
+        assert_eq!(track, 0);
+        assert!(reason.contains("retail fallback"));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

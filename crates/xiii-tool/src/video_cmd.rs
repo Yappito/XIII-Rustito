@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use xiii_video::container::BikFile;
-use xiii_video::{AudioTables, BinkTables, Decoder};
+use xiii_video::{AudioTables, BinkTables, DecodedTrack, Decoder};
 
 pub const USAGE: &str = "\
   xiii-tool video info <file.bik>
@@ -45,11 +45,19 @@ pub const USAGE: &str = "\
 
   xiii-tool video audio <file.bik> [--game-dir DIR] [--track N] [--frames N]
           [--out FILE.wav] [--ref FILE.s16]
-      Decode one Bink Audio track (default 0) to 16-bit PCM using the tables in
-      the installation's binkw32.dll (the root is inferred from <root>/Video/).
-      --out writes a WAV (refused inside the installation); --ref compares with
-      a black-box oracle s16le file (SNR, max difference, differing samples in
-      and outside the block cross-fades).
+       Decode one Bink Audio track (default 0) to 16-bit PCM using the tables in
+       the installation's binkw32.dll (the root is inferred from <root>/Video/).
+       --out writes a WAV (refused inside the installation); --ref compares with
+       a black-box oracle s16le file (SNR, max difference, differing samples in
+       and outside the block cross-fades).
+
+  xiii-tool video tracks <file.bik> [--game-dir DIR] [--secs N]
+       Decode every audio track and report, per track: decoded length, sample
+       rate/channels, packet/error counts, RMS (normalised 0..1 and dBFS) and
+       peak. Then the pairwise Pearson correlation of the first --secs seconds
+       (default 30) of each track, mono-downmixed, to show how similar the
+       tracks are to each other (language dubs of the same scene correlate
+       strongly; unrelated content does not).
 
 Run with no subcommand for this help.";
 
@@ -66,6 +74,7 @@ pub fn run(args: &[String]) -> ExitCode {
         Some("frames") => frames(&args[1..]),
         Some("validate") => validate(&args[1..]),
         Some("audio") => audio(&args[1..]),
+        Some("tracks") => tracks(&args[1..]),
         Some(other) => usage_error(&format!("unknown video command '{other}'")),
         None => {
             println!("USAGE:\n{USAGE}");
@@ -910,6 +919,186 @@ fn audio(args: &[String]) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Decodes every audio track and reports per-track loudness plus the pairwise
+/// similarity of the first `--secs` seconds (see the USAGE text).
+fn tracks(args: &[String]) -> ExitCode {
+    let mut file: Option<PathBuf> = None;
+    let mut game_dir: Option<PathBuf> = None;
+    let mut secs = 30.0f64;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--game-dir" => game_dir = it.next().map(PathBuf::from),
+            "--secs" => {
+                secs = match it.next().and_then(|v| v.parse().ok()) {
+                    Some(v) => v,
+                    None => return usage_error("--secs needs a number"),
+                };
+                if !(secs.is_finite() && secs > 0.0) {
+                    return usage_error("--secs must be a positive number");
+                }
+            }
+            s if s.starts_with("--") => return usage_error(&format!("unknown option '{s}'")),
+            s if file.is_none() => file = Some(PathBuf::from(s)),
+            s => return usage_error(&format!("unexpected argument '{s}'")),
+        }
+    }
+    let Some(file) = file else {
+        return usage_error("video tracks needs a .bik file");
+    };
+    let Some(game_dir) = game_dir.or_else(|| install_root_of(&file)) else {
+        return usage_error("video tracks needs --game-dir (or a file inside <root>/Video)");
+    };
+    let data = match read_file(&file) {
+        Ok(d) => d,
+        Err(c) => return c,
+    };
+    let bik = match BikFile::parse(&data) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: {}: {e}", file.display());
+            return ExitCode::from(1);
+        }
+    };
+    let tables = match AudioTables::from_install(&game_dir) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let ntracks = bik.audio.len();
+    let video_secs = bik.frame_count() as f64 / bik.header.fps();
+    println!(
+        "{}: {} audio track(s), {} frames, {:.3}s video",
+        file.display(),
+        ntracks,
+        bik.frame_count(),
+        video_secs
+    );
+    if ntracks == 0 {
+        println!("(no audio tracks)");
+        return ExitCode::SUCCESS;
+    }
+    let mut decoded: Vec<DecodedTrack> = Vec::with_capacity(ntracks);
+    for t in 0..ntracks {
+        match xiii_video::audio::decode_track(&data, &bik, t, &tables, None) {
+            Ok(d) => decoded.push(d),
+            Err(e) => {
+                eprintln!("error: track {t}: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    for (t, d) in decoded.iter().enumerate() {
+        let ch = usize::from(d.channels.max(1));
+        let duration = d.pcm.len() as f64 / ch as f64 / f64::from(d.sample_rate.max(1));
+        let rms = rms_normalized(&d.pcm);
+        let peak = peak_normalized(&d.pcm);
+        let rms_db = if rms == 0.0 {
+            f64::NEG_INFINITY
+        } else {
+            20.0 * rms.log10()
+        };
+        println!(
+            "track {t}: {:.3}s decoded, {} Hz x {} ch, {} packets, {} errors, \
+             RMS {:.4} ({:.1} dBFS), peak {:.4}",
+            duration, d.sample_rate, d.channels, d.packets, d.errors, rms, rms_db, peak
+        );
+        if let Some(e) = &d.first_error {
+            println!("  first error: {e}");
+        }
+    }
+    // Mono-downmixed prefix of each track, long enough for the correlation window.
+    let mono: Vec<Vec<f64>> = decoded
+        .iter()
+        .map(|d| {
+            let rate = f64::from(d.sample_rate.max(1));
+            let n = (secs * rate) as usize;
+            mono_downmix(&d.pcm, d.channels.max(1) as usize)
+                .into_iter()
+                .take(n)
+                .collect()
+        })
+        .collect();
+    println!("\npairwise Pearson correlation of the first {secs:.0}s (mono-downmixed):");
+    for i in 0..ntracks {
+        for j in (i + 1)..ntracks {
+            let r = pearson(&mono[i], &mono[j]);
+            let r = if r.is_nan() {
+                "n/a".to_string()
+            } else {
+                format!("{r:.4}")
+            };
+            println!("  track {i} vs track {j}: {r}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Root-mean-square of `pcm` normalised to 0..1 (full scale = 32768).
+fn rms_normalized(pcm: &[i16]) -> f64 {
+    if pcm.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = pcm
+        .iter()
+        .map(|&s| {
+            let v = f64::from(s) / 32768.0;
+            v * v
+        })
+        .sum();
+    (sum / pcm.len() as f64).sqrt()
+}
+
+/// Largest absolute sample, normalised to 0..1.
+fn peak_normalized(pcm: &[i16]) -> f64 {
+    pcm.iter()
+        .map(|&s| f64::from(s).abs() / 32768.0)
+        .fold(0.0f64, f64::max)
+}
+
+/// Averages the interleaved channels of `pcm` into a mono sequence (0..1 scale).
+fn mono_downmix(pcm: &[i16], channels: usize) -> Vec<f64> {
+    let ch = channels.max(1);
+    let n = pcm.len() / ch;
+    (0..n)
+        .map(|i| {
+            let start = i * ch;
+            let sum: f64 = pcm[start..start + ch]
+                .iter()
+                .map(|&s| f64::from(s) / 32768.0)
+                .sum();
+            sum / ch as f64
+        })
+        .collect()
+}
+
+/// Pearson correlation coefficient over the common length of `a` and `b`
+/// (`NaN` when either has zero variance or is empty).
+fn pearson(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return f64::NAN;
+    }
+    let a = &a[..n];
+    let b = &b[..n];
+    let mean_a = a.iter().sum::<f64>() / n as f64;
+    let mean_b = b.iter().sum::<f64>() / n as f64;
+    let (mut num, mut den_a, mut den_b) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let da = a[i] - mean_a;
+        let db = b[i] - mean_b;
+        num += da * db;
+        den_a += da * da;
+        den_b += db * db;
+    }
+    if den_a == 0.0 || den_b == 0.0 {
+        return f64::NAN;
+    }
+    num / (den_a.sqrt() * den_b.sqrt())
 }
 
 /// Appends the display area of `frame` as planar yuv420p (chroma `(w+1)/2 x (h+1)/2`).
