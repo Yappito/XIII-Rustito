@@ -51,6 +51,10 @@ pub struct Options {
     pub map: Option<String>,
     /// Installation root (read-only).
     pub game_dir: Option<PathBuf>,
+    /// User-writable checkpoint directory; defaults to the platform application-data location.
+    pub save_dir: Option<PathBuf>,
+    /// Load this numbered save slot before starting play.
+    pub load: Option<u32>,
     /// Viewer camera override: x, y, z (Bevy metres), yaw, pitch (degrees).
     pub view: Option<[f32; 5]>,
     /// Import the map, print the counters and exit without opening a window.
@@ -126,6 +130,8 @@ impl Default for Options {
             height: 720,
             map: None,
             game_dir: None,
+            save_dir: None,
+            load: None,
             view: None,
             dump: false,
             find: None,
@@ -154,6 +160,7 @@ xiii-app --map NAME --game-dir DIR [--view x,y,z,yaw,pitch] [--dump]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH] [--lighting off|baked]
 xiii-app --map NAME --game-dir DIR --collision-test
 xiii-app --map NAME --game-dir DIR --play [--play-script FILE] [--audio off|on]
+         [--save-dir DIR] [--load SLOT]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH]
 xiii-app --menu --game-dir DIR [--menu-script FILE]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH]
@@ -165,6 +172,8 @@ xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
   --smoke              Run the native window/GPU/input/audio smoke scene (default).
   --map NAME           Diagnostic map viewer: import NAME (e.g. Plage00) from --game-dir.
   --game-dir DIR       Owned XIII installation (read-only).
+  --save-dir DIR       User-writable checkpoint directory (default: app data/xiii-rustito/saves).
+  --load SLOT          Restore a checkpoint save slot before starting --play.
   --play               First-person movement prototype (NOT gameplay) on --map.
   --audio off|on       Play resolved VM sound/music events (default on); `off` resolves
                        and plays nothing (still counts events in the overlay).
@@ -310,6 +319,15 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
                 }
             }
             "--game-dir" => opts.game_dir = Some(PathBuf::from(value("--game-dir")?)),
+            "--save-dir" => opts.save_dir = Some(PathBuf::from(value("--save-dir")?)),
+            "--load" => {
+                let v = value("--load")?;
+                opts.load = Some(
+                    v.parse()
+                        .map_err(|_| format!("invalid --load slot {v:?}"))?,
+                );
+                opts.mode = Mode::Play;
+            }
             "--dump" => opts.dump = true,
             "--collision-test" => opts.collision_test = true,
             "--model" => {
@@ -467,6 +485,18 @@ mod tests {
             Some(std::path::Path::new("s.txt"))
         );
         assert!(p(&["--menu-script"]).is_err());
+    }
+
+    #[test]
+    fn parses_load_save_directory_options() {
+        let o = p(&["--play", "--load", "3", "--save-dir", "user/saves"]).unwrap();
+        assert_eq!(o.mode, Mode::Play);
+        assert_eq!(o.load, Some(3));
+        assert_eq!(
+            o.save_dir.as_deref(),
+            Some(std::path::Path::new("user/saves"))
+        );
+        assert!(p(&["--load", "-1"]).is_err());
     }
 
     #[test]

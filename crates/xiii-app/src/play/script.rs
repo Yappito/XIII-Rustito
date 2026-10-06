@@ -16,6 +16,13 @@
 //! - `pitch <degrees>`: set camera pitch.
 //! - `use` (alias `grab`/`interact`): request one use/interact action (edge-triggered); the
 //!   host runs the VM's mover lock/unlock/open chain (`Session::use_mover`).
+//! - `use <ActorName>`: use/interact with a named actor directly (edges around hidden interaction
+//!   doors and dynamic pawns the camera ray cannot pick).
+//! - `search <ActorName>`: search a named dead pawn's inventory through the game's own
+//!   `PlayerController.SearchPawn` (the corpse-search half of `Grab`).
+//! - `take_control` (alias `assume_control`): item18 host bridge that runs the controller's own
+//!   `EnterStartState` with `bOkForMoving = true`, releasing a player frozen by a cutscene the
+//!   host does not play. Labelled a diagnostic bridge.
 //! - `teleport <x> <y> <z>` (alias `place`): move the player box centre to this Unreal-unit
 //!   position and drop the velocity. Used by the trigger demonstration because the Plage00
 //!   trigger is ~47,000 UU from the PlayerStart (about 100 s of walking at `GroundSpeed`). The
@@ -61,8 +68,16 @@ pub enum Command {
     Teleport([f32; 3]),
     /// Autopilot toward an Unreal-unit waypoint (the driver re-aims and walks; not a teleport).
     Goto([f32; 3]),
-    /// Request one use/interact action (edge-triggered; the VM `Grab`/use chain).
+    /// Request one use/interact action (edge-triggered; the VM `Grab`/use chain). Ray-based: the
+    /// host picks the actor in front of the camera.
     Use,
+    /// Use/interact with a named actor directly (edge-triggered). Needed for invisible interaction
+    /// doors (Plage01 `Porte1`) and to search a named corpse; the ray cannot pick a hidden door or
+    /// a dynamic pawn.
+    UseNamed(String),
+    /// Search a named dead pawn's inventory (the game's own `PlayerController.SearchPawn`); the
+    /// corpse-search half of the engine's `Grab` interaction.
+    Search(String),
     /// Request one fire action (edge-triggered; routed to the player's weapon, item14).
     Fire,
     /// Grant the player the named `Package.Class` weapon (item14 diagnostic bootstrap; the
@@ -81,6 +96,12 @@ pub enum Command {
     /// Equip the best weapon the player already carries in the game's own inventory chain (the
     /// `BringUp`/`ChangedWeapon` path), e.g. after walking onto a map weapon pickup (item14b).
     Equip,
+    /// item18 diagnostic bridge: give the local player control by running the game's own
+    /// `XIIIPlayerController.EnterStartState` with `bOkForMoving = true` (the HUD's normal
+    /// "first display done" transition). Needed because the decoded Plage01 intro leaves the
+    /// controller frozen in `NoControl` (the host does not play the cutscene sequence). Labelled
+    /// a host bridge, never silent.
+    TakeControl,
 }
 
 /// A parsed input script, time-ordered.
@@ -154,7 +175,16 @@ impl Script {
                     let z = it.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
                     Command::Goto([x, y, z])
                 }
-                "use" | "grab" | "interact" => Command::Use,
+                "use" | "grab" | "interact" => match it.next() {
+                    Some(target) => Command::UseNamed(target.to_owned()),
+                    None => Command::Use,
+                },
+                "search" | "loot" => {
+                    let target = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: search needs an actor name"))?;
+                    Command::Search(target.to_owned())
+                }
                 "fire" | "shoot" => Command::Fire,
                 "weapon" | "grant" => {
                     let path = it
@@ -175,6 +205,7 @@ impl Script {
                     Command::SetGoal(n)
                 }
                 "equip" | "select" => Command::Equip,
+                "take_control" | "take-control" | "assume_control" => Command::TakeControl,
                 other => return Err(format!("line {n}: unknown command {other:?}")),
             };
             events.push(Event { t, command });
@@ -219,12 +250,18 @@ pub struct Drive {
     equip_pending: bool,
     /// Weapons requested (`weapon <Package.Class>`) and not yet applied by the host.
     weapons: Vec<String>,
+    /// Named `use <ActorName>` targets not yet applied by the host.
+    use_named: Vec<String>,
+    /// Named `search <ActorName>` targets not yet applied by the host.
+    search: Vec<String>,
     /// Active `goto` waypoint (Unreal units), if any.
     goto: Option<[f32; 3]>,
     /// Set by `wait_travel`; blocks further events until the host calls [`Drive::notify_travel`].
     waiting_travel: bool,
     /// Objective numbers requested (`set_goal <N>`) and not yet applied by the host.
     goals: Vec<i32>,
+    /// `take_control` requested (edge-triggered) and not yet applied by the host.
+    control_pending: bool,
 }
 
 impl Drive {
@@ -242,9 +279,12 @@ impl Drive {
             fire_pending: false,
             equip_pending: false,
             weapons: Vec::new(),
+            use_named: Vec::new(),
+            search: Vec::new(),
             goto: None,
             waiting_travel: false,
             goals: Vec::new(),
+            control_pending: false,
         }
     }
 
@@ -258,6 +298,21 @@ impl Drive {
     /// `MapInfo.SetGoalComplete`).
     pub fn take_goals(&mut self) -> Vec<i32> {
         std::mem::take(&mut self.goals)
+    }
+
+    /// Drains the named `use <ActorName>` targets due so far.
+    pub fn take_use_named(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.use_named)
+    }
+
+    /// Drains the named `search <ActorName>` targets due so far.
+    pub fn take_search(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.search)
+    }
+
+    /// Takes the pending `take_control` request (edge-triggered).
+    pub fn take_control(&mut self) -> bool {
+        std::mem::take(&mut self.control_pending)
     }
 
     /// Whether the driver is blocked on a `wait_travel` command.
@@ -300,6 +355,8 @@ impl Drive {
                 }
                 &Command::Goto(p) => self.goto = Some(p),
                 Command::Use => self.use_pending = true,
+                Command::UseNamed(target) => self.use_named.push(target.clone()),
+                Command::Search(target) => self.search.push(target.clone()),
                 Command::Fire => self.fire_pending = true,
                 Command::Weapon(path) => self.weapons.push(path.clone()),
                 &Command::SetGoal(n) => self.goals.push(n),
@@ -310,6 +367,7 @@ impl Drive {
                     break;
                 }
                 Command::Equip => self.equip_pending = true,
+                Command::TakeControl => self.control_pending = true,
             }
             self.cursor += 1;
         }
@@ -417,6 +475,28 @@ mod tests {
         assert!(!d.waiting_travel());
         let _ = d.advance(5.0, &mut sim);
         assert!((sim.yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn parses_named_use_search_and_take_control() {
+        let s = Script::parse(
+            "t=0.0 take_control\nt=0.5 use Porte1\nt=1.0 search BaseSoldier6\nt=1.5 use\n",
+        )
+        .unwrap();
+        assert_eq!(s.events.len(), 4);
+        let mut sim = PlayerSim::new([0.0; 3], 0.0);
+        let mut d = Drive::new(&s);
+        let _ = d.advance(0.0, &mut sim);
+        assert!(d.take_control(), "take_control is edge-triggered");
+        assert!(!d.take_control());
+        let _ = d.advance(0.5, &mut sim);
+        assert_eq!(d.take_use_named(), vec!["Porte1".to_owned()]);
+        let _ = d.advance(1.0, &mut sim);
+        assert_eq!(d.take_search(), vec!["BaseSoldier6".to_owned()]);
+        // A bare `use` is still the ray-based action.
+        let i = d.advance(1.5, &mut sim);
+        assert!(i.use_action);
+        assert!(d.take_use_named().is_empty());
     }
 
     #[test]

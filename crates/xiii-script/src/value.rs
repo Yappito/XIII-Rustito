@@ -22,6 +22,18 @@ pub enum ObjRef {
     External(u32),
 }
 
+/// An UnrealScript delegate: the object the delegate runs on plus the function name. `UE2`
+/// stores delegates as a `(Object, FunctionName)` pair; an unbound delegate has no object.
+/// Produced by the `delegate <property>` token (`0x44`, a fresh delegate bound to the current
+/// context) and by `DelegateProperty` assignment (`0x45`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delegate {
+    /// The object the delegate is bound to (`None` for an empty delegate).
+    pub object: Option<ObjRef>,
+    /// The UnrealScript function to run.
+    pub function: String,
+}
+
 /// A script value. `Unsupported` holds values the loader could not convert (unknown struct
 /// layouts, raw arrays); reading one in script is an explicit error.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +66,8 @@ pub enum Value {
     Struct(Vec<(String, Value)>),
     /// Dynamic array.
     Array(Vec<Value>),
+    /// `delegate` reference (`None` = unbound/empty delegate).
+    Delegate(Option<Delegate>),
     /// Value the loader could not convert (description).
     Unsupported(String),
 }
@@ -75,6 +89,7 @@ impl Value {
             Value::Rotator(_) => "rotator",
             Value::Struct(_) => "struct",
             Value::Array(_) => "array",
+            Value::Delegate(_) => "delegate",
             Value::Unsupported(_) => "unsupported",
         }
     }
@@ -110,7 +125,7 @@ pub enum Ty {
     Struct(Vec<(String, Ty)>),
     /// Dynamic array of the inner type.
     Array(Box<Ty>),
-    /// Delegate (not supported by the interpreter yet).
+    /// Delegate (an `(object, function)` pair).
     Delegate,
 }
 
@@ -131,7 +146,7 @@ impl Ty {
                 Value::Struct(members.iter().map(|(n, t)| (n.clone(), t.zero())).collect())
             }
             Ty::Array(_) => Value::Array(Vec::new()),
-            Ty::Delegate => Value::Unsupported("delegate".to_owned()),
+            Ty::Delegate => Value::Delegate(None),
         }
     }
 }
@@ -157,6 +172,14 @@ impl fmt::Display for Value {
             Value::Rotator([p, y, r]) => write!(f, "rot({p},{y},{r})"),
             Value::Struct(m) => write!(f, "struct({} members)", m.len()),
             Value::Array(a) => write!(f, "array({})", a.len()),
+            Value::Delegate(None) => write!(f, "delegate(None)"),
+            Value::Delegate(Some(d)) => write!(
+                f,
+                "delegate({}:{})",
+                d.function,
+                d.object
+                    .map_or_else(|| "None".to_owned(), |o| format!("{o:?}"))
+            ),
             Value::Unsupported(d) => write!(f, "<unsupported {d}>"),
         }
     }

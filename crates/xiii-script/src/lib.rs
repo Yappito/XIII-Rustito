@@ -18,6 +18,7 @@ pub mod disasm;
 mod error;
 pub mod events;
 pub mod external;
+mod item20;
 pub mod linker;
 pub mod localize;
 pub mod natives;
@@ -27,6 +28,7 @@ pub mod physics;
 mod reader;
 pub mod reflect;
 pub mod registry;
+pub mod residuals;
 pub mod value;
 pub mod vm;
 pub mod voice;
@@ -35,7 +37,8 @@ pub use animation::{AnimationData, FixedAnimation, SeqInfo};
 pub use bytecode::{Call, Label, Script, ScriptLimits, Token, TokenKind, decode_script};
 pub use error::{Result, ScriptError, ScriptErrorKind};
 pub use events::{
-    DialogueEvent, PresentationEvent, RenderTargetEvent, SoundEvent, TravelRequest, TravelSource,
+    DialogueEvent, PresentationEvent, RenderTargetEvent, SaveCheckpointEvent, SoundEvent,
+    TravelRequest, TravelSource,
 };
 pub use external::ExternalObjectData;
 pub use linker::{ExternalLookup, ExternalPackage, GlobalRef, ScriptPackage, ScriptSet};

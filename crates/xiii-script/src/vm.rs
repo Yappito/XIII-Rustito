@@ -33,7 +33,7 @@ use crate::navigation::{
 use crate::physics::{HitZones, WorldPhysics};
 use crate::reflect::{Property, PropertyKind, ScriptObject, function_flags, property_flags};
 use crate::registry::{NativeCtx, NativeDef, NativeOutcome, Registry};
-use crate::value::{ObjRef, ObjectId, Ty, Value};
+use crate::value::{Delegate, ObjRef, ObjectId, Ty, Value};
 
 /// Interpreter limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +287,16 @@ pub const LEVEL_START_LIFECYCLE: &[&str] = &[
 /// Actor lifecycle run on a runtime `Actor.Spawn` (`ULevel::SpawnActor`): the spawned actor runs
 /// these events in order. `Spawned` has no declaration in the GOG packages (no handler is a
 /// no-op), so its presence is a hypothesis from the UE2 engine, recorded here explicitly.
+///
+/// All of these run **inside** `Spawn` before it returns to the caller (the caller's statements
+/// after the `Spawn(...)` expression run afterwards). **Order measured in `Engine.dll`**
+/// `ULevel::SpawnActor` (`XIII_Game/system/Engine.dll`, image base 0x10300000, export RVA
+/// 0x88a20 -> VA 0x10388a20): `call eventPreBeginPlay` @0x10388dad, `call eventBeginPlay`
+/// @0x10388db4, `call eventPostBeginPlay` @0x10388e6b, then `GetLevelInfo()` +
+/// `cmpb $0x3, 0x410(%eax)` (`ALevelInfo.NetMode != NM_Client`, 0x10388e78) with a conditional
+/// `call eventPostNetBeginPlay` @0x10388e83, then `call eventSetInitialState` @0x10388e8a.
+/// `NetMode` is `NM_Standalone (0)` in single player, so `PostNetBeginPlay` runs; `PostBeginPlay`
+/// runs before it. This matches UT2004 and the original hypothesis.
 pub const RUNTIME_SPAWN_LIFECYCLE: &[&str] = &[
     "Spawned",
     "PreBeginPlay",
@@ -511,8 +521,38 @@ pub struct BoneScale {
     pub bone: String,
 }
 
+/// `Actor.SetBoneRotation(name BoneName, rotator BoneTurn, int Space, float Alpha)`.
+///
+/// The engine forwards the request to the skeletal-mesh instance's bone controller. The headless
+/// VM stores the request per actor in call order; no skeletal transform is evaluated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoneRotation {
+    /// Target bone.
+    pub bone: String,
+    /// Bone rotation offset.
+    pub turn: [i32; 3],
+    /// Rotation space (engine value; `EX_Nothing` omitted argument reads as 0).
+    pub space: i32,
+    /// Blend alpha.
+    pub alpha: f32,
+}
+
+/// `Actor.SetBoneLocation(name BoneName, vector BoneTrans, float Alpha)`.
+///
+/// The engine forwards the request to the skeletal-mesh instance's bone controller. The headless
+/// VM stores the request per actor in call order; no skeletal transform is evaluated.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoneLocation {
+    /// Target bone.
+    pub bone: String,
+    /// Bone translation offset.
+    pub trans: [f32; 3],
+    /// Blend alpha.
+    pub alpha: f32,
+}
+
 /// Per-actor bone-control state set by `Pawn.SpineYawControl` / `Actor.SetBoneDirection` /
-/// `Actor.SetBoneScalePerAxis`.
+/// `Actor.SetBoneScalePerAxis` / `Actor.SetBoneRotation` / `Actor.SetBoneLocation`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BoneState {
     /// Latest `Pawn.SpineYawControl` parameters, if the native ran.
@@ -521,6 +561,10 @@ pub struct BoneState {
     pub directions: Vec<BoneDirection>,
     /// `Actor.SetBoneScalePerAxis` requests, in call order.
     pub scales: Vec<BoneScale>,
+    /// `Actor.SetBoneRotation` requests, in call order.
+    pub rotations: Vec<BoneRotation>,
+    /// `Actor.SetBoneLocation` requests, in call order.
+    pub locations: Vec<BoneLocation>,
 }
 
 /// Read-only view of one animation channel, for a host renderer that samples the decoded
@@ -974,6 +1018,10 @@ pub struct Instance {
     disabled: HashSet<String>,
     /// Executed by the VM (in scope).
     pub active: bool,
+    /// Suspended after a script error (`active` was cleared by [`Vm::suspend_for_error`]). A
+    /// non-static call to a suspended actor is dropped; item14c records that visibly (see
+    /// [`Vm::suspended_deferred_calls`]) instead of silently no-oping.
+    pub suspended: bool,
     /// Derives from `Actor`.
     pub is_actor: bool,
     /// Destroyed: behaves as `None` for further references.
@@ -992,10 +1040,14 @@ pub struct Instance {
 enum Place {
     Local(usize),
     Slot(ObjectId, usize),
-    Elem(Box<Place>, usize),
+    /// Dynamic-array element. The third field is the declared element type, used to
+    /// initialise elements grown by an out-of-range assignment (UE2 zeroes new elements to the
+    /// element type's default, e.g. a zero struct with all its members, not an `int 0`).
+    Elem(Box<Place>, usize, Option<Ty>),
     Member(Box<Place>, String),
-    /// A dynamic array's `Length` (UE2 `Array.Length = n` resizes the array).
-    ArrayLen(Box<Place>),
+    /// A dynamic array's `Length` (UE2 `Array.Length = n` resizes the array). The second field is
+    /// the declared element type, used to zero the grown elements.
+    ArrayLen(Box<Place>, Option<Ty>),
 }
 
 struct IterState {
@@ -1180,10 +1232,49 @@ pub struct Vm<'s> {
     /// Set by [`Vm::update_ai_perception`] so `SeePlayer`/`EnemyNotVisible` fire only on change,
     /// as the engine's sight counter does, instead of restarting an AI state every tick.
     ai_visible: HashMap<ObjectId, bool>,
+    /// item14c: non-static calls dropped because the target actor was **suspended** (not merely
+    /// out of the executed scope). Every such drop also records a trace note; this counter makes
+    /// the total visible to the host/report so a suspended actor's silent no-ops cannot hide.
+    suspended_deferred_calls: u64,
+    /// item18: Bink video durations in seconds, keyed by lowercased file stem. The host registers
+    /// them (the VM deliberately has no filesystem access); an entry is absent when the Bink header
+    /// could not be read, in which case `VideoPlayer.GetStatus` keeps the old "finished" Partial.
+    video_durations: HashMap<String, f32>,
+    /// item18: the currently open `Engine.VideoPlayer` (`None` before `Open`).
+    video: Option<VideoPlayback>,
+}
+
+/// item18: host-driven `Engine.VideoPlayer` state.
+///
+/// `Engine.VideoPlayer.Open(name)` records the clip and any host-registered duration;
+/// `Play` starts its clock at [`Vm::time`]; `GetStatus` returns `1` (playing) until the real
+/// duration elapses and `0` (finished) after. No decoder is linked, so this times the video
+/// without displaying it (the host labels that Partial). A clip whose Bink header could not be
+/// read has no duration and reports finished immediately, preserving the item16 menu behavior.
+#[derive(Debug, Clone)]
+pub struct VideoPlayback {
+    /// Lowercased file stem as passed to `Open` (directory and `.bik` stripped).
+    pub name: String,
+    /// Decoded duration in seconds, when the host read the Bink header.
+    pub duration: Option<f32>,
+    /// VM time at which `Play` was called (`None` before `Play`).
+    pub started_at: Option<f64>,
 }
 
 fn lower(s: &str) -> String {
     s.to_ascii_lowercase()
+}
+
+/// item18: normalises a `VideoPlayer` clip name to a lowercased stem (drops any directory and a
+/// trailing `.bik`), so `MapInfo.EndMapVideo` (`cine01`) and a registered `Cine01.bik` agree.
+fn video_stem(name: &str) -> String {
+    let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let stem = if file.len() > 4 && file[file.len() - 4..].eq_ignore_ascii_case(".bik") {
+        &file[..file.len() - 4]
+    } else {
+        file
+    };
+    stem.to_ascii_lowercase()
 }
 
 impl<'s> Vm<'s> {
@@ -1233,6 +1324,9 @@ impl<'s> Vm<'s> {
             external_data: None,
             profile: NativeProfile::default(),
             ai_visible: HashMap::new(),
+            suspended_deferred_calls: 0,
+            video_durations: HashMap::new(),
+            video: None,
         }
     }
 
@@ -1602,6 +1696,64 @@ impl<'s> Vm<'s> {
     /// Whether a travel request is waiting (without consuming it).
     pub fn travel_requested(&self) -> bool {
         self.pending_travel.is_some()
+    }
+
+    // ---------------------------------------------------------------- item18 VideoPlayer
+
+    /// Registers the real duration of a Bink clip (seconds), keyed by file stem. The host reads
+    /// the Bink header because `xiii-script` has no filesystem access. A non-finite or negative
+    /// duration is ignored (never stored) so `GetStatus` cannot be made to hang on bad data.
+    pub fn set_video_duration(&mut self, name: &str, seconds: f32) {
+        if seconds.is_finite() && seconds >= 0.0 {
+            self.video_durations.insert(video_stem(name), seconds);
+        }
+    }
+
+    /// `Engine.VideoPlayer.Open(name)`: records the clip. Returns `true` when a duration is known
+    /// (the video will be timed) and `false` when it is not (the call is still accepted, and
+    /// `GetStatus` reports finished — the labelled Partial).
+    pub fn video_open(&mut self, name: &str) -> bool {
+        let stem = video_stem(name);
+        let duration = self.video_durations.get(&stem).copied();
+        self.video = Some(VideoPlayback {
+            name: stem,
+            duration,
+            started_at: None,
+        });
+        duration.is_some()
+    }
+
+    /// `Engine.VideoPlayer.Play()`: starts (or restarts) the clip clock.
+    pub fn video_play(&mut self) {
+        if let Some(v) = self.video.as_mut() {
+            v.started_at = Some(self.time);
+        }
+    }
+
+    /// `Engine.VideoPlayer.Stop()`: clears the clip.
+    pub fn video_stop(&mut self) {
+        self.video = None;
+    }
+
+    /// `Engine.VideoPlayer.GetStatus() -> int`: `1` while the clip is playing, `0` when it is
+    /// finished, not started, or has no known duration. The decoder is not linked, so nothing is
+    /// displayed; this only reports the clip's real timing.
+    pub fn video_status(&self) -> i32 {
+        let Some(v) = self.video.as_ref() else {
+            return 0;
+        };
+        let Some(started) = v.started_at else {
+            return 0;
+        };
+        match v.duration {
+            Some(d) if (self.time - started) < f64::from(d) => 1,
+            _ => 0,
+        }
+    }
+
+    /// The current `Engine.VideoPlayer` clip stem, if one is open (diagnostics).
+    pub fn video_name(&self) -> Option<&str> {
+        self.video.as_ref().map(|v| v.name.as_str())
     }
 
     /// Records a travel request and queues the matching presentation event. The first request
@@ -2367,6 +2519,7 @@ impl<'s> Vm<'s> {
             generation: 0,
             disabled: HashSet::new(),
             active: false,
+            suspended: false,
             is_actor,
             deleted: false,
             export: None,
@@ -2719,6 +2872,38 @@ impl<'s> Vm<'s> {
         }
     }
 
+    /// `Actor.SetBoneRotation`: record the request for the renderer.
+    pub(crate) fn add_bone_rotation(
+        &mut self,
+        id: ObjectId,
+        bone: String,
+        turn: [i32; 3],
+        space: i32,
+        alpha: f32,
+    ) {
+        if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone.rotations.push(BoneRotation {
+                bone,
+                turn,
+                space,
+                alpha,
+            });
+        }
+    }
+
+    /// `Actor.SetBoneLocation`: record the request for the renderer.
+    pub(crate) fn add_bone_location(
+        &mut self,
+        id: ObjectId,
+        bone: String,
+        trans: [f32; 3],
+        alpha: f32,
+    ) {
+        if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone.locations.push(BoneLocation { bone, trans, alpha });
+        }
+    }
+
     /// Clears the per-actor bone-control state (used by `IAController.HalteAuFeu`).
     pub(crate) fn reset_bone_state(&mut self, id: ObjectId) {
         if let Some(o) = self.objects.get_mut(id as usize) {
@@ -3027,6 +3212,53 @@ impl<'s> Vm<'s> {
         self.call_values(func, this, args)
     }
 
+    /// Invokes a delegate property from outside script (the host's GUI render loop calls the
+    /// page/control `__OnPreDraw__`/`__OnDraw__` delegates this way).
+    ///
+    /// Reads the delegate `property` from `context`. A bound delegate calls its own
+    /// `(object, function)`; an unbound/absent one calls `declared` on `context` — the same
+    /// fallback as the `DelegateFunction` (`0x43`) opcode. Fails explicitly when the target
+    /// function does not exist; it never silently draws nothing.
+    pub fn call_delegate(
+        &mut self,
+        context: ObjectId,
+        property: &str,
+        declared: &str,
+        args: Vec<Value>,
+    ) -> VmResult<Value> {
+        self.steps = 0;
+        let bound = match self.get_property(context, property) {
+            Some(Value::Delegate(Some(d))) => Some(d.clone()),
+            Some(Value::Delegate(None)) | None => None,
+            Some(other) => return Err(self.type_err("delegate", other)),
+        };
+        match bound {
+            Some(d) => {
+                let obj = match d.object {
+                    Some(ObjRef::Instance(i)) => i,
+                    Some(ObjRef::Static(g)) => self.default_object(g)?,
+                    Some(ObjRef::External(_)) | None => context,
+                };
+                let f = self.find_function(obj, &d.function, true).ok_or_else(|| {
+                    self.err(VmErrorKind::NoSuchFunction {
+                        object: self.objects[obj as usize].name.clone(),
+                        name: d.function.clone(),
+                    })
+                })?;
+                self.call_values(f, obj, args)
+            }
+            None => {
+                let f = self.find_function(context, declared, true).ok_or_else(|| {
+                    self.err(VmErrorKind::NoSuchFunction {
+                        object: self.objects[context as usize].name.clone(),
+                        name: declared.to_owned(),
+                    })
+                })?;
+                self.call_values(f, context, args)
+            }
+        }
+    }
+
     /// `GotoState` from outside script (harness/tests).
     pub fn goto_state(&mut self, id: ObjectId, state: &str, label: Option<&str>) -> VmResult<()> {
         self.steps = 0;
@@ -3092,6 +3324,7 @@ impl<'s> Vm<'s> {
                 self.dispatch_tick(id, dt)?;
             }
         }
+        self.dispatch_player_ticks(dt)?;
         self.detect_server_travel();
         Ok(())
     }
@@ -3231,6 +3464,14 @@ impl<'s> Vm<'s> {
                 errors.push((suspended, e));
             }
         }
+        for id in 0..self.objects.len() as ObjectId {
+            if self.player_tick_overridden(id)
+                && let Err(e) = self.dispatch_player_tick(id, dt)
+            {
+                let suspended = self.suspend_for_error(id, &e);
+                errors.push((suspended, e));
+            }
+        }
         self.detect_server_travel();
         errors
     }
@@ -3247,6 +3488,67 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
+    /// item18: per-frame `PlayerTick` dispatch to the local player controllers, after the actor
+    /// `Tick` pass (UE2 `ULevel::Tick` order; [`Self::tick`] calls this at the same point).
+    ///
+    /// UE2's engine calls `APlayerController::PlayerTick(DeltaTime)` every frame, which runs the
+    /// controller's `PlayerTick` event; a state can override it (`PlayingVideo.PlayerTick` ends the
+    /// level-end video, `GameEndedDeath.PlayerTick` drives the death cam). The host owns the player
+    /// pawn's movement (see `Session::step`), and the class-level
+    /// `PlayerController.PlayerTick`/`PlayerWalking.PlayerMove` script **is** that movement: it
+    /// reaches the engine movement natives `CheckBob` (#504) and `FindStairRotation` (#524), which
+    /// the port replaces and does not register. Running it would double-move the pawn and suspend
+    /// the controller. So this dispatches `PlayerTick` only when the controller's **current state**
+    /// defines it — exactly the script the host does not own.
+    fn dispatch_player_ticks(&mut self, dt: f32) -> VmResult<()> {
+        for id in 0..self.objects.len() as ObjectId {
+            if self.player_tick_overridden(id) {
+                self.dispatch_player_tick(id, dt)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// True when `id` is an active, live `PlayerController` actor whose current state (or a
+    /// super-state) defines `PlayerTick`. See [`Self::dispatch_player_ticks`].
+    fn player_tick_overridden(&self, id: ObjectId) -> bool {
+        let o = &self.objects[id as usize];
+        o.active
+            && o.is_actor
+            && !o.deleted
+            && self.is_a(id, "playercontroller")
+            && self.state_defines_function(id, "PlayerTick")
+    }
+
+    /// Fires `PlayerTick(DeltaTime)` on one controller (the caller has already checked it is a
+    /// state override).
+    fn dispatch_player_tick(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
+        if let Some(f) = self.find_function(id, "PlayerTick", true) {
+            self.call_values(f, id, vec![Value::Float(dt)])?;
+        }
+        Ok(())
+    }
+
+    /// True when the object's current state or one of its super-states defines `name` (so the
+    /// lookup would resolve to a state function rather than the class chain).
+    fn state_defines_function(&self, id: ObjectId, name: &str) -> bool {
+        let mut st = self.objects[id as usize].state;
+        let mut guard = 0;
+        while let Some(s) = st {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            if self.find_function_in(s, name).is_some() {
+                return true;
+            }
+            st = self
+                .struct_header(s)
+                .and_then(|h| self.set.resolve(s.package, h.field.super_field));
+        }
+        false
+    }
+
     /// Suspends the actor that should stop after a failing tick: the innermost object on the
     /// error stack when it can be resolved, otherwise the actor being ticked. Returns the id.
     fn suspend_for_error(&mut self, ticked: ObjectId, e: &VmError) -> ObjectId {
@@ -3257,8 +3559,15 @@ impl<'s> Vm<'s> {
             .unwrap_or(ticked);
         if let Some(o) = self.objects.get_mut(id as usize) {
             o.active = false;
+            o.suspended = true;
         }
         id
+    }
+
+    /// item14c: number of non-static calls dropped because the target actor was suspended after a
+    /// script error. Every drop also records a `Note`; this is the cumulative count for reports.
+    pub fn suspended_deferred_calls(&self) -> u64 {
+        self.suspended_deferred_calls
     }
 
     // ------------------------------------------------------------------ state code
@@ -3649,8 +3958,20 @@ impl<'s> Vm<'s> {
             && !self.objects[target as usize].name.starts_with("Default__")
             && !f.is_static()
         {
+            // item14c: a **suspended** actor (cleared by `suspend_for_error`) is not the same as
+            // a placed actor outside the executed scope. Dropping its call silently would hide a
+            // real script failure, so every drop on a suspended target is counted and traced.
+            let suspended = self.objects[target as usize].suspended;
             let o = &self.objects[target as usize];
             let (tname, class) = (o.name.clone(), set.path(o.class));
+            if suspended {
+                self.suspended_deferred_calls += 1;
+                self.note(TraceKind::Note(format!(
+                    "suspended actor {tname} dropped {}.{}: suspended after a script error",
+                    class,
+                    self.short_path(func)
+                )));
+            }
             if layout.ret.is_some() {
                 return Err(self.err(VmErrorKind::DeferredWithReturnValue {
                     target: tname,
@@ -4403,6 +4724,32 @@ impl<'s> Vm<'s> {
         }
     }
 
+    /// Declared `Ty` of the property referenced by a variable token or a context member token.
+    /// Used to initialise dynamic-array elements grown by `Length = n` / out-of-range writes with
+    /// the element type's zero instead of guessing from the assigned scalar.
+    fn token_property_ty(&self, frame: &Frame<'s>, t: &Token) -> Option<Ty> {
+        use TokenKind as K;
+        let g = match &t.kind {
+            K::LocalVariable(r) | K::InstanceVariable(r) | K::DefaultVariable(r) => {
+                self.set.resolve(frame.pkg, *r)?
+            }
+            K::Context(c) => self.member_property(frame.pkg, &c.member)?,
+            _ => return None,
+        };
+        match self.set.object(g) {
+            Some(ScriptObject::Property(p)) => Some(self.ty_of(g.package, &p.kind, 0)),
+            _ => None,
+        }
+    }
+
+    /// Declared element type of the dynamic-array expression `t`, if it is an array property.
+    fn array_elem_ty(&self, frame: &Frame<'s>, t: &Token) -> Option<Ty> {
+        match self.token_property_ty(frame, t)? {
+            Ty::Array(inner) => Some(*inner),
+            _ => None,
+        }
+    }
+
     /// Static class of an object-typed token (`self`, a class literal, a variable whose declared
     /// type is an object/class, or a chained context), when it can be determined.
     pub(crate) fn context_object_class(
@@ -4774,6 +5121,88 @@ impl<'s> Vm<'s> {
                 let y = self.eval(frame, b)?;
                 Value::Bool(values_equal(&x, &y) == (t.opcode == 0x32))
             }
+            // `0x44` in an assignment right-hand side: a fresh delegate bound to the current
+            // context object (`self.__OnDraw__Delegate = delegateprop InternalOnDraw`).
+            K::DelegateProperty(name) => {
+                let function = self.set.packages[frame.pkg].name_text(*name).to_owned();
+                Value::Delegate(Some(Delegate {
+                    object: Some(ObjRef::Instance(target)),
+                    function,
+                }))
+            }
+            // `0x3F`: an explicitly empty delegate (`delegate(D) = none`).
+            K::EmptyDelegate => Value::Delegate(None),
+            // `0x45`: delegate assignment, evaluated like a normal `Let` but storing a delegate
+            // value (the destination slot's declared type is `delegate`).
+            K::LetDelegate { lhs, rhs } => {
+                let place = self.place(frame, lhs, target)?;
+                let v = self.eval(frame, rhs)?;
+                match place {
+                    Some(p) => self.write(frame, &p, v)?,
+                    None => self.accessed_none(),
+                }
+                Value::Void
+            }
+            // `0x43`: `Object.delegate <DelegateProperty>:<Function>(args)`. Read the delegate
+            // property from the context object; a bound delegate calls its own object/function,
+            // an unbound one calls `<Function>` on the context (UE2 semantics).
+            K::DelegateFunction {
+                property,
+                name,
+                call,
+            } => {
+                let prop_name = self
+                    .set
+                    .resolve(frame.pkg, *property)
+                    .map(|g| self.object_name(g).to_owned())
+                    .unwrap_or_else(|| self.set.packages[frame.pkg].ref_name(*property).to_owned());
+                let bound = match self.get_property(target, &prop_name) {
+                    Some(Value::Delegate(Some(d))) => Some(d.clone()),
+                    Some(Value::Delegate(None)) | None => None,
+                    Some(other) => {
+                        return Err(self.type_err("delegate", other));
+                    }
+                };
+                let declared = self.set.packages[frame.pkg].name_text(*name).to_owned();
+                match bound {
+                    Some(d) => {
+                        let obj = match d.object {
+                            Some(ObjRef::Instance(i)) => i,
+                            Some(ObjRef::Static(g)) => self.default_object(g)?,
+                            Some(ObjRef::External(_)) => {
+                                return Err(self.err(VmErrorKind::UnsupportedValue {
+                                    desc: format!(
+                                        "delegate {prop_name} on a non-script external object"
+                                    ),
+                                }));
+                            }
+                            None => target,
+                        };
+                        let f = self.find_function(obj, &d.function, true).ok_or_else(|| {
+                            self.err(VmErrorKind::NoSuchFunction {
+                                object: self.objects[obj as usize].name.clone(),
+                                name: d.function.clone(),
+                            })
+                        })?;
+                        self.invoke(frame, f, call, obj, None)?
+                    }
+                    None => {
+                        let f = self.find_function(target, &declared, true).ok_or_else(|| {
+                            self.err(VmErrorKind::NoSuchFunction {
+                                object: self.objects[target as usize].name.clone(),
+                                name: declared.clone(),
+                            })
+                        })?;
+                        self.invoke(frame, f, call, target, None)?
+                    }
+                }
+            }
+            // `0x3B..=0x3E`: delegate equality/inequality; `0x3B`/`0x3D` are the `==` forms.
+            K::DelegateCompare { a, b, .. } => {
+                let x = self.eval(frame, a)?;
+                let y = self.eval(frame, b)?;
+                Value::Bool(values_equal(&x, &y) == matches!(t.opcode, 0x3B | 0x3D))
+            }
             _ => {
                 return Err(self.err(VmErrorKind::UnsupportedToken {
                     opcode: t.opcode,
@@ -4983,6 +5412,7 @@ impl<'s> Vm<'s> {
             }
             K::DynArrayElement { index, array } => {
                 let i = self.int(frame, index)?;
+                let elem_ty = self.array_elem_ty(frame, array);
                 let Some(base) = self.place(frame, array, target)? else {
                     return Ok(None);
                 };
@@ -4992,7 +5422,7 @@ impl<'s> Vm<'s> {
                         len: 0,
                     }));
                 }
-                Place::Elem(Box::new(base), i as usize)
+                Place::Elem(Box::new(base), i as usize, elem_ty)
             }
             K::StructMember { property, expr } => {
                 let g = self.resolve_ref(frame, *property)?;
@@ -5005,10 +5435,11 @@ impl<'s> Vm<'s> {
             // `Array.Length = n` is the UE2 dynamic-array resize idiom; it is the only
             // assignable use of `DynArrayLength`.
             K::DynArrayLength(e) => {
+                let elem_ty = self.array_elem_ty(frame, e);
                 let Some(base) = self.place(frame, e, target)? else {
                     return Ok(None);
                 };
-                Place::ArrayLen(Box::new(base))
+                Place::ArrayLen(Box::new(base), elem_ty)
             }
             _ => return Err(self.err(VmErrorKind::NotAPlace { opcode: t.opcode })),
         }))
@@ -5018,7 +5449,7 @@ impl<'s> Vm<'s> {
         let v = match p {
             Place::Local(i) => frame.locals.get(*i).cloned(),
             Place::Slot(o, i) => self.objects[*o as usize].props.get(*i).cloned(),
-            Place::Elem(base, i) => match self.read(frame, base)? {
+            Place::Elem(base, i, _) => match self.read(frame, base)? {
                 Value::Array(a) => match a.get(*i) {
                     Some(v) => Some(v.clone()),
                     None => {
@@ -5034,7 +5465,7 @@ impl<'s> Vm<'s> {
                 member_get(&self.read(frame, base)?, m)
                     .ok_or_else(|| self.err(VmErrorKind::Other(format!("no struct member {m}"))))?,
             ),
-            Place::ArrayLen(base) => match self.read(frame, base)? {
+            Place::ArrayLen(base, _) => match self.read(frame, base)? {
                 Value::Array(a) => Some(Value::Int(a.len() as i32)),
                 other => return Err(self.type_err("array", &other)),
             },
@@ -5062,20 +5493,26 @@ impl<'s> Vm<'s> {
                 }
                 self.objects[*o as usize].props[*i] = v;
             }
-            Place::Elem(base, i) => {
+            Place::Elem(base, i, elem_ty) => {
                 let mut arr = match self.read(frame, base)? {
                     Value::Array(a) => a,
                     other => return Err(self.type_err("array", &other)),
                 };
                 if *i >= arr.len() {
-                    // UE2 grows a dynamic array on assignment past its end.
-                    let zero = match &v {
-                        Value::Int(_) => Value::Int(0),
-                        Value::Float(_) => Value::Float(0.0),
-                        Value::Object(_) => Value::Object(None),
-                        Value::Name(_) => Value::Name("None".into()),
-                        other => other.clone(),
-                    };
+                    // UE2 grows a dynamic array on assignment past its end and initialises the new
+                    // elements to the element type's default (a zero struct, not the assigned
+                    // scalar). The declared element type is known when the array expression is a
+                    // property; otherwise fall back to the assigned value's zero.
+                    let zero = elem_ty.as_ref().map_or_else(
+                        || match &v {
+                            Value::Int(_) => Value::Int(0),
+                            Value::Float(_) => Value::Float(0.0),
+                            Value::Object(_) => Value::Object(None),
+                            Value::Name(_) => Value::Name("None".into()),
+                            other => other.clone(),
+                        },
+                        Ty::zero,
+                    );
                     arr.resize(*i + 1, zero);
                 }
                 arr[*i] = v;
@@ -5088,7 +5525,7 @@ impl<'s> Vm<'s> {
                 }
                 self.write(frame, base, s)?;
             }
-            Place::ArrayLen(base) => {
+            Place::ArrayLen(base, elem_ty) => {
                 let n = match v {
                     Value::Int(i) => i.max(0) as usize,
                     other => return Err(self.type_err("int", &other)),
@@ -5097,14 +5534,20 @@ impl<'s> Vm<'s> {
                     Value::Array(a) => a,
                     other => return Err(self.type_err("array", &other)),
                 };
-                let zero = match arr.last() {
-                    Some(Value::Float(_)) => Value::Float(0.0),
-                    Some(Value::Object(_)) => Value::Object(None),
-                    Some(Value::Name(_)) => Value::Name("None".into()),
-                    Some(Value::Bool(_)) => Value::Bool(false),
-                    Some(Value::Byte(_)) => Value::Byte(0),
-                    _ => Value::Int(0),
-                };
+                // UE2 `Array.Length = n` initialises the grown elements to the element type's
+                // default. When the property's declared element type is known, use it (a zero
+                // struct carries all its members); otherwise infer from an existing element.
+                let zero = elem_ty.as_ref().map_or_else(
+                    || match arr.last() {
+                        Some(Value::Float(_)) => Value::Float(0.0),
+                        Some(Value::Object(_)) => Value::Object(None),
+                        Some(Value::Name(_)) => Value::Name("None".into()),
+                        Some(Value::Bool(_)) => Value::Bool(false),
+                        Some(Value::Byte(_)) => Value::Byte(0),
+                        _ => Value::Int(0),
+                    },
+                    Ty::zero,
+                );
                 arr.resize(n, zero);
                 self.write(frame, base, Value::Array(arr))?;
             }
@@ -5581,12 +6024,59 @@ impl<'s> Vm<'s> {
         if let Some(f) = self.find_function(id, "Destroyed", true) {
             self.call_values(f, id, Vec::new())?;
         }
+        // Leave a clean inventory chain. `Inventory.Destroyed` unlinks the item via
+        // `Instigator/Owner.DeleteInventory`, but that call is on another actor and can be
+        // deferred (out of the executed scope), leaving the destroyed item reachable from the
+        // owner. A stale head then makes `PlayerController.SearchPawn`'s `while (i = P.Inventory)`
+        // loop forever (measured: the corpse-search BudgetExceeded). Removing it here is what
+        // UE2's `AActor::Destroy` guarantees; it is a no-op when the script already unlinked it.
+        if self.is_a(id, "inventory") {
+            for owner_prop in ["Instigator", "Owner"] {
+                if let Some(Value::Object(Some(ObjRef::Instance(owner)))) =
+                    self.get_property(id, owner_prop).cloned()
+                {
+                    self.unlink_inventory(owner, id);
+                }
+            }
+        }
         let actor = self.objects[id as usize].name.clone();
         self.note(TraceKind::Destroyed {
             actor,
             result: true,
         });
         Ok(true)
+    }
+
+    /// Removes `item` from `owner`'s `Inventory` singly-linked chain (or from `item`'s
+    /// predecessor in it). Used by [`Vm::destroy`] and the host corpse-search bridge to guarantee
+    /// a clean chain when the script's `Inventory.Destroyed`/`DeleteInventory` unlink was deferred
+    /// (a call on an out-of-scope actor). No-op when `item` is not linked.
+    pub fn unlink_inventory(&mut self, owner: ObjectId, item: ObjectId) {
+        let mut cur = owner;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            if guard > 1024 {
+                return;
+            }
+            let next = match self.get_property(cur, "Inventory").cloned() {
+                Some(Value::Object(Some(ObjRef::Instance(n)))) => n,
+                _ => return,
+            };
+            if next == item {
+                let after = self
+                    .get_property(item, "Inventory")
+                    .cloned()
+                    .unwrap_or(Value::Object(None));
+                let _ = self.set_property(cur, "Inventory", 0, after);
+                let _ = self.set_property(item, "Inventory", 0, Value::Object(None));
+                return;
+            }
+            cur = next;
+            if cur == owner {
+                return;
+            }
+        }
     }
 
     /// First live (not deleted) object with a name (case-insensitive).
@@ -6001,8 +6491,14 @@ impl<'s> Vm<'s> {
             if !gate && !self.bool_prop(b, "bCollideActors") {
                 continue;
             }
-            // Skip actors in the tracer's owner chain (upstream TraceFirstHit IsOwnedBy).
-            if self.is_owned_by(id, b) {
+            // A trace must ignore both the tracer's owners and its owned attachments. UE2's
+            // TraceFirstHit/IsOwnedBy filtering is target-relative: the candidate hit actor is
+            // ignored when its Owner chain contains the tracer. The reverse check also excludes
+            // owner-chain actors (for example the player pawn when the weapon traces).
+            // item18 B11 measured the missing direction: `XIII.M60`'s line hit its own
+            // `StarFPMF` (`Owner=m601`) and classified that first-person mesh's bone, so
+            // `ProcessTraceHit` received the attachment instead of the soldier.
+            if self.is_owned_by(b, id) || self.is_owned_by(id, b) {
                 continue;
             }
             let (lb, rb, hb) = self.actor_cylinder(b);

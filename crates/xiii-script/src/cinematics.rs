@@ -129,7 +129,18 @@ fn play_str_voice(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<N
             time,
         },
     ));
-    val(Value::Bool(true))
+    // The engine's audio subsystem fires `EndOfVoice` on the speaking actor when the wave ends;
+    // the headless VM has no audio callback, so it schedules the actor's `Timer` event for the
+    // same delay (`DialogueManager.STA_HeadAnimation.Timer` calls `EndOfVoice`). Without a host
+    // [`crate::voice::VoiceDuration`] provider the native reports the voice as not started, so the
+    // script takes its own `STA_HeadAnimation.NoSound` 2 s timer branch (never a silent success).
+    match duration {
+        Some(d) => {
+            vm.set_timer(c.this, d.max(0.01), false);
+            val(Value::Bool(true))
+        }
+        None => val(Value::Bool(false)),
+    }
 }
 
 /// `Actor.PlayVoice(object<Sound> Sound, optional int Param1..Param5)` (native 353): the

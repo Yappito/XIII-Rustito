@@ -11,13 +11,14 @@
 //!
 //! **What is host-side (documented).** XIII's menu is drawn by a native GUI subsystem
 //! (`GUI.dll`'s `GUIController`/`GUIComponent` render loop) that the x64 runtime does not have.
-//! This module replaces only that render loop: it instantiates the pages/controls, calls the
-//! same script callbacks the native loop calls (delegates are not interpreted by the VM, so the
-//! callbacks are invoked directly), and draws the recorded Canvas commands. The `ViewportOwner`
-//! (the engine's player/viewport link) is left `None`; the menu functions used here tolerate
-//! that (they only use it for `GetLevel`/`GetPlayerOwner`). The `cine00` intro video is not
-//! decoded, so `VideoPlayer.*` is a labelled stub and the new-game `ClientTravel("Plage00")`
-//! request is recorded for the host travel step.
+//! This module replaces the *render loop*: it instantiates the real pages/controls and runs the
+//! game's own `InitComponent` -> `Created`/`FocusFirst` page-open path and its
+//! `__OnPreDraw__`/`__OnDraw__` callbacks through the VM's delegate opcodes
+//! (`DelegateProperty`/`LetDelegate`/`DelegateFunction`). It draws the recorded `Engine.Canvas`
+//! commands. The `ViewportOwner` (the engine's player/viewport link) is a minimal host-created
+//! `Engine.Player` -> `Engine.PlayerController` pair. The `cine00` intro video is not decoded,
+//! so `VideoPlayer.*` is a labelled stub and the new-game `ClientTravel("Plage00")` request is
+//! recorded for the host travel step.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -76,10 +77,10 @@ const XIIIMENU_LABELS: [&str; XIIIMENU_CONTROL_COUNT] = [
     "quit",
 ];
 
-/// `XIIIMenu` label struct properties, in `Controls` order. The decoded `XIIIMenu.AfterPaint`
-/// draws a button's label only for the highlighted control; the native GUI renderer draws every
-/// component's caption, so the host draws all six through the same decoded
-/// `XIIIWindow.DrawLabel` (the captions are `XIIIMenu`'s localised `*Text` defaults).
+/// `XIIIMenu` label struct properties, in `Controls` order. `XIIIMenu.AfterPaint` draws a
+/// button's label only when `bDisplayTex` is set (the focused/hovered control), which its
+/// `__OnActivate__` -> `MouseEnter` delegate sets. Used by the opt-in layout test.
+#[allow(dead_code)] // exercised by the opt-in menu layout test
 const XIIIMENU_LABEL_PROPS: [&str; XIIIMENU_CONTROL_COUNT] = [
     "ContinueLabel",
     "MultiLabel",
@@ -421,25 +422,25 @@ impl MenuSession {
             .spawn(page_class, "XIIIMenu(menu)")
             .map_err(|e| format!("creating main menu: {e}"))?;
         vm.set_active(page, true);
-        vm.set_property(
+        // Run the game's own page-open path. `XIIIWindow.InitComponent` assigns the
+        // `__OnOpen__`/`__OnPreDraw__`/`__OnDraw__`/`__OnKeyEvent__` delegates, sets `myRoot`
+        // and calls `Created` (which loads the panel textures with `DynamicLoadObject` and
+        // builds the six controls with `CreateControl`). `GUI.GUIPage.InitComponent` then
+        // initialises every control (its delegates and `myRoot`) and focuses the first one,
+        // which activates its `MouseEnter` (highlight) by delegate. The VM now interprets the
+        // delegate opcodes, so this is the real flow rather than the item16 host wiring.
+        if let Err(e) = vm.send_event(
             page,
-            "myRoot",
-            0,
-            Value::Object(Some(ObjRef::Instance(root))),
-        );
-
-        // Run the game's `Created`: loads the button/onomatopoeia textures with
-        // `DynamicLoadObject` and builds the controls with `CreateControl` (the `new` opcode).
-        // The decoded function ends with a delegate assignment (`delegateprop`), which the VM
-        // does not interpret, so a trailing error is expected and the controls are already
-        // built. `SendEvent` on a non-actor does not suspend the object.
-        let mut created_error = None;
-        if let Err(e) = vm.send_event(page, "Created", Vec::new()) {
-            created_error = Some(e.to_string());
+            "InitComponent",
+            vec![
+                Value::Object(Some(ObjRef::Instance(root))),
+                Value::Object(None),
+            ],
+        ) {
+            log.push(format!("[menu] XIIIMenu.InitComponent: {e}"));
         }
 
-        // Wire each control to the page (its `MenuOwner`, which the native GUI would set) and
-        // the root, then run the control `Created`.
+        // Read the built controls for `--menu-script` target resolution and the report.
         let mut controls = Vec::new();
         let mut control_labels = Vec::new();
         if let Some(Value::Array(items)) = vm.get_property(page, "Controls").cloned() {
@@ -447,18 +448,7 @@ impl MenuSession {
                 let Value::Object(Some(ObjRef::Instance(id))) = item else {
                     continue;
                 };
-                let id = *id;
-                vm.set_property(
-                    id,
-                    "MenuOwner",
-                    0,
-                    Value::Object(Some(ObjRef::Instance(page))),
-                );
-                vm.set_property(id, "myRoot", 0, Value::Object(Some(ObjRef::Instance(root))));
-                if let Err(e) = vm.send_event(id, "Created", Vec::new()) {
-                    log.push(format!("[menu] control {i} Created: {e}"));
-                }
-                controls.push(id);
+                controls.push(*id);
                 control_labels.push(
                     XIIIMENU_LABELS
                         .get(i)
@@ -467,26 +457,26 @@ impl MenuSession {
                 );
             }
         }
-        // Initial focus on Continue (index 0), as the decoded `OpenMenu`/`ResetFocus` flow does
-        // for a fresh main menu.
-        if let Some(first) = controls.first() {
-            vm.set_property(
-                page,
-                "FocusedControl",
-                0,
-                Value::Object(Some(ObjRef::Instance(*first))),
-            );
-        }
         log.push(format!(
             "[menu] XIIIMenu: {} control(s) {:?}",
             controls.len(),
             control_labels
         ));
-        if let Some(e) = &created_error {
+        // The focused control comes from the game's own `GUIPage.InitComponent` -> `FocusFirst`
+        // (delegate `__OnActivate__` -> `MouseEnter` sets `bDisplayTex`, so its caption is
+        // drawn by `AfterPaint`). Report it so an empty focus is visible, not hidden.
+        let focused = match vm.get_property(page, "FocusedControl") {
+            Some(Value::Object(Some(ObjRef::Instance(i)))) => Some(*i),
+            _ => None,
+        };
+        if let Some(f) = focused {
             log.push(format!(
-                "[menu] XIIIMenu.Created returned an error after building the controls \
-                 (expected: the trailing delegate assignment): {e}"
+                "[menu] focus: {} ({})",
+                vm.objects[f as usize].name,
+                vm.set().path(vm.objects[f as usize].class)
             ));
+        } else {
+            log.push("[menu] focus: none (FocusFirst found no tab-stop control)".to_owned());
         }
 
         let packages = PackageCache::open(game_dir)?;
@@ -643,8 +633,9 @@ impl MenuSession {
         }
     }
 
-    /// Instantiates a decoded page class as the active page and wires its controls (the host
-    /// bridge for the native `GUIController.OpenMenu` page stack). Used by `--menu-script open`.
+    /// Instantiates a decoded page class as the active page and runs its own `InitComponent`
+    /// (the host bridge for the native `GUIController.OpenMenu` page stack). Used by
+    /// `--menu-script open`.
     fn open_page(&mut self, class_name: &str) -> Result<(), String> {
         let class = runtime::resolve_class_path(self.vm.set(), class_name)
             .ok_or_else(|| format!("page class {class_name} is not loaded"))?;
@@ -653,14 +644,17 @@ impl MenuSession {
             .spawn(class, "MenuPage(menu)")
             .map_err(|e| e.to_string())?;
         self.vm.set_active(page, true);
-        self.vm.set_property(
+        // The game's own page-open path: assigns the draw/key delegates, calls `Created`
+        // (builds controls) and `FocusFirst` (activates the first control's highlight).
+        if let Err(e) = self.vm.send_event(
             page,
-            "myRoot",
-            0,
-            Value::Object(Some(ObjRef::Instance(self.root))),
-        );
-        if let Err(e) = self.vm.send_event(page, "Created", Vec::new()) {
-            self.errors.push(format!("{class_name}.Created: {e}"));
+            "InitComponent",
+            vec![
+                Value::Object(Some(ObjRef::Instance(self.root))),
+                Value::Object(None),
+            ],
+        ) {
+            self.errors.push(format!("{class_name}.InitComponent: {e}"));
         }
         let mut controls = Vec::new();
         let mut labels = Vec::new();
@@ -669,24 +663,7 @@ impl MenuSession {
                 let Value::Object(Some(ObjRef::Instance(id))) = item else {
                     continue;
                 };
-                let id = *id;
-                self.vm.set_property(
-                    id,
-                    "MenuOwner",
-                    0,
-                    Value::Object(Some(ObjRef::Instance(page))),
-                );
-                self.vm.set_property(
-                    id,
-                    "myRoot",
-                    0,
-                    Value::Object(Some(ObjRef::Instance(self.root))),
-                );
-                if let Err(e) = self.vm.send_event(id, "Created", Vec::new()) {
-                    self.errors
-                        .push(format!("{class_name} control {i} Created: {e}"));
-                }
-                controls.push(id);
+                controls.push(*id);
                 labels.push(format!("control{i}"));
             }
         }
@@ -700,7 +677,12 @@ impl MenuSession {
         Ok(())
     }
 
-    /// Runs the decoded paint callbacks for one frame and collects the Canvas commands.
+    /// Runs the decoded GUI render loop for one frame and collects the Canvas commands.
+    ///
+    /// The native `GUI.dll` loop walks the component tree: every page/control is pre-drawn
+    /// (`__OnPreDraw__`), then drawn (`__OnDraw__`), and the page's `AfterPaint` draws the
+    /// focused control's onomatopoeia and caption. All three callbacks are the game's own
+    /// delegates (assigned by `InitComponent`), invoked through [`Vm::call_delegate`].
     fn refresh_commands(&mut self) {
         let (clip_w, clip_h) = (self.clip[0], self.clip[1]);
         if clip_w <= 0.0 || clip_h <= 0.0 {
@@ -711,28 +693,76 @@ impl MenuSession {
         self.vm
             .set_property(self.canvas, "ClipY", 0, Value::Float(clip_h));
         let canvas = Value::Object(Some(ObjRef::Instance(self.canvas)));
-        // Page ratios (`XIIIWindow.BeforePaint`) and the controls' own pre-draw (origin,
-        // `fRatioX/Y`, stretch) then draw (Paint + AfterPaint), matching the native render loop.
-        self.call(
+        self.call_delegate(
             self.page,
-            "BeforePaint",
-            vec![canvas.clone(), zero(), zero()],
+            "__OnPreDraw__Delegate",
+            "OnPreDraw",
+            vec![canvas.clone()],
         );
         let controls = self.controls.clone();
-        for (i, c) in controls.iter().copied().enumerate() {
-            self.call(c, "InternalOnPreDraw", vec![canvas.clone()]);
-            self.call(c, "InternalOnDraw", vec![canvas.clone()]);
-            // The native GUI draws each component's caption; draw the game's label structs
-            // through `XIIIWindow.DrawLabel` (host bridge, documented in the module header).
-            if let Some(prop) = XIIIMENU_LABEL_PROPS.get(i)
-                && let Some(label) = self.vm.get_property(self.page, prop).cloned()
-            {
-                self.call(self.page, "DrawLabel", vec![canvas.clone(), label]);
-            }
+        for c in controls.iter().copied() {
+            self.call_delegate(
+                c,
+                "__OnPreDraw__Delegate",
+                "OnPreDraw",
+                vec![canvas.clone()],
+            );
         }
+        for c in controls.iter().copied() {
+            self.call_delegate(c, "__OnDraw__Delegate", "OnDraw", vec![canvas.clone()]);
+        }
+        self.call_delegate(
+            self.page,
+            "__OnDraw__Delegate",
+            "OnDraw",
+            vec![canvas.clone()],
+        );
+        // `XIIIMenu.AfterPaint` is a plain virtual (no `__AfterPaint__` delegate): it draws the
+        // focused control's onomatopoeia and its label (`Continue`, `Options`, ...). Called with
+        // the page origin in place from the page's `__OnDraw__`.
         self.call(self.page, "AfterPaint", vec![canvas, zero(), zero()]);
         self.commands = self.vm.drain_canvas();
         self.fps += 1;
+    }
+
+    /// Mouse hover focus, following the native controller's hit test: the control whose
+    /// `Bounds` (set by its own `InternalOnPreDraw`) contains the cursor receives focus, which
+    /// runs its `__OnActivate__` -> `MouseEnter` delegate (highlight + zoom). Controls are read
+    /// back-to-front so the topmost wins.
+    fn hover(&mut self, cursor: Option<(f32, f32)>) {
+        let Some((cx, cy)) = cursor else {
+            return;
+        };
+        let mut target = None;
+        for c in self.controls.iter().rev().copied() {
+            let bound = |i: usize| match self.vm.get_property_elem(c, "Bounds", i) {
+                Some(Value::Float(v)) => Some(*v),
+                Some(Value::Int(v)) => Some(*v as f32),
+                _ => None,
+            };
+            if let (Some(x0), Some(y0), Some(x1), Some(y1)) =
+                (bound(0), bound(1), bound(2), bound(3))
+                && cx >= x0
+                && cx <= x1
+                && cy >= y0
+                && cy <= y1
+            {
+                target = Some(c);
+                break;
+            }
+        }
+        let Some(t) = target else {
+            return;
+        };
+        let focused = match self.vm.get_property(self.page, "FocusedControl") {
+            Some(Value::Object(Some(ObjRef::Instance(i)))) => Some(*i),
+            _ => None,
+        };
+        if focused != Some(t) {
+            // `GUIComponent.SetFocus(None)` runs the page/control focus state machine and the
+            // `__OnActivate__`/`__OnDeActivate__` delegates.
+            let _ = self.vm.send_event(t, "SetFocus", vec![Value::Object(None)]);
+        }
     }
 
     fn call(&mut self, id: ObjectId, func: &str, args: Vec<Value>) {
@@ -743,10 +773,106 @@ impl MenuSession {
             }
         }
     }
+
+    /// Invokes a `__On*__` delegate through the VM; on failure records `declared` plus the error.
+    fn call_delegate(&mut self, id: ObjectId, property: &str, declared: &str, args: Vec<Value>) {
+        if let Err(e) = self.vm.call_delegate(id, property, declared, args) {
+            let msg = format!("{declared}: {e}");
+            if !self.errors.iter().any(|x| x == &msg) {
+                self.errors.push(msg);
+            }
+        }
+    }
 }
 
 fn zero() -> Value {
     Value::Float(0.0)
+}
+
+/// Screen X/Y scale factors used by the native menu layout (`XIIIWindow.BeforePaint`, decoded
+/// at `xidinterf.u` @62903). For the map menu (`bMapMenu`) `fRatioX = min(ClipX/640, 800/640)`
+/// and `fRatioY = min(ClipY/480, 600/480)`; the design space is 640x480.
+pub fn map_menu_ratio(clip: [f32; 2]) -> [f32; 2] {
+    [
+        (clip[0] / 640.0).min(800.0 / 640.0),
+        (clip[1] / 480.0).min(600.0 / 480.0),
+    ]
+}
+
+/// Canvas origin the page/control sets for the map menu (`XIIIGUIBaseButton.InternalOnPreDraw`,
+/// decoded at `xidinterf.u` @380779 / `XIIIWindow.InternalOnPreDraw` @106097): the design area
+/// is centred when the clip is larger than 800x600.
+#[allow(dead_code)] // exercised by the layout tests in this module
+pub fn map_menu_origin(win: [f32; 2], clip: [f32; 2]) -> [f32; 2] {
+    let ratio = map_menu_ratio(clip);
+    let mut x = win[0] * 640.0 * ratio[0];
+    let mut y = win[1] * 480.0 * ratio[1];
+    if clip[0] > 800.0 {
+        x += (clip[0] - 800.0) / 2.0;
+    }
+    if clip[1] > 600.0 {
+        y += (clip[1] - 600.0) / 2.0;
+    }
+    [x, y]
+}
+
+/// Screen rectangle `[x, y, w, h]` of a control. `win` is the normalized design rectangle
+/// `XIIIWindow.CreateControl` stores (`WinLeft = X/640`, `WinWidth = W/640`, ...). This is the
+/// `InternalOnPreDraw` origin plus the `Bounds[2] = WinWidth*640*fRatioX` size.
+#[allow(dead_code)] // exercised by the layout tests in this module
+pub fn map_menu_control_rect(win: [f32; 4], clip: [f32; 2]) -> [f32; 4] {
+    let ratio = map_menu_ratio(clip);
+    let [x, y] = map_menu_origin([win[0], win[1]], clip);
+    [x, y, win[2] * 640.0 * ratio[0], win[3] * 480.0 * ratio[1]]
+}
+
+/// Screen rectangle `[x, y, w, h]` of a caption label. `label` is the design-space
+/// `{XPos, YPos, XSize, YSize}` `XIIIWindow.InitLabel` stores; `XIIIWindow.DrawLabel` scales it
+/// by the page ratios around the page origin.
+#[allow(dead_code)] // exercised by the layout tests in this module
+pub fn map_menu_label_rect(label: [f32; 4], clip: [f32; 2]) -> [f32; 4] {
+    let ratio = map_menu_ratio(clip);
+    let [ox, oy] = map_menu_origin([0.0, 0.0], clip);
+    [
+        ox + label[0] * ratio[0],
+        oy + label[1] * ratio[1],
+        label[2] * ratio[0],
+        label[3] * ratio[1],
+    ]
+}
+
+/// Modeled placement of a `bBoundToParent` child inside `parent` (a screen rectangle). No
+/// main-menu control sets `bBoundToParent`/`bScaleToParent` (both default `false`; only
+/// `GUIComponent.FillOwner` sets them true), so this is **not** on the menu path. The native
+/// `ActualLeft/ActualTop/ActualWidth/ActualHeight` implementations were not decoded, so this is
+/// a documented model (hypothesis), not a measurement.
+#[allow(dead_code)] // exercised by the layout tests in this module
+pub fn bound_child_rect(parent: [f32; 4], win: [f32; 4], scale_to_parent: bool) -> [f32; 4] {
+    let x = parent[0] + win[0] * parent[2];
+    let y = parent[1] + win[1] * parent[3];
+    let w = if scale_to_parent {
+        win[2] * parent[2]
+    } else {
+        win[2] * 640.0
+    };
+    let h = if scale_to_parent {
+        win[3] * parent[3]
+    } else {
+        win[3] * 480.0
+    };
+    [x, y, w, h]
+}
+
+/// True when two screen rectangles overlap (touching edges do not count).
+#[allow(dead_code)] // exercised by the layout tests in this module
+pub fn rects_overlap(a: [f32; 4], b: [f32; 4]) -> bool {
+    a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
+}
+
+/// True when `r` lies inside `[0,0,w,h]`.
+#[allow(dead_code)] // exercised by the layout tests in this module
+pub fn rect_inside(r: [f32; 4], screen: [f32; 2]) -> bool {
+    r[0] >= 0.0 && r[1] >= 0.0 && r[0] + r[2] <= screen[0] && r[1] + r[3] <= screen[1]
 }
 
 /// Unreal key codes for the keys `--menu-script` names (`XIIIMenu.InternalOnKeyEvent` compares
@@ -860,12 +986,14 @@ fn frame(
         return;
     };
     let dt = time.delta_secs();
+    let cursor = window.single().ok().and_then(|w| w.cursor_position());
     session.clip = window
         .single()
         .map(|w| [w.width(), w.height()])
         .unwrap_or([1280.0, 720.0]);
     session.advance(dt);
     session.refresh_commands();
+    session.hover(cursor.map(|p| (p.x, p.y)));
 }
 
 fn draw(
@@ -979,6 +1107,7 @@ fn draw(
                         ImageNode {
                             image: handle,
                             rect,
+                            image_mode: bevy::ui::widget::NodeImageMode::Stretch,
                             color: to_color(*color),
                             ..default()
                         },
@@ -1030,6 +1159,7 @@ fn draw(
                             ImageNode {
                                 image: page.handle.clone(),
                                 rect: Some(Rect::new(gx, gy, gx + gw, gy + gh)),
+                                image_mode: bevy::ui::widget::NodeImageMode::Stretch,
                                 color: to_color(*color),
                                 ..default()
                             },
@@ -1061,7 +1191,7 @@ fn decode_texture_path(
     path: &str,
     images: &mut Assets<Image>,
 ) -> Option<Handle<Image>> {
-    let (package, object) = path.rsplit_once('.')?;
+    let (package, object) = path.split_once('.')?;
     let leaf = object.rsplit('.').next().unwrap_or(object);
     let loaded = cache.get(package).ok()?;
     let pkg = &loaded.package;
@@ -1293,6 +1423,124 @@ mod tests {
         assert_eq!(unreal_key("nonsense"), None);
     }
 
+    /// The layout constants come from the decoded `XIIIWindow.BeforePaint` (640x480 design,
+    /// `fRatio = min(Clip/design, 800/640)` for the map menu) and the centring in
+    /// `InternalOnPreDraw`. Checked against three resolutions, including the clamp and the
+    /// sub-800x600 case (no centring).
+    #[test]
+    fn map_menu_scaling_matches_native_before_paint() {
+        // 640x480: ratio 1, no centre offset.
+        assert_eq!(map_menu_ratio([640.0, 480.0]), [1.0, 1.0]);
+        assert_eq!(map_menu_origin([0.0, 0.0], [640.0, 480.0]), [0.0, 0.0]);
+        // 1280x720: ratio clamps at 1.25; the 800x600 design area is centred.
+        assert_eq!(map_menu_ratio([1280.0, 720.0]), [1.25, 1.25]);
+        assert_eq!(map_menu_origin([0.0, 0.0], [1280.0, 720.0]), [240.0, 60.0]);
+        // 1600x1200: still clamped to 1.25, larger centre offset.
+        assert_eq!(map_menu_ratio([1600.0, 1200.0]), [1.25, 1.25]);
+        assert_eq!(
+            map_menu_origin([0.0, 0.0], [1600.0, 1200.0]),
+            [400.0, 300.0]
+        );
+        // A control at design (27,19)-(318,147) normalized by CreateControl.
+        let win = [27.0 / 640.0, 19.0 / 480.0, 318.0 / 640.0, 147.0 / 480.0];
+        let r = map_menu_control_rect(win, [1280.0, 720.0]);
+        assert!((r[0] - 273.75).abs() < 1e-3, "{r:?}");
+        assert!((r[1] - 83.75).abs() < 1e-3, "{r:?}");
+        assert!((r[2] - 397.5).abs() < 1e-3, "{r:?}");
+        assert!((r[3] - 183.75).abs() < 1e-3, "{r:?}");
+    }
+
+    /// The six decoded main-menu controls and captions (positions from `XIIIMenu.Created`):
+    /// every control and caption lies inside the screen and no two captions overlap. Uses the
+    /// decoded design-space values (documented in the report), so it runs without the corpus.
+    #[test]
+    fn decoded_main_menu_rects_are_contained_and_labels_do_not_overlap() {
+        let clip = [1280.0, 720.0];
+        // (X, Y, W, H) from `XIIIMenu.Created` `CreateControl` calls.
+        let controls = [
+            (27.0, 19.0, 318.0, 147.0),
+            (457.0, 19.0, 155.0, 280.0),
+            (27.0, 181.0, 244.0, 252.0),
+            (287.0, 181.0, 156.0, 252.0),
+            (457.0, 310.0, 155.0, 123.0),
+            (361.0, 19.0, 80.0, 147.0),
+        ];
+        for (x, y, w, h) in controls {
+            let win = [x / 640.0, y / 480.0, w / 640.0, h / 480.0];
+            let r = map_menu_control_rect(win, clip);
+            assert!(rect_inside(r, clip), "control rect {r:?} outside {clip:?}");
+        }
+        // (XPos, YPos, XSize, YSize) from `XIIIMenu.Created` `InitLabel` calls.
+        let labels = [
+            (16.0, 32.0, 128.0, 32.0),
+            (420.0, 220.0, 128.0, 32.0),
+            (16.0, 350.0, 128.0, 32.0),
+            (350.0, 320.0, 128.0, 32.0),
+            (500.0, 350.0, 128.0, 32.0),
+            (380.0, 120.0, 128.0, 32.0),
+        ];
+        let rects: Vec<[f32; 4]> = labels
+            .iter()
+            .map(|&l| map_menu_label_rect([l.0, l.1, l.2, l.3], clip))
+            .collect();
+        for r in &rects {
+            assert!(rect_inside(*r, clip), "label rect {r:?} outside {clip:?}");
+        }
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                assert!(
+                    !rects_overlap(rects[i], rects[j]),
+                    "labels {i} {:?} and {j} {:?} overlap",
+                    rects[i],
+                    rects[j]
+                );
+            }
+        }
+    }
+
+    /// `bBoundToParent`/`bScaleToParent` model: `GUIComponent.FillOwner` (gui.u @33859) sets
+    /// `Win = (0,0,1,1)` plus both flags, and a bound+scaled child then fills its parent. This is
+    /// a documented model of the un-decoded native `Actual*` functions, not a measurement; no
+    /// main-menu control sets the flags.
+    #[test]
+    fn bound_to_parent_fill_semantics() {
+        let parent = [100.0, 50.0, 400.0, 300.0];
+        let full = [0.0, 0.0, 1.0, 1.0];
+        assert_eq!(bound_child_rect(parent, full, true), parent);
+        // Not scaled: the child keeps its design size (640x480 space).
+        let half = [0.25, 0.5, 0.5, 0.5];
+        assert_eq!(
+            bound_child_rect(parent, half, false),
+            [100.0 + 0.25 * 400.0, 50.0 + 0.5 * 300.0, 320.0, 240.0]
+        );
+    }
+
+    fn vm_f32(vm: &Vm<'_>, id: ObjectId, name: &str) -> f32 {
+        match vm.get_property(id, name) {
+            Some(Value::Float(v)) => *v,
+            Some(Value::Int(v)) => *v as f32,
+            _ => panic!("{name} is not a float on {id}"),
+        }
+    }
+
+    fn label_rect(vm: &Vm<'_>, page: ObjectId, prop: &str) -> [f32; 4] {
+        let Some(Value::Struct(fields)) = vm.get_property(page, prop) else {
+            panic!("{prop} is not a struct");
+        };
+        let get = |n: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                .and_then(|(_, v)| match v {
+                    Value::Float(f) => Some(*f),
+                    Value::Int(i) => Some(*i as f32),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{prop}.{n} missing"))
+        };
+        [get("XPos"), get("YPos"), get("XSize"), get("YSize")]
+    }
+
     fn opt_in_root() -> Option<PathBuf> {
         let root = std::env::var_os("XIII_GOG_DIR")?;
         let path = PathBuf::from(&root);
@@ -1353,6 +1601,75 @@ mod tests {
             req.map,
             req.url,
             session.errors.first()
+        );
+    }
+
+    /// Opt-in corpus test: after the game's own `InitComponent` builds the main menu, every
+    /// control's rect (from its decoded `WinLeft/WinTop/WinWidth/WinHeight`) is inside the
+    /// 1280x720 screen and none of the six captions overlaps another. Also checks the focused
+    /// control's `bDisplayTex` is set (the `__OnActivate__` -> `MouseEnter` delegate ran), which
+    /// is what makes `AfterPaint` draw its caption.
+    #[test]
+    fn opt_in_menu_control_and_caption_rects_fit_the_screen() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = MenuSession::open(&game_dir, None).expect("open the front-end menu");
+        session.clip = [1280.0, 720.0];
+        session.refresh_commands();
+        let clip = session.clip;
+        assert_eq!(session.controls.len(), XIIIMENU_CONTROL_COUNT);
+        let mut controls = Vec::new();
+        for c in &session.controls {
+            let win = [
+                vm_f32(&session.vm, *c, "WinLeft"),
+                vm_f32(&session.vm, *c, "WinTop"),
+                vm_f32(&session.vm, *c, "WinWidth"),
+                vm_f32(&session.vm, *c, "WinHeight"),
+            ];
+            let r = map_menu_control_rect(win, clip);
+            assert!(
+                rect_inside(r, clip),
+                "control {} rect {r:?} outside {clip:?}",
+                session.control_labels[controls.len()]
+            );
+            controls.push(r);
+        }
+        let mut captions = Vec::new();
+        let mut names = Vec::new();
+        for prop in XIIIMENU_LABEL_PROPS {
+            let design = label_rect(&session.vm, session.page, prop);
+            let r = map_menu_label_rect(design, clip);
+            assert!(rect_inside(r, clip), "{prop} rect {r:?} outside {clip:?}");
+            captions.push(r);
+            names.push(prop);
+        }
+        for i in 0..captions.len() {
+            for j in (i + 1)..captions.len() {
+                assert!(
+                    !rects_overlap(captions[i], captions[j]),
+                    "captions {} {:?} and {} {:?} overlap",
+                    names[i],
+                    captions[i],
+                    names[j],
+                    captions[j]
+                );
+            }
+        }
+        // The first control is focused (GUIPage.InitComponent -> FocusFirst) and its delegate
+        // highlight is on, so `XIIIMenu.AfterPaint` draws its caption.
+        let focused = session.controls[0];
+        assert!(
+            matches!(
+                session.vm.get_property(focused, "bDisplayTex"),
+                Some(Value::Bool(true))
+            ),
+            "the focused control's MouseEnter delegate must set bDisplayTex"
+        );
+        println!(
+            "[menu test] control_rects={controls:?} caption_rects={captions:?} focused={}",
+            session.control_labels[0]
         );
     }
 
