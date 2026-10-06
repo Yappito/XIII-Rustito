@@ -1039,8 +1039,13 @@ pub struct Instance {
     pub is_actor: bool,
     /// Destroyed: behaves as `None` for further references.
     pub deleted: bool,
-    /// Memoised `Tick` dispatch, keyed by the state used for virtual resolution. Class chains are
-    /// fixed for an instance; a state transition invalidates the cached result.
+    /// Memoised `Tick` dispatch for this instance, keyed by the state it was resolved in.
+    ///
+    /// `None` until the first `Tick` lookup; `Some((state, function))` afterwards. The class
+    /// chain is fixed for the instance's life, so the entry stays valid while `state` is
+    /// unchanged; `do_goto_state` clears it when the state changes (the only input the lookup
+    /// depends on), so a stale entry is impossible. This turns the per-actor, per-frame
+    /// state+class function scan into a single `Option` comparison in the steady state.
     tick_fn: Option<(Option<GlobalRef>, Option<GlobalRef>)>,
     /// Map export it was loaded from.
     pub export: Option<GlobalRef>,
@@ -1119,6 +1124,23 @@ pub struct NativeProfile {
     pub movers_micros: u64,
     /// Cumulative microseconds in the state-code loop.
     pub state_micros: u64,
+    /// Cumulative microseconds in the per-frame `Tick` dispatch loop of `tick_suspending`
+    /// (the pass that resolves and calls `Tick` on every active actor).
+    pub tick_dispatch_micros: u64,
+    /// Cumulative microseconds in the per-frame `PlayerTick` dispatch loop.
+    pub player_tick_dispatch_micros: u64,
+    /// Cumulative microseconds inside per-frame `Tick`/`PlayerTick` executions, keyed by
+    /// `Class.Function` (the dispatch loop's [`Vm::call_values`] time; natives inside are
+    /// additionally counted in `micros`).
+    pub tick_fns: BTreeMap<String, u64>,
+    /// `Tick` resolution attempts and the subset served from the per-instance memo.
+    pub tick_lookups: u64,
+    /// `Tick` resolutions served from the per-instance memo (no state/class scan).
+    pub tick_cache_hits: u64,
+    /// `Vm::spawn` calls (per-frame object churn diagnostic).
+    pub spawn_count: u64,
+    /// `objects` `Vec` capacity growths inside `Vm::spawn` (per-frame reallocation diagnostic).
+    pub objects_reallocs: u64,
     /// Cumulative microseconds inside native implementations (sum over all natives).
     pub natives_micros: u64,
     /// Cumulative microseconds writing the host-owned player fields into the VM.
@@ -1129,6 +1151,9 @@ pub struct NativeProfile {
     pub events_micros: u64,
     /// Cumulative microseconds in the one-way render sync (`update_sync`).
     pub sync_micros: u64,
+    /// Cumulative microseconds in the host AI-perception pass (`update_ai_perception`, including
+    /// the `SeePlayer`/`EnemyNotVisible` dispatch it performs).
+    pub perception_micros: u64,
     /// Cumulative microseconds building mover collision states (`mover_states`).
     pub mover_states_micros: u64,
 }
@@ -1142,12 +1167,20 @@ impl NativeProfile {
         self.animation_micros = 0;
         self.movers_micros = 0;
         self.state_micros = 0;
+        self.tick_dispatch_micros = 0;
+        self.player_tick_dispatch_micros = 0;
+        self.tick_fns.clear();
+        self.tick_lookups = 0;
+        self.tick_cache_hits = 0;
+        self.spawn_count = 0;
+        self.objects_reallocs = 0;
         self.natives_micros = 0;
         self.player_write_micros = 0;
         self.touch_micros = 0;
         self.events_micros = 0;
         self.sync_micros = 0;
         self.mover_states_micros = 0;
+        self.perception_micros = 0;
     }
 }
 
@@ -2680,6 +2713,10 @@ impl<'s> Vm<'s> {
         let layout = self.class_layout(class)?;
         let is_actor = layout.chain_names.iter().any(|n| n == "actor");
         let id = self.objects.len() as ObjectId;
+        if self.profile.enabled {
+            self.profile.spawn_count += 1;
+        }
+        let cap_before = self.objects.capacity();
         let mut props = layout.defaults.clone();
         // UE2 `Object.Class` is a native property that always answers the object's UClass; it is
         // not a serialized default. Scripts read `default.Class` / `self.Class` to identify a
@@ -2717,6 +2754,9 @@ impl<'s> Vm<'s> {
             anim: AnimState::default(),
             bone: BoneState::default(),
         });
+        if self.profile.enabled && self.objects.capacity() != cap_before {
+            self.profile.objects_reallocs += 1;
+        }
         // UE2 gives every instance its own copy of the class-default subobjects (component
         // objects) its default properties reference. The serialized class defaults hold `Static`
         // references to those class-package exports, which have no VM instance of their own;
@@ -3709,6 +3749,7 @@ impl<'s> Vm<'s> {
         if profiling {
             self.profile.state_micros += t0.elapsed().as_micros() as u64;
         }
+        let t0 = Instant::now();
         for id in 0..self.objects.len() as ObjectId {
             if self.objects[id as usize].active
                 && self.objects[id as usize].is_actor
@@ -3718,6 +3759,10 @@ impl<'s> Vm<'s> {
                 errors.push((suspended, e));
             }
         }
+        if profiling {
+            self.profile.tick_dispatch_micros += t0.elapsed().as_micros() as u64;
+        }
+        let t0 = Instant::now();
         for id in 0..self.objects.len() as ObjectId {
             if self.player_tick_overridden(id)
                 && let Err(e) = self.dispatch_player_tick(id, dt)
@@ -3726,8 +3771,48 @@ impl<'s> Vm<'s> {
                 errors.push((suspended, e));
             }
         }
+        if profiling {
+            self.profile.player_tick_dispatch_micros += t0.elapsed().as_micros() as u64;
+        }
         self.detect_server_travel();
         errors
+    }
+
+    /// `Class.Tick` label for the per-function dispatch profile (`--perf-natives`).
+    fn tick_fn_key(&self, id: ObjectId) -> String {
+        let cls = self.objects[id as usize]
+            .layout
+            .chain_names
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        format!("{cls}.Tick")
+    }
+
+    /// `Tick` function resolved on `id`, memoised per instance and keyed by the current state.
+    ///
+    /// The result depends only on the instance's class chain (fixed for its life) and its
+    /// current state; `do_goto_state` clears the memo whenever the state changes, so a memo hit
+    /// is guaranteed to equal a fresh [`Vm::find_function`]. On a miss the fresh lookup is stored
+    /// and returned. The first lookup for an instance with no state stores `None` so a class with
+    /// no `Tick` handler is not re-scanned every frame either.
+    fn tick_function(&mut self, id: ObjectId) -> Option<GlobalRef> {
+        if let Some((state, f)) = self.objects[id as usize].tick_fn
+            && state == self.objects[id as usize].state
+        {
+            if self.profile.enabled {
+                self.profile.tick_lookups += 1;
+                self.profile.tick_cache_hits += 1;
+            }
+            return f;
+        }
+        if self.profile.enabled {
+            self.profile.tick_lookups += 1;
+        }
+        let state = self.objects[id as usize].state;
+        let f = self.find_function(id, "Tick", true);
+        self.objects[id as usize].tick_fn = Some((state, f));
+        f
     }
 
     /// Fires the per-frame `Tick(DeltaTime)` event on one active actor. UE2's engine calls
@@ -3735,18 +3820,6 @@ impl<'s> Vm<'s> {
     /// must also dispatch `Tick` or per-frame script (the `CineController2` sequence interpreter,
     /// `XIIIBaseHud.Tick`, pawn controllers) never runs. `Tick` is looked up in the actor's
     /// current state first, then the class chain.
-    fn tick_function(&mut self, id: ObjectId) -> Option<GlobalRef> {
-        let state = self.objects[id as usize].state;
-        if let Some((cached_state, function)) = self.objects[id as usize].tick_fn
-            && cached_state == state
-        {
-            return function;
-        }
-        let function = self.find_function(id, "Tick", true);
-        self.objects[id as usize].tick_fn = Some((state, function));
-        function
-    }
-
     fn dispatch_tick(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
         let trace_cine = cine_trace_enabled() && self.is_a(id, "CineController2");
         let action_before =
@@ -3754,8 +3827,14 @@ impl<'s> Vm<'s> {
                 Some(Value::Int(index)) => Some(*index),
                 _ => None,
             });
-        if let Some(f) = self.tick_function(id) {
+        let f = self.tick_function(id);
+        if let Some(f) = f {
+            let t0 = self.profile.enabled.then(Instant::now);
             self.call_values(f, id, vec![Value::Float(dt)])?;
+            if let Some(t0) = t0 {
+                let key = self.tick_fn_key(id);
+                *self.profile.tick_fns.entry(key).or_default() += t0.elapsed().as_micros() as u64;
+            }
         }
         if trace_cine {
             let action_after = match self.get_property(id, "ScriptedActionIndex") {
@@ -4048,6 +4127,9 @@ impl<'s> Vm<'s> {
             let o = &mut self.objects[id as usize];
             o.state = new_state;
             o.state_code = code;
+            // Invalidate the memoised `Tick` resolution: the state is the only input to the
+            // virtual lookup, and it just changed. A stale entry would call the old state's
+            // `Tick`, exactly the wrong behaviour.
             o.tick_fn = None;
             o.generation += 1;
         }
@@ -7295,6 +7377,7 @@ impl<'s> Vm<'s> {
         if self.objects.get(player as usize).is_none_or(|o| o.deleted) {
             return;
         }
+        let t0 = self.profile.enabled.then(Instant::now);
         let player_dead = self.bool_prop(player, "bIsDead");
         let controllers: Vec<ObjectId> = self
             .objects
@@ -7334,6 +7417,9 @@ impl<'s> Vm<'s> {
                     Err(e) => out.push((name, format!("EnemyNotVisible: {e}"))),
                 }
             }
+        }
+        if let Some(t0) = t0 {
+            self.profile.perception_micros += t0.elapsed().as_micros() as u64;
         }
     }
 
