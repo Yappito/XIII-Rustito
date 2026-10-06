@@ -40,6 +40,20 @@ pub struct ParticleRenderData {
     pub systems: Vec<ParticleSystem>,
 }
 
+/// Last per-frame particle census, used by `--benchmark` to show whether emitted particles
+/// changed the workload between revisions.
+#[derive(Resource, Default, Debug, Clone, Copy)]
+pub struct ParticleStats {
+    /// Renderable emitter components in the loaded map.
+    pub emitters: usize,
+    /// Emitters currently enabled by the VM bridge.
+    pub enabled_emitters: usize,
+    /// Emitters that the authored level-start properties enable.
+    pub authored_enabled_emitters: usize,
+    /// Active particles after the most recent simulator step.
+    pub live_particles: usize,
+}
+
 /// One rendered sub-emitter: its simulator, mesh and material handles.
 #[derive(Component)]
 pub struct ParticleEmitterRender {
@@ -47,6 +61,11 @@ pub struct ParticleEmitterRender {
     pub system: usize,
     /// Index into the system's `emitters`.
     pub emitter: usize,
+    /// Corresponding VM object after the play session links map exports.
+    pub vm_id: Option<xiii_script::ObjectId>,
+    /// Whether the VM path lookup has been attempted. `vm_id == None` alone cannot distinguish
+    /// an unresolved emitter from a cached miss.
+    pub vm_lookup_attempted: bool,
     /// Per-sub-emitter deterministic simulator.
     pub sim: EmitterSim,
     /// Active particle count of the previous frame (avoids re-adding an empty mesh).
@@ -59,6 +78,7 @@ pub struct ParticlePlugin;
 impl Plugin for ParticlePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ParticleRenderData>()
+            .init_resource::<ParticleStats>()
             .add_systems(Update, update_particles);
     }
 }
@@ -127,6 +147,8 @@ pub fn spawn_particles(
                 ParticleEmitterRender {
                     system: si,
                     emitter: ei,
+                    vm_id: None,
+                    vm_lookup_attempted: false,
                     sim,
                     last_count: 0,
                 },
@@ -547,13 +569,16 @@ pub fn update_particles(
     cameras: Query<(&Transform, &Camera)>,
     mut emitters: Query<(Entity, &mut ParticleEmitterRender)>,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut stats: ResMut<ParticleStats>,
 ) {
     if data.systems.is_empty() {
+        *stats = ParticleStats::default();
         return;
     }
     // The main camera is the highest-order 3D camera (the sky camera has order 0).
     let camera = cameras.iter().max_by_key(|(_, c)| c.order).map(|(t, _)| *t);
     let dt = time.delta_secs();
+    let mut census = ParticleStats::default();
     for (entity, mut e) in &mut emitters {
         let Some(system) = data.systems.get(e.system) else {
             continue;
@@ -563,6 +588,10 @@ pub fn update_particles(
         };
         e.sim.step(desc, dt);
         let count = e.sim.active();
+        census.emitters += 1;
+        census.enabled_emitters += usize::from(e.sim.enabled);
+        census.authored_enabled_emitters += usize::from(initially_enabled(system, desc));
+        census.live_particles += count;
         if count == 0 && e.last_count == 0 {
             continue;
         }
@@ -571,6 +600,7 @@ pub fn update_particles(
         commands.entity(entity).insert(Mesh3d(handle));
         e.last_count = count;
     }
+    *stats = census;
 }
 
 /// Reads back the total number of live particles.

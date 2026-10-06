@@ -105,6 +105,13 @@ pub struct Perf {
     pub interval: BTreeMap<&'static str, Counter>,
     /// Timer accumulators since the start.
     pub total: BTreeMap<&'static str, Counter>,
+    /// Per-call samples in microseconds since the start (for per-counter p99; bounded by
+    /// `sample_cap`, so a long run does not grow without limit).
+    pub total_samples: BTreeMap<&'static str, Vec<f64>>,
+    /// How many per-call samples are retained per counter. Beyond this, later samples are
+    /// dropped (the counter's `calls` still counts all of them). Enough for a stable p99 over
+    /// the windows this tool reports.
+    pub sample_cap: usize,
     /// Fixed steps since the last table.
     pub interval_steps: u64,
     /// Fixed steps since the start.
@@ -128,6 +135,8 @@ impl Default for Perf {
             last_report: now,
             interval: BTreeMap::new(),
             total: BTreeMap::new(),
+            total_samples: BTreeMap::new(),
+            sample_cap: 8192,
             interval_steps: 0,
             total_steps: 0,
             last_frame_count: 0,
@@ -162,6 +171,10 @@ impl Perf {
             let c = map.entry(name).or_default();
             c.micros += micros;
             c.calls += 1;
+        }
+        let samples = self.total_samples.entry(name).or_default();
+        if samples.len() < self.sample_cap {
+            samples.push(d.as_micros() as f64);
         }
     }
 
@@ -214,6 +227,9 @@ fn benchmark_system(
     mut perf: ResMut<Perf>,
     store: Res<DiagnosticsStore>,
     render: Option<Res<RenderStats>>,
+    particles: Option<Res<crate::viewer::particles::ParticleStats>>,
+    particle_data: Option<Res<crate::viewer::particles::ParticleRenderData>>,
+    particle_emitters: Query<&crate::viewer::particles::ParticleEmitterRender>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let Some(n) = perf.config.benchmark else {
@@ -270,6 +286,38 @@ fn benchmark_system(
             r.objects, r.draw_entities, r.mesh_assets, r.material_assets, r.triangles
         );
     }
+    if let Some(p) = particles {
+        println!(
+            "[perf]   particles: emitters {} | authored-enabled {} | VM-enabled {} | live {}",
+            p.emitters, p.authored_enabled_emitters, p.enabled_emitters, p.live_particles
+        );
+        if let Some(data) = particle_data {
+            let mut authored_enabled = Vec::new();
+            let mut vm_enabled = Vec::new();
+            for emitter in &particle_emitters {
+                let Some(system) = data.systems.get(emitter.system) else {
+                    continue;
+                };
+                let Some(desc) = system.emitters.get(emitter.emitter) else {
+                    continue;
+                };
+                if xiii_world::particles::initially_enabled(system, desc) {
+                    authored_enabled.push(desc.name.as_str());
+                }
+                if emitter.sim.enabled {
+                    vm_enabled.push(desc.name.as_str());
+                }
+            }
+            println!(
+                "[perf]   particle emitter paths authored-enabled: {}",
+                authored_enabled.join(", ")
+            );
+            println!(
+                "[perf]   particle emitter paths VM-enabled: {}",
+                vm_enabled.join(", ")
+            );
+        }
+    }
     perf.final_requested = true;
     exit.write(AppExit::Success);
 }
@@ -297,9 +345,27 @@ fn stats(values: &[f64]) -> Option<(usize, f64, f64, f64, f64, f64, f64)> {
     ))
 }
 
-/// Formats one counter row: `name`, per-call mean milliseconds, total seconds spent in the
-/// window, calls, and the share of the window as a percentage.
-fn counter_row(name: &str, c: &Counter, window_secs: f64, steps: u64) -> String {
+/// The `p`-th percentile (0-100) in microseconds of `values`, using the same linear index rule
+/// as [`stats`]; `None` for an empty slice.
+fn percentile_us(values: &[f64], p: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<f64> = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let idx = ((p / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
+    Some(sorted[idx.min(sorted.len() - 1)])
+}
+
+/// Formats one counter row: `name`, per-call mean and p99 microseconds, total seconds spent in
+/// the window, calls, and the share of the window as a percentage.
+fn counter_row(
+    name: &str,
+    c: &Counter,
+    window_secs: f64,
+    samples: Option<&[f64]>,
+    steps: u64,
+) -> String {
     let total_secs = c.micros as f64 / 1e6;
     let pct = if window_secs > 0.0 {
         total_secs / window_secs * 100.0
@@ -316,9 +382,10 @@ fn counter_row(name: &str, c: &Counter, window_secs: f64, steps: u64) -> String 
     } else {
         0.0
     };
+    let p99 = samples.and_then(|s| percentile_us(s, 99.0)).unwrap_or(0.0);
     let _ = steps;
     format!(
-        "  {name:<20} {per_call:>9.1} us   {total_secs:>8.3} s  {pct:>6.1}%  {calls_per_sec:>9.1}/s  (calls {})",
+        "  {name:<20} {per_call:>9.1} us  p99 {p99:>9.1} us  {total_secs:>8.3} s  {pct:>6.1}%  {calls_per_sec:>9.1}/s  (calls {})",
         c.calls
     )
 }
@@ -332,17 +399,36 @@ fn print_profile(profile: Option<&NativeProfile>, header: &str) {
     }
     println!("[perf] {header} VM section totals (microseconds, cumulative):");
     println!(
-        "  timers {}  animation {}  interpolation/movers {}  state-code {}  natives {}",
-        p.timers_micros, p.animation_micros, p.movers_micros, p.state_micros, p.natives_micros
+        "  timers {}  animation {}  interpolation/movers {}  state-code {}  tick-dispatch {}  player-tick-dispatch {}  natives {}",
+        p.timers_micros,
+        p.animation_micros,
+        p.movers_micros,
+        p.state_micros,
+        p.tick_dispatch_micros,
+        p.player_tick_dispatch_micros,
+        p.natives_micros
     );
     println!(
-        "  host: player-write {}  touch-refresh {}  event-drain/touch {}  render-sync {}  mover-states {}",
+        "  host: player-write {}  touch-refresh {}  event-drain/touch {}  render-sync {}  mover-states {}  ai-perception {}",
         p.player_write_micros,
         p.touch_micros,
         p.events_micros,
         p.sync_micros,
-        p.mover_states_micros
+        p.mover_states_micros,
+        p.perception_micros
     );
+    println!(
+        "  tick-resolution: {} lookups, {} memo hits | spawns {} (objects reallocs {})",
+        p.tick_lookups, p.tick_cache_hits, p.spawn_count, p.objects_reallocs
+    );
+    let mut ticks: Vec<(&String, u64)> = p.tick_fns.iter().map(|(k, v)| (k, *v)).collect();
+    ticks.sort_by_key(|a| std::cmp::Reverse(a.1));
+    if !ticks.is_empty() {
+        println!("[perf] {header} top per-frame Tick executions by cumulative time:");
+        for (name, micros) in ticks.iter().take(10) {
+            println!("  {name:<44} {:>10.3} ms", *micros as f64 / 1000.0);
+        }
+    }
     let mut natives: Vec<(&String, u64, u64)> = p
         .micros
         .iter()
@@ -440,9 +526,20 @@ fn print_table(
         perf.interval_steps
     };
     if !counters.is_empty() {
-        println!("[perf]   system timers (mean per call, total, % of {window_secs:.1}s window):");
+        println!(
+            "[perf]   system timers (mean/p99 per call, total, % of {window_secs:.1}s window):"
+        );
         for (name, c) in counters {
-            println!("{}", counter_row(name, c, window_secs, steps));
+            println!(
+                "{}",
+                counter_row(
+                    name,
+                    c,
+                    window_secs,
+                    perf.total_samples.get(name).map(Vec::as_slice),
+                    steps
+                )
+            );
         }
         println!("[perf]   fixed steps in window: {steps}");
     }
@@ -481,5 +578,67 @@ fn perf_report_system(
     }
     if perf.last_report.elapsed().as_secs_f32() >= perf.config.interval {
         print_table(&mut perf, &store, render.as_deref(), profile, false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentile_us_empty_is_none() {
+        assert!(percentile_us(&[], 99.0).is_none());
+    }
+
+    #[test]
+    fn percentile_us_matches_linear_index() {
+        // 100 samples 0..=99: the linear index rule round(p/100*(n-1)) gives 99 at p=100,
+        // 0 at p=0, and 98 at p=99.
+        let values: Vec<f64> = (0..100).map(|v| v as f64).collect();
+        assert_eq!(percentile_us(&values, 0.0), Some(0.0));
+        assert_eq!(percentile_us(&values, 100.0), Some(99.0));
+        assert_eq!(percentile_us(&values, 99.0), Some(98.0));
+    }
+
+    #[test]
+    fn percentile_us_single_sample_collapses() {
+        assert_eq!(percentile_us(&[42.0], 99.0), Some(42.0));
+    }
+
+    #[test]
+    fn counter_row_reports_p99_tail_not_just_mean() {
+        // 98 calls at 10 us and two outliers (900, 1000). Mean is 28.8 us; p99 (index 98) is
+        // 900 us. A row that only showed the mean would hide the tail.
+        let mut c = Counter::default();
+        let mut samples = vec![10.0; 98];
+        c.micros += 98 * 10;
+        c.calls += 98;
+        for v in [900.0, 1000.0] {
+            c.micros += v as u64;
+            c.calls += 1;
+            samples.push(v);
+        }
+        let row = counter_row("vm_step", &c, 20.0, Some(&samples), 100);
+        assert!(row.contains("vm_step"), "row: {row}");
+        assert!(row.contains("28.8 us"), "row: {row}");
+        assert!(row.contains("900.0 us"), "row: {row}");
+        // No samples (a counter only fed through `span` before samples existed) still prints.
+        let row = counter_row("vm_step", &c, 20.0, None, 100);
+        assert!(row.contains("p99"), "row: {row}");
+    }
+
+    #[test]
+    fn add_records_samples_up_to_cap() {
+        let mut p = Perf::default();
+        p.config.enabled = true;
+        p.sample_cap = 3;
+        for i in 0..5 {
+            p.add("x", Duration::from_micros(i as u64));
+        }
+        let c = p.total.get("x").unwrap();
+        assert_eq!(c.calls, 5);
+        // Samples are capped; the first `cap` are kept.
+        assert_eq!(p.total_samples.get("x").unwrap().len(), 3);
+        assert_eq!(p.total_samples.get("x").unwrap(), &[0.0, 1.0, 2.0]);
     }
 }

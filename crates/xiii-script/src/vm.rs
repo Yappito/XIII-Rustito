@@ -1039,6 +1039,14 @@ pub struct Instance {
     pub is_actor: bool,
     /// Destroyed: behaves as `None` for further references.
     pub deleted: bool,
+    /// Memoised `Tick` dispatch for this instance, keyed by the state it was resolved in.
+    ///
+    /// `None` until the first `Tick` lookup; `Some((state, function))` afterwards. The class
+    /// chain is fixed for the instance's life, so the entry stays valid while `state` is
+    /// unchanged; `do_goto_state` clears it when the state changes (the only input the lookup
+    /// depends on), so a stale entry is impossible. This turns the per-actor, per-frame
+    /// state+class function scan into a single `Option` comparison in the steady state.
+    tick_fn: Option<(Option<GlobalRef>, Option<GlobalRef>)>,
     /// Map export it was loaded from.
     pub export: Option<GlobalRef>,
     /// The three UE2 actor timers (`Timer`, `Timer2`, `Timer3`), independently scheduled.
@@ -1116,6 +1124,23 @@ pub struct NativeProfile {
     pub movers_micros: u64,
     /// Cumulative microseconds in the state-code loop.
     pub state_micros: u64,
+    /// Cumulative microseconds in the per-frame `Tick` dispatch loop of `tick_suspending`
+    /// (the pass that resolves and calls `Tick` on every active actor).
+    pub tick_dispatch_micros: u64,
+    /// Cumulative microseconds in the per-frame `PlayerTick` dispatch loop.
+    pub player_tick_dispatch_micros: u64,
+    /// Cumulative microseconds inside per-frame `Tick`/`PlayerTick` executions, keyed by
+    /// `Class.Function` (the dispatch loop's [`Vm::call_values`] time; natives inside are
+    /// additionally counted in `micros`).
+    pub tick_fns: BTreeMap<String, u64>,
+    /// `Tick` resolution attempts and the subset served from the per-instance memo.
+    pub tick_lookups: u64,
+    /// `Tick` resolutions served from the per-instance memo (no state/class scan).
+    pub tick_cache_hits: u64,
+    /// `Vm::spawn` calls (per-frame object churn diagnostic).
+    pub spawn_count: u64,
+    /// `objects` `Vec` capacity growths inside `Vm::spawn` (per-frame reallocation diagnostic).
+    pub objects_reallocs: u64,
     /// Cumulative microseconds inside native implementations (sum over all natives).
     pub natives_micros: u64,
     /// Cumulative microseconds writing the host-owned player fields into the VM.
@@ -1126,6 +1151,9 @@ pub struct NativeProfile {
     pub events_micros: u64,
     /// Cumulative microseconds in the one-way render sync (`update_sync`).
     pub sync_micros: u64,
+    /// Cumulative microseconds in the host AI-perception pass (`update_ai_perception`, including
+    /// the `SeePlayer`/`EnemyNotVisible` dispatch it performs).
+    pub perception_micros: u64,
     /// Cumulative microseconds building mover collision states (`mover_states`).
     pub mover_states_micros: u64,
 }
@@ -1139,12 +1167,20 @@ impl NativeProfile {
         self.animation_micros = 0;
         self.movers_micros = 0;
         self.state_micros = 0;
+        self.tick_dispatch_micros = 0;
+        self.player_tick_dispatch_micros = 0;
+        self.tick_fns.clear();
+        self.tick_lookups = 0;
+        self.tick_cache_hits = 0;
+        self.spawn_count = 0;
+        self.objects_reallocs = 0;
         self.natives_micros = 0;
         self.player_write_micros = 0;
         self.touch_micros = 0;
         self.events_micros = 0;
         self.sync_micros = 0;
         self.mover_states_micros = 0;
+        self.perception_micros = 0;
     }
 }
 
@@ -1204,6 +1240,9 @@ pub struct Vm<'s> {
     /// Outbound presentation events emitted by presentation natives (sound, texture, display,
     /// projectors). Drained with [`Vm::drain_events`].
     events: Vec<PresentationEvent>,
+    /// Explicit `ParticleEmitter.SpawnParticle` requests for the presentation host. The emitter
+    /// object and request origin remain VM-owned; the renderer consumes these commands once.
+    particle_spawns: Vec<(ObjectId, usize)>,
     /// Pending level-travel request (item15). Set by the `PlayerController.ClientTravel` native
     /// or observed on `LevelInfo.NextURL` after the game's `ServerTravel`; consumed by the host
     /// with [`Vm::take_travel_request`]. The VM itself never loads a map.
@@ -1367,6 +1406,7 @@ impl<'s> Vm<'s> {
             voice_duration: None,
             save_slots: None,
             events: Vec::new(),
+            particle_spawns: Vec::new(),
             pending_travel: None,
             level_info: None,
             last_next_url: String::new(),
@@ -1762,6 +1802,23 @@ impl<'s> Vm<'s> {
     /// Drains the outbound presentation events emitted since the last call.
     pub fn drain_events(&mut self) -> Vec<PresentationEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    /// Queues an explicit script `ParticleEmitter.SpawnParticle` request against this VM object.
+    pub fn spawn_particles(&mut self, emitter: ObjectId, amount: usize) {
+        if amount > 0
+            && self
+                .objects
+                .get(emitter as usize)
+                .is_some_and(|o| !o.deleted)
+        {
+            self.particle_spawns.push((emitter, amount));
+        }
+    }
+
+    /// Drains particle spawn commands for the renderer. Commands are consumed exactly once.
+    pub fn drain_particle_spawns(&mut self) -> Vec<(ObjectId, usize)> {
+        std::mem::take(&mut self.particle_spawns)
     }
 
     /// Number of presentation events waiting to be drained.
@@ -2656,6 +2713,10 @@ impl<'s> Vm<'s> {
         let layout = self.class_layout(class)?;
         let is_actor = layout.chain_names.iter().any(|n| n == "actor");
         let id = self.objects.len() as ObjectId;
+        if self.profile.enabled {
+            self.profile.spawn_count += 1;
+        }
+        let cap_before = self.objects.capacity();
         let mut props = layout.defaults.clone();
         // UE2 `Object.Class` is a native property that always answers the object's UClass; it is
         // not a serialized default. Scripts read `default.Class` / `self.Class` to identify a
@@ -2687,11 +2748,15 @@ impl<'s> Vm<'s> {
             suspended: false,
             is_actor,
             deleted: false,
+            tick_fn: None,
             export: None,
             timers: [None, None, None],
             anim: AnimState::default(),
             bone: BoneState::default(),
         });
+        if self.profile.enabled && self.objects.capacity() != cap_before {
+            self.profile.objects_reallocs += 1;
+        }
         // UE2 gives every instance its own copy of the class-default subobjects (component
         // objects) its default properties reference. The serialized class defaults hold `Static`
         // references to those class-package exports, which have no VM instance of their own;
@@ -2891,6 +2956,24 @@ impl<'s> Vm<'s> {
             .iter()
             .position(|o| !o.deleted && o.name.eq_ignore_ascii_case(name))
             .map(|i| i as ObjectId)
+    }
+
+    /// Finds a live instance created from a package export by its full object path.
+    /// Map subobjects such as `SpriteEmitter` are ordinary VM instances even though they do not
+    /// derive from `Actor`; presentation systems use this lookup to read their authoritative
+    /// script properties without replaying lifecycle events from the trace.
+    pub fn find_export_instance(&self, path: &str) -> Option<ObjectId> {
+        self.by_export.iter().find_map(|(g, &id)| {
+            if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
+                return None;
+            }
+            let p = &self.set.packages[g.package];
+            let object_path = p
+                .package
+                .object_path(ObjectRef::Export(g.export))
+                .unwrap_or_default();
+            object_path.eq_ignore_ascii_case(path).then_some(id)
+        })
     }
 
     /// Class-level function by name, ignoring state shadowing. Host-driven verbs that the engine
@@ -3666,6 +3749,7 @@ impl<'s> Vm<'s> {
         if profiling {
             self.profile.state_micros += t0.elapsed().as_micros() as u64;
         }
+        let t0 = Instant::now();
         for id in 0..self.objects.len() as ObjectId {
             if self.objects[id as usize].active
                 && self.objects[id as usize].is_actor
@@ -3675,6 +3759,10 @@ impl<'s> Vm<'s> {
                 errors.push((suspended, e));
             }
         }
+        if profiling {
+            self.profile.tick_dispatch_micros += t0.elapsed().as_micros() as u64;
+        }
+        let t0 = Instant::now();
         for id in 0..self.objects.len() as ObjectId {
             if self.player_tick_overridden(id)
                 && let Err(e) = self.dispatch_player_tick(id, dt)
@@ -3683,8 +3771,48 @@ impl<'s> Vm<'s> {
                 errors.push((suspended, e));
             }
         }
+        if profiling {
+            self.profile.player_tick_dispatch_micros += t0.elapsed().as_micros() as u64;
+        }
         self.detect_server_travel();
         errors
+    }
+
+    /// `Class.Tick` label for the per-function dispatch profile (`--perf-natives`).
+    fn tick_fn_key(&self, id: ObjectId) -> String {
+        let cls = self.objects[id as usize]
+            .layout
+            .chain_names
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        format!("{cls}.Tick")
+    }
+
+    /// `Tick` function resolved on `id`, memoised per instance and keyed by the current state.
+    ///
+    /// The result depends only on the instance's class chain (fixed for its life) and its
+    /// current state; `do_goto_state` clears the memo whenever the state changes, so a memo hit
+    /// is guaranteed to equal a fresh [`Vm::find_function`]. On a miss the fresh lookup is stored
+    /// and returned. The first lookup for an instance with no state stores `None` so a class with
+    /// no `Tick` handler is not re-scanned every frame either.
+    fn tick_function(&mut self, id: ObjectId) -> Option<GlobalRef> {
+        if let Some((state, f)) = self.objects[id as usize].tick_fn
+            && state == self.objects[id as usize].state
+        {
+            if self.profile.enabled {
+                self.profile.tick_lookups += 1;
+                self.profile.tick_cache_hits += 1;
+            }
+            return f;
+        }
+        if self.profile.enabled {
+            self.profile.tick_lookups += 1;
+        }
+        let state = self.objects[id as usize].state;
+        let f = self.find_function(id, "Tick", true);
+        self.objects[id as usize].tick_fn = Some((state, f));
+        f
     }
 
     /// Fires the per-frame `Tick(DeltaTime)` event on one active actor. UE2's engine calls
@@ -3699,8 +3827,14 @@ impl<'s> Vm<'s> {
                 Some(Value::Int(index)) => Some(*index),
                 _ => None,
             });
-        if let Some(f) = self.find_function(id, "Tick", true) {
+        let f = self.tick_function(id);
+        if let Some(f) = f {
+            let t0 = self.profile.enabled.then(Instant::now);
             self.call_values(f, id, vec![Value::Float(dt)])?;
+            if let Some(t0) = t0 {
+                let key = self.tick_fn_key(id);
+                *self.profile.tick_fns.entry(key).or_default() += t0.elapsed().as_micros() as u64;
+            }
         }
         if trace_cine {
             let action_after = match self.get_property(id, "ScriptedActionIndex") {
@@ -3993,6 +4127,10 @@ impl<'s> Vm<'s> {
             let o = &mut self.objects[id as usize];
             o.state = new_state;
             o.state_code = code;
+            // Invalidate the memoised `Tick` resolution: the state is the only input to the
+            // virtual lookup, and it just changed. A stale entry would call the old state's
+            // `Tick`, exactly the wrong behaviour.
+            o.tick_fn = None;
             o.generation += 1;
         }
         self.note(TraceKind::StateChange {
@@ -6397,14 +6535,6 @@ impl<'s> Vm<'s> {
         let mut ids = map_ids.to_vec();
         ids.push(info);
         self.begin_play(&ids)?;
-        // Level-start placement: a placed pickup's collision cylinder rests on the first walkable
-        // surface below it (`Location.Z = surface + CollisionHeight`). Measured: Plage01
-        // `Plage01CahuteKeyPick0` has `Location.Z=1257.59`, `CollisionHeight=8`, and the floor
-        // plank under it is at 1259.91, so the decoded `Location` is the cylinder base and the
-        // pickup is sunk into the plank; `ValidTouch`'s eye->key `FastTrace` then hits the plank.
-        // This corrects the cylinder onto its support (no-op without a physics provider and
-        // idempotent once resting).
-        self.settle_pickups();
         // Upstream clears `bStartup` again once the level-start events have run (hypothesis
         // for XIII); leaving it set would make every later runtime spawn look like a
         // level-start spawn (e.g. auto-possession in `Pawn.PostBeginPlay`).
@@ -6426,56 +6556,6 @@ impl<'s> Vm<'s> {
             }
         }
         Ok(())
-    }
-
-    /// **Host workaround (hypothesis, not engine behaviour found in the data):** at level start,
-    /// put each placed `Pickup`'s collision cylinder on the first walkable surface below it,
-    /// i.e. `Location.Z = surface_z + CollisionHeight`.
-    ///
-    /// Measured: Plage01 `Plage01CahuteKeyPick0` has `Location.Z=1257.5927`, `CollisionHeight=8`
-    /// and the plank under it at 1259.91, so its centre is 2.3 UU below the surface and
-    /// `ValidTouch`'s eye->key `FastTrace` hits the plank. Pickups keep `Physics=0` and no decoded
-    /// script moves them, so how the original engine makes this pickup touchable is unknown
-    /// (candidates: our placement/collision of the desk, one-sided line checks, or a different
-    /// `ValidTouch` trace). Replace this with the real mechanism once found. Uses the
-    /// world-physics provider; without one it is a no-op; idempotent. Returns the number of
-    /// actors moved (callers should count/log it).
-    pub fn settle_pickups(&mut self) -> usize {
-        if self.physics.is_none() {
-            return 0;
-        }
-        let mut settled = 0;
-        for id in 0..self.objects.len() as ObjectId {
-            if !self.is_live_actor(id) || !self.is_a(id, "pickup") {
-                continue;
-            }
-            if !self.bool_prop(id, "bCollideWorld") {
-                continue;
-            }
-            let Some(loc) = self.vector_prop(id, "Location") else {
-                continue;
-            };
-            let h = self.f32_prop(id, "CollisionHeight");
-            if h <= 0.0 {
-                continue;
-            }
-            let end = [loc[0], loc[1], loc[2] - 2.0 * h - 32.0];
-            let hit = match self.physics.as_mut() {
-                Some(p) => p.trace(loc, end, [0.0; 3]),
-                None => continue,
-            };
-            let Some(hit) = hit else { continue };
-            // Rest only on an upward-facing (walkable) surface; a ceiling/steep face is skipped.
-            if hit.normal[2] < 0.7 {
-                continue;
-            }
-            let new_z = hit.location[2] + h;
-            if (new_z - loc[2]).abs() > 0.01 {
-                self.set_property(id, "Location", 0, Value::Vector([loc[0], loc[1], new_z]));
-                settled += 1;
-            }
-        }
-        settled
     }
 
     /// `Actor.Destroy` in the engine's `ULevel::DestroyActor` order (`Engine.dll`
@@ -7297,6 +7377,7 @@ impl<'s> Vm<'s> {
         if self.objects.get(player as usize).is_none_or(|o| o.deleted) {
             return;
         }
+        let t0 = self.profile.enabled.then(Instant::now);
         let player_dead = self.bool_prop(player, "bIsDead");
         let controllers: Vec<ObjectId> = self
             .objects
@@ -7336,6 +7417,9 @@ impl<'s> Vm<'s> {
                     Err(e) => out.push((name, format!("EnemyNotVisible: {e}"))),
                 }
             }
+        }
+        if let Some(t0) = t0 {
+            self.profile.perception_micros += t0.elapsed().as_micros() as u64;
         }
     }
 

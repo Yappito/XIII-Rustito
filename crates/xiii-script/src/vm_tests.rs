@@ -32,6 +32,8 @@ const B_STRUCTPROP: i32 = -8;
 const B_BOOLPROP: i32 = -9;
 /// `Core.StrProperty` import appended at the end of the `B` import table (see `B::build`).
 const B_STRPROP: i32 = -10;
+/// `Core.ByteProperty` fixture sentinel, resolved to a trailing import in `B::build`.
+const B_BYTEPROP: i32 = i32::MIN;
 
 impl B {
     fn new() -> Self {
@@ -232,6 +234,17 @@ impl B {
             imports.push((core, package, 0, pn));
             imports.push((engine, cn, -(pkg_idx + 1), on));
         }
+        // Keep external import indices stable; fixtures that use byte properties add the new
+        // import after all existing external pairs and resolve the sentinel export class above.
+        if self.exports.iter().any(|e| e.class == B_BYTEPROP) {
+            let byteprop_ref = -(imports.len() as i32 + 1);
+            imports.push((core, class, -1, self.name("ByteProperty")));
+            for export in &mut self.exports {
+                if export.class == B_BYTEPROP {
+                    export.class = byteprop_ref;
+                }
+            }
+        }
         let names: Vec<&str> = self.names.iter().map(String::as_str).collect();
         build_package(&names, &imports, &self.exports)
     }
@@ -363,6 +376,49 @@ fn fixture() -> Vec<u8> {
     b.class(object, 0, add);
     b.class(actor, object, counter);
     let _ = IMP_CORE;
+    b.build()
+}
+
+/// `Actor` fixture for the per-instance `Tick` memo: a **class** `Tick` (`Counter = 1`) and a
+/// **state-scoped** `Tick` in `Waiting` (`Counter = 10`), so the resolved `Tick` differs by
+/// state and a stale memo is observable as the wrong constant being written.
+fn tick_state_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let class_tick = b.reserve(IMP_FUNCTION, actor, "Tick");
+    let waiting = b.reserve(IMP_STATE, actor, "Waiting");
+    let counter = b.reserve(IMP_INTPROP, actor, "Counter");
+    let rc = counter as u8;
+    // Counter's sibling is the class Tick; the state is the class Tick's sibling.
+    b.prop(counter, class_tick, 0);
+    // Class Tick: `Counter = 1` (`Let Counter = IntOne`), then return void. Memory: Let(1) +
+    // instance var(1 opcode + 4 ref) + int one(1) + return(1) + nothing(1) = 9.
+    b.func(
+        class_tick,
+        waiting,
+        0,
+        &[0x0F, 0x01, rc, 0x26, 0x04, 0x0B],
+        9,
+        0,
+        ff::DEFINED,
+    );
+    // State-scoped Tick: `Counter = 10` (int const 10 = `0x2C 0x0A`), return void.
+    // Memory: Let(1) + instance var(1 + 4) + int const(2) + return(1) + nothing(1) = 10.
+    let state_tick = b.reserve(IMP_FUNCTION, waiting, "Tick");
+    b.func(
+        state_tick,
+        0,
+        0,
+        &[0x0F, 0x01, rc, 0x2C, 10, 0x04, 0x0B],
+        10,
+        0,
+        ff::DEFINED,
+    );
+    // The state has no code of its own, only the state-scoped Tick child.
+    b.state_children(waiting, 0, state_tick, &[], 0, 0);
+    b.class(object, 0, 0);
+    b.class(actor, object, counter);
     b.build()
 }
 
@@ -499,6 +555,33 @@ fn step_budget_stops_runaway_loops() {
         .unwrap_err();
     assert_eq!(e.kind, VmErrorKind::BudgetExceeded { limit: 1000 });
     assert_eq!(e.stack.last().unwrap().function, "Test.Object.Spin");
+}
+
+#[test]
+fn tick_memo_re_resolves_after_state_change() {
+    let set = set_of(tick_state_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(g(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    // No state: the class `Tick` runs (`Counter = 1`). The memo records `(None, class Tick)`.
+    vm.tick(0.016).unwrap();
+    assert_eq!(vm.get_property(a, "Counter"), Some(&Value::Int(1)));
+    // Enter `Waiting`: the state has its own `Tick` (`Counter = 10`). If the memo were not
+    // invalidated it would keep calling the class `Tick` and the counter would stay 1.
+    vm.goto_state(a, "Waiting", None).unwrap();
+    vm.tick(0.016).unwrap();
+    assert_eq!(
+        vm.get_property(a, "Counter"),
+        Some(&Value::Int(10)),
+        "state Tick must win over the stored class Tick"
+    );
+    // The memo is keyed by state: staying in `Waiting` keeps using the state `Tick`.
+    vm.tick(0.016).unwrap();
+    assert_eq!(vm.get_property(a, "Counter"), Some(&Value::Int(10)));
+    // Leaving the state (to `None`) re-resolves to the class `Tick` (`Counter = 1`).
+    vm.goto_state(a, "None", None).unwrap();
+    vm.tick(0.016).unwrap();
+    assert_eq!(vm.get_property(a, "Counter"), Some(&Value::Int(1)));
 }
 
 #[test]
@@ -6075,8 +6158,8 @@ fn synthetic_add_inventory_links_the_chain_and_rejects_duplicates() {
 }
 
 /// Synthetic package with a `Pickup` class carrying `Location` (`Core.Struct` `Vector`),
-/// `CollisionHeight` (`float`) and `bCollideWorld` (`bool`) — the fields `settle_pickups` reads.
-fn settle_package() -> Vec<u8> {
+/// `CollisionHeight` (`float`), `bCollideWorld` (`bool`) and `Physics` (`byte`).
+fn pickup_physics_fixture() -> Vec<u8> {
     let mut b = B::new();
     let object = b.reserve(0, 0, "Object");
     let actor = b.reserve(0, 0, "Actor");
@@ -6087,9 +6170,11 @@ fn settle_package() -> Vec<u8> {
     let loc = b.reserve(B_STRUCTPROP, pickup, "Location");
     let height = b.reserve(IMP_FLOATPROP, loc, "CollisionHeight");
     let collide = b.reserve(B_BOOLPROP, height, "bCollideWorld");
+    let physics = b.reserve(B_BYTEPROP, collide, "Physics");
     b.prop_with(loc, height, 0, &compact(vector));
     b.prop(height, collide, 0);
-    b.prop(collide, 0, 0);
+    b.prop(collide, physics, 0);
+    b.prop_with(physics, 0, 0, &compact(0));
     b.class(object, 0, 0);
     b.class(actor, object, 0);
     b.class(pickup, actor, loc);
@@ -6097,31 +6182,22 @@ fn settle_package() -> Vec<u8> {
 }
 
 #[test]
-fn settle_pickups_rests_a_placed_pickup_on_its_support() {
-    let set = set_of(settle_package());
+fn physics_none_pickup_keeps_its_authored_location_above_floor() {
+    let set = set_of(pickup_physics_fixture());
     let mut vm = Vm::new(&set, VmLimits::default());
     vm.set_physics(Box::new(crate::physics::FlatPhysics::new(100.0)));
     let p = vm.spawn(g(&set, "Pickup"), "Key").unwrap();
-    // The decoded map `Location` is the cylinder base: `z == floor` -> embedded; the cylinder
-    // centre must become `floor + CollisionHeight`.
-    vm.set_property(p, "Location", 0, Value::Vector([10.0, 20.0, 100.0]));
+    // PHYS_None does not floor-snap a map-placed actor, even when world queries are available.
+    vm.set_property(p, "Location", 0, Value::Vector([10.0, 20.0, 140.0]));
     vm.set_property(p, "CollisionHeight", 0, Value::Float(8.0));
     vm.set_property(p, "bCollideWorld", 0, Value::Bool(true));
-    assert_eq!(vm.settle_pickups(), 1, "the embedded pickup must be moved");
+    vm.set_property(p, "Physics", 0, Value::Byte(0)); // PHYS_None
+    vm.begin_play(&[p]).unwrap();
     assert_eq!(
         vm.vector_prop(p, "Location").unwrap(),
-        [10.0, 20.0, 108.0],
-        "the cylinder centre rests on the floor + CollisionHeight"
+        [10.0, 20.0, 140.0],
+        "PHYS_None preserves the authored position above the floor"
     );
-    // Idempotent once resting.
-    assert_eq!(vm.settle_pickups(), 0);
-    // A pickup with `bCollideWorld=false` is left alone.
-    let q = vm.spawn(g(&set, "Pickup"), "Floating").unwrap();
-    vm.set_property(q, "Location", 0, Value::Vector([0.0, 0.0, 100.0]));
-    vm.set_property(q, "CollisionHeight", 0, Value::Float(8.0));
-    vm.set_property(q, "bCollideWorld", 0, Value::Bool(false));
-    assert_eq!(vm.settle_pickups(), 0);
-    assert_eq!(vm.vector_prop(q, "Location").unwrap(), [0.0, 0.0, 100.0]);
 }
 
 #[test]
@@ -7510,6 +7586,37 @@ fn set_max_particles_records_and_does_not_fail() {
         &e.kind,
         TraceKind::Note(s) if s.contains("SetMaxParticles(12)") && s.contains("no particle subsystem")
     )));
+}
+
+#[test]
+fn particle_spawn_native_queues_a_vm_owned_emitter_request_once() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let emitter = vm.spawn(sg(&set, "Actor"), "EmitterSubobject").unwrap();
+    let mut a = vec![Value::Int(3)];
+    let out = call_native(
+        &mut vm,
+        "ParticleEmitter.SpawnParticle",
+        emitter,
+        &[false],
+        &mut a,
+    );
+    assert!(matches!(out, NativeOutcome::Value(Value::Void)));
+    assert_eq!(vm.drain_particle_spawns(), vec![(emitter, 3)]);
+    assert!(vm.drain_particle_spawns().is_empty(), "requests drain once");
+
+    let mut a = vec![Value::Int(-1)];
+    call_native(
+        &mut vm,
+        "ParticleEmitter.SpawnParticle",
+        emitter,
+        &[false],
+        &mut a,
+    );
+    assert!(
+        vm.drain_particle_spawns().is_empty(),
+        "negative amount is inert"
+    );
 }
 
 #[test]
