@@ -318,6 +318,27 @@ fn cine_steering(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Na
         }
         arrived
     };
+    if std::env::var_os("XIII_CINE_TRACE").is_some_and(|v| v != "0" && !v.is_empty())
+        && vm.objects[pawn as usize]
+            .name
+            .eq_ignore_ascii_case("Cine11")
+    {
+        let from = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let delta = [
+            target[0] - from[0],
+            target[1] - from[1],
+            target[2] - from[2],
+        ];
+        let distance = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+        println!(
+            "[cine-trace-steering] t={:.3}s tick={} controller={} pawn={} dt={dt:.5} speed={speed:.3} from={from:?} target={target:?} distance={distance:.3} collide-world={} arrived={arrived}",
+            vm.time,
+            vm.tick_count,
+            vm.objects[c.this as usize].name,
+            vm.objects[pawn as usize].name,
+            vm.bool_prop(pawn, "bCollideWorld")
+        );
+    }
     if arrived {
         vm.send_event(c.this, "EndOfMove", Vec::new())?;
     }
