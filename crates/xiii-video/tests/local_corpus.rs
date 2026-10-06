@@ -123,6 +123,35 @@ fn gog_first_60_frames_of_every_file_decode() {
     assert!(files >= 19, "expected 19 cutscenes, found {files}");
 }
 
+/// item23 parity: every Steam cutscene decodes, including the three 2-frame logo stubs
+/// (`alien`/`nvidia`/`ubi`) that differ from GOG's full logo videos (measured: 392-byte
+/// 2-frame files, all three byte-identical on the Steam install).
+#[test]
+fn steam_first_60_frames_of_every_file_decode() {
+    let Some(root) = dir("XIII_STEAM_DIR") else {
+        println!("SKIPPED: XIII_STEAM_DIR not set");
+        return;
+    };
+    let tables = xiii_video::BinkTables::from_install(&root).expect("tables");
+    let decoder = xiii_video::Decoder::new(tables);
+    let mut files = 0usize;
+    for entry in std::fs::read_dir(root.join("Video"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let p = entry.path();
+        if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("bik")) {
+            continue;
+        }
+        let data = std::fs::read(&p).expect("read bik");
+        decode_checked(&data, &decoder, Some(60), &p.display().to_string());
+        files += 1;
+    }
+    assert!(files >= 19, "expected 19 cutscenes, found {files}");
+    println!("Steam: {files} cutscenes, first 60 frames each decode with 0 errors");
+}
+
 // ------------------------------------------------------------------ Bink Audio
 
 /// Structural checks only: the table values themselves stay in the DLL.
@@ -293,4 +322,37 @@ fn gog_audio_track_selection() {
         "Cine01.bik reports 1 audio track in the GOG corpus"
     );
     println!("Cine01.bik: {} track, GOG selects track 0", bik.audio.len());
+}
+
+/// item23 parity: the Steam install's `[Engine.Engine] Language=int` (read from
+/// `System/Default.ini`, capital `System`, with a `XIII.ini` the GOG install lacks) matches no
+/// dub prefix, so the `--video` game rule selects track 0, the same as GOG.
+#[test]
+fn steam_audio_track_selection() {
+    let Some(root) = dir("XIII_STEAM_DIR") else {
+        println!("SKIPPED: XIII_STEAM_DIR not set");
+        return;
+    };
+    let language = xiii_video::language_from_install(&root)
+        .unwrap_or_else(|| panic!("Steam install has no [Engine.Engine] Language= key"));
+    println!("Steam [Engine.Engine] Language={language}");
+    assert_eq!(language, "int", "Steam Default.ini sets Language=int");
+    assert_eq!(
+        xiii_video::select_audio_track_for(&language, 5),
+        0,
+        "Steam Language={language} should select track 0"
+    );
+
+    // A five-track file reports 5 tracks; the rule still picks 0 for `int`.
+    let data = std::fs::read(root.join("Video").join("Cine00.bik")).expect("read Cine00.bik");
+    let bik = xiii_video::container::BikFile::parse(&data).expect("parse Cine00.bik");
+    assert_eq!(
+        bik.audio.len(),
+        5,
+        "Cine00.bik should report 5 audio tracks"
+    );
+    println!(
+        "Cine00.bik: {} tracks, Steam selects track 0",
+        bik.audio.len()
+    );
 }
