@@ -97,6 +97,41 @@ pub struct SceneLightEntity {
 #[derive(Component)]
 pub struct LightReceiver;
 
+/// World-space bounds used to avoid drawing receivers outside every active light range.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct LightReceiverBounds {
+    pub center: Vec3,
+    pub half_size: Vec3,
+}
+
+/// Computes a conservative world-space AABB from mesh vertices and the placed transform.
+pub fn receiver_bounds(positions: &[[f32; 3]], transform: Transform) -> LightReceiverBounds {
+    let matrix = transform.to_matrix();
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for position in positions {
+        let point = matrix.transform_point3(Vec3::from_array(*position));
+        min = min.min(point);
+        max = max.max(point);
+    }
+    if positions.is_empty() {
+        min = transform.translation;
+        max = transform.translation;
+    }
+    LightReceiverBounds {
+        center: (min + max) * 0.5,
+        half_size: (max - min) * 0.5,
+    }
+}
+
+/// Diagnostic switch used for the image-preserving A/B comparison.
+pub const ENV_NO_LIGHT_CULL: &str = "XIII_VIEWER_NO_LIGHT_CULL";
+/// Freezes animated map lights and UV materials at time zero for deterministic screenshots.
+pub const ENV_FREEZE_ANIMATION: &str = "XIII_VIEWER_FREEZE_ANIMATION";
+
+const CULL_CELL_SIZE: f32 = 32.0;
+const MAX_INDEXED_HALF_EXTENT: f32 = 32.0;
+
 /// Bevy `PointLight` of one [`SceneLight`] at relative time `t` seconds.
 pub fn point_light_for(light: &SceneLight, t: f32) -> PointLight {
     let chroma = hsb_to_rgb(light.hue, light.saturation, 255.0);
@@ -212,7 +247,11 @@ pub fn update_scene_lights(
     data: Res<LightRenderData>,
     mut lights: Query<(&SceneLightEntity, &mut PointLight)>,
 ) {
-    let t = time.elapsed_secs();
+    let t = if std::env::var_os(ENV_FREEZE_ANIMATION).is_some() {
+        0.0
+    } else {
+        time.elapsed_secs()
+    };
     for (entity, mut light) in &mut lights {
         let Some(scene_light) = data.lights.get(entity.index) else {
             continue;
@@ -221,6 +260,137 @@ pub fn update_scene_lights(
         light.color = Color::srgb(chroma[0], chroma[1], chroma[2]);
         light.intensity = scene_light.lumens_at(t);
         light.range = scene_light.range_m();
+    }
+}
+
+/// AABB/sphere test using squared distances; boundary touching counts as an intersection.
+pub fn sphere_intersects_aabb(center: Vec3, radius: f32, min: Vec3, max: Vec3) -> bool {
+    if !radius.is_finite()
+        || radius < 0.0
+        || !center.is_finite()
+        || !min.is_finite()
+        || !max.is_finite()
+    {
+        return false;
+    }
+    let closest = center.clamp(min.min(max), min.max(max));
+    closest.distance_squared(center) <= radius * radius
+}
+
+fn point_light_reaches(light: &PointLight, transform: &Transform, min: Vec3, max: Vec3) -> bool {
+    light.intensity.is_finite()
+        && light.intensity > 0.0
+        && light.range > 0.0
+        && sphere_intersects_aabb(transform.translation, light.range, min, max)
+}
+
+fn cell(point: Vec3) -> (i32, i32, i32) {
+    (
+        (point.x / CULL_CELL_SIZE).floor() as i32,
+        (point.y / CULL_CELL_SIZE).floor() as i32,
+        (point.z / CULL_CELL_SIZE).floor() as i32,
+    )
+}
+
+/// Computes the visible receiver set from bounds and current light components. Ordinary
+/// receivers are bucketed by center; queries include their maximum half-extent before the exact
+/// sphere/AABB test. Oversized receivers use an exact-test list so one BSP/terrain section cannot
+/// expand a query across the map.
+fn receiver_visibility<'a>(
+    bounds: &[(Vec3, Vec3)],
+    lights: impl Iterator<Item = (&'a PointLight, &'a Transform)>,
+) -> Vec<bool> {
+    let mut buckets: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+    let mut max_half = Vec3::ZERO;
+    let mut oversized = Vec::new();
+    for (index, (center, half)) in bounds.iter().copied().enumerate() {
+        if half.max_element() > MAX_INDEXED_HALF_EXTENT {
+            oversized.push(index);
+        } else {
+            max_half = max_half.max(half);
+            buckets.entry(cell(center)).or_default().push(index);
+        }
+    }
+
+    let mut visible = vec![false; bounds.len()];
+    for (light, transform) in lights {
+        let radius = light.range;
+        if light.intensity <= 0.0 || !radius.is_finite() || radius <= 0.0 {
+            continue;
+        }
+        let center = transform.translation;
+        let query_half = Vec3::splat(radius) + max_half;
+        let lo = cell(center - query_half);
+        let hi = cell(center + query_half);
+        for x in lo.0..=hi.0 {
+            for y in lo.1..=hi.1 {
+                for z in lo.2..=hi.2 {
+                    let Some(candidates) = buckets.get(&(x, y, z)) else {
+                        continue;
+                    };
+                    for &index in candidates {
+                        let (receiver_center, half) = bounds[index];
+                        if !visible[index]
+                            && point_light_reaches(
+                                light,
+                                transform,
+                                receiver_center - half,
+                                receiver_center + half,
+                            )
+                        {
+                            visible[index] = true;
+                        }
+                    }
+                }
+            }
+        }
+        for &index in &oversized {
+            if visible[index] {
+                continue;
+            }
+            let (receiver_center, half) = bounds[index];
+            if point_light_reaches(
+                light,
+                transform,
+                receiver_center - half,
+                receiver_center + half,
+            ) {
+                visible[index] = true;
+            }
+        }
+    }
+
+    visible
+}
+
+/// Updates receiver visibility from current `PointLight`s. Runs after the viewer or VM light
+/// sync, so changed transforms, ranges and lifetimes are reflected before rendering.
+pub fn cull_receivers(
+    mut receivers: Query<(Entity, &LightReceiverBounds, &mut Visibility)>,
+    lights: Query<(&PointLight, &Transform)>,
+) {
+    if std::env::var_os(ENV_NO_LIGHT_CULL).is_some() {
+        return;
+    }
+
+    let mut entities = Vec::new();
+    let mut bounds = Vec::new();
+    for (entity, receiver, _) in &receivers {
+        entities.push(entity);
+        bounds.push((receiver.center, receiver.half_size.abs()));
+    }
+    let visible = receiver_visibility(&bounds, lights.iter());
+    for (entity, is_visible) in entities.into_iter().zip(visible) {
+        if let Ok((_, _, mut visibility)) = receivers.get_mut(entity) {
+            let wanted = if is_visible {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            };
+            if *visibility != wanted {
+                *visibility = wanted;
+            }
+        }
     }
 }
 
@@ -380,5 +550,125 @@ mod tests {
         let l = light(LightType::Blink, 255.0);
         // Blink can be on or off but always finite.
         assert!(point_light_for(&l, 0.0).intensity.is_finite());
+    }
+
+    #[test]
+    fn receiver_cull_includes_exact_range_boundary() {
+        let light = PointLight {
+            intensity: 10.0,
+            range: 2.0,
+            ..default()
+        };
+        let transform = Transform::from_xyz(0.0, 0.0, 0.0);
+        assert!(point_light_reaches(
+            &light,
+            &transform,
+            Vec3::new(2.0, -0.5, -0.5),
+            Vec3::new(3.0, 0.5, 0.5),
+        ));
+        let bounds = [(Vec3::new(2.5, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5))];
+        assert_eq!(
+            receiver_visibility(&bounds, std::iter::once((&light, &transform))),
+            vec![true]
+        );
+    }
+
+    #[test]
+    fn receiver_cull_ignores_zero_range_even_at_touching_point() {
+        let light = PointLight {
+            intensity: 10.0,
+            range: 0.0,
+            ..default()
+        };
+        assert!(!point_light_reaches(
+            &light,
+            &Transform::IDENTITY,
+            Vec3::ZERO,
+            Vec3::ZERO,
+        ));
+        let bounds = [(Vec3::ZERO, Vec3::ZERO)];
+        assert_eq!(
+            receiver_visibility(&bounds, std::iter::once((&light, &Transform::IDENTITY)),),
+            vec![false]
+        );
+    }
+
+    #[test]
+    fn receiver_spanning_light_is_kept_even_when_its_center_is_outside_range() {
+        let light = PointLight {
+            intensity: 10.0,
+            range: 1.0,
+            ..default()
+        };
+        let transform = Transform::from_xyz(0.0, 0.0, 0.0);
+        assert!(point_light_reaches(
+            &light,
+            &transform,
+            Vec3::new(0.5, -0.25, -0.25),
+            Vec3::new(5.0, 0.25, 0.25),
+        ));
+        let bounds = [(Vec3::new(2.75, 0.0, 0.0), Vec3::new(2.25, 0.25, 0.25))];
+        assert_eq!(
+            receiver_visibility(&bounds, std::iter::once((&light, &transform))),
+            vec![true],
+            "cell broadphase must keep a wide receiver whose center is outside range"
+        );
+    }
+
+    #[test]
+    fn moved_light_stops_reaching_receiver() {
+        let light = PointLight {
+            intensity: 10.0,
+            range: 1.0,
+            ..default()
+        };
+        let receiver_min = Vec3::new(-0.5, -0.5, -0.5);
+        let receiver_max = Vec3::splat(0.5);
+        assert!(point_light_reaches(
+            &light,
+            &Transform::IDENTITY,
+            receiver_min,
+            receiver_max
+        ));
+        assert!(!point_light_reaches(
+            &light,
+            &Transform::from_xyz(10.0, 0.0, 0.0),
+            receiver_min,
+            receiver_max,
+        ));
+        let bounds = [(Vec3::ZERO, Vec3::splat(0.5))];
+        let moved = Transform::from_xyz(10.0, 0.0, 0.0);
+        assert_eq!(
+            receiver_visibility(&bounds, std::iter::once((&light, &moved))),
+            vec![false]
+        );
+    }
+
+    #[test]
+    fn oversized_receiver_uses_fallback_and_is_not_lost_by_spatial_grid() {
+        let light = PointLight {
+            intensity: 10.0,
+            range: 1.0,
+            ..default()
+        };
+        let transform = Transform::IDENTITY;
+        let bounds = [(Vec3::new(40.0, 0.0, 0.0), Vec3::new(40.0, 1.0, 1.0))];
+        assert_eq!(
+            receiver_visibility(&bounds, std::iter::once((&light, &transform))),
+            vec![true]
+        );
+    }
+
+    #[test]
+    fn transformed_receiver_bounds_enclose_rotated_scaled_vertices() {
+        let transform = Transform {
+            translation: Vec3::new(10.0, 2.0, -3.0),
+            rotation: Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+            scale: Vec3::new(2.0, 1.0, 1.0),
+        };
+        let bounds = receiver_bounds(&[[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], transform);
+        assert!((bounds.center - transform.translation).length() < 1e-5);
+        assert!((bounds.half_size.z - 2.0).abs() < 1e-5);
+        assert!(bounds.half_size.x < 1e-5);
     }
 }

@@ -130,13 +130,6 @@ pub(crate) struct PlayCam;
 #[derive(Component)]
 struct PlayOverlay;
 
-/// Cursor into the VM trace for the particle-trigger host bridge (index of the next unread
-/// trace record).
-#[derive(Resource, Default)]
-struct ParticleTriggerCursor {
-    trace_len: usize,
-}
-
 /// Bevy light entities driven by live VM light actors: map-placed `TriggerLight`/
 /// `ScriptedLight`/`MovableLight` and runtime-spawned lights such as the Beretta's
 /// `XIII.MuzzleLight`. The VM owns the actors; this host map only mirrors them.
@@ -214,7 +207,6 @@ impl Plugin for PlayPlugin {
             .init_resource::<ShotFlag>()
             .init_resource::<RenderSync>()
             .init_resource::<weapons::WeaponView>()
-            .init_resource::<ParticleTriggerCursor>()
             .init_resource::<RuntimeLights>()
             .add_plugins(viewer::particles::ParticlePlugin)
             .add_plugins(MaterialPlugin::<viewer::lights::ReceiverMaterial>::default())
@@ -238,8 +230,8 @@ impl Plugin for PlayPlugin {
                     viewer::animate_uv,
                     viewer::fog::update_fog,
                     viewer::decals::update_runtime_projectors,
-                    sync_particle_triggers,
-                    sync_vm_lights,
+                    sync_vm_particle_emitters,
+                    (sync_vm_lights, viewer::lights::cull_receivers).chain(),
                     pawns::update_pawns,
                     weapons::update_weapon_view,
                     hud::refresh,
@@ -1178,17 +1170,12 @@ fn fixed_step(
     }
 }
 
-/// Host bridge for triggered emitters. The VM does not instantiate `ParticleEmitter` subobjects
-/// (their class chain is `Object`, not `Actor`, and `Vm::load_level` only creates Actors), so the
-/// script's `Emitters[i].Disabled = ...` cannot be read back from the VM. Instead this observes the
-/// VM trace for `Trigger` events delivered to a triggered-emitter actor and applies the same
-/// effect the `TriggerEmit`/`TriggerToggle` state handlers would: toggle the matching host
-/// simulator (a `TriggerControl` handler resets to the level-start state). Ordinary `Emitter`
-/// actors are not toggled, matching their lack of a `Trigger` override.
-fn sync_particle_triggers(
+/// Mirrors the VM-owned `ParticleEmitter.Disabled` field into the renderer's simulator gate.
+/// Map-exported non-Actor subobjects are instantiated by `Vm::load_level`, so authored
+/// `TriggerEmit`/`TriggerToggle`/`TriggerControl` script writes are already the source of truth.
+fn sync_vm_particle_emitters(
     mut session: NonSendMut<Result<session::Session, String>>,
     data: Res<viewer::particles::ParticleRenderData>,
-    mut cursor: ResMut<ParticleTriggerCursor>,
     mut emitters: Query<&mut viewer::particles::ParticleEmitterRender>,
     mut perf: ResMut<crate::perf::Perf>,
 ) {
@@ -1196,49 +1183,33 @@ fn sync_particle_triggers(
     let Ok(sess) = session.as_mut() else {
         return;
     };
-    let trace = &sess.vm().trace;
-    if trace.len() < cursor.trace_len {
-        cursor.trace_len = 0;
+    let requests = sess.vm_mut().drain_particle_spawns();
+    let mut requested_by_emitter = std::collections::HashMap::with_capacity(requests.len());
+    for (id, amount) in requests {
+        *requested_by_emitter.entry(id).or_insert(0usize) += amount;
     }
-    let start = cursor.trace_len.min(trace.len());
-    let mut events: Vec<(String, String)> = Vec::new();
-    for ev in &trace[start..] {
-        if let xiii_script::TraceKind::Event {
-            target, function, ..
-        } = &ev.kind
-            && function.to_ascii_lowercase().contains("trigger")
-        {
-            events.push((target.clone(), function.clone()));
-        }
-    }
-    cursor.trace_len = trace.len();
-    if events.is_empty() {
-        perf.span("particle_triggers", t0);
-        return;
-    }
+    let vm = sess.vm();
     for mut e in &mut emitters {
         let Some(system) = data.systems.get(e.system) else {
             continue;
         };
-        if !system.triggered {
+        let Some(desc) = system.emitters.get(e.emitter) else {
             continue;
+        };
+        if !e.vm_lookup_attempted {
+            e.vm_id = vm.find_export_instance(&desc.name);
+            e.vm_lookup_attempted = true;
         }
-        for (target, function) in &events {
-            if !system.path.eq_ignore_ascii_case(target) {
-                continue;
-            }
-            if function.to_ascii_lowercase().contains("triggercontrol") {
-                e.sim.reset();
-                if let Some(desc) = system.emitters.get(e.emitter) {
-                    e.sim
-                        .set_enabled(xiii_world::particles::initially_enabled(system, desc));
-                }
-            } else {
-                e.sim.toggle();
-            }
+        let Some(id) = e.vm_id else {
+            continue;
+        };
+        if let Some(xiii_script::Value::Bool(disabled)) = vm.get_property(id, "Disabled") {
+            e.sim.set_enabled(!disabled);
         }
+        let requested = requested_by_emitter.remove(&id).unwrap_or_default();
+        e.sim.spawn_requested(desc, requested);
     }
-    perf.span("particle_triggers", t0);
+    perf.span("particle_vm_sync", t0);
 }
 
 /// Mirrors the VM's live light actors to Bevy `PointLight` entities. Map-placed dynamic lights
@@ -2670,6 +2641,102 @@ mod tests {
                 .iter()
                 .filter_map(|(_, _, m)| m.clone())
                 .collect::<std::collections::BTreeSet<_>>()
+        );
+    }
+
+    /// item32 opt-in regression: the authored Plage01 trigger wakes BaseSoldier6 from faction.
+    /// `IAController.Init` reads `MapInfo.XIIIPawn` after two latent sleeps (about 0.2-0.3 s);
+    /// the game's own `MapInfo.FirstFrame` (run by `MapInfo.Timer` after `checkTime` = 0.1 s)
+    /// sets it first, so `Trigger` engages the real player.
+    #[test]
+    fn opt_in_plage01_faction_trigger_cue_enters_scripted_attack() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = session::Session::open(&game_dir, "Plage01").expect("open Plage01");
+        let soldier = session
+            .vm()
+            .find_object("BaseSoldier6")
+            .expect("BaseSoldier6");
+        let controller = match session.vm().get_property(soldier, "Controller") {
+            Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => *id,
+            _ => panic!("BaseSoldier6 has no controller"),
+        };
+        let player = session.player;
+        let player_loc = session
+            .vm()
+            .vector_prop(player, "Location")
+            .expect("player location");
+
+        for _ in 0..120 {
+            session.step(
+                1.0 / 60.0,
+                player_loc,
+                0.0,
+                [0.0; 3],
+                &session::PlayerVMModes::default(),
+            );
+        }
+        let map_info = session.map_info().expect("Plage01 MapInfo");
+        assert_eq!(
+            session.vm().get_property(map_info, "XIIIPawn"),
+            Some(&xiii_script::Value::Object(Some(
+                xiii_script::ObjRef::Instance(player)
+            ))),
+            "MapInfo.FirstFrame (MapInfo.Timer after checkTime 0.1 s) must have set XIIIPawn to the logged-in pawn"
+        );
+        assert_eq!(
+            session.vm().state_name(controller).as_deref(),
+            Some("faction"),
+            "BaseSoldier6 should begin in the map-authored faction order"
+        );
+
+        // Deliver the real trigger event with the logged-in pawn. The map dispatcher and the
+        // soldier's own Pawn.Trigger -> IAController.Trigger chain perform the state transition.
+        let touch = session
+            .vm()
+            .find_object("TouchTrigger8")
+            .expect("TouchTrigger8");
+        session
+            .vm_mut()
+            .send_event(
+                touch,
+                "Touch",
+                vec![xiii_script::Value::Object(Some(
+                    xiii_script::ObjRef::Instance(player),
+                ))],
+            )
+            .expect("TouchTrigger8.Touch");
+
+        let mut engagement = None;
+        for tick in 0..600u32 {
+            session.step(
+                1.0 / 60.0,
+                player_loc,
+                0.0,
+                [0.0; 3],
+                &session::PlayerVMModes::default(),
+            );
+            let state = session.vm().state_name(controller);
+            if matches!(
+                state.as_deref(),
+                Some("Acquisition" | "Attaque" | "AttaqueScriptee")
+            ) {
+                engagement = Some((tick as f32 / 60.0, state));
+                break;
+            }
+        }
+        println!(
+            "[item32] cue TouchTrigger8 -> XIIIDispatcher3.OutEvents('tueur_conducteur'); \
+             BaseSoldier6 engagement {engagement:?}"
+        );
+        assert!(
+            engagement.is_some(),
+            "the authored tueur_conducteur cue did not move BaseSoldier6 from faction to \
+             Acquisition/Attaque/AttaqueScriptee; current state {:?}, first error {:?}",
+            session.vm().state_name(controller),
+            session.first_error()
         );
     }
 

@@ -2100,6 +2100,67 @@ mod tests {
         })
     }
 
+    /// Corpus regression for the authored `SPADS02b` `Explo02` particle event. `Cine9.Event` and
+    /// `TrigerredEmitter2.Tag` both decode as `Explo02`; the real VM Trigger state must change the
+    /// map-exported `SpriteEmitter` objects, and their VM state must start the decoded simulator.
+    #[test]
+    fn opt_in_spads02b_explo02_emitter_uses_vm_owned_particle_state() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let scene = viewer::load_scene(&Options {
+            map: Some("SPADS02b".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        })
+        .expect("import SPADS02b");
+        let system = scene
+            .particle_systems
+            .iter()
+            .find(|system| system.path.ends_with("TrigerredEmitter2"))
+            .expect("SPADS02b has TrigerredEmitter2");
+        let mut session = Session::open(&game_dir, "SPADS02b").expect("open SPADS02b VM");
+        let vm = session.vm_mut();
+        let actor = vm
+            .find_export_instance(&system.path)
+            .expect("VM owns the map emitter actor");
+        let mut simulations = Vec::new();
+        for desc in &system.emitters {
+            let id = vm
+                .find_export_instance(&desc.name)
+                .unwrap_or_else(|| panic!("VM owns map sub-emitter {}", desc.name));
+            assert_eq!(
+                vm.get_property(id, "Disabled"),
+                Some(&Value::Bool(true)),
+                "Explo02 emitter starts disabled before its authored event"
+            );
+            simulations.push((
+                id,
+                desc,
+                xiii_world::particles::EmitterSim::new(simulations.len()),
+            ));
+        }
+        vm.send_event(actor, "Trigger", Vec::new())
+            .expect("deliver the map emitter's Trigger event");
+        let mut live = 0;
+        for (id, desc, mut sim) in simulations {
+            let Some(Value::Bool(disabled)) = vm.get_property(id, "Disabled") else {
+                panic!("{} has a VM-owned Disabled property", desc.name);
+            };
+            assert!(!disabled, "Explo02 must enable {}", desc.name);
+            sim.set_enabled(!disabled);
+            for _ in 0..60 {
+                sim.step(desc, 1.0 / 60.0);
+            }
+            live += sim.active();
+        }
+        println!(
+            "[particle event test] map=SPADS02b emitter=TrigerredEmitter2 event=Explo02 live={live}"
+        );
+        assert!(live > 0, "the VM-owned event must start particle emission");
+    }
+
     /// item18: the Bink header duration used by `VideoPlayer.GetStatus` (frames / fps).
     #[test]
     fn bink_header_duration_is_frames_over_fps() {
