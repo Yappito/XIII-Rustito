@@ -297,7 +297,42 @@ fn image_from_rgba(rgba: &[u8], w: usize, h: usize) -> Image {
     )
 }
 
-/// Opens audio track 0 when audio is on and the file has a decodable track.
+/// Resolves the audio track to play: the `--video-track` override when given, else the game's
+/// rule from the installation's `[Engine.Engine] Language=` (see [`xiii_video::track`]).
+/// Returns the track index and a human-readable reason for the log line.
+fn resolve_track(
+    cfg: &VideoConfig,
+    game_dir: &std::path::Path,
+    track_count: usize,
+) -> Result<(usize, String), String> {
+    if let Some(n) = cfg.options.video_track {
+        if n as usize >= track_count {
+            return Err(format!(
+                "--video-track {n} is out of range (the file has {track_count} audio track(s))"
+            ));
+        }
+        return Ok((n as usize, format!("--video-track {n} override")));
+    }
+    match xiii_video::language_from_install(game_dir) {
+        Some(language) => {
+            let track = xiii_video::select_audio_track_for(&language, track_count);
+            Ok((
+                track,
+                format!("game rule: Language={language} selects track {track}"),
+            ))
+        }
+        // No `[Engine.Engine] Language=` key: the game's rule falls through to track 0.
+        None => {
+            let track = xiii_video::select_audio_track_for("int", track_count);
+            Ok((
+                track,
+                format!("no [Engine.Engine] Language= key; defaulting to track {track}"),
+            ))
+        }
+    }
+}
+
+/// Opens the selected audio track when audio is on and the file has a decodable track.
 fn open_audio(
     cfg: &VideoConfig,
     game_dir: &std::path::Path,
@@ -307,14 +342,16 @@ fn open_audio(
         println!("[video] audio off (--audio off): wall clock");
         return Ok(None);
     }
-    let Some(track) = bik.audio.first() else {
+    if bik.audio.is_empty() {
         println!("[video] no audio track: wall clock");
         return Ok(None);
-    };
+    }
+    let (track, why) = resolve_track(cfg, game_dir, bik.audio.len())?;
+    let track_info = &bik.audio[track];
     let tables = AudioTables::from_install(game_dir).map_err(|e| e.to_string())?;
-    let decoder = AudioDecoder::new(&tables, track).map_err(|e| e.to_string())?;
+    let decoder = AudioDecoder::new(&tables, track_info).map_err(|e| e.to_string())?;
     println!(
-        "[video] audio track 0 of {}: {} Hz x {} ch, DCT, block {} samples/channel (clean-room Bink Audio)",
+        "[video] audio track {track} of {} ({why}): {} Hz x {} ch, DCT, block {} samples/channel (clean-room Bink Audio)",
         bik.audio.len(),
         decoder.sample_rate(),
         decoder.channels(),
@@ -323,7 +360,7 @@ fn open_audio(
     Ok(Some(AudioPlayback {
         decoder,
         shared: Arc::new(PcmShared::default()),
-        track: 0,
+        track,
         next_frame: 0,
         queued: 0,
         packets: 0,
@@ -426,7 +463,7 @@ fn setup(
             channels: a.decoder.channels(),
         };
         commands.spawn((
-            Name::new("bink audio track 0"),
+            Name::new(format!("bink audio track {}", a.track)),
             AudioPlayer(bink_audio.add(asset)),
             PlaybackSettings::ONCE,
         ));
