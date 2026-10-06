@@ -1981,6 +1981,7 @@ mod tests {
         let save = crate::save::SaveFile {
             map: "Plage00".into(),
             teleporter: "PlayerStart".into(),
+            save_trigger_tag: "Debut".into(),
             description: "Synthetic beach".into(),
             health: 150.0,
             speed_factor_limit: 1.0,
@@ -1989,6 +1990,9 @@ mod tests {
             rotation: [0; 3],
             objectives: Vec::new(),
             inventory: Vec::new(),
+            sound_to_launch: None,
+            selected_weapon: None,
+            music_vars: Vec::new(),
         };
         crate::save::write(&dir, 3, &save).unwrap();
         let mut provider = MenuSaveSlots::open(dir.clone()).unwrap();
@@ -2173,6 +2177,17 @@ mod tests {
 
     /// Opt-in corpus test: the decoded front end spawns without suspensions and the New game
     /// entry reaches the game's own `ClientTravel("Plage00")` map request.
+    /// A fresh, empty save directory for one test: tests must never read the user's real saves
+    /// (`%APPDATA%`), whose contents depend on whatever was played or written last.
+    fn test_save_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "xiii-menu-test-saves-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
     #[test]
     fn opt_in_menu_spawns_and_newgame_requests_the_map() {
         let Some(game_dir) = opt_in_root() else {
@@ -2180,12 +2195,8 @@ mod tests {
             return;
         };
         let script = MenuScript::parse("t=0.1 newgame\n").unwrap();
-        let mut session = MenuSession::open(
-            &game_dir,
-            save_dir(&Options::default()).unwrap(),
-            Some(script),
-        )
-        .expect("open the front-end menu");
+        let mut session = MenuSession::open(&game_dir, test_save_dir("newgame"), Some(script))
+            .expect("open the front-end menu");
         assert_eq!(
             session.controls.len(),
             XIIIMENU_CONTROL_COUNT,
@@ -2238,9 +2249,8 @@ mod tests {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
         };
-        let mut session =
-            MenuSession::open(&game_dir, save_dir(&Options::default()).unwrap(), None)
-                .expect("open the front-end menu");
+        let mut session = MenuSession::open(&game_dir, test_save_dir("rects"), None)
+            .expect("open the front-end menu");
         session.clip = [1280.0, 720.0];
         session.refresh_commands();
         let clip = session.clip;

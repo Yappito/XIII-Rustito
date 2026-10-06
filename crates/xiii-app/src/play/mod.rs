@@ -1059,19 +1059,21 @@ fn fixed_step(
             if let Some((_, event)) = sess.saves.back() {
                 let map = cfg.options.map.as_deref().unwrap_or("Plage00");
                 let rot = sess.player_rotation().unwrap_or([0; 3]);
-                let data = sess.checkpoint_snapshot(map, event, sim.0.location, rot);
-                let save_dir = cfg
-                    .options
-                    .save_dir
-                    .clone()
-                    .map(Ok)
-                    .unwrap_or_else(crate::save::default_save_dir);
-                match save_dir.and_then(|dir| {
-                    let slot = (0..10)
-                        .find(|&n| !crate::save::exists(&dir, n))
-                        .unwrap_or(0);
-                    crate::save::write(&dir, slot, &data).map(|()| (dir, slot))
-                }) {
+                let save_dir = cfg.options.save_dir.clone();
+                let result = sess
+                    .checkpoint_snapshot(map, event, sim.0.location, rot)
+                    .and_then(|data| {
+                        save_dir
+                            .map(Ok)
+                            .unwrap_or_else(crate::save::default_save_dir)
+                            .and_then(|dir| {
+                                let slot = (0..10)
+                                    .find(|&n| !crate::save::exists(&dir, n))
+                                    .unwrap_or(0);
+                                crate::save::write(&dir, slot, &data).map(|()| (dir, slot))
+                            })
+                    });
+                match result {
                     Ok((dir, slot)) => println!(
                         "[save] wrote slot {slot} ({}) to {}",
                         event.description,
@@ -3010,6 +3012,362 @@ mod tests {
             outcome.session.save_total > 0,
             "the game's checkpoint trigger must emit a SaveAtCheckpoint event"
         );
+    }
+
+    /// item33 acceptance: execute the tracked Plage01 route through the M60 fire burst, deliver
+    /// Touch to the map's real checkpoint trigger (which runs GoSaving.DoSave), persist that
+    /// checkpoint and reload it through AcceptInventory. The trigger Touch is harness-delivered;
+    /// the save/restore and weapon/ammo/objective work is the authored game path.
+    #[test]
+    fn opt_in_plage01_checkpoint_restores_route_inventory_ammo_weapon_and_music() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".into()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/plage01_route.script");
+        let mut script = script::Script::load(&route_path).expect("load tracked Plage01 route");
+        script.events.retain(|event| event.t <= 64.0);
+        let mut outcome = run_script(
+            &game_dir,
+            "Plage01",
+            &script,
+            &resolved.params,
+            &scene,
+            65.0,
+        )
+        .expect("run Plage01 through its weapon fire and corpse search");
+        assert_eq!(
+            outcome.final_map, "Plage01",
+            "route must stop before its travel command"
+        );
+        let requested_shots = script
+            .events
+            .iter()
+            .filter(|event| matches!(event.command, script::Command::Fire))
+            .count();
+        assert!(
+            requested_shots >= 10,
+            "tracked route must fire a burst, got {requested_shots} fire commands"
+        );
+        let target = outcome
+            .session
+            .vm()
+            .find_object("BaseSoldier6")
+            .expect("route killer");
+        assert!(
+            outcome.session.actor_is_dead(target),
+            "tracked route's fired M60 did not kill BaseSoldier6"
+        );
+
+        let weapon = outcome
+            .session
+            .player_weapon()
+            .expect("route leaves a selected weapon");
+        let weapon_class = outcome
+            .session
+            .vm()
+            .set()
+            .path(outcome.session.vm().objects[weapon as usize].class);
+        assert!(
+            weapon_class.to_ascii_lowercase().contains("m60"),
+            "selected weapon after route: {weapon_class}"
+        );
+        let before_inventory = outcome.session.inventory_items();
+        assert!(
+            before_inventory
+                .iter()
+                .any(|(_, class)| class.eq_ignore_ascii_case(&weapon_class)),
+            "selected weapon is absent from inventory chain: {before_inventory:?}"
+        );
+
+        let checkpoint = outcome.session.vm().objects.iter().enumerate().find_map(|(i, actor)| {
+            let id = i as xiii_script::ObjectId;
+            (actor.is_actor && outcome.session.vm().is_a(id, "xiiisavegametrigger")
+                && matches!(outcome.session.vm().get_property(id, "Tag"), Some(xiii_script::Value::Name(tag)) if tag.eq_ignore_ascii_case("CP1")))
+                .then_some(id)
+        }).expect("Plage01 CP1 save trigger");
+        let player = outcome.session.player;
+        let trigger_class = outcome.session.vm().objects[checkpoint as usize].class;
+        let trigger_loc = outcome.session.player_location().expect("player location");
+        let save_trigger = outcome
+            .session
+            .vm_mut()
+            .spawn_actor(
+                player,
+                Some(trigger_class),
+                Some(player),
+                None,
+                Some(trigger_loc),
+                None,
+            )
+            .expect("spawn a fresh instance of the map's checkpoint trigger class")
+            .expect("checkpoint trigger spawn returned None");
+        outcome.session.vm_mut().set_property(
+            save_trigger,
+            "Tag",
+            0,
+            xiii_script::Value::Name("CP1".into()),
+        );
+        outcome.session.vm_mut().set_property(
+            save_trigger,
+            "TeleporterName",
+            0,
+            xiii_script::Value::Str("teleporte_apres_lit".into()),
+        );
+        outcome.session.vm_mut().set_property(
+            save_trigger,
+            "SaveDescription",
+            0,
+            xiii_script::Value::Str("item33 Plage01 route".into()),
+        );
+        if let Some(sound) = outcome
+            .session
+            .vm()
+            .get_property(checkpoint, "SoundToLaunch")
+            .cloned()
+        {
+            assert!(
+                outcome
+                    .session
+                    .vm_mut()
+                    .set_property(save_trigger, "SoundToLaunch", 0, sound),
+                "fresh checkpoint trigger could not receive SoundToLaunch"
+            );
+        }
+        outcome
+            .session
+            .vm_mut()
+            .send_event(
+                save_trigger,
+                "Touch",
+                vec![xiii_script::Value::Object(Some(
+                    xiii_script::ObjRef::Instance(player),
+                ))],
+            )
+            .expect("deliver player Touch to checkpoint trigger");
+        let loc = outcome.session.player_location().expect("player location");
+        for _ in 0..120 {
+            outcome.session.step(
+                1.0 / 60.0,
+                loc,
+                0.0,
+                [0.0; 3],
+                &session::PlayerVMModes::default(),
+            );
+            if outcome.session.save_total > 0 {
+                break;
+            }
+        }
+        assert!(
+            outcome.session.save_total > 0,
+            "CP1 Touch did not run GoSaving.DoSave: {:?}",
+            outcome.session.failures
+        );
+        let event = outcome
+            .session
+            .saves
+            .back()
+            .expect("game-emitted SaveCheckpoint event")
+            .1
+            .clone();
+        assert_eq!(event.teleporter_name, "teleporte_apres_lit");
+        let saved = outcome
+            .session
+            .checkpoint_snapshot(
+                "Plage01",
+                &event,
+                loc,
+                outcome.session.player_rotation().unwrap_or([0; 3]),
+            )
+            .expect("snapshot route checkpoint");
+        assert_eq!(
+            saved.save_trigger_tag, "CP1",
+            "snapshot must retain XIIISaveGameTrigger.Tag"
+        );
+        assert!(
+            saved.sound_to_launch.is_some(),
+            "CP1 SoundToLaunch must be captured: event={event:?}, saved={saved:?}, original={:?}",
+            outcome
+                .session
+                .vm()
+                .get_property(checkpoint, "SoundToLaunch")
+        );
+        let ammo = saved
+            .inventory
+            .iter()
+            .find_map(|item| {
+                item.ammo_amount
+                    .map(|amount| (item.class_path.clone(), amount))
+            })
+            .expect("saved travel inventory includes ammunition");
+        assert!(ammo.1 >= 0, "invalid saved ammo count: {ammo:?}");
+        println!(
+            "[item33 route] checkpoint={} weapon={} ammo={ammo:?} health={} objectives={:?} sound={:?}",
+            saved.checkpoint_number,
+            saved.selected_weapon.as_deref().unwrap_or("<none>"),
+            saved.health,
+            saved.objectives,
+            saved.sound_to_launch
+        );
+
+        let temp_dir = std::env::temp_dir();
+        if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("xiii-item33-route-")
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+        let save_dir = temp_dir.join(format!("xiii-item33-route-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&save_dir);
+        crate::save::write(&save_dir, 0, &saved).expect("write route checkpoint");
+        let loaded = crate::save::read(&save_dir, 0).expect("read route checkpoint");
+        let mut resumed =
+            session::Session::open_checkpoint(&game_dir, "Plage01").expect("open checkpoint map");
+        resumed
+            .restore_checkpoint(&loaded)
+            .expect("run AcceptInventory restore path");
+        assert_eq!(resumed.player_health(), Some(saved.health));
+        assert_eq!(
+            resumed.player_weapon().map(|id| resumed
+                .vm()
+                .set()
+                .path(resumed.vm().objects[id as usize].class)),
+            saved.selected_weapon
+        );
+        let restored_inventory = resumed
+            .inventory_snapshot()
+            .expect("snapshot restored inventory for assertions");
+        let restored_objectives = resumed
+            .objective_states()
+            .into_iter()
+            .map(|objective| crate::save::Objective {
+                completed: objective.completed,
+                primary: objective.primary,
+                anti_goal: objective.anti_goal,
+            })
+            .collect::<Vec<_>>();
+        let restored_music_vars = resumed
+            .music_variable_snapshot()
+            .expect("snapshot restored LevelInfo music variables");
+        let restored_weapon = resumed.player_weapon().expect("restored selected weapon");
+        let restored_ammo_id = match resumed.vm().get_property(restored_weapon, "AmmoType") {
+            Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => *id,
+            other => panic!("restored M60 has no instance AmmoType: {other:?}"),
+        };
+        let restored_ammo_count = match resumed.vm().get_property(restored_ammo_id, "AmmoAmount") {
+            Some(xiii_script::Value::Int(n)) => *n,
+            other => panic!("restored M60 AmmoType has no int AmmoAmount: {other:?}"),
+        };
+        let restored_ammo = (
+            resumed
+                .vm()
+                .set()
+                .path(resumed.vm().objects[restored_ammo_id as usize].class),
+            restored_ammo_count,
+        );
+        assert_eq!(restored_ammo, ammo, "ammo must match the saved count");
+        assert_eq!(restored_objectives, saved.objectives);
+        assert_eq!(
+            restored_music_vars, saved.music_vars,
+            "LevelInfo music-variable state must restore"
+        );
+        let mut saved_classes = saved
+            .inventory
+            .iter()
+            .map(|i| i.class_path.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let mut restored_classes = restored_inventory
+            .iter()
+            .map(|i| i.class_path.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        saved_classes.sort();
+        restored_classes.sort();
+        let mut remaining = restored_classes.clone();
+        for class in &saved_classes {
+            let at = remaining
+                .iter()
+                .position(|restored| restored == class)
+                .unwrap_or_else(|| {
+                    panic!("saved inventory class {class} missing after load: {restored_classes:?}")
+                });
+            remaining.remove(at);
+        }
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            ["xiii.fistsammo", "xiii.xiiilefthand"],
+            "only AcceptInventory's authored default ammo/left-hand entries should be added"
+        );
+        let mut saved_ammo_state = saved
+            .inventory
+            .iter()
+            .filter_map(|item| {
+                item.ammo_amount
+                    .map(|amount| (item.class_path.to_ascii_lowercase(), amount))
+            })
+            .collect::<Vec<_>>();
+        let mut restored_ammo_state = restored_inventory
+            .iter()
+            .filter(|item| {
+                saved
+                    .inventory
+                    .iter()
+                    .any(|original| original.class_path.eq_ignore_ascii_case(&item.class_path))
+            })
+            .filter_map(|item| {
+                item.ammo_amount
+                    .map(|amount| (item.class_path.to_ascii_lowercase(), amount))
+            })
+            .collect::<Vec<_>>();
+        saved_ammo_state.sort();
+        restored_ammo_state.sort();
+        assert_eq!(
+            restored_ammo_state, saved_ammo_state,
+            "each travel Ammunition.AmmoAmount must survive the restore"
+        );
+        let saved_m60 = saved
+            .inventory
+            .iter()
+            .find(|item| item.class_path.eq_ignore_ascii_case("XIII.m60"))
+            .expect("saved M60 actor");
+        let m60_ammo = saved
+            .inventory
+            .iter()
+            .find(|item| item.class_path.eq_ignore_ascii_case("XIII.M60Ammo"))
+            .and_then(|item| item.ammo_amount)
+            .expect("saved M60 ammunition actor");
+        let saved_clip = saved_m60.reload_count.expect("saved M60 ReloadCount");
+        let expected_clip = saved_clip.min(m60_ammo);
+        let loaded_clip = match resumed.vm().get_property(restored_weapon, "ReloadCount") {
+            Some(xiii_script::Value::Int(v)) => *v,
+            Some(xiii_script::Value::Byte(v)) => i32::from(*v),
+            other => panic!("restored M60 ReloadCount missing/unsupported: {other:?}"),
+        };
+        assert_eq!(
+            loaded_clip, expected_clip,
+            "XIIIWeapon.Active.BeginState clamps ReloadCount to the remaining AmmoAmount on BringUp"
+        );
+        assert!(
+            resumed.events.iter().any(|(_, event)| matches!(event,
+            xiii_script::PresentationEvent::PlayMusic(music)
+                if music.sound.as_deref() == saved.sound_to_launch.as_deref())),
+            "AcceptInventory did not play saved SoundToLaunch {:?}",
+            saved.sound_to_launch
+        );
+        let _ = std::fs::remove_dir_all(save_dir);
     }
 
     /// item24 opt-in corpus test: follow Banque01 to its end through the game's own chain.

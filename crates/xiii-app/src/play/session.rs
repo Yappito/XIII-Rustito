@@ -110,14 +110,8 @@ pub struct Session {
     /// AI perception events dispatched by the host sight bridge (item14b): `(time, controller,
     /// event)`, oldest first (bounded). `SeePlayer`/`EnemyNotVisible` only.
     pub perception_log: VecDeque<(f64, String, String)>,
-    /// Next VM time at which the host AI fire bridge may fire each controlled weapon. The engine
-    /// fires from `AWeapon::Tick` (native); the VM has no weapon tick, so the host re-issues the
-    /// weapon's class `Fire` while the controller requests fire, throttled per weapon.
-    ai_fire_at: std::collections::HashMap<ObjectId, f64>,
     /// Pawns whose native tear-off `PlayDying` was delivered (see `finish_tearoff_deaths`).
     tearoff_death_callbacks: HashSet<ObjectId>,
-    /// AI shots the host fire bridge issued: `(time, soldier, weapon)`.
-    pub ai_shots: VecDeque<(f64, String, String)>,
     /// Fixed steps run.
     pub tick_count: u64,
     /// Set once the end-game has stopped the active cutscene controllers (item15 bridge): the
@@ -472,9 +466,7 @@ impl Session {
             hitbox_dropped,
             hitbox_errors,
             perception_log: VecDeque::new(),
-            ai_fire_at: std::collections::HashMap::new(),
             tearoff_death_callbacks: HashSet::new(),
-            ai_shots: VecDeque::new(),
             tick_count: 0,
             cine_stopped: false,
             render_canvas: None,
@@ -512,111 +504,6 @@ impl Session {
             let rot = self.vm.rotation_prop(*id).unwrap_or([0; 3]);
             let boxes = xiii_world::hitbox::world_boxes(mesh, loc, rot, clip);
             table.insert(*id, boxes);
-        }
-    }
-
-    /// item14b host AI fire bridge (labelled). The engine fires an AI weapon from its native
-    /// `AWeapon::Tick` while the controller's `bTire` is set. The VM has no weapon tick and
-    /// `XIIIWeapon.Active`'s `Fire` shadow is empty, so `IAController.Timer`'s
-    /// `pawn.weapon.fire(1.0)` resolves to nothing. This re-issues the weapon's **class**
-    /// `Fire(1.0)` (the same resolution the player's fire path uses, item14) for every live
-    /// `IAController` whose `bTire` is set and whose pawn is alive, throttled by the pawn's
-    /// `OffsetTimeBetweenShots`. It is not the engine's native tick and is reported per shot.
-    fn ai_fire(&mut self) {
-        let now = self.vm.time;
-        let mut candidates: Vec<(ObjectId, ObjectId, ObjectId, Option<ObjectId>)> = Vec::new();
-        for i in 0..self.vm.objects.len() {
-            let ctrl = i as ObjectId;
-            let o = &self.vm.objects[i];
-            if !o.is_actor
-                || o.deleted
-                || !o.active
-                || !self.vm.is_a(ctrl, "iacontroller")
-                || !matches!(self.vm.get_property(ctrl, "bTire"), Some(Value::Bool(true)))
-            {
-                continue;
-            }
-            let Some(pawn) = instance_prop(&self.vm, ctrl, "Pawn") else {
-                continue;
-            };
-            if matches!(
-                self.vm.get_property(pawn, "bIsDead"),
-                Some(Value::Bool(true))
-            ) {
-                continue;
-            }
-            let Some(weapon) = instance_prop(&self.vm, pawn, "Weapon") else {
-                continue;
-            };
-            let enemy = instance_prop(&self.vm, ctrl, "Enemy");
-            candidates.push((ctrl, pawn, weapon, enemy));
-        }
-        for (ctrl, pawn, weapon, enemy) in candidates {
-            let due = self.ai_fire_at.get(&weapon).copied().unwrap_or(0.0);
-            if now < due {
-                continue;
-            }
-            let gap = match self.vm.get_property(pawn, "OffsetTimeBetweenShots") {
-                Some(Value::Float(f)) if *f > 0.0 => f64::from(*f),
-                _ => 0.4,
-            };
-            self.ai_fire_at.insert(weapon, now + gap);
-            let soldier = self.vm.objects[pawn as usize].name.clone();
-            let weapon_name = self.vm.objects[weapon as usize].name.clone();
-            // Engine `AIController`-native focus: turn the pawn and its controller toward the
-            // enemy and keep the weapon at the eye (the host owns no AI rotation code otherwise).
-            let pl = self.vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
-            if let Some(enemy) = enemy {
-                let el = self.vm.vector_prop(enemy, "Location").unwrap_or(pl);
-                let d = [el[0] - pl[0], el[1] - pl[1], el[2] - pl[2]];
-                let horiz = (d[0] * d[0] + d[1] * d[1]).sqrt();
-                let yaw = d[1].atan2(d[0]);
-                let pitch = d[2].atan2(horiz.max(1e-6));
-                let rot = [
-                    (pitch / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN).round() as i32,
-                    (yaw / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN).round() as i32,
-                    0,
-                ];
-                let _ = self
-                    .vm
-                    .set_property(ctrl, "Rotation", 0, Value::Rotator(rot));
-                let _ = self
-                    .vm
-                    .set_property(pawn, "Rotation", 0, Value::Rotator(rot));
-            }
-            let eye = match self.vm.get_property(pawn, "EyeHeight") {
-                Some(Value::Float(h)) => *h,
-                _ => match self.vm.get_property(pawn, "BaseEyeHeight") {
-                    Some(Value::Float(h)) => *h,
-                    _ => 0.0,
-                },
-            };
-            let _ = self.vm.set_property(
-                weapon,
-                "Location",
-                0,
-                Value::Vector([pl[0], pl[1], pl[2] + eye]),
-            );
-            match self.vm.class_function(weapon, "Fire") {
-                Some(f) => match self.vm.call_function(f, weapon, vec![Value::Float(1.0)]) {
-                    Ok(_) => {
-                        println!("[play] AI t={now:.3}s {soldier} fires {weapon_name}");
-                        self.ai_shots.push_back((now, soldier, weapon_name));
-                    }
-                    Err(e) => {
-                        self.record_failure(&soldier, &e);
-                    }
-                },
-                None => {
-                    let _ = ctrl;
-                    self.blocked.push(format!(
-                        "AI fire: {soldier} {weapon_name} has no class Fire"
-                    ));
-                }
-            }
-        }
-        while self.ai_shots.len() > 128 {
-            self.ai_shots.pop_front();
         }
     }
 
@@ -793,9 +680,6 @@ impl Session {
         while self.perception_log.len() > 128 {
             self.perception_log.pop_front();
         }
-        // The engine fires AI weapons from the native weapon tick; the host bridge re-issues the
-        // weapon's class `Fire` while the controller requests fire (see [`Session::ai_fire`]).
-        self.ai_fire();
         self.tick_count += 1;
         let t0 = Instant::now();
         self.drain_events();
@@ -1184,6 +1068,125 @@ impl Session {
         out
     }
 
+    /// Strict checkpoint serialization of the live inventory chain plus the selected weapon if
+    /// it is not linked there. No data-bearing actor/property failure is silently discarded.
+    pub fn inventory_snapshot(&self) -> Result<Vec<crate::save::InventoryItem>, String> {
+        let mut ids = Vec::new();
+        let mut cursor = self.inventory_head(self.player);
+        while let Some(id) = cursor {
+            if ids.contains(&id) {
+                return Err(format!(
+                    "player inventory chain loops at actor {}",
+                    self.vm.objects[id as usize].name
+                ));
+            }
+            if ids.len() >= 4096 {
+                return Err("player inventory exceeds the 4096-item save bound".into());
+            }
+            ids.push(id);
+            cursor = self.inventory_head(id);
+        }
+        if let Some(selected) = self.player_weapon()
+            && !ids.contains(&selected)
+        {
+            ids.push(selected);
+        }
+        ids.into_iter()
+            .map(|id| {
+                let actor = self
+                    .vm
+                    .objects
+                    .get(id as usize)
+                    .ok_or_else(|| format!("player inventory object id {id} is absent"))?;
+                let class_path = self.vm.set().path(actor.class);
+                let ammo_amount = match self.vm.get_property(id, "AmmoAmount") {
+                    Some(Value::Int(value)) => Some(*value),
+                    Some(other) => {
+                        return Err(format!(
+                            "inventory {}.AmmoAmount is {}, expected int",
+                            actor.name,
+                            other.type_name()
+                        ));
+                    }
+                    None => None,
+                };
+                let reload_count = match self.vm.get_property(id, "ReloadCount") {
+                    Some(Value::Int(value)) => Some(*value),
+                    Some(Value::Byte(value)) => Some(i32::from(*value)),
+                    Some(other) => {
+                        return Err(format!(
+                            "inventory {}.ReloadCount is {}, expected byte/int",
+                            actor.name,
+                            other.type_name()
+                        ));
+                    }
+                    None => None,
+                };
+                Ok(crate::save::InventoryItem {
+                    class_path,
+                    name: actor.name.clone(),
+                    ammo_amount,
+                    reload_count,
+                })
+            })
+            .collect()
+    }
+
+    /// Decoded named LevelInfo music counters, with explicit errors for unsupported live data.
+    pub fn music_variable_snapshot(&self) -> Result<Vec<crate::save::MusicVariable>, String> {
+        let level_info = self
+            .vm
+            .find_level_info()
+            .ok_or("checkpoint has no LevelInfo")?;
+        match self.vm.get_property(level_info, "MusicVars") {
+            Some(Value::Array(entries)) => entries
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let Value::Struct(fields) = entry else {
+                        return Err(format!("LevelInfo.MusicVars[{i}] is not a struct"));
+                    };
+                    let name = fields
+                        .iter()
+                        .find_map(|(field, value)| {
+                            field.eq_ignore_ascii_case("name").then_some(value)
+                        })
+                        .ok_or_else(|| format!("LevelInfo.MusicVars[{i}] has no name"))?;
+                    let value = fields
+                        .iter()
+                        .find_map(|(field, value)| {
+                            field.eq_ignore_ascii_case("value").then_some(value)
+                        })
+                        .ok_or_else(|| format!("LevelInfo.MusicVars[{i}] has no value"))?;
+                    let name = match name {
+                        Value::Str(name) => name.clone(),
+                        other => {
+                            return Err(format!(
+                                "LevelInfo.MusicVars[{i}].name is {}, expected string",
+                                other.type_name()
+                            ));
+                        }
+                    };
+                    let value = match value {
+                        Value::Int(value) => *value,
+                        other => {
+                            return Err(format!(
+                                "LevelInfo.MusicVars[{i}].value is {}, expected int",
+                                other.type_name()
+                            ));
+                        }
+                    };
+                    Ok(crate::save::MusicVariable { name, value })
+                })
+                .collect(),
+            Some(other) => Err(format!(
+                "LevelInfo.MusicVars is {}, expected array",
+                other.type_name()
+            )),
+            None => Err("LevelInfo has no MusicVars property".into()),
+        }
+    }
+
     /// Current player `Rotation` (Unreal rotator units), if the pawn has one.
     pub fn player_rotation(&self) -> Option<[i32; 3]> {
         match self.vm.get_property(self.player, "Rotation") {
@@ -1450,9 +1453,9 @@ impl Session {
         out
     }
 
-    /// Reapplies the decoded checkpoint fields and returns the checkpoint actor's Unreal location.
-    /// XIII's save semantics are map travel plus checkpoint tag and ThingsToSave fields, not a VM
-    /// heap restore. Inventory reconstruction is done through the same `GiveTo` entry point.
+    /// Reconstructs the native travel inventory, then invokes XIII's own AcceptInventory event.
+    /// The event owns checkpoint cleanup, objective restore, inventory defaults, ammo refresh,
+    /// and bringing up the current weapon. Returns the saved checkpoint's Unreal location.
     pub fn restore_checkpoint(&mut self, save: &crate::save::SaveFile) -> Result<[f32; 3], String> {
         let tag_match = |v: &Value| match v {
             Value::Name(n) | Value::Str(n) => n.eq_ignore_ascii_case(&save.teleporter),
@@ -1479,48 +1482,143 @@ impl Session {
             .ok_or_else(|| format!("checkpoint {:?} has no Location", save.teleporter))?;
         self.vm
             .set_property(self.player, "Location", 0, Value::Vector(loc));
-        self.vm.set_property(
-            self.player,
-            "Health",
-            0,
-            Value::Int(save.health.round() as i32),
-        );
-        self.vm.set_property(
-            self.player,
-            "SpeedFactorLimit",
-            0,
-            Value::Float(save.speed_factor_limit),
-        );
-        if let Some(gi) = self.game_info {
-            self.vm.set_property(
-                gi,
-                "CheckpointNumber",
-                0,
-                Value::Int(save.checkpoint_number),
-            );
-        }
-        if let Some(mi) = self.map_info()
-            && let Some(Value::Array(mut goals)) = self.vm.get_property(mi, "Objectif").cloned()
-        {
-            for (i, state) in save.objectives.iter().enumerate() {
-                let Some(Value::Struct(fields)) = goals.get_mut(i) else {
-                    break;
-                };
-                for (name, flag) in [
-                    ("bCompleted", state.completed),
-                    ("bPrimary", state.primary),
-                    ("bAntiGoal", state.anti_goal),
-                ] {
-                    if let Some((_, value)) = fields
-                        .iter_mut()
-                        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-                    {
-                        *value = Value::Bool(flag);
+
+        // v1 saves did not retain XIIISaveGameTrigger.Tag. Recover it from the map's authored
+        // TeleporterName when possible; v2 stores the exact tag from DoSave.
+        let trigger_tag = if save.save_trigger_tag.eq_ignore_ascii_case(&save.teleporter) {
+            self.vm
+                .objects
+                .iter()
+                .enumerate()
+                .find_map(|(i, actor)| {
+                    let id = i as ObjectId;
+                    if !actor.is_actor || !self.vm.is_a(id, "xiiisavegametrigger") {
+                        return None;
                     }
-                }
+                    let teleporter = self.vm.get_property(id, "TeleporterName")?;
+                    let matches = matches!(teleporter, Value::Str(value) | Value::Name(value)
+                    if value.eq_ignore_ascii_case(&save.teleporter));
+                    matches.then(|| match self.vm.get_property(id, "Tag") {
+                        Some(Value::Name(tag)) => tag.clone(),
+                        _ => save.save_trigger_tag.clone(),
+                    })
+                })
+                .unwrap_or_else(|| save.save_trigger_tag.clone())
+        } else {
+            save.save_trigger_tag.clone()
+        };
+
+        // Level start can already have destroyed the checkpoint trigger while dispatching the
+        // PlayerStart event (before the native checkpoint inventory is imported). Reconstitute
+        // that map-authored trigger from its loaded actor record so AcceptInventory's AllActors /
+        // CleanMap / objective-copy / Destroy sequence runs on the actual game class. This is a
+        // generic travel-load ordering bridge; it copies only the trigger's authored fields.
+        let trigger_is_live = self.vm.objects.iter().enumerate().any(|(i, actor)| {
+            !actor.deleted && actor.is_actor && self.vm.is_a(i as ObjectId, "xiiisavegametrigger")
+                && matches!(self.vm.get_property(i as ObjectId, "Tag"), Some(Value::Name(tag)) if tag.eq_ignore_ascii_case(&trigger_tag))
+        });
+        if !trigger_is_live {
+            let source = self.vm.objects.iter().enumerate().find_map(|(i, actor)| {
+                let id = i as ObjectId;
+                (actor.is_actor && self.vm.is_a(id, "xiiisavegametrigger")
+                    && matches!(self.vm.get_property(id, "Tag"), Some(Value::Name(tag)) if tag.eq_ignore_ascii_case(&trigger_tag)))
+                    .then_some(id)
+            }).ok_or_else(|| format!("checkpoint trigger {:?} is absent from loaded map {}", trigger_tag, save.map))?;
+            let class = self.vm.objects[source as usize].class;
+            let trigger_loc = self.vm.vector_prop(source, "Location");
+            let actors_to_destroy = self.vm.get_property(source, "ActorsToDestroy").cloned();
+            let restored_trigger = self
+                .vm
+                .spawn_actor(
+                    self.player,
+                    Some(class),
+                    Some(self.player),
+                    None,
+                    trigger_loc,
+                    None,
+                )
+                .map_err(|e| format!("recreating checkpoint trigger {trigger_tag}: {e}"))?
+                .ok_or_else(|| {
+                    format!("recreating checkpoint trigger {trigger_tag} returned None")
+                })?;
+            self.vm
+                .set_property(restored_trigger, "Tag", 0, Value::Name(trigger_tag.clone()));
+            if let Some(actors_to_destroy) = actors_to_destroy
+                && !self
+                    .vm
+                    .set_property(restored_trigger, "ActorsToDestroy", 0, actors_to_destroy)
+            {
+                return Err(format!(
+                    "checkpoint trigger {trigger_tag} has no writable ActorsToDestroy"
+                ));
             }
-            self.vm.set_property(mi, "Objectif", 0, Value::Array(goals));
         }
+
+        let save_class = runtime::resolve_class_path(self.vm.set(), "XIII.XIIIThingsToSave")
+            .ok_or("XIII.XIIIThingsToSave class is not loaded")?;
+        let save_actor = self
+            .vm
+            .spawn_actor(
+                self.player,
+                Some(save_class),
+                Some(self.player),
+                None,
+                Some(loc),
+                None,
+            )
+            .map_err(|e| format!("spawning XIIIThingsToSave: {e}"))?
+            .ok_or("spawning XIIIThingsToSave returned None")?;
+        let mut objective_values = Vec::with_capacity(save.objectives.len());
+        for objective in &save.objectives {
+            objective_values.push(Value::Struct(vec![
+                ("bcompleted".into(), Value::Bool(objective.completed)),
+                ("bprimary".into(), Value::Bool(objective.primary)),
+                ("bantigoal".into(), Value::Bool(objective.anti_goal)),
+            ]));
+        }
+        for (name, value) in [
+            ("XIIISaveGameTriggerTag", Value::Name(trigger_tag)),
+            ("Health", Value::Int(save.health.round() as i32)),
+            ("SpeedFactorLimit", Value::Float(save.speed_factor_limit)),
+            ("CheckpointNumber", Value::Int(save.checkpoint_number)),
+            ("ObjectivesState", Value::Array(objective_values)),
+        ] {
+            if !self.vm.set_property(save_actor, name, 0, value) {
+                return Err(format!("XIIIThingsToSave has no writable {name} property"));
+            }
+        }
+        if let Some(path) = &save.sound_to_launch {
+            let sound = self
+                .vm
+                .objects
+                .iter()
+                .enumerate()
+                .find_map(|(i, o)| {
+                    if o.deleted
+                        || !o.is_actor
+                        || !self.vm.is_a(i as ObjectId, "xiiisavegametrigger")
+                    {
+                        return None;
+                    }
+                    let value = self.vm.get_property(i as ObjectId, "SoundToLaunch")?;
+                    self.vm
+                        .obj_path(value)
+                        .filter(|candidate| candidate.eq_ignore_ascii_case(path))
+                        .map(|_| value.clone())
+                })
+                .or_else(|| self.vm.external_asset(path).map(|(value, _)| value))
+                .ok_or_else(|| format!("saved SoundToLaunch cannot be resolved: {path}"))?;
+            if !self.vm.set_property(save_actor, "SoundToLaunch", 0, sound) {
+                return Err("XIIIThingsToSave has no writable SoundToLaunch property".into());
+            }
+        }
+        self.vm
+            .send_event(
+                save_actor,
+                "GiveTo",
+                vec![Value::Object(Some(ObjRef::Instance(self.player)))],
+            )
+            .map_err(|e| format!("linking XIIIThingsToSave into inventory: {e}"))?;
         for item in &save.inventory {
             if item
                 .class_path
@@ -1532,28 +1630,192 @@ impl Session {
                 runtime::resolve_class_path(self.vm.set(), &item.class_path).ok_or_else(|| {
                     format!("saved inventory class is not loaded: {}", item.class_path)
                 })?;
-            let id = self
-                .vm
-                .spawn_actor(
-                    self.player,
-                    Some(class),
-                    Some(self.player),
-                    None,
-                    Some(loc),
-                    None,
-                )
-                .map_err(|e| format!("spawning saved inventory {}: {e}", item.class_path))?
-                .ok_or_else(|| {
-                    format!("saved inventory spawn returned None: {}", item.class_path)
-                })?;
-            self.vm
-                .send_event(
-                    id,
-                    "GiveTo",
-                    vec![Value::Object(Some(ObjRef::Instance(self.player)))],
-                )
-                .map_err(|e| format!("restoring saved inventory {}: {e}", item.class_path))?;
+            let mut existing = None;
+            let mut cursor = self.inventory_head(self.player);
+            let mut guard = 0usize;
+            while let Some(candidate) = cursor {
+                guard += 1;
+                if guard > 256 {
+                    return Err(
+                        "player inventory loop while rebuilding saved travel inventory".into(),
+                    );
+                }
+                let actor = &self.vm.objects[candidate as usize];
+                let same_class = self
+                    .vm
+                    .set()
+                    .path(actor.class)
+                    .eq_ignore_ascii_case(&item.class_path);
+                let same_inventory_item = actor.name.eq_ignore_ascii_case(&item.name)
+                    || (item.ammo_amount.is_some()
+                        && self.vm.get_property(candidate, "AmmoAmount").is_some());
+                if same_class && same_inventory_item {
+                    existing = Some(candidate);
+                    break;
+                }
+                cursor = self.inventory_head(candidate);
+            }
+            let id = if let Some(id) = existing {
+                id
+            } else {
+                self.vm
+                    .spawn_actor(
+                        self.player,
+                        Some(class),
+                        Some(self.player),
+                        None,
+                        Some(loc),
+                        None,
+                    )
+                    .map_err(|e| format!("spawning saved inventory {}: {e}", item.class_path))?
+                    .ok_or_else(|| {
+                        format!(
+                            "spawning saved inventory returned None: {}",
+                            item.class_path
+                        )
+                    })?
+            };
+            if existing.is_none() {
+                self.vm
+                    .send_event(
+                        id,
+                        "GiveTo",
+                        vec![Value::Object(Some(ObjRef::Instance(self.player)))],
+                    )
+                    .map_err(|e| format!("restoring saved inventory {}: {e}", item.class_path))?;
+            }
+            if let Some(amount) = item.ammo_amount
+                && !self
+                    .vm
+                    .set_property(id, "AmmoAmount", 0, Value::Int(amount))
+            {
+                return Err(format!(
+                    "saved item {} has no writable AmmoAmount",
+                    item.name
+                ));
+            }
+            if let Some(count) = item.reload_count {
+                let value = match self.vm.get_property(id, "ReloadCount") {
+                    Some(Value::Byte(_)) if (0..=i32::from(u8::MAX)).contains(&count) => {
+                        Value::Byte(count as u8)
+                    }
+                    Some(Value::Int(_)) => Value::Int(count),
+                    Some(other) => {
+                        return Err(format!(
+                            "saved item {} has unsupported ReloadCount type {}",
+                            item.name,
+                            other.type_name()
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "saved item {} has no ReloadCount property",
+                            item.name
+                        ));
+                    }
+                };
+                if !self.vm.set_property(id, "ReloadCount", 0, value) {
+                    return Err(format!(
+                        "saved item {} has no writable ReloadCount",
+                        item.name
+                    ));
+                }
+            }
         }
+        let game_info = self
+            .game_info
+            .ok_or("GameInfo is not available for AcceptInventory")?;
+        self.vm
+            .send_event(
+                game_info,
+                "AcceptInventory",
+                vec![Value::Object(Some(ObjRef::Instance(self.player)))],
+            )
+            .map_err(|e| format!("XIIIGameInfo.AcceptInventory failed: {e}"))?;
+        if let Some(path) = &save.selected_weapon {
+            let mut weapon = None;
+            let mut cursor = self.inventory_head(self.player);
+            let mut guard = 0usize;
+            while let Some(candidate) = cursor {
+                guard += 1;
+                if guard > 256 {
+                    return Err("player inventory loop while resolving selected weapon".into());
+                }
+                let actor = &self.vm.objects[candidate as usize];
+                if self.vm.is_a(candidate, "weapon")
+                    && self.vm.set().path(actor.class).eq_ignore_ascii_case(path)
+                {
+                    weapon = Some(candidate);
+                    break;
+                }
+                cursor = self.inventory_head(candidate);
+            }
+            let weapon = weapon.ok_or_else(|| {
+                format!("saved selected weapon is not in the restored inventory: {path}")
+            })?;
+            self.vm.set_property(
+                self.player,
+                "PendingWeapon",
+                0,
+                Value::Object(Some(ObjRef::Instance(weapon))),
+            );
+            self.vm
+                .send_event(self.player, "ChangedWeapon", Vec::new())
+                .map_err(|e| {
+                    format!("selecting saved weapon {path} through Pawn.ChangedWeapon: {e}")
+                })?;
+        }
+        if !save.music_vars.is_empty() {
+            let level_info = self
+                .vm
+                .find_level_info()
+                .ok_or("checkpoint restore has no LevelInfo for music variables")?;
+            let Some(Value::Array(mut entries)) =
+                self.vm.get_property(level_info, "MusicVars").cloned()
+            else {
+                return Err("LevelInfo.MusicVars is not an array during checkpoint restore".into());
+            };
+            for saved in &save.music_vars {
+                let mut found = false;
+                for entry in &mut entries {
+                    let Value::Struct(fields) = entry else {
+                        continue;
+                    };
+                    let name_matches = fields.iter().any(|(key, value)| {
+                        key.eq_ignore_ascii_case("name")
+                            && matches!(value, Value::Str(name) if name.eq_ignore_ascii_case(&saved.name))
+                    });
+                    if !name_matches {
+                        continue;
+                    }
+                    let Some((_, Value::Int(value))) = fields
+                        .iter_mut()
+                        .find(|(key, _)| key.eq_ignore_ascii_case("value"))
+                    else {
+                        return Err(format!(
+                            "LevelInfo.MusicVars entry {:?} has no integer value",
+                            saved.name
+                        ));
+                    };
+                    *value = saved.value;
+                    found = true;
+                    break;
+                }
+                if !found {
+                    return Err(format!(
+                        "saved music variable {:?} is absent from the loaded map",
+                        saved.name
+                    ));
+                }
+            }
+            if !self
+                .vm
+                .set_property(level_info, "MusicVars", 0, Value::Array(entries))
+            {
+                return Err("LevelInfo.MusicVars is not writable".into());
+            }
+        }
+        self.drain_events();
         Ok(loc)
     }
 
@@ -1564,21 +1826,54 @@ impl Session {
         event: &SaveCheckpointEvent,
         position: [f32; 3],
         rotation: [i32; 3],
-    ) -> crate::save::SaveFile {
-        let health = self.player_health().unwrap_or(0.0);
+    ) -> Result<crate::save::SaveFile, String> {
+        let health = self
+            .player_health()
+            .ok_or("checkpoint snapshot player has no Health property")?;
         let speed_factor_limit = match self.vm.get_property(self.player, "SpeedFactorLimit") {
             Some(Value::Float(v)) => *v,
-            _ => 0.0,
+            Some(other) => {
+                return Err(format!(
+                    "player SpeedFactorLimit is {}, expected float",
+                    other.type_name()
+                ));
+            }
+            None => return Err("checkpoint snapshot player has no SpeedFactorLimit".into()),
         };
-        let checkpoint_number = self
+        let game_info = self
             .game_info
-            .and_then(|i| match self.vm.get_property(i, "CheckpointNumber") {
-                Some(Value::Int(v)) => Some(*v),
-                _ => None,
-            })
-            .unwrap_or(0);
-        let objectives = self
-            .objective_states()
+            .ok_or("checkpoint snapshot has no GameInfo")?;
+        let checkpoint_number = match self.vm.get_property(game_info, "CheckpointNumber") {
+            Some(Value::Int(value)) => *value,
+            Some(other) => {
+                return Err(format!(
+                    "GameInfo.CheckpointNumber is {}, expected int",
+                    other.type_name()
+                ));
+            }
+            None => return Err("GameInfo has no CheckpointNumber".into()),
+        };
+        let map_info = self
+            .map_info()
+            .ok_or("checkpoint snapshot has no MapInfo")?;
+        let goal_count = match self.vm.get_property(map_info, "Objectif") {
+            Some(Value::Array(goals)) => goals.len(),
+            Some(other) => {
+                return Err(format!(
+                    "MapInfo.Objectif is {}, expected array",
+                    other.type_name()
+                ));
+            }
+            None => return Err("MapInfo has no Objectif array".into()),
+        };
+        let objective_states = self.objective_states();
+        if objective_states.len() != goal_count {
+            return Err(format!(
+                "decoded {} of {goal_count} MapInfo objectives",
+                objective_states.len()
+            ));
+        }
+        let objectives = objective_states
             .into_iter()
             .map(|o| crate::save::Objective {
                 completed: o.completed,
@@ -1586,14 +1881,66 @@ impl Session {
                 anti_goal: o.anti_goal,
             })
             .collect();
-        let inventory = self
-            .inventory_items()
-            .into_iter()
-            .map(|(name, class_path)| crate::save::InventoryItem { class_path, name })
-            .collect();
-        crate::save::SaveFile {
+        let selected_weapon = self
+            .player_weapon()
+            .map(|id| self.vm.set().path(self.vm.objects[id as usize].class));
+        let inventory = self.inventory_snapshot()?;
+        let saved_trigger = self
+            .vm
+            .objects
+            .iter()
+            .enumerate()
+            .find_map(|(i, actor)| {
+                (actor.is_actor && actor.name.eq_ignore_ascii_case(&event.actor))
+                    .then_some(i as ObjectId)
+            })
+            .ok_or_else(|| format!("SaveCheckpoint actor {:?} is not in the VM", event.actor))?;
+        let sound_value = self
+            .vm
+            .get_property(saved_trigger, "SoundToLaunch")
+            .ok_or_else(|| {
+                format!(
+                    "checkpoint trigger {} has no SoundToLaunch property",
+                    event.actor
+                )
+            })?;
+        let sound_to_launch = match sound_value {
+            Value::Object(None) => None,
+            Value::Object(Some(_)) => Some(self.vm.obj_path(sound_value).ok_or_else(|| {
+                format!(
+                    "checkpoint trigger {} SoundToLaunch has no resolvable object path",
+                    event.actor
+                )
+            })?),
+            other => {
+                return Err(format!(
+                    "checkpoint trigger {} SoundToLaunch is {}, expected object",
+                    event.actor,
+                    other.type_name()
+                ));
+            }
+        };
+        let save_trigger_tag = match self.vm.get_property(saved_trigger, "Tag") {
+            Some(Value::Name(tag)) | Some(Value::Str(tag)) => tag.clone(),
+            Some(other) => {
+                return Err(format!(
+                    "checkpoint trigger {} Tag is {}, expected name",
+                    event.actor,
+                    other.type_name()
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "checkpoint trigger {} has no Tag property",
+                    event.actor
+                ));
+            }
+        };
+        let music_vars = self.music_variable_snapshot()?;
+        Ok(crate::save::SaveFile {
             map: map.to_owned(),
             teleporter: event.teleporter_name.clone(),
+            save_trigger_tag,
             description: event.description.clone(),
             health,
             speed_factor_limit,
@@ -1602,7 +1949,10 @@ impl Session {
             rotation,
             objectives,
             inventory,
-        }
+            sound_to_launch,
+            selected_weapon,
+            music_vars,
+        })
     }
 
     /// One compact line of the objective states (goal index, primary/anti/completed flags, text).
@@ -2844,13 +3194,33 @@ mod tests {
         }
         let hp1 = session.player_health().expect("player health");
         println!("[ai test] perception: {:?}", session.perception_log);
+        let weapon = instance_prop(session.vm(), soldier, "Weapon").expect("weapon");
+        let combat_events: Vec<_> = session
+            .vm()
+            .trace
+            .iter()
+            .filter_map(|event| match &event.kind {
+                xiii_script::TraceKind::Event {
+                    target, function, ..
+                } if target == &session.vm().objects[ctrl as usize].name
+                    && (function.ends_with(".Timer") || function.ends_with(".AnimEnd")) =>
+                {
+                    Some((event.time, function.clone()))
+                }
+                xiii_script::TraceKind::StateChange {
+                    actor, from, to, ..
+                } if actor == &session.vm().objects[weapon as usize].name => {
+                    Some((event.time, format!("weapon {from:?}->{to:?}")))
+                }
+                _ => None,
+            })
+            .collect();
         println!(
-            "[ai test] {} AI shots, first at {:?}",
-            session.ai_shots.len(),
-            session.ai_shots.front()
-        );
-        println!(
-            "[ai test] player Health {hp0} -> {hp1} (low {hp_low}), first Attaque at {first_attack:?}s"
+            "[ai test] player Health {hp0} -> {hp1} (low {hp_low}), first Attaque at {first_attack:?}s; combat events={combat_events:?}, final bTire={:?} bFire={:?}, weapon state={:?}, ReloadCount={:?}",
+            session.vm().get_property(ctrl, "bTire"),
+            session.vm().get_property(ctrl, "bFire"),
+            session.vm().state_name(weapon),
+            session.vm().get_property(weapon, "ReloadCount"),
         );
         // The soldier's own state machine acquired the enemy.
         assert!(
@@ -2864,10 +3234,6 @@ mod tests {
             first_attack.is_some(),
             "the soldier never entered Attaque (perception {:?})",
             session.perception_log
-        );
-        assert!(
-            !session.ai_shots.is_empty(),
-            "the soldier never fired its weapon"
         );
         // The game's own damage chain reduced the player's Health.
         assert!(
@@ -2896,6 +3262,189 @@ mod tests {
         assert!(
             matches!(warning, Some(Value::Bool(true))) && active_timer,
             "BaseSoldier17's script-driven player hit must set the XIIIBaseHud flag and a live directional timer"
+        );
+    }
+
+    /// Opt-in Plage01 combat: deliver the authored `TouchTrigger7` (`Event=tueur_conducteur`)
+    /// cue to BaseSoldier6's controller, then record whether the game's scripted attack targets
+    /// and fires at a stationary player. This also pins the current compiled-script no-fire path.
+    #[test]
+    fn opt_in_plage01_authored_cue_soldier_combat_or_measured_no_fire_path() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Plage01").expect("open Plage01");
+        let soldier = session.vm().find_object("BaseSoldier6").expect("soldier");
+        let cue = session
+            .vm()
+            .find_object("TouchTrigger7")
+            .expect("authored cue");
+        let trigger_event = session.vm().get_property(cue, "Event").cloned();
+        assert_eq!(trigger_event, Some(Value::Name("tueur_conducteur".into())));
+        let warm_player = session.player_location().expect("player location");
+        for _ in 0..360 {
+            session.step(
+                1.0 / 60.0,
+                warm_player,
+                0.0,
+                [0.0; 3],
+                &PlayerVMModes::default(),
+            );
+        }
+        // Deliver the map's own Touch event with the player's actual spawn position. Touch
+        // dispatches the authored Event through its configured targets into the AI controller.
+        let player = session.player;
+        let player_location = session.player_location().expect("player location");
+        session
+            .vm_mut()
+            .send_event(
+                cue,
+                "Touch",
+                vec![Value::Object(Some(ObjRef::Instance(player)))],
+            )
+            .expect("deliver authored TouchTrigger7.Touch");
+        assert!(
+            session.vm().trace.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    xiii_script::TraceKind::Event { target, function, args }
+                        if target == "TouchTrigger7"
+                            && function.ends_with(".Touch")
+                            && args.iter().any(|arg| arg == &session.player_name)
+                )
+            }),
+            "the player's authored TouchTrigger7 cue was not delivered"
+        );
+        let controller = instance_prop(session.vm(), soldier, "Controller").expect("AI controller");
+        let weapon = instance_prop(session.vm(), soldier, "Weapon").expect("soldier weapon");
+        assert_eq!(
+            session.vm().state_name(controller).as_deref(),
+            Some("AttaqueScriptee")
+        );
+        let cue_enemy = instance_prop(session.vm(), controller, "Enemy");
+        let cue_enemy_name = cue_enemy.map(|id| session.vm().objects[id as usize].name.clone());
+        let initial_rotation = session.vm().rotation_prop(soldier).unwrap_or([0; 3]);
+        let health_before = session.player_health().expect("player health");
+        let soldier_location = session
+            .vm()
+            .vector_prop(soldier, "Location")
+            .expect("soldier location");
+        let sight_radius = match session.vm().get_property(soldier, "SightRadius") {
+            Some(Value::Float(radius)) => *radius,
+            other => panic!("BaseSoldier6 SightRadius is not a float: {other:?}"),
+        };
+        let player_distance = ((player_location[0] - soldier_location[0]).powi(2)
+            + (player_location[1] - soldier_location[1]).powi(2)
+            + (player_location[2] - soldier_location[2]).powi(2))
+        .sqrt();
+        let mut scripted_attack_seen = false;
+        let mut controller_attack_seen = false;
+        let mut held_fire_seen = false;
+        let mut fire_request_seen = false;
+        for _ in 0..900 {
+            session.step(
+                1.0 / 60.0,
+                player_location,
+                0.0,
+                [0.0; 3],
+                &PlayerVMModes::default(),
+            );
+            scripted_attack_seen |=
+                session.vm().state_name(controller).as_deref() == Some("AttaqueScriptee");
+            controller_attack_seen |=
+                session.vm().state_name(controller).as_deref() == Some("Attaque");
+            held_fire_seen |= matches!(
+                session.vm().get_property(controller, "bTire"),
+                Some(Value::Bool(true))
+            );
+            fire_request_seen |= [
+                (controller, "bFire"),
+                (controller, "bAltFire"),
+                (soldier, "bFire"),
+                (soldier, "bAltFire"),
+                (weapon, "bFire"),
+                (weapon, "bAltFire"),
+            ]
+            .into_iter()
+            .any(|(actor, property)| {
+                matches!(
+                    session.vm().get_property(actor, property),
+                    Some(Value::Bool(true))
+                )
+            }) || held_fire_seen;
+        }
+        let state = session.vm().state_name(soldier);
+        let controller_state = session.vm().state_name(controller);
+        let final_rotation = session.vm().rotation_prop(soldier).unwrap_or([0; 3]);
+        let health_after = session.player_health().expect("player health");
+        let wants_fire = matches!(
+            session.vm().get_property(controller, "bTire"),
+            Some(Value::Bool(true))
+        );
+        let final_enemy = instance_prop(session.vm(), controller, "Enemy")
+            .map(|id| session.vm().objects[id as usize].name.clone());
+        let scripted_states: Vec<_> = session
+            .vm()
+            .trace
+            .iter()
+            .filter_map(|event| match &event.kind {
+                xiii_script::TraceKind::StateChange {
+                    actor, from, to, ..
+                } if actor == &session.vm().objects[controller as usize].name => {
+                    Some((from.clone(), to.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let can_see: Vec<_> = session
+            .vm()
+            .trace
+            .iter()
+            .filter_map(|event| match &event.kind {
+                xiii_script::TraceKind::Native {
+                    path,
+                    this,
+                    args,
+                    result,
+                    ..
+                } if path.ends_with("Controller.CanSee")
+                    && this == &session.vm().objects[controller as usize].name =>
+                {
+                    Some((event.time, args.clone(), result.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let left_scripted_attack = scripted_states.iter().any(|(from, to)| {
+            from.as_deref() == Some("AttaqueScriptee") && to.as_deref() == Some("temporise")
+        });
+        println!(
+            "[Plage01 combat] cue=TouchTrigger7 event={trigger_event:?}, player={player_location:?}, soldier={soldier_location:?}, distance={player_distance:.1}, SightRadius={sight_radius}, cue Enemy={cue_enemy_name:?}, final Enemy={final_enemy:?}, scripted={scripted_attack_seen}, combat={controller_attack_seen}, held-fire-seen={held_fire_seen}, fire-request-seen={fire_request_seen}, bTire={wants_fire}, soldier state={state:?}, controller state={controller_state:?}, controller states={scripted_states:?}, CanSee={can_see:?}, rotation {initial_rotation:?}->{final_rotation:?}, Health {health_before}->{health_after}; suspended={:?}",
+            session.suspended
+        );
+        assert!(
+            scripted_attack_seen,
+            "the authored cue did not release the soldier"
+        );
+        assert!(
+            player_distance > sight_radius
+                && can_see.iter().any(|(_, _, result)| result == "false"),
+            "the actual player position should be outside SightRadius with a measured failed CanSee: distance={player_distance}, SightRadius={sight_radius}, CanSee={can_see:?}"
+        );
+        // Whether this authored map cue yields combat is determined by the map's own dispatch,
+        // AI state chain, and LOS result at the player's actual spawn location.
+        assert!(
+            cue_enemy == Some(player)
+                && final_enemy.is_none()
+                && left_scripted_attack
+                && controller_state.as_deref() == Some("Patrouille")
+                && !controller_attack_seen
+                && !held_fire_seen
+                && !fire_request_seen
+                && !wants_fire
+                && health_after == health_before,
+            "unexpected combat result: Health {health_before}->{health_after}, bTire={wants_fire}"
         );
     }
 
@@ -2958,9 +3507,10 @@ mod tests {
             Some(&Value::Name("LOAD".into())),
             "open_checkpoint must leave StartSpotEvent=LOAD after the login chain"
         );
-        let saved = crate::save::SaveFile {
+        let mut saved = crate::save::SaveFile {
             map: "Plage00".into(),
             teleporter: "PlayerStart".into(),
+            save_trigger_tag: "Debut".into(),
             description: "corpus resume regression".into(),
             health: 150.0,
             speed_factor_limit: 1.0,
@@ -2977,7 +3527,16 @@ mod tests {
                 })
                 .collect(),
             inventory: Vec::new(),
+            sound_to_launch: Some("XIIIsound.Music__Plage01.Plage01__hMusicInit2".into()),
+            selected_weapon: None,
+            music_vars: Vec::new(),
         };
+        let first_objective = saved
+            .objectives
+            .first_mut()
+            .expect("Plage00 has at least one objective");
+        first_objective.completed = !first_objective.completed;
+        first_objective.primary = !first_objective.primary;
         // One restore, before the first ticked step — the same point the `--play` host applies
         // it (`setup_inner`, after `Session::open`). FirstFrame runs later, on the MapInfo's
         // first Timer tick, and must not overwrite the restored fields.
@@ -2985,6 +3544,16 @@ mod tests {
         session
             .restore_checkpoint(&saved)
             .expect("apply checkpoint once before the first step");
+        assert!(
+            session.events.iter().any(|(_, event)| matches!(
+                event,
+                xiii_script::PresentationEvent::PlayMusic(music)
+                    if music.sound.as_deref() == saved.sound_to_launch.as_deref()
+            )),
+            "AcceptInventory did not emit saved SoundToLaunch={:?}: {:?}",
+            saved.sound_to_launch,
+            session.events
+        );
         assert_eq!(
             session.vm().get_property(game_info, "CheckpointNumber"),
             Some(&Value::Int(7)),
@@ -3206,12 +3775,14 @@ mod tests {
             source.step(1.0 / 60.0, loc, 0., [0.; 3], &PlayerVMModes::default());
         }
         let event = source.saves.back().expect("checkpoint event").1.clone();
-        let saved = source.checkpoint_snapshot(
-            "Plage00",
-            &event,
-            source.player_location().expect("live player position"),
-            source.player_rotation().expect("live player rotation"),
-        );
+        let saved = source
+            .checkpoint_snapshot(
+                "Plage00",
+                &event,
+                source.player_location().expect("live player position"),
+                source.player_rotation().expect("live player rotation"),
+            )
+            .expect("snapshot checkpoint save");
         let dir = std::env::temp_dir().join(format!("xiii-corpus-save-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         crate::save::write(&dir, 0, &saved).expect("write checkpoint file");
