@@ -1690,6 +1690,23 @@ fn level_info_inc_attaque(
     val(Value::Void)
 }
 
+/// `LevelInfo.GetPlateForme() -> int`: the platform the game runs on.
+///
+/// Engine.dll `?execGetPlateForme@ALevelInfo` (VA 0x103df410) returns the `int` at offset 0x7c of
+/// `GSys` (Core's `USystem`), the `[Core.System] PlateForm` setting: `Default.ini` ships
+/// `PlateForm=0`. Scripts compare it with 1/2/3 for the console builds (e.g. `XIIIPawn` damage
+/// feedback, `XIIIBaseHud`); the PC value is 0.
+fn level_info_get_plate_forme(
+    _vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    val(Value::Int(PLATFORM_PC))
+}
+
+/// `[Core.System] PlateForm` of the shipped PC `Default.ini` (read by `GetPlateForme`).
+const PLATFORM_PC: i32 = 0;
+
 /// `LevelInfo.DecAttaque()` (native 588, static). The matching `IncAttaque` implementation is
 /// item14b's visible Partial; this records the inverse counter operation at the exact decoded
 /// call site. The game's shared alarm/attack counter is not modelled, so this is deliberately a
@@ -4794,6 +4811,12 @@ fn builtin_defs() -> Vec<NativeDef> {
             level_info_inc_attaque,
         )
     });
+    v.push(def(
+        "Engine.LevelInfo.GetPlateForme",
+        "native(0) native function int GetPlateForme()",
+        "Engine.dll ?execGetPlateForme@ALevelInfo VA 0x103df410: returns GSys+0x7c ([Core.System] PlateForm, 0 in the shipped Default.ini)",
+        level_info_get_plate_forme,
+    ));
     // item19: complete the BaseSoldier.Died alert-level-2 path paired with item14b's IncAttaque.
     // The VM records the decrement visibly while the retail alarm counter/network is unresolved.
     v.push(NativeDef {
