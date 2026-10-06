@@ -172,7 +172,8 @@ xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
                        (triggered emitters start inactive); `all` forces every emitter on
                        (inspection). Default `default`.
   --video FILE         Play a Bink 1 cutscene with the clean-room decoder at the file's fps.
-                       Requires --game-dir (for the binkw32.dll tables). Exits after
+                       Uses --game-dir for the binkw32.dll tables, or the installation
+                       containing the file's Video folder when omitted. Exits after
                        --exit-after-secs and/or writes --screenshot.
   --menu               Front-end menu: load the entry map and run the game's menu classes
                        (`XIDInterf.XIIIRootWindow` / `XIIIMenu`) through the VM, draw them

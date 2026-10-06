@@ -329,20 +329,32 @@ impl BikFile {
         let mut o = start;
         let mut packets = Vec::with_capacity(self.audio.len());
         for (t, _track) in self.audio.iter().enumerate() {
-            if o + 8 > end {
+            if o + 4 > end {
                 return Err(VideoError::at(
                     VideoErrorKind::Truncated,
                     o as u64,
                     format!("frame {frame}: audio header {t} runs past the frame"),
                 ));
             }
+            // A zero length means "no audio for this track in this frame": only the length
+            // word is present (measured: `ubi.bik` frame 5 stores length 0 and its video
+            // payload starts right after that word; skipping a sample-count word as well
+            // desynchronised the video plane).
             let len_plus4 = u32_at(data, o)?;
-            let samples = u32_at(data, o + 4)?;
-            o += 8;
+            o += 4;
             if len_plus4 == 0 {
                 packets.push(None);
                 continue;
             }
+            if o + 4 > end {
+                return Err(VideoError::at(
+                    VideoErrorKind::Truncated,
+                    o as u64,
+                    format!("frame {frame}: audio sample count {t} runs past the frame"),
+                ));
+            }
+            let samples = u32_at(data, o)?;
+            o += 4;
             // The stored length counts the four-byte sample-count word as well.
             let payload = u64::from(len_plus4).saturating_sub(4);
             let payload = payload.min((end - o) as u64);
@@ -439,6 +451,49 @@ mod tests {
         }
         d.resize(data_start + frames as usize * 2, 0);
         d
+    }
+
+    /// A one-track container whose frame payloads are given verbatim.
+    fn with_payloads(payloads: &[Vec<u8>]) -> Vec<u8> {
+        let n = payloads.len() as u32;
+        let mut d = synth(n, 1, n);
+        let table_base = 44 + 12;
+        let data_start = table_base + (payloads.len() + 1) * 4;
+        d.truncate(data_start);
+        let mut off = data_start;
+        for (i, p) in payloads.iter().enumerate() {
+            let v = if i == 0 { off as u32 | 1 } else { off as u32 };
+            d[table_base + i * 4..table_base + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            d.extend_from_slice(p);
+            off += p.len();
+        }
+        let end = off as u32;
+        let i = payloads.len();
+        d[table_base + i * 4..table_base + i * 4 + 4].copy_from_slice(&end.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn zero_length_audio_has_no_sample_count_word() {
+        let mut f0 = Vec::new();
+        f0.extend_from_slice(&8u32.to_le_bytes()); // audio length incl. sample count
+        f0.extend_from_slice(&99u32.to_le_bytes()); // sample count
+        f0.extend_from_slice(&[1, 2, 3, 4]); // audio bytes
+        f0.extend_from_slice(&[0xA0, 0xA1, 0xA2, 0xA3]); // video
+        let mut f1 = Vec::new();
+        f1.extend_from_slice(&0u32.to_le_bytes()); // no audio
+        f1.extend_from_slice(&[0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5]); // video
+        let d = with_payloads(&[f0, f1]);
+        let bik = BikFile::parse(&d).unwrap();
+        let p0 = bik.frame_packets(&d, 0).unwrap();
+        let a = p0.audio[0].as_ref().unwrap();
+        assert_eq!((a.size, a.samples), (4, 99));
+        assert_eq!(p0.video_size, 4);
+        assert_eq!(d[p0.video_offset as usize], 0xA0);
+        let p1 = bik.frame_packets(&d, 1).unwrap();
+        assert!(p1.audio[0].is_none());
+        assert_eq!(p1.video_size, 6);
+        assert_eq!(d[p1.video_offset as usize], 0xB0);
     }
 
     #[test]

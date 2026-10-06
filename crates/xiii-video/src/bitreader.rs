@@ -60,28 +60,30 @@ impl<'a> BitReader<'a> {
             self.bit_pos = self.data.len() * 8;
             return 0;
         }
-        let mut v: u32 = 0;
-        for i in 0..n {
-            let p = self.bit_pos + i;
-            let bit = (self.data[p >> 3] >> (p & 7)) & 1;
-            v |= u32::from(bit) << i;
-        }
+        let v = self.gather(n);
         self.bit_pos += n;
         v
     }
 
-    /// Peeks `n` bits (`n <= 32`) without consuming them. A short peek returns 0.
+    /// Peeks `n` bits (`n <= 32`) without consuming them. Bits past the end read as zero.
     pub fn peek(&self, n: usize) -> u32 {
-        if n == 0 || self.short(n) {
+        if n == 0 {
             return 0;
         }
-        let mut v: u32 = 0;
-        for i in 0..n {
-            let p = self.bit_pos + i;
-            let bit = (self.data[p >> 3] >> (p & 7)) & 1;
-            v |= u32::from(bit) << i;
+        self.gather(n)
+    }
+
+    /// Collects `n <= 32` bits at the cursor; bytes past the end contribute zeros.
+    fn gather(&self, n: usize) -> u32 {
+        let byte = self.bit_pos >> 3;
+        let shift = self.bit_pos & 7;
+        let mut word = [0u8; 8];
+        let avail = self.data.len().saturating_sub(byte).min(8);
+        if avail > 0 {
+            word[..avail].copy_from_slice(&self.data[byte..byte + avail]);
         }
-        v
+        let v = u64::from_le_bytes(word) >> shift;
+        (v & ((1u64 << n) - 1)) as u32
     }
 
     /// Reads one bit.
@@ -139,6 +141,15 @@ mod tests {
         let data = [0xFF];
         let mut r = BitReader::new(&data);
         assert_eq!(r.read_signed(4), -1);
+    }
+
+    #[test]
+    fn peek_past_end_reads_zero_bits() {
+        let data = [0xFFu8];
+        let mut r = BitReader::new(&data);
+        r.skip(4);
+        assert_eq!(r.peek(8), 0x0F);
+        assert_eq!(r.bits_read(), 4);
     }
 
     #[test]

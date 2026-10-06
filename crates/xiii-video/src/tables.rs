@@ -60,14 +60,21 @@ pub struct BinkTables {
     pub huffman_tables: Vec<Vec<u8>>,
     /// Lookup width (in bits) for each precomputed Huffman table.
     pub tree_maxbits: [u8; 16],
+    /// Run lengths of the RLE bundle symbols 12..=15, stored directly after the width table
+    /// (the RLE refill at `0x3001c311` indexes `width_table + 4 + symbol`).
+    pub rle_runs: [u8; 4],
     /// Run-fill scan patterns.
     pub patterns: Patterns,
     /// Two-colour pattern masks read from the RAD DLL.
     pub binary_patterns: BinaryPatterns,
     /// DCT coefficient scan order.
     pub scan: [u8; 64],
-    /// Dequantisation tables.
+    /// Intra-block dequantisation tables (first matching family in the DLL; used by the 8x8
+    /// intra DCT routine at `0x3001dd68`, which indexes `0x3004b2c0 + q * 256`).
     pub quant: QuantTables,
+    /// Inter-block dequantisation tables (second matching family; used by the inter DCT add
+    /// routine `0x30020500`, which indexes `0x3004d300 + q * 256`).
+    pub quant_inter: QuantTables,
     /// Size in bytes of the DLL the tables were read from.
     pub dll_size: u64,
     /// FNV-1a 64-bit hash of the DLL bytes (diagnostics only; not an authentication).
@@ -119,22 +126,26 @@ impl BinkTables {
         let huffman_offset = find_huffman_lengths(bytes)?;
         let patterns_offset = find_patterns(bytes)?;
         let scan = find_scan_from_patterns(bytes, patterns_offset)?;
-        let quant_offset = find_quant(bytes)?;
+        let (quant_offset, quant_inter_offset) = find_quant_pair(bytes)?;
         let (tree_maxbits, tree_offset) = find_tree_tables(bytes)?;
         let binary_pattern_offset = find_binary_patterns(bytes)?;
         let huffman = read_huffman(bytes, huffman_offset);
         let huffman_tables = read_tree_tables(bytes, tree_offset, &tree_maxbits);
+        let rle_runs = read_rle_runs(bytes, tree_offset, &tree_maxbits)?;
         let patterns = read_patterns(bytes, patterns_offset);
         let quant = read_quant(bytes, quant_offset);
+        let quant_inter = read_quant(bytes, quant_inter_offset);
         let binary_patterns = read_binary_patterns(bytes, binary_pattern_offset);
         Ok(BinkTables {
             huffman_lengths: huffman,
             huffman_tables,
             tree_maxbits,
+            rle_runs,
             patterns,
             binary_patterns,
             scan,
             quant,
+            quant_inter,
             dll_size: bytes.len() as u64,
             dll_fnv1a: fnv1a64(bytes),
         })
@@ -319,9 +330,54 @@ pub fn expected_quant_first_column() -> [i32; 16] {
 }
 
 /// Finds the 16x64 `i32` quantisation tables by their documented scale sequence.
+///
+/// Returns the first matching family (the intra tables).
 pub fn find_quant(dll: &[u8]) -> Result<usize> {
+    let all = find_quant_all(dll);
+    all.first().copied().ok_or_else(|| {
+        VideoError::new(
+            VideoErrorKind::TableNotFound,
+            "quantisation tables not found in binkw32.dll",
+        )
+    })
+}
+
+/// Finds the intra and the inter quantisation families.
+///
+/// The shipped decoder keeps two distinct 16x64 families with the same first column (the
+/// documented quantiser scale): the intra DCT routine reads the first, the inter DCT add
+/// routine the second (see [`BinkTables::quant_inter`]). Both must be present, must not
+/// overlap and must differ.
+pub fn find_quant_pair(dll: &[u8]) -> Result<(usize, usize)> {
+    let all = find_quant_all(dll);
+    let first = *all.first().ok_or_else(|| {
+        VideoError::new(
+            VideoErrorKind::TableNotFound,
+            "quantisation tables not found in binkw32.dll",
+        )
+    })?;
+    let second = all
+        .iter()
+        .copied()
+        .find(|&o| o >= first + 16 * 256)
+        .ok_or_else(|| {
+            VideoError::new(
+                VideoErrorKind::TableNotFound,
+                "second (inter) quantisation table family not found in binkw32.dll",
+            )
+        })?;
+    if dll[first..first + 16 * 256] == dll[second..second + 16 * 256] {
+        return Err(VideoError::new(
+            VideoErrorKind::BadTable,
+            "intra and inter quantisation families are identical",
+        ));
+    }
+    Ok((first, second))
+}
+
+fn find_quant_all(dll: &[u8]) -> Vec<usize> {
     let expected = expected_quant_first_column();
-    let mut offset = None;
+    let mut found = Vec::new();
     let stride = 64 * 4; // 64 i32
     for b in 0..dll.len().saturating_sub(16 * stride) {
         let mut ok = true;
@@ -333,26 +389,13 @@ pub fn find_quant(dll: &[u8]) -> Result<usize> {
                 break;
             }
         }
-        if !ok {
-            continue;
-        }
         // Invariant: every entry is positive and the tables are scaled copies of each other
         // (cross products agree, ignoring rounding).
-        if !quant_tables_are_scaled(dll, b) {
-            continue;
-        }
-        // The same table (or an overlapping copy) can occur more than once; the first match is
-        // the canonical one.
-        if offset.is_none() {
-            offset = Some(b);
+        if ok && quant_tables_are_scaled(dll, b) {
+            found.push(b);
         }
     }
-    offset.ok_or_else(|| {
-        VideoError::new(
-            VideoErrorKind::TableNotFound,
-            "quantisation tables not found in binkw32.dll",
-        )
-    })
+    found
 }
 
 fn quant_tables_are_scaled(dll: &[u8], base: usize) -> bool {
@@ -461,6 +504,33 @@ pub fn find_tree_tables(dll: &[u8]) -> Result<([u8; 16], usize)> {
     })
 }
 
+/// Reads the four RLE run lengths that follow the lookup-width table.
+///
+/// Invariant: each run is a positive multiple of four (the refill writes runs in 4-byte units,
+/// `0x3001c327..0x3001c337`) and the runs are strictly increasing.
+fn read_rle_runs(dll: &[u8], start: usize, widths: &[u8; 16]) -> Result<[u8; 4]> {
+    let total: usize = widths.iter().map(|&b| 1usize << b).sum();
+    let at = start + total + 8 + 16;
+    let runs: [u8; 4] = dll
+        .get(at..at + 4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| {
+            VideoError::new(
+                VideoErrorKind::TableNotFound,
+                "RLE run-length table past the end of binkw32.dll",
+            )
+        })?;
+    let ok = runs.iter().all(|&r| r != 0 && r % 4 == 0 && r <= 64)
+        && runs.windows(2).all(|w| w[0] < w[1]);
+    if !ok {
+        return Err(VideoError::new(
+            VideoErrorKind::BadTable,
+            format!("RLE run-length table {runs:?} fails its invariant"),
+        ));
+    }
+    Ok(runs)
+}
+
 fn read_tree_tables(dll: &[u8], start: usize, widths: &[u8; 16]) -> Vec<Vec<u8>> {
     let mut out = Vec::with_capacity(16);
     let mut p = start;
@@ -550,7 +620,7 @@ mod tests {
     /// Builds a synthetic buffer containing a planted Huffman length table, pattern table,
     /// scan permutation and quant tables, at known offsets with padding.
     fn plant() -> (Vec<u8>, usize, usize, usize) {
-        let mut dll = vec![0u8; 8192];
+        let mut dll = vec![0u8; 16384];
 
         let huff_at = 100usize;
         // Row 0: all fours. Rows 1..: a complete prefix code (use all length 4 again).
@@ -574,22 +644,25 @@ mod tests {
 
         let quant_at = 2000usize;
         let expected = expected_quant_first_column();
-        for q in 0..16 {
-            for i in 0..64 {
-                let v = if i == 0 {
-                    expected[q]
-                } else {
-                    // A positive base matrix scaled by the quantiser ratio.
-                    (1000.0 * QUANTISERS[q] / QUANTISERS[0] + 0.5).floor() as i32 * (i as i32 + 1)
-                };
-                dll[quant_at + q * 256 + i * 4..quant_at + q * 256 + i * 4 + 4]
-                    .copy_from_slice(&v.to_le_bytes());
+        // Two families (intra, then inter) with the same first column but different bases.
+        for (family, base) in [(quant_at, 1000.0), (quant_at + 4096 + 32, 1300.0)] {
+            for q in 0..16 {
+                for i in 0..64 {
+                    let v = if i == 0 {
+                        expected[q]
+                    } else {
+                        // A positive base matrix scaled by the quantiser ratio.
+                        (base * QUANTISERS[q] / QUANTISERS[0] + 0.5).floor() as i32 * (i as i32 + 1)
+                    };
+                    dll[family + q * 256 + i * 4..family + q * 256 + i * 4 + 4]
+                        .copy_from_slice(&v.to_le_bytes());
+                }
             }
         }
 
         // Precomputed Huffman lookup tables: 16 tables of 16 bytes (width 4), then eight zeros,
         // then the width table.
-        let tree_at = 6200usize;
+        let tree_at = 12200usize;
         for t in 0..16 {
             for i in 0..16 {
                 dll[tree_at + t * 16 + i] = 0x40 + i as u8;
@@ -599,7 +672,9 @@ mod tests {
         for i in 0..16 {
             dll[widths_at + i] = 4;
         }
-        let binary_at = 6600usize;
+        // Synthetic RLE run lengths (any increasing multiples of four).
+        dll[widths_at + 16..widths_at + 20].copy_from_slice(&[4, 8, 16, 20]);
+        let binary_at = 12600usize;
         for i in 0..16usize {
             let mut mask = 0u32;
             for bit in 0..4 {
@@ -620,14 +695,16 @@ mod tests {
         let scan = find_scan_from_patterns(&dll, pat).unwrap();
         assert!(is_perm64(&scan));
         assert_eq!(find_quant(&dll).unwrap(), quant);
-        assert_eq!(find_binary_patterns(&dll).unwrap(), 6600);
+        assert_eq!(find_quant_pair(&dll).unwrap(), (quant, quant + 4096 + 32));
+        assert_eq!(find_binary_patterns(&dll).unwrap(), 12600);
         let (widths, tree_at) = find_tree_tables(&dll).unwrap();
         assert_eq!(widths, [4u8; 16]);
-        assert_eq!(tree_at, 6200);
+        assert_eq!(tree_at, 12200);
         let tables = BinkTables::from_dll_bytes(&dll).unwrap();
         assert_eq!(tables.huffman_lengths.rows[0], [4u8; 16]);
         assert_eq!(tables.huffman_tables.len(), 16);
         assert_eq!(tables.tree_maxbits[0], 4);
+        assert_eq!(tables.rle_runs, [4, 8, 16, 20]);
         assert_eq!(tables.binary_patterns.masks[0], 0);
         assert_eq!(tables.binary_patterns.masks[15], u32::MAX);
         assert_eq!(
@@ -652,8 +729,34 @@ mod tests {
     #[test]
     fn corrupt_quant_is_rejected() {
         let (mut dll, _h, _p, quant) = plant();
-        dll[quant] ^= 0xFF; // break the first column
-        assert!(find_quant(&dll).is_err());
+        dll[quant] ^= 0xFF; // break the first column of the intra family
+        // Only one family is left, so the intra/inter pair cannot be formed.
+        assert!(find_quant_pair(&dll).is_err());
+        assert_ne!(find_quant(&dll).ok(), Some(quant));
+    }
+
+    #[test]
+    fn bad_rle_runs_are_rejected() {
+        let (mut dll, _h, _p, _q) = plant();
+        let widths_at = 12200 + 16 * 16 + 8;
+        dll[widths_at + 17] = 6; // not a multiple of four
+        assert_eq!(
+            BinkTables::from_dll_bytes(&dll).unwrap_err().kind(),
+            VideoErrorKind::BadTable
+        );
+    }
+
+    #[test]
+    fn missing_inter_family_is_reported() {
+        let (mut dll, _h, _p, quant) = plant();
+        // Break the second family's first column; the intra family alone must not suffice.
+        let second = quant + 4096 + 32;
+        dll[second] ^= 0xFF;
+        assert_eq!(
+            find_quant_pair(&dll).unwrap_err().kind(),
+            VideoErrorKind::TableNotFound
+        );
+        assert_eq!(find_quant(&dll).unwrap(), quant);
     }
 
     #[test]

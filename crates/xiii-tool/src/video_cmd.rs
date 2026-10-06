@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use xiii_video::container::BikFile;
-use xiii_video::{BinkTables, Decoder, VideoErrorKind};
+use xiii_video::{BinkTables, Decoder};
 
 pub const USAGE: &str = "\
   xiii-tool video info <file.bik>
@@ -23,16 +23,21 @@ pub const USAGE: &str = "\
       and dequantisation), with the structural invariant each passed.
 
   xiii-tool video frames <file.bik> --game-dir <install-root>
-          [--start K] [--count N] [--png-out DIR]
-      Decode frames K..K+N and print per-frame bit consumption and block-type
-      histogram. With --png-out, write each frame as RGBA8 PNG. Refuses to write
-      PNGs inside the installation.
+          [--start K] [--count N] [--png-out DIR] [--yuv-out FILE]
+      Decode frames 0..K+N (frames before K are decoded as references but not
+      printed) and print per-frame bit consumption and block-type histogram.
+      With --png-out, write each frame K.. as RGBA8 PNG; with --yuv-out, append
+      each frame K.. as raw display-size yuv420p. Refuses to write inside the
+      installation.
 
-  xiii-tool video validate <install-root> [--limit N] [--all]
+  xiii-tool video validate <install-root> [--limit N] [--all] [--psnr-ref DIR]
       Read every Video/*.bik under the installation, load the DLL tables once and
       decode frames sequentially (all frames unless --limit N). Prints per-file
-      decoded frames, errors, bit consumption and decode fps. Exits 1 on any
-      decode error or missing table.
+      decoded frames, errors, bit consumption, plane slack and decode fps. With
+      --psnr-ref, DIR holds black-box oracle frames per file (<stem>.frames: frame
+      numbers; <stem>.yuv: those frames as display-size yuv420p) and the sampled
+      frames are compared (exact match or PSNR). Exits 1 on any decode error,
+      plane overrun, missing reference sample or missing table.
 
 Run with no subcommand for this help.";
 
@@ -172,8 +177,18 @@ fn tables(args: &[String]) -> ExitCode {
                 is_permutation(&t.scan)
             );
             println!(
-                "quant: q0[0]={} q15[0]={} q0[63]={}",
+                "quant (intra): q0[0]={} q15[0]={} q0[63]={}",
                 t.quant.tables[0][0], t.quant.tables[15][0], t.quant.tables[0][63]
+            );
+            println!(
+                "quant (inter): q0[0]={} q15[0]={} q0[63]={}",
+                t.quant_inter.tables[0][0],
+                t.quant_inter.tables[15][0],
+                t.quant_inter.tables[0][63]
+            );
+            println!(
+                "huffman lookup widths: {:?}; rle runs: {:?}",
+                t.tree_maxbits, t.rle_runs
             );
             ExitCode::SUCCESS
         }
@@ -195,32 +210,116 @@ fn is_permutation(v: &[u8; 64]) -> bool {
     true
 }
 
+/// Aggregate results of decoding a frame range.
+#[derive(Default)]
+struct RangeResult {
+    decoded: usize,
+    bits: usize,
+    error: Option<String>,
+    max_slack_bits: usize,
+    overruns: usize,
+    stale_reads: u64,
+    noop_blocks: u64,
+    clamped_motion: u64,
+    block_types: [u64; 10],
+    sub_types: [u64; 10],
+    /// (frame, squared-error sum, sample count, exact) per compared sample.
+    samples: Vec<(usize, u64, u64, bool)>,
+}
+
+/// Oracle reference frames for a file: frame numbers plus their raw yuv420p bytes.
+struct Reference {
+    frames: Vec<usize>,
+    yuv: Vec<u8>,
+}
+
+fn load_reference(dir: &Path, stem: &str) -> Option<Reference> {
+    let list = std::fs::read_to_string(dir.join(format!("{stem}.frames"))).ok()?;
+    let frames: Vec<usize> = list
+        .split_whitespace()
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    let yuv = std::fs::read(dir.join(format!("{stem}.yuv"))).ok()?;
+    Some(Reference { frames, yuv })
+}
+
+fn yuv420_bytes(frame: &xiii_video::YuvFrame) -> Vec<u8> {
+    let mut v = Vec::new();
+    let _ = write_yuv420(&mut v, frame);
+    v
+}
+
 fn decode_range(
     decoder: &Decoder,
     bik: &BikFile,
     data: &[u8],
-    start: usize,
     count: usize,
-) -> (usize, Vec<usize>, Option<String>) {
+    reference: Option<&Reference>,
+) -> RangeResult {
+    let mut r = RangeResult::default();
     let mut prev = None;
-    let mut decoded = 0usize;
-    let mut bits = Vec::new();
-    let end = (start + count).min(bik.frame_count());
-    for i in start..end {
+    let end = count.min(bik.frame_count());
+    for i in 0..end {
         let video = match xiii_video::frame_video(data, bik, i) {
             Ok(v) => v,
-            Err(e) => return (decoded, bits, Some(e.to_string())),
+            Err(e) => {
+                r.error = Some(e.to_string());
+                return r;
+            }
         };
         match decoder.decode_frame(video, &bik.header, prev.as_ref()) {
             Ok((frame, stats)) => {
-                bits.push(stats.bits_used);
+                r.bits += stats.bits_used;
+                r.max_slack_bits = r.max_slack_bits.max(stats.max_plane_slack_bits);
+                r.overruns += usize::from(stats.plane_overrun);
+                r.stale_reads += stats.stale_reads;
+                r.noop_blocks += stats.noop_blocks;
+                r.clamped_motion += stats.clamped_motion;
+                for k in 0..10 {
+                    r.block_types[k] += stats.block_type_counts[k];
+                    r.sub_types[k] += stats.sub_type_counts[k];
+                }
+                if let Some(rf) = reference
+                    && let Some(k) = rf.frames.iter().position(|&f| f == i)
+                {
+                    let ours = yuv420_bytes(&frame);
+                    let n = ours.len();
+                    match rf.yuv.get(k * n..(k + 1) * n) {
+                        Some(theirs) => {
+                            let se: u64 = ours
+                                .iter()
+                                .zip(theirs)
+                                .map(|(&a, &b)| {
+                                    let d = i64::from(a) - i64::from(b);
+                                    (d * d) as u64
+                                })
+                                .sum();
+                            r.samples.push((i, se, n as u64, ours == theirs));
+                        }
+                        None => {
+                            r.error = Some(format!("reference has no sample for frame {i}"));
+                            return r;
+                        }
+                    }
+                }
                 prev = Some(frame);
-                decoded += 1;
+                r.decoded += 1;
             }
-            Err(e) => return (decoded, bits, Some(format!("frame {i}: {e}"))),
+            Err(e) => {
+                r.error = Some(format!("frame {i}: {e}"));
+                return r;
+            }
         }
     }
-    (decoded, bits, None)
+    r
+}
+
+fn psnr(se: u64, n: u64) -> f64 {
+    if se == 0 {
+        f64::INFINITY
+    } else {
+        10.0 * (255.0f64 * 255.0 * n as f64 / se as f64).log10()
+    }
 }
 
 fn frames(args: &[String]) -> ExitCode {
@@ -229,6 +328,7 @@ fn frames(args: &[String]) -> ExitCode {
     let mut start = 0usize;
     let mut count = 1usize;
     let mut png_out: Option<PathBuf> = None;
+    let mut yuv_out: Option<PathBuf> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -246,6 +346,7 @@ fn frames(args: &[String]) -> ExitCode {
                 };
             }
             "--png-out" => png_out = it.next().map(PathBuf::from),
+            "--yuv-out" => yuv_out = it.next().map(PathBuf::from),
             s if s.starts_with("--") => return usage_error(&format!("unknown option '{s}'")),
             s if file.is_none() => file = Some(PathBuf::from(s)),
             s => return usage_error(&format!("unexpected argument '{s}'")),
@@ -272,20 +373,31 @@ fn frames(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if let Some(out) = &png_out
-        && inside(out, &game_dir)
-    {
-        eprintln!(
-            "error: refusing to write PNGs inside the installation ({})",
-            out.display()
-        );
-        return ExitCode::from(2);
+    for out in png_out.iter().chain(yuv_out.iter()) {
+        if inside(&out.join("x"), &game_dir) || inside(out, &game_dir) {
+            eprintln!(
+                "error: refusing to write inside the installation ({})",
+                out.display()
+            );
+            return ExitCode::from(2);
+        }
     }
+    let mut yuv_file = match &yuv_out {
+        Some(p) => match std::fs::File::create(p) {
+            Ok(f) => Some(std::io::BufWriter::new(f)),
+            Err(e) => {
+                eprintln!("error: cannot create {}: {e}", p.display());
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
     let decoder = Decoder::new(tables);
     let started = Instant::now();
     let mut prev = None;
     let mut decoded = 0usize;
-    for i in start..(start + count).min(bik.frame_count()) {
+    let mut reported = 0usize;
+    for i in 0..(start + count).min(bik.frame_count()) {
         let video = match xiii_video::frame_video(&data, &bik, i) {
             Ok(v) => v,
             Err(e) => {
@@ -294,17 +406,30 @@ fn frames(args: &[String]) -> ExitCode {
             }
         };
         match decoder.decode_frame(video, &bik.header, prev.as_ref()) {
+            Ok((frame, _stats)) if i < start => {
+                prev = Some(frame);
+                decoded += 1;
+            }
             Ok((frame, stats)) => {
-                let rgba = frame.to_rgba();
                 println!(
-                    "frame {i}: {}x{} bits {}/{} block-types {:?}",
+                    "frame {i}: {}x{} bits {}/{} block-types {:?} noop {} stale {} clamped-mv {}",
                     frame.width,
                     frame.height,
                     stats.bits_used,
                     stats.bits_total,
-                    stats.block_type_counts
+                    stats.block_type_counts,
+                    stats.noop_blocks,
+                    stats.stale_reads,
+                    stats.clamped_motion
                 );
+                if let Some(f) = yuv_file.as_mut()
+                    && let Err(e) = write_yuv420(f, &frame)
+                {
+                    eprintln!("error: cannot write YUV: {e}");
+                    return ExitCode::from(2);
+                }
                 if let Some(dir) = &png_out {
+                    let rgba = frame.to_rgba();
                     let path = dir.join(format!("{}_{i:05}.png", stem(&file)));
                     if let Err(e) = write_png(&path, &rgba, frame.width, frame.height) {
                         eprintln!("error: cannot write {}: {e}", path.display());
@@ -313,6 +438,7 @@ fn frames(args: &[String]) -> ExitCode {
                 }
                 prev = Some(frame);
                 decoded += 1;
+                reported += 1;
             }
             Err(e) => {
                 eprintln!("error: frame {i}: {e}");
@@ -321,7 +447,7 @@ fn frames(args: &[String]) -> ExitCode {
         }
     }
     println!(
-        "decoded {decoded} frame(s) in {:.3}s ({:.1} fps)",
+        "decoded {decoded} frame(s) ({reported} reported) in {:.3}s ({:.1} fps)",
         started.elapsed().as_secs_f64(),
         decoded as f64 / started.elapsed().as_secs_f64().max(1e-9)
     );
@@ -368,9 +494,11 @@ fn find_bik_files(root: &Path) -> Vec<PathBuf> {
 fn validate(args: &[String]) -> ExitCode {
     let mut root = None;
     let mut limit: Option<usize> = None;
+    let mut psnr_ref: Option<PathBuf> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--psnr-ref" => psnr_ref = it.next().map(PathBuf::from),
             "--limit" => {
                 limit = it.next().and_then(|v| v.parse().ok());
                 if limit.is_none() {
@@ -410,15 +538,17 @@ fn validate(args: &[String]) -> ExitCode {
     let mut failures = 0usize;
     let mut total_frames = 0usize;
     let mut total_errors = 0usize;
+    let mut block_types = [0u64; 10];
+    let mut sub_types = [0u64; 10];
     println!(
-        "{:<16} {:>7} {:>7} {:>10} {:>9} {:>9}  note",
-        "file", "frames", "decoded", "bits", "secs", "fps"
+        "{:<8} {:>6} {:>7} {:>11} {:>5} {:>5} {:>5} {:>5} {:>6} {:>7}  per-sample result / note",
+        "file", "frames", "decoded", "bits", "slack", "ovrun", "stale", "noop", "fps", "exact",
     );
     for path in &files {
         let data = match std::fs::read(path) {
             Ok(d) => d,
             Err(e) => {
-                println!("{:<16} ERROR cannot read: {e}", stem(path));
+                println!("{:<8} ERROR cannot read: {e}", stem(path));
                 failures += 1;
                 continue;
             }
@@ -426,44 +556,124 @@ fn validate(args: &[String]) -> ExitCode {
         let bik = match BikFile::parse(&data) {
             Ok(b) => b,
             Err(e) => {
-                println!("{:<16} ERROR container: {e}", stem(path));
+                println!("{:<8} ERROR container: {e}", stem(path));
                 failures += 1;
                 continue;
             }
         };
+        let reference = psnr_ref
+            .as_deref()
+            .and_then(|d| load_reference(d, &stem(path)));
+        if psnr_ref.is_some() && reference.is_none() {
+            println!(
+                "{:<8} ERROR no oracle reference in the --psnr-ref directory",
+                stem(path)
+            );
+            failures += 1;
+            continue;
+        }
         let count = limit.unwrap_or(bik.frame_count());
         let started = Instant::now();
-        let (decoded, bits, err) = decode_range(&decoder, &bik, &data, 0, count);
+        let r = decode_range(&decoder, &bik, &data, count, reference.as_ref());
         let secs = started.elapsed().as_secs_f64();
-        let bits_used: usize = bits.iter().sum();
-        total_frames += decoded;
-        if err.is_some() {
+        total_frames += r.decoded;
+        for k in 0..10 {
+            block_types[k] += r.block_types[k];
+            sub_types[k] += r.sub_types[k];
+        }
+        let mut bad = r.error.is_some() || r.overruns > 0;
+        if r.error.is_some() {
             total_errors += 1;
+        }
+        let mut note = String::new();
+        if let Some(rf) = &reference {
+            let wanted = rf.frames.iter().filter(|&&f| f < count).count();
+            if r.samples.len() != wanted {
+                bad = true;
+            }
+            for (f, se, n, exact) in &r.samples {
+                if *exact {
+                    let _ = write!(note, "{f}:exact ");
+                } else {
+                    let _ = write!(note, "{f}:{:.2}dB ", psnr(*se, *n));
+                }
+            }
+        }
+        if let Some(e) = &r.error {
+            note.push_str(e);
+        }
+        if bad {
             failures += 1;
         }
+        let exact = format!(
+            "{}/{}",
+            r.samples.iter().filter(|s| s.3).count(),
+            r.samples.len()
+        );
         println!(
-            "{:<16} {:>7} {:>7} {:>10} {:>9.3} {:>9.1}  {}",
+            "{:<8} {:>6} {:>7} {:>11} {:>5} {:>5} {:>5} {:>5} {:>6.0} {:>7}  {}",
             stem(path),
             bik.frame_count(),
-            decoded,
-            bits_used,
-            secs,
-            decoded as f64 / secs.max(1e-9),
-            err.as_deref().unwrap_or("ok")
+            r.decoded,
+            r.bits,
+            r.max_slack_bits,
+            r.overruns,
+            r.stale_reads,
+            r.noop_blocks,
+            r.decoded as f64 / secs.max(1e-9),
+            exact,
+            if note.is_empty() {
+                "ok"
+            } else {
+                note.trim_end()
+            }
         );
+        if r.clamped_motion > 0 {
+            println!(
+                "{:<8} note: {} motion vectors left the plane and were clamped",
+                stem(path),
+                r.clamped_motion
+            );
+        }
     }
     println!(
         "summary: {} files, {total_frames} frames decoded, {total_errors} files with errors",
         files.len()
+    );
+    println!("block types 0..9: {block_types:?}");
+    println!("16x16 sub-types 0..9: {sub_types:?}");
+    println!(
+        "columns: slack = max unread bits in a size-delimited plane (<32 expected); ovrun = \
+         frames with a plane read past its size word; stale = bundle reads past decoded data; \
+         noop = blocks the shipped decoder skips; exact = sampled frames identical to the \
+         oracle / sampled frames"
     );
     if failures == 0 {
         println!("result: OK");
         ExitCode::SUCCESS
     } else {
         println!("result: FAIL ({failures} file(s))");
-        let _ = VideoErrorKind::Unsupported;
         ExitCode::from(1)
     }
+}
+
+/// Appends the display area of `frame` as planar yuv420p (chroma `(w+1)/2 x (h+1)/2`).
+fn write_yuv420(
+    out: &mut impl std::io::Write,
+    frame: &xiii_video::YuvFrame,
+) -> std::io::Result<()> {
+    for y in 0..frame.height {
+        let o = y * frame.plane_width;
+        out.write_all(&frame.y[o..o + frame.width])?;
+    }
+    let (cw, ch) = (frame.width.div_ceil(2), frame.height.div_ceil(2));
+    for plane in [&frame.u, &frame.v] {
+        for y in 0..ch {
+            let o = y * frame.chroma_width;
+            out.write_all(&plane[o..o + cw])?;
+        }
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ minimal PNG writer

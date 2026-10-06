@@ -1,16 +1,16 @@
 //! Bink 1 (revision `i`) video decoder.
 //!
-//! Structure follows the public prose descriptions cited in `README.md`: per-plane Huffman
-//! "bundles", the ten 8x8 block types, motion compensation, DCT and residue. The fixed tables
-//! (Huffman code lengths, run-fill patterns, DCT scan order, dequantisation) come from the
-//! installation's `binkw32.dll` via [`crate::tables::BinkTables`].
+//! The structure follows the public prose descriptions cited in `README.md` (per-plane Huffman
+//! "bundles", ten 8x8 block types, motion compensation, DCT and residue). Every bit-level rule
+//! was established from the disassembly of RAD's own `binkw32.dll` shipped with the game; the
+//! relevant addresses are cited next to each rule. The fixed tables (Huffman lookup tables, RLE
+//! run lengths, run-fill patterns, two-colour masks, coefficient scan order and both
+//! dequantisation families) are read from that DLL at runtime via [`crate::tables::BinkTables`].
 //!
-//! **Status:** the decoder is a clean-room implementation under validation; see
-//! `local/reports/item17b-bink-cleanroom.md` for the measured agreement with the FFmpeg
-//! black-box oracle. It never reports success for a construct it cannot decode: unknown block
-//! types or bitstream underrun return an explicit [`VideoError`].
-
-use std::sync::OnceLock;
+//! The decoder never reports success for a construct it cannot decode: bitstream underrun,
+//! a run that overshoots its bundle count, or a 16x16 block crossing the plane edge return an
+//! explicit [`VideoError`]. Constructs the shipped decoder treats as a plain advance (block
+//! types 10..15, unused 16x16 sub-types) are counted in [`FrameStats`] rather than hidden.
 
 use crate::bitreader::BitReader;
 use crate::container::Header;
@@ -18,59 +18,53 @@ use crate::error::{Result, VideoError, VideoErrorKind};
 use crate::huffman::StaticTree;
 use crate::tables::BinkTables;
 
-/// Indices of the nine bundles in plane-header order.
-mod bundle {
-    pub const BLOCK_TYPES: usize = 0;
-    pub const SUB_BLOCK_TYPES: usize = 1;
-    pub const COLORS: usize = 2;
-    pub const PATTERN: usize = 3;
-    pub const X_OFF: usize = 4;
-    pub const Y_OFF: usize = 5;
-    pub const INTRA_DC: usize = 6;
-    pub const INTER_DC: usize = 7;
-    pub const RUN: usize = 8;
-    pub const COUNT: usize = 9;
-}
-
-const IDENTITY: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-
-/// Run lengths for the 4-bit RLE bundles (public prose: MultimediaWiki *Bink Video*).
-const RUN_VALUES: [usize; 4] = [4, 8, 12, 32];
-
 /// One decoded frame in planes.
 #[derive(Debug, Clone)]
 pub struct YuvFrame {
-    /// Luma plane (plane width x plane height).
+    /// Luma plane (`plane_width` x `plane_height`).
     pub y: Vec<u8>,
-    /// Cb plane (half resolution).
+    /// First chroma plane (Cb), `chroma_width` x `chroma_height`.
     pub u: Vec<u8>,
-    /// Cr plane (half resolution).
+    /// Second chroma plane (Cr), `chroma_width` x `chroma_height`.
     pub v: Vec<u8>,
     /// Alpha plane at luma resolution, when present.
     pub a: Option<Vec<u8>>,
-    /// Luma width in pixels (8-aligned).
+    /// Display width in pixels (header width).
     pub width: usize,
-    /// Luma height in pixels (8-aligned).
+    /// Display height in pixels (header height).
     pub height: usize,
+    /// Luma plane width (display width rounded up to 8).
+    pub plane_width: usize,
+    /// Luma plane height (display height rounded up to 8).
+    pub plane_height: usize,
+    /// Chroma plane width (`(width + 1) / 2` rounded up to 8).
+    pub chroma_width: usize,
+    /// Chroma plane height (`(height + 1) / 2` rounded up to 8).
+    pub chroma_height: usize,
 }
 
 impl YuvFrame {
-    /// Converts to tightly packed RGBA8 using full-range BT.601 (labelled approximation).
+    /// Converts the display area to tightly packed RGBA8.
+    ///
+    /// Matrix (labelled assumption): ITU-R BT.601, limited ("TV") range, 4:2:0 nearest-sample
+    /// chroma. This is how the FFmpeg black-box oracle presents Bink output; RAD's own
+    /// YUV->RGB blitters were not analysed.
     pub fn to_rgba(&self) -> Vec<u8> {
         let mut out = vec![0u8; self.width * self.height * 4];
-        let cw = self.width / 2;
         for yy in 0..self.height {
             for xx in 0..self.width {
-                let yi = yy * self.width + xx;
-                let y = f32::from(self.y[yi]);
-                let ci = (yy / 2) * cw + xx / 2;
-                let u = f32::from(self.u[ci]) - 128.0;
-                let v = f32::from(self.v[ci]) - 128.0;
-                let o = yi * 4;
+                let y = (f32::from(self.y[yy * self.plane_width + xx]) - 16.0) * (255.0 / 219.0);
+                let ci = (yy / 2) * self.chroma_width + xx / 2;
+                let u = (f32::from(self.u[ci]) - 128.0) * (255.0 / 224.0);
+                let v = (f32::from(self.v[ci]) - 128.0) * (255.0 / 224.0);
+                let o = (yy * self.width + xx) * 4;
                 out[o] = clamp8(y + 1.402 * v);
                 out[o + 1] = clamp8(y - 0.344_136 * u - 0.714_136 * v);
                 out[o + 2] = clamp8(y + 1.772 * u);
-                out[o + 3] = self.a.as_ref().map_or(255, |a| a[yi]);
+                out[o + 3] = self
+                    .a
+                    .as_ref()
+                    .map_or(255, |a| a[yy * self.plane_width + xx]);
             }
         }
         out
@@ -84,20 +78,54 @@ fn clamp8(v: f32) -> u8 {
 /// Per-frame statistics from the decoder.
 #[derive(Debug, Clone, Default)]
 pub struct FrameStats {
-    /// Bits consumed by the video payload.
+    /// Bits consumed by the video payload (all planes).
     pub bits_used: usize,
     /// Total bits available in the packet.
     pub bits_total: usize,
     /// Block types seen, indexed by type (0..=9).
     pub block_type_counts: [u64; 10],
+    /// 16x16 sub-block types seen, indexed by sub-type (values above 9 are not counted here;
+    /// like every sub-type other than 3/5/6/8/9 they also appear in `noop_blocks`).
+    pub sub_type_counts: [u64; 10],
     /// True if any block type was outside 0..=9.
     pub saw_unknown_block: bool,
+    /// Blocks the shipped decoder treats as a plain advance (types 10..15 and 16x16
+    /// sub-types outside 3/5/6/8/9); their pixels keep the previous buffer contents.
+    pub noop_blocks: u64,
+    /// Bundle values read past the decoded range of their bundle (the shipped decoder reads
+    /// stale buffer bytes there; a well-formed stream never does this).
+    pub stale_reads: u64,
+    /// Motion vectors whose source block left the plane and was clamped.
+    pub clamped_motion: u64,
+    /// Largest number of unread bits left in a plane whose extent is known (alpha and luma
+    /// from their size words, the last chroma plane from the packet end). The shipped reader
+    /// works in 32-bit words, so a correctly parsed plane leaves fewer than 32 bits.
+    pub max_plane_slack_bits: usize,
+    /// True if a plane read past its size word's extent.
+    pub plane_overrun: bool,
+}
+
+impl FrameStats {
+    fn note_extent(&mut self, used_bits: usize, extent_bytes: usize) {
+        let extent = extent_bytes * 8;
+        if used_bits > extent {
+            self.plane_overrun = true;
+        } else {
+            self.max_plane_slack_bits = self.max_plane_slack_bits.max(extent - used_bits);
+        }
+    }
 }
 
 /// The clean-room decoder.
 #[derive(Debug, Clone)]
 pub struct Decoder {
     tables: BinkTables,
+}
+
+/// Bits the plane decoder consumed from its start.
+#[derive(Debug)]
+struct PlaneResult {
+    bits: usize,
 }
 
 impl Decoder {
@@ -111,490 +139,911 @@ impl Decoder {
         &self.tables
     }
 
-    /// Decodes a full frame from `packet` (the video payload), using `prev` for motion.
+    /// Decodes a full frame from `packet` (the video payload), using `prev` as the reference.
     ///
-    /// Revision `i` prefixes the alpha (when present) and luma planes with a 32-bit byte size
-    /// (MultimediaWiki *Bink Video*: "since version 'i' there is 32-bit word containing plane
-    /// data size in bytes before alpha and luma plane"). U and V follow the luma plane with no
-    /// prefix.
+    /// Packet layout for revision `i` (frame routine `0x3001f350`): an optional alpha plane
+    /// preceded by a 32-bit size, a 32-bit size then the luma plane, then the two chroma
+    /// planes (Cr first, then Cb). Each size counts from the size word itself: chroma starts at
+    /// `luma_size_word + size` (`0x3001f413..0x3001f41a`). The second chroma plane starts at the
+    /// 32-bit word after the last word the first chroma plane's bit reader loaded (the plane
+    /// routine returns its word pointer, `0x3001f2f5`).
     pub fn decode_frame(
         &self,
         packet: &[u8],
         header: &Header,
         prev: Option<&YuvFrame>,
     ) -> Result<(YuvFrame, FrameStats)> {
-        let w = align8(header.width as usize);
-        let h = align8(header.height as usize);
-        let cw = align8(w / 2);
-        let ch = align8(h / 2);
+        let width = header.width as usize;
+        let height = header.height as usize;
+        // Plane sizes: `(w + 7) & ~7` for luma and `((w + 1) / 2 + 7) & ~7` for chroma
+        // (`0x3001f391`, `0x3001f453..0x3001f47b`).
+        let w = align8(width);
+        let h = align8(height);
+        let cw = align8(width.div_ceil(2));
+        let ch = align8(height.div_ceil(2));
         let mut stats = FrameStats {
             bits_total: packet.len() * 8,
             ..Default::default()
         };
-        // Revision `i` prefixes the alpha and luma planes with a 32-bit byte size. The plane
-        // payloads are decoded from their own byte ranges.
+        let prev = prev.filter(|p| p.plane_width == w && p.plane_height == h);
+
         let mut off = 0usize;
-        let alpha_size = if header.has_alpha() {
-            Some(read_u32(packet, &mut off)? as usize)
+        let a = if header.has_alpha() {
+            let size = read_u32(packet, off)? as usize;
+            let plane_start = off + 4;
+            let mut plane = start_plane(prev.and_then(|p| p.a.as_deref()), w * h);
+            let r = self.decode_plane(
+                packet,
+                plane_start,
+                w,
+                h,
+                prev.and_then(|p| p.a.as_deref()),
+                &mut plane,
+                &mut stats,
+            )?;
+            stats.bits_used += r.bits;
+            off = checked_plane_end(packet, off, size, "alpha")?;
+            stats.note_extent(r.bits, size - 4);
+            Some(plane)
         } else {
             None
         };
-        let y_size = read_u32(packet, &mut off)? as usize;
 
-        let mut used = 0usize;
-        let a = match alpha_size {
-            Some(sz) => {
-                let slice = slice_with_lookahead(packet, off, sz)?;
-                off += sz;
-                let mut br = BitReader::new(&slice);
-                let p = self.decode_plane(
-                    &mut br,
-                    w,
-                    h,
-                    prev.and_then(|p| p.a.as_deref()),
-                    false,
-                    &mut stats,
-                )?;
-                used += br.bits_read();
-                Some(p)
-            }
-            None => None,
-        };
-        let y_slice = slice_with_lookahead(packet, off, y_size)?;
-        off += y_size;
-        let mut ybr = BitReader::new(&y_slice);
-        let y = self.decode_plane(
-            &mut ybr,
+        let y_size = read_u32(packet, off)? as usize;
+        let mut y = start_plane(prev.map(|p| p.y.as_slice()), w * h);
+        let r = self.decode_plane(
+            packet,
+            off + 4,
             w,
             h,
             prev.map(|p| p.y.as_slice()),
-            false,
+            &mut y,
             &mut stats,
         )?;
-        used += ybr.bits_read();
+        stats.bits_used += r.bits;
+        let chroma_start = checked_plane_end(packet, off, y_size, "luma")?;
+        stats.note_extent(r.bits, y_size - 4);
 
-        let mut chroma = packet
-            .get(off..)
-            .ok_or_else(|| {
-                VideoError::new(VideoErrorKind::Truncated, "chroma plane starts past packet")
-            })?
-            .to_vec();
-        chroma.resize(chroma.len().saturating_add(24), 0);
-        let mut cbr = BitReader::new(&chroma);
-        let u = self.decode_plane(
-            &mut cbr,
-            cw,
-            ch,
-            prev.map(|p| p.u.as_slice()),
-            true,
-            &mut stats,
-        )?;
-        let v = self.decode_plane(
-            &mut cbr,
-            cw,
-            ch,
-            prev.map(|p| p.v.as_slice()),
-            true,
-            &mut stats,
-        )?;
-        used += cbr.bits_read();
+        let (u, v) = if header.has_gray() {
+            // Grayscale files have no chroma planes (`0x3001f41e`: flag 0x20000 skips them).
+            (vec![128u8; cw * ch], vec![128u8; cw * ch])
+        } else {
+            // The first coded chroma plane is Cr, the second Cb (measured: swapping them
+            // against the FFmpeg oracle turns a 22.8 dB chroma mismatch into an exact match on
+            // `ubi.bik` frame 1).
+            let mut v = start_plane(prev.map(|p| p.v.as_slice()), cw * ch);
+            let rv = self.decode_plane(
+                packet,
+                chroma_start,
+                cw,
+                ch,
+                prev.map(|p| p.v.as_slice()),
+                &mut v,
+                &mut stats,
+            )?;
+            stats.bits_used += rv.bits;
+            let u_start = chroma_start + rv.bits.div_ceil(32) * 4;
+            let mut u = start_plane(prev.map(|p| p.u.as_slice()), cw * ch);
+            let ru = self.decode_plane(
+                packet,
+                u_start,
+                cw,
+                ch,
+                prev.map(|p| p.u.as_slice()),
+                &mut u,
+                &mut stats,
+            )?;
+            stats.bits_used += ru.bits;
+            stats.note_extent(ru.bits, packet.len().saturating_sub(u_start));
+            (u, v)
+        };
 
-        stats.bits_used = used;
         Ok((
             YuvFrame {
                 y,
                 u,
                 v,
                 a,
-                width: w,
-                height: h,
+                width,
+                height,
+                plane_width: w,
+                plane_height: h,
+                chroma_width: cw,
+                chroma_height: ch,
             },
             stats,
         ))
     }
 
+    /// Decodes one plane starting at byte `start` of `packet` into `out`.
+    ///
+    /// Plane routine `0x3001d3b0`: read the tree descriptors, then for each 8-pixel block row
+    /// refill every bundle whose decoded data is used up, then walk the blocks of the row.
+    #[allow(clippy::too_many_arguments)]
     fn decode_plane(
         &self,
-        br: &mut BitReader<'_>,
+        packet: &[u8],
+        start: usize,
         w: usize,
         h: usize,
         prev: Option<&[u8]>,
-        chroma: bool,
+        out: &mut [u8],
         stats: &mut FrameStats,
-    ) -> Result<Vec<u8>> {
-        let bw = w / 8;
-        let bh = h / 8;
-        let plane_start_bit = br.bits_read();
-        let mut bundles = self.read_plane_header(br, bw, bh)?;
-        let mut out = match prev {
-            Some(p) if p.len() == w * h => p.to_vec(),
-            _ => vec![if chroma { 128 } else { 0 }; w * h],
+    ) -> Result<PlaneResult> {
+        let data = packet.get(start..).ok_or_else(|| {
+            VideoError::new(
+                VideoErrorKind::Truncated,
+                format!("plane starts at byte {start}, past packet {}", packet.len()),
+            )
+        })?;
+        let mut br = BitReader::new(data);
+        let mut b = Bundles::read_header(&mut br, w / 8, &self.tables)?;
+        let zero;
+        let prev: &[u8] = match prev {
+            Some(p) => p,
+            None => {
+                zero = vec![0u8; w * h];
+                &zero
+            }
         };
-        let mut pred_dc = 0i32;
-
-        let trace = std::env::var_os("XIII_VIDEO_TRACE_BLOCKS").is_some();
-        let mut row = 0usize;
-        while row < bh {
-            if std::env::var_os("XIII_VIDEO_TRACE_ROW").is_some() {
-                eprintln!("plane {w}x{h} row {row}/{bh} bit {}", br.bits_read());
-            }
-            let mut col = 0usize;
-            while col < bw {
-                let bt = bundles[bundle::BLOCK_TYPES].next(br)?;
-                if trace && row < 16 {
-                    eprintln!("block row={row} col={col} type={bt} bit={}", br.bits_read());
-                }
-                stats.block_type_counts[usize::from(bt.min(9))] += 1;
-                if bt > 9 {
-                    // The DLL treats block types 10..15 as a plain advance (`0x3001dad9`).
-                    stats.saw_unknown_block = true;
-                    col += 1;
-                    continue;
-                }
-                let mut advance2 = false;
-                match bt {
-                    0 => {}
-                    1 => {
-                        // The 16x16 type is encountered on both 8-pixel rows. The second row
-                        // (`y & 8`, DLL test at 0x3001e5ce) advances over the already-rendered
-                        // half without consuming another subtype.
-                        if row & 1 == 0 {
-                            let sub = bundles[bundle::SUB_BLOCK_TYPES].next(br)?;
-                            if trace && row < 16 {
-                                eprintln!("  subtype={sub} bit={}", br.bits_read());
-                            }
-                            let mut block = [0u8; 64];
-                            self.decode_scalar_block(br, &mut bundles, sub, &mut block)?;
-                            scale_block_2x(&block, &mut out, w, col * 8, row * 8);
-                        }
-                        advance2 = true;
-                    }
-                    2 => {
-                        let dx = bundles[bundle::X_OFF].next_signed(br)?;
-                        let dy = bundles[bundle::Y_OFF].next_signed(br)?;
-                        motion_copy(&mut out, w, h, col * 8, row * 8, dx, dy);
-                    }
-                    3 => {
-                        // The run block's pattern index is a raw 4-bit bitstream value
-                        // (`0x3001db7d`: `andl $0xf`), not a pattern-bundle symbol.
-                        let pattern = br.read(4) as usize;
-                        fill_run(
-                            br,
-                            &mut bundles,
-                            pattern,
-                            &self.tables.patterns.patterns,
-                            &mut out,
-                            w,
-                            col * 8,
-                            row * 8,
-                        )?;
-                    }
-                    4 => {
-                        let n_masks = br.read(7) as usize;
-                        let dx = bundles[bundle::X_OFF].next_signed(br)?;
-                        let dy = bundles[bundle::Y_OFF].next_signed(br)?;
-                        motion_copy(&mut out, w, h, col * 8, row * 8, dx, dy);
-                        let mut block = [0i16; 64];
-                        read_residue(br, &mut block, n_masks, &self.tables.scan)?;
-                        add_residue(&block, &self.tables.scan, &mut out, w, col * 8, row * 8);
-                    }
-                    5 => {
-                        let dc = bundles[bundle::INTRA_DC].next_dc(br)?;
-                        let q = br.read(4) as usize;
-                        let mut block = [0i32; 64];
-                        read_dct_coeffs(br, &mut block, &self.tables.scan)?;
-                        reconstruct(
-                            &mut block,
-                            q,
-                            &self.tables,
-                            &mut out,
-                            w,
-                            col * 8,
-                            row * 8,
-                            AddMode::Intra {
-                                dc,
-                                pred: &mut pred_dc,
-                            },
-                        );
-                    }
-                    6 => {
-                        let c = bundles[bundle::COLORS].next(br)?;
-                        fill_block(&mut out, w, col * 8, row * 8, c);
-                    }
-                    7 => {
-                        let dx = bundles[bundle::X_OFF].next_signed(br)?;
-                        let dy = bundles[bundle::Y_OFF].next_signed(br)?;
-                        motion_copy(&mut out, w, h, col * 8, row * 8, dx, dy);
-                        let dc = bundles[bundle::INTER_DC].next_dc(br)?;
-                        let q = br.read(4) as usize;
-                        let mut block = [0i32; 64];
-                        read_dct_coeffs(br, &mut block, &self.tables.scan)?;
-                        reconstruct(
-                            &mut block,
-                            q,
-                            &self.tables,
-                            &mut out,
-                            w,
-                            col * 8,
-                            row * 8,
-                            AddMode::Inter {
-                                dc,
-                                pred: &mut pred_dc,
-                            },
-                        );
-                    }
-                    8 => {
-                        let c0 = bundles[bundle::COLORS].next(br)?;
-                        let c1 = bundles[bundle::COLORS].next(br)?;
-                        pattern_fill_rows(
-                            &mut out,
-                            w,
-                            col * 8,
-                            row * 8,
-                            c0,
-                            c1,
-                            &mut bundles[bundle::PATTERN],
-                            &self.tables.binary_patterns.masks,
-                            br,
-                        )?;
-                    }
-                    9 => {
-                        for yy in 0..8 {
-                            for xx in 0..8 {
-                                let c = bundles[bundle::COLORS].next(br)?;
-                                out[(row * 8 + yy) * w + col * 8 + xx] = c;
-                            }
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-                if advance2 {
-                    col += 2;
-                } else {
-                    col += 1;
-                }
-            }
-            row += 1;
+        let plane = Plane { w, h, prev };
+        let mut at = (0usize, 0usize);
+        if let Err(e) = self.plane_rows(&mut br, &mut b, &plane, out, &mut at, stats) {
+            return Err(VideoError::new(
+                e.kind(),
+                format!(
+                    "{w}x{h} plane, block row {} col {} (bit {}): {}",
+                    at.0,
+                    at.1,
+                    br.bits_read(),
+                    e.message()
+                ),
+            ));
         }
         if br.overflowed() {
             return Err(VideoError::new(
                 VideoErrorKind::OutOfData,
                 format!(
-                    "plane {w}x{h} bitstream ended early at bit {} of {}",
-                    br.bits_read(),
+                    "{w}x{h} plane read past the end of the packet ({} bits available)",
                     br.total_bits()
                 ),
             ));
         }
-        if std::env::var_os("XIII_VIDEO_TRACE_PLANES").is_some() {
-            eprintln!(
-                "plane {w}x{h} chroma={chroma} consumed {} bits ({} bytes)",
-                br.bits_read().saturating_sub(plane_start_bit),
-                br.bits_read().saturating_sub(plane_start_bit).div_ceil(8)
-            );
-        }
-        Ok(out)
+        Ok(PlaneResult {
+            bits: br.bits_read(),
+        })
     }
 
-    /// Decodes one 8x8 scalar block (used by the 16x16 scaled type).
-    ///
-    /// Sub-types map to the 8x8 block types 3..9 (`binkw32.dll` jump table at
-    /// `0x3001f328`): 3 run, 4 residue (skipped), 5 intra DCT, 6 fill, 7 inter DCT
-    /// (skipped), 8 pattern, 9 raw.
-    fn decode_scalar_block(
+    /// Walks the block rows of one plane (`0x3001da10..0x3001f2ef`).
+    #[allow(clippy::too_many_arguments)]
+    fn plane_rows(
         &self,
         br: &mut BitReader<'_>,
-        bundles: &mut [Bundle; bundle::COUNT],
-        sub: u8,
-        block: &mut [u8; 64],
+        b: &mut Bundles,
+        plane: &Plane<'_>,
+        out: &mut [u8],
+        at: &mut (usize, usize),
+        stats: &mut FrameStats,
     ) -> Result<()> {
-        match sub {
-            3 => {
-                let pattern = br.read(4) as usize & 15;
-                *block = fill_run_values(br, bundles, &self.tables.patterns.patterns[pattern])?;
-            }
-            5 => {
-                let dc = bundles[bundle::INTRA_DC].next_dc(br)?;
-                let q = br.read(4) as usize;
-                let mut coeff = [0i32; 64];
-                read_dct_coeffs(br, &mut coeff, &self.tables.scan)?;
-                *block = reconstruct_block(&mut coeff, q, &self.tables, false, dc);
-            }
-            6 => {
-                let c = bundles[bundle::COLORS].next(br)?;
-                *block = [c; 64];
-            }
-            8 => {
-                let c0 = bundles[bundle::COLORS].next(br)?;
-                let c1 = bundles[bundle::COLORS].next(br)?;
-                for y in 0..8 {
-                    let row_pattern = bundles[bundle::PATTERN].next(br)?;
-                    for x in 0..8 {
-                        let nibble = if x < 4 {
-                            row_pattern & 0x0f
-                        } else {
-                            row_pattern >> 4
-                        } as usize;
-                        let bit = (self.tables.binary_patterns.masks[nibble] >> ((x & 3) * 8))
-                            & 0xff
-                            != 0;
-                        block[y * 8 + x] = if bit { c1 } else { c0 };
+        let (w, h) = (plane.w, plane.h);
+        let (bw, bh) = (w / 8, h / 8);
+
+        for row in 0..bh {
+            *at = (row, 0);
+            b.refill_all(br, &self.tables)?;
+            let mut col = 0usize;
+            while col < bw {
+                at.1 = col;
+                let bx = col * 8;
+                let by = row * 8;
+                let bt = b.block_types.next(stats)?;
+                if bt > 9 {
+                    // Block types above 9 are a plain advance (`0x3001dad9` -> `0x3001f274`).
+                    stats.saw_unknown_block = true;
+                    stats.noop_blocks += 1;
+                    col += 1;
+                    continue;
+                }
+                stats.block_type_counts[usize::from(bt)] += 1;
+                match bt {
+                    0 => {
+                        // Skip: copy the co-located block of the previous frame (`0x3001dae6`).
+                        let blk = plane.fetch(bx as i32, by as i32, stats);
+                        put8(out, w, bx, by, &blk);
                     }
+                    1 => {
+                        // 16x16 scaled block (`0x3001e5ce`). On odd block rows (`y & 8`) the
+                        // type only advances over the half already written.
+                        if bx + 16 > w {
+                            return Err(VideoError::new(
+                                VideoErrorKind::BadValue,
+                                format!("16x16 block at ({bx},{by}) crosses the {w}x{h} plane"),
+                            ));
+                        }
+                        if row & 1 == 0 {
+                            if by + 16 > h {
+                                return Err(VideoError::new(
+                                    VideoErrorKind::BadValue,
+                                    format!("16x16 block at ({bx},{by}) crosses the {w}x{h} plane"),
+                                ));
+                            }
+                            let sub = b.sub_types.next(stats)?;
+                            if let Some(c) = stats.sub_type_counts.get_mut(usize::from(sub)) {
+                                *c += 1;
+                            }
+                            match self.decode_scaled(br, b, sub, stats)? {
+                                Some(blk) => put16(out, w, bx, by, &blk),
+                                None => stats.noop_blocks += 1,
+                            }
+                        }
+                        col += 2;
+                        continue;
+                    }
+                    2 => {
+                        // Motion copy from the previous frame (`0x3001e46b`).
+                        let dx = i32::from(b.x_off.next(stats)? as i8);
+                        let dy = i32::from(b.y_off.next(stats)? as i8);
+                        let blk = plane.fetch(bx as i32 + dx, by as i32 + dy, stats);
+                        put8(out, w, bx, by, &blk);
+                    }
+                    3 => {
+                        let blk = self.decode_run(br, b, stats)?;
+                        put8(out, w, bx, by, &blk);
+                    }
+                    4 => {
+                        // Motion copy plus residue (`0x3001de16`): a 7-bit mask budget is read
+                        // after the vectors, then `0x30021a90` adds the residue bytes.
+                        let dx = i32::from(b.x_off.next(stats)? as i8);
+                        let dy = i32::from(b.y_off.next(stats)? as i8);
+                        let mut blk = plane.fetch(bx as i32 + dx, by as i32 + dy, stats);
+                        let masks = br.read(7);
+                        let res = read_residue(br, masks)?;
+                        for (i, &r) in res.iter().enumerate() {
+                            let p = usize::from(self.tables.scan[i]);
+                            blk[p] = blk[p].wrapping_add(r as u8);
+                        }
+                        put8(out, w, bx, by, &blk);
+                    }
+                    5 => {
+                        // Intra DCT (`0x3001dd68`): DC from its bundle, coefficients, then the
+                        // 4-bit quantiser, then dequantise + IDCT with the intra family.
+                        let coeffs = self.read_dct_block(br, b.intra_dc.next(stats)?)?;
+                        let q = br.read(4) as usize;
+                        let blk = idct(&coeffs, &self.tables.quant.tables[q], None);
+                        put8(out, w, bx, by, &blk);
+                    }
+                    6 => {
+                        // Fill (`0x3001e0ca`).
+                        let c = b.colors.next(stats)?;
+                        put8(out, w, bx, by, &[c; 64]);
+                    }
+                    7 => {
+                        // Inter DCT (`0x3001df57`): motion copy, inter DC, coefficients, 4-bit
+                        // quantiser, then IDCT added to the prediction (`0x30020500`).
+                        let dx = i32::from(b.x_off.next(stats)? as i8);
+                        let dy = i32::from(b.y_off.next(stats)? as i8);
+                        let pred = plane.fetch(bx as i32 + dx, by as i32 + dy, stats);
+                        let coeffs = self.read_dct_block(br, b.inter_dc.next(stats)?)?;
+                        let q = br.read(4) as usize;
+                        let blk = idct(&coeffs, &self.tables.quant_inter.tables[q], Some(&pred));
+                        put8(out, w, bx, by, &blk);
+                    }
+                    8 => {
+                        let blk = self.decode_pattern(b, stats)?;
+                        put8(out, w, bx, by, &blk);
+                    }
+                    9 => {
+                        // Raw: 64 colour-bundle bytes in row order (`0x3001e535`).
+                        let mut blk = [0u8; 64];
+                        for p in blk.iter_mut() {
+                            *p = b.colors.next(stats)?;
+                        }
+                        put8(out, w, bx, by, &blk);
+                    }
+                    _ => unreachable!("block type checked above"),
                 }
+                col += 1;
             }
-            9 => {
-                for v in block.iter_mut() {
-                    *v = bundles[bundle::COLORS].next(br)?;
-                }
-            }
-            // Sub-types outside 3..=9 (and the DCT/known set) are treated as a plain advance by
-            // the shipped decoder (`0x3001e5ed`: `sub - 3 > 6` -> skip).
-            _ => {}
         }
         Ok(())
     }
 
-    /// Reads the nine bundle descriptors that begin every plane.
-    fn read_plane_header(
+    /// Decodes the 8x8 content of a 16x16 block (`0x3001e5ed`, jump table `0x3001f328`).
+    ///
+    /// Sub-types 3 (run), 5 (intra DCT), 6 (fill), 8 (pattern) and 9 (raw) decode an 8x8 block
+    /// that the shipped routines write pixel-doubled; every other sub-type is a plain advance.
+    fn decode_scaled(
         &self,
         br: &mut BitReader<'_>,
-        bw: usize,
-        bh: usize,
-    ) -> Result<[Bundle; bundle::COUNT]> {
-        // Order measured from the plane decoder in `binkw32.dll` (0x3001d94e..0x3001d9f2):
-        // block types, sub-block types, then the colour codebook (16 context trees followed by
-        // the low-nibble tree at 0x3001c120), then pattern, X motion, Y motion and run.
-        let block_types = read_tree(br)?;
-        let sub_block = read_tree(br)?;
-        let mut colors_high = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let t = read_tree(br)?;
-            colors_high.push(build_static(t, &self.tables));
-        }
-        let colors_low = read_tree(br)?;
-        let pattern = read_tree(br)?;
-        let x_off = read_tree(br)?;
-        let y_off = read_tree(br)?;
-        let run = read_tree(br)?;
-
-        // runsize = floor(log2(count + 511)) + 1, measured from the plane-decoder code path in
-        // `binkw32.dll` (the `+0x1ff` threshold chain at 0x3001d43e).
-        let rs = |count: usize| -> usize { floor_log2(count.saturating_add(511)) + 1 };
-        let mut states: [Bundle; bundle::COUNT] = std::array::from_fn(|_| Bundle::empty());
-        states[bundle::BLOCK_TYPES] = Bundle::new(
-            Kind::RleRun,
-            build_static(block_types, &self.tables),
-            rs(bw),
-        );
-        states[bundle::SUB_BLOCK_TYPES] = Bundle::new(
-            Kind::RleRun,
-            build_static(sub_block, &self.tables),
-            rs(bw / 2),
-        );
-        states[bundle::COLORS] = Bundle::colors(
-            build_static(colors_low, &self.tables),
-            colors_high,
-            rs(bw * 64),
-        );
-        states[bundle::PATTERN] =
-            Bundle::new(Kind::Pair, build_static(pattern, &self.tables), rs(bw * 8));
-        states[bundle::X_OFF] =
-            Bundle::new(Kind::Signed, build_static(x_off, &self.tables), rs(bw));
-        states[bundle::Y_OFF] =
-            Bundle::new(Kind::Signed, build_static(y_off, &self.tables), rs(bw));
-        states[bundle::INTRA_DC] = Bundle::dc(rs(bw), 11, false);
-        states[bundle::INTER_DC] = Bundle::dc(rs(bw), 11, true);
-        states[bundle::RUN] =
-            Bundle::new(Kind::Plain4, build_static(run, &self.tables), rs(bw * 48));
-        // The DLL's t==0 cursor sentinel may read from buf+4 after a refill has no entries.
-        // Reserve the plane's maximum 8x8-cell count so those reads remain bounded and retain
-        // the same backing bytes across refills.
-        let stale_capacity = bw.saturating_mul(bh).saturating_add(8);
-        for bundle in &mut states {
-            bundle.data.resize(stale_capacity, 0);
-            bundle.signed.resize(stale_capacity, 0);
-            bundle.dc.resize(stale_capacity, 0);
-        }
-        states[bundle::BLOCK_TYPES].name = "block";
-        states[bundle::SUB_BLOCK_TYPES].name = "sub";
-        states[bundle::COLORS].name = "colors";
-        states[bundle::PATTERN].name = "pattern";
-        states[bundle::X_OFF].name = "xoff";
-        states[bundle::Y_OFF].name = "yoff";
-        states[bundle::INTRA_DC].name = "intra_dc";
-        states[bundle::INTER_DC].name = "inter_dc";
-        states[bundle::RUN].name = "run";
-        Ok(states)
-    }
-}
-
-fn build_static(desc: (u8, [u8; 16]), tables: &BinkTables) -> Option<StaticTree> {
-    let table = tables.huffman_tables.get(desc.0 as usize)?;
-    StaticTree::new(table, desc.1).ok()
-}
-
-/// Reads a tree descriptor and returns its number and symbol permutation.
-fn read_tree(br: &mut BitReader<'_>) -> Result<(u8, [u8; 16])> {
-    let tree_num = br.read(4) as u8;
-    if tree_num > 15 {
-        return Err(VideoError::new(
-            VideoErrorKind::BadValue,
-            format!("Huffman tree number {tree_num}"),
-        ));
-    }
-    let mut syms = IDENTITY;
-    if tree_num == 0 {
-        return Ok((0, syms));
-    }
-    if br.bit() == 1 {
-        // The 3-bit field is one less than the number of explicitly coded symbols: the DLL
-        // loop runs `for (i = 0; i <= n; i++)` (0x3001c0e2..0x3001c0e7).
-        let n = br.read(3) as usize + 1;
-        let mut used = [false; 16];
-        let mut next = 0u8;
-        for (i, slot) in syms.iter_mut().enumerate() {
-            if i < n {
-                let s = br.read(4) as u8 & 15;
-                *slot = s;
-                used[s as usize] = true;
-            } else {
-                while next < 16 && used[next as usize] {
-                    next += 1;
+        b: &mut Bundles,
+        sub: u8,
+        stats: &mut FrameStats,
+    ) -> Result<Option<[u8; 64]>> {
+        Ok(Some(match sub {
+            3 => self.decode_run(br, b, stats)?,
+            5 => {
+                // `0x3001ef08`: DC, coefficients, quantiser, then the scaled IDCT `0x300204d0`
+                // (intra family, same arithmetic as `0x3001f4d0`, pixels doubled).
+                let coeffs = self.read_dct_block(br, b.intra_dc.next(stats)?)?;
+                let q = br.read(4) as usize;
+                idct(&coeffs, &self.tables.quant.tables[q], None)
+            }
+            6 => [b.colors.next(stats)?; 64],
+            8 => self.decode_pattern(b, stats)?,
+            9 => {
+                let mut blk = [0u8; 64];
+                for p in blk.iter_mut() {
+                    *p = b.colors.next(stats)?;
                 }
-                let s = next.min(15);
-                *slot = s;
-                used[s as usize] = true;
-                next = next.saturating_add(1);
+                blk
             }
-        }
-    } else {
-        let depth = br.read(2) as usize;
-        let mut cur = syms;
-        for level in 0..=depth.min(4) {
-            let size = 1usize << level;
-            let skip = size * 2;
-            let mut tmp = [0u8; 16];
-            let mut j = 0;
-            while j < 16 {
-                merge(
-                    br,
-                    &mut tmp[j..j + skip],
-                    &cur[j..j + size],
-                    &cur[j + size..j + skip],
-                );
-                j += skip;
-            }
-            cur = tmp;
-        }
-        syms = cur;
+            _ => return Ok(None),
+        }))
     }
-    Ok((tree_num, syms))
+
+    /// Run block (`0x3001db7d`, scaled variant `0x3001eae6`).
+    ///
+    /// A raw 4-bit pattern index selects one of the 16 fill orders. While fewer than 63 pixels
+    /// are filled a flag bit chooses between a single-colour run (colour, then run length) and
+    /// a run of literal colours; run lengths are the run-bundle byte plus one. If exactly 63
+    /// pixels are filled, the last one is a literal colour with no flag bit (`0x3001dc96`).
+    fn decode_run(
+        &self,
+        br: &mut BitReader<'_>,
+        b: &mut Bundles,
+        stats: &mut FrameStats,
+    ) -> Result<[u8; 64]> {
+        let pattern = &self.tables.patterns.patterns[br.read(4) as usize];
+        let mut blk = [0u8; 64];
+        let mut i = 0usize;
+        while i < 63 {
+            if br.bit() == 1 {
+                let c = b.colors.next(stats)?;
+                let run = usize::from(b.run.next(stats)?) + 1;
+                for _ in 0..run {
+                    let pos = *pattern.get(i).ok_or_else(run_overflow)?;
+                    blk[usize::from(pos)] = c;
+                    i += 1;
+                }
+            } else {
+                let run = usize::from(b.run.next(stats)?) + 1;
+                for _ in 0..run {
+                    let pos = *pattern.get(i).ok_or_else(run_overflow)?;
+                    blk[usize::from(pos)] = b.colors.next(stats)?;
+                    i += 1;
+                }
+            }
+        }
+        if i == 63 {
+            blk[usize::from(pattern[63])] = b.colors.next(stats)?;
+        }
+        Ok(blk)
+    }
+
+    /// Two-colour pattern block (`0x3001e153`): two colours, then eight pattern bytes (one per
+    /// row; low nibble = pixels 0..3, high nibble = 4..7). A set mask bit selects the second
+    /// colour (`0x3004f850`-style masks AND second colour, complement AND first).
+    fn decode_pattern(&self, b: &mut Bundles, stats: &mut FrameStats) -> Result<[u8; 64]> {
+        let c0 = b.colors.next(stats)?;
+        let c1 = b.colors.next(stats)?;
+        let masks = &self.tables.binary_patterns.masks;
+        let mut blk = [0u8; 64];
+        for y in 0..8 {
+            let p = b.pattern.next(stats)?;
+            for x in 0..8 {
+                let nibble = if x < 4 { p & 0x0f } else { p >> 4 };
+                let set = (masks[usize::from(nibble)] >> ((x & 3) * 8)) & 0xff != 0;
+                blk[y * 8 + x] = if set { c1 } else { c0 };
+            }
+        }
+        Ok(blk)
+    }
+
+    /// Reads one DCT block's coefficients (`0x30020c70`) and places them in natural order using
+    /// the DLL's scan table; the DC comes from its bundle.
+    fn read_dct_block(&self, br: &mut BitReader<'_>, dc: i16) -> Result<[i16; 64]> {
+        let local = read_dct_coeffs(br)?;
+        let mut block = [0i16; 64];
+        block[0] = dc;
+        // `0x3002145c..0x30021562` scatter list index `i` to position `scan[i]`.
+        for i in 1..64 {
+            block[usize::from(self.tables.scan[i])] = local[i];
+        }
+        Ok(block)
+    }
+}
+
+fn run_overflow() -> VideoError {
+    VideoError::new(
+        VideoErrorKind::BadValue,
+        "run block fills more than 64 pixels",
+    )
+}
+
+/// Reference plane access for motion compensation.
+struct Plane<'a> {
+    w: usize,
+    h: usize,
+    prev: &'a [u8],
+}
+
+impl Plane<'_> {
+    /// Copies the 8x8 block at (`x`, `y`) of the previous frame. The shipped decoder does no
+    /// bounds handling; out-of-plane sources are clamped here and counted.
+    fn fetch(&self, x: i32, y: i32, stats: &mut FrameStats) -> [u8; 64] {
+        let mut blk = [0u8; 64];
+        let max_x = self.w as i32 - 8;
+        let max_y = self.h as i32 - 8;
+        if x < 0 || y < 0 || x > max_x || y > max_y {
+            stats.clamped_motion += 1;
+        }
+        let x = x.clamp(0, max_x.max(0)) as usize;
+        let y = y.clamp(0, max_y.max(0)) as usize;
+        for r in 0..8 {
+            let s = (y + r) * self.w + x;
+            blk[r * 8..r * 8 + 8].copy_from_slice(&self.prev[s..s + 8]);
+        }
+        blk
+    }
+}
+
+fn put8(out: &mut [u8], w: usize, bx: usize, by: usize, blk: &[u8; 64]) {
+    for r in 0..8 {
+        let d = (by + r) * w + bx;
+        out[d..d + 8].copy_from_slice(&blk[r * 8..r * 8 + 8]);
+    }
+}
+
+/// Writes an 8x8 block pixel-doubled into a 16x16 area (the scaled sub-block routines write
+/// every value as a 2x2 square, e.g. `0x3001ef9c`).
+fn put16(out: &mut [u8], w: usize, bx: usize, by: usize, blk: &[u8; 64]) {
+    for r in 0..16 {
+        let d = (by + r) * w + bx;
+        for c in 0..16 {
+            out[d + c] = blk[(r / 2) * 8 + c / 2];
+        }
+    }
+}
+
+fn start_plane(prev: Option<&[u8]>, len: usize) -> Vec<u8> {
+    match prev {
+        Some(p) if p.len() == len => p.to_vec(),
+        _ => vec![0u8; len],
+    }
+}
+
+fn checked_plane_end(packet: &[u8], word_at: usize, size: usize, what: &str) -> Result<usize> {
+    let end = word_at
+        .checked_add(size)
+        .filter(|&e| e <= packet.len() && size >= 4)
+        .ok_or_else(|| {
+            VideoError::new(
+                VideoErrorKind::BadValue,
+                format!(
+                    "{what} plane size {size} at byte {word_at} does not fit the {}-byte packet",
+                    packet.len()
+                ),
+            )
+        })?;
+    Ok(end)
+}
+
+fn read_u32(data: &[u8], off: usize) -> Result<u32> {
+    let s = data.get(off..off + 4).ok_or_else(|| {
+        VideoError::new(
+            VideoErrorKind::Truncated,
+            format!("plane size word at byte {off}"),
+        )
+    })?;
+    Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn align8(n: usize) -> usize {
+    (n + 7) & !7
+}
+
+/// `floor(log2(n + 511)) + 1`: the count width of every bundle (the `+0x1ff` threshold chain
+/// at `0x3001d43e`).
+fn count_bits(n: usize) -> usize {
+    let v = n + 511;
+    (usize::BITS - v.leading_zeros()) as usize
+}
+
+// ---------------------------------------------------------------------------------------------
+// Bundles
+// ---------------------------------------------------------------------------------------------
+
+/// What a byte bundle's refill routine does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByteKind {
+    /// Block/sub-block types: 4-bit RLE (`0x3001c190`).
+    Rle,
+    /// Colours: context-coded high nibble plus low nibble (`0x3001c6d0`).
+    Colors,
+    /// Pattern rows: two symbols per byte, no constant fill (`0x3001cb70`).
+    Pattern,
+    /// Motion vector components: symbol plus sign (`0x3001cd70`).
+    Motion,
+    /// Run lengths: plain 4-bit symbols (`0x3001c980`).
+    Run,
+}
+
+/// A byte bundle. `cur`/`end` mirror the shipped decoder's read and end pointers: a refill
+/// happens at the start of a block row only when `cur == end`. A zero count sets `cur = 4`,
+/// `end = 0` (`0x3001c3c4`), which disables further refills for the plane.
+struct ByteBundle {
+    kind: ByteKind,
+    count_bits: usize,
+    tree: StaticTree,
+    buf: Vec<u8>,
+    cur: usize,
+    end: usize,
+}
+
+impl ByteBundle {
+    fn new(kind: ByteKind, count_bits: usize, tree: StaticTree) -> Self {
+        Self {
+            kind,
+            count_bits,
+            tree,
+            buf: vec![0u8; (1usize << count_bits) + 64],
+            cur: 0,
+            end: 0,
+        }
+    }
+
+    fn next(&mut self, stats: &mut FrameStats) -> Result<u8> {
+        let v = *self.buf.get(self.cur).ok_or_else(|| {
+            VideoError::new(
+                VideoErrorKind::OutOfData,
+                format!(
+                    "{:?} bundle read past its buffer (index {})",
+                    self.kind, self.cur
+                ),
+            )
+        })?;
+        if self.cur >= self.end {
+            stats.stale_reads += 1;
+        }
+        self.cur += 1;
+        Ok(v)
+    }
+
+    /// Reads the count and, if non-zero, starts a new decoded range at the buffer start.
+    /// Returns the count, or `None` when no refill happens.
+    fn begin(&mut self, br: &mut BitReader<'_>) -> Option<usize> {
+        if self.cur != self.end {
+            return None;
+        }
+        let t = br.read(self.count_bits) as usize;
+        if t == 0 {
+            self.cur = 4;
+            self.end = 0;
+            return None;
+        }
+        self.cur = 0;
+        self.end = t;
+        Some(t)
+    }
+
+    fn refill(&mut self, br: &mut BitReader<'_>, rle_runs: &[u8; 4]) -> Result<()> {
+        let Some(t) = self.begin(br) else {
+            return Ok(());
+        };
+        match self.kind {
+            ByteKind::Rle => {
+                if br.bit() == 1 {
+                    // Constant fill: a raw nibble repeated `t` times (`0x3001c35d..0x3001c3c0`).
+                    let v = br.read(4) as u8;
+                    self.buf[..t].fill(v);
+                } else {
+                    // `t` counts output values; symbols 12..15 repeat the last literal
+                    // (initially 0, reset per refill: `0x3001c282`) by the DLL's run lengths.
+                    let mut left = t as isize;
+                    let mut pos = 0usize;
+                    let mut last = 0u8;
+                    while left > 0 {
+                        let v = self.tree.decode(br);
+                        if v < 12 {
+                            self.buf[pos] = v;
+                            pos += 1;
+                            left -= 1;
+                            last = v;
+                        } else {
+                            let run = usize::from(rle_runs[usize::from(v - 12)]);
+                            self.buf[pos..pos + run].fill(last);
+                            pos += run;
+                            left -= run as isize;
+                        }
+                    }
+                    if left != 0 {
+                        // The shipped loop only stops at exactly zero (`0x3001c34f`).
+                        return Err(VideoError::new(
+                            VideoErrorKind::BadValue,
+                            format!("RLE run overshoots its bundle count {t}"),
+                        ));
+                    }
+                }
+            }
+            ByteKind::Run => {
+                // `0x3001c980`: constant raw nibble, or `t` symbols.
+                if br.bit() == 1 {
+                    let v = br.read(4) as u8;
+                    self.buf[..t].fill(v);
+                } else {
+                    for i in 0..t {
+                        self.buf[i] = self.tree.decode(br);
+                    }
+                }
+            }
+            ByteKind::Pattern => {
+                // `0x3001cb70`: no fill flag; byte = second symbol << 4 | first symbol.
+                for i in 0..t {
+                    let lo = self.tree.decode(br);
+                    let hi = self.tree.decode(br);
+                    self.buf[i] = (hi << 4) | lo;
+                }
+            }
+            ByteKind::Motion => {
+                // `0x3001cd70`: constant raw nibble or symbols, each non-zero value followed by
+                // a sign bit (1 = negative).
+                if br.bit() == 1 {
+                    let mut v = br.read(4) as u8;
+                    if v != 0 && br.bit() == 1 {
+                        v = v.wrapping_neg();
+                    }
+                    self.buf[..t].fill(v);
+                } else {
+                    for i in 0..t {
+                        let mut v = self.tree.decode(br);
+                        if v != 0 && br.bit() == 1 {
+                            v = v.wrapping_neg();
+                        }
+                        self.buf[i] = v;
+                    }
+                }
+            }
+            ByteKind::Colors => unreachable!("colours use ColorBundle"),
+        }
+        Ok(())
+    }
+}
+
+/// The colour bundle: 16 high-nibble trees selected by the previous high nibble, plus one
+/// low-nibble tree (`0x3001c120`, refill `0x3001c6d0` for revision `i`).
+struct ColorBundle {
+    inner: ByteBundle,
+    high: Vec<StaticTree>,
+    /// Previous high nibble; reset to 0 per plane (`0x3001c178`), kept across refills.
+    ctx: u8,
+}
+
+impl ColorBundle {
+    fn next(&mut self, stats: &mut FrameStats) -> Result<u8> {
+        self.inner.next(stats)
+    }
+
+    fn decode_one(&mut self, br: &mut BitReader<'_>) -> u8 {
+        let hi = self.high[usize::from(self.ctx)].decode(br);
+        self.ctx = hi;
+        let lo = self.inner.tree.decode(br);
+        (hi << 4) | lo
+    }
+
+    fn refill(&mut self, br: &mut BitReader<'_>) {
+        let Some(t) = self.inner.begin(br) else {
+            return;
+        };
+        if br.bit() == 1 {
+            // Constant fill: one coded colour replicated `t` times (`0x3001c7a0`, `0x3001c90a`).
+            let c = self.decode_one(br);
+            self.inner.buf[..t].fill(c);
+        } else {
+            for i in 0..t {
+                self.inner.buf[i] = self.decode_one(br);
+            }
+        }
+    }
+}
+
+/// A DC bundle of 16-bit values (`0x3001cfe0`).
+struct DcBundle {
+    count_bits: usize,
+    signed: bool,
+    buf: Vec<i16>,
+    cur: usize,
+    end: usize,
+}
+
+impl DcBundle {
+    fn new(count_bits: usize, signed: bool) -> Self {
+        Self {
+            count_bits,
+            signed,
+            buf: vec![0i16; (1usize << count_bits) + 64],
+            cur: 0,
+            end: 0,
+        }
+    }
+
+    fn next(&mut self, stats: &mut FrameStats) -> Result<i16> {
+        let v = *self.buf.get(self.cur).ok_or_else(|| {
+            VideoError::new(
+                VideoErrorKind::OutOfData,
+                format!("DC bundle read past its buffer (index {})", self.cur),
+            )
+        })?;
+        if self.cur >= self.end {
+            stats.stale_reads += 1;
+        }
+        self.cur += 1;
+        Ok(v)
+    }
+
+    /// First value: 11 bits (intra), or 10 bits plus a sign bit for non-zero values (inter).
+    /// The rest come in groups of up to eight: a 4-bit width, then per value a delta of that
+    /// width with a sign bit for non-zero deltas; width 0 repeats the running value.
+    fn refill(&mut self, br: &mut BitReader<'_>) {
+        if self.cur != self.end {
+            return;
+        }
+        let t = br.read(self.count_bits) as usize;
+        if t == 0 {
+            self.cur = 4;
+            self.end = 0;
+            return;
+        }
+        self.cur = 0;
+        self.end = t;
+        let mut acc: i32 = if self.signed {
+            let v = br.read(10) as i32;
+            if v != 0 && br.bit() == 1 { -v } else { v }
+        } else {
+            br.read(11) as i32
+        };
+        self.buf[0] = acc as i16;
+        let mut pos = 1usize;
+        let mut left = t - 1;
+        while left > 0 {
+            let n = left.min(8);
+            let bits = br.read(4) as usize;
+            if bits == 0 {
+                self.buf[pos..pos + n].fill(acc as i16);
+            } else {
+                for k in 0..n {
+                    let mut d = br.read(bits) as i32;
+                    if d != 0 && br.bit() == 1 {
+                        d = -d;
+                    }
+                    acc = acc.wrapping_add(d);
+                    self.buf[pos + k] = acc as i16;
+                }
+            }
+            pos += n;
+            left -= n;
+        }
+    }
+}
+
+/// The nine bundles of a plane.
+struct Bundles {
+    block_types: ByteBundle,
+    sub_types: ByteBundle,
+    colors: ColorBundle,
+    pattern: ByteBundle,
+    x_off: ByteBundle,
+    y_off: ByteBundle,
+    intra_dc: DcBundle,
+    inter_dc: DcBundle,
+    run: ByteBundle,
+}
+
+impl Bundles {
+    /// Reads the plane header: block-type tree, sub-type tree, 16 colour-context trees plus
+    /// the low-nibble tree, pattern, X, Y and run trees (`0x3001d94e..0x3001d9f2`).
+    fn read_header(br: &mut BitReader<'_>, bw: usize, tables: &BinkTables) -> Result<Self> {
+        let block_types = read_tree(br, tables)?;
+        let sub_types = read_tree(br, tables)?;
+        let mut high = Vec::with_capacity(16);
+        for _ in 0..16 {
+            high.push(read_tree(br, tables)?);
+        }
+        let colors_low = read_tree(br, tables)?;
+        let pattern = read_tree(br, tables)?;
+        let x_off = read_tree(br, tables)?;
+        let y_off = read_tree(br, tables)?;
+        let run = read_tree(br, tables)?;
+        // Count widths (`0x3001d43e..0x3001d90b`): block types bw, sub-types bw/2, colours
+        // bw*64, pattern bw*8, motion bw, DC bw, run bw*48.
+        Ok(Self {
+            block_types: ByteBundle::new(ByteKind::Rle, count_bits(bw), block_types),
+            sub_types: ByteBundle::new(ByteKind::Rle, count_bits(bw / 2), sub_types),
+            colors: ColorBundle {
+                inner: ByteBundle::new(ByteKind::Colors, count_bits(bw * 64), colors_low),
+                high,
+                ctx: 0,
+            },
+            pattern: ByteBundle::new(ByteKind::Pattern, count_bits(bw * 8), pattern),
+            x_off: ByteBundle::new(ByteKind::Motion, count_bits(bw), x_off),
+            y_off: ByteBundle::new(ByteKind::Motion, count_bits(bw), y_off),
+            intra_dc: DcBundle::new(count_bits(bw), false),
+            inter_dc: DcBundle::new(count_bits(bw), true),
+            run: ByteBundle::new(ByteKind::Run, count_bits(bw * 48), run),
+        })
+    }
+
+    /// Row-start refills in the shipped order (`0x3001da10..0x3001daa2`).
+    fn refill_all(&mut self, br: &mut BitReader<'_>, tables: &BinkTables) -> Result<()> {
+        let runs = &tables.rle_runs;
+        self.block_types.refill(br, runs)?;
+        self.sub_types.refill(br, runs)?;
+        self.colors.refill(br);
+        self.pattern.refill(br, runs)?;
+        self.x_off.refill(br, runs)?;
+        self.y_off.refill(br, runs)?;
+        self.intra_dc.refill(br);
+        self.inter_dc.refill(br);
+        self.run.refill(br, runs)?;
+        Ok(())
+    }
+}
+
+/// Reads a tree descriptor (`0x3001bd60`) and returns its lookup decoder.
+///
+/// 4-bit tree number (0 = raw nibbles, identity order). Otherwise one bit selects either an
+/// explicit list (3-bit `n`, then `n + 1` 4-bit symbols, the unused symbols following in
+/// ascending order) or a 2-bit merge depth `d`: `d + 1` levels of pairwise merges of the
+/// identity order where each merge bit 1 takes from the second half (`0x3001bcc0`).
+fn read_tree(br: &mut BitReader<'_>, tables: &BinkTables) -> Result<StaticTree> {
+    let tree_num = br.read(4) as usize;
+    let mut syms: [u8; 16] = std::array::from_fn(|i| i as u8);
+    if tree_num != 0 {
+        if br.bit() == 1 {
+            let n = br.read(3) as usize;
+            let mut used = [false; 16];
+            for slot in syms.iter_mut().take(n + 1) {
+                let s = br.read(4) as u8;
+                *slot = s;
+                used[usize::from(s)] = true;
+            }
+            let mut i = n + 1;
+            for (s, &u) in used.iter().enumerate() {
+                if !u && i < 16 {
+                    syms[i] = s as u8;
+                    i += 1;
+                }
+            }
+        } else {
+            let depth = br.read(2) as usize;
+            let mut cur = syms;
+            for level in 0..=depth {
+                let size = 1usize << level;
+                let mut tmp = [0u8; 16];
+                for j in (0..16).step_by(size * 2) {
+                    merge(
+                        br,
+                        &mut tmp[j..j + size * 2],
+                        &cur[j..j + size],
+                        &cur[j + size..j + size * 2],
+                    );
+                }
+                cur = tmp;
+            }
+            syms = cur;
+        }
+    }
+    let table = tables.huffman_tables.get(tree_num).ok_or_else(|| {
+        VideoError::new(
+            VideoErrorKind::BadTable,
+            format!("no Huffman lookup table {tree_num}"),
+        )
+    })?;
+    StaticTree::new(table, syms)
 }
 
 fn merge(br: &mut BitReader<'_>, dst: &mut [u8], s1: &[u8], s2: &[u8]) {
-    let size = s1.len();
     let (mut i1, mut i2, mut o) = (0, 0, 0);
-    while i1 < size && i2 < size {
+    while i1 < s1.len() && i2 < s2.len() {
         if br.bit() == 0 {
             dst[o] = s1[i1];
             i1 += 1;
@@ -604,845 +1053,581 @@ fn merge(br: &mut BitReader<'_>, dst: &mut [u8], s1: &[u8], s2: &[u8]) {
         }
         o += 1;
     }
-    while i1 < size {
-        dst[o] = s1[i1];
-        i1 += 1;
-        o += 1;
-    }
-    while i2 < size {
-        dst[o] = s2[i2];
-        i2 += 1;
+    for &v in s1[i1..].iter().chain(&s2[i2..]) {
+        dst[o] = v;
         o += 1;
     }
 }
 
-/// Bundle value encoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    /// 4-bit RLE bundle: values >= 12 are runs of the previous value (block/sub-block types).
-    RleRun,
-    /// Plain 4-bit bundle with an optional constant fill (run lengths).
-    Plain4,
-    Signed,
-    Pair,
-    Colors,
-    Raw16,
+// ---------------------------------------------------------------------------------------------
+// Coefficients and residue
+// ---------------------------------------------------------------------------------------------
+
+/// Work list of coefficient groups. Each entry byte is `index << 2 | mode`:
+/// mode 0 = four singles at `index` plus a 16-group at `index + 4`; mode 1 = a 16-group that
+/// splits into four 4-groups; mode 2 = a 4-group; mode 3 = one pending coefficient. New
+/// pending singles are pushed at the front, split groups at the back; a zero byte is a removed
+/// entry.
+struct WorkList {
+    buf: [u8; 192],
+    start: usize,
+    end: usize,
 }
 
-/// Cached bundle state.
-#[derive(Debug, Clone)]
-struct Bundle {
-    name: &'static str,
-    kind: Kind,
-    runsize: usize,
-    tree: Option<StaticTree>,
-    high: Vec<Option<StaticTree>>,
-    data: Vec<u8>,
-    pos: usize,
-    data_end: usize,
-    sentinel: bool,
-    signed: Vec<i32>,
-    signed_pos: usize,
-    signed_end: usize,
-    dc: Vec<i32>,
-    dc_pos: usize,
-    dc_end: usize,
-    lastval: u8,
-    previous_value: u8,
-    dc_start_bits: usize,
-    dc_signed: bool,
-}
-
-impl Bundle {
-    fn empty() -> Self {
+impl WorkList {
+    fn new(initial: &[u8]) -> Self {
+        let mut buf = [0u8; 192];
+        let start = 96;
+        buf[start..start + initial.len()].copy_from_slice(initial);
         Self {
-            name: "unassigned",
-            kind: Kind::Plain4,
-            runsize: 0,
-            tree: None,
-            high: Vec::new(),
-            data: Vec::new(),
-            pos: 0,
-            data_end: 0,
-            sentinel: false,
-            signed: Vec::new(),
-            signed_pos: 0,
-            signed_end: 0,
-            dc: Vec::new(),
-            dc_pos: 0,
-            dc_end: 0,
-            lastval: 0,
-            previous_value: 0,
-            dc_start_bits: 0,
-            dc_signed: false,
+            buf,
+            start,
+            end: start + initial.len(),
         }
-    }
-    fn new(kind: Kind, tree: Option<StaticTree>, runsize: usize) -> Self {
-        let mut b = Self::empty();
-        b.kind = kind;
-        b.tree = tree;
-        b.runsize = runsize;
-        b
-    }
-    fn colors(tree: Option<StaticTree>, high: Vec<Option<StaticTree>>, runsize: usize) -> Self {
-        let mut b = Self::new(Kind::Colors, tree, runsize);
-        b.high = high;
-        b
     }
 
-    fn dc(runsize: usize, start_bits: usize, signed: bool) -> Self {
-        let mut b = Self::new(Kind::Raw16, None, runsize);
-        b.dc_start_bits = start_bits;
-        b.dc_signed = signed;
-        b
-    }
-
-    fn next(&mut self, br: &mut BitReader<'_>) -> Result<u8> {
-        if self.name == "sub" && std::env::var_os("XIII_VIDEO_TRACE_SUB").is_some() {
-            eprintln!(
-                "sub next pos={} len={} bit={}",
-                self.pos,
-                self.data.len(),
-                br.bits_read()
-            );
+    fn push_front(&mut self, e: u8) -> Result<()> {
+        if self.start == 0 {
+            return Err(list_overflow());
         }
-        if self.sentinel {
-            let v = self.data.get(self.pos).copied().ok_or_else(|| {
-                VideoError::new(
-                    VideoErrorKind::OutOfData,
-                    format!("{} zero-count sentinel exceeded stale buffer", self.name),
-                )
-            })?;
-            self.pos += 1;
-            return Ok(v);
-        }
-        if self.pos >= self.data_end {
-            self.refill(br)?;
-        }
-        if !self.sentinel && self.pos >= self.data_end {
-            return Err(VideoError::new(
-                VideoErrorKind::OutOfData,
-                format!(
-                    "bundle {} produced no value (kind {:?} runsize {})",
-                    self.name, self.kind, self.runsize
-                ),
-            ));
-        }
-        let v = self.data[self.pos];
-        self.pos += 1;
-        Ok(v)
-    }
-
-    fn next_signed(&mut self, br: &mut BitReader<'_>) -> Result<i32> {
-        if self.sentinel {
-            let v = self.signed.get(self.signed_pos).copied().ok_or_else(|| {
-                VideoError::new(
-                    VideoErrorKind::OutOfData,
-                    "signed zero-count sentinel exhausted",
-                )
-            })?;
-            self.signed_pos += 1;
-            return Ok(v);
-        }
-        if self.signed_pos >= self.signed_end {
-            self.refill_signed(br)?;
-        }
-        if self.sentinel {
-            let v = self.signed.get(self.signed_pos).copied().ok_or_else(|| {
-                VideoError::new(
-                    VideoErrorKind::OutOfData,
-                    "signed zero-count sentinel exhausted",
-                )
-            })?;
-            self.signed_pos += 1;
-            return Ok(v);
-        }
-        if !self.sentinel && self.signed_pos >= self.signed_end {
-            return Err(VideoError::new(
-                VideoErrorKind::OutOfData,
-                format!("signed bundle produced no value (runsize {})", self.runsize),
-            ));
-        }
-        let v = self.signed[self.signed_pos];
-        self.signed_pos += 1;
-        Ok(v)
-    }
-
-    fn next_dc(&mut self, br: &mut BitReader<'_>) -> Result<i32> {
-        if self.sentinel {
-            let v = self.dc.get(self.dc_pos).copied().ok_or_else(|| {
-                VideoError::new(
-                    VideoErrorKind::OutOfData,
-                    "DC zero-count sentinel exhausted",
-                )
-            })?;
-            self.dc_pos += 1;
-            return Ok(v);
-        }
-        if self.dc_pos >= self.dc_end {
-            self.refill_dc(br)?;
-        }
-        if self.sentinel {
-            let v = self.dc.get(self.dc_pos).copied().ok_or_else(|| {
-                VideoError::new(
-                    VideoErrorKind::OutOfData,
-                    "DC zero-count sentinel exhausted",
-                )
-            })?;
-            self.dc_pos += 1;
-            return Ok(v);
-        }
-        if !self.sentinel && self.dc_pos >= self.dc_end {
-            return Err(VideoError::new(
-                VideoErrorKind::OutOfData,
-                format!("DC bundle produced no value (runsize {})", self.runsize),
-            ));
-        }
-        let v = self.dc[self.dc_pos];
-        self.dc_pos += 1;
-        Ok(v)
-    }
-
-    fn refill(&mut self, br: &mut BitReader<'_>) -> Result<()> {
-        let old_data = self.data.clone();
-        let t = br.read(self.runsize) as usize;
-        if std::env::var_os("XIII_VIDEO_TRACE_REFILL").is_some() {
-            eprintln!(
-                "refill {} {:?} bits={} t={}",
-                self.name,
-                self.kind,
-                br.bits_read(),
-                t
-            );
-        }
-        if t == 0 {
-            // The DLL's empty-refill sentinel sets cur_dec=buf+4 and cur_end=buf
-            // (`0x3001c3c4`, `0x3001cb3e`, `0x3001c952`). Consumers still read from the
-            // stale buffer for four bytes. Preserve that observable behavior rather than
-            // converting zero-count to an empty Rust vector.
-            self.data = old_data;
-            self.pos = 4;
-            self.data_end = 0;
-            self.sentinel = true;
-            return Ok(());
-        }
-        self.data.clear();
-        self.pos = 0;
-        self.data_end = 0;
-        self.sentinel = false;
-        match self.kind {
-            Kind::RleRun => {
-                if br.bit() != 0 {
-                    let v = br.read(4) as u8;
-                    self.data.resize(t, v);
-                    self.previous_value = v;
-                } else {
-                    // `t` is the number of *output* values (the DLL decrements the remaining
-                    // count by the run length; 0x3001c321/0x3001c342): v < 12 is one literal,
-                    // v >= 12 is RUN_VALUES[v-12] copies of the previous value.
-                    let mut out = 0usize;
-                    while out < t {
-                        let v = self.tree.as_ref().map_or(0, |tr| tr.decode(br));
-                        if v < 12 {
-                            self.data.push(v);
-                            out += 1;
-                        } else {
-                            let run = RUN_VALUES[(v - 12) as usize];
-                            let last = self.data.last().copied().unwrap_or(self.previous_value);
-                            self.data.extend(std::iter::repeat_n(last, run));
-                            out += run;
-                        }
-                    }
-                    // The DLL's visible range is exactly [buf, buf+t), even if a final run
-                    // writes beyond the requested count.
-                    self.data.truncate(t);
-                }
-            }
-            Kind::Plain4 => {
-                if br.bit() == 1 {
-                    let v = br.read(4) as u8;
-                    self.data.extend(std::iter::repeat_n(v, t));
-                } else {
-                    for _ in 0..t {
-                        self.data
-                            .push(self.tree.as_ref().map_or(0, |tr| tr.decode(br)));
-                    }
-                }
-            }
-            Kind::Pair => {
-                for _ in 0..t {
-                    let n0 = self.tree.as_ref().map_or(0, |tr| tr.decode(br));
-                    let n1 = self.tree.as_ref().map_or(0, |tr| tr.decode(br));
-                    self.data.push(n0 | (n1 << 4));
-                }
-            }
-            Kind::Colors => {
-                if br.bit() == 1 {
-                    // The shared refill's constant path reads one nibble and expands it to a
-                    // byte by duplicating that nibble (`0x3001c35d..0x3001c3c0`).
-                    let nibble = br.read(4) as u8;
-                    self.data.resize(t, nibble | (nibble << 4));
-                } else {
-                    for _ in 0..t {
-                        let hi = match self
-                            .high
-                            .get(self.lastval as usize)
-                            .and_then(|t| t.as_ref())
-                        {
-                            Some(tr) => tr.decode(br),
-                            None => br.read(4) as u8,
-                        };
-                        let lo = self.tree.as_ref().map_or(0, |tr| tr.decode(br));
-                        self.lastval = hi;
-                        self.data.push((hi << 4) | lo);
-                    }
-                }
-            }
-            Kind::Signed | Kind::Raw16 => {}
-        }
-        if !self.data.is_empty() && self.kind == Kind::RleRun {
-            self.previous_value = *self.data.last().unwrap_or(&self.previous_value);
-        }
-        self.data_end = self.data.len();
-        if old_data.len() > self.data.len() {
-            self.data.extend_from_slice(&old_data[self.data.len()..]);
-        }
+        self.start -= 1;
+        self.buf[self.start] = e;
         Ok(())
     }
 
-    fn refill_signed(&mut self, br: &mut BitReader<'_>) -> Result<()> {
-        let old_signed = self.signed.clone();
-        let t = br.read(self.runsize) as usize;
-        if t == 0 {
-            self.signed = old_signed;
-            self.signed_pos = 4;
-            self.signed_end = 0;
-            self.sentinel = true;
-            return Ok(());
+    fn push_back(&mut self, e: u8) -> Result<()> {
+        if self.end >= self.buf.len() {
+            return Err(list_overflow());
         }
-        self.signed.clear();
-        self.signed_pos = 0;
-        self.signed_end = 0;
-        self.sentinel = false;
-        let fill = br.bit() != 0;
-        if fill {
-            let mut v = br.read(4) as i32;
-            if v != 0 && br.bit() != 0 {
+        self.buf[self.end] = e;
+        self.end += 1;
+        Ok(())
+    }
+}
+
+fn list_overflow() -> VideoError {
+    VideoError::new(VideoErrorKind::BadValue, "coefficient work list overflow")
+}
+
+/// One pass of the coefficient list walk shared by the DCT and residue readers.
+///
+/// `on_new(br, index)` is called when a coefficient becomes significant. Returns `Ok(true)`
+/// when `on_new` asked to stop.
+fn walk_list(
+    br: &mut BitReader<'_>,
+    list: &mut WorkList,
+    on_new: &mut dyn FnMut(&mut BitReader<'_>, u8) -> Result<bool>,
+) -> Result<bool> {
+    let mut p = list.start;
+    while p < list.end {
+        let e = list.buf[p];
+        if e == 0 || br.bit() == 0 {
+            p += 1;
+            continue;
+        }
+        let idx = e >> 2;
+        match e & 3 {
+            0 | 2 => {
+                if e & 3 == 0 {
+                    // Mode 0 keeps the entry as the following 16-group (`0x30020db2`).
+                    list.buf[p] = ((idx + 4) << 2) | 1;
+                } else {
+                    // Mode 2 removes the entry (`0x30020df3`).
+                    list.buf[p] = 0;
+                    p += 1;
+                }
+                // Four singles: bit 1 defers the coefficient to the front of the list, bit 0
+                // makes it significant now (`0x30020dfe..0x30021165`).
+                for j in 0..4 {
+                    let i = idx + j;
+                    if br.bit() == 1 {
+                        list.push_front((i << 2) | 3)?;
+                    } else if on_new(br, i)? {
+                        return Ok(true);
+                    }
+                }
+            }
+            1 => {
+                // Split a 16-group into four 4-groups (`0x30020dc1`); the entry is re-examined.
+                list.buf[p] = (idx << 2) | 2;
+                list.push_back(((idx + 4) << 2) | 2)?;
+                list.push_back(((idx + 8) << 2) | 2)?;
+                list.push_back(((idx + 12) << 2) | 2)?;
+            }
+            _ => {
+                // A pending single becomes significant (`0x300210db`).
+                if on_new(br, idx)? {
+                    return Ok(true);
+                }
+                list.buf[p] = 0;
+                p += 1;
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// DCT coefficient reader (`0x30020c70`), returning coefficients in list order (1..=63).
+///
+/// A 4-bit `bits` value gives the number of passes. In the pass with threshold
+/// `mask = 1 << k` (k from `bits - 1` down to 0), a newly significant coefficient reads `k`
+/// more magnitude bits (`value = bits | mask`) and a sign bit; there is no later refinement.
+fn read_dct_coeffs(br: &mut BitReader<'_>) -> Result<[i16; 64]> {
+    let mut local = [0i16; 64];
+    let bits = br.read(4);
+    let mut list = WorkList::new(&[
+        4 << 2,
+        24 << 2,
+        44 << 2,
+        (1 << 2) | 3,
+        (2 << 2) | 3,
+        (3 << 2) | 3,
+    ]);
+    for k in (0..bits).rev() {
+        let mask = 1u32 << k;
+        let mut on_new = |br: &mut BitReader<'_>, i: u8| -> Result<bool> {
+            let mut v = (br.read(k as usize) | mask) as i32;
+            if br.bit() == 1 {
                 v = -v;
             }
-            self.signed.resize(t, v);
-        } else {
-            for _ in 0..t {
-                let mut v = self.tree.as_ref().map_or(0, |tr| tr.decode(br)) as i32;
-                if v != 0 && br.bit() != 0 {
-                    v = -v;
+            local[usize::from(i)] = v as i16;
+            Ok(false)
+        };
+        walk_list(br, &mut list, &mut on_new)?;
+    }
+    Ok(local)
+}
+
+/// Residue reader (`0x30021590`), returning signed byte residues in list order.
+///
+/// A 3-bit value plus one gives the number of passes; the threshold `mask` starts at
+/// `1 << (passes - 1)` as a signed byte and is halved arithmetically. Each pass first refines
+/// every already significant coefficient (bit 1 adds `mask` away from zero), then walks the
+/// list (new coefficients get `+-mask`). The walk stops after `masks + 1` such operations.
+fn read_residue(br: &mut BitReader<'_>, masks: u32) -> Result<[i8; 64]> {
+    let mut out = [0i8; 64];
+    let passes = br.read(3) + 1;
+    let mut mask = (1u8 << (passes - 1)) as i8;
+    let mut list = WorkList::new(&[4 << 2, 24 << 2, 44 << 2, 2]);
+    let mut nz: Vec<u8> = Vec::with_capacity(64);
+    let mut ops = 0u32;
+    for _ in 0..passes {
+        for &k in &nz {
+            if br.bit() == 1 {
+                let i = usize::from(k);
+                let step = if out[i] < 0 {
+                    mask.wrapping_neg()
+                } else {
+                    mask
+                };
+                out[i] = out[i].wrapping_add(step);
+                let old = ops;
+                ops += 1;
+                if old == masks {
+                    return Ok(out);
                 }
-                self.signed.push(v);
             }
         }
-        self.signed_end = self.signed.len();
-        if old_signed.len() > self.signed.len() {
-            self.signed
-                .extend_from_slice(&old_signed[self.signed.len()..]);
+        let m = mask;
+        let mut on_new = |br: &mut BitReader<'_>, i: u8| -> Result<bool> {
+            nz.push(i);
+            out[usize::from(i)] = if br.bit() == 1 { m.wrapping_neg() } else { m };
+            let old = ops;
+            ops += 1;
+            Ok(old == masks)
+        };
+        if walk_list(br, &mut list, &mut on_new)? {
+            return Ok(out);
         }
-        Ok(())
+        mask >>= 1;
     }
-
-    fn refill_dc(&mut self, br: &mut BitReader<'_>) -> Result<()> {
-        let old_dc = self.dc.clone();
-        let t = br.read(self.runsize) as usize;
-        if t == 0 {
-            self.dc = old_dc;
-            self.dc_pos = 2;
-            self.dc_end = 0;
-            self.sentinel = true;
-            return Ok(());
-        }
-        self.dc.clear();
-        self.dc_pos = 0;
-        self.dc_end = 0;
-        self.sentinel = false;
-        let mut start = br.read(
-            self.dc_start_bits
-                .saturating_sub(usize::from(self.dc_signed)),
-        ) as i32;
-        if self.dc_signed && start != 0 && br.bit() != 0 {
-            start = -start;
-        }
-        self.dc.push(start);
-        let mut cur = start;
-        let mut i = 1;
-        while i < t {
-            let n = 8.min(t - i);
-            let w = br.read(4) as usize;
-            if w == 0 {
-                for _ in 0..n {
-                    self.dc.push(cur);
-                }
-                i += n;
-                continue;
-            }
-            for _ in 0..n {
-                let mut v = br.read(w) as i32;
-                if v != 0 && br.bit() == 1 {
-                    v = -v;
-                }
-                cur += v;
-                self.dc.push(cur);
-                i += 1;
-            }
-        }
-        self.dc_end = self.dc.len();
-        if old_dc.len() > self.dc.len() {
-            self.dc.extend_from_slice(&old_dc[self.dc.len()..]);
-        }
-        Ok(())
-    }
+    Ok(out)
 }
 
-fn motion_copy(out: &mut [u8], w: usize, h: usize, bx: usize, by: usize, dx: i32, dy: i32) {
-    let mut copy = [0u8; 64];
-    for yy in 0..8 {
-        for xx in 0..8 {
-            let sx = bx as i32 + xx as i32 + dx;
-            let sy = by as i32 + yy as i32 + dy;
-            copy[yy * 8 + xx] = if sx < 0 || sy < 0 || sx >= w as i32 || sy >= h as i32 {
-                128
-            } else {
-                out[sy as usize * w + sx as usize]
-            };
-        }
-    }
-    for yy in 0..8 {
-        for xx in 0..8 {
-            out[(by + yy) * w + bx + xx] = copy[yy * 8 + xx];
-        }
-    }
+// ---------------------------------------------------------------------------------------------
+// IDCT
+// ---------------------------------------------------------------------------------------------
+
+/// One 8-point pass of the shipped integer IDCT (`0x3001f4f0..0x3001f6ae` columns,
+/// `0x3001f6e0..` rows). Constants are 11-bit fixed point: 2896 (`0xb50`), 3784 (`0xec8`),
+/// 2217 (`0x8a9`) and -5352 (`0xffffeb18`).
+fn idct8(x: [i32; 8]) -> [i32; 8] {
+    let a = x[0].wrapping_add(x[4]);
+    let b = x[0].wrapping_sub(x[4]);
+    let c = x[2].wrapping_add(x[6]);
+    let t = (x[2].wrapping_sub(x[6]).wrapping_mul(2896) >> 11).wrapping_sub(c);
+    let e0 = a.wrapping_add(c);
+    let e3 = a.wrapping_sub(c);
+    let e1 = b.wrapping_add(t);
+    let e2 = b.wrapping_sub(t);
+
+    let p = x[1].wrapping_add(x[7]);
+    let s = x[1].wrapping_sub(x[7]);
+    let q = x[3].wrapping_add(x[5]);
+    let r = x[5].wrapping_sub(x[3]);
+    let o0 = q.wrapping_add(p);
+    let z = s.wrapping_add(r).wrapping_mul(3784) >> 11;
+    let b1 = (r.wrapping_mul(-5352) >> 11)
+        .wrapping_sub(o0)
+        .wrapping_add(z);
+    let b2 = (p.wrapping_sub(q).wrapping_mul(2896) >> 11).wrapping_sub(b1);
+    let b3 = (s.wrapping_mul(2217) >> 11)
+        .wrapping_sub(z)
+        .wrapping_add(b2);
+
+    [
+        e0.wrapping_add(o0),
+        e1.wrapping_add(b1),
+        e2.wrapping_add(b2),
+        e3.wrapping_sub(b3),
+        e3.wrapping_add(b3),
+        e2.wrapping_sub(b2),
+        e1.wrapping_sub(b1),
+        e0.wrapping_sub(o0),
+    ]
 }
 
-fn scale_block_2x(block: &[u8; 64], out: &mut [u8], w: usize, bx: usize, by: usize) {
-    for yy in 0..16 {
-        for xx in 0..16 {
-            let idx = (by + yy) * w + bx + xx;
-            if idx < out.len() {
-                out[idx] = block[(yy / 2) * 8 + xx / 2];
-            }
+/// Dequantise (`coef * q >> 11`, per column on input) and run the 2-D IDCT. Each output is
+/// `(v + 0x7f) >> 8` truncated to a byte; with `pred` it is added to the prediction with
+/// byte wrap-around (`0x30020500`), otherwise stored directly (`0x3001f4d0`). Neither path
+/// saturates.
+fn idct(coeffs: &[i16; 64], quant: &[i32; 64], pred: Option<&[u8; 64]>) -> [u8; 64] {
+    let mut tmp = [0i32; 64];
+    for c in 0..8 {
+        let col: [i32; 8] = std::array::from_fn(|r| {
+            i32::from(coeffs[r * 8 + c]).wrapping_mul(quant[r * 8 + c]) >> 11
+        });
+        let o = idct8(col);
+        for r in 0..8 {
+            tmp[r * 8 + c] = o[r];
         }
     }
-}
-
-fn fill_block(out: &mut [u8], w: usize, bx: usize, by: usize, c: u8) {
-    for yy in 0..8 {
-        for xx in 0..8 {
-            out[(by + yy) * w + bx + xx] = c;
-        }
-    }
-}
-
-fn pattern_position(pattern: &[u8; 64], i: usize) -> usize {
-    pattern[i] as usize
-}
-
-#[allow(clippy::too_many_arguments)]
-fn pattern_fill_rows(
-    out: &mut [u8],
-    w: usize,
-    bx: usize,
-    by: usize,
-    c0: u8,
-    c1: u8,
-    pattern: &mut Bundle,
-    masks: &[u32; 16],
-    br: &mut BitReader<'_>,
-) -> Result<()> {
-    for y in 0..8 {
-        let row_pattern = pattern.next(br)?;
-        for x in 0..8 {
-            let nibble = if x < 4 {
-                row_pattern & 0x0f
-            } else {
-                row_pattern >> 4
-            } as usize;
-            let bit = (masks[nibble] >> ((x & 3) * 8)) & 0xff != 0;
-            out[(by + y) * w + bx + x] = if bit { c1 } else { c0 };
-        }
-    }
-    Ok(())
-}
-
-/// Decodes the 64 run-fill values in pattern order (used by the 8x8 and 16x16 run blocks).
-fn fill_run_values(
-    br: &mut BitReader<'_>,
-    bundles: &mut [Bundle; bundle::COUNT],
-    pattern: &[u8; 64],
-) -> Result<[u8; 64]> {
-    let mut vals = [0u8; 64];
-    let mut filled = 0usize;
-    while filled < 64 {
-        if br.bit() == 1 {
-            // Solid run path reads the colour before the run byte (`0x3001dc16` then
-            // `0x3001dc25`).
-            let c = bundles[bundle::COLORS].next(br)?;
-            // The block handler increments the stored run byte (`movzbl; incl`), so the
-            // encoded value is length minus one.
-            let run = bundles[bundle::RUN].next(br)? as usize + 1;
-            for _ in 0..run {
-                if filled >= 64 {
-                    break;
-                }
-                vals[pattern_position(pattern, filled)] = c;
-                filled += 1;
-            }
-        } else {
-            // Literal run path reads the run length, then consumes that many colours.
-            let run = bundles[bundle::RUN].next(br)? as usize + 1;
-            for _ in 0..run {
-                if filled >= 64 {
-                    break;
-                }
-                let c = bundles[bundle::COLORS].next(br)?;
-                vals[pattern_position(pattern, filled)] = c;
-                filled += 1;
-            }
-        }
-    }
-    Ok(vals)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn fill_run(
-    br: &mut BitReader<'_>,
-    bundles: &mut [Bundle; bundle::COUNT],
-    pattern: usize,
-    patterns: &[[u8; 64]; 16],
-    out: &mut [u8],
-    w: usize,
-    bx: usize,
-    by: usize,
-) -> Result<()> {
-    let pat = &patterns[pattern & 15];
-    let vals = fill_run_values(br, bundles, pat)?;
-    for yy in 0..8 {
-        for xx in 0..8 {
-            out[(by + yy) * w + bx + xx] = vals[yy * 8 + xx];
-        }
-    }
-    Ok(())
-}
-
-fn add_residue(block: &[i16; 64], scan: &[u8; 64], out: &mut [u8], w: usize, bx: usize, by: usize) {
-    for &s in scan.iter() {
-        let p = s as usize;
-        let idx = (by + p / 8) * w + bx + p % 8;
-        out[idx] = clamp8(f32::from(out[idx]) + f32::from(block[p]));
-    }
-}
-
-/// DC prediction mode for reconstruction.
-enum AddMode<'a> {
-    Intra { dc: i32, pred: &'a mut i32 },
-    Inter { dc: i32, pred: &'a mut i32 },
-}
-
-/// Dequantises with `q`, runs a float IDCT and writes the block into the plane.
-#[allow(clippy::too_many_arguments)]
-fn reconstruct(
-    block: &mut [i32; 64],
-    q: usize,
-    tables: &BinkTables,
-    out: &mut [u8],
-    w: usize,
-    bx: usize,
-    by: usize,
-    mode: AddMode<'_>,
-) {
-    let (dc, add) = match mode {
-        AddMode::Intra { dc, pred } => {
-            *pred = dc;
-            (dc, false)
-        }
-        AddMode::Inter { dc, pred } => {
-            let v = *pred + dc;
-            *pred = v;
-            (v, true)
-        }
-    };
-    block[0] = dc;
-    let spatial = dequant_idct(block, q, tables);
-    for yy in 0..8 {
-        for xx in 0..8 {
-            let idx = (by + yy) * w + bx + xx;
-            let val = if add {
-                f32::from(out[idx]) + spatial[yy * 8 + xx]
-            } else {
-                128.0 + spatial[yy * 8 + xx]
-            };
-            out[idx] = clamp8(val);
-        }
-    }
-}
-
-/// Dequantises with `q` and runs an 8x8 float IDCT, returning the spatial block.
-fn dequant_idct(block: &mut [i32; 64], q: usize, tables: &BinkTables) -> [f32; 64] {
-    let quant = &tables.quant.tables[q.min(15)];
-    for i in 0..64 {
-        block[i] = ((i64::from(block[i]) * i64::from(quant[i])) >> 11) as i32;
-    }
-    static BASIS: OnceLock<[[f32; 8]; 8]> = OnceLock::new();
-    let basis = BASIS.get_or_init(|| {
-        std::array::from_fn(|k| {
-            std::array::from_fn(|x| {
-                let scale = if k == 0 { 1.0 / 2f32.sqrt() } else { 1.0 };
-                scale * (((2 * x + 1) as f32 * k as f32 * std::f32::consts::PI) / 16.0).cos()
-            })
-        })
-    });
-    let mut horizontal = [[0f32; 8]; 8];
-    for v in 0..8 {
-        for x in 0..8 {
-            let mut sum = 0.0;
-            for u in 0..8 {
-                sum += block[v * 8 + u] as f32 * basis[u][x];
-            }
-            horizontal[v][x] = sum;
-        }
-    }
-    let mut spatial = [0f32; 64];
-    for y in 0..8 {
-        for x in 0..8 {
-            let mut sum = 0.0;
-            for v in 0..8 {
-                sum += horizontal[v][x] * basis[v][y];
-            }
-            spatial[y * 8 + x] = sum * 0.25;
-        }
-    }
-    spatial
-}
-
-/// Reconstructs an 8x8 block (used by the 16x16 scaled DCT sub-type).
-fn reconstruct_block(
-    coeff: &mut [i32; 64],
-    q: usize,
-    tables: &BinkTables,
-    add: bool,
-    dc: i32,
-) -> [u8; 64] {
-    coeff[0] = dc;
-    let spatial = dequant_idct(coeff, q, tables);
     let mut out = [0u8; 64];
-    for i in 0..64 {
-        out[i] = clamp8(if add { 0.0 } else { 128.0 } + spatial[i]);
+    for r in 0..8 {
+        let row: [i32; 8] = std::array::from_fn(|c| tmp[r * 8 + c]);
+        let o = idct8(row);
+        for c in 0..8 {
+            let v = (o[c].wrapping_add(0x7f) >> 8) as u8;
+            out[r * 8 + c] = match pred {
+                Some(p) => p[r * 8 + c].wrapping_add(v),
+                None => v,
+            };
+        }
     }
     out
 }
 
-/// Reads DCT coefficient magnitudes for one block.
-fn read_dct_coeffs(br: &mut BitReader<'_>, block: &mut [i32; 64], scan: &[u8; 64]) -> Result<()> {
-    let maxbits = br.read(4) as usize;
-    if maxbits == 0 {
-        return Ok(());
-    }
-    if maxbits > 15 {
-        return Err(VideoError::new(
-            VideoErrorKind::BadValue,
-            format!("DCT maxbits {maxbits}"),
-        ));
-    }
-    let tree = dct_tree();
-    let mut decided = 0u64;
-    let mut sign = [false; 64];
-    let mut mag = [0i32; 64];
-    let mut mask = 1i32.checked_shl(maxbits as u32 - 1).unwrap_or(0);
-    while mask != 0 {
-        for (i, value) in mag.iter_mut().enumerate() {
-            if decided & (1u64 << i) != 0 && br.bit() == 1 {
-                *value |= mask;
-            }
-        }
-        traverse_dct(&tree, br, mask, &mut mag, &mut decided, &mut sign);
-        mask >>= 1;
-    }
-    for i in 0..64 {
-        if decided & (1u64 << i) != 0 {
-            let v = if sign[i] { -mag[i] } else { mag[i] };
-            block[scan[i] as usize] = v;
-        }
-    }
-    Ok(())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn traverse_dct(
-    node: &DctNode,
-    br: &mut BitReader<'_>,
-    mask: i32,
-    mag: &mut [i32; 64],
-    decided: &mut u64,
-    sign: &mut [bool; 64],
-) {
-    match node {
-        DctNode::Leaf(idx) => {
-            let i = *idx as usize;
-            let bit = 1u64 << i;
-            if *decided & bit != 0 {
-                return;
-            }
-            if br.bit() == 1 {
-                *decided |= bit;
-                sign[i] = br.bit() == 1;
-                mag[i] |= mask;
+    /// LSB-first bit writer for building synthetic streams.
+    struct BitWriter {
+        bytes: Vec<u8>,
+        bit: usize,
+    }
+
+    impl BitWriter {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                bit: 0,
             }
         }
-        DctNode::Branch {
-            children,
-            mask: subtree_mask,
-        } => {
-            let all_decided = subtree_mask & !*decided == 0;
-            if all_decided {
-                return;
+        fn put(&mut self, v: u32, n: usize) {
+            for i in 0..n {
+                if self.bit / 8 >= self.bytes.len() {
+                    self.bytes.push(0);
+                }
+                if (v >> i) & 1 == 1 {
+                    self.bytes[self.bit / 8] |= 1 << (self.bit % 8);
+                }
+                self.bit += 1;
             }
-            if br.bit() == 1 {
-                for c in children {
-                    traverse_dct(c, br, mask, mag, decided, sign);
+        }
+    }
+
+    #[test]
+    fn count_bits_matches_threshold_chain() {
+        // 0x1ff + n compared against powers of two: n = 0 -> 9 bits, n = 1 -> 10 bits.
+        assert_eq!(count_bits(0), 9);
+        assert_eq!(count_bits(1), 10);
+        assert_eq!(count_bits(80), 10);
+        assert_eq!(count_bits(513), 11);
+        assert_eq!(count_bits(80 * 64), 13);
+    }
+
+    #[test]
+    fn idct_of_dc_only_block_is_flat() {
+        let mut c = [0i16; 64];
+        c[0] = 1024; // 1024 * 65536 >> 11 = 32768 -> (32768 + 127) >> 8 = 128
+        let q = [65536i32; 64];
+        let out = idct(&c, &q, None);
+        assert!(out.iter().all(|&v| v == 128), "{out:?}");
+    }
+
+    #[test]
+    fn idct_add_wraps_instead_of_saturating() {
+        let mut c = [0i16; 64];
+        c[0] = 80; // 80 * 65536 >> 11 = 2560 -> (2560 + 127) >> 8 = 10
+        let q = [65536i32; 64];
+        let pred = [250u8; 64];
+        let out = idct(&c, &q, Some(&pred));
+        assert!(out.iter().all(|&v| v == 4), "{out:?}");
+    }
+
+    #[test]
+    fn dct_reader_zero_bits_reads_nothing_else() {
+        let mut w = BitWriter::new();
+        w.put(0, 4);
+        w.put(0xFFFF, 16);
+        let mut br = BitReader::new(&w.bytes);
+        let local = read_dct_coeffs(&mut br).unwrap();
+        assert!(local.iter().all(|&v| v == 0));
+        assert_eq!(br.bits_read(), 4);
+    }
+
+    #[test]
+    fn dct_reader_single_coefficient_last_pass() {
+        // bits = 1: one pass with mask 1 and no magnitude bits. Entries: [4:m0, 24:m0, 44:m0,
+        // 1:m3, 2:m3, 3:m3]. Skip the first three (bit 0), take coefficient 1 (bit 1) with a
+        // negative sign, skip 2 and 3.
+        let mut w = BitWriter::new();
+        w.put(1, 4);
+        for b in [0, 0, 0, 1, 1, 0, 0] {
+            w.put(b, 1);
+        }
+        let mut br = BitReader::new(&w.bytes);
+        let local = read_dct_coeffs(&mut br).unwrap();
+        assert_eq!(local[1], -1);
+        assert_eq!(local.iter().filter(|&&v| v != 0).count(), 1);
+        assert_eq!(br.bits_read(), 11);
+    }
+
+    #[test]
+    fn dct_reader_group_defers_with_bit_one() {
+        // bits = 2: pass k=1 (mask 2, one magnitude bit). Entry 4:m0 is opened; its four
+        // singles 4..7: coefficient 4 significant now (bit 0, magnitude 1 -> 3, sign +),
+        // coefficient 5 deferred (bit 1), 6 and 7 deferred. The re-examined entry 8:m1 is
+        // skipped (bit 0), then 24, 44 and singles 1..3 are skipped.
+        let mut w = BitWriter::new();
+        w.put(2, 4);
+        w.put(1, 1); // open 4:m0
+        w.put(0, 1); // coef 4 now
+        w.put(1, 1); // magnitude bit
+        w.put(0, 1); // sign +
+        w.put(1, 1); // defer 5
+        w.put(1, 1); // defer 6
+        w.put(1, 1); // defer 7
+        w.put(0, 1); // 8:m1 skipped
+        for _ in 0..5 {
+            w.put(0, 1); // 24, 44, 1, 2, 3
+        }
+        // Final pass (mask 1): list is [7:m3, 6:m3, 5:m3, 8:m1, 24, 44, 1, 2, 3]; take 5.
+        w.put(0, 1); // 7
+        w.put(0, 1); // 6
+        w.put(1, 1); // 5
+        w.put(1, 1); // sign -
+        for _ in 0..6 {
+            w.put(0, 1);
+        }
+        let mut br = BitReader::new(&w.bytes);
+        let local = read_dct_coeffs(&mut br).unwrap();
+        assert_eq!(local[4], 3);
+        assert_eq!(local[5], -1);
+        assert_eq!(local.iter().filter(|&&v| v != 0).count(), 2);
+        assert_eq!(br.bits_read(), w.bit);
+    }
+
+    #[test]
+    fn residue_stops_after_mask_budget() {
+        // passes = 1 (mask 1). Entry 4:m0 opened; coefficient 4 significant (+1). With a mask
+        // budget of 0 the reader stops right after that first operation.
+        let mut w = BitWriter::new();
+        w.put(0, 3);
+        w.put(1, 1); // open 4:m0
+        w.put(0, 1); // coef 4 now
+        w.put(0, 1); // sign +
+        w.put(0xFF, 8); // must not be consumed
+        let mut br = BitReader::new(&w.bytes);
+        let res = read_residue(&mut br, 0).unwrap();
+        assert_eq!(res[4], 1);
+        assert_eq!(br.bits_read(), 6);
+    }
+
+    #[test]
+    fn dc_bundle_deltas_and_repeat_groups() {
+        // count bits for bw = 1 is 10; t = 10 values. Start 100 (11 bits). Group of 8 with
+        // width 2: deltas +1 x8. Then group of 1 with width 0: repeat.
+        let mut w = BitWriter::new();
+        w.put(10, 10);
+        w.put(100, 11);
+        w.put(2, 4);
+        for _ in 0..8 {
+            w.put(1, 2);
+            w.put(0, 1);
+        }
+        w.put(0, 4);
+        let mut br = BitReader::new(&w.bytes);
+        let mut dc = DcBundle::new(count_bits(1), false);
+        dc.refill(&mut br);
+        let mut stats = FrameStats::default();
+        let vals: Vec<i16> = (0..10).map(|_| dc.next(&mut stats).unwrap()).collect();
+        assert_eq!(vals, vec![100, 101, 102, 103, 104, 105, 106, 107, 108, 108]);
+        assert_eq!(stats.stale_reads, 0);
+        // Fully consumed: the next row refills; a zero count disables further refills.
+        let mut w2 = BitWriter::new();
+        w2.put(0, 10);
+        let mut br2 = BitReader::new(&w2.bytes);
+        dc.refill(&mut br2);
+        assert_eq!((dc.cur, dc.end), (4, 0));
+        dc.refill(&mut br2);
+        assert_eq!(
+            br2.bits_read(),
+            10,
+            "no further count is read after a zero count"
+        );
+    }
+
+    /// Synthetic tables: every tree is the raw-nibble lookup table (no DLL bytes involved).
+    fn synthetic_tables() -> BinkTables {
+        use crate::tables::{BinaryPatterns, HuffmanLengths, Patterns, QuantTables};
+        let raw: Vec<u8> = (0..16u8).map(|i| 0x40 | i).collect();
+        let mut masks = [0u32; 16];
+        for (n, m) in masks.iter_mut().enumerate() {
+            for bit in 0..4 {
+                if n & (1 << bit) != 0 {
+                    *m |= 0xff << (bit * 8);
                 }
             }
         }
-    }
-}
-
-fn node_mask(node: &DctNode) -> u64 {
-    match node {
-        DctNode::Leaf(i) => 1u64 << *i,
-        DctNode::Branch { mask, .. } => *mask,
-    }
-}
-
-/// Node of the fixed DCT coefficient tree (public prose: Kostya's coefficient-tree post).
-#[derive(Debug)]
-enum DctNode {
-    Leaf(u8),
-    Branch { children: Vec<DctNode>, mask: u64 },
-}
-
-fn branch(children: Vec<DctNode>) -> DctNode {
-    let mask = children
-        .iter()
-        .fold(0u64, |mask, child| mask | node_mask(child));
-    DctNode::Branch { children, mask }
-}
-
-fn leaves(a: u8, n: u8) -> Vec<DctNode> {
-    (a..a + n).map(DctNode::Leaf).collect()
-}
-
-fn dct_tree() -> DctNode {
-    branch(vec![
-        branch(vec![
-            branch(leaves(4, 4)),
-            branch(vec![
-                branch(leaves(8, 4)),
-                branch(leaves(12, 4)),
-                branch(leaves(16, 4)),
-                branch(leaves(20, 4)),
-            ]),
-        ]),
-        branch(vec![
-            branch(leaves(24, 4)),
-            branch(vec![
-                branch(leaves(28, 4)),
-                branch(leaves(32, 4)),
-                branch(leaves(36, 4)),
-                branch(leaves(40, 4)),
-            ]),
-        ]),
-        branch(vec![
-            branch(leaves(44, 4)),
-            branch(vec![
-                branch(leaves(48, 4)),
-                branch(leaves(52, 4)),
-                branch(leaves(56, 4)),
-                branch(leaves(60, 4)),
-            ]),
-        ]),
-        DctNode::Leaf(1),
-        DctNode::Leaf(2),
-        DctNode::Leaf(3),
-    ])
-}
-
-/// Residue reader.
-fn read_residue(
-    br: &mut BitReader<'_>,
-    block: &mut [i16; 64],
-    masks_count: usize,
-    scan: &[u8; 64],
-) -> Result<()> {
-    // Lossy residue: 7-bit mask count already read by the caller; here each mask is a bit plane.
-    let tree = dct_tree();
-    let mut decided = 0u64;
-    let mut sign = [false; 64];
-    let mut mag = [0i32; 64];
-    let mut mask = 1i32
-        .checked_shl(masks_count.saturating_sub(1) as u32)
-        .unwrap_or(0);
-    while mask != 0 {
-        for (i, value) in mag.iter_mut().enumerate() {
-            if decided & (1u64 << i) != 0 && br.bit() == 1 {
-                *value |= mask;
-            }
-        }
-        traverse_dct(&tree, br, mask, &mut mag, &mut decided, &mut sign);
-        mask >>= 1;
-    }
-    for i in 0..64 {
-        if decided & (1u64 << i) != 0 {
-            let v = if sign[i] { -mag[i] } else { mag[i] };
-            block[scan[i] as usize] = v as i16;
+        BinkTables {
+            huffman_lengths: HuffmanLengths {
+                rows: [[4u8; 16]; 16],
+            },
+            huffman_tables: vec![raw; 16],
+            tree_maxbits: [4; 16],
+            rle_runs: [4, 8, 16, 20],
+            patterns: Patterns {
+                patterns: [std::array::from_fn(|i| i as u8); 16],
+            },
+            binary_patterns: BinaryPatterns { masks },
+            scan: std::array::from_fn(|i| i as u8),
+            quant: QuantTables {
+                tables: [[65536; 64]; 16],
+            },
+            quant_inter: QuantTables {
+                tables: [[65536; 64]; 16],
+            },
+            dll_size: 0,
+            dll_fnv1a: 0,
         }
     }
-    Ok(())
-}
 
-fn read_u32(data: &[u8], off: &mut usize) -> Result<u32> {
-    let s = data.get(*off..*off + 4).ok_or_else(|| {
-        VideoError::new(
-            VideoErrorKind::Truncated,
-            format!("plane size word at byte {off}"),
-        )
-    })?;
-    *off += 4;
-    Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-}
-
-fn slice_with_lookahead(data: &[u8], off: usize, len: usize) -> Result<Vec<u8>> {
-    let end = off
-        .checked_add(len)
-        .ok_or_else(|| VideoError::new(VideoErrorKind::BadValue, "plane range overflow"))?;
-    let plane = data.get(off..end).ok_or_else(|| {
-        VideoError::new(
-            VideoErrorKind::Truncated,
-            format!("plane range {off}..{end} past packet {}", data.len()),
-        )
-    })?;
-    // Nine bundles can each request up to 16 count bits at the plane tail (144 bits); round up
-    // to a 32-bit word boundary for the DLL reader's lookahead.
-    let cap = len
-        .checked_add(24)
-        .ok_or_else(|| VideoError::new(VideoErrorKind::BadValue, "plane lookahead overflow"))?;
-    let mut padded = Vec::with_capacity(cap);
-    padded.extend_from_slice(plane);
-    padded.resize(cap, 0);
-    Ok(padded)
-}
-
-fn floor_log2(n: usize) -> usize {
-    if n <= 1 {
-        0
-    } else {
-        (usize::BITS - 1 - n.leading_zeros()) as usize
+    /// Writes a plane header with every tree number 0 (raw nibbles).
+    fn raw_header(w: &mut BitWriter) {
+        for _ in 0..23 {
+            w.put(0, 4);
+        }
     }
-}
 
-fn align8(n: usize) -> usize {
-    (n + 7) & !7
+    #[test]
+    fn plane_decodes_fill_pattern_and_raw_blocks_in_row_refill_order() {
+        // A 24x8 plane: three 8x8 blocks in one row. Bundle counts are 10 bits wide for every
+        // bundle at this width (count_bits(3), (1), (192), (24), (3), (3), (144)).
+        let mut w = BitWriter::new();
+        raw_header(&mut w);
+        // Block types: t = 3, literal symbols 6 (fill), 8 (pattern), 9 (raw).
+        w.put(3, 10);
+        w.put(0, 1);
+        for v in [6, 8, 9] {
+            w.put(v, 4);
+        }
+        w.put(0, 10); // sub-types: none
+        // Colours: t = 67 (1 fill + 2 pattern + 64 raw); context-coded high nibble (raw tree)
+        // then low nibble. Colour k = 0x10 + k for k < 67, i.e. high 1..5.
+        w.put(67, 10);
+        w.put(0, 1);
+        for k in 0..67u32 {
+            let c = 0x10 + k;
+            w.put(c >> 4, 4);
+            w.put(c & 15, 4);
+        }
+        // Pattern rows: t = 8; byte = second symbol << 4 | first symbol. Row r = 0x0F or 0xF0.
+        w.put(8, 10);
+        for r in 0..8 {
+            let (lo, hi) = if r % 2 == 0 { (0xF, 0x0) } else { (0x0, 0xF) };
+            w.put(lo, 4);
+            w.put(hi, 4);
+        }
+        for _ in 0..5 {
+            w.put(0, 10); // x, y, intra DC, inter DC, run: empty
+        }
+        let mut data = w.bytes.clone();
+        data.resize(data.len() + 8, 0);
+        let dec = Decoder::new(synthetic_tables());
+        let mut out = vec![0u8; 24 * 8];
+        let mut stats = FrameStats::default();
+        let r = dec
+            .decode_plane(&data, 0, 24, 8, None, &mut out, &mut stats)
+            .unwrap();
+        assert_eq!(r.bits, w.bit, "every written bit is consumed, nothing more");
+        assert_eq!(stats.block_type_counts[6..], [1, 0, 1, 1]);
+        assert_eq!(stats.stale_reads, 0);
+        // Fill block: colour 0x10.
+        assert!((0..8).all(|y| out[y * 24..y * 24 + 8].iter().all(|&p| p == 0x10)));
+        // Pattern block: colours 0x11 (clear bit) / 0x12 (set bit); row 0 low nibble set.
+        assert_eq!(
+            &out[8..16],
+            &[0x12, 0x12, 0x12, 0x12, 0x11, 0x11, 0x11, 0x11]
+        );
+        assert_eq!(
+            &out[24 + 8..24 + 16],
+            &[0x11, 0x11, 0x11, 0x11, 0x12, 0x12, 0x12, 0x12]
+        );
+        // Raw block: colours 0x13.. in row order.
+        assert_eq!(out[16], 0x13);
+        assert_eq!(out[7 * 24 + 23], 0x13 + 63);
+    }
+
+    #[test]
+    fn plane_rejects_an_rle_run_that_overshoots_its_count() {
+        let mut w = BitWriter::new();
+        raw_header(&mut w);
+        w.put(3, 10); // block types: t = 3
+        w.put(0, 1);
+        w.put(12, 4); // run symbol: 4 copies > 3 remaining
+        let mut data = w.bytes.clone();
+        data.resize(data.len() + 64, 0);
+        let dec = Decoder::new(synthetic_tables());
+        let mut out = vec![0u8; 24 * 8];
+        let err = dec
+            .decode_plane(&data, 0, 24, 8, None, &mut out, &mut FrameStats::default())
+            .unwrap_err();
+        assert_eq!(err.kind(), VideoErrorKind::BadValue);
+        assert!(err.message().contains("overshoots"), "{err}");
+    }
+
+    #[test]
+    fn plane_reports_underrun_instead_of_succeeding() {
+        let mut w = BitWriter::new();
+        raw_header(&mut w);
+        w.put(3, 10); // three block types announced, data missing
+        let data = w.bytes.clone();
+        let dec = Decoder::new(synthetic_tables());
+        let mut out = vec![0u8; 24 * 8];
+        let err = dec
+            .decode_plane(&data, 0, 24, 8, None, &mut out, &mut FrameStats::default())
+            .unwrap_err();
+        assert_eq!(err.kind(), VideoErrorKind::OutOfData, "{err}");
+    }
+
+    #[test]
+    fn work_list_overflow_is_an_error() {
+        let mut l = WorkList::new(&[1]);
+        for _ in 0..96 {
+            l.push_front(3).unwrap();
+        }
+        assert!(l.push_front(3).is_err());
+    }
 }

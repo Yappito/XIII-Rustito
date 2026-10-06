@@ -82,8 +82,15 @@ fn setup(mut commands: Commands, cfg: Res<VideoConfig>, mut images: ResMut<Asset
         commands.write_message(AppExit::error());
         return;
     };
-    let Some(game_dir) = cfg.options.game_dir.clone() else {
-        eprintln!("[video] --video needs --game-dir");
+    let Some(game_dir) = cfg
+        .options
+        .game_dir
+        .clone()
+        .or_else(|| install_root_of(&file))
+    else {
+        eprintln!(
+            "[video] --video needs --game-dir (or a file inside the installation's Video folder)"
+        );
         commands.write_message(AppExit::error());
         return;
     };
@@ -158,48 +165,71 @@ fn setup(mut commands: Commands, cfg: Res<VideoConfig>, mut images: ResMut<Asset
     });
 }
 
+/// The installation root for a cutscene stored as `<root>/Video/<file>.bik`.
+fn install_root_of(file: &std::path::Path) -> Option<std::path::PathBuf> {
+    let video_dir = file.parent()?;
+    let name = video_dir
+        .file_name()?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if name != "video" {
+        return None;
+    }
+    video_dir.parent().map(std::path::Path::to_path_buf)
+}
+
 fn advance(
     cfg: Res<VideoConfig>,
-    mut state: ResMut<VideoState>,
+    state: Option<ResMut<VideoState>>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    let fps = state.bik.header.fps();
-    let frame_time = Duration::from_secs_f64(1.0 / fps.max(1.0));
-    if state.last_advance.elapsed() < frame_time {
+    // Setup failed (and requested exit): nothing to play.
+    let Some(mut state) = state else {
         return;
-    }
-    state.last_advance = Instant::now();
-    let i = state.next_frame;
-    if i >= state.bik.frame_count() {
-        return;
-    }
-    state.next_frame += 1;
-    let video = match xiii_video::frame_video(&state.data, &state.bik, i) {
-        Ok(v) => v,
-        Err(e) => {
-            state.errors += 1;
-            state.first_error.get_or_insert_with(|| e.to_string());
-            return;
-        }
     };
-    match state
-        .decoder
-        .decode_frame(video, &state.bik.header, state.prev.as_ref())
-    {
-        Ok((frame, _stats)) => {
-            let rgba = frame.to_rgba();
-            if let Some(mut img) = images.get_mut(&state.handle) {
-                img.data = Some(rgba);
+    // Frames are due by wall-clock time since playback start, so playback keeps the file's
+    // frame rate even when the window updates less often (e.g. unfocused); every due frame is
+    // decoded (inter frames depend on their predecessor), only the newest one is uploaded.
+    let fps = state.bik.header.fps().max(1.0);
+    let due =
+        ((state.start.elapsed().as_secs_f64() * fps) as usize + 1).min(state.bik.frame_count());
+    let mut newest = None;
+    while state.next_frame < due {
+        let i = state.next_frame;
+        state.next_frame += 1;
+        let video = match xiii_video::frame_video(&state.data, &state.bik, i) {
+            Ok(v) => v,
+            Err(e) => {
+                state.errors += 1;
+                state.first_error.get_or_insert_with(|| e.to_string());
+                continue;
             }
-            state.prev = Some(frame);
-            state.decoded += 1;
+        };
+        match state
+            .decoder
+            .decode_frame(video, &state.bik.header, state.prev.as_ref())
+        {
+            Ok((frame, _stats)) => {
+                state.prev = Some(frame);
+                state.decoded += 1;
+                newest = Some(i);
+            }
+            Err(e) => {
+                state.errors += 1;
+                state
+                    .first_error
+                    .get_or_insert_with(|| format!("frame {i}: {e}"));
+            }
         }
-        Err(e) => {
-            state.errors += 1;
-            state
-                .first_error
-                .get_or_insert_with(|| format!("frame {i}: {e}"));
+    }
+    if newest.is_some()
+        && let Some(frame) = state.prev.as_ref()
+    {
+        let rgba = frame.to_rgba();
+        if let Some(mut img) = images.get_mut(&state.handle) {
+            img.data = Some(rgba);
         }
+        state.last_advance = Instant::now();
     }
     let _ = &cfg;
 }
@@ -207,10 +237,13 @@ fn advance(
 fn unattended(
     mut commands: Commands,
     cfg: Res<VideoConfig>,
-    mut state: ResMut<VideoState>,
+    state: Option<ResMut<VideoState>>,
     flag: Res<ShotFlag>,
     mut exit: MessageWriter<AppExit>,
 ) {
+    let Some(mut state) = state else {
+        return;
+    };
     let Some(secs) = cfg.options.exit_after_secs else {
         return;
     };
