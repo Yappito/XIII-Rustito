@@ -33,7 +33,7 @@ use crate::navigation::{
 use crate::physics::{HitZones, WorldPhysics};
 use crate::reflect::{Property, PropertyKind, ScriptObject, function_flags, property_flags};
 use crate::registry::{NativeCtx, NativeDef, NativeOutcome, Registry};
-use crate::value::{ObjRef, ObjectId, Ty, Value};
+use crate::value::{Delegate, ObjRef, ObjectId, Ty, Value};
 
 /// Interpreter limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2984,6 +2984,53 @@ impl<'s> Vm<'s> {
         self.call_values(func, this, args)
     }
 
+    /// Invokes a delegate property from outside script (the host's GUI render loop calls the
+    /// page/control `__OnPreDraw__`/`__OnDraw__` delegates this way).
+    ///
+    /// Reads the delegate `property` from `context`. A bound delegate calls its own
+    /// `(object, function)`; an unbound/absent one calls `declared` on `context` — the same
+    /// fallback as the `DelegateFunction` (`0x43`) opcode. Fails explicitly when the target
+    /// function does not exist; it never silently draws nothing.
+    pub fn call_delegate(
+        &mut self,
+        context: ObjectId,
+        property: &str,
+        declared: &str,
+        args: Vec<Value>,
+    ) -> VmResult<Value> {
+        self.steps = 0;
+        let bound = match self.get_property(context, property) {
+            Some(Value::Delegate(Some(d))) => Some(d.clone()),
+            Some(Value::Delegate(None)) | None => None,
+            Some(other) => return Err(self.type_err("delegate", other)),
+        };
+        match bound {
+            Some(d) => {
+                let obj = match d.object {
+                    Some(ObjRef::Instance(i)) => i,
+                    Some(ObjRef::Static(g)) => self.default_object(g)?,
+                    Some(ObjRef::External(_)) | None => context,
+                };
+                let f = self.find_function(obj, &d.function, true).ok_or_else(|| {
+                    self.err(VmErrorKind::NoSuchFunction {
+                        object: self.objects[obj as usize].name.clone(),
+                        name: d.function.clone(),
+                    })
+                })?;
+                self.call_values(f, obj, args)
+            }
+            None => {
+                let f = self.find_function(context, declared, true).ok_or_else(|| {
+                    self.err(VmErrorKind::NoSuchFunction {
+                        object: self.objects[context as usize].name.clone(),
+                        name: declared.to_owned(),
+                    })
+                })?;
+                self.call_values(f, context, args)
+            }
+        }
+    }
+
     /// `GotoState` from outside script (harness/tests).
     pub fn goto_state(&mut self, id: ObjectId, state: &str, label: Option<&str>) -> VmResult<()> {
         self.steps = 0;
@@ -4692,6 +4739,88 @@ impl<'s> Vm<'s> {
                 let x = self.eval(frame, a)?;
                 let y = self.eval(frame, b)?;
                 Value::Bool(values_equal(&x, &y) == (t.opcode == 0x32))
+            }
+            // `0x44` in an assignment right-hand side: a fresh delegate bound to the current
+            // context object (`self.__OnDraw__Delegate = delegateprop InternalOnDraw`).
+            K::DelegateProperty(name) => {
+                let function = self.set.packages[frame.pkg].name_text(*name).to_owned();
+                Value::Delegate(Some(Delegate {
+                    object: Some(ObjRef::Instance(target)),
+                    function,
+                }))
+            }
+            // `0x3F`: an explicitly empty delegate (`delegate(D) = none`).
+            K::EmptyDelegate => Value::Delegate(None),
+            // `0x45`: delegate assignment, evaluated like a normal `Let` but storing a delegate
+            // value (the destination slot's declared type is `delegate`).
+            K::LetDelegate { lhs, rhs } => {
+                let place = self.place(frame, lhs, target)?;
+                let v = self.eval(frame, rhs)?;
+                match place {
+                    Some(p) => self.write(frame, &p, v)?,
+                    None => self.accessed_none(),
+                }
+                Value::Void
+            }
+            // `0x43`: `Object.delegate <DelegateProperty>:<Function>(args)`. Read the delegate
+            // property from the context object; a bound delegate calls its own object/function,
+            // an unbound one calls `<Function>` on the context (UE2 semantics).
+            K::DelegateFunction {
+                property,
+                name,
+                call,
+            } => {
+                let prop_name = self
+                    .set
+                    .resolve(frame.pkg, *property)
+                    .map(|g| self.object_name(g).to_owned())
+                    .unwrap_or_else(|| self.set.packages[frame.pkg].ref_name(*property).to_owned());
+                let bound = match self.get_property(target, &prop_name) {
+                    Some(Value::Delegate(Some(d))) => Some(d.clone()),
+                    Some(Value::Delegate(None)) | None => None,
+                    Some(other) => {
+                        return Err(self.type_err("delegate", other));
+                    }
+                };
+                let declared = self.set.packages[frame.pkg].name_text(*name).to_owned();
+                match bound {
+                    Some(d) => {
+                        let obj = match d.object {
+                            Some(ObjRef::Instance(i)) => i,
+                            Some(ObjRef::Static(g)) => self.default_object(g)?,
+                            Some(ObjRef::External(_)) => {
+                                return Err(self.err(VmErrorKind::UnsupportedValue {
+                                    desc: format!(
+                                        "delegate {prop_name} on a non-script external object"
+                                    ),
+                                }));
+                            }
+                            None => target,
+                        };
+                        let f = self.find_function(obj, &d.function, true).ok_or_else(|| {
+                            self.err(VmErrorKind::NoSuchFunction {
+                                object: self.objects[obj as usize].name.clone(),
+                                name: d.function.clone(),
+                            })
+                        })?;
+                        self.invoke(frame, f, call, obj, None)?
+                    }
+                    None => {
+                        let f = self.find_function(target, &declared, true).ok_or_else(|| {
+                            self.err(VmErrorKind::NoSuchFunction {
+                                object: self.objects[target as usize].name.clone(),
+                                name: declared.clone(),
+                            })
+                        })?;
+                        self.invoke(frame, f, call, target, None)?
+                    }
+                }
+            }
+            // `0x3B..=0x3E`: delegate equality/inequality; `0x3B`/`0x3D` are the `==` forms.
+            K::DelegateCompare { a, b, .. } => {
+                let x = self.eval(frame, a)?;
+                let y = self.eval(frame, b)?;
+                Value::Bool(values_equal(&x, &y) == matches!(t.opcode, 0x3B | 0x3D))
             }
             _ => {
                 return Err(self.err(VmErrorKind::UnsupportedToken {

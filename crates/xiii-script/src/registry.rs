@@ -5015,6 +5015,9 @@ fn builtin_defs() -> Vec<NativeDef> {
     // item16 front-end menu natives (VideoPlayer, ClientTravel, menu sounds). Kept in the same
     // `canvas.rs` block so a parallel edit to the registry stays out of the way.
     v.extend(crate::canvas::menu_defs());
+    // item16b GUI-frame natives (`GUIController.GetStyle`/`InitStateFrame`). New block so a
+    // parallel edit to the registry stays out of the way.
+    v.extend(crate::canvas::item16b_defs());
     // Cinematic/dialogue natives (`crates/xiii-script/src/cinematics.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::cinematics::cinematic_defs());

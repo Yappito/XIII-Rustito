@@ -1240,6 +1240,80 @@ pub fn menu_defs() -> Vec<NativeDef> {
     v
 }
 
+// -------------------------------------------------------------------------------------------
+// item16b: GUI-frame natives needed by the decoded front-end
+//
+// The item16 host called the page's `Created` directly, bypassing
+// `gui.GUIController.InternalMenuInit` / `XIIIGUIBaseButton.InitComponent` because the VM did
+// not interpret delegate opcodes. This block supplies the two controller services those
+// decoded functions use so the real init path can run (item16b):
+//
+//   * `GUI.GUIComponent.InitComponent` (block `gui-all.txt`, `gui.u` @15432) does
+//     `self.Style = self.Controller.GetStyle(self.StyleName)`. No style table is loaded, so
+//     `GetStyle` returns `None` (Partial, labelled): `XIIIWindow`/`XIIIGUIBaseButton` carry
+//     their own `WhiteColor`/`BlackColor`/`HighlightColor` defaults, which is what the menu
+//     drawing reads.
+//   * `GUIController.OpenMenuWithClass` (gui.u @36514) calls the final native
+//     `InitStateFrame(NewMenu)` before `InternalMenuInit`. The host bridge does not use the
+//     page stack, but the call is accepted and recorded so the decoded flow is not blocked.
+//
+// Both are registered from `registry::builtin_defs` through the same menu block hook.
+
+/// `GUI.GUIController.GetStyle(string StyleName) -> object<GUIStyles>`.
+///
+/// No style table is loaded; returns `None` and records a Partial note the first time. The
+/// menu classes do not rely on the style object for their colours.
+fn gui_controller_get_style(
+    vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let name = a.first().and_then(|v| match v {
+        Value::Str(s) | Value::Name(s) => Some(s.clone()),
+        _ => None,
+    });
+    vm.note(TraceKind::Note(format!(
+        "GUI.GUIController.GetStyle({}) -> None (no style table loaded; Partial, item16b)",
+        name.as_deref().unwrap_or("None")
+    )));
+    val(Value::Object(None))
+}
+
+/// `GUI.GUIController.InitStateFrame(object<GUIPage> Page)` (final native).
+fn gui_controller_init_state_frame(
+    vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    vm.note(TraceKind::Note(
+        "GUI.GUIController.InitStateFrame accepted (host bridge does not run the page stack; Partial, item16b)"
+            .into(),
+    ));
+    val(Value::Void)
+}
+
+/// The item16b GUI-frame natives. `registry::builtin_defs` extends the built-in table with
+/// these.
+#[allow(clippy::vec_init_then_push)]
+pub fn item16b_defs() -> Vec<NativeDef> {
+    let mut v: Vec<NativeDef> = Vec::new();
+    v.push(partial(
+        "no GUI style table loaded: returns None and records a Partial note; menu colours come from the class defaults",
+        "GUIController.GetStyle",
+        "native(0) event function object<GUIStyles> GetStyle(string StyleName)",
+        "gui.u GUIComponent.InitComponent 0x0016 reads Controller.GetStyle(StyleName); gui.GUIController.GetStyle decoded",
+        gui_controller_get_style,
+    ));
+    v.push(partial(
+        "host bridge does not run the GUIController page stack; the call is accepted and recorded",
+        "GUIController.InitStateFrame",
+        "native(0) final static function InitStateFrame(object<GUIPage> Page)",
+        "gui.u GUIController.OpenMenuWithClass 0x000F calls InitStateFrame(NewMenu)",
+        gui_controller_init_state_frame,
+    ));
+    v
+}
+
 #[cfg(test)]
 mod menu_tests {
     use super::*;

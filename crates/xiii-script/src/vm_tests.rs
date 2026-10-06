@@ -9,7 +9,7 @@ use crate::localize::LocalizationData;
 use crate::reflect::function_flags as ff;
 use crate::reflect::property_flags as pf;
 use crate::tests::{Exp, build_package, compact};
-use crate::value::{ObjRef, ObjectId, Value};
+use crate::value::{Delegate, ObjRef, ObjectId, Value};
 use crate::vm::{Latent, TraceKind, Vm, VmErrorKind, VmLimits};
 
 struct B {
@@ -505,8 +505,9 @@ fn registry_entries_are_documented() {
     // item14b added 10 AI natives (264 -> 274); item3p added the five missing rotator operators
     // (142, 203, 287, 288, 289), the float power operator (170) and a visible Partial for
     // `ParticleEmitter.SetMaxParticles` (274 -> 281); item16 added the menu natives
-    // (`VideoPlayer.*`, `Actor.*AllSounds`, `PlayerController.ClientTravel`) (281 -> 289).
-    assert_eq!(defs.len(), 289);
+    // (`VideoPlayer.*`, `Actor.*AllSounds`, `PlayerController.ClientTravel`) (281 -> 289);
+    // item16b added the GUI-frame natives (`GUIController.GetStyle`/`InitStateFrame`) (289 -> 291).
+    assert_eq!(defs.len(), 291);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -6498,4 +6499,97 @@ fn set_max_particles_records_and_does_not_fail() {
         &e.kind,
         TraceKind::Note(s) if s.contains("SetMaxParticles(12)") && s.contains("no particle subsystem")
     )));
+}
+
+// ---------------------------------------------------------------------------------------
+// Delegate opcodes: assignment (0x45/0x44), empty delegate (0x3F), call (0x43).
+
+/// Package with a delegate property `Handler`, the bound function `Target` (returns 42) and
+/// `Set` / `Clear` / `Fire` exercising `letdelegate`, `emptyd`, and the delegate call.
+fn delegate_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    // `Core.DelegateProperty` import (the property's class).
+    let delegate_class = b.add_external("Core", "Class", "DelegateProperty");
+    let handler = b.reserve(delegate_class, object, "Handler");
+    let target = b.reserve(IMP_FUNCTION, object, "Target");
+    let set = b.reserve(IMP_FUNCTION, object, "Set");
+    let fire = b.reserve(IMP_FUNCTION, object, "Fire");
+    let clear = b.reserve(IMP_FUNCTION, object, "Clear");
+    // Delegate property: `DelegateProperty.Function` ref is None (unused by the VM).
+    let extra = compact(0);
+    b.prop_with(handler, target, 0, &extra);
+    // `return 42`.
+    let target_code = [0x04, 0x1D, 42, 0, 0, 0];
+    b.func(target, set, 0, &target_code, 6, 0, ff::DEFINED);
+    // `self.Handler = delegateprop Target`.
+    let target_name = b.name("Target");
+    let mut set_code = vec![0x45, 0x01];
+    set_code.extend(compact(handler));
+    set_code.push(0x44);
+    set_code.extend(compact(target_name));
+    b.func(set, fire, 0, &set_code, 11, 0, ff::DEFINED);
+    // `self.Handler = emptydelegate`.
+    let mut clear_code = vec![0x45, 0x01];
+    clear_code.extend(compact(handler));
+    clear_code.push(0x3F);
+    b.func(clear, 0, 0, &clear_code, 7, 0, ff::DEFINED);
+    // `return self.delegate Handler:Target()` (the context supplies `self`).
+    let mut fire_code = vec![0x04, 0x19, 0x17, 0x00, 0x00, 0x00, 0x43];
+    fire_code.extend(compact(handler));
+    fire_code.extend(compact(target_name));
+    fire_code.push(0x16);
+    b.func(fire, clear, 0, &fire_code, 16, 0, ff::DEFINED);
+    b.class(object, 0, handler);
+    b.build()
+}
+
+#[test]
+fn delegate_assignment_calls_the_bound_function() {
+    let set = set_of(delegate_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(g(&set, "Object"), "D").unwrap();
+    vm.set_active(o, true);
+    vm.call_function(g(&set, "Object.Set"), o, vec![]).unwrap();
+    match vm.get_property(o, "Handler") {
+        Some(Value::Delegate(Some(d))) => {
+            assert_eq!(d.function, "Target");
+            assert_eq!(d.object, Some(ObjRef::Instance(o)));
+        }
+        other => panic!("Handler = {other:?}"),
+    }
+    let v = vm.call_function(g(&set, "Object.Fire"), o, vec![]).unwrap();
+    assert_eq!(v, Value::Int(42));
+}
+
+#[test]
+fn empty_delegate_falls_back_to_the_declared_function() {
+    let set = set_of(delegate_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(g(&set, "Object"), "D").unwrap();
+    vm.set_active(o, true);
+    vm.call_function(g(&set, "Object.Set"), o, vec![]).unwrap();
+    // Clearing the delegate must not leave a stale binding.
+    vm.call_function(g(&set, "Object.Clear"), o, vec![])
+        .unwrap();
+    assert_eq!(vm.get_property(o, "Handler"), Some(&Value::Delegate(None)));
+    // An unbound delegate call runs the declared function on the context.
+    let v = vm.call_function(g(&set, "Object.Fire"), o, vec![]).unwrap();
+    assert_eq!(v, Value::Int(42));
+}
+
+#[test]
+fn delegate_values_are_equatable_and_none_is_distinct() {
+    let d = Value::Delegate(Some(Delegate {
+        object: Some(ObjRef::Instance(3)),
+        function: "Target".into(),
+    }));
+    let same = Value::Delegate(Some(Delegate {
+        object: Some(ObjRef::Instance(3)),
+        function: "target".into(),
+    }));
+    // Case-sensitive function names: different spelling is a different delegate.
+    assert!(!crate::vm::values_equal(&d, &same));
+    assert!(crate::vm::values_equal(&d, &d.clone()));
+    assert!(!crate::vm::values_equal(&Value::Delegate(None), &d));
 }
