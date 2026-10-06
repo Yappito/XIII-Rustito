@@ -20,6 +20,7 @@ pub mod script;
 pub mod session;
 pub mod sim;
 pub mod travel;
+pub mod voice;
 pub mod weapons;
 
 use std::collections::HashMap;
@@ -1814,6 +1815,9 @@ struct MapRuntime {
     volumes: movement_modes::VolumeMotion,
     sim: PlayerSim,
     sources: Vec<String>,
+    /// Shared counter of voice names this map's `VoiceDuration` provider could not resolve (the
+    /// provider is re-installed on every map open, including travel reloads).
+    voice_unresolved: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Opens a script session and builds the movement world for `map` from `scene` (the headless
@@ -1825,6 +1829,16 @@ fn open_map_runtime(
     params: &PlayerParams,
 ) -> Result<MapRuntime, String> {
     let mut session = session::Session::open(game_dir, map)?;
+    // The headless path has no Bevy audio resource; scan the same decoded HX library so
+    // `Actor.PlayStrVoice` takes the engine's voice-completion path (real wave length) instead of
+    // the script's `NoSound` fallback. Names the library cannot resolve keep returning `false`.
+    let voice_library = std::sync::Arc::new(std::sync::Mutex::new(xiii_audio::SoundLibrary::scan(
+        game_dir,
+    )));
+    let (voice_provider, voice_unresolved) = voice::LibraryVoiceDuration::new(voice_library);
+    session
+        .vm_mut()
+        .set_voice_duration(Box::new(voice_provider));
     session.register_movers(scene);
     let mover_states = session.mover_states();
     let (mut world, mover_collision) = movers::MoverCollision::build(scene, &mover_states);
@@ -1875,6 +1889,7 @@ fn open_map_runtime(
         volumes,
         sim,
         sources,
+        voice_unresolved,
     })
 }
 
@@ -1900,6 +1915,8 @@ pub(crate) fn run_script(
     let mut travel = Vec::new();
     let mut map_objectives = Vec::new();
     let mut runtime = open_map_runtime(game_dir, map, scene, params)?;
+    // Accumulated unresolved voice names across maps (the provider is re-installed per map).
+    let mut voice_unresolved_total = 0u64;
     // Player footsteps (item6e): the same notify-free synthesis `fixed_step` uses, so the
     // headless path reports and can play them. Rebuilt for each map after a level transition.
     let mut surfaces = footsteps::SurfaceSounds::from_scene(scene);
@@ -2060,6 +2077,9 @@ pub(crate) fn run_script(
             };
             let next_scene = viewer::load_scene(&opts)?;
             let t0 = Instant::now();
+            voice_unresolved_total += runtime
+                .voice_unresolved
+                .load(std::sync::atomic::Ordering::Relaxed);
             runtime = open_map_runtime(game_dir, &plan.map, &next_scene, params)?;
             // Rebuild the footstep surface map and driver for the next map.
             surfaces = footsteps::SurfaceSounds::from_scene(&next_scene);
@@ -2081,6 +2101,17 @@ pub(crate) fn run_script(
         );
     }
     map_objectives.push((runtime.name.clone(), runtime.session.objective_states()));
+    let unresolved = voice_unresolved_total
+        + runtime
+            .voice_unresolved
+            .load(std::sync::atomic::Ordering::Relaxed);
+    if unresolved > 0 {
+        println!(
+            "[play] voice durations: {unresolved} name(s) unresolved (those lines use the script's NoSound fallback)"
+        );
+    } else {
+        println!("[play] voice durations: every requested name resolved from the HX library");
+    }
     Ok(ScriptOutcome {
         session: runtime.session,
         ticks,

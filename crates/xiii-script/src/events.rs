@@ -227,8 +227,31 @@ pub enum PresentationEvent {
     Dialogue(DialogueEvent),
     /// `RenderTargetMaterial.Update`: render the camera pose into the panel material.
     RenderTarget(RenderTargetEvent),
+    /// `Actor.SaveAtCheckpoint`: the script asked to write a checkpoint save. The host records it;
+    /// the VM never writes into the game installation (see [`SaveCheckpointEvent`]).
+    SaveCheckpoint(SaveCheckpointEvent),
     /// A level-travel request (see [`TravelRequest`]).
     TravelRequest(TravelRequest),
+}
+
+/// A checkpoint-save request decoded from `Actor.SaveAtCheckpoint`
+/// (`engine.u Actor.SaveAtCheckpoint(string TeleporterName, string ContentDescription)`).
+///
+/// `XIIISaveGameTrigger.GoSaving.DoSave` builds a `XIIIThingsToSave` actor, copies the player's
+/// health/speed/objectives into it and calls this native to persist the checkpoint. The VM is
+/// headless and read-only over the installation, so it records the request here (the host may
+/// later write to a user data directory) and reports success to the script, exactly as the retail
+/// native returns `true` when the save is written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SaveCheckpointEvent {
+    /// Object the native ran on (the calling actor).
+    pub actor: String,
+    /// Decoded `TeleporterName` (the `PlayerStart` tag the save resumes from).
+    pub teleporter_name: String,
+    /// Decoded `ContentDescription` (the save slot description).
+    pub description: String,
+    /// VM time in seconds when the native ran.
+    pub time: f64,
 }
 
 impl PresentationEvent {
@@ -247,6 +270,7 @@ impl PresentationEvent {
             | Self::PlaySndPNJOno { actor, .. } => actor,
             Self::Dialogue(e) => &e.actor,
             Self::RenderTarget(e) => &e.actor,
+            Self::SaveCheckpoint(e) => &e.actor,
             Self::TravelRequest(e) => &e.actor,
         }
     }
@@ -266,6 +290,7 @@ impl PresentationEvent {
             | Self::PlaySndPNJOno { time, .. } => *time,
             Self::Dialogue(e) => e.time,
             Self::RenderTarget(e) => e.time,
+            Self::SaveCheckpoint(e) => e.time,
             Self::TravelRequest(e) => e.time,
         }
     }
@@ -378,6 +403,11 @@ impl std::fmt::Display for PresentationEvent {
                 e.cam_rotation[1],
                 e.cam_rotation[2],
                 e.fov
+            ),
+            Self::SaveCheckpoint(e) => write!(
+                f,
+                "SaveAtCheckpoint {} teleporter={} description={}",
+                e.actor, e.teleporter_name, e.description
             ),
             Self::TravelRequest(e) => write!(
                 f,

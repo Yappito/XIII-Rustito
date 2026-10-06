@@ -5217,6 +5217,9 @@ fn builtin_defs() -> Vec<NativeDef> {
     // item16 front-end menu natives (VideoPlayer, ClientTravel, menu sounds). Kept in the same
     // `canvas.rs` block so a parallel edit to the registry stays out of the way.
     v.extend(crate::canvas::menu_defs());
+    // item16b GUI-frame natives (`GUIController.GetStyle`/`InitStateFrame`). New block so a
+    // parallel edit to the registry stays out of the way.
+    v.extend(crate::canvas::item16b_defs());
     // Cinematic/dialogue natives (`crates/xiii-script/src/cinematics.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::cinematics::cinematic_defs());
@@ -5225,6 +5228,9 @@ fn builtin_defs() -> Vec<NativeDef> {
     v.extend(crate::cartoon::cartoon_defs());
     // item18: small VM gaps found on the Plage01 route (float `%`, particle spawn Partial).
     v.extend(item18_defs());
+    // Intro/checkpoint residual natives (`crates/xiii-script/src/residuals.rs`). Kept in one
+    // block so a parallel edit to the registry stays out of the way.
+    v.extend(crate::residuals::residual_defs());
     // Paths are matched without the package ("Class.Function"): strip it.
     for d in &mut v {
         if let Some(rest) = d.path.strip_prefix("Engine.") {
