@@ -1233,6 +1233,161 @@ impl Session {
         out
     }
 
+    /// Reapplies the decoded checkpoint fields and returns the checkpoint actor's Unreal location.
+    /// XIII's save semantics are map travel plus checkpoint tag and ThingsToSave fields, not a VM
+    /// heap restore. Inventory reconstruction is done through the same `GiveTo` entry point.
+    pub fn restore_checkpoint(&mut self, save: &crate::save::SaveFile) -> Result<[f32; 3], String> {
+        let tag_match = |v: &Value| match v {
+            Value::Name(n) | Value::Str(n) => n.eq_ignore_ascii_case(&save.teleporter),
+            _ => false,
+        };
+        let checkpoint = self
+            .vm
+            .objects
+            .iter()
+            .enumerate()
+            .find_map(|(i, o)| {
+                (!o.deleted && o.is_actor && tag_match(self.vm.get_property(i as ObjectId, "Tag")?))
+                    .then_some(i as ObjectId)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "checkpoint tag {:?} is absent on map {}",
+                    save.teleporter, save.map
+                )
+            })?;
+        let loc = self
+            .vm
+            .vector_prop(checkpoint, "Location")
+            .ok_or_else(|| format!("checkpoint {:?} has no Location", save.teleporter))?;
+        self.vm
+            .set_property(self.player, "Location", 0, Value::Vector(loc));
+        self.vm.set_property(
+            self.player,
+            "Health",
+            0,
+            Value::Int(save.health.round() as i32),
+        );
+        self.vm.set_property(
+            self.player,
+            "SpeedFactorLimit",
+            0,
+            Value::Float(save.speed_factor_limit),
+        );
+        if let Some(gi) = self.game_info {
+            self.vm.set_property(
+                gi,
+                "CheckpointNumber",
+                0,
+                Value::Int(save.checkpoint_number),
+            );
+        }
+        if let Some(mi) = self.map_info()
+            && let Some(Value::Array(mut goals)) = self.vm.get_property(mi, "Objectif").cloned()
+        {
+            for (i, state) in save.objectives.iter().enumerate() {
+                let Some(Value::Struct(fields)) = goals.get_mut(i) else {
+                    break;
+                };
+                for (name, flag) in [
+                    ("bCompleted", state.completed),
+                    ("bPrimary", state.primary),
+                    ("bAntiGoal", state.anti_goal),
+                ] {
+                    if let Some((_, value)) = fields
+                        .iter_mut()
+                        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                    {
+                        *value = Value::Bool(flag);
+                    }
+                }
+            }
+            self.vm.set_property(mi, "Objectif", 0, Value::Array(goals));
+        }
+        for item in &save.inventory {
+            if item
+                .class_path
+                .eq_ignore_ascii_case("XIII.XIIIThingsToSave")
+            {
+                continue;
+            }
+            let class =
+                runtime::resolve_class_path(self.vm.set(), &item.class_path).ok_or_else(|| {
+                    format!("saved inventory class is not loaded: {}", item.class_path)
+                })?;
+            let id = self
+                .vm
+                .spawn_actor(
+                    self.player,
+                    Some(class),
+                    Some(self.player),
+                    None,
+                    Some(loc),
+                    None,
+                )
+                .map_err(|e| format!("spawning saved inventory {}: {e}", item.class_path))?
+                .ok_or_else(|| {
+                    format!("saved inventory spawn returned None: {}", item.class_path)
+                })?;
+            self.vm
+                .send_event(
+                    id,
+                    "GiveTo",
+                    vec![Value::Object(Some(ObjRef::Instance(self.player)))],
+                )
+                .map_err(|e| format!("restoring saved inventory {}: {e}", item.class_path))?;
+        }
+        Ok(loc)
+    }
+
+    /// Captures the minimal ThingsToSave-compatible fields from the live VM.
+    pub fn checkpoint_snapshot(
+        &self,
+        map: &str,
+        event: &SaveCheckpointEvent,
+        position: [f32; 3],
+        rotation: [i32; 3],
+    ) -> crate::save::SaveFile {
+        let health = self.player_health().unwrap_or(0.0);
+        let speed_factor_limit = match self.vm.get_property(self.player, "SpeedFactorLimit") {
+            Some(Value::Float(v)) => *v,
+            _ => 0.0,
+        };
+        let checkpoint_number = self
+            .game_info
+            .and_then(|i| match self.vm.get_property(i, "CheckpointNumber") {
+                Some(Value::Int(v)) => Some(*v),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let objectives = self
+            .objective_states()
+            .into_iter()
+            .map(|o| crate::save::Objective {
+                completed: o.completed,
+                primary: o.primary,
+                anti_goal: o.anti_goal,
+            })
+            .collect();
+        let inventory = self
+            .inventory_items()
+            .into_iter()
+            .map(|(name, class_path)| crate::save::InventoryItem { class_path, name })
+            .collect();
+        crate::save::SaveFile {
+            map: map.to_owned(),
+            teleporter: event.teleporter_name.clone(),
+            description: event.description.clone(),
+            health,
+            speed_factor_limit,
+            checkpoint_number,
+            location: position,
+            rotation,
+            objectives,
+            inventory,
+        }
+    }
+
     /// One compact line of the objective states (goal index, primary/anti/completed flags, text).
     pub fn objective_summary(&self) -> String {
         let states = self.objective_states();
@@ -2295,6 +2450,62 @@ mod tests {
         println!(
             "[save test] checkpoint {:?} teleporter={:?} description={:?}",
             save.actor, save.teleporter_name, save.description
+        );
+    }
+
+    /// Opt-in checkpoint persistence/restore through the same map and named teleporter used by
+    /// Plage00's `DoSave`; this deliberately uses a temporary user directory, not game data.
+    #[test]
+    fn opt_in_plage00_checkpoint_file_restores_decoded_state() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut source = Session::open(&game_dir, "Plage00").expect("open source Plage00");
+        for _ in 0..120 {
+            if source.save_total > 0 {
+                break;
+            }
+            let loc = source.player_location().unwrap_or([0.; 3]);
+            source.step(1.0 / 60.0, loc, 0., [0.; 3], &PlayerVMModes::default());
+        }
+        let event = source.saves.back().expect("checkpoint event").1.clone();
+        let saved = source.checkpoint_snapshot(
+            "Plage00",
+            &event,
+            source.player_location().expect("live player position"),
+            source.player_rotation().expect("live player rotation"),
+        );
+        let dir = std::env::temp_dir().join(format!("xiii-corpus-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::save::write(&dir, 0, &saved).expect("write checkpoint file");
+        let disk = crate::save::read(&dir, 0).expect("read checkpoint file");
+        let mut restored = Session::open(&game_dir, &disk.map).expect("open load map");
+        let checkpoint_position = restored
+            .restore_checkpoint(&disk)
+            .expect("restore checkpoint");
+        assert_eq!(restored.player_health(), Some(disk.health));
+        assert_eq!(
+            restored
+                .objective_states()
+                .iter()
+                .map(|x| (x.completed, x.primary, x.anti_goal))
+                .collect::<Vec<_>>(),
+            disk.objectives
+                .iter()
+                .map(|x| (x.completed, x.primary, x.anti_goal))
+                .collect::<Vec<_>>()
+        );
+        assert!(checkpoint_position.iter().all(|v| v.is_finite()));
+        assert_eq!(disk.map, "Plage00");
+        assert_eq!(disk.teleporter, "PlayerStart");
+        let _ = std::fs::remove_dir_all(dir);
+        println!(
+            "[save test] restored map={} teleporter={} health={} objectives={}",
+            disk.map,
+            disk.teleporter,
+            disk.health,
+            disk.objectives.len()
         );
     }
 

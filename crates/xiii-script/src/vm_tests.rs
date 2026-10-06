@@ -528,8 +528,8 @@ fn registry_entries_are_documented() {
     // item16, registered once); item3o added `SaveAtCheckpoint`, `OrthoRotation` and three
     // `SetBone*` Partials; item16b added `GUIController.GetStyle`/`InitStateFrame`; item18 added
     // `%` (173), `Normalize` (198), `ParticleEmitter.SpawnParticle` and `Actor.KillAllSounds`.
-    // Must equal `Registry::builtin().defs().count()`.
-    assert_eq!(defs.len(), 302);
+    // item20 adds ten decoded GUI save-slot declarations.
+    assert_eq!(defs.len(), 312);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),

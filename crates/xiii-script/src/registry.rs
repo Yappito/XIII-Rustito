@@ -5231,6 +5231,8 @@ fn builtin_defs() -> Vec<NativeDef> {
     // Intro/checkpoint residual natives (`crates/xiii-script/src/residuals.rs`). Kept in one
     // block so a parallel edit to the registry stays out of the way.
     v.extend(crate::residuals::residual_defs());
+    // item20: decoded GUI save-slot APIs. Host directory integration is required to enable them.
+    v.extend(crate::item20::save_defs());
     // Paths are matched without the package ("Class.Function"): strip it.
     for d in &mut v {
         if let Some(rest) = d.path.strip_prefix("Engine.") {

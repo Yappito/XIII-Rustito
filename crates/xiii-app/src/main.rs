@@ -10,6 +10,7 @@ mod menu;
 mod perf;
 mod play;
 mod reach;
+mod save;
 mod smoke;
 mod viewer;
 

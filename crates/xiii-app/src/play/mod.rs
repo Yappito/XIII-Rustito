@@ -105,6 +105,7 @@ struct FootstepRes(footsteps::FootstepDriver);
 #[derive(Resource)]
 struct TraceState {
     tick: u64,
+    saved_total: u64,
     start: Instant,
     exit_secs: Option<f32>,
     shot: u8,
@@ -152,8 +153,25 @@ impl Plugin for PlayPlugin {
         // Load the script session before the window opens. `Session` holds `Rc`-based VM state
         // (it is `!Send`), so it lives in a non-send resource on the main thread; a load failure
         // is stored and reported by `setup`, which exits with an error.
-        let game_dir = self.options.game_dir.clone().unwrap_or_default();
-        let map = self.options.map.clone().unwrap_or_default();
+        let mut options = self.options.clone();
+        if let Some(slot) = options.load {
+            match options
+                .save_dir
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(crate::save::default_save_dir)
+                .and_then(|dir| crate::save::read(&dir, slot))
+            {
+                Ok(saved) => {
+                    options.map = Some(saved.map);
+                }
+                Err(e) => {
+                    eprintln!("[save] load slot {slot} failed: {e}");
+                }
+            }
+        }
+        let game_dir = options.game_dir.clone().unwrap_or_default();
+        let map = options.map.clone().unwrap_or_default();
         let t0 = Instant::now();
         let mut session = session::Session::open(&game_dir, &map);
         println!(
@@ -161,54 +179,52 @@ impl Plugin for PlayPlugin {
             t0.elapsed().as_secs_f32()
         );
         if let Ok(s) = session.as_mut() {
-            s.enable_native_timers(self.options.perf_natives);
+            s.enable_native_timers(options.perf_natives);
         }
         app.insert_non_send(session);
-        app.insert_resource(PlayConfig {
-            options: self.options.clone(),
-        })
-        .insert_resource(ClearColor(Color::srgb(0.45, 0.62, 0.82)))
-        .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
-        .init_resource::<ShotFlag>()
-        .init_resource::<RenderSync>()
-        .init_resource::<weapons::WeaponView>()
-        .init_resource::<ParticleTriggerCursor>()
-        .init_resource::<RuntimeLights>()
-        .add_plugins(viewer::particles::ParticlePlugin)
-        .init_resource::<cinematics::CinematicState>()
-        .init_resource::<cartoon::CartoonState>()
-        .init_resource::<cartoon::CartoonRenderTarget>()
-        .init_resource::<viewer::decals::RuntimeProjectorDecals>()
-        .insert_resource(viewer::fog::FogDisabled(viewer::fog::fog_disabled()))
-        .add_systems(Startup, setup)
-        .add_systems(FixedUpdate, (fixed_step, travel).chain())
-        .add_systems(
-            Update,
-            (
-                controls,
-                grab_cursor,
-                mouse_look,
-                cinematics::collect,
-                sync_camera,
-                cinematics::draw,
-                viewer::sky_follow,
-                viewer::animate_uv,
-                viewer::fog::update_fog,
-                viewer::decals::update_runtime_projectors,
-                sync_particle_triggers,
-                sync_vm_lights,
-                pawns::update_pawns,
-                weapons::update_weapon_view,
-                hud::refresh,
-                cartoon::collect,
-                cartoon::sync_render_target,
-                hud::draw,
-                overlay,
-                unattended,
+        app.insert_resource(PlayConfig { options })
+            .insert_resource(ClearColor(Color::srgb(0.45, 0.62, 0.82)))
+            .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
+            .init_resource::<ShotFlag>()
+            .init_resource::<RenderSync>()
+            .init_resource::<weapons::WeaponView>()
+            .init_resource::<ParticleTriggerCursor>()
+            .init_resource::<RuntimeLights>()
+            .add_plugins(viewer::particles::ParticlePlugin)
+            .init_resource::<cinematics::CinematicState>()
+            .init_resource::<cartoon::CartoonState>()
+            .init_resource::<cartoon::CartoonRenderTarget>()
+            .init_resource::<viewer::decals::RuntimeProjectorDecals>()
+            .insert_resource(viewer::fog::FogDisabled(viewer::fog::fog_disabled()))
+            .add_systems(Startup, setup)
+            .add_systems(FixedUpdate, (fixed_step, travel).chain())
+            .add_systems(
+                Update,
+                (
+                    controls,
+                    grab_cursor,
+                    mouse_look,
+                    cinematics::collect,
+                    sync_camera,
+                    cinematics::draw,
+                    viewer::sky_follow,
+                    viewer::animate_uv,
+                    viewer::fog::update_fog,
+                    viewer::decals::update_runtime_projectors,
+                    sync_particle_triggers,
+                    sync_vm_lights,
+                    pawns::update_pawns,
+                    weapons::update_weapon_view,
+                    hud::refresh,
+                    cartoon::collect,
+                    cartoon::sync_render_target,
+                    hud::draw,
+                    overlay,
+                    unattended,
+                )
+                    .chain(),
             )
-                .chain(),
-        )
-        .add_systems(Last, (cinematics::report_exit, cartoon::report_exit));
+            .add_systems(Last, (cinematics::report_exit, cartoon::report_exit));
     }
 }
 
@@ -542,8 +558,8 @@ fn setup_inner(
     // comes from the host's FindSpot placement (the raw PlayerStart overlaps the floor) and the
     // facing from the pawn's script-set Rotation. The host writes the placed position back to
     // the VM on the first tick. Same rule as the scripted path in `run_script`.
-    let start_center = bevy_to_unreal_position(spawn.position);
-    let start_rot = match (session.login_script, session.player_rotation()) {
+    let mut start_center = bevy_to_unreal_position(spawn.position);
+    let mut start_rot = match (session.login_script, session.player_rotation()) {
         (1, Some(r)) => {
             println!(
                 "[play] attaching host movement to the script-created pawn {} (VM location {:?} UU, rot {:?})",
@@ -555,6 +571,24 @@ fn setup_inner(
         }
         _ => rot,
     };
+    if let Some(slot) = opts.load {
+        let dir = opts
+            .save_dir
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(crate::save::default_save_dir)?;
+        let saved = crate::save::read(&dir, slot)?;
+        start_center = session.restore_checkpoint(&saved)?;
+        start_rot = saved.rotation;
+        println!(
+            "[save] restored slot {slot}: map={} checkpoint={} health={} objectives={} inventory={}",
+            saved.map,
+            saved.checkpoint_number,
+            saved.health,
+            saved.objectives.len(),
+            saved.inventory.len()
+        );
+    }
     let yaw = start_rot[1] as f32 * std::f32::consts::TAU / 65536.0;
     let mut sim = PlayerSim::new(start_center, yaw);
     sim.grounded = true;
@@ -762,6 +796,7 @@ fn setup_inner(
         commands.insert_resource(ScriptRes { drive });
         commands.insert_resource(TraceState {
             tick: 0,
+            saved_total: 0,
             start: Instant::now(),
             exit_secs,
             shot: 0,
@@ -990,6 +1025,33 @@ fn fixed_step(
             floor_normal: sim.0.floor_normal,
         };
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
+        if sess.save_total > state.saved_total {
+            state.saved_total = sess.save_total;
+            if let Some((_, event)) = sess.saves.back() {
+                let map = cfg.options.map.as_deref().unwrap_or("Plage00");
+                let rot = sess.player_rotation().unwrap_or([0; 3]);
+                let data = sess.checkpoint_snapshot(map, event, sim.0.location, rot);
+                let save_dir = cfg
+                    .options
+                    .save_dir
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(crate::save::default_save_dir);
+                match save_dir.and_then(|dir| {
+                    let slot = (0..10)
+                        .find(|&n| !crate::save::exists(&dir, n))
+                        .unwrap_or(0);
+                    crate::save::write(&dir, slot, &data).map(|()| (dir, slot))
+                }) {
+                    Ok((dir, slot)) => println!(
+                        "[save] wrote slot {slot} ({}) to {}",
+                        event.description,
+                        dir.display()
+                    ),
+                    Err(e) => eprintln!("[save] checkpoint write failed: {e}"),
+                }
+            }
+        }
         perf.span("vm_step", t0);
         // The VM owns the mover poses; write them into the dynamic collision set so the next
         // player step collides with the moved brush.
