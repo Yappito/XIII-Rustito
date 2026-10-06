@@ -93,6 +93,11 @@ pub struct Options {
     pub perf_interval: f32,
     /// `--perf`: also time individual VM natives (adds overhead; top 10 reported).
     pub perf_natives: bool,
+    /// `--benchmark`: render a fixed number of frames as fast as possible, print frame-time
+    /// statistics and exit. Ignores `--exit-after-secs` for the measured loop.
+    pub benchmark: Option<u32>,
+    /// `--benchmark`: warm-up frames discarded before the measured frames.
+    pub benchmark_warmup: u32,
 }
 
 /// Audio playback toggle for `--play`.
@@ -155,6 +160,8 @@ impl Default for Options {
             perf: false,
             perf_interval: 5.0,
             perf_natives: false,
+            benchmark: None,
+            benchmark_warmup: 0,
         }
     }
 }
@@ -226,6 +233,9 @@ xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
   --perf               Print a per-system frame-time/CPU table every 5 s and at exit.
   --perf-interval S    Seconds between --perf tables (default 5).
   --perf-natives       --perf: also time individual VM natives (adds overhead).
+  --benchmark N        Render N frames as fast as possible, print p50/p99 frame time and fps,
+                       and exit (after --benchmark-warmup frames). For repeatable measurement.
+  --benchmark-warmup N Frames discarded before a --benchmark measurement (default 0).
   --size WxH           Initial logical window size (default 1280x720).
   -h, --help           Print this help.
 
@@ -272,6 +282,22 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
                 if opts.mode == Mode::Smoke {
                     opts.mode = Mode::Viewer;
                 }
+            }
+            "--benchmark" => {
+                let v = value("--benchmark")?;
+                let n: u32 = v
+                    .parse()
+                    .map_err(|_| format!("invalid --benchmark {v:?}"))?;
+                if n == 0 {
+                    return Err("--benchmark must be > 0".into());
+                }
+                opts.benchmark = Some(n);
+            }
+            "--benchmark-warmup" => {
+                let v = value("--benchmark-warmup")?;
+                opts.benchmark_warmup = v
+                    .parse()
+                    .map_err(|_| format!("invalid --benchmark-warmup {v:?}"))?;
             }
             "--perf-interval" => {
                 let v = value("--perf-interval")?;
@@ -527,6 +553,26 @@ mod tests {
             Some(std::path::Path::new("user/saves"))
         );
         assert!(p(&["--load", "-1"]).is_err());
+    }
+
+    #[test]
+    fn parses_benchmark_flags() {
+        let o = p(&["--play", "--benchmark", "600"]).unwrap();
+        assert_eq!(o.benchmark, Some(600));
+        assert_eq!(o.benchmark_warmup, 0);
+        let o = p(&["--benchmark", "10", "--benchmark-warmup", "3"]).unwrap();
+        assert_eq!(o.benchmark, Some(10));
+        assert_eq!(o.benchmark_warmup, 3);
+        // Boundary: zero or non-numeric frame counts are rejected; a zero warm-up is allowed.
+        assert!(p(&["--benchmark", "0"]).is_err());
+        assert!(p(&["--benchmark", "x"]).is_err());
+        assert!(p(&["--benchmark"]).is_err());
+        assert_eq!(
+            p(&["--benchmark", "5", "--benchmark-warmup", "0"])
+                .unwrap()
+                .benchmark_warmup,
+            0
+        );
     }
 
     #[test]

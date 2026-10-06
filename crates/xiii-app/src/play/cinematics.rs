@@ -222,7 +222,9 @@ pub fn collect(
     mut session: NonSendMut<Result<Session, String>>,
     mut state: ResMut<CinematicState>,
     mut audio: Option<ResMut<crate::audio::AudioRes>>,
+    mut perf: ResMut<crate::perf::Perf>,
 ) {
+    let t0 = std::time::Instant::now();
     let session = match &mut *session {
         Ok(session) => session,
         Err(_) => return,
@@ -322,6 +324,7 @@ pub fn collect(
     state.input_suppressed = state.last_suppress_state.is_some();
 
     state.subtitles.retain(|s| s.end > now);
+    perf.span("cine_collect", t0);
 }
 
 /// Real decoded length of a voice name from the audio library, if available.

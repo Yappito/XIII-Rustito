@@ -30,6 +30,10 @@ pub struct PerfConfig {
     pub interval: f32,
     /// `--perf-natives` was given (individual VM natives are timed).
     pub natives: bool,
+    /// `--benchmark N`: render `N` frames as fast as possible, print the final table and exit.
+    pub benchmark: Option<u32>,
+    /// `--benchmark`: warm-up frames discarded before the measured frames.
+    pub benchmark_warmup: u32,
 }
 
 impl Default for PerfConfig {
@@ -38,6 +42,8 @@ impl Default for PerfConfig {
             enabled: false,
             interval: 5.0,
             natives: false,
+            benchmark: None,
+            benchmark_warmup: 0,
         }
     }
 }
@@ -109,6 +115,8 @@ pub struct Perf {
     pub final_requested: bool,
     /// The final table was already printed.
     pub final_printed: bool,
+    /// Benchmark: the frame count at which the measured window begins (after warm-up).
+    pub benchmark_start_frame: Option<u64>,
 }
 
 impl Default for Perf {
@@ -125,6 +133,7 @@ impl Default for Perf {
             last_frame_count: 0,
             final_requested: false,
             final_printed: false,
+            benchmark_start_frame: None,
         }
     }
 }
@@ -185,12 +194,84 @@ pub struct PerfPlugin {
 impl Plugin for PerfPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(Perf::new(self.config));
-        if self.config.enabled {
+        if self.config.enabled || self.config.benchmark.is_some() {
             app.add_plugins(FrameTimeDiagnosticsPlugin::new(200_000))
-                .add_plugins(EntityCountDiagnosticsPlugin::new(4))
-                .add_systems(Last, perf_report_system);
+                .add_plugins(EntityCountDiagnosticsPlugin::new(4));
+        }
+        if self.config.enabled {
+            app.add_systems(Last, perf_report_system);
+        }
+        if self.config.benchmark.is_some() {
+            app.add_systems(Last, benchmark_system);
         }
     }
+}
+
+/// `--benchmark N`: counts warm-up then measured frames, prints a frame-time table for the
+/// measured window only, and exits. The window excludes the warm-up so first-frame shader and
+/// asset uploads do not skew the percentiles.
+fn benchmark_system(
+    mut perf: ResMut<Perf>,
+    store: Res<DiagnosticsStore>,
+    render: Option<Res<RenderStats>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let Some(n) = perf.config.benchmark else {
+        return;
+    };
+    let frame_count = store
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_COUNT)
+        .and_then(|d| d.value())
+        .unwrap_or(0.0) as u64;
+    match perf.benchmark_start_frame {
+        None => {
+            if frame_count >= u64::from(perf.config.benchmark_warmup) {
+                perf.benchmark_start_frame = Some(frame_count);
+            }
+            return;
+        }
+        Some(start) => {
+            let measured = frame_count.saturating_sub(start);
+            if measured < u64::from(n) {
+                return;
+            }
+        }
+    }
+    // The measured window is the last `n` frame-time samples.
+    let mut samples: Vec<f64> = store
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .map(|d| d.values().copied().collect())
+        .unwrap_or_default();
+    if samples.len() > n as usize {
+        samples.drain(0..samples.len() - n as usize);
+    }
+    let entities = store
+        .get(&EntityCountDiagnosticsPlugin::ENTITY_COUNT)
+        .and_then(|d| d.value())
+        .unwrap_or(0.0);
+    println!(
+        "[perf] ===== BENCHMARK {n} frames (warm-up {}) | entities {entities:.0} =====",
+        perf.config.benchmark_warmup
+    );
+    match stats(&samples) {
+        Some((n, mean, p50, p95, p99, min, max)) => {
+            println!(
+                "[perf]   frame ms: mean {mean:6.2}  p50 {p50:6.2}  p95 {p95:6.2}  p99 {p99:6.2}  \
+                 min {min:6.2}  max {max:6.2}  (samples {n}) | p50 {:.1} fps | mean {:.1} fps",
+                1000.0 / p50.max(1e-9),
+                1000.0 / mean.max(1e-9),
+            );
+        }
+        None => println!("[perf]   frame ms: no samples"),
+    }
+    if let Some(r) = render {
+        println!(
+            "[perf]   render: objects {} | mesh entities (pre-cull draw submissions) {} | mesh assets {} | material assets {} | triangles {}",
+            r.objects, r.draw_entities, r.mesh_assets, r.material_assets, r.triangles
+        );
+    }
+    perf.final_requested = true;
+    exit.write(AppExit::Success);
 }
 
 /// Returns `(count, mean, p50, p95, p99, min, max)` in milliseconds for `values`.

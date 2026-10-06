@@ -90,7 +90,9 @@ pub fn update_fog(
     disabled: Res<FogDisabled>,
     mut main: Query<(&Transform, &mut DistanceFog, &mut AmbientLight), Without<SkyCamera>>,
     mut sky: Query<(&SkyCamera, &mut DistanceFog, &mut AmbientLight), With<SkyCamera>>,
+    mut perf: ResMut<crate::perf::Perf>,
 ) {
+    let t0 = std::time::Instant::now();
     // Main camera.
     for (transform, mut fog, mut ambient) in &mut main {
         let params = if disabled.0 {
@@ -116,6 +118,7 @@ pub fn update_fog(
         *fog = distance_fog(&params);
         *ambient = ambient_or_none(&params);
     }
+    perf.span("fog_update", t0);
 }
 
 /// `XIII_VIEWER_NO_FOG` disables fog selection (a diagnostic resource).

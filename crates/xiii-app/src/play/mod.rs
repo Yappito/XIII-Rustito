@@ -1030,6 +1030,7 @@ fn fixed_step(
     // animation, which `--play` does not render, so the host synthesises it from the same
     // surface lookup the script would read from `LastCollidedMaterial`. Emit only when audio is
     // enabled; the queue is drained by the audio plugin.
+    let t0 = Instant::now();
     if audio_enabled
         && let Some(step) =
             footsteps
@@ -1042,6 +1043,7 @@ fn fixed_step(
             step.sound,
         ));
     }
+    perf.span("footsteps", t0);
     if let Ok(sess) = session.as_mut() {
         let t0 = Instant::now();
         let modes = session::PlayerVMModes {
@@ -1185,7 +1187,9 @@ fn sync_particle_triggers(
     data: Res<viewer::particles::ParticleRenderData>,
     mut cursor: ResMut<ParticleTriggerCursor>,
     mut emitters: Query<&mut viewer::particles::ParticleEmitterRender>,
+    mut perf: ResMut<crate::perf::Perf>,
 ) {
+    let t0 = Instant::now();
     let Ok(sess) = session.as_mut() else {
         return;
     };
@@ -1206,6 +1210,7 @@ fn sync_particle_triggers(
     }
     cursor.trace_len = trace.len();
     if events.is_empty() {
+        perf.span("particle_triggers", t0);
         return;
     }
     for mut e in &mut emitters {
@@ -1230,6 +1235,7 @@ fn sync_particle_triggers(
             }
         }
     }
+    perf.span("particle_triggers", t0);
 }
 
 /// Mirrors the VM's live light actors to Bevy `PointLight` entities. Map-placed dynamic lights
@@ -1242,7 +1248,9 @@ fn sync_vm_lights(
     session: NonSend<Result<session::Session, String>>,
     mut state: ResMut<RuntimeLights>,
     mut lights: Query<(&mut PointLight, &mut Transform)>,
+    mut perf: ResMut<crate::perf::Perf>,
 ) {
+    let t0 = Instant::now();
     let Ok(sess) = session.as_ref() else {
         return;
     };
@@ -1310,6 +1318,7 @@ fn sync_vm_lights(
     state.active = state.entities.len();
     state.muzzle_actors = muzzle_actors;
     state.attach_actors = attach_actors;
+    perf.span("vm_lights", t0);
 }
 
 /// One VM status line: time, active/suspended counts, dispatcher state, player VM position,

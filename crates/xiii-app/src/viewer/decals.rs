@@ -32,6 +32,7 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::pbr::decal::{ForwardDecal, ForwardDecalMaterial, ForwardDecalMaterialExt};
 use bevy::prelude::*;
 
+use xiii_collision::{Aabb, Bvh};
 use xiii_world::WorldScene;
 use xiii_world::projectors::{ProjectorBlend, ProjectorDef, ProjectorPose};
 
@@ -265,32 +266,56 @@ pub struct RuntimeProjector;
 
 /// A downward collision probe over the imported scene's line soup, so a runtime blob shadow can
 /// be placed on the surface below its pawn (UE2 projects the shadow downward onto the receiver).
-#[derive(Resource, Default)]
+///
+/// The triangles are indexed by a broad-phase [`Bvh`]: a `down` query only visits the leaves
+/// overlapping the ray's column, instead of scanning the whole soup. The result is identical to
+/// the previous linear scan (a nearest-hit `min` over the same triangles); the BVH is a broad
+/// phase, not a different query.
+#[derive(Resource)]
 pub struct GroundQuery {
     triangles: Vec<([[f32; 3]; 3], u32)>,
+    bvh: Bvh,
+}
+
+impl Default for GroundQuery {
+    fn default() -> Self {
+        Self {
+            triangles: Vec::new(),
+            bvh: Bvh::build(&[]),
+        }
+    }
 }
 
 impl GroundQuery {
     /// Builds the probe from an imported scene's line collision.
     pub fn from_scene(scene: &WorldScene) -> Self {
-        Self {
-            triangles: scene.line_collision().collect(),
-        }
+        let triangles: Vec<([[f32; 3]; 3], u32)> = scene.line_collision().collect();
+        let bvh = Bvh::build(&triangles.iter().map(|(t, _)| *t).collect::<Vec<_>>());
+        Self { triangles, bvh }
     }
 
     /// Nearest hit below `origin` within `max_dist` metres: `(point, unit normal)`.
+    ///
+    /// Ties on the hit distance are resolved by the triangle's index in the soup, which is the
+    /// order the previous linear scan visited them in, so the result is identical to that scan
+    /// regardless of the BVH traversal order.
     pub fn down(&self, origin: [f32; 3], max_dist: f32) -> Option<([f32; 3], [f32; 3])> {
         let dir = [0.0f32, -1.0, 0.0];
-        let mut best: Option<(f32, [f32; 3])> = None;
-        for (t, _) in &self.triangles {
+        // The downward segment spans at most `max_dist` metres; a broad-phase box around it.
+        let mut query = Aabb::empty();
+        query.include(origin);
+        query.include([origin[0], origin[1] - max_dist, origin[2]]);
+        let mut best: Option<(f32, u32, [f32; 3])> = None;
+        self.bvh.traverse(query, |i| {
+            let t = &self.triangles[i as usize].0;
             if let Some(d) = ray_tri_down(origin, dir, t)
                 && d <= max_dist
-                && best.is_none_or(|(b, _)| d < b)
+                && best.is_none_or(|(b, bi, _)| d < b || (d == b && i < bi))
             {
-                best = Some((d, triangle_normal(*t)));
+                best = Some((d, i, triangle_normal(*t)));
             }
-        }
-        best.map(|(d, n)| ([origin[0], origin[1] - d, origin[2]], n))
+        });
+        best.map(|(d, _, n)| ([origin[0], origin[1] - d, origin[2]], n))
     }
 }
 
@@ -370,6 +395,7 @@ pub struct RuntimeProjectorDecals {
 /// The runtime shadow's `ProjTexture` is built by `ShadowProjector.PostBeginPlay` from a
 /// procedural `ShadowBitmapMaterial`, which has no decodable image; those decals use the
 /// generated soft blob (a labelled diagnostic fallback, not the exact asset).
+#[allow(clippy::too_many_arguments)]
 pub fn update_runtime_projectors(
     mut commands: Commands,
     session: bevy::ecs::system::NonSend<Result<crate::play::session::Session, String>>,
@@ -378,7 +404,9 @@ pub fn update_runtime_projectors(
     mut decals: ResMut<RuntimeProjectorDecals>,
     mut decal_materials: ResMut<Assets<ForwardDecalMaterial<StandardMaterial>>>,
     mut transforms: Query<&mut Transform>,
+    mut perf: ResMut<crate::perf::Perf>,
 ) {
+    let t0 = std::time::Instant::now();
     let Some(assets) = assets.take() else {
         return;
     };
@@ -447,6 +475,7 @@ pub fn update_runtime_projectors(
             false
         }
     });
+    perf.span("runtime_projectors", t0);
 }
 
 #[cfg(test)]
@@ -499,5 +528,124 @@ mod tests {
         let at = |x: usize, y: usize| data[(y * 8 + x) * 4 + 3];
         assert_eq!(at(0, 0), 0, "corner is transparent");
         assert!(at(4, 4) > 200, "centre is opaque");
+    }
+
+    /// Builds a `GroundQuery` from raw `(triangle, source)` pairs without a scene.
+    fn ground_from(triangles: Vec<([[f32; 3]; 3], u32)>) -> GroundQuery {
+        let tris: Vec<_> = triangles.iter().map(|(t, _)| *t).collect();
+        GroundQuery {
+            triangles,
+            bvh: Bvh::build(&tris),
+        }
+    }
+
+    /// Brute-force nearest downward hit, the reference the BVH must match.
+    fn brute_down(
+        triangles: &[([[f32; 3]; 3], u32)],
+        origin: [f32; 3],
+        max_dist: f32,
+    ) -> Option<([f32; 3], [f32; 3])> {
+        let mut best: Option<(f32, [f32; 3])> = None;
+        for (t, _) in triangles {
+            if let Some(d) = ray_tri_down(origin, [0.0, -1.0, 0.0], t)
+                && d <= max_dist
+                && best.is_none_or(|(b, _)| d < b)
+            {
+                best = Some((d, triangle_normal(*t)));
+            }
+        }
+        best.map(|(d, n)| ([origin[0], origin[1] - d, origin[2]], n))
+    }
+
+    #[test]
+    fn bvh_down_matches_brute_force_over_a_grid() {
+        // A spread of triangles at different heights so a broad-phase bug cannot pass.
+        let mut tris = Vec::new();
+        for i in 0..40 {
+            let x = (i % 8) as f32 - 4.0;
+            let z = (i / 8) as f32 - 2.0;
+            let y = 0.5 + (i % 5) as f32 * 0.3;
+            tris.push((
+                [
+                    [x - 0.4, y, z - 0.4],
+                    [x + 0.4, y, z - 0.4],
+                    [x, y, z + 0.4],
+                ],
+                i,
+            ));
+        }
+        let g = ground_from(tris.clone());
+        for ox in -5..=5 {
+            for oz in -3..=3 {
+                let o = [ox as f32, 10.0, oz as f32];
+                assert_eq!(
+                    g.down(o, 100.0),
+                    brute_down(&tris, o, 100.0),
+                    "origin {o:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn down_respects_max_distance_boundary() {
+        // A floor exactly at y = 0, origin at y = 5: a hit at distance 5 is in-range only when
+        // `max_dist >= 5` (the same `<=` comparison as the previous linear scan).
+        let tris = vec![([[-1.0, 0.0, -1.0], [1.0, 0.0, -1.0], [0.0, 0.0, 1.0]], 0u32)];
+        let g = ground_from(tris.clone());
+        assert!(
+            g.down([0.0, 5.0, 0.0], 5.0).is_some(),
+            "hit at the boundary"
+        );
+        assert!(g.down([0.0, 5.0, 0.0], 4.999).is_none(), "just short");
+        assert_eq!(
+            g.down([0.0, 5.0, 0.0], 5.0),
+            brute_down(&tris, [0.0, 5.0, 0.0], 5.0)
+        );
+    }
+
+    #[test]
+    fn down_beyond_the_soup_bounds_is_none() {
+        // The BVH query box is the downward segment, so a far-away origin must not error or
+        // false-positive against a triangle it cannot reach.
+        let tris = vec![([[-1.0, 0.0, -1.0], [1.0, 0.0, -1.0], [0.0, 0.0, 1.0]], 0u32)];
+        let g = ground_from(tris);
+        assert!(g.down([1000.0, 5.0, 1000.0], 100.0).is_none());
+        assert!(GroundQuery::default().down([0.0, 1.0, 0.0], 1.0).is_none());
+    }
+
+    #[test]
+    fn down_breaks_distance_ties_by_input_index() {
+        // Two triangles at exactly y = 0 with opposite winding (opposite normals). The previous
+        // linear scan returned the first in input order; the BVH must too, so the returned normal
+        // is deterministic (index 0's, pointing +Y).
+        let a = [[-1.0, 0.0, -1.0], [1.0, 0.0, -1.0], [0.0, 0.0, 1.0]];
+        let b = [[-1.0, 0.0, -1.0], [0.0, 0.0, 1.0], [1.0, 0.0, -1.0]];
+        let g = ground_from(vec![(a, 0u32), (b, 1u32)]);
+        let (_, n) = g.down([0.0, 5.0, 0.0], 10.0).expect("a floor");
+        assert_eq!(n, triangle_normal(a), "index 0 must win the tie");
+        assert_eq!(
+            g.down([0.0, 5.0, 0.0], 10.0),
+            brute_down(&[(a, 0), (b, 1)], [0.0, 5.0, 0.0], 10.0)
+        );
+    }
+
+    #[test]
+    fn down_picks_the_nearest_of_two_overlapping_floors() {
+        // Two stacked floors: the BVH must still return the closer one at every sample.
+        let hi = [[-2.0, 1.0, -2.0], [2.0, 1.0, -2.0], [0.0, 1.0, 2.0]];
+        let lo = [[-2.0, 0.0, -2.0], [2.0, 0.0, -2.0], [0.0, 0.0, 2.0]];
+        let tris = vec![(hi, 0u32), (lo, 1u32)];
+        let g = ground_from(tris.clone());
+        let hit = g.down([0.0, 5.0, 0.0], 100.0).expect("a floor");
+        assert!(
+            (hit.0[1] - 1.0).abs() < 1e-4,
+            "nearest floor is y=1: {:?}",
+            hit.0
+        );
+        assert_eq!(
+            g.down([0.0, 5.0, 0.0], 100.0),
+            brute_down(&tris, [0.0, 5.0, 0.0], 100.0)
+        );
     }
 }

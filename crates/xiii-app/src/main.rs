@@ -160,8 +160,15 @@ fn build_app(opts: cli::Options) -> App {
             enabled: opts.perf,
             interval: opts.perf_interval,
             natives: opts.perf_natives,
+            benchmark: opts.benchmark,
+            benchmark_warmup: opts.benchmark_warmup,
         },
     });
+    // An unattended benchmark must not be throttled by winit's low-power `unfocused_mode` (which
+    // would cap an unfocused window at ~1 Hz); force continuous updates for the measured loop.
+    if opts.benchmark.is_some() {
+        app.insert_resource(bevy::winit::WinitSettings::continuous());
+    }
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: match opts.mode {

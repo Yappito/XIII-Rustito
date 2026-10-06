@@ -188,7 +188,9 @@ pub fn collect(
     session: NonSend<Result<Session, String>>,
     hud: Option<Res<HudRuntime>>,
     mut state: ResMut<CartoonState>,
+    mut perf: ResMut<crate::perf::Perf>,
 ) {
+    let t0 = std::time::Instant::now();
     let session = match &*session {
         Ok(s) => s,
         Err(_) => return,
@@ -307,11 +309,13 @@ pub fn collect(
             mapinfo.map_or("-".to_owned(), |m| vm.objects[m as usize].name.clone()),
         ));
     }
+    perf.span("cartoon_collect", t0);
 }
 
 /// Keeps the render-to-texture camera in sync with the script's requested panel view. Runs after
 /// [`collect`] (which reads the `RenderTargetMaterial.Update` event) and before `hud::draw`
 /// (which substitutes the image for the `CWndMat` tile). Inactive maps never spawn the camera.
+#[allow(clippy::too_many_arguments)]
 pub fn sync_render_target(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
@@ -320,7 +324,9 @@ pub fn sync_render_target(
     session: NonSend<Result<Session, String>>,
     hud: Option<Res<HudRuntime>>,
     mut cams: Query<(&mut Camera, &mut Transform), With<CartoonCam>>,
+    mut perf: ResMut<crate::perf::Perf>,
 ) {
+    let t0 = std::time::Instant::now();
     let Ok(session) = &*session else {
         return;
     };
@@ -380,6 +386,7 @@ pub fn sync_render_target(
     }
     rt.active = true;
     rt.frames += 1;
+    perf.span("cartoon_sync", t0);
 }
 
 /// Prints the cartoon timeline on exit, so an unattended run records the effect.
