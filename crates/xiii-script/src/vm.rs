@@ -23,7 +23,7 @@ use xiii_package::{Limits, ObjectRef, PropertyBlock, PropertyValue, RawReason, S
 use crate::animation::{AnimationData, SeqInfo};
 use crate::bytecode::{Call, Context, Script, Token, TokenKind, opcode_name};
 use crate::canvas::CanvasState;
-use crate::events::{PresentationEvent, SoundEvent};
+use crate::events::{PresentationEvent, SoundEvent, TravelRequest, TravelSource};
 use crate::external::ExternalObjectData;
 use crate::linker::{GlobalRef, ScriptSet};
 use crate::localize::{LocalizationData, placeholder};
@@ -1175,6 +1175,15 @@ pub struct Vm<'s> {
     /// Outbound presentation events emitted by presentation natives (sound, texture, display,
     /// projectors). Drained with [`Vm::drain_events`].
     events: Vec<PresentationEvent>,
+    /// Pending level-travel request (item15). Set by the `PlayerController.ClientTravel` native
+    /// or observed on `LevelInfo.NextURL` after the game's `ServerTravel`; consumed by the host
+    /// with [`Vm::take_travel_request`]. The VM itself never loads a map.
+    pending_travel: Option<crate::events::TravelRequest>,
+    /// Cached `LevelInfo` instance for the per-tick `NextURL` check (`None` until the map is
+    /// loaded).
+    level_info: Option<ObjectId>,
+    /// Last non-empty `LevelInfo.NextURL` seen, so one travel request is reported per URL.
+    last_next_url: String,
     /// Local URL the runtime loaded this map with (`<Map>?<options>`), returned by
     /// `LevelInfo.GetLocalURL` (UE2 `ALevelInfo::GetLocalURL`). The runtime owns the string;
     /// empty until it is configured.
@@ -1247,6 +1256,9 @@ impl<'s> Vm<'s> {
             last_trace_bone: "None".to_owned(),
             voice_duration: None,
             events: Vec::new(),
+            pending_travel: None,
+            level_info: None,
+            last_next_url: String::new(),
             local_url: String::new(),
             url_options: String::new(),
             address_url: String::new(),
@@ -1617,6 +1629,27 @@ impl<'s> Vm<'s> {
     /// Appends a presentation event at the current VM time.
     pub(crate) fn emit_event(&mut self, event: PresentationEvent) {
         self.events.push(event);
+    }
+
+    /// Takes the pending level-travel request, if any. The host calls this after each step; the
+    /// VM never loads a map itself.
+    pub fn take_travel_request(&mut self) -> Option<crate::events::TravelRequest> {
+        self.pending_travel.take()
+    }
+
+    /// Whether a travel request is waiting (without consuming it).
+    pub fn travel_requested(&self) -> bool {
+        self.pending_travel.is_some()
+    }
+
+    /// Records a travel request and queues the matching presentation event. The first request
+    /// wins until the host consumes it (a repeated `ServerTravel`/`ClientTravel` in the same
+    /// step does not overwrite it).
+    pub(crate) fn request_travel(&mut self, request: crate::events::TravelRequest) {
+        self.emit_event(PresentationEvent::TravelRequest(request.clone()));
+        if self.pending_travel.is_none() {
+            self.pending_travel = Some(request);
+        }
     }
 
     /// Emits a `PlaySound`/`PlayMusic` event from a native's decoded arguments. `args[0]` is the
@@ -2060,9 +2093,30 @@ impl<'s> Vm<'s> {
         }
     }
 
+    /// Resolves a `Package.Object` name against the registered external (non-script) packages
+    /// the way `DynamicLoadObject` must, returning the interned [`ObjRef::External`] value and
+    /// its recorded class path. `None` when the package is unregistered/missing or the export is
+    /// absent (or an ambiguous bare name). Used by `Object.DynamicLoadObject` for `.utx`
+    /// textures, `.usx` meshes and `.uax` sounds, and by the front-end menu host for the root
+    /// window's background textures.
+    pub fn external_asset(&self, path: &str) -> Option<(Value, String)> {
+        match self.set.external_lookup(path) {
+            crate::linker::ExternalLookup::Found(class) => {
+                let id = self.intern_external(path, Some(class.clone()));
+                Some((Value::Object(Some(ObjRef::External(id))), class))
+            }
+            _ => None,
+        }
+    }
+
     /// Interns an external object path, returning its id. A path maps to exactly one id, so
     /// equality by path holds even when two references record different classes.
-    fn intern_external(&self, path: &str, class: Option<String>) -> u32 {
+    ///
+    /// `pub(crate)` so `DynamicLoadObject` (registry.rs) can turn a registered non-script asset
+    /// path (a `.utx` texture, `.usx` mesh, `.uax` sound) into the same [`ObjRef::External`] a
+    /// reference from a script package would produce; the external-property provider then
+    /// answers `USize`/`VSize`.
+    pub(crate) fn intern_external(&self, path: &str, class: Option<String>) -> u32 {
         let mut table = self.externals.borrow_mut();
         if let Some(&id) = table.index.get(path) {
             return id;
@@ -2546,6 +2600,8 @@ impl<'s> Vm<'s> {
             self.apply_block(map, &props.block, &layout, &mut values);
             self.objects[id as usize].props = values;
         }
+        // Cache the map's `LevelInfo` for the per-tick `NextURL` travel check.
+        self.level_info = self.find_level_info();
         Ok(actors)
     }
 
@@ -2562,6 +2618,14 @@ impl<'s> Vm<'s> {
     /// empty shadow) can call this instead of [`Vm::send_event`], which is state-aware.
     pub fn class_function(&self, id: ObjectId, name: &str) -> Option<GlobalRef> {
         self.find_function(id, name, false)
+    }
+
+    /// True when `id`'s class-chain names contain `needle` (case-insensitive). `find_level_info`
+    /// uses it for `levelinfo`; the host uses it for the `XIDCine.BeachFinalFall` allow-list.
+    pub fn class_chain_contains(&self, id: ObjectId, needle: &str) -> bool {
+        self.objects
+            .get(id as usize)
+            .is_some_and(|o| o.layout.chain_names.iter().any(|n| n.contains(needle)))
     }
 
     /// Marks an object as executed (in scope).
@@ -3098,7 +3162,44 @@ impl<'s> Vm<'s> {
                 self.dispatch_tick(id, dt)?;
             }
         }
+        self.detect_server_travel();
         Ok(())
+    }
+
+    /// Reports a level-travel request when the script called `LevelInfo.ServerTravel` and the
+    /// engine field `NextURL` became non-empty. The real engine's tick consumes `NextURL` and
+    /// loads the map; the headless VM only reports it ([`Vm::take_travel_request`]). `ClientTravel`
+    /// requests take precedence (the `pending_travel` guard), and each distinct URL is reported
+    /// once.
+    fn detect_server_travel(&mut self) {
+        let Some(level) = self.level_info else {
+            return;
+        };
+        let url = match self.get_property(level, "NextURL") {
+            Some(Value::Str(s)) if !s.is_empty() => s.clone(),
+            _ => return,
+        };
+        if url == self.last_next_url {
+            return;
+        }
+        self.last_next_url = url.clone();
+        if self.pending_travel.is_some() {
+            return;
+        }
+        let items = matches!(
+            self.get_property(level, "bNextItems"),
+            Some(Value::Bool(true))
+        );
+        let actor = self.objects[level as usize].name.clone();
+        let time = self.time;
+        self.request_travel(TravelRequest {
+            actor,
+            url,
+            mode: 0,
+            items,
+            source: TravelSource::ServerTravel,
+            time,
+        });
     }
 
     /// Like [`Vm::tick`], but a failing actor is **suspended** (`active = false`) and the failure
@@ -3200,6 +3301,7 @@ impl<'s> Vm<'s> {
                 errors.push((suspended, e));
             }
         }
+        self.detect_server_travel();
         errors
     }
 

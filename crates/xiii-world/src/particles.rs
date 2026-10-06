@@ -86,6 +86,44 @@ pub struct ParticleMesh {
     pub two_sided: bool,
 }
 
+/// Beam geometry parameters of a `BeamEmitter`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BeamDesc {
+    /// `BeamTextureUScale` (tiling of the sprite across the beam width).
+    pub texture_u_scale: f32,
+    /// `BeamTextureVScale` (tiling along the beam length).
+    pub texture_v_scale: f32,
+    /// `RotatingSheets`: number of ribbons rotated around the beam axis (capped by the renderer).
+    pub rotating_sheets: u32,
+    /// `BeamDistanceRange`: the beam length (Unreal units) when `DetermineEndPointBy` is distance.
+    pub distance_range: [f32; 2],
+    /// `DetermineEndPointBy` (`EBeamEndPointType` byte).
+    pub determine_end_point_by: u8,
+    /// `LowFrequencyPoints` (coarse path samples).
+    pub low_frequency_points: u32,
+    /// `HighFrequencyPoints` (fine path samples).
+    pub high_frequency_points: u32,
+    /// `LowFrequencyNoiseRange` (per-axis Unreal units).
+    pub low_frequency_noise: [[f32; 2]; 3],
+    /// `HighFrequencyNoiseRange` (per-axis Unreal units).
+    pub high_frequency_noise: [[f32; 2]; 3],
+    /// `UseBranching`.
+    pub use_branching: bool,
+    /// `BranchEmitter` (sub-emitter index, `-1` = none).
+    pub branch_emitter: i32,
+}
+
+/// Line-sprite parameters of a `SparkEmitter`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SparkDesc {
+    /// `LineSegmentsRange`: number of line segments drawn per particle.
+    pub line_segments: [f32; 2],
+    /// `TimeBeforeVisibleRange` (seconds before the trail becomes visible).
+    pub time_before_visible: [f32; 2],
+    /// `TimeBetweenSegmentsRange` (seconds between trail samples).
+    pub time_between_segments: [f32; 2],
+}
+
 /// What a sub-emitter draws.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EmitterShape {
@@ -93,7 +131,11 @@ pub enum EmitterShape {
     Sprite,
     /// Static-mesh particles (`MeshEmitter`).
     Mesh(Box<ParticleMesh>),
-    /// A class whose drawing is recognized but not modelled (Beam/Spark/...).
+    /// A beam emitter: a textured ribbon (or several, `RotatingSheets`) along the particle path.
+    Beam(Box<BeamDesc>),
+    /// A spark emitter: line-segment trails from the particle.
+    Spark(Box<SparkDesc>),
+    /// A class whose drawing is recognized but not modelled (`TrailEmitter`, ...).
     Unsupported(String),
 }
 
@@ -295,6 +337,22 @@ const MODELED_PROPS: &[&str] = &[
     "usemeshblendmode",
     "rendertwosided",
     "scaleaxis",
+    // BeamEmitter (modelled beam ribbon).
+    "beamtextureuscale",
+    "beamtexturevscale",
+    "rotatingsheets",
+    "beamdistancerange",
+    "determineendpointby",
+    "lowfrequencypoints",
+    "highfrequencypoints",
+    "lowfrequencynoiserange",
+    "highfrequencynoiserange",
+    "usebranching",
+    "branchemitter",
+    // SparkEmitter (modelled line trails).
+    "linesegmentsrange",
+    "timebeforevisiblerange",
+    "timebetweensegmentsrange",
 ];
 
 /// Property names whose inherited class default is consulted when the map block omits them.
@@ -346,6 +404,22 @@ const INHERITED_PROPS: &[&str] = &[
     "secondsbeforeinactive",
     "autodestroy",
     "autoreset",
+    // BeamEmitter parameters.
+    "beamtextureuscale",
+    "beamtexturevscale",
+    "rotatingsheets",
+    "beamdistancerange",
+    "determineendpointby",
+    "lowfrequencypoints",
+    "highfrequencypoints",
+    "lowfrequencynoiserange",
+    "highfrequencynoiserange",
+    "usebranching",
+    "branchemitter",
+    // SparkEmitter parameters.
+    "linesegmentsrange",
+    "timebeforevisiblerange",
+    "timebetweensegmentsrange",
 ];
 
 /// `ParticleEmitter` (and subclass) class default for a property the map does not serialize.
@@ -474,9 +548,25 @@ pub fn decode_emitter(
         .collect();
 
     let shape = match class.to_ascii_lowercase().as_str() {
-        "beamemitter" | "sparkemitter" | "trailemitter" => {
-            EmitterShape::Unsupported(class.to_owned())
-        }
+        "beamemitter" => EmitterShape::Beam(Box::new(BeamDesc {
+            texture_u_scale: f32_of(values, "beamtextureuscale", 1.0),
+            texture_v_scale: f32_of(values, "beamtexturevscale", 1.0),
+            rotating_sheets: i32_of(values, "rotatingsheets", 0).max(0) as u32,
+            distance_range: range_of(values, "beamdistancerange", [0.0, 0.0]),
+            determine_end_point_by: u8_of(values, "determineendpointby", 0),
+            low_frequency_points: i32_of(values, "lowfrequencypoints", 3).max(0) as u32,
+            high_frequency_points: i32_of(values, "highfrequencypoints", 10).max(0) as u32,
+            low_frequency_noise: range_vec_of(values, "lowfrequencynoiserange", [[0.0; 2]; 3]),
+            high_frequency_noise: range_vec_of(values, "highfrequencynoiserange", [[0.0; 2]; 3]),
+            use_branching: bool_of(values, "usebranching", false),
+            branch_emitter: i32_of(values, "branchemitter", -1),
+        })),
+        "sparkemitter" => EmitterShape::Spark(Box::new(SparkDesc {
+            line_segments: range_of(values, "linesegmentsrange", [5.0, 5.0]),
+            time_before_visible: range_of(values, "timebeforevisiblerange", [0.0, 0.0]),
+            time_between_segments: range_of(values, "timebetweensegmentsrange", [0.0, 0.0]),
+        })),
+        "trailemitter" => EmitterShape::Unsupported(class.to_owned()),
         "meshemitter" => EmitterShape::Sprite, // replaced with Mesh once the mesh resolves
         _ => EmitterShape::Sprite,
     };
@@ -1575,9 +1665,56 @@ mod tests {
     }
 
     #[test]
-    fn beam_and_spark_are_marked_unsupported() {
-        let d = decode_emitter("BeamEmitter", "b", &BTreeMap::new());
-        assert!(matches!(d.shape, EmitterShape::Unsupported(_)));
+    fn beam_and_spark_decode_their_geometry_parameters() {
+        let beam = decode_emitter(
+            "BeamEmitter",
+            "b",
+            &values(vec![
+                ("rotatingsheets", ParticleValue::Int(10)),
+                ("highfrequencypoints", ParticleValue::Int(15)),
+                ("lowfrequencypoints", ParticleValue::Int(5)),
+                (
+                    "highfrequencynoiserange",
+                    ParticleValue::RangeVector([[-200.0, 200.0], [-200.0, 200.0], [-25.0, 25.0]]),
+                ),
+                ("beamtextureuscale", ParticleValue::Float(3.0)),
+                ("beamdistancerange", ParticleValue::Range([0.0, 300.0])),
+                ("determineendpointby", ParticleValue::Byte(3)),
+            ]),
+        );
+        match &beam.shape {
+            EmitterShape::Beam(b) => {
+                assert_eq!(b.rotating_sheets, 10);
+                assert_eq!(b.high_frequency_points, 15);
+                assert_eq!(b.low_frequency_points, 5);
+                assert_eq!(b.texture_u_scale, 3.0);
+                assert_eq!(b.distance_range, [0.0, 300.0]);
+                assert_eq!(b.determine_end_point_by, 3);
+                assert_eq!(b.high_frequency_noise[0], [-200.0, 200.0]);
+            }
+            other => panic!("expected Beam, got {other:?}"),
+        }
+        let spark = decode_emitter(
+            "SparkEmitter",
+            "s",
+            &values(vec![
+                ("linesegmentsrange", ParticleValue::Range([3.0, 6.0])),
+                (
+                    "timebetweensegmentsrange",
+                    ParticleValue::Range([0.02, 0.05]),
+                ),
+            ]),
+        );
+        match &spark.shape {
+            EmitterShape::Spark(s) => {
+                assert_eq!(s.line_segments, [3.0, 6.0]);
+                assert_eq!(s.time_between_segments, [0.02, 0.05]);
+            }
+            other => panic!("expected Spark, got {other:?}"),
+        }
+        // TrailEmitter is still a recognized-but-unmodelled class.
+        let trail = decode_emitter("TrailEmitter", "t", &BTreeMap::new());
+        assert!(matches!(trail.shape, EmitterShape::Unsupported(_)));
     }
 
     #[test]

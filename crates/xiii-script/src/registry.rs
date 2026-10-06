@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::events::{PresentationEvent, SoundEvent};
+use crate::events::{PresentationEvent, SoundEvent, TravelRequest, TravelSource};
 use crate::linker::GlobalRef;
 use crate::value::{ObjRef, ObjectId, Value};
 use crate::vm::{Latent, TraceKind, Vm, VmErrorKind, VmResult};
@@ -636,7 +636,19 @@ fn dynamic_load_object(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmRes
         Some(Value::Object(Some(ObjRef::Instance(i)))) => {
             Some(vm.short_path(vm.objects[*i as usize].class))
         }
-        Some(Value::Object(Some(ObjRef::Static(g)))) => vm.class_path_of(*g),
+        // A class argument (`class'Engine.Texture'` / `obj'Engine.Texture'`) is itself a class
+        // object whose `class_path_of` is `Core.Class`; the requested class is the class's own
+        // path (`Engine.Texture`). A non-class static object uses its class path.
+        Some(Value::Object(Some(ObjRef::Static(g)))) => {
+            if matches!(
+                vm.set().object(*g),
+                Some(crate::reflect::ScriptObject::Class(_))
+            ) {
+                Some(vm.set().path(*g))
+            } else {
+                vm.class_path_of(*g)
+            }
+        }
         _ => None,
     };
     match vm.find_loaded_object(&name) {
@@ -657,7 +669,36 @@ fn dynamic_load_object(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmRes
             }
             val(Value::Object(Some(ObjRef::Static(g))))
         }
-        None => val(Value::Object(None)),
+        None => {
+            // Non-script packages registered by the runtime (`.utx` textures, `.usx` meshes,
+            // `.uax` sounds) are not part of the loaded script set, so `find_loaded_object`
+            // misses them. `XIDInterf.XIIIMenu.Created` loads its button/background textures
+            // this way (`DynamicLoadObject("XIIIMenuStart.continue01gris",
+            // class'Engine.Texture')`); resolve them to an `ObjRef::External` so the external
+            // property provider answers `USize`/`VSize` and the Canvas sees the texture path.
+            match vm.set().external_lookup(&name) {
+                crate::linker::ExternalLookup::Found(class) => {
+                    if let Some(req) = &requested
+                        && !native_class_is_a(&class, req)
+                    {
+                        vm.note(TraceKind::Note(format!(
+                            "DynamicLoadObject: {name} is not a {req} (class {class})"
+                        )));
+                        return val(Value::Object(None));
+                    }
+                    let id = vm.intern_external(&name, Some(class));
+                    val(Value::Object(Some(ObjRef::External(id))))
+                }
+                crate::linker::ExternalLookup::MissingPackage
+                | crate::linker::ExternalLookup::MissingExport => {
+                    vm.note(TraceKind::Note(format!(
+                        "DynamicLoadObject: {name} not found in its package"
+                    )));
+                    val(Value::Object(None))
+                }
+                crate::linker::ExternalLookup::Unknown => val(Value::Object(None)),
+            }
+        }
     }
 }
 
@@ -2519,6 +2560,89 @@ fn console_command(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<
         }
     };
     val(Value::Str(reply))
+}
+
+/// `PlayerController.ClientTravel(string URL, byte<ETravelType> TravelType, bool bItems) -> void`.
+///
+/// The engine's client-travel entry point. `XIIIGameInfo.ProcessServerTravel` (xiii.u) calls it
+/// for a network client (`Player != None`) and `LevelInfo.ServerTravel` reaches it in the
+/// standalone path through `Game.ProcessServerTravel`; the front-end menu reaches it too
+/// (`XIIIMenu.EndOfVideo`, item16). The VM never loads a map: it records a
+/// [`TravelRequest`](crate::events::TravelRequest) (the URL, the `ETravelType` byte and `bItems`)
+/// for the host to consume with [`Vm::take_travel_request`], **and** the item16 structured trace
+/// note (`canvas::format_travel_note`) that the `xiii-app --menu` host reads via
+/// `canvas::parse_travel_note`. This is the single registration for the native.
+fn client_travel(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let url = string(vm, a, 0)?;
+    let mode = byte(vm, a, 1)?;
+    let items = boolean(vm, a, 2)?;
+    vm.note(TraceKind::Note(crate::canvas::format_travel_note(
+        &url, mode, items,
+    )));
+    let actor = vm.objects[c.this as usize].name.clone();
+    let time = vm.time;
+    vm.request_travel(TravelRequest {
+        actor,
+        url,
+        mode,
+        items,
+        source: TravelSource::ClientTravel,
+        time,
+    });
+    val(Value::Void)
+}
+
+/// `PlayerController.GetDefaultURL(string Option) -> string` (native 510).
+///
+/// UE2 reads the option (`Skin`/`Face`/`Team`/`Name`/`Class`) from the player's stored
+/// connection defaults. The headless VM has no player profile; it returns the empty string and
+/// records a visible note. The standalone travel path does not reach this native
+/// (`XIIIGameInfo.ProcessServerTravel` only calls it when `Level.NetMode == 2`).
+fn get_default_url(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let option = string(vm, a, 0)?;
+    vm.note(TraceKind::Note(format!(
+        "GetDefaultURL({option:?}) has no player profile; returned an empty string"
+    )));
+    val(Value::Str(String::new()))
+}
+
+/// `PlayerController.CalcFirstPersonView(out Vector CameraLocation, out Rotator CameraRotation)`
+/// (native 497).
+///
+/// The first-person camera pose on the goal/end-game path: `MapInfo.DoTravel` ->
+/// `XIIIGameInfo.EndGame` -> `XIIIPlayerController.GameEnded.BeginState` -> `global.PlayerCalcView`
+/// -> `engine.PlayerController.PlayerCalcView` calls it. The headless VM has no renderer, so the
+/// pose is the host's first-person description: the pawn's eye position and the controller's
+/// rotation (falling back to the pawn's). Without it the end-game state suspends and the level
+/// cannot travel (item15).
+fn calc_first_person_view(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let pawn = vm.obj_prop(c.this, "Pawn").unwrap_or(c.this);
+    let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+    let eye = match vm.get_property(pawn, "EyeHeight") {
+        Some(Value::Float(h)) => *h,
+        _ => match vm.get_property(pawn, "BaseEyeHeight") {
+            Some(Value::Float(h)) => *h,
+            _ => 0.0,
+        },
+    };
+    let rot = match vm.get_property(c.this, "Rotation") {
+        Some(Value::Rotator(r)) => *r,
+        _ => match vm.get_property(pawn, "Rotation") {
+            Some(Value::Rotator(r)) => *r,
+            _ => [0; 3],
+        },
+    };
+    if let Some(slot) = a.get_mut(0) {
+        *slot = Value::Vector([loc[0], loc[1], loc[2] + eye]);
+    }
+    if let Some(slot) = a.get_mut(1) {
+        *slot = Value::Rotator(rot);
+    }
+    val(Value::Void)
 }
 
 fn replace_texture_by_another(
@@ -4913,6 +5037,37 @@ fn builtin_defs() -> Vec<NativeDef> {
             )
         });
     }
+    // Level-travel natives (item15). Kept in one block so parallel registry edits stay out of the
+    // way. `ClientTravel` is the engine entry point reached by `XIIIGameInfo.ProcessServerTravel`;
+    // it never loads a map, only records a host `TravelRequest`.
+    v.push(def(
+        "PlayerController.ClientTravel",
+        "native(0) net reliable native event static function ClientTravel(string URL, byte<ETravelType> TravelType, bool bItems)",
+        "engine.u PlayerController.ClientTravel decoded; xiii.u XIIIGameInfo.ProcessServerTravel 0x008F; records a TravelRequest for the host (the VM loads no map)",
+        client_travel,
+    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no player profile in the headless VM; returns \"\" with a visible note (the standalone travel path does not reach it)",
+        ),
+        ..def(
+            "PlayerController.GetDefaultURL",
+            "native(510) final native static function string GetDefaultURL(string Option)",
+            "engine.u PlayerController.GetDefaultURL decoded (native 510); xiii.u XIIIGameInfo.ProcessServerTravel builds the URL options from it",
+            get_default_url,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no renderer: the first-person pose is the pawn eye position and the controller rotation (enough for the end-game camera hand-off; not a projection match)",
+        ),
+        ..def(
+            "PlayerController.CalcFirstPersonView",
+            "native(497) final native static function CalcFirstPersonView(out struct<Vector> CameraLocation, out struct<Rotator> CameraRotation)",
+            "engine.u PlayerController.CalcFirstPersonView decoded (native 497); reachable from XIIIGameInfo.EndGame -> GameEnded.BeginState -> global.PlayerCalcView on the level-complete path",
+            calc_first_person_view,
+        )
+    });
     // item3p: the missing rotator operators, reached by the campaign survey. `Multiply_RotatorFloat`
     // (287, `xidcine.HelicoDeco.HelicoTick` 0x01F4) and `EqualEqual_RotatorRotator` (142,
     // `xiii.MitraillTop.GoToWaitingPos.Tick` 0x0035) were the two highest-count unimplemented
@@ -4971,6 +5126,9 @@ fn builtin_defs() -> Vec<NativeDef> {
     // Canvas draw-recording natives (`crates/xiii-script/src/canvas.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::canvas::canvas_defs());
+    // item16 front-end menu natives (VideoPlayer, ClientTravel, menu sounds). Kept in the same
+    // `canvas.rs` block so a parallel edit to the registry stays out of the way.
+    v.extend(crate::canvas::menu_defs());
     // Cinematic/dialogue natives (`crates/xiii-script/src/cinematics.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::cinematics::cinematic_defs());
@@ -4987,4 +5145,25 @@ fn builtin_defs() -> Vec<NativeDef> {
         }
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Item15/item16 merge guard: `Registry` is a `BTreeMap`, so a second registration of the same
+    /// `Class.Function` silently replaces the first. This checks the raw `builtin_defs()` list so a
+    /// duplicate (e.g. two `PlayerController.ClientTravel`) fails the build instead of silently
+    /// dropping one implementation.
+    #[test]
+    fn no_native_is_registered_twice() {
+        let mut seen: std::collections::BTreeMap<String, &'static str> =
+            std::collections::BTreeMap::new();
+        for d in builtin_defs() {
+            let key = d.path.to_ascii_lowercase();
+            if let Some(prev) = seen.insert(key, d.path) {
+                panic!("native {prev} is registered twice");
+            }
+        }
+    }
 }

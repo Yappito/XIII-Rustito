@@ -204,6 +204,9 @@ fn value_path(vm: &Vm<'_>, v: &Value) -> Option<String> {
         Value::Object(Some(ObjRef::Instance(i))) => {
             vm.objects.get(*i as usize).map(|o| o.name.clone())
         }
+        // An asset in a non-script package (a `.utx` texture, `.usx` mesh, ...) resolved by
+        // `DynamicLoadObject`: the host needs its `Package.Object` path to decode and draw it.
+        Value::Object(Some(r @ ObjRef::External(_))) => vm.external_path(r),
         Value::NativeClass(s) => Some(s.clone()),
         Value::Name(s) | Value::Str(s) => Some(s.clone()),
         _ => None,
@@ -334,7 +337,10 @@ fn set_draw_color(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<N
         }
     };
     let (r, g, b) = (component(0)?, component(1)?, component(2)?);
-    let alpha = if a.len() > 3 { component(3)? } else { 255 };
+    // `A` is optional: the VM fills an omitted optional argument with a zero value, so a
+    // present zero must be distinguished from "caller omitted it" (e.g. the decoded
+    // `XIIIWindow.DrawLabel` calls `SetDrawColor(255,255,255)` and expects opaque white).
+    let alpha = if c.omitted(3) { 255 } else { component(3)? };
     let color = Value::Struct(vec![
         ("b".to_owned(), Value::Byte(b)),
         ("g".to_owned(), Value::Byte(g)),
@@ -1005,4 +1011,239 @@ pub fn canvas_defs() -> Vec<NativeDef> {
         hud_draw_3d_line,
     ));
     v
+}
+
+// -------------------------------------------------------------------------------------------
+// item16: front-end menu path natives
+//
+// The decoded front end runs the menu classes (`XIDInterf.XIIIRootWindow`,
+// `XIDInterf.XIIIMenu`, `GUI.GUIController`) through the VM. The menu scripts reach four
+// engine services the headless VM must supply:
+//
+//   * `Engine.VideoPlayer.*` (native 476/482..484): the new-game entry starts the `cine00`
+//     intro video; `XIIIMenu.PlayingVideo.Tick` polls `VideoPlayer.GetStatus` (native 476,
+//     disassembled against the same-numbered `ScriptedTexture.TextSize`; the VM resolves it
+//     by argument count), and `XIIIMenu.EndOfVideo` then calls `ClientTravel`.
+//   * `Engine.PlayerController.ClientTravel` (native 0, by name): the game's own map-load
+//     request. The VM has no world to travel to, so the native records a structured trace
+//     note; the host (`xiii-app --menu`) reads it and performs the travel step.
+//   * `Engine.Actor.PlayMenu` / `StopAllSounds` / `PauseAllSounds` / `ResumeAllSounds`
+//     (natives 351/342/340/338): menu click/rollover sounds. The VM has no audio device;
+//     these are accepted and labelled Partial, not silently completed.
+//
+// The natives live in this block (`canvas.rs`) because the menu draws through the recorded
+// `Engine.Canvas` command list this module already owns, and they are registered by
+// `Registry::builtin` through `registry::builtin_defs`.
+
+/// Marker prefix of the structured `ClientTravel` trace note. Keep in sync with
+/// [`parse_travel_note`].
+pub const TRAVEL_NOTE_PREFIX: &str = "item16 ClientTravel ";
+
+/// One map-load request decoded from `PlayerController.ClientTravel`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TravelRequest {
+    /// The raw URL argument (may carry `?options`).
+    pub url: String,
+    /// The map name (the part of `url` before `?`), e.g. `Plage00`.
+    pub map: String,
+    /// The decoded `ETravelType` byte.
+    pub travel_type: u8,
+    /// The decoded `bItems` flag.
+    pub items: bool,
+}
+
+/// Builds the structured trace note recorded by `ClientTravel`.
+pub fn format_travel_note(url: &str, travel_type: u8, items: bool) -> String {
+    format!(
+        "{TRAVEL_NOTE_PREFIX}url={url} travel={travel_type} items={}",
+        u8::from(items)
+    )
+}
+
+/// Parses a [`format_travel_note`] note back into a [`TravelRequest`]. Returns `None` for an
+/// unrelated note or a malformed one (never a guessed URL).
+pub fn parse_travel_note(note: &str) -> Option<TravelRequest> {
+    let rest = note.strip_prefix(TRAVEL_NOTE_PREFIX)?;
+    let mut url = None;
+    let mut travel_type = 0u8;
+    let mut items = false;
+    for field in rest.split(' ') {
+        if let Some(v) = field.strip_prefix("url=") {
+            url = Some(v.to_owned());
+        } else if let Some(v) = field.strip_prefix("travel=") {
+            travel_type = v.parse().ok()?;
+        } else if let Some(v) = field.strip_prefix("items=") {
+            items = v != "0";
+        }
+    }
+    let url = url?;
+    let map = url.split('?').next().unwrap_or(&url).to_ascii_lowercase();
+    Some(TravelRequest {
+        url,
+        map,
+        travel_type,
+        items,
+    })
+}
+
+/// `Engine.VideoPlayer.Open(string Filename) -> bool` (native 484).
+///
+/// No video decoder is linked; the call is accepted, recorded and reports success so the
+/// decoded `XIIIMenu` new-game path proceeds (the host labels the skipped video).
+fn video_player_open(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let name = text(vm, a, 0).unwrap_or_default();
+    vm.note(TraceKind::Note(format!(
+        "item16 VideoPlayer.Open({name:?}) accepted (no Bink decoder; not played)"
+    )));
+    val(Value::Bool(true))
+}
+
+/// `Engine.VideoPlayer.Play()` (native 483).
+fn video_player_play(vm: &mut Vm<'_>, _c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    vm.note(TraceKind::Note(
+        "item16 VideoPlayer.Play() accepted (no Bink decoder; not played)".into(),
+    ));
+    val(Value::Void)
+}
+
+/// `Engine.VideoPlayer.Stop()` (native 482).
+fn video_player_stop(vm: &mut Vm<'_>, _c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    vm.note(TraceKind::Note(
+        "item16 VideoPlayer.Stop() accepted (no Bink decoder)".into(),
+    ));
+    val(Value::Void)
+}
+
+/// `Engine.VideoPlayer.GetStatus() -> int` (native 476; the same number is
+/// `ScriptedTexture.TextSize(string, out, out, Font)`, which the VM's argument-count
+/// resolution keeps distinct). `0` means "no video playing", so
+/// `XIIIMenu.PlayingVideo.Tick` runs `EndOfVideo` on the next host drive.
+fn video_player_get_status(
+    _vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    val(Value::Int(0))
+}
+
+/// `Engine.Actor.StopAllSounds()` (native 342). No audio device; accepted.
+fn actor_stop_all_sounds(
+    _vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    val(Value::Void)
+}
+
+/// `Engine.Actor.PauseAllSounds()` (native 340). No audio device; accepted.
+fn actor_pause_all_sounds(
+    _vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    val(Value::Void)
+}
+
+/// `Engine.Actor.ResumeAllSounds()` (native 338). No audio device; accepted.
+fn actor_resume_all_sounds(
+    _vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    val(Value::Void)
+}
+
+/// The menu-path natives defined by this block. `registry::builtin_defs` extends the
+/// built-in table with these.
+#[allow(clippy::vec_init_then_push)]
+pub fn menu_defs() -> Vec<NativeDef> {
+    let mut v: Vec<NativeDef> = Vec::new();
+    v.push(partial(
+        "no Bink decoder yet (item17a): the video is accepted but not played; GetStatus reports finished",
+        "VideoPlayer.Open",
+        "native(484) final native static function bool Open(string Filename)",
+        "engine.u VideoPlayer.Open decoded; XIIIMenu.InternalOnClick opens sVideo (default cine00)",
+        video_player_open,
+    ));
+    v.push(partial(
+        "no Bink decoder yet (item17a): the video is accepted but not played; GetStatus reports finished",
+        "VideoPlayer.Play",
+        "native(483) final native static function Play()",
+        "engine.u VideoPlayer.Play decoded; XIIIMenu.InternalOnClick calls it",
+        video_player_play,
+    ));
+    v.push(partial(
+        "no Bink decoder yet (item17a): the video is accepted but not played; GetStatus reports finished",
+        "VideoPlayer.Stop",
+        "native(482) final native static function Stop()",
+        "engine.u VideoPlayer.Stop decoded; XIIIMenu.InternalOnKeyEvent stops the video",
+        video_player_stop,
+    ));
+    v.push(partial(
+        "no Bink decoder yet (item17a): the video is accepted but not played; GetStatus reports finished",
+        "VideoPlayer.GetStatus",
+        "native(476) final native static function int GetStatus()",
+        "engine.u VideoPlayer.GetStatus decoded; XIIIMenu.PlayingVideo.Tick ends on 0 (index 476 also names ScriptedTexture.TextSize, separated by argument count)",
+        video_player_get_status,
+    ));
+    // `Actor.PlayMenu` (native 351) is already registered by the cartoon-panel block
+    // (`crates/xiii-script/src/cartoon.rs`), which emits a `PlaySound` presentation event; the
+    // menu reuses it rather than overriding it here.
+    v.push(partial(
+        "no audio device: the call is accepted and discarded (the VM has no mixer)",
+        "Actor.StopAllSounds",
+        "native(342) final native static function StopAllSounds()",
+        "engine.u Actor.StopAllSounds decoded; XIIIMenu.InternalOnClick calls it on new game",
+        actor_stop_all_sounds,
+    ));
+    v.push(partial(
+        "no audio device: the call is accepted and discarded (the VM has no mixer)",
+        "Actor.PauseAllSounds",
+        "native(340) final native static function PauseAllSounds()",
+        "engine.u Actor.PauseAllSounds decoded; XIIIRootWindow.UWindows.BeginState calls it",
+        actor_pause_all_sounds,
+    ));
+    v.push(partial(
+        "no audio device: the call is accepted and discarded (the VM has no mixer)",
+        "Actor.ResumeAllSounds",
+        "native(338) final native static function ResumeAllSounds()",
+        "engine.u Actor.ResumeAllSounds decoded; XIIIRootWindow.UWindows.EndState calls it",
+        actor_resume_all_sounds,
+    ));
+    // `PlayerController.ClientTravel` is registered once, in `registry::builtin_defs` (the item15
+    // travel block): that single implementation records both this block's trace note
+    // (`format_travel_note`) and the item15 host `TravelRequest`, so the menu host and `--play`
+    // both work from one registration.
+    v
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+
+    #[test]
+    fn travel_note_round_trips_and_extracts_the_map() {
+        let note = format_travel_note("Plage00?Difficulty=1", 0, false);
+        let r = parse_travel_note(&note).expect("parses");
+        assert_eq!(r.url, "Plage00?Difficulty=1");
+        assert_eq!(r.map, "plage00");
+        assert_eq!(r.travel_type, 0);
+        assert!(!r.items);
+    }
+
+    #[test]
+    fn travel_note_rejects_unrelated_and_malformed_input() {
+        assert!(parse_travel_note("some other note").is_none());
+        assert!(parse_travel_note("item16 ClientTravel travel=0 items=0").is_none());
+        assert!(parse_travel_note("item16 ClientTravel url=Plage00 travel=x items=0").is_none());
+    }
+
+    #[test]
+    fn travel_note_preserves_items_and_travel_type() {
+        let r = parse_travel_note(&format_travel_note("Banque01", 3, true)).unwrap();
+        assert_eq!(
+            (r.map.as_str(), r.travel_type, r.items),
+            ("banque01", 3, true)
+        );
+    }
 }

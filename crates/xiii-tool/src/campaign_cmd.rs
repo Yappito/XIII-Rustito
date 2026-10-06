@@ -660,6 +660,7 @@ fn event_kind(e: &PresentationEvent) -> &'static str {
         PresentationEvent::Dialogue(_) => "Dialogue",
         PresentationEvent::RenderTarget(_) => "RenderTargetMaterial.Update",
         PresentationEvent::SaveCheckpoint(_) => "SaveAtCheckpoint",
+        PresentationEvent::TravelRequest(_) => "TravelRequest",
     }
 }
 

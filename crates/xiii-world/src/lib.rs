@@ -25,6 +25,7 @@ pub mod animation;
 pub mod audio;
 pub mod fog;
 pub mod hitbox;
+pub mod lights;
 pub mod materials;
 pub mod movement_volumes;
 pub mod nav_provider;
@@ -175,6 +176,10 @@ pub struct WorldScene {
     pub projectors: Vec<projectors::ProjectorPose>,
     /// Decoded particle emitter systems placed in the map (see [`particles`]).
     pub particle_systems: Vec<particles::ParticleSystem>,
+    /// Every map-placed `Light`-subclass actor and its decoded UE2 light properties (see
+    /// [`lights`]). Baked/non-emitting lights are included for diagnostics; use
+    /// [`lights::SceneLight::render_dynamic`] to select the runtime ones.
+    pub lights: Vec<lights::SceneLight>,
 }
 
 impl WorldScene {
@@ -1728,6 +1733,7 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
     import_bsp(&mut im, &map_pkg);
     import_terrain(&mut im, &map_pkg);
     particles::import_particles(&mut im, &map_pkg, &mut defaults);
+    lights::import_lights(&mut im, &map_pkg, &mut defaults);
     // Per-zone object counts (static-mesh actors, BSP groups), after every object exists.
     let mut counts = vec![0usize; im.scene.zones.len()];
     let mut unzoned = 0usize;

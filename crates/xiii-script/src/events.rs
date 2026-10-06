@@ -71,6 +71,38 @@ pub struct DialogueEvent {
     pub time: f64,
 }
 
+/// Where a [`TravelRequest`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TravelSource {
+    /// `PlayerController.ClientTravel(URL, TravelType, bItems)` (native 0): the engine's
+    /// client-travel entry point, reached by `XIIIGameInfo.ProcessServerTravel` for a network
+    /// client (`Player != None`).
+    ClientTravel,
+    /// `LevelInfo.NextURL` became non-empty after the script called `LevelInfo.ServerTravel`
+    /// (`engine.u`): the standalone path. The real engine's tick consumes `NextURL`; the headless
+    /// VM reports it as a request instead of loading anything itself.
+    ServerTravel,
+}
+
+/// A level-travel request: the URL (map plus optional `?Key=Value` options), the UE2
+/// `ETravelType` byte and the `bItems` carry-over flag. The VM never loads a map; the host
+/// consumes this with [`crate::vm::Vm::take_travel_request`] and performs the reload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TravelRequest {
+    /// Object that produced the request (display name).
+    pub actor: String,
+    /// The requested URL, exactly as the script built it (may carry `?options`).
+    pub url: String,
+    /// UE2 `ETravelType` byte (`ClientTravel`'s `TravelType`; `0` = absolute for `ServerTravel`).
+    pub mode: u8,
+    /// `bItems`: whether the next map keeps the player's inventory.
+    pub items: bool,
+    /// Which path produced the request.
+    pub source: TravelSource,
+    /// VM time in seconds when the request was observed.
+    pub time: f64,
+}
+
 /// A render-to-texture camera request decoded from `RenderTargetMaterial.Update`.
 ///
 /// The comic-panel HUD (`xiii.XIIIBaseHud.DrawCartoonWindowBis`) draws each panel with
@@ -198,6 +230,8 @@ pub enum PresentationEvent {
     /// `Actor.SaveAtCheckpoint`: the script asked to write a checkpoint save. The host records it;
     /// the VM never writes into the game installation (see [`SaveCheckpointEvent`]).
     SaveCheckpoint(SaveCheckpointEvent),
+    /// A level-travel request (see [`TravelRequest`]).
+    TravelRequest(TravelRequest),
 }
 
 /// A checkpoint-save request decoded from `Actor.SaveAtCheckpoint`
@@ -237,6 +271,7 @@ impl PresentationEvent {
             Self::Dialogue(e) => &e.actor,
             Self::RenderTarget(e) => &e.actor,
             Self::SaveCheckpoint(e) => &e.actor,
+            Self::TravelRequest(e) => &e.actor,
         }
     }
 
@@ -256,6 +291,7 @@ impl PresentationEvent {
             Self::Dialogue(e) => e.time,
             Self::RenderTarget(e) => e.time,
             Self::SaveCheckpoint(e) => e.time,
+            Self::TravelRequest(e) => e.time,
         }
     }
 }
@@ -372,6 +408,11 @@ impl std::fmt::Display for PresentationEvent {
                 f,
                 "SaveAtCheckpoint {} teleporter={} description={}",
                 e.actor, e.teleporter_name, e.description
+            ),
+            Self::TravelRequest(e) => write!(
+                f,
+                "TravelRequest {} url={} mode={} items={} source={:?}",
+                e.actor, e.url, e.mode, e.items, e.source
             ),
         }
     }

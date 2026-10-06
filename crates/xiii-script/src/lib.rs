@@ -37,6 +37,7 @@ pub use bytecode::{Call, Label, Script, ScriptLimits, Token, TokenKind, decode_s
 pub use error::{Result, ScriptError, ScriptErrorKind};
 pub use events::{
     DialogueEvent, PresentationEvent, RenderTargetEvent, SaveCheckpointEvent, SoundEvent,
+    TravelRequest, TravelSource,
 };
 pub use external::ExternalObjectData;
 pub use linker::{ExternalLookup, ExternalPackage, GlobalRef, ScriptPackage, ScriptSet};

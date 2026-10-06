@@ -4,7 +4,7 @@ Updated: **2026-10-05 (second session)**. Research phase (2026-10-04), M0, M1 an
 
 ## Next session: start here
 
-State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `1b16fd4` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
+State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `3d97dc8` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
 ### How the user wants work organized
 
@@ -26,7 +26,7 @@ State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XII
 ### Environment notes
 
 - cargo/rustc in `C:\Users\ZoliBen\.cargo\bin` (Git Bash: `export PATH="$HOME/.cargo/bin:$PATH"`). Rust 1.99.0 pinned, MSVC 14.44. No `gh` CLI.
-- Full verification (about 2-4 minutes warm): `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && XIII_GOG_DIR=P:/AI/XIII/XIII_Game XIII_STEAM_DIR="P:/SteamLibrary/steamapps/common/XIII - Classic" cargo test --workspace`. Last result (`1b16fd4`): **554 passed, 0 failed**. Use `bash P:/AI/XIII/local/verify.sh` (git-ignored helper: fmt + clippy + full tests with real exit status) before every push; piping cargo into `tail`/`awk` once masked a compile failure and broke main. Use absolute paths: some older opt-in tests resolve relative `XIII_GOG_DIR` against the crate directory.
+- Full verification (about 2-4 minutes warm): `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && XIII_GOG_DIR=P:/AI/XIII/XIII_Game XIII_STEAM_DIR="P:/SteamLibrary/steamapps/common/XIII - Classic" cargo test --workspace`. Last result (`3d97dc8`): **630 passed, 0 failed**. Use `bash P:/AI/XIII/local/verify.sh` (git-ignored helper: fmt + clippy + full tests with real exit status) before every push; piping cargo into `tail`/`awk` once masked a compile failure and broke main. Use absolute paths: some older opt-in tests resolve relative `XIII_GOG_DIR` against the crate directory.
 - Viewer: `cargo run -p xiii-app --release -- --map Plage01 --game-dir XIII_Game` (`--exit-after-secs N --screenshot <png>`, `--dump`, `--collision-test`, `--reach-test`, `--lighting off|baked`). Character: `--model xiiipersos.XIIIM --anim Walk`. Movement + VM prototype: `--play --map Plage01 [--play-script <file>]` (E = use). Headless VM: `xiii-tool script run --game-dir XIII_Game --map Plage00 --begin-play --physics map --anim map --nav map --events`.
 - Disassembler (user-approved): `llvm-objdump` from `rustup component add llvm-tools`, at `C:/Users/ZoliBen/.rustup/toolchains/1.99.0-x86_64-pc-windows-msvc/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-objdump.exe`. DLLs are read only; disassembly output stays in git-ignored `local/re/`, never committed or pasted into code.
 - Launch parallel opencode runs a few seconds apart: simultaneous starts fail with `database is locked`.
@@ -34,8 +34,11 @@ State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XII
 
 ### In flight when this was written
 
-- `item5e` BSP vertex stream lighting (worktree `local/wt/bsp`, Ollama Cloud; resumed once after an early stop).
-- `item5g` zone distance fog + projector (blob) shadows (worktree `local/wt/audio`, Ollama Cloud).
+- `item17a` clean-room Bink 1 container + video decoder, new crate `xiii-video` (worktree `local/wt/viewer`).
+- `item3o` Plage00 intro to its end, `HudMessage` TypeMismatch, checkpoint save `bcompleted`, `OrthoRotation` (worktree `local/wt/locale`; coordinator merged main into it and removed duplicate natives).
+- `item15` level end + travel (Plage00 -> Plage01 works through the game's goal/EndGame/ServerTravel chain; labelled `BeachFinalFall` start bridge because its real starter is not in the decoded data); merge conflicts being resolved (worktree `local/wt/steam`; `PlayerController.ClientTravel` must be registered once - also in item16's block).
+- `item1k` `physWalking`/`FindSpot` port: evidence-wording correction (worktree `local/wt/sweep`).
+- `item16b` menu layout + delegates (worktree `local/wt/bsp`); `item14c` game's own weapon give/attach/fire path + Beretta reachability (worktree `local/wt/fx`).
 - Specs in each worktree's `local/tasks/` (copies in `P:/AI/XIII/local/tasks/`); logs in `P:/AI/XIII/local/logs/`; reports in each worktree's `local/reports/`.
 
 ## User intent
@@ -155,6 +158,17 @@ Per-task reports with all numbers and commands: `local/reports/item1-collision.m
 - **Performance:** VM tick 2.6 ms -> 0.36-0.52 ms (Banque01, ~900 actors); all maps > 240 FPS release on the RTX 4090.
 - **Scale:** 90 UU/m (user-approved estimate).
 
+### Fourth 2026-10-05 block (up to `3d97dc8`) — measured, prototype, not a playable mission
+
+- **Combat (item14b):** hit zones from decoded SkeletalMesh bone boxes posed by the current animation (MiocheM: head 75 dmg, spine 31); `Weapon.PlayFiringSound` emits a positional `PlaySound` event; AI perception (`SeePlayer`/`EnemyNotVisible` from `SightRadius`/`PeripheralVision`/line of sight), `SetEnemy` raises `EnemyAcquired`, 10 AI natives, independent `Timer`/`Timer2`/`Timer3`. Base01 `BaseSoldier17` runs `Tenir -> Acquisition -> Attaque`, fires its M16, player Health 150 -> 90. Labelled host bridges: AI `Fire` re-issue (engine `AWeapon::Tick`) and focus rotation. Plage00/01 soldiers are ordered to the scripted `faction` stasis and never fight. The Plage01 Beretta pickup is not reached by walking (player stops 80 UU short; diagnostic grant kept) - investigated in item14c.
+- **Campaign residuals (item3p):** 0 suspended actors on all 35 maps (per-instance class-default subobjects for `BreakableMover`, unknown animation = UE2 visible no-op); rotator `*`/`/`/`==`/`!=` and float `**` natives.
+- **Collision (item1j):** extent-box pawn primitive confirmed in `Engine.dll` (`MINFLOORZ` 0.7, `MAXSTEPHEIGHT` 35, `physWalking` sub-step bound 8); reach 22,345 -> 22,353. item1k (porting `physWalking`/`stepUp` structure + `ULevel::FindSpot`) measures 22,504 and walkable-ledge stalls 136 -> 35; its evidence wording is being corrected before merge.
+- **Footsteps (item6e):** `XIIIPlayerPawn.PlayFootStep` reads the floor material's `XIIIFootStepSound`; the host synthesises the notify cadence from the decoded `Run`/`Walk` clips (no third-person anim in `--play`): Plage00 sand `XIIIFSSab`, Plage01 planks `XIIIFSBoi`, Banque01 marble `XIIIFSMar`. The 195 unresolved sound references are not resolvable from the shipped data (reasons pinned by an opt-in test).
+- **Rendering:** BSP `FBspVertexStream` decoded (32 B: position, 4-byte flags-or-colour, uv0, uv1; position-validated on Plage00/01/Banque01; the 4-byte field is white at corners and 0 at collinear vertices, so it is **not** rendered as lighting); variable-length `LightMapBits`; labelled tail 4.45 MB -> 1.34 MB. Dynamic lights (item5h): decoded `Light` actors, UE2 HSB colour, additive light-only pass over the unlit baked materials, VM lights follow actors in `--play`; Beam/Spark emitters. Labelled muzzle-flash presentation bridge (grant skips `AttachToPawn`; item14c removes it).
+- **Menus (item16):** `--menu` loads `MapMenu`, spawns `XIDInterf.XIIIRootWindow`/`XIIIMenu`, runs their decoded draw/input callbacks through the Canvas path (real comic-panel textures and fonts); New Game -> `VideoPlayer` (Partial: no decoder yet) -> `EndOfVideo` -> the game's own `ClientTravel("Plage00")`; the host starts `--play`. Layout is a first pass (captions misplaced, stray white bars; host calls page callbacks directly because delegates are not interpreted) - item16b.
+- **Video (user decision 2026-10-05):** all 19 cutscenes are Bink 1 (`BIKi`); the user chose an **own clean-room Rust decoder** (new crate `xiii-video`, from public format documentation only; never copy or translate FFmpeg code). Plage01's `EndMapVideo` is `cine01`, so Plage01 cannot end until `VideoPlayer` plays (or completes) it and `PlayingVideo.PlayerTick` is dispatched.
+- Full verification at `3d97dc8`: 630 tests passed, 0 failed; Plage00 `--trace` byte-identical to the baseline.
+
 ### Verified results
 
 | Check | Result |
@@ -209,12 +223,12 @@ Native Windows reports an RTX 4090. Rust/Cargo were not found on the inspected W
 
 ## Exact next work
 
-1. **Toward a completable Plage00/Plage01:** continue the Plage00 intro past the first line (dialogue sequence, `CineController2` camera moves, end of cutscene, control returned); level end/transition to the next map (`XIIIGoalTrigger`, `NextMapLevelWithUnr`); checkpoint save (`XIIISaveGameTrigger.GoSaving.DoSave` fails on struct member `bcompleted`).
-2. **Combat fidelity:** per-bone hit zones from the decoded SkeletalMesh hit boxes posed by the current animation; real weapon pickups instead of the grant; `PlayFiringSound` as a sound event; soldier attack behaviour against the player; damage/death presentation.
-3. **Residual VM errors:** `HudMessage.SetUpLocalizedMessage` TypeMismatch (suspends the player's message path), `Object.OrthoRotation`, the last 3 campaign suspensions (Amos01 `Cine2` default anim, USA02 `BreakableMover` nested subobjects).
-4. **Rendering:** land BSP vertex lighting (item5e) and fog/projectors (item5g); Beam/Spark emitters; dynamic lights (muzzle flash); the comic outline look (needs reference captures).
-5. **Collision primitive:** UE2 pawn vs world uses the extent box (assumed) - verify against `Engine.dll` (`ULevel::MoveActor`, `FCollisionHash`) and the remaining reach failures.
-6. **Menus, save/load, options** (not started).
+1. **Toward a completable Plage00/Plage01:** merge item3o (intro to its end, checkpoint save) and item15 (travel); then the Plage01 end: `VideoPlayer` playing `cine01` through `xiii-video` (item17a decoder, then Bink audio), `PlayingVideo.PlayerTick` dispatch (the host does not dispatch `PlayerTick`), the second objective ("Leave the beach using the killer's pick-up truck"); a full Plage01 run-through by the game's own logic to list every remaining blocker; find the real starter of `XIDCine.BeachFinalFall` to remove the bridge.
+2. **Combat fidelity:** item14c (game's own `GiveTo`/`AttachToPawn`, fire-path `WeaponAttachment` cast, Beretta reachability); then damage/death presentation and soldiers leaving `faction` stasis on their scripted cues.
+3. **Video:** Bink audio after item17a; `VideoPlayer` natives backed by the decoder (menu intro `cine00`, level-end videos).
+4. **Menus/save:** item16b layout and delegates; then save/load (checkpoint save currently emits a `SaveCheckpoint` event only) and options persistence.
+5. **Rendering:** the comic outline look (needs reference captures); remaining Model tail variant (798 exports).
+6. **Collision:** merge item1k; remaining reach groups (rotated movers, overhangs).
 
 Do not report playable progress from the viewer, the `--play` prototype or headless traces until a mission can be completed by the game's own logic without host shortcuts.
 
