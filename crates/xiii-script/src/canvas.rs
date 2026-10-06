@@ -1088,42 +1088,52 @@ pub fn parse_travel_note(note: &str) -> Option<TravelRequest> {
 
 /// `Engine.VideoPlayer.Open(string Filename) -> bool` (native 484).
 ///
-/// No video decoder is linked; the call is accepted, recorded and reports success so the
-/// decoded `XIIIMenu` new-game path proceeds (the host labels the skipped video).
+/// Records the clip in the VM (`Vm::video_open`). No video decoder is linked, so nothing is
+/// displayed; if the host registered the Bink-header duration, `GetStatus` times the clip, else it
+/// reports finished immediately (the labelled Partial). The boolean is `true` whenever a duration
+/// is known, so the decoded `XIIIMenu`/`XIII` code proceeds either way.
 fn video_player_open(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let name = text(vm, a, 0).unwrap_or_default();
+    let timed = vm.video_open(&name);
     vm.note(TraceKind::Note(format!(
-        "item16 VideoPlayer.Open({name:?}) accepted (no Bink decoder; not played)"
+        "item18 VideoPlayer.Open({name:?}) accepted (no Bink decoder; not played; {})",
+        if timed {
+            "duration known, GetStatus times it"
+        } else {
+            "no duration registered, GetStatus reports finished"
+        }
     )));
-    val(Value::Bool(true))
+    val(Value::Bool(timed))
 }
 
-/// `Engine.VideoPlayer.Play()` (native 483).
+/// `Engine.VideoPlayer.Play()` (native 483): starts the clip clock (`Vm::video_play`).
 fn video_player_play(vm: &mut Vm<'_>, _c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    vm.video_play();
     vm.note(TraceKind::Note(
-        "item16 VideoPlayer.Play() accepted (no Bink decoder; not played)".into(),
+        "item18 VideoPlayer.Play() accepted (no Bink decoder; not played)".into(),
     ));
     val(Value::Void)
 }
 
-/// `Engine.VideoPlayer.Stop()` (native 482).
+/// `Engine.VideoPlayer.Stop()` (native 482): clears the clip (`Vm::video_stop`).
 fn video_player_stop(vm: &mut Vm<'_>, _c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    vm.video_stop();
     vm.note(TraceKind::Note(
-        "item16 VideoPlayer.Stop() accepted (no Bink decoder)".into(),
+        "item18 VideoPlayer.Stop() accepted (no Bink decoder)".into(),
     ));
     val(Value::Void)
 }
 
 /// `Engine.VideoPlayer.GetStatus() -> int` (native 476; the same number is
 /// `ScriptedTexture.TextSize(string, out, out, Font)`, which the VM's argument-count
-/// resolution keeps distinct). `0` means "no video playing", so
-/// `XIIIMenu.PlayingVideo.Tick` runs `EndOfVideo` on the next host drive.
+/// resolution keeps distinct). `1` while a host-timed clip is playing, `0` when it finished (or
+/// has no known duration), so `PlayingVideo.PlayerTick` runs `ServerTravel` at the real end.
 fn video_player_get_status(
-    _vm: &mut Vm<'_>,
+    vm: &mut Vm<'_>,
     _c: &NativeCtx,
     _a: &mut [Value],
 ) -> VmResult<NativeOutcome> {
-    val(Value::Int(0))
+    val(Value::Int(vm.video_status()))
 }
 
 /// `Engine.Actor.StopAllSounds()` (native 342). No audio device; accepted.
@@ -1159,31 +1169,31 @@ fn actor_resume_all_sounds(
 pub fn menu_defs() -> Vec<NativeDef> {
     let mut v: Vec<NativeDef> = Vec::new();
     v.push(partial(
-        "no Bink decoder yet (item17a): the video is accepted but not played; GetStatus reports finished",
+        "no Bink decoder linked (item17a): the clip is accepted but not displayed; a host-registered Bink-header duration lets GetStatus time it (item18), else it reports finished",
         "VideoPlayer.Open",
         "native(484) final native static function bool Open(string Filename)",
-        "engine.u VideoPlayer.Open decoded; XIIIMenu.InternalOnClick opens sVideo (default cine00)",
+        "engine.u VideoPlayer.Open decoded; XIIIMenu.InternalOnClick opens sVideo (default cine00); item18 times cine01 via the Bink header (frames/fps)",
         video_player_open,
     ));
     v.push(partial(
-        "no Bink decoder yet (item17a): the video is accepted but not played; GetStatus reports finished",
+        "no Bink decoder linked (item17a): the clip is accepted but not displayed; GetStatus times the real duration (item18)",
         "VideoPlayer.Play",
         "native(483) final native static function Play()",
-        "engine.u VideoPlayer.Play decoded; XIIIMenu.InternalOnClick calls it",
+        "engine.u VideoPlayer.Play decoded; XIIIMenu.InternalOnClick calls it; item18 PlayingVideo.PlayerTick",
         video_player_play,
     ));
     v.push(partial(
-        "no Bink decoder yet (item17a): the video is accepted but not played; GetStatus reports finished",
+        "no Bink decoder linked (item17a): the clip is accepted but not displayed (item18)",
         "VideoPlayer.Stop",
         "native(482) final native static function Stop()",
         "engine.u VideoPlayer.Stop decoded; XIIIMenu.InternalOnKeyEvent stops the video",
         video_player_stop,
     ));
     v.push(partial(
-        "no Bink decoder yet (item17a): the video is accepted but not played; GetStatus reports finished",
+        "no Bink decoder linked (item17a): GetStatus reports the real Bink duration when the host registered it, else 0 (item18)",
         "VideoPlayer.GetStatus",
         "native(476) final native static function int GetStatus()",
-        "engine.u VideoPlayer.GetStatus decoded; XIIIMenu.PlayingVideo.Tick ends on 0 (index 476 also names ScriptedTexture.TextSize, separated by argument count)",
+        "engine.u VideoPlayer.GetStatus decoded; XIIIGameInfo EndMapVideo cine01 ends via PlayingVideo.PlayerTick; index 476 also names ScriptedTexture.TextSize, separated by argument count",
         video_player_get_status,
     ));
     // `Actor.PlayMenu` (native 351) is already registered by the cartoon-panel block

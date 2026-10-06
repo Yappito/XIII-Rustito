@@ -13,6 +13,7 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::io::Read;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
@@ -93,6 +94,10 @@ pub struct Session {
     /// Number of `localized` class-default values filled from the `.int` files while building
     /// the level's class layouts.
     pub localized_overrides: u64,
+    /// item18: number of Bink clips found next to the installation whose header was read.
+    pub video_clips: usize,
+    /// item18: number of those clips whose frames/fps gave a finite duration.
+    pub video_timed: usize,
     /// Host per-bone hit-zone provider installed on the VM (item14b). The shared table is
     /// refreshed each fixed step from every live pawn's decoded skeleton and its VM animation.
     pub hit_zones: xiii_world::hitbox::PosedHitZones,
@@ -162,8 +167,26 @@ pub enum UseOutcome {
     Unlocked,
     /// An (unlocked) door was triggered to open/close.
     Triggered,
+    /// A dead pawn in reach was searched (the game's own `PlayerController.SearchPawn`), which
+    /// transfers its inventory to the player.
+    CorpseSearched,
     /// The script raised on the transition.
     Error(String),
+}
+
+/// item18: one `MapInfo.Objectif[]` entry (the `XIIIGoals` struct) read from the live VM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectiveState {
+    /// Objective index (`Objectif[i]`).
+    pub index: usize,
+    /// `GoalText` (localised display text).
+    pub text: String,
+    /// `bCompleted`.
+    pub completed: bool,
+    /// `bPrimary` (the objective is currently shown/validated).
+    pub primary: bool,
+    /// `bAntiGoal` (completing it fails the mission).
+    pub anti_goal: bool,
 }
 
 /// Outcome of a host fire action (item14).
@@ -185,6 +208,12 @@ impl Session {
         let (set, map_idx) = runtime::load_with_map(game_dir, map)?;
         let set: &'static ScriptSet = Box::leak(Box::new(set));
         let mut vm = Vm::new(set, VmLimits::default());
+
+        // item18: the VM has no filesystem access, so the host reads each Bink clip's header
+        // (frames / fps) and registers the real duration. `VideoPlayer.GetStatus` then times the
+        // level-end clip instead of reporting it finished immediately. Only the `--play` session
+        // registers durations, so the `--menu` path keeps its instant `GetStatus`.
+        let (video_clips, video_timed) = register_video_durations(&mut vm, game_dir);
 
         // Install the install's localisation files before the first class layout is built, so
         // `localized` class defaults (for example `Plage01CahuteKeyPick.PickupMessage`) are
@@ -402,6 +431,8 @@ impl Session {
             dispatcher,
             localization_language,
             localized_overrides: 0,
+            video_clips,
+            video_timed,
             hit_zones,
             hitbox_meshes,
             hitbox_dropped,
@@ -745,6 +776,21 @@ impl Session {
             return;
         }
         self.cine_stopped = true;
+        let stopped = self.stop_cutscene_actors();
+        if !stopped.is_empty() {
+            println!(
+                "[play] game ended: stopped {} cutscene controller(s): {}",
+                stopped.len(),
+                stopped.join(", ")
+            );
+        }
+    }
+
+    /// Suspends every active cutscene actor (`class_chain_contains("cine")`/`"beachinbed"`). The
+    /// decoded `CineController2.Interpret` re-asserts `PC.GotoState('NoControl')` each time its
+    /// sequence runs, so a stuck level-start cine keeps freezing the player; both the level-end
+    /// bridge and the item18 `take_control` bridge stop them. Returns the stopped names.
+    fn stop_cutscene_actors(&mut self) -> Vec<String> {
         let mut stopped = Vec::new();
         for i in 0..self.vm.objects.len() {
             let id = i as ObjectId;
@@ -758,13 +804,7 @@ impl Session {
                 stopped.push(self.vm.objects[i].name.clone());
             }
         }
-        if !stopped.is_empty() {
-            println!(
-                "[play] game ended: stopped {} cutscene controller(s): {}",
-                stopped.len(),
-                stopped.join(", ")
-            );
-        }
+        stopped
     }
 
     /// Read-only access to the script VM for host-side queries (the `--play` pawn renderer reads
@@ -843,6 +883,14 @@ impl Session {
             }
         }
         out
+    }
+
+    /// The player controller's current state (for the per-tick trace; `-` when there is no
+    /// controller).
+    pub fn player_controller_state(&self) -> String {
+        self.controller
+            .and_then(|c| self.vm.state_name(c))
+            .unwrap_or_else(|| "-".to_owned())
     }
 
     /// Name and current state of each soldier, for the trigger-chain report.
@@ -1065,6 +1113,157 @@ impl Session {
         }
     }
 
+    /// item18: host corpse-search bridge. The engine's `XIIIPlayerController.Grab` reaches
+    /// `SearchPawn(Pawn)` when `MyInteraction.bCanSearchCorpse` (the HUD interaction target); the
+    /// host has no dynamic-pawn targeting, so a named dead pawn is searched through the
+    /// controller's **own** `SearchPawn`, which transfers the corpse's inventory to the player.
+    /// Not a no-op: a non-pawn or live target returns [`UseOutcome::NotAMover`].
+    pub fn search_corpse(&mut self, target_name: &str) -> UseOutcome {
+        let Some(target) = self.vm.find_object(target_name) else {
+            return UseOutcome::NotAMover;
+        };
+        if !self.vm.is_a(target, "pawn") || !self.actor_is_dead(target) {
+            return UseOutcome::NotAMover;
+        }
+        // Collect every item the corpse owns: the `Inventory` chain plus any live `Inventory`
+        // object whose `Instigator` is the corpse. The second set matters because the VM defers a
+        // script call on an out-of-scope actor, so `FirstFrame.GiveSomething -> GiveTo ->
+        // AddInventory` can leave the truck key with `Instigator` set but never linked into the
+        // chain (measured: `XIII.Keys` owns `Instigator=BaseSoldier6` yet the chain is
+        // `Fists -> FistsAmmo`). UE2's `SearchPawn` walks the chain only; the host also picks up
+        // the orphaned owner items, transfers each through its own `Transfer` (which fires
+        // `cleftueur`), and enforces the unlink so the walk always advances.
+        let mut items: Vec<ObjectId> = Vec::new();
+        {
+            let mut cur = target;
+            let mut guard = 0;
+            loop {
+                guard += 1;
+                if guard > 256 {
+                    break;
+                }
+                match self.vm.get_property(cur, "Inventory") {
+                    Some(Value::Object(Some(ObjRef::Instance(n)))) => {
+                        if !items.contains(n) {
+                            items.push(*n);
+                        }
+                        cur = *n;
+                    }
+                    _ => break,
+                }
+            }
+        }
+        for (i, o) in self.vm.objects.iter().enumerate() {
+            let id = i as ObjectId;
+            if o.deleted || id == target || items.contains(&id) {
+                continue;
+            }
+            if !self.vm.is_a(id, "inventory") {
+                continue;
+            }
+            if matches!(
+                self.vm.get_property(id, "Instigator"),
+                Some(Value::Object(Some(ObjRef::Instance(n)))) if *n == target
+            ) {
+                items.push(id);
+            }
+        }
+        for item in items {
+            if let Some(f) = self.vm.class_function(item, "Transfer") {
+                let arg = Value::Object(Some(ObjRef::Instance(self.player)));
+                if let Err(e) = self.vm.call_function(f, item, vec![arg]) {
+                    return UseOutcome::Error(e.to_string());
+                }
+            }
+            self.vm.unlink_inventory(target, item);
+        }
+        self.drain_events();
+        UseOutcome::CorpseSearched
+    }
+
+    /// Host use action on a named actor: a mover (lock/unlock/open) or, failing that, a dead pawn
+    /// (search). See [`Session::use_mover`] and [`Session::search_corpse`].
+    pub fn use_target(&mut self, name: &str) -> UseOutcome {
+        match self.use_mover(name) {
+            UseOutcome::NotAMover => self.search_corpse(name),
+            other => other,
+        }
+    }
+
+    /// The map's live `MapInfo` object (the `XIDMaps.<Map>` instance), if begin-play spawned one.
+    pub fn map_info(&self) -> Option<ObjectId> {
+        instance_prop(&self.vm, self.game_info?, "MapInfo")
+    }
+
+    /// item18: the map's `Objectif[]` entries as the script sees them, so a run can report the
+    /// objective states over time (requirement 4).
+    pub fn objective_states(&self) -> Vec<ObjectiveState> {
+        let Some(mi) = self.map_info() else {
+            return Vec::new();
+        };
+        // `MapInfo.Objectif` is a dynamic array of `XIIIGoals` structs (read as one `Value::Array`
+        // whose elements are `Value::Struct`, see the `opt_in_plage00_objectif_probe` test).
+        let Some(Value::Array(elems)) = self.vm.get_property(mi, "Objectif") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (index, elem) in elems.iter().enumerate() {
+            let Value::Struct(fields) = elem else {
+                continue;
+            };
+            let field = |name: &str| {
+                fields
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v)
+            };
+            let text = match field("GoalText") {
+                Some(Value::Str(s)) | Some(Value::Name(s)) => s.clone(),
+                _ => String::new(),
+            };
+            let get_bool = |name: &str| matches!(field(name), Some(Value::Bool(true)));
+            out.push(ObjectiveState {
+                index,
+                text,
+                completed: get_bool("bCompleted"),
+                primary: get_bool("bPrimary"),
+                anti_goal: get_bool("bAntiGoal"),
+            });
+        }
+        out
+    }
+
+    /// One compact line of the objective states (goal index, primary/anti/completed flags, text).
+    pub fn objective_summary(&self) -> String {
+        let states = self.objective_states();
+        if states.is_empty() {
+            return "objectives: <none>".to_owned();
+        }
+        states
+            .iter()
+            .map(|o| {
+                format!(
+                    "[{}{}{}] {}",
+                    o.index,
+                    if o.primary { " P" } else { " -" },
+                    if o.completed {
+                        " C"
+                    } else if o.anti_goal {
+                        " A"
+                    } else {
+                        " ."
+                    },
+                    if o.text.is_empty() {
+                        "<empty>"
+                    } else {
+                        o.text.as_str()
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
     /// First failure formatted with its stack, if any.
     pub fn first_error(&self) -> Option<&str> {
         self.first_error.as_deref()
@@ -1093,6 +1292,44 @@ impl Session {
         );
         println!("[play] set_goal {n} via {name}.SetGoalComplete (bLevelComplete={complete})");
         Ok(())
+    }
+
+    /// item18 host bridge: hand the local player control by running the game's own
+    /// `XIIIPlayerController.EnterStartState` with `bOkForMoving = true`. In the retail game the
+    /// HUD sets `bOkForMoving` once the first frame is displayed; the decoded Plage01 intro
+    /// instead leaves the controller frozen in `NoControl` (the host does not play its cutscene
+    /// sequence), so a windowed run cannot move. This calls the same game function the HUD path
+    /// uses; the resulting state is returned. Labelled a bridge in the report, never silent.
+    pub fn take_control(&mut self) -> Result<String, String> {
+        let c = self
+            .controller
+            .ok_or_else(|| "no player controller".to_owned())?;
+        let _ = self
+            .vm
+            .set_property(c, "bOkForMoving", 0, Value::Bool(true));
+        let f = self
+            .vm
+            .class_function(c, "EnterStartState")
+            .ok_or_else(|| "controller has no EnterStartState".to_owned())?;
+        self.vm
+            .call_function(f, c, Vec::new())
+            .map_err(|e| e.to_string())?;
+        // A stuck level-start cutscene re-asserts `NoControl` every tick
+        // (`CineController2.Interpret`); stop those controllers so the control holds.
+        let stopped = self.stop_cutscene_actors();
+        self.drain_events();
+        let state = self.vm.state_name(c).unwrap_or_else(|| "<none>".to_owned());
+        if state.eq_ignore_ascii_case("NoControl") {
+            return Err("EnterStartState did not leave NoControl".to_owned());
+        }
+        if !stopped.is_empty() {
+            println!(
+                "[play] take_control: stopped {} cutscene controller(s): {}",
+                stopped.len(),
+                stopped.join(", ")
+            );
+        }
+        Ok(state)
     }
 
     /// The player pawn's current `Weapon` object, if any.
@@ -1474,6 +1711,75 @@ pub fn render_delta(previous: [f32; 3], current: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+/// item18: reads every Bink clip next to the installation and registers its real duration in the
+/// VM (`Vm::set_video_duration`). Returns `(clips found, clips timed)`.
+///
+/// The Bink 1 header is fixed and cheap to read (header layout: `BIK` + revision at 0; frame count
+/// at 8; width at 20; height at 24; fps numerator at 28; fps denominator at 32 — see
+/// `crates/xiii-video/src/container.rs` in the item17a worktree and the public Bink container
+/// documentation). Duration = frame_count / (fps_num / fps_den). Only the first 36 bytes are read,
+/// so registering all clips costs a handful of small reads, not the multi-megabyte files.
+fn register_video_durations(vm: &mut Vm<'_>, game_dir: &Path) -> (usize, usize) {
+    let mut clips = 0usize;
+    let mut timed = 0usize;
+    let Ok(entries) = std::fs::read_dir(game_dir) else {
+        return (clips, timed);
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir()
+            || !dir
+                .file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("video"))
+        {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if !path
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("bik"))
+            {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            clips += 1;
+            let mut header = [0u8; 36];
+            if std::fs::File::open(&path)
+                .and_then(|mut f| f.read_exact(&mut header))
+                .is_err()
+            {
+                continue;
+            }
+            if let Some(secs) = bink_duration_secs(&header) {
+                vm.set_video_duration(stem, secs);
+                timed += 1;
+            }
+        }
+    }
+    (clips, timed)
+}
+
+/// Duration of a Bink 1 clip from its fixed header, or `None` for a bad signature / zero fields.
+fn bink_duration_secs(header: &[u8; 36]) -> Option<f32> {
+    if &header[0..3] != b"BIK" {
+        return None;
+    }
+    let frames = u32::from_le_bytes(header[8..12].try_into().ok()?);
+    let fps_num = u32::from_le_bytes(header[28..32].try_into().ok()?);
+    let fps_den = u32::from_le_bytes(header[32..36].try_into().ok()?);
+    if frames == 0 || fps_num == 0 || fps_den == 0 {
+        return None;
+    }
+    let secs = frames as f32 * fps_den as f32 / fps_num as f32;
+    secs.is_finite().then_some(secs)
+}
+
 /// First live `PlayerStart` in the map: `(Location, Rotation)` in Unreal units.
 fn find_player_start(vm: &Vm) -> Option<([f32; 3], [i32; 3])> {
     for (i, o) in vm.objects.iter().enumerate() {
@@ -1582,6 +1888,25 @@ mod tests {
         } else {
             path
         })
+    }
+
+    /// item18: the Bink header duration used by `VideoPlayer.GetStatus` (frames / fps).
+    #[test]
+    fn bink_header_duration_is_frames_over_fps() {
+        let mut h = [0u8; 36];
+        h[0..4].copy_from_slice(b"BIKi");
+        h[8..12].copy_from_slice(&1358u32.to_le_bytes()); // Cine01 frames
+        h[28..32].copy_from_slice(&25u32.to_le_bytes());
+        h[32..36].copy_from_slice(&1u32.to_le_bytes());
+        let secs = bink_duration_secs(&h).expect("duration");
+        assert!((secs - 54.32).abs() < 0.01, "1358/25 = {secs}");
+        // A bad signature or a zero field is rejected (never a guessed duration).
+        let mut bad = h;
+        bad[0] = b'X';
+        assert!(bink_duration_secs(&bad).is_none());
+        let mut zero = h;
+        zero[8..12].copy_from_slice(&0u32.to_le_bytes());
+        assert!(bink_duration_secs(&zero).is_none());
     }
 
     /// Opt-in corpus test: the Plage00 single-player login runs through script
