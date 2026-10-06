@@ -1994,6 +1994,7 @@ mod tests {
         let save = crate::save::SaveFile {
             map: "Plage00".into(),
             teleporter: "PlayerStart".into(),
+            save_trigger_tag: "Debut".into(),
             description: "Synthetic beach".into(),
             health: 150.0,
             speed_factor_limit: 1.0,
@@ -2002,6 +2003,9 @@ mod tests {
             rotation: [0; 3],
             objectives: Vec::new(),
             inventory: Vec::new(),
+            sound_to_launch: None,
+            selected_weapon: None,
+            music_vars: Vec::new(),
         };
         crate::save::write(&dir, 3, &save).unwrap();
         let mut provider = MenuSaveSlots::open(dir.clone()).unwrap();
