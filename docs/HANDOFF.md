@@ -234,7 +234,7 @@ Native Windows reports an RTX 4090. Rust/Cargo were not found on the inspected W
 
 1. **Toward a completable Plage00/Plage01 with the player in control:** windowed `--play` run of the Plage01 route (the headless route test passes; confirm the windowed path and remove the remaining route teleports by fixing movement/pathing gaps); play the `cine01` video in `--play` through `VideoPlayer` backed by `xiii-video` (today only its duration is honoured); Banque01 run-through after travel.
 2. **Save/load:** finish item20b (game-driven `LOAD` start event, menu Load/Continue), inventory/ammo detail, `SoundToLaunch`.
-3. **Menus:** item16c (3D `MapMenu` backdrop, menu audio, working options with persistence, translucency).
+3. **Menus:** item16c merged (options pages with the game's controls, user-directory INI persistence, menu audio). Open question for the user: what the retail main menu shows behind the panels. `MapMenu` has no menu camera (only editor `Engine.Camera` viewports and a small white `fondialog` room); branch `item16d-menu-backdrop` (worktree `local/wt/bsp`, not merged) renders the level's `CameraLocationDynamic` view, which shows a tilted white room with black corners. Needs a reference screenshot of the real menu before choosing.
 4. **Combat:** soldiers leaving `faction` stasis on their scripted cues on Plage00/01; damage/death presentation; Bink audio track selection (the 5 tracks are probably language dubs, unverified).
 5. **Rendering:** the comic outline look (needs reference captures).
 6. **VM fidelity:** `Vm::destroy` marks the actor deleted before `Destroyed` runs (the engine does the reverse; list natives work around it with raw reads); function calls/writes through a just-destroyed actor still return Accessed None.
