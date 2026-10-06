@@ -217,6 +217,7 @@ impl Plugin for PlayPlugin {
             .init_resource::<ParticleTriggerCursor>()
             .init_resource::<RuntimeLights>()
             .add_plugins(viewer::particles::ParticlePlugin)
+            .add_plugins(MaterialPlugin::<viewer::lights::ReceiverMaterial>::default())
             .init_resource::<cinematics::CinematicState>()
             .init_resource::<cartoon::CartoonState>()
             .init_resource::<cartoon::CartoonRenderTarget>()
@@ -435,6 +436,7 @@ fn setup(
     mut sync: ResMut<RenderSync>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut receiver_materials: ResMut<Assets<viewer::lights::ReceiverMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     mut decal_materials: ResMut<Assets<ForwardDecalMaterial<StandardMaterial>>>,
@@ -455,6 +457,7 @@ fn setup(
         &mut sync,
         &mut meshes,
         &mut materials,
+        &mut receiver_materials,
         &mut images,
         &mut bindposes,
         &mut decal_materials,
@@ -476,6 +479,7 @@ fn setup_inner(
     sync: &mut RenderSync,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    receiver_materials: &mut Assets<viewer::lights::ReceiverMaterial>,
     images: &mut Assets<Image>,
     bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
     decal_materials: &mut Assets<ForwardDecalMaterial<StandardMaterial>>,
@@ -643,6 +647,7 @@ fn setup_inner(
         commands,
         meshes,
         materials,
+        receiver_materials,
         images,
         &scene,
         opts.lighting == crate::cli::Lighting::Baked,
@@ -704,12 +709,10 @@ fn setup_inner(
         RenderLayers::layer(viewer::MAIN_LAYER),
         bevy::core_pipeline::prepass::DepthPrepass,
         viewer::fog::distance_fog(&start_params),
-        viewer::lights::receiver_ambient_if_enabled().unwrap_or_else(|| {
-            viewer::fog::ambient_light(&start_params).unwrap_or_else(|| AmbientLight {
-                color: Color::NONE,
-                brightness: 0.0,
-                ..default()
-            })
+        viewer::fog::ambient_light(&start_params).unwrap_or_else(|| AmbientLight {
+            color: Color::NONE,
+            brightness: 0.0,
+            ..default()
         }),
         Transform::from_translation(Vec3::from_array(eye)),
         PlayCam,
@@ -1714,6 +1717,7 @@ fn travel(
     mut sync: ResMut<RenderSync>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut receiver_materials: ResMut<Assets<viewer::lights::ReceiverMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     mut decal_materials: ResMut<Assets<ForwardDecalMaterial<StandardMaterial>>>,
@@ -1787,6 +1791,7 @@ fn travel(
         &mut sync,
         &mut meshes,
         &mut materials,
+        &mut receiver_materials,
         &mut images,
         &mut bindposes,
         &mut decal_materials,

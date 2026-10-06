@@ -4,11 +4,18 @@
 //! lights are already in the geometry. To add the runtime lights without double-counting the
 //! baked lighting, this module uses a **light-only additive pass**:
 //!
-//! - the existing unlit textured pass is left untouched (it carries the baked colours);
-//! - a second copy of every opaque surface is spawned with a *lit* `StandardMaterial` in
-//!   `AlphaMode::Add` and a white base colour, so it contributes only the dynamic-light term;
-//! - the camera's `AmbientLight` is forced to zero while the receivers exist (it has no effect on
-//!   the unlit pass and would otherwise add a constant offset everywhere).
+//! - the existing unlit textured pass is left untouched (it carries the baked colours, the zone
+//!   fog and the in-shader tonemapping);
+//! - a second copy of every opaque surface is spawned with a lit [`ReceiverMaterial`] in
+//!   `AlphaMode::Add` and a white base colour, so it contributes only the dynamic-light term.
+//!
+//! The receiver pass must add exactly zero where no light reaches (item31, measured on Plage01:
+//! before, up to 4/255 was added to 41% of the frame with no light in range). Everything in
+//! Bevy's PBR path that is not direct lighting is therefore removed from it: zone ambient (black
+//! ambient occlusion; the camera keeps the zone ambient for lit actors), distance fog
+//! (`fog_enabled: false`; blending towards the fog colour would add it a second time), and the
+//! in-shader tonemapping and deband dither of a non-HDR camera (`tonemap(0)` is not 0, and the
+//! dither adds noise). The added light is therefore not tonemapped.
 //!
 //! Point lights are spawned from the decoded [`xiii_world::lights::SceneLight`]s in the viewer and
 //! from the live VM actors in `--play` (see `play::sync_vm_lights`), so map-placed non-static
@@ -17,7 +24,45 @@
 use std::collections::HashMap;
 
 use bevy::camera::visibility::RenderLayers;
+use bevy::mesh::MeshVertexBufferLayoutRef;
+use bevy::pbr::{
+    ExtendedMaterial, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
+};
 use bevy::prelude::*;
+use bevy::render::render_resource::{
+    AsBindGroup, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+};
+use bevy::shader::ShaderDefVal;
+
+/// The additive light-receiver material: a lit `StandardMaterial` whose pipeline drops the
+/// post-lighting terms that are not light (see the module docs).
+pub type ReceiverMaterial = ExtendedMaterial<StandardMaterial, ReceiverExtension>;
+
+/// Shader-pipeline extension of [`ReceiverMaterial`]; it has no data of its own.
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone, Default)]
+pub struct ReceiverExtension {}
+
+impl MaterialExtension for ReceiverExtension {
+    fn specialize(
+        _pipeline: &MaterialExtensionPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialExtensionKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        if let Some(fragment) = &mut descriptor.fragment {
+            strip_post_lighting_defs(&mut fragment.shader_defs);
+        }
+        Ok(())
+    }
+}
+
+/// Removes the in-shader tonemapping and deband dither from a receiver fragment shader.
+pub fn strip_post_lighting_defs(defs: &mut Vec<ShaderDefVal>) {
+    defs.retain(|def| {
+        !matches!(def, ShaderDefVal::Bool(name, _)
+            if name == "TONEMAP_IN_SHADER" || name == "DEBAND_DITHER")
+    });
+}
 
 use xiii_decode::common::actor_to_bevy;
 use xiii_script::{ObjectId, Value, Vm};
@@ -64,16 +109,6 @@ pub fn point_light_for(light: &SceneLight, t: f32) -> PointLight {
     }
 }
 
-/// A zero ambient light used while the receiver pass exists (prevents double-counting the zone
-/// ambient that the baked vertex colours already contain).
-pub fn receiver_ambient() -> AmbientLight {
-    AmbientLight {
-        color: Color::NONE,
-        brightness: 0.0,
-        ..default()
-    }
-}
-
 /// Spawns one `PointLight` per drawable map light. Returns how many were spawned.
 pub fn spawn_scene_lights(commands: &mut Commands, scene: &WorldScene) -> usize {
     if lights_disabled() {
@@ -99,10 +134,12 @@ pub fn spawn_scene_lights(commands: &mut Commands, scene: &WorldScene) -> usize 
 /// Builds one additive receiver material per distinct resolved material. The base texture tints
 /// the added light by the surface albedo; the base colour is white so the pass is light-only.
 pub fn receiver_materials(
-    materials: &mut Assets<StandardMaterial>,
+    materials: &mut Assets<ReceiverMaterial>,
+    images: &mut Assets<Image>,
     image_handles: &[Handle<Image>],
     scene: &WorldScene,
-) -> HashMap<usize, Handle<StandardMaterial>> {
+) -> HashMap<usize, Handle<ReceiverMaterial>> {
+    let no_ambient = images.add(no_ambient_occlusion());
     let mut out = HashMap::new();
     for (index, resolved) in scene.materials.iter().enumerate() {
         let Some(texture) = resolved.base else {
@@ -113,21 +150,59 @@ pub fn receiver_materials(
         };
         out.insert(
             index,
-            materials.add(StandardMaterial {
-                base_color: Color::WHITE,
-                base_color_texture: Some(handle.clone()),
-                unlit: false,
-                alpha_mode: AlphaMode::Add,
-                cull_mode: if resolved.two_sided {
-                    None
-                } else {
-                    Some(bevy::render::render_resource::Face::Back)
-                },
-                ..default()
-            }),
+            materials.add(receiver_material(
+                handle.clone(),
+                no_ambient.clone(),
+                resolved.two_sided,
+            )),
         );
     }
     out
+}
+
+/// One additive receiver material: white base colour tinted by the surface texture, lit, added.
+pub fn receiver_material(
+    texture: Handle<Image>,
+    no_ambient: Handle<Image>,
+    two_sided: bool,
+) -> ReceiverMaterial {
+    ReceiverMaterial {
+        base: StandardMaterial {
+            base_color: Color::WHITE,
+            base_color_texture: Some(texture),
+            unlit: false,
+            alpha_mode: AlphaMode::Add,
+            // The base pass already carries the zone fog and ambient; in an additive pass either
+            // would be added a second time (fog blends towards the fog colour, and the camera's
+            // zone ambient stays on for lit actors). Black ambient occlusion zeroes the
+            // ambient/indirect term for this pass only.
+            fog_enabled: false,
+            occlusion_texture: Some(no_ambient),
+            cull_mode: if two_sided {
+                None
+            } else {
+                Some(bevy::render::render_resource::Face::Back)
+            },
+            ..default()
+        },
+        extension: ReceiverExtension::default(),
+    }
+}
+
+/// A 1x1 black ambient-occlusion texture: removes the ambient/indirect term from a material while
+/// leaving direct (point-light) lighting untouched.
+pub fn no_ambient_occlusion() -> Image {
+    Image::new_fill(
+        bevy::render::render_resource::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        bevy::render::render_resource::TextureDimension::D2,
+        &[0, 0, 0, 255],
+        bevy::render::render_resource::TextureFormat::Rgba8Unorm,
+        bevy::asset::RenderAssetUsages::RENDER_WORLD,
+    )
 }
 
 /// Recomputes every map light's colour/intensity each frame (pulse/blink/flicker/strobe).
@@ -199,11 +274,6 @@ pub fn scene_light_from_vm(vm: &Vm<'_>, id: ObjectId) -> Option<SceneLight> {
     })
 }
 
-/// Diagnostic: the light-receiver ambient when the pass is enabled.
-pub fn receiver_ambient_if_enabled() -> Option<AmbientLight> {
-    (!lights_disabled()).then(receiver_ambient)
-}
-
 /// Re-exported so callers can name the light-selection predicate without importing the world
 /// crate's module path.
 pub fn is_render_dynamic(light: &SceneLight) -> bool {
@@ -214,6 +284,49 @@ pub fn is_render_dynamic(light: &SceneLight) -> bool {
 mod tests {
     use super::*;
     use xiii_decode::common::BevyTransform;
+
+    /// item31: the receiver pass must add nothing but direct light. Each non-light term found
+    /// adding a constant on Plage01 (ambient, fog, in-shader tonemapping, dither) stays removed.
+    #[test]
+    fn receiver_material_is_light_only() {
+        let m = receiver_material(Handle::default(), Handle::default(), false);
+        assert_eq!(m.base.alpha_mode, AlphaMode::Add);
+        assert!(!m.base.unlit);
+        assert!(!m.base.fog_enabled, "fog would be added a second time");
+        assert!(
+            m.base.occlusion_texture.is_some(),
+            "zone ambient must be occluded"
+        );
+        assert_eq!(m.base.emissive, LinearRgba::BLACK);
+        assert_eq!(m.base.base_color, Color::WHITE);
+        assert!(
+            receiver_material(Handle::default(), Handle::default(), true)
+                .base
+                .cull_mode
+                .is_none()
+        );
+
+        let occlusion = no_ambient_occlusion();
+        assert_eq!(occlusion.data.as_deref(), Some(&[0u8, 0, 0, 255][..]));
+    }
+
+    #[test]
+    fn receiver_shader_drops_tonemapping_and_dither_only() {
+        let mut defs: Vec<ShaderDefVal> = vec![
+            "TONEMAP_IN_SHADER".into(),
+            "DEBAND_DITHER".into(),
+            "VERTEX_UVS_A".into(),
+            ShaderDefVal::UInt("MAX_DIRECTIONAL_LIGHTS".into(), 10),
+        ];
+        strip_post_lighting_defs(&mut defs);
+        assert_eq!(
+            defs,
+            vec![
+                ShaderDefVal::from("VERTEX_UVS_A"),
+                ShaderDefVal::UInt("MAX_DIRECTIONAL_LIGHTS".into(), 10),
+            ]
+        );
+    }
 
     fn light(light_type: LightType, brightness: f32) -> SceneLight {
         SceneLight {

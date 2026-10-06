@@ -132,6 +132,7 @@ impl Plugin for ViewerPlugin {
         .init_resource::<PickData>()
         .insert_resource(fog::FogDisabled(fog::fog_disabled()))
         .add_plugins(particles::ParticlePlugin)
+        .add_plugins(MaterialPlugin::<lights::ReceiverMaterial>::default())
         .add_systems(Startup, setup)
         .add_systems(
             Update,
@@ -382,6 +383,7 @@ pub(crate) fn spawn_scene_geometry(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    receiver_materials: &mut Assets<lights::ReceiverMaterial>,
     images: &mut Assets<Image>,
     scene: &WorldScene,
     baked: bool,
@@ -398,7 +400,7 @@ pub(crate) fn spawn_scene_geometry(
     let receivers = !lights::lights_disabled()
         && (force_lights || scene.lights.iter().any(lights::is_render_dynamic));
     let receiver_mats = if receivers {
-        lights::receiver_materials(materials, &image_handles, scene)
+        lights::receiver_materials(receiver_materials, images, &image_handles, scene)
     } else {
         std::collections::HashMap::new()
     };
@@ -499,6 +501,7 @@ fn setup(
     cfg: Res<ViewerConfig>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut receiver_materials: ResMut<Assets<lights::ReceiverMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut decal_materials: ResMut<Assets<ForwardDecalMaterial<StandardMaterial>>>,
     mut pick: ResMut<PickData>,
@@ -525,6 +528,7 @@ fn setup(
         &mut commands,
         &mut meshes,
         &mut materials,
+        &mut receiver_materials,
         &mut images,
         &scene,
         baked,
@@ -626,12 +630,10 @@ fn setup(
         RenderLayers::layer(MAIN_LAYER),
         DepthPrepass,
         fog::distance_fog(&start_params),
-        lights::receiver_ambient_if_enabled().unwrap_or_else(|| {
-            fog::ambient_light(&start_params).unwrap_or_else(|| AmbientLight {
-                color: Color::NONE,
-                brightness: 0.0,
-                ..default()
-            })
+        fog::ambient_light(&start_params).unwrap_or_else(|| AmbientLight {
+            color: Color::NONE,
+            brightness: 0.0,
+            ..default()
         }),
         Transform::from_translation(pos).with_rotation(Quat::from_euler(
             EulerRot::YXZ,
