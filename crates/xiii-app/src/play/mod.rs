@@ -966,6 +966,19 @@ fn fixed_step(
         Ok(sess) => cinematics::input_suppressed(sess),
         Err(_) => false,
     };
+    if let Some(drive) = script.drive.as_mut() {
+        let tracked = drive.tracking_actor().and_then(|name| {
+            (*session).as_ref().ok().and_then(|sess| {
+                let id = sess.vm().find_live_object(name)?;
+                Some((name.to_owned(), sess.vm().vector_prop(id, "Location")))
+            })
+        });
+        if let Some((name, location)) = tracked {
+            drive.set_track_location(Some(&name), location);
+        } else {
+            drive.set_track_location(None, None);
+        }
+    }
     // Always advance the script so an explicit `take_control` diagnostic can be read even while a cutscene
     // suppresses input; the axis input and the other command queues are dropped when suppressed.
     let (mut input, weapons, goals, equip, use_named, search) = match script.drive.as_mut() {
@@ -1989,6 +2002,16 @@ pub(crate) fn run_script(
     let mut tick = 0u64;
     while tick < ticks {
         let elapsed = tick as f32 * DT;
+        if let Some(name) = drive.tracking_actor().map(str::to_owned) {
+            let location = runtime
+                .session
+                .vm()
+                .find_live_object(&name)
+                .and_then(|id| runtime.session.vm().vector_prop(id, "Location"));
+            drive.set_track_location(Some(&name), location);
+        } else {
+            drive.set_track_location(None, None);
+        }
         let input = drive.advance(elapsed, &mut runtime.sim);
         let weapons = drive.take_weapons();
         let goals = drive.take_goals();

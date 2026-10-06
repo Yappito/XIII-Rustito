@@ -14,6 +14,7 @@
 //! - `yaw <degrees>`: set absolute yaw (Unreal convention: 0 = +X, positive toward +Y).
 //! - `turn <degrees>`: add to yaw.
 //! - `pitch <degrees>`: set camera pitch.
+//! - `track <actor|off>`: continuously aim at a named actor (resolved by the playback host).
 //! - `use` (alias `grab`/`interact`): request one use/interact action (edge-triggered); the
 //!   host runs the VM's mover lock/unlock/open chain (`Session::use_mover`).
 //! - `use <ActorName>`: use/interact with a named actor directly (edges around hidden interaction
@@ -64,6 +65,8 @@ pub enum Command {
     Turn(f32),
     /// Pitch in degrees.
     Pitch(f32),
+    /// Continuously aim at an actor; `None` disables tracking.
+    Track(Option<String>),
     /// Move the box centre to an absolute Unreal-unit position (harness bootstrap).
     Teleport([f32; 3]),
     /// Autopilot toward an Unreal-unit waypoint (the driver re-aims and walks; not a teleport).
@@ -162,6 +165,11 @@ impl Script {
                 "yaw" => Command::Yaw(num(&mut it)?),
                 "turn" => Command::Turn(num(&mut it)?),
                 "pitch" => Command::Pitch(num(&mut it)?),
+                "track" => match it.next() {
+                    Some("off") => Command::Track(None),
+                    Some(actor) => Command::Track(Some(actor.to_owned())),
+                    None => return Err(format!("line {n}: track needs an actor name or off")),
+                },
                 "teleport" | "place" => {
                     let x = num(&mut it)?;
                     let y = num(&mut it)?;
@@ -262,6 +270,8 @@ pub struct Drive {
     goals: Vec<i32>,
     /// `take_control` requested (edge-triggered) and not yet applied by the host.
     control_pending: bool,
+    tracking: Option<String>,
+    track_location: Option<[f32; 3]>,
 }
 
 impl Drive {
@@ -285,6 +295,8 @@ impl Drive {
             waiting_travel: false,
             goals: Vec::new(),
             control_pending: false,
+            tracking: None,
+            track_location: None,
         }
     }
 
@@ -313,6 +325,18 @@ impl Drive {
     /// Takes the pending `take_control` request (edge-triggered).
     pub fn take_control(&mut self) -> bool {
         std::mem::take(&mut self.control_pending)
+    }
+
+    /// Supplies the current actor location to the active tracking command.
+    pub fn set_track_location(&mut self, actor: Option<&str>, location: Option<[f32; 3]>) {
+        self.track_location = match (self.tracking.as_deref(), actor) {
+            (Some(wanted), Some(found)) if wanted.eq_ignore_ascii_case(found) => location,
+            _ => None,
+        };
+    }
+
+    pub fn tracking_actor(&self) -> Option<&str> {
+        self.tracking.as_deref()
     }
 
     /// Whether the driver is blocked on a `wait_travel` command.
@@ -347,6 +371,10 @@ impl Drive {
                 &Command::Yaw(deg) => sim.yaw = deg.to_radians(),
                 &Command::Turn(deg) => sim.yaw += deg.to_radians(),
                 &Command::Pitch(deg) => sim.pitch = deg.to_radians(),
+                Command::Track(actor) => {
+                    self.tracking = actor.clone();
+                    self.track_location = None;
+                }
                 &Command::Teleport(p) => {
                     sim.location = p;
                     sim.velocity = [0.0; 3];
@@ -370,6 +398,15 @@ impl Drive {
                 Command::TakeControl => self.control_pending = true,
             }
             self.cursor += 1;
+        }
+        if let Some(target) = self.track_location {
+            let dx = target[0] - sim.location[0];
+            let dy = target[1] - sim.location[1];
+            let dz = target[2] - (sim.location[2] + 60.0);
+            if dx != 0.0 || dy != 0.0 {
+                sim.yaw = dy.atan2(dx).rem_euclid(std::f32::consts::TAU);
+                sim.pitch = dz.atan2(dx.hypot(dy));
+            }
         }
         // `goto` autopilot: re-aim and hold forward until within reach of the waypoint. The
         // simulation still moves the player; only the yaw/axis are driven.
@@ -504,6 +541,29 @@ mod tests {
         let s = Script::parse("\n# nothing\n").unwrap();
         assert!(s.events.is_empty());
         assert_eq!(s.last_time(), 0.0);
+    }
+
+    #[test]
+    fn tracking_parses_aims_in_three_dimensions_and_off_releases_it() {
+        let s = Script::parse("t=0 track Target\nt=1 track off\n").unwrap();
+        assert_eq!(s.events[0].command, Command::Track(Some("Target".into())));
+        assert_eq!(s.events[1].command, Command::Track(None));
+        let mut sim = PlayerSim::new([0.0; 3], 0.0);
+        let mut d = Drive::new(&s);
+        d.advance(0.0, &mut sim);
+        d.set_track_location(Some("target"), Some([0.0, 10.0, 70.0]));
+        d.advance(0.1, &mut sim);
+        assert!((sim.yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+        assert!((sim.pitch - (10.0f32 / 10.0).atan()).abs() < 1e-5);
+        d.set_track_location(Some("other"), Some([10.0, 0.0, 100.0]));
+        d.advance(0.2, &mut sim);
+        assert!((sim.yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+        d.advance(1.0, &mut sim);
+        d.set_track_location(Some("Target"), Some([10.0, 0.0, 100.0]));
+        let yaw = sim.yaw;
+        d.advance(1.1, &mut sim);
+        assert_eq!(sim.yaw, yaw);
+        assert!(Script::parse("t=0 track\n").is_err());
     }
 
     #[test]
