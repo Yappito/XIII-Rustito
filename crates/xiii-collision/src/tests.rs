@@ -364,6 +364,51 @@ fn ray_matches_wall_distance_and_overlap_finds_it() {
 }
 
 #[test]
+fn static_mesh_ray_rejects_a_backface_from_behind_the_collision_face() {
+    // Converted Plage01 desk top: Bevy's up normal is +Y. The key ray starts below the
+    // triangle and travels upward, so this is the backface direction for this winding.
+    let tri = [[-1.0, 0.0, -1.0], [-1.0, 0.0, 1.0], [1.0, 0.0, 1.0]];
+    let w = world(vec![(tri, 7)]);
+    let mut one_sided = vec![false; 8];
+    one_sided[7] = true;
+    assert!(
+        w.ray_with_one_sided_sources([-0.5, -0.1, 0.5], [-0.5, 0.1, 0.5], &one_sided)
+            .is_none(),
+        "a ray starting behind the one-sided mesh face leaves without a hit"
+    );
+    assert!(
+        w.ray_with_one_sided_sources([-0.5, 0.1, 0.5], [-0.5, -0.1, 0.5], &one_sided)
+            .is_some(),
+        "the matching front-facing direction still hits"
+    );
+    assert!(
+        w.ray([-0.5, -0.1, 0.5], [-0.5, 0.1, 0.5]).is_some(),
+        "unclassified sources retain the legacy two-sided behavior"
+    );
+}
+
+#[test]
+fn ray_from_inside_a_closed_two_sided_soup_still_reports_the_exit_surface() {
+    let cube = [
+        [[-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [1.0, 1.0, -1.0]],
+        [[-1.0, -1.0, -1.0], [1.0, 1.0, -1.0], [-1.0, 1.0, -1.0]],
+        [[-1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [1.0, -1.0, 1.0]],
+        [[-1.0, -1.0, 1.0], [-1.0, 1.0, 1.0], [1.0, 1.0, 1.0]],
+        [[-1.0, -1.0, -1.0], [-1.0, 1.0, -1.0], [-1.0, 1.0, 1.0]],
+        [[-1.0, -1.0, -1.0], [-1.0, 1.0, 1.0], [-1.0, -1.0, 1.0]],
+        [[1.0, -1.0, -1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0]],
+        [[1.0, -1.0, -1.0], [1.0, 1.0, 1.0], [1.0, 1.0, -1.0]],
+        [[-1.0, -1.0, -1.0], [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0]],
+        [[-1.0, -1.0, -1.0], [1.0, -1.0, 1.0], [1.0, -1.0, -1.0]],
+        [[-1.0, 1.0, -1.0], [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0]],
+        [[-1.0, 1.0, -1.0], [1.0, 1.0, -1.0], [1.0, 1.0, 1.0]],
+    ];
+    let w = world(cube.into_iter().map(|tri| (tri, 3)));
+    let hit = w.ray([0.0, 0.0, 0.0], [2.0, 0.0, 0.0]).expect("exit hit");
+    assert!(hit.t > 0.0 && hit.t < 1.0, "exit surface time: {}", hit.t);
+}
+
+#[test]
 fn degenerate_triangles_are_dropped() {
     let mut entries: Vec<(Triangle, u32)> = wall_x(0.0).into_iter().map(|t| (t, 0)).collect();
     entries.push(([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]], 9)); // collinear

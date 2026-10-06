@@ -10,12 +10,11 @@
 //! corpus fonts (`PoliceF20`, `PoliceF16`, `XIIIConsoleFont`, `XIIISmallFont`), their page
 //! textures and their glyph rectangles. `StrLen`/`TextSize` measure with the decoded metrics.
 //!
-//! **Host bridge (documented deviation).** The decoded `XIIIFontInfo` class default properties
-//! are all `None`, and no script assignment of the HUD's `SmallFont`/`MedFont`/`BigFont`/
-//! `LargeFont` was found in the decoded bytecode, so the host assigns the decoded fonts to the
-//! HUD by size before the first frame. The assignment is reported at startup. Tiles whose
-//! material did not resolve to a decodable `Engine.Texture` render as nothing and are counted in
-//! [`HudRuntime::missing_materials`] (never a silent success).
+//! The decoded `Engine.Canvas` class defaults leave `SmallFont` and `MedFont` empty. The retail
+//! `UCanvas::Init` native loads `PoliceF16` and `PoliceF20` into those slots; runtime setup mirrors
+//! that behavior from `XIIIFonts.utx`. Decoded `HUD.UseSmallFont`/`UseMediumFont` then select
+//! `Canvas.Font`. Tiles whose material did not resolve to a decodable `Engine.Texture` render as
+//! nothing and are counted in [`HudRuntime::missing_materials`] (never a silent success).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -49,8 +48,6 @@ pub struct HudFontPage {
 
 /// One decoded font plus its uploaded page textures.
 pub struct HudFont {
-    /// `Package.Object` path, e.g. `XIIIFonts.PoliceF20`.
-    pub path: String,
     /// Page textures, indexed by [`FontGlyph::page`].
     pub pages: Vec<HudFontPage>,
     /// Decoded metrics and glyph table.
@@ -86,22 +83,6 @@ impl FontDb {
             .get(&lowered)
             .or_else(|| self.by_key.get(&leaf))
             .map(|i| &self.fonts[*i])
-    }
-
-    /// Font assigned to the HUD's `SmallFont`/`MedFont`/`BigFont`/`LargeFont` (by size order).
-    /// Documented host bridge: the script's own font selection has no decoded assignment.
-    fn ordered(&self) -> Vec<&HudFont> {
-        let mut fonts: Vec<&HudFont> = self.fonts.iter().collect();
-        fonts.sort_by_key(|f| {
-            f.font
-                .pages
-                .iter()
-                .flat_map(|p| p.glyphs.iter())
-                .map(|g| g.v_size)
-                .max()
-                .unwrap_or(0)
-        });
-        fonts
     }
 }
 
@@ -220,11 +201,7 @@ pub fn load_fonts(game_dir: &Path, images: &mut Assets<Image>) -> Result<FontDb,
                 .collect::<Vec<_>>(),
             font.glyph_count()
         );
-        fonts.push(HudFont {
-            path: font_path,
-            pages,
-            font,
-        });
+        fonts.push(HudFont { pages, font });
     }
     if fonts.is_empty() {
         return Err("XIIIFonts.utx has no decodable Engine.Font exports".to_owned());
@@ -281,8 +258,22 @@ fn color_value(r: u8, g: u8, b: u8, a: u8) -> Value {
     ])
 }
 
-/// Builds the HUD runtime: decodes the fonts, creates the Canvas, assigns the host font bridge
-/// and installs the VM font provider. Returns the runtime for insertion as a non-send resource.
+/// Mirrors the retail `UCanvas::Init` font setup using the decoded fonts in `XIIIFonts.utx`.
+pub(super) fn initialize_canvas_fonts(
+    vm: &mut Vm<'static>,
+    canvas: ObjectId,
+) -> Result<[String; 2], String> {
+    let selected = ["XIIIFonts.PoliceF16", "XIIIFonts.PoliceF20"];
+    for (prop, path) in [("SmallFont", selected[0]), ("MedFont", selected[1])] {
+        if !vm.set_property(canvas, prop, 0, Value::Name(path.to_owned())) {
+            return Err(format!("Engine.Canvas has no {prop} property"));
+        }
+    }
+    Ok(selected.map(str::to_owned))
+}
+
+/// Builds the HUD runtime: decodes the fonts, creates and initializes the Canvas, and installs
+/// the VM font provider. Returns the runtime for insertion as a non-send resource.
 pub fn setup(
     session: &mut Session,
     game_dir: &Path,
@@ -307,49 +298,23 @@ pub fn setup(
     vm.set_property(canvas, "OrgY", 0, Value::Float(0.0));
     vm.set_property(canvas, "Style", 0, Value::Byte(1));
 
+    let selected = initialize_canvas_fonts(vm, canvas)?;
+    for path in &selected {
+        if fonts.find(path).is_none() {
+            return Err(format!(
+                "Engine.Canvas default font {path} is not in XIIIFonts.utx"
+            ));
+        }
+    }
+
     // Locate the script HUD (`PlayerController.myHUD`, else any live HUD actor).
     let hud = controller
         .and_then(|c| instance_prop(vm, c, "myHUD"))
         .or_else(|| find_hud(vm));
     if let Some(hud) = hud {
-        // Host font bridge: assign the decoded fonts to the HUD's own font properties and to
-        // the Canvas's (the engine's base `HUD.Use*Font` reads `Canvas.SmallFont`). The decoded
-        // `XIIIFontInfo` defaults are all `None`, so this mapping is a documented host
-        // deviation; fonts are ordered by glyph height.
-        let ordered = fonts.ordered();
-        let pick = |i: usize| {
-            ordered
-                .get(i.min(ordered.len().saturating_sub(1)))
-                .map(|f| f.path.clone())
-        };
-        let names = [
-            ("SmallFont", pick(0)),
-            ("MedFont", pick(1)),
-            ("BigFont", pick(2)),
-            ("LargeFont", pick(3)),
-            ("HugeFont", pick(3)),
-            ("NumericLargeFont", pick(3)),
-            ("MsgFont", pick(2)),
-            ("ItemFont", pick(0)),
-            ("HeadFont", pick(3)),
-            ("DialogFont", pick(1)),
-        ];
-        for (prop, font) in &names {
-            if let Some(path) = font {
-                // `set_property` returns false for a property the HUD does not declare; that is
-                // fine (the name list is a superset of the decoded font properties).
-                let _ = vm.set_property(hud, prop, 0, Value::Name(path.clone()));
-                let _ = vm.set_property(canvas, prop, 0, Value::Name(path.clone()));
-            }
-        }
         println!(
-            "[hud] script HUD {} found; host font bridge: {}",
-            vm.objects[hud as usize].name,
-            names
-                .iter()
-                .filter_map(|(p, f)| f.as_ref().map(|f| format!("{p}={f}")))
-                .collect::<Vec<_>>()
-                .join(", ")
+            "[hud] script HUD {} found; Canvas native defaults: SmallFont={}, MedFont={}",
+            vm.objects[hud as usize].name, selected[0], selected[1],
         );
     } else {
         println!("[hud] no live HUD actor found; PostRender will not be called");

@@ -2877,6 +2877,58 @@ mod local_tests {
         })
     }
 
+    #[test]
+    fn opt_in_plage01_key_support_collision_source() {
+        let Some(path) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+        let scene = import_map(&mut cache, "Plage01").expect("import Plage01");
+        let key = [-491.839_f32, -314.1377_f32, 1257.5927_f32];
+        let mut hits = Vec::new();
+        for (tri, source) in scene.line_collision() {
+            let to_uu = |v: [f32; 3]| [-v[2] * 90.0, v[0] * 90.0, v[1] * 90.0];
+            let tri = tri.map(to_uu);
+            let min_x = tri.iter().map(|v| v[0]).fold(f32::INFINITY, f32::min);
+            let max_x = tri.iter().map(|v| v[0]).fold(f32::NEG_INFINITY, f32::max);
+            let min_y = tri.iter().map(|v| v[1]).fold(f32::INFINITY, f32::min);
+            let max_y = tri.iter().map(|v| v[1]).fold(f32::NEG_INFINITY, f32::max);
+            let min_z = tri.iter().map(|v| v[2]).fold(f32::INFINITY, f32::min);
+            let max_z = tri.iter().map(|v| v[2]).fold(f32::NEG_INFINITY, f32::max);
+            if min_x <= key[0]
+                && max_x >= key[0]
+                && min_y <= key[1]
+                && max_y >= key[1]
+                && min_z <= 1260.0
+                && max_z >= 1259.0
+            {
+                hits.push((scene.collision_sources[source as usize].clone(), tri));
+            }
+        }
+        println!("[key support collision] candidates={}", hits.len());
+        for (source, tri) in &hits {
+            println!("[key support collision] {source}: {tri:?}");
+        }
+        let mut physics = physics::WorldPhysicsAdapter::from_scene(&scene);
+        let eye = [key[0], key[1], 1298.0];
+        let from_key = xiii_script::physics::WorldPhysics::trace(&mut physics, key, eye, [0.0; 3]);
+        let from_eye = xiii_script::physics::WorldPhysics::trace(&mut physics, eye, key, [0.0; 3]);
+        println!("[key support trace] key_to_eye={from_key:?} eye_to_key={from_eye:?}");
+        assert!(
+            from_key.is_none(),
+            "pickup-to-eye trace leaves through the mesh backface"
+        );
+        assert!(
+            from_eye.is_some(),
+            "eye-to-pickup trace enters the top face"
+        );
+        assert!(
+            !hits.is_empty(),
+            "supporting plank triangle should be in line soup"
+        );
+    }
+
     /// Opt-in corpus guard and evidence table for the static-mesh collision flags. Prints the
     /// per-mesh table (used by `local/reports/item1g-*.txt`) and asserts the measured structural
     /// facts: `UseSimpleBoxCollision`/`UseSimpleKarmaCollision` are never set in this corpus, so

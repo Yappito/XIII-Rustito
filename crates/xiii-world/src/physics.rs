@@ -72,6 +72,9 @@ pub fn unreal_extent_to_bevy(e: [f32; 3]) -> BevyVec3 {
 pub struct WorldPhysicsAdapter {
     box_world: CollisionWorld,
     line_world: CollisionWorld,
+    /// Per collision source: whether its engine collision faces reject a ray from their back
+    /// side (static-mesh sources, `UStaticMesh::LineCheck`).
+    line_one_sided_sources: Vec<bool>,
     /// Per registered mover: `(box moving-object index, line moving-object index)`.
     movers: Vec<(usize, usize)>,
     mover_by_name: HashMap<String, usize>,
@@ -87,9 +90,20 @@ impl WorldPhysicsAdapter {
         Self {
             box_world: CollisionWorld::new(box_entries),
             line_world: CollisionWorld::new(line_entries),
+            line_one_sided_sources: Vec::new(),
             movers: Vec::new(),
             mover_by_name: HashMap::new(),
         }
+    }
+
+    fn from_scene_with_line_sidedness(scene: &crate::WorldScene) -> Self {
+        let mut physics = Self::from_entries(scene.box_collision(), scene.line_collision());
+        physics.line_one_sided_sources = scene
+            .collision_sources
+            .iter()
+            .map(|path| path.contains(" -> "))
+            .collect();
+        physics
     }
 
     /// Number of movers registered with [`WorldPhysics::register_mover`].
@@ -99,7 +113,7 @@ impl WorldPhysicsAdapter {
 
     /// Builds the adapter from an imported world's query-specific collision soups.
     pub fn from_scene(scene: &crate::WorldScene) -> Self {
-        Self::from_entries(scene.box_collision(), scene.line_collision())
+        Self::from_scene_with_line_sidedness(scene)
     }
 
     /// The extent-query (box) collision world (for diagnostics and tests).
@@ -120,7 +134,8 @@ impl WorldPhysicsAdapter {
         let half = unreal_extent_to_bevy(extent);
         let zero = half.iter().all(|x| x.abs() < 1e-9);
         let hit = if zero {
-            self.line_world.ray(s, e)
+            self.line_world
+                .ray_with_one_sided_sources(s, e, &self.line_one_sided_sources)
         } else {
             self.box_world.sweep(s, e, half)
         }?;

@@ -70,3 +70,10 @@ Tests (unit or opt-in) must not read anything under `local/` (reports, scripts, 
 exist only in one worktree and the test silently breaks everywhere else. Put fixtures you author
 (play scripts, expected values) under the crate's `tests/data/` and commit them; game data is only
 read through `XIII_GOG_DIR`/`XIII_STEAM_DIR`.
+
+## Never touch the user's own game state
+
+Tests and manual runs must not read or write the user's `%APPDATA%` (save slots, menu INI).
+Tests create a fresh temporary directory. Manual `--play`/`--menu` runs pass `--save-dir` and
+`--config-dir` pointing to a temporary directory: a checkpoint reached during a benchmark or a
+route run otherwise writes a real save slot, and other tests or the user then see it.
