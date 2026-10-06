@@ -425,18 +425,6 @@ impl xiii_script::ExternalObjectData for MenuTextureData {
 }
 
 impl MenuSession {
-    /// Loads the script set and entry map, and spawns the root controller + main menu page. Fonts
-    /// are loaded later (they need the Bevy `Assets<Image>`).
-    #[cfg(test)]
-    fn open(
-        game_dir: &Path,
-        save_dir: PathBuf,
-        script: Option<MenuScript>,
-    ) -> Result<MenuSession, String> {
-        let dir = config::default_dir()?;
-        Self::open_configured(game_dir, save_dir, &dir, script)
-    }
-
     fn open_configured(
         game_dir: &Path,
         save_dir: PathBuf,
@@ -1974,6 +1962,31 @@ pub fn first_error(session: &MenuSession) -> Option<&str> {
 mod tests {
     use super::*;
 
+    struct TestStorage(PathBuf);
+
+    impl TestStorage {
+        fn new(label: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("xiii-menu-{label}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            Self(root)
+        }
+
+        fn config_dir(&self) -> PathBuf {
+            self.0.join("config")
+        }
+
+        fn save_dir(&self) -> PathBuf {
+            self.0.join("saves")
+        }
+    }
+
+    impl Drop for TestStorage {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn menu_slot_provider_lists_dates_and_requires_an_existing_slot_for_read() {
         let dir = std::env::temp_dir().join(format!("xiii-menu-store-test-{}", std::process::id()));
@@ -2180,9 +2193,11 @@ mod tests {
             return;
         };
         let script = MenuScript::parse("t=0.1 newgame\n").unwrap();
-        let mut session = MenuSession::open(
+        let storage = TestStorage::new("newgame");
+        let mut session = MenuSession::open_configured(
             &game_dir,
-            save_dir(&Options::default()).unwrap(),
+            storage.save_dir(),
+            &storage.config_dir(),
             Some(script),
         )
         .expect("open the front-end menu");
@@ -2238,9 +2253,14 @@ mod tests {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
         };
-        let mut session =
-            MenuSession::open(&game_dir, save_dir(&Options::default()).unwrap(), None)
-                .expect("open the front-end menu");
+        let storage = TestStorage::new("controls");
+        let mut session = MenuSession::open_configured(
+            &game_dir,
+            storage.save_dir(),
+            &storage.config_dir(),
+            None,
+        )
+        .expect("open the front-end menu");
         session.clip = [1280.0, 720.0];
         session.refresh_commands();
         let clip = session.clip;

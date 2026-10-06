@@ -20,9 +20,9 @@
 //!   doors and dynamic pawns the camera ray cannot pick).
 //! - `search <ActorName>`: search a named dead pawn's inventory through the game's own
 //!   `PlayerController.SearchPawn` (the corpse-search half of `Grab`).
-//! - `take_control` (alias `assume_control`): item18 host bridge that runs the controller's own
-//!   `EnterStartState` with `bOkForMoving = true`, releasing a player frozen by a cutscene the
-//!   host does not play. Labelled a diagnostic bridge.
+//! - `take_control` (alias `assume_control`): explicit diagnostic command that runs the
+//!   controller's own `EnterStartState` with `bOkForMoving = true`. No normal interactive or
+//!   campaign route issues this command; it is available only in a supplied `--play-script`.
 //! - `teleport <x> <y> <z>` (alias `place`): move the player box centre to this Unreal-unit
 //!   position and drop the velocity. Used by the trigger demonstration because the Plage00
 //!   trigger is ~47,000 UU from the PlayerStart (about 100 s of walking at `GroundSpeed`). The
@@ -96,11 +96,11 @@ pub enum Command {
     /// Equip the best weapon the player already carries in the game's own inventory chain (the
     /// `BringUp`/`ChangedWeapon` path), e.g. after walking onto a map weapon pickup (item14b).
     Equip,
-    /// item18 diagnostic bridge: give the local player control by running the game's own
+    /// item18 diagnostic command: give the local player control by running the game's own
     /// `XIIIPlayerController.EnterStartState` with `bOkForMoving = true` (the HUD's normal
     /// "first display done" transition). Needed because the decoded Plage01 intro leaves the
-    /// controller frozen in `NoControl` (the host does not play the cutscene sequence). Labelled
-    /// a host bridge, never silent.
+    /// controller frozen in `NoControl` when a diagnostic script does not play the authored
+    /// cutscene sequence. Normal campaign play does not depend on this command.
     TakeControl,
 }
 
