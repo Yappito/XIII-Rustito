@@ -497,6 +497,11 @@ fn setup_inner(
         "[play] localisation: language={} localized class-default overrides={}",
         session.localization_language, session.localized_overrides
     );
+    println!(
+        "[play] video clips: {} Bink header(s) read, {} timed (VideoPlayer.GetStatus uses the real duration)",
+        session.video_clips, session.video_timed
+    );
+    println!("[play] objectives: {}", session.objective_summary());
     let pawns_now = session.player_pawn_actors();
     println!(
         "[play] player pawns: {} live XIIIPlayerPawn actor(s): {}",
@@ -858,7 +863,9 @@ fn perform_use(
     let (origin, dir) = use_ray(sim, params);
     match ray_target(world, sources, origin, dir, USE_REACH_M) {
         Some(target) => {
-            let outcome = sess.use_mover(&target);
+            // A mover is used through its own lock/unlock/open chain; a dead pawn in front is
+            // searched (the engine `Grab` interaction). `use_target` tries both, in that order.
+            let outcome = sess.use_target(&target);
             println!("[play] use {target}: {outcome:?}");
         }
         None => println!("[play] use: nothing in reach"),
@@ -904,24 +911,40 @@ fn fixed_step(
         Ok(sess) => cinematics::input_suppressed(sess),
         Err(_) => false,
     };
-    let (input, weapons, goals, equip) = if suppressed {
-        (Input::default(), Vec::new(), Vec::new(), false)
-    } else {
-        match script.drive.as_mut() {
-            Some(drive) => {
-                let input = drive.advance(elapsed, &mut sim.0);
-                let weapons = drive.take_weapons();
-                let goals = drive.take_goals();
-                let equip = drive.take_equip();
-                (input, weapons, goals, equip)
-            }
-            None => (
-                read_keyboard(&keys, &buttons),
-                Vec::new(),
-                Vec::new(),
-                false,
-            ),
+    // Always advance the script so the `take_control` bridge can be read even while a cutscene
+    // suppresses input; the axis input and the other command queues are dropped when suppressed.
+    let (mut input, weapons, goals, equip, use_named, search) = match script.drive.as_mut() {
+        Some(drive) => {
+            let input = drive.advance(elapsed, &mut sim.0);
+            (
+                input,
+                drive.take_weapons(),
+                drive.take_goals(),
+                drive.take_equip(),
+                drive.take_use_named(),
+                drive.take_search(),
+            )
         }
+        None => (
+            read_keyboard(&keys, &buttons),
+            Vec::new(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+    };
+    let control = script
+        .drive
+        .as_mut()
+        .is_some_and(script::Drive::take_control);
+    if suppressed {
+        input = Input::default();
+    }
+    let (weapons, goals, equip, use_named, search) = if suppressed {
+        (Vec::new(), Vec::new(), false, Vec::new(), Vec::new())
+    } else {
+        (weapons, goals, equip, use_named, search)
     };
     let use_action = input.use_action;
     let fire = input.fire;
@@ -1019,12 +1042,33 @@ fn fixed_step(
                 Err(e) => println!("[play] equip failed: {e}"),
             }
         }
+        if control {
+            match sess.take_control() {
+                Ok(state) => println!("[play] take_control (host bridge): controller -> {state}"),
+                Err(e) => println!("[play] take_control failed: {e}"),
+            }
+        }
         if use_action {
             perform_use(sess, &wr.world, &wr.sources, &sim.0, &params.0);
         }
+        for target in &use_named {
+            let outcome = sess.use_target(target);
+            println!("[play] use {target}: {outcome:?}");
+        }
+        for target in &search {
+            let outcome = sess.search_corpse(target);
+            println!("[play] search {target}: {outcome:?}");
+        }
         if fire {
             match sess.fire(sim.0.yaw, sim.0.pitch) {
-                session::FireOutcome::Fired => flash_muzzle_light(sess, &sim.0, &params.0),
+                session::FireOutcome::Fired => {
+                    println!(
+                        "[play] fire bone={} | {}",
+                        sess.vm().last_trace_bone(),
+                        combat_snapshot(sess)
+                    );
+                    flash_muzzle_light(sess, &sim.0, &params.0);
+                }
                 other => println!("[play] fire: {other:?}"),
             }
         }
@@ -1255,11 +1299,12 @@ fn sync_vm_lights(
 /// event count and last player touch.
 fn format_vm_trace(sess: &session::Session) -> String {
     format!(
-        "vm t={:.3}s active={} suspended={} dispatcher={} player={} health={} physics={} events={} last_touch={}",
+        "vm t={:.3}s active={} suspended={} dispatcher={} ctrl={} player={} health={} physics={} events={} last_touch={} | {}",
         sess.vm_time(),
         sess.active_actors(),
         sess.suspended.len(),
         sess.dispatcher_state().unwrap_or_else(|| "-".to_owned()),
+        sess.player_controller_state(),
         sess.player_location()
             .map(|l| format!("({:.1},{:.1},{:.1})", l[0], l[1], l[2]))
             .unwrap_or_else(|| "-".to_owned()),
@@ -1271,6 +1316,7 @@ fn format_vm_trace(sess: &session::Session) -> String {
             .unwrap_or_else(|| "-".to_owned()),
         sess.total_events(),
         sess.last_touch().unwrap_or_else(|| "-".to_owned()),
+        sess.objective_summary(),
     )
 }
 
@@ -1731,6 +1777,10 @@ pub(crate) struct ScriptOutcome {
     pub final_map: String,
     /// One entry per level transition, in order (empty when the run did not travel).
     pub travel: Vec<TravelHop>,
+    /// item18: each map the run passed through and its `MapInfo.Objectif[]` states as the run left
+    /// it (the final map's states are the last entry). Requirement 4's "objective states over
+    /// time" across a multi-map run.
+    pub map_objectives: Vec<(String, Vec<session::ObjectiveState>)>,
     /// Host-synthesised footsteps in order:
     /// `(seconds, XIIIFootStepSound wrapper path, floor material path)`.
     pub footsteps: Vec<(f32, String, Option<String>)>,
@@ -1848,6 +1898,7 @@ pub(crate) fn run_script(
     let mut drive = script::Drive::new(script);
     let mut trace = Vec::new();
     let mut travel = Vec::new();
+    let mut map_objectives = Vec::new();
     let mut runtime = open_map_runtime(game_dir, map, scene, params)?;
     // Player footsteps (item6e): the same notify-free synthesis `fixed_step` uses, so the
     // headless path reports and can play them. Rebuilt for each map after a level transition.
@@ -1861,6 +1912,9 @@ pub(crate) fn run_script(
         let weapons = drive.take_weapons();
         let goals = drive.take_goals();
         let equip = drive.take_equip();
+        let use_named = drive.take_use_named();
+        let search = drive.take_search();
+        let control = drive.take_control();
         let fired = input.fire;
         if runtime.volumes.is_empty() {
             runtime
@@ -1921,6 +1975,12 @@ pub(crate) fn run_script(
                 Err(e) => println!("[play] equip failed: {e}"),
             }
         }
+        if control {
+            match runtime.session.take_control() {
+                Ok(state) => println!("[play] take_control (host bridge): controller -> {state}"),
+                Err(e) => println!("[play] take_control failed: {e}"),
+            }
+        }
         if input.use_action {
             perform_use(
                 &mut runtime.session,
@@ -1929,6 +1989,14 @@ pub(crate) fn run_script(
                 &runtime.sim,
                 params,
             );
+        }
+        for target in &use_named {
+            let outcome = runtime.session.use_target(target);
+            println!("[play] use {target}: {outcome:?}");
+        }
+        for target in &search {
+            let outcome = runtime.session.search_corpse(target);
+            println!("[play] search {target}: {outcome:?}");
         }
         if fired {
             match runtime.session.fire(runtime.sim.yaw, runtime.sim.pitch) {
@@ -1982,6 +2050,7 @@ pub(crate) fn run_script(
                 vm_time: req.time,
                 tick,
             });
+            map_objectives.push((runtime.name.clone(), runtime.session.objective_states()));
             // The script block (if any) is released; the next map starts a fresh run.
             drive.notify_travel();
             let opts = crate::cli::Options {
@@ -2011,6 +2080,7 @@ pub(crate) fn run_script(
             duration
         );
     }
+    map_objectives.push((runtime.name.clone(), runtime.session.objective_states()));
     Ok(ScriptOutcome {
         session: runtime.session,
         ticks,
@@ -2018,6 +2088,7 @@ pub(crate) fn run_script(
         trace,
         final_map: runtime.name,
         travel,
+        map_objectives,
         footsteps: footstep_log,
     })
 }
@@ -2131,6 +2202,32 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
             hop.from, hop.to, hop.url, hop.mode, hop.items, hop.vm_time, hop.tick
         );
     }
+    for (map, states) in &outcome.map_objectives {
+        println!(
+            "[play]   objectives as the run left {map}: {}",
+            states
+                .iter()
+                .map(|o| format!(
+                    "[{}{}{}] {}",
+                    o.index,
+                    if o.primary { " P" } else { " -" },
+                    if o.completed {
+                        " C"
+                    } else if o.anti_goal {
+                        " A"
+                    } else {
+                        " ."
+                    },
+                    if o.text.is_empty() {
+                        "<empty>"
+                    } else {
+                        o.text.as_str()
+                    }
+                ))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+    }
     println!("[play] {}", session.bootstrap_note);
     match pawns::headless_report(session, &game_dir) {
         Ok(line) => println!("[play] {line}"),
@@ -2148,6 +2245,11 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
         "[play] localisation: language={} localized class-default overrides={}",
         session.localization_language, session.localized_overrides
     );
+    println!(
+        "[play] video clips: {} Bink header(s) read, {} timed (VideoPlayer.GetStatus uses the real duration)",
+        session.video_clips, session.video_timed
+    );
+    println!("[play] objectives: {}", session.objective_summary());
     let pawns_now = session.player_pawn_actors();
     println!(
         "[play] player pawns: {} live XIIIPlayerPawn actor(s): {}",
@@ -2180,6 +2282,15 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
             .map(|w| session.vm().objects[w as usize].name.clone())
             .unwrap_or_else(|| "none".to_owned()),
         combat_snapshot(session)
+    );
+    println!(
+        "[play] player inventory: {}",
+        session
+            .inventory_items()
+            .iter()
+            .map(|(n, c)| format!("{n} [{c}]"))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     for b in &session.blocked {
         println!("[play]   script path blocked: {b}");
@@ -2487,6 +2598,120 @@ mod tests {
             dist >= 2.0 * UNREAL_UNITS_PER_METER,
             "player only {dist:.1} UU outside the door plane (need >= {:.0})",
             2.0 * UNREAL_UNITS_PER_METER
+        );
+    }
+
+    /// item18 opt-in corpus test: follow the decoded Plage01 route as far as the port supports it
+    /// and assert the measured objective states and the game's own level end. `take_control` is the
+    /// labelled host bridge for the stuck intro; `set_goal 91/92` are the labelled bridges for the
+    /// cutscene promotions; `teleport` is a diagnostic shortcut for the large beach distances. The
+    /// two player-driven completions (the `TouchTrigger9` walk, the corpse search + `Porte1`) run
+    /// through the game's own code. Asserts the same stages the report records.
+    #[test]
+    fn opt_in_plage01_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let script = script::Script::parse(
+            "t=0.00 take_control\n\
+             t=0.10 set_goal 91\n\
+             t=0.20 teleport -491.8 -414.1 1265.0\n\
+             t=0.30 goto -491.84 -314.14\n\
+             t=0.50 jump\nt=1.00 jump\nt=1.50 jump\nt=2.00 jump\nt=2.50 jump\nt=3.00 forward 0\n\
+             t=3.40 teleport -742.1444 -808.429 1311.0449\nt=3.40 yaw 312.891\nt=3.40 forward 1\n\
+             t=5.00 turn -45\nt=5.70 forward 0\nt=6.00 use\nt=7.00 forward 1\nt=8.00 forward 0\n\
+             t=8.50 teleport -307.0 -1500.0 1311.0\nt=8.50 yaw 90\nt=8.50 forward 1\nt=12.00 forward 0\n\
+             t=13.00 set_goal 92\nt=13.20 weapon XIII.m60\nt=14.00 equip\n\
+             t=15.00 teleport 1802.0 -12700.0 1100.0\nt=15.00 yaw 270\n\
+             t=15.10 fire\nt=15.30 fire\nt=15.50 fire\nt=15.70 fire\nt=15.90 fire\nt=16.10 fire\n\
+             t=16.30 fire\nt=16.50 fire\nt=16.70 fire\nt=16.90 fire\nt=17.10 fire\nt=17.30 fire\n\
+             t=17.50 fire\nt=17.70 fire\nt=17.90 fire\nt=18.10 fire\nt=18.30 fire\nt=18.50 fire\n\
+             t=19.00 search BaseSoldier6\n\
+             t=21.00 teleport 1215.0 -14000.0 1105.0\nt=21.00 yaw 270\n\
+             t=21.50 use Porte1\nt=22.50 use Porte1\n",
+        )
+        .unwrap();
+        let outcome = run_script(
+            &game_dir,
+            "Plage01",
+            &script,
+            &resolved.params,
+            &scene,
+            90.0,
+        )
+        .expect("run Plage01 route");
+        println!("[route] map objectives: {:?}", outcome.map_objectives);
+        println!(
+            "[route] travel: {:?}, final map {}",
+            outcome.travel, outcome.final_map
+        );
+        let (plage, states) = outcome
+            .map_objectives
+            .first()
+            .expect("Plage01 objective states");
+        assert_eq!(plage, "Plage01");
+        assert!(
+            states.len() >= 2,
+            "Plage01 MapInfo must expose its objectives: {states:?}"
+        );
+        assert!(
+            states[0].primary && states[0].completed,
+            "objective 0 (escape) must be promoted and completed: {:?}",
+            states[0]
+        );
+        assert!(
+            states[1].primary && states[1].completed,
+            "objective 1 (truck) must be promoted and completed: {:?}",
+            states[1]
+        );
+        // PlayerTick dispatch is what turns `PlayingVideo` into `ServerTravel`; the route reaches
+        // it because `PlayerTick` now runs and `VideoPlayer.GetStatus` times `Cine01`.
+        assert!(
+            !outcome.travel.is_empty(),
+            "the level must travel; blocked actors: {:?}",
+            outcome.session.suspended
+        );
+        assert_eq!(outcome.final_map, "banque01");
+        assert_eq!(outcome.travel[0].to, "banque01");
+    }
+
+    /// item18 opt-in VM/session test for the `PlayerTick` dispatch itself: putting the real
+    /// `XIIIPlayerController` into its `PlayingVideo` state and ticking once must run
+    /// `PlayingVideo.PlayerTick`, which calls `Level.ServerTravel(MapInfo.NextMapLevelWithUnr)`
+    /// when no `VideoPlayer` is held. Without the dispatch, the controller sits in `PlayingVideo`
+    /// forever and no request appears.
+    #[test]
+    fn opt_in_plage01_player_tick_reaches_server_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = session::Session::open(&game_dir, "Plage01").expect("open Plage01");
+        let ctrl = session.controller.expect("player controller");
+        session
+            .vm_mut()
+            .goto_state(ctrl, "PlayingVideo", None)
+            .expect("enter PlayingVideo");
+        assert_eq!(
+            session.vm().state_name(ctrl).as_deref(),
+            Some("PlayingVideo")
+        );
+        // Use the app's tolerant tick: an unrelated suspended save trigger
+        // (`XIIISaveGameTrigger.DoSave`'s undecoded save struct) must not abort the dispatch test.
+        let _ = session.vm_mut().tick_suspending(0.05);
+        let req = session.vm_mut().take_travel_request();
+        assert!(
+            req.as_ref()
+                .is_some_and(|r| r.url.eq_ignore_ascii_case("banque01.unr")),
+            "PlayingVideo.PlayerTick must request banque01; got {req:?}"
         );
     }
 

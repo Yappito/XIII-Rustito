@@ -1180,10 +1180,45 @@ pub struct Vm<'s> {
     /// Set by [`Vm::update_ai_perception`] so `SeePlayer`/`EnemyNotVisible` fire only on change,
     /// as the engine's sight counter does, instead of restarting an AI state every tick.
     ai_visible: HashMap<ObjectId, bool>,
+    /// item18: Bink video durations in seconds, keyed by lowercased file stem. The host registers
+    /// them (the VM deliberately has no filesystem access); an entry is absent when the Bink header
+    /// could not be read, in which case `VideoPlayer.GetStatus` keeps the old "finished" Partial.
+    video_durations: HashMap<String, f32>,
+    /// item18: the currently open `Engine.VideoPlayer` (`None` before `Open`).
+    video: Option<VideoPlayback>,
+}
+
+/// item18: host-driven `Engine.VideoPlayer` state.
+///
+/// `Engine.VideoPlayer.Open(name)` records the clip and any host-registered duration;
+/// `Play` starts its clock at [`Vm::time`]; `GetStatus` returns `1` (playing) until the real
+/// duration elapses and `0` (finished) after. No decoder is linked, so this times the video
+/// without displaying it (the host labels that Partial). A clip whose Bink header could not be
+/// read has no duration and reports finished immediately, preserving the item16 menu behavior.
+#[derive(Debug, Clone)]
+pub struct VideoPlayback {
+    /// Lowercased file stem as passed to `Open` (directory and `.bik` stripped).
+    pub name: String,
+    /// Decoded duration in seconds, when the host read the Bink header.
+    pub duration: Option<f32>,
+    /// VM time at which `Play` was called (`None` before `Play`).
+    pub started_at: Option<f64>,
 }
 
 fn lower(s: &str) -> String {
     s.to_ascii_lowercase()
+}
+
+/// item18: normalises a `VideoPlayer` clip name to a lowercased stem (drops any directory and a
+/// trailing `.bik`), so `MapInfo.EndMapVideo` (`cine01`) and a registered `Cine01.bik` agree.
+fn video_stem(name: &str) -> String {
+    let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let stem = if file.len() > 4 && file[file.len() - 4..].eq_ignore_ascii_case(".bik") {
+        &file[..file.len() - 4]
+    } else {
+        file
+    };
+    stem.to_ascii_lowercase()
 }
 
 impl<'s> Vm<'s> {
@@ -1233,6 +1268,8 @@ impl<'s> Vm<'s> {
             external_data: None,
             profile: NativeProfile::default(),
             ai_visible: HashMap::new(),
+            video_durations: HashMap::new(),
+            video: None,
         }
     }
 
@@ -1602,6 +1639,64 @@ impl<'s> Vm<'s> {
     /// Whether a travel request is waiting (without consuming it).
     pub fn travel_requested(&self) -> bool {
         self.pending_travel.is_some()
+    }
+
+    // ---------------------------------------------------------------- item18 VideoPlayer
+
+    /// Registers the real duration of a Bink clip (seconds), keyed by file stem. The host reads
+    /// the Bink header because `xiii-script` has no filesystem access. A non-finite or negative
+    /// duration is ignored (never stored) so `GetStatus` cannot be made to hang on bad data.
+    pub fn set_video_duration(&mut self, name: &str, seconds: f32) {
+        if seconds.is_finite() && seconds >= 0.0 {
+            self.video_durations.insert(video_stem(name), seconds);
+        }
+    }
+
+    /// `Engine.VideoPlayer.Open(name)`: records the clip. Returns `true` when a duration is known
+    /// (the video will be timed) and `false` when it is not (the call is still accepted, and
+    /// `GetStatus` reports finished — the labelled Partial).
+    pub fn video_open(&mut self, name: &str) -> bool {
+        let stem = video_stem(name);
+        let duration = self.video_durations.get(&stem).copied();
+        self.video = Some(VideoPlayback {
+            name: stem,
+            duration,
+            started_at: None,
+        });
+        duration.is_some()
+    }
+
+    /// `Engine.VideoPlayer.Play()`: starts (or restarts) the clip clock.
+    pub fn video_play(&mut self) {
+        if let Some(v) = self.video.as_mut() {
+            v.started_at = Some(self.time);
+        }
+    }
+
+    /// `Engine.VideoPlayer.Stop()`: clears the clip.
+    pub fn video_stop(&mut self) {
+        self.video = None;
+    }
+
+    /// `Engine.VideoPlayer.GetStatus() -> int`: `1` while the clip is playing, `0` when it is
+    /// finished, not started, or has no known duration. The decoder is not linked, so nothing is
+    /// displayed; this only reports the clip's real timing.
+    pub fn video_status(&self) -> i32 {
+        let Some(v) = self.video.as_ref() else {
+            return 0;
+        };
+        let Some(started) = v.started_at else {
+            return 0;
+        };
+        match v.duration {
+            Some(d) if (self.time - started) < f64::from(d) => 1,
+            _ => 0,
+        }
+    }
+
+    /// The current `Engine.VideoPlayer` clip stem, if one is open (diagnostics).
+    pub fn video_name(&self) -> Option<&str> {
+        self.video.as_ref().map(|v| v.name.as_str())
     }
 
     /// Records a travel request and queues the matching presentation event. The first request
@@ -3092,6 +3187,7 @@ impl<'s> Vm<'s> {
                 self.dispatch_tick(id, dt)?;
             }
         }
+        self.dispatch_player_ticks(dt)?;
         self.detect_server_travel();
         Ok(())
     }
@@ -3231,6 +3327,14 @@ impl<'s> Vm<'s> {
                 errors.push((suspended, e));
             }
         }
+        for id in 0..self.objects.len() as ObjectId {
+            if self.player_tick_overridden(id)
+                && let Err(e) = self.dispatch_player_tick(id, dt)
+            {
+                let suspended = self.suspend_for_error(id, &e);
+                errors.push((suspended, e));
+            }
+        }
         self.detect_server_travel();
         errors
     }
@@ -3245,6 +3349,67 @@ impl<'s> Vm<'s> {
             self.call_values(f, id, vec![Value::Float(dt)])?;
         }
         Ok(())
+    }
+
+    /// item18: per-frame `PlayerTick` dispatch to the local player controllers, after the actor
+    /// `Tick` pass (UE2 `ULevel::Tick` order; [`Self::tick`] calls this at the same point).
+    ///
+    /// UE2's engine calls `APlayerController::PlayerTick(DeltaTime)` every frame, which runs the
+    /// controller's `PlayerTick` event; a state can override it (`PlayingVideo.PlayerTick` ends the
+    /// level-end video, `GameEndedDeath.PlayerTick` drives the death cam). The host owns the player
+    /// pawn's movement (see `Session::step`), and the class-level
+    /// `PlayerController.PlayerTick`/`PlayerWalking.PlayerMove` script **is** that movement: it
+    /// reaches the engine movement natives `CheckBob` (#504) and `FindStairRotation` (#524), which
+    /// the port replaces and does not register. Running it would double-move the pawn and suspend
+    /// the controller. So this dispatches `PlayerTick` only when the controller's **current state**
+    /// defines it — exactly the script the host does not own.
+    fn dispatch_player_ticks(&mut self, dt: f32) -> VmResult<()> {
+        for id in 0..self.objects.len() as ObjectId {
+            if self.player_tick_overridden(id) {
+                self.dispatch_player_tick(id, dt)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// True when `id` is an active, live `PlayerController` actor whose current state (or a
+    /// super-state) defines `PlayerTick`. See [`Self::dispatch_player_ticks`].
+    fn player_tick_overridden(&self, id: ObjectId) -> bool {
+        let o = &self.objects[id as usize];
+        o.active
+            && o.is_actor
+            && !o.deleted
+            && self.is_a(id, "playercontroller")
+            && self.state_defines_function(id, "PlayerTick")
+    }
+
+    /// Fires `PlayerTick(DeltaTime)` on one controller (the caller has already checked it is a
+    /// state override).
+    fn dispatch_player_tick(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
+        if let Some(f) = self.find_function(id, "PlayerTick", true) {
+            self.call_values(f, id, vec![Value::Float(dt)])?;
+        }
+        Ok(())
+    }
+
+    /// True when the object's current state or one of its super-states defines `name` (so the
+    /// lookup would resolve to a state function rather than the class chain).
+    fn state_defines_function(&self, id: ObjectId, name: &str) -> bool {
+        let mut st = self.objects[id as usize].state;
+        let mut guard = 0;
+        while let Some(s) = st {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            if self.find_function_in(s, name).is_some() {
+                return true;
+            }
+            st = self
+                .struct_header(s)
+                .and_then(|h| self.set.resolve(s.package, h.field.super_field));
+        }
+        false
     }
 
     /// Suspends the actor that should stop after a failing tick: the innermost object on the
@@ -5581,12 +5746,59 @@ impl<'s> Vm<'s> {
         if let Some(f) = self.find_function(id, "Destroyed", true) {
             self.call_values(f, id, Vec::new())?;
         }
+        // Leave a clean inventory chain. `Inventory.Destroyed` unlinks the item via
+        // `Instigator/Owner.DeleteInventory`, but that call is on another actor and can be
+        // deferred (out of the executed scope), leaving the destroyed item reachable from the
+        // owner. A stale head then makes `PlayerController.SearchPawn`'s `while (i = P.Inventory)`
+        // loop forever (measured: the corpse-search BudgetExceeded). Removing it here is what
+        // UE2's `AActor::Destroy` guarantees; it is a no-op when the script already unlinked it.
+        if self.is_a(id, "inventory") {
+            for owner_prop in ["Instigator", "Owner"] {
+                if let Some(Value::Object(Some(ObjRef::Instance(owner)))) =
+                    self.get_property(id, owner_prop).cloned()
+                {
+                    self.unlink_inventory(owner, id);
+                }
+            }
+        }
         let actor = self.objects[id as usize].name.clone();
         self.note(TraceKind::Destroyed {
             actor,
             result: true,
         });
         Ok(true)
+    }
+
+    /// Removes `item` from `owner`'s `Inventory` singly-linked chain (or from `item`'s
+    /// predecessor in it). Used by [`Vm::destroy`] and the host corpse-search bridge to guarantee
+    /// a clean chain when the script's `Inventory.Destroyed`/`DeleteInventory` unlink was deferred
+    /// (a call on an out-of-scope actor). No-op when `item` is not linked.
+    pub fn unlink_inventory(&mut self, owner: ObjectId, item: ObjectId) {
+        let mut cur = owner;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            if guard > 1024 {
+                return;
+            }
+            let next = match self.get_property(cur, "Inventory").cloned() {
+                Some(Value::Object(Some(ObjRef::Instance(n)))) => n,
+                _ => return,
+            };
+            if next == item {
+                let after = self
+                    .get_property(item, "Inventory")
+                    .cloned()
+                    .unwrap_or(Value::Object(None));
+                let _ = self.set_property(cur, "Inventory", 0, after);
+                let _ = self.set_property(item, "Inventory", 0, Value::Object(None));
+                return;
+            }
+            cur = next;
+            if cur == owner {
+                return;
+            }
+        }
     }
 
     /// First live (not deleted) object with a name (case-insensitive).

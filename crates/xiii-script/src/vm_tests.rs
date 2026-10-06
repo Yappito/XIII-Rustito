@@ -150,9 +150,22 @@ impl B {
     }
 
     fn state(&mut self, r: i32, next: i32, script: &[u8], mem: u32, labels_at: u16) {
+        self.state_children(r, next, 0, script, mem, labels_at);
+    }
+
+    /// A `Core.State` whose `children` point at a state-scoped function (item18 `PlayerTick`).
+    fn state_children(
+        &mut self,
+        r: i32,
+        next: i32,
+        children: i32,
+        script: &[u8],
+        mem: u32,
+        labels_at: u16,
+    ) {
         let friendly = self.exports[(r - 1) as usize].name;
         let mut p = compact(0);
-        p.extend(self.header(0, next, 0, friendly, script, mem));
+        p.extend(self.header(0, next, children, friendly, script, mem));
         p.extend(u64::MAX.to_le_bytes());
         p.extend(u64::MAX.to_le_bytes());
         p.extend(labels_at.to_le_bytes());
@@ -508,8 +521,10 @@ fn registry_entries_are_documented() {
     // and a visible Partial for `ParticleEmitter.SetMaxParticles`; item16 added the menu natives
     // (`VideoPlayer.*`, `Actor.*AllSounds`, `PlayerController.ClientTravel`); item15 added
     // `PlayerController.GetDefaultURL` and `CalcFirstPersonView`, and `ClientTravel` is shared
-    // with item16 (registered once).
-    assert_eq!(defs.len(), 291);
+    // with item16 (registered once); item18 added the float `%` operator (173), the rotator
+    // `Normalize` (198), a Partial `ParticleEmitter.SpawnParticle`, and a Partial
+    // `Actor.KillAllSounds`.
+    assert_eq!(defs.len(), 295);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -777,9 +792,22 @@ impl SpawnB {
     }
 
     fn state(&mut self, r: i32, next: i32, script: &[u8], mem: u32, labels_at: u16) {
+        self.state_children(r, next, 0, script, mem, labels_at);
+    }
+
+    /// A `Core.State` whose `children` point at a state-scoped function (item18 `PlayerTick`).
+    fn state_children(
+        &mut self,
+        r: i32,
+        next: i32,
+        children: i32,
+        script: &[u8],
+        mem: u32,
+        labels_at: u16,
+    ) {
         let friendly = self.exports[(r - 1) as usize].name;
         let mut p = compact(0);
-        p.extend(self.header(0, next, 0, friendly, script, mem));
+        p.extend(self.header(0, next, children, friendly, script, mem));
         p.extend(u64::MAX.to_le_bytes());
         p.extend(u64::MAX.to_le_bytes());
         p.extend(labels_at.to_le_bytes());
@@ -6541,4 +6569,49 @@ fn set_max_particles_records_and_does_not_fail() {
         &e.kind,
         TraceKind::Note(s) if s.contains("SetMaxParticles(12)") && s.contains("no particle subsystem")
     )));
+}
+
+#[test]
+fn video_player_status_times_a_host_registered_duration() {
+    let set = set_of(fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    // No open clip: finished.
+    assert_eq!(vm.video_status(), 0);
+    // A registered duration is timed from `Play`.
+    vm.set_video_duration("Cine01.bik", 10.0);
+    assert!(vm.video_open("cine01"));
+    vm.video_play();
+    assert_eq!(vm.video_status(), 1);
+    for _ in 0..99 {
+        vm.tick(0.1).unwrap();
+    }
+    assert_eq!(vm.video_status(), 1, "9.9 s < 10 s");
+    vm.tick(0.2).unwrap();
+    assert_eq!(vm.video_status(), 0, "10.1 s >= 10 s");
+    // An unknown clip reports finished immediately (the labelled Partial).
+    assert!(!vm.video_open("movie_without_header"));
+    vm.video_play();
+    assert_eq!(vm.video_status(), 0);
+    // A bad duration is rejected, so a corrupt header cannot stop the level end.
+    vm.set_video_duration("bad", f32::NAN);
+    assert!(!vm.video_open("bad"));
+}
+
+#[test]
+fn percent_float_float_matches_fmod() {
+    let set = set_of(fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(g(&set, "Object"), "O").unwrap();
+    let mut a = vec![Value::Float(7.5), Value::Float(2.0)];
+    let out = call_native(
+        &mut vm,
+        "Object.Percent_FloatFloat",
+        o,
+        &[false, false],
+        &mut a,
+    );
+    let NativeOutcome::Value(Value::Float(v)) = out else {
+        panic!("expected a float");
+    };
+    assert!((v - 1.5).abs() < 1e-6, "7.5 % 2.0 = {v}");
 }
