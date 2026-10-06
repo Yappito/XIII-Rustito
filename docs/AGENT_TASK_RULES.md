@@ -63,3 +63,10 @@ you created before finishing.
   relevant. A permission denial is final: do not work around it.
 - Never write to `XIII_Game/` or any game installation. No git commands that change history,
   branches or the index. No new dependencies unless the spec allows them.
+
+## Tests must not depend on git-ignored files
+
+Tests (unit or opt-in) must not read anything under `local/` (reports, scripts, notes): those files
+exist only in one worktree and the test silently breaks everywhere else. Put fixtures you author
+(play scripts, expected values) under the crate's `tests/data/` and commit them; game data is only
+read through `XIII_GOG_DIR`/`XIII_STEAM_DIR`.

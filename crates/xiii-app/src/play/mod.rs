@@ -160,7 +160,7 @@ impl Plugin for PlayPlugin {
                 .clone()
                 .map(Ok)
                 .unwrap_or_else(crate::save::default_save_dir)
-                .and_then(|dir| crate::save::read(&dir, slot))
+                .and_then(|dir| crate::save::SaveStore::open(dir).read(slot))
             {
                 Ok(saved) => {
                     options.map = Some(saved.map);
@@ -173,7 +173,11 @@ impl Plugin for PlayPlugin {
         let game_dir = options.game_dir.clone().unwrap_or_default();
         let map = options.map.clone().unwrap_or_default();
         let t0 = Instant::now();
-        let mut session = session::Session::open(&game_dir, &map);
+        let mut session = if options.load.is_some() {
+            session::Session::open_checkpoint(&game_dir, &map)
+        } else {
+            session::Session::open(&game_dir, &map)
+        };
         println!(
             "[play] script session open (scripts, begin-play, providers): {:.2}s",
             t0.elapsed().as_secs_f32()
@@ -577,7 +581,7 @@ fn setup_inner(
             .clone()
             .map(Ok)
             .unwrap_or_else(crate::save::default_save_dir)?;
-        let saved = crate::save::read(&dir, slot)?;
+        let saved = crate::save::SaveStore::open(dir).read(slot)?;
         start_center = session.restore_checkpoint(&saved)?;
         start_rot = saved.rotation;
         println!(
@@ -2652,8 +2656,9 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let route_path = workspace.join("local/reports/item19/route.script");
+        // Tracked fixture (our own route commands; no game data).
+        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/plage01_route.script");
         let script = script::Script::load(&route_path).expect("load item19 Plage01 route");
         let outcome = run_script(
             &game_dir,
