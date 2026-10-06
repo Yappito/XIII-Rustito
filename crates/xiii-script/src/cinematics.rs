@@ -271,3 +271,170 @@ pub fn cinematic_defs() -> Vec<NativeDef> {
         ),
     ]
 }
+
+/// item19: `CineController2.Steering(Vector vTargetLocation, float dt, float fDetectionDistance,
+/// bool bDisableAvoidance, bool bFinalLocation)` (native, XIDCine.dll RVA 0x21a0).
+///
+/// `CineController2.PlayingSequence.Tick` calls `Steering` every tick while a `movseq`/`movseqb`
+/// action is moving the possessed cine pawn. The engine native steers that pawn toward the target
+/// through the physics tick and the engine dispatches the controller's `EndOfMove` when the move
+/// finishes; the sequence's own `EndOfMove` -> `NextMove` -> `EndOfSeq` chain then clears the
+/// `endofseq` pause bit that gates the next action. The VM runs no NPC physics tick, so this
+/// native performs the swept-horizontal move itself through the world provider
+/// ([`Vm::move_pawn_step`], the same step the latent `MoveTo` uses) and dispatches the
+/// controller's own `EndOfMove` on arrival. Without it the Plage01 intro suspended at the first
+/// `movseqb` (`UnimplementedNative`), so the level-start cutscene never reached its end.
+fn cine_steering(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let target = match a.first() {
+        Some(Value::Vector(v)) => *v,
+        Some(other) => {
+            return Err(vm.err(VmErrorKind::TypeMismatch {
+                expected: "vector",
+                found: other.type_name(),
+            }));
+        }
+        None => return Err(vm.err(VmErrorKind::Other("missing argument".into()))),
+    };
+    let dt = match a.get(1) {
+        Some(Value::Float(v)) => *v,
+        _ => return val(Value::Void),
+    };
+    // The steered actor is the possessed cine pawn (`Controller.Pawn`); `Player` is only the
+    // watched player pawn.
+    let Some(pawn) = vm.obj_prop(c.this, "Pawn") else {
+        return val(Value::Void);
+    };
+    let speed = vm.f32_prop(pawn, "GroundSpeed");
+    // During a `movseq` the sequence turns the cine pawn's world collision off (`collisionoff`)
+    // so it follows the authored path through geometry; `Move` would instead stop at the walls.
+    let arrived = if vm.bool_prop(pawn, "bCollideWorld") {
+        vm.move_pawn_step(pawn, target, speed, dt)?
+    } else {
+        let loc = vm.vector_prop(pawn, "Location").unwrap_or(target);
+        let radius = vm.f32_prop(pawn, "CollisionRadius");
+        let (next, arrived) = crate::navigation::move_step(loc, target, speed, dt, radius);
+        if next != loc {
+            vm.set_property(pawn, "Location", 0, Value::Vector(next));
+        }
+        arrived
+    };
+    if arrived {
+        vm.send_event(c.this, "EndOfMove", Vec::new())?;
+    }
+    val(Value::Void)
+}
+
+/// item19: Bullet-trail presentation is not a gameplay dependency. The scripted impacts need to
+/// pass through these Engine.Trail calls to reach their authored follow-up events, but headless
+/// runs have no ribbon renderer. Preserve the call as a visible Partial rather than suspending
+/// ScriptedImpacts or silently claiming to render a trail.
+fn trail_presentation_partial(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    vm.note(TraceKind::Note(format!(
+        "{}: bullet-trail presentation not rendered (item19 Partial)",
+        c.path
+    )));
+    val(Value::Void)
+}
+
+/// item19: return an actor-space Coords placeholder for a skeletal bone query. The camera-only
+/// `BeachInBedWithXIII.LookAtBimbo.Tick` reads `.Origin`; the VM has no posed-bone transform
+/// provider, so the actor origin is returned and the Partial is visible in the native catalog.
+/// This keeps the wake-up state alive to execute the map's GetUpStandUp/control-return chain.
+fn get_bone_coords_partial(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let origin = vm.vector_prop(c.this, "Location").unwrap_or([0.0; 3]);
+    vm.note(TraceKind::Note(format!(
+        "{}: skeletal bone pose unavailable; Coords.Origin uses actor Location (item19 Partial)",
+        c.path
+    )));
+    val(Value::Struct(vec![
+        ("Origin".into(), Value::Vector(origin)),
+        ("XAxis".into(), Value::Vector([1.0, 0.0, 0.0])),
+        ("YAxis".into(), Value::Vector([0.0, 1.0, 0.0])),
+        ("ZAxis".into(), Value::Vector([0.0, 0.0, 1.0])),
+    ]))
+}
+
+/// item19: bone rotation is likewise presentation-only for the remaining decoded cine path;
+/// return the actor's rotation with an explicit Partial note rather than failing the wake-up.
+fn get_bone_rotation_partial(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let rotation = vm.rotation_prop(c.this).unwrap_or([0; 3]);
+    vm.note(TraceKind::Note(format!(
+        "{}: skeletal bone pose unavailable; rotation uses actor Rotation (item19 Partial)",
+        c.path
+    )));
+    val(Value::Rotator(rotation))
+}
+
+/// item19 natives. Kept in one block so a parallel registry edit merges without touching it;
+/// `registry::builtin_defs` extends the built-in table with [`item19_defs`].
+pub fn item19_defs() -> Vec<NativeDef> {
+    vec![
+        def(
+            "CineController2.Steering",
+            "native(0) function Steering(struct<Vector> vTargetLocation, float dt, float \
+             fDetectionDistance, bool bDisableAvoidance, bool bFinalLocation)",
+            "XIDCine.dll ?execSteering@ACineController2 RVA 0x21a0 (steers Controller.Pawn toward \
+             vTargetLocation; the engine's EndOfMove ends the move); xidcine.u \
+             CineController2.PlayingSequence.Tick 0x06DA calls it every tick of a movseq/movseqb \
+             action. The VM has no NPC physics tick, so it performs the world-provider step and \
+             dispatches EndOfMove on arrival.",
+            cine_steering,
+        ),
+        partial(
+            "particle/ribbon trail is not rendered; call remains visible and does not interrupt \
+             the scripted impact/event chain",
+            "Engine.Trail.Init",
+            "native(601) final static function Init()",
+            "engine.u Trail.Init is native-only; called by xidcine.ScriptedImpacts.Impact after \
+             spawning XIII.BulletTrail; item19 keeps the cinematic impact event chain running \
+             while explicitly omitting this presentation effect",
+            trail_presentation_partial,
+        ),
+        partial(
+            "particle/ribbon trail section is not rendered; call remains visible",
+            "Engine.Trail.AddSection",
+            "native(603) final static function AddSection(struct<Vector> Position)",
+            "engine.u Trail.AddSection is native-only; xidcine.ScriptedImpacts.Impact adds the \
+             start/hit positions to XIII.BulletTrail; item19 diagnostic presentation Partial",
+            trail_presentation_partial,
+        ),
+        partial(
+            "particle/ribbon trail is not rendered; call remains visible",
+            "Engine.Trail.Reset",
+            "native(0) function Reset()",
+            "engine.u Trail.Reset is native-only; called by the scripted bullet-trail lifecycle; \
+             item19 diagnostic presentation Partial",
+            trail_presentation_partial,
+        ),
+        partial(
+            "skeletal bone transform unavailable; returns Coords with actor Location as Origin",
+            "Engine.Actor.GetBoneCoords",
+            "native(410) final native function Coords GetBoneCoords(name BoneName)",
+            "engine.u Actor.GetBoneCoords; XIDCine.BeachInBedWithXIII.LookAtBimbo.Tick reads \
+             GetBoneCoords('X Neck').Origin to aim the wake-up camera. Headless VM has no posed-bone \
+             query, so item19 supplies an explicit actor-origin Partial so the state can reach \
+             GetUpStandUp and its game-owned PlayerWalking transition.",
+            get_bone_coords_partial,
+        ),
+        partial(
+            "skeletal bone rotation unavailable; returns actor Rotation",
+            "Engine.Actor.GetBoneRotation",
+            "native(409) final native function Rotator GetBoneRotation(name BoneName, optional int Space)",
+            "engine.u Actor.GetBoneRotation; item19's cutscene path receives an explicit actor-rotation \
+             Partial rather than an unimplemented-native suspension",
+            get_bone_rotation_partial,
+        ),
+    ]
+}

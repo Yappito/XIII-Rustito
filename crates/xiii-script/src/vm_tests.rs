@@ -527,9 +527,11 @@ fn registry_entries_are_documented() {
     // `PlayerController.GetDefaultURL` and `CalcFirstPersonView` (`ClientTravel` is shared with
     // item16, registered once); item3o added `SaveAtCheckpoint`, `OrthoRotation` and three
     // `SetBone*` Partials; item16b added `GUIController.GetStyle`/`InitStateFrame`; item18 added
-    // `%` (173), `Normalize` (198), `ParticleEmitter.SpawnParticle` and `Actor.KillAllSounds`.
+    // `%` (173), `Normalize` (198), `ParticleEmitter.SpawnParticle` and `Actor.KillAllSounds`;
+    // item19 added `CineController2.Steering`, Trail presentation Partials, cutscene bone-query
+    // Partials and the visible Partial for `LevelInfo.DecAttaque` (588).
     // Must equal `Registry::builtin().defs().count()`.
-    assert_eq!(defs.len(), 302);
+    assert_eq!(defs.len(), 309);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -1791,11 +1793,18 @@ fn pawn_and_controller_lists_insert_and_unlink() {
         vm.get_property(p3, "NextPawn"),
         Some(&Value::Object(Some(ObjRef::Instance(p1))))
     );
-    assert_eq!(vm.get_property(p2, "NextPawn"), Some(&Value::Object(None)));
+    assert_eq!(
+        vm.get_property(p2, "NextPawn"),
+        Some(&Value::Object(Some(ObjRef::Instance(p1))))
+    );
     // Remove the head.
     call_native(&mut vm, "Engine.Pawn.RemovePawnFromList", p3, &[], &mut []);
     assert_eq!(
         vm.get_property(level, "PawnList"),
+        Some(&Value::Object(Some(ObjRef::Instance(p1))))
+    );
+    assert_eq!(
+        vm.get_property(p3, "NextPawn"),
         Some(&Value::Object(Some(ObjRef::Instance(p1))))
     );
     // Removing an object not in the list is a no-op.
@@ -1831,6 +1840,334 @@ fn pawn_and_controller_lists_insert_and_unlink() {
         vm.get_property(level, "ControllerList"),
         Some(&Value::Object(Some(ObjRef::Instance(c1))))
     );
+    assert_eq!(
+        vm.get_property(c2, "NextController"),
+        Some(&Value::Object(Some(ObjRef::Instance(c1))))
+    );
+}
+
+#[test]
+fn self_removal_during_script_style_list_walk_preserves_remaining_nodes() {
+    let set = list_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let level = vm.spawn(sg(&set, "Actor"), "Level").unwrap();
+
+    // Mirrors the script pattern used by EndGame: P = Level.ControllerList; while (P != None)
+    // { P.RemoveController(); P = P.NextController; }. Read NextController only after removal,
+    // so clearing the removed node's link reproduces the engine traversal failure.
+    let c1 = vm.spawn(sg(&set, "Controller"), "C1").unwrap();
+    let c2 = vm.spawn(sg(&set, "Controller"), "C2").unwrap();
+    let c3 = vm.spawn(sg(&set, "Controller"), "C3").unwrap();
+    for c in [c1, c2, c3] {
+        vm.set_property(c, "Level", 0, Value::Object(Some(ObjRef::Instance(level))));
+        call_native(&mut vm, "Engine.Controller.AddController", c, &[], &mut []);
+    }
+    let mut visited_controllers = Vec::new();
+    let mut current = Some(c3);
+    while let Some(controller) = current {
+        visited_controllers.push(controller);
+        call_native(
+            &mut vm,
+            "Engine.Controller.RemoveController",
+            controller,
+            &[],
+            &mut [],
+        );
+        current = match vm.get_property(controller, "NextController") {
+            Some(Value::Object(Some(ObjRef::Instance(next)))) => Some(*next),
+            _ => None,
+        };
+    }
+    assert_eq!(visited_controllers, [c3, c2, c1]);
+    assert_eq!(
+        vm.get_property(level, "ControllerList"),
+        Some(&Value::Object(None))
+    );
+
+    // The PawnList counterpart is traversed the same way by engine code. It must preserve the
+    // removed pawn's NextPawn link too, not just the controller list's link.
+    let p1 = vm.spawn(sg(&set, "Pawn"), "P1").unwrap();
+    let p2 = vm.spawn(sg(&set, "Pawn"), "P2").unwrap();
+    let p3 = vm.spawn(sg(&set, "Pawn"), "P3").unwrap();
+    for pawn in [p1, p2, p3] {
+        vm.set_property(
+            pawn,
+            "Level",
+            0,
+            Value::Object(Some(ObjRef::Instance(level))),
+        );
+        call_native(&mut vm, "Engine.Pawn.AddPawnToList", pawn, &[], &mut []);
+    }
+    let mut visited_pawns = Vec::new();
+    let mut current = Some(p3);
+    while let Some(pawn) = current {
+        visited_pawns.push(pawn);
+        call_native(
+            &mut vm,
+            "Engine.Pawn.RemovePawnFromList",
+            pawn,
+            &[],
+            &mut [],
+        );
+        current = match vm.get_property(pawn, "NextPawn") {
+            Some(Value::Object(Some(ObjRef::Instance(next)))) => Some(*next),
+            _ => None,
+        };
+    }
+    assert_eq!(visited_pawns, [p3, p2, p1]);
+    assert_eq!(
+        vm.get_property(level, "PawnList"),
+        Some(&Value::Object(None))
+    );
+}
+
+/// Synthetic package for a bytecode EndGame-style list walk (no proprietary data):
+/// `Actor.WalkControllers`/`WalkPawns` = `P = List; while (P != None) { P.Destroy(); P = P.Next; }`
+/// and `Controller.Destroyed` = `RemoveController()` (native 530), `Pawn.Destroyed` =
+/// `RemovePawnFromList()` (name-bound native), the same shape as engine.u `Controller.Destroyed`
+/// (+0x12 `RemoveController`) and XIIIGameInfo.EndGame (+0x02A8..+0x0336, where
+/// `GotoState('GameEnded')` destroys every non-player controller before `P = P.nextController`).
+fn list_walk_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "Controller");
+    let obj = compact(0);
+    let ne = b.reserve(IMP_FUNCTION, object, "NotEqual_ObjectObject");
+    let ne_a = b.reserve(IMP_OBJECTPROP, ne, "A");
+    let ne_b = b.reserve(IMP_OBJECTPROP, ne, "B");
+    let ne_r = b.reserve(IMP_OBJECTPROP, ne, "ReturnValue");
+    b.prop_with(ne_a, ne_b, PARM, &obj);
+    b.prop_with(ne_b, ne_r, PARM, &obj);
+    b.prop_with(ne_r, 0, PARM | RETURN_PARM, &obj);
+    b.func(ne, 0, ne_a, &[], 0, 119, FINAL | NATIVE | OPERATOR | STATIC);
+
+    let level = b.reserve(IMP_OBJECTPROP, actor, "Level");
+    let pawn_list = b.reserve(IMP_OBJECTPROP, actor, "PawnList");
+    let next_pawn = b.reserve(IMP_OBJECTPROP, actor, "NextPawn");
+    let controller_list = b.reserve(IMP_OBJECTPROP, actor, "ControllerList");
+    let next_controller = b.reserve(IMP_OBJECTPROP, actor, "NextController");
+    let destroy = b.reserve(IMP_FUNCTION, actor, "Destroy");
+    let walk_c = b.reserve(IMP_FUNCTION, actor, "WalkControllers");
+    let walk_c_p = b.reserve(IMP_OBJECTPROP, walk_c, "P");
+    let walk_p = b.reserve(IMP_FUNCTION, actor, "WalkPawns");
+    let walk_p_p = b.reserve(IMP_OBJECTPROP, walk_p, "P");
+    let remove_c = b.reserve(IMP_FUNCTION, controller, "RemoveController");
+    let c_destroyed = b.reserve(IMP_FUNCTION, controller, "Destroyed");
+    let remove_p = b.reserve(IMP_FUNCTION, pawn, "RemovePawnFromList");
+    let p_destroyed = b.reserve(IMP_FUNCTION, pawn, "Destroyed");
+    b.prop_with(level, pawn_list, 0, &obj);
+    b.prop_with(pawn_list, next_pawn, 0, &obj);
+    b.prop_with(next_pawn, controller_list, 0, &obj);
+    b.prop_with(controller_list, next_controller, 0, &obj);
+    b.prop_with(next_controller, destroy, 0, &obj);
+    // `Actor.Destroy` = native 279 (extended opcode 0x61 0x17).
+    b.func(destroy, walk_c, 0, &[], 0, 279, FINAL | NATIVE);
+
+    let walk = |list: i32, next: i32, local: i32| -> Vec<u8> {
+        let (l, n, p) = (list as u8, next as u8, local as u8);
+        #[rustfmt::skip]
+        let code = vec![
+            0x0F, 0x00, p, 0x01, l,                                   // 0000 P = self.List
+            0x07, 0x39, 0x00, 0x77, 0x00, p, 0x2A, 0x16,             // 000B if !(P != None) goto 0x39
+            0x19, 0x00, p, 0x03, 0x00, 0x00, 0x61, 0x17, 0x16,       // 0016 P.Destroy()
+            0x0F, 0x00, p, 0x19, 0x00, p, 0x05, 0x00, 0x04, 0x01, n, // 0022 P = P.Next
+            0x06, 0x0B, 0x00,                                         // 0036 goto 0x0B
+            0x04, 0x0B,                                               // 0039 return
+        ];
+        code
+    };
+    b.prop_with(walk_c_p, 0, 0, &obj);
+    b.prop_with(walk_p_p, 0, 0, &obj);
+    let code = walk(controller_list, next_controller, walk_c_p);
+    b.func(walk_c, walk_p, walk_c_p, &code, 0x3B, 0, DEFINED);
+    let code = walk(pawn_list, next_pawn, walk_p_p);
+    b.func(walk_p, 0, walk_p_p, &code, 0x3B, 0, DEFINED);
+
+    // `Controller.RemoveController` = native 530 (extended opcode 0x62 0x12).
+    b.func(remove_c, c_destroyed, 0, &[], 0, 530, FINAL | NATIVE);
+    // `Destroyed() { RemoveController(); }`
+    b.func(
+        c_destroyed,
+        0,
+        0,
+        &[0x62, 0x12, 0x16, 0x04, 0x0B],
+        5,
+        0,
+        DEFINED | EVENT,
+    );
+    // `Pawn.RemovePawnFromList` is name-bound (native index 0): a FinalFunction call.
+    b.func(remove_p, p_destroyed, 0, &[], 0, 0, FINAL | NATIVE);
+    b.func(
+        p_destroyed,
+        0,
+        0,
+        &[0x1C, remove_p as u8, 0x16, 0x04, 0x0B],
+        8,
+        0,
+        DEFINED | EVENT,
+    );
+
+    b.class(object, 0, ne, 0);
+    b.class(actor, object, level, 0);
+    b.class(pawn, actor, remove_p, 0);
+    b.class(controller, actor, remove_c, 0);
+    b.build()
+}
+
+fn list_walk_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Test",
+        list_walk_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+fn obj_prop(vm: &Vm<'_>, id: ObjectId, name: &str) -> Option<ObjectId> {
+    match vm.get_property(id, name) {
+        Some(Value::Object(Some(ObjRef::Instance(i)))) => Some(*i),
+        _ => None,
+    }
+}
+
+/// Spawns `n` list members of `class`, links them with the add native and returns them in
+/// list order (head first).
+fn linked_members(
+    vm: &mut Vm<'_>,
+    set: &ScriptSet,
+    level: ObjectId,
+    class: &str,
+    add_native: &str,
+    n: usize,
+) -> Vec<ObjectId> {
+    let mut members = Vec::new();
+    for i in 0..n {
+        let m = vm.spawn(sg(set, class), &format!("{class}{i}")).unwrap();
+        vm.set_active(m, true);
+        vm.set_property(m, "Level", 0, Value::Object(Some(ObjRef::Instance(level))));
+        call_native(vm, add_native, m, &[], &mut []);
+        members.push(m);
+    }
+    members.reverse();
+    members
+}
+
+/// Root cause (item19 Plage01 EndGame): `Vm::destroy` marks the actor deleted before running
+/// `Destroyed`, whose `RemoveController()` then has to unlink a node the VM already treats as
+/// None. The engine's list natives compare raw pointers (Engine.dll 0x10367ae2..0x10367b1a), so
+/// a self-removal from `Destroyed` must unlink the head and a middle node.
+#[test]
+fn destroyed_event_removes_the_deleted_node_from_the_level_lists() {
+    let set = list_walk_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let level = vm.spawn(sg(&set, "Actor"), "Level").unwrap();
+    vm.set_active(level, true);
+    let cs = linked_members(
+        &mut vm,
+        &set,
+        level,
+        "Controller",
+        "Engine.Controller.AddController",
+        3,
+    );
+    // Middle node: the predecessor skips it; the destroyed node keeps its successor.
+    vm.destroy(cs[1]).unwrap();
+    assert!(vm.objects[cs[1] as usize].deleted);
+    assert_eq!(obj_prop(&vm, cs[0], "NextController"), Some(cs[2]));
+    assert_eq!(obj_prop(&vm, cs[1], "NextController"), Some(cs[2]));
+    // Head node.
+    vm.destroy(cs[0]).unwrap();
+    assert_eq!(obj_prop(&vm, level, "ControllerList"), Some(cs[2]));
+    assert_eq!(obj_prop(&vm, cs[0], "NextController"), Some(cs[2]));
+
+    let ps = linked_members(&mut vm, &set, level, "Pawn", "Engine.Pawn.AddPawnToList", 3);
+    vm.destroy(ps[0]).unwrap();
+    assert_eq!(obj_prop(&vm, level, "PawnList"), Some(ps[1]));
+    vm.destroy(ps[2]).unwrap();
+    assert_eq!(obj_prop(&vm, ps[1], "NextPawn"), None);
+    assert_eq!(obj_prop(&vm, level, "PawnList"), Some(ps[1]));
+}
+
+/// Bytecode walk that destroys the current controller/pawn and then advances through it, as
+/// XIIIGameInfo.EndGame does. Every node must be visited (destroyed) and the lists end empty;
+/// with the old VM the walk stopped after the first node (unlink failed and `P.NextController`
+/// on the destroyed `P` read as Accessed None), so the local player controller later in the list
+/// never received `GameEnded`.
+#[test]
+fn script_list_walk_survives_self_destroying_nodes() {
+    let set = list_walk_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let level = vm.spawn(sg(&set, "Actor"), "Level").unwrap();
+    vm.set_active(level, true);
+    let cs = linked_members(
+        &mut vm,
+        &set,
+        level,
+        "Controller",
+        "Engine.Controller.AddController",
+        3,
+    );
+    vm.call_function(sg(&set, "Actor.WalkControllers"), level, Vec::new())
+        .unwrap();
+    for &c in &cs {
+        assert!(
+            vm.objects[c as usize].deleted,
+            "{} was not visited by the walk",
+            vm.objects[c as usize].name
+        );
+    }
+    assert_eq!(obj_prop(&vm, level, "ControllerList"), None);
+    assert!(
+        !vm.trace
+            .iter()
+            .any(|e| matches!(e.kind, TraceKind::AccessedNone { .. })),
+        "reading NextController through a just-destroyed controller is not Accessed None in UE2"
+    );
+
+    let ps = linked_members(&mut vm, &set, level, "Pawn", "Engine.Pawn.AddPawnToList", 3);
+    vm.call_function(sg(&set, "Actor.WalkPawns"), level, Vec::new())
+        .unwrap();
+    for &p in &ps {
+        assert!(vm.objects[p as usize].deleted);
+    }
+    assert_eq!(obj_prop(&vm, level, "PawnList"), None);
+}
+
+/// The engine list natives dereference `Level` unconditionally; the VM must not silently edit
+/// links when it is None (the old code cleared the node's own `NextController`).
+#[test]
+fn list_removal_without_level_leaves_links_and_records_a_note() {
+    let set = list_walk_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Controller"), "A").unwrap();
+    let b2 = vm.spawn(sg(&set, "Controller"), "B").unwrap();
+    vm.set_property(
+        a,
+        "NextController",
+        0,
+        Value::Object(Some(ObjRef::Instance(b2))),
+    );
+    call_native(
+        &mut vm,
+        "Engine.Controller.RemoveController",
+        a,
+        &[],
+        &mut [],
+    );
+    assert_eq!(obj_prop(&vm, a, "NextController"), Some(b2));
+    assert!(vm.trace.iter().any(|e| matches!(
+        &e.kind,
+        TraceKind::Note(n) if n.contains("ControllerList") && n.contains("Level is None")
+    )));
 }
 
 #[test]
@@ -2769,6 +3106,27 @@ fn set_location_refuses_encroachment_and_moves_when_free() {
         Some(&Value::Vector([0.0, 0.0, 0.0]))
     );
 
+    // The decoded Plage01 wake-up script disables `bCollideWorld` before setting the pawn's bed
+    // pose, which overlaps the closed `Fenetre3`/nearby window actor cylinders. UE2's scripted
+    // FarMoveActor path permits that collisionless cutscene placement; restoring world collision
+    // restores normal encroachment rejection.
+    vm.set_property(a, "bCollideWorld", 0, Value::Bool(false));
+    let mut args = [Value::Vector([500.0, 0.0, 0.0])];
+    let ok = match try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap()
+    {
+        NativeOutcome::Value(Value::Bool(b)) => b,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        ok,
+        "collisionless scripted placement must not be blocked by an actor"
+    );
+    assert_eq!(
+        vm.get_property(a, "Location"),
+        Some(&Value::Vector([500.0, 0.0, 0.0]))
+    );
+    vm.set_property(a, "bCollideWorld", 0, Value::Bool(true));
+
     // A free destination moves and touches an actor already there.
     let c = phys_actor(&mut vm, &set, "C", [0.0, 100.0, 0.0]);
     set_collision_fields(&mut vm, c, true, false);
@@ -2783,7 +3141,9 @@ fn set_location_refuses_encroachment_and_moves_when_free() {
         vm.get_property(a, "Location"),
         Some(&Value::Vector([0.0, 100.0, 0.0]))
     );
-    assert_eq!(vm.get_property(a, "Touches"), Some(&Value::Int(1)));
+    // The earlier collisionless move still generated its overlap touch with B; the later move
+    // adds the touch with C rather than resetting the actor's accumulated touch counter.
+    assert_eq!(vm.get_property(a, "Touches"), Some(&Value::Int(2)));
     assert_eq!(vm.get_property(c, "Touches"), Some(&Value::Int(1)));
 }
 
@@ -3504,6 +3864,35 @@ fn levelinfo_get_local_url_returns_the_configured_url() {
     vm.set_address_url(":7777");
     let r = try_native(&mut vm, "Engine.LevelInfo.GetAddressURL", a, &[], &mut args).unwrap();
     assert_eq!(r, NativeOutcome::Value(Value::Str(":7777".into())));
+}
+
+#[test]
+fn levelinfo_dec_attaque_records_partial_counter_decrement() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let level = vm.spawn(sg(&set, "Actor"), "LevelInfoFixture").unwrap();
+    let mut args = [];
+    assert_eq!(
+        try_native(
+            &mut vm,
+            "Engine.LevelInfo.DecAttaque",
+            level,
+            &[],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Void)
+    );
+    assert!(vm.trace.iter().any(|event| matches!(
+        &event.kind,
+        TraceKind::Note(note) if note.contains("DecAttaque") && note.contains("decrement")
+    )));
+    assert!(
+        crate::registry::Registry::builtin()
+            .get("levelinfo.decattaque")
+            .is_some_and(|def| matches!(def.status, crate::registry::NativeStatus::Partial(_)))
+    );
+    assert!(!vm.missing_natives.contains_key("LevelInfo.DecAttaque"));
 }
 
 #[test]

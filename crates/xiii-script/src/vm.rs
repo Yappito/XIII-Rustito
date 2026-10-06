@@ -4572,6 +4572,33 @@ impl<'s> Vm<'s> {
         self.context_value(v)
     }
 
+    /// A destroyed actor whose plain variable `member` is read through a context expression
+    /// (`P.NextController`). UE2 keeps the actor's memory until reference cleanup: Core.dll
+    /// `UObject::execContext` (0x101173a0..0x1011740d) only reports Accessed None for a NULL
+    /// context (no bDeleteMe check), Engine.dll `ULevel::DestroyActor` only sets bDeleteMe
+    /// (`AActor+0x2c` bit 0x10000, at 0x1038965a), and `ULevel::CleanupDestroyed`
+    /// (0x10387ae0) nulls references only once at least 128 (0x80, at 0x10387b63) destroyed
+    /// actors are pending or on a forced cleanup. So a script that destroys the current node of
+    /// a list walk still reads its stale `NextController`/`NextPawn` (XIIIGameInfo.EndGame
+    /// +0x0322 `P = P.nextController` after `GotoState('GameEnded')` destroyed an AI
+    /// controller). Function calls through a destroyed context keep the VM's Accessed-None
+    /// behaviour (not modelled here).
+    fn destroyed_variable_context(&self, v: &Value, member: &Token) -> Option<ObjectId> {
+        let Value::Object(Some(ObjRef::Instance(i))) = v else {
+            return None;
+        };
+        let o = self.objects.get(*i as usize)?;
+        if !o.deleted || !o.is_actor {
+            return None;
+        }
+        let plain_variable = match &member.kind {
+            TokenKind::InstanceVariable(_) => true,
+            TokenKind::BoolVariable(e) => matches!(e.kind, TokenKind::InstanceVariable(_)),
+            _ => false,
+        };
+        plain_variable.then_some(*i)
+    }
+
     /// Target object from an already-evaluated context object expression. `None` = UE2
     /// Accessed-None (a null/deleted/native-only object).
     fn context_value(&mut self, v: Value) -> VmResult<Option<ObjectId>> {
@@ -4632,6 +4659,18 @@ impl<'s> Vm<'s> {
                 self.set.resolve(frame.pkg, *r)
             }
             K::BoolVariable(_) => return Value::Bool(false),
+            // `None.ArrayProp[i]` continues the Accessed-None chain with the element type's zero
+            // (UE2 logs Accessed None and reads the element zero). Without this the chain
+            // produced `void`, and the next context raised TypeMismatch instead — measured:
+            // `self.Tatata.Emitters[0].RespawnDeadParticles = true` with `Tatata == None`
+            // (`xidcine.ScriptedImpacts.Burst.Timer2` 0x0000) suspended the whole scripted
+            // machine-gun chain that ends the Plage01 intro.
+            K::DynArrayElement { array, .. } | K::ArrayElement { array, .. } => {
+                return match self.token_property_ty(frame, array) {
+                    Some(Ty::Array(inner)) => inner.zero(),
+                    _ => Value::Void,
+                };
+            }
             K::FinalFunction { function, .. } => {
                 let g = self.set.resolve(frame.pkg, *function);
                 return g.map_or(Value::Void, |g| {
@@ -4851,6 +4890,8 @@ impl<'s> Vm<'s> {
                             }));
                         }
                     }
+                } else if let Some(obj) = self.destroyed_variable_context(&v, &c.member) {
+                    self.eval_in(frame, &c.member, obj)?
                 } else {
                     match self.context_value(v)? {
                         Some(obj) => self.eval_in(frame, &c.member, obj)?,
@@ -6405,7 +6446,12 @@ impl<'s> Vm<'s> {
                 return Ok(false);
             }
         }
-        if self.bool_prop(id, "bCollideActors") {
+        // A scripted `SetLocation` with world/placement collision disabled is the UE2 cutscene
+        // teleport path: `BeachInBedWithXIII.Waiting.Tick` moves the player into the authored bed
+        // pose while `bCollideWorld == false`. The Plage01 bed pose overlaps the map's closed
+        // window actor cylinders; UE2 permits this scripted placement in collisionless mode.
+        // Normal encroachment rejection remains active whenever either collision check is enabled.
+        if self.bool_prop(id, "bCollideActors") && check_world {
             for b in 0..self.objects.len() as ObjectId {
                 if b == id || !self.is_live_actor(b) || !self.blocks_pair(id, b) {
                     continue;
@@ -7162,7 +7208,15 @@ impl<'s> Vm<'s> {
             )));
             return Ok(());
         };
-        let rate = if rate > 0.0 { rate } else { info.rate };
+        // UE2 `AActor::PlayAnim`/`LoopAnim` pass `Rate` as a **multiplier** of the sequence's own
+        // authored rate (`Engine.dll ?execPlayAnim@AActor` RVA 0xDF990 pushes the default `1.0`;
+        // the mesh instance advances `AnimRate * Seq->Rate` frames per second). The provider's
+        // `SeqInfo.rate` is that authored rate (30 fps for the decoded MeshAnimation clips), so a
+        // script rate of `1.0` must play at 30 fps, not 1. `rate <= 0` means "use the authored
+        // rate" (`LoopAnim(DefaultAnim)` and `PlayAnim(seq, 0.0, ...)`). Without the multiply every
+        // scripted animation ran ~30x slow, which delayed the Plage01 intro past its dialogue cues.
+        let natural = if info.rate > 0.0 { info.rate } else { 1.0 };
+        let rate = if rate > 0.0 { rate * natural } else { natural };
         let mut notifies = info.notifies;
         notifies.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         self.objects[id as usize].anim.channels.insert(
@@ -7400,7 +7454,26 @@ impl<'s> Vm<'s> {
             self.set_property(id, "bAnimFinished", 0, Value::Bool(true));
             let actor = self.objects[id as usize].name.clone();
             self.note(TraceKind::AnimEnd { actor, channel });
-            self.send_event(id, "AnimEnd", vec![Value::Int(i32::from(channel))])?;
+            // UE2 `APawn::NotifyAnimEnd` (Engine.dll RVA 0xB0A00) sends `AnimEnd(Channel)` to the
+            // **controller** when the controller is probing the event (`UObject::IsProbing`),
+            // otherwise to the pawn itself. The decoded cutscene controllers rely on this: the
+            // animation runs on the possessed `Cine2` pawn but the handler that clears the
+            // sequence pause bit is the controller's `PlayingSequence.AnimEnd`; without the
+            // forward the intro waits forever. `IsProbing` is modelled as "the controller's
+            // state-aware handler is not the empty `Engine.Actor.AnimEnd` base".
+            let controller = self.obj_prop(id, "Controller");
+            let controller_probes = controller.is_some_and(|c| {
+                self.find_function(c, "AnimEnd", true)
+                    .is_some_and(|f| !self.short_path(f).ends_with("Actor.AnimEnd"))
+            });
+            match (controller_probes, controller) {
+                (true, Some(c)) => {
+                    self.send_event(c, "AnimEnd", vec![Value::Int(i32::from(channel))])?;
+                }
+                _ => {
+                    self.send_event(id, "AnimEnd", vec![Value::Int(i32::from(channel))])?;
+                }
+            }
         }
         Ok(())
     }
