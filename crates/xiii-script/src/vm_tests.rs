@@ -2167,6 +2167,341 @@ fn list_removal_without_level_leaves_links_and_records_a_note() {
     )));
 }
 
+/// Synthetic package for the destroyed-actor access rules (item25). `Actor` has a `V` int, a
+/// `Next` object property and functions exercising every access form through a context:
+/// - `GetSelfV() -> int`      `return self.V`
+/// - `SetV(int x)`            `self.V = x`
+/// - `GetThrough(other) -> int`  `return other.V`        (plain variable read)
+/// - `SetThrough(other, x)`   `other.V = x`               (plain variable write)
+/// - `CallThrough(other) -> int` `return other.Bump()`    (call through a context)
+/// - `Bump() -> int`          `self.V = self.V + 1; return self.V`
+/// - `Destroyed() -> int`     the script `Destroyed` handler: `self.NestedDestroy(); return self.V`
+///   (it returns a value only so a test can observe the actor's state during the event)
+/// - `NestedDestroy()`        `self.Destroy()`            (nested destroy from `Destroyed`)
+///
+/// `Destroyed` is the script event handler (the VM ignores an event handler's return value).
+fn destroyed_access_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let v = b.reserve(IMP_INTPROP, actor, "V");
+    let seen = b.reserve(IMP_INTPROP, actor, "Seen");
+    let next = b.reserve(IMP_OBJPROP, actor, "Next");
+    let get_self_v = b.reserve(IMP_FUNCTION, actor, "GetSelfV");
+    let set_v = b.reserve(IMP_FUNCTION, actor, "SetV");
+    let get_through = b.reserve(IMP_FUNCTION, actor, "GetThrough");
+    let set_through = b.reserve(IMP_FUNCTION, actor, "SetThrough");
+    let call_through = b.reserve(IMP_FUNCTION, actor, "CallThrough");
+    let bump = b.reserve(IMP_FUNCTION, actor, "Bump");
+    let destroyed_v = b.reserve(IMP_FUNCTION, actor, "Destroyed");
+    let nested = b.reserve(IMP_FUNCTION, actor, "NestedDestroy");
+    let destroy = b.reserve(IMP_FUNCTION, actor, "Destroy");
+
+    let set_v_x = b.reserve(IMP_INTPROP, set_v, "X");
+    let get_through_other = b.reserve(IMP_OBJPROP, get_through, "Other");
+    let set_through_other = b.reserve(IMP_OBJPROP, set_through, "Other");
+    let set_through_x = b.reserve(IMP_INTPROP, set_through, "X");
+    let call_through_other = b.reserve(IMP_OBJPROP, call_through, "Other");
+    let bump_ret = b.reserve(IMP_INTPROP, bump, "ReturnValue");
+    let destroyed_ret = b.reserve(IMP_INTPROP, destroyed_v, "ReturnValue");
+    let nested_ret = b.reserve(IMP_BOOLPROP, nested, "ReturnValue");
+
+    // The class child chain is linked through each export's `next` argument of `prop`/`func`
+    // (separate calls do not accumulate): v -> next -> GetSelfV -> SetV -> GetThrough ->
+    // SetThrough -> CallThrough -> Bump -> DestroyedV -> NestedDestroy -> Destroy.
+    let null_obj = compact(0);
+    b.prop(v, seen, 0);
+    b.prop(seen, next, 0);
+    b.prop_with(next, get_self_v, 0, &null_obj);
+
+    // Function parameter chains, linked through each property's `next`.
+    b.prop(set_v_x, 0, PARM);
+    b.prop_with(set_through_other, set_through_x, PARM, &null_obj);
+    b.prop(set_through_x, 0, PARM);
+    b.prop_with(get_through_other, 0, PARM, &null_obj);
+    b.prop_with(call_through_other, 0, PARM, &null_obj);
+    b.prop(bump_ret, 0, RETURN_PARM);
+    b.prop(destroyed_ret, 0, RETURN_PARM);
+    b.prop(nested_ret, 0, RETURN_PARM);
+
+    let rv = v as u8;
+    let rseen = seen as u8;
+    let rx = set_v_x as u8;
+    let ro = get_through_other as u8;
+    let co = call_through_other as u8;
+    let so = set_through_other as u8;
+    let sx = set_through_x as u8;
+
+    // `return self.V` (GetSelfV).
+    b.func(get_self_v, set_v, 0, &[0x04, 0x01, rv], 6, 0, DEFINED);
+
+    // `self.V = X` (SetV).
+    b.func(
+        set_v,
+        get_through,
+        set_v_x,
+        &[0x0F, 0x01, rv, 0x00, rx, 0x04, 0x0B],
+        13,
+        0,
+        DEFINED,
+    );
+
+    // `return Other.V` (GetThrough).
+    b.func(
+        get_through,
+        set_through,
+        get_through_other,
+        &[0x04, 0x19, 0x00, ro, 0xFF, 0xFF, 0x00, 0x01, rv],
+        15,
+        0,
+        DEFINED,
+    );
+
+    // `Other.V = X; return` (SetThrough).
+    b.func(
+        set_through,
+        call_through,
+        set_through_other,
+        &[
+            0x0F, 0x19, 0x00, so, 0xFF, 0xFF, 0x00, 0x01, rv, 0x00, sx, 0x04, 0x0B,
+        ],
+        22,
+        0,
+        DEFINED,
+    );
+
+    // `return Other.Bump()` (CallThrough): `Return(Context Other -> VirtualFunction Bump())`.
+    let bump_name = b.name("Bump");
+    let call_code = [0x04, 0x19, 0x00, co, 0xFF, 0xFF, 0x00, 0x1B]
+        .into_iter()
+        .chain(compact(bump_name))
+        .chain([0x16, 0x0B])
+        .collect::<Vec<u8>>();
+    b.func(
+        call_through,
+        bump,
+        call_through_other,
+        &call_code,
+        17,
+        0,
+        DEFINED,
+    );
+
+    // `self.V = 3; return self.V` (Bump). A fixed mutation avoids a native operator dependency.
+    let bump_code = vec![
+        0x0F, 0x01, rv, 0x2C, 3, // 0000 V = 3
+        0x04, 0x01, rv, // 0006 return V
+    ];
+    b.func(bump, destroyed_v, bump_ret, &bump_code, 14, 0, DEFINED);
+
+    // `self.NestedDestroy(); return self.V` (Destroyed), the script event handler.
+    // It exercises both the read-through-destroyed rule and the nested `Destroy` guard.
+    let destroyed_code = [
+        0x0F,
+        0x01,
+        rseen,
+        0x01,
+        rv, // Seen = V
+        0x1C,
+        nested as u8,
+        0x16, // self.NestedDestroy()
+        0x04,
+        0x01,
+        rv, // return V
+    ]
+    .to_vec();
+    b.func(
+        destroyed_v,
+        nested,
+        destroyed_ret,
+        &destroyed_code,
+        23,
+        0,
+        DEFINED | EVENT,
+    );
+
+    // `return self.Destroy()` (NestedDestroy): native 279, a FinalFunction call.
+    b.func(
+        nested,
+        destroy,
+        nested_ret,
+        &[0x61, 0x17, 0x16, 0x04, 0x0B],
+        5,
+        0,
+        DEFINED,
+    );
+    // `Actor.Destroy` native 279.
+    b.func(destroy, 0, 0, &[], 0, 279, FINAL | NATIVE);
+
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, v, 0);
+    b.build()
+}
+
+fn destroyed_access_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Test",
+        destroyed_access_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+/// item25: the engine runs `ULevel::DestroyActor` in the order state-clear, `Destroyed`, then
+/// `bDeleteMe` (`Engine.dll` 0x103890e0, `Destroyed` at 0x103893f7-0x10389429, `orl $0x10000,
+/// 0x2c` at 0x1038965a). A plain variable read through the actor still works **inside** its own
+/// `Destroyed` (the engine has not set `bDeleteMe` yet).
+#[test]
+fn destroyed_event_can_still_read_the_actor() {
+    let set = destroyed_access_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_property(a, "V", 0, Value::Int(42));
+    vm.destroy(a).unwrap();
+    // `Destroyed` ran: it copied `self.V` into `self.Seen` while readable (the engine has not set
+    // `bDeleteMe` yet), then called the nested `Destroy` (a no-op).
+    assert_eq!(
+        vm.get_property(a, "Seen"),
+        Some(&Value::Int(42)),
+        "Destroyed must read self.V"
+    );
+    assert!(vm.objects[a as usize].deleted);
+    // A nested `Destroy` from inside `Destroyed` is a no-op (the engine's `bDeleteMe` gate).
+    assert!(
+        !vm.trace.iter().any(|e| matches!(
+            &e.kind,
+            TraceKind::Note(n) if n.contains("skipped")
+        )),
+        "the Destroyed event must run, not be skipped"
+    );
+}
+
+/// item25: through a just-destroyed actor (`bDeleteMe` set, not yet cleaned), a plain variable
+/// read and a write still work; `execContext` has no `bDeleteMe` test (`Core.dll` 0x101173d3).
+#[test]
+fn destroyed_actor_plain_variable_read_and_write_still_work() {
+    let set = destroyed_access_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    let b = vm.spawn(sg(&set, "Actor"), "B").unwrap();
+    vm.set_active(a, true);
+    vm.set_property(b, "V", 0, Value::Int(7));
+    vm.destroy(b).unwrap();
+
+    let get = sg(&set, "Actor.GetThrough");
+    let val = vm
+        .call_function(get, a, vec![Value::Object(Some(ObjRef::Instance(b)))])
+        .unwrap();
+    assert_eq!(val, Value::Int(7), "stale V is still readable");
+
+    let set_fn = sg(&set, "Actor.SetThrough");
+    vm.call_function(
+        set_fn,
+        a,
+        vec![Value::Object(Some(ObjRef::Instance(b))), Value::Int(9)],
+    )
+    .unwrap();
+    assert_eq!(
+        vm.get_property(b, "V"),
+        Some(&Value::Int(9)),
+        "a write through a just-destroyed actor lands"
+    );
+}
+
+/// item25: a call through a just-destroyed actor runs (`execVirtualFunction` -> `CallFunction`
+/// has no `bDeleteMe` gate), unlike an engine-delivered event (`ProcessEvent` skips it).
+#[test]
+fn destroyed_actor_call_through_context_runs() {
+    let set = destroyed_access_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    let b = vm.spawn(sg(&set, "Actor"), "B").unwrap();
+    vm.set_active(a, true);
+    vm.set_active(b, true);
+    vm.set_property(b, "V", 0, Value::Int(5));
+    vm.destroy(b).unwrap();
+
+    let call = sg(&set, "Actor.CallThrough");
+    let val = vm
+        .call_function(call, a, vec![Value::Object(Some(ObjRef::Instance(b)))])
+        .unwrap();
+    assert_eq!(val, Value::Int(3), "Bump() ran on the destroyed actor");
+    assert_eq!(vm.get_property(b, "V"), Some(&Value::Int(3)));
+}
+
+/// item25: an engine-delivered event to a `bDeleteMe` actor is dropped (ProcessEvent), recorded
+/// visibly, while a script call still runs (previous test).
+#[test]
+fn deleted_actor_event_is_dropped_and_traced() {
+    let set = destroyed_access_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.destroy(a).unwrap();
+    let before = vm.get_property(a, "V").cloned();
+    // `Bump` is a script function, but deliver it as an event the way the engine would.
+    let r = vm.send_event(a, "Bump", Vec::new()).unwrap();
+    assert!(r.is_none(), "event to a bDeleteMe actor is not delivered");
+    assert_eq!(vm.get_property(a, "V").cloned(), before);
+    assert!(vm.trace.iter().any(|e| matches!(
+        &e.kind,
+        TraceKind::Note(n) if n.contains("bDeleteMe")
+    )));
+}
+
+/// item25: `Disable('All')`/`bProbesDisabled` suppresses **all** events, including `Destroyed`
+/// (the engine's ProcessEvent probe check), and `Enable('All')` restores them.
+#[test]
+fn probes_disabled_all_suppresses_destroyed_event() {
+    let set = destroyed_access_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    call_native(
+        &mut vm,
+        "Object.Disable",
+        a,
+        &[],
+        &mut [Value::Name("All".into())],
+    );
+    assert!(vm.probes_disabled(a));
+    assert_eq!(
+        vm.call_function(sg(&set, "Actor.Destroy"), a, Vec::new())
+            .unwrap(),
+        Value::Bool(true)
+    );
+    assert!(vm.objects[a as usize].deleted);
+    // `Destroyed` was not delivered: the probe is disabled, so no `DestroyedV` event ran. The
+    // fixture has no native `Destroyed`, so a delivered event would be an `EVENT`/`NO HANDLER`
+    // record rather than a `Probe` one; assert the event function did not run.
+    assert!(
+        !vm.trace.iter().any(|e| matches!(
+            &e.kind,
+            TraceKind::Event { function, .. } if function.ends_with("Destroyed")
+        )),
+        "a probes-disabled actor must not run Destroyed"
+    );
+}
+
+/// item25: a nested `Destroy` from inside `Destroyed` is a no-op: the engine has not returned from
+/// `DestroyActor` yet but `bDeleteMe` is treated as set for re-entry, and the second call returns
+/// 1 without re-running the event (idempotent).
+#[test]
+fn nested_destroy_during_destroyed_is_idempotent() {
+    let set = destroyed_access_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    // NestedDestroy's `self.Destroy()` would recurse without the guard.
+    vm.destroy(a).unwrap();
+    assert!(vm.objects[a as usize].deleted);
+    assert!(!vm.is_destroying(a));
+}
+
 #[test]
 fn script_optional_param_defaults_to_zero() {
     let set = list_set();

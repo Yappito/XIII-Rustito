@@ -3043,12 +3043,10 @@ fn prop_object(vm: &Vm<'_>, id: ObjectId, name: &str) -> Option<ObjectId> {
     }
 }
 
-/// Raw object-pointer read for the engine's native list maintenance. Unlike [`prop_object`] it
-/// does not hide destroyed actors: `AController::execRemoveController` and
-/// `APawn::execRemovePawnFromList` compare and copy raw `AActor*` values, and a controller runs
-/// `RemoveController` from its own `Destroyed` event (engine.u `Controller.Destroyed` +0x12),
-/// i.e. while the VM has already marked it deleted (see [`Vm::destroy`]).
-fn raw_prop_object(vm: &Vm<'_>, id: ObjectId, name: &str) -> Option<ObjectId> {
+/// Raw object-pointer read for the engine's native list maintenance. It does not hide destroyed
+/// actors: the engine's list natives compare and copy raw `AActor*` values and `execContext` has
+/// no `bDeleteMe` test, so a just-destroyed node keeps its stale link (item25).
+fn prop_object_raw(vm: &Vm<'_>, id: ObjectId, name: &str) -> Option<ObjectId> {
     match vm.get_property(id, name) {
         Some(Value::Object(Some(ObjRef::Instance(i)))) => Some(*i),
         _ => None,
@@ -3058,6 +3056,13 @@ fn raw_prop_object(vm: &Vm<'_>, id: ObjectId, name: &str) -> Option<ObjectId> {
 /// `Level.PawnList`/`Level.ControllerList` insert-at-head and unlink, shared by the pawn and
 /// controller list natives (UE2 `APawn::AddPawnToList`/`RemovePawnFromList` and the controller
 /// equivalents).
+///
+/// The engine works on raw `AActor*` links, and `execContext` has no `bDeleteMe` test, so a plain
+/// property read already sees a destroyed node exactly as the engine does (see
+/// [`Vm::bypass_context_none`] and [`Vm::destroy`]): the item-25 change that runs `Destroyed`
+/// before `bDeleteMe` makes the old `raw_prop_object` workaround unnecessary. These helpers use
+/// the ordinary property read (which is never gated on `deleted`), and the script-level reads in
+/// `XIIIGameInfo.EndGame`/`Destroyed` go through the VM's context path.
 ///
 /// Engine.dll `AController::execAddController` (0x10367a80..0x10367ab5): `NextController (0x214)
 /// = Level (0x7c)->ControllerList (0x450); Level->ControllerList = this`. The pawn variant is
@@ -3069,7 +3074,7 @@ fn list_insert_head(
     list: &str,
     next: &str,
 ) -> VmResult<()> {
-    let head = raw_prop_object(vm, level, list);
+    let head = prop_object_raw(vm, level, list);
     vm.set_property(obj, next, 0, Value::Object(head.map(ObjRef::Instance)));
     vm.set_property(level, list, 0, Value::Object(Some(ObjRef::Instance(obj))));
     Ok(())
@@ -3086,15 +3091,15 @@ fn list_insert_head(
 /// The engine dereferences `this.Level` (0x7c) without a null check; with no `Level` the VM has
 /// no list to edit, so it records a visible note and leaves every link unchanged.
 fn list_remove(vm: &mut Vm<'_>, obj: ObjectId, list: &str, next: &str) -> VmResult<()> {
-    let Some(level) = raw_prop_object(vm, obj, "Level") else {
+    let Some(level) = prop_object_raw(vm, obj, "Level") else {
         let actor = vm.objects[obj as usize].name.clone();
         vm.note(TraceKind::Note(format!(
             "{list} unlink of {actor}: Level is None (the engine dereferences Level unconditionally); links left unchanged"
         )));
         return Ok(());
     };
-    let successor = raw_prop_object(vm, obj, next);
-    if raw_prop_object(vm, level, list) == Some(obj) {
+    let successor = prop_object_raw(vm, obj, next);
+    if prop_object_raw(vm, level, list) == Some(obj) {
         vm.set_property(
             level,
             list,
@@ -3103,14 +3108,14 @@ fn list_remove(vm: &mut Vm<'_>, obj: ObjectId, list: &str, next: &str) -> VmResu
         );
         return Ok(());
     }
-    let mut cur = raw_prop_object(vm, level, list);
+    let mut cur = prop_object_raw(vm, level, list);
     let mut guard = 0;
     while let Some(c) = cur {
         guard += 1;
         if guard > 65_536 {
             break;
         }
-        let after = raw_prop_object(vm, c, next);
+        let after = prop_object_raw(vm, c, next);
         if after == Some(obj) {
             vm.set_property(c, next, 0, Value::Object(successor.map(ObjRef::Instance)));
             break;
@@ -3123,7 +3128,7 @@ fn list_remove(vm: &mut Vm<'_>, obj: ObjectId, list: &str, next: &str) -> VmResu
 /// Level for the list natives, or a visible note when it is None (the engine dereferences
 /// `Level` (0x7c) unconditionally in all four natives).
 fn list_level(vm: &mut Vm<'_>, obj: ObjectId, list: &str) -> Option<ObjectId> {
-    let level = raw_prop_object(vm, obj, "Level");
+    let level = prop_object_raw(vm, obj, "Level");
     if level.is_none() {
         let actor = vm.objects[obj as usize].name.clone();
         vm.note(TraceKind::Note(format!(

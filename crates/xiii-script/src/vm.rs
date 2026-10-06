@@ -1016,6 +1016,15 @@ pub struct Instance {
     state_code: Option<StateCode>,
     generation: u64,
     disabled: HashSet<String>,
+    /// `Destroy` is running its `Destroyed` event right now (`bDeleteMe` is not set yet). The
+    /// engine sets this before the event: `ULevel::DestroyActor` clears the state and calls
+    /// `AActor::ProcessEvent` for `Destroyed` only while `!bDeleteMe`. `Vm::destroy` uses it to
+    /// make a nested `Destroy` a no-op (the engine returns 1 with `bDeleteMe` set by then) while
+    /// still keeping the actor readable/writable during its own `Destroyed`.
+    destroying: bool,
+    /// All probes of the actor were disabled (`AActor+0x34` bit 0x1, `bProbesDisabled`). Read from
+    /// the serialized property `bProbesDisabled` at spawn/layout time; `Disable`/`Enable` update it.
+    probes_disabled: bool,
     /// Executed by the VM (in scope).
     pub active: bool,
     /// Suspended after a script error (`active` was cleared by [`Vm::suspend_for_error`]). A
@@ -2540,6 +2549,12 @@ impl<'s> Vm<'s> {
         if let Some(slot) = layout.slot_by_name("class") {
             props[slot.base] = Value::Object(Some(ObjRef::Static(class)));
         }
+        // `Disable`/`Enable` set `bProbesDisabled`; the actor carries that flag from its class
+        // defaults at construction, so a `Disable` before the first `Tick` is already effective
+        // and `Enable` can clear it (Engine.dll `AActor+0x34` bit 0x1, `?execDisable@AActor`).
+        let probes_disabled = layout
+            .slot_by_name("bprobesdisabled")
+            .is_some_and(|s| matches!(props[s.base], Value::Bool(true)));
         self.objects.push(Instance {
             class,
             name: name.to_owned(),
@@ -2549,6 +2564,8 @@ impl<'s> Vm<'s> {
             state_code: None,
             generation: 0,
             disabled: HashSet::new(),
+            destroying: false,
+            probes_disabled,
             active: false,
             suspended: false,
             is_actor,
@@ -2779,6 +2796,19 @@ impl<'s> Vm<'s> {
         if let Some(o) = self.objects.get_mut(id as usize) {
             o.active = active;
         }
+    }
+
+    /// True when the actor's whole-probe-disable bit is set (`Disable('All')`/`bProbesDisabled`).
+    pub fn probes_disabled(&self, id: ObjectId) -> bool {
+        self.objects
+            .get(id as usize)
+            .is_some_and(|o| o.probes_disabled)
+    }
+
+    /// True while `[Vm::destroy]` is running this actor's `Destroyed` event (the engine has not
+    /// set `bDeleteMe` yet).
+    pub fn is_destroying(&self, id: ObjectId) -> bool {
+        self.objects.get(id as usize).is_some_and(|o| o.destroying)
     }
 
     /// Reads a property by name (first element).
@@ -3218,6 +3248,13 @@ impl<'s> Vm<'s> {
 
     /// Calls a script event on an object as the engine would (honours `Disable`). Returns
     /// `Ok(None)` when the probe is disabled or the class has no handler.
+    ///
+    /// A `bDeleteMe` actor receives no `ProcessEvent` at all: `Core.dll ?ProcessEvent@UObject`
+    /// (0x1011e880) calls the object's `IsPendingKill` vtable slot (`vtable+0x38`, 0x10101e60 for
+    /// `UObject`; `Engine.dll ?IsPendingKill@AActor` 0x10304b40 returns `AActor+0x2e & 1`, the
+    /// `bDeleteMe` byte) and returns without running the function when it is non-zero. A probe
+    /// disabled for this event, or a `Disable('All')` probe set (see [`Vm::disable_probe`]), also
+    /// drops the event visibly.
     pub fn send_event(
         &mut self,
         id: ObjectId,
@@ -3226,11 +3263,20 @@ impl<'s> Vm<'s> {
     ) -> VmResult<Option<Value>> {
         self.steps = 0;
         let actor = self.objects[id as usize].name.clone();
-        if self.objects[id as usize].disabled.contains(&lower(event)) {
+        if self.objects[id as usize].probes_disabled
+            || self.objects[id as usize].disabled.contains(&lower(event))
+        {
             self.note(TraceKind::ProbeDisabled {
                 actor,
                 probe: event.to_owned(),
             });
+            return Ok(None);
+        }
+        if self.objects[id as usize].deleted && !self.objects[id as usize].destroying {
+            // ProcessEvent on a bDeleteMe actor is a no-op (no handler even runs).
+            self.note(TraceKind::Note(format!(
+                "{actor}.{event}: skipped, actor has bDeleteMe (ProcessEvent drops deleted actors)"
+            )));
             return Ok(None);
         }
         let Some(f) = self.find_function(id, event, true) else {
@@ -4002,9 +4048,16 @@ impl<'s> Vm<'s> {
         // dispatches on the class default object; UE2 runs both regardless of instance scope
         // (`MessageClass.default.GetColor`, `Message.static.GetString`). Only non-static calls
         // on *placed* actors outside the executed scope are deferred.
+        // A call through a just-destroyed actor runs in the engine: `execFinalFunction`/
+        // `execVirtualFunction` reach `CallFunction` directly, which has no `bDeleteMe` guard (see
+        // `bypass_context_none`). The VM's `deleted`/`destroying` flags stand in for that, so such
+        // a call is never treated as an out-of-scope deferral.
+        let destroyed_target =
+            self.objects[target as usize].deleted || self.objects[target as usize].destroying;
         if !self.objects[target as usize].active
             && !self.objects[target as usize].name.starts_with("Default__")
             && !f.is_static()
+            && !destroyed_target
         {
             // item14c: a **suspended** actor (cleared by `suspend_for_error`) is not the same as
             // a placed actor outside the executed scope. Dropping its call silently would hide a
@@ -4649,41 +4702,30 @@ impl<'s> Vm<'s> {
         self.note(TraceKind::AccessedNone { function, offset });
     }
 
-    fn context_target(
-        &mut self,
-        frame: &mut Frame<'s>,
-        object: &Token,
-        target: ObjectId,
-    ) -> VmResult<Option<ObjectId>> {
-        let v = self.eval_in(frame, object, target)?;
-        self.context_value(v)
-    }
-
-    /// A destroyed actor whose plain variable `member` is read through a context expression
-    /// (`P.NextController`). UE2 keeps the actor's memory until reference cleanup: Core.dll
-    /// `UObject::execContext` (0x101173a0..0x1011740d) only reports Accessed None for a NULL
-    /// context (no bDeleteMe check), Engine.dll `ULevel::DestroyActor` only sets bDeleteMe
-    /// (`AActor+0x2c` bit 0x10000, at 0x1038965a), and `ULevel::CleanupDestroyed`
-    /// (0x10387ae0) nulls references only once at least 128 (0x80, at 0x10387b63) destroyed
-    /// actors are pending or on a forced cleanup. So a script that destroys the current node of
-    /// a list walk still reads its stale `NextController`/`NextPawn` (XIIIGameInfo.EndGame
-    /// +0x0322 `P = P.nextController` after `GotoState('GameEnded')` destroyed an AI
-    /// controller). Function calls through a destroyed context keep the VM's Accessed-None
-    /// behaviour (not modelled here).
-    fn destroyed_variable_context(&self, v: &Value, member: &Token) -> Option<ObjectId> {
+    /// Object id behind a context expression the VM would otherwise resolve to `None` because the
+    /// actor is destroyed, when the engine would not. Core.dll `UObject::execContext`
+    /// (`0x101173a0..0x1011740d`, the null check at `0x101173d3`) only reports Accessed None for a
+    /// NULL context; it does **not** test `bDeleteMe`.
+    ///
+    /// The engine's own bytecode paths are `execContext` (for `P.member`) and
+    /// `execVirtualFunction`/`execFinalFunction`, which call `UObject::CallFunction`; that runs the
+    /// body directly and never routes through `UObject::ProcessEvent`. So a plain variable read,
+    /// a write and a function call through a just-destroyed actor all still work in the engine;
+    /// `ProcessEvent` (the engine-delivered `event`/probe path, [Vm::send_event]) is what a
+    /// `bDeleteMe` actor skips. `ULevel::DestroyActor` runs `Destroyed` **before** setting
+    /// `bDeleteMe` (`0x1038965a`), and `ULevel::CleanupDestroyed` (`0x10387ae0`) only nulls
+    /// references once at least 128 (`0x80` at `0x10387b63`) destroyed actors are pending, so a
+    /// just-destroyed actor stays readable/writable — this is why `XIIIGameInfo.EndGame` +0x0322
+    /// `P = P.nextController` still walks a destroyed AI controller.
+    ///
+    /// The `member` operand is kept for the callers' clarity; the bypass is per-actor, so the same
+    /// rule applies to reads, writes and calls.
+    fn bypass_context_none(&self, v: &Value, _member: &Token) -> Option<ObjectId> {
         let Value::Object(Some(ObjRef::Instance(i))) = v else {
             return None;
         };
         let o = self.objects.get(*i as usize)?;
-        if !o.deleted || !o.is_actor {
-            return None;
-        }
-        let plain_variable = match &member.kind {
-            TokenKind::InstanceVariable(_) => true,
-            TokenKind::BoolVariable(e) => matches!(e.kind, TokenKind::InstanceVariable(_)),
-            _ => false,
-        };
-        plain_variable.then_some(*i)
+        (o.is_actor && (o.destroying || o.deleted)).then_some(*i)
     }
 
     /// Target object from an already-evaluated context object expression. `None` = UE2
@@ -4977,7 +5019,7 @@ impl<'s> Vm<'s> {
                             }));
                         }
                     }
-                } else if let Some(obj) = self.destroyed_variable_context(&v, &c.member) {
+                } else if let Some(obj) = self.bypass_context_none(&v, &c.member) {
                     self.eval_in(frame, &c.member, obj)?
                 } else {
                     match self.context_value(v)? {
@@ -5475,10 +5517,19 @@ impl<'s> Vm<'s> {
             K::InstanceVariable(r) => self.var_slot(frame, *r, target, false)?,
             K::DefaultVariable(r) => self.var_slot(frame, *r, target, true)?,
             K::BoolVariable(e) => return self.place(frame, e, target),
-            K::Context(c) => match self.context_target(frame, &c.object, target)? {
-                Some(obj) => return self.place(frame, &c.member, obj),
-                None => return Ok(None),
-            },
+            K::Context(c) => {
+                // Writes through a destroyed-but-uncleaned actor still land: `execContext` has no
+                // `bDeleteMe` test (see `bypass_context_none`), so `P.NextController = x` updates
+                // the stale memory the engine would update.
+                let v = self.eval_in(frame, &c.object, target)?;
+                if let Some(obj) = self.bypass_context_none(&v, &c.member) {
+                    return self.place(frame, &c.member, obj);
+                }
+                match self.context_value(v)? {
+                    Some(obj) => return self.place(frame, &c.member, obj),
+                    None => return Ok(None),
+                }
+            }
             K::ArrayElement { index, array } => {
                 let i = self.int(frame, index)?;
                 let Some(base) = self.place(frame, array, target)? else {
@@ -5688,6 +5739,14 @@ impl<'s> Vm<'s> {
     // ------------------------------------------------------------------ helpers for natives
 
     pub(crate) fn disable_probe(&mut self, id: ObjectId, probe: &str, disable: bool) {
+        // UE2 `Disable('All')` sets the actor-wide `bProbesDisabled` bit; a named probe is
+        // recorded in the actor's disabled-probe set (UE2 `FObject::DisableProbe`; not separately
+        // disassembled here). `Enable('All')` clears the bit. The VM keeps both: the whole-actor
+        // flag suppresses every event, so `Destroyed` is dropped too (the engine's probe check).
+        if probe.eq_ignore_ascii_case("all") {
+            self.objects[id as usize].probes_disabled = disable;
+            self.set_property(id, "bProbesDisabled", 0, Value::Bool(disable));
+        }
         let o = &mut self.objects[id as usize];
         if disable {
             o.disabled.insert(lower(probe));
@@ -6138,22 +6197,45 @@ impl<'s> Vm<'s> {
         settled
     }
 
-    /// `Actor.Destroy`: runs `Destroyed`, then marks the object deleted so later references act
-    /// as `None` and it leaves iterators. Idempotent; a nested `Destroy` during `Destroyed` is
-    /// ignored (the object is already marked), so it cannot recurse or panic.
+    /// `Actor.Destroy` in the engine's `ULevel::DestroyActor` order (`Engine.dll`
+    /// `?DestroyActor@ULevel` RVA 0x890e0): clear the actor's state and latent action, run the
+    /// `Destroyed` event, then set `bDeleteMe` and remove it from the level lists.
+    ///
+    /// `deleted` (the "acts as `None`" flag) is set **after** `Destroyed`, exactly as the engine
+    /// sets `bDeleteMe` after the event; `destroying` is the in-progress guard that makes a nested
+    /// `Destroy` from inside `Destroyed` a no-op (the engine's re-entry returns 1). A plain
+    /// variable read/write and a call through the actor still work during and after the event
+    /// (execContext/CallFunction have no delete gate; see `bypass_context_none`), while
+    /// `ProcessEvent`-delivered events stop once `deleted` is set.
     pub fn destroy(&mut self, id: ObjectId) -> VmResult<bool> {
-        if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
+        if self
+            .objects
+            .get(id as usize)
+            .is_none_or(|o| o.deleted || o.destroying)
+        {
             return Ok(true);
         }
-        self.objects[id as usize].deleted = true;
-        self.objects[id as usize].active = false;
+        // `ULevel::DestroyActor` clears the state (and its latent action) before `Destroyed`.
+        self.objects[id as usize].destroying = true;
         self.objects[id as usize].state = None;
         self.objects[id as usize].state_code = None;
-        self.objects[id as usize].timers = [None, None, None];
         self.objects[id as usize].generation += 1;
-        if let Some(f) = self.find_function(id, "Destroyed", true) {
-            self.call_values(f, id, Vec::new())?;
-        }
+        // A `bProbesDisabled` actor receives no `ProcessEvent`, so `Destroyed` never runs.
+        let event = if !self.objects[id as usize].probes_disabled {
+            self.find_function(id, "Destroyed", true)
+        } else {
+            None
+        };
+        let result = match event {
+            Some(f) => self.call_values(f, id, Vec::new()).map(|_| ()),
+            None => Ok(()),
+        };
+        // `bDeleteMe` is now set; the actor stops executing.
+        self.objects[id as usize].destroying = false;
+        self.objects[id as usize].deleted = true;
+        result?;
+        self.objects[id as usize].active = false;
+        self.objects[id as usize].timers = [None, None, None];
         // Leave a clean inventory chain. `Inventory.Destroyed` unlinks the item via
         // `Instigator/Owner.DeleteInventory`, but that call is on another actor and can be
         // deferred (out of the executed scope), leaving the destroyed item reachable from the
