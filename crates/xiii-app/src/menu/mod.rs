@@ -1376,6 +1376,7 @@ impl Plugin for MenuPlugin {
         app.insert_non_send(session)
             .insert_non_send(crate::video::CutsceneHost(cutscene_host))
             .add_plugins((crate::video::CutscenePlugin, cutscene::CutsceneSystems))
+            .add_plugins(MaterialPlugin::<crate::viewer::lights::ReceiverMaterial>::default())
             .insert_resource(MenuConfig {
                 options: self.options.clone(),
             })
@@ -1386,12 +1387,14 @@ impl Plugin for MenuPlugin {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup(
     mut commands: Commands,
     cfg: Res<MenuConfig>,
     mut session: NonSendMut<Result<MenuSession, String>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut receiver_materials: ResMut<Assets<crate::viewer::lights::ReceiverMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -1488,6 +1491,7 @@ fn setup(
                 &mut commands,
                 &mut meshes,
                 &mut materials,
+                &mut receiver_materials,
                 &mut images,
                 &scene,
                 true,

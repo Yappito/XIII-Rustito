@@ -217,6 +217,7 @@ impl Plugin for PlayPlugin {
             .init_resource::<ParticleTriggerCursor>()
             .init_resource::<RuntimeLights>()
             .add_plugins(viewer::particles::ParticlePlugin)
+            .add_plugins(MaterialPlugin::<viewer::lights::ReceiverMaterial>::default())
             .init_resource::<cinematics::CinematicState>()
             .init_resource::<cartoon::CartoonState>()
             .init_resource::<cartoon::CartoonRenderTarget>()
@@ -238,7 +239,7 @@ impl Plugin for PlayPlugin {
                     viewer::fog::update_fog,
                     viewer::decals::update_runtime_projectors,
                     sync_particle_triggers,
-                    sync_vm_lights,
+                    (sync_vm_lights, viewer::lights::cull_receivers).chain(),
                     pawns::update_pawns,
                     weapons::update_weapon_view,
                     hud::refresh,
@@ -435,6 +436,7 @@ fn setup(
     mut sync: ResMut<RenderSync>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut receiver_materials: ResMut<Assets<viewer::lights::ReceiverMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     mut decal_materials: ResMut<Assets<ForwardDecalMaterial<StandardMaterial>>>,
@@ -455,6 +457,7 @@ fn setup(
         &mut sync,
         &mut meshes,
         &mut materials,
+        &mut receiver_materials,
         &mut images,
         &mut bindposes,
         &mut decal_materials,
@@ -476,6 +479,7 @@ fn setup_inner(
     sync: &mut RenderSync,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    receiver_materials: &mut Assets<viewer::lights::ReceiverMaterial>,
     images: &mut Assets<Image>,
     bindposes: &mut Assets<SkinnedMeshInverseBindposes>,
     decal_materials: &mut Assets<ForwardDecalMaterial<StandardMaterial>>,
@@ -643,6 +647,7 @@ fn setup_inner(
         commands,
         meshes,
         materials,
+        receiver_materials,
         images,
         &scene,
         opts.lighting == crate::cli::Lighting::Baked,
@@ -704,12 +709,10 @@ fn setup_inner(
         RenderLayers::layer(viewer::MAIN_LAYER),
         bevy::core_pipeline::prepass::DepthPrepass,
         viewer::fog::distance_fog(&start_params),
-        viewer::lights::receiver_ambient_if_enabled().unwrap_or_else(|| {
-            viewer::fog::ambient_light(&start_params).unwrap_or_else(|| AmbientLight {
-                color: Color::NONE,
-                brightness: 0.0,
-                ..default()
-            })
+        viewer::fog::ambient_light(&start_params).unwrap_or_else(|| AmbientLight {
+            color: Color::NONE,
+            brightness: 0.0,
+            ..default()
         }),
         Transform::from_translation(Vec3::from_array(eye)),
         PlayCam,
@@ -1714,6 +1717,7 @@ fn travel(
     mut sync: ResMut<RenderSync>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut receiver_materials: ResMut<Assets<viewer::lights::ReceiverMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut bindposes: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     mut decal_materials: ResMut<Assets<ForwardDecalMaterial<StandardMaterial>>>,
@@ -1787,6 +1791,7 @@ fn travel(
         &mut sync,
         &mut meshes,
         &mut materials,
+        &mut receiver_materials,
         &mut images,
         &mut bindposes,
         &mut decal_materials,
@@ -2665,6 +2670,102 @@ mod tests {
                 .iter()
                 .filter_map(|(_, _, m)| m.clone())
                 .collect::<std::collections::BTreeSet<_>>()
+        );
+    }
+
+    /// item32 opt-in regression: the authored Plage01 trigger wakes BaseSoldier6 from faction.
+    /// `IAController.Init` reads `MapInfo.XIIIPawn` after two latent sleeps (about 0.2-0.3 s);
+    /// the game's own `MapInfo.FirstFrame` (run by `MapInfo.Timer` after `checkTime` = 0.1 s)
+    /// sets it first, so `Trigger` engages the real player.
+    #[test]
+    fn opt_in_plage01_faction_trigger_cue_enters_scripted_attack() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = session::Session::open(&game_dir, "Plage01").expect("open Plage01");
+        let soldier = session
+            .vm()
+            .find_object("BaseSoldier6")
+            .expect("BaseSoldier6");
+        let controller = match session.vm().get_property(soldier, "Controller") {
+            Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => *id,
+            _ => panic!("BaseSoldier6 has no controller"),
+        };
+        let player = session.player;
+        let player_loc = session
+            .vm()
+            .vector_prop(player, "Location")
+            .expect("player location");
+
+        for _ in 0..120 {
+            session.step(
+                1.0 / 60.0,
+                player_loc,
+                0.0,
+                [0.0; 3],
+                &session::PlayerVMModes::default(),
+            );
+        }
+        let map_info = session.map_info().expect("Plage01 MapInfo");
+        assert_eq!(
+            session.vm().get_property(map_info, "XIIIPawn"),
+            Some(&xiii_script::Value::Object(Some(
+                xiii_script::ObjRef::Instance(player)
+            ))),
+            "MapInfo.FirstFrame (MapInfo.Timer after checkTime 0.1 s) must have set XIIIPawn to the logged-in pawn"
+        );
+        assert_eq!(
+            session.vm().state_name(controller).as_deref(),
+            Some("faction"),
+            "BaseSoldier6 should begin in the map-authored faction order"
+        );
+
+        // Deliver the real trigger event with the logged-in pawn. The map dispatcher and the
+        // soldier's own Pawn.Trigger -> IAController.Trigger chain perform the state transition.
+        let touch = session
+            .vm()
+            .find_object("TouchTrigger8")
+            .expect("TouchTrigger8");
+        session
+            .vm_mut()
+            .send_event(
+                touch,
+                "Touch",
+                vec![xiii_script::Value::Object(Some(
+                    xiii_script::ObjRef::Instance(player),
+                ))],
+            )
+            .expect("TouchTrigger8.Touch");
+
+        let mut engagement = None;
+        for tick in 0..600u32 {
+            session.step(
+                1.0 / 60.0,
+                player_loc,
+                0.0,
+                [0.0; 3],
+                &session::PlayerVMModes::default(),
+            );
+            let state = session.vm().state_name(controller);
+            if matches!(
+                state.as_deref(),
+                Some("Acquisition" | "Attaque" | "AttaqueScriptee")
+            ) {
+                engagement = Some((tick as f32 / 60.0, state));
+                break;
+            }
+        }
+        println!(
+            "[item32] cue TouchTrigger8 -> XIIIDispatcher3.OutEvents('tueur_conducteur'); \
+             BaseSoldier6 engagement {engagement:?}"
+        );
+        assert!(
+            engagement.is_some(),
+            "the authored tueur_conducteur cue did not move BaseSoldier6 from faction to \
+             Acquisition/Attaque/AttaqueScriptee; current state {:?}, first error {:?}",
+            session.vm().state_name(controller),
+            session.first_error()
         );
     }
 
