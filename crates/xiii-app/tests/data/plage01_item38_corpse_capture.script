@@ -1,0 +1,28 @@
+# Windowed item38 capture at the accepted Plage01 fight point. The VM weapon/damage/death path
+# executes; this is a compact visual capture alongside the full route integration case. Wait
+# until the authored intro handoff, then use the same accepted head-zone aim point.
+t=45.00 weapon XIII.M60
+t=45.20 teleport 1802.4131 -12992.034 1070.843
+t=45.20 yaw 90
+t=45.20 pitch 5
+t=45.30 fire
+t=45.50 fire
+t=45.70 fire
+t=45.90 fire
+t=46.10 fire
+t=46.30 fire
+t=46.50 fire
+t=46.70 fire
+t=46.90 fire
+t=47.10 fire
+t=47.30 fire
+t=47.50 fire
+t=47.70 fire
+t=47.90 fire
+t=48.10 fire
+t=48.30 fire
+# Diagnostic camera placement after the scripted kill, looking from south toward the pawn; this
+# does not participate in the route integration assertion.
+t=48.50 teleport 1802.4 -14000.0 1070.8
+t=48.50 yaw 90
+t=48.50 pitch 0

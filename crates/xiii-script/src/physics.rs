@@ -40,6 +40,12 @@ pub trait WorldPhysics {
     /// blocking hit, if any (`MoveOutcome.time` < 1 means the move was cut short).
     fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome;
 
+    /// Pawn walking movement. Providers backed by `xiii-collision` override this with its
+    /// UE2-style step-up/floor-follow primitive; the default preserves point/diagnostic providers.
+    fn walk_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        self.move_box(start, delta, extent)
+    }
+
     /// Point/free placement test: can a box of the given half-extents sit at `location`
     /// without overlapping world geometry? For `SetLocation`/spawn placement checks.
     fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool;

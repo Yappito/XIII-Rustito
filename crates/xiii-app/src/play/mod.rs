@@ -524,10 +524,7 @@ fn setup_inner(
         session.active_actors(),
         session.bootstrap_note
     );
-    println!(
-        "[play] login path: script={} bootstrap={}",
-        session.login_script, session.login_bootstrap
-    );
+    println!("[play] player login path: script={}", session.login_script);
     println!("[play] hit boxes: {}", session.hitbox_summary());
     for e in &session.hitbox_errors {
         println!("[play]   hit-box mesh failed: {e}");
@@ -969,7 +966,20 @@ fn fixed_step(
         Ok(sess) => cinematics::input_suppressed(sess),
         Err(_) => false,
     };
-    // Always advance the script so the `take_control` bridge can be read even while a cutscene
+    if let Some(drive) = script.drive.as_mut() {
+        let tracked = drive.tracking_actor().and_then(|name| {
+            (*session).as_ref().ok().and_then(|sess| {
+                let id = sess.vm().find_live_object(name)?;
+                Some((name.to_owned(), sess.vm().vector_prop(id, "Location")))
+            })
+        });
+        if let Some((name, location)) = tracked {
+            drive.set_track_location(Some(&name), location);
+        } else {
+            drive.set_track_location(None, None);
+        }
+    }
+    // Always advance the script so an explicit `take_control` diagnostic can be read even while a cutscene
     // suppresses input; the axis input and the other command queues are dropped when suppressed.
     let (mut input, weapons, goals, equip, use_named, search) = match script.drive.as_mut() {
         Some(drive) => {
@@ -1115,7 +1125,7 @@ fn fixed_step(
         }
         if control {
             match sess.take_control() {
-                Ok(state) => println!("[play] take_control (host bridge): controller -> {state}"),
+                Ok(state) => println!("[play] take_control diagnostic: controller -> {state}"),
                 Err(e) => println!("[play] take_control failed: {e}"),
             }
         }
@@ -1360,12 +1370,57 @@ fn sync_camera(
     sim: Res<SimRes>,
     params: Res<ParamsRes>,
     cine: Res<cinematics::CinematicState>,
+    mut session: NonSendMut<Result<session::Session, String>>,
     mut cams: Query<&mut Transform, With<PlayCam>>,
 ) {
+    let death_camera = match session.as_mut() {
+        Ok(sess) => {
+            let controller = sess.controller;
+            controller.and_then(|controller| {
+                let state = sess.vm().state_name(controller);
+                matches!(
+                    state.as_deref(),
+                    Some("GameEndedDeath" | "GameEndedDrown" | "GameEndedFalling")
+                )
+                .then(|| {
+                    // The engine calls the controller's state-scoped PlayerCalcView every
+                    // rendered frame. Drive that same VM event here so its script-owned camera
+                    // location/rotation, pitch easing and roll effect remain authoritative.
+                    let zero_vector = Value::Struct(vec![
+                        ("X".into(), Value::Float(0.0)),
+                        ("Y".into(), Value::Float(0.0)),
+                        ("Z".into(), Value::Float(0.0)),
+                    ]);
+                    let zero_rotator = Value::Struct(vec![
+                        ("Pitch".into(), Value::Int(0)),
+                        ("Yaw".into(), Value::Int(0)),
+                        ("Roll".into(), Value::Int(0)),
+                    ]);
+                    if let Err(e) = sess.vm_mut().send_event(
+                        controller,
+                        "PlayerCalcView",
+                        vec![Value::Object(None), zero_vector, zero_rotator],
+                    ) {
+                        eprintln!("[play] controller PlayerCalcView failed: {e}");
+                        return None;
+                    }
+                    let vm = sess.vm();
+                    let location = vm.vector_prop(controller, "vGameEndedCamLoc")?;
+                    let rotation = vm.rotation_prop(controller)?;
+                    Some(cinematics::camera_transform(location, rotation))
+                })
+                .flatten()
+            })
+        }
+        Err(_) => None,
+    };
     for mut t in &mut cams {
         if let Some(v) = &cine.view {
             // A script selected a cutscene camera (`CamView`/`ViewTarget`); render from it.
             let (loc, rot) = cinematics::camera_transform(v.location, v.rotation);
+            t.translation = loc;
+            t.rotation = rot;
+        } else if let Some((loc, rot)) = death_camera {
             t.translation = loc;
             t.rotation = rot;
         } else {
@@ -2019,6 +2074,16 @@ fn run_script_inner(
     let mut tick = 0u64;
     while tick < ticks {
         let elapsed = tick as f32 * DT;
+        if let Some(name) = drive.tracking_actor().map(str::to_owned) {
+            let location = runtime
+                .session
+                .vm()
+                .find_live_object(&name)
+                .and_then(|id| runtime.session.vm().vector_prop(id, "Location"));
+            drive.set_track_location(Some(&name), location);
+        } else {
+            drive.set_track_location(None, None);
+        }
         let mut input = drive.advance(elapsed, &mut runtime.sim);
         let mut weapons = drive.take_weapons();
         let goals = drive.take_goals();
@@ -2111,7 +2176,7 @@ fn run_script_inner(
         }
         if control {
             match runtime.session.take_control() {
-                Ok(state) => println!("[play] take_control (host bridge): controller -> {state}"),
+                Ok(state) => println!("[play] take_control diagnostic: controller -> {state}"),
                 Err(e) => println!("[play] take_control failed: {e}"),
             }
         }
@@ -2388,10 +2453,7 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
         Ok(line) => println!("[play] {line}"),
         Err(e) => println!("[play] pawns headless report failed: {e}"),
     }
-    println!(
-        "[play] login path: script={} bootstrap={}",
-        session.login_script, session.login_bootstrap
-    );
+    println!("[play] player login path: script={}", session.login_script);
     println!("[play] hit boxes: {}", session.hitbox_summary());
     for e in &session.hitbox_errors {
         println!("[play]   hit-box mesh failed: {e}");
@@ -2880,6 +2942,13 @@ mod tests {
         let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/plage01_route.script");
         let script = script::Script::load(&route_path).expect("load item19 Plage01 route");
+        assert!(
+            script
+                .events
+                .iter()
+                .all(|event| !matches!(&event.command, script::Command::TakeControl)),
+            "the normal Plage01 route must release control through the authored intro"
+        );
         let outcome = run_script_with_cinematic_input(
             &game_dir,
             "Plage01",
@@ -3498,7 +3567,9 @@ mod tests {
     /// `GameEnded.BeginState` (XIIIEndGameType 4) -> `GameEndedSuccess.Timer` ->
     /// `VP.Open(MapInfo.EndMapVideo)` -> `PlayingVideo.BeginState` -> `VP.Play()` — with the
     /// host cutscene player installed on the session VM (headless form: caller-paced clock, no
-    /// audio device). The game's own `PlayingVideo.PlayerTick` must then request the level
+    /// audio device). First let Plage01's opening sequence reach its decoded release handoff; the
+    /// test does not rely on `take_control` or on suspending cine actors when `bGameEnded` changes.
+    /// The game's own `PlayingVideo.PlayerTick` must then request the level
     /// travel when — and only when — the host has decoded every frame of `Cine01.bik`
     /// (1358 frames / 25 fps ≈ 54.32 s).
     #[test]
@@ -3510,6 +3581,33 @@ mod tests {
         let mut session = session::Session::open(&game_dir, "Plage01").expect("open Plage01");
         let host = crate::video::VideoHostHandle::new(game_dir.clone(), false);
         session.vm_mut().set_video_host(Box::new(host.clone()));
+        let dt = 1.0f64 / 30.0;
+        let intro_steps = (46.0 / dt) as usize;
+        let mut location = session.player_location().expect("player location");
+        let mut yaw = 0.0;
+        let mut velocity = [0.0; 3];
+        for _ in 0..intro_steps {
+            session.drive_render_phase();
+            session.step(
+                dt as f32,
+                location,
+                yaw,
+                velocity,
+                &session::PlayerVMModes::default(),
+            );
+            if let Some((script_location, script_yaw, script_velocity)) = session.script_pawn_pose()
+            {
+                location = script_location;
+                yaw = script_yaw;
+                velocity = script_velocity;
+            }
+        }
+        let controller = session.controller.expect("player controller");
+        assert_ne!(
+            session.vm().state_name(controller).as_deref(),
+            Some("NoControl"),
+            "Plage01's authored intro must release the player through its own script sequence"
+        );
         let gi = session.game_info.expect("GameInfo");
         session
             .vm_mut()
@@ -3525,14 +3623,13 @@ mod tests {
         // Step until the chain's `PlayingVideo` state starts the host playback, then until the
         // game's own `PlayerTick` requests the travel. The host advances with the VM's time, so
         // travel can only be requested once every frame is decoded.
-        let dt = 1.0 / 30.0;
-        let max_steps = 80.0f64 / dt; // 80 s of VM time: the 45 s intro margin + the 54.3 s clip
+        let max_steps = (64.0f64 / dt).ceil() as usize;
         let mut duration_opt: Option<f64> = None;
         let mut started_at = None;
         let mut status_before_end = None;
         let mut travel_at = None;
         let t0 = std::time::Instant::now();
-        for _i in 0..((max_steps).ceil() as usize) {
+        for _i in 0..max_steps {
             session.step(
                 dt as f32,
                 [0.0; 3],
@@ -4072,16 +4169,23 @@ mod tests {
             .vm_mut()
             .spawn(canvas_class, "WidgetTestCanvas")
             .expect("spawn Canvas");
+        let selected =
+            hud::initialize_canvas_fonts(session.vm_mut(), canvas).expect("Canvas native fonts");
+        assert!(
+            selected[0].ends_with(".PoliceF16") && selected[1].ends_with(".PoliceF20"),
+            "Canvas fonts must match Engine.Canvas.Init: {selected:?}"
+        );
+        for (prop, path) in [("SmallFont", &selected[0]), ("MedFont", &selected[1])] {
+            assert_eq!(
+                session.vm().get_property(canvas, prop),
+                Some(&xiii_script::Value::Name(path.clone())),
+                "Canvas.{prop} must match the Engine.Canvas.Init font"
+            );
+        }
         let vm = session.vm_mut();
         vm.set_property(canvas, "ClipX", 0, xiii_script::Value::Float(1280.0));
         vm.set_property(canvas, "ClipY", 0, xiii_script::Value::Float(720.0));
         vm.set_property(canvas, "Style", 0, xiii_script::Value::Byte(1));
-        vm.set_property(
-            canvas,
-            "Font",
-            0,
-            xiii_script::Value::Name("Dummy".to_owned()),
-        );
         vm.set_canvas_fonts(Box::new(DummyFonts));
         let arg = xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(canvas)));
         session
@@ -4103,11 +4207,11 @@ mod tests {
         );
     }
 
-    /// A synthetic `CanvasFonts` provider: 4 units per character, 8 tall.
+    /// A synthetic `CanvasFonts` provider for any font: 4 units per character, 8 tall.
     struct DummyFonts;
     impl xiii_script::canvas::CanvasFonts for DummyFonts {
-        fn measure(&self, font: &str, text: &str) -> Option<(f32, f32)> {
-            (font.eq_ignore_ascii_case("Dummy")).then(|| (text.chars().count() as f32 * 4.0, 8.0))
+        fn measure(&self, _font: &str, text: &str) -> Option<(f32, f32)> {
+            Some((text.chars().count() as f32 * 4.0, 8.0))
         }
     }
 
@@ -4134,6 +4238,13 @@ mod tests {
             .vm_mut()
             .spawn(canvas_class, "TestCanvas")
             .expect("spawn Canvas");
+        let player = session.player;
+        let missing_font = hud::initialize_canvas_fonts(session.vm_mut(), player)
+            .expect_err("a pawn must not be accepted as an Engine.Canvas");
+        assert!(
+            missing_font.contains("has no SmallFont property"),
+            "unexpected Engine.Canvas initialization error: {missing_font}"
+        );
         let vm = session.vm_mut();
         vm.set_property(
             canvas,
@@ -4149,7 +4260,6 @@ mod tests {
         vm.set_property(canvas, "ClipX", 0, Value::Float(1280.0));
         vm.set_property(canvas, "ClipY", 0, Value::Float(720.0));
         vm.set_property(canvas, "Style", 0, Value::Byte(1));
-        vm.set_property(canvas, "Font", 0, Value::Name("Dummy".to_owned()));
         vm.set_canvas_fonts(Box::new(DummyFonts));
 
         // The HUD is the controller's `myHUD` (or the first live HUD actor).
@@ -4163,13 +4273,16 @@ mod tests {
                 .or_else(|| hud::find_hud(vm))
         }
         .expect("Plage00 has a live HUD");
-        // Host font bridge (as `hud::setup` does): assign the synthetic font to the HUD's own
-        // font properties.
-        for prop in ["SmallFont", "MedFont", "BigFont", "LargeFont"] {
-            session
-                .vm_mut()
-                .set_property(hud, prop, 0, Value::Name("Dummy".to_owned()));
-        }
+        let selected =
+            hud::initialize_canvas_fonts(session.vm_mut(), canvas).expect("Canvas native fonts");
+        assert_eq!(
+            session.vm().get_property(canvas, "SmallFont"),
+            Some(&Value::Name(selected[0].clone()))
+        );
+        assert_eq!(
+            session.vm().get_property(canvas, "MedFont"),
+            Some(&Value::Name(selected[1].clone()))
+        );
         let vm = session.vm_mut();
         let arg = Value::Object(Some(xiii_script::ObjRef::Instance(canvas)));
         match vm.send_event(hud, "PostRender", vec![arg]) {
@@ -4276,6 +4389,58 @@ mod tests {
         assert!(
             dead || health.is_some_and(|h| h <= 0.0),
             "BaseSoldier6 did not die: health {health:?}, dead {dead}"
+        );
+    }
+
+    /// Item38 acceptance: run the authored Plage01 route fixture, then verify the VM selected a
+    /// real death sequence for the named killer and left its non-looping channel at its final
+    /// frame. The renderer samples that VM channel every frame, including after it becomes
+    /// inactive, so the same state produces the corpse pose rather than a host-selected pose.
+    #[test]
+    fn opt_in_item38_plage01_route_killer_finishes_in_scripted_death_pose() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let route = script::Script::parse(include_str!("../../tests/data/plage01_route.script"))
+            .expect("parse the checked-in Plage01 route fixture");
+        let outcome = run_script(&game_dir, "Plage01", &route, &resolved.params, &scene, 65.0)
+            .expect("run the requested Plage01 route through the killer");
+        let vm = outcome.session.vm();
+        let killer = vm
+            .find_object("BaseSoldier6")
+            .expect("Plage01 BaseSoldier6 remains addressable as a corpse");
+        assert!(
+            outcome.session.actor_is_dead(killer),
+            "the route must kill BaseSoldier6"
+        );
+        let animation = vm
+            .actor_animation(killer)
+            .expect("the dead pawn keeps its VM animation channels");
+        println!(
+            "[item38 Plage01] BaseSoldier6 animation channels: {:?}",
+            animation.channels
+        );
+        let death = animation
+            .channels
+            .iter()
+            .find(|c| c.sequence.to_ascii_lowercase().starts_with("death"))
+            .expect("XIIIPawn.PlayDyingAnim must select a Death* sequence");
+        println!(
+            "[item38 Plage01] BaseSoldier6 bIsDead=true, death sequence {} frame {:.2}/{} active={}",
+            death.sequence, death.frame, death.frames, death.active
+        );
+        assert!(!death.looping, "a corpse death sequence must not loop");
+        assert!(
+            !death.active && death.frame >= death.frames.saturating_sub(1) as f32,
+            "the dying pose must remain at the sequence's final frame: {death:?}"
         );
     }
 

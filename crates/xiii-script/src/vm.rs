@@ -1005,9 +1005,22 @@ struct Timer {
 
 /// Event dispatched by timer slot 0/1/2 (UE2 `SetTimer`, `SetTimer2`, `Controller.SetTimer3`).
 const TIMER_EVENTS: [&str; 3] = ["Timer", "Timer2", "Timer3"];
+/// UE2 `EPhysics::PHYS_Walking` (engine.u enum order; see `item7b-movement-modes.md`).
+const PHYS_WALKING: u8 = 1;
+
+fn vm_move_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("XIII_VM_MOVE_TRACE")
+            .is_some_and(|value| value != "0" && !value.is_empty())
+    })
+}
 
 fn cine_trace_enabled() -> bool {
-    std::env::var_os("XIII_CINE_TRACE").is_some_and(|v| v != "0" && !v.is_empty())
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("XIII_CINE_TRACE").is_some_and(|v| v != "0" && !v.is_empty())
+    })
 }
 
 /// An interpreter object.
@@ -7739,22 +7752,42 @@ impl<'s> Vm<'s> {
         }
         let delta = [next[0] - location[0], next[1] - location[1], 0.0];
         let extent = self.actor_extent(pawn);
-        let outcome = self
-            .physics
-            .as_mut()
-            .map(|p| p.move_box(location, delta, extent));
-        let end = outcome.map_or_else(|| add3(location, delta), |o| o.end);
-        if cine_trace_enabled()
-            && self.objects[pawn as usize]
-                .name
-                .eq_ignore_ascii_case("Cine11")
-            && let Some(hit) = outcome.and_then(|o| o.hit)
+        // UE2 calls APawn::physWalking only for PHYS_Walking with world collision enabled.
+        // Controller.MoveTo can be
+        // requested for pawns in other physics modes (e.g. BaseSoldier defaults to PHYS_None),
+        // so do not apply walking step-up/floor-follow to them. Cine Steering also bypasses this
+        // path entirely while bCollideWorld is false (`collisionoff`).
+        let collides_world = match self.get_property(pawn, "bCollideWorld") {
+            Some(Value::Bool(enabled)) => *enabled,
+            // Native Actor default is bCollideWorld=true; small synthetic VM fixtures can omit
+            // the reflected slot while still modelling a walking Pawn.
+            _ => true,
+        };
+        let walking = self.byte_prop(pawn, "Physics") == PHYS_WALKING && collides_world;
+        let outcome = self.physics.as_mut().map(|p| {
+            if walking {
+                p.walk_box(location, delta, extent)
+            } else {
+                p.move_box(location, delta, extent)
+            }
+        });
+        if vm_move_trace_enabled()
+            && let Some(hit) = outcome.and_then(|outcome| outcome.hit)
         {
+            let object = &self.objects[pawn as usize];
+            let classname = self.set.path(object.class);
             println!(
-                "[cine-trace-block] t={:.3}s tick={} actor=Cine11 start={location:?} delta={delta:?} extent={extent:?} hit_time={:.6} hit_location={:?} normal={:?} end={end:?}",
-                self.time, self.tick_count, hit.time, hit.location, hit.normal
+                "[vm-pawn-move] pawn={} class={} Physics={} bCollideWorld={} walking={} from={location:?} delta={delta:?} extent={extent:?} hit_time={:.6} normal={:?}",
+                object.name,
+                classname,
+                self.byte_prop(pawn, "Physics"),
+                self.bool_prop(pawn, "bCollideWorld"),
+                walking,
+                hit.time,
+                hit.normal
             );
         }
+        let end = outcome.map_or_else(|| add3(location, delta), |o| o.end);
         self.set_property(pawn, "Location", 0, Value::Vector(end));
         Ok(horizontal_distance(end, destination) <= radius)
     }

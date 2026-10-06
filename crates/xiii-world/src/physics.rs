@@ -10,7 +10,9 @@
 
 use std::collections::HashMap;
 
-use xiii_collision::{CollisionWorld, MovingObject, Triangle, Vec3 as BevyVec3};
+use xiii_collision::{
+    CollisionWorld, MovingObject, Triangle, Vec3 as BevyVec3, WalkParams, walk_move,
+};
 use xiii_decode::common::{
     UNREAL_UNITS_PER_METER, to_bevy_direction, to_bevy_position, to_bevy_scale,
 };
@@ -172,6 +174,36 @@ impl WorldPhysics for WorldPhysicsAdapter {
                 hit: Some(hit),
             },
             None => MoveOutcome { end, hit: None },
+        }
+    }
+
+    fn walk_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        let center = to_bevy_position(start);
+        let end = [
+            start[0] + delta[0],
+            start[1] + delta[1],
+            start[2] + delta[2],
+        ];
+        let end_bevy = to_bevy_position(end);
+        let movement = [
+            end_bevy[0] - center[0],
+            end_bevy[1] - center[1],
+            end_bevy[2] - center[2],
+        ];
+        let half = unreal_extent_to_bevy(extent);
+        let params = WalkParams {
+            max_step_height: 35.0 / UNREAL_UNITS_PER_METER,
+            ..WalkParams::default()
+        };
+        let result = walk_move(&self.box_world, center, movement, half, &params);
+        let hit = result.contacts.first().map(|contact| WorldHit {
+            location: bevy_to_unreal_position(contact.position),
+            normal: bevy_to_unreal_direction(contact.normal),
+            time: contact.t,
+        });
+        MoveOutcome {
+            end: bevy_to_unreal_position(result.position),
+            hit,
         }
     }
 
@@ -351,6 +383,43 @@ mod tests {
         // Point-free: in the air above the floor yes, inside the wall no.
         assert!(p.point_free(u([0.0, 4.0, 0.0]), [10.0, 10.0, 10.0]));
         assert!(!p.point_free(u([-5.0, 0.25, 0.0]), [10.0, 10.0, 10.0]));
+    }
+
+    #[test]
+    fn walk_box_steps_up_within_engine_step_height_and_rejects_higher_steps() {
+        // Floor at Bevy Y=0; a 0.3 m ledge is below 35 UU (0.3889 m), while a 0.5 m
+        // ledge is above it. Each ledge is represented by its top and vertical face.
+        let ledge = |height: f32| -> Vec<(Triangle, u32)> {
+            vec![
+                ([[-2.0, 0.0, -2.0], [0.5, 0.0, -2.0], [0.5, 0.0, 2.0]], 0),
+                ([[-2.0, 0.0, -2.0], [0.5, 0.0, 2.0], [-2.0, 0.0, 2.0]], 0),
+                (
+                    [[0.5, 0.0, -2.0], [0.5, height, -2.0], [0.5, height, 2.0]],
+                    1,
+                ),
+                ([[0.5, 0.0, -2.0], [0.5, height, 2.0], [0.5, 0.0, 2.0]], 1),
+                (
+                    [[0.5, height, -2.0], [4.0, height, -2.0], [4.0, height, 2.0]],
+                    1,
+                ),
+                (
+                    [[0.5, height, -2.0], [4.0, height, 2.0], [0.5, height, 2.0]],
+                    1,
+                ),
+            ]
+        };
+        let s = UNREAL_UNITS_PER_METER;
+        let start = u([-1.0, 0.9, 0.0]);
+        let extent = [0.2 * s, 0.2 * s, 0.9 * s];
+        let delta = [0.0, 2.0 * s, 0.0];
+        let mut low = WorldPhysicsAdapter::from_entries(ledge(0.3), Vec::new());
+        let stepped = low.walk_box(start, delta, extent);
+        assert!(stepped.end[1] > start[1] + 1.0 * s, "{stepped:?}");
+        assert!(stepped.end[2] >= 0.3 * s - 2.0, "{stepped:?}");
+
+        let mut high = WorldPhysicsAdapter::from_entries(ledge(0.5), Vec::new());
+        let blocked = high.walk_box(start, delta, extent);
+        assert!(blocked.end[1] < start[1] + 1.5 * s, "{blocked:?}");
     }
 
     #[test]
