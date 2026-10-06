@@ -66,6 +66,10 @@ fn main() -> AppExit {
             );
         }
         let menu_exit = menu::build_menu_app(opts.clone()).run();
+        if let Some(slot) = menu::take_save_load_request() {
+            println!("[app] menu requested save slot {slot}; handing off to --play --load {slot}");
+            return run_play_travel_step(&opts, "Plage00", Some(slot));
+        }
         if let Some(req) = menu::take_travel_request() {
             // The game's own `PlayerController.ClientTravel` asked for a map. Bevy/winit only
             // allows one event loop per process, so the host travel step starts `--play` as a
@@ -75,7 +79,7 @@ fn main() -> AppExit {
                 "[app] host travel step: the menu requested map {}; starting --play --map {}",
                 req.map, req.map
             );
-            return run_play_travel_step(&opts, &req.map);
+            return run_play_travel_step(&opts, &req.map, None);
         }
         return menu_exit;
     }
@@ -98,7 +102,7 @@ fn main() -> AppExit {
 /// Host travel step: launches this binary in `--play` mode on the map the menu's own
 /// `ClientTravel` requested, forwarding the unattended flags, and returns the child's exit
 /// status. A separate process is required because Bevy/winit builds its event loop once.
-fn run_play_travel_step(opts: &cli::Options, map: &str) -> AppExit {
+fn run_play_travel_step(opts: &cli::Options, map: &str, load: Option<u32>) -> AppExit {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -108,8 +112,14 @@ fn run_play_travel_step(opts: &cli::Options, map: &str) -> AppExit {
     };
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--play").arg("--map").arg(map);
+    if let Some(slot) = load {
+        cmd.arg("--load").arg(slot.to_string());
+    }
     if let Some(dir) = &opts.game_dir {
         cmd.arg("--game-dir").arg(dir);
+    }
+    if let Some(dir) = &opts.save_dir {
+        cmd.arg("--save-dir").arg(dir);
     }
     if let Some(secs) = opts.exit_after_secs {
         cmd.arg("--exit-after-secs").arg(secs.to_string());

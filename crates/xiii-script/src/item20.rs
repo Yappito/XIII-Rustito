@@ -1,24 +1,139 @@
 //! item20 GUI save-slot native declarations.
 //!
-//! Disk persistence belongs to `xiii-app`, not the filesystem-free VM. Until the menu VM has a
-//! host save-store adapter, these natives reject requests explicitly rather than claiming a slot
-//! read/write succeeded. `GetMaxNumberOfSavingSlots` reflects the ten-slot GUI range used by the
-//! decoded front-end; request/poll operations return false and therefore remain visibly blocked.
+//! GUI save-slot natives delegate to a host-installed provider; the VM itself has no filesystem.
 
 use crate::registry::{NativeCtx, NativeDef, NativeFn, NativeOutcome, NativeStatus};
 use crate::value::Value;
 use crate::vm::{Vm, VmResult};
 
-fn unavailable(vm: &mut Vm<'_>, ctx: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
-    vm.note(crate::vm::TraceKind::Note(format!(
-        "item20 {} unavailable: GUI host save-store adapter is not connected",
-        ctx.path
-    )));
-    if ctx.path.ends_with("GetMaxNumberOfSavingSlots") {
-        Ok(NativeOutcome::Value(Value::Int(10)))
-    } else {
-        Ok(NativeOutcome::Value(Value::Bool(false)))
+/// Metadata for one host save slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveSlotInfo {
+    /// User-visible save description.
+    pub description: String,
+    /// Calendar `[year, month, day, hour, minute]` in UTC.
+    pub date: [i32; 5],
+}
+
+/// Synchronous save-slot interface installed by a front-end host.
+pub trait SaveSlotProvider {
+    /// Returns metadata for an occupied slot.
+    fn slot(&self, slot: u32) -> Option<SaveSlotInfo>;
+    /// Starts an empty-slot query.
+    fn request_empty(&mut self, slot: u32) -> bool;
+    /// Completes the prior empty-slot query.
+    fn poll_empty(&mut self) -> Option<bool>;
+    /// Starts a description query.
+    fn request_description(&mut self, slot: u32) -> bool;
+    /// Completes the prior description query.
+    fn poll_description(&mut self) -> Option<String>;
+    /// Starts a date/time query.
+    fn request_date(&mut self, slot: u32) -> bool;
+    /// Completes the prior date/time query.
+    fn poll_date(&mut self) -> Option<[i32; 5]>;
+    /// Starts reading an occupied slot.
+    fn request_read(&mut self, slot: u32) -> bool;
+    /// Reports whether the requested read completed.
+    fn poll_read(&mut self) -> bool;
+    /// Takes the selected slot after the menu calls `LoadAtCheckpoint`.
+    fn take_read_slot(&mut self) -> Option<u32>;
+}
+
+fn native(vm: &mut Vm<'_>, ctx: &NativeCtx, args: &mut [Value]) -> VmResult<NativeOutcome> {
+    let path = ctx.path.rsplit('.').next().unwrap_or(&ctx.path);
+    if std::env::var_os("XIII_WATCH_SAVE_SLOTS").is_some() {
+        eprintln!("[vm-save-slot] {} args={:?}", ctx.path, args);
     }
+    if path == "GetMaxNumberOfSavingSlots" {
+        return Ok(NativeOutcome::Value(Value::Int(10)));
+    }
+    let Some(provider) = vm.save_slots_mut() else {
+        vm.note(crate::vm::TraceKind::Note(format!(
+            "item20 {path}: no host save-store provider"
+        )));
+        return Ok(NativeOutcome::Value(Value::Bool(false)));
+    };
+    let slot_arg = || {
+        args.first().and_then(|v| match v {
+            Value::Int(n) if *n >= 0 => Some(*n as u32),
+            _ => None,
+        })
+    };
+    let ok = match path {
+        "RequestIsSlotEmpty" => slot_arg().is_some_and(|s| provider.request_empty(s)),
+        "IsSlotEmptyFinished" => {
+            if args.len() >= 2 {
+                match provider.poll_empty() {
+                    Some(empty) => {
+                        args[0] = Value::Int(0);
+                        args[1] = Value::Bool(empty);
+                    }
+                    None => {
+                        args[0] = Value::Int(-1);
+                        args[1] = Value::Bool(true);
+                    }
+                }
+            }
+            true
+        }
+        "RequestGetSlotContentDescription" => {
+            slot_arg().is_some_and(|s| provider.request_description(s))
+        }
+        "IsGetSlotContentDescriptionFinished" => {
+            if args.len() >= 2 {
+                match provider.poll_description() {
+                    Some(description) => {
+                        args[0] = Value::Int(0);
+                        args[1] = Value::Str(description);
+                    }
+                    None => {
+                        args[0] = Value::Int(-1);
+                        args[1] = Value::Str(String::new());
+                    }
+                }
+            }
+            true
+        }
+        "RequestGetSlotContentDateAndTime" => slot_arg().is_some_and(|s| provider.request_date(s)),
+        "IsGetSlotContentDateAndTimeFinished" => {
+            if args.len() >= 6 {
+                match provider.poll_date() {
+                    Some(d) => {
+                        args[0] = Value::Int(0);
+                        for (a, v) in args[1..6].iter_mut().zip(d) {
+                            *a = Value::Int(v);
+                        }
+                    }
+                    None => {
+                        args[0] = Value::Int(-1);
+                        for a in &mut args[1..6] {
+                            *a = Value::Int(0);
+                        }
+                    }
+                }
+            }
+            true
+        }
+        "RequestReadSlot" => slot_arg().is_some_and(|s| provider.request_read(s)),
+        "IsReadSlotFinished" => {
+            if let Some(a) = args.first_mut() {
+                *a = Value::Int(0);
+            }
+            provider.poll_read()
+        }
+        "LoadAtCheckpoint" => {
+            if let Some(slot) = provider.take_read_slot() {
+                vm.note(crate::vm::TraceKind::Note(format!(
+                    "GUI_SAVE_LOAD_SLOT:{slot}"
+                )));
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
+    Ok(NativeOutcome::Value(Value::Bool(ok)))
 }
 
 fn def(path: &'static str, signature: &'static str, evidence: &'static str) -> NativeDef {
@@ -26,11 +141,9 @@ fn def(path: &'static str, signature: &'static str, evidence: &'static str) -> N
         path,
         signature,
         evidence,
-        status: NativeStatus::Partial(
-            "menu host save-store adapter is not connected; this call reports failure",
-        ),
+        status: NativeStatus::Implemented,
         short_circuit: None,
-        f: unavailable as NativeFn,
+        f: native as NativeFn,
     }
 }
 
@@ -103,7 +216,7 @@ mod tests {
                 "duplicate {}",
                 d.path
             );
-            assert!(matches!(d.status, NativeStatus::Partial(_)));
+            assert!(matches!(d.status, NativeStatus::Implemented));
             assert!(!d.signature.is_empty() && !d.evidence.is_empty());
         }
     }

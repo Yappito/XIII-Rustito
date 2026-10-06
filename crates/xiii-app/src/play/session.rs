@@ -205,6 +205,20 @@ impl Session {
     /// map actor, runs the level start tolerantly and creates the player pawn (script path when
     /// it works, explicit harness bootstrap otherwise).
     pub fn open(game_dir: &Path, map: &str) -> Result<Session, String> {
+        Self::open_inner(game_dir, map, None)
+    }
+
+    /// Opens a map as a checkpoint resume, asking its level-start scripts to see the game's
+    /// `StartSpotEvent=LOAD` condition before any placed actor's startup callbacks execute.
+    pub fn open_checkpoint(game_dir: &Path, map: &str) -> Result<Session, String> {
+        Self::open_inner(game_dir, map, Some("LOAD"))
+    }
+
+    fn open_inner(
+        game_dir: &Path,
+        map: &str,
+        start_event: Option<&str>,
+    ) -> Result<Session, String> {
         let (set, map_idx) = runtime::load_with_map(game_dir, map)?;
         let set: &'static ScriptSet = Box::leak(Box::new(set));
         let mut vm = Vm::new(set, VmLimits::default());
@@ -250,7 +264,12 @@ impl Session {
         })?;
 
         // The runtime owns the single-player URL; `LevelInfo.GetLocalURL` and
-        // `GameInfo.InitGame`/`Login` read it before any actor begins play.
+        // `GameInfo.InitGame`/`Login` read it before any actor begins play. No decoded script
+        // parses a `?load=` option (`XIIIGameInfo.InitGame` 0x0006..0x004D reads
+        // Name/Class/Team; `Engine.GameInfo.InitGame` reads Difficulty/GameSpeed/AccessControl/
+        // AdminPassword/GameRules), so the retail `?load=9` option of
+        // `PlayerController.QuickLoad` is consumed by the engine's native load path — the port
+        // presents the resume through the post-login `StartSpotEvent` set below instead.
         runtime::configure_local_url(&mut vm, game_dir, map);
 
         let begin = runtime::begin_play_all(&mut vm, &actors, game_class);
@@ -381,6 +400,13 @@ impl Session {
             );
         }
         let player = player.expect("player created above");
+        if let Some(event) = start_event {
+            // The engine's checkpoint-load path sets GameInfo.StartSpotEvent after the login
+            // chain (XIII's own `RestartPlayer` copies `StartSpot.Event` into it first —
+            // bytecode 0x037A). `Plage00.FirstFrame`'s guard at 0x0013 then skips re-applying
+            // the wounded intro Health when it reads "LOAD". Set it here, once, after spawn.
+            vm.set_start_spot_event(event);
+        }
 
         let dispatcher = vm.find_object("XIIIDispatcher0");
 
@@ -2621,6 +2647,150 @@ mod tests {
         println!(
             "[save test] checkpoint {:?} teleporter={:?} description={:?}",
             save.actor, save.teleporter_name, save.description
+        );
+    }
+
+    #[test]
+    fn opt_in_plage00_checkpoint_resume_retains_health_for_ten_seconds() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session =
+            Session::open_checkpoint(&game_dir, "Plage00").expect("open Plage00 resume");
+        // The port presents the resume the way the engine's native checkpoint-load path does:
+        // after the login chain (`XIIIGameInfo.RestartPlayer` 0x037A has already copied
+        // `StartSpot.Event`), GameInfo.StartSpotEvent is "LOAD", so the level's own
+        // `Plage00.FirstFrame` guard (0x0013) skips re-applying the wounded intro Health.
+        let game_info = session.game_info.expect("GameInfo");
+        assert_eq!(
+            session.vm().get_property(game_info, "StartSpotEvent"),
+            Some(&Value::Name("LOAD".into())),
+            "open_checkpoint must leave StartSpotEvent=LOAD after the login chain"
+        );
+        let saved = crate::save::SaveFile {
+            map: "Plage00".into(),
+            teleporter: "PlayerStart".into(),
+            description: "corpus resume regression".into(),
+            health: 150.0,
+            speed_factor_limit: 1.0,
+            checkpoint_number: 7,
+            location: session.player_location().expect("player location"),
+            rotation: session.player_rotation().unwrap_or([0; 3]),
+            objectives: session
+                .objective_states()
+                .into_iter()
+                .map(|o| crate::save::Objective {
+                    completed: o.completed,
+                    primary: o.primary,
+                    anti_goal: o.anti_goal,
+                })
+                .collect(),
+            inventory: Vec::new(),
+        };
+        // One restore, before the first ticked step — the same point the `--play` host applies
+        // it (`setup_inner`, after `Session::open`). FirstFrame runs later, on the MapInfo's
+        // first Timer tick, and must not overwrite the restored fields.
+        let location = saved.location;
+        session
+            .restore_checkpoint(&saved)
+            .expect("apply checkpoint once before the first step");
+        assert_eq!(
+            session.vm().get_property(game_info, "CheckpointNumber"),
+            Some(&Value::Int(7)),
+            "the restore must set the saved CheckpointNumber before play resumes"
+        );
+        let mut health_min = f32::MAX;
+        for _ in 0..660 {
+            session.step(
+                1.0 / 60.0,
+                location,
+                0.0,
+                [0.0; 3],
+                &PlayerVMModes::default(),
+            );
+            if let Some(h) = session.player_health() {
+                health_min = health_min.min(h);
+            }
+        }
+        assert!(
+            session.vm_time() >= 10.0,
+            "did not simulate ten seconds (t={})",
+            session.vm_time()
+        );
+        assert_eq!(
+            session.player_health(),
+            Some(150.0),
+            "FirstFrame re-applied the wounded intro health over the restored value"
+        );
+        assert!(
+            (health_min - 150.0).abs() < f32::EPSILON,
+            "health dropped below the restored 150 during ten seconds (min {health_min})"
+        );
+        assert_eq!(
+            session
+                .objective_states()
+                .iter()
+                .map(|o| (o.completed, o.primary, o.anti_goal))
+                .collect::<Vec<_>>(),
+            saved
+                .objectives
+                .iter()
+                .map(|o| (o.completed, o.primary, o.anti_goal))
+                .collect::<Vec<_>>()
+        );
+        // `RestartPlayer`'s own `TriggerEvent(StartSpot.Event)` re-arms the level's
+        // Tag='Debut' `XIIISaveGameTrigger`, whose `GoSaving.DoSave` (0x0191) increments the
+        // checkpoint again during resumed play — the game's own re-save, measured 7 -> 8.
+        let checkpoint_now = session.vm().get_property(game_info, "CheckpointNumber");
+        assert!(
+            matches!(checkpoint_now, Some(Value::Int(n)) if *n >= 7),
+            "CheckpointNumber regressed below the restored 7 ({checkpoint_now:?})"
+        );
+        println!(
+            "[save corpus] Plage00 Health={} checkpoint={checkpoint_now:?} after {:.3}s of resumed play",
+            session.player_health().unwrap_or(-1.0),
+            session.vm_time()
+        );
+    }
+
+    /// Opt-in corpus regression (coordinator requirement): a normal (non-checkpoint) Plage00
+    /// start must still run `Plage00.FirstFrame`'s wounded-intro write
+    /// (`Health = default.Health * 0.5` at bytecode 0x003E), because `StartSpotEvent` is the
+    /// PlayerStart's own `Event` (`'Debut'`), not "LOAD".
+    #[test]
+    fn opt_in_plage00_normal_start_applies_the_wounded_intro_health() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00");
+        assert_eq!(
+            session
+                .vm()
+                .get_property(session.game_info.expect("GameInfo"), "StartSpotEvent"),
+            Some(&Value::Name("Debut".into())),
+            "a normal start must leave RestartPlayer's StartSpot.Event value in place"
+        );
+        let location = session.player_location().expect("player location");
+        for _ in 0..30 {
+            session.step(
+                1.0 / 60.0,
+                location,
+                0.0,
+                [0.0; 3],
+                &PlayerVMModes::default(),
+            );
+        }
+        assert_eq!(
+            session.player_health(),
+            Some(75.0),
+            "FirstFrame's wounded-intro Health write (default 150 * 0.5) did not run"
+        );
+        println!(
+            "[save corpus] normal Plage00 start: Health={} after {:.3}s",
+            session.player_health().unwrap_or(-1.0),
+            session.vm_time()
         );
     }
 

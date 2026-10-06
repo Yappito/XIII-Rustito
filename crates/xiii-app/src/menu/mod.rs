@@ -38,6 +38,7 @@ use xiii_package::Limits;
 use xiii_package::ObjectRef as PkgRef;
 use xiii_script::canvas::{CanvasFonts, DrawCommand, TravelRequest, parse_travel_note};
 use xiii_script::{ObjRef, ObjectId, ScriptSet, TraceKind, Value, Vm, VmLimits};
+use xiii_script::{SaveSlotInfo, SaveSlotProvider};
 use xiii_world::PackageCache;
 use xiii_world::runtime;
 
@@ -47,6 +48,115 @@ use crate::play::hud::{self, FontDb};
 /// Process-wide travel request written when the menu selects New game and read by `main`, which
 /// then performs the host travel step (`--play` on the requested map).
 static TRAVEL_REQUEST: Mutex<Option<TravelRequest>> = Mutex::new(None);
+static SAVE_LOAD_REQUEST: Mutex<Option<u32>> = Mutex::new(None);
+
+pub fn take_save_load_request() -> Option<u32> {
+    SAVE_LOAD_REQUEST.lock().ok().and_then(|mut g| g.take())
+}
+
+fn save_dir(options: &Options) -> Result<PathBuf, String> {
+    match &options.save_dir {
+        Some(dir) => Ok(dir.clone()),
+        None => crate::save::default_save_dir(),
+    }
+}
+
+struct MenuSaveSlots {
+    store: crate::save::SaveStore,
+    slots: Vec<crate::save::SlotInfo>,
+    requested: Option<(u8, u32)>,
+    read_slot: Option<u32>,
+}
+impl MenuSaveSlots {
+    fn open(dir: PathBuf) -> Result<Self, String> {
+        let store = crate::save::SaveStore::open(dir);
+        let slots = store.list()?;
+        Ok(Self {
+            store,
+            slots,
+            requested: None,
+            read_slot: None,
+        })
+    }
+
+    fn info(&self, slot: u32) -> Option<SaveSlotInfo> {
+        let i = self.slots.iter().find(|i| i.slot == slot)?;
+        let secs = i.modified_unix as i64;
+        let days = secs.div_euclid(86400);
+        let sod = secs.rem_euclid(86400);
+        let z = days + 719468;
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let mut y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = mp + if mp < 10 { 3 } else { -9 };
+        y += i64::from(m <= 2);
+        Some(SaveSlotInfo {
+            description: i.description.clone(),
+            date: [
+                y as i32,
+                m as i32,
+                d as i32,
+                (sod / 3600) as i32,
+                ((sod % 3600) / 60) as i32,
+            ],
+        })
+    }
+}
+impl SaveSlotProvider for MenuSaveSlots {
+    fn slot(&self, s: u32) -> Option<SaveSlotInfo> {
+        self.info(s)
+    }
+    fn request_empty(&mut self, s: u32) -> bool {
+        if s >= 10 {
+            return false;
+        }
+        self.requested = Some((0, s));
+        true
+    }
+    fn poll_empty(&mut self) -> Option<bool> {
+        let (_, s) = self.requested?;
+        Some(self.info(s).is_none())
+    }
+    fn request_description(&mut self, s: u32) -> bool {
+        if self.info(s).is_none() {
+            return false;
+        }
+        self.requested = Some((1, s));
+        true
+    }
+    fn poll_description(&mut self) -> Option<String> {
+        let (_, s) = self.requested?;
+        Some(self.info(s)?.description)
+    }
+    fn request_date(&mut self, s: u32) -> bool {
+        if self.info(s).is_none() {
+            return false;
+        }
+        self.requested = Some((2, s));
+        true
+    }
+    fn poll_date(&mut self) -> Option<[i32; 5]> {
+        let (_, s) = self.requested?;
+        Some(self.info(s)?.date)
+    }
+    fn request_read(&mut self, s: u32) -> bool {
+        if self.info(s).is_none() || self.store.read(s).is_err() {
+            return false;
+        }
+        self.read_slot = Some(s);
+        true
+    }
+    fn poll_read(&mut self) -> bool {
+        self.read_slot.is_some()
+    }
+    fn take_read_slot(&mut self) -> Option<u32> {
+        self.read_slot.take()
+    }
+}
 
 /// Takes the recorded travel request, if any.
 pub fn take_travel_request() -> Option<TravelRequest> {
@@ -199,6 +309,7 @@ impl MenuScript {
 /// The menu VM: the spawned root/page/controls, the decoded fonts and the current draw list.
 pub struct MenuSession {
     vm: Vm<'static>,
+    save_dir: PathBuf,
     root: ObjectId,
     page: ObjectId,
     canvas: ObjectId,
@@ -207,6 +318,7 @@ pub struct MenuSession {
     fonts: Option<Arc<FontDb>>,
     packages: PackageCache,
     commands: Vec<DrawCommand>,
+    slot_lines: Vec<String>,
     entities: Vec<Entity>,
     clip: [f32; 2],
     trace_cursor: usize,
@@ -309,12 +421,17 @@ impl xiii_script::ExternalObjectData for MenuTextureData {
 impl MenuSession {
     /// Loads the script set and entry map, and spawns the root controller + main menu page. Fonts
     /// are loaded later (they need the Bevy `Assets<Image>`).
-    fn open(game_dir: &Path, script: Option<MenuScript>) -> Result<MenuSession, String> {
+    fn open(
+        game_dir: &Path,
+        save_dir: PathBuf,
+        script: Option<MenuScript>,
+    ) -> Result<MenuSession, String> {
         // `[URL] LocalMap=mapmenu.unr` in Default.ini is the local front-end map. `[URL] Map`
         // names `Index.unr`, which is absent from this corpus; MapMenu is the installed one.
         let (set, map_idx) = runtime::load_with_map(game_dir, "MapMenu")?;
         let set: &'static ScriptSet = Box::leak(Box::new(set));
         let mut vm = Vm::new(set, VmLimits::default());
+        vm.set_save_slots(Box::new(MenuSaveSlots::open(save_dir.clone())?));
         runtime::configure_localization(&mut vm, game_dir)?;
         runtime::configure_external_objects(&mut vm, game_dir);
         // The menu's `DynamicLoadObject` names are leaf names whose exports live under a group
@@ -483,6 +600,7 @@ impl MenuSession {
         let trace_cursor = vm.trace.len();
         Ok(MenuSession {
             vm,
+            save_dir,
             root,
             page,
             canvas,
@@ -491,6 +609,7 @@ impl MenuSession {
             fonts: None,
             packages,
             commands: Vec::new(),
+            slot_lines: Vec::new(),
             entities: Vec::new(),
             clip: [0.0, 0.0],
             trace_cursor,
@@ -524,6 +643,9 @@ impl MenuSession {
             }
             let action = s.action.clone();
             self.next_action += 1;
+            if std::env::var_os("XIII_WATCH_SAVE_SLOTS").is_some() {
+                eprintln!("[menu-action] {action:?} at {elapsed:.3}");
+            }
             if let Err(e) = self.apply_action(&action) {
                 self.errors.push(format!("{action:?}: {e}"));
             }
@@ -552,6 +674,14 @@ impl MenuSession {
                 && let Some(req) = parse_travel_note(note)
             {
                 self.travel = Some(req);
+            }
+            if let TraceKind::Note(note) = &ev.kind
+                && let Some(slot) = note
+                    .strip_prefix("GUI_SAVE_LOAD_SLOT:")
+                    .and_then(|s| s.parse().ok())
+                && let Ok(mut request) = SAVE_LOAD_REQUEST.lock()
+            {
+                *request = Some(slot);
             }
         }
         self.trace_cursor = self.vm.trace.len();
@@ -585,6 +715,54 @@ impl MenuSession {
                 Ok(())
             }
             Action::Click(target) => {
+                if !self.vm.is_a(self.page, "XIIIMenuLoadGameWindow")
+                    && target.eq_ignore_ascii_case("loadgame")
+                {
+                    return self.open_page("XIDInterf.XIIIMenuLoadGameWindow");
+                }
+                if !self.vm.is_a(self.page, "XIIIMenuLoadGameWindow")
+                    && target.eq_ignore_ascii_case("continue")
+                {
+                    let store = crate::save::SaveStore::open(self.save_dir.clone());
+                    let newest = store
+                        .newest()?
+                        .ok_or("Continue requested but no save slot exists")?;
+                    if let Ok(mut request) = SAVE_LOAD_REQUEST.lock() {
+                        *request = Some(newest.slot);
+                    }
+                    println!(
+                        "[menu] Continue selected newest save slot {} ({})",
+                        newest.slot, newest.description
+                    );
+                    return Ok(());
+                }
+                if self.vm.is_a(self.page, "XIIIMenuLoadGameWindow")
+                    && let Ok(control_index) = target.parse::<u32>()
+                    && control_index >= 2
+                {
+                    let visible = match self.vm.get_property(self.page, "MaxViewable") {
+                        Some(Value::Int(n)) if *n > 0 => *n as u32,
+                        _ => 5,
+                    };
+                    let page = match self.vm.get_property(self.page, "onPage") {
+                        Some(Value::Int(n)) if *n > 0 => *n as u32,
+                        _ => 1,
+                    };
+                    let slot = (page - 1) * visible + control_index - 2;
+                    let Some(provider) = self.vm.save_slots_mut() else {
+                        return Err("save-slot provider is unavailable".into());
+                    };
+                    if !provider.request_read(slot) || !provider.poll_read() {
+                        return Err(format!("save slot {slot} is empty or unreadable"));
+                    }
+                    let Some(slot) = provider.take_read_slot() else {
+                        return Err("save-slot provider did not return the selected slot".into());
+                    };
+                    if let Ok(mut request) = SAVE_LOAD_REQUEST.lock() {
+                        *request = Some(slot);
+                    }
+                    return Ok(());
+                }
                 let c = self
                     .control(target)
                     .ok_or_else(|| format!("no control {target:?}"))?;
@@ -656,6 +834,40 @@ impl MenuSession {
         ) {
             self.errors.push(format!("{class_name}.InitComponent: {e}"));
         }
+        if class_name.eq_ignore_ascii_case("XIDInterf.XIIIMenuLoadGameWindow") {
+            // The state machine uses GUI.dll's latent Sleep/poll loop. This host GUI page has no
+            // native GUI scheduler, so complete its already-requested slot queries from the same
+            // provider and feed the page's own SaveSlotsInfo/PageSwitch presentation path.
+            let _ = self.vm.goto_state(page, "None", None);
+            let provider = MenuSaveSlots::open(self.save_dir.clone())?;
+            let mut info = vec![Value::Str(String::new()); 10];
+            self.slot_lines.clear();
+            for slot in &provider.slots {
+                let Some(slot_info) = provider.info(slot.slot) else {
+                    continue;
+                };
+                let [year, month, day, hour, minute] = slot_info.date;
+                let minute = if minute < 10 {
+                    format!("0{minute}")
+                } else {
+                    minute.to_string()
+                };
+                let rendered = format!(
+                    "{}  {hour}:{minute} {month}/{day}/{year}",
+                    slot_info.description
+                );
+                if slot.slot < 5 {
+                    self.slot_lines.push(rendered.clone());
+                }
+                info[slot.slot as usize] = Value::Str(rendered);
+            }
+            for (index, value) in info.into_iter().enumerate() {
+                self.vm.set_property(page, "SaveSlotsInfo", index, value);
+            }
+            if let Err(e) = self.vm.send_event(page, "PageSwitch", Vec::new()) {
+                self.errors.push(format!("load-game PageSwitch: {e}"));
+            }
+        }
         let mut controls = Vec::new();
         let mut labels = Vec::new();
         if let Some(Value::Array(items)) = self.vm.get_property(page, "Controls").cloned() {
@@ -668,8 +880,10 @@ impl MenuSession {
             }
         }
         println!(
-            "[menu] opened page {class_name}: {} control(s)",
-            controls.len()
+            "[menu] opened page {class_name}: {} control(s), state={:?}, active={}",
+            controls.len(),
+            self.vm.state_name(page),
+            self.vm.objects[page as usize].active
         );
         self.page = page;
         self.controls = controls;
@@ -722,6 +936,20 @@ impl MenuSession {
         // the page origin in place from the page's `__OnDraw__`.
         self.call(self.page, "AfterPaint", vec![canvas, zero(), zero()]);
         self.commands = self.vm.drain_canvas();
+        for (i, line) in self.slot_lines.iter().enumerate() {
+            self.commands.push(DrawCommand::Text {
+                text: line.clone(),
+                x: 165.0,
+                y: 220.0 + i as f32 * 30.0,
+                font: Some("XIIIFonts.PoliceF16".into()),
+                color: [255, 255, 255, 255],
+                clip: self.clip,
+                center: false,
+                style: 1,
+                justify: 0,
+                clipped: true,
+            });
+        }
         self.fps += 1;
     }
 
@@ -914,13 +1142,14 @@ impl Plugin for MenuPlugin {
         let t0 = Instant::now();
         let session = match &self.options.menu_script {
             Some(path) => match MenuScript::load(path) {
-                Ok(s) => MenuSession::open(&game_dir, Some(s)),
+                Ok(s) => save_dir(&self.options)
+                    .and_then(|dir| MenuSession::open(&game_dir, dir, Some(s))),
                 Err(e) => {
                     eprintln!("[menu] input script {}: {e}", path.display());
                     Err(e)
                 }
             },
-            None => MenuSession::open(&game_dir, None),
+            None => save_dir(&self.options).and_then(|dir| MenuSession::open(&game_dir, dir, None)),
         };
         println!(
             "[menu] menu session open (MapMenu + XIDInterf.XIIIMenu): {:.2}s",
@@ -1397,6 +1626,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn menu_slot_provider_lists_dates_and_requires_an_existing_slot_for_read() {
+        let dir = std::env::temp_dir().join(format!("xiii-menu-store-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let save = crate::save::SaveFile {
+            map: "Plage00".into(),
+            teleporter: "PlayerStart".into(),
+            description: "Synthetic beach".into(),
+            health: 150.0,
+            speed_factor_limit: 1.0,
+            checkpoint_number: 1,
+            location: [0.0; 3],
+            rotation: [0; 3],
+            objectives: Vec::new(),
+            inventory: Vec::new(),
+        };
+        crate::save::write(&dir, 3, &save).unwrap();
+        let mut provider = MenuSaveSlots::open(dir.clone()).unwrap();
+        let listed = provider.slot(3).unwrap();
+        assert_eq!(listed.description, "Synthetic beach");
+        assert!((1970..=9999).contains(&listed.date[0]));
+        assert!((1..=12).contains(&listed.date[1]));
+        assert!((1..=31).contains(&listed.date[2]));
+        assert!((0..=23).contains(&listed.date[3]));
+        assert!((0..=59).contains(&listed.date[4]));
+        assert!(provider.slot(10).is_none());
+        assert!(!provider.request_empty(10));
+        assert!(provider.request_empty(3));
+        assert_eq!(provider.poll_empty(), Some(false));
+        assert!(provider.request_description(3));
+        assert_eq!(
+            provider.poll_description().as_deref(),
+            Some("Synthetic beach")
+        );
+        assert!(!provider.request_read(2));
+        assert!(provider.request_read(3));
+        assert!(provider.poll_read());
+        assert_eq!(provider.take_read_slot(), Some(3));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn menu_script_parses_actions_and_rejects_bad_lines() {
         let s = MenuScript::parse(
             "# comment\nt=0.5 newgame\nt=1.0 key down\n t=2 focus 4\nt=3 click quit\n",
@@ -1561,8 +1831,12 @@ mod tests {
             return;
         };
         let script = MenuScript::parse("t=0.1 newgame\n").unwrap();
-        let mut session =
-            MenuSession::open(&game_dir, Some(script)).expect("open the front-end menu");
+        let mut session = MenuSession::open(
+            &game_dir,
+            save_dir(&Options::default()).unwrap(),
+            Some(script),
+        )
+        .expect("open the front-end menu");
         assert_eq!(
             session.controls.len(),
             XIIIMENU_CONTROL_COUNT,
@@ -1615,7 +1889,9 @@ mod tests {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
         };
-        let mut session = MenuSession::open(&game_dir, None).expect("open the front-end menu");
+        let mut session =
+            MenuSession::open(&game_dir, save_dir(&Options::default()).unwrap(), None)
+                .expect("open the front-end menu");
         session.clip = [1280.0, 720.0];
         session.refresh_commands();
         let clip = session.clip;

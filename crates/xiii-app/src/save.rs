@@ -33,6 +33,57 @@ pub struct InventoryItem {
     pub name: String,
 }
 
+/// Metadata shown by the decoded load-game page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotInfo {
+    pub slot: u32,
+    pub description: String,
+    pub modified_unix: u64,
+}
+
+/// Host-side store adapter for the ten GUI save slots.
+pub struct SaveStore {
+    dir: PathBuf,
+}
+
+impl SaveStore {
+    pub fn open(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+    pub fn list(&self) -> Result<Vec<SlotInfo>, String> {
+        let mut slots = Vec::new();
+        for slot in 0..10 {
+            let path = slot_path(&self.dir, slot);
+            if !path.is_file() {
+                continue;
+            }
+            let save = read(&self.dir, slot)?;
+            let modified = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .map_err(|e| format!("reading modification time for {}: {e}", path.display()))?;
+            let modified_unix = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| format!("save slot {} predates the Unix epoch: {e}", path.display()))?
+                .as_secs();
+            slots.push(SlotInfo {
+                slot,
+                description: save.description,
+                modified_unix,
+            });
+        }
+        Ok(slots)
+    }
+    pub fn read(&self, slot: u32) -> Result<SaveFile, String> {
+        read(&self.dir, slot)
+    }
+    pub fn newest(&self) -> Result<Option<SlotInfo>, String> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .max_by_key(|s| (s.modified_unix, s.slot)))
+    }
+}
+
 pub fn default_save_dir() -> Result<PathBuf, String> {
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA")
@@ -285,5 +336,25 @@ mod tests {
         let mut s = sample();
         s.health = f32::NAN;
         assert!(encode(&s).is_err());
+    }
+
+    #[test]
+    fn store_lists_valid_slots_and_orders_newest_with_stable_ties() {
+        let d = std::env::temp_dir().join(format!("xiii-store-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let store = SaveStore::open(d.clone());
+        assert!(store.list().unwrap().is_empty());
+        write(&d, 2, &sample()).unwrap();
+        let mut newer = sample();
+        newer.description = "newer".into();
+        write(&d, 7, &newer).unwrap();
+        let listed = store.list().unwrap();
+        assert_eq!(
+            listed.iter().map(|s| s.slot).collect::<Vec<_>>(),
+            vec![2, 7]
+        );
+        assert_eq!(store.read(7).unwrap().description, "newer");
+        assert_eq!(store.newest().unwrap().unwrap().slot, 7);
+        let _ = std::fs::remove_dir_all(d);
     }
 }

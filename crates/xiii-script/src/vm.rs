@@ -1186,6 +1186,8 @@ pub struct Vm<'s> {
     /// Voice-wave duration provider (dialogue natives). `None` = `Actor.GetWaveDuration` reports
     /// `0` with a visible note (the script then falls back to its own default wave length).
     pub(crate) voice_duration: Option<Box<dyn crate::voice::VoiceDuration>>,
+    /// Optional host save-slot adapter for GUIController natives.
+    pub(crate) save_slots: Option<Box<dyn crate::item20::SaveSlotProvider>>,
     /// Outbound presentation events emitted by presentation natives (sound, texture, display,
     /// projectors). Drained with [`Vm::drain_events`].
     events: Vec<PresentationEvent>,
@@ -1308,6 +1310,7 @@ impl<'s> Vm<'s> {
             hit_zones: None,
             last_trace_bone: "None".to_owned(),
             voice_duration: None,
+            save_slots: None,
             events: Vec::new(),
             pending_travel: None,
             level_info: None,
@@ -1505,6 +1508,19 @@ impl<'s> Vm<'s> {
         self.voice_duration = Some(provider);
     }
 
+    /// Installs the front-end's filesystem-backed GUI save-slot adapter.
+    pub fn set_save_slots(&mut self, provider: Box<dyn crate::item20::SaveSlotProvider>) {
+        self.save_slots = Some(provider);
+    }
+
+    /// Mutable access used by host GUI actions that need to complete a slot read.
+    pub fn save_slots_mut(&mut self) -> Option<&mut dyn crate::item20::SaveSlotProvider> {
+        match self.save_slots.as_mut() {
+            Some(p) => Some(p.as_mut()),
+            None => None,
+        }
+    }
+
     /// True when a voice-duration provider is available.
     pub fn has_voice_duration(&self) -> bool {
         self.voice_duration.is_some()
@@ -1534,6 +1550,21 @@ impl<'s> Vm<'s> {
     /// The configured URL options (empty until [`Vm::set_local_url`]).
     pub fn url_options(&self) -> &str {
         &self.url_options
+    }
+
+    /// Sets the GameInfo's `StartSpotEvent` name (the value `Plage00.FirstFrame`'s 0x0013 guard
+    /// checks before re-applying the wounded intro health; XIII's only script writer is
+    /// `XIIIGameInfo.RestartPlayer` 0x037A, which copies `StartSpot.Event`, so the retail
+    /// "LOAD" value must come from the engine's native checkpoint-load path after the login
+    /// chain — the front-end host presents a resume by setting it at that same point).
+    pub fn set_start_spot_event(&mut self, value: impl Into<String>) {
+        let id = (0..self.objects.len() as ObjectId).find(|&id| {
+            let o = &self.objects[id as usize];
+            !o.deleted && o.is_actor && self.is_a(id, "gameinfo")
+        });
+        if let Some(id) = id {
+            let _ = self.set_property(id, "StartSpotEvent", 0, Value::Name(value.into()));
+        }
     }
 
     /// Configures the `Host:Port` address form returned by `LevelInfo.GetAddressURL`. The
@@ -2913,6 +2944,23 @@ impl<'s> Vm<'s> {
 
     /// Writes a property by name and element.
     pub fn set_property(&mut self, id: ObjectId, name: &str, elem: usize, v: Value) -> bool {
+        if std::env::var_os("XIII_WATCH_PLAYER_HEALTH").is_some()
+            && self.objects.get(id as usize).is_some_and(|o| {
+                o.is_actor && o.layout.chain_names.iter().any(|c| c == "xiiiplayerpawn")
+            })
+            && name.eq_ignore_ascii_case("health")
+        {
+            let writer = self.stack.last().map_or("<host>", |s| s.function.as_str());
+            let offset = self.stack.last().map_or(0, |s| s.offset);
+            eprintln!(
+                "[vm-health-write] t={:.6} pawn={} writer={} offset=0x{:04X} value={}",
+                self.time,
+                self.objects[id as usize].name,
+                writer,
+                offset,
+                self.value_text(&v)
+            );
+        }
         let Some(o) = self.objects.get_mut(id as usize) else {
             return false;
         };
@@ -5490,6 +5538,47 @@ impl<'s> Vm<'s> {
                 let len = self.objects[*o as usize].props.len();
                 if *i >= len {
                     return Err(self.err(VmErrorKind::Other("bad slot".into())));
+                }
+                if std::env::var_os("XIII_WATCH_PLAYER_HEALTH").is_some()
+                    && self.objects[*o as usize].is_actor
+                    && self.is_a(*o, "XIIIPlayerPawn")
+                    && self.objects[*o as usize]
+                        .layout
+                        .slots
+                        .iter()
+                        .find(|s| s.base == *i)
+                        .is_some_and(|s| s.name.eq_ignore_ascii_case("health"))
+                {
+                    let writer = self.stack.last().map_or("<host>", |s| s.function.as_str());
+                    let offset = self.stack.last().map_or(0, |s| s.offset);
+                    eprintln!(
+                        "[vm-health-write] t={:.6} pawn={} writer={} offset=0x{:04X} value={}",
+                        self.time,
+                        self.objects[*o as usize].name,
+                        writer,
+                        offset,
+                        self.value_text(&v)
+                    );
+                }
+                if std::env::var_os("XIII_WATCH_PLAYER_HEALTH").is_some()
+                    && self.objects[*o as usize].is_actor
+                    && self.objects[*o as usize]
+                        .layout
+                        .slots
+                        .iter()
+                        .find(|s| s.base == *i)
+                        .is_some_and(|s| s.name.eq_ignore_ascii_case("startspotevent"))
+                {
+                    let writer = self.stack.last().map_or("<host>", |s| s.function.as_str());
+                    let offset = self.stack.last().map_or(0, |s| s.offset);
+                    eprintln!(
+                        "[vm-sse-write] t={:.6} obj={} writer={} offset=0x{:04X} value={}",
+                        self.time,
+                        self.objects[*o as usize].name,
+                        writer,
+                        offset,
+                        self.value_text(&v)
+                    );
                 }
                 self.objects[*o as usize].props[*i] = v;
             }
