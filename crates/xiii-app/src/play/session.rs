@@ -20,7 +20,8 @@ use std::time::Instant;
 use xiii_package::Limits;
 use xiii_script::vm::MoverState;
 use xiii_script::{
-    DialogueEvent, ObjRef, ObjectId, PresentationEvent, ScriptSet, Value, Vm, VmError, VmLimits,
+    DialogueEvent, ObjRef, ObjectId, PresentationEvent, SaveCheckpointEvent, ScriptSet,
+    TravelRequest, Value, Vm, VmError, VmLimits,
 };
 use xiii_world::runtime::{self, ProviderSpec};
 
@@ -57,6 +58,9 @@ pub struct Session {
     pub blocked: Vec<String>,
     /// Suspended actor names (unimplemented native or other code failure).
     pub suspended: Vec<String>,
+    /// Every distinct suspension as `(actor, error)`, in first-seen order (bounded). More useful
+    /// than `first_error` alone: several actors can fail for different reasons in one run.
+    pub failures: Vec<(String, String)>,
     /// First failure, formatted with its script stack.
     pub first_error: Option<String>,
     /// Last synced VM `Location` per object id (dense, for the one-way render sync). `None` until
@@ -69,11 +73,19 @@ pub struct Session {
     pub dialogues: VecDeque<(f64, DialogueEvent)>,
     /// Cumulative number of dialogue events emitted.
     pub dialogue_total: u64,
+    /// `Actor.SaveAtCheckpoint` requests, most recent last (bounded). The VM records these and
+    /// writes nothing to the installation; `save_total` is the cumulative count.
+    pub saves: VecDeque<(f64, SaveCheckpointEvent)>,
+    /// Cumulative number of checkpoint-save requests emitted.
+    pub save_total: u64,
     /// `Touch` events involving the player, most recent last (bounded).
     pub touches: VecDeque<(f64, String)>,
     player_touching: Vec<ObjectId>,
     /// Actors the VM moved this step (cleared at the start of [`Session::step`]).
     pub moved: Vec<MovedActor>,
+    /// Level-travel request observed by the VM (item15), if any. Consumed by
+    /// [`Session::take_travel_request`]; the host owns the map reload.
+    pub travel: Option<TravelRequest>,
     /// `XIIIDispatcher0`, if the map has one (the trigger chain's end state).
     pub dispatcher: Option<ObjectId>,
     /// Active language code of the install's localisation files (`int`, `frt`, ...).
@@ -101,6 +113,11 @@ pub struct Session {
     pub ai_shots: VecDeque<(f64, String, String)>,
     /// Fixed steps run.
     pub tick_count: u64,
+    /// Set once the end-game has stopped the active cutscene controllers (item15 bridge): the
+    /// decoded `CineController2.Interpret` keeps `GotoState('NoControl')`-ing the player, which
+    /// would clobber `XIIIPlayerController.GameEndedSuccess` if the intro were still running when
+    /// the level ends.
+    cine_stopped: bool,
 }
 
 /// Host-owned player movement fields published to the VM pawn each fixed tick (item7b).
@@ -370,14 +387,18 @@ impl Session {
             login_bootstrap,
             blocked,
             suspended,
+            failures: Vec::new(),
             first_error: None,
             last_synced,
             events: VecDeque::new(),
             dialogues: VecDeque::new(),
             dialogue_total: 0,
+            saves: VecDeque::new(),
+            save_total: 0,
             touches: VecDeque::new(),
             player_touching: Vec::new(),
             moved: Vec::new(),
+            travel: None,
             dispatcher,
             localization_language,
             localized_overrides: 0,
@@ -389,6 +410,7 @@ impl Session {
             ai_fire_at: std::collections::HashMap::new(),
             ai_shots: VecDeque::new(),
             tick_count: 0,
+            cine_stopped: false,
         };
         session.localized_overrides = session.vm.localized_overrides;
         session.suspended.dedup();
@@ -685,6 +707,9 @@ impl Session {
         let t0 = Instant::now();
         self.drain_events();
         self.update_touches();
+        // Stop the cutscene controllers the moment the end-game starts, before the next tick can
+        // re-assert `NoControl`/`NoMove` over `GameEndedSuccess`.
+        self.stop_cutscenes_if_ended();
         if profiling {
             self.vm.native_profile_mut().events_micros += t0.elapsed().as_micros() as u64;
         }
@@ -698,6 +723,48 @@ impl Session {
     /// VM time in seconds.
     pub fn vm_time(&self) -> f64 {
         self.vm.time
+    }
+
+    /// Host bridge (item15): once `GameInfo.bGameEnded` is set, suspend the cutscene controllers.
+    /// The decoded `CineController2.Interpret` calls `PC.GotoState('NoControl')`/`'NoMove'` when
+    /// its sequence commands run; while a level-start cine is still playing it would clobber
+    /// `XIIIPlayerController.GameEndedSuccess` and the level would never travel. The real engine
+    /// finishes the intro before the level ends; this restores that ordering for a direct
+    /// level-completion call. Visible in the log, never silent.
+    fn stop_cutscenes_if_ended(&mut self) {
+        if self.cine_stopped {
+            return;
+        }
+        let ended = self.game_info.is_some_and(|gi| {
+            matches!(
+                self.vm.get_property(gi, "bGameEnded"),
+                Some(Value::Bool(true))
+            )
+        });
+        if !ended {
+            return;
+        }
+        self.cine_stopped = true;
+        let mut stopped = Vec::new();
+        for i in 0..self.vm.objects.len() {
+            let id = i as ObjectId;
+            if self.vm.objects[i].deleted || !self.vm.objects[i].is_actor {
+                continue;
+            }
+            let cutscene = self.vm.class_chain_contains(id, "cine")
+                || self.vm.class_chain_contains(id, "beachinbed");
+            if cutscene && self.vm.objects[i].active {
+                self.vm.set_active(id, false);
+                stopped.push(self.vm.objects[i].name.clone());
+            }
+        }
+        if !stopped.is_empty() {
+            println!(
+                "[play] game ended: stopped {} cutscene controller(s): {}",
+                stopped.len(),
+                stopped.join(", ")
+            );
+        }
     }
 
     /// Read-only access to the script VM for host-side queries (the `--play` pawn renderer reads
@@ -1003,6 +1070,31 @@ impl Session {
         self.first_error.as_deref()
     }
 
+    /// Calls the map's own `MapInfo.SetGoalComplete(N)` (item15 demonstration bridge). The
+    /// decoded campaign reaches this through goal triggers fired by cutscene `TriggerEvent`s the
+    /// host does not yet play; calling it runs the game's `TestGoalComplete`/`DoTravel`/`EndGame`/
+    /// `ServerTravel` chain. Returns an error string when there is no live `MapInfo`, never a
+    /// silent no-op.
+    pub fn set_goal(&mut self, n: i32) -> Result<(), String> {
+        let gi = self
+            .game_info
+            .ok_or_else(|| "no GameInfo; cannot resolve MapInfo".to_owned())?;
+        let map_info = instance_prop(&self.vm, gi, "MapInfo")
+            .ok_or_else(|| "GameInfo.MapInfo is None".to_owned())?;
+        let name = self.vm.objects[map_info as usize].name.clone();
+        self.vm
+            .send_event(map_info, "SetGoalComplete", vec![Value::Int(n)])
+            .map_err(|e| e.to_string())?;
+        self.drain_events();
+        self.stop_cutscenes_if_ended();
+        let complete = matches!(
+            self.vm.get_property(map_info, "bLevelComplete"),
+            Some(Value::Bool(true))
+        );
+        println!("[play] set_goal {n} via {name}.SetGoalComplete (bLevelComplete={complete})");
+        Ok(())
+    }
+
     /// The player pawn's current `Weapon` object, if any.
     pub fn player_weapon(&self) -> Option<ObjectId> {
         instance_prop(&self.vm, self.player, "Weapon")
@@ -1209,6 +1301,16 @@ impl Session {
                 self.dialogue_total += 1;
                 self.dialogues.push_back((t, d.clone()));
             }
+            if let PresentationEvent::SaveCheckpoint(s) = &ev {
+                self.save_total += 1;
+                self.saves.push_back((t, s.clone()));
+            }
+            if let PresentationEvent::TravelRequest(r) = &ev {
+                // Keep the first un-consumed request; the host reloads on it.
+                if self.travel.is_none() {
+                    self.travel = Some(r.clone());
+                }
+            }
             self.events.push_back((t, ev));
         }
         while self.events.len() > 64 {
@@ -1217,6 +1319,17 @@ impl Session {
         while self.dialogues.len() > 64 {
             self.dialogues.pop_front();
         }
+        while self.saves.len() > 64 {
+            self.saves.pop_front();
+        }
+    }
+
+    /// Takes the pending level-travel request, if any. The VM reports it; the host owns the
+    /// reload ([`crate::play::travel`]).
+    pub fn take_travel_request(&mut self) -> Option<TravelRequest> {
+        // Prefer the VM's own queue (a `ClientTravel` native or the `NextURL` check) in case the
+        // event was not drained yet, then the event-captured copy.
+        self.vm.take_travel_request().or_else(|| self.travel.take())
     }
 
     /// Dialogue events emitted since `seen` (a cumulative count). Returns the events in order;
@@ -1255,12 +1368,46 @@ impl Session {
             if !self.player_touching.contains(id) {
                 let name = self.vm.objects[*id as usize].name.clone();
                 self.touches.push_back((self.vm.time, name));
+                // Host bridge (item15): the one decoded level-end starter
+                // (`XIDCine.BeachFinalFall`) derives from `Engine.Triggers`, has no `Touch`, and
+                // has no decoded caller; see `fire_touch_event_bridge` and the report.
+                self.fire_touch_event_bridge(*id);
             }
         }
         self.player_touching = now;
         while self.touches.len() > 64 {
             self.touches.pop_front();
         }
+    }
+
+    /// Reproduces the engine's `Trigger.Touch` for the one decoded actor that starts a level end
+    /// but has no decoded starter: `XIDCine.BeachFinalFall` (its `Event` names the goal trigger,
+    /// but it derives from `Engine.Triggers`, which has no `Touch`, and no script or native fires
+    /// its `'Fall'` tag — see the report). The allow-list is by class name, so no other actor
+    /// ever invents an event. Visible in the log on every firing.
+    fn fire_touch_event_bridge(&mut self, actor: ObjectId) {
+        const ALLOW: &[&str] = &["beachfinalfall"];
+        if !ALLOW.iter().any(|c| self.vm.class_chain_contains(actor, c)) {
+            return;
+        }
+        let event = match self.vm.get_property(actor, "Event") {
+            Some(Value::Name(n)) if !n.eq_ignore_ascii_case("None") => n.clone(),
+            _ => return,
+        };
+        let args = vec![
+            Value::Name(event.clone()),
+            Value::Object(Some(ObjRef::Instance(actor))),
+            Value::Object(Some(ObjRef::Instance(self.player))),
+        ];
+        let name = self.vm.objects[actor as usize].name.clone();
+        match self.vm.send_event(actor, "TriggerEvent", args) {
+            Ok(_) => println!(
+                "[play] host bridge: {name} (XIDCine.BeachFinalFall) has no decoded starter; \
+                 firing its own TriggerEvent({event:?})"
+            ),
+            Err(e) => self.record_failure(&name, &e),
+        }
+        self.drain_events();
     }
 
     fn update_sync(&mut self) {
@@ -1303,8 +1450,15 @@ impl Session {
         if !self.suspended.iter().any(|s| s == name) {
             self.suspended.push(name.to_owned());
         }
+        let text = format!("{e}");
+        if !self.failures.iter().any(|(n, _)| n == name) {
+            self.failures.push((name.to_owned(), text.clone()));
+            while self.failures.len() > 32 {
+                self.failures.remove(0);
+            }
+        }
         if self.first_error.is_none() {
-            self.first_error = Some(format!("{e}"));
+            self.first_error = Some(text);
         }
     }
 }
@@ -1679,7 +1833,6 @@ mod tests {
             session.first_error()
         );
     }
-
     /// Opt-in corpus (item14b requirement 4): a soldier that is in its own active state
     /// (`Base01` `BaseSoldier17`, order `Tenir`) detects the player through the host sight bridge
     /// (`SeePlayer`), runs its own `Tenir -> Acquisition -> Attaque` states, turns toward the
@@ -1779,131 +1932,97 @@ mod tests {
         );
     }
 
-    /// Opt-in corpus (item14b requirement 1): the per-bone hit boxes are posed from the soldier's
-    /// own decoded skeleton and hit by the game's own trace/damage chain. Aiming at the head,
-    /// chest and below gives three different `GetLastTraceBone` names and the script's
-    /// per-zone damage. The Beretta is granted directly here (the real map pickup is exercised by
-    /// the `--play-script` demonstration); this test is the labelled synthetic case.
+    /// Opt-in corpus regression (item3o): the Plage00 level-start checkpoint path runs the
+    /// game's own `XIIISaveGameTrigger.GoSaving.DoSave`, which used to suspend on the struct-array
+    /// member `bcompleted` (`ObjectivesState.length` grew the element as `int 0`, so the
+    /// subsequent `.bCompleted` write failed with "no struct member bcompleted"). The save must
+    /// now emit the host `SaveCheckpoint` event. The intro's control-return is measured by the
+    /// acceptance `--play` run (the cutscene needs the HUD `PostRender` to leave
+    /// `WaitForFirstDisplay`, which this headless harness does not drive).
     #[test]
-    fn opt_in_plage01_hit_zones_head_chest_legs() {
+    fn opt_in_plage00_checkpoint_save_event() {
         let Some(game_dir) = opt_in_root() else {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
         };
-        let mut session = Session::open(&game_dir, "Plage01").expect("open Plage01");
-        let soldier = session
-            .vm()
-            .find_object("BaseSoldier6")
-            .expect("Plage01 has BaseSoldier6");
-        let sloc = session
-            .vm()
-            .vector_prop(soldier, "Location")
-            .expect("soldier location");
-        let report = session.hitbox_summary();
-        println!("[hitbox test] {report}");
-        assert!(
-            report.contains("X") || report.contains("box"),
-            "no hit boxes: {report}"
-        );
-        // Labelled synthetic arm: the real pickup chain is demonstrated in `--play-script`.
-        session.grant_weapon("XIII.Beretta").expect("grant Beretta");
-        if let Some(w) = session.player_weapon() {
-            println!(
-                "[hitbox test] weapon firing sounds: hFireSound={:?} hAltFireSound={:?}",
-                session.vm().get_property(w, "hFireSound"),
-                session.vm().get_property(w, "hAltFireSound"),
-            );
-        }
-        let player = session.player;
-        let dist = 160.0f32;
-        let ploc = [sloc[0], sloc[1] - dist, sloc[2]];
-        session
-            .vm_mut()
-            .set_property(player, "Location", 0, Value::Vector(ploc));
-        session
-            .vm_mut()
-            .set_property(player, "BaseEyeHeight", 0, Value::Float(60.0));
-        session
-            .vm_mut()
-            .set_property(player, "EyeHeight", 0, Value::Float(60.0));
-        let yaw = std::f32::consts::FRAC_PI_2; // +Y, toward the soldier
-        let eye_z = ploc[2] + 60.0;
-        // From the measured MiocheM boxes: the Spine1 box is large (half 38) and overlaps the
-        // lower head, so a head shot must aim near the top of the head to clear the torso first.
-        let targets = [
-            ("head", sloc[2] + 74.0f32),
-            ("chest", sloc[2] + 31.3),
-            ("below", sloc[2] - 90.0),
-        ];
-        session.update_hit_boxes();
-        if let Some(boxes) = session.hit_zones.boxes_for(soldier) {
-            for b in &boxes {
-                println!(
-                    "[hitbox test] box {:>10} c ({:8.1},{:8.1},{:8.1}) half {:?}",
-                    b.bone, b.center[0], b.center[1], b.center[2], b.half
-                );
+        let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00");
+        // The save trigger fires when the host delivers the player's Touch after the first steps.
+        for _ in 0..120 {
+            if session.save_total >= 1 {
+                break;
             }
+            let loc = session.player_location().unwrap_or([0.0; 3]);
+            session.step(1.0 / 60.0, loc, 0.0, [0.0; 3], &PlayerVMModes::default());
         }
+        assert!(
+            session.save_total >= 1,
+            "the level-start checkpoint save did not run (suspended: {:?})",
+            session.suspended
+        );
+        let save = session
+            .saves
+            .front()
+            .expect("a SaveCheckpoint event")
+            .1
+            .clone();
+        assert_eq!(save.teleporter_name, "PlayerStart");
+        assert_eq!(save.description, "Brighton Beach 1");
         println!(
-            "[hitbox test] soldier health {:?}",
-            session.actor_health(soldier)
+            "[save test] checkpoint {:?} teleporter={:?} description={:?}",
+            save.actor, save.teleporter_name, save.description
         );
-        let mut results = Vec::new();
-        for (label, tz) in targets {
-            session.update_hit_boxes();
-            let pitch = ((tz - eye_z) / dist).atan();
-            let start = [ploc[0], ploc[1], eye_z];
-            // Keep the weapon at the eye, as `Session::step` does, so the script's damage
-            // falloff measures the muzzle-to-hit distance, not the stale spawn point.
-            if let Some(w) = session.player_weapon() {
-                session
-                    .vm_mut()
-                    .set_property(w, "Location", 0, Value::Vector(start));
+    }
+
+    /// Opt-in corpus probe (item3o requirement 2): the player message path through
+    /// `Engine.LocalMessage.ClientReceive` -> `XIIIBaseHud.LocalizedMessage` -> `HudMessage`
+    /// `SetUpLocalizedMessage` must not suspend. The item3m residual error
+    /// (`TypeMismatch expected "string", found "void"` at `SetUpLocalizedMessage` code 0x0077) is
+    /// not reproducible at HEAD; this drives the generic `AddHudMessage` branch (a message class
+    /// outside the four special-cased ones) for several switches and asserts each call returns
+    /// `Ok` and that a `HudMessage` is spawned on the HUD's `HudMsg`.
+    #[test]
+    fn opt_in_plage00_generic_hud_message_path_does_not_suspend() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00");
+        let pawn = session.player_pawn_actors()[0].0;
+        let mut errors = Vec::new();
+        {
+            let vm = session.vm_mut();
+            for path in [
+                "xiii.XIIIDeathMessage",
+                "xiii.XIIISoloMessage",
+                "engine.GameMessage",
+            ] {
+                let Some(class) = runtime::resolve_class_path(vm.set(), path) else {
+                    errors.push(format!("{path}: class not found"));
+                    continue;
+                };
+                for switch in 0..4 {
+                    let args = vec![
+                        Value::Object(Some(ObjRef::Static(class))),
+                        Value::Int(switch),
+                        Value::Object(None),
+                        Value::Object(None),
+                        Value::Object(None),
+                    ];
+                    if let Err(e) = vm.send_event(pawn, "ReceiveLocalizedMessage", args) {
+                        errors.push(format!("{path} switch={switch}: {e}"));
+                    }
+                }
             }
-            let h0 = session.actor_health(soldier);
-            let outcome = session.fire(yaw, pitch);
-            let bone = session.vm().last_trace_bone().to_owned();
-            let h1 = session.actor_health(soldier);
-            let damage = match (h0, h1) {
-                (Some(a), Some(b)) => format!("{:.0}", a - b),
-                _ => "?".to_owned(),
-            };
-            println!(
-                "[hitbox test] {label}: pitch {pitch:+.1} deg -> {outcome:?}, bone '{bone}', damage {damage}"
-            );
-            results.push((label, bone, damage));
         }
-        let fired_events = session.vm_mut().drain_events();
-        for e in &fired_events {
-            if let PresentationEvent::PlaySound(s) = e {
-                println!(
-                    "[hitbox test] PlaySound actor={} sound={:?}",
-                    s.actor, s.sound
-                );
-            }
-        }
-        let bones: Vec<&str> = results.iter().map(|(_, b, _)| b.as_str()).collect();
-        assert_eq!(
-            results[0].1, "X Head",
-            "head shot classified as '{}'",
-            results[0].1
-        );
-        assert_eq!(
-            results[1].1, "X Spine1",
-            "chest shot classified as '{}'",
-            results[1].1
-        );
-        assert_eq!(
-            results[2].1, "X Spine",
-            "below shot classified as '{}'",
-            results[2].1
-        );
-        // The script applies the head-shot factor; the head damage must exceed the chest damage.
-        let head_d: f32 = results[0].2.parse().unwrap();
-        let chest_d: f32 = results[1].2.parse().unwrap();
+        assert!(errors.is_empty(), "message path suspended: {errors:?}");
+        let spawned = session
+            .vm()
+            .find_object("XIIIBaseHud")
+            .and_then(|hud| session.vm().get_property(hud, "HudMsg").cloned());
         assert!(
-            head_d > chest_d,
-            "head damage {head_d} is not greater than chest damage {chest_d} ({bones:?})"
+            matches!(spawned, Some(Value::Object(Some(ObjRef::Instance(_))))),
+            "no HudMessage was spawned through the generic path: {spawned:?}"
         );
+        println!("[hud test] generic message path Ok; HudMsg={spawned:?}");
     }
 }

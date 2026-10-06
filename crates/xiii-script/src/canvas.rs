@@ -1153,27 +1153,6 @@ fn actor_resume_all_sounds(
     val(Value::Void)
 }
 
-/// `Engine.PlayerController.ClientTravel(string URL, byte TravelType, bool bItems)`.
-///
-/// This is the game's own map-load request (`XIIIMenu.EndOfVideo` calls it with `Plage00`
-/// after the new-game video). The headless VM cannot change map, so the request is recorded
-/// in the trace via [`format_travel_note`]; the host performs the travel step.
-fn client_travel(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let url = text(vm, a, 0)?;
-    let travel_type = match a.get(1) {
-        Some(Value::Byte(b)) => *b,
-        Some(Value::Int(i)) => *i as u8,
-        _ => 0,
-    };
-    let items = flag(a, 2);
-    vm.note(TraceKind::Note(format_travel_note(
-        &url,
-        travel_type,
-        items,
-    )));
-    val(Value::Void)
-}
-
 /// The menu-path natives defined by this block. `registry::builtin_defs` extends the
 /// built-in table with these.
 #[allow(clippy::vec_init_then_push)]
@@ -1231,12 +1210,10 @@ pub fn menu_defs() -> Vec<NativeDef> {
         "engine.u Actor.ResumeAllSounds decoded; XIIIRootWindow.UWindows.EndState calls it",
         actor_resume_all_sounds,
     ));
-    v.push(def(
-        "PlayerController.ClientTravel",
-        "native(0) net reliable native event static function ClientTravel(string URL, byte<ETravelType> TravelType, bool bItems)",
-        "engine.u PlayerController.ClientTravel decoded; XIIIMenu.EndOfVideo travels to Plage00 (the game's own map-load request)",
-        client_travel,
-    ));
+    // `PlayerController.ClientTravel` is registered once, in `registry::builtin_defs` (the item15
+    // travel block): that single implementation records both this block's trace note
+    // (`format_travel_note`) and the item15 host `TravelRequest`, so the menu host and `--play`
+    // both work from one registration.
     v
 }
 
