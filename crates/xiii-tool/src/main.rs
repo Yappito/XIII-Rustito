@@ -10,6 +10,7 @@ use std::time::Instant;
 mod anim_cmd;
 mod audio_cmd;
 mod locale_cmd;
+mod video_cmd;
 
 use xiii_package::{Limits, Package};
 use xiii_tool::{corpus, coverage, deps, props, report};
@@ -61,6 +62,10 @@ USAGE:
       errors and warnings, or one Localize(Section, Key, Package) lookup. Run
       'xiii-tool locale' for details.
 
+  xiii-tool video <info|tables|frames|validate> ...
+      Clean-room Bink 1 cutscenes: container info, DLL table location, frame
+      export to PNG and corpus decode validation. Run 'xiii-tool video' for details.
+
   xiii-tool script <classes|functions|disasm|natives|coverage> ...
       Compiled UnrealScript (M2c): run 'xiii-tool script' for details.
 
@@ -110,6 +115,7 @@ fn main() -> ExitCode {
         Some("campaign") => xiii_tool::campaign_cmd::run_cmd(&args[1..]),
         Some("anim") => anim_cmd::run(&args[1..]),
         Some("audio") => audio_cmd::run(&args[1..]),
+        Some("video") => video_cmd::run(&args[1..]),
         Some("locale") => locale_cmd::run(&args[1..]),
         Some("script") => xiii_tool::script_cmd::run(&args[1..]),
         Some(cmd) if xiii_tool::world_cmd::COMMANDS.contains(&cmd) => {

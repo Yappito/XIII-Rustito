@@ -1,0 +1,13 @@
+[package]
+name = "xiii-video"
+description = "Clean-room Bink 1 (BIK revision i) container reader and video decoder for XIII cutscenes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

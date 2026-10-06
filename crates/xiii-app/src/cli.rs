@@ -18,6 +18,8 @@ pub enum Mode {
     Play,
     /// Front-end menu (`item16`): `--menu` + `--game-dir`, optional `--menu-script`.
     Menu,
+    /// Bink cutscene playback: `--video FILE` + `--game-dir`.
+    Video,
 }
 
 /// Viewer baked-lighting mode.
@@ -71,6 +73,8 @@ pub struct Options {
     pub play_script: Option<PathBuf>,
     /// Front-end menu: deterministic input script selecting entries (`--menu-script`).
     pub menu_script: Option<PathBuf>,
+    /// Bink 1 cutscene to play (`--video FILE`).
+    pub video: Option<PathBuf>,
     /// `--play` sound playback (`--audio off|on`, default on).
     pub audio: Audio,
     /// Particle level-start state (`--particles default|all`, default default).
@@ -133,6 +137,7 @@ impl Default for Options {
             lighting: Lighting::default(),
             play_script: None,
             menu_script: None,
+            video: None,
             audio: Audio::default(),
             particles: Particles::default(),
             perf: false,
@@ -152,6 +157,8 @@ xiii-app --map NAME --game-dir DIR --play [--play-script FILE] [--audio off|on]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH]
 xiii-app --menu --game-dir DIR [--menu-script FILE]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH]
+xiii-app --video FILE --game-dir DIR
+         [--exit-after-secs S] [--screenshot PATH] [--size WxH]
 xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH]
 
@@ -164,6 +171,9 @@ xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
   --particles MODE     Particle level-start state: `default` honours the level-start state
                        (triggered emitters start inactive); `all` forces every emitter on
                        (inspection). Default `default`.
+  --video FILE         Play a Bink 1 cutscene with the clean-room decoder at the file's fps.
+                       Requires --game-dir (for the binkw32.dll tables). Exits after
+                       --exit-after-secs and/or writes --screenshot.
   --menu               Front-end menu: load the entry map and run the game's menu classes
                        (`XIDInterf.XIIIRootWindow` / `XIIIMenu`) through the VM, draw them
                        through the Canvas path. Requires --game-dir.
@@ -258,6 +268,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
                 if opts.mode == Mode::Smoke {
                     opts.mode = Mode::Play;
                 }
+            }
+            "--video" => {
+                opts.video = Some(PathBuf::from(value("--video")?));
+                opts.mode = Mode::Video;
             }
             "--menu" => opts.mode = Mode::Menu,
             "--menu-script" => {

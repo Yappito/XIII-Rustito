@@ -16,6 +16,7 @@ xiii-script.workspace = true
 xiii-collision.workspace = true
 xiii-audio.workspace = true
 xiii-world.workspace = true
+xiii-video.workspace = true
 
 [lints]
 workspace = true
