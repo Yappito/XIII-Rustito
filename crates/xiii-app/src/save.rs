@@ -4,12 +4,14 @@
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"XIIISAV\0";
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SaveFile {
     pub map: String,
     pub teleporter: String,
+    /// Tag of the `XIIISaveGameTrigger` whose `DoSave` created the travel actor.
+    pub save_trigger_tag: String,
     pub description: String,
     pub health: f32,
     pub speed_factor_limit: f32,
@@ -18,6 +20,12 @@ pub struct SaveFile {
     pub rotation: [i32; 3],
     pub objectives: Vec<Objective>,
     pub inventory: Vec<InventoryItem>,
+    /// `XIIISaveGameTrigger.SoundToLaunch`, retained as an object path.
+    pub sound_to_launch: Option<String>,
+    /// Selected weapon's Unreal class path (resolved through the restored inventory chain).
+    pub selected_weapon: Option<String>,
+    /// Current LevelInfo music-script variables mirrored into HXAudio by the engine saver.
+    pub music_vars: Vec<MusicVariable>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +39,16 @@ pub struct Objective {
 pub struct InventoryItem {
     pub class_path: String,
     pub name: String,
+    /// `Ammunition.AmmoAmount`, when this inventory object has the property.
+    pub ammo_amount: Option<i32>,
+    /// `XIIIWeapon.ReloadCount`, when this inventory object has the property.
+    pub reload_count: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MusicVariable {
+    pub name: String,
+    pub value: i32,
 }
 
 /// Metadata shown by the decoded load-game page.
@@ -134,6 +152,9 @@ fn put_string(out: &mut Vec<u8>, value: &str) -> Result<(), String> {
 }
 
 fn encode(s: &SaveFile) -> Result<Vec<u8>, String> {
+    if s.objectives.len() > 4096 || s.inventory.len() > 4096 || s.music_vars.len() > 4096 {
+        return Err("save count exceeds 4096 item limit".into());
+    }
     if !s.health.is_finite()
         || !s.speed_factor_limit.is_finite()
         || s.location.iter().any(|v| !v.is_finite())
@@ -144,6 +165,7 @@ fn encode(s: &SaveFile) -> Result<Vec<u8>, String> {
     b.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     put_string(&mut b, &s.map)?;
     put_string(&mut b, &s.teleporter)?;
+    put_string(&mut b, &s.save_trigger_tag)?;
     put_string(&mut b, &s.description)?;
     b.extend_from_slice(&s.health.to_le_bytes());
     b.extend_from_slice(&s.speed_factor_limit.to_le_bytes());
@@ -170,8 +192,42 @@ fn encode(s: &SaveFile) -> Result<Vec<u8>, String> {
     for i in &s.inventory {
         put_string(&mut b, &i.class_path)?;
         put_string(&mut b, &i.name)?;
+        put_optional_i32(&mut b, i.ammo_amount);
+        put_optional_i32(&mut b, i.reload_count);
+    }
+    put_optional_string(&mut b, s.sound_to_launch.as_deref())?;
+    put_optional_string(&mut b, s.selected_weapon.as_deref())?;
+    b.extend_from_slice(
+        &u32::try_from(s.music_vars.len())
+            .map_err(|_| "too many music variables")?
+            .to_le_bytes(),
+    );
+    for var in &s.music_vars {
+        put_string(&mut b, &var.name)?;
+        b.extend_from_slice(&var.value.to_le_bytes());
     }
     Ok(b)
+}
+
+fn put_optional_i32(out: &mut Vec<u8>, value: Option<i32>) {
+    match value {
+        Some(v) => {
+            out.push(1);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn put_optional_string(out: &mut Vec<u8>, value: Option<&str>) -> Result<(), String> {
+    match value {
+        Some(v) => {
+            out.push(1);
+            put_string(out, v)?;
+        }
+        None => out.push(0),
+    }
+    Ok(())
 }
 
 struct Cursor<'a> {
@@ -195,6 +251,20 @@ impl<'a> Cursor<'a> {
             self.take(4)?.try_into().map_err(|_| "truncated i32")?,
         ))
     }
+    fn optional_i32(&mut self) -> Result<Option<i32>, String> {
+        match self.take(1)?[0] {
+            0 => Ok(None),
+            1 => Ok(Some(self.i32()?)),
+            _ => Err("invalid optional integer flag".into()),
+        }
+    }
+    fn optional_string(&mut self) -> Result<Option<String>, String> {
+        match self.take(1)?[0] {
+            0 => Ok(None),
+            1 => Ok(Some(self.string()?)),
+            _ => Err("invalid optional string flag".into()),
+        }
+    }
     fn f32(&mut self) -> Result<f32, String> {
         Ok(f32::from_le_bytes(
             self.take(4)?.try_into().map_err(|_| "truncated f32")?,
@@ -215,13 +285,18 @@ fn decode(b: &[u8]) -> Result<SaveFile, String> {
         return Err("invalid save magic".into());
     }
     let version = c.u32()?;
-    if version != FORMAT_VERSION {
+    if !(1..=FORMAT_VERSION).contains(&version) {
         return Err(format!(
             "unsupported save version {version} (supported {FORMAT_VERSION})"
         ));
     }
     let map = c.string()?;
     let teleporter = c.string()?;
+    let save_trigger_tag = if version >= 2 {
+        c.string()?
+    } else {
+        teleporter.clone()
+    };
     let description = c.string()?;
     let health = c.f32()?;
     let speed_factor_limit = c.f32()?;
@@ -256,10 +331,38 @@ fn decode(b: &[u8]) -> Result<SaveFile, String> {
     }
     let mut inventory = Vec::with_capacity(n as usize);
     for _ in 0..n {
+        let class_path = c.string()?;
+        let name = c.string()?;
+        let (ammo_amount, reload_count) = if version >= 2 {
+            (c.optional_i32()?, c.optional_i32()?)
+        } else {
+            (None, None)
+        };
         inventory.push(InventoryItem {
-            class_path: c.string()?,
-            name: c.string()?,
+            class_path,
+            name,
+            ammo_amount,
+            reload_count,
         });
+    }
+    let (sound_to_launch, selected_weapon) = if version >= 2 {
+        (c.optional_string()?, c.optional_string()?)
+    } else {
+        (None, None)
+    };
+    let mut music_vars = Vec::new();
+    if version >= 2 {
+        let n = c.u32()?;
+        if n > 4096 {
+            return Err(format!("music variable count {n} exceeds limit"));
+        }
+        music_vars.reserve(n as usize);
+        for _ in 0..n {
+            music_vars.push(MusicVariable {
+                name: c.string()?,
+                value: c.i32()?,
+            });
+        }
     }
     if c.p != b.len() {
         return Err(format!("{} trailing bytes in save", b.len() - c.p));
@@ -273,6 +376,7 @@ fn decode(b: &[u8]) -> Result<SaveFile, String> {
     Ok(SaveFile {
         map,
         teleporter,
+        save_trigger_tag,
         description,
         health,
         speed_factor_limit,
@@ -281,6 +385,9 @@ fn decode(b: &[u8]) -> Result<SaveFile, String> {
         rotation,
         objectives,
         inventory,
+        sound_to_launch,
+        selected_weapon,
+        music_vars,
     })
 }
 
@@ -291,6 +398,7 @@ mod tests {
         SaveFile {
             map: "Plage00".into(),
             teleporter: "PlayerStart".into(),
+            save_trigger_tag: "Debut".into(),
             description: "Brighton Beach 1".into(),
             health: 87.,
             speed_factor_limit: 0.5,
@@ -305,6 +413,14 @@ mod tests {
             inventory: vec![InventoryItem {
                 class_path: "XIII.Fists".into(),
                 name: "Fists0".into(),
+                ammo_amount: Some(23),
+                reload_count: Some(7),
+            }],
+            sound_to_launch: Some("XIIIsound.Music__Plage01.Plage01__hMusicInit".into()),
+            selected_weapon: Some("XIII.Fists".into()),
+            music_vars: vec![MusicVariable {
+                name: "NbAttente".into(),
+                value: 3,
             }],
         }
     }
@@ -323,13 +439,85 @@ mod tests {
     #[test]
     fn rejects_unknown_version_truncation_and_trailing_data() {
         let mut b = encode(&sample()).unwrap();
-        b[8] = 2;
+        b[8] = 99;
         assert!(decode(&b).unwrap_err().contains("unsupported save version"));
         let b = encode(&sample()).unwrap();
         assert!(decode(&b[..b.len() - 1]).is_err());
         let mut b = encode(&sample()).unwrap();
         b.push(0);
         assert!(decode(&b).unwrap_err().contains("trailing bytes"));
+    }
+    #[test]
+    fn version_two_fields_round_trip_and_version_one_remains_readable() {
+        let encoded = encode(&sample()).unwrap();
+        assert_eq!(decode(&encoded).unwrap(), sample());
+
+        // A v1 save with no inventory had no extension bytes; v1 readers default the newly
+        // introduced music/selection/ammo details to absent.
+        let mut legacy = sample();
+        legacy.inventory.clear();
+        legacy.sound_to_launch = None;
+        legacy.selected_weapon = None;
+        legacy.music_vars.clear();
+        legacy.save_trigger_tag = legacy.teleporter.clone();
+        let mut bytes = encode(&legacy).unwrap();
+        let (trigger_tag_start, trigger_tag_end) = {
+            let mut c = Cursor { b: &bytes, p: 12 };
+            let _ = c.string().unwrap();
+            let _ = c.string().unwrap();
+            let start = c.p;
+            let _ = c.string().unwrap();
+            (start, c.p)
+        };
+        bytes.drain(trigger_tag_start..trigger_tag_end);
+        // v2's extension ends in an empty music-variable count (4 bytes).
+        bytes.truncate(bytes.len() - 6);
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(decode(&bytes).unwrap(), legacy);
+    }
+
+    #[test]
+    fn rejects_oversized_counts_and_invalid_optional_tags() {
+        let mut bytes = encode(&sample()).unwrap();
+        // Skip the three length-prefixed strings, fixed fields, and the objective count/data.
+        let mut c = Cursor { b: &bytes, p: 12 };
+        let _ = c.string().unwrap();
+        let _ = c.string().unwrap();
+        let _ = c.string().unwrap();
+        let _ = c.string().unwrap();
+        c.take(4 + 4 + 4 + 12 + 12).unwrap();
+        let objective_count = c.u32().unwrap();
+        c.take(objective_count as usize * 3).unwrap();
+        let inventory_count_at = c.p;
+        bytes[inventory_count_at..inventory_count_at + 4].copy_from_slice(&4097u32.to_le_bytes());
+        assert!(
+            decode(&bytes)
+                .unwrap_err()
+                .contains("inventory count 4097 exceeds limit")
+        );
+
+        let mut bytes = encode(&sample()).unwrap();
+        // Corrupt the first optional field tag after its item's two strings.
+        let tag_at = {
+            let mut c = Cursor { b: &bytes, p: 12 };
+            let _ = c.string().unwrap();
+            let _ = c.string().unwrap();
+            let _ = c.string().unwrap();
+            let _ = c.string().unwrap();
+            c.take(4 + 4 + 4 + 12 + 12).unwrap();
+            let n = c.u32().unwrap();
+            c.take(n as usize * 3).unwrap();
+            let _ = c.u32().unwrap();
+            let _ = c.string().unwrap();
+            let _ = c.string().unwrap();
+            c.p
+        };
+        bytes[tag_at] = 2;
+        assert!(
+            decode(&bytes)
+                .unwrap_err()
+                .contains("invalid optional integer flag")
+        );
     }
     #[test]
     fn rejects_non_finite_values() {
