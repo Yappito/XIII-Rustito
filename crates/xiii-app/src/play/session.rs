@@ -400,6 +400,9 @@ impl Session {
             );
         }
         let player = player.expect("player created above");
+        if let Some(pc) = controller {
+            initialize_headless_player_interaction(&mut vm, set, pc)?;
+        }
         if let Some(event) = start_event {
             // The engine's checkpoint-load path sets GameInfo.StartSpotEvent after the login
             // chain (XIII's own `RestartPlayer` copies `StartSpot.Event` into it first —
@@ -2374,6 +2377,71 @@ impl Session {
             self.first_error = Some(text);
         }
     }
+}
+
+/// The interactive retail engine runs `PlayerController.InitInputSystem` after login. For XIII
+/// that script obtains an `XIIIPlayerInteraction` through `InteractionMaster.AddInteraction`,
+/// then assigns `MyPC`/`Level`; the headless VM has no `UPlayer`/viewport to provide that engine
+/// bootstrap. The controller's decoded `NoControl.EndState` nevertheless reads
+/// `MyInteraction.TargetActor` on every cinematic control handoff. Install the minimum local
+/// interaction object required by that script contract so normal state transitions do not
+/// suspend the player controller. The host owns input and targeting in headless mode.
+fn initialize_headless_player_interaction(
+    vm: &mut Vm<'static>,
+    set: &ScriptSet,
+    pc: ObjectId,
+) -> Result<(), String> {
+    if !matches!(
+        vm.get_property(pc, "MyInteraction"),
+        Some(Value::Object(None))
+    ) {
+        return Ok(());
+    }
+    let class_path = match vm.get_property(pc, "MyInteractionClass") {
+        Some(Value::Str(path)) => path,
+        other => {
+            return Err(format!(
+                "{pc} has no MyInteractionClass path for headless input bootstrap: {other:?}"
+            ));
+        }
+    };
+    let (package_name, object_path) = class_path
+        .split_once('.')
+        .ok_or_else(|| format!("invalid MyInteractionClass path {class_path:?}"))?;
+    let package = set
+        .package_index(package_name)
+        .ok_or_else(|| format!("MyInteractionClass package {package_name:?} is not loaded"))?;
+    let export = set.packages[package]
+        .export_by_path(object_path)
+        .ok_or_else(|| format!("MyInteractionClass export {class_path:?} is not loaded"))?;
+    let class = xiii_script::GlobalRef { package, export };
+    let interaction = vm
+        .spawn(class, "XIIIPlayerInteraction(headless)")
+        .map_err(|e| format!("spawn headless player interaction: {e}"))?;
+    let level = vm
+        .get_property(pc, "Level")
+        .cloned()
+        .unwrap_or(Value::Object(None));
+    if !vm.set_property(interaction, "Level", 0, level) {
+        return Err("XIIIPlayerInteraction has no Level property".into());
+    }
+    if !vm.set_property(
+        interaction,
+        "MyPC",
+        0,
+        Value::Object(Some(ObjRef::Instance(pc))),
+    ) {
+        return Err("XIIIPlayerInteraction has no MyPC property".into());
+    }
+    if !vm.set_property(
+        pc,
+        "MyInteraction",
+        0,
+        Value::Object(Some(ObjRef::Instance(interaction))),
+    ) {
+        return Err("XIIIPlayerController has no MyInteraction property".into());
+    }
+    Ok(())
 }
 
 /// Unreal-space delta between two VM `Location`s. The host converts it with the single

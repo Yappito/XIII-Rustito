@@ -1967,6 +1967,7 @@ fn open_map_runtime(
 /// the script can never diverge from the interactive path. When the game's own code requests
 /// level travel, the next map is imported and a fresh session is opened (the host owns the
 /// transition); the run continues on the new map until the duration is spent.
+#[cfg(test)]
 pub(crate) fn run_script(
     game_dir: &Path,
     map: &str,
@@ -1974,6 +1975,32 @@ pub(crate) fn run_script(
     params: &PlayerParams,
     scene: &xiii_world::WorldScene,
     duration: f32,
+) -> Result<ScriptOutcome, String> {
+    run_script_inner(game_dir, map, script, params, scene, duration, false)
+}
+
+/// Player-route variant of [`run_script`]: honor the controller's authored cinematic states in
+/// exactly the same way as the interactive runtime. Diagnostic movement probes retain the
+/// legacy unsuppressed harness path unless they explicitly request this behavior.
+pub(crate) fn run_script_with_cinematic_input(
+    game_dir: &Path,
+    map: &str,
+    script: &script::Script,
+    params: &PlayerParams,
+    scene: &xiii_world::WorldScene,
+    duration: f32,
+) -> Result<ScriptOutcome, String> {
+    run_script_inner(game_dir, map, script, params, scene, duration, true)
+}
+
+fn run_script_inner(
+    game_dir: &Path,
+    map: &str,
+    script: &script::Script,
+    params: &PlayerParams,
+    scene: &xiii_world::WorldScene,
+    duration: f32,
+    respect_cinematic_input: bool,
 ) -> Result<ScriptOutcome, String> {
     let started = Instant::now();
     let ticks = (duration / DT).ceil() as u64;
@@ -1992,13 +2019,25 @@ pub(crate) fn run_script(
     let mut tick = 0u64;
     while tick < ticks {
         let elapsed = tick as f32 * DT;
-        let input = drive.advance(elapsed, &mut runtime.sim);
-        let weapons = drive.take_weapons();
+        let mut input = drive.advance(elapsed, &mut runtime.sim);
+        let mut weapons = drive.take_weapons();
         let goals = drive.take_goals();
-        let equip = drive.take_equip();
-        let use_named = drive.take_use_named();
-        let search = drive.take_search();
+        let mut equip = drive.take_equip();
+        let mut use_named = drive.take_use_named();
+        let mut search = drive.take_search();
         let control = drive.take_control();
+        // Match the interactive fixed_step: FPC/FPL/CameraView/PlayingVideo own the pawn while
+        // the authored cinematic runs. The headless route must still advance its script cursor,
+        // but player-axis/action commands are ignored. Explicit test-only set_goal commands are
+        // retained; they are host bridges, not player inputs, and existing Banque01 coverage
+        // labels them as such.
+        if respect_cinematic_input && cinematics::input_suppressed(&runtime.session) {
+            input = Input::default();
+            weapons.clear();
+            equip = false;
+            use_named.clear();
+            search.clear();
+        }
         let fired = input.fire;
         if runtime.volumes.is_empty() {
             runtime
@@ -2304,7 +2343,8 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
             script.last_time() + 2.0
         }
     });
-    let outcome = run_script(&game_dir, &map, &script, &params, &scene, duration)?;
+    let outcome =
+        run_script_with_cinematic_input(&game_dir, &map, &script, &params, &scene, duration)?;
     let session = &outcome.session;
     println!(
         "[play] travel: {} transition(s), final map {}",
@@ -2602,7 +2642,7 @@ mod tests {
             "t=45.0 forward 1\nt=46.5 forward -1\nt=48.0 forward 1\nt=49.5 forward -1\nt=51.0 forward 1\nt=52.5 forward -1\nt=54.0 forward 0\n",
         )
         .unwrap();
-        let outcome = run_script(
+        let outcome = run_script_with_cinematic_input(
             &game_dir,
             "Plage01",
             &script,
@@ -2771,7 +2811,7 @@ mod tests {
              t=53.00 forward 0\n",
         )
         .unwrap();
-        let outcome = run_script(
+        let outcome = run_script_with_cinematic_input(
             &game_dir,
             "Plage01",
             &script,
@@ -2840,7 +2880,7 @@ mod tests {
         let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/plage01_route.script");
         let script = script::Script::load(&route_path).expect("load item19 Plage01 route");
-        let outcome = run_script(
+        let outcome = run_script_with_cinematic_input(
             &game_dir,
             "Plage01",
             &script,
@@ -3352,7 +3392,7 @@ mod tests {
         let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/banque01_route.script");
         let script = script::Script::load(&route_path).expect("load item24 banque01 route");
-        let outcome = run_script(
+        let outcome = run_script_with_cinematic_input(
             &game_dir,
             "banque01",
             &script,
@@ -3588,9 +3628,177 @@ mod tests {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
         };
-        for map in ["Plage00", "Plage01"] {
+        for map in ["Plage00", "Plage01", "Amos01"] {
             probe_objectifs(&game_dir, map);
         }
+    }
+
+    /// item40 route attempt: player input only for 120 seconds, with no teleports/bridges. The
+    /// route is considered blocked only when the decoded opening cine still owns the controller
+    /// and the primary rooftop goal remains incomplete; otherwise this test requires travel.
+    #[test]
+    fn opt_in_amos01_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Amos01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Amos01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let route_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/amos01_route.script");
+        let script = script::Script::load(&route_path).expect("load item40 Amos01 route");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Amos01",
+            &script,
+            &resolved.params,
+            &scene,
+            120.0,
+        )
+        .expect("run Amos01 opening probe");
+        let pc = outcome
+            .session
+            .controller
+            .expect("Amos01 player controller");
+        let player_state = outcome.session.vm().state_name(pc);
+        let objectives = outcome.session.objective_states();
+        println!(
+            "[amos01 route] player={} final_state={player_state:?} inventory={:?} bWeaponMode={:?} OldWeap={:?} objectives={objectives:?} travel={:?}",
+            outcome.session.vm().objects[pc as usize].name,
+            outcome.session.inventory_items(),
+            outcome.session.vm().get_property(pc, "bWeaponMode"),
+            outcome.session.vm().get_property(pc, "OldWeap"),
+            outcome.travel
+        );
+        for event in &outcome.session.vm().trace {
+            if let xiii_script::TraceKind::StateChange {
+                actor, from, to, ..
+            } = &event.kind
+                && actor.eq_ignore_ascii_case("XIIIPlayerController")
+            {
+                println!("[amos01 control] t={:.3} {from:?} -> {to:?}", event.time);
+            }
+            if let xiii_script::TraceKind::Event {
+                target,
+                function,
+                args,
+            } = &event.kind
+                && (target.eq_ignore_ascii_case("Amos0") || function.ends_with(".Trigger"))
+            {
+                println!(
+                    "[amos01 event] t={:.3} {target}.{function}{args:?}",
+                    event.time
+                );
+            }
+        }
+        for (i, object) in outcome.session.vm().objects.iter().enumerate() {
+            let id = i as xiii_script::ObjectId;
+            if object.deleted || !object.suspended {
+                continue;
+            }
+            println!(
+                "[amos01 suspended] {} state={:?} class={:?}",
+                object.name,
+                outcome.session.vm().state_name(id),
+                object.class
+            );
+        }
+        for (i, object) in outcome.session.vm().objects.iter().enumerate() {
+            let id = i as xiii_script::ObjectId;
+            if object.deleted || !outcome.session.vm().is_a(id, "XIIIGoalTrigger") {
+                continue;
+            }
+            let number = outcome.session.vm().get_property(id, "GoalNumber");
+            if !matches!(number, Some(xiii_script::Value::Int(1))) {
+                continue;
+            }
+            let vm = outcome.session.vm();
+            println!(
+                "[amos01 goal] {} GoalNumber={number:?} Event={:?} Tag={:?} Location={:?}",
+                object.name,
+                vm.get_property(id, "Event"),
+                vm.get_property(id, "Tag"),
+                vm.vector_prop(id, "Location")
+            );
+        }
+        for (i, object) in outcome.session.vm().objects.iter().enumerate() {
+            let id = i as xiii_script::ObjectId;
+            if object.deleted || !outcome.session.vm().is_a(id, "TouchTrigger") {
+                continue;
+            }
+            if !matches!(outcome.session.vm().get_property(id, "Event"),
+                Some(xiii_script::Value::Name(name)) if name.eq_ignore_ascii_case("findemap"))
+            {
+                continue;
+            }
+            let vm = outcome.session.vm();
+            println!(
+                "[amos01 goal-source] {} Event=findemap Location={:?}",
+                object.name,
+                vm.vector_prop(id, "Location")
+            );
+        }
+        assert_eq!(outcome.final_map, "Amos01");
+        assert!(
+            outcome.travel.is_empty(),
+            "route unexpectedly travelled: {:?}",
+            outcome.travel
+        );
+        assert_eq!(
+            player_state.as_deref(),
+            Some("NoMove"),
+            "if control returned, route must complete and travel to Toits01"
+        );
+        let controller_failure = outcome
+            .session
+            .failures
+            .iter()
+            .find(|(name, _)| name == "XIIIPlayerController")
+            .map(|(_, error)| error);
+        assert!(
+            controller_failure.is_some_and(|error| {
+                error.contains("CallDepthExceeded")
+                    && error.contains("XIIIPlayerController.SwitchWeapon")
+                    && error.contains("CineController2.PlayingSequence.Tick")
+            }),
+            "expected measured authored-cine weapon-switch blocker; got {controller_failure:?}"
+        );
+        assert!(
+            matches!(
+                outcome.session.vm().get_property(pc, "MyInteraction"),
+                Some(xiii_script::Value::Object(Some(
+                    xiii_script::ObjRef::Instance(_)
+                )))
+            ),
+            "the headless InitInputSystem adapter must provide MyInteraction"
+        );
+        let rooftop = objectives
+            .iter()
+            .find(|o| o.index == 1)
+            .expect("rooftop objective");
+        assert!(
+            rooftop.primary && !rooftop.completed,
+            "observed blocker requires the primary rooftop goal to remain incomplete: {rooftop:?}"
+        );
+        let first_after_intro_state = outcome
+            .trace
+            .iter()
+            .find(|sample| sample.1 >= 0.5)
+            .expect("post-cutscene-state player trace")
+            .2;
+        let finish = outcome.trace.last().expect("player trace").2;
+        assert_eq!(
+            first_after_intro_state, finish,
+            "player moved after CineController22 froze the controller"
+        );
+        println!(
+            "[amos01 route] BLOCKED: authored CineController22 still owns NoMove; its weapon-mode tick recurses through SwitchWeapon with no Weapon in inventory. Input held for 120 s; rooftop objective remains pending."
+        );
     }
 
     fn probe_objectifs(game_dir: &std::path::Path, map: &str) {
