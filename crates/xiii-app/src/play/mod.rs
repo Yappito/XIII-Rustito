@@ -2673,6 +2673,102 @@ mod tests {
         );
     }
 
+    /// item32 opt-in regression: the authored Plage01 trigger wakes BaseSoldier6 from faction.
+    /// `IAController.Init` reads `MapInfo.XIIIPawn` after two latent sleeps (about 0.2-0.3 s);
+    /// the game's own `MapInfo.FirstFrame` (run by `MapInfo.Timer` after `checkTime` = 0.1 s)
+    /// sets it first, so `Trigger` engages the real player.
+    #[test]
+    fn opt_in_plage01_faction_trigger_cue_enters_scripted_attack() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = session::Session::open(&game_dir, "Plage01").expect("open Plage01");
+        let soldier = session
+            .vm()
+            .find_object("BaseSoldier6")
+            .expect("BaseSoldier6");
+        let controller = match session.vm().get_property(soldier, "Controller") {
+            Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => *id,
+            _ => panic!("BaseSoldier6 has no controller"),
+        };
+        let player = session.player;
+        let player_loc = session
+            .vm()
+            .vector_prop(player, "Location")
+            .expect("player location");
+
+        for _ in 0..120 {
+            session.step(
+                1.0 / 60.0,
+                player_loc,
+                0.0,
+                [0.0; 3],
+                &session::PlayerVMModes::default(),
+            );
+        }
+        let map_info = session.map_info().expect("Plage01 MapInfo");
+        assert_eq!(
+            session.vm().get_property(map_info, "XIIIPawn"),
+            Some(&xiii_script::Value::Object(Some(
+                xiii_script::ObjRef::Instance(player)
+            ))),
+            "MapInfo.FirstFrame (MapInfo.Timer after checkTime 0.1 s) must have set XIIIPawn to the logged-in pawn"
+        );
+        assert_eq!(
+            session.vm().state_name(controller).as_deref(),
+            Some("faction"),
+            "BaseSoldier6 should begin in the map-authored faction order"
+        );
+
+        // Deliver the real trigger event with the logged-in pawn. The map dispatcher and the
+        // soldier's own Pawn.Trigger -> IAController.Trigger chain perform the state transition.
+        let touch = session
+            .vm()
+            .find_object("TouchTrigger8")
+            .expect("TouchTrigger8");
+        session
+            .vm_mut()
+            .send_event(
+                touch,
+                "Touch",
+                vec![xiii_script::Value::Object(Some(
+                    xiii_script::ObjRef::Instance(player),
+                ))],
+            )
+            .expect("TouchTrigger8.Touch");
+
+        let mut engagement = None;
+        for tick in 0..600u32 {
+            session.step(
+                1.0 / 60.0,
+                player_loc,
+                0.0,
+                [0.0; 3],
+                &session::PlayerVMModes::default(),
+            );
+            let state = session.vm().state_name(controller);
+            if matches!(
+                state.as_deref(),
+                Some("Acquisition" | "Attaque" | "AttaqueScriptee")
+            ) {
+                engagement = Some((tick as f32 / 60.0, state));
+                break;
+            }
+        }
+        println!(
+            "[item32] cue TouchTrigger8 -> XIIIDispatcher3.OutEvents('tueur_conducteur'); \
+             BaseSoldier6 engagement {engagement:?}"
+        );
+        assert!(
+            engagement.is_some(),
+            "the authored tueur_conducteur cue did not move BaseSoldier6 from faction to \
+             Acquisition/Attaque/AttaqueScriptee; current state {:?}, first error {:?}",
+            session.vm().state_name(controller),
+            session.first_error()
+        );
+    }
+
     /// Opt-in corpus test (requirement 6): the Plage01 script run opens the locked hut door
     /// (`Porte6`) with the host use action and ends with the player at least 2 m (180 UU) outside
     /// the door plane, along the door's own forward axis. No teleport.
