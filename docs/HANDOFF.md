@@ -4,7 +4,7 @@ Updated: **2026-10-05 (second session)**. Research phase (2026-10-04), M0, M1 an
 
 ## Next session: start here
 
-State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `3d97dc8` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
+State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `9903901` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
 ### How the user wants work organized
 
@@ -26,7 +26,7 @@ State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XII
 ### Environment notes
 
 - cargo/rustc in `C:\Users\ZoliBen\.cargo\bin` (Git Bash: `export PATH="$HOME/.cargo/bin:$PATH"`). Rust 1.99.0 pinned, MSVC 14.44. No `gh` CLI.
-- Full verification (about 2-4 minutes warm): `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && XIII_GOG_DIR=P:/AI/XIII/XIII_Game XIII_STEAM_DIR="P:/SteamLibrary/steamapps/common/XIII - Classic" cargo test --workspace`. Last result (`3d97dc8`): **630 passed, 0 failed**. Use `bash P:/AI/XIII/local/verify.sh` (git-ignored helper: fmt + clippy + full tests with real exit status) before every push; piping cargo into `tail`/`awk` once masked a compile failure and broke main. Use absolute paths: some older opt-in tests resolve relative `XIII_GOG_DIR` against the crate directory.
+- Full verification (about 2-4 minutes warm): `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && XIII_GOG_DIR=P:/AI/XIII/XIII_Game XIII_STEAM_DIR="P:/SteamLibrary/steamapps/common/XIII - Classic" cargo test --workspace`. Last result (`9903901`): **747 passed, 0 failed**. Use `bash P:/AI/XIII/local/verify.sh` (git-ignored helper: fmt + clippy + full tests with real exit status) before every push; piping cargo into `tail`/`awk` once masked a compile failure and broke main. Use absolute paths: some older opt-in tests resolve relative `XIII_GOG_DIR` against the crate directory.
 - Viewer: `cargo run -p xiii-app --release -- --map Plage01 --game-dir XIII_Game` (`--exit-after-secs N --screenshot <png>`, `--dump`, `--collision-test`, `--reach-test`, `--lighting off|baked`). Character: `--model xiiipersos.XIIIM --anim Walk`. Movement + VM prototype: `--play --map Plage01 [--play-script <file>]` (E = use). Headless VM: `xiii-tool script run --game-dir XIII_Game --map Plage00 --begin-play --physics map --anim map --nav map --events`.
 - Disassembler (user-approved): `llvm-objdump` from `rustup component add llvm-tools`, at `C:/Users/ZoliBen/.rustup/toolchains/1.99.0-x86_64-pc-windows-msvc/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-objdump.exe`. DLLs are read only; disassembly output stays in git-ignored `local/re/`, never committed or pasted into code.
 - Launch parallel opencode runs a few seconds apart: simultaneous starts fail with `database is locked`.
@@ -34,12 +34,9 @@ State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XII
 
 ### In flight when this was written
 
-- `item17a` clean-room Bink 1 container + video decoder, new crate `xiii-video` (worktree `local/wt/viewer`).
-- `item3o` Plage00 intro to its end, `HudMessage` TypeMismatch, checkpoint save `bcompleted`, `OrthoRotation` (worktree `local/wt/locale`; coordinator merged main into it and removed duplicate natives).
-- `item15` level end + travel (Plage00 -> Plage01 works through the game's goal/EndGame/ServerTravel chain; labelled `BeachFinalFall` start bridge because its real starter is not in the decoded data); merge conflicts being resolved (worktree `local/wt/steam`; `PlayerController.ClientTravel` must be registered once - also in item16's block).
-- `item1k` `physWalking`/`FindSpot` port: evidence-wording correction (worktree `local/wt/sweep`).
-- `item16b` menu layout + delegates (worktree `local/wt/bsp`); `item14c` game's own weapon give/attach/fire path + Beretta reachability (worktree `local/wt/fx`).
-- Specs in each worktree's `local/tasks/` (copies in `P:/AI/XIII/local/tasks/`); logs in `P:/AI/XIII/local/logs/`; reports in each worktree's `local/reports/`.
+- `item20b` save/load fidelity (worktree `local/wt/sweep`, uncommitted; opencode session `item20b-save-fidelity`): menu Load/Continue via `SaveSlotProvider` works; the checkpoint-load `StartSpotEvent = "LOAD"` correction was cut off by a provider limit - resume it, remove the t=0.20 s re-apply bridge, keep health 150 for 10 s and Plage00's normal-start 75.
+- `item16c` menu completion (worktree `local/wt/codex1`, partial Codex CLI edit in `canvas.rs` only; the Codex workspace ran out of credits).
+- Specs in `P:/AI/XIII/local/tasks/`; logs in `P:/AI/XIII/local/logs/`; reports in each worktree's `local/reports/`.
 
 ## User intent
 
@@ -158,6 +155,18 @@ Per-task reports with all numbers and commands: `local/reports/item1-collision.m
 - **Performance:** VM tick 2.6 ms -> 0.36-0.52 ms (Banque01, ~900 actors); all maps > 240 FPS release on the RTX 4090.
 - **Scale:** 90 UU/m (user-approved estimate).
 
+### Fifth block (2026-10-06, up to `9903901`) — measured, prototype, not a playable mission
+
+- **Plage01 start to end by the game's own logic (headless route test):** the level-start cutscene, both objectives (`objectif91`/`92` fired by the game's chains), corpse search for the truck key, `Porte1`, then `XIIIGameInfo.EndGame` -> `XIIIPlayerController.GameEnded` -> `GameEndedSuccess` -> `PlayingVideo` (`cine01`, real Bink duration) -> `ServerTravel("banque01.unr")` at 123.4 s. No `take_control`/`set_goal` bridges on the route; remaining host decisions: diagnostic teleports and an `XIII.m60` grant in the route script, tick-scope restores, the game-end cutscene stop. Root causes fixed from Engine.dll: list natives never clear the removed node's link (`execRemoveController` 0x10367ac0, `execRemovePawnFromList` 0x103b02e0); plain variable reads through a just-destroyed actor return the stale value (`execContext` 0x101173a0, `CleanupDestroyed` 0x10387ae0); `PlayerTick` dispatch (state overrides only); exact-class `FindInventoryType`; spawn event order measured in `ULevel::SpawnActor` (PostNetBeginPlay after PostBeginPlay, skipped on clients).
+- **Plage00 intro:** plays to control return (voice lengths from decoded waves; 0.28 s / 3.1 s lines, control at 6.2 s).
+- **Video (user decision: clean-room):** new crate `xiii-video`. Bink 1 video decoder byte-exact (Y/Cb/Cr) vs a black-box FFmpeg oracle on all sampled frames, all 19 cutscenes / 24,167 frames, 0 errors; Bink audio (DCT variant) 100,190 packets, 0 errors, 85.8-92.4 dB (DLL floor/clip cross-fade rounding); decoder tables are read at runtime from the installation's `binkw32.dll`, never stored in the repo. `--video` plays with the audio clock as master. An earlier FFmpeg-derived attempt was rejected and archived outside the repo (`local/archive/`), never merged.
+- **Combat/weapon:** the diagnostic grant runs the game's own `GiveTo`; the muzzle flash comes from the game's chain (no host bridge); the shooter's own attachment no longer blocks its trace; calls dropped on suspended actors are traced and counted.
+- **Menus:** UnrealScript delegates in the VM; the menu is driven by the game's own `InitComponent`/`OnDraw` delegates with the real panel layout.
+- **Save/load (partial):** checkpoint save files in a user directory from the game's `DoSave`/`SaveAtCheckpoint`; `--play --load N`. In progress (`local/wt/sweep`, item20b, uncommitted): menu Load/Continue through a `SaveSlotProvider`, and making checkpoint loads set `StartSpotEvent = "LOAD"` the way the game does (`Plage00.FirstFrame` skips the wounded-health write only then).
+- **World data:** all 7,194 BSP Models decode byte-exact; reach classification (closed movers labelled, ladder/jump edges excluded): 98.6 % of walk-testable edges pass.
+- Full verification at `9903901`: 747 tests passed; Plage00 `--trace` byte-identical.
+- **Delegation note:** OpenCode Go (weekly), OpenAI `gpt-6-luna`, Ollama Cloud (5 h) and Z.AI (5 h) all hit limits on 2026-10-06; the Codex CLI workspace (second OpenAI subscription) had no credits. Hard bit-level reverse engineering (Bink) succeeded only with Claude sub-agents. Codex CLI headless needs `-c 'windows.sandbox="unelevated"' -s workspace-write` (helper `local/codex-run.sh`) and worktrees without the `XIII_Game` junction.
+
 ### Fourth 2026-10-05 block (up to `3d97dc8`) — measured, prototype, not a playable mission
 
 - **Combat (item14b):** hit zones from decoded SkeletalMesh bone boxes posed by the current animation (MiocheM: head 75 dmg, spine 31); `Weapon.PlayFiringSound` emits a positional `PlaySound` event; AI perception (`SeePlayer`/`EnemyNotVisible` from `SightRadius`/`PeripheralVision`/line of sight), `SetEnemy` raises `EnemyAcquired`, 10 AI natives, independent `Timer`/`Timer2`/`Timer3`. Base01 `BaseSoldier17` runs `Tenir -> Acquisition -> Attaque`, fires its M16, player Health 150 -> 90. Labelled host bridges: AI `Fire` re-issue (engine `AWeapon::Tick`) and focus rotation. Plage00/01 soldiers are ordered to the scripted `faction` stasis and never fight. The Plage01 Beretta pickup is not reached by walking (player stops 80 UU short; diagnostic grant kept) - investigated in item14c.
@@ -223,12 +232,12 @@ Native Windows reports an RTX 4090. Rust/Cargo were not found on the inspected W
 
 ## Exact next work
 
-1. **Toward a completable Plage00/Plage01:** merge item3o (intro to its end, checkpoint save) and item15 (travel); then the Plage01 end: `VideoPlayer` playing `cine01` through `xiii-video` (item17a decoder, then Bink audio), `PlayingVideo.PlayerTick` dispatch (the host does not dispatch `PlayerTick`), the second objective ("Leave the beach using the killer's pick-up truck"); a full Plage01 run-through by the game's own logic to list every remaining blocker; find the real starter of `XIDCine.BeachFinalFall` to remove the bridge.
-2. **Combat fidelity:** item14c (game's own `GiveTo`/`AttachToPawn`, fire-path `WeaponAttachment` cast, Beretta reachability); then damage/death presentation and soldiers leaving `faction` stasis on their scripted cues.
-3. **Video:** Bink audio after item17a; `VideoPlayer` natives backed by the decoder (menu intro `cine00`, level-end videos).
-4. **Menus/save:** item16b layout and delegates; then save/load (checkpoint save currently emits a `SaveCheckpoint` event only) and options persistence.
-5. **Rendering:** the comic outline look (needs reference captures); remaining Model tail variant (798 exports).
-6. **Collision:** merge item1k; remaining reach groups (rotated movers, overhangs).
+1. **Toward a completable Plage00/Plage01 with the player in control:** windowed `--play` run of the Plage01 route (the headless route test passes; confirm the windowed path and remove the remaining route teleports by fixing movement/pathing gaps); play the `cine01` video in `--play` through `VideoPlayer` backed by `xiii-video` (today only its duration is honoured); Banque01 run-through after travel.
+2. **Save/load:** finish item20b (game-driven `LOAD` start event, menu Load/Continue), inventory/ammo detail, `SoundToLaunch`.
+3. **Menus:** item16c (3D `MapMenu` backdrop, menu audio, working options with persistence, translucency).
+4. **Combat:** soldiers leaving `faction` stasis on their scripted cues on Plage00/01; damage/death presentation; Bink audio track selection (the 5 tracks are probably language dubs, unverified).
+5. **Rendering:** the comic outline look (needs reference captures).
+6. **VM fidelity:** `Vm::destroy` marks the actor deleted before `Destroyed` runs (the engine does the reverse; list natives work around it with raw reads); function calls/writes through a just-destroyed actor still return Accessed None.
 
 Do not report playable progress from the viewer, the `--play` prototype or headless traces until a mission can be completed by the game's own logic without host shortcuts.
 
