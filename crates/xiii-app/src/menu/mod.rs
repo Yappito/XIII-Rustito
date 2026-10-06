@@ -16,9 +16,12 @@
 //! `__OnPreDraw__`/`__OnDraw__` callbacks through the VM's delegate opcodes
 //! (`DelegateProperty`/`LetDelegate`/`DelegateFunction`). It draws the recorded `Engine.Canvas`
 //! commands. The `ViewportOwner` (the engine's player/viewport link) is a minimal host-created
-//! `Engine.Player` -> `Engine.PlayerController` pair. The `cine00` intro video is not decoded,
-//! so `VideoPlayer.*` is a labelled stub and the new-game `ClientTravel("Plage00")` request is
-//! recorded for the host travel step.
+//! `Engine.Player` -> `Engine.PlayerController` pair. The `cine00` intro video is played by the
+//! item21 host cutscene player (`menu::cutscene`/`crate::video`): the game's own
+//! `VideoPlayer.Open/Play/Stop/GetStatus` natives drive it fullscreen over the menu and the
+//! new-game `ClientTravel("Plage00")` request is recorded for the host travel step.
+
+mod cutscene;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -811,6 +814,24 @@ impl MenuSession {
         }
     }
 
+    /// Sends a live key press to the game's menu handler only while its `VideoPlayer` is open.
+    /// During `PlayingVideo`, the game's own `InternalOnKeyEvent` decides whether the key stops
+    /// the clip (Enter/Escape) or is ignored/passed to the base handler; the host adds no skip
+    /// mapping of its own.
+    pub(crate) fn video_key_event(&mut self, key: u8) {
+        if self.vm.video_name().is_none() {
+            return;
+        }
+        if let Err(e) = self.vm.send_event(
+            self.page,
+            "InternalOnKeyEvent",
+            vec![Value::Byte(key), Value::Byte(1), Value::Float(0.0)],
+        ) {
+            self.errors.push(format!("live key {key}: {e}"));
+        }
+        self.scan_trace();
+    }
+
     /// Instantiates a decoded page class as the active page and runs its own `InitComponent`
     /// (the host bridge for the native `GUIController.OpenMenu` page stack). Used by
     /// `--menu-script open`.
@@ -1140,7 +1161,7 @@ impl Plugin for MenuPlugin {
     fn build(&self, app: &mut App) {
         let game_dir = self.options.game_dir.clone().unwrap_or_default();
         let t0 = Instant::now();
-        let session = match &self.options.menu_script {
+        let mut session = match &self.options.menu_script {
             Some(path) => match MenuScript::load(path) {
                 Ok(s) => save_dir(&self.options)
                     .and_then(|dir| MenuSession::open(&game_dir, dir, Some(s))),
@@ -1155,14 +1176,41 @@ impl Plugin for MenuPlugin {
             "[menu] menu session open (MapMenu + XIDInterf.XIIIMenu): {:.2}s",
             t0.elapsed().as_secs_f32()
         );
+        // item21: the game's new-game path opens `cine00` through `Engine.VideoPlayer`; install
+        // the host cutscene player so it is decoded, played fullscreen (letterboxed) with its
+        // Bink Audio track, and `GetStatus` follows the actual playback.
+        let cutscene_host = session.as_mut().ok().and_then(|s| {
+            let dir = Path::new(&game_dir);
+            if !dir.is_dir() {
+                return None;
+            }
+            // `MenuSession` does not use the play `Session::open` duration scan. Keep the same
+            // labelled Bink-header fallback for cine00 if the clean-room decoder/tables cannot
+            // decode it.
+            let cine00 = dir.join("Video").join("Cine00.bik");
+            let mut header = [0u8; 36];
+            if std::fs::File::open(&cine00)
+                .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut header))
+                .is_ok()
+                && let Some(duration) = crate::video::bink_duration_from_header(&header)
+            {
+                s.vm.set_video_duration("cine00", duration);
+            }
+            let host = crate::video::VideoHostHandle::new(dir.to_path_buf(), true);
+            s.vm.set_video_host(Box::new(host.clone()));
+            println!("[menu] item21 cutscene host installed (the new-game clip plays fullscreen)");
+            Some(host)
+        });
         app.insert_non_send(session)
+            .insert_non_send(crate::video::CutsceneHost(cutscene_host))
+            .add_plugins((crate::video::CutscenePlugin, cutscene::CutsceneSystems))
             .insert_resource(MenuConfig {
                 options: self.options.clone(),
             })
             .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
             .init_resource::<MenuShotFlag>()
             .add_systems(Startup, setup)
-            .add_systems(Update, (frame, draw, unattended).chain());
+            .add_systems(Update, (frame, draw, cutscene::sync, unattended).chain());
     }
 }
 

@@ -1244,23 +1244,65 @@ pub struct Vm<'s> {
     video_durations: HashMap<String, f32>,
     /// item18: the currently open `Engine.VideoPlayer` (`None` before `Open`).
     video: Option<VideoPlayback>,
+    /// item21: optional host playback provider (the Bevy runtime's `xiii-video` player). When
+    /// installed, `GetStatus` reports completion from the actual host playback instead of the
+    /// Bink-header duration timer.
+    video_host: Option<Box<dyn VideoPlayerHost>>,
+}
+
+/// item21: host-backed cutscene playback for `Engine.VideoPlayer`. The VM is filesystem-free and
+/// has no display or audio device; the host (the Bevy runtime) installs an implementation that
+/// decodes the clip with the clean-room `xiii-video` decoder and plays it fullscreen with its
+/// Bink Audio track. `Engine.VideoPlayer.GetStatus` then reports completion from the actual host
+/// playback, not a VM timer. The duration fallback ([`Vm::set_video_duration`]) stays for hosts
+/// that cannot decode a file (labelled at the native).
+pub trait VideoPlayerHost {
+    /// Opens the clip named `name` (lowercased file stem). `Some(duration)` when the host can
+    /// decode the file and will play it; `None` when it cannot (the caller falls back to a
+    /// registered duration, labelled).
+    fn open(&mut self, name: &str) -> Option<f32>;
+    /// Starts playback of the opened clip (`Engine.VideoPlayer.Play`).
+    fn play(&mut self);
+    /// Stops playback and releases the clip (`Engine.VideoPlayer.Stop`; the menu's
+    /// `InternalOnKeyEvent` calls it, the level-end `PlayingVideo` state never does).
+    fn stop(&mut self);
+    /// True once the host playback ran to its end (every decoded frame shown).
+    fn finished(&self) -> bool;
+    /// True when the host playback failed (frames could not be decoded);
+    /// `GetStatus` then reports the game's error status `2`.
+    fn errored(&self) -> bool;
+}
+
+/// item21: how the open clip is timed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoTiming {
+    /// The host decodes and plays the clip; completion follows the host playback.
+    Host,
+    /// The file could not be decoded (or no host is installed); the clip is timed from the
+    /// registered Bink-header duration instead (labelled at the native).
+    Duration,
+    /// Nothing times the clip; `GetStatus` reports finished immediately.
+    Untimed,
 }
 
 /// item18: host-driven `Engine.VideoPlayer` state.
 ///
-/// `Engine.VideoPlayer.Open(name)` records the clip and any host-registered duration;
-/// `Play` starts its clock at [`Vm::time`]; `GetStatus` returns `1` (playing) until the real
-/// duration elapses and `0` (finished) after. No decoder is linked, so this times the video
-/// without displaying it (the host labels that Partial). A clip whose Bink header could not be
-/// read has no duration and reports finished immediately, preserving the item16 menu behavior.
+/// `Engine.VideoPlayer.Open(name)` records the clip; `Play` starts it at [`Vm::time`];
+/// `GetStatus` returns `1` (playing) until the clip ends and `0` (finished) after. With a
+/// [`VideoPlayerHost`] installed the clip is decoded and played by the host and completion
+/// follows the host playback; otherwise the host-registered Bink-header duration times it
+/// (labelled Partial). A clip with no duration and no host reports finished immediately,
+/// preserving the item16 menu behavior.
 #[derive(Debug, Clone)]
 pub struct VideoPlayback {
     /// Lowercased file stem as passed to `Open` (directory and `.bik` stripped).
     pub name: String,
-    /// Decoded duration in seconds, when the host read the Bink header.
+    /// Decoded duration in seconds (from the host decoder or the Bink header).
     pub duration: Option<f32>,
     /// VM time at which `Play` was called (`None` before `Play`).
     pub started_at: Option<f64>,
+    /// item21: how this clip is timed.
+    pub timing: VideoTiming,
 }
 
 fn lower(s: &str) -> String {
@@ -1330,6 +1372,7 @@ impl<'s> Vm<'s> {
             suspended_deferred_calls: 0,
             video_durations: HashMap::new(),
             video: None,
+            video_host: None,
         }
     }
 
@@ -1729,46 +1772,98 @@ impl<'s> Vm<'s> {
         self.pending_travel.is_some()
     }
 
-    // ---------------------------------------------------------------- item18 VideoPlayer
+    // ---------------------------------------------------------------- item18/21 VideoPlayer
 
     /// Registers the real duration of a Bink clip (seconds), keyed by file stem. The host reads
     /// the Bink header because `xiii-script` has no filesystem access. A non-finite or negative
     /// duration is ignored (never stored) so `GetStatus` cannot be made to hang on bad data.
+    /// With a [`VideoPlayerHost`] installed this is only the labelled fallback for clips the
+    /// host cannot decode.
     pub fn set_video_duration(&mut self, name: &str, seconds: f32) {
         if seconds.is_finite() && seconds >= 0.0 {
             self.video_durations.insert(video_stem(name), seconds);
         }
     }
 
-    /// `Engine.VideoPlayer.Open(name)`: records the clip. Returns `true` when a duration is known
-    /// (the video will be timed) and `false` when it is not (the call is still accepted, and
-    /// `GetStatus` reports finished — the labelled Partial).
+    /// item21: installs the host playback provider. `Engine.VideoPlayer` clips are then decoded
+    /// and played by the host and `GetStatus` follows the host playback.
+    pub fn set_video_host(&mut self, host: Box<dyn VideoPlayerHost>) {
+        self.video_host = Some(host);
+    }
+
+    /// Whether a host playback provider is installed.
+    pub fn has_video_host(&self) -> bool {
+        self.video_host.is_some()
+    }
+
+    /// `Engine.VideoPlayer.Open(name)`: records the clip. Returns `true` when the clip is timed
+    /// (the host decodes it, or a Bink-header duration is registered as the labelled fallback)
+    /// and `false` when it is not (the call is still accepted, and `GetStatus` reports
+    /// finished — the labelled Partial). A new `Open` stops any clip the host is still playing.
     pub fn video_open(&mut self, name: &str) -> bool {
         let stem = video_stem(name);
-        let duration = self.video_durations.get(&stem).copied();
+        if self
+            .video
+            .as_ref()
+            .is_some_and(|v| v.timing == VideoTiming::Host)
+            && let Some(host) = self.video_host.as_mut()
+        {
+            host.stop();
+        }
+        let mut duration = None;
+        let mut timing = VideoTiming::Untimed;
+        if let Some(host) = self.video_host.as_mut()
+            && let Some(d) = host.open(&stem)
+        {
+            duration = Some(d);
+            timing = VideoTiming::Host;
+        }
+        if timing == VideoTiming::Untimed
+            && let Some(d) = self.video_durations.get(&stem).copied()
+        {
+            duration = Some(d);
+            timing = VideoTiming::Duration;
+        }
         self.video = Some(VideoPlayback {
             name: stem,
             duration,
             started_at: None,
+            timing,
         });
         duration.is_some()
     }
 
-    /// `Engine.VideoPlayer.Play()`: starts (or restarts) the clip clock.
+    /// `Engine.VideoPlayer.Play()`: starts (or restarts) the clip. With a host decoder the
+    /// host playback starts; completion then follows the host, not this timestamp.
     pub fn video_play(&mut self) {
-        if let Some(v) = self.video.as_mut() {
-            v.started_at = Some(self.time);
+        let host_played = match self.video.as_mut() {
+            Some(v) => {
+                v.started_at = Some(self.time);
+                v.timing == VideoTiming::Host
+            }
+            None => false,
+        };
+        if host_played && let Some(host) = self.video_host.as_mut() {
+            host.play();
         }
     }
 
-    /// `Engine.VideoPlayer.Stop()`: clears the clip.
+    /// `Engine.VideoPlayer.Stop()`: stops the host playback and clears the clip.
     pub fn video_stop(&mut self) {
+        if self.video.is_some()
+            && let Some(host) = self.video_host.as_mut()
+        {
+            host.stop();
+        }
         self.video = None;
     }
 
-    /// `Engine.VideoPlayer.GetStatus() -> int`: `1` while the clip is playing, `0` when it is
-    /// finished, not started, or has no known duration. The decoder is not linked, so nothing is
-    /// displayed; this only reports the clip's real timing.
+    /// `Engine.VideoPlayer.GetStatus() -> int`, the game's own status codes (decoded
+    /// `XIIIPlayerController.PlayingVideo.PlayerTick` switches on them): `1` while the clip
+    /// plays, `0` when it ended (or was never started / cannot be timed) and `2` when the host
+    /// playback failed ("Error playing video"). With a host decoder installed, completion is
+    /// the host playback's actual end; otherwise the registered Bink-header duration times the
+    /// clip from `Play`.
     pub fn video_status(&self) -> i32 {
         let Some(v) = self.video.as_ref() else {
             return 0;
@@ -1776,10 +1871,28 @@ impl<'s> Vm<'s> {
         let Some(started) = v.started_at else {
             return 0;
         };
-        match v.duration {
-            Some(d) if (self.time - started) < f64::from(d) => 1,
-            _ => 0,
+        match v.timing {
+            VideoTiming::Host => match self.video_host.as_ref() {
+                Some(h) if h.errored() => 2,
+                Some(h) if !h.finished() => 1,
+                _ => 0,
+            },
+            VideoTiming::Duration => match v.duration {
+                Some(d) if (self.time - started) < f64::from(d) => 1,
+                _ => 0,
+            },
+            VideoTiming::Untimed => 0,
         }
+    }
+
+    /// How the currently open clip is timed, if one is open (the native's trace label).
+    pub fn video_timing(&self) -> Option<VideoTiming> {
+        self.video.as_ref().map(|v| v.timing)
+    }
+
+    /// Duration of the currently open clip, if known (the native's trace label).
+    pub fn video_duration(&self) -> Option<f32> {
+        self.video.as_ref().and_then(|v| v.duration)
     }
 
     /// The current `Engine.VideoPlayer` clip stem, if one is open (diagnostics).

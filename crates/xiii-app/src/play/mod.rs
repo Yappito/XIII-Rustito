@@ -11,6 +11,7 @@
 
 pub mod cartoon;
 pub mod cinematics;
+pub mod cutscene;
 pub mod footsteps;
 pub mod hud;
 pub mod movement_modes;
@@ -114,6 +115,10 @@ struct TraceState {
     /// Set when a level transition completed: the unattended run screenshots the new map a short
     /// time later and exits, independent of the original budget.
     post_travel_at: Option<Instant>,
+    /// item21: set when the in-game cutscene video began playing (unattended + screenshot runs
+    /// only): the screenshot fires [`cutscene::VIDEO_SHOT_AFTER_SECS`] into playback and the run
+    /// exits once the shot is confirmed, independent of the original budget.
+    video_exit_at: Option<Instant>,
 }
 
 #[derive(Resource, Default)]
@@ -182,10 +187,27 @@ impl Plugin for PlayPlugin {
             "[play] script session open (scripts, begin-play, providers): {:.2}s",
             t0.elapsed().as_secs_f32()
         );
+        let cutscene_host = session.as_mut().ok().and_then(|s| {
+            let dir = Path::new(&game_dir);
+            if !dir.is_dir() {
+                return None;
+            }
+            let host = cutscene::install(
+                s.vm_mut(),
+                dir,
+                options.audio == crate::cli::Audio::On,
+            );
+            println!(
+                "[play] item21 cutscene host installed (VideoPlayer clips are decoded and played fullscreen)"
+            );
+            Some(host)
+        });
         if let Ok(s) = session.as_mut() {
             s.enable_native_timers(options.perf_natives);
         }
         app.insert_non_send(session);
+        app.add_plugins((crate::video::CutscenePlugin, cutscene::CutsceneSystems));
+        app.insert_non_send(cutscene::CutsceneHost(cutscene_host));
         app.insert_resource(PlayConfig { options })
             .insert_resource(ClearColor(Color::srgb(0.45, 0.62, 0.82)))
             .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
@@ -807,6 +829,7 @@ fn setup_inner(
             shot_done: false,
             target_at: None,
             post_travel_at: None,
+            video_exit_at: None,
         });
     } else {
         // The reload owns a fresh per-map runtime, but the input-script cursor (`ScriptRes`) and
@@ -1531,9 +1554,50 @@ fn unattended(
     mut state: ResMut<TraceState>,
     flag: Res<ShotFlag>,
     sim: Res<SimRes>,
+    host: NonSend<cutscene::CutsceneHost>,
     mut perf: ResMut<crate::perf::Perf>,
     mut exit: MessageWriter<AppExit>,
 ) {
+    // item21 hook: an unattended run with a screenshot requested screenshots the in-game
+    // cutscene video [`cutscene::VIDEO_SHOT_AFTER_SECS`] into playback (the video may start
+    // long after the wall-clock budget began) and exits once the shot is confirmed.
+    if cfg.options.screenshot.is_some()
+        && state.video_exit_at.is_none()
+        && cutscene::playing_for(&host, cutscene::VIDEO_SHOT_AFTER_SECS)
+    {
+        if let Some(path) = cfg.options.screenshot.clone() {
+            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            commands
+                .spawn(Screenshot::primary_window())
+                .observe(save_to_disk(path))
+                .observe(|_: On<ScreenshotCaptured>, mut f: ResMut<ShotFlag>| f.0 = true);
+        }
+        state.video_exit_at = Some(Instant::now());
+        println!(
+            "[play] cutscene video playing ({:.1}s into playback); screenshot requested",
+            host.0.as_ref().map_or(0.0, |h| h.time_estimate())
+        );
+    }
+    if let Some(at) = state.video_exit_at {
+        // Wait for the screenshot to land (8 s backstop), then exit.
+        if flag.0 || at.elapsed() >= Duration::from_secs(8) {
+            println!(
+                "[play] exit {:.1}s into cutscene playback, {} frames, screenshot {}",
+                host.0.as_ref().map_or(0.0, |h| h.time_estimate()),
+                state.tick,
+                match (&cfg.options.screenshot, flag.0) {
+                    (Some(p), true) => format!("saved {}", p.display()),
+                    (Some(p), false) => format!("NOT confirmed {}", p.display()),
+                    (None, _) => "none".into(),
+                }
+            );
+            perf.request_final();
+            exit.write(AppExit::Success);
+        }
+        return;
+    }
     // After a level transition the new map owns a short tail: screenshot it once the scene has
     // settled, then exit, regardless of the original exit budget.
     if let Some(at) = state.post_travel_at {
@@ -1637,6 +1701,7 @@ fn travel(
     mut commands: Commands,
     mut cfg: ResMut<PlayConfig>,
     mut session: NonSendMut<Result<session::Session, String>>,
+    mut cutscene_host: NonSendMut<cutscene::CutsceneHost>,
     mut sync: ResMut<RenderSync>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -1699,6 +1764,13 @@ fn travel(
             return;
         }
     };
+    // item21: reinstall the cutscene host on the new map's VM. Dropping the old session stops
+    // its clip; the overlay sync tears the picture/audio down once the new host has none open.
+    cutscene_host.0 = Some(cutscene::install(
+        s.vm_mut(),
+        Path::new(&game_dir),
+        cfg.options.audio == crate::cli::Audio::On,
+    ));
     match setup_inner(
         &mut commands,
         &cfg.options,
@@ -1812,6 +1884,10 @@ struct MapRuntime {
     /// Shared counter of voice names this map's `VoiceDuration` provider could not resolve (the
     /// provider is re-installed on every map open, including travel reloads).
     voice_unresolved: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// item21: the host `VideoPlayer` provider installed on this map's VM. Driven by
+    /// `advance_virtual_all` each fixed step (no audio device headless: completion is the
+    /// decoded frame count).
+    video_host: Option<crate::video::VideoHostHandle>,
 }
 
 /// Opens a script session and builds the movement world for `map` from `scene` (the headless
@@ -1823,6 +1899,15 @@ fn open_map_runtime(
     params: &PlayerParams,
 ) -> Result<MapRuntime, String> {
     let mut session = session::Session::open(game_dir, map)?;
+    // item21: install the host `VideoPlayer` provider. Headless runs have no output device, so
+    // audio is off and playback is caller-paced (`advance_virtual_all`): `GetStatus` still
+    // reports completion from the decoded frame count, which is what the level-end
+    // `PlayingVideo` state waits for.
+    let video_host = {
+        let host = crate::video::VideoHostHandle::new(game_dir.to_path_buf(), false);
+        session.vm_mut().set_video_host(Box::new(host.clone()));
+        Some(host)
+    };
     // The headless path has no Bevy audio resource; scan the same decoded HX library so
     // `Actor.PlayStrVoice` takes the engine's voice-completion path (real wave length) instead of
     // the script's `NoSound` fallback. Names the library cannot resolve keep returning `false`.
@@ -1884,6 +1969,7 @@ fn open_map_runtime(
         sim,
         sources,
         voice_unresolved,
+        video_host,
     })
 }
 
@@ -1972,6 +2058,11 @@ pub(crate) fn run_script(
             runtime.sim.location = location;
             runtime.sim.yaw = yaw;
             runtime.sim.velocity = velocity;
+        }
+        // item21: advance the host cutscene player with the VM's own time. `PlayingVideo`'s
+        // `GetStatus` (next tick) then ends when the decoded frame count elapsed.
+        if let Some(h) = runtime.video_host.as_ref() {
+            h.advance_virtual_all(f64::from(DT));
         }
         let states = runtime.session.mover_states();
         runtime.mover_collision.update(&mut runtime.world, &states);
@@ -2101,6 +2192,12 @@ pub(crate) fn run_script(
         );
     }
     map_objectives.push((runtime.name.clone(), runtime.session.objective_states()));
+    if let Some(h) = runtime.video_host.as_ref() {
+        println!("[play] {}", h.report_line());
+        for d in h.diagnostics() {
+            println!("[play]   video host: {d}");
+        }
+    }
     let unresolved = voice_unresolved_total
         + runtime
             .voice_unresolved
@@ -2913,6 +3010,134 @@ mod tests {
             req.as_ref()
                 .is_some_and(|r| r.url.eq_ignore_ascii_case("banque01.unr")),
             "PlayingVideo.PlayerTick must request banque01; got {req:?}"
+        );
+    }
+
+    /// item21 opt-in corpus test (requirement 4): a `PlayingVideo` with `cine01` reports
+    /// completion only after the decoded frame count elapsed. The run drives the game's real
+    /// level-end chain — `XIIIGameInfo.EndGame(None, "GoalComplete")` ->
+    /// `GameEnded.BeginState` (XIIIEndGameType 4) -> `GameEndedSuccess.Timer` ->
+    /// `VP.Open(MapInfo.EndMapVideo)` -> `PlayingVideo.BeginState` -> `VP.Play()` — with the
+    /// host cutscene player installed on the session VM (headless form: caller-paced clock, no
+    /// audio device). The game's own `PlayingVideo.PlayerTick` must then request the level
+    /// travel when — and only when — the host has decoded every frame of `Cine01.bik`
+    /// (1358 frames / 25 fps ≈ 54.32 s).
+    #[test]
+    fn opt_in_plage01_playingvideo_completes_when_decoded_frames_elapse() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = session::Session::open(&game_dir, "Plage01").expect("open Plage01");
+        let host = crate::video::VideoHostHandle::new(game_dir.clone(), false);
+        session.vm_mut().set_video_host(Box::new(host.clone()));
+        let gi = session.game_info.expect("GameInfo");
+        session
+            .vm_mut()
+            .send_event(
+                gi,
+                "EndGame",
+                vec![
+                    xiii_script::Value::Object(None),
+                    xiii_script::Value::Str("GoalComplete".to_owned()),
+                ],
+            )
+            .expect("EndGame(GoalComplete)");
+        // Step until the chain's `PlayingVideo` state starts the host playback, then until the
+        // game's own `PlayerTick` requests the travel. The host advances with the VM's time, so
+        // travel can only be requested once every frame is decoded.
+        let dt = 1.0 / 30.0;
+        let max_steps = 80.0f64 / dt; // 80 s of VM time: the 45 s intro margin + the 54.3 s clip
+        let mut duration_opt: Option<f64> = None;
+        let mut started_at = None;
+        let mut status_before_end = None;
+        let mut travel_at = None;
+        let t0 = std::time::Instant::now();
+        for _i in 0..((max_steps).ceil() as usize) {
+            session.step(
+                dt as f32,
+                [0.0; 3],
+                0.0,
+                [0.0; 3],
+                &session::PlayerVMModes::default(),
+            );
+            if started_at.is_none() && host.is_playing() {
+                started_at = Some(session.vm_time());
+                duration_opt = Some(
+                    host.frame_count().expect("open clip") as f64 / host.fps().expect("open clip"),
+                );
+                assert_eq!(
+                    session.vm().video_status(),
+                    1,
+                    "the host playback just started; GetStatus must report playing"
+                );
+                assert_eq!(
+                    session.vm().video_timing(),
+                    Some(xiii_script::VideoTiming::Host),
+                    "cine01 must be host-decoded, not duration-timed"
+                );
+            }
+            if travel_at.is_none()
+                && let Some(req) = session.take_travel_request()
+            {
+                assert!(
+                    req.url.eq_ignore_ascii_case("banque01.unr"),
+                    "PlayingVideo.PlayerTick must request banque01; got {:?}",
+                    req.url
+                );
+                travel_at = Some(session.vm_time());
+                break;
+            }
+            host.advance_virtual_all(dt);
+            if let (Some(start), Some(dur), false) = (started_at, duration_opt, travel_at.is_some())
+            {
+                let played = session.vm_time() - start;
+                if played >= dur - 1.0 && played < dur && status_before_end.is_none() {
+                    status_before_end = Some(session.vm().video_status());
+                }
+            }
+        }
+        let wall = t0.elapsed().as_secs_f32();
+        let start = started_at.unwrap_or_else(|| {
+            panic!("the game's end chain must start the cutscene playback");
+        });
+        let duration = duration_opt.unwrap_or_else(|| {
+            panic!("the clip must still be open when travel ends the state");
+        });
+        let Some(travel_at) = travel_at else {
+            panic!(
+                "PlayingVideo must end in travel once the decoded frames elapsed \
+                 ({duration:.3}s of playback, started at VM {start:.3}, decoded {:?}/{:?})",
+                host.decoded(),
+                host.frame_count(),
+            );
+        };
+        let waited = travel_at - start;
+        println!(
+            "[item21 test] cine01: {:?} frames, travel after {waited:.3}s of VM playback \
+             ({duration:.3}s clip); decoded {:?}; wall {wall:.2}s",
+            host.frame_count(),
+            host.decoded(),
+        );
+        assert_eq!(
+            status_before_end,
+            Some(1),
+            "GetStatus must still report playing 1 s before the clip ends"
+        );
+        assert!(
+            waited >= duration - 2.0 * dt,
+            "travel came too early: {waited:.3}s < duration {duration:.3}s (the clip must not \
+             end before every frame is decoded)"
+        );
+        assert!(
+            waited <= duration + 2.0 * dt,
+            "travel came too late: {waited:.3}s > duration {duration:.3}s (GetStatus must \
+             follow the host playback, not a longer timer)"
+        );
+        assert_eq!(
+            host.decoded(),
+            host.frame_count(),
+            "the travel tick must have decoded every frame"
         );
     }
 
