@@ -42,6 +42,13 @@ pub struct QuantTables {
     pub tables: [[i32; 64]; 16],
 }
 
+/// The 16 masks used by Bink's two-colour pattern block type (one 4-pixel group per dword).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryPatterns {
+    /// Mask bit `k` selects the second colour for pixel `k` of a four-pixel group.
+    pub masks: [u32; 16],
+}
+
 /// All fixed tables required by the decoder, read from the installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinkTables {
@@ -55,6 +62,8 @@ pub struct BinkTables {
     pub tree_maxbits: [u8; 16],
     /// Run-fill scan patterns.
     pub patterns: Patterns,
+    /// Two-colour pattern masks read from the RAD DLL.
+    pub binary_patterns: BinaryPatterns,
     /// DCT coefficient scan order.
     pub scan: [u8; 64],
     /// Dequantisation tables.
@@ -112,15 +121,18 @@ impl BinkTables {
         let scan = find_scan_from_patterns(bytes, patterns_offset)?;
         let quant_offset = find_quant(bytes)?;
         let (tree_maxbits, tree_offset) = find_tree_tables(bytes)?;
+        let binary_pattern_offset = find_binary_patterns(bytes)?;
         let huffman = read_huffman(bytes, huffman_offset);
         let huffman_tables = read_tree_tables(bytes, tree_offset, &tree_maxbits);
         let patterns = read_patterns(bytes, patterns_offset);
         let quant = read_quant(bytes, quant_offset);
+        let binary_patterns = read_binary_patterns(bytes, binary_pattern_offset);
         Ok(BinkTables {
             huffman_lengths: huffman,
             huffman_tables,
             tree_maxbits,
             patterns,
+            binary_patterns,
             scan,
             quant,
             dll_size: bytes.len() as u64,
@@ -476,6 +488,50 @@ fn read_patterns(dll: &[u8], offset: usize) -> Patterns {
     Patterns { patterns }
 }
 
+/// Finds the compact two-colour pattern mask table and verifies the following table is its
+/// bitwise complement. The mask family is recognized structurally: its four bytes encode the
+/// four bits of each 4-pixel nibble.
+pub fn find_binary_patterns(dll: &[u8]) -> Result<usize> {
+    let len = 16 * 4;
+    for start in 0..dll.len().saturating_sub(len * 2) {
+        let mut matches = true;
+        for i in 0..16usize {
+            let mut expected = 0u32;
+            for bit in 0..4 {
+                expected |= u32::from(if i & (1 << bit) != 0 { 0xffu8 } else { 0 }) << (bit * 8);
+            }
+            let o = start + i * 4;
+            let actual = u32::from_le_bytes([dll[o], dll[o + 1], dll[o + 2], dll[o + 3]]);
+            if actual != expected {
+                matches = false;
+                break;
+            }
+            let o = start + len + i * 4;
+            let complement = u32::from_le_bytes([dll[o], dll[o + 1], dll[o + 2], dll[o + 3]]);
+            if complement != !expected {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            return Ok(start);
+        }
+    }
+    Err(VideoError::new(
+        VideoErrorKind::TableNotFound,
+        "two-colour pattern mask tables not found in binkw32.dll",
+    ))
+}
+
+fn read_binary_patterns(dll: &[u8], offset: usize) -> BinaryPatterns {
+    let mut masks = [0u32; 16];
+    for (i, mask) in masks.iter_mut().enumerate() {
+        let o = offset + i * 4;
+        *mask = u32::from_le_bytes([dll[o], dll[o + 1], dll[o + 2], dll[o + 3]]);
+    }
+    BinaryPatterns { masks }
+}
+
 fn read_quant(dll: &[u8], offset: usize) -> QuantTables {
     let mut tables = [[0i32; 64]; 16];
     for (q, row) in tables.iter_mut().enumerate() {
@@ -543,6 +599,16 @@ mod tests {
         for i in 0..16 {
             dll[widths_at + i] = 4;
         }
+        let binary_at = 6600usize;
+        for i in 0..16usize {
+            let mut mask = 0u32;
+            for bit in 0..4 {
+                mask |= u32::from(if i & (1 << bit) != 0 { 0xffu8 } else { 0 }) << (bit * 8);
+            }
+            dll[binary_at + i * 4..binary_at + i * 4 + 4].copy_from_slice(&mask.to_le_bytes());
+            dll[binary_at + 64 + i * 4..binary_at + 64 + i * 4 + 4]
+                .copy_from_slice(&(!mask).to_le_bytes());
+        }
         (dll, huff_at, pat_at, quant_at)
     }
 
@@ -554,6 +620,7 @@ mod tests {
         let scan = find_scan_from_patterns(&dll, pat).unwrap();
         assert!(is_perm64(&scan));
         assert_eq!(find_quant(&dll).unwrap(), quant);
+        assert_eq!(find_binary_patterns(&dll).unwrap(), 6600);
         let (widths, tree_at) = find_tree_tables(&dll).unwrap();
         assert_eq!(widths, [4u8; 16]);
         assert_eq!(tree_at, 6200);
@@ -561,6 +628,8 @@ mod tests {
         assert_eq!(tables.huffman_lengths.rows[0], [4u8; 16]);
         assert_eq!(tables.huffman_tables.len(), 16);
         assert_eq!(tables.tree_maxbits[0], 4);
+        assert_eq!(tables.binary_patterns.masks[0], 0);
+        assert_eq!(tables.binary_patterns.masks[15], u32::MAX);
         assert_eq!(
             tables.quant.tables[15][0],
             expected_quant_first_column()[15]

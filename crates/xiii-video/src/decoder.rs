@@ -10,6 +10,8 @@
 //! black-box oracle. It never reports success for a construct it cannot decode: unknown block
 //! types or bitstream underrun return an explicit [`VideoError`].
 
+use std::sync::OnceLock;
+
 use crate::bitreader::BitReader;
 use crate::container::Header;
 use crate::error::{Result, VideoError, VideoErrorKind};
@@ -129,10 +131,11 @@ impl Decoder {
             bits_total: packet.len() * 8,
             ..Default::default()
         };
+        // Revision `i` prefixes the alpha and luma planes with a 32-bit byte size. The plane
+        // payloads are decoded from their own byte ranges.
         let mut off = 0usize;
         let alpha_size = if header.has_alpha() {
-            let s = read_u32(packet, &mut off)? as usize;
-            Some(s)
+            Some(read_u32(packet, &mut off)? as usize)
         } else {
             None
         };
@@ -141,14 +144,15 @@ impl Decoder {
         let mut used = 0usize;
         let a = match alpha_size {
             Some(sz) => {
-                let slice = slice_at(packet, off, sz)?;
+                let slice = slice_with_lookahead(packet, off, sz)?;
                 off += sz;
-                let mut br = BitReader::new(slice);
+                let mut br = BitReader::new(&slice);
                 let p = self.decode_plane(
                     &mut br,
                     w,
                     h,
                     prev.and_then(|p| p.a.as_deref()),
+                    false,
                     &mut stats,
                 )?;
                 used += br.bits_read();
@@ -156,15 +160,43 @@ impl Decoder {
             }
             None => None,
         };
-        let y_slice = slice_at(packet, off, y_size)?;
+        let y_slice = slice_with_lookahead(packet, off, y_size)?;
         off += y_size;
-        let mut ybr = BitReader::new(y_slice);
-        let y = self.decode_plane(&mut ybr, w, h, prev.map(|p| p.y.as_slice()), &mut stats)?;
+        let mut ybr = BitReader::new(&y_slice);
+        let y = self.decode_plane(
+            &mut ybr,
+            w,
+            h,
+            prev.map(|p| p.y.as_slice()),
+            false,
+            &mut stats,
+        )?;
         used += ybr.bits_read();
 
-        let mut cbr = BitReader::new(&packet[off..]);
-        let u = self.decode_plane(&mut cbr, cw, ch, prev.map(|p| p.u.as_slice()), &mut stats)?;
-        let v = self.decode_plane(&mut cbr, cw, ch, prev.map(|p| p.v.as_slice()), &mut stats)?;
+        let mut chroma = packet
+            .get(off..)
+            .ok_or_else(|| {
+                VideoError::new(VideoErrorKind::Truncated, "chroma plane starts past packet")
+            })?
+            .to_vec();
+        chroma.resize(chroma.len().saturating_add(24), 0);
+        let mut cbr = BitReader::new(&chroma);
+        let u = self.decode_plane(
+            &mut cbr,
+            cw,
+            ch,
+            prev.map(|p| p.u.as_slice()),
+            true,
+            &mut stats,
+        )?;
+        let v = self.decode_plane(
+            &mut cbr,
+            cw,
+            ch,
+            prev.map(|p| p.v.as_slice()),
+            true,
+            &mut stats,
+        )?;
         used += cbr.bits_read();
 
         stats.bits_used = used;
@@ -187,38 +219,54 @@ impl Decoder {
         w: usize,
         h: usize,
         prev: Option<&[u8]>,
+        chroma: bool,
         stats: &mut FrameStats,
     ) -> Result<Vec<u8>> {
         let bw = w / 8;
         let bh = h / 8;
-        let mut bundles = self.read_plane_header(br, bw)?;
+        let plane_start_bit = br.bits_read();
+        let mut bundles = self.read_plane_header(br, bw, bh)?;
         let mut out = match prev {
             Some(p) if p.len() == w * h => p.to_vec(),
-            _ => vec![0u8; w * h],
+            _ => vec![if chroma { 128 } else { 0 }; w * h],
         };
         let mut pred_dc = 0i32;
 
+        let trace = std::env::var_os("XIII_VIDEO_TRACE_BLOCKS").is_some();
         let mut row = 0usize;
         while row < bh {
+            if std::env::var_os("XIII_VIDEO_TRACE_ROW").is_some() {
+                eprintln!("plane {w}x{h} row {row}/{bh} bit {}", br.bits_read());
+            }
             let mut col = 0usize;
             while col < bw {
                 let bt = bundles[bundle::BLOCK_TYPES].next(br)?;
+                if trace && row < 16 {
+                    eprintln!("block row={row} col={col} type={bt} bit={}", br.bits_read());
+                }
                 stats.block_type_counts[usize::from(bt.min(9))] += 1;
                 if bt > 9 {
+                    // The DLL treats block types 10..15 as a plain advance (`0x3001dad9`).
                     stats.saw_unknown_block = true;
-                    return Err(VideoError::new(
-                        VideoErrorKind::Unsupported,
-                        format!("block type {bt}"),
-                    ));
+                    col += 1;
+                    continue;
                 }
                 let mut advance2 = false;
                 match bt {
                     0 => {}
                     1 => {
-                        let sub = bundles[bundle::SUB_BLOCK_TYPES].next(br)?;
-                        let mut block = [0u8; 64];
-                        self.decode_scalar_block(br, &mut bundles, sub, &mut block)?;
-                        scale_block_2x(&block, &mut out, w, col * 8, row * 8);
+                        // The 16x16 type is encountered on both 8-pixel rows. The second row
+                        // (`y & 8`, DLL test at 0x3001e5ce) advances over the already-rendered
+                        // half without consuming another subtype.
+                        if row & 1 == 0 {
+                            let sub = bundles[bundle::SUB_BLOCK_TYPES].next(br)?;
+                            if trace && row < 16 {
+                                eprintln!("  subtype={sub} bit={}", br.bits_read());
+                            }
+                            let mut block = [0u8; 64];
+                            self.decode_scalar_block(br, &mut bundles, sub, &mut block)?;
+                            scale_block_2x(&block, &mut out, w, col * 8, row * 8);
+                        }
                         advance2 = true;
                     }
                     2 => {
@@ -227,7 +275,9 @@ impl Decoder {
                         motion_copy(&mut out, w, h, col * 8, row * 8, dx, dy);
                     }
                     3 => {
-                        let pattern = bundles[bundle::PATTERN].next(br)? as usize & 15;
+                        // The run block's pattern index is a raw 4-bit bitstream value
+                        // (`0x3001db7d`: `andl $0xf`), not a pattern-bundle symbol.
+                        let pattern = br.read(4) as usize;
                         fill_run(
                             br,
                             &mut bundles,
@@ -296,16 +346,17 @@ impl Decoder {
                     8 => {
                         let c0 = bundles[bundle::COLORS].next(br)?;
                         let c1 = bundles[bundle::COLORS].next(br)?;
-                        let pat = bundles[bundle::PATTERN].next(br)? as usize & 15;
-                        pattern_fill(
+                        pattern_fill_rows(
                             &mut out,
                             w,
                             col * 8,
                             row * 8,
                             c0,
                             c1,
-                            &self.tables.patterns.patterns[pat],
-                        );
+                            &mut bundles[bundle::PATTERN],
+                            &self.tables.binary_patterns.masks,
+                            br,
+                        )?;
                     }
                     9 => {
                         for yy in 0..8 {
@@ -317,7 +368,7 @@ impl Decoder {
                     }
                     _ => unreachable!(),
                 }
-                if advance2 && col + 2 < bw {
+                if advance2 {
                     col += 2;
                 } else {
                     col += 1;
@@ -328,13 +379,28 @@ impl Decoder {
         if br.overflowed() {
             return Err(VideoError::new(
                 VideoErrorKind::OutOfData,
-                "plane bitstream ended early",
+                format!(
+                    "plane {w}x{h} bitstream ended early at bit {} of {}",
+                    br.bits_read(),
+                    br.total_bits()
+                ),
             ));
+        }
+        if std::env::var_os("XIII_VIDEO_TRACE_PLANES").is_some() {
+            eprintln!(
+                "plane {w}x{h} chroma={chroma} consumed {} bits ({} bytes)",
+                br.bits_read().saturating_sub(plane_start_bit),
+                br.bits_read().saturating_sub(plane_start_bit).div_ceil(8)
+            );
         }
         Ok(out)
     }
 
     /// Decodes one 8x8 scalar block (used by the 16x16 scaled type).
+    ///
+    /// Sub-types map to the 8x8 block types 3..9 (`binkw32.dll` jump table at
+    /// `0x3001f328`): 3 run, 4 residue (skipped), 5 intra DCT, 6 fill, 7 inter DCT
+    /// (skipped), 8 pattern, 9 raw.
     fn decode_scalar_block(
         &self,
         br: &mut BitReader<'_>,
@@ -343,31 +409,47 @@ impl Decoder {
         block: &mut [u8; 64],
     ) -> Result<()> {
         match sub {
+            3 => {
+                let pattern = br.read(4) as usize & 15;
+                *block = fill_run_values(br, bundles, &self.tables.patterns.patterns[pattern])?;
+            }
+            5 => {
+                let dc = bundles[bundle::INTRA_DC].next_dc(br)?;
+                let q = br.read(4) as usize;
+                let mut coeff = [0i32; 64];
+                read_dct_coeffs(br, &mut coeff, &self.tables.scan)?;
+                *block = reconstruct_block(&mut coeff, q, &self.tables, false, dc);
+            }
             6 => {
                 let c = bundles[bundle::COLORS].next(br)?;
                 *block = [c; 64];
+            }
+            8 => {
+                let c0 = bundles[bundle::COLORS].next(br)?;
+                let c1 = bundles[bundle::COLORS].next(br)?;
+                for y in 0..8 {
+                    let row_pattern = bundles[bundle::PATTERN].next(br)?;
+                    for x in 0..8 {
+                        let nibble = if x < 4 {
+                            row_pattern & 0x0f
+                        } else {
+                            row_pattern >> 4
+                        } as usize;
+                        let bit = (self.tables.binary_patterns.masks[nibble] >> ((x & 3) * 8))
+                            & 0xff
+                            != 0;
+                        block[y * 8 + x] = if bit { c1 } else { c0 };
+                    }
+                }
             }
             9 => {
                 for v in block.iter_mut() {
                     *v = bundles[bundle::COLORS].next(br)?;
                 }
             }
-            8 => {
-                let c0 = bundles[bundle::COLORS].next(br)?;
-                let c1 = bundles[bundle::COLORS].next(br)?;
-                let pat = bundles[bundle::PATTERN].next(br)? as usize & 15;
-                for i in 0..64 {
-                    block[pattern_position(&self.tables.patterns.patterns[pat], i)] =
-                        if i % 2 == 0 { c0 } else { c1 };
-                }
-            }
-            0 => {}
-            other => {
-                return Err(VideoError::new(
-                    VideoErrorKind::Unsupported,
-                    format!("16x16 sub-block type {other}"),
-                ));
-            }
+            // Sub-types outside 3..=9 (and the DCT/known set) are treated as a plain advance by
+            // the shipped decoder (`0x3001e5ed`: `sub - 3 > 6` -> skip).
+            _ => {}
         }
         Ok(())
     }
@@ -377,6 +459,7 @@ impl Decoder {
         &self,
         br: &mut BitReader<'_>,
         bw: usize,
+        bh: usize,
     ) -> Result<[Bundle; bundle::COUNT]> {
         // Order measured from the plane decoder in `binkw32.dll` (0x3001d94e..0x3001d9f2):
         // block types, sub-block types, then the colour codebook (16 context trees followed by
@@ -419,10 +502,28 @@ impl Decoder {
             Bundle::new(Kind::Signed, build_static(x_off, &self.tables), rs(bw));
         states[bundle::Y_OFF] =
             Bundle::new(Kind::Signed, build_static(y_off, &self.tables), rs(bw));
-        states[bundle::INTRA_DC] = Bundle::new(Kind::Raw16, None, rs(bw * 8));
-        states[bundle::INTER_DC] = Bundle::new(Kind::Raw16, None, rs(bw * 8));
+        states[bundle::INTRA_DC] = Bundle::dc(rs(bw), 11, false);
+        states[bundle::INTER_DC] = Bundle::dc(rs(bw), 11, true);
         states[bundle::RUN] =
-            Bundle::new(Kind::Plain4, build_static(run, &self.tables), rs(bw * 8));
+            Bundle::new(Kind::Plain4, build_static(run, &self.tables), rs(bw * 48));
+        // The DLL's t==0 cursor sentinel may read from buf+4 after a refill has no entries.
+        // Reserve the plane's maximum 8x8-cell count so those reads remain bounded and retain
+        // the same backing bytes across refills.
+        let stale_capacity = bw.saturating_mul(bh).saturating_add(8);
+        for bundle in &mut states {
+            bundle.data.resize(stale_capacity, 0);
+            bundle.signed.resize(stale_capacity, 0);
+            bundle.dc.resize(stale_capacity, 0);
+        }
+        states[bundle::BLOCK_TYPES].name = "block";
+        states[bundle::SUB_BLOCK_TYPES].name = "sub";
+        states[bundle::COLORS].name = "colors";
+        states[bundle::PATTERN].name = "pattern";
+        states[bundle::X_OFF].name = "xoff";
+        states[bundle::Y_OFF].name = "yoff";
+        states[bundle::INTRA_DC].name = "intra_dc";
+        states[bundle::INTER_DC].name = "inter_dc";
+        states[bundle::RUN].name = "run";
         Ok(states)
     }
 }
@@ -531,33 +632,49 @@ enum Kind {
 /// Cached bundle state.
 #[derive(Debug, Clone)]
 struct Bundle {
+    name: &'static str,
     kind: Kind,
     runsize: usize,
     tree: Option<StaticTree>,
     high: Vec<Option<StaticTree>>,
     data: Vec<u8>,
     pos: usize,
+    data_end: usize,
+    sentinel: bool,
     signed: Vec<i32>,
     signed_pos: usize,
+    signed_end: usize,
     dc: Vec<i32>,
     dc_pos: usize,
+    dc_end: usize,
     lastval: u8,
+    previous_value: u8,
+    dc_start_bits: usize,
+    dc_signed: bool,
 }
 
 impl Bundle {
     fn empty() -> Self {
         Self {
+            name: "unassigned",
             kind: Kind::Plain4,
             runsize: 0,
             tree: None,
             high: Vec::new(),
             data: Vec::new(),
             pos: 0,
+            data_end: 0,
+            sentinel: false,
             signed: Vec::new(),
             signed_pos: 0,
+            signed_end: 0,
             dc: Vec::new(),
             dc_pos: 0,
+            dc_end: 0,
             lastval: 0,
+            previous_value: 0,
+            dc_start_bits: 0,
+            dc_signed: false,
         }
     }
     fn new(kind: Kind, tree: Option<StaticTree>, runsize: usize) -> Self {
@@ -573,14 +690,42 @@ impl Bundle {
         b
     }
 
+    fn dc(runsize: usize, start_bits: usize, signed: bool) -> Self {
+        let mut b = Self::new(Kind::Raw16, None, runsize);
+        b.dc_start_bits = start_bits;
+        b.dc_signed = signed;
+        b
+    }
+
     fn next(&mut self, br: &mut BitReader<'_>) -> Result<u8> {
-        if self.pos >= self.data.len() {
+        if self.name == "sub" && std::env::var_os("XIII_VIDEO_TRACE_SUB").is_some() {
+            eprintln!(
+                "sub next pos={} len={} bit={}",
+                self.pos,
+                self.data.len(),
+                br.bits_read()
+            );
+        }
+        if self.sentinel {
+            let v = self.data.get(self.pos).copied().ok_or_else(|| {
+                VideoError::new(
+                    VideoErrorKind::OutOfData,
+                    format!("{} zero-count sentinel exceeded stale buffer", self.name),
+                )
+            })?;
+            self.pos += 1;
+            return Ok(v);
+        }
+        if self.pos >= self.data_end {
             self.refill(br)?;
         }
-        if self.pos >= self.data.len() {
+        if !self.sentinel && self.pos >= self.data_end {
             return Err(VideoError::new(
                 VideoErrorKind::OutOfData,
-                "bundle produced no value",
+                format!(
+                    "bundle {} produced no value (kind {:?} runsize {})",
+                    self.name, self.kind, self.runsize
+                ),
             ));
         }
         let v = self.data[self.pos];
@@ -589,13 +734,33 @@ impl Bundle {
     }
 
     fn next_signed(&mut self, br: &mut BitReader<'_>) -> Result<i32> {
-        if self.signed_pos >= self.signed.len() {
+        if self.sentinel {
+            let v = self.signed.get(self.signed_pos).copied().ok_or_else(|| {
+                VideoError::new(
+                    VideoErrorKind::OutOfData,
+                    "signed zero-count sentinel exhausted",
+                )
+            })?;
+            self.signed_pos += 1;
+            return Ok(v);
+        }
+        if self.signed_pos >= self.signed_end {
             self.refill_signed(br)?;
         }
-        if self.signed_pos >= self.signed.len() {
+        if self.sentinel {
+            let v = self.signed.get(self.signed_pos).copied().ok_or_else(|| {
+                VideoError::new(
+                    VideoErrorKind::OutOfData,
+                    "signed zero-count sentinel exhausted",
+                )
+            })?;
+            self.signed_pos += 1;
+            return Ok(v);
+        }
+        if !self.sentinel && self.signed_pos >= self.signed_end {
             return Err(VideoError::new(
                 VideoErrorKind::OutOfData,
-                "signed bundle produced no value",
+                format!("signed bundle produced no value (runsize {})", self.runsize),
             ));
         }
         let v = self.signed[self.signed_pos];
@@ -604,13 +769,33 @@ impl Bundle {
     }
 
     fn next_dc(&mut self, br: &mut BitReader<'_>) -> Result<i32> {
-        if self.dc_pos >= self.dc.len() {
+        if self.sentinel {
+            let v = self.dc.get(self.dc_pos).copied().ok_or_else(|| {
+                VideoError::new(
+                    VideoErrorKind::OutOfData,
+                    "DC zero-count sentinel exhausted",
+                )
+            })?;
+            self.dc_pos += 1;
+            return Ok(v);
+        }
+        if self.dc_pos >= self.dc_end {
             self.refill_dc(br)?;
         }
-        if self.dc_pos >= self.dc.len() {
+        if self.sentinel {
+            let v = self.dc.get(self.dc_pos).copied().ok_or_else(|| {
+                VideoError::new(
+                    VideoErrorKind::OutOfData,
+                    "DC zero-count sentinel exhausted",
+                )
+            })?;
+            self.dc_pos += 1;
+            return Ok(v);
+        }
+        if !self.sentinel && self.dc_pos >= self.dc_end {
             return Err(VideoError::new(
                 VideoErrorKind::OutOfData,
-                "DC bundle produced no value",
+                format!("DC bundle produced no value (runsize {})", self.runsize),
             ));
         }
         let v = self.dc[self.dc_pos];
@@ -619,25 +804,58 @@ impl Bundle {
     }
 
     fn refill(&mut self, br: &mut BitReader<'_>) -> Result<()> {
-        self.data.clear();
-        self.pos = 0;
+        let old_data = self.data.clone();
         let t = br.read(self.runsize) as usize;
+        if std::env::var_os("XIII_VIDEO_TRACE_REFILL").is_some() {
+            eprintln!(
+                "refill {} {:?} bits={} t={}",
+                self.name,
+                self.kind,
+                br.bits_read(),
+                t
+            );
+        }
         if t == 0 {
+            // The DLL's empty-refill sentinel sets cur_dec=buf+4 and cur_end=buf
+            // (`0x3001c3c4`, `0x3001cb3e`, `0x3001c952`). Consumers still read from the
+            // stale buffer for four bytes. Preserve that observable behavior rather than
+            // converting zero-count to an empty Rust vector.
+            self.data = old_data;
+            self.pos = 4;
+            self.data_end = 0;
+            self.sentinel = true;
             return Ok(());
         }
+        self.data.clear();
+        self.pos = 0;
+        self.data_end = 0;
+        self.sentinel = false;
         match self.kind {
             Kind::RleRun => {
-                // MultimediaWiki 4-bit RLE bundle: v < 12 is literal, else a run of the previous
-                // value with lengths RUN_VALUES[v - 12].
-                for _ in 0..t {
-                    let v = self.tree.as_ref().map_or(0, |tr| tr.decode(br));
-                    if v < 12 {
-                        self.data.push(v);
-                    } else {
-                        let run = RUN_VALUES[(v - 12) as usize];
-                        let last = self.data.last().copied().unwrap_or(0);
-                        self.data.extend(std::iter::repeat_n(last, run));
+                if br.bit() != 0 {
+                    let v = br.read(4) as u8;
+                    self.data.resize(t, v);
+                    self.previous_value = v;
+                } else {
+                    // `t` is the number of *output* values (the DLL decrements the remaining
+                    // count by the run length; 0x3001c321/0x3001c342): v < 12 is one literal,
+                    // v >= 12 is RUN_VALUES[v-12] copies of the previous value.
+                    let mut out = 0usize;
+                    while out < t {
+                        let v = self.tree.as_ref().map_or(0, |tr| tr.decode(br));
+                        if v < 12 {
+                            self.data.push(v);
+                            out += 1;
+                        } else {
+                            let run = RUN_VALUES[(v - 12) as usize];
+                            let last = self.data.last().copied().unwrap_or(self.previous_value);
+                            self.data.extend(std::iter::repeat_n(last, run));
+                            out += run;
+                        }
                     }
+                    // The DLL's visible range is exactly [buf, buf+t), even if a final run
+                    // writes beyond the requested count.
+                    self.data.truncate(t);
                 }
             }
             Kind::Plain4 => {
@@ -660,6 +878,11 @@ impl Bundle {
             }
             Kind::Colors => {
                 if br.bit() == 1 {
+                    // The shared refill's constant path reads one nibble and expands it to a
+                    // byte by duplicating that nibble (`0x3001c35d..0x3001c3c0`).
+                    let nibble = br.read(4) as u8;
+                    self.data.resize(t, nibble | (nibble << 4));
+                } else {
                     for _ in 0..t {
                         let hi = match self
                             .high
@@ -673,52 +896,93 @@ impl Bundle {
                         self.lastval = hi;
                         self.data.push((hi << 4) | lo);
                     }
-                } else {
-                    let last = self.data.last().copied().unwrap_or(0);
-                    self.data.extend(std::iter::repeat_n(last, t));
                 }
             }
             Kind::Signed | Kind::Raw16 => {}
+        }
+        if !self.data.is_empty() && self.kind == Kind::RleRun {
+            self.previous_value = *self.data.last().unwrap_or(&self.previous_value);
+        }
+        self.data_end = self.data.len();
+        if old_data.len() > self.data.len() {
+            self.data.extend_from_slice(&old_data[self.data.len()..]);
         }
         Ok(())
     }
 
     fn refill_signed(&mut self, br: &mut BitReader<'_>) -> Result<()> {
-        self.signed.clear();
-        self.signed_pos = 0;
+        let old_signed = self.signed.clone();
         let t = br.read(self.runsize) as usize;
         if t == 0 {
+            self.signed = old_signed;
+            self.signed_pos = 4;
+            self.signed_end = 0;
+            self.sentinel = true;
             return Ok(());
         }
-        for _ in 0..t {
-            let v = self.tree.as_ref().map_or(0, |tr| tr.decode(br)) as i32;
-            let v = if br.bit() == 1 { -v } else { v };
-            self.signed.push(v);
+        self.signed.clear();
+        self.signed_pos = 0;
+        self.signed_end = 0;
+        self.sentinel = false;
+        let fill = br.bit() != 0;
+        if fill {
+            let mut v = br.read(4) as i32;
+            if v != 0 && br.bit() != 0 {
+                v = -v;
+            }
+            self.signed.resize(t, v);
+        } else {
+            for _ in 0..t {
+                let mut v = self.tree.as_ref().map_or(0, |tr| tr.decode(br)) as i32;
+                if v != 0 && br.bit() != 0 {
+                    v = -v;
+                }
+                self.signed.push(v);
+            }
+        }
+        self.signed_end = self.signed.len();
+        if old_signed.len() > self.signed.len() {
+            self.signed
+                .extend_from_slice(&old_signed[self.signed.len()..]);
         }
         Ok(())
     }
 
     fn refill_dc(&mut self, br: &mut BitReader<'_>) -> Result<()> {
-        self.dc.clear();
-        self.dc_pos = 0;
+        let old_dc = self.dc.clone();
         let t = br.read(self.runsize) as usize;
         if t == 0 {
+            self.dc = old_dc;
+            self.dc_pos = 2;
+            self.dc_end = 0;
+            self.sentinel = true;
             return Ok(());
         }
-        let start = br.read(16) as i32;
+        self.dc.clear();
+        self.dc_pos = 0;
+        self.dc_end = 0;
+        self.sentinel = false;
+        let mut start = br.read(
+            self.dc_start_bits
+                .saturating_sub(usize::from(self.dc_signed)),
+        ) as i32;
+        if self.dc_signed && start != 0 && br.bit() != 0 {
+            start = -start;
+        }
         self.dc.push(start);
         let mut cur = start;
         let mut i = 1;
         while i < t {
+            let n = 8.min(t - i);
             let w = br.read(4) as usize;
             if w == 0 {
-                while i < t {
+                for _ in 0..n {
                     self.dc.push(cur);
-                    i += 1;
                 }
-                break;
+                i += n;
+                continue;
             }
-            for _ in 0..8.min(t - i) {
+            for _ in 0..n {
                 let mut v = br.read(w) as i32;
                 if v != 0 && br.bit() == 1 {
                     v = -v;
@@ -727,6 +991,10 @@ impl Bundle {
                 self.dc.push(cur);
                 i += 1;
             }
+        }
+        self.dc_end = self.dc.len();
+        if old_dc.len() > self.dc.len() {
+            self.dc.extend_from_slice(&old_dc[self.dc.len()..]);
         }
         Ok(())
     }
@@ -775,19 +1043,70 @@ fn pattern_position(pattern: &[u8; 64], i: usize) -> usize {
     pattern[i] as usize
 }
 
-fn pattern_fill(
+#[allow(clippy::too_many_arguments)]
+fn pattern_fill_rows(
     out: &mut [u8],
     w: usize,
     bx: usize,
     by: usize,
     c0: u8,
     c1: u8,
-    pattern: &[u8; 64],
-) {
-    for i in 0..64 {
-        let p = pattern_position(pattern, i);
-        out[(by + p / 8) * w + bx + p % 8] = if i % 2 == 0 { c0 } else { c1 };
+    pattern: &mut Bundle,
+    masks: &[u32; 16],
+    br: &mut BitReader<'_>,
+) -> Result<()> {
+    for y in 0..8 {
+        let row_pattern = pattern.next(br)?;
+        for x in 0..8 {
+            let nibble = if x < 4 {
+                row_pattern & 0x0f
+            } else {
+                row_pattern >> 4
+            } as usize;
+            let bit = (masks[nibble] >> ((x & 3) * 8)) & 0xff != 0;
+            out[(by + y) * w + bx + x] = if bit { c1 } else { c0 };
+        }
     }
+    Ok(())
+}
+
+/// Decodes the 64 run-fill values in pattern order (used by the 8x8 and 16x16 run blocks).
+fn fill_run_values(
+    br: &mut BitReader<'_>,
+    bundles: &mut [Bundle; bundle::COUNT],
+    pattern: &[u8; 64],
+) -> Result<[u8; 64]> {
+    let mut vals = [0u8; 64];
+    let mut filled = 0usize;
+    while filled < 64 {
+        if br.bit() == 1 {
+            // Solid run path reads the colour before the run byte (`0x3001dc16` then
+            // `0x3001dc25`).
+            let c = bundles[bundle::COLORS].next(br)?;
+            // The block handler increments the stored run byte (`movzbl; incl`), so the
+            // encoded value is length minus one.
+            let run = bundles[bundle::RUN].next(br)? as usize + 1;
+            for _ in 0..run {
+                if filled >= 64 {
+                    break;
+                }
+                vals[pattern_position(pattern, filled)] = c;
+                filled += 1;
+            }
+        } else {
+            // Literal run path reads the run length, then consumes that many colours.
+            let run = bundles[bundle::RUN].next(br)? as usize + 1;
+            for _ in 0..run {
+                if filled >= 64 {
+                    break;
+                }
+                let c = bundles[bundle::COLORS].next(br)?;
+                vals[pattern_position(pattern, filled)] = c;
+                filled += 1;
+            }
+        }
+    }
+    Ok(vals)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -802,30 +1121,10 @@ fn fill_run(
     by: usize,
 ) -> Result<()> {
     let pat = &patterns[pattern & 15];
-    // The run bundle drives how many pixels each colour paints; the pattern gives order.
-    let mut filled = 0usize;
-    while filled < 64 {
-        let run = bundles[bundle::RUN].next(br)? as usize;
-        if br.bit() == 1 {
-            let c = bundles[bundle::COLORS].next(br)?;
-            for _ in 0..run.max(1) {
-                if filled >= 64 {
-                    break;
-                }
-                let p = pattern_position(pat, filled);
-                out[(by + p / 8) * w + bx + p % 8] = c;
-                filled += 1;
-            }
-        } else {
-            for _ in 0..run.max(1) {
-                if filled >= 64 {
-                    break;
-                }
-                let c = bundles[bundle::COLORS].next(br)?;
-                let p = pattern_position(pat, filled);
-                out[(by + p / 8) * w + bx + p % 8] = c;
-                filled += 1;
-            }
+    let vals = fill_run_values(br, bundles, pat)?;
+    for yy in 0..8 {
+        for xx in 0..8 {
+            out[(by + yy) * w + bx + xx] = vals[yy * 8 + xx];
         }
     }
     Ok(())
@@ -869,28 +1168,7 @@ fn reconstruct(
         }
     };
     block[0] = dc;
-    let quant = &tables.quant.tables[q.min(15)];
-    for i in 0..64 {
-        block[i] = ((i64::from(block[i]) * i64::from(quant[i])) >> 11) as i32;
-    }
-    let mut spatial = [0f32; 64];
-    for v in 0..8 {
-        for u in 0..8 {
-            let mut sum = 0f32;
-            for y in 0..8 {
-                for x in 0..8 {
-                    let cu = if u == 0 { 1.0 / 2f32.sqrt() } else { 1.0 };
-                    let cv = if v == 0 { 1.0 / 2f32.sqrt() } else { 1.0 };
-                    sum += cu
-                        * cv
-                        * (block[y * 8 + x] as f32)
-                        * (((2 * x + 1) as f32 * u as f32 * std::f32::consts::PI) / 16.0).cos()
-                        * (((2 * y + 1) as f32 * v as f32 * std::f32::consts::PI) / 16.0).cos();
-                }
-            }
-            spatial[v * 8 + u] = sum / 4.0;
-        }
-    }
+    let spatial = dequant_idct(block, q, tables);
     for yy in 0..8 {
         for xx in 0..8 {
             let idx = (by + yy) * w + bx + xx;
@@ -902,6 +1180,61 @@ fn reconstruct(
             out[idx] = clamp8(val);
         }
     }
+}
+
+/// Dequantises with `q` and runs an 8x8 float IDCT, returning the spatial block.
+fn dequant_idct(block: &mut [i32; 64], q: usize, tables: &BinkTables) -> [f32; 64] {
+    let quant = &tables.quant.tables[q.min(15)];
+    for i in 0..64 {
+        block[i] = ((i64::from(block[i]) * i64::from(quant[i])) >> 11) as i32;
+    }
+    static BASIS: OnceLock<[[f32; 8]; 8]> = OnceLock::new();
+    let basis = BASIS.get_or_init(|| {
+        std::array::from_fn(|k| {
+            std::array::from_fn(|x| {
+                let scale = if k == 0 { 1.0 / 2f32.sqrt() } else { 1.0 };
+                scale * (((2 * x + 1) as f32 * k as f32 * std::f32::consts::PI) / 16.0).cos()
+            })
+        })
+    });
+    let mut horizontal = [[0f32; 8]; 8];
+    for v in 0..8 {
+        for x in 0..8 {
+            let mut sum = 0.0;
+            for u in 0..8 {
+                sum += block[v * 8 + u] as f32 * basis[u][x];
+            }
+            horizontal[v][x] = sum;
+        }
+    }
+    let mut spatial = [0f32; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            let mut sum = 0.0;
+            for v in 0..8 {
+                sum += horizontal[v][x] * basis[v][y];
+            }
+            spatial[y * 8 + x] = sum * 0.25;
+        }
+    }
+    spatial
+}
+
+/// Reconstructs an 8x8 block (used by the 16x16 scaled DCT sub-type).
+fn reconstruct_block(
+    coeff: &mut [i32; 64],
+    q: usize,
+    tables: &BinkTables,
+    add: bool,
+    dc: i32,
+) -> [u8; 64] {
+    coeff[0] = dc;
+    let spatial = dequant_idct(coeff, q, tables);
+    let mut out = [0u8; 64];
+    for i in 0..64 {
+        out[i] = clamp8(if add { 0.0 } else { 128.0 } + spatial[i]);
+    }
+    out
 }
 
 /// Reads DCT coefficient magnitudes for one block.
@@ -917,21 +1250,21 @@ fn read_dct_coeffs(br: &mut BitReader<'_>, block: &mut [i32; 64], scan: &[u8; 64
         ));
     }
     let tree = dct_tree();
-    let mut decided = [false; 64];
+    let mut decided = 0u64;
     let mut sign = [false; 64];
     let mut mag = [0i32; 64];
     let mut mask = 1i32.checked_shl(maxbits as u32 - 1).unwrap_or(0);
     while mask != 0 {
-        for i in 0..64 {
-            if decided[i] && br.bit() == 1 {
-                mag[i] |= mask;
+        for (i, value) in mag.iter_mut().enumerate() {
+            if decided & (1u64 << i) != 0 && br.bit() == 1 {
+                *value |= mask;
             }
         }
         traverse_dct(&tree, br, mask, &mut mag, &mut decided, &mut sign);
         mask >>= 1;
     }
     for i in 0..64 {
-        if decided[i] {
+        if decided & (1u64 << i) != 0 {
             let v = if sign[i] { -mag[i] } else { mag[i] };
             block[scan[i] as usize] = v;
         }
@@ -944,23 +1277,27 @@ fn traverse_dct(
     br: &mut BitReader<'_>,
     mask: i32,
     mag: &mut [i32; 64],
-    decided: &mut [bool; 64],
+    decided: &mut u64,
     sign: &mut [bool; 64],
 ) {
     match node {
         DctNode::Leaf(idx) => {
             let i = *idx as usize;
-            if decided[i] {
+            let bit = 1u64 << i;
+            if *decided & bit != 0 {
                 return;
             }
             if br.bit() == 1 {
-                decided[i] = true;
+                *decided |= bit;
                 sign[i] = br.bit() == 1;
                 mag[i] |= mask;
             }
         }
-        DctNode::Branch(children) => {
-            let all_decided = children.iter().all(|c| subtree_all_decided(c, decided));
+        DctNode::Branch {
+            children,
+            mask: subtree_mask,
+        } => {
+            let all_decided = subtree_mask & !*decided == 0;
             if all_decided {
                 return;
             }
@@ -973,10 +1310,10 @@ fn traverse_dct(
     }
 }
 
-fn subtree_all_decided(node: &DctNode, decided: &[bool; 64]) -> bool {
+fn node_mask(node: &DctNode) -> u64 {
     match node {
-        DctNode::Leaf(i) => decided[*i as usize],
-        DctNode::Branch(children) => children.iter().all(|c| subtree_all_decided(c, decided)),
+        DctNode::Leaf(i) => 1u64 << *i,
+        DctNode::Branch { mask, .. } => *mask,
     }
 }
 
@@ -984,7 +1321,14 @@ fn subtree_all_decided(node: &DctNode, decided: &[bool; 64]) -> bool {
 #[derive(Debug)]
 enum DctNode {
     Leaf(u8),
-    Branch(Vec<DctNode>),
+    Branch { children: Vec<DctNode>, mask: u64 },
+}
+
+fn branch(children: Vec<DctNode>) -> DctNode {
+    let mask = children
+        .iter()
+        .fold(0u64, |mask, child| mask | node_mask(child));
+    DctNode::Branch { children, mask }
 }
 
 fn leaves(a: u8, n: u8) -> Vec<DctNode> {
@@ -992,32 +1336,32 @@ fn leaves(a: u8, n: u8) -> Vec<DctNode> {
 }
 
 fn dct_tree() -> DctNode {
-    DctNode::Branch(vec![
-        DctNode::Branch(vec![
-            DctNode::Branch(leaves(4, 4)),
-            DctNode::Branch(vec![
-                DctNode::Branch(leaves(8, 4)),
-                DctNode::Branch(leaves(12, 4)),
-                DctNode::Branch(leaves(16, 4)),
-                DctNode::Branch(leaves(20, 4)),
+    branch(vec![
+        branch(vec![
+            branch(leaves(4, 4)),
+            branch(vec![
+                branch(leaves(8, 4)),
+                branch(leaves(12, 4)),
+                branch(leaves(16, 4)),
+                branch(leaves(20, 4)),
             ]),
         ]),
-        DctNode::Branch(vec![
-            DctNode::Branch(leaves(24, 4)),
-            DctNode::Branch(vec![
-                DctNode::Branch(leaves(28, 4)),
-                DctNode::Branch(leaves(32, 4)),
-                DctNode::Branch(leaves(36, 4)),
-                DctNode::Branch(leaves(40, 4)),
+        branch(vec![
+            branch(leaves(24, 4)),
+            branch(vec![
+                branch(leaves(28, 4)),
+                branch(leaves(32, 4)),
+                branch(leaves(36, 4)),
+                branch(leaves(40, 4)),
             ]),
         ]),
-        DctNode::Branch(vec![
-            DctNode::Branch(leaves(44, 4)),
-            DctNode::Branch(vec![
-                DctNode::Branch(leaves(48, 4)),
-                DctNode::Branch(leaves(52, 4)),
-                DctNode::Branch(leaves(56, 4)),
-                DctNode::Branch(leaves(60, 4)),
+        branch(vec![
+            branch(leaves(44, 4)),
+            branch(vec![
+                branch(leaves(48, 4)),
+                branch(leaves(52, 4)),
+                branch(leaves(56, 4)),
+                branch(leaves(60, 4)),
             ]),
         ]),
         DctNode::Leaf(1),
@@ -1035,23 +1379,23 @@ fn read_residue(
 ) -> Result<()> {
     // Lossy residue: 7-bit mask count already read by the caller; here each mask is a bit plane.
     let tree = dct_tree();
-    let mut decided = [false; 64];
+    let mut decided = 0u64;
     let mut sign = [false; 64];
     let mut mag = [0i32; 64];
     let mut mask = 1i32
         .checked_shl(masks_count.saturating_sub(1) as u32)
         .unwrap_or(0);
     while mask != 0 {
-        for i in 0..64 {
-            if decided[i] && br.bit() == 1 {
-                mag[i] |= mask;
+        for (i, value) in mag.iter_mut().enumerate() {
+            if decided & (1u64 << i) != 0 && br.bit() == 1 {
+                *value |= mask;
             }
         }
         traverse_dct(&tree, br, mask, &mut mag, &mut decided, &mut sign);
         mask >>= 1;
     }
     for i in 0..64 {
-        if decided[i] {
+        if decided & (1u64 << i) != 0 {
             let v = if sign[i] { -mag[i] } else { mag[i] };
             block[scan[i] as usize] = v as i16;
         }
@@ -1070,17 +1414,25 @@ fn read_u32(data: &[u8], off: &mut usize) -> Result<u32> {
     Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
-fn slice_at(data: &[u8], off: usize, len: usize) -> Result<&[u8]> {
-    data.get(off..off + len).ok_or_else(|| {
+fn slice_with_lookahead(data: &[u8], off: usize, len: usize) -> Result<Vec<u8>> {
+    let end = off
+        .checked_add(len)
+        .ok_or_else(|| VideoError::new(VideoErrorKind::BadValue, "plane range overflow"))?;
+    let plane = data.get(off..end).ok_or_else(|| {
         VideoError::new(
             VideoErrorKind::Truncated,
-            format!(
-                "plane range {off}..{} past packet {}",
-                off + len,
-                data.len()
-            ),
+            format!("plane range {off}..{end} past packet {}", data.len()),
         )
-    })
+    })?;
+    // Nine bundles can each request up to 16 count bits at the plane tail (144 bits); round up
+    // to a 32-bit word boundary for the DLL reader's lookahead.
+    let cap = len
+        .checked_add(24)
+        .ok_or_else(|| VideoError::new(VideoErrorKind::BadValue, "plane lookahead overflow"))?;
+    let mut padded = Vec::with_capacity(cap);
+    padded.extend_from_slice(plane);
+    padded.resize(cap, 0);
+    Ok(padded)
 }
 
 fn floor_log2(n: usize) -> usize {

@@ -23,7 +23,7 @@ disassembly of RAD's own library that ships with the game. The following sources
 4. **`XIII_Game/system/binkw32.dll`** (RAD Game Tools, read-only, shipped with the game): the fixed
    tables are *located and read from this binary at runtime*, never copied into the repository.
    Disassembly with `llvm-objdump` (output only under git-ignored `local/re/`) established the
-   plane-header tree order and the lookup-table representation; see below.
+    plane-header tree order, bundle refill behavior and lookup-table representation; see below.
 5. **FFmpeg binary as a black-box oracle only**: reference PNG frames for comparison; no FFmpeg
    source was opened, fetched or paraphrased. (Incidental note: unrelated web-search result
    excerpts displayed FFmpeg identifiers; they were not opened and no table bytes or code structure
@@ -39,6 +39,7 @@ by signature and checks an invariant:
 | Huffman code lengths (16×16) | 256-byte window whose row 0 is sixteen `4`s and every row is a complete prefix code | `sum 2^-len == 1` per row |
 | Huffman lookup tables (16) | the width table (`4..=7`) preceded by eight zero bytes and followed, `sum 2^width` earlier, by the raw-nibble table `40 41 .. 4f` | every table uses all 16 leaf positions and code lengths `1..=width` |
 | Run-fill patterns (16×64) | sixteen consecutive 64-byte permutations preceded by eight zero bytes and the DCT scan permutation | each chunk is a permutation of `0..63` |
+| Two-colour masks (16×`u32`) | structural search for four replicated-byte bits per nibble plus the following complement table | every nibble maps to its four mask bits; second table is bitwise complement |
 | DCT scan order (64) | the permutation immediately before the pattern table | permutation of `0..63` |
 | Dequantisation (16×64 `i32`) | first column equals `round(65536 * q)` for the documented quantisers `{1, 4/3, 5/3, 2, 8/3, 3.5, 4, 5, 6, 8, 12, 17, 22, 28, 34, 44}` | positive; tables proportional |
 
@@ -51,3 +52,8 @@ On the shipped GOG DLL (375808 bytes, FNV-1a64 `4362b2f63155a3e5`) the locator f
 `Decoder::decode_frame` decodes the Y, U, V (and alpha) planes; `YuvFrame::to_rgba` converts to
 RGBA8 with a labelled full-range BT.601 matrix. The output is diagnostic: the module is under
 validation and returns an explicit error for constructs it cannot decode (see the task report).
+
+The DLL's common constant-refill path reads a 4-bit value and replicates it into each output byte
+(`0x3001c35d..0x3001c3c0`); colour bundles use that expansion as well. The decoder remains
+incomplete: a successful frame return is not evidence of pixel agreement or complete cutscene
+support.
