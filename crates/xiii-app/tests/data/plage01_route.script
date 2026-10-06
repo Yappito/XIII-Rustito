@@ -1,0 +1,70 @@
+# item19: Plage01 route. No take_control or set_goal bridges.
+#
+# The start cutscene and objective promotions are driven by the decoded scripts. Teleports are
+# explicitly diagnostic movement shortcuts only; interactions, touches, combat, corpse search,
+# door use and level travel still go through the game's own chains.
+# The first movement starts after the opening bed/cutscene has had time to reach its authored
+# control handoff; the fixed-step trace records the objective state at each sample.
+
+t=45.00 teleport -491.8 -414.1 1265.0 # diagnostic: approach hut key
+t=45.10 goto -491.84 -314.14
+t=45.30 jump
+t=45.80 jump
+t=46.30 jump
+t=46.80 jump
+t=47.30 jump
+t=47.80 forward 0
+
+# Leave the hut via the game's key/pick-lock/door chain.
+t=48.40 teleport -742.1444 -808.429 1311.0449 # diagnostic: return to PlayerStart side of hut
+t=48.40 yaw 312.891
+t=48.40 forward 1
+t=50.00 turn -45
+t=50.70 forward 0
+t=51.00 use
+t=52.00 forward 1
+t=53.00 forward 0
+
+# TouchTrigger9 completes objective 0 after Cine2's own objectif91 promotes it.
+t=53.50 teleport -307.0 -1500.0 1311.0 # diagnostic: approach objective-0 trigger
+t=53.50 yaw 90
+t=53.50 forward 1
+t=57.00 forward 0
+
+# The authored TouchTrigger8 -> Dispatcher3 -> TouchTrigger7 chain promotes objective 1 and
+# starts the killer. Teleports are movement diagnostics; the triggers themselves are touched.
+t=58.00 teleport 1227.0 -12624.0 1100.0 # diagnostic: approach passe_par_arriere trigger
+t=58.50 teleport 1093.0 -13854.0 1113.0 # diagnostic: approach tueur_conducteur trigger
+
+# Diagnostic weapon bootstrap; the actual fire/death/inventory transfer are the game's code.
+t=59.00 weapon XIII.m60
+# grant_weapon directly wires and brings up this diagnostic weapon; `equip` would walk the
+# inventory chain, where the game's AddInventory HUD notification is currently deferred.
+t=60.00 teleport 1802.0 -12700.0 1100.0 # diagnostic: approach killer
+t=60.00 yaw 270
+t=60.10 fire
+t=60.30 fire
+t=60.50 fire
+t=60.70 fire
+t=60.90 fire
+t=61.10 fire
+t=61.30 fire
+t=61.50 fire
+t=61.70 fire
+t=61.90 fire
+t=62.10 fire
+t=62.30 fire
+t=62.50 fire
+t=62.70 fire
+t=62.90 fire
+t=63.10 fire
+t=63.30 fire
+t=63.50 fire
+t=64.00 search BaseSoldier6
+
+# Search the dead killer for the game's ClefPickup and use it on the truck's Porte1.
+t=66.00 teleport 1215.0 -14000.0 1105.0 # diagnostic: approach truck door
+t=66.00 yaw 270
+t=66.50 use Porte1
+t=67.50 use Porte1
+t=68.00 wait_travel

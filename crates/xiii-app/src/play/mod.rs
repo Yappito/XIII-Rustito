@@ -2656,8 +2656,9 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let route_path = workspace.join("local/reports/item19/route.script");
+        // Tracked fixture (our own route commands; no game data).
+        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/plage01_route.script");
         let script = script::Script::load(&route_path).expect("load item19 Plage01 route");
         let outcome = run_script(
             &game_dir,
