@@ -1,0 +1,4 @@
+# Item38 windowed player-damage case. BaseSoldier17's measured test pose is in front of the
+# player at this location; the soldier's authored Tenir/Attaque behavior fires its own M16.
+t=0.00 teleport -10277.623 6744.154 867.0
+t=0.00 yaw -180

@@ -12,7 +12,7 @@
 //! makes a play window survive the still-partial native layer.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::Read;
 use std::path::Path;
 use std::rc::Rc;
@@ -21,7 +21,7 @@ use std::time::Instant;
 use xiii_package::Limits;
 use xiii_script::vm::MoverState;
 use xiii_script::{
-    DialogueEvent, ObjRef, ObjectId, PresentationEvent, SaveCheckpointEvent, ScriptSet,
+    DialogueEvent, ObjRef, ObjectId, PresentationEvent, SaveCheckpointEvent, ScriptSet, TraceKind,
     TravelRequest, Value, Vm, VmError, VmLimits,
 };
 use xiii_world::runtime::{self, ProviderSpec};
@@ -104,6 +104,8 @@ pub struct Session {
     /// AI perception events dispatched by the host sight bridge (item14b): `(time, controller,
     /// event)`, oldest first (bounded). `SeePlayer`/`EnemyNotVisible` only.
     pub perception_log: VecDeque<(f64, String, String)>,
+    /// Pawns whose native tear-off `PlayDying` was delivered (see `finish_tearoff_deaths`).
+    tearoff_death_callbacks: HashSet<ObjectId>,
     /// Fixed steps run.
     pub tick_count: u64,
     /// Minimal Canvas used only by the headless route to drive the engine's render-phase script
@@ -420,6 +422,7 @@ impl Session {
             hitbox_dropped,
             hitbox_errors,
             perception_log: VecDeque::new(),
+            tearoff_death_callbacks: HashSet::new(),
             tick_count: 0,
             render_canvas: None,
             script_pawn_sync: None,
@@ -612,6 +615,12 @@ impl Session {
         for (id, e) in self.vm.tick_suspending(dt) {
             self.suspend(id, &e);
         }
+        // In NM_Standalone, XIIIPawn.Died sets bTearOff instead of calling PlayDying (xiii.u
+        // XIIIPawn.Died 0x01C5-0x01E9). The engine then delivers it natively:
+        // APawn::UpdateMovementAnimation (Engine.dll 0x103b5c70) calls eventPlayDying(
+        // HitDamageType, TakeHitLocation) at 0x103b5e2a while bTearOff is set and bPlayedDeath is
+        // not. The death clip choice stays in XIIIPawn.PlayDying / PlayDyingAnim.
+        self.finish_tearoff_deaths();
         // item14b: drive the engine's own AI perception. The host performs the sight test (range /
         // facing / line of sight) and dispatches `SeePlayer`/`EnemyNotVisible`; the soldier's own
         // `IAController` states react (acquire, turn, fire). Run after the VM tick so the
@@ -650,6 +659,53 @@ impl Session {
         }
         if profiling {
             self.vm.native_profile_mut().sync_micros += t0.elapsed().as_micros() as u64;
+        }
+    }
+
+    /// The engine's native `PlayDying` delivery for torn-off pawns (`APawn::UpdateMovementAnimation`,
+    /// Engine.dll 0x103b5c70: `bTearOff && !bPlayedDeath`). The set only stops a failing script
+    /// `PlayDying` from being retried every tick.
+    fn finish_tearoff_deaths(&mut self) {
+        let dying: Vec<(ObjectId, Value, Value)> = self
+            .vm
+            .objects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, object)| {
+                let id = index as ObjectId;
+                if !object.is_actor
+                    || object.deleted
+                    || self.tearoff_death_callbacks.contains(&(index as ObjectId))
+                    || !matches!(
+                        self.vm.get_property(id, "bTearOff"),
+                        Some(Value::Bool(true))
+                    )
+                    || matches!(
+                        self.vm.get_property(id, "bPlayedDeath"),
+                        Some(Value::Bool(true))
+                    )
+                {
+                    return None;
+                }
+                let damage_type = self.vm.get_property(id, "HitDamageType")?.clone();
+                let hit_location = self.vm.get_property(id, "TakeHitLocation")?.clone();
+                Some((id, damage_type, hit_location))
+            })
+            .collect();
+        for (id, damage_type, hit_location) in dying {
+            let actor = self.vm.objects[id as usize].name.clone();
+            self.tearoff_death_callbacks.insert(id);
+            match self
+                .vm
+                .send_event(id, "PlayDying", vec![damage_type, hit_location])
+            {
+                Ok(_) => {
+                    self.vm.note(TraceKind::Note(format!(
+                        "{actor}.PlayDying delivered for standalone bTearOff death"
+                    )));
+                }
+                Err(e) => self.record_failure(&format!("{actor}.PlayDying"), &e),
+            }
         }
     }
 
@@ -3034,6 +3090,9 @@ mod tests {
             sloc[2] + 20.0,
         ];
         let yaw_to_soldier = (-fwd[1]).atan2(-fwd[0]);
+        println!(
+            "[item38 Base01] BaseSoldier17 at {sloc:?}, test player at {ploc:?}, yaw {yaw_to_soldier:.4}"
+        );
         let hp0 = session.player_health().expect("player health");
         let mut first_attack = None;
         let mut hp_low = hp0;
@@ -3101,6 +3160,28 @@ mod tests {
             hp1 < hp0,
             "the soldier's fire did not reduce the player's Health ({hp0} -> {hp1}); first error {:?}",
             session.first_error()
+        );
+        let controller = session.controller.expect("Base01 player controller");
+        let hud = instance_prop(session.vm(), controller, "myHUD")
+            .expect("XIIIPlayerController.ClientSetHUD creates myHUD");
+        let warning = session.vm().get_property(hud, "bDrawDamageWarn");
+        let timers: Vec<_> = (0..4)
+            .map(|i| {
+                session
+                    .vm()
+                    .get_property_elem(hud, "fDrawDamageWarnTimer", i)
+                    .cloned()
+            })
+            .collect();
+        let active_timer = timers.iter().any(|v| match v {
+            Some(Value::Float(x)) => *x > 0.0,
+            Some(Value::Int(x)) => *x > 0,
+            _ => false,
+        });
+        println!("[item38 Base01] XIIIBaseHud bDrawDamageWarn={warning:?}, timers={timers:?}");
+        assert!(
+            matches!(warning, Some(Value::Bool(true))) && active_timer,
+            "BaseSoldier17's script-driven player hit must set the XIIIBaseHud flag and a live directional timer"
         );
     }
 

@@ -1370,12 +1370,57 @@ fn sync_camera(
     sim: Res<SimRes>,
     params: Res<ParamsRes>,
     cine: Res<cinematics::CinematicState>,
+    mut session: NonSendMut<Result<session::Session, String>>,
     mut cams: Query<&mut Transform, With<PlayCam>>,
 ) {
+    let death_camera = match session.as_mut() {
+        Ok(sess) => {
+            let controller = sess.controller;
+            controller.and_then(|controller| {
+                let state = sess.vm().state_name(controller);
+                matches!(
+                    state.as_deref(),
+                    Some("GameEndedDeath" | "GameEndedDrown" | "GameEndedFalling")
+                )
+                .then(|| {
+                    // The engine calls the controller's state-scoped PlayerCalcView every
+                    // rendered frame. Drive that same VM event here so its script-owned camera
+                    // location/rotation, pitch easing and roll effect remain authoritative.
+                    let zero_vector = Value::Struct(vec![
+                        ("X".into(), Value::Float(0.0)),
+                        ("Y".into(), Value::Float(0.0)),
+                        ("Z".into(), Value::Float(0.0)),
+                    ]);
+                    let zero_rotator = Value::Struct(vec![
+                        ("Pitch".into(), Value::Int(0)),
+                        ("Yaw".into(), Value::Int(0)),
+                        ("Roll".into(), Value::Int(0)),
+                    ]);
+                    if let Err(e) = sess.vm_mut().send_event(
+                        controller,
+                        "PlayerCalcView",
+                        vec![Value::Object(None), zero_vector, zero_rotator],
+                    ) {
+                        eprintln!("[play] controller PlayerCalcView failed: {e}");
+                        return None;
+                    }
+                    let vm = sess.vm();
+                    let location = vm.vector_prop(controller, "vGameEndedCamLoc")?;
+                    let rotation = vm.rotation_prop(controller)?;
+                    Some(cinematics::camera_transform(location, rotation))
+                })
+                .flatten()
+            })
+        }
+        Err(_) => None,
+    };
     for mut t in &mut cams {
         if let Some(v) = &cine.view {
             // A script selected a cutscene camera (`CamView`/`ViewTarget`); render from it.
             let (loc, rot) = cinematics::camera_transform(v.location, v.rotation);
+            t.translation = loc;
+            t.rotation = rot;
+        } else if let Some((loc, rot)) = death_camera {
             t.translation = loc;
             t.rotation = rot;
         } else {
@@ -4136,6 +4181,58 @@ mod tests {
         assert!(
             dead || health.is_some_and(|h| h <= 0.0),
             "BaseSoldier6 did not die: health {health:?}, dead {dead}"
+        );
+    }
+
+    /// Item38 acceptance: run the authored Plage01 route fixture, then verify the VM selected a
+    /// real death sequence for the named killer and left its non-looping channel at its final
+    /// frame. The renderer samples that VM channel every frame, including after it becomes
+    /// inactive, so the same state produces the corpse pose rather than a host-selected pose.
+    #[test]
+    fn opt_in_item38_plage01_route_killer_finishes_in_scripted_death_pose() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let route = script::Script::parse(include_str!("../../tests/data/plage01_route.script"))
+            .expect("parse the checked-in Plage01 route fixture");
+        let outcome = run_script(&game_dir, "Plage01", &route, &resolved.params, &scene, 65.0)
+            .expect("run the requested Plage01 route through the killer");
+        let vm = outcome.session.vm();
+        let killer = vm
+            .find_object("BaseSoldier6")
+            .expect("Plage01 BaseSoldier6 remains addressable as a corpse");
+        assert!(
+            outcome.session.actor_is_dead(killer),
+            "the route must kill BaseSoldier6"
+        );
+        let animation = vm
+            .actor_animation(killer)
+            .expect("the dead pawn keeps its VM animation channels");
+        println!(
+            "[item38 Plage01] BaseSoldier6 animation channels: {:?}",
+            animation.channels
+        );
+        let death = animation
+            .channels
+            .iter()
+            .find(|c| c.sequence.to_ascii_lowercase().starts_with("death"))
+            .expect("XIIIPawn.PlayDyingAnim must select a Death* sequence");
+        println!(
+            "[item38 Plage01] BaseSoldier6 bIsDead=true, death sequence {} frame {:.2}/{} active={}",
+            death.sequence, death.frame, death.frames, death.active
+        );
+        assert!(!death.looping, "a corpse death sequence must not loop");
+        assert!(
+            !death.active && death.frame >= death.frames.saturating_sub(1) as f32,
+            "the dying pose must remain at the sequence's final frame: {death:?}"
         );
     }
 
