@@ -110,12 +110,6 @@ pub struct Session {
     /// AI perception events dispatched by the host sight bridge (item14b): `(time, controller,
     /// event)`, oldest first (bounded). `SeePlayer`/`EnemyNotVisible` only.
     pub perception_log: VecDeque<(f64, String, String)>,
-    /// Next VM time at which the host AI fire bridge may fire each controlled weapon. The engine
-    /// fires from `AWeapon::Tick` (native); the VM has no weapon tick, so the host re-issues the
-    /// weapon's class `Fire` while the controller requests fire, throttled per weapon.
-    ai_fire_at: std::collections::HashMap<ObjectId, f64>,
-    /// AI shots the host fire bridge issued: `(time, soldier, weapon)`.
-    pub ai_shots: VecDeque<(f64, String, String)>,
     /// Fixed steps run.
     pub tick_count: u64,
     /// Set once the end-game has stopped the active cutscene controllers (item15 bridge): the
@@ -470,8 +464,6 @@ impl Session {
             hitbox_dropped,
             hitbox_errors,
             perception_log: VecDeque::new(),
-            ai_fire_at: std::collections::HashMap::new(),
-            ai_shots: VecDeque::new(),
             tick_count: 0,
             cine_stopped: false,
             render_canvas: None,
@@ -509,111 +501,6 @@ impl Session {
             let rot = self.vm.rotation_prop(*id).unwrap_or([0; 3]);
             let boxes = xiii_world::hitbox::world_boxes(mesh, loc, rot, clip);
             table.insert(*id, boxes);
-        }
-    }
-
-    /// item14b host AI fire bridge (labelled). The engine fires an AI weapon from its native
-    /// `AWeapon::Tick` while the controller's `bTire` is set. The VM has no weapon tick and
-    /// `XIIIWeapon.Active`'s `Fire` shadow is empty, so `IAController.Timer`'s
-    /// `pawn.weapon.fire(1.0)` resolves to nothing. This re-issues the weapon's **class**
-    /// `Fire(1.0)` (the same resolution the player's fire path uses, item14) for every live
-    /// `IAController` whose `bTire` is set and whose pawn is alive, throttled by the pawn's
-    /// `OffsetTimeBetweenShots`. It is not the engine's native tick and is reported per shot.
-    fn ai_fire(&mut self) {
-        let now = self.vm.time;
-        let mut candidates: Vec<(ObjectId, ObjectId, ObjectId, Option<ObjectId>)> = Vec::new();
-        for i in 0..self.vm.objects.len() {
-            let ctrl = i as ObjectId;
-            let o = &self.vm.objects[i];
-            if !o.is_actor
-                || o.deleted
-                || !o.active
-                || !self.vm.is_a(ctrl, "iacontroller")
-                || !matches!(self.vm.get_property(ctrl, "bTire"), Some(Value::Bool(true)))
-            {
-                continue;
-            }
-            let Some(pawn) = instance_prop(&self.vm, ctrl, "Pawn") else {
-                continue;
-            };
-            if matches!(
-                self.vm.get_property(pawn, "bIsDead"),
-                Some(Value::Bool(true))
-            ) {
-                continue;
-            }
-            let Some(weapon) = instance_prop(&self.vm, pawn, "Weapon") else {
-                continue;
-            };
-            let enemy = instance_prop(&self.vm, ctrl, "Enemy");
-            candidates.push((ctrl, pawn, weapon, enemy));
-        }
-        for (ctrl, pawn, weapon, enemy) in candidates {
-            let due = self.ai_fire_at.get(&weapon).copied().unwrap_or(0.0);
-            if now < due {
-                continue;
-            }
-            let gap = match self.vm.get_property(pawn, "OffsetTimeBetweenShots") {
-                Some(Value::Float(f)) if *f > 0.0 => f64::from(*f),
-                _ => 0.4,
-            };
-            self.ai_fire_at.insert(weapon, now + gap);
-            let soldier = self.vm.objects[pawn as usize].name.clone();
-            let weapon_name = self.vm.objects[weapon as usize].name.clone();
-            // Engine `AIController`-native focus: turn the pawn and its controller toward the
-            // enemy and keep the weapon at the eye (the host owns no AI rotation code otherwise).
-            let pl = self.vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
-            if let Some(enemy) = enemy {
-                let el = self.vm.vector_prop(enemy, "Location").unwrap_or(pl);
-                let d = [el[0] - pl[0], el[1] - pl[1], el[2] - pl[2]];
-                let horiz = (d[0] * d[0] + d[1] * d[1]).sqrt();
-                let yaw = d[1].atan2(d[0]);
-                let pitch = d[2].atan2(horiz.max(1e-6));
-                let rot = [
-                    (pitch / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN).round() as i32,
-                    (yaw / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN).round() as i32,
-                    0,
-                ];
-                let _ = self
-                    .vm
-                    .set_property(ctrl, "Rotation", 0, Value::Rotator(rot));
-                let _ = self
-                    .vm
-                    .set_property(pawn, "Rotation", 0, Value::Rotator(rot));
-            }
-            let eye = match self.vm.get_property(pawn, "EyeHeight") {
-                Some(Value::Float(h)) => *h,
-                _ => match self.vm.get_property(pawn, "BaseEyeHeight") {
-                    Some(Value::Float(h)) => *h,
-                    _ => 0.0,
-                },
-            };
-            let _ = self.vm.set_property(
-                weapon,
-                "Location",
-                0,
-                Value::Vector([pl[0], pl[1], pl[2] + eye]),
-            );
-            match self.vm.class_function(weapon, "Fire") {
-                Some(f) => match self.vm.call_function(f, weapon, vec![Value::Float(1.0)]) {
-                    Ok(_) => {
-                        println!("[play] AI t={now:.3}s {soldier} fires {weapon_name}");
-                        self.ai_shots.push_back((now, soldier, weapon_name));
-                    }
-                    Err(e) => {
-                        self.record_failure(&soldier, &e);
-                    }
-                },
-                None => {
-                    let _ = ctrl;
-                    self.blocked.push(format!(
-                        "AI fire: {soldier} {weapon_name} has no class Fire"
-                    ));
-                }
-            }
-        }
-        while self.ai_shots.len() > 128 {
-            self.ai_shots.pop_front();
         }
     }
 
@@ -784,9 +671,6 @@ impl Session {
         while self.perception_log.len() > 128 {
             self.perception_log.pop_front();
         }
-        // The engine fires AI weapons from the native weapon tick; the host bridge re-issues the
-        // weapon's class `Fire` while the controller requests fire (see [`Session::ai_fire`]).
-        self.ai_fire();
         self.tick_count += 1;
         let t0 = Instant::now();
         self.drain_events();
@@ -2724,13 +2608,33 @@ mod tests {
         }
         let hp1 = session.player_health().expect("player health");
         println!("[ai test] perception: {:?}", session.perception_log);
+        let weapon = instance_prop(session.vm(), soldier, "Weapon").expect("weapon");
+        let combat_events: Vec<_> = session
+            .vm()
+            .trace
+            .iter()
+            .filter_map(|event| match &event.kind {
+                xiii_script::TraceKind::Event {
+                    target, function, ..
+                } if target == &session.vm().objects[ctrl as usize].name
+                    && (function.ends_with(".Timer") || function.ends_with(".AnimEnd")) =>
+                {
+                    Some((event.time, function.clone()))
+                }
+                xiii_script::TraceKind::StateChange {
+                    actor, from, to, ..
+                } if actor == &session.vm().objects[weapon as usize].name => {
+                    Some((event.time, format!("weapon {from:?}->{to:?}")))
+                }
+                _ => None,
+            })
+            .collect();
         println!(
-            "[ai test] {} AI shots, first at {:?}",
-            session.ai_shots.len(),
-            session.ai_shots.front()
-        );
-        println!(
-            "[ai test] player Health {hp0} -> {hp1} (low {hp_low}), first Attaque at {first_attack:?}s"
+            "[ai test] player Health {hp0} -> {hp1} (low {hp_low}), first Attaque at {first_attack:?}s; combat events={combat_events:?}, final bTire={:?} bFire={:?}, weapon state={:?}, ReloadCount={:?}",
+            session.vm().get_property(ctrl, "bTire"),
+            session.vm().get_property(ctrl, "bFire"),
+            session.vm().state_name(weapon),
+            session.vm().get_property(weapon, "ReloadCount"),
         );
         // The soldier's own state machine acquired the enemy.
         assert!(
@@ -2745,15 +2649,194 @@ mod tests {
             "the soldier never entered Attaque (perception {:?})",
             session.perception_log
         );
-        assert!(
-            !session.ai_shots.is_empty(),
-            "the soldier never fired its weapon"
-        );
         // The game's own damage chain reduced the player's Health.
         assert!(
             hp1 < hp0,
             "the soldier's fire did not reduce the player's Health ({hp0} -> {hp1}); first error {:?}",
             session.first_error()
+        );
+    }
+
+    /// Opt-in Plage01 combat: deliver the authored `TouchTrigger7` (`Event=tueur_conducteur`)
+    /// cue to BaseSoldier6's controller, then record whether the game's scripted attack targets
+    /// and fires at a stationary player. This also pins the current compiled-script no-fire path.
+    #[test]
+    fn opt_in_plage01_authored_cue_soldier_combat_or_measured_no_fire_path() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Plage01").expect("open Plage01");
+        let soldier = session.vm().find_object("BaseSoldier6").expect("soldier");
+        let cue = session
+            .vm()
+            .find_object("TouchTrigger7")
+            .expect("authored cue");
+        let trigger_event = session.vm().get_property(cue, "Event").cloned();
+        assert_eq!(trigger_event, Some(Value::Name("tueur_conducteur".into())));
+        let warm_player = session.player_location().expect("player location");
+        for _ in 0..360 {
+            session.step(
+                1.0 / 60.0,
+                warm_player,
+                0.0,
+                [0.0; 3],
+                &PlayerVMModes::default(),
+            );
+        }
+        // Deliver the map's own Touch event with the player's actual spawn position. Touch
+        // dispatches the authored Event through its configured targets into the AI controller.
+        let player = session.player;
+        let player_location = session.player_location().expect("player location");
+        session
+            .vm_mut()
+            .send_event(
+                cue,
+                "Touch",
+                vec![Value::Object(Some(ObjRef::Instance(player)))],
+            )
+            .expect("deliver authored TouchTrigger7.Touch");
+        assert!(
+            session.vm().trace.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    xiii_script::TraceKind::Event { target, function, args }
+                        if target == "TouchTrigger7"
+                            && function.ends_with(".Touch")
+                            && args.iter().any(|arg| arg == &session.player_name)
+                )
+            }),
+            "the player's authored TouchTrigger7 cue was not delivered"
+        );
+        let controller = instance_prop(session.vm(), soldier, "Controller").expect("AI controller");
+        let weapon = instance_prop(session.vm(), soldier, "Weapon").expect("soldier weapon");
+        assert_eq!(
+            session.vm().state_name(controller).as_deref(),
+            Some("AttaqueScriptee")
+        );
+        let cue_enemy = instance_prop(session.vm(), controller, "Enemy");
+        let cue_enemy_name = cue_enemy.map(|id| session.vm().objects[id as usize].name.clone());
+        let initial_rotation = session.vm().rotation_prop(soldier).unwrap_or([0; 3]);
+        let health_before = session.player_health().expect("player health");
+        let soldier_location = session
+            .vm()
+            .vector_prop(soldier, "Location")
+            .expect("soldier location");
+        let sight_radius = match session.vm().get_property(soldier, "SightRadius") {
+            Some(Value::Float(radius)) => *radius,
+            other => panic!("BaseSoldier6 SightRadius is not a float: {other:?}"),
+        };
+        let player_distance = ((player_location[0] - soldier_location[0]).powi(2)
+            + (player_location[1] - soldier_location[1]).powi(2)
+            + (player_location[2] - soldier_location[2]).powi(2))
+        .sqrt();
+        let mut scripted_attack_seen = false;
+        let mut controller_attack_seen = false;
+        let mut held_fire_seen = false;
+        let mut fire_request_seen = false;
+        for _ in 0..900 {
+            session.step(
+                1.0 / 60.0,
+                player_location,
+                0.0,
+                [0.0; 3],
+                &PlayerVMModes::default(),
+            );
+            scripted_attack_seen |=
+                session.vm().state_name(controller).as_deref() == Some("AttaqueScriptee");
+            controller_attack_seen |=
+                session.vm().state_name(controller).as_deref() == Some("Attaque");
+            held_fire_seen |= matches!(
+                session.vm().get_property(controller, "bTire"),
+                Some(Value::Bool(true))
+            );
+            fire_request_seen |= [
+                (controller, "bFire"),
+                (controller, "bAltFire"),
+                (soldier, "bFire"),
+                (soldier, "bAltFire"),
+                (weapon, "bFire"),
+                (weapon, "bAltFire"),
+            ]
+            .into_iter()
+            .any(|(actor, property)| {
+                matches!(
+                    session.vm().get_property(actor, property),
+                    Some(Value::Bool(true))
+                )
+            }) || held_fire_seen;
+        }
+        let state = session.vm().state_name(soldier);
+        let controller_state = session.vm().state_name(controller);
+        let final_rotation = session.vm().rotation_prop(soldier).unwrap_or([0; 3]);
+        let health_after = session.player_health().expect("player health");
+        let wants_fire = matches!(
+            session.vm().get_property(controller, "bTire"),
+            Some(Value::Bool(true))
+        );
+        let final_enemy = instance_prop(session.vm(), controller, "Enemy")
+            .map(|id| session.vm().objects[id as usize].name.clone());
+        let scripted_states: Vec<_> = session
+            .vm()
+            .trace
+            .iter()
+            .filter_map(|event| match &event.kind {
+                xiii_script::TraceKind::StateChange {
+                    actor, from, to, ..
+                } if actor == &session.vm().objects[controller as usize].name => {
+                    Some((from.clone(), to.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let can_see: Vec<_> = session
+            .vm()
+            .trace
+            .iter()
+            .filter_map(|event| match &event.kind {
+                xiii_script::TraceKind::Native {
+                    path,
+                    this,
+                    args,
+                    result,
+                    ..
+                } if path.ends_with("Controller.CanSee")
+                    && this == &session.vm().objects[controller as usize].name =>
+                {
+                    Some((event.time, args.clone(), result.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let left_scripted_attack = scripted_states.iter().any(|(from, to)| {
+            from.as_deref() == Some("AttaqueScriptee") && to.as_deref() == Some("temporise")
+        });
+        println!(
+            "[Plage01 combat] cue=TouchTrigger7 event={trigger_event:?}, player={player_location:?}, soldier={soldier_location:?}, distance={player_distance:.1}, SightRadius={sight_radius}, cue Enemy={cue_enemy_name:?}, final Enemy={final_enemy:?}, scripted={scripted_attack_seen}, combat={controller_attack_seen}, held-fire-seen={held_fire_seen}, fire-request-seen={fire_request_seen}, bTire={wants_fire}, soldier state={state:?}, controller state={controller_state:?}, controller states={scripted_states:?}, CanSee={can_see:?}, rotation {initial_rotation:?}->{final_rotation:?}, Health {health_before}->{health_after}; suspended={:?}",
+            session.suspended
+        );
+        assert!(
+            scripted_attack_seen,
+            "the authored cue did not release the soldier"
+        );
+        assert!(
+            player_distance > sight_radius
+                && can_see.iter().any(|(_, _, result)| result == "false"),
+            "the actual player position should be outside SightRadius with a measured failed CanSee: distance={player_distance}, SightRadius={sight_radius}, CanSee={can_see:?}"
+        );
+        // Whether this authored map cue yields combat is determined by the map's own dispatch,
+        // AI state chain, and LOS result at the player's actual spawn location.
+        assert!(
+            cue_enemy == Some(player)
+                && final_enemy.is_none()
+                && left_scripted_attack
+                && controller_state.as_deref() == Some("Patrouille")
+                && !controller_attack_seen
+                && !held_fire_seen
+                && !fire_request_seen
+                && !wants_fire
+                && health_after == health_before,
+            "unexpected combat result: Health {health_before}->{health_after}, bTire={wants_fire}"
         );
     }
 

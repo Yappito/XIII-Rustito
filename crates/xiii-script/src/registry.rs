@@ -1328,17 +1328,13 @@ fn controller_can_see(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResu
     val(Value::Bool(vm.nav_line_of_sight_to(c.this, other)?))
 }
 
-/// `Pawn.PressingFire() -> bool` (native 0): UE2 `APawn::execPressingFire` returns the pawn's
-/// `bFire` (the held fire button published by its controller). Falls back to the controller's
-/// `bFire` and then the instigator's, since the weapon path calls it on the firing pawn.
+/// `Pawn.PressingFire() -> bool` (native 0): Engine.dll `APawn::execPressingFire` returns false
+/// without a controller and otherwise reads the controller's `bFire` field. It does not inspect
+/// the pawn, instigator, or XIII's script-only `IAController.bTire` field.
 fn pawn_pressing_fire(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let fire = vm.bool_prop(c.this, "bFire")
-        || vm
-            .obj_prop(c.this, "Controller")
-            .is_some_and(|ctrl| vm.bool_prop(ctrl, "bFire"))
-        || vm
-            .obj_prop(c.this, "Instigator")
-            .is_some_and(|inst| vm.bool_prop(inst, "bFire"));
+    let fire = vm
+        .obj_prop(c.this, "Controller")
+        .is_some_and(|ctrl| vm.bool_prop(ctrl, "bFire"));
     val(Value::Bool(fire))
 }
 
@@ -1462,31 +1458,20 @@ fn move_toward(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nati
     val(Value::Void)
 }
 
-/// `Controller.FinishRotation`: snap the pawn's yaw to face the controller's `FocalPoint`.
-///
-/// The engine suspends state code while it interpolates the rotation at `RotationRate.Yaw`. The
-/// headless VM has no per-tick rotation, so the snap is applied immediately (no latent). The
-/// decoded declaration is `final latent function FinishRotation()`.
+/// `Controller.FinishRotation`: enable physics rotation toward Focus/FocalPoint and suspend the
+/// current state until the pawn reaches the target orientation.
 fn finish_rotation(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
-    if let (Some(pawn), Some(focal)) = (
-        vm.obj_prop(c.this, "Pawn"),
-        vm.vector_prop(c.this, "FocalPoint"),
-    ) {
-        let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
-        // UE2 rotator units: 65536 per full turn; yaw is the Z component.
-        let dx = focal[0] - loc[0];
-        let dy = focal[1] - loc[1];
-        let yaw = (dy.atan2(dx) * (65536.0 / std::f32::consts::TAU)) as i32;
-        let rot = match vm.get_property(pawn, "Rotation") {
-            Some(Value::Rotator(r)) => [r[0], r[1], yaw],
-            _ => [0, 0, yaw],
-        };
-        vm.set_property(pawn, "Rotation", 0, Value::Rotator(rot));
-        vm.note(crate::vm::TraceKind::Log(format!(
-            "FinishRotation: {} -> yaw {}",
-            vm.objects[c.this as usize].name, yaw
-        )));
+    if !c.in_state_code {
+        return Err(vm.err(VmErrorKind::LatentOutsideState {
+            path: c.path.clone(),
+        }));
     }
+    if let Some(pawn) = vm.obj_prop(c.this, "Pawn") {
+        vm.set_property(pawn, "bRotateToDesired", 0, Value::Bool(true));
+    }
+    vm.pending_latent = Some(Latent::Rotation {
+        started: vm.time_now(),
+    });
     val(Value::Void)
 }
 
@@ -4683,9 +4668,7 @@ fn builtin_defs() -> Vec<NativeDef> {
         )
     });
     v.push(NativeDef {
-        status: NativeStatus::Partial(
-            "snaps the pawn yaw to FocalPoint immediately; the engine's per-tick rotation interpolation at RotationRate.Yaw is not modelled",
-        ),
+        status: NativeStatus::Implemented,
         ..def(
             "Engine.Controller.FinishRotation",
             "native(508) final latent function FinishRotation()",
@@ -4906,8 +4889,9 @@ fn builtin_defs() -> Vec<NativeDef> {
     v.push(def(
         "Engine.Pawn.PressingFire",
         "native(0) final simulated native function bool PressingFire()",
-        "engine.u Pawn.PressingFire decoded (native 0, return bool); returns the pawn's held fire \
-         button (`bFire`); the melee/weapon fire animation path calls it",
+        "engine.u Pawn.PressingFire decoded (native 0, return bool); Engine.dll \
+         ?execPressingFire@APawn reads Controller.bFire (not IAController.bTire); the \
+         XIIIWeapon state fire chain calls it",
         pawn_pressing_fire,
     ));
     v.push(NativeDef {

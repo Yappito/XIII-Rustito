@@ -382,6 +382,87 @@ fn g(set: &ScriptSet, path: &str) -> GlobalRef {
     }
 }
 
+fn pressing_fire_package() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let controller = b.reserve(0, 0, "Controller");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller_fire = b.reserve(B_BOOLPROP, controller, "bFire");
+    let controller_ai_fire = b.reserve(B_BOOLPROP, controller, "bTire");
+    let pawn_controller = b.reserve(IMP_OBJPROP, pawn, "Controller");
+    let pawn_fire = b.reserve(B_BOOLPROP, pawn, "bFire");
+    let pawn_instigator = b.reserve(IMP_OBJPROP, pawn, "Instigator");
+    let pressing_fire = b.reserve(IMP_FUNCTION, pawn, "PressingFire");
+    let result = b.reserve(B_BOOLPROP, pressing_fire, "ReturnValue");
+    b.prop(controller_fire, controller_ai_fire, 0);
+    b.prop(controller_ai_fire, 0, 0);
+    b.prop_with(pawn_controller, pawn_fire, 0, &compact(0));
+    b.prop(pawn_fire, pawn_instigator, 0);
+    b.prop_with(pawn_instigator, 0, 0, &compact(0));
+    b.prop(result, 0, pf::PARM | pf::RETURN_PARM);
+    b.func(
+        pressing_fire,
+        0,
+        result,
+        &[],
+        0,
+        0,
+        ff::FINAL | ff::NATIVE | ff::SIMULATED,
+    );
+    b.class(object, 0, 0);
+    b.class(actor, object, 0);
+    b.class(controller, actor, controller_fire);
+    b.class(pawn, actor, pawn_controller);
+    b.build()
+}
+
+#[test]
+fn pawn_pressing_fire_reads_controller_bfire_not_pawn_or_ai_btire() {
+    let engine = ScriptPackage::load(
+        "Engine",
+        pressing_fire_package(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("synthetic Engine package");
+    let mut set = ScriptSet::new();
+    set.add(engine);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pawn = vm.spawn(g(&set, "Pawn"), "Pawn").unwrap();
+    let controller = vm.spawn(g(&set, "Controller"), "Controller").unwrap();
+    let pressing_fire = g(&set, "Pawn.PressingFire");
+
+    vm.set_property(pawn, "bFire", 0, Value::Bool(true));
+    assert_eq!(
+        vm.call_function(pressing_fire, pawn, vec![]).unwrap(),
+        Value::Bool(false),
+        "without a controller, Pawn.bFire does not make PressingFire true"
+    );
+    vm.set_property(
+        pawn,
+        "Controller",
+        0,
+        Value::Object(Some(ObjRef::Instance(controller))),
+    );
+    vm.set_property(controller, "bTire", 0, Value::Bool(true));
+    assert_eq!(
+        vm.call_function(pressing_fire, pawn, vec![]).unwrap(),
+        Value::Bool(false),
+        "IAController.bTire is a separate script property"
+    );
+    vm.set_property(controller, "bFire", 0, Value::Bool(true));
+    assert_eq!(vm.obj_prop(pawn, "Controller"), Some(controller));
+    assert_eq!(
+        vm.get_property(controller, "bFire"),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(
+        vm.call_function(pressing_fire, pawn, vec![]).unwrap(),
+        Value::Bool(true)
+    );
+}
+
 #[test]
 fn arithmetic_loop_and_out_parameter() {
     let set = set_of(fixture());
@@ -432,6 +513,49 @@ fn state_labels_latent_sleep_and_goto_state() {
     // State code is done: further ticks change nothing.
     vm.tick(0.25).unwrap();
     assert_eq!(vm.get_property(a, "Counter"), Some(&Value::Int(3)));
+}
+
+#[test]
+fn repeating_weapon_script_timer_refires_at_the_configured_interval() {
+    let set = set_of(fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let weapon = vm.spawn(g(&set, "Actor"), "Weapon").unwrap();
+    vm.set_active(weapon, true);
+    vm.set_timer(weapon, 0.5, true);
+
+    for _ in 0..3 {
+        vm.tick(0.125).unwrap();
+    }
+    assert!(
+        !vm.trace
+            .iter()
+            .any(|event| matches!(event.kind, TraceKind::Timer { .. })),
+        "a weapon timer fired before its authored interval"
+    );
+    vm.tick(0.125).unwrap();
+
+    let timer_events: Vec<_> = vm
+        .trace
+        .iter()
+        .filter(|event| matches!(&event.kind, TraceKind::Timer { actor } if actor == "Weapon"))
+        .collect();
+    assert_eq!(timer_events.len(), 1);
+    assert_eq!(timer_events[0].tick, 4);
+    assert!((timer_events[0].time - 0.5).abs() < 1e-6);
+
+    for _ in 0..3 {
+        vm.tick(0.125).unwrap();
+    }
+    vm.tick(0.125).unwrap();
+    let refire_ticks: Vec<_> = vm
+        .trace
+        .iter()
+        .filter_map(|event| {
+            matches!(&event.kind, TraceKind::Timer { actor } if actor == "Weapon")
+                .then_some(event.tick)
+        })
+        .collect();
+    assert_eq!(refire_ticks, [4, 8]);
 }
 
 #[test]

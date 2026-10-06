@@ -378,6 +378,11 @@ pub enum Latent {
         /// VM time when it started.
         started: f64,
     },
+    /// `Controller.FinishRotation`: wait until its pawn has reached Focus/FocalPoint.
+    Rotation {
+        /// VM time when it started.
+        started: f64,
+    },
 }
 
 /// An object reference into a package outside the loaded script set (e.g. a `Sound` in a
@@ -1320,6 +1325,42 @@ pub struct VideoPlayback {
 
 fn lower(s: &str) -> String {
     s.to_ascii_lowercase()
+}
+
+/// UE2 `FixedTurn`: move the wrapped 16-bit rotator component toward its target by at most
+/// `rate * dt` units. Values are kept signed because Unreal serializes rotators that way.
+fn rotation_step(current: i32, desired: i32, rate: i32, dt: f32) -> i32 {
+    if rate <= 0 || !dt.is_finite() || dt <= 0.0 {
+        return current;
+    }
+    let delta = rotation_delta(current, desired);
+    // Engine APawn::physicsRotation stores the rate*DeltaTime product as f32 and uses
+    // x86 `fistp` (round to nearest, ties to even) before calling AActor::FixedTurn.
+    let max_step = ((rate as f32 * dt).round_ties_even() as i64).max(0);
+    let step = delta.clamp(-max_step, max_step);
+    (i64::from(current) + step) as i32
+}
+
+fn rotation_delta(current: i32, desired: i32) -> i64 {
+    let mut delta = (i64::from(desired) - i64::from(current)).rem_euclid(65536);
+    if delta > 32768 {
+        delta -= 65536;
+    }
+    delta
+}
+
+#[cfg(test)]
+mod combat_timing_tests {
+    use super::rotation_step;
+
+    #[test]
+    fn focus_rotation_respects_rate_and_wraps_signed_rotators() {
+        assert_eq!(rotation_step(0, 10_000, 900, 0.5), 450);
+        assert_eq!(rotation_step(0, 20, 10, 0.55), 6);
+        assert_eq!(rotation_step(32_700, -32_700, 1_000, 0.1), 32_800);
+        assert_eq!(rotation_step(-32_700, 32_700, 1_000, 0.1), -32_800);
+        assert_eq!(rotation_step(10, -20, 0, 1.0), 10);
+    }
 }
 
 /// item18: normalises a `VideoPlayer` clip name to a lowercased stem (drops any directory and a
@@ -3675,6 +3716,8 @@ impl<'s> Vm<'s> {
                 errors.push((suspended, e));
             }
         }
+        // Pawn physics rotation runs after script Tick callbacks, as it does in the engine.
+        self.update_focus_rotations(dt);
         for id in 0..self.objects.len() as ObjectId {
             if self.player_tick_overridden(id)
                 && let Err(e) = self.dispatch_player_tick(id, dt)
@@ -3715,6 +3758,102 @@ impl<'s> Vm<'s> {
             self.trace_cinematic_controller(id, phase);
         }
         Ok(())
+    }
+
+    fn focus_rotation_complete(&self, controller: ObjectId) -> bool {
+        let Some(pawn) = self.obj_prop(controller, "Pawn") else {
+            return true;
+        };
+        let Some(target) = self
+            .obj_prop(controller, "Focus")
+            .and_then(|focus| self.vector_prop(focus, "Location"))
+            .or_else(|| self.vector_prop(controller, "FocalPoint"))
+        else {
+            return true;
+        };
+        let location = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let dx = target[0] - location[0];
+        let dy = target[1] - location[1];
+        let dz = target[2] - location[2];
+        let scale = 65536.0 / std::f32::consts::TAU;
+        let desired = [
+            (dz.atan2(dx.hypot(dy)) * scale).round() as i32,
+            (dy.atan2(dx) * scale).round() as i32,
+            0,
+        ];
+        let current = self.rotation_prop(pawn).unwrap_or([0; 3]);
+        current
+            .iter()
+            .zip(desired)
+            .all(|(a, b)| rotation_delta(*a, b).abs() <= 1)
+    }
+
+    /// Mirror focus-derived controller rotation and the pawn's Engine.dll physicsRotation.
+    /// UpdateRotation supplies the controller's facing; APawn::physicsRotation then advances
+    /// the pawn toward Controller.Rotation through FixedTurn and RotationRate.
+    fn update_focus_rotations(&mut self, dt: f32) {
+        if !dt.is_finite() || dt <= 0.0 {
+            return;
+        }
+        let controllers: Vec<ObjectId> = self
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(i, o)| {
+                o.is_actor && o.active && !o.deleted && self.is_a(*i as ObjectId, "controller")
+            })
+            .map(|(i, _)| i as ObjectId)
+            .collect();
+        for controller in controllers {
+            // Combat focus steering is owned by AAIController/its game subclasses. Player and
+            // scripted controllers also use FinishRotation for view/cinematic work; their view
+            // rotation follows player input and must not be treated as AI focus steering here.
+            if !self.is_a(controller, "aicontroller") {
+                continue;
+            }
+            let Some(pawn) = self.obj_prop(controller, "Pawn") else {
+                continue;
+            };
+            if !self.bool_prop(pawn, "bRotateToDesired") {
+                continue;
+            }
+            let focus_point = self
+                .obj_prop(controller, "Focus")
+                .and_then(|focus| self.vector_prop(focus, "Location"))
+                .or_else(|| self.vector_prop(controller, "FocalPoint"));
+            let Some(target) = focus_point else {
+                continue;
+            };
+            let location = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+            let dx = target[0] - location[0];
+            let dy = target[1] - location[1];
+            let dz = target[2] - location[2];
+            if dx == 0.0 && dy == 0.0 && dz == 0.0 {
+                continue;
+            }
+            let horizontal = dx.hypot(dy);
+            let scale = 65536.0 / std::f32::consts::TAU;
+            let desired = [
+                (dz.atan2(horizontal) * scale).round() as i32,
+                (dy.atan2(dx) * scale).round() as i32,
+                0,
+            ];
+            let _ = self.set_property(pawn, "DesiredRotation", 0, Value::Rotator(desired));
+            let current = self.rotation_prop(pawn).unwrap_or([0; 3]);
+            let rate = match self.get_property(pawn, "RotationRate") {
+                Some(Value::Rotator(rate)) => *rate,
+                _ => [0; 3],
+            };
+            let next = [
+                rotation_step(current[0], desired[0], rate[0], dt),
+                rotation_step(current[1], desired[1], rate[1], dt),
+                rotation_step(current[2], desired[2], rate[2], dt),
+            ];
+            let _ = self.set_property(pawn, "Rotation", 0, Value::Rotator(next));
+            // AController::Tick invokes APawn::rotateToward(FocalPoint), then copies the
+            // pawn's current rotation back to the controller before pawn physics advances.
+            let _ = self.set_property(controller, "Rotation", 0, Value::Rotator(current));
+        }
     }
 
     /// Temporary, opt-in diagnostic for the authored XIDCine action interpreter. Kept in the VM
@@ -4068,6 +4207,20 @@ impl<'s> Vm<'s> {
                         started,
                     });
                 }
+                Some(Latent::Rotation { started }) => {
+                    if !self.focus_rotation_complete(id) {
+                        return Ok(());
+                    }
+                    if let Some(c) = self.objects[id as usize].state_code.as_mut() {
+                        c.latent = None;
+                    }
+                    let actor = self.objects[id as usize].name.clone();
+                    self.note(TraceKind::LatentResume {
+                        actor,
+                        native: "Controller.FinishRotation".into(),
+                        started,
+                    });
+                }
                 Some(Latent::AnimEnd { channel, started }) => {
                     // `Actor.FinishAnim`: resume once the channel stops animating.
                     if self.anim_channel_active(id, channel) {
@@ -4159,6 +4312,11 @@ impl<'s> Vm<'s> {
                             self.note(TraceKind::AnimSuspend { actor, native })
                         }
                         Latent::Interp { .. } => self.note(TraceKind::LatentStart {
+                            actor,
+                            native,
+                            seconds: 0.0,
+                        }),
+                        Latent::Rotation { .. } => self.note(TraceKind::LatentStart {
                             actor,
                             native,
                             seconds: 0.0,
