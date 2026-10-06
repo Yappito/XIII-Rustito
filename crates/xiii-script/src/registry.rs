@@ -3253,15 +3253,14 @@ fn set_max_particles(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResul
     val(Value::Void)
 }
 
-/// item18: `ParticleEmitter.SpawnParticle(int Amount)`. The port has no particle subsystem (the
-/// renderer draws decoded emitters separately), so the spawn is recorded and discarded, like
-/// [`set_max_particles`]. Called by `xidcine.Shells.TriggerParticle` on the m60/kalash fire path;
-/// it must not suspend the weapon, and damage never depends on it.
-fn particle_spawn(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let n = int(vm, a, 0).unwrap_or(0);
-    vm.note(crate::vm::TraceKind::Note(format!(
-        "ParticleEmitter.SpawnParticle({n}): recorded; no particle subsystem"
-    )));
+/// `ParticleEmitter.SpawnParticle(int Amount)`: keep the request attached to the VM-owned
+/// subobject; the presentation host consumes it once and injects that many particles into its
+/// simulator. Called by `xidcine.Shells.TriggerParticle` on the m60/kalash fire path.
+fn particle_spawn(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let amount = int(vm, a, 0)?;
+    if amount > 0 {
+        vm.spawn_particles(c.this, amount as usize);
+    }
     val(Value::Void)
 }
 
@@ -3297,17 +3296,12 @@ fn item18_defs() -> Vec<NativeDef> {
             "core.u Object.Percent_FloatFloat decoded; UE2 appFmod (C fmod); xiii.m60.RumbleFX 0x004E (ReloadCount % 1) on the fire path",
             percent_ff,
         ),
-        NativeDef {
-            status: NativeStatus::Partial(
-                "no particle subsystem: the spawn is accepted and recorded but no particle is simulated (presentational)",
-            ),
-            ..def(
-                "ParticleEmitter.SpawnParticle",
-                "native(0) native function SpawnParticle(int Amount)",
-                "engine.u ParticleEmitter.SpawnParticle; xidcine.Shells.TriggerParticle 0x006C on the m60/kalash fire path",
-                particle_spawn,
-            )
-        },
+        def(
+            "ParticleEmitter.SpawnParticle",
+            "native(0) native function SpawnParticle(int Amount)",
+            "engine.u ParticleEmitter.SpawnParticle; xidcine.Shells.TriggerParticle 0x006C on the m60/kalash fire path",
+            particle_spawn,
+        ),
         NativeDef {
             status: NativeStatus::Partial(
                 "no audio device: the call is accepted and discarded (the VM has no mixer)",

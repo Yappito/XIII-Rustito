@@ -214,6 +214,9 @@ fn benchmark_system(
     mut perf: ResMut<Perf>,
     store: Res<DiagnosticsStore>,
     render: Option<Res<RenderStats>>,
+    particles: Option<Res<crate::viewer::particles::ParticleStats>>,
+    particle_data: Option<Res<crate::viewer::particles::ParticleRenderData>>,
+    particle_emitters: Query<&crate::viewer::particles::ParticleEmitterRender>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let Some(n) = perf.config.benchmark else {
@@ -269,6 +272,38 @@ fn benchmark_system(
             "[perf]   render: objects {} | mesh entities (pre-cull draw submissions) {} | mesh assets {} | material assets {} | triangles {}",
             r.objects, r.draw_entities, r.mesh_assets, r.material_assets, r.triangles
         );
+    }
+    if let Some(p) = particles {
+        println!(
+            "[perf]   particles: emitters {} | authored-enabled {} | VM-enabled {} | live {}",
+            p.emitters, p.authored_enabled_emitters, p.enabled_emitters, p.live_particles
+        );
+        if let Some(data) = particle_data {
+            let mut authored_enabled = Vec::new();
+            let mut vm_enabled = Vec::new();
+            for emitter in &particle_emitters {
+                let Some(system) = data.systems.get(emitter.system) else {
+                    continue;
+                };
+                let Some(desc) = system.emitters.get(emitter.emitter) else {
+                    continue;
+                };
+                if xiii_world::particles::initially_enabled(system, desc) {
+                    authored_enabled.push(desc.name.as_str());
+                }
+                if emitter.sim.enabled {
+                    vm_enabled.push(desc.name.as_str());
+                }
+            }
+            println!(
+                "[perf]   particle emitter paths authored-enabled: {}",
+                authored_enabled.join(", ")
+            );
+            println!(
+                "[perf]   particle emitter paths VM-enabled: {}",
+                vm_enabled.join(", ")
+            );
+        }
     }
     perf.final_requested = true;
     exit.write(AppExit::Success);

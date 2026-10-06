@@ -1039,6 +1039,9 @@ pub struct Instance {
     pub is_actor: bool,
     /// Destroyed: behaves as `None` for further references.
     pub deleted: bool,
+    /// Memoised `Tick` dispatch, keyed by the state used for virtual resolution. Class chains are
+    /// fixed for an instance; a state transition invalidates the cached result.
+    tick_fn: Option<(Option<GlobalRef>, Option<GlobalRef>)>,
     /// Map export it was loaded from.
     pub export: Option<GlobalRef>,
     /// The three UE2 actor timers (`Timer`, `Timer2`, `Timer3`), independently scheduled.
@@ -1204,6 +1207,9 @@ pub struct Vm<'s> {
     /// Outbound presentation events emitted by presentation natives (sound, texture, display,
     /// projectors). Drained with [`Vm::drain_events`].
     events: Vec<PresentationEvent>,
+    /// Explicit `ParticleEmitter.SpawnParticle` requests for the presentation host. The emitter
+    /// object and request origin remain VM-owned; the renderer consumes these commands once.
+    particle_spawns: Vec<(ObjectId, usize)>,
     /// Pending level-travel request (item15). Set by the `PlayerController.ClientTravel` native
     /// or observed on `LevelInfo.NextURL` after the game's `ServerTravel`; consumed by the host
     /// with [`Vm::take_travel_request`]. The VM itself never loads a map.
@@ -1367,6 +1373,7 @@ impl<'s> Vm<'s> {
             voice_duration: None,
             save_slots: None,
             events: Vec::new(),
+            particle_spawns: Vec::new(),
             pending_travel: None,
             level_info: None,
             last_next_url: String::new(),
@@ -1762,6 +1769,23 @@ impl<'s> Vm<'s> {
     /// Drains the outbound presentation events emitted since the last call.
     pub fn drain_events(&mut self) -> Vec<PresentationEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    /// Queues an explicit script `ParticleEmitter.SpawnParticle` request against this VM object.
+    pub fn spawn_particles(&mut self, emitter: ObjectId, amount: usize) {
+        if amount > 0
+            && self
+                .objects
+                .get(emitter as usize)
+                .is_some_and(|o| !o.deleted)
+        {
+            self.particle_spawns.push((emitter, amount));
+        }
+    }
+
+    /// Drains particle spawn commands for the renderer. Commands are consumed exactly once.
+    pub fn drain_particle_spawns(&mut self) -> Vec<(ObjectId, usize)> {
+        std::mem::take(&mut self.particle_spawns)
     }
 
     /// Number of presentation events waiting to be drained.
@@ -2687,6 +2711,7 @@ impl<'s> Vm<'s> {
             suspended: false,
             is_actor,
             deleted: false,
+            tick_fn: None,
             export: None,
             timers: [None, None, None],
             anim: AnimState::default(),
@@ -2891,6 +2916,24 @@ impl<'s> Vm<'s> {
             .iter()
             .position(|o| !o.deleted && o.name.eq_ignore_ascii_case(name))
             .map(|i| i as ObjectId)
+    }
+
+    /// Finds a live instance created from a package export by its full object path.
+    /// Map subobjects such as `SpriteEmitter` are ordinary VM instances even though they do not
+    /// derive from `Actor`; presentation systems use this lookup to read their authoritative
+    /// script properties without replaying lifecycle events from the trace.
+    pub fn find_export_instance(&self, path: &str) -> Option<ObjectId> {
+        self.by_export.iter().find_map(|(g, &id)| {
+            if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
+                return None;
+            }
+            let p = &self.set.packages[g.package];
+            let object_path = p
+                .package
+                .object_path(ObjectRef::Export(g.export))
+                .unwrap_or_default();
+            object_path.eq_ignore_ascii_case(path).then_some(id)
+        })
     }
 
     /// Class-level function by name, ignoring state shadowing. Host-driven verbs that the engine
@@ -3692,6 +3735,18 @@ impl<'s> Vm<'s> {
     /// must also dispatch `Tick` or per-frame script (the `CineController2` sequence interpreter,
     /// `XIIIBaseHud.Tick`, pawn controllers) never runs. `Tick` is looked up in the actor's
     /// current state first, then the class chain.
+    fn tick_function(&mut self, id: ObjectId) -> Option<GlobalRef> {
+        let state = self.objects[id as usize].state;
+        if let Some((cached_state, function)) = self.objects[id as usize].tick_fn
+            && cached_state == state
+        {
+            return function;
+        }
+        let function = self.find_function(id, "Tick", true);
+        self.objects[id as usize].tick_fn = Some((state, function));
+        function
+    }
+
     fn dispatch_tick(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
         let trace_cine = cine_trace_enabled() && self.is_a(id, "CineController2");
         let action_before =
@@ -3699,7 +3754,7 @@ impl<'s> Vm<'s> {
                 Some(Value::Int(index)) => Some(*index),
                 _ => None,
             });
-        if let Some(f) = self.find_function(id, "Tick", true) {
+        if let Some(f) = self.tick_function(id) {
             self.call_values(f, id, vec![Value::Float(dt)])?;
         }
         if trace_cine {
@@ -3993,6 +4048,7 @@ impl<'s> Vm<'s> {
             let o = &mut self.objects[id as usize];
             o.state = new_state;
             o.state_code = code;
+            o.tick_fn = None;
             o.generation += 1;
         }
         self.note(TraceKind::StateChange {
@@ -6397,14 +6453,6 @@ impl<'s> Vm<'s> {
         let mut ids = map_ids.to_vec();
         ids.push(info);
         self.begin_play(&ids)?;
-        // Level-start placement: a placed pickup's collision cylinder rests on the first walkable
-        // surface below it (`Location.Z = surface + CollisionHeight`). Measured: Plage01
-        // `Plage01CahuteKeyPick0` has `Location.Z=1257.59`, `CollisionHeight=8`, and the floor
-        // plank under it is at 1259.91, so the decoded `Location` is the cylinder base and the
-        // pickup is sunk into the plank; `ValidTouch`'s eye->key `FastTrace` then hits the plank.
-        // This corrects the cylinder onto its support (no-op without a physics provider and
-        // idempotent once resting).
-        self.settle_pickups();
         // Upstream clears `bStartup` again once the level-start events have run (hypothesis
         // for XIII); leaving it set would make every later runtime spawn look like a
         // level-start spawn (e.g. auto-possession in `Pawn.PostBeginPlay`).
@@ -6426,56 +6474,6 @@ impl<'s> Vm<'s> {
             }
         }
         Ok(())
-    }
-
-    /// **Host workaround (hypothesis, not engine behaviour found in the data):** at level start,
-    /// put each placed `Pickup`'s collision cylinder on the first walkable surface below it,
-    /// i.e. `Location.Z = surface_z + CollisionHeight`.
-    ///
-    /// Measured: Plage01 `Plage01CahuteKeyPick0` has `Location.Z=1257.5927`, `CollisionHeight=8`
-    /// and the plank under it at 1259.91, so its centre is 2.3 UU below the surface and
-    /// `ValidTouch`'s eye->key `FastTrace` hits the plank. Pickups keep `Physics=0` and no decoded
-    /// script moves them, so how the original engine makes this pickup touchable is unknown
-    /// (candidates: our placement/collision of the desk, one-sided line checks, or a different
-    /// `ValidTouch` trace). Replace this with the real mechanism once found. Uses the
-    /// world-physics provider; without one it is a no-op; idempotent. Returns the number of
-    /// actors moved (callers should count/log it).
-    pub fn settle_pickups(&mut self) -> usize {
-        if self.physics.is_none() {
-            return 0;
-        }
-        let mut settled = 0;
-        for id in 0..self.objects.len() as ObjectId {
-            if !self.is_live_actor(id) || !self.is_a(id, "pickup") {
-                continue;
-            }
-            if !self.bool_prop(id, "bCollideWorld") {
-                continue;
-            }
-            let Some(loc) = self.vector_prop(id, "Location") else {
-                continue;
-            };
-            let h = self.f32_prop(id, "CollisionHeight");
-            if h <= 0.0 {
-                continue;
-            }
-            let end = [loc[0], loc[1], loc[2] - 2.0 * h - 32.0];
-            let hit = match self.physics.as_mut() {
-                Some(p) => p.trace(loc, end, [0.0; 3]),
-                None => continue,
-            };
-            let Some(hit) = hit else { continue };
-            // Rest only on an upward-facing (walkable) surface; a ceiling/steep face is skipped.
-            if hit.normal[2] < 0.7 {
-                continue;
-            }
-            let new_z = hit.location[2] + h;
-            if (new_z - loc[2]).abs() > 0.01 {
-                self.set_property(id, "Location", 0, Value::Vector([loc[0], loc[1], new_z]));
-                settled += 1;
-            }
-        }
-        settled
     }
 
     /// `Actor.Destroy` in the engine's `ULevel::DestroyActor` order (`Engine.dll`

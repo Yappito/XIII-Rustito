@@ -10,8 +10,8 @@
 //! - [`CollisionWorld`] stores triangles in Bevy space (metres) with a `u32` source id
 //!   each and builds a bounding-volume hierarchy once. Queries traverse only overlapping
 //!   nodes, not every triangle.
-//! - Triangles are two-sided: the soup carries no reliable facing for collision, so the
-//!   contact normal is chosen to oppose the sweep direction, not from the winding.
+//! - Swept extent tests treat triangles two-sided and choose contact normals against motion.
+//!   Rays can select one-sided sources when the engine's line-check path rejects backfaces.
 //! - No Bevy, no filesystem, no external crates.
 
 #![warn(missing_docs)]
@@ -273,16 +273,48 @@ impl CollisionWorld {
     /// SAT is not used here because a zero-extent box at an exact point can be rejected by a
     /// near-degenerate edge axis.
     pub fn ray(&self, start: Vec3, end: Vec3) -> Option<SweepHit> {
+        self.ray_with_one_sided_sources(start, end, &[])
+    }
+
+    /// Nearest ray hit with backface rejection for the selected collision sources.
+    ///
+    /// The engine's `UStaticMesh::LineCheck` uses the oriented collision triangle and rejects
+    /// the backface direction. `one_sided[source]` selects those sources; sources outside the
+    /// slice remain two-sided. Use [`CollisionWorld::ray`] for a fully two-sided query.
+    pub fn ray_with_one_sided_sources(
+        &self,
+        start: Vec3,
+        end: Vec3,
+        one_sided: &[bool],
+    ) -> Option<SweepHit> {
+        let is_one_sided = |source: u32| one_sided.get(source as usize).copied().unwrap_or(false);
         let d = sub(end, start);
         let mut query = Aabb::empty();
         query.include(start);
         query.include(end);
         let mut best: Option<SweepHit> = None;
         self.for_each_candidate(query, |i| {
-            consider_ray(&mut best, start, d, self.triangle(i), i, self.source(i));
+            let source = self.source(i);
+            consider_ray(
+                &mut best,
+                start,
+                d,
+                self.triangle(i),
+                i,
+                source,
+                is_one_sided(source),
+            );
         });
         self.for_each_dynamic_candidate(query, |t, source, _idx| {
-            consider_ray(&mut best, start, d, &t, u32::MAX, source);
+            consider_ray(
+                &mut best,
+                start,
+                d,
+                &t,
+                u32::MAX,
+                source,
+                is_one_sided(source),
+            );
         });
         best
     }
@@ -333,8 +365,9 @@ fn consider_ray(
     tri: &Triangle,
     index: u32,
     source: u32,
+    one_sided: bool,
 ) {
-    if let Some(t) = ray_triangle(start, d, tri)
+    if let Some(t) = ray_triangle(start, d, tri, one_sided)
         && best.is_none_or(|b| t < b.t)
     {
         let n = normalize(triangle_normal(tri));
@@ -665,12 +698,12 @@ fn aabb_triangle_overlap(center: Vec3, half: Vec3, t: &Triangle) -> Option<()> {
 
 /// Möller-Trumbore ray/triangle intersection (both sides). `d` is the segment vector; the
 /// returned value is `t` in [0,1] along `start + t*d`.
-fn ray_triangle(o: Vec3, d: Vec3, t: &Triangle) -> Option<f32> {
+fn ray_triangle(o: Vec3, d: Vec3, t: &Triangle, one_sided: bool) -> Option<f32> {
     let e1 = sub(t[1], t[0]);
     let e2 = sub(t[2], t[0]);
     let p = cross(d, e2);
     let det = dot(e1, p);
-    if det.abs() < 1e-12 {
+    if (one_sided && det <= 1e-12) || (!one_sided && det.abs() < 1e-12) {
         return None;
     }
     let inv = 1.0 / det;
