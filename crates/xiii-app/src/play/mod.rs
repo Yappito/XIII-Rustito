@@ -951,30 +951,7 @@ fn fixed_step(
         perf.span("mover_collision", t0);
         for path in &weapons {
             match sess.grant_weapon(path) {
-                Ok(msg) => {
-                    println!("[play] weapon {msg}");
-                    // The diagnostic grant wires `Pawn.Weapon` directly instead of going
-                    // through `Pawn.ChangedWeapon`, so the weapon's third-person attachment
-                    // (`XIII.BerettaAttach` -> `MFSmallAttach` -> `XIII.MuzzleLight`) is never
-                    // spawned. Run the game's own `Inventory.AttachToPawn` so the muzzle light
-                    // exists; the spawn happens before any later native in the function, so a
-                    // failure to attach is reported, not fatal (item5h host bridge).
-                    if let Some(weapon) = sess.player_weapon() {
-                        let pawn = sess.player;
-                        let arg = Value::Object(Some(xiii_script::ObjRef::Instance(pawn)));
-                        let vm = sess.vm_mut();
-                        match vm.class_function(weapon, "AttachToPawn") {
-                            Some(f) => {
-                                if let Err(e) = vm.call_function(f, weapon, vec![arg]) {
-                                    println!("[play] weapon AttachToPawn partial: {e}");
-                                } else {
-                                    println!("[play] weapon attachment spawned via AttachToPawn");
-                                }
-                            }
-                            None => println!("[play] weapon has no AttachToPawn function"),
-                        }
-                    }
-                }
+                Ok(msg) => println!("[play] weapon {msg}"),
                 Err(e) => println!("[play] weapon grant failed {path}: {e}"),
             }
         }
@@ -989,7 +966,16 @@ fn fixed_step(
         }
         if fire {
             match sess.fire(sim.0.yaw, sim.0.pitch) {
-                session::FireOutcome::Fired => flash_muzzle_light(sess, &sim.0, &params.0),
+                // The weapon's own `IncrementFlashCount` -> `ThirdPersonEffects` chain spawns the
+                // muzzle flash and calls `MuzzleLight.Flash`; the VM light sync renders it.
+                session::FireOutcome::Fired => {
+                    println!(
+                        "[play] fire [{}] bone {} | {}",
+                        state.tick as f32 * DT,
+                        sess.vm().last_trace_bone(),
+                        combat_snapshot(sess)
+                    );
+                }
                 other => println!("[play] fire: {other:?}"),
             }
         }
@@ -1017,63 +1003,6 @@ fn fixed_step(
         if let Ok(sess) = session.as_ref() {
             println!("[play] {}", format_vm_trace(sess));
         }
-    }
-}
-
-/// Presentation bridge for the player's muzzle flash light (item5h).
-///
-/// The retail chain is `Weapon.IncrementFlashCount` -> `WeaponAttachment(ThirdPersonActor)
-/// .ThirdPersonEffects` -> `MuzzleAttach` (spawns `MFSmallAttach`) -> `MuzzleFlashAttachment
-/// .Visible.Tick` -> `XIII.MuzzleLight.Flash`. The diagnostic weapon grant wires `Pawn.Weapon`
-/// directly, so the third-person attachment has to be created by the host (see the grant above),
-/// and the VM's `WeaponAttachment(...)` cast does not reach it on the fire path. This bridge
-/// therefore runs the game's own `MFSmallAttach` spawn (`ThirdPersonEffects`) once and then calls
-/// the game's own `XIII.MuzzleLight.Flash` at the muzzle position from
-/// `MuzzleFlashAttachment.Visible.Tick` (`Instigator.Location + EyePosition + ViewRotation*70`).
-/// The light itself is a real VM actor the renderer then follows; no light value is forged.
-fn flash_muzzle_light(sess: &mut session::Session, sim: &PlayerSim, params: &PlayerParams) {
-    let Some(weapon) = sess.player_weapon() else {
-        return;
-    };
-    let object_prop = |vm: &xiii_script::Vm<'_>, id, name: &str| match vm.get_property(id, name) {
-        Some(Value::Object(Some(xiii_script::ObjRef::Instance(i)))) => Some(*i),
-        _ => None,
-    };
-    let vm = sess.vm_mut();
-    let Some(attachment) = object_prop(vm, weapon, "ThirdPersonActor") else {
-        println!("[play] muzzle: no third-person attachment");
-        return;
-    };
-    // The attachment exists (host-created at grant); run the game's MuzzleAttach once so its
-    // MuzzleFlash sub-attachment (and its MuzzleLight) exists.
-    if object_prop(vm, attachment, "MuzzleFlash").is_none() {
-        match vm.class_function(attachment, "ThirdPersonEffects") {
-            Some(f) => {
-                if let Err(e) = vm.call_function(f, attachment, vec![]) {
-                    println!("[play] muzzle ThirdPersonEffects: {e}");
-                }
-            }
-            None => println!("[play] muzzle: no ThirdPersonEffects function"),
-        }
-    }
-    let Some(muzzle_flash) = object_prop(vm, attachment, "MuzzleFlash") else {
-        println!("[play] muzzle: no MuzzleFlash after ThirdPersonEffects");
-        return;
-    };
-    let Some(light) = object_prop(vm, muzzle_flash, "MFLight") else {
-        println!("[play] muzzle: MuzzleFlash has no MFLight");
-        return;
-    };
-    let eye = sim.eye_location(params);
-    let (sy, cy) = sim.yaw.sin_cos();
-    let (sp, cp) = sim.pitch.sin_cos();
-    let muzzle = [
-        eye[0] + cy * cp * 70.0,
-        eye[1] + sy * cp * 70.0,
-        eye[2] + sp * 70.0,
-    ];
-    if let Some(f) = vm.class_function(light, "Flash") {
-        let _ = vm.call_function(f, light, vec![Value::Vector(muzzle)]);
     }
 }
 
@@ -1220,10 +1149,11 @@ fn sync_vm_lights(
 /// event count and last player touch.
 fn format_vm_trace(sess: &session::Session) -> String {
     format!(
-        "vm t={:.3}s active={} suspended={} dispatcher={} player={} health={} physics={} events={} last_touch={}",
+        "vm t={:.3}s active={} suspended={} suspended_dropped={} dispatcher={} player={} health={} physics={} events={} last_touch={}",
         sess.vm_time(),
         sess.active_actors(),
         sess.suspended.len(),
+        sess.vm().suspended_deferred_calls(),
         sess.dispatcher_state().unwrap_or_else(|| "-".to_owned()),
         sess.player_location()
             .map(|l| format!("({:.1},{:.1},{:.1})", l[0], l[1], l[2]))
@@ -2483,6 +2413,101 @@ mod tests {
         assert!(
             dead || health.is_some_and(|h| h <= 0.0),
             "BaseSoldier6 did not die: health {health:?}, dead {dead}"
+        );
+    }
+
+    /// Opt-in item18 B11 regression: the M60's decoded `RumbleFX` calls float `%` before its
+    /// `TraceFire`. The VM must implement `Percent_FloatFloat` so the M60 continues through
+    /// `ProcessTraceHit` -> `TakeDamage` instead of aborting in `IncrementFlashCount`.
+    #[test]
+    fn opt_in_plage01_m60_fires_through_rumblefx_and_damages_soldier() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let script = script::Script::parse(
+            "t=0.00 weapon XIII.M60\n\
+             t=0.20 teleport 1802.4131 -12992.034 1070.843\n\
+             t=0.20 yaw 90\nt=0.20 pitch 5\n\
+             t=0.30 fire\nt=0.90 fire\nt=1.50 fire\nt=2.10 fire\nt=2.70 fire\n",
+        )
+        .expect("parse M60 fight script");
+        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 4.0)
+            .expect("run Plage01 M60 fight");
+        let soldier = outcome
+            .session
+            .vm()
+            .find_object("BaseSoldier6")
+            .expect("Plage01 BaseSoldier6");
+        let health = outcome.session.actor_health(soldier);
+        let ammo_amount = outcome.session.player_weapon().and_then(|w| {
+            match outcome.session.vm().get_property(w, "AmmoType") {
+                Some(Value::Object(Some(xiii_script::ObjRef::Instance(a)))) => {
+                    match outcome.session.vm().get_property(*a, "AmmoAmount") {
+                        Some(Value::Int(n)) => Some(*n),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        });
+        println!(
+            "[M60 test] BaseSoldier6 health {:?}, bone {:?}, M60 ammo {:?}",
+            health,
+            outcome.session.vm().get_property(soldier, "LastBoneHit"),
+            ammo_amount
+        );
+        assert!(
+            health.is_some_and(|h| h < 625.0),
+            "M60 fire stopped before damaging BaseSoldier6 (Health {health:?})"
+        );
+    }
+
+    /// Opt-in item18 B11 comparison: use the same Base01 clear-line M60 script as the windowed
+    /// `fixed_step` probe (`local/re/fight-base01-clear.script`). The trace first intersects
+    /// BaseSoldier3, not BaseSoldier17; the actual trace target must take damage in the headless
+    /// `run_script` path too, proving `Session::fire`/`ProcessTraceHit` agree across drivers.
+    #[test]
+    fn opt_in_base01_m60_run_script_damages_actual_trace_target() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Base01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Base01");
+        let resolved = resolve_params(&game_dir).expect("resolve parameters");
+        let script = script::Script::parse(
+            "t=0.00 weapon XIII.M60\nt=0.20 teleport -10347.6 6904.2 867.0\
+             \nt=0.20 yaw -90\nt=0.20 pitch 0\nt=0.40 fire\nt=1.00 fire\
+             \nt=1.60 fire\nt=2.20 fire\nt=2.80 fire\n",
+        )
+        .expect("parse clear-line M60 script");
+        let outcome = run_script(&game_dir, "Base01", &script, &resolved.params, &scene, 4.0)
+            .expect("run Base01 clear-line M60 script");
+        let target = outcome
+            .session
+            .vm()
+            .find_object("BaseSoldier3")
+            .expect("the ray's first pawn target");
+        let health = outcome.session.actor_health(target);
+        println!(
+            "[B11 comparison] run_script BaseSoldier3 Health={health:?}, LastBoneHit={:?}",
+            outcome.session.vm().get_property(target, "LastBoneHit")
+        );
+        assert!(
+            health.is_some_and(|h| h < 750.0),
+            "the actual trace target did not take M60 damage: {health:?}"
         );
     }
 

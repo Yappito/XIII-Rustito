@@ -1067,12 +1067,16 @@ impl Session {
         }
     }
 
-    /// Diagnostic weapon bootstrap for `--play-script` (item14): spawn `class_path`, run the
-    /// game's own `Weapon.GiveTo`/`BringUp`, and wire the player's `Weapon`/`PendingWeapon` so the
-    /// normal fire path works. The campaign maps start the player with `XIII.Fists`; the real
-    /// pickup/equip chain (`Pickup.Touch` -> `Pawn.AddInventory` -> `ChangedWeapon`) needs a walk
-    /// to a map pickup, which the deterministic demonstration does not include. This grant is
-    /// reported, never silent, and the firing/damage/death behaviour is still the game's scripts.
+    /// Diagnostic weapon bootstrap for `--play-script` (item14/item14c): spawn `class_path` and
+    /// run the **game's own** give/equip path — `Weapon.GiveTo(Pawn)` (inventory + ammo +
+    /// `ClientWeaponSet`) and, when the pawn already carries a weapon, `Pawn.ChangedWeapon` (the
+    /// same switch the game runs for the first weapon or a manual change), which sets
+    /// `Pawn.Weapon`, calls `Weapon.BringUp` and `Weapon.AttachToPawn`. Nothing wires
+    /// `Pawn.Weapon` directly. The campaign maps start the player with `XIII.Fists`, and
+    /// `Weapon.ClientWeaponSet(true)` deliberately does not switch a human-controlled pawn that
+    /// already has a weapon, so the explicit `PendingWeapon` + `ChangedWeapon` step is the game's
+    /// own switch, not a host shortcut. This grant is reported, never silent, and the
+    /// firing/damage/death behaviour is still the game's scripts.
     pub fn grant_weapon(&mut self, class_path: &str) -> Result<String, String> {
         let class = runtime::resolve_class_path(self.vm.set(), class_path)
             .ok_or_else(|| format!("weapon class {class_path} is not loaded"))?;
@@ -1085,42 +1089,42 @@ impl Session {
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("spawning {class_path} returned None"))?;
         let p = Value::Object(Some(ObjRef::Instance(pawn)));
-        // The normal path sets these in `Inventory.GiveTo`/`ChangedWeapon`; wire them explicitly.
+        // `GiveTo`/`ClientWeaponSet` read `Owner` (the engine's `Spawn` sets it) and `Instigator`.
         self.vm.set_property(id, "Instigator", 0, p.clone());
         self.vm.set_property(id, "Owner", 0, p.clone());
-        // The game's own GiveTo adds the weapon to the inventory chain and creates its ammo.
+        // The game's own pickup entry point: adds to the inventory chain, creates the ammo and
+        // (only when the pawn has no active weapon) runs `ClientWeaponSet` -> `ChangedWeapon`.
         let give = self.vm.send_event(id, "GiveTo", vec![p.clone()]);
-        self.vm
-            .set_property(pawn, "Weapon", 0, Value::Object(Some(ObjRef::Instance(id))));
-        self.vm.set_property(
-            pawn,
-            "PendingWeapon",
-            0,
-            Value::Object(Some(ObjRef::Instance(id))),
-        );
-        // `Weapon.GiveTo` normally runs `GiveAmmo` + `AmmoType.AddAmmo(ReloadCount)`; the HUD
-        // notification inside GiveTo is a deferred message native, so run the ammo half here.
-        let give_ammo = self.vm.send_event(id, "GiveAmmo", vec![p.clone()]);
-        if let Some(ammo) = instance_prop(&self.vm, id, "AmmoType") {
-            let amount = match self.vm.get_property(id, "ReloadCount") {
-                Some(Value::Int(n)) if *n > 0 => *n,
-                _ => 13,
-            };
-            self.vm
-                .set_property(ammo, "AmmoAmount", 0, Value::Int(amount));
-            self.vm
-                .set_property(ammo, "MaxAmmo", 0, Value::Int(amount.max(50)));
-        }
-        let bring = self.vm.send_event(id, "BringUp", vec![]);
+        let active_after_give = self.player_weapon() == Some(id);
+        // When the pawn already had a weapon, run the game's own switch: set the field the engine
+        // sets and call the pawn's `ChangedWeapon` (the same call `ClientWeaponSet` makes).
+        let changed = if active_after_give {
+            None
+        } else {
+            self.vm.set_property(
+                pawn,
+                "PendingWeapon",
+                0,
+                Value::Object(Some(ObjRef::Instance(id))),
+            );
+            Some(self.vm.send_event(pawn, "ChangedWeapon", Vec::new()))
+        };
         let name = self.vm.objects[id as usize].name.clone();
         if let Err(e) = &give {
-            // Not fatal: the explicit wiring above still arms the weapon, and `GiveAmmo` above
-            // creates the ammo. Reported so a real regression is visible.
             self.blocked
                 .push(format!("grant_weapon {name} GiveTo: {e}"));
         }
+        if let Some(Err(e)) = &changed {
+            // A failing switch leaves the pawn unarmed: reported, not a silent success.
+            self.blocked
+                .push(format!("grant_weapon {name} ChangedWeapon: {e}"));
+        }
+        let weapon = self.player_weapon();
+        let attach = weapon.and_then(|w| instance_prop(&self.vm, w, "ThirdPersonActor"));
         Ok(format!(
-            "granted {name} ({class_path}); GiveTo {give:?}, GiveAmmo {give_ammo:?}, BringUp {bring:?}"
+            "granted {name} ({class_path}) via GiveTo; GiveTo {give:?}, \
+             active-after-GiveTo={active_after_give}, ChangedWeapon {changed:?}, \
+             Pawn.Weapon={weapon:?}, ThirdPersonActor={attach:?}"
         ))
     }
 
@@ -1558,16 +1562,20 @@ mod tests {
         );
     }
 
-    /// Opt-in corpus (item14b requirement 2): the map's real `XIII.BerettaPick` (`BerettaPick0`)
-    /// sits at `(-737.654,-511.886,1262.99)` UU, ~3.4 m from `PlayerStart0`, but the player
-    /// spawns **inside the Plage01 hut** and every direct walk from the spawn / an open-side
-    /// harness teleport stops at hut geometry (`x=-657` from +X, no movement from -X/-Y) more
-    /// than 64 UU short of the pickup's touch radius. The pickup is therefore **not reachable
-    /// early by walking**; the item14b demonstration keeps the labelled `weapon XIII.Beretta`
-    /// grant for the synthetic zone test, and the real pickup chain itself is exercised by the
-    /// `opt_in_plage01_key_pickup_without_host_grant_opens_porte6` test on the same map. This
-    /// test records the measured block (it asserts the negative, so a future reachability fix
-    /// fails it visibly).
+    /// Opt-in corpus (item14b requirement 2, re-measured by item14c): the map's real
+    /// `XIII.BerettaPick` (`BerettaPick0`) sits at `(-737.654,-511.886,1262.99)` UU, ~3.3 m from
+    /// `PlayerStart0`, but the player spawns **inside the Plage01 hut**. The pickup's collision
+    /// is correct (`CollisionRadius 30`, `CollisionHeight 10`, `bCollideActors=true`,
+    /// `bBlockActors/bBlockPlayers=false`), so the cylinder touch threshold is `34 + 30 = 64` UU;
+    /// the swept walk from the item14b teleport point stops on the static-mesh hut wall
+    /// `StaticMeshActor287 -> StaticPlage2.GR_interieur02` (normal +X) 80.4 UU short, and a
+    /// natural walk from the PlayerStart stops after ~7 UU. The pickup is therefore **not
+    /// reachable early by a direct walk**; the item14b demonstration keeps the labelled `weapon
+    /// XIII.Beretta` grant for the synthetic zone test, and the real pickup chain itself is
+    /// exercised by the `opt_in_plage01_key_pickup_without_host_grant_opens_porte6` test on the
+    /// same map. This test records the measured block (it asserts the negative, so a future
+    /// reachability fix fails it visibly). See `opt_in_plage01_beretta_blocking_contacts` for the
+    /// contact dump and the touch-shape probe.
     #[test]
     fn opt_in_plage01_beretta_pickup_is_not_reachable_early() {
         let Some(game_dir) = opt_in_root() else {
@@ -1610,6 +1618,169 @@ mod tests {
                 .iter()
                 .any(|(_, c)| c.to_ascii_lowercase().contains("beretta")),
             "the Beretta was picked up without a reachable walk"
+        );
+    }
+
+    /// Opt-in diagnostic + regression (item14c requirement 3): what blocks the player near
+    /// `BerettaPick0`. The pickup's own collision is correct (`CollisionRadius 30`,
+    /// `CollisionHeight 10`, `bCollideActors=true`, `bBlockActors`/`bBlockPlayers=false`), so the
+    /// cylinder-vs-cylinder touch threshold is `34 + 30 = 64` UU. Placing the player exactly on
+    /// the pickup (a shape probe, not a walk) delivers the game's own `Pickup.Touch` and collects
+    /// it, so the player-vs-pickup touch uses the right shapes. The block is world geometry: the
+    /// swept walk from the item14b teleport point stops on `StaticMeshActor287 ->
+    /// StaticPlage2.GR_interieur02` (a static-mesh hut wall, contact normal +X) 80.4 UU from the
+    /// pickup, and a natural walk from the PlayerStart stops after ~7 UU. The pickup is therefore
+    /// not reachable early by a direct walk; this is the measured truth the negative regression
+    /// below records.
+    #[test]
+    fn opt_in_plage01_beretta_blocking_contacts() {
+        use xiii_collision::{CollisionWorld, MoveParams, move_slide};
+        use xiii_decode::common::to_bevy_position;
+        use xiii_world::physics::{bevy_to_unreal_direction, bevy_to_unreal_position};
+
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let params = &resolved.params;
+        let session = Session::open(&game_dir, "Plage01").expect("open Plage01");
+        let pick = session
+            .vm()
+            .find_object("BerettaPick0")
+            .expect("BerettaPick0");
+        let ploc = session
+            .vm()
+            .vector_prop(pick, "Location")
+            .expect("pickup location");
+        let radius = match session.vm().get_property(pick, "CollisionRadius") {
+            Some(Value::Float(f)) => *f,
+            other => panic!("BerettaPick0.CollisionRadius = {other:?}"),
+        };
+        let height = match session.vm().get_property(pick, "CollisionHeight") {
+            Some(Value::Float(f)) => *f,
+            other => panic!("BerettaPick0.CollisionHeight = {other:?}"),
+        };
+        println!(
+            "[beretta test] BerettaPick0 loc ({:.2},{:.2},{:.2}) UU, cylinder r{radius} h{height}, \
+             bCollideActors={:?} bBlockActors={:?} bBlockPlayers={:?}",
+            ploc[0],
+            ploc[1],
+            ploc[2],
+            session.vm().get_property(pick, "bCollideActors"),
+            session.vm().get_property(pick, "bBlockActors"),
+            session.vm().get_property(pick, "bBlockPlayers"),
+        );
+        assert_eq!((radius, height), (30.0, 10.0), "pickup cylinder changed");
+        assert!(
+            matches!(
+                session.vm().get_property(pick, "bCollideActors"),
+                Some(Value::Bool(true))
+            ),
+            "the pickup must be touchable (bCollideActors)"
+        );
+        assert!(
+            matches!(
+                session.vm().get_property(pick, "bBlockActors"),
+                Some(Value::Bool(false))
+            ),
+            "the pickup must not block actors"
+        );
+        let threshold = params.radius_uu + radius;
+        // Swept walk from the item14b teleport point toward the pickup: dump every contact.
+        let world = CollisionWorld::new(scene.box_collision());
+        let half = params.half_extents_bevy();
+        let start = to_bevy_position([-637.654, -511.886, 1265.0]);
+        let end = to_bevy_position([ploc[0], ploc[1], ploc[2]]);
+        let mv = MoveParams {
+            max_step_height: 0.0,
+            ..MoveParams::default()
+        };
+        let res = move_slide(
+            &world,
+            start,
+            [end[0] - start[0], 0.0, end[2] - start[2]],
+            half,
+            &mv,
+        );
+        let final_uu = bevy_to_unreal_position(res.position);
+        let gap = ((final_uu[0] - ploc[0]).powi(2) + (final_uu[1] - ploc[1]).powi(2)).sqrt();
+        println!(
+            "[beretta test] teleport-side walk: end ({:.1},{:.1},{:.1}) UU, gap {gap:.1} UU \
+             (touch threshold {threshold:.0}), {} contact(s)",
+            final_uu[0],
+            final_uu[1],
+            final_uu[2],
+            res.contacts.len()
+        );
+        let mut contact_sources = Vec::new();
+        for c in &res.contacts {
+            let src = scene
+                .collision_sources
+                .get(c.source as usize)
+                .map(String::as_str)
+                .unwrap_or("?");
+            let n = bevy_to_unreal_direction(c.normal);
+            let p = bevy_to_unreal_position(c.position);
+            println!(
+                "[beretta test]   contact src {src} tri {} normal ({:.2},{:.2},{:.2}) at \
+                 ({:.1},{:.1},{:.1}) UU",
+                c.triangle, n[0], n[1], n[2], p[0], p[1], p[2]
+            );
+            contact_sources.push(src.to_owned());
+        }
+        assert!(
+            contact_sources
+                .iter()
+                .any(|s| s.contains("StaticPlage2.GR_interieur02")),
+            "the measured blocker changed: {contact_sources:?}"
+        );
+        assert!(
+            gap > threshold,
+            "the pickup is now within touch range ({gap:.1} <= {threshold:.0}): update the walk"
+        );
+        // Natural walk from the actual PlayerStart (no teleport) confirms the spawn-side block.
+        let natural =
+            script::Script::parse("t=0.00 goto -737.654 -511.886\nt=8.00 forward 0\n").unwrap();
+        let outcome = run_script(&game_dir, "Plage01", &natural, params, &scene, 10.0)
+            .expect("run natural walk");
+        let (_, _, npos, _) = outcome.trace.last().expect("trace sample");
+        let ngap = ((npos[0] - ploc[0]).powi(2) + (npos[1] - ploc[1]).powi(2)).sqrt();
+        println!(
+            "[beretta test] natural walk from PlayerStart: end ({:.1},{:.1},{:.1}) UU, gap {ngap:.1} UU",
+            npos[0], npos[1], npos[2]
+        );
+        assert!(
+            ngap > threshold,
+            "the PlayerStart walk now reaches the pickup ({ngap:.1}): update the regression"
+        );
+        // Shape probe: the cylinder test must collect the pickup when the player is on it. This
+        // is a touch-shape check, not a walk.
+        let mut probe = Session::open(&game_dir, "Plage01").expect("open probe");
+        let player = probe.player;
+        let before = probe.inventory_items();
+        probe
+            .vm_mut()
+            .set_property(player, "Location", 0, Value::Vector(ploc));
+        let _ = probe.vm_mut().refresh_touching_of(player);
+        let after = probe.inventory_items();
+        println!(
+            "[beretta test] overlap probe: inventory before {} item(s), after {} item(s): {:?}",
+            before.len(),
+            after.len(),
+            after
+        );
+        assert!(
+            after
+                .iter()
+                .any(|(_, c)| c.to_ascii_lowercase().contains("beretta")),
+            "the cylinder-vs-cylinder touch did not collect the overlapping pickup: {after:?}"
         );
     }
 
@@ -1904,6 +2075,115 @@ mod tests {
         assert!(
             head_d > chest_d,
             "head damage {head_d} is not greater than chest damage {chest_d} ({bones:?})"
+        );
+    }
+
+    /// Opt-in corpus (item14c requirement 4): the diagnostic grant uses the game's own
+    /// `Weapon.GiveTo(Pawn)` path; `ClientWeaponSet` -> `Pawn.ChangedWeapon` ->
+    /// `Weapon.AttachToPawn` sets `Pawn.Weapon` and spawns the third-person attachment
+    /// (`XIII.BerettaAttach`). Firing then runs the game's own `XIIIWeapon.Fire` -> `LoneFire` ->
+    /// `LocalFire` -> `PlayFiring` -> `IncrementFlashCount` ->
+    /// `WeaponAttachment(ThirdPersonActor).ThirdPersonEffects` -> `MuzzleAttach` (spawns
+    /// `MFSmallAttach`, whose `PostBeginPlay` spawns `MuzzleLight`) ->
+    /// `MuzzleFlashAttachment.Visible.Tick` -> `MuzzleLight.Flash`. No host bridge exists any
+    /// more: the `MuzzleLight` actor and its `LT_Steady` flash are the game's own code.
+    #[test]
+    fn opt_in_plage01_give_to_attaches_and_fires_the_muzzle_light() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Plage01").expect("open Plage01");
+        let msg = session.grant_weapon("XIII.Beretta").expect("grant Beretta");
+        println!("[muzzle test] {msg}");
+        let weapon = session
+            .player_weapon()
+            .expect("the game's GiveTo path must set Pawn.Weapon");
+        assert!(
+            session.vm().is_a(weapon, "weapon"),
+            "Pawn.Weapon is not a weapon"
+        );
+        let attach = instance_prop(session.vm(), weapon, "ThirdPersonActor")
+            .expect("GiveTo/ChangedWeapon must set ThirdPersonActor");
+        assert!(
+            session.vm().is_a(attach, "weaponattachment"),
+            "ThirdPersonActor is not a WeaponAttachment: {}",
+            session
+                .vm()
+                .set()
+                .path(session.vm().objects[attach as usize].class)
+        );
+        let count_muzzle = |s: &Session| -> usize {
+            (0..s.vm().objects.len())
+                .filter(|&i| {
+                    !s.vm().objects[i].deleted && s.vm().is_a(i as ObjectId, "MuzzleLight")
+                })
+                .count()
+        };
+        assert_eq!(
+            count_muzzle(&session),
+            0,
+            "a MuzzleLight already exists before any shot"
+        );
+        // Fire through the same entry point the host uses (`class_function(weapon, "Fire")`).
+        let outcome = session.fire(0.0, 0.0);
+        assert_eq!(outcome, FireOutcome::Fired, "the weapon did not fire");
+        // `ThirdPersonEffects` runs inside the fire call, so `MuzzleAttach`/`MFSmallAttach` and
+        // its `MFLight` must already exist.
+        let mf = instance_prop(session.vm(), attach, "MuzzleFlash")
+            .expect("ThirdPersonEffects must spawn MuzzleFlash");
+        assert!(
+            session.vm().is_a(mf, "muzzleflashattachment"),
+            "MuzzleFlash is not a MuzzleFlashAttachment"
+        );
+        let light = instance_prop(session.vm(), mf, "MFLight")
+            .expect("MFSmallAttach.PostBeginPlay must spawn MFLight");
+        assert!(
+            session.vm().is_a(light, "muzzlelight"),
+            "MFLight is not a MuzzleLight"
+        );
+        // The first `Visible` state runs with `DrawType == 8` (set by
+        // `InventoryAttachment.PostNetBeginPlay`), so its `Visible.Tick` guard cannot fire; when
+        // it ends, `Visible.EndState` sets `DrawType = 0`. The next fire's `MuzzleFlash.Flash()`
+        // re-enters `Visible` with `DrawType == 0`, and its `Visible.Tick` calls
+        // `MFLight.Flash` at `TickCount > 3` (this is the retail repeated-fire path). Fire a few
+        // shots, ticking each, and sample `LightType` to catch the `LT_Steady` (1) flash before
+        // `MuzzleLight.Tick` turns it back off.
+        let mut muzzle_ids: Vec<ObjectId> = Vec::new();
+        let mut flash_seen = false;
+        for shot in 0..3 {
+            let outcome = session.fire(0.0, 0.0);
+            assert_eq!(outcome, FireOutcome::Fired, "shot {shot} did not fire");
+            for _ in 0..14 {
+                let loc = session.player_location().unwrap_or([0.0; 3]);
+                session.step(1.0 / 60.0, loc, 0.0, [0.0; 3], &PlayerVMModes::default());
+                for i in 0..session.vm().objects.len() {
+                    let id = i as ObjectId;
+                    if !session.vm().objects[i].deleted && session.vm().is_a(id, "MuzzleLight") {
+                        if !muzzle_ids.contains(&id) {
+                            muzzle_ids.push(id);
+                        }
+                        if matches!(
+                            session.vm().get_property(id, "LightType"),
+                            Some(Value::Byte(1))
+                        ) {
+                            flash_seen = true;
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "[muzzle test] MuzzleLight actors {:?}; game Flash reached LT_Steady: {flash_seen}",
+            muzzle_ids
+        );
+        assert!(
+            !muzzle_ids.is_empty(),
+            "firing did not spawn the game's MuzzleLight"
+        );
+        assert!(
+            flash_seen,
+            "the game's MuzzleFlashAttachment.Visible.Tick never called MuzzleLight.Flash"
         );
     }
 }

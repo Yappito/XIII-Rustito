@@ -389,6 +389,15 @@ fn pow_ff(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOut
     val(Value::Float(x.powf(y)))
 }
 
+/// `Object.Percent_FloatFloat` (173): `A % B`, UE2 `appFmod` (C `fmod`, remainder with the sign of
+/// the dividend). Decoded call site `xiii.m60.RumbleFX` 0x004E (`ReloadCount % 1`); a zero divisor
+/// yields `NaN` as C `fmod`, never a silent clamp. Before item14c this was unimplemented, so the
+/// M60's `IncrementFlashCount` -> `RumbleFX` raised and aborted the fire before `TraceFire`.
+fn percent_ff(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let (x, y) = (float(vm, a, 0)?, float(vm, a, 1)?);
+    val(Value::Float(x % y))
+}
+
 fn not_b(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     val(Value::Bool(!boolean(vm, a, 0)?))
 }
@@ -3135,6 +3144,50 @@ fn change_rnd_cube_spr_prop(
     val(Value::Bool(false))
 }
 
+// ---- item14c: bullet-trail natives on the weapon-attachment fire path. `XIIIWeaponAttachment
+// .Timer2` spawns the weapon's `TraceClass` and calls `Trail.Init` then `Trail.AddSection` for
+// each traced point. Before item14c the unimplemented `Trail.Init` suspended `BerettaAttach`, and
+// the VM then deferred every call to the suspended attachment (including the
+// `WeaponAttachment(ThirdPersonActor).ThirdPersonEffects()` call from `IncrementFlashCount`), so
+// the game's own muzzle-flash chain never ran. The trail itself is presentation only; this
+// runtime has no trail renderer, so `Init` records the request in the trace and the sections are
+// accepted and dropped. The attachment therefore stays active and its game-side effects run.
+fn trail_init(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    let owner = vm
+        .objects
+        .get(c.this as usize)
+        .map(|o| o.name.clone())
+        .unwrap_or_else(|| "?".to_owned());
+    vm.note(TraceKind::Note(format!(
+        "Trail.Init on {owner}: recorded; no trail renderer (attachment kept active)"
+    )));
+    val(Value::Void)
+}
+
+/// `Trail.AddSection` (native 603): append a traced point to the trail. No trail renderer exists,
+/// so the point is dropped (the native still returns normally). Not recorded per call: a fired
+/// burst emits several sections and the per-shot `Trail.Init` note above already makes the gap
+/// visible.
+fn trail_add_section(_: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Void)
+}
+
+/// `Trail.Reset` (name-based native, index 0): clear the trail's sections. No trail renderer
+/// exists, so there is nothing to clear; accepted and dropped so the attachment stays active.
+fn trail_reset(_: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Void)
+}
+
+/// `ParticleEmitter.SpawnParticle` (name-based native, index 0): emit `Amount` particles from the
+/// emitter's current state. The host renders particles from its own decoded emitter simulation
+/// (`viewer::particles`), not through this script native, so the call is accepted and dropped.
+/// Before item14c it suspended the weapon's `Shells` emitter on the fire path, which then made the
+/// deferred `Shells.TriggerParticle` error suspend `BerettaAttach` and silently stop the game's
+/// muzzle-flash chain.
+fn spawn_particle(_: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Void)
+}
+
 fn builtin_defs() -> Vec<NativeDef> {
     let mut v = vec![
         def(
@@ -5009,6 +5062,69 @@ fn builtin_defs() -> Vec<NativeDef> {
             set_max_particles,
         )
     });
+    // item14c: the weapon-attachment bullet-trail natives. `XIIIWeaponAttachment.Timer2` spawns
+    // the weapon's `TraceClass` and calls these; before this block the missing `Trail.Init`
+    // suspended `BerettaAttach` and the game's own muzzle-flash chain was silently deferred. Kept
+    // in its own block so parallel registry edits stay out of the way.
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no trail renderer: the request is recorded in the trace and the section list is not \
+             built; the attachment actor stays active",
+        ),
+        ..def(
+            "Engine.Trail.Init",
+            "native(601) final native static function Init()",
+            "engine.u Trail.Init decoded (void, no params); xiii.XIIIWeaponAttachment.Timer2 0x0088 \
+             calls it after spawning the weapon's TraceClass; Engine.dll ?execTrailInit",
+            trail_init,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no trail renderer: the traced point is accepted and dropped",
+        ),
+        ..def(
+            "Engine.Trail.AddSection",
+            "native(603) final native static function AddSection(struct<Vector> Position)",
+            "engine.u Trail.AddSection decoded (struct<Vector>, void); \
+             xiii.XIIIWeaponAttachment.Timer2 0x01F8/0x022B/0x0292/0x02BE add each traced point",
+            trail_add_section,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no trail renderer: there is nothing to clear; accepted and dropped",
+        ),
+        ..def(
+            "Engine.Trail.Reset",
+            "native(0) function Reset()",
+            "engine.u Trail.Reset decoded (void, no params); called by Trail.Tick while the \
+             weapon attachment's traced trail lives",
+            trail_reset,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no VM particle subsystem: the host renders decoded emitters itself; the call is \
+             accepted and dropped",
+        ),
+        ..def(
+            "Engine.ParticleEmitter.SpawnParticle",
+            "native(0) function SpawnParticle(int Amount)",
+            "engine.u ParticleEmitter.SpawnParticle decoded (int, void); xiii.Shells.TriggerParticle \
+             0x006C calls it on the weapon attachment's shell emitter",
+            spawn_particle,
+        )
+    });
+    // item18 B11: the M60's fire path. `xiii.m60.RumbleFX` 0x004E evaluates `ReloadCount % 1`;
+    // the unimplemented `Percent_FloatFloat` raised inside `IncrementFlashCount`, aborting the
+    // fire before `TraceFire` (the soldier took no damage). `appFmod` semantics, never clamped.
+    v.push(def(
+        "Object.Percent_FloatFloat",
+        "native(173) final operator float %(float A, float B)",
+        "core.u Object.Percent_FloatFloat decoded; UE2 appFmod; xiii.m60.RumbleFX 0x004E",
+        percent_ff,
+    ));
     // Canvas draw-recording natives (`crates/xiii-script/src/canvas.rs`). Kept in one block so a
     // parallel edit to the registry stays out of the way.
     v.extend(crate::canvas::canvas_defs());

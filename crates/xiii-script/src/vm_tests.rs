@@ -504,9 +504,9 @@ fn registry_entries_are_documented() {
     let defs: Vec<_> = r.defs().collect();
     // item14b added 10 AI natives (264 -> 274); item3p added the five missing rotator operators
     // (142, 203, 287, 288, 289), the float power operator (170) and a visible Partial for
-    // `ParticleEmitter.SetMaxParticles` (274 -> 281); item16 added the menu natives
-    // (`VideoPlayer.*`, `Actor.*AllSounds`, `PlayerController.ClientTravel`) (281 -> 289).
-    assert_eq!(defs.len(), 289);
+    // `ParticleEmitter.SetMaxParticles` (274 -> 281); item16 added menu natives (281 -> 289);
+    // item14c added four trail/particle Partials and item18 added Percent_FloatFloat (289 -> 294).
+    assert_eq!(defs.len(), 294);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -2485,6 +2485,41 @@ fn host_written_location_drives_touch_refresh() {
 }
 
 #[test]
+fn trace_skips_weapon_owned_first_person_muzzle_flash() {
+    // item18 B11: `M60.TraceFire` could hit its own `StarFPMF` attachment before the pawn. The
+    // attachment has `bCollideActors=false` but `bBlockZeroExtentTraces=true`; UE2's owner-chain
+    // filter must skip a candidate whose Owner chain contains the tracer (not just the reverse).
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let weapon = phys_actor(&mut vm, &set, "Weapon", [0.0, 0.0, 0.0]);
+    let flash = phys_actor(&mut vm, &set, "StarFPMF", [50.0, 0.0, 0.0]);
+    let soldier = phys_actor(&mut vm, &set, "Soldier", [100.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, weapon, true, false);
+    set_collision_fields(&mut vm, flash, false, true);
+    set_collision_fields(&mut vm, soldier, true, true);
+    vm.set_property(
+        flash,
+        "Owner",
+        0,
+        Value::Object(Some(ObjRef::Instance(weapon))),
+    );
+
+    let (hit, location, _) = vm
+        .vm_trace(weapon, [0.0, 0.0, 0.0], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(
+        Some(soldier),
+        hit,
+        "weapon-owned flash must not intercept Trace"
+    );
+    assert!(
+        location[0] > 80.0,
+        "trace should reach the soldier: {location:?}"
+    );
+}
+
+#[test]
 fn exact_contact_boundary_overlaps() {
     let set = phys_set();
     let mut vm = Vm::new(&set, VmLimits::default());
@@ -3871,6 +3906,142 @@ fn pawn_without_controller_class_stays_uncontrolled() {
         !vm.trace
             .iter()
             .any(|e| matches!(&e.kind, TraceKind::Spawned { .. }))
+    );
+}
+
+/// Synthetic weapon-attachment cast fixture (item14c): `Object` <- `Actor` <-
+/// `InventoryAttachment` <- `WeaponAttachment`, plus a `Caller` with a `ThirdPersonActor` object
+/// link and a `Fire` function whose only statement is
+/// `WeaponAttachment(ThirdPersonActor).ThirdPersonEffects()`. `ThirdPersonEffects` sets
+/// `self.Fired = true`. This is the VM shape of the retail `Weapon.IncrementFlashCount` ->
+/// `WeaponAttachment(ThirdPersonActor).ThirdPersonEffects()` chain.
+fn weapon_attachment_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let inv_attach = b.reserve(0, 0, "InventoryAttachment");
+    let weapon_attach = b.reserve(0, 0, "WeaponAttachment");
+    let caller = b.reserve(0, 0, "Caller");
+
+    let tpa = b.reserve(IMP_OBJPROP, caller, "ThirdPersonActor");
+    let fire = b.reserve(IMP_FUNCTION, caller, "Fire");
+    let fired = b.reserve(B_BOOLPROP, weapon_attach, "Fired");
+    let effects = b.reserve(IMP_FUNCTION, weapon_attach, "ThirdPersonEffects");
+    let effects_name = b.name("ThirdPersonEffects");
+
+    b.prop_with(tpa, fire, 0, &compact(0));
+    b.prop(fired, effects, 0);
+
+    // Caller.Fire(): WeaponAttachment(self.ThirdPersonActor).ThirdPersonEffects().
+    let fire_code = vec![
+        0x19, // Context
+        0x2E, // DynamicCast
+    ]
+    .into_iter()
+    .chain(compact(weapon_attach))
+    .chain([0x01])
+    .chain(compact(tpa))
+    .chain([
+        0x00, 0x00, 0x00, // Context skip u16 + size u8
+        0x1B, // VirtualFunction
+    ])
+    .chain(compact(effects_name))
+    .chain([
+        0x16, // EndFunctionParms
+        0x04, // Return
+        0x0B, // Nothing
+    ])
+    .collect::<Vec<u8>>();
+    // `mem` is the decoded memory size (object refs/names count 4 bytes, not their file length).
+    b.func(fire, 0, 0, &fire_code, 22, 0, ff::DEFINED);
+
+    // WeaponAttachment.ThirdPersonEffects(): self.Fired = true.
+    let effects_code = vec![
+        0x0F, // Let
+        0x01, // InstanceVariable
+    ]
+    .into_iter()
+    .chain(compact(fired))
+    .chain([0x27, 0x04, 0x0B]) // True, Return, Nothing
+    .collect::<Vec<u8>>();
+    b.func(effects, 0, 0, &effects_code, 9, 0, ff::DEFINED);
+
+    b.class(object, 0, 0);
+    b.class(actor, object, 0);
+    b.class(inv_attach, actor, 0);
+    b.class(weapon_attach, inv_attach, fired);
+    b.class(caller, actor, tpa);
+    b.build()
+}
+
+#[test]
+fn weapon_attachment_cast_reaches_third_person_effects() {
+    let set = set_of(weapon_attachment_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let caller = vm.spawn(g(&set, "Caller"), "Weapon").unwrap();
+    let attach = vm.spawn(g(&set, "WeaponAttachment"), "Attach").unwrap();
+    vm.set_active(caller, true);
+    vm.set_active(attach, true);
+    vm.set_property(
+        caller,
+        "ThirdPersonActor",
+        0,
+        Value::Object(Some(ObjRef::Instance(attach))),
+    );
+    vm.call_function(g(&set, "Caller.Fire"), caller, vec![])
+        .expect("the cast + call must run");
+    assert_eq!(
+        vm.get_property(attach, "Fired"),
+        Some(&Value::Bool(true)),
+        "the DynamicCast must reach the WeaponAttachment's ThirdPersonEffects"
+    );
+    // A plain Actor fails the `WeaponAttachment(...)` cast: the chained call is a no-op
+    // (`Accessed None`), never a crash, and it must not set anything on the non-attachment.
+    let other = vm.spawn(g(&set, "Actor"), "Other").unwrap();
+    vm.set_property(
+        caller,
+        "ThirdPersonActor",
+        0,
+        Value::Object(Some(ObjRef::Instance(other))),
+    );
+    vm.call_function(g(&set, "Caller.Fire"), caller, vec![])
+        .expect("a failed cast must be a no-op, not an error");
+    assert_eq!(vm.get_property(other, "Fired"), None);
+}
+
+#[test]
+fn suspended_actor_calls_are_counted_and_traced() {
+    let set = set_of(weapon_attachment_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let caller = vm.spawn(g(&set, "Caller"), "Weapon").unwrap();
+    let attach = vm.spawn(g(&set, "WeaponAttachment"), "Attach").unwrap();
+    vm.set_active(caller, true);
+    vm.set_active(attach, true);
+    vm.set_property(
+        caller,
+        "ThirdPersonActor",
+        0,
+        Value::Object(Some(ObjRef::Instance(attach))),
+    );
+    // Suspend the attachment as `suspend_for_error` would (a script error cleared `active`).
+    vm.objects[attach as usize].active = false;
+    vm.objects[attach as usize].suspended = true;
+    assert_eq!(vm.suspended_deferred_calls(), 0);
+    // The inner `WeaponAttachment(ThirdPersonActor).ThirdPersonEffects()` call is dropped: it
+    // must be counted and traced, not silently no-op'd.
+    vm.call_function(g(&set, "Caller.Fire"), caller, vec![])
+        .expect("the caller itself runs");
+    assert_eq!(
+        vm.suspended_deferred_calls(),
+        1,
+        "the dropped call on the suspended attachment must be counted"
+    );
+    assert!(
+        vm.trace.iter().any(|e| matches!(
+            &e.kind,
+            TraceKind::Note(s) if s.contains("suspended actor Attach")
+        )),
+        "the dropped call must be recorded in the trace"
     );
 }
 
@@ -6278,6 +6449,50 @@ fn get_axes_fills_the_rotator_basis() {
     assert_eq!(a[1], Value::Vector([1.0, 0.0, 0.0]));
     assert_eq!(a[2], Value::Vector([0.0, 1.0, 0.0]));
     assert_eq!(a[3], Value::Vector([0.0, 0.0, 1.0]));
+}
+
+#[test]
+fn percent_float_float_uses_fmod_for_negative_and_zero_divisors() {
+    let set = set_of(fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let object = vm.spawn(g(&set, "Object"), "O").unwrap();
+
+    let mut args = [Value::Float(5.5), Value::Float(2.0)];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Object.Percent_FloatFloat",
+            object,
+            &[false, false],
+            &mut args,
+        ),
+        NativeOutcome::Value(Value::Float(1.5))
+    );
+    // C/UE2 fmod retains the dividend's sign; this is not Euclidean modulo.
+    let mut args = [Value::Float(-5.5), Value::Float(2.0)];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Object.Percent_FloatFloat",
+            object,
+            &[false, false],
+            &mut args,
+        ),
+        NativeOutcome::Value(Value::Float(-1.5))
+    );
+    // The native mirrors fmod's floating-point zero-divisor result (NaN), not an integer-style
+    // DivisionByZero error or a silent zero fallback.
+    let mut args = [Value::Float(1.0), Value::Float(0.0)];
+    assert!(matches!(
+        call_native(
+            &mut vm,
+            "Object.Percent_FloatFloat",
+            object,
+            &[false, false],
+            &mut args,
+        ),
+        NativeOutcome::Value(Value::Float(v)) if v.is_nan()
+    ));
 }
 
 /// The rotator operators the campaign survey hit: `Multiply_RotatorFloat` (287,
