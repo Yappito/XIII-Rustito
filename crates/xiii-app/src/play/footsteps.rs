@@ -91,8 +91,19 @@ impl SurfaceSounds {
     }
 
     /// Entry of the box triangle `triangle` of `world`, or `None` out of range.
+    ///
+    /// A hit on a **dynamic** mover triangle reports `triangle == u32::MAX` (the collision world
+    /// cannot map it back to an input-soup entry; see `CollisionWorld::ray`). `origin` would
+    /// panic on that index, so dynamic hits yield `None` here — a moving brush has no
+    /// static-surface footstep sound (the engine's `Trace` result carries no source material for
+    /// a mover either). The caller then emits no footstep rather than crashing.
     pub fn entry(&self, world: &CollisionWorld, triangle: u32) -> Option<&SurfaceEntry> {
-        self.entries.get(world.origin(triangle) as usize)
+        let origin = if triangle == u32::MAX {
+            return None;
+        } else {
+            world.origin(triangle)
+        };
+        self.entries.get(origin as usize)
     }
 
     /// Wrapper `Sound` path of the box triangle `triangle` of `world`, or `None`.
@@ -311,6 +322,19 @@ mod tests {
             .ray([0.0, 5.0, 0.0], [0.0, -5.0, 0.0])
             .expect("floor hit");
         assert_eq!(s.sound(&world, hit.triangle), Some("XIII.Ft.Met"));
+    }
+
+    /// A hit on a **moving-brush** triangle reports `triangle == u32::MAX` (the collision world
+    /// has no input-soup origin for a dynamic triangle). The surface lookup must return `None`
+    /// for it rather than indexing `origins[u32::MAX]` and panicking. Regression for the
+    /// Banque01 route crash (`index out of bounds: the len is 21570 but the index is 4294967295`).
+    #[test]
+    fn dynamic_triangle_hit_has_no_surface_entry() {
+        let world = flat_floor();
+        let s = surfaces(Some("XIII.Ft.Met"));
+        assert_eq!(s.entry(&world, u32::MAX), None);
+        // A real static index still resolves.
+        assert!(s.entry(&world, 0).is_some());
     }
 
     /// Standing still: no footsteps (the `bMoving` gate).

@@ -1,0 +1,35 @@
+# item24: Banque01 route. The end-of-level travel is the game's own
+# MapInfo.SetGoalComplete -> TestGoalComplete -> DoTravel -> XIIIGameInfo.EndGame ->
+# XIIIPlayerController.GameEnded -> GameEndedSuccess -> PlayingVideo (EndMapVideo "cine02", real
+# Bink duration) -> PlayingVideo.PlayerTick -> Level.ServerTravel("Amos01.unr") chain.
+#
+# Teleports below are explicitly diagnostic movement shortcuts: the route volumes span the whole
+# bank (~13,000 UU wide) and the port does not path between them. Walking onto each volume still
+# delivers the volume's own engine `Touch`, so every `TouchTrigger`/`DetectionVolume`/`GoalTrigger`
+# touch recorded by the run is the game's own code.
+#
+# `set_goal` is a labelled host bridge (prints "set_goal N via Banque0.SetGoalComplete"): Banque01
+# promotes its objectives from three scripted bank scenes that the port cannot complete (blockers
+# B1-B3 in the item24 report); the bridge calls the map's own `MapInfo.SetGoalComplete`, exactly
+# what the cutscene `playerevent`/`ev` chains would call. No teleport or bridge changes objective
+# state silently.
+
+# Game's own touches: walk each trigger volume the end-of-level sequence depends on.
+t=1.00 teleport -428 -2312 80       # diagnostic: DetectionVolume1 (Event julien_cine, bank teller scene)
+t=5.00 teleport 1300.03 -1917.39 1478  # diagnostic: TouchTrigger5 (Event vignracaille -> Dispatcher2)
+t=9.00 teleport 865 -4075 1530      # diagnostic: TouchTrigger2 (Event arrivee_fbi)
+t=13.00 teleport 1134 -4222 480     # diagnostic: TouchTrigger3 (Event fbi_dial2)
+t=17.00 teleport 1148 -4063 380     # diagnostic: TouchTrigger4 (Event arrivee_amos)
+t=20.00 teleport 1014.38 -4309 620  # diagnostic: TouchTrigger10 (Event CarOut)
+t=23.00 teleport -182 -1338 130     # diagnostic: TouchTrigger12 (Event gardien_cine)
+t=26.00 teleport 1341.37 -4019.51 380  # diagnostic: XIIIGoalTrigger2 (Tag fin_map, GoalNumber 1)
+
+# Bridged objectives (blockers B1-B3): objective 0 "Access the strongroom" is promoted by Cine1's
+# `ev vignclefbanque` and completed by Cine15's `event fin_flash` -> XIIIDispatcher4 ->
+# `GT_quitterbanque`; objective 1 "Escape from the bank" is completed by Cine11's
+# `playerevent fin_map`. None of the three scenes reaches its label (the host does not run the
+# cinematic sequence latents/anim notifies), so the route invokes the same `MapInfo.SetGoalComplete`
+# those events call. Labelled bridge, never silent.
+t=30.00 set_goal 0
+t=31.00 set_goal 1
+t=32.00 wait_travel

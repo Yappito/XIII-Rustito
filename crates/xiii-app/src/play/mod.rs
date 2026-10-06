@@ -2789,6 +2789,101 @@ mod tests {
         );
     }
 
+    /// item24 opt-in corpus test: follow Banque01 to its end through the game's own chain.
+    ///
+    /// `MapInfo.NextMapLevelWithUnr` is `"Amos01.unr"` and `EndMapVideo` is `"cine02"` (848
+    /// frames / 25 fps = 33.92 s), so the level-end path is the same `SetGoalComplete ->
+    /// TestGoalComplete -> DoTravel -> EndGame -> GameEndedSuccess -> PlayingVideo ->
+    /// PlayingVideo.PlayerTick -> ServerTravel` chain as Plage01. The route fixture
+    /// (`tests/data/banque01_route.script`) walks onto the map's own trigger/volume actors and
+    /// uses two labelled `set_goal` bridges for the objectives that three scripted bank scenes
+    /// would otherwise promote (blockers B1-B3 in the item24 report). This test asserts the
+    /// measured Banque01 objective states and the travel hop; it does not claim the cutscenes
+    /// play.
+    #[test]
+    fn opt_in_banque01_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("banque01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import banque01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/banque01_route.script");
+        let script = script::Script::load(&route_path).expect("load item24 banque01 route");
+        let outcome = run_script(
+            &game_dir,
+            "banque01",
+            &script,
+            &resolved.params,
+            &scene,
+            90.0,
+        )
+        .expect("run banque01 route");
+        let banque = outcome
+            .map_objectives
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("banque01"))
+            .expect("banque01 objective states");
+        println!("[route] banque01 objectives: {:?}", banque.1);
+        for obj in &banque.1 {
+            println!(
+                "[route]   [{}] primary={} completed={} anti_goal={} {:?}",
+                obj.index, obj.primary, obj.completed, obj.anti_goal, obj.text
+            );
+        }
+        println!(
+            "[route] travel: {:?}, final map {}",
+            outcome.travel, outcome.final_map
+        );
+        assert!(
+            banque.1.len() >= 3,
+            "Banque01 MapInfo must expose its objectives: {:?}",
+            banque.1
+        );
+        // Objective 0 "Access the strongroom." must be primary and completed.
+        assert!(
+            banque.1[0].primary && banque.1[0].completed,
+            "objective 0 (strongroom) must be promoted and completed: {:?}",
+            banque.1[0]
+        );
+        // Objective 1 "Escape from the bank." must be primary and completed.
+        assert!(
+            banque.1[1].primary && banque.1[1].completed,
+            "objective 1 (escape) must be promoted and completed: {:?}",
+            banque.1[1]
+        );
+        // Objective 2 "Do not kill the bank staff." is the anti-goal, completed at level start
+        // and still completed (the route kills no teller).
+        assert!(
+            banque.1[2].anti_goal,
+            "objective 2 must be the anti-goal: {:?}",
+            banque.1[2]
+        );
+        assert!(
+            banque.1[2].completed,
+            "the bank-staff anti-goal must remain completed: {:?}",
+            banque.1[2]
+        );
+        // The game's own `TestGoalComplete`/`DoTravel`/`EndGame`/`ServerTravel` chain must run.
+        // (`outcome.session` is the map the run travelled *to*, so the Banque01 touch log is only
+        // in the run's stdout; the objective states above are captured as the run left Banque01.)
+        assert!(
+            !outcome.travel.is_empty(),
+            "the level must travel; blocked actors: {:?}",
+            outcome.session.suspended
+        );
+        assert_eq!(outcome.final_map, "Amos01");
+        assert_eq!(outcome.travel[0].from, "banque01");
+        assert_eq!(outcome.travel[0].to, "Amos01");
+        assert_eq!(outcome.travel[0].url, "Amos01.unr");
+    }
+
     /// item18 opt-in VM/session test for the `PlayerTick` dispatch itself: putting the real
     /// `XIIIPlayerController` into its `PlayingVideo` state and ticking once must run
     /// `PlayingVideo.PlayerTick`, which calls `Level.ServerTravel(MapInfo.NextMapLevelWithUnr)`
