@@ -11,4 +11,5 @@ pub mod props;
 pub mod report;
 pub mod script_cmd;
 pub mod script_run;
+pub mod video_cmd;
 pub mod world_cmd;

@@ -287,6 +287,16 @@ pub const LEVEL_START_LIFECYCLE: &[&str] = &[
 /// Actor lifecycle run on a runtime `Actor.Spawn` (`ULevel::SpawnActor`): the spawned actor runs
 /// these events in order. `Spawned` has no declaration in the GOG packages (no handler is a
 /// no-op), so its presence is a hypothesis from the UE2 engine, recorded here explicitly.
+///
+/// All of these run **inside** `Spawn` before it returns to the caller (the caller's statements
+/// after the `Spawn(...)` expression run afterwards). **Order measured in `Engine.dll`**
+/// `ULevel::SpawnActor` (`XIII_Game/system/Engine.dll`, image base 0x10300000, export RVA
+/// 0x88a20 -> VA 0x10388a20): `call eventPreBeginPlay` @0x10388dad, `call eventBeginPlay`
+/// @0x10388db4, `call eventPostBeginPlay` @0x10388e6b, then `GetLevelInfo()` +
+/// `cmpb $0x3, 0x410(%eax)` (`ALevelInfo.NetMode != NM_Client`, 0x10388e78) with a conditional
+/// `call eventPostNetBeginPlay` @0x10388e83, then `call eventSetInitialState` @0x10388e8a.
+/// `NetMode` is `NM_Standalone (0)` in single player, so `PostNetBeginPlay` runs; `PostBeginPlay`
+/// runs before it. This matches UT2004 and the original hypothesis.
 pub const RUNTIME_SPAWN_LIFECYCLE: &[&str] = &[
     "Spawned",
     "PreBeginPlay",
@@ -1008,6 +1018,10 @@ pub struct Instance {
     disabled: HashSet<String>,
     /// Executed by the VM (in scope).
     pub active: bool,
+    /// Suspended after a script error (`active` was cleared by [`Vm::suspend_for_error`]). A
+    /// non-static call to a suspended actor is dropped; item14c records that visibly (see
+    /// [`Vm::suspended_deferred_calls`]) instead of silently no-oping.
+    pub suspended: bool,
     /// Derives from `Actor`.
     pub is_actor: bool,
     /// Destroyed: behaves as `None` for further references.
@@ -1218,6 +1232,10 @@ pub struct Vm<'s> {
     /// Set by [`Vm::update_ai_perception`] so `SeePlayer`/`EnemyNotVisible` fire only on change,
     /// as the engine's sight counter does, instead of restarting an AI state every tick.
     ai_visible: HashMap<ObjectId, bool>,
+    /// item14c: non-static calls dropped because the target actor was **suspended** (not merely
+    /// out of the executed scope). Every such drop also records a trace note; this counter makes
+    /// the total visible to the host/report so a suspended actor's silent no-ops cannot hide.
+    suspended_deferred_calls: u64,
     /// item18: Bink video durations in seconds, keyed by lowercased file stem. The host registers
     /// them (the VM deliberately has no filesystem access); an entry is absent when the Bink header
     /// could not be read, in which case `VideoPlayer.GetStatus` keeps the old "finished" Partial.
@@ -1306,6 +1324,7 @@ impl<'s> Vm<'s> {
             external_data: None,
             profile: NativeProfile::default(),
             ai_visible: HashMap::new(),
+            suspended_deferred_calls: 0,
             video_durations: HashMap::new(),
             video: None,
         }
@@ -2500,6 +2519,7 @@ impl<'s> Vm<'s> {
             generation: 0,
             disabled: HashSet::new(),
             active: false,
+            suspended: false,
             is_actor,
             deleted: false,
             export: None,
@@ -3539,8 +3559,15 @@ impl<'s> Vm<'s> {
             .unwrap_or(ticked);
         if let Some(o) = self.objects.get_mut(id as usize) {
             o.active = false;
+            o.suspended = true;
         }
         id
+    }
+
+    /// item14c: number of non-static calls dropped because the target actor was suspended after a
+    /// script error. Every drop also records a `Note`; this is the cumulative count for reports.
+    pub fn suspended_deferred_calls(&self) -> u64 {
+        self.suspended_deferred_calls
     }
 
     // ------------------------------------------------------------------ state code
@@ -3931,8 +3958,20 @@ impl<'s> Vm<'s> {
             && !self.objects[target as usize].name.starts_with("Default__")
             && !f.is_static()
         {
+            // item14c: a **suspended** actor (cleared by `suspend_for_error`) is not the same as
+            // a placed actor outside the executed scope. Dropping its call silently would hide a
+            // real script failure, so every drop on a suspended target is counted and traced.
+            let suspended = self.objects[target as usize].suspended;
             let o = &self.objects[target as usize];
             let (tname, class) = (o.name.clone(), set.path(o.class));
+            if suspended {
+                self.suspended_deferred_calls += 1;
+                self.note(TraceKind::Note(format!(
+                    "suspended actor {tname} dropped {}.{}: suspended after a script error",
+                    class,
+                    self.short_path(func)
+                )));
+            }
             if layout.ret.is_some() {
                 return Err(self.err(VmErrorKind::DeferredWithReturnValue {
                     target: tname,
@@ -6498,8 +6537,14 @@ impl<'s> Vm<'s> {
             if !gate && !self.bool_prop(b, "bCollideActors") {
                 continue;
             }
-            // Skip actors in the tracer's owner chain (upstream TraceFirstHit IsOwnedBy).
-            if self.is_owned_by(id, b) {
+            // A trace must ignore both the tracer's owners and its owned attachments. UE2's
+            // TraceFirstHit/IsOwnedBy filtering is target-relative: the candidate hit actor is
+            // ignored when its Owner chain contains the tracer. The reverse check also excludes
+            // owner-chain actors (for example the player pawn when the weapon traces).
+            // item18 B11 measured the missing direction: `XIII.M60`'s line hit its own
+            // `StarFPMF` (`Owner=m601`) and classified that first-person mesh's bone, so
+            // `ProcessTraceHit` received the attachment instead of the soldier.
+            if self.is_owned_by(b, id) || self.is_owned_by(id, b) {
                 continue;
             }
             let (lb, rb, hb) = self.actor_cylinder(b);

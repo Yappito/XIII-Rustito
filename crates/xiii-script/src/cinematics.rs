@@ -324,22 +324,6 @@ fn cine_steering(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Na
     val(Value::Void)
 }
 
-/// item19: Bullet-trail presentation is not a gameplay dependency. The scripted impacts need to
-/// pass through these Engine.Trail calls to reach their authored follow-up events, but headless
-/// runs have no ribbon renderer. Preserve the call as a visible Partial rather than suspending
-/// ScriptedImpacts or silently claiming to render a trail.
-fn trail_presentation_partial(
-    vm: &mut Vm<'_>,
-    c: &NativeCtx,
-    _: &mut [Value],
-) -> VmResult<NativeOutcome> {
-    vm.note(TraceKind::Note(format!(
-        "{}: bullet-trail presentation not rendered (item19 Partial)",
-        c.path
-    )));
-    val(Value::Void)
-}
-
 /// item19: return an actor-space Coords placeholder for a skeletal bone query. The camera-only
 /// `BeachInBedWithXIII.LookAtBimbo.Tick` reads `.Origin`; the VM has no posed-bone transform
 /// provider, so the actor origin is returned and the Partial is visible in the native catalog.
@@ -391,32 +375,6 @@ pub fn item19_defs() -> Vec<NativeDef> {
              action. The VM has no NPC physics tick, so it performs the world-provider step and \
              dispatches EndOfMove on arrival.",
             cine_steering,
-        ),
-        partial(
-            "particle/ribbon trail is not rendered; call remains visible and does not interrupt \
-             the scripted impact/event chain",
-            "Engine.Trail.Init",
-            "native(601) final static function Init()",
-            "engine.u Trail.Init is native-only; called by xidcine.ScriptedImpacts.Impact after \
-             spawning XIII.BulletTrail; item19 keeps the cinematic impact event chain running \
-             while explicitly omitting this presentation effect",
-            trail_presentation_partial,
-        ),
-        partial(
-            "particle/ribbon trail section is not rendered; call remains visible",
-            "Engine.Trail.AddSection",
-            "native(603) final static function AddSection(struct<Vector> Position)",
-            "engine.u Trail.AddSection is native-only; xidcine.ScriptedImpacts.Impact adds the \
-             start/hit positions to XIII.BulletTrail; item19 diagnostic presentation Partial",
-            trail_presentation_partial,
-        ),
-        partial(
-            "particle/ribbon trail is not rendered; call remains visible",
-            "Engine.Trail.Reset",
-            "native(0) function Reset()",
-            "engine.u Trail.Reset is native-only; called by the scripted bullet-trail lifecycle; \
-             item19 diagnostic presentation Partial",
-            trail_presentation_partial,
         ),
         partial(
             "skeletal bone transform unavailable; returns Coords with actor Location as Origin",

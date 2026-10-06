@@ -34,10 +34,10 @@ fn gog_world_decoders_cover_every_export() {
         ("Engine.StaticMesh", 6128, 0),
         ("Engine.Polys", 7194, 0),
         ("Engine.TerrainSector", 2208, 0),
-        // Engine.Model: 6,396 exports consume the payload exactly; the 798 build-variant
-        // exports keep an explicit unsupported tail. Engine.TerrainInfo is still a prefix
-        // decoder with a tail on every export.
-        ("Engine.Model", 7194, 798),
+        // Engine.Model: every export consumes the payload exactly after item1m (the 798
+        // build-variant tails are decoded). Engine.TerrainInfo is still a prefix decoder with
+        // a tail on every export.
+        ("Engine.Model", 7194, 0),
         ("Engine.TerrainInfo", 18, 18),
     ];
     for (class, n, partial) in expect {
