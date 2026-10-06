@@ -366,6 +366,49 @@ fn fixture() -> Vec<u8> {
     b.build()
 }
 
+/// `Actor` fixture for the per-instance `Tick` memo: a **class** `Tick` (`Counter = 1`) and a
+/// **state-scoped** `Tick` in `Waiting` (`Counter = 10`), so the resolved `Tick` differs by
+/// state and a stale memo is observable as the wrong constant being written.
+fn tick_state_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let class_tick = b.reserve(IMP_FUNCTION, actor, "Tick");
+    let waiting = b.reserve(IMP_STATE, actor, "Waiting");
+    let counter = b.reserve(IMP_INTPROP, actor, "Counter");
+    let rc = counter as u8;
+    // Counter's sibling is the class Tick; the state is the class Tick's sibling.
+    b.prop(counter, class_tick, 0);
+    // Class Tick: `Counter = 1` (`Let Counter = IntOne`), then return void. Memory: Let(1) +
+    // instance var(1 opcode + 4 ref) + int one(1) + return(1) + nothing(1) = 9.
+    b.func(
+        class_tick,
+        waiting,
+        0,
+        &[0x0F, 0x01, rc, 0x26, 0x04, 0x0B],
+        9,
+        0,
+        ff::DEFINED,
+    );
+    // State-scoped Tick: `Counter = 10` (int const 10 = `0x2C 0x0A`), return void.
+    // Memory: Let(1) + instance var(1 + 4) + int const(2) + return(1) + nothing(1) = 10.
+    let state_tick = b.reserve(IMP_FUNCTION, waiting, "Tick");
+    b.func(
+        state_tick,
+        0,
+        0,
+        &[0x0F, 0x01, rc, 0x2C, 10, 0x04, 0x0B],
+        10,
+        0,
+        ff::DEFINED,
+    );
+    // The state has no code of its own, only the state-scoped Tick child.
+    b.state_children(waiting, 0, state_tick, &[], 0, 0);
+    b.class(object, 0, 0);
+    b.class(actor, object, counter);
+    b.build()
+}
+
 fn set_of(data: Vec<u8>) -> ScriptSet {
     let p = ScriptPackage::load("Test", data, &ScriptLimits::default(), &Limits::default())
         .expect("package");
@@ -499,6 +542,33 @@ fn step_budget_stops_runaway_loops() {
         .unwrap_err();
     assert_eq!(e.kind, VmErrorKind::BudgetExceeded { limit: 1000 });
     assert_eq!(e.stack.last().unwrap().function, "Test.Object.Spin");
+}
+
+#[test]
+fn tick_memo_re_resolves_after_state_change() {
+    let set = set_of(tick_state_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(g(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    // No state: the class `Tick` runs (`Counter = 1`). The memo records `(None, class Tick)`.
+    vm.tick(0.016).unwrap();
+    assert_eq!(vm.get_property(a, "Counter"), Some(&Value::Int(1)));
+    // Enter `Waiting`: the state has its own `Tick` (`Counter = 10`). If the memo were not
+    // invalidated it would keep calling the class `Tick` and the counter would stay 1.
+    vm.goto_state(a, "Waiting", None).unwrap();
+    vm.tick(0.016).unwrap();
+    assert_eq!(
+        vm.get_property(a, "Counter"),
+        Some(&Value::Int(10)),
+        "state Tick must win over the stored class Tick"
+    );
+    // The memo is keyed by state: staying in `Waiting` keeps using the state `Tick`.
+    vm.tick(0.016).unwrap();
+    assert_eq!(vm.get_property(a, "Counter"), Some(&Value::Int(10)));
+    // Leaving the state (to `None`) re-resolves to the class `Tick` (`Counter = 1`).
+    vm.goto_state(a, "None", None).unwrap();
+    vm.tick(0.016).unwrap();
+    assert_eq!(vm.get_property(a, "Counter"), Some(&Value::Int(1)));
 }
 
 #[test]
