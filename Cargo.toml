@@ -7,6 +7,7 @@ members = [
     "crates/xiii-script",
     "crates/xiii-collision",
     "crates/xiii-audio",
+    "crates/xiii-video",
     "crates/xiii-locale",
     "crates/xiii-world",
     "crates/xiii-tool",
@@ -27,6 +28,7 @@ xiii-decode = { path = "crates/xiii-decode" }
 xiii-script = { path = "crates/xiii-script" }
 xiii-collision = { path = "crates/xiii-collision" }
 xiii-audio = { path = "crates/xiii-audio" }
+xiii-video = { path = "crates/xiii-video" }
 xiii-locale = { path = "crates/xiii-locale" }
 xiii-world = { path = "crates/xiii-world" }
 # Exact pin; used by xiii-tool for --json output and inventory comparison.

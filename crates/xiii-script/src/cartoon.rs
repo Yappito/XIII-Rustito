@@ -295,17 +295,49 @@ fn char_is_num(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<Nat
 
 /// `CineController2.FindAnActor(string ActorName) -> Actor`.
 ///
-/// XIDCine.dll `?execFindAnActor@ACineController2` RVA 0x1e70: walks the level's live actors and
-/// returns the one whose name matches `ActorName` (FName comparison, case-insensitive). The VM
-/// searches every live actor, which is the same set `Interpret` addresses.
-fn find_an_actor(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+/// XIDCine.dll `?execFindAnActor@ACineController2` RVA 0x1e70. The decoded literals in `.rdata`
+/// (`PositionInfo` at 0x10005770, `self` at 0x10005780, `none` at 0x10005788, `player` at
+/// 0x10005790) give the four special cases the real native evaluates before the plain name
+/// lookup: `self` returns the controller, `player` its `Player` pawn, `none` returns `None`, and
+/// a numeric argument is the prefix `PositionInfo` + the number (the map's waypoint anchors are
+/// exported as `PositionInfo22`, not `22`). Anything else is matched by live-actor name. Before
+/// this fix only the last case existed, so every `movseq w 22`/`lookat 23` resolved to `None` and
+/// the Plage01 intro stalled waiting for an `EndOfSeq` that could never arrive.
+fn find_an_actor(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let name = match a.first() {
         Some(Value::Str(s)) | Some(Value::Name(s)) => s.clone(),
         _ => String::new(),
     };
+    if name.eq_ignore_ascii_case("self") {
+        // The disassembly returns the controller's possessed pawn (offset 0x1f0, the field the
+        // `Steering` error text calls "Pawn"), falling back to the controller when it is unset.
+        return val(Value::Object(Some(ObjRef::Instance(
+            vm.obj_prop(c.this, "Pawn").unwrap_or(c.this),
+        ))));
+    }
+    if name.eq_ignore_ascii_case("none") {
+        return val(Value::Object(None));
+    }
+    if name.eq_ignore_ascii_case("player") {
+        return Ok(NativeOutcome::Value(
+            match vm.get_property(c.this, "Player") {
+                Some(Value::Object(Some(ObjRef::Instance(i))))
+                    if vm.objects.get(*i as usize).is_some_and(|o| !o.deleted) =>
+                {
+                    Value::Object(Some(ObjRef::Instance(*i)))
+                }
+                _ => Value::Object(None),
+            },
+        ));
+    }
+    let target = if name.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+        format!("PositionInfo{name}")
+    } else {
+        name
+    };
     let found = (0..vm.objects.len() as ObjectId).find(|&i| {
         let o = &vm.objects[i as usize];
-        o.is_actor && !o.deleted && o.name.eq_ignore_ascii_case(&name)
+        o.is_actor && !o.deleted && o.name.eq_ignore_ascii_case(&target)
     });
     let v = match found {
         Some(id) => Value::Object(Some(ObjRef::Instance(id))),

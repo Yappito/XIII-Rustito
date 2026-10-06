@@ -1029,6 +1029,11 @@ fn fixed_step(
             floor_normal: sim.0.floor_normal,
         };
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
+        if let Some((location, yaw, velocity)) = sess.script_pawn_pose() {
+            sim.0.location = location;
+            sim.0.yaw = yaw;
+            sim.0.velocity = velocity;
+        }
         if sess.save_total > state.saved_total {
             state.saved_total = sess.save_total;
             if let Some((_, event)) = sess.saves.back() {
@@ -1955,6 +1960,7 @@ pub(crate) fn run_script(
             landed_velocity_z: runtime.sim.landed.then_some(runtime.sim.land_velocity_z),
             floor_normal: runtime.sim.floor_normal,
         };
+        runtime.session.drive_render_phase();
         runtime.session.step(
             DT,
             runtime.sim.location,
@@ -1962,6 +1968,11 @@ pub(crate) fn run_script(
             runtime.sim.velocity,
             &modes,
         );
+        if let Some((location, yaw, velocity)) = runtime.session.script_pawn_pose() {
+            runtime.sim.location = location;
+            runtime.sim.yaw = yaw;
+            runtime.sim.velocity = velocity;
+        }
         let states = runtime.session.mover_states();
         runtime.mover_collision.update(&mut runtime.world, &states);
         for path in &weapons {
@@ -2488,8 +2499,8 @@ mod tests {
 
     /// Opt-in corpus test (item6e requirement 3): a scripted shuttle walk on Plage01 emits
     /// footsteps whose names come from the floor's `XIIIFootStepSound` material properties. The
-    /// start is on the hut interior floor (the script login spawn), whose texture carries
-    /// `XIIIPlage.PLmeub05` -> `XIIIsound.Footsteps__XIIIFSBoi.…`.
+    /// nine-second walk starts after the game's wake-up handoff returns control at 45 s. The hut
+    /// interior texture carries `XIIIPlage.PLmeub05` -> `XIIIsound.Footsteps__XIIIFSBoi.…`.
     #[test]
     fn opt_in_plage01_scripted_walk_plays_surface_footsteps() {
         let Some(game_dir) = opt_in_root() else {
@@ -2504,7 +2515,7 @@ mod tests {
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
         let script = script::Script::parse(
-            "t=0.0 forward 1\nt=1.5 forward -1\nt=3.0 forward 1\nt=4.5 forward -1\nt=6.0 forward 1\nt=7.5 forward -1\nt=9.0 forward 0\n",
+            "t=45.0 forward 1\nt=46.5 forward -1\nt=48.0 forward 1\nt=49.5 forward -1\nt=51.0 forward 1\nt=52.5 forward -1\nt=54.0 forward 0\n",
         )
         .unwrap();
         let outcome = run_script(
@@ -2513,7 +2524,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            10.0,
+            55.0,
         )
         .expect("run Plage01 shuttle walk");
         assert!(
@@ -2571,17 +2582,24 @@ mod tests {
         // through the game's own pickup chain (autopilot `goto` + jumps; approached from the
         // key's open -Y side), then walks to `Porte6` and uses the carried key.
         let script = script::Script::parse(
-            "t=0.00 teleport -491.8 -414.1 1265.0\n\
-             t=0.10 goto -491.84 -314.14\nt=0.30 jump\nt=0.80 jump\nt=1.30 jump\nt=1.80 jump\n\
-             t=2.30 jump\nt=2.80 forward 0\n\
-             t=3.20 teleport -742.1444 -808.429 1311.0449\n\
-             t=3.20 yaw 312.891\nt=3.20 turn 2\nt=3.20 forward 1\n\
-             t=4.80 turn -45\nt=5.50 forward 0\nt=5.80 use\nt=6.80 use\nt=7.00 forward 1\n\
-             t=8.00 forward 0\n",
+            "t=45.00 teleport -491.8 -414.1 1265.0\n\
+             t=45.10 goto -491.84 -314.14\nt=45.30 jump\nt=45.80 jump\nt=46.30 jump\nt=46.80 jump\n\
+             t=47.30 jump\nt=47.80 forward 0\n\
+             t=48.20 teleport -742.1444 -808.429 1311.0449\n\
+             t=48.20 yaw 312.891\nt=48.20 turn 2\nt=48.20 forward 1\n\
+             t=49.80 turn -45\nt=50.50 forward 0\nt=50.80 use\nt=51.80 use\nt=52.00 forward 1\n\
+             t=53.00 forward 0\n",
         )
         .unwrap();
-        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 9.0)
-            .expect("run Plage01 door walk");
+        let outcome = run_script(
+            &game_dir,
+            "Plage01",
+            &script,
+            &resolved.params,
+            &scene,
+            54.0,
+        )
+        .expect("run Plage01 door walk");
         let s = &outcome.session;
         assert!(
             s.inventory_items()
@@ -2621,12 +2639,10 @@ mod tests {
         );
     }
 
-    /// item18 opt-in corpus test: follow the decoded Plage01 route as far as the port supports it
-    /// and assert the measured objective states and the game's own level end. `take_control` is the
-    /// labelled host bridge for the stuck intro; `set_goal 91/92` are the labelled bridges for the
-    /// cutscene promotions; `teleport` is a diagnostic shortcut for the large beach distances. The
-    /// two player-driven completions (the `TouchTrigger9` walk, the corpse search + `Porte1`) run
-    /// through the game's own code. Asserts the same stages the report records.
+    /// item19 opt-in corpus test: follow Plage01 without `take_control`/`set_goal`. The intro and
+    /// objective promotions must come from the map's Cine2/ScriptedImpacts/TouchTrigger chains;
+    /// teleports in the route file are explicitly diagnostic movement shortcuts only. Pickup,
+    /// doors, damage/death, corpse search, goal completion and travel use the game's own code.
     #[test]
     fn opt_in_plage01_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -2640,35 +2656,91 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let script = script::Script::parse(
-            "t=0.00 take_control\n\
-             t=0.10 set_goal 91\n\
-             t=0.20 teleport -491.8 -414.1 1265.0\n\
-             t=0.30 goto -491.84 -314.14\n\
-             t=0.50 jump\nt=1.00 jump\nt=1.50 jump\nt=2.00 jump\nt=2.50 jump\nt=3.00 forward 0\n\
-             t=3.40 teleport -742.1444 -808.429 1311.0449\nt=3.40 yaw 312.891\nt=3.40 forward 1\n\
-             t=5.00 turn -45\nt=5.70 forward 0\nt=6.00 use\nt=7.00 forward 1\nt=8.00 forward 0\n\
-             t=8.50 teleport -307.0 -1500.0 1311.0\nt=8.50 yaw 90\nt=8.50 forward 1\nt=12.00 forward 0\n\
-             t=13.00 set_goal 92\nt=13.20 weapon XIII.m60\nt=14.00 equip\n\
-             t=15.00 teleport 1802.0 -12700.0 1100.0\nt=15.00 yaw 270\n\
-             t=15.10 fire\nt=15.30 fire\nt=15.50 fire\nt=15.70 fire\nt=15.90 fire\nt=16.10 fire\n\
-             t=16.30 fire\nt=16.50 fire\nt=16.70 fire\nt=16.90 fire\nt=17.10 fire\nt=17.30 fire\n\
-             t=17.50 fire\nt=17.70 fire\nt=17.90 fire\nt=18.10 fire\nt=18.30 fire\nt=18.50 fire\n\
-             t=19.00 search BaseSoldier6\n\
-             t=21.00 teleport 1215.0 -14000.0 1105.0\nt=21.00 yaw 270\n\
-             t=21.50 use Porte1\nt=22.50 use Porte1\n",
-        )
-        .unwrap();
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let route_path = workspace.join("local/reports/item19/route.script");
+        let script = script::Script::load(&route_path).expect("load item19 Plage01 route");
         let outcome = run_script(
             &game_dir,
             "Plage01",
             &script,
             &resolved.params,
             &scene,
-            90.0,
+            140.0,
         )
         .expect("run Plage01 route");
+        println!(
+            "[route] player inventory after route: {:?}",
+            outcome.session.inventory_items()
+        );
+        for (i, object) in outcome.session.vm().objects.iter().enumerate() {
+            let id = i as xiii_script::ObjectId;
+            if !object.deleted && outcome.session.vm().is_a(id, "keys") {
+                println!(
+                    "[route] key {} active={} Instigator={:?} Owner={:?} Inventory={:?} KeyCodeName={:?} ItemName={:?}",
+                    object.name,
+                    object.active,
+                    outcome.session.vm().get_property(id, "Instigator"),
+                    outcome.session.vm().get_property(id, "Owner"),
+                    outcome.session.vm().get_property(id, "Inventory"),
+                    outcome.session.vm().get_property(id, "KeyCodeName"),
+                    outcome.session.vm().get_property(id, "ItemName"),
+                );
+            }
+        }
         println!("[route] map objectives: {:?}", outcome.map_objectives);
+        println!(
+            "[route] end state: game_ended={:?}, controller={:?}, controller_state={:?}, controller_active={:?}",
+            outcome.session.game_info.and_then(|gi| outcome
+                .session
+                .vm()
+                .get_property(gi, "bGameEnded")
+                .cloned()),
+            outcome
+                .session
+                .controller
+                .map(|c| outcome.session.vm().objects[c as usize].name.clone()),
+            outcome
+                .session
+                .controller
+                .and_then(|c| outcome.session.vm().state_name(c)),
+            outcome
+                .session
+                .controller
+                .map(|c| outcome.session.vm().objects[c as usize].active),
+        );
+        let level = outcome.session.vm().find_level_info();
+        let mut listed = Vec::new();
+        let mut current =
+            level.and_then(
+                |id| match outcome.session.vm().get_property(id, "ControllerList") {
+                    Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(next)))) => {
+                        Some(*next)
+                    }
+                    _ => None,
+                },
+            );
+        for _ in 0..64 {
+            let Some(id) = current else { break };
+            listed.push(outcome.session.vm().objects[id as usize].name.clone());
+            current = match outcome.session.vm().get_property(id, "NextController") {
+                Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(next)))) => {
+                    Some(*next)
+                }
+                _ => None,
+            };
+        }
+        println!("[route] LevelInfo={level:?} ControllerList={listed:?}");
+        for ev in &outcome.session.vm().trace {
+            let rendered = format!("{:?}", ev.kind);
+            if rendered.contains("ClientGameEnded")
+                || rendered.contains("GameEndedSuccess")
+                || rendered.contains("ServerTravel")
+                || rendered.contains("AddController")
+                || rendered.contains("RemoveController")
+            {
+                println!("[route] ending trace t={:.3}: {rendered}", ev.time);
+            }
+        }
         println!(
             "[route] travel: {:?}, final map {}",
             outcome.travel, outcome.final_map
@@ -2701,6 +2773,19 @@ mod tests {
         );
         assert_eq!(outcome.final_map, "banque01");
         assert_eq!(outcome.travel[0].to, "banque01");
+        assert!(
+            !outcome
+                .session
+                .failures
+                .iter()
+                .any(|(_, error)| error.to_ascii_lowercase().contains("bcompleted")),
+            "Plage01 checkpoint save hit the old bcompleted struct error: {:?}",
+            outcome.session.failures
+        );
+        assert!(
+            outcome.session.save_total > 0,
+            "the game's checkpoint trigger must emit a SaveAtCheckpoint event"
+        );
     }
 
     /// item18 opt-in VM/session test for the `PlayerTick` dispatch itself: putting the real
@@ -3186,16 +3271,23 @@ mod tests {
         // horizontal shot is a chest hit; the head needs the ray to clear the torso first. The
         // battle is entirely script-driven (no host damage).
         let script = script::Script::parse(
-            "t=0.00 weapon XIII.Beretta\n\
-             t=0.20 teleport 1802.4131 -12992.034 1070.843\n\
-             t=0.20 yaw 90\n\
-             t=0.20 pitch 5\n\
-             t=0.30 fire\nt=0.90 fire\nt=1.50 fire\nt=2.10 fire\nt=2.70 fire\nt=3.30 fire\n\
-             t=3.90 fire\nt=4.50 fire\nt=5.10 fire\nt=5.70 fire\nt=6.30 fire\n",
+            "t=45.00 weapon XIII.Beretta\n\
+             t=45.20 teleport 1802.4131 -12992.034 1070.843\n\
+             t=45.20 yaw 90\n\
+             t=45.20 pitch 5\n\
+             t=45.30 fire\nt=45.90 fire\nt=46.50 fire\nt=47.10 fire\nt=47.70 fire\nt=48.30 fire\n\
+             t=48.90 fire\nt=49.50 fire\nt=50.10 fire\nt=50.70 fire\nt=51.30 fire\n",
         )
         .unwrap();
-        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 8.0)
-            .expect("run Plage01 fight");
+        let outcome = run_script(
+            &game_dir,
+            "Plage01",
+            &script,
+            &resolved.params,
+            &scene,
+            53.0,
+        )
+        .expect("run Plage01 fight");
         let s = &outcome.session;
         let soldier = (0..s.vm().objects.len())
             .find(|&i| {

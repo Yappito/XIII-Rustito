@@ -421,6 +421,21 @@ pub fn report_exit(
                     .map_or_else(|| "-".to_owned(), |v| format!("{v:?}")),
             );
         }
+        for i in 0..vm.objects.len() {
+            let id = i as ObjectId;
+            let o = &vm.objects[i];
+            if o.deleted || !o.is_actor || !o.name.starts_with("CineController") {
+                continue;
+            }
+            println!(
+                "[cartoon] {} state={:?} action={:?} flags={:?} warn={:?}",
+                o.name,
+                vm.state_name(id),
+                vm.get_property(id, "ScriptedActionIndex"),
+                vm.get_property(id, "flagsPaused"),
+                vm.get_property(id, "WarnMemory"),
+            );
+        }
         if !s.saves.is_empty() {
             println!("[cartoon] checkpoint saves ({}):", s.save_total);
             for (t, e) in &s.saves {

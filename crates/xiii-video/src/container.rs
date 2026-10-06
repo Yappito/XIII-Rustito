@@ -1,0 +1,624 @@
+//! Bink 1 container reader (`BIK`, revision `i`).
+//!
+//! Layout measured on the 19 XIII cutscenes and cross-checked with the MultimediaWiki
+//! *Bink Container* prose description: a 44-byte main header, then a per-track audio header
+//! block (12 bytes per track in the XIII corpus), then a little-endian frame-offset table with
+//! one entry per frame plus a trailing end entry. Bit 0 of an offset marks a keyframe.
+//!
+//! The reader is strictly bounded: every read is checked against the buffer and it returns
+//! [`VideoError`] instead of panicking on file data.
+
+use crate::error::{Result, VideoError, VideoErrorKind};
+
+/// Revision byte of the Bink 1 streams this crate understands.
+pub const REVISION_I: u8 = b'i';
+
+/// Video flags (bytes 36..40).
+pub const FLAG_ALPHA: u32 = 0x0010_0000;
+/// Grayscale flag.
+pub const FLAG_GRAY: u32 = 0x0002_0000;
+
+fn u16_at(d: &[u8], o: usize) -> Result<u16> {
+    let s = d
+        .get(o..o + 2)
+        .ok_or_else(|| VideoError::at(VideoErrorKind::Truncated, o as u64, "u16"))?;
+    Ok(u16::from_le_bytes([s[0], s[1]]))
+}
+
+fn u32_at(d: &[u8], o: usize) -> Result<u32> {
+    let s = d
+        .get(o..o + 4)
+        .ok_or_else(|| VideoError::at(VideoErrorKind::Truncated, o as u64, "u32"))?;
+    Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+/// Main header of a Bink 1 file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Header {
+    /// Codec revision byte (always `b'i'` here).
+    pub revision: u8,
+    /// `file size not including the first 8 bytes` (bytes 4..8).
+    pub file_size_field: u32,
+    /// Frame count at offset 8 (normally authoritative).
+    pub frames_a: u32,
+    /// Largest single frame in bytes.
+    pub largest_frame: u32,
+    /// Frame count at offset 16 (a duplicate; differs on one XIII file).
+    pub frames_b: u32,
+    /// Coded video width.
+    pub width: u32,
+    /// Coded video height.
+    pub height: u32,
+    /// Frames-per-second numerator (bytes 28..32).
+    pub fps_num: u32,
+    /// Frames-per-second denominator (bytes 32..36).
+    pub fps_den: u32,
+    /// Video flags (bytes 36..40).
+    pub flags: u32,
+    /// Number of audio tracks.
+    pub audio_tracks: u32,
+}
+
+impl Header {
+    /// True when the file carries an alpha plane.
+    pub fn has_alpha(&self) -> bool {
+        self.flags & FLAG_ALPHA != 0
+    }
+
+    /// True when the file is grayscale.
+    pub fn has_gray(&self) -> bool {
+        self.flags & FLAG_GRAY != 0
+    }
+
+    /// Frames per second as a floating point ratio (`0.0` when the denominator is zero).
+    pub fn fps(&self) -> f64 {
+        if self.fps_den == 0 {
+            0.0
+        } else {
+            f64::from(self.fps_num) / f64::from(self.fps_den)
+        }
+    }
+}
+
+/// One audio track header entry.
+///
+/// The header stores the tracks' fields in three groups of `N` little-endian dwords each
+/// (measured on the 5-track XIII cutscenes: `N` x maximum decoded bytes, then `N` x
+/// `sample_rate | flags << 16`, then `N` x track id), not as one 12-byte record per track. The
+/// DLL keeps the second group as one dword per track (`[bink + 0x264]`, read by
+/// `BinkOpenTrack` at `0x30015acb`) and the first as the track's maximum size
+/// (`[bink + 0x260]`, `0x30015b95`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioTrack {
+    /// Largest decoded packet in bytes (first header group; `BinkGetTrackMaxSize`).
+    pub max_decoded_bytes: u32,
+    /// Sample rate in Hz.
+    pub sample_rate: u16,
+    /// Raw flags word (the high half of the second group's dword).
+    pub flags: u16,
+    /// Track id.
+    pub id: u32,
+}
+
+impl AudioTrack {
+    /// True when the stereo flag (`0x2000`) is set (`shr 0x1d; and 1; inc` = channel count at
+    /// `0x30015afa`).
+    pub fn stereo(&self) -> bool {
+        self.flags & 0x2000 != 0
+    }
+    /// Channel count derived from the stereo flag (1 or 2).
+    pub fn channels(&self) -> u16 {
+        if self.stereo() { 2 } else { 1 }
+    }
+    /// True when the decoded output is 16-bit (flag `0x4000`; `shr 0x1b; and 8; add 8` at
+    /// `0x30015b76` gives 8 or 16 bits per sample).
+    pub fn sixteen_bit(&self) -> bool {
+        self.flags & 0x4000 != 0
+    }
+    /// True when the track uses the DCT Bink Audio variant: flag `0x1000` set and `0x8000`
+    /// clear (`BinkOpen` at `0x30012fe5..0x30012ffa`). Every other combination selects the
+    /// RDFT variant.
+    pub fn audio_dct(&self) -> bool {
+        self.flags & 0x1000 != 0 && self.flags & 0x8000 == 0
+    }
+}
+
+/// One frame-offset table entry resolved to an absolute byte range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameEntry {
+    /// Absolute file offset of the frame's data.
+    pub offset: u64,
+    /// Frame byte length (`next.offset - offset`).
+    pub size: u64,
+    /// Keyframe bit (bit 0 of the table entry).
+    pub keyframe: bool,
+}
+
+/// One decoded audio packet reference inside a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioPacketRef {
+    /// Offset of the packet payload (after the two u32 header words).
+    pub offset: u64,
+    /// Packet payload length in bytes.
+    pub size: u64,
+    /// Declared decoded size of the packet in bytes of 16-bit PCM (all channels). The DLL
+    /// decodes blocks until this many bytes are produced, truncating the last block
+    /// (`BinkGetTrackData` at `0x30015c66..0x30015d09`, `BinkDoFrame` at `0x300141b4`).
+    pub decoded_bytes: u32,
+}
+
+/// A parsed Bink 1 file.
+#[derive(Debug, Clone)]
+pub struct BikFile {
+    /// Main header.
+    pub header: Header,
+    /// Audio track headers.
+    pub audio: Vec<AudioTrack>,
+    /// Frame ranges, one per frame.
+    pub frames: Vec<FrameEntry>,
+    /// File byte offset where the frame data of frame 0 begins (end of the index table).
+    pub data_start: u64,
+    /// True when the frame count had to be taken from the duplicate header field.
+    pub used_duplicate_frame_count: bool,
+    /// Total file length in bytes.
+    pub len: u64,
+}
+
+impl BikFile {
+    /// Parses a Bink 1 file from its bytes. The buffer must be the whole file.
+    pub fn parse(d: &[u8]) -> Result<Self> {
+        if d.len() < 44 {
+            return Err(VideoError::at(
+                VideoErrorKind::Truncated,
+                0,
+                format!("file is {} bytes, need at least 44", d.len()),
+            ));
+        }
+        if &d[0..3] != b"BIK" {
+            return Err(VideoError::at(
+                VideoErrorKind::BadSignature,
+                0,
+                "not a Bink 1 file (missing 'BIK')",
+            ));
+        }
+        let revision = d[3];
+        if revision != REVISION_I {
+            return Err(VideoError::at(
+                VideoErrorKind::BadSignature,
+                3,
+                format!("unsupported Bink revision 0x{revision:02x}, expected 0x69 ('i')"),
+            ));
+        }
+        let header = Header {
+            revision,
+            file_size_field: u32_at(d, 4)?,
+            frames_a: u32_at(d, 8)?,
+            largest_frame: u32_at(d, 12)?,
+            frames_b: u32_at(d, 16)?,
+            width: u32_at(d, 20)?,
+            height: u32_at(d, 24)?,
+            fps_num: u32_at(d, 28)?,
+            fps_den: u32_at(d, 32)?,
+            flags: u32_at(d, 36)?,
+            audio_tracks: u32_at(d, 40)?,
+        };
+        if header.width == 0 || header.height == 0 || header.width > 32767 || header.height > 32767
+        {
+            return Err(VideoError::at(
+                VideoErrorKind::BadValue,
+                20,
+                format!("invalid dimensions {}x{}", header.width, header.height),
+            ));
+        }
+        if header.audio_tracks > 256 {
+            return Err(VideoError::at(
+                VideoErrorKind::BadValue,
+                40,
+                format!("{} audio tracks (> 256)", header.audio_tracks),
+            ));
+        }
+
+        // Audio headers: three groups of `n` dwords (see [`AudioTrack`]); 12 bytes per track in
+        // total, which is what places the frame-offset table.
+        let n_audio = header.audio_tracks as usize;
+        let audio_bytes = n_audio
+            .checked_mul(12)
+            .ok_or_else(|| VideoError::at(VideoErrorKind::BadValue, 44, "audio header overflow"))?;
+        let table_base = 44usize
+            .checked_add(audio_bytes)
+            .ok_or_else(|| VideoError::at(VideoErrorKind::BadValue, 44, "table offset overflow"))?;
+
+        let mut audio = Vec::with_capacity(n_audio);
+        for t in 0..n_audio {
+            let max_at = 44 + t * 4;
+            let fmt_at = 44 + n_audio * 4 + t * 4;
+            let id_at = 44 + n_audio * 8 + t * 4;
+            audio.push(AudioTrack {
+                max_decoded_bytes: u32_at(d, max_at)?,
+                sample_rate: u16_at(d, fmt_at)?,
+                flags: u16_at(d, fmt_at + 2)?,
+                id: u32_at(d, id_at)?,
+            });
+        }
+
+        // Resolve the frame count. The offset-8 field is authoritative (the wiki's "number of
+        // frames"); the duplicate at offset 16 is only tried if that index is structurally
+        // invalid. Cine14's table is zero-padded past the real count, so entries are validated
+        // (monotone, in range) rather than compared against the first offset.
+        let (frames, used_duplicate) = if index_valid(d, table_base, header.frames_a) {
+            (header.frames_a, false)
+        } else if index_valid(d, table_base, header.frames_b) {
+            (header.frames_b, true)
+        } else {
+            return Err(VideoError::at(
+                VideoErrorKind::BadValue,
+                table_base as u64,
+                format!(
+                    "frame index is invalid for both frame counts ({} and {})",
+                    header.frames_a, header.frames_b
+                ),
+            ));
+        };
+
+        let table_len = (frames as usize + 1).checked_mul(4).ok_or_else(|| {
+            VideoError::at(
+                VideoErrorKind::BadValue,
+                table_base as u64,
+                "index overflow",
+            )
+        })?;
+        let table_end = table_base.checked_add(table_len).ok_or_else(|| {
+            VideoError::at(
+                VideoErrorKind::BadValue,
+                table_base as u64,
+                "index overflow",
+            )
+        })?;
+        if table_end > d.len() {
+            return Err(VideoError::at(
+                VideoErrorKind::Truncated,
+                table_base as u64,
+                format!("frame index needs {table_end} bytes, file is {}", d.len()),
+            ));
+        }
+
+        let mut raw = Vec::with_capacity(frames as usize + 1);
+        for i in 0..=frames as usize {
+            raw.push(u32_at(d, table_base + i * 4)?);
+        }
+
+        let end_of_file = d.len() as u64;
+        let mut entries: Vec<FrameEntry> = Vec::with_capacity(frames as usize);
+        for i in 0..frames as usize {
+            let a = u64::from(raw[i] & !1);
+            let b = if i + 1 < raw.len() {
+                let next = u64::from(raw[i + 1] & !1);
+                // The trailing entry is the end of the last frame; clamp to file length.
+                if next < a {
+                    end_of_file
+                } else {
+                    next.min(end_of_file)
+                }
+            } else {
+                end_of_file
+            };
+            if a < table_end as u64 || a > end_of_file || b > end_of_file || b < a {
+                return Err(VideoError::at(
+                    VideoErrorKind::BadValue,
+                    table_base as u64 + i as u64 * 4,
+                    format!("frame {i} range {a}..{b} is outside the file"),
+                ));
+            }
+            entries.push(FrameEntry {
+                offset: a,
+                size: b - a,
+                keyframe: raw[i] & 1 != 0,
+            });
+        }
+
+        Ok(BikFile {
+            header,
+            audio,
+            frames: entries,
+            data_start: table_end as u64,
+            used_duplicate_frame_count: used_duplicate,
+            len: end_of_file,
+        })
+    }
+
+    /// Number of frames in the index.
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// Splits one frame's payload into per-track audio packets and the trailing video packet.
+    ///
+    /// Audio packets are located but not decoded. Bounds are checked against `frame`.
+    pub fn frame_packets(&self, data: &[u8], frame: usize) -> Result<FramePackets> {
+        let f = *self.frames.get(frame).ok_or_else(|| {
+            VideoError::new(VideoErrorKind::BadValue, format!("no frame {frame}"))
+        })?;
+        let start = usize::try_from(f.offset)
+            .map_err(|_| VideoError::at(VideoErrorKind::BadValue, f.offset, "offset too large"))?;
+        let end = usize::try_from(f.offset + f.size)
+            .map_err(|_| VideoError::at(VideoErrorKind::BadValue, f.offset, "offset too large"))?;
+        if end > data.len() {
+            return Err(VideoError::at(
+                VideoErrorKind::Truncated,
+                f.offset,
+                format!("frame {frame} ends at {end}, past buffer {}", data.len()),
+            ));
+        }
+        let mut o = start;
+        let mut packets = Vec::with_capacity(self.audio.len());
+        for (t, _track) in self.audio.iter().enumerate() {
+            if o + 4 > end {
+                return Err(VideoError::at(
+                    VideoErrorKind::Truncated,
+                    o as u64,
+                    format!("frame {frame}: audio header {t} runs past the frame"),
+                ));
+            }
+            // A zero length means "no audio for this track in this frame": only the length
+            // word is present (measured: `ubi.bik` frame 5 stores length 0 and its video
+            // payload starts right after that word; skipping a sample-count word as well
+            // desynchronised the video plane).
+            let len_plus4 = u32_at(data, o)?;
+            o += 4;
+            if len_plus4 == 0 {
+                packets.push(None);
+                continue;
+            }
+            if o + 4 > end {
+                return Err(VideoError::at(
+                    VideoErrorKind::Truncated,
+                    o as u64,
+                    format!("frame {frame}: audio sample count {t} runs past the frame"),
+                ));
+            }
+            let samples = u32_at(data, o)?;
+            o += 4;
+            // The stored length counts the four-byte sample-count word as well.
+            let payload = u64::from(len_plus4).saturating_sub(4);
+            let payload = payload.min((end - o) as u64);
+            packets.push(Some(AudioPacketRef {
+                offset: o as u64,
+                size: payload,
+                decoded_bytes: samples,
+            }));
+            o = o.saturating_add(payload as usize);
+        }
+        if o > end {
+            return Err(VideoError::at(
+                VideoErrorKind::BadValue,
+                o as u64,
+                format!("frame {frame}: audio packets overflow the frame"),
+            ));
+        }
+        Ok(FramePackets {
+            audio: packets,
+            video_offset: o as u64,
+            video_size: (end - o) as u64,
+        })
+    }
+}
+
+/// Checks that an `n`-frame index fits and its offsets are monotone and in range. Trailing
+/// entries may be zero-padded past the real frame count, so only `0..=n` is inspected.
+fn index_valid(d: &[u8], table_base: usize, n: u32) -> bool {
+    if n == 0 {
+        return false;
+    }
+    let Some(end) = (n as usize + 1)
+        .checked_mul(4)
+        .and_then(|bytes| table_base.checked_add(bytes))
+    else {
+        return false;
+    };
+    if end > d.len() {
+        return false;
+    }
+    let mut prev = table_base as u64;
+    for i in 0..=n as usize {
+        let off = u64::from(u32_at(d, table_base + i * 4).unwrap_or(0) & !1);
+        if off < table_base as u64 || off > d.len() as u64 || off < prev {
+            return false;
+        }
+        prev = off;
+    }
+    true
+}
+
+/// Per-frame split: audio packet references plus the video payload range.
+#[derive(Debug, Clone)]
+pub struct FramePackets {
+    /// One optional packet reference per audio track, in track order.
+    pub audio: Vec<Option<AudioPacketRef>>,
+    /// Byte offset of the video payload.
+    pub video_offset: u64,
+    /// Byte length of the video payload.
+    pub video_size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synth(frames: u32, audio_tracks: u32, frames_b: u32) -> Vec<u8> {
+        // Header + audio + index + one byte per frame.
+        let table_base = 44 + audio_tracks as usize * 12;
+        let data_start = table_base + (frames as usize + 1) * 4;
+        let mut d = vec![0u8; 44];
+        d[0..3].copy_from_slice(b"BIK");
+        d[3] = b'i';
+        d[4..8].copy_from_slice(&0u32.to_le_bytes());
+        d[8..12].copy_from_slice(&frames.to_le_bytes());
+        d[12..16].copy_from_slice(&0u32.to_le_bytes());
+        d[16..20].copy_from_slice(&frames_b.to_le_bytes());
+        d[20..24].copy_from_slice(&640u32.to_le_bytes());
+        d[24..28].copy_from_slice(&480u32.to_le_bytes());
+        d[28..32].copy_from_slice(&30u32.to_le_bytes());
+        d[32..36].copy_from_slice(&1u32.to_le_bytes());
+        d[36..40].copy_from_slice(&0u32.to_le_bytes());
+        d[40..44].copy_from_slice(&audio_tracks.to_le_bytes());
+        for _ in 0..audio_tracks {
+            d.extend_from_slice(&[0u8; 12]);
+        }
+        assert_eq!(d.len(), table_base);
+        d.resize(data_start, 0);
+        // Index entries: frame k at data_start + 2*k (even, so bit 0 is the keyframe flag).
+        for i in 0..=frames as usize {
+            let off = data_start as u32 + i as u32 * 2;
+            let v = if i == 0 { off | 1 } else { off };
+            d[table_base + i * 4..table_base + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        d.resize(data_start + frames as usize * 2, 0);
+        d
+    }
+
+    /// A one-track container whose frame payloads are given verbatim.
+    fn with_payloads(payloads: &[Vec<u8>]) -> Vec<u8> {
+        let n = payloads.len() as u32;
+        let mut d = synth(n, 1, n);
+        let table_base = 44 + 12;
+        let data_start = table_base + (payloads.len() + 1) * 4;
+        d.truncate(data_start);
+        let mut off = data_start;
+        for (i, p) in payloads.iter().enumerate() {
+            let v = if i == 0 { off as u32 | 1 } else { off as u32 };
+            d[table_base + i * 4..table_base + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            d.extend_from_slice(p);
+            off += p.len();
+        }
+        let end = off as u32;
+        let i = payloads.len();
+        d[table_base + i * 4..table_base + i * 4 + 4].copy_from_slice(&end.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn zero_length_audio_has_no_sample_count_word() {
+        let mut f0 = Vec::new();
+        f0.extend_from_slice(&8u32.to_le_bytes()); // audio length incl. sample count
+        f0.extend_from_slice(&99u32.to_le_bytes()); // sample count
+        f0.extend_from_slice(&[1, 2, 3, 4]); // audio bytes
+        f0.extend_from_slice(&[0xA0, 0xA1, 0xA2, 0xA3]); // video
+        let mut f1 = Vec::new();
+        f1.extend_from_slice(&0u32.to_le_bytes()); // no audio
+        f1.extend_from_slice(&[0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5]); // video
+        let d = with_payloads(&[f0, f1]);
+        let bik = BikFile::parse(&d).unwrap();
+        let p0 = bik.frame_packets(&d, 0).unwrap();
+        let a = p0.audio[0].as_ref().unwrap();
+        assert_eq!((a.size, a.decoded_bytes), (4, 99));
+        assert_eq!(p0.video_size, 4);
+        assert_eq!(d[p0.video_offset as usize], 0xA0);
+        let p1 = bik.frame_packets(&d, 1).unwrap();
+        assert!(p1.audio[0].is_none());
+        assert_eq!(p1.video_size, 6);
+        assert_eq!(d[p1.video_offset as usize], 0xB0);
+    }
+
+    #[test]
+    fn parses_synthetic_container() {
+        let d = synth(5, 1, 5);
+        let f = BikFile::parse(&d).unwrap();
+        assert_eq!(f.frame_count(), 5);
+        assert!(f.frames[0].keyframe);
+        assert!(!f.frames[1].keyframe);
+        assert_eq!(f.audio.len(), 1);
+        assert_eq!(f.header.width, 640);
+        assert!((f.header.fps() - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn uses_offset8_frame_count() {
+        // Offset 8 is authoritative even when the duplicate differs.
+        let d = synth(5, 0, 5);
+        let d2 = {
+            let mut v = d.clone();
+            v[16..20].copy_from_slice(&9u32.to_le_bytes());
+            v
+        };
+        let f = BikFile::parse(&d2).unwrap();
+        assert_eq!(f.frame_count(), 5);
+        assert!(!f.used_duplicate_frame_count);
+    }
+
+    #[test]
+    fn falls_back_to_duplicate_when_primary_index_is_invalid() {
+        // Break the end entry of the 5-frame index, then rely on the duplicate count of 2.
+        let mut d = synth(5, 0, 5);
+        d[8..12].copy_from_slice(&5u32.to_le_bytes());
+        d[16..20].copy_from_slice(&2u32.to_le_bytes());
+        let table_base = 44usize;
+        let end_entry = table_base + 5 * 4;
+        d[end_entry..end_entry + 4].copy_from_slice(&0u32.to_le_bytes());
+        let f = BikFile::parse(&d).unwrap();
+        assert_eq!(f.frame_count(), 2);
+        assert!(f.used_duplicate_frame_count);
+    }
+
+    #[test]
+    fn rejects_bad_signature_and_revision() {
+        let mut d = synth(3, 0, 3);
+        d[0] = b'X';
+        assert_eq!(
+            BikFile::parse(&d).unwrap_err().kind(),
+            VideoErrorKind::BadSignature
+        );
+        let mut d = synth(3, 0, 3);
+        d[3] = b'f';
+        assert_eq!(
+            BikFile::parse(&d).unwrap_err().kind(),
+            VideoErrorKind::BadSignature
+        );
+    }
+
+    #[test]
+    fn rejects_truncation_and_bad_offsets() {
+        assert_eq!(
+            BikFile::parse(&[0u8; 10]).unwrap_err().kind(),
+            VideoErrorKind::Truncated
+        );
+        let mut d = synth(3, 0, 3);
+        // Corrupt an index entry to point before the file start.
+        d[44..48].copy_from_slice(&0x0000_0001u32.to_le_bytes());
+        assert_eq!(
+            BikFile::parse(&d).unwrap_err().kind(),
+            VideoErrorKind::BadValue
+        );
+    }
+
+    #[test]
+    fn audio_headers_are_grouped_per_field() {
+        // Two tracks: [max0, max1], [fmt0, fmt1], [id0, id1].
+        let mut d = synth(3, 2, 3);
+        let at = 44;
+        d[at..at + 4].copy_from_slice(&0x0002_1c00u32.to_le_bytes());
+        d[at + 4..at + 8].copy_from_slice(&0x0000_4000u32.to_le_bytes());
+        d[at + 8..at + 12].copy_from_slice(&(44100u32 | 0x7000 << 16).to_le_bytes());
+        d[at + 12..at + 16].copy_from_slice(&(22050u32 | 0x1000 << 16).to_le_bytes());
+        d[at + 16..at + 20].copy_from_slice(&7u32.to_le_bytes());
+        d[at + 20..at + 24].copy_from_slice(&9u32.to_le_bytes());
+        let f = BikFile::parse(&d).unwrap();
+        assert_eq!(f.audio.len(), 2);
+        let (a, b) = (&f.audio[0], &f.audio[1]);
+        assert_eq!(
+            (a.max_decoded_bytes, a.sample_rate, a.flags, a.id),
+            (0x21c00, 44100, 0x7000, 7)
+        );
+        assert_eq!(
+            (a.channels(), a.sixteen_bit(), a.audio_dct()),
+            (2, true, true)
+        );
+        assert_eq!(
+            (b.max_decoded_bytes, b.sample_rate, b.flags, b.id),
+            (0x4000, 22050, 0x1000, 9)
+        );
+        assert_eq!(
+            (b.channels(), b.sixteen_bit(), b.audio_dct()),
+            (1, false, true)
+        );
+    }
+}

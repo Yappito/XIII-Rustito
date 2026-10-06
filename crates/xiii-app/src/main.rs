@@ -12,6 +12,7 @@ mod play;
 mod reach;
 mod save;
 mod smoke;
+mod video;
 mod viewer;
 
 use bevy::prelude::*;
@@ -173,6 +174,7 @@ fn build_app(opts: cli::Options) -> App {
                     "XIII Classic runtime - movement prototype (NOT gameplay)".into()
                 }
                 cli::Mode::Menu => "XIII Classic runtime - front-end menu (item16)".into(),
+                cli::Mode::Video => "XIII Classic runtime - Bink cutscene".into(),
             },
             resolution: (opts.width, opts.height).into(),
             present_mode,
@@ -200,6 +202,9 @@ fn build_app(opts: cli::Options) -> App {
         cli::Mode::Menu => {
             // Handled before `build_app`; a menu App is built by `menu::build_menu_app`.
             app.add_plugins(menu::MenuPlugin { options: opts });
+        }
+        cli::Mode::Video => {
+            app.add_plugins(video::VideoPlugin { options: opts });
         }
     }
 

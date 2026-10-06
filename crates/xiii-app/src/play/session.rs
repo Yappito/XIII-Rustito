@@ -123,6 +123,12 @@ pub struct Session {
     /// would clobber `XIIIPlayerController.GameEndedSuccess` if the intro were still running when
     /// the level ends.
     cine_stopped: bool,
+    /// Minimal Canvas used only by the headless route to drive the engine's render-phase script
+    /// gates. The windowed renderer owns its own Canvas through `hud::setup`.
+    render_canvas: Option<ObjectId>,
+    /// Pawn pose owned by a script cutscene this step; the host movement sim copies it back after
+    /// `step` so it resumes from the script's final pose rather than snapping to its stale pose.
+    script_pawn_sync: Option<([f32; 3], f32, [f32; 3])>,
 }
 
 /// Host-owned player movement fields published to the VM pawn each fixed tick (item7b).
@@ -468,6 +474,8 @@ impl Session {
             ai_shots: VecDeque::new(),
             tick_count: 0,
             cine_stopped: false,
+            render_canvas: None,
+            script_pawn_sync: None,
         };
         session.localized_overrides = session.vm.localized_overrides;
         session.suspended.dedup();
@@ -646,75 +654,94 @@ impl Session {
         modes: &PlayerVMModes,
     ) {
         self.moved.clear();
+        self.script_pawn_sync = None;
+        let script_owned_before = self.script_owns_player_pawn();
+        // A cutscene can defer a return-valued inventory callback while it temporarily removes
+        // the player pawn from the VM tick set. Once the game's controller state returns to
+        // PlayerWalking, the pawn is again a live participant: pickup Touch -> GiveTo ->
+        // AddInventory must execute on it rather than being deferred as an out-of-scope event.
+        if self
+            .controller
+            .is_some_and(|pc| self.vm.is_in_state(pc, "PlayerWalking"))
+            && !self.vm.objects[self.player as usize].active
+        {
+            self.vm.set_active(self.player, true);
+            println!(
+                "[play] t={:.3}s restored local player pawn to VM tick scope after cutscene handoff",
+                self.vm.time
+            );
+        }
         // Refresh the posed hit boxes before the VM traces (host `fire` and any script trace in
         // this tick see the current body pose).
         self.update_hit_boxes();
         let profiling = self.vm.native_profile().enabled;
         let t0 = Instant::now();
-        let _ = self
-            .vm
-            .set_property(self.player, "Location", 0, Value::Vector(location));
-        // On the landing tick, publish the impact velocity so `TakeFallingDamage` reads it.
-        let published_velocity = match modes.landed_velocity_z {
-            Some(vz) => [velocity[0], velocity[1], vz],
-            None => velocity,
-        };
-        let _ = self.vm.set_property(
-            self.player,
-            "Velocity",
-            0,
-            Value::Vector(published_velocity),
-        );
-        let yaw_units = (yaw / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN).round() as i32;
-        let _ = self.vm.set_property(
-            self.player,
-            "Rotation",
-            0,
-            Value::Rotator([0, yaw_units, 0]),
-        );
-        // The engine tracks the look direction on the `PlayerController` (`Pawn.GetViewRotation`
-        // returns `Controller.Rotation` for a player pawn); the host owns the player's yaw, so
-        // write it to the controller too. Without this `XIIIWeapon.RealTraceFire` traces along the
-        // controller default rotation (item14).
-        if let Some(ctrl) = self.controller {
+        if !script_owned_before {
             let _ = self
                 .vm
-                .set_property(ctrl, "Rotation", 0, Value::Rotator([0, yaw_units, 0]));
-        }
-        // The host owns the player's movement; keep the held weapon at the eye so the script's
-        // damage falloff (`XIIIBulletsAmmo.ProcessTraceHit` measures `HitLocation - W.Location`)
-        // sees the muzzle distance, not the weapon's stale spawn position. The engine's
-        // `XIIIWeapon.Active.BeginState` does `SetLocation(Instigator.Location + CalcDrawOffset)`.
-        if let Some(weapon) = self.player_weapon() {
-            let eye = match self.vm.get_property(self.player, "EyeHeight") {
-                Some(Value::Float(h)) => *h,
-                _ => match self.vm.get_property(self.player, "BaseEyeHeight") {
-                    Some(Value::Float(h)) => *h,
-                    _ => 0.0,
-                },
+                .set_property(self.player, "Location", 0, Value::Vector(location));
+            // On the landing tick, publish the impact velocity so `TakeFallingDamage` reads it.
+            let published_velocity = match modes.landed_velocity_z {
+                Some(vz) => [velocity[0], velocity[1], vz],
+                None => velocity,
             };
             let _ = self.vm.set_property(
-                weapon,
-                "Location",
+                self.player,
+                "Velocity",
                 0,
-                Value::Vector([location[0], location[1], location[2] + eye]),
+                Value::Vector(published_velocity),
             );
+            let yaw_units = (yaw / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN).round() as i32;
+            let _ = self.vm.set_property(
+                self.player,
+                "Rotation",
+                0,
+                Value::Rotator([0, yaw_units, 0]),
+            );
+            // The engine tracks the look direction on the `PlayerController` (`Pawn.GetViewRotation`
+            // returns `Controller.Rotation` for a player pawn); the host owns the player's yaw, so
+            // write it to the controller too. Without this `XIIIWeapon.RealTraceFire` traces along the
+            // controller default rotation (item14).
+            if let Some(ctrl) = self.controller {
+                let _ =
+                    self.vm
+                        .set_property(ctrl, "Rotation", 0, Value::Rotator([0, yaw_units, 0]));
+            }
+            // The host owns the player's movement; keep the held weapon at the eye so the script's
+            // damage falloff (`XIIIBulletsAmmo.ProcessTraceHit` measures `HitLocation - W.Location`)
+            // sees the muzzle distance, not the weapon's stale spawn position. The engine's
+            // `XIIIWeapon.Active.BeginState` does `SetLocation(Instigator.Location + CalcDrawOffset)`.
+            if let Some(weapon) = self.player_weapon() {
+                let eye = match self.vm.get_property(self.player, "EyeHeight") {
+                    Some(Value::Float(h)) => *h,
+                    _ => match self.vm.get_property(self.player, "BaseEyeHeight") {
+                        Some(Value::Float(h)) => *h,
+                        _ => 0.0,
+                    },
+                };
+                let _ = self.vm.set_property(
+                    weapon,
+                    "Location",
+                    0,
+                    Value::Vector([location[0], location[1], location[2] + eye]),
+                );
+            }
+            let _ =
+                self.vm
+                    .set_property(self.player, "bIsCrouched", 0, Value::Bool(modes.crouched));
+            let _ = self.vm.set_property(
+                self.player,
+                "bWantsToCrouch",
+                0,
+                Value::Bool(modes.crouched),
+            );
+            let _ =
+                self.vm
+                    .set_property(self.player, "bUnderWater", 0, Value::Bool(modes.in_water));
+            let _ = self
+                .vm
+                .set_property(self.player, "Physics", 0, Value::Byte(modes.physics));
         }
-        let _ = self
-            .vm
-            .set_property(self.player, "bIsCrouched", 0, Value::Bool(modes.crouched));
-        let _ = self.vm.set_property(
-            self.player,
-            "bWantsToCrouch",
-            0,
-            Value::Bool(modes.crouched),
-        );
-        let _ = self
-            .vm
-            .set_property(self.player, "bUnderWater", 0, Value::Bool(modes.in_water));
-        let _ = self
-            .vm
-            .set_property(self.player, "Physics", 0, Value::Byte(modes.physics));
         if profiling {
             self.vm.native_profile_mut().player_write_micros += t0.elapsed().as_micros() as u64;
         }
@@ -732,7 +759,7 @@ impl Session {
         self.drain_events();
 
         // The pawn's own landing path (fall damage is the game's code, not the host's).
-        if modes.landed_velocity_z.is_some() {
+        if !script_owned_before && modes.landed_velocity_z.is_some() {
             let arg = Value::Vector(modes.floor_normal);
             if let Err(e) = self.vm.send_event(self.player, "Landed", vec![arg]) {
                 self.record_failure("Landed", &e);
@@ -772,9 +799,104 @@ impl Session {
         }
         let t0 = Instant::now();
         self.update_sync();
+        if script_owned_before || self.script_owns_player_pawn() {
+            let location = self.vm.vector_prop(self.player, "Location");
+            let rotation = self.vm.rotation_prop(self.player);
+            let velocity = self.vm.vector_prop(self.player, "Velocity");
+            if let (Some(location), Some(rotation), Some(velocity)) = (location, rotation, velocity)
+            {
+                self.script_pawn_sync = Some((
+                    location,
+                    rotation[1] as f32 * std::f32::consts::TAU / ROTATOR_UNITS_PER_TURN,
+                    velocity,
+                ));
+            }
+        }
         if profiling {
             self.vm.native_profile_mut().sync_micros += t0.elapsed().as_micros() as u64;
         }
+    }
+
+    /// Drive render-phase callbacks in the deterministic headless harness. The actual windowed
+    /// app calls `HUD.PostRender` from `hud::refresh`; this mirrors that engine callback until the
+    /// script HUD opens the one-way `MapInfo.EndCartoonEffect` gate.
+    pub fn drive_render_phase(&mut self) {
+        let end_cartoon = self.map_info().is_some_and(|mi| {
+            matches!(
+                self.vm.get_property(mi, "EndCartoonEffect"),
+                Some(Value::Bool(true))
+            )
+        });
+        if !end_cartoon {
+            let hud = self
+                .controller
+                .and_then(|pc| instance_prop(&self.vm, pc, "myHUD"))
+                .or_else(|| crate::play::hud::find_hud(&self.vm));
+            if let Some(hud) = hud {
+                let canvas = if let Some(canvas) = self.render_canvas {
+                    canvas
+                } else {
+                    let Some(class) = runtime::resolve_class_path(self.vm.set(), "Engine.Canvas")
+                    else {
+                        self.blocked
+                            .push("headless HUD gate: Engine.Canvas class not loaded".into());
+                        return;
+                    };
+                    let canvas = match self.vm.spawn(class, "HUDCanvas(headless)") {
+                        Ok(canvas) => canvas,
+                        Err(e) => {
+                            self.record_failure("headless HUD Canvas", &e);
+                            return;
+                        }
+                    };
+                    for (prop, value) in [
+                        ("ClipX", Value::Float(1280.0)),
+                        ("ClipY", Value::Float(720.0)),
+                        ("CurX", Value::Float(0.0)),
+                        ("CurY", Value::Float(0.0)),
+                        ("OrgX", Value::Float(0.0)),
+                        ("OrgY", Value::Float(0.0)),
+                        ("Style", Value::Byte(1)),
+                    ] {
+                        let _ = self.vm.set_property(canvas, prop, 0, value);
+                    }
+                    self.render_canvas = Some(canvas);
+                    canvas
+                };
+                let arg = Value::Object(Some(ObjRef::Instance(canvas)));
+                if let Err(e) = self.vm.send_event(hud, "PostRender", vec![arg]) {
+                    self.record_failure("headless HUD.PostRender", &e);
+                }
+                self.vm.drain_canvas();
+                self.drain_events();
+            }
+        }
+        if let Some(pc) = self.controller
+            && self.vm.is_in_state(pc, "WaitForFirstDisplay")
+            && let Err(e) = self
+                .vm
+                .send_event(pc, "RenderOverlays", vec![Value::Object(None)])
+        {
+            self.record_failure("headless PlayerController.RenderOverlays", &e);
+        }
+    }
+
+    /// Host movement ownership is temporarily ceded by the Plage01 wake-up script. While this is
+    /// true, `BeachInBedWithXIII` owns `Location`/`Rotation` and restores collision before it
+    /// returns the controller to PlayerWalking.
+    fn script_owns_player_pawn(&self) -> bool {
+        self.controller.is_some_and(|pc| {
+            self.vm.is_in_state(pc, "NoControl")
+                && matches!(
+                    self.vm.get_property(self.player, "bCollideWorld"),
+                    Some(Value::Bool(false))
+                )
+        })
+    }
+
+    /// Script-driven player pose for the host movement sim to follow during the bed wake-up cine.
+    pub fn script_pawn_pose(&self) -> Option<([f32; 3], f32, [f32; 3])> {
+        self.script_pawn_sync
     }
 
     /// VM time in seconds.
@@ -1106,6 +1228,11 @@ impl Session {
         }
         let pawn = self.player;
         let controller = self.controller.unwrap_or(pawn);
+        // A user-issued use action is delivered to the local controller and pawn even when an
+        // unrelated deferred call previously suspended either from the VM's tick set. In
+        // particular, the final truck-door trigger broadcasts GameEndedSuccess to the controller.
+        self.vm.set_active(pawn, true);
+        self.vm.set_active(controller, true);
         if self.vm.is_in_state(target, "Locked") {
             let Some(key) = self.carried_key_for(target) else {
                 // No matching key carried: run the door's own `Locked.PlayerTrigger` (plays the
@@ -1151,6 +1278,10 @@ impl Session {
         if !self.vm.is_a(target, "pawn") || !self.actor_is_dead(target) {
             return UseOutcome::NotAMover;
         }
+        // A player-controlled pawn remains a live participant in the host search action even if
+        // an earlier deferred controller/UI call removed it from the VM's tick set. The real
+        // SearchPawn -> Transfer -> AddInventory chain needs that scope to link the picked-up key.
+        self.vm.set_active(self.player, true);
         // Collect every item the corpse owns: the `Inventory` chain plus any live `Inventory`
         // object whose `Instigator` is the corpse. The second set matters because the VM defers a
         // script call on an out-of-scope actor, so `FirstFrame.GiveSomething -> GiveTo ->
@@ -1195,6 +1326,10 @@ impl Session {
             }
         }
         for item in items {
+            // Corpse-owned inventory objects can be outside the actor execution scope even though
+            // the dead pawn is searchable. `Transfer` is the game's real pickup chain and must run
+            // on the key so its `GiveTo`/`AddInventory` code can link it to the live player.
+            self.vm.set_active(item, true);
             if let Some(f) = self.vm.class_function(item, "Transfer") {
                 let arg = Value::Object(Some(ObjRef::Instance(self.player)));
                 if let Err(e) = self.vm.call_function(f, item, vec![arg]) {
@@ -1526,6 +1661,12 @@ impl Session {
         let Some(weapon) = self.player_weapon() else {
             return FireOutcome::NoWeapon;
         };
+        // A host fire input can arrive while the VM has suspended the locally controlled pawn
+        // and its diagnostic weapon after unrelated deferred inventory/UI calls. Both are live
+        // participants in this action; restore their execution scope before running the game's
+        // normal aim, reload and trace-fire chain.
+        self.vm.set_active(self.player, true);
+        self.vm.set_active(weapon, true);
         // The host owns the player view (yaw and pitch); the VM's controller state code does not
         // sync it, so re-assert it here where the script reads `GetViewRotation` (item14). The
         // pitch matters for item14b: a level shot at eye height only ever hits the head box, so
@@ -2173,17 +2314,24 @@ mod tests {
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
         let script = script::Script::parse(
-            "t=0.00 teleport -491.8 -414.1 1265.0\n\
-             t=0.10 goto -491.84 -314.14\nt=0.30 jump\nt=0.80 jump\nt=1.30 jump\nt=1.80 jump\n\
-             t=2.30 jump\nt=2.80 forward 0\n\
-             t=3.20 teleport -742.1444 -808.429 1311.0449\n\
-             t=3.20 yaw 312.891\nt=3.20 turn 2\nt=3.20 forward 1\n\
-             t=4.80 turn -45\nt=5.50 forward 0\nt=5.80 use\nt=6.80 use\nt=7.00 forward 1\n\
-             t=8.00 forward 0\n",
+            "t=45.00 teleport -491.8 -414.1 1265.0\n\
+             t=45.10 goto -491.84 -314.14\nt=45.30 jump\nt=45.80 jump\nt=46.30 jump\nt=46.80 jump\n\
+             t=47.30 jump\nt=47.80 forward 0\n\
+             t=48.20 teleport -742.1444 -808.429 1311.0449\n\
+             t=48.20 yaw 312.891\nt=48.20 turn 2\nt=48.20 forward 1\n\
+             t=49.80 turn -45\nt=50.50 forward 0\nt=50.80 use\nt=51.80 use\nt=52.00 forward 1\n\
+             t=53.00 forward 0\n",
         )
         .unwrap();
-        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 9.0)
-            .expect("run Plage01 key+door walk");
+        let outcome = run_script(
+            &game_dir,
+            "Plage01",
+            &script,
+            &resolved.params,
+            &scene,
+            54.0,
+        )
+        .expect("run Plage01 key+door walk");
         let s = &outcome.session;
         let inv = s.inventory_items();
         println!("[key test] inventory: {inv:?}");

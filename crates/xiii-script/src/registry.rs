@@ -1107,7 +1107,15 @@ fn ne_ss(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutc
 }
 
 fn goto_state(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let state = name(vm, a, 0)?;
+    // UE2 `GotoState(, Label)` means continue in the current state at Label, not GotoState(None).
+    // `BeachInBedWithXIII.Waiting.Timer` uses `GotoState(, 'blink')`; treating the omitted first
+    // argument as the name `None` exited Waiting, permanently skipping its Tick/GetUpStandUp
+    // release path on Plage01.
+    let state = if c.omitted(0) {
+        vm.state_name(c.this).unwrap_or_else(|| "None".to_owned())
+    } else {
+        name(vm, a, 0)?
+    };
     let label = match a.get(1) {
         Some(Value::Name(l)) if !l.eq_ignore_ascii_case("None") => l.clone(),
         _ => "Begin".to_owned(),
@@ -1692,6 +1700,22 @@ fn level_info_inc_attaque(
 ) -> VmResult<NativeOutcome> {
     vm.note(TraceKind::Note(
         "LevelInfo.IncAttaque (native 589): level attack counter; the VM has no alarm network"
+            .into(),
+    ));
+    val(Value::Void)
+}
+
+/// `LevelInfo.DecAttaque()` (native 588, static). The matching `IncAttaque` implementation is
+/// item14b's visible Partial; this records the inverse counter operation at the exact decoded
+/// call site. The game's shared alarm/attack counter is not modelled, so this is deliberately a
+/// diagnostic Partial rather than a silent success stub.
+fn level_info_dec_attaque(
+    vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    vm.note(TraceKind::Note(
+        "LevelInfo.DecAttaque (native 588): level attack counter decrement; the VM has no alarm network"
             .into(),
     ));
     val(Value::Void)
@@ -3019,9 +3043,25 @@ fn prop_object(vm: &Vm<'_>, id: ObjectId, name: &str) -> Option<ObjectId> {
     }
 }
 
+/// Raw object-pointer read for the engine's native list maintenance. Unlike [`prop_object`] it
+/// does not hide destroyed actors: `AController::execRemoveController` and
+/// `APawn::execRemovePawnFromList` compare and copy raw `AActor*` values, and a controller runs
+/// `RemoveController` from its own `Destroyed` event (engine.u `Controller.Destroyed` +0x12),
+/// i.e. while the VM has already marked it deleted (see [`Vm::destroy`]).
+fn raw_prop_object(vm: &Vm<'_>, id: ObjectId, name: &str) -> Option<ObjectId> {
+    match vm.get_property(id, name) {
+        Some(Value::Object(Some(ObjRef::Instance(i)))) => Some(*i),
+        _ => None,
+    }
+}
+
 /// `Level.PawnList`/`Level.ControllerList` insert-at-head and unlink, shared by the pawn and
 /// controller list natives (UE2 `APawn::AddPawnToList`/`RemovePawnFromList` and the controller
 /// equivalents).
+///
+/// Engine.dll `AController::execAddController` (0x10367a80..0x10367ab5): `NextController (0x214)
+/// = Level (0x7c)->ControllerList (0x450); Level->ControllerList = this`. The pawn variant is
+/// the same shape on `PawnList (0x454)`/`NextPawn (0x4cc)`.
 fn list_insert_head(
     vm: &mut Vm<'_>,
     obj: ObjectId,
@@ -3029,47 +3069,72 @@ fn list_insert_head(
     list: &str,
     next: &str,
 ) -> VmResult<()> {
-    let head = prop_object(vm, level, list);
+    let head = raw_prop_object(vm, level, list);
     vm.set_property(obj, next, 0, Value::Object(head.map(ObjRef::Instance)));
     vm.set_property(level, list, 0, Value::Object(Some(ObjRef::Instance(obj))));
     Ok(())
 }
 
+/// Engine.dll `AController::execRemoveController` (0x10367ac0..0x10367b21) and
+/// `APawn::execRemovePawnFromList` (0x103b02e0..0x103b0341): if `Level->List == this` the head
+/// becomes `this.Next`; otherwise walk the raw links to the predecessor and set
+/// `pred.Next = this.Next`. All comparisons are raw pointers (a destroyed node is still linked
+/// and still matched), and `this.Next` is never cleared, so a script loop that removes the
+/// current node and then advances with `P = P.NextController` (XIIIGameInfo.EndGame +0x02A8..
+/// +0x0336, where `GotoState('GameEnded')` destroys AI controllers) still reaches the rest.
+///
+/// The engine dereferences `this.Level` (0x7c) without a null check; with no `Level` the VM has
+/// no list to edit, so it records a visible note and leaves every link unchanged.
 fn list_remove(vm: &mut Vm<'_>, obj: ObjectId, list: &str, next: &str) -> VmResult<()> {
-    let Some(level) = prop_object(vm, obj, "Level") else {
-        vm.set_property(obj, next, 0, Value::Object(None));
+    let Some(level) = raw_prop_object(vm, obj, "Level") else {
+        let actor = vm.objects[obj as usize].name.clone();
+        vm.note(TraceKind::Note(format!(
+            "{list} unlink of {actor}: Level is None (the engine dereferences Level unconditionally); links left unchanged"
+        )));
         return Ok(());
     };
-    if prop_object(vm, level, list) == Some(obj) {
-        let successor = prop_object(vm, obj, next);
+    let successor = raw_prop_object(vm, obj, next);
+    if raw_prop_object(vm, level, list) == Some(obj) {
         vm.set_property(
             level,
             list,
             0,
             Value::Object(successor.map(ObjRef::Instance)),
         );
-    } else {
-        let mut cur = prop_object(vm, level, list);
-        let mut guard = 0;
-        while let Some(c) = cur {
-            guard += 1;
-            if guard > 65_536 {
-                break;
-            }
-            if prop_object(vm, c, next) == Some(obj) {
-                let successor = prop_object(vm, obj, next);
-                vm.set_property(c, next, 0, Value::Object(successor.map(ObjRef::Instance)));
-                break;
-            }
-            cur = prop_object(vm, c, next);
-        }
+        return Ok(());
     }
-    vm.set_property(obj, next, 0, Value::Object(None));
+    let mut cur = raw_prop_object(vm, level, list);
+    let mut guard = 0;
+    while let Some(c) = cur {
+        guard += 1;
+        if guard > 65_536 {
+            break;
+        }
+        let after = raw_prop_object(vm, c, next);
+        if after == Some(obj) {
+            vm.set_property(c, next, 0, Value::Object(successor.map(ObjRef::Instance)));
+            break;
+        }
+        cur = after;
+    }
     Ok(())
 }
 
+/// Level for the list natives, or a visible note when it is None (the engine dereferences
+/// `Level` (0x7c) unconditionally in all four natives).
+fn list_level(vm: &mut Vm<'_>, obj: ObjectId, list: &str) -> Option<ObjectId> {
+    let level = raw_prop_object(vm, obj, "Level");
+    if level.is_none() {
+        let actor = vm.objects[obj as usize].name.clone();
+        vm.note(TraceKind::Note(format!(
+            "{list} insert of {actor}: Level is None (the engine dereferences Level unconditionally); links left unchanged"
+        )));
+    }
+    level
+}
+
 fn add_pawn_to_list(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
-    if let Some(level) = prop_object(vm, c.this, "Level") {
+    if let Some(level) = list_level(vm, c.this, "PawnList") {
         list_insert_head(vm, c.this, level, "PawnList", "NextPawn")?;
     }
     val(Value::Void)
@@ -3085,7 +3150,7 @@ fn remove_pawn_from_list(
 }
 
 fn add_controller(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
-    if let Some(level) = prop_object(vm, c.this, "Level") {
+    if let Some(level) = list_level(vm, c.this, "ControllerList") {
         list_insert_head(vm, c.this, level, "ControllerList", "NextController")?;
     }
     val(Value::Void)
@@ -4743,6 +4808,19 @@ fn builtin_defs() -> Vec<NativeDef> {
             level_info_inc_attaque,
         )
     });
+    // item19: complete the BaseSoldier.Died alert-level-2 path paired with item14b's IncAttaque.
+    // The VM records the decrement visibly while the retail alarm counter/network is unresolved.
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "records the level attack counter decrement; the shared alarm/attack bookkeeping is not modelled",
+        ),
+        ..def(
+            "Engine.LevelInfo.DecAttaque",
+            "native(588) final native static function DecAttaque()",
+            "engine.u LevelInfo.DecAttaque decoded (native 588, 1-byte body); XIDPawn.dll XIDPawn.BaseSoldier.Died calls it when IAController.NiveauALerte == 2 (local/re/item15/d_Cine2.txt)",
+            level_info_dec_attaque,
+        )
+    });
     v.push(NativeDef {
         status: NativeStatus::Partial(
             "unit vector from the pawn to Enemy.Location (pawn forward fallback); dispersion/aim \
@@ -5303,6 +5381,9 @@ fn builtin_defs() -> Vec<NativeDef> {
     v.extend(crate::cartoon::cartoon_defs());
     // item18: small VM gaps found on the Plage01 route (float `%`, particle spawn Partial).
     v.extend(item18_defs());
+    // item19: CineController2 cutscene movement and explicit bullet-trail presentation Partials.
+    // New block so a parallel registry edit stays out of the way.
+    v.extend(crate::cinematics::item19_defs());
     // Intro/checkpoint residual natives (`crates/xiii-script/src/residuals.rs`). Kept in one
     // block so a parallel edit to the registry stays out of the way.
     v.extend(crate::residuals::residual_defs());
