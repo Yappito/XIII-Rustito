@@ -7291,6 +7291,11 @@ impl<'s> Vm<'s> {
         }
     }
 
+    /// Live actors in `id`'s `Touching` list (the host-side view of the same list).
+    pub fn touching(&self, id: ObjectId) -> Vec<ObjectId> {
+        self.touching_list(id)
+    }
+
     fn set_touching_list(&mut self, id: ObjectId, list: Vec<ObjectId>) {
         let items = list
             .into_iter()

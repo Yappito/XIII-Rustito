@@ -1,10 +1,14 @@
-# item30: Plage01 route, walked end to end. No teleports except the killer and truck-door
-# ones, which are replaced segment by segment (see local/reports/item30-plage01-walk.md).
+# item30: Plage01 route, walked end to end. No teleport lines. Segments A-D are the measured
+# walks from local/reports/item30-plage01-walk.md (hut, beach nav walk incl. the running jump
+# over the crate wall, TouchTrigger8/7 + killer, truck return legs + Porte1).
 #
-# Steps 1-2 (this file): the hut AND the beach/back-route walk to TouchTrigger8 are fully
-# walked. The TouchTrigger7 teleport lands on the trigger after the detour (it fires the
-# game's own killer chain); the killer and truck-door teleports keep their roles, re-timed to
-# after the walk.
+# The `weapon XIII.m60` grant is a diagnostic weapon bootstrap that stays: the level's own
+# picked-up Beretta is mis-wired to the pawn's fists ammo by the game's decoded pickup chain
+# (zero damage; see the report's "Weapon decision"), and fixing that mis-wiring is a separate
+# task. The fire/death/corpse-search/inventory work is the game's own code.
+#
+# The killer (BaseSoldier6) walks while attacking, so the view is tracked onto it around the
+# firing (`track BaseSoldier6` / `track off`).
 
 # ---- hut: key, Beretta, door (all walked) ------------------------------------------------
 t=45.00 goto -491.84 -314.14
@@ -86,22 +90,20 @@ t=286.00 goto 643.2 -14174.5
 t=293.90 goto 1282.8 -13568.0
 t=301.00 goto 770.5 -12990.7
 t=307.30 goto 1282.4 -12591.3
+# T8 is touched at ~308 s; its killer-scene chain holds the player controller ~13 s, so the
+# killer approach starts after the handback. TouchTrigger7 (tueur_conducteur, r850 at
+# 1093,-13854) fires earlier on the shore walk (~287 s) - that is the game's own chain.
 
-# ---- TouchTrigger7, the killer and the truck door: still teleported in this step ----------
-# The T8 chain (the killer scene) holds the player controller ~13 s (firing inside it defers
-# Pawn.AdjustAim, measured; a T7 teleport 0.5 s into the scene wedged the handback for the
-# rest of the run). Touching T7 after the scene ends (v6: 12.6 s) keeps the chain healthy.
-t=322.00 teleport 1093.0 -13854.0 1113.0
-
-# Diagnostic weapon bootstrap; the actual fire/death/inventory transfer are the game's code.
-# The cliff-vignette chain (dispatcher_tueur_falaise1/2, tueur_rampe) drops the player
-# controller from the executed scope at t~157; firing inside the held window defers
-# Pawn.AdjustAim, and the control return lands 3-4 s after the LAST deferred fire across
-# nine measured runs. Spaced probe fires therefore walk the hold to its end (any probe that
-# lands also damages the killer); the kill burst follows past the longest observed hold.
+# ---- the killer: walked approach (PathNode45 -> AttackPoint47 ReachSpec), then the old
+# route's proven firing geometry (1802,-12700, yaw 270). The killer walks while attacking, so
+# the view is tracked onto it around the firing.
+t=322.20 goto 1776.3 -12641.1
+t=327.50 goto 1802.0 -12700.0
 t=330.00 weapon XIII.m60
-t=331.00 teleport 1802.0 -12700.0 1100.0
+t=330.80 yaw 270.0
 t=331.00 track BaseSoldier6
+# Spaced probe fires walk any held window to its end (any probe that lands also damages the
+# killer); the kill burst follows past the longest observed hold.
 t=345.00 fire
 t=355.00 fire
 t=365.00 fire
@@ -154,11 +156,22 @@ t=407.20 fire
 t=407.60 fire
 t=408.00 fire
 t=408.20 track off
+
+# Search the dead killer for the game's ClefPickup (the pick-up truck key).
 t=408.50 search BaseSoldier6
 
-# Search the dead killer for the game's ClefPickup and use it on the truck's Porte1.
-t=410.50 teleport 1215.0 -14000.0 1105.0
-t=410.50 yaw 270
-t=411.00 use Porte1
-t=412.00 use Porte1
-t=412.50 wait_travel
+# ---- Segment D: walked return legs (AttackPoint47 -> PathNode45 -> PathNode46 -> PathNode48
+# -> PathNode47 -> PathNode18 -> AttackPoint43), then the truck staging point --------------
+t=413.60 goto 1282.4 -12591.3
+t=419.90 goto 770.5 -12990.7
+t=426.20 goto 1282.8 -13568.0
+t=433.30 goto 643.2 -14174.5
+t=441.20 goto 1235.0 -14319.0
+t=447.30 goto 1391.8 -14279.6
+t=450.40 goto 1215.0 -14000.0
+# Porte1 is interaction-hidden, so the named use is required; two uses (Unlocked + Triggered).
+t=455.30 yaw 270.0
+t=455.40 use Porte1
+t=456.40 use Porte1
+t=456.90 wait_travel
+t=458.90 forward 0

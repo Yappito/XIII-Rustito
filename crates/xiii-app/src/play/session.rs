@@ -598,6 +598,55 @@ impl Session {
         if let Err(e) = self.vm.refresh_touching_of(self.player) {
             self.suspend(self.player, &e);
         }
+        // item30: the game's own Tick auto-search (`XIIIPlayerPawn.Tick` 0x017B-0x024F, the
+        // `bAutoPickup` block) drains a touched dead pawn's chain through `Inventory.Transfer`,
+        // whose unlink runs on the item's `Instigator` (`engine.Ammunition.Transfer` 0x0012).
+        // Chain members created by `Weapon.GiveAmmo`'s `AddInventory`/`InsertInventory` carry no
+        // such `Instigator` (engine.u `Weapon.GiveAmmo` 0x008A/0x00DC never sets it), so the
+        // game's own `while (i = P.Inventory)` head never leaves the chain and the loop spins
+        // forever (measured: the Plage01 bed handoff suspends the session with BudgetExceeded at
+        // t=45.13). The engine routes corpse inventory through its carcass machinery, which the
+        // VM does not model; the host completes the same invariant `Session::search_corpse`
+        // already enforces for the host-driven search: a chain member whose `Instigator` is not
+        // the chain owner gets the owner as `Instigator`, exactly the value the engine's own
+        // `GiveTo` leaves on transferred items.
+        for touched in self.vm.touching(self.player) {
+            let dead = matches!(
+                self.vm.get_property(touched, "bIsDead"),
+                Some(Value::Bool(true))
+            );
+            if !dead {
+                continue;
+            }
+            let mut cur = instance_prop(&self.vm, touched, "Inventory");
+            let mut guard = 0;
+            while let Some(item) = cur {
+                guard += 1;
+                if guard > 256 {
+                    break;
+                }
+                let owner_instigator = matches!(
+                    self.vm.get_property(item, "Instigator"),
+                    Some(Value::Object(Some(ObjRef::Instance(i)))) if *i == touched
+                );
+                if !owner_instigator {
+                    self.vm.set_property(
+                        item,
+                        "Instigator",
+                        0,
+                        Value::Object(Some(ObjRef::Instance(touched))),
+                    );
+                    let item_name = self.vm.objects[item as usize].name.clone();
+                    let pawn_name = self.vm.objects[touched as usize].name.clone();
+                    println!(
+                        "[play] t={:.3}s corpse-chain bridge: {} on dead {} gets Instigator={} \
+                         (the game's SearchPawn drain needs the chain owner)",
+                        self.vm.time, item_name, pawn_name, pawn_name
+                    );
+                }
+                cur = instance_prop(&self.vm, item, "Inventory");
+            }
+        }
         if profiling {
             self.vm.native_profile_mut().touch_micros += t0.elapsed().as_micros() as u64;
         }

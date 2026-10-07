@@ -2373,6 +2373,20 @@ fn pawn_eye_position(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResu
     val(Value::Vector([0.0, 0.0, h]))
 }
 
+/// `BaseSoldier.EyePosition`: the soldier eye offset. The caller
+/// (`xidpawn.IAController.Chasse.PickDestination` 0x013C, `ViewSpot = Pawn.Location +
+/// Pawn.EyePosition()`) adds `Location`, so the override is Location-relative like the base
+/// `Engine.Pawn.EyePosition`. **Partial**: the VM returns the `EyeHeight` offset along +Z
+/// (falling back to `BaseEyeHeight`); the DLL body's per-soldier stance/lean offsets are not
+/// reproduced.
+fn base_soldier_eye_position(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    pawn_eye_position(vm, c, _a)
+}
+
 /// item14 `Pawn.GetViewRotation`: the rotation the pawn looks along. UE2 returns the controller's
 /// rotation for a player-controlled pawn; the VM returns `Controller.Rotation` when present,
 /// else the pawn's own `Rotation`.
@@ -5154,6 +5168,20 @@ fn builtin_defs() -> Vec<NativeDef> {
              XIIIWeapon.RealTraceFire adds it to Instigator.Location for the trace start; \
              Engine.dll ?execEyePosition@APawn",
             pawn_eye_position,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "returns EyeHeight/BaseEyeHeight along +Z; the DLL body's per-soldier stance/lean \
+             offsets are not reproduced",
+        ),
+        ..def(
+            "XIDPawn.BaseSoldier.EyePosition",
+            "native(0) simulated native function Vector EyePosition()",
+            "xidpawn.u BaseSoldier.EyePosition decoded (return Vector, native); the caller \
+             IAController.Chasse.PickDestination 0x013C adds Pawn.Location, so the override is \
+             Location-relative; XIDPawn.dll ?execEyePosition@ABaseSoldier",
+            base_soldier_eye_position,
         )
     });
     v.push(NativeDef {
