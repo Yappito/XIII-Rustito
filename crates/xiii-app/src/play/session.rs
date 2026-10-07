@@ -2700,14 +2700,16 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        // Start 3 s after the old 45 s mark: with the engine's cine arrival rule
+        // (XIDCine IsTargetReached) the Plage01 intro returns control at ~46.5 s, not ~44.5 s.
         let script = script::Script::parse(
-            "t=45.00 teleport -491.8 -414.1 1265.0\n\
-             t=45.10 goto -491.84 -314.14\nt=45.30 jump\nt=45.80 jump\nt=46.30 jump\nt=46.80 jump\n\
-             t=47.30 jump\nt=47.80 forward 0\n\
-             t=48.20 teleport -742.1444 -808.429 1311.0449\n\
-             t=48.20 yaw 312.891\nt=48.20 turn 2\nt=48.20 forward 1\n\
-             t=49.80 turn -45\nt=50.50 forward 0\nt=50.80 use\nt=51.80 use\nt=52.00 forward 1\n\
-             t=53.00 forward 0\n",
+            "t=48.00 teleport -491.8 -414.1 1265.0\n\
+             t=48.10 goto -491.84 -314.14\nt=48.30 jump\nt=48.80 jump\nt=49.30 jump\nt=49.80 jump\n\
+             t=50.30 jump\nt=50.80 forward 0\n\
+             t=51.20 teleport -742.1444 -808.429 1311.0449\n\
+             t=51.20 yaw 312.891\nt=51.20 turn 2\nt=51.20 forward 1\n\
+             t=52.80 turn -45\nt=53.50 forward 0\nt=53.80 use\nt=54.80 use\nt=55.00 forward 1\n\
+             t=56.00 forward 0\n",
         )
         .unwrap();
         let outcome = run_script(
@@ -2716,7 +2718,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            54.0,
+            57.0,
         )
         .expect("run Plage01 key+door walk");
         let s = &outcome.session;

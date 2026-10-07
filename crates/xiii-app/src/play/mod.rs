@@ -2823,14 +2823,16 @@ mod tests {
         // Item3i: the door key is no longer host-granted. The pawn walks onto the hut key
         // through the game's own pickup chain (autopilot `goto` + jumps; approached from the
         // key's open -Y side), then walks to `Porte6` and uses the carried key.
+        // Start 3 s after the old 45 s mark: with the engine's cine arrival rule
+        // (XIDCine IsTargetReached) the Plage01 intro returns control at ~46.5 s, not ~44.5 s.
         let script = script::Script::parse(
-            "t=45.00 teleport -491.8 -414.1 1265.0\n\
-             t=45.10 goto -491.84 -314.14\nt=45.30 jump\nt=45.80 jump\nt=46.30 jump\nt=46.80 jump\n\
-             t=47.30 jump\nt=47.80 forward 0\n\
-             t=48.20 teleport -742.1444 -808.429 1311.0449\n\
-             t=48.20 yaw 312.891\nt=48.20 turn 2\nt=48.20 forward 1\n\
-             t=49.80 turn -45\nt=50.50 forward 0\nt=50.80 use\nt=51.80 use\nt=52.00 forward 1\n\
-             t=53.00 forward 0\n",
+            "t=48.00 teleport -491.8 -414.1 1265.0\n\
+             t=48.10 goto -491.84 -314.14\nt=48.30 jump\nt=48.80 jump\nt=49.30 jump\nt=49.80 jump\n\
+             t=50.30 jump\nt=50.80 forward 0\n\
+             t=51.20 teleport -742.1444 -808.429 1311.0449\n\
+             t=51.20 yaw 312.891\nt=51.20 turn 2\nt=51.20 forward 1\n\
+             t=52.80 turn -45\nt=53.50 forward 0\nt=53.80 use\nt=54.80 use\nt=55.00 forward 1\n\
+             t=56.00 forward 0\n",
         )
         .unwrap();
         let outcome = run_script(
@@ -2839,7 +2841,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            54.0,
+            57.0,
         )
         .expect("run Plage01 door walk");
         let s = &outcome.session;
@@ -4143,13 +4145,15 @@ mod tests {
         // boxes (item14b) the large `X Spine1` box overlaps the lower head, so a point-blank
         // horizontal shot is a chest hit; the head needs the ray to clear the torso first. The
         // battle is entirely script-driven (no host damage).
+        // Start 3 s after the old 45 s mark: with the engine's cine arrival rule
+        // (XIDCine IsTargetReached) the Plage01 intro returns control at ~46.5 s, not ~44.5 s.
         let script = script::Script::parse(
-            "t=45.00 weapon XIII.Beretta\n\
-             t=45.20 teleport 1802.4131 -12992.034 1070.843\n\
-             t=45.20 yaw 90\n\
-             t=45.20 pitch 5\n\
-             t=45.30 fire\nt=45.90 fire\nt=46.50 fire\nt=47.10 fire\nt=47.70 fire\nt=48.30 fire\n\
-             t=48.90 fire\nt=49.50 fire\nt=50.10 fire\nt=50.70 fire\nt=51.30 fire\n",
+            "t=48.00 weapon XIII.Beretta\n\
+             t=48.20 teleport 1802.4131 -12992.034 1070.843\n\
+             t=48.20 yaw 90\n\
+             t=48.20 pitch 5\n\
+             t=48.30 fire\nt=48.90 fire\nt=49.50 fire\nt=50.10 fire\nt=50.70 fire\nt=51.30 fire\n\
+             t=51.90 fire\nt=52.50 fire\nt=53.10 fire\nt=53.70 fire\nt=54.30 fire\n",
         )
         .unwrap();
         let outcome = run_script(
@@ -4158,7 +4162,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            53.0,
+            56.0,
         )
         .expect("run Plage01 fight");
         let s = &outcome.session;
