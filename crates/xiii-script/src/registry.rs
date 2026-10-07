@@ -2170,12 +2170,14 @@ fn set_view_target(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<
     val(Value::Void)
 }
 
-/// `Actor.MakeNoise`: UE2 notifies nearby AI (`Pawn.HearNoise`) of a noise at the actor's
-/// location. The VM has no AI hearing/perception model, so the call is accepted and discarded
-/// (registered `Partial` with that reason; `GameInfo.PlayTeleportEffect` calls it on the
-/// player-login path).
-fn make_noise(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
-    let _ = vm;
+/// Engine.dll `AActor::execMakeNoise` (RVA 0xAFF40) forwards Loudness to
+/// `AActor::CheckNoiseHearing` (RVA 0x6B6D0), which calls `AController::CanHear` (RVA 0x6B0F0)
+/// and dispatches `HearNoise(Loudness, NoiseMaker)` to eligible controllers. The VM reproduces
+/// the controller/pawn/range/world-occlusion path; XIII's native sound-slot and team filters are
+/// not represented in the VM and remain an explicit partial.
+fn make_noise(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let loudness = float(vm, a, 0)?;
+    vm.vm_make_noise(c.this, loudness)?;
     val(Value::Void)
 }
 
@@ -4220,7 +4222,7 @@ fn builtin_defs() -> Vec<NativeDef> {
         ),
         NativeDef {
             status: NativeStatus::Partial(
-                "no AI hearing/perception model: the call is accepted and discarded, AI `HearNoise` is not invoked",
+                "dispatches by pawn HearingThreshold, loudness-scaled distance and clear world trace; engine sound-slot, team and controller CanHear filters remain unmodelled",
             ),
             ..def(
                 "Engine.Actor.MakeNoise",
@@ -4290,7 +4292,7 @@ fn builtin_defs() -> Vec<NativeDef> {
         },
         NativeDef {
             status: NativeStatus::Partial(
-                "world move via the physics provider (move_box, no sliding); actor blocking is a cylinder-sweep stop; no Bump/EncroachingOn events; player/projectile bBlockPlayers pairing is inferred from class names (XIII has no bIsPlayerPawn field)",
+                "world move via physics provider; cylinder blocking dispatches Bump to the blocking actor, then refreshes Touch/UnTouch; encroachment events and exact native ordering remain unverified; player/projectile bBlockPlayers pairing inferred from class names",
             ),
             ..def(
                 "Engine.Actor.Move",
@@ -4630,7 +4632,7 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "world line trace between the pawn eyes; actor occlusion is not modelled",
+            "world line trace between pawn eyes; actor occlusion not modelled (engine disassembly notes unavailable for verification)",
         ),
         ..def(
             "Engine.Controller.LineOfSightTo",

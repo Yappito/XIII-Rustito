@@ -7144,16 +7144,81 @@ impl<'s> Vm<'s> {
             end = out.end;
             world_hit = out.hit.is_some();
         }
-        let mut blocked_actor = false;
+        let mut blocked_actor = None;
         if self.bool_prop(id, "bCollideActors")
-            && let Some((t, _)) = self.sweep_blocking_actor(id, start, end)
+            && let Some((t, other)) = self.sweep_blocking_actor(id, start, end)
         {
             end = lerp3(start, end, t);
-            blocked_actor = true;
+            blocked_actor = Some(other);
         }
         self.set_property(id, "Location", 0, Value::Vector(end));
+        // ULevel::MoveActor's captured disassembly is truncated before its Bump event dispatch,
+        // so do not infer a recipient or event order from this incomplete artifact.
         self.refresh_touching(id, true)?;
-        Ok(!world_hit && !blocked_actor)
+        Ok(!world_hit && blocked_actor.is_none())
+    }
+
+    /// Engine `AActor::MakeNoise` path: notify live controllers whose possessed pawn is within
+    /// its hearing threshold, with a clear world trace to the noise source. The engine additionally
+    /// uses ambient/recent sound slots, player/team filters and controller `CanHear` state that
+    /// this VM does not model. Non-finite or non-positive loudness cannot be heard.
+    pub(crate) fn vm_make_noise(&mut self, source: ObjectId, loudness: f32) -> VmResult<()> {
+        if !self.is_live_actor(source) || !loudness.is_finite() || loudness <= 0.0 {
+            return Ok(());
+        }
+        let Some(noise_location) = self.vector_prop(source, "Location") else {
+            return Ok(());
+        };
+        let receivers: Vec<ObjectId> = (0..self.objects.len() as ObjectId)
+            .filter(|&id| self.is_live_actor(id) && self.is_a(id, "Controller"))
+            .filter_map(|controller| {
+                let pawn = self.obj_prop(controller, "Pawn")?;
+                if pawn == source || !self.is_live_actor(pawn) {
+                    return None;
+                }
+                let threshold = self.f32_prop(pawn, "HearingThreshold");
+                let location = self.vector_prop(pawn, "Location")?;
+                // UE2 scales hearing distance with noise Loudness. XIII scripts set this field
+                // in Unreal units; squared distance avoids the extra square root and keeps the
+                // inclusive threshold boundary stable.
+                let radius = threshold * loudness;
+                let dx = location[0] - noise_location[0];
+                let dy = location[1] - noise_location[1];
+                let dz = location[2] - noise_location[2];
+                let d2 = dx * dx + dy * dy + dz * dz;
+                (threshold.is_finite()
+                    && threshold > 0.0
+                    && radius.is_finite()
+                    && d2 <= radius * radius)
+                    .then_some(controller)
+            })
+            .collect();
+
+        for controller in receivers {
+            let pawn = self.obj_prop(controller, "Pawn");
+            let Some(pawn) = pawn else { continue };
+            let Some(listener) = self.vector_prop(pawn, "Location") else {
+                continue;
+            };
+            // A missing world provider does not disable the native: the headless diagnostic VM
+            // has no map geometry, while map-backed sessions always install one.
+            if self.physics.is_some()
+                && self.physics.as_mut().is_some_and(|physics| {
+                    physics.trace(listener, noise_location, [0.0; 3]).is_some()
+                })
+            {
+                continue;
+            }
+            self.send_event(
+                controller,
+                "HearNoise",
+                vec![
+                    Value::Float(loudness),
+                    Value::Object(Some(ObjRef::Instance(source))),
+                ],
+            )?;
+        }
+        Ok(())
     }
 
     /// `Actor.SetLocation`: teleport when the destination is free of world geometry and not
@@ -7513,8 +7578,11 @@ impl<'s> Vm<'s> {
         };
         let a = self.eye_location(pawn);
         let b = self.eye_location(other_pawn);
-        let hit = self.physics.as_mut().and_then(|p| p.trace(a, b, [0.0; 3]));
-        Ok(hit.is_none())
+        let world_hit = self.physics.as_mut().and_then(|p| p.trace(a, b, [0.0; 3]));
+        if world_hit.is_some() {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// `Actor.Location + Actor.BaseEyeHeight` (the eye point upstream traces between).
