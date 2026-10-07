@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use crate::events::{PresentationEvent, SoundEvent, TravelRequest, TravelSource};
 use crate::linker::GlobalRef;
 use crate::value::{ObjRef, ObjectId, Value};
-use crate::vm::{Latent, TraceKind, Vm, VmErrorKind, VmResult};
+use crate::vm::{Latent, TraceKind, Vm, VmErrorKind, VmResult, PHYS_FALLING};
 
 /// Context of one native invocation.
 #[derive(Debug, Clone)]
@@ -1472,6 +1472,27 @@ fn finish_rotation(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult
     vm.pending_latent = Some(Latent::Rotation {
         started: vm.time_now(),
     });
+    val(Value::Void)
+}
+
+/// `Controller.WaitForLanding`: suspend the current state until the controller's pawn is no
+/// longer in `PHYS_Falling`. Upstream returns immediately (no latent) when there is no pawn or
+/// the pawn is not falling; the per-tick landing advance is [`Vm::advance_falling`].
+fn wait_for_landing(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    if !c.in_state_code {
+        return Err(vm.err(VmErrorKind::LatentOutsideState {
+            path: c.path.clone(),
+        }));
+    }
+    if let Some(pawn) = vm.obj_prop(c.this, "Pawn")
+        && !vm.objects.get(pawn as usize).is_none_or(|o| o.deleted)
+        && vm.byte_prop(pawn, "Physics") == PHYS_FALLING
+    {
+        vm.pending_latent = Some(Latent::Landing {
+            pawn,
+            started: vm.time_now(),
+        });
+    }
     val(Value::Void)
 }
 
@@ -4685,6 +4706,23 @@ fn builtin_defs() -> Vec<NativeDef> {
             "native(508) final latent function FinishRotation()",
             "engine.u Controller.FinishRotation decoded (void, latent); UE2 AController::FinishRotation waits for the pawn to face FocalPoint; Engine.dll ?execFinishRotation@AController",
             finish_rotation,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "latent ends when the pawn's Physics leaves PHYS_Falling; the per-tick fall advance \
+             applies LevelInfo gravity and lands on the world floor (no fall damage physics, \
+             no velocity-driven horizontal drift)",
+        ),
+        ..def(
+            "Engine.Controller.WaitForLanding",
+            "native(527) final latent function WaitForLanding()",
+            "engine.u Controller.WaitForLanding decoded (void, latent); UE2 AController::\
+             WaitForLanding returns immediately when the pawn is not falling, else waits for the \
+             landing; Engine.dll ?execWaitForLanding@AController and \
+             ?execPollWaitForLanding@AController; the map caller is xidpawn.IAController.Init \
+             code 0x00F0 (rappel spawn, after SetPhysics(PHYS_Falling) at 0x0077)",
+            wait_for_landing,
         )
     });
     // ---- item8b movers/doors: kept in their own block so a parallel AI-native edit merges

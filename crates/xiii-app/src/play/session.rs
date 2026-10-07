@@ -2334,6 +2334,14 @@ impl Session {
     }
 
     fn record_failure(&mut self, name: &str, e: &VmError) {
+        // item30 temporary: suspension visibility (removed with the investigation).
+        if self.failures.len() + self.suspended.len() < 200 {
+            println!(
+                "[play] suspend t={:.3}s {name}: {}",
+                self.vm.time,
+                e.to_string().split('\n').next().unwrap_or("")
+            );
+        }
         if !self.suspended.iter().any(|s| s == name) {
             self.suspended.push(name.to_owned());
         }

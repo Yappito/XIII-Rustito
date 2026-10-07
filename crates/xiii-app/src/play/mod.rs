@@ -2058,6 +2058,15 @@ pub(crate) fn run_script(
                 .vm()
                 .find_live_object(&name)
                 .and_then(|id| runtime.session.vm().vector_prop(id, "Location"));
+            // item30 temporary: tracked-actor positions over time (removed with the
+            // killer-scene investigation).
+            if tick.is_multiple_of(TRACE_EVERY) {
+                if let Some(loc) = location {
+                    println!("[track] t={elapsed:.3}s {name} at ({:.1},{:.1},{:.1})", loc[0], loc[1], loc[2]);
+                } else {
+                    println!("[track] t={elapsed:.3}s {name} not live");
+                }
+            }
             drive.set_track_location(Some(&name), location);
         } else {
             drive.set_track_location(None, None);
@@ -2523,6 +2532,11 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
     }
     if let Some(first) = session.first_error() {
         println!("[play] first script error: {first}");
+    }
+    // item30 temporary: every recorded script failure with its actor (removed with the
+    // killer-scene investigation).
+    for (name, error) in session.failures.iter() {
+        println!("[play] failure {name}: {error}");
     }
     // Footstep summary and the full ordered list (requirement 3: count and names on Plage01).
     let mut by_sound: std::collections::BTreeMap<String, (usize, Option<String>)> =

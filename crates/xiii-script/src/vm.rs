@@ -383,6 +383,16 @@ pub enum Latent {
         /// VM time when it started.
         started: f64,
     },
+    /// `Controller.WaitForLanding`: wait until its pawn is no longer in `PHYS_Falling`
+    /// (Engine.dll `?execWaitForLanding@AController` / `?execPollWaitForLanding@AController`).
+    /// The per-tick `PHYS_Falling` advance that lands the pawn lives in
+    /// [`Vm::advance_falling`].
+    Landing {
+        /// Pawn the landing is waited on.
+        pawn: ObjectId,
+        /// VM time when it started.
+        started: f64,
+    },
 }
 
 /// An object reference into a package outside the loaded script set (e.g. a `Sound` in a
@@ -1006,7 +1016,9 @@ struct Timer {
 /// Event dispatched by timer slot 0/1/2 (UE2 `SetTimer`, `SetTimer2`, `Controller.SetTimer3`).
 const TIMER_EVENTS: [&str; 3] = ["Timer", "Timer2", "Timer3"];
 /// UE2 `EPhysics::PHYS_Walking` (engine.u enum order; see `item7b-movement-modes.md`).
-const PHYS_WALKING: u8 = 1;
+pub(crate) const PHYS_WALKING: u8 = 1;
+/// UE2 `EPhysics::PHYS_Falling` (engine.u enum order).
+pub(crate) const PHYS_FALLING: u8 = 2;
 
 fn vm_move_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1811,6 +1823,15 @@ impl<'s> Vm<'s> {
     fn step(&mut self) -> VmResult<()> {
         self.steps += 1;
         if self.steps > self.limits.max_steps {
+            // item30 temporary: identify the budget consumer (removed with the investigation).
+            if self.steps == self.limits.max_steps + 1 {
+                let stack: Vec<String> = self
+                    .stack
+                    .iter()
+                    .map(|s| format!("{} @ {}", s.object, s.function))
+                    .collect();
+                println!("[vm budget] steps exceeded; stack: {stack:?}");
+            }
             return Err(self.err(VmErrorKind::BudgetExceeded {
                 limit: self.limits.max_steps,
             }));
@@ -3228,6 +3249,27 @@ impl<'s> Vm<'s> {
 
     /// Writes a property by name and element.
     pub fn set_property(&mut self, id: ObjectId, name: &str, elem: usize, v: Value) -> bool {
+        if std::env::var_os("XIII_WATCH_BEDCHAIN").is_some()
+            && name.eq_ignore_ascii_case("inventory")
+        {
+            let writer = self
+                .stack
+                .last()
+                .map(|s| format!("{} @ {}", s.object, s.function))
+                .unwrap_or_else(|| "<host>".to_owned());
+            let oname = self.objects[id as usize].name.clone();
+            let vt = self.value_text(&v);
+            let interesting = oname.starts_with("Cine0")
+                || vt.contains("Fists3")
+                || vt.contains("FistsAmmo3")
+                || oname == "XIIIPlayerPawn";
+            if interesting {
+                eprintln!(
+                    "[vm-bedchain] t={:.3} set {oname}.Inventory = {vt} (writer {writer})",
+                    self.time
+                );
+            }
+        }
         if std::env::var_os("XIII_WATCH_PLAYER_HEALTH").is_some()
             && self.objects.get(id as usize).is_some_and(|o| {
                 o.is_actor && o.layout.chain_names.iter().any(|c| c == "xiiiplayerpawn")
@@ -3662,6 +3704,13 @@ impl<'s> Vm<'s> {
                 self.advance_interpolation(id, dt)?;
             }
         }
+        // Falling pawns advance in the same pre-state slice (UE2 `physFalling` runs in Tick), so
+        // a `WaitForLanding` waiter resumes in the tick its pawn lands.
+        for id in 0..self.objects.len() as ObjectId {
+            if self.objects[id as usize].active {
+                self.advance_falling(id, dt)?;
+            }
+        }
         for id in 0..self.objects.len() as ObjectId {
             if self.objects[id as usize].active {
                 self.process_state(id, dt)?;
@@ -3783,6 +3832,18 @@ impl<'s> Vm<'s> {
         for id in 0..self.objects.len() as ObjectId {
             if self.objects[id as usize].active
                 && let Err(e) = self.advance_interpolation(id, dt)
+            {
+                let suspended = self.suspend_for_error(id, &e);
+                errors.push((suspended, e));
+            }
+        }
+        if profiling {
+            self.profile.movers_micros += t0.elapsed().as_micros() as u64;
+        }
+        let t0 = Instant::now();
+        for id in 0..self.objects.len() as ObjectId {
+            if self.objects[id as usize].active
+                && let Err(e) = self.advance_falling(id, dt)
             {
                 let suspended = self.suspend_for_error(id, &e);
                 errors.push((suspended, e));
@@ -4306,6 +4367,22 @@ impl<'s> Vm<'s> {
         loop {
             rounds += 1;
             if rounds > 10_000 {
+                // item30 temporary: identify the spinning state (removed with the investigation).
+                let name = self.objects[id as usize].name.clone();
+                let state = self.objects[id as usize]
+                    .state
+                    .map(|g| self.set.path(g))
+                    .unwrap_or_default();
+                let pc = self
+                    .objects[id as usize]
+                    .state_code
+                    .as_ref()
+                    .map(|c| c.pc)
+                    .unwrap_or(0);
+                println!(
+                    "[vm spin] actor={name} state={state} pc={pc:#x} rounds={rounds} steps={}",
+                    self.steps
+                );
                 return Err(self.err(VmErrorKind::BudgetExceeded {
                     limit: self.limits.max_steps,
                 }));
@@ -4369,6 +4446,25 @@ impl<'s> Vm<'s> {
                     self.note(TraceKind::LatentResume {
                         actor,
                         native: "Controller.FinishRotation".into(),
+                        started,
+                    });
+                }
+                Some(Latent::Landing { pawn, started }) => {
+                    // `Controller.WaitForLanding`: resume once the pawn left PHYS_Falling
+                    // (advanced by `advance_falling` earlier this tick). A gone pawn resumes
+                    // like upstream's `!Pawn` check.
+                    let landed = !self.is_live_actor(pawn)
+                        || self.byte_prop(pawn, "Physics") != PHYS_FALLING;
+                    if !landed {
+                        return Ok(());
+                    }
+                    if let Some(c) = self.objects[id as usize].state_code.as_mut() {
+                        c.latent = None;
+                    }
+                    let actor = self.objects[id as usize].name.clone();
+                    self.note(TraceKind::LatentResume {
+                        actor,
+                        native: "Controller.WaitForLanding".into(),
                         started,
                     });
                 }
@@ -4468,6 +4564,11 @@ impl<'s> Vm<'s> {
                             seconds: 0.0,
                         }),
                         Latent::Rotation { .. } => self.note(TraceKind::LatentStart {
+                            actor,
+                            native,
+                            seconds: 0.0,
+                        }),
+                        Latent::Landing { .. } => self.note(TraceKind::LatentStart {
                             actor,
                             native,
                             seconds: 0.0,
@@ -4619,6 +4720,105 @@ impl<'s> Vm<'s> {
         target: ObjectId,
         index: Option<u16>,
     ) -> VmResult<Value> {
+        // item30 temporary: auto-search visibility (removed with the investigation).
+        if self.short_path(func).ends_with("SearchPawn") {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 12 {
+                let pawn = call
+                    .args
+                    .first()
+                    .and_then(|a| self.eval(frame, a).ok());
+                let (chain, owner) = match &pawn {
+                    Some(Value::Object(Some(ObjRef::Instance(id)))) => {
+                        let mut items = Vec::new();
+                        let mut cur = Some(*id);
+                        for _ in 0..8 {
+                            let Some(c) = cur else { break };
+                            items.push(self.objects[c as usize].name.clone());
+                            cur = match self.get_property(c, "Inventory") {
+                                Some(Value::Object(Some(ObjRef::Instance(n)))) => Some(*n),
+                                _ => None,
+                            };
+                        }
+                        let owner = match self.get_property(*id, "Owner") {
+                            Some(Value::Object(Some(ObjRef::Instance(o)))) => {
+                                self.objects[*o as usize].name.clone()
+                            }
+                            _ => "-".to_owned(),
+                        };
+                        (items.join(" -> "), owner)
+                    }
+                    _ => ("-".to_owned(), "-".to_owned()),
+                };
+                let tloc = self
+                    .vector_prop(target, "Location")
+                    .map(|l| format!("({:.1},{:.1},{:.1})", l[0], l[1], l[2]))
+                    .unwrap_or("?".to_owned());
+                let ploc = pawn
+                    .as_ref()
+                    .and_then(|v| match v {
+                        Value::Object(Some(ObjRef::Instance(id))) => {
+                            self.vector_prop(*id, "Location")
+                        }
+                        _ => None,
+                    })
+                    .map(|l| format!("({:.1},{:.1},{:.1})", l[0], l[1], l[2]))
+                    .unwrap_or("?".to_owned());
+                let dims = |id: ObjectId| -> String {
+                    let r = self.f32_prop(id, "CollisionRadius");
+                    let h = self.f32_prop(id, "CollisionHeight");
+                    let ca = self.bool_prop(id, "bCollideActors");
+                    let ba = self.bool_prop(id, "bBlockActors");
+                    format!("r={r:.1} h={h:.1} collideActors={ca} blockActors={ba}")
+                };
+                println!(
+                    "[vm search] t={:.2}s SearchPawn on {} at {tloc} ({}) (owner {owner}) chain: {chain}; XP at {ploc} ({})",
+                    self.time,
+                    self.objects[target as usize].name,
+                    dims(target),
+                    pawn.as_ref()
+                        .and_then(|v| match v {
+                            Value::Object(Some(ObjRef::Instance(id))) => Some(dims(*id)),
+                            _ => None,
+                        })
+                        .unwrap_or_default()
+                );
+                // item30 temporary: per-item ownership (removed with the investigation).
+                if let Some(Value::Object(Some(ObjRef::Instance(id)))) = pawn.as_ref() {
+                    let mut cur = Some(*id);
+                    for _ in 0..3 {
+                        let Some(c) = cur else { break };
+                        let own = match self.get_property(c, "Owner") {
+                            Some(Value::Object(Some(ObjRef::Instance(o)))) => {
+                                self.objects[*o as usize].name.clone()
+                            }
+                            _ => "-".to_owned(),
+                        };
+                        let inst = match self.get_property(c, "Instigator") {
+                            Some(Value::Object(Some(ObjRef::Instance(o)))) => {
+                                self.objects[*o as usize].name.clone()
+                            }
+                            _ => "-".to_owned(),
+                        };
+                        let inv = match self.get_property(c, "Inventory") {
+                            Some(Value::Object(Some(ObjRef::Instance(o)))) => {
+                                self.objects[*o as usize].name.clone()
+                            }
+                            _ => "-".to_owned(),
+                        };
+                        println!(
+                            "[vm search]   item {} owner={own} instigator={inst} inventory={inv}",
+                            self.objects[c as usize].name
+                        );
+                        cur = match self.get_property(c, "Inventory") {
+                            Some(Value::Object(Some(ObjRef::Instance(n)))) => Some(*n),
+                            _ => None,
+                        };
+                    }
+                }
+            }
+        }
         let set = self.set;
         let Some(ScriptObject::Function(f)) = set.object(func) else {
             return Err(self.err(VmErrorKind::Unresolved {
@@ -4673,11 +4873,33 @@ impl<'s> Vm<'s> {
             for a in &call.args {
                 self.eval(frame, a)?;
             }
-            self.note(TraceKind::Deferred {
-                target: tname,
-                class,
-                function: self.short_path(func),
-            });
+            // item30 temporary: live drop visibility (removed with the investigation).
+            static DROPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 40 {
+                let from = self
+                    .stack
+                    .last()
+                    .map(|s| format!("{} @ {}", s.object, s.function))
+                    .unwrap_or_default();
+                let f = self.short_path(func);
+                println!(
+                    "[vm drop] t={:.2}s dropped {class}.{f} on suspended {tname} (from {from})",
+                    self.time
+                );
+                self.note(TraceKind::Deferred {
+                    target: tname.clone(),
+                    class: class.clone(),
+                    function: f,
+                });
+            } else {
+                self.note(TraceKind::Deferred {
+                    target: tname.clone(),
+                    class: class.clone(),
+                    function: self.short_path(func),
+                });
+            }
+            drop(class);
             return Ok(Value::Void);
         }
         let mut locals = Vec::with_capacity(layout.size);
@@ -6262,6 +6484,43 @@ impl<'s> Vm<'s> {
                         self.value_text(&v)
                     );
                 }
+                if std::env::var_os("XIII_WATCH_BEDCHAIN").is_some()
+                    && self.objects[*o as usize]
+                        .layout
+                        .slots
+                        .iter()
+                        .find(|s| s.base == *i)
+                        .is_some_and(|s| {
+                            s.name.eq_ignore_ascii_case("inventory")
+                                || s.name.eq_ignore_ascii_case("bsearchable")
+                                || s.name.eq_ignore_ascii_case("health")
+                        })
+                {
+                    let writer = self
+                        .stack
+                        .last()
+                        .map(|s| format!("{} @ {}", s.object, s.function))
+                        .unwrap_or_else(|| "<host>".to_owned());
+                    let oname = self.objects[*o as usize].name.clone();
+                    let vt = self.value_text(&v);
+                    if oname.starts_with("Cine0")
+                        || oname == "XIIIPlayerPawn"
+                        || vt.contains("Fists3")
+                        || vt.contains("FistsAmmo3")
+                    {
+                        eprintln!(
+                            "[vm-bedchain] t={:.3} set {oname}.{} = {vt} (writer {writer})",
+                            self.time,
+                            self.objects[*o as usize]
+                                .layout
+                                .slots
+                                .iter()
+                                .find(|s| s.base == *i)
+                                .map(|s| s.name.as_str())
+                                .unwrap_or("?")
+                        );
+                    }
+                }
                 self.objects[*o as usize].props[*i] = v;
             }
             Place::Elem(base, i, elem_ty) => {
@@ -6577,7 +6836,7 @@ impl<'s> Vm<'s> {
     }
 
     /// Byte property value (`0` when absent; `Int` is accepted for a byte-typed slot).
-    fn byte_prop(&self, id: ObjectId, name: &str) -> u8 {
+    pub(crate) fn byte_prop(&self, id: ObjectId, name: &str) -> u8 {
         match self.get_property(id, name) {
             Some(Value::Byte(b)) => *b,
             Some(Value::Int(i)) => *i as u8,
@@ -7075,6 +7334,24 @@ impl<'s> Vm<'s> {
     /// Sets up a touch pair: links first (so a recursive call sees the binding), then sends
     /// `Touch` to `a` and to `b` (upstream `AActor::Touch`: both sides are notified).
     fn begin_touch(&mut self, a: ObjectId, b: ObjectId) -> VmResult<()> {
+        // item30 temporary: touch-begin visibility (removed with the investigation).
+        if std::env::var_os("XIII_WATCH_BEDCHAIN").is_some()
+            && (self.objects[a as usize].name == "XIIIPlayerPawn"
+                || self.objects[b as usize].name == "XIIIPlayerPawn")
+        {
+            println!(
+                "[vm touch] t={:.3}s begin {} at {:?} r={:?} h={:?} <-> {} at {:?} r={:?} h={:?}",
+                self.time,
+                self.objects[a as usize].name,
+                self.vector_prop(a, "Location"),
+                self.f32_prop(a, "CollisionRadius"),
+                self.f32_prop(a, "CollisionHeight"),
+                self.objects[b as usize].name,
+                self.vector_prop(b, "Location"),
+                self.f32_prop(b, "CollisionRadius"),
+                self.f32_prop(b, "CollisionHeight")
+            );
+        }
         self.touching_add(a, b);
         self.touching_add(b, a);
         self.deliver_touch_event(a, "Touch", b)?;
@@ -8158,6 +8435,60 @@ impl<'s> Vm<'s> {
             );
         }
         self.update_physics_mover(id);
+        Ok(())
+    }
+
+    /// One tick of `PHYS_Falling` for a script pawn: integrate `LevelInfo` gravity into
+    /// `Velocity.Z`, move the pawn through the world provider, and on a floor hit set
+    /// `Physics = PHYS_Walking` and deliver the pawn's own `Landed(HitNormal)` event. This is
+    /// what ends a `Controller.WaitForLanding` latent (the poll resumes when `Physics` leaves
+    /// `PHYS_Falling`).
+    ///
+    /// Evidence: Engine.dll `?physFalling@APawn` (named export) for the physics mode; the
+    /// gravity/floor/Landed ordering is upstream UE2 `APawn::physFalling` (`V.Z += Gravity*dt`,
+    /// floor contact calls `Landed`); the map caller is `xidpawn.IAController.Init` 0x0077-0x013A
+    /// (rappel spawn sets `PHYS_Falling`, waits, then sets `PHYS_Walking`). The horizontal
+    /// velocity drift, acceleration caps and fall-damage computation of the DLL body are not
+    /// reproduced (labelled Partial in the registry note for `WaitForLanding`).
+    fn advance_falling(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
+        if !self.is_live_actor(id) {
+            return Ok(());
+        }
+        if self.byte_prop(id, "Physics") != PHYS_FALLING {
+            return Ok(());
+        }
+        let gravity = self
+            .level_info
+            .map(|l| self.f32_prop(l, "Gravity"))
+            .filter(|g| g.is_finite() && *g != 0.0)
+            .unwrap_or(-950.0);
+        let mut velocity = self.vector_prop(id, "Velocity").unwrap_or([0.0; 3]);
+        velocity[2] += gravity * dt;
+        let start = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
+        let delta = [velocity[0] * dt, velocity[1] * dt, velocity[2] * dt];
+        let collides_world = self.bool_prop(id, "bCollideWorld");
+        let extent = self.actor_extent(id);
+        let (end, floor_normal) = if collides_world {
+            match self.physics.as_mut() {
+                Some(p) => {
+                    let out = p.move_box(start, delta, extent);
+                    let normal = out
+                        .hit
+                        .filter(|hit| hit.normal[2] > 0.5)
+                        .map(|hit| hit.normal);
+                    (out.end, normal)
+                }
+                None => (add3(start, delta), None),
+            }
+        } else {
+            (add3(start, delta), None)
+        };
+        self.set_property(id, "Velocity", 0, Value::Vector(velocity));
+        self.set_property(id, "Location", 0, Value::Vector(end));
+        if let Some(normal) = floor_normal {
+            self.set_property(id, "Physics", 0, Value::Byte(PHYS_WALKING));
+            self.send_event(id, "Landed", vec![Value::Vector(normal)])?;
+        }
         Ok(())
     }
 
