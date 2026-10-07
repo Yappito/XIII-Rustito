@@ -3410,8 +3410,78 @@ fn trail_reset(_: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<Nativ
     val(Value::Void)
 }
 
+/// Headless counterpart of `UInteraction::Initialize`: native viewport/input registration is
+/// unavailable, while the script-owned AddInteraction sequence still owns array membership,
+/// Master, MyPC and Level. Keep this operation explicit in traces instead of silently accepting
+/// an unknown native.
+fn interaction_initialize(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    vm.note(TraceKind::Note(format!(
+        "{}: headless Interaction.Initialize (no viewport input device)",
+        vm.objects[c.this as usize].name
+    )));
+    val(Value::Void)
+}
+
+/// Force-feedback devices are not exposed by the headless VM; retain the controller state and
+/// make the unavailable hardware side effect visible in the trace.
+fn force_feedback_enable(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let enabled = boolean(vm, a, 0)?;
+    vm.note(TraceKind::Note(format!(
+        "{}: headless ForceFeedbackController.EnableForceFeedback({enabled}) (device unavailable)",
+        vm.objects[c.this as usize].name
+    )));
+    val(Value::Void)
+}
+
+fn force_feedback_is_enabled(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    vm.note(TraceKind::Note(format!(
+        "{}: headless ForceFeedbackController.IsForceFeedbackEnable=false (device unavailable)",
+        vm.objects[c.this as usize].name
+    )));
+    val(Value::Bool(false))
+}
+
 fn builtin_defs() -> Vec<NativeDef> {
     let mut v = vec![
+        NativeDef {
+            status: NativeStatus::Partial("headless runtime has no force-feedback device"),
+            ..def(
+                "ForceFeedbackController.EnableForceFeedback",
+                "native(0) function EnableForceFeedback(bool bEnable)",
+                "Engine.ForceFeedbackController native declaration; device output unavailable in headless runtime",
+                force_feedback_enable,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial("headless runtime has no force-feedback device"),
+            ..def(
+                "ForceFeedbackController.IsForceFeedbackEnable",
+                "native(0) function bool IsForceFeedbackEnable()",
+                "Engine.ForceFeedbackController native declaration; no device reports disabled",
+                force_feedback_is_enabled,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial("headless viewport/input registration unavailable"),
+            ..def(
+                "Interaction.Initialize",
+                "native(0) function Interaction.Initialize()",
+                "Engine.Interaction.Initialize declaration; headless runtime supplies Player/Console/InteractionMaster but no UViewport input device",
+                interaction_initialize,
+            )
+        },
         def(
             "Object.Not_PreBool",
             "native(129) preoperator bool !(bool A)",

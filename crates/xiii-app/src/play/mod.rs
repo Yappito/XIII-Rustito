@@ -3848,22 +3848,8 @@ mod tests {
         );
         assert_eq!(
             player_state.as_deref(),
-            Some("NoMove"),
-            "if control returned, route must complete and travel to Toits01"
-        );
-        let controller_failure = outcome
-            .session
-            .failures
-            .iter()
-            .find(|(name, _)| name == "XIIIPlayerController")
-            .map(|(_, error)| error);
-        assert!(
-            controller_failure.is_some_and(|error| {
-                error.contains("CallDepthExceeded")
-                    && error.contains("XIIIPlayerController.SwitchWeapon")
-                    && error.contains("CineController2.PlayingSequence.Tick")
-            }),
-            "expected measured authored-cine weapon-switch blocker; got {controller_failure:?}"
+            Some("PlayerWalking"),
+            "the authored cutscene must return control through the initialized interaction path"
         );
         assert!(
             matches!(
@@ -3872,7 +3858,7 @@ mod tests {
                     xiii_script::ObjRef::Instance(_)
                 )))
             ),
-            "the headless InitInputSystem adapter must provide MyInteraction"
+            "InitInputSystem must provide MyInteraction"
         );
         let rooftop = objectives
             .iter()
@@ -3880,7 +3866,7 @@ mod tests {
             .expect("rooftop objective");
         assert!(
             rooftop.primary && !rooftop.completed,
-            "observed blocker requires the primary rooftop goal to remain incomplete: {rooftop:?}"
+            "this forward-only fixture does not yet reach the rooftop goal: {rooftop:?}"
         );
         let first_after_intro_state = outcome
             .trace
@@ -3889,12 +3875,12 @@ mod tests {
             .expect("post-cutscene-state player trace")
             .2;
         let finish = outcome.trace.last().expect("player trace").2;
-        assert_eq!(
+        assert_ne!(
             first_after_intro_state, finish,
-            "player moved after CineController22 froze the controller"
+            "the returned PlayerWalking controller must accept the route's forward input"
         );
         println!(
-            "[amos01 route] BLOCKED: authored CineController22 still owns NoMove; its weapon-mode tick recurses through SwitchWeapon with no Weapon in inventory. Input held for 120 s; rooftop objective remains pending."
+            "[amos01 route] PARTIAL: InitInputSystem returns the controller to PlayerWalking and forward input moves it; the forward-only fixture does not reach the rooftop objective or request Toits01 travel."
         );
     }
 
