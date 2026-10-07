@@ -425,18 +425,6 @@ impl xiii_script::ExternalObjectData for MenuTextureData {
 }
 
 impl MenuSession {
-    /// Loads the script set and entry map, and spawns the root controller + main menu page. Fonts
-    /// are loaded later (they need the Bevy `Assets<Image>`).
-    #[cfg(test)]
-    fn open(
-        game_dir: &Path,
-        save_dir: PathBuf,
-        script: Option<MenuScript>,
-    ) -> Result<MenuSession, String> {
-        let dir = config::default_dir()?;
-        Self::open_configured(game_dir, save_dir, &dir, script)
-    }
-
     fn open_configured(
         game_dir: &Path,
         save_dir: PathBuf,
@@ -1376,6 +1364,7 @@ impl Plugin for MenuPlugin {
         app.insert_non_send(session)
             .insert_non_send(crate::video::CutsceneHost(cutscene_host))
             .add_plugins((crate::video::CutscenePlugin, cutscene::CutsceneSystems))
+            .add_plugins(MaterialPlugin::<crate::viewer::lights::ReceiverMaterial>::default())
             .insert_resource(MenuConfig {
                 options: self.options.clone(),
             })
@@ -1386,12 +1375,14 @@ impl Plugin for MenuPlugin {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup(
     mut commands: Commands,
     cfg: Res<MenuConfig>,
     mut session: NonSendMut<Result<MenuSession, String>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut receiver_materials: ResMut<Assets<crate::viewer::lights::ReceiverMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -1488,6 +1479,7 @@ fn setup(
                 &mut commands,
                 &mut meshes,
                 &mut materials,
+                &mut receiver_materials,
                 &mut images,
                 &scene,
                 true,
@@ -1970,6 +1962,31 @@ pub fn first_error(session: &MenuSession) -> Option<&str> {
 mod tests {
     use super::*;
 
+    struct TestStorage(PathBuf);
+
+    impl TestStorage {
+        fn new(label: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("xiii-menu-{label}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            Self(root)
+        }
+
+        fn config_dir(&self) -> PathBuf {
+            self.0.join("config")
+        }
+
+        fn save_dir(&self) -> PathBuf {
+            self.0.join("saves")
+        }
+    }
+
+    impl Drop for TestStorage {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn menu_slot_provider_lists_dates_and_requires_an_existing_slot_for_read() {
         let dir = std::env::temp_dir().join(format!("xiii-menu-store-test-{}", std::process::id()));
@@ -1977,6 +1994,7 @@ mod tests {
         let save = crate::save::SaveFile {
             map: "Plage00".into(),
             teleporter: "PlayerStart".into(),
+            save_trigger_tag: "Debut".into(),
             description: "Synthetic beach".into(),
             health: 150.0,
             speed_factor_limit: 1.0,
@@ -1985,6 +2003,9 @@ mod tests {
             rotation: [0; 3],
             objectives: Vec::new(),
             inventory: Vec::new(),
+            sound_to_launch: None,
+            selected_weapon: None,
+            music_vars: Vec::new(),
         };
         crate::save::write(&dir, 3, &save).unwrap();
         let mut provider = MenuSaveSlots::open(dir.clone()).unwrap();
@@ -2176,9 +2197,11 @@ mod tests {
             return;
         };
         let script = MenuScript::parse("t=0.1 newgame\n").unwrap();
-        let mut session = MenuSession::open(
+        let storage = TestStorage::new("newgame");
+        let mut session = MenuSession::open_configured(
             &game_dir,
-            save_dir(&Options::default()).unwrap(),
+            storage.save_dir(),
+            &storage.config_dir(),
             Some(script),
         )
         .expect("open the front-end menu");
@@ -2234,9 +2257,14 @@ mod tests {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
         };
-        let mut session =
-            MenuSession::open(&game_dir, save_dir(&Options::default()).unwrap(), None)
-                .expect("open the front-end menu");
+        let storage = TestStorage::new("controls");
+        let mut session = MenuSession::open_configured(
+            &game_dir,
+            storage.save_dir(),
+            &storage.config_dir(),
+            None,
+        )
+        .expect("open the front-end menu");
         session.clip = [1280.0, 720.0];
         session.refresh_commands();
         let clip = session.clip;

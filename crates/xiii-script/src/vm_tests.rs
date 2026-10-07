@@ -32,6 +32,8 @@ const B_STRUCTPROP: i32 = -8;
 const B_BOOLPROP: i32 = -9;
 /// `Core.StrProperty` import appended at the end of the `B` import table (see `B::build`).
 const B_STRPROP: i32 = -10;
+/// `Core.ByteProperty` fixture sentinel, resolved to a trailing import in `B::build`.
+const B_BYTEPROP: i32 = i32::MIN;
 
 impl B {
     fn new() -> Self {
@@ -232,6 +234,17 @@ impl B {
             imports.push((core, package, 0, pn));
             imports.push((engine, cn, -(pkg_idx + 1), on));
         }
+        // Keep external import indices stable; fixtures that use byte properties add the new
+        // import after all existing external pairs and resolve the sentinel export class above.
+        if self.exports.iter().any(|e| e.class == B_BYTEPROP) {
+            let byteprop_ref = -(imports.len() as i32 + 1);
+            imports.push((core, class, -1, self.name("ByteProperty")));
+            for export in &mut self.exports {
+                if export.class == B_BYTEPROP {
+                    export.class = byteprop_ref;
+                }
+            }
+        }
         let names: Vec<&str> = self.names.iter().map(String::as_str).collect();
         build_package(&names, &imports, &self.exports)
     }
@@ -366,6 +379,49 @@ fn fixture() -> Vec<u8> {
     b.build()
 }
 
+/// `Actor` fixture for the per-instance `Tick` memo: a **class** `Tick` (`Counter = 1`) and a
+/// **state-scoped** `Tick` in `Waiting` (`Counter = 10`), so the resolved `Tick` differs by
+/// state and a stale memo is observable as the wrong constant being written.
+fn tick_state_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let class_tick = b.reserve(IMP_FUNCTION, actor, "Tick");
+    let waiting = b.reserve(IMP_STATE, actor, "Waiting");
+    let counter = b.reserve(IMP_INTPROP, actor, "Counter");
+    let rc = counter as u8;
+    // Counter's sibling is the class Tick; the state is the class Tick's sibling.
+    b.prop(counter, class_tick, 0);
+    // Class Tick: `Counter = 1` (`Let Counter = IntOne`), then return void. Memory: Let(1) +
+    // instance var(1 opcode + 4 ref) + int one(1) + return(1) + nothing(1) = 9.
+    b.func(
+        class_tick,
+        waiting,
+        0,
+        &[0x0F, 0x01, rc, 0x26, 0x04, 0x0B],
+        9,
+        0,
+        ff::DEFINED,
+    );
+    // State-scoped Tick: `Counter = 10` (int const 10 = `0x2C 0x0A`), return void.
+    // Memory: Let(1) + instance var(1 + 4) + int const(2) + return(1) + nothing(1) = 10.
+    let state_tick = b.reserve(IMP_FUNCTION, waiting, "Tick");
+    b.func(
+        state_tick,
+        0,
+        0,
+        &[0x0F, 0x01, rc, 0x2C, 10, 0x04, 0x0B],
+        10,
+        0,
+        ff::DEFINED,
+    );
+    // The state has no code of its own, only the state-scoped Tick child.
+    b.state_children(waiting, 0, state_tick, &[], 0, 0);
+    b.class(object, 0, 0);
+    b.class(actor, object, counter);
+    b.build()
+}
+
 fn set_of(data: Vec<u8>) -> ScriptSet {
     let p = ScriptPackage::load("Test", data, &ScriptLimits::default(), &Limits::default())
         .expect("package");
@@ -380,6 +436,87 @@ fn g(set: &ScriptSet, path: &str) -> GlobalRef {
         package: 0,
         export: set.packages[0].export_by_path(path).expect(path),
     }
+}
+
+fn pressing_fire_package() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let controller = b.reserve(0, 0, "Controller");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller_fire = b.reserve(B_BOOLPROP, controller, "bFire");
+    let controller_ai_fire = b.reserve(B_BOOLPROP, controller, "bTire");
+    let pawn_controller = b.reserve(IMP_OBJPROP, pawn, "Controller");
+    let pawn_fire = b.reserve(B_BOOLPROP, pawn, "bFire");
+    let pawn_instigator = b.reserve(IMP_OBJPROP, pawn, "Instigator");
+    let pressing_fire = b.reserve(IMP_FUNCTION, pawn, "PressingFire");
+    let result = b.reserve(B_BOOLPROP, pressing_fire, "ReturnValue");
+    b.prop(controller_fire, controller_ai_fire, 0);
+    b.prop(controller_ai_fire, 0, 0);
+    b.prop_with(pawn_controller, pawn_fire, 0, &compact(0));
+    b.prop(pawn_fire, pawn_instigator, 0);
+    b.prop_with(pawn_instigator, 0, 0, &compact(0));
+    b.prop(result, 0, pf::PARM | pf::RETURN_PARM);
+    b.func(
+        pressing_fire,
+        0,
+        result,
+        &[],
+        0,
+        0,
+        ff::FINAL | ff::NATIVE | ff::SIMULATED,
+    );
+    b.class(object, 0, 0);
+    b.class(actor, object, 0);
+    b.class(controller, actor, controller_fire);
+    b.class(pawn, actor, pawn_controller);
+    b.build()
+}
+
+#[test]
+fn pawn_pressing_fire_reads_controller_bfire_not_pawn_or_ai_btire() {
+    let engine = ScriptPackage::load(
+        "Engine",
+        pressing_fire_package(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("synthetic Engine package");
+    let mut set = ScriptSet::new();
+    set.add(engine);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pawn = vm.spawn(g(&set, "Pawn"), "Pawn").unwrap();
+    let controller = vm.spawn(g(&set, "Controller"), "Controller").unwrap();
+    let pressing_fire = g(&set, "Pawn.PressingFire");
+
+    vm.set_property(pawn, "bFire", 0, Value::Bool(true));
+    assert_eq!(
+        vm.call_function(pressing_fire, pawn, vec![]).unwrap(),
+        Value::Bool(false),
+        "without a controller, Pawn.bFire does not make PressingFire true"
+    );
+    vm.set_property(
+        pawn,
+        "Controller",
+        0,
+        Value::Object(Some(ObjRef::Instance(controller))),
+    );
+    vm.set_property(controller, "bTire", 0, Value::Bool(true));
+    assert_eq!(
+        vm.call_function(pressing_fire, pawn, vec![]).unwrap(),
+        Value::Bool(false),
+        "IAController.bTire is a separate script property"
+    );
+    vm.set_property(controller, "bFire", 0, Value::Bool(true));
+    assert_eq!(vm.obj_prop(pawn, "Controller"), Some(controller));
+    assert_eq!(
+        vm.get_property(controller, "bFire"),
+        Some(&Value::Bool(true))
+    );
+    assert_eq!(
+        vm.call_function(pressing_fire, pawn, vec![]).unwrap(),
+        Value::Bool(true)
+    );
 }
 
 #[test]
@@ -432,6 +569,49 @@ fn state_labels_latent_sleep_and_goto_state() {
     // State code is done: further ticks change nothing.
     vm.tick(0.25).unwrap();
     assert_eq!(vm.get_property(a, "Counter"), Some(&Value::Int(3)));
+}
+
+#[test]
+fn repeating_weapon_script_timer_refires_at_the_configured_interval() {
+    let set = set_of(fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let weapon = vm.spawn(g(&set, "Actor"), "Weapon").unwrap();
+    vm.set_active(weapon, true);
+    vm.set_timer(weapon, 0.5, true);
+
+    for _ in 0..3 {
+        vm.tick(0.125).unwrap();
+    }
+    assert!(
+        !vm.trace
+            .iter()
+            .any(|event| matches!(event.kind, TraceKind::Timer { .. })),
+        "a weapon timer fired before its authored interval"
+    );
+    vm.tick(0.125).unwrap();
+
+    let timer_events: Vec<_> = vm
+        .trace
+        .iter()
+        .filter(|event| matches!(&event.kind, TraceKind::Timer { actor } if actor == "Weapon"))
+        .collect();
+    assert_eq!(timer_events.len(), 1);
+    assert_eq!(timer_events[0].tick, 4);
+    assert!((timer_events[0].time - 0.5).abs() < 1e-6);
+
+    for _ in 0..3 {
+        vm.tick(0.125).unwrap();
+    }
+    vm.tick(0.125).unwrap();
+    let refire_ticks: Vec<_> = vm
+        .trace
+        .iter()
+        .filter_map(|event| {
+            matches!(&event.kind, TraceKind::Timer { actor } if actor == "Weapon")
+                .then_some(event.tick)
+        })
+        .collect();
+    assert_eq!(refire_ticks, [4, 8]);
 }
 
 #[test]
@@ -502,6 +682,33 @@ fn step_budget_stops_runaway_loops() {
 }
 
 #[test]
+fn tick_memo_re_resolves_after_state_change() {
+    let set = set_of(tick_state_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(g(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    // No state: the class `Tick` runs (`Counter = 1`). The memo records `(None, class Tick)`.
+    vm.tick(0.016).unwrap();
+    assert_eq!(vm.get_property(a, "Counter"), Some(&Value::Int(1)));
+    // Enter `Waiting`: the state has its own `Tick` (`Counter = 10`). If the memo were not
+    // invalidated it would keep calling the class `Tick` and the counter would stay 1.
+    vm.goto_state(a, "Waiting", None).unwrap();
+    vm.tick(0.016).unwrap();
+    assert_eq!(
+        vm.get_property(a, "Counter"),
+        Some(&Value::Int(10)),
+        "state Tick must win over the stored class Tick"
+    );
+    // The memo is keyed by state: staying in `Waiting` keeps using the state `Tick`.
+    vm.tick(0.016).unwrap();
+    assert_eq!(vm.get_property(a, "Counter"), Some(&Value::Int(10)));
+    // Leaving the state (to `None`) re-resolves to the class `Tick` (`Counter = 1`).
+    vm.goto_state(a, "None", None).unwrap();
+    vm.tick(0.016).unwrap();
+    assert_eq!(vm.get_property(a, "Counter"), Some(&Value::Int(1)));
+}
+
+#[test]
 fn inactive_objects_do_not_run_state_code() {
     let set = set_of(fixture());
     let mut vm = Vm::new(&set, VmLimits::default());
@@ -528,7 +735,7 @@ fn registry_entries_are_documented() {
     // Partials and the visible Partial for `LevelInfo.DecAttaque` (588); item14c added four
     // trail/particle Partials (SpawnParticle is shared with item18); item20 adds ten decoded GUI
     // save-slot declarations. Must equal `Registry::builtin().defs().count()`.
-    assert_eq!(defs.len(), 326);
+    assert_eq!(defs.len(), 327);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -2719,6 +2926,7 @@ fn nav_fixture() -> Vec<u8> {
     let rotation = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
     let radius = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
     let height = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
+    let physics = b.reserve(IMP_BYTEPROP, actor, "Physics");
     let ground = b.reserve(IMP_FLOATPROP, pawn, "GroundSpeed");
     let eye = b.reserve(IMP_FLOATPROP, pawn, "BaseEyeHeight");
 
@@ -2733,6 +2941,8 @@ fn nav_fixture() -> Vec<u8> {
     b.prop_with(location, rotation, 0, &vector_extra);
     b.prop_with(rotation, radius, 0, &rotator_extra);
     b.prop(radius, height, 0);
+    b.prop(height, physics, 0);
+    b.prop_with(physics, 0, 0, &compact(0));
     b.prop_with(c_pawn, dest, 0, &object_extra);
     b.prop_with(dest, focal, 0, &vector_extra);
     b.prop_with(focal, move_target, 0, &vector_extra);
@@ -5103,6 +5313,210 @@ fn move_to_sets_destination_and_latent_then_completes_at_ground_speed() {
     assert_eq!(vm.vector_prop(pawn, "Location"), Some([300.0, 0.0, 0.0]));
 }
 
+/// Finite angled wall used to prove that a VM-driven PHYS_Walking pawn receives provider sliding.
+/// The wall lies on `normal·p = offset` and is bounded along its tangent, so its far end is
+/// traversable. Non-walking `move_box` deliberately stops at the first contact.
+struct AngledWallPhysics {
+    normal: [f32; 2],
+    tangent: [f32; 2],
+    offset: f32,
+    half_length: f32,
+}
+
+impl AngledWallPhysics {
+    fn hit(&self, start: [f32; 3], delta: [f32; 3], radius: f32) -> Option<(f32, [f32; 3])> {
+        let signed = start[0] * self.normal[0] + start[1] * self.normal[1];
+        let into = delta[0] * self.normal[0] + delta[1] * self.normal[1];
+        if signed > self.offset - radius || into <= 0.0 {
+            return None;
+        }
+        let time = (self.offset - radius - signed) / into;
+        if !(0.0..=1.0).contains(&time) {
+            return None;
+        }
+        let point = [start[0] + delta[0] * time, start[1] + delta[1] * time];
+        let along = point[0] * self.tangent[0] + point[1] * self.tangent[1];
+        (along.abs() <= self.half_length + radius)
+            .then_some((time, [self.normal[0], self.normal[1], 0.0]))
+    }
+
+    fn outcome(
+        &self,
+        start: [f32; 3],
+        delta: [f32; 3],
+        end: [f32; 3],
+        time: f32,
+        normal: [f32; 3],
+    ) -> MoveOutcome {
+        MoveOutcome {
+            end,
+            hit: Some(WorldHit {
+                location: [
+                    start[0] + delta[0] * time,
+                    start[1] + delta[1] * time,
+                    start[2] + delta[2] * time,
+                ],
+                normal,
+                time,
+            }),
+        }
+    }
+}
+
+impl WorldPhysics for AngledWallPhysics {
+    fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
+        let delta = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+        let (time, normal) = self.hit(start, delta, extent[0].max(extent[1]))?;
+        Some(WorldHit {
+            location: [
+                start[0] + delta[0] * time,
+                start[1] + delta[1] * time,
+                start[2] + delta[2] * time,
+            ],
+            normal,
+            time,
+        })
+    }
+
+    fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        let full_end = [
+            start[0] + delta[0],
+            start[1] + delta[1],
+            start[2] + delta[2],
+        ];
+        match self.hit(start, delta, extent[0].max(extent[1])) {
+            Some((t, n)) => self.outcome(
+                start,
+                delta,
+                [
+                    start[0] + delta[0] * t,
+                    start[1] + delta[1] * t,
+                    full_end[2],
+                ],
+                t,
+                n,
+            ),
+            None => MoveOutcome {
+                end: full_end,
+                hit: None,
+            },
+        }
+    }
+
+    fn walk_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        let radius = extent[0].max(extent[1]);
+        let full_end = [
+            start[0] + delta[0],
+            start[1] + delta[1],
+            start[2] + delta[2],
+        ];
+        let Some((time, normal)) = self.hit(start, delta, radius) else {
+            return MoveOutcome {
+                end: full_end,
+                hit: None,
+            };
+        };
+        let contact = [
+            start[0] + delta[0] * time,
+            start[1] + delta[1] * time,
+            full_end[2],
+        ];
+        let left = [(1.0 - time) * delta[0], (1.0 - time) * delta[1]];
+        let into = left[0] * normal[0] + left[1] * normal[1];
+        let slide = [left[0] - into * normal[0], left[1] - into * normal[1]];
+        self.outcome(
+            start,
+            delta,
+            [contact[0] + slide[0], contact[1] + slide[1], full_end[2]],
+            time,
+            normal,
+        )
+    }
+
+    fn point_free(&mut self, _location: [f32; 3], _extent: [f32; 3]) -> bool {
+        true
+    }
+}
+
+#[test]
+fn vm_walking_pawn_slides_along_finite_angled_wall_and_reaches_target() {
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(AngledWallPhysics {
+        normal: [0.9486833, 0.31622776],
+        tangent: [-0.31622776, 0.9486833],
+        offset: 50.0,
+        half_length: 30.0,
+    }));
+    let (ctrl, pawn) = nav_actor_pair(&mut vm, &set, 1.0, 2.0, 100.0);
+    vm.set_property(pawn, "Physics", 0, Value::Byte(1)); // PHYS_Walking
+    assert_eq!(vm.get_property(pawn, "Physics"), Some(&Value::Byte(1)));
+    let mut args = [Value::Vector([100.0, 0.0, 0.0])];
+    let _ = call_native_stateful(
+        &mut vm,
+        "Engine.Controller.MoveTo",
+        ctrl,
+        &[false, true, true],
+        &mut args,
+    );
+
+    let mut arrived = false;
+    for _ in 0..500 {
+        arrived = vm
+            .move_pawn_step(pawn, [100.0, 0.0, 0.0], 0.0, 0.1)
+            .unwrap();
+        if arrived {
+            break;
+        }
+    }
+    assert!(
+        arrived,
+        "VM walking pawn failed to route around the angled wall: {:?}",
+        vm.vector_prop(pawn, "Location")
+    );
+    let final_pos = vm.vector_prop(pawn, "Location").unwrap();
+    assert!((final_pos[0] - 100.0).abs() <= 1.0, "{final_pos:?}");
+    assert!(final_pos[1].abs() <= 1.0, "{final_pos:?}");
+}
+
+#[test]
+fn vm_nonwalking_pawn_keeps_direct_swept_move() {
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(AngledWallPhysics {
+        normal: [0.9486833, 0.31622776],
+        tangent: [-0.31622776, 0.9486833],
+        offset: 50.0,
+        half_length: 30.0,
+    }));
+    let (_ctrl, pawn) = nav_actor_pair(&mut vm, &set, 1.0, 2.0, 100.0);
+    vm.set_property(pawn, "Physics", 0, Value::Byte(0)); // PHYS_None
+    assert_eq!(vm.get_property(pawn, "Physics"), Some(&Value::Byte(0)));
+
+    let mut arrived = false;
+    for _ in 0..100 {
+        arrived = vm
+            .move_pawn_step(pawn, [100.0, 0.0, 0.0], 0.0, 0.1)
+            .unwrap();
+        if arrived {
+            break;
+        }
+    }
+    assert!(
+        !arrived,
+        "PHYS_None must not receive the PHYS_Walking slide"
+    );
+    let pos = vm.vector_prop(pawn, "Location").unwrap();
+    assert!(
+        pos[0] < 55.0,
+        "direct swept move should stop at the wall: {pos:?}"
+    );
+    assert!(
+        pos[1].abs() < 1.0,
+        "direct move must not slide along the wall: {pos:?}"
+    );
+}
+
 #[test]
 fn move_toward_sets_move_target_and_destination() {
     let set = nav_set();
@@ -6075,8 +6489,8 @@ fn synthetic_add_inventory_links_the_chain_and_rejects_duplicates() {
 }
 
 /// Synthetic package with a `Pickup` class carrying `Location` (`Core.Struct` `Vector`),
-/// `CollisionHeight` (`float`) and `bCollideWorld` (`bool`) — the fields `settle_pickups` reads.
-fn settle_package() -> Vec<u8> {
+/// `CollisionHeight` (`float`), `bCollideWorld` (`bool`) and `Physics` (`byte`).
+fn pickup_physics_fixture() -> Vec<u8> {
     let mut b = B::new();
     let object = b.reserve(0, 0, "Object");
     let actor = b.reserve(0, 0, "Actor");
@@ -6087,9 +6501,11 @@ fn settle_package() -> Vec<u8> {
     let loc = b.reserve(B_STRUCTPROP, pickup, "Location");
     let height = b.reserve(IMP_FLOATPROP, loc, "CollisionHeight");
     let collide = b.reserve(B_BOOLPROP, height, "bCollideWorld");
+    let physics = b.reserve(B_BYTEPROP, collide, "Physics");
     b.prop_with(loc, height, 0, &compact(vector));
     b.prop(height, collide, 0);
-    b.prop(collide, 0, 0);
+    b.prop(collide, physics, 0);
+    b.prop_with(physics, 0, 0, &compact(0));
     b.class(object, 0, 0);
     b.class(actor, object, 0);
     b.class(pickup, actor, loc);
@@ -6097,31 +6513,22 @@ fn settle_package() -> Vec<u8> {
 }
 
 #[test]
-fn settle_pickups_rests_a_placed_pickup_on_its_support() {
-    let set = set_of(settle_package());
+fn physics_none_pickup_keeps_its_authored_location_above_floor() {
+    let set = set_of(pickup_physics_fixture());
     let mut vm = Vm::new(&set, VmLimits::default());
     vm.set_physics(Box::new(crate::physics::FlatPhysics::new(100.0)));
     let p = vm.spawn(g(&set, "Pickup"), "Key").unwrap();
-    // The decoded map `Location` is the cylinder base: `z == floor` -> embedded; the cylinder
-    // centre must become `floor + CollisionHeight`.
-    vm.set_property(p, "Location", 0, Value::Vector([10.0, 20.0, 100.0]));
+    // PHYS_None does not floor-snap a map-placed actor, even when world queries are available.
+    vm.set_property(p, "Location", 0, Value::Vector([10.0, 20.0, 140.0]));
     vm.set_property(p, "CollisionHeight", 0, Value::Float(8.0));
     vm.set_property(p, "bCollideWorld", 0, Value::Bool(true));
-    assert_eq!(vm.settle_pickups(), 1, "the embedded pickup must be moved");
+    vm.set_property(p, "Physics", 0, Value::Byte(0)); // PHYS_None
+    vm.begin_play(&[p]).unwrap();
     assert_eq!(
         vm.vector_prop(p, "Location").unwrap(),
-        [10.0, 20.0, 108.0],
-        "the cylinder centre rests on the floor + CollisionHeight"
+        [10.0, 20.0, 140.0],
+        "PHYS_None preserves the authored position above the floor"
     );
-    // Idempotent once resting.
-    assert_eq!(vm.settle_pickups(), 0);
-    // A pickup with `bCollideWorld=false` is left alone.
-    let q = vm.spawn(g(&set, "Pickup"), "Floating").unwrap();
-    vm.set_property(q, "Location", 0, Value::Vector([0.0, 0.0, 100.0]));
-    vm.set_property(q, "CollisionHeight", 0, Value::Float(8.0));
-    vm.set_property(q, "bCollideWorld", 0, Value::Bool(false));
-    assert_eq!(vm.settle_pickups(), 0);
-    assert_eq!(vm.vector_prop(q, "Location").unwrap(), [0.0, 0.0, 100.0]);
 }
 
 #[test]
@@ -7510,6 +7917,37 @@ fn set_max_particles_records_and_does_not_fail() {
         &e.kind,
         TraceKind::Note(s) if s.contains("SetMaxParticles(12)") && s.contains("no particle subsystem")
     )));
+}
+
+#[test]
+fn particle_spawn_native_queues_a_vm_owned_emitter_request_once() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let emitter = vm.spawn(sg(&set, "Actor"), "EmitterSubobject").unwrap();
+    let mut a = vec![Value::Int(3)];
+    let out = call_native(
+        &mut vm,
+        "ParticleEmitter.SpawnParticle",
+        emitter,
+        &[false],
+        &mut a,
+    );
+    assert!(matches!(out, NativeOutcome::Value(Value::Void)));
+    assert_eq!(vm.drain_particle_spawns(), vec![(emitter, 3)]);
+    assert!(vm.drain_particle_spawns().is_empty(), "requests drain once");
+
+    let mut a = vec![Value::Int(-1)];
+    call_native(
+        &mut vm,
+        "ParticleEmitter.SpawnParticle",
+        emitter,
+        &[false],
+        &mut a,
+    );
+    assert!(
+        vm.drain_particle_spawns().is_empty(),
+        "negative amount is inert"
+    );
 }
 
 #[test]

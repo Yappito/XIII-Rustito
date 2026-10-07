@@ -1199,6 +1199,24 @@ impl EmitterSim {
         self.particles.iter().filter(|p| p.active).count()
     }
 
+    /// Executes an explicit script `SpawnParticle(Amount)` request. The call does not depend on
+    /// the automatic spawn gate (`Disabled`); it still respects `MaxParticles` and the emitter's
+    /// non-respawning lifetime cap.
+    pub fn spawn_requested(&mut self, desc: &EmitterDesc, amount: usize) -> usize {
+        let mut spawned = 0;
+        for _ in 0..amount {
+            if self.active() >= desc.max_particles
+                || (!desc.respawn_dead_particles && self.spawned_total >= desc.max_particles)
+            {
+                break;
+            }
+            self.spawn_one(desc);
+            self.spawned_total += 1;
+            spawned += 1;
+        }
+        spawned
+    }
+
     /// Spawns one particle into a slot with fresh randomized values.
     fn spawn_one(&mut self, desc: &EmitterDesc) {
         let position = match desc.start_location_shape {
@@ -1810,6 +1828,23 @@ mod tests {
             desc.max_particles
         );
         assert!(sim.active() >= 9, "expected the rate to fill the pool");
+    }
+
+    #[test]
+    fn scripted_spawn_is_capped_and_reset_reopens_the_nonrespawning_pool() {
+        let mut desc = simple_desc();
+        desc.max_particles = 2;
+        desc.respawn_dead_particles = false;
+        let mut sim = EmitterSim::new(3);
+        assert_eq!(sim.spawn_requested(&desc, 5), 2);
+        assert_eq!(sim.active(), 2);
+        assert_eq!(sim.spawn_requested(&desc, 1), 0, "pool limit is enforced");
+        sim.reset();
+        assert_eq!(
+            sim.spawn_requested(&desc, 1),
+            1,
+            "Reset clears the lifetime cap"
+        );
     }
 
     #[test]

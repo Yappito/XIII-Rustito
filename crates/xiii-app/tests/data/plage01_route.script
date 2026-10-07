@@ -101,7 +101,7 @@ t=322.00 teleport 1093.0 -13854.0 1113.0
 # lands also damages the killer); the kill burst follows past the longest observed hold.
 t=330.00 weapon XIII.m60
 t=331.00 teleport 1802.0 -12700.0 1100.0
-t=331.00 yaw 270
+t=331.00 track BaseSoldier6
 t=345.00 fire
 t=355.00 fire
 t=365.00 fire
@@ -153,6 +153,7 @@ t=406.80 fire
 t=407.20 fire
 t=407.60 fire
 t=408.00 fire
+t=408.20 track off
 t=408.50 search BaseSoldier6
 
 # Search the dead killer for the game's ClefPickup and use it on the truck's Porte1.

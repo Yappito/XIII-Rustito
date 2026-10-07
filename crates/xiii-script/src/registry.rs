@@ -1328,17 +1328,13 @@ fn controller_can_see(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResu
     val(Value::Bool(vm.nav_line_of_sight_to(c.this, other)?))
 }
 
-/// `Pawn.PressingFire() -> bool` (native 0): UE2 `APawn::execPressingFire` returns the pawn's
-/// `bFire` (the held fire button published by its controller). Falls back to the controller's
-/// `bFire` and then the instigator's, since the weapon path calls it on the firing pawn.
+/// `Pawn.PressingFire() -> bool` (native 0): Engine.dll `APawn::execPressingFire` returns false
+/// without a controller and otherwise reads the controller's `bFire` field. It does not inspect
+/// the pawn, instigator, or XIII's script-only `IAController.bTire` field.
 fn pawn_pressing_fire(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let fire = vm.bool_prop(c.this, "bFire")
-        || vm
-            .obj_prop(c.this, "Controller")
-            .is_some_and(|ctrl| vm.bool_prop(ctrl, "bFire"))
-        || vm
-            .obj_prop(c.this, "Instigator")
-            .is_some_and(|inst| vm.bool_prop(inst, "bFire"));
+    let fire = vm
+        .obj_prop(c.this, "Controller")
+        .is_some_and(|ctrl| vm.bool_prop(ctrl, "bFire"));
     val(Value::Bool(fire))
 }
 
@@ -1462,31 +1458,20 @@ fn move_toward(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nati
     val(Value::Void)
 }
 
-/// `Controller.FinishRotation`: snap the pawn's yaw to face the controller's `FocalPoint`.
-///
-/// The engine suspends state code while it interpolates the rotation at `RotationRate.Yaw`. The
-/// headless VM has no per-tick rotation, so the snap is applied immediately (no latent). The
-/// decoded declaration is `final latent function FinishRotation()`.
+/// `Controller.FinishRotation`: enable physics rotation toward Focus/FocalPoint and suspend the
+/// current state until the pawn reaches the target orientation.
 fn finish_rotation(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
-    if let (Some(pawn), Some(focal)) = (
-        vm.obj_prop(c.this, "Pawn"),
-        vm.vector_prop(c.this, "FocalPoint"),
-    ) {
-        let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
-        // UE2 rotator units: 65536 per full turn; yaw is the Z component.
-        let dx = focal[0] - loc[0];
-        let dy = focal[1] - loc[1];
-        let yaw = (dy.atan2(dx) * (65536.0 / std::f32::consts::TAU)) as i32;
-        let rot = match vm.get_property(pawn, "Rotation") {
-            Some(Value::Rotator(r)) => [r[0], r[1], yaw],
-            _ => [0, 0, yaw],
-        };
-        vm.set_property(pawn, "Rotation", 0, Value::Rotator(rot));
-        vm.note(crate::vm::TraceKind::Log(format!(
-            "FinishRotation: {} -> yaw {}",
-            vm.objects[c.this as usize].name, yaw
-        )));
+    if !c.in_state_code {
+        return Err(vm.err(VmErrorKind::LatentOutsideState {
+            path: c.path.clone(),
+        }));
     }
+    if let Some(pawn) = vm.obj_prop(c.this, "Pawn") {
+        vm.set_property(pawn, "bRotateToDesired", 0, Value::Bool(true));
+    }
+    vm.pending_latent = Some(Latent::Rotation {
+        started: vm.time_now(),
+    });
     val(Value::Void)
 }
 
@@ -1704,6 +1689,23 @@ fn level_info_inc_attaque(
     ));
     val(Value::Void)
 }
+
+/// `LevelInfo.GetPlateForme() -> int`: the platform the game runs on.
+///
+/// Engine.dll `?execGetPlateForme@ALevelInfo` (VA 0x103df410) returns the `int` at offset 0x7c of
+/// `GSys` (Core's `USystem`), the `[Core.System] PlateForm` setting: `Default.ini` ships
+/// `PlateForm=0`. Scripts compare it with 1/2/3 for the console builds (e.g. `XIIIPawn` damage
+/// feedback, `XIIIBaseHud`); the PC value is 0.
+fn level_info_get_plate_forme(
+    _vm: &mut Vm<'_>,
+    _c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    val(Value::Int(PLATFORM_PC))
+}
+
+/// `[Core.System] PlateForm` of the shipped PC `Default.ini` (read by `GetPlateForme`).
+const PLATFORM_PC: i32 = 0;
 
 /// `LevelInfo.DecAttaque()` (native 588, static). The matching `IncAttaque` implementation is
 /// item14b's visible Partial; this records the inverse counter operation at the exact decoded
@@ -3253,15 +3255,14 @@ fn set_max_particles(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResul
     val(Value::Void)
 }
 
-/// item18: `ParticleEmitter.SpawnParticle(int Amount)`. The port has no particle subsystem (the
-/// renderer draws decoded emitters separately), so the spawn is recorded and discarded, like
-/// [`set_max_particles`]. Called by `xidcine.Shells.TriggerParticle` on the m60/kalash fire path;
-/// it must not suspend the weapon, and damage never depends on it.
-fn particle_spawn(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let n = int(vm, a, 0).unwrap_or(0);
-    vm.note(crate::vm::TraceKind::Note(format!(
-        "ParticleEmitter.SpawnParticle({n}): recorded; no particle subsystem"
-    )));
+/// `ParticleEmitter.SpawnParticle(int Amount)`: keep the request attached to the VM-owned
+/// subobject; the presentation host consumes it once and injects that many particles into its
+/// simulator. Called by `xidcine.Shells.TriggerParticle` on the m60/kalash fire path.
+fn particle_spawn(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let amount = int(vm, a, 0)?;
+    if amount > 0 {
+        vm.spawn_particles(c.this, amount as usize);
+    }
     val(Value::Void)
 }
 
@@ -3297,17 +3298,12 @@ fn item18_defs() -> Vec<NativeDef> {
             "core.u Object.Percent_FloatFloat decoded; UE2 appFmod (C fmod); xiii.m60.RumbleFX 0x004E (ReloadCount % 1) on the fire path",
             percent_ff,
         ),
-        NativeDef {
-            status: NativeStatus::Partial(
-                "no particle subsystem: the spawn is accepted and recorded but no particle is simulated (presentational)",
-            ),
-            ..def(
-                "ParticleEmitter.SpawnParticle",
-                "native(0) native function SpawnParticle(int Amount)",
-                "engine.u ParticleEmitter.SpawnParticle; xidcine.Shells.TriggerParticle 0x006C on the m60/kalash fire path",
-                particle_spawn,
-            )
-        },
+        def(
+            "ParticleEmitter.SpawnParticle",
+            "native(0) native function SpawnParticle(int Amount)",
+            "engine.u ParticleEmitter.SpawnParticle; xidcine.Shells.TriggerParticle 0x006C on the m60/kalash fire path",
+            particle_spawn,
+        ),
         NativeDef {
             status: NativeStatus::Partial(
                 "no audio device: the call is accepted and discarded (the VM has no mixer)",
@@ -4683,9 +4679,7 @@ fn builtin_defs() -> Vec<NativeDef> {
         )
     });
     v.push(NativeDef {
-        status: NativeStatus::Partial(
-            "snaps the pawn yaw to FocalPoint immediately; the engine's per-tick rotation interpolation at RotationRate.Yaw is not modelled",
-        ),
+        status: NativeStatus::Implemented,
         ..def(
             "Engine.Controller.FinishRotation",
             "native(508) final latent function FinishRotation()",
@@ -4817,6 +4811,12 @@ fn builtin_defs() -> Vec<NativeDef> {
             level_info_inc_attaque,
         )
     });
+    v.push(def(
+        "Engine.LevelInfo.GetPlateForme",
+        "native(0) native function int GetPlateForme()",
+        "Engine.dll ?execGetPlateForme@ALevelInfo VA 0x103df410: returns GSys+0x7c ([Core.System] PlateForm, 0 in the shipped Default.ini)",
+        level_info_get_plate_forme,
+    ));
     // item19: complete the BaseSoldier.Died alert-level-2 path paired with item14b's IncAttaque.
     // The VM records the decrement visibly while the retail alarm counter/network is unresolved.
     v.push(NativeDef {
@@ -4906,8 +4906,9 @@ fn builtin_defs() -> Vec<NativeDef> {
     v.push(def(
         "Engine.Pawn.PressingFire",
         "native(0) final simulated native function bool PressingFire()",
-        "engine.u Pawn.PressingFire decoded (native 0, return bool); returns the pawn's held fire \
-         button (`bFire`); the melee/weapon fire animation path calls it",
+        "engine.u Pawn.PressingFire decoded (native 0, return bool); Engine.dll \
+         ?execPressingFire@APawn reads Controller.bFire (not IAController.bTire); the \
+         XIIIWeapon state fire chain calls it",
         pawn_pressing_fire,
     ));
     v.push(NativeDef {
