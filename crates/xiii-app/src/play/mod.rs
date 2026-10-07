@@ -97,6 +97,11 @@ struct ScriptRes {
     drive: Option<script::Drive>,
 }
 
+/// item30 temporary: last seen controller active flag (removed with the investigation).
+thread_local! {
+    static CONTROLLER_ACTIVE_LAST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
 /// Player footstep cadence for `--play` (surface lookup table + accumulator). See
 /// [`footsteps`] for the evidence (notify-driven in the original; synthesised here because the
 /// player pawn has no third-person animation).
@@ -2140,6 +2145,17 @@ pub(crate) fn run_script(
                 format_vm_trace(&runtime.session),
                 format_mover_trace(&runtime.session)
             );
+            // item30 temporary: controller active-flag transitions (removed with the
+            // killer-scene investigation).
+            if let Some(c) = runtime.session.controller {
+                let active = runtime.session.vm().objects[c as usize].active;
+                if active != CONTROLLER_ACTIVE_LAST.with(|f| f.get()) {
+                    CONTROLLER_ACTIVE_LAST.with(|f| f.set(active));
+                    println!(
+                        "[ctrl trace] t={elapsed:.3}s controller active -> {active}"
+                    );
+                }
+            }
         }
 
         // Level transition: the game's own goal/travel code requested it. The VM reported the
@@ -2766,13 +2782,15 @@ mod tests {
         let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/plage01_route.script");
         let script = script::Script::load(&route_path).expect("load item19 Plage01 route");
+        // item30: the walked hut adds ~17.5 s before the back-route block, so the level-end
+        // cinematic (~55 s after Porte1) needs a longer budget than the teleport route's 140 s.
         let outcome = run_script(
             &game_dir,
             "Plage01",
             &script,
             &resolved.params,
             &scene,
-            140.0,
+            530.0,
         )
         .expect("run Plage01 route");
         println!(
