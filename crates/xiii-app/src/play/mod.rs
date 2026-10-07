@@ -3531,6 +3531,47 @@ mod tests {
         assert_eq!(outcome.travel[0].url, "Amos01.unr");
     }
 
+    #[test]
+    fn opt_in_banque01_postrender_completes_while_player_moves() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = session::Session::open(&game_dir, "Banque01").expect("open Banque01");
+        let dt = 1.0f32 / 30.0;
+        let mut location = session.player_location().expect("player location");
+        let velocity = [1.0, 0.0, 0.0];
+        for _ in 0..90 {
+            session.drive_render_phase();
+            location[0] += velocity[0] * dt;
+            session.step(
+                dt,
+                location,
+                0.0,
+                velocity,
+                &session::PlayerVMModes::default(),
+            );
+            if let Some(pose) = session.script_pawn_pose() {
+                location = pose.0;
+            }
+        }
+        assert!(
+            session.failures.is_empty(),
+            "render/step failures: {:?}",
+            session.failures
+        );
+        let mi = session.map_info().expect("MapInfo");
+        assert_eq!(
+            session.vm().get_property(mi, "EndCartoonEffect"),
+            Some(&xiii_script::Value::Bool(true))
+        );
+        let cine = session.vm().find_live_object("Cine1").expect("Cine1 actor");
+        assert_eq!(
+            session.vm().get_property(cine, "bInitialized"),
+            Some(&xiii_script::Value::Bool(true))
+        );
+    }
+
     /// item18 opt-in VM/session test for the `PlayerTick` dispatch itself: putting the real
     /// `XIIIPlayerController` into its `PlayingVideo` state and ticking once must run
     /// `PlayingVideo.PlayerTick`, which calls `Level.ServerTravel(MapInfo.NextMapLevelWithUnr)`
