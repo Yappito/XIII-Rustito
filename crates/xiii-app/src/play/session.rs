@@ -359,6 +359,7 @@ impl Session {
         let controller = controller.ok_or_else(|| {
             "script login created the player pawn without a PlayerController".to_owned()
         })?;
+        initialize_headless_input_system(&mut vm, set, controller)?;
         if let Some(event) = start_event {
             // The engine's checkpoint-load path sets GameInfo.StartSpotEvent after the login
             // chain (XIII's own `RestartPlayer` copies `StartSpot.Event` into it first —
@@ -2350,6 +2351,79 @@ impl Session {
     }
 }
 
+/// Builds the engine-owned Player/InteractionMaster/Console object graph which a windowed
+/// viewport supplies, then runs the retail controller callback. Interaction creation itself is
+/// deliberately left to XIIIPlayerController.InitInputSystem -> InteractionMaster.AddInteraction.
+fn initialize_headless_input_system(
+    vm: &mut Vm<'static>,
+    set: &ScriptSet,
+    pc: ObjectId,
+) -> Result<(), String> {
+    let object = |path: &str| -> Result<xiii_script::GlobalRef, String> {
+        let (package_name, object_path) = path
+            .split_once('.')
+            .ok_or_else(|| format!("invalid engine class path {path:?}"))?;
+        let package = set
+            .package_index(package_name)
+            .ok_or_else(|| format!("engine class package {package_name:?} is not loaded"))?;
+        let export = set.packages[package]
+            .export_by_path(object_path)
+            .ok_or_else(|| format!("engine class {path:?} is not loaded"))?;
+        Ok(xiii_script::GlobalRef { package, export })
+    };
+    let player = vm
+        .spawn(object("Engine.Player")?, "Player(headless)")
+        .map_err(|e| format!("spawn Engine.Player: {e}"))?;
+    let master = vm
+        .spawn(
+            object("Engine.InteractionMaster")?,
+            "InteractionMaster(headless)",
+        )
+        .map_err(|e| format!("spawn Engine.InteractionMaster: {e}"))?;
+    // The master is a real live runtime object: AddInteraction has a return value and VM calls
+    // through inactive spawned objects correctly defer that result rather than inventing one.
+    vm.set_active(master, true);
+    let console = vm
+        .spawn(object("Engine.Console")?, "Console(headless)")
+        .map_err(|e| format!("spawn Engine.Console: {e}"))?;
+    let link = |vm: &mut Vm<'static>, owner, field: &str, target| {
+        if vm.set_property(
+            owner,
+            field,
+            0,
+            Value::Object(Some(ObjRef::Instance(target))),
+        ) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} has no {field} property",
+                vm.objects[owner as usize].name
+            ))
+        }
+    };
+    link(vm, player, "InteractionMaster", master)?;
+    link(vm, player, "Console", console)?;
+    link(vm, master, "Console", console)?;
+    link(vm, console, "ViewportOwner", player)?;
+    link(vm, pc, "Player", player)?;
+    vm.send_event(pc, "InitInputSystem", Vec::new())
+        .map_err(|e| format!("PlayerController.InitInputSystem: {e}"))?;
+    let interaction = match vm.get_property(pc, "MyInteraction") {
+        Some(Value::Object(Some(ObjRef::Instance(id)))) => *id,
+        other => {
+            return Err(format!(
+                "InitInputSystem did not assign MyInteraction: {other:?}"
+            ));
+        }
+    };
+    let my_pc = matches!(vm.get_property(interaction, "MyPC"),
+        Some(Value::Object(Some(ObjRef::Instance(id)))) if *id == pc);
+    if !my_pc {
+        return Err("InitInputSystem interaction MyPC does not reference the controller".into());
+    }
+    Ok(())
+}
+
 /// Unreal-space delta between two VM `Location`s. The host converts it with the single
 /// coordinate policy and adds it to the render entity's translation, so a VM-moved actor's
 /// render transform follows the VM one way (an unmoved actor gives a zero delta).
@@ -2647,6 +2721,44 @@ mod tests {
             session.bootstrap_note
         );
         let pc = session.controller.expect("a script player controller");
+        let interaction = match session.vm.get_property(pc, "MyInteraction") {
+            Some(Value::Object(Some(ObjRef::Instance(id)))) => *id,
+            other => panic!("InitInputSystem MyInteraction is {other:?}"),
+        };
+        assert!(
+            matches!(session.vm.get_property(interaction, "MyPC"),
+                Some(Value::Object(Some(ObjRef::Instance(id)))) if *id == pc),
+            "the script-created interaction must point back to its player controller"
+        );
+        assert!(
+            session.vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                TraceKind::Event { target, function, .. }
+                    if target == "XIIIPlayerController"
+                        && function.ends_with("XIIIPlayerController.InitInputSystem")
+            )),
+            "the VM trace must record PlayerController.InitInputSystem"
+        );
+        assert!(
+            session.vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                TraceKind::Event { function, .. }
+                    if function.ends_with("InteractionMaster.AddInteraction")
+            )),
+            "the VM trace must record the script's InteractionMaster.AddInteraction call"
+        );
+        assert!(
+            session.vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                TraceKind::NewObject { class, .. }
+                    if class.to_ascii_lowercase().ends_with("xiii.xiiiplayerinteraction")
+            )),
+            "the interaction must be allocated by script new in InteractionMaster.AddInteraction"
+        );
+        println!(
+            "[InitInputSystem test] interaction={} MyPC={} trace=InitInputSystem",
+            session.vm.objects[interaction as usize].name, session.vm.objects[pc as usize].name
+        );
         assert!(
             session.vm.is_a(pc, "XIIIPlayerController"),
             "controller is {}",

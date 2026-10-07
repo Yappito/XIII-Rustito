@@ -734,8 +734,9 @@ fn registry_entries_are_documented() {
     // item19 added `CineController2.Steering`, Trail presentation Partials, cutscene bone-query
     // Partials and the visible Partial for `LevelInfo.DecAttaque` (588); item14c added four
     // trail/particle Partials (SpawnParticle is shared with item18); item20 adds ten decoded GUI
-    // save-slot declarations. Must equal `Registry::builtin().defs().count()`.
-    assert_eq!(defs.len(), 327);
+    // save-slot declarations; item40c adds the headless Interaction.Initialize and ForceFeedback
+    // viewport/device Partials. Must equal `Registry::builtin().defs().count()`.
+    assert_eq!(defs.len(), 330);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
