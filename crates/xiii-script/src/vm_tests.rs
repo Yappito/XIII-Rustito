@@ -6414,6 +6414,10 @@ fn inventory_package() -> Vec<u8> {
     let mut b = B::new();
     let object = b.reserve(0, 0, "Object");
     let inventory = b.reserve(0, 0, "Inventory");
+    let ammo = b.reserve(0, 0, "Ammo");
+    let fists_ammo = b.reserve(0, 0, "FistsAmmo");
+    let nine_mm_ammo = b.reserve(0, 0, "NineMmAmmo");
+    let nine_mm_child = b.reserve(0, 0, "NineMmAmmoChild");
     let pawn = b.reserve(0, 0, "Pawn");
     // `Inventory` properties (inherited by `Pawn`): the link and the owner.
     let inv_inv = b.reserve(IMP_OBJPROP, inventory, "Inventory");
@@ -6468,8 +6472,57 @@ fn inventory_package() -> Vec<u8> {
     b.func(add, 0, newitem, &code, 102, 0, ff::DEFINED);
     b.class(object, 0, neq);
     b.class(inventory, object, inv_inv);
+    b.class(ammo, inventory, 0);
+    b.class(fists_ammo, ammo, 0);
+    b.class(nine_mm_ammo, ammo, 0);
+    b.class(nine_mm_child, nine_mm_ammo, 0);
     b.class(pawn, inventory, add);
     b.build()
+}
+
+#[test]
+fn find_inventory_type_does_not_match_a_subclass_of_the_requested_ammo() {
+    let set = set_of(inventory_package());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pawn = vm.spawn(g(&set, "Pawn"), "P").unwrap();
+    let ammo = vm.spawn(g(&set, "NineMmAmmoChild"), "PickedAmmo").unwrap();
+    vm.set_active(pawn, true);
+    vm.set_active(ammo, true);
+    vm.set_property(
+        pawn,
+        "Inventory",
+        0,
+        Value::Object(Some(ObjRef::Instance(ammo))),
+    );
+
+    let mut query = [Value::Object(Some(ObjRef::Static(g(&set, "Ammo"))))];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Engine.Pawn.FindInventoryType",
+            pawn,
+            &[],
+            &mut query
+        ),
+        NativeOutcome::Value(Value::Object(None)),
+        "a 9 mm subclass must not be returned for an Ammo/base-class query"
+    );
+
+    let mut exact_query = [Value::Object(Some(ObjRef::Static(g(
+        &set,
+        "NineMmAmmoChild",
+    ))))];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Engine.Pawn.FindInventoryType",
+            pawn,
+            &[],
+            &mut exact_query
+        ),
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(ammo)))),
+        "the same linked item must be found by its concrete class"
+    );
 }
 
 #[test]
