@@ -299,50 +299,97 @@ fn cine_steering(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Na
         Some(Value::Float(v)) => *v,
         _ => return val(Value::Void),
     };
+    let detection_distance = match a.get(2) {
+        Some(Value::Float(v)) => *v,
+        _ => return val(Value::Void),
+    };
+    let _disable_avoidance = match a.get(3) {
+        Some(Value::Bool(v)) => *v,
+        _ => return val(Value::Void),
+    };
+    let _final_location = match a.get(4) {
+        Some(Value::Bool(v)) => *v,
+        _ => return val(Value::Void),
+    };
     // The steered actor is the possessed cine pawn (`Controller.Pawn`); `Player` is only the
     // watched player pawn.
     let Some(pawn) = vm.obj_prop(c.this, "Pawn") else {
         return val(Value::Void);
     };
     let speed = vm.f32_prop(pawn, "GroundSpeed");
+    let loc = vm.vector_prop(pawn, "Location").unwrap_or(target);
+    // execSteering tests arrival first (IsTargetReached at 0x100022dd) and, when reached, sends
+    // EndOfMove and returns without moving. Its direction argument is the controller's `Plane`
+    // (field 0x404), which the sequence script sets: `Normal(Target - Pawn)` when a move starts,
+    // and in `PlayingSequence.Tick` `NextTarget.Location - Target.Location` (or the target's
+    // rotation vector without a next target), so "passed" means crossing the plane through the
+    // target that faces the next waypoint.
+    let plane = match vm.get_property(c.this, "Plane") {
+        Some(Value::Vector(v)) => *v,
+        _ => [0.0; 3],
+    };
+    if cine_target_reached(loc, target, plane, detection_distance) {
+        vm.send_event(c.this, "EndOfMove", Vec::new())?;
+        return val(Value::Void);
+    }
     // During a `movseq` the sequence turns the cine pawn's world collision off (`collisionoff`)
     // so it follows the authored path through geometry; `Move` would instead stop at the walls.
-    let arrived = if vm.bool_prop(pawn, "bCollideWorld") {
-        vm.move_pawn_step(pawn, target, speed, dt)?
+    // Steering sets the pawn's velocity toward the target and physics moves a full
+    // `speed * dt` step, so the pawn can overshoot the target point and cross `Plane`; it does
+    // not stop at its collision radius or snap onto the target (Cine pawns commonly have
+    // DetectionDistance 0, so arrival is the plane crossing).
+    let step_target = full_step_target(loc, target, speed * dt);
+    if vm.bool_prop(pawn, "bCollideWorld") {
+        vm.move_pawn_step_within(pawn, step_target, speed, dt, 0.0)?;
     } else {
-        let loc = vm.vector_prop(pawn, "Location").unwrap_or(target);
-        let radius = vm.f32_prop(pawn, "CollisionRadius");
-        let (next, arrived) = crate::navigation::move_step(loc, target, speed, dt, radius);
+        let (next, _) = crate::navigation::move_step(loc, step_target, speed, dt, 0.0);
         if next != loc {
             vm.set_property(pawn, "Location", 0, Value::Vector(next));
         }
-        arrived
-    };
-    if std::env::var_os("XIII_CINE_TRACE").is_some_and(|v| v != "0" && !v.is_empty())
-        && vm.objects[pawn as usize]
-            .name
-            .eq_ignore_ascii_case("Cine11")
-    {
-        let from = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
-        let delta = [
-            target[0] - from[0],
-            target[1] - from[1],
-            target[2] - from[2],
-        ];
-        let distance = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-        println!(
-            "[cine-trace-steering] t={:.3}s tick={} controller={} pawn={} dt={dt:.5} speed={speed:.3} from={from:?} target={target:?} distance={distance:.3} collide-world={} arrived={arrived}",
-            vm.time,
-            vm.tick_count,
-            vm.objects[c.this as usize].name,
-            vm.objects[pawn as usize].name,
-            vm.bool_prop(pawn, "bCollideWorld")
-        );
-    }
-    if arrived {
-        vm.send_event(c.this, "EndOfMove", Vec::new())?;
     }
     val(Value::Void)
+}
+
+/// The point one full horizontal step of `step` toward `target` (may lie past the target).
+fn full_step_target(location: [f32; 3], target: [f32; 3], step: f32) -> [f32; 3] {
+    let dx = target[0] - location[0];
+    let dy = target[1] - location[1];
+    let length = (dx * dx + dy * dy).sqrt();
+    if length <= 0.0 || step <= 0.0 {
+        return location;
+    }
+    [
+        location[0] + dx / length * step,
+        location[1] + dy / length * step,
+        location[2],
+    ]
+}
+
+/// Coordinator disassembly of XIDCine.dll: `execSteering` VA 0x100021a0 calls virtual
+/// `IsTargetReached(Target, fDetectionDistance, Dir)` at 0x100022dd (controller field 0x404),
+/// and true dispatches `EndOfMove` at 0x100022e7-0x10002301. `ACineController2::IsTargetReached`
+/// VA 0x10001d40 is XY-only: nonzero delta with `Dir dot delta <= 0` means passed, otherwise
+/// strict XY distance `< fDetectionDistance`; there is no Z check. The direction is the
+/// controller's `Plane` (field 0x404).
+#[cfg(test)]
+fn horizontal_direction(location: [f32; 3], target: [f32; 3]) -> [f32; 3] {
+    let dx = target[0] - location[0];
+    let dy = target[1] - location[1];
+    let length = (dx * dx + dy * dy).sqrt();
+    if length > 0.0 {
+        [dx / length, dy / length, 0.0]
+    } else {
+        [0.0; 3]
+    }
+}
+
+fn cine_target_reached(location: [f32; 3], target: [f32; 3], dir: [f32; 3], radius: f32) -> bool {
+    let dx = target[0] - location[0];
+    let dy = target[1] - location[1];
+    let nonzero = dx != 0.0 || dy != 0.0;
+    (!nonzero)
+        || (nonzero && dir[0] * dx + dir[1] * dy <= 0.0)
+        || dx * dx + dy * dy < radius * radius
 }
 
 /// item19: return an actor-space Coords placeholder for a skeletal bone query. The camera-only
@@ -416,4 +463,82 @@ pub fn item19_defs() -> Vec<NativeDef> {
             get_bone_rotation_partial,
         ),
     ]
+}
+
+#[cfg(test)]
+mod cine_arrival_tests {
+    use super::{cine_target_reached, full_step_target, horizontal_direction};
+
+    #[test]
+    fn full_step_can_overshoot_and_then_counts_as_passed() {
+        // 10 UU from the target with a 25 UU step: the pawn ends 15 UU past it, and with the
+        // path-facing Plane the next arrival test reports the target as passed (radius 0).
+        let next = full_step_target([0.0, 0.0, 5.0], [10.0, 0.0, 99.0], 25.0);
+        assert_eq!(next, [25.0, 0.0, 5.0]);
+        assert!(cine_target_reached(
+            next,
+            [10.0, 0.0, 99.0],
+            [1.0, 0.0, 0.0],
+            0.0
+        ));
+        assert!(!cine_target_reached(
+            [0.0, 0.0, 5.0],
+            [10.0, 0.0, 99.0],
+            [1.0, 0.0, 0.0],
+            0.0
+        ));
+        assert_eq!(
+            full_step_target([3.0, 4.0, 0.0], [3.0, 4.0, 7.0], 25.0),
+            [3.0, 4.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn zero_radius_arrives_at_or_past_target() {
+        assert!(!cine_target_reached(
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            0.0
+        ));
+        assert!(cine_target_reached(
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0; 3],
+            0.0
+        ));
+        assert!(cine_target_reached(
+            [2.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            0.0
+        ));
+    }
+
+    #[test]
+    fn radius_is_strict_and_ignores_z() {
+        assert!(cine_target_reached(
+            [0.0, 0.0, 1000.0],
+            [2.99, 0.0, -1000.0],
+            [1.0, 0.0, 0.0],
+            3.0
+        ));
+        assert!(!cine_target_reached(
+            [0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            3.0
+        ));
+    }
+
+    #[test]
+    fn zero_radius_passed_target_uses_pre_move_direction() {
+        let direction = horizontal_direction([0.0, 0.0, 9.0], [1.0, 0.0, -9.0]);
+        assert!(cine_target_reached(
+            [2.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            direction,
+            0.0
+        ));
+    }
 }

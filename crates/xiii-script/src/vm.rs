@@ -7739,8 +7739,22 @@ impl<'s> Vm<'s> {
         speed: f32,
         dt: f32,
     ) -> VmResult<bool> {
-        let location = self.vector_prop(pawn, "Location").unwrap_or(destination);
         let radius = self.f32_prop(pawn, "CollisionRadius");
+        self.move_pawn_step_within(pawn, destination, speed, dt, radius)
+    }
+
+    /// [`Vm::move_pawn_step`] with an explicit stop radius: the pawn stops moving (and reports
+    /// arrival) once its horizontal distance to `destination` is within `radius`. Cine steering
+    /// passes 0, since its arrival test is `IsTargetReached`, not the pawn's collision radius.
+    pub(crate) fn move_pawn_step_within(
+        &mut self,
+        pawn: ObjectId,
+        destination: [f32; 3],
+        speed: f32,
+        dt: f32,
+        radius: f32,
+    ) -> VmResult<bool> {
+        let location = self.vector_prop(pawn, "Location").unwrap_or(destination);
         let speed = if speed > 0.0 {
             speed
         } else {
