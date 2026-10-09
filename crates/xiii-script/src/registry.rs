@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use crate::events::{PresentationEvent, SoundEvent, TravelRequest, TravelSource};
 use crate::linker::GlobalRef;
 use crate::value::{ObjRef, ObjectId, Value};
-use crate::vm::{Latent, TraceKind, Vm, VmErrorKind, VmResult, PHYS_FALLING};
+use crate::vm::{Latent, PHYS_FALLING, TraceKind, Vm, VmErrorKind, VmResult};
 
 /// Context of one native invocation.
 #[derive(Debug, Clone)]
@@ -5300,7 +5300,7 @@ fn builtin_defs() -> Vec<NativeDef> {
              offsets are not reproduced",
         ),
         ..def(
-            "XIDPawn.BaseSoldier.EyePosition",
+            "BaseSoldier.EyePosition",
             "native(0) simulated native function Vector EyePosition()",
             "xidpawn.u BaseSoldier.EyePosition decoded (return Vector, native); the caller \
              IAController.Chasse.PickDestination 0x013C adds Pawn.Location, so the override is \

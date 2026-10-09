@@ -1,4 +1,4 @@
-# item30: Plage01 route, walked end to end. No teleport lines. Segments A-D are the measured
+# item30: Plage01 route, walked end to end. No teleport commands. Segments A-D are the measured
 # walks from local/reports/item30-plage01-walk.md (hut, beach nav walk incl. the running jump
 # over the crate wall, TouchTrigger8/7 + killer, truck return legs + Porte1).
 #
@@ -11,167 +11,134 @@
 # firing (`track BaseSoldier6` / `track off`).
 
 # ---- hut: key, Beretta, door (all walked) ------------------------------------------------
-t=45.00 goto -491.84 -314.14
-t=45.40 jump
-t=45.90 jump
-t=46.40 jump
-t=46.90 jump
-t=47.40 jump
-t=47.90 forward 0
-t=49.00 goto -560.0 -520.0
-t=51.50 yaw 180
-t=51.60 forward 1
-t=51.70 jump
-t=52.20 forward 0
-t=53.00 goto -700.0 -511.89
-t=55.00 forward 0
-t=56.00 goto -500.0 -620.0
-t=59.50 goto -521.9 -724.9
-t=63.50 yaw 314.891
-t=63.60 forward 1
-t=65.10 forward 0
-t=65.20 goto -250.0 -1226.0
-t=68.20 yaw 268.0
-t=68.30 use
-t=68.80 use
-t=69.30 use
-t=69.60 forward 1
-t=71.10 forward 0
+# All times include the +2.2 s intro offset measured after the origin/main merge (control
+# returns at ~46.8 s now, not ~45.0 s): inputs issued while the intro suppresses input are
+# dropped, so the segment A jumps must land after the handback.
+t=47.20 goto -491.84 -314.14
+t=47.60 jump
+t=48.10 jump
+t=48.60 jump
+t=49.10 jump
+t=49.60 jump
+t=50.10 forward 0
+t=51.20 goto -560.0 -520.0
+t=53.70 yaw 180
+t=53.80 forward 1
+t=53.90 jump
+t=54.40 forward 0
+t=55.20 goto -700.0 -511.89
+t=57.20 forward 0
+t=58.20 goto -500.0 -620.0
+t=61.70 goto -521.9 -724.9
+t=65.70 yaw 314.891
+t=65.80 forward 1
+t=67.30 forward 0
+t=67.40 goto -250.0 -1226.0
+t=70.40 yaw 268.0
+t=70.50 use
+t=71.00 use
+t=71.50 use
+t=71.80 forward 1
+t=73.30 forward 0
 # TouchTrigger9 (-307,-1396) on the way down; objective 0 completes in the game's own chain.
-t=71.30 goto -307.0 -1400.0
+t=73.50 goto -307.0 -1400.0
 
 # ---- beach: nav polyline southwest to the truck shore ------------------------------------
 # Waypoints are the map's decoded ReachSpec polyline; each goto fires at distance/150 + 2 s
 # (the slowest measured shore pace), so the driver never runs ahead of the player. The crate
 # wall at the west end (stack top 1132 vs the 1067 passerelle shelf) is crossed with a running
 # jump - UE2 movement: 65 UU is above the 35 UU step and below the 92.8 UU jump apex.
-t=75.50 goto 643.3 -2397.5
-t=80.10 goto 495.7 -2753.6
-t=86.00 goto -6.5 -3041.7
-t=92.70 goto 256.4 -3696.2
-t=99.50 goto 527.7 -4360.9
-t=104.80 goto 422.3 -4846.9
-t=112.30 goto -78.5 -5502.2
-t=121.90 goto 98.1 -6628.7
-t=131.60 goto -909.8 -7179.3
-t=139.10 goto -805.2 -7997.7
-t=142.00 goto -861.8 -8127.4
-t=150.70 goto -1686.3 -8702.9
-t=158.70 goto -2554.9 -8907.9
-t=166.90 goto -3413.6 -9257.6
-t=170.70 goto -3665.9 -9354.3
-t=175.10 goto -3990.0 -9424.0
-t=179.40 goto -4119.0 -9427.7
-t=179.90 jump
-t=180.70 jump
-t=181.50 jump
-t=182.30 jump
-t=183.10 jump
-t=183.90 jump
-t=187.50 goto -4319.9 -9475.7
-t=192.00 goto -4630.0 -9531.7
-t=200.50 goto -5568.0 -9793.0
-t=207.30 goto -5902.0 -10424.5
-t=211.00 goto -5839.7 -10664.2
-t=215.60 goto -5738.4 -11048.0
-t=221.00 goto -5445.3 -11461.0
-t=226.30 goto -5103.0 -11821.9
-t=232.30 goto -4557.0 -12080.8
-t=238.40 goto -4011.9 -12352.8
-t=242.30 goto -3731.0 -12423.8
-t=245.20 goto -3602.6 -12453.4
-t=251.80 goto -2941.9 -12662.5
-t=261.20 goto -2029.2 -13286.1
-t=269.00 goto -1191.2 -13523.4
-t=276.70 goto -366.7 -13757.3
-t=286.00 goto 643.2 -14174.5
+t=77.70 goto 643.3 -2397.5
+t=82.30 goto 495.7 -2753.6
+t=88.20 goto -6.5 -3041.7
+t=94.90 goto 256.4 -3696.2
+t=101.70 goto 527.7 -4360.9
+t=107.00 goto 422.3 -4846.9
+t=114.50 goto -78.5 -5502.2
+t=124.10 goto 98.1 -6628.7
+t=133.80 goto -909.8 -7179.3
+t=141.30 goto -805.2 -7997.7
+t=144.20 goto -861.8 -8127.4
+t=152.90 goto -1686.3 -8702.9
+t=160.90 goto -2554.9 -8907.9
+t=169.10 goto -3413.6 -9257.6
+t=172.90 goto -3665.9 -9354.3
+t=177.30 goto -3990.0 -9424.0
+t=181.60 goto -4119.0 -9427.7
+t=182.10 jump
+t=182.90 jump
+t=183.70 jump
+t=184.50 jump
+t=185.30 jump
+t=186.10 jump
+t=189.70 goto -4319.9 -9475.7
+t=194.20 goto -4630.0 -9531.7
+t=202.70 goto -5568.0 -9793.0
+t=209.50 goto -5902.0 -10424.5
+t=213.20 goto -5839.7 -10664.2
+t=217.80 goto -5738.4 -11048.0
+t=223.20 goto -5445.3 -11461.0
+t=228.50 goto -5103.0 -11821.9
+t=234.50 goto -4557.0 -12080.8
+t=240.60 goto -4011.9 -12352.8
+t=244.50 goto -3731.0 -12423.8
+t=247.40 goto -3602.6 -12453.4
+t=254.00 goto -2941.9 -12662.5
+t=263.40 goto -2029.2 -13286.1
+t=271.20 goto -1191.2 -13523.4
+t=278.90 goto -366.7 -13757.3
+t=288.20 goto 643.2 -14174.5
 
 # ---- back route: TouchTrigger8 (passe_par_arriere) walked up the back-route nav points ----
-t=293.90 goto 1282.8 -13568.0
-t=301.00 goto 770.5 -12990.7
-t=307.30 goto 1282.4 -12591.3
-# T8 is touched at ~308 s; its killer-scene chain holds the player controller ~13 s, so the
+t=296.10 goto 1282.8 -13568.0
+t=303.20 goto 770.5 -12990.7
+t=309.50 goto 1282.4 -12591.3
+# T8 is touched at ~310.5 s; its killer-scene chain holds the player controller ~13 s, so the
 # killer approach starts after the handback. TouchTrigger7 (tueur_conducteur, r850 at
-# 1093,-13854) fires earlier on the shore walk (~287 s) - that is the game's own chain.
+# 1093,-13854) fires earlier on the shore walk (~289.6 s) - that is the game's own chain.
 
-# ---- the killer: walked approach (PathNode45 -> AttackPoint47 ReachSpec), then the old
-# route's proven firing geometry (1802,-12700, yaw 270). The killer walks while attacking, so
-# the view is tracked onto it around the firing.
-t=322.20 goto 1776.3 -12641.1
-t=327.50 goto 1802.0 -12700.0
-t=330.00 weapon XIII.m60
-t=330.80 yaw 270.0
-t=331.00 track BaseSoldier6
-# Spaced probe fires walk any held window to its end (any probe that lands also damages the
-# killer); the kill burst follows past the longest observed hold.
-t=345.00 fire
-t=355.00 fire
-t=365.00 fire
-t=375.00 fire
-t=385.00 fire
-t=390.00 fire
-t=390.40 fire
-t=390.80 fire
-t=391.20 fire
-t=391.60 fire
-t=392.00 fire
-t=392.40 fire
-t=392.80 fire
-t=393.20 fire
-t=393.60 fire
-t=394.00 fire
-t=394.40 fire
-t=394.80 fire
-t=395.20 fire
-t=395.60 fire
-t=396.00 fire
-t=396.40 fire
-t=396.80 fire
-t=397.20 fire
-t=397.60 fire
-t=398.00 fire
-t=398.40 fire
-t=398.80 fire
-t=399.20 fire
-t=399.60 fire
-t=400.00 fire
-t=400.40 fire
-t=400.80 fire
-t=401.20 fire
-t=401.60 fire
-t=402.00 fire
-t=402.40 fire
-t=402.80 fire
-t=403.20 fire
-t=403.60 fire
-t=404.00 fire
-t=404.40 fire
-t=404.80 fire
-t=405.20 fire
-t=405.60 fire
-t=406.00 fire
-t=406.40 fire
-t=406.80 fire
-t=407.20 fire
-t=407.60 fire
-t=408.00 fire
-t=408.20 track off
+# ---- the killer: the walked T7 shore touch (~289.6 s) sends the killer to the parking wall;
+# he parks at ~(1771,-13026) (measured with track, scratch item30c_e3/e5/e6). The north firing
+# pose and a 372 UU southern spot deal zero damage (the wall blocks; measured), so the player
+# walks down the proven nav legs after the T8 handback (~13 s scene hold) and fights from
+# (1771,-13200), 174 UU south of him - measured kill in 12 m60 shots + CorpseSearched there
+# (scratch item30c_e6). The killer walks while attacking, so the view is tracked onto it.
+t=326.00 weapon XIII.m60
+t=326.40 goto 1282.4 -12591.3
+t=333.00 goto 770.5 -12990.7
+t=340.50 goto 1282.8 -13568.0
+t=348.50 goto 1771.0 -13200.0
+t=355.00 track BaseSoldier6
+# m60 burst: 12 Spine1 hits kill (56 hp each, measured); 16 shots give margin. Spacing 0.45 s
+# is the weapon's own fire cadence.
+t=355.50 fire
+t=355.95 fire
+t=356.40 fire
+t=356.85 fire
+t=357.30 fire
+t=357.75 fire
+t=358.20 fire
+t=358.65 fire
+t=359.10 fire
+t=359.55 fire
+t=360.00 fire
+t=360.45 fire
+t=360.90 fire
+t=361.35 fire
+t=361.80 fire
+t=362.25 fire
+t=366.00 search BaseSoldier6
 
-# Search the dead killer for the game's ClefPickup (the pick-up truck key).
-t=408.50 search BaseSoldier6
-
-# ---- Segment D: walked return legs (AttackPoint47 -> PathNode45 -> PathNode46 -> PathNode48
-# -> PathNode47 -> PathNode18 -> AttackPoint43), then the truck staging point --------------
-t=413.60 goto 1282.4 -12591.3
-t=419.90 goto 770.5 -12990.7
-t=426.20 goto 1282.8 -13568.0
-t=433.30 goto 643.2 -14174.5
-t=441.20 goto 1235.0 -14319.0
-t=447.30 goto 1391.8 -14279.6
-t=450.40 goto 1215.0 -14000.0
+# ---- Segment D: walked return legs (fight spot -> PathNode48 -> PathNode47 -> PathNode18
+# -> AttackPoint43), then the truck staging point -------------------------------------------
+t=367.00 goto 1282.8 -13568.0
+t=374.50 goto 643.2 -14174.5
+t=383.00 goto 1235.0 -14319.0
+t=389.50 goto 1391.8 -14279.6
+t=392.50 goto 1215.0 -14000.0
 # Porte1 is interaction-hidden, so the named use is required; two uses (Unlocked + Triggered).
-t=455.30 yaw 270.0
-t=455.40 use Porte1
-t=456.40 use Porte1
-t=456.90 wait_travel
-t=458.90 forward 0
+t=397.00 yaw 270.0
+t=397.10 use Porte1
+t=398.10 use Porte1
+t=398.60 wait_travel
+t=400.60 forward 0

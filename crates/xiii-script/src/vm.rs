@@ -4375,8 +4375,7 @@ impl<'s> Vm<'s> {
                     .state
                     .map(|g| self.set.path(g))
                     .unwrap_or_default();
-                let pc = self
-                    .objects[id as usize]
+                let pc = self.objects[id as usize]
                     .state_code
                     .as_ref()
                     .map(|c| c.pc)
@@ -4727,10 +4726,7 @@ impl<'s> Vm<'s> {
             static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 12 {
-                let pawn = call
-                    .args
-                    .first()
-                    .and_then(|a| self.eval(frame, a).ok());
+                let pawn = call.args.first().and_then(|a| self.eval(frame, a).ok());
                 let (chain, owner) = match &pawn {
                     Some(Value::Object(Some(ObjRef::Instance(id)))) => {
                         let mut items = Vec::new();

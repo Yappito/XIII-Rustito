@@ -97,11 +97,6 @@ struct ScriptRes {
     drive: Option<script::Drive>,
 }
 
-/// item30 temporary: last seen controller active flag (removed with the investigation).
-thread_local! {
-    static CONTROLLER_ACTIVE_LAST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-}
-
 /// Player footstep cadence for `--play` (surface lookup table + accumulator). See
 /// [`footsteps`] for the evidence (notify-driven in the original; synthesised here because the
 /// player pawn has no third-person animation).
@@ -2089,7 +2084,10 @@ fn run_script_inner(
             // killer-scene investigation).
             if tick.is_multiple_of(TRACE_EVERY) {
                 if let Some(loc) = location {
-                    println!("[track] t={elapsed:.3}s {name} at ({:.1},{:.1},{:.1})", loc[0], loc[1], loc[2]);
+                    println!(
+                        "[track] t={elapsed:.3}s {name} at ({:.1},{:.1},{:.1})",
+                        loc[0], loc[1], loc[2]
+                    );
                 } else {
                     println!("[track] t={elapsed:.3}s {name} not live");
                 }
@@ -2236,17 +2234,6 @@ fn run_script_inner(
                 format_vm_trace(&runtime.session),
                 format_mover_trace(&runtime.session)
             );
-            // item30 temporary: controller active-flag transitions (removed with the
-            // killer-scene investigation).
-            if let Some(c) = runtime.session.controller {
-                let active = runtime.session.vm().objects[c as usize].active;
-                if active != CONTROLLER_ACTIVE_LAST.with(|f| f.get()) {
-                    CONTROLLER_ACTIVE_LAST.with(|f| f.set(active));
-                    println!(
-                        "[ctrl trace] t={elapsed:.3}s controller active -> {active}"
-                    );
-                }
-            }
         }
 
         // Level transition: the game's own goal/travel code requested it. The VM reported the
@@ -3132,14 +3119,16 @@ mod tests {
         let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/plage01_route.script");
         let mut script = script::Script::load(&route_path).expect("load tracked Plage01 route");
-        script.events.retain(|event| event.t <= 64.0);
+        // item30c: the walked route fires its M60 burst at t=355.5-362.25 (the killer dies at
+        // ~360.5); cut there so the run stops well before the level-end travel (t~454).
+        script.events.retain(|event| event.t <= 370.0);
         let mut outcome = run_script(
             &game_dir,
             "Plage01",
             &script,
             &resolved.params,
             &scene,
-            65.0,
+            380.0,
         )
         .expect("run Plage01 through its weapon fire and corpse search");
         assert_eq!(
@@ -3298,14 +3287,33 @@ mod tests {
                 .vm()
                 .get_property(checkpoint, "SoundToLaunch")
         );
+        // item30c: the walked route also carries the picked-up Beretta, whose mis-wired pickup
+        // chains its AmmoType to the fists ammo (see the route fixture comment) - so "first ammo
+        // item in the save" is no longer the selected weapon's ammo. Resolve the selected
+        // weapon's own AmmoType class from the live VM and match that saved item.
+        let vm = outcome.session.vm();
+        let weapon = outcome
+            .session
+            .player_weapon()
+            .expect("route leaves a weapon");
+        let weapon_ammo_class = match vm.get_property(weapon, "AmmoType") {
+            Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => {
+                vm.set().path(vm.objects[*id as usize].class)
+            }
+            other => panic!("route weapon has no instance AmmoType: {other:?}"),
+        };
         let ammo = saved
             .inventory
             .iter()
             .find_map(|item| {
-                item.ammo_amount
-                    .map(|amount| (item.class_path.clone(), amount))
+                (item.class_path.eq_ignore_ascii_case(&weapon_ammo_class))
+                    .then(|| {
+                        item.ammo_amount
+                            .map(|amount| (item.class_path.clone(), amount))
+                    })
+                    .flatten()
             })
-            .expect("saved travel inventory includes ammunition");
+            .expect("saved travel inventory includes the selected weapon's ammunition");
         assert!(ammo.1 >= 0, "invalid saved ammo count: {ammo:?}");
         println!(
             "[item33 route] checkpoint={} weapon={} ammo={ammo:?} health={} objectives={:?} sound={:?}",
@@ -3334,10 +3342,23 @@ mod tests {
         let loaded = crate::save::read(&save_dir, 0).expect("read route checkpoint");
         let mut resumed =
             session::Session::open_checkpoint(&game_dir, "Plage01").expect("open checkpoint map");
+        // The game's own load chain never reduces health: xiii.XIIIGameInfo.AcceptInventory runs
+        // `P.Health = Max(P.default.Health*0.25 + 1, P.Health)` (0x0173) and then
+        // `P.Health = Max(P.Health, S.Health)` over the ThingsToSave (0x0223) - the saved value
+        // is only a floor (disassembled from xiii.u; a wounded 144 hp save reloads at the 150 hp
+        // spawn default). Measure the fresh pawn's spawn health before the restore and expect
+        // exactly that game semantic.
+        let spawn_health = resumed
+            .player_health()
+            .expect("checkpoint pawn spawn health");
         resumed
             .restore_checkpoint(&loaded)
             .expect("run AcceptInventory restore path");
-        assert_eq!(resumed.player_health(), Some(saved.health));
+        assert_eq!(
+            resumed.player_health(),
+            Some(saved.health.max(spawn_health)),
+            "restored health must be the game's own max(spawn, saved) semantic"
+        );
         assert_eq!(
             resumed.player_weapon().map(|id| resumed
                 .vm()
@@ -3404,9 +3425,17 @@ mod tests {
             remaining.remove(at);
         }
         remaining.sort();
+        // item30c: AcceptInventory's authored defaults are the fists ammo and the left hand.
+        // The walked route's save already contains a FistsAmmo item (the picked-up Beretta's
+        // mis-wired ammo, amount 1), so that default is consumed by the saved-class matching
+        // above and only the genuinely-absent defaults remain.
+        let expected_leftovers: Vec<String> = ["xiii.fistsammo", "xiii.xiiilefthand"]
+            .iter()
+            .filter(|class| !saved_classes.contains(&class.to_string()))
+            .map(|class| class.to_string())
+            .collect();
         assert_eq!(
-            remaining,
-            ["xiii.fistsammo", "xiii.xiiilefthand"],
+            remaining, expected_leftovers,
             "only AcceptInventory's authored default ammo/left-hand entries should be added"
         );
         let mut saved_ammo_state = saved
@@ -4474,8 +4503,17 @@ mod tests {
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
         let route = script::Script::parse(include_str!("../../tests/data/plage01_route.script"))
             .expect("parse the checked-in Plage01 route fixture");
-        let outcome = run_script(&game_dir, "Plage01", &route, &resolved.params, &scene, 65.0)
-            .expect("run the requested Plage01 route through the killer");
+        // item30c: the walked route kills BaseSoldier6 at ~360.5 s; the death pose needs a few
+        // seconds after that (the run stops long before the level-end travel at ~454 s).
+        let outcome = run_script(
+            &game_dir,
+            "Plage01",
+            &route,
+            &resolved.params,
+            &scene,
+            375.0,
+        )
+        .expect("run the requested Plage01 route through the killer");
         let vm = outcome.session.vm();
         let killer = vm
             .find_object("BaseSoldier6")

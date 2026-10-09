@@ -735,8 +735,10 @@ fn registry_entries_are_documented() {
     // Partials and the visible Partial for `LevelInfo.DecAttaque` (588); item14c added four
     // trail/particle Partials (SpawnParticle is shared with item18); item20 adds ten decoded GUI
     // save-slot declarations; item40c adds the headless Interaction.Initialize and ForceFeedback
-    // viewport/device Partials; item43 adds Actor.TraceActors. Must equal `Registry::builtin().defs().count()`.
-    assert_eq!(defs.len(), 331);
+    // viewport/device Partials; item43 adds Actor.TraceActors; item30b adds the latent
+    // Engine.Controller.WaitForLanding (527) and item30c the BaseSoldier.EyePosition override
+    // (both from the item30 Plage01 walk). Must equal `Registry::builtin().defs().count()`.
+    assert_eq!(defs.len(), 333);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
