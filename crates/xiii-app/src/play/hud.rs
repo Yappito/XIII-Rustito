@@ -378,9 +378,13 @@ pub fn refresh(
         .map(|w| [w.width(), w.height()])
         .unwrap_or([1280.0, 720.0]);
     hud.clip = size;
+    {
+        let vm = session.vm_mut();
+        vm.set_property(canvas, "ClipX", 0, Value::Float(size[0]));
+        vm.set_property(canvas, "ClipY", 0, Value::Float(size[1]));
+    }
+    session.render_interaction(canvas);
     let vm = session.vm_mut();
-    vm.set_property(canvas, "ClipX", 0, Value::Float(size[0]));
-    vm.set_property(canvas, "ClipY", 0, Value::Float(size[1]));
     let arg = Value::Object(Some(ObjRef::Instance(canvas)));
     match vm.send_event(hud_id, "PostRender", vec![arg]) {
         Ok(_) => {

@@ -466,8 +466,8 @@ fn key_pair(times: &[f32], frame: f32, track_time: f32, looping: bool) -> (usize
 
 impl BoneTrack {
     /// Samples the local transform at `frame` (0..=track_time). With `looping`, the interval
-    /// after the last key interpolates back to the first key (hypothesis; UE2 behavior for the
-    /// last key not yet compared against the original).
+    /// after the last key interpolates back to the first key (Engine.dll track sampler
+    /// 0x103ef228?0x103ef2c3). Non-loop playback stops at frame N-1 before the wrap interval.
     pub fn sample(&self, frame: f32, track_time: f32, looping: bool) -> Transform {
         let (a, b, t) = key_pair(&self.times, frame, track_time, looping);
         let rotation = match (self.rotations.get(a), self.rotations.get(b)) {

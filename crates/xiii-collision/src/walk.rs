@@ -22,13 +22,14 @@
 //! - `APawn::physWalking`/`stepUp` sweep with the pawn's extent box; `AActor::stepUp`
 //!   (`0x103bb0a0`) is the same shape without the ground logic.
 //! - `ULevel::MoveActor` (`0x1038a770`) moves the box, then checks blocking actors. item27k
-//!   measured its world-check back-off: the check segment is extended 2 UU behind the start
-//!   (`+2.0` at `0x1038a981`, unit dir from `1.0/|delta|`) and a world hit inside that back-off
-//!   (`(2+|delta|)*t_hit <= 2`, branch at `0x1038aba8`) is discarded (`0x1038abaf`) instead of
-//!   stopping the move — a mover escapes geometry it starts flush with/inside. For this crate's
-//!   continuous sweep that reduces exactly to discarding start-penetrating hits, which walk
-//!   enables via `SweepParams::discard_start_penetration` (walkable floors are exempt: the
-//!   engine rides slopes through its own floor machinery, not the move back-off).
+//!   measured its world-check back-off, corrected by item27n: the check segment is extended
+//!   2 UU forward beyond the requested end (`+2.0` at `0x1038a981`, unit dir from
+//!   `1.0/|delta|`) and a world hit inside that back-off
+//!   (`(2+|delta|)*t_hit <= 2`, branch at `0x1038aba8`) zeroes the delta and hit time
+//!   (`0x1038abaf`), blocking movement. It is not a discard permitting penetration. This
+//!   crate's `SweepParams::discard_start_penetration` remains an explicit **host approximation**
+//!   for genuinely embedded triangle-soup starts; touching faces now block. Walkable floors
+//!   are exempt, as they are handled by the floor machinery.
 //! - `ATerrainInfo::LineCheck` (`0x10409eb0`) clamps the ray to the base heightmap and indexes
 //!   `Vertices[HeightmapX*y + x]`; `UModel::LineCheck` (`0x10419b80`) is a BSP ray/segment with
 //!   extent; `UStaticMesh::LineCheck` (`0x10402e00`) dispatches to the per-polygon or simplified
@@ -72,12 +73,10 @@ use crate::{
 /// is not proven here (no such branch was located); see [`probe_floor`].
 pub const FLOOR_PROBE_RATIO: f32 = 37.0 / 35.0;
 
-/// Sweep parameters for walk movement. The engine's `ULevel::MoveActor` runs its world check
-/// along a segment extended 2 UU behind the start and discards hits inside that back-off
-/// (Engine.dll 0x1038a89a-0x1038ac05); for this crate's continuous sweep that reduces to
-/// discarding start-penetrating hits (see [`SweepParams::discard_start_penetration`]), so a
-/// walker never deadlocks against geometry it starts flush with/inside. Walk turns it on for
-/// every sub-sweep; `move_slide` (plain blocking moves) keeps the default.
+/// Sweep parameters for walk movement. Overlap recovery for genuinely embedded starts is
+/// a host approximation, not `ULevel::MoveActor`'s back-off (see module evidence and
+/// [`SweepParams::discard_start_penetration`]). Touching faces still block motion into them.
+/// Walk turns recovery on for every sub-sweep; `move_slide` keeps the default.
 fn walk_sweep_params(
     ignore_resting_floor_z: Option<f32>,
     walkable_floor_z: Option<f32>,

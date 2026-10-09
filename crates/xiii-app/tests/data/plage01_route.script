@@ -38,8 +38,7 @@ t=58.50 teleport 1093.0 -13854.0 1113.0 # diagnostic: approach tueur_conducteur 
 
 # Diagnostic weapon bootstrap; the actual fire/death/inventory transfer are the game's code.
 t=59.00 weapon XIII.m60
-# grant_weapon directly wires and brings up this diagnostic weapon; `equip` would walk the
-# inventory chain, where the game's AddInventory HUD notification is currently deferred.
+# This fixture retains its labelled weapon grant; carried-weapon input uses switch_weapon.
 t=60.00 teleport 1802.0 -12700.0 1100.0 # diagnostic: approach killer
 t=60.00 track BaseSoldier6
 t=60.10 fire

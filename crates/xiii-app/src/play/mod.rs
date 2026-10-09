@@ -761,10 +761,7 @@ fn setup_inner(
         if pawn_scene.attachments.is_empty() {
             String::new()
         } else {
-            format!(
-                "; attachments not rendered: {}",
-                pawn_scene.attachments.join(", ")
-            )
+            format!("; bone attachments: {}", pawn_scene.attachments.join(", "))
         }
     );
     if pawn_scene.bone_controls_not_applied > 0 {
@@ -993,14 +990,13 @@ fn fixed_step(
     }
     // Always advance the script so an explicit `take_control` diagnostic can be read even while a cutscene
     // suppresses input; the axis input and the other command queues are dropped when suppressed.
-    let (mut input, weapons, goals, equip, use_named, search) = match script.drive.as_mut() {
+    let (mut input, weapons, goals, use_named, search) = match script.drive.as_mut() {
         Some(drive) => {
             let input = drive.advance(elapsed, &mut sim.0);
             (
                 input,
                 drive.take_weapons(),
                 drive.take_goals(),
-                drive.take_equip(),
                 drive.take_use_named(),
                 drive.take_search(),
             )
@@ -1009,11 +1005,44 @@ fn fixed_step(
             read_keyboard(&keys, &buttons),
             Vec::new(),
             Vec::new(),
-            false,
             Vec::new(),
             Vec::new(),
         ),
     };
+    let mut weapon_inputs = if let Some(drive) = script.drive.as_mut() {
+        drive.take_weapon_inputs()
+    } else {
+        let groups = [0, 1, 2, 3, 4, 6, 9, 11, 14, 15];
+        let digits = [
+            KeyCode::Digit0,
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+            KeyCode::Digit5,
+            KeyCode::Digit6,
+            KeyCode::Digit7,
+            KeyCode::Digit8,
+            KeyCode::Digit9,
+        ];
+        let mut inputs: Vec<_> = digits
+            .into_iter()
+            .zip(groups)
+            .filter_map(|(key, group)| keys.just_pressed(key).then_some(Some(group)))
+            .collect();
+        if keys.just_pressed(KeyCode::KeyX) || keys.just_pressed(KeyCode::PageUp) {
+            inputs.push(None);
+        }
+        inputs
+    };
+    if suppressed {
+        weapon_inputs.clear();
+    }
+    let wake: Vec<String> = script
+        .drive
+        .as_mut()
+        .map(script::Drive::take_wake)
+        .unwrap_or_default();
     let control = script
         .drive
         .as_mut()
@@ -1021,10 +1050,10 @@ fn fixed_step(
     if suppressed {
         input = Input::default();
     }
-    let (weapons, goals, equip, use_named, search) = if suppressed {
-        (Vec::new(), Vec::new(), false, Vec::new(), Vec::new())
+    let (weapons, goals, use_named, search) = if suppressed {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
     } else {
-        (weapons, goals, equip, use_named, search)
+        (weapons, goals, use_named, search)
     };
     let use_action = input.use_action;
     let fire = input.fire;
@@ -1071,6 +1100,7 @@ fn fixed_step(
             floor_normal: sim.0.floor_normal,
         };
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
+        sess.sync_view_rotation(sim.0.yaw, sim.0.pitch);
         if let Some((location, yaw, velocity)) = sess.script_pawn_pose() {
             sim.0.location = location;
             sim.0.yaw = yaw;
@@ -1130,10 +1160,9 @@ fn fixed_step(
                 println!("[play] set_goal {n} failed: {e}");
             }
         }
-        if equip {
-            match sess.equip_inventory_weapon() {
-                Ok(msg) => println!("[play] equip {msg}"),
-                Err(e) => println!("[play] equip failed: {e}"),
+        for group in weapon_inputs {
+            if let Err(e) = sess.weapon_input(group) {
+                sess.blocked.push(format!("weapon input {group:?}: {e}"));
             }
         }
         if control {
@@ -1152,6 +1181,12 @@ fn fixed_step(
         for target in &search {
             let outcome = sess.search_corpse(target);
             println!("[play] search {target}: {outcome:?}");
+        }
+        for target in &wake {
+            match sess.wake_actor(target) {
+                Ok(msg) => println!("[play] wake {msg}"),
+                Err(e) => println!("[play] wake failed: {e}"),
+            }
         }
         if fire {
             match sess.fire(sim.0.yaw, sim.0.pitch) {
@@ -2112,9 +2147,10 @@ fn run_script_inner(
         let mut input = drive.advance(elapsed, &mut runtime.sim);
         let mut weapons = drive.take_weapons();
         let goals = drive.take_goals();
-        let mut equip = drive.take_equip();
+        let mut weapon_inputs = drive.take_weapon_inputs();
         let mut use_named = drive.take_use_named();
         let mut search = drive.take_search();
+        let wake = drive.take_wake();
         let control = drive.take_control();
         // Match the interactive fixed_step: FPC/FPL/CameraView/PlayingVideo own the pawn while
         // the authored cinematic runs. The headless route must still advance its script cursor,
@@ -2124,9 +2160,11 @@ fn run_script_inner(
         if respect_cinematic_input && cinematics::input_suppressed(&runtime.session) {
             input = Input::default();
             weapons.clear();
-            equip = false;
+            weapon_inputs.clear();
             use_named.clear();
             search.clear();
+            // `wake` is a host bridge like `set_goal`, not a player input: it stays available
+            // while an authored cinematic suppresses the player axes.
         }
         let fired = input.fire;
         if runtime.volumes.is_empty() {
@@ -2162,7 +2200,6 @@ fn run_script_inner(
             landed_velocity_z: runtime.sim.landed.then_some(runtime.sim.land_velocity_z),
             floor_normal: runtime.sim.floor_normal,
         };
-        runtime.session.drive_render_phase();
         runtime.session.step(
             DT,
             runtime.sim.location,
@@ -2170,6 +2207,10 @@ fn run_script_inner(
             runtime.sim.velocity,
             &modes,
         );
+        runtime
+            .session
+            .sync_view_rotation(runtime.sim.yaw, runtime.sim.pitch);
+        runtime.session.drive_render_phase();
         if let Some((location, yaw, velocity)) = runtime.session.script_pawn_pose() {
             runtime.sim.location = location;
             runtime.sim.yaw = yaw;
@@ -2194,10 +2235,9 @@ fn run_script_inner(
                 println!("[play] set_goal {n} failed: {e}");
             }
         }
-        if equip {
-            match runtime.session.equip_inventory_weapon() {
-                Ok(msg) => println!("[play] equip {msg}"),
-                Err(e) => println!("[play] equip failed: {e}"),
+        for group in weapon_inputs {
+            if let Err(e) = runtime.session.weapon_input(group) {
+                return Err(format!("weapon input {group:?}: {e}"));
             }
         }
         if control {
@@ -2222,6 +2262,12 @@ fn run_script_inner(
         for target in &search {
             let outcome = runtime.session.search_corpse(target);
             println!("[play] search {target}: {outcome:?}");
+        }
+        for target in &wake {
+            match runtime.session.wake_actor(target) {
+                Ok(msg) => println!("[play] wake {msg}"),
+                Err(e) => println!("[play] wake failed: {e}"),
+            }
         }
         if fired {
             match runtime.session.fire(runtime.sim.yaw, runtime.sim.pitch) {
@@ -3309,14 +3355,18 @@ mod tests {
                 .vm()
                 .get_property(checkpoint, "SoundToLaunch")
         );
+        // The chain now begins with the authored entry defaults (`Fists` -> `FistsAmmo` -> ...),
+        // so "the first ammo item" is no longer the route weapon's ammunition. Compare the
+        // selected weapon's own ammo class end to end.
         let ammo = saved
             .inventory
             .iter()
-            .find_map(|item| {
+            .find(|item| item.class_path.eq_ignore_ascii_case("XIII.M60Ammo"))
+            .and_then(|item| {
                 item.ammo_amount
                     .map(|amount| (item.class_path.clone(), amount))
             })
-            .expect("saved travel inventory includes ammunition");
+            .expect("saved travel inventory includes the selected weapon's ammunition");
         assert!(ammo.1 >= 0, "invalid saved ammo count: {ammo:?}");
         println!(
             "[item33 route] checkpoint={} weapon={} ammo={ammo:?} health={} objectives={:?} sound={:?}",
@@ -3415,10 +3465,25 @@ mod tests {
             remaining.remove(at);
         }
         remaining.sort();
+        // Authored `XIIIGameInfo.AcceptInventory` adds exactly three classes beyond the saved
+        // travel inventory, and only when the restored chain lacks them (all measured script):
+        // the default weapon `Fists` (`AddDefaultInventory` 0x04CF ->
+        // `BaseMutator.GetDefaultWeapon` -> `XIIISoloMutator.DefaultWeaponName`="XIII.Fists",
+        // Spawn+GiveTo; `Weapon.GiveAmmo` links `FistsAmmo` at amount 0) and `XIIILeftHand`
+        // (0x0844-0x08A0, Spawn+GiveTo when `FindInventoryType` misses). A fresh-start route
+        // save legitimately lacks them because `XIIIGameInfo.RestartPlayer` omits stock UE2's
+        // `AddDefaultInventory` and these maps carry no MapInfo `InitialInv`; a save that
+        // already holds the defaults must be restored without duplicates.
+        let mut expected_extras: Vec<String> = Vec::new();
+        for class in ["xiii.fists", "xiii.fistsammo", "xiii.xiiilefthand"] {
+            if !saved_classes.iter().any(|c| c == class) {
+                expected_extras.push(class.to_owned());
+            }
+        }
+        expected_extras.sort();
         assert_eq!(
-            remaining,
-            ["xiii.fistsammo", "xiii.xiiilefthand"],
-            "only AcceptInventory's authored default ammo/left-hand entries should be added"
+            remaining, expected_extras,
+            "only AcceptInventory's authored default weapon/ammo/left-hand entries may be added"
         );
         let mut saved_ammo_state = saved
             .inventory
@@ -3971,6 +4036,15 @@ mod tests {
         // the player ends crouched inside the duct, west of the broken grille.
         let vm = outcome.session.vm();
         assert!(
+            vm.trace.iter().any(|event| {
+                (123.0..123.1).contains(&event.time)
+                    && matches!(&event.kind,
+                xiii_script::TraceKind::Event { function, .. }
+                    if function.ends_with("XIIIPlayerController.Grab"))
+            }),
+            "the chair must be grabbed by the controller script, not a host Touch bridge"
+        );
+        assert!(
             vm.find_live_object("BreakAbleMover16").is_none(),
             "the chair swing must break (destroy) the duct grille BreakAbleMover16"
         );
@@ -4499,7 +4573,13 @@ mod tests {
 
     /// item44: collect the placed Beretta through the map pickup and verify its ammunition class
     /// and authored damage path. The teleport only positions the player on the pickup; no weapon
-    /// grant command is used.
+    /// grant command is used. The authored entry defaults equip `Fists` (`AcceptInventory` at
+    /// map entry), and the authored `Weapon.ClientWeaponSet(True)` deliberately does not switch
+    /// a human-controlled pawn that already holds a weapon (bytecode 0x0084), so the route
+    /// selects the picked-up Beretta through SwitchWeapon(2), which waits for the old weapon's
+    /// decoded Down animation before ChangedWeapon brings up the new weapon.
+    /// The route wakes `BaseSoldier6` first: the map parks him in `IAController.faction`
+    /// (invisible, `bCollideActors=false`) until a scripted trigger fires his controller.
     #[test]
     fn opt_in_plage01_beretta_pickup_uses_nine_mm_and_damages_soldier() {
         let Some(game_dir) = opt_in_root() else {
@@ -4525,6 +4605,7 @@ mod tests {
              t=60.00 teleport 1802.0 -12700.0 1100.0\n\
              t=60.00 track BaseSoldier6\n\
              t=60.05 track off\nt=60.05 pitch 5\n\
+             t=60.10 switch_weapon 2\n\
              t=60.20 fire\nt=60.80 fire\nt=61.40 fire\nt=62.00 fire\nt=62.60 fire\n",
         )
         .expect("parse pickup combat route");
@@ -4542,6 +4623,39 @@ mod tests {
             .player_weapon()
             .expect("map pickup must equip the Beretta");
         let vm = session.vm();
+        let down = vm
+            .trace
+            .iter()
+            .find(|event| {
+                event.time >= 60.1
+                    && matches!(&event.kind,
+                xiii_script::TraceKind::StateChange { actor, to: Some(state), .. }
+                    if actor.starts_with("Fists") && state == "DownWeapon")
+            })
+            .expect("SwitchWeapon must lower the old Fists through DownWeapon");
+        let ended = vm
+            .trace
+            .iter()
+            .find(|event| {
+                event.time > down.time
+                    && matches!(&event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target.starts_with("Fists") && function.ends_with("DownWeapon.AnimEnd"))
+            })
+            .expect("decoded Down clip must deliver the state-scoped AnimEnd later");
+        assert!(
+            vm.trace.iter().any(|event| {
+                event.time == ended.time
+                    && matches!(&event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target == &session.player_name && function.ends_with("ChangedWeapon"))
+            }),
+            "the old weapon's AnimEnd must call Pawn.ChangedWeapon"
+        );
+        println!(
+            "[item49] Fists DownWeapon at {:.3}s -> AnimEnd/ChangedWeapon at {:.3}s",
+            down.time, ended.time
+        );
         let pickup = vm
             .objects
             .iter()
@@ -4585,6 +4699,64 @@ mod tests {
         assert!(
             health.is_some_and(|health| health < 550.0),
             "a shot from the picked Beretta must damage BaseSoldier6"
+        );
+    }
+
+    /// Item47b continuation (A): with the engine's decoded actor-trace filter, a parked soldier
+    /// (`IAController.faction`: `SetCollision(false,false,false)`, `SetDrawType(0)`, `bStasis`)
+    /// does not block hitscan bullets — it is not in the collision hash. Two otherwise identical
+    /// Plage01 runs: one fires five Beretta shots at the parked `BaseSoldier6`, one does not
+    /// fire. Both must report the same `Health`. The pre-decode "extent OR bCollideActors"
+    /// heuristic made the parked soldier shootable, contradicting the engine's hash gating
+    /// (`ULevel::SpawnActor`/`SetActorCollision`/`FarMoveActor` all insert only while
+    /// `bCollideActors` holds). The woken case is covered by the Beretta pickup test above.
+    #[test]
+    fn opt_in_plage01_parked_soldier_does_not_block_bullets() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let health_for = |fires: &str| -> Option<f32> {
+            let script = script::Script::parse(&format!(
+                "t=48.00 weapon XIII.Beretta\n\
+                 t=48.20 teleport 1802.4131 -12992.034 1070.843\n\
+                 t=48.20 yaw 90\nt=48.20 pitch 5\n\
+                 {fires}"
+            ))
+            .expect("parse parked-soldier route");
+            let outcome = run_script(
+                &game_dir,
+                "Plage01",
+                &script,
+                &resolved.params,
+                &scene,
+                52.0,
+            )
+            .expect("run parked-soldier route");
+            let soldier = outcome
+                .session
+                .vm()
+                .find_object("BaseSoldier6")
+                .expect("Plage01 BaseSoldier6");
+            outcome.session.actor_health(soldier)
+        };
+        let no_shots = health_for("").expect("control-run health");
+        let five_shots =
+            health_for("t=49.20 fire\nt=49.80 fire\nt=50.40 fire\nt=50.90 fire\nt=51.30 fire\n");
+        println!(
+            "[parked test] BaseSoldier6 health: no shots {no_shots:?}, five shots at the parked soldier {five_shots:?}"
+        );
+        assert_eq!(
+            Some(no_shots),
+            five_shots,
+            "bullets must pass through the parked (bCollideActors=false) soldier"
         );
     }
 

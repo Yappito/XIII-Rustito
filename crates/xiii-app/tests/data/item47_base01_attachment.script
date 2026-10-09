@@ -1,0 +1,4 @@
+# Extra item47 camera diagnostic: the requested default-spawn capture is kept separately.
+# Face BaseSoldier17 from 200 UU in front; no weapon/native/animation overrides.
+t=0 teleport -10147.623 6744.154 867.0
+t=0 yaw -180

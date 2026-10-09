@@ -29,23 +29,21 @@ pub struct SweepParams {
     /// grazing `t = 0` contact is the nearest hit and hides the real obstacle behind it
     /// (item1k: the walkable-ledge stall). `None` (default) keeps the plain behaviour.
     pub ignore_resting_floor_z: Option<f32>,
-    /// When true, a triangle the box already overlaps/touches at `t = 0` **never blocks** —
-    /// the sweep continues and reports only geometry the box reaches while clear. This is the
-    /// engine's measured `ULevel::MoveActor` behaviour (Engine.dll 0x1038a89a-0x1038ac05): the
-    /// world check runs along a segment extended 2 UU behind the start (`+2.0` at 0x1038a981)
-    /// and a hit inside that back-off — `(2+|delta|)*t_hit <= 2`, branch at 0x1038aba8 — is
-    /// discarded (0x1038abaf) instead of stopping the move, letting a mover escape geometry it
-    /// starts flush with/inside. For a true continuous sweep this reduces exactly to discarding
-    /// start-penetrating hits: any `t = 0` contact lies at/behind the start box, i.e. within
-    /// the back-off, while every hit found from a clear box maps to a contact strictly ahead of
-    /// the start and still blocks. A surface whose normal up-component reaches
-    /// [`Self::walkable_floor_z`] is exempt: the engine rides walkable floors through its own
-    /// floor machinery (`physWalking`'s floor snap), not through the move back-off. `false`
-    /// (default) keeps the plain behaviour; walk movement turns it on.
+    /// Explicit overlap-recovery approximation: ignore a `t = 0` hit only when the box
+    /// genuinely penetrates the triangle plane (by more than the contact epsilon).
+    /// Merely touching a wall still blocks motion into it, including with this option set.
+    /// This is **not** a port of `ULevel::MoveActor`'s back-off: item27n re-read
+    /// Engine.dll 0x1038a89a-0x1038ac05. The engine extends the check **forward** by 2 UU;
+    /// when `(2+|delta|)*t_hit <= 2`, 0x1038abaf zeroes the delta and hit time. It does not
+    /// discard the hit and allow the requested motion. The overlap-recovery approximation
+    /// remains for imported triangle-soup starts already embedded in geometry; the engine's
+    /// BSP/mesh checks and extent SAT are not equivalent there. Walkable floors (see
+    /// [`Self::walkable_floor_z`]) are exempt so slope riding retains its floor machinery.
+    /// `false` (default) keeps the plain behaviour; walk movement turns this policy on.
     pub discard_start_penetration: bool,
     /// Walkability threshold for [`Self::discard_start_penetration`] exemptions: a
     /// start-penetrating contact with `normal.y >= z` follows the plain (non-discarding) rules
-    /// so ramp/slope riding keeps working. `None` discards every start-penetrating contact.
+    /// so ramp/slope riding keeps working. `None` exempts no genuinely penetrating contact.
     pub walkable_floor_z: Option<f32>,
 }
 
@@ -113,32 +111,38 @@ pub fn sweep_aabb(
     world.for_each_candidate(query, |i| {
         let t = world.triangle(i);
         if let Some(h) = sweep_triangle(start, d, half_extents, t, i, world.source(i)) {
-            consider_sweep_hit(&mut best, h, params, d, start, t);
+            consider_sweep_hit(&mut best, h, params, d, start, half_extents, t);
         }
     });
     world.for_each_dynamic_candidate(query, |t, source, _idx| {
         if let Some(h) = sweep_triangle(start, d, half_extents, &t, u32::MAX, source) {
-            consider_sweep_hit(&mut best, h, params, d, start, &t);
+            consider_sweep_hit(&mut best, h, params, d, start, half_extents, &t);
         }
     });
     best
 }
 
 /// Keeps a swept hit when it passes the start-penetration filter and is nearer than `best`.
+#[allow(clippy::too_many_arguments)]
 fn consider_sweep_hit(
     best: &mut Option<SweepHit>,
     mut h: SweepHit,
     params: &SweepParams,
     d: Vec3,
     start: Vec3,
+    half: Vec3,
     tri: &Triangle,
 ) {
     if h.start_penetrating {
-        // The engine's MoveActor discards hits within the 2-UU back-off behind the start
-        // (see `SweepParams::discard_start_penetration`): the mover escapes geometry it starts
-        // flush with/inside instead of deadlocking against it.
+        // Overlap recovery is only for an embedded box. The SAT t=0 flag also includes
+        // touching, which must not turn a legal flush start into permission to tunnel.
         if params.discard_start_penetration
             && params.walkable_floor_z.is_none_or(|z| h.normal[1] < z)
+            && {
+                let plane = normalize(cross(sub(tri[1], tri[0]), sub(tri[2], tri[0])));
+                let radius = dot(half, plane.map(f32::abs));
+                radius - dot(sub(start, tri[0]), plane).abs() > TOUCH_EPS
+            }
         {
             return;
         }

@@ -10,6 +10,7 @@
 //! Layout evidence and references: crate README, section "Skeletal meshes and animation".
 
 pub mod anim;
+pub mod blend;
 mod error;
 pub mod math;
 pub mod mesh;
