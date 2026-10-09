@@ -740,6 +740,11 @@ fn registry_entries_are_documented() {
     // (both from the item30 Plage01 walk) plus the item30 walk's Actor.AnimIsInGroup (395).
     // Must equal `Registry::builtin().defs().count()`.
     assert_eq!(defs.len(), 334);
+    // viewport/device Partials; item43 adds Actor.TraceActors; the item47b banque01 regression
+    // fix adds `PlayerController.AdjustAimForDisplay` (498); item49b adds
+    // `Actor.DetachFromBone` (403). Must equal
+    // `Registry::builtin().defs().count()`.
+    assert_eq!(defs.len(), 333);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -1092,6 +1097,7 @@ fn spawn_fixture() -> Vec<u8> {
     let rotator_extra = compact(rotator_struct);
     let owner = b.reserve(IMP_OBJECTPROP, actor, "Owner");
     let instigator = b.reserve(IMP_OBJECTPROP, actor, "Instigator");
+    let seen_instigator = b.reserve(IMP_OBJECTPROP, actor, "SeenInstigator");
     let level = b.reserve(IMP_OBJECTPROP, actor, "Level");
     let tag = b.reserve(IMP_NAMEPROP, actor, "Tag");
     let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
@@ -1102,6 +1108,8 @@ fn spawn_fixture() -> Vec<u8> {
     let spawned = b.reserve(IMP_FUNCTION, actor, "Spawned");
     b.prop_with(owner, instigator, 0, &object_extra);
     b.prop_with(instigator, level, 0, &object_extra);
+    b.prop_with(instigator, seen_instigator, 0, &object_extra);
+    b.prop_with(seen_instigator, level, 0, &object_extra);
     b.prop_with(level, tag, 0, &object_extra);
     b.prop(tag, location, 0);
     b.prop_with(location, rotation, 0, &vector_extra);
@@ -1127,7 +1135,20 @@ fn spawn_fixture() -> Vec<u8> {
         ];
         b.func(r, next, 0, &code, 0x10, 0, DEFINED);
     };
-    bump(&mut b, spawned, pre);
+    let mut spawned_code = vec![0x0F, 0x01, seen_instigator as u8, 0x01, instigator as u8];
+    spawned_code.extend([
+        0x0F,
+        0x01,
+        calls as u8,
+        0x92,
+        0x00,
+        calls as u8,
+        0x26,
+        0x16,
+        0x04,
+        0x0B,
+    ]);
+    b.func(spawned, pre, 0, &spawned_code, 0x1B, 0, DEFINED);
     bump(&mut b, pre, begin);
     bump(&mut b, begin, post);
     bump(&mut b, post, net);
@@ -1460,6 +1481,53 @@ fn spawn_none_class_returns_none_and_abstract_refused() {
     assert!(vm.trace.iter().any(
         |e| matches!(&e.kind, TraceKind::SpawnRefused { reason } if reason.contains("abstract"))
     ));
+}
+
+#[test]
+fn item49b_spawn_inherits_instigator_before_spawned_independently_of_owner() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pawn = vm.spawn(sg(&set, "Actor"), "Pawn").unwrap();
+    let proxy = vm.spawn(sg(&set, "Actor"), "Weapon").unwrap();
+    let other_owner = vm.spawn(sg(&set, "Actor"), "OtherOwner").unwrap();
+    vm.set_property(
+        proxy,
+        "Instigator",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    for owner in [None, Some(other_owner)] {
+        let ammo = vm
+            .spawn_actor(proxy, Some(sg(&set, "Child")), owner, None, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(obj_prop(&vm, ammo, "Instigator"), Some(pawn));
+        assert_eq!(
+            obj_prop(&vm, ammo, "SeenInstigator"),
+            Some(pawn),
+            "Spawned must see inherited instigator"
+        );
+        assert_eq!(obj_prop(&vm, ammo, "Owner"), owner);
+        let nested = vm
+            .spawn_actor(ammo, Some(sg(&set, "Child")), None, None, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(obj_prop(&vm, nested, "SeenInstigator"), Some(pawn));
+    }
+    // A spawner without an Instigator must not substitute itself or its Owner.
+    let no_instigator = vm
+        .spawn_actor(
+            other_owner,
+            Some(sg(&set, "Child")),
+            Some(pawn),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(obj_prop(&vm, no_instigator, "Instigator"), None);
+    assert_eq!(obj_prop(&vm, no_instigator, "SeenInstigator"), None);
 }
 
 #[test]
@@ -1899,12 +1967,129 @@ fn rng_is_deterministic_and_seeded() {
     let mut d = Vm::new(&set, VmLimits::default());
     for _ in 0..1000 {
         let f = d.rand_float();
-        assert!((0.0..1.0).contains(&f), "{f}");
+        assert!((0.0..=1.0).contains(&f), "{f}");
         let i = d.rand_int(7);
         assert!((0..7).contains(&i), "{i}");
     }
     assert_eq!(d.rand_int(0), 0);
     assert_eq!(d.rand_int(-5), 0);
+}
+
+#[test]
+fn item51_retail_frand_stream_includes_endpoint_and_rand_shares_state() {
+    let set = spawn_set();
+    let mut vm = Vm::new(
+        &set,
+        VmLimits {
+            rng_seed: 1,
+            ..VmLimits::default()
+        },
+    );
+    // MSVCR70's seed-1 sequence. Rand(nonpositive) must not consume a step.
+    assert_eq!(vm.rand_int(0), 0);
+    assert_eq!(vm.rand_int(-1), 0);
+    assert_eq!(vm.next_random(), 41);
+    assert_eq!(vm.rand_float(), 18467.0 * f32::from_bits(0x38000100));
+    assert_eq!(vm.rand_int(100), 6334 % 100);
+    // This seed reaches the maximum CRT result on the next step; FRand can be 1.0.
+    let mut endpoint = Vm::new(
+        &set,
+        VmLimits {
+            rng_seed: 0x1_f01b_f641,
+            ..VmLimits::default()
+        },
+    );
+    assert_eq!(endpoint.rand_float(), 1.0);
+    let mut zero = Vm::new(
+        &set,
+        VmLimits {
+            rng_seed: 0xa170_f641,
+            ..VmLimits::default()
+        },
+    );
+    assert_eq!(zero.rand_float(), 0.0);
+}
+
+#[test]
+fn item51_playanim_omitted_rate_moves_but_explicit_zero_holds_through_small_steps() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(30, 30.0)));
+    let actor = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(actor, true);
+    let mut args = [
+        Value::Name("Walk".into()),
+        Value::Float(0.0),
+        Value::Float(0.0),
+        Value::Int(0),
+    ];
+    try_native(
+        &mut vm,
+        "Engine.Actor.PlayAnim",
+        actor,
+        &[false, true, true, true],
+        &mut args,
+    )
+    .unwrap();
+    vm.tick(0.1).unwrap();
+    assert!((vm.objects[actor as usize].anim.channels[&0].frame - 3.0).abs() < 1e-5);
+    try_native(
+        &mut vm,
+        "Engine.Actor.PlayAnim",
+        actor,
+        &[false; 4],
+        &mut args,
+    )
+    .unwrap();
+    for _ in 0..600 {
+        vm.tick(1.0 / 60.0).unwrap();
+    }
+    assert_eq!(vm.objects[actor as usize].anim.channels[&0].frame, 0.0);
+    assert_eq!(vm.objects[actor as usize].anim.channels[&0].rate, 0.0);
+    assert!(
+        !vm.trace
+            .iter()
+            .any(|e| matches!(e.kind, TraceKind::AnimEnd { .. }))
+    );
+}
+
+#[test]
+fn item51_trace_additional_categories_work_when_traceactors_is_false() {
+    let set = set_of(trace_package());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let shooter = vm.spawn(g(&set, "Actor"), "Shooter").unwrap();
+    let target = vm.spawn(g(&set, "Actor"), "Target").unwrap();
+    vm.set_active(target, true);
+    vm.set_property(target, "Location", 0, Value::Vector([100.0, 0.0, 0.0]));
+    vm.set_property(target, "CollisionRadius", 0, Value::Float(20.0));
+    vm.set_property(target, "CollisionHeight", 0, Value::Float(20.0));
+    for p in [
+        "bCollideActors",
+        "bBlockActors",
+        "bBlockPlayers",
+        "bBlockZeroExtentTraces",
+    ] {
+        vm.set_property(target, p, 0, Value::Bool(true));
+    }
+    let mut args = trace_args();
+    args[4] = Value::Bool(false);
+    args.extend([Value::Object(None), Value::Int(0)]);
+    assert_eq!(
+        call_native(&mut vm, "Actor.Trace", shooter, &[false; 8], &mut args),
+        NativeOutcome::Value(Value::Object(None))
+    );
+    args[7] = Value::Int(0x30);
+    assert_eq!(
+        call_native(&mut vm, "Actor.Trace", shooter, &[false; 8], &mut args),
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(target))))
+    );
+    // Additional category flags cannot bypass collision-hash membership.
+    vm.set_property(target, "bCollideActors", 0, Value::Bool(false));
+    assert_eq!(
+        call_native(&mut vm, "Actor.Trace", shooter, &[false; 8], &mut args),
+        NativeOutcome::Value(Value::Object(None))
+    );
 }
 
 #[test]
@@ -2840,6 +3025,7 @@ fn phys_fixture() -> Vec<u8> {
     let object = b.reserve(0, 0, "Object");
     let actor = b.reserve(0, 0, "Actor");
     let child = b.reserve(0, 0, "Child");
+    let decoration = b.reserve(0, 0, "Decoration");
     let levelinfo = b.reserve(0, 0, "LevelInfo");
 
     let add = b.reserve(IMP_FUNCTION, object, "Add_IntInt");
@@ -2887,6 +3073,9 @@ fn phys_fixture() -> Vec<u8> {
     let block_nonzero = b.reserve(IMP_BOOLPROP, actor, "bBlockNonZeroExtentTraces");
     let movable = b.reserve(IMP_BOOLPROP, actor, "bMovable");
     let bstatic = b.reserve(IMP_BOOLPROP, actor, "bStatic");
+    let proj_target = b.reserve(IMP_BOOLPROP, actor, "bProjTarget");
+    let hidden = b.reserve(IMP_BOOLPROP, actor, "bHidden");
+    let world_geometry = b.reserve(IMP_BOOLPROP, actor, "bWorldGeometry");
     let touches = b.reserve(IMP_INTPROP, actor, "Touches");
     let untouches = b.reserve(IMP_INTPROP, actor, "UnTouches");
     let touching = b.reserve(IMP_ARRAYPROP, actor, "Touching");
@@ -2907,7 +3096,10 @@ fn phys_fixture() -> Vec<u8> {
     b.prop(block_players, proj_target, 0);
     b.prop(proj_target, block_zero, 0);
     b.prop(block_zero, block_nonzero, 0);
-    b.prop(block_nonzero, movable, 0);
+    b.prop(block_nonzero, proj_target, 0);
+    b.prop(proj_target, hidden, 0);
+    b.prop(hidden, world_geometry, 0);
+    b.prop(world_geometry, movable, 0);
     b.prop(movable, bstatic, 0);
     b.prop(bstatic, touches, 0);
     b.prop(touches, untouches, 0);
@@ -2943,6 +3135,7 @@ fn phys_fixture() -> Vec<u8> {
     b.class(object, 0, add, 0);
     b.class(actor, object, owner, 0);
     b.class(child, actor, 0, 0);
+    b.class(decoration, actor, 0, 0);
     b.class(levelinfo, actor, 0, 0);
     b.build()
 }
@@ -4051,6 +4244,162 @@ fn trace_actors_orders_hits_filters_class_and_returns_all_outs() {
     );
 }
 
+#[test]
+fn item49_view_target_requires_aim_range_and_clear_world_segment() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let caller = phys_actor(&mut vm, &set, "Viewer", [0.0, 0.0, 40.0]);
+    let target = phys_actor(&mut vm, &set, "Pickup", [100.0, 0.0, 40.0]);
+    set_collision_fields(&mut vm, target, true, true);
+    let start = [0.0, 0.0, 40.0];
+    let trace = |vm: &mut Vm<'_>, end| {
+        vm.vm_trace_actors(caller, None, start, end, [0.0; 3])
+            .unwrap()
+    };
+    assert_eq!(trace(&mut vm, [160.0, 0.0, 40.0])[0].0, target);
+    assert!(
+        trace(&mut vm, [-160.0, 0.0, 40.0]).is_empty(),
+        "looking away cannot target a named pickup"
+    );
+    vm.set_property(target, "Location", 0, Value::Vector([200.0, 0.0, 40.0]));
+    assert!(
+        trace(&mut vm, [160.0, 0.0, 40.0]).is_empty(),
+        "out-of-reach pickup"
+    );
+    // An explicit synthetic floor occludes the pickup below it.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([-100.0, -100.0, -1.0], [100.0, 100.0, 1.0]),
+    ));
+    vm.set_property(target, "Location", 0, Value::Vector([0.0, 0.0, -40.0]));
+    assert!(
+        trace(&mut vm, [0.0, 0.0, -120.0]).is_empty(),
+        "world geometry occludes interaction"
+    );
+}
+
+/// Item47b: the decoded engine actor-trace filter (`trace_admits_actor`). Each case maps to a
+/// measured Engine.dll behavior cited in the function's documentation.
+#[test]
+fn trace_filter_parked_actor_with_extent_flag_is_not_hit() {
+    // `IAController.faction.BeginState` parks a pawn with `SetCollision(false,false,false)` while
+    // its `bBlockZeroExtentTraces` stays true (measured on Plage01 `BaseSoldier6`). Hash
+    // membership (`bCollideActors`) gates candidacy — the old "extent OR bCollideActors"
+    // heuristic wrongly let parked soldiers block bullets.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let parked = phys_actor(&mut vm, &set, "Parked", [40.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, parked, false, true);
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 0.0], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(
+        None, hit,
+        "a parked (bCollideActors=false) actor must not block"
+    );
+    assert!(
+        (location[0] - 200.0).abs() < 0.01,
+        "the ray must pass through: {location:?}"
+    );
+}
+
+#[test]
+fn trace_filter_projtarget_actor_is_hit_without_block_flags() {
+    // `AActor::ShouldTrace` (VA 0x10354640): with the script-trace flag word, an in-hash,
+    // extent-blocking actor is admitted when `bProjTarget` is set even without block flags.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let target = phys_actor(&mut vm, &set, "Target", [40.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, target, true, false);
+    vm.set_property(target, "bProjTarget", 0, Value::Bool(true));
+    vm.set_property(target, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 0.0], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(Some(target), hit);
+}
+
+#[test]
+fn trace_filter_membership_and_extent_without_shouldtrace_passes_through() {
+    // Membership plus the extent prefilter without `ShouldTrace` admission (no `bProjTarget`,
+    // no `bBlockActors && bBlockPlayers`) is not enough — the third decoded stage rejects.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let ghost = phys_actor(&mut vm, &set, "Ghost", [40.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, ghost, true, false);
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 0.0], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(None, hit);
+}
+
+#[test]
+fn trace_filter_hidden_colliding_actor_still_blocks() {
+    // `bHidden` is tested nowhere in the decoded trace path (hash insert/remove, hash walk,
+    // every `ShouldTrace` override). A colliding hidden actor blocks — the carried first-person
+    // weapon passes only because its class clears `bCollideActors` (`xiii.Fists`, measured).
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let hidden = phys_actor(&mut vm, &set, "Hidden", [40.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, hidden, true, true);
+    vm.set_property(hidden, "bHidden", 0, Value::Bool(true));
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 0.0], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(Some(hidden), hit);
+}
+
+#[test]
+fn trace_filter_decoration_chain_admits_without_block_flags() {
+    // `AMover`/`ADecoration::ShouldTrace` (shared VA 0x10306c70) returns `TraceFlags & 2`, which
+    // the script-trace flag word always sets: an in-hash decoration is admitted regardless of its
+    // block flags.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let prop = vm.spawn(pg(&set, "Decoration"), "Prop").unwrap();
+    vm.set_property(prop, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, prop, true, false);
+    vm.set_property(prop, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 0.0], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(Some(prop), hit);
+}
+
+#[test]
+fn trace_filter_world_geometry_actor_is_hit_without_block_flags() {
+    // World-geometry actors are admitted by the `TraceFlags & 0x80` branch of
+    // `AActor::ShouldTrace` (`IsBlockedBy` bit 30 of `+0x2c`).
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let blocker = phys_actor(&mut vm, &set, "Blocker", [40.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, blocker, true, false);
+    vm.set_property(blocker, "bWorldGeometry", 0, Value::Bool(true));
+    vm.set_property(blocker, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 0.0], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(Some(blocker), hit);
+}
+
 fn set_collision_fields(vm: &mut Vm<'_>, id: ObjectId, colliding: bool, blocking: bool) {
     vm.set_property(id, "bCollideActors", 0, Value::Bool(colliding));
     vm.set_property(id, "bCollideWorld", 0, Value::Bool(true));
@@ -4317,6 +4666,101 @@ fn trace_skips_weapon_owned_first_person_muzzle_flash() {
 }
 
 #[test]
+fn trace_ignores_actors_outside_the_collision_hash() {
+    // item40e: `Engine.dll` only puts `bCollideActors` actors in the collision hash
+    // (`FCollisionHash::AddActor` asserts it; `AActor::SetCollision` removes/re-adds on change),
+    // so an actor with the `Actor` default `bBlockZeroExtentTraces=true` but
+    // `bCollideActors=false` (a hidden `TriggerLight` in front of an Amos01 grille) must not stop
+    // a weapon trace. The colliding actor behind it is hit.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    let light = phys_actor(&mut vm, &set, "TriggerLight2", [50.0, 0.0, 0.0]);
+    let target = phys_actor(&mut vm, &set, "Target", [120.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    set_collision_fields(&mut vm, light, false, true);
+    set_collision_fields(&mut vm, target, true, true);
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(
+        hit,
+        Some(target),
+        "a non-colliding actor must not block Trace"
+    );
+
+    // Collision-hash membership alone is not enough: the extent flag still selects line traces.
+    vm.set_property(target, "bBlockZeroExtentTraces", 0, Value::Bool(false));
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, None, "no zero-extent blocker left on the line");
+    assert_eq!(location, [200.0, 0.0, 0.0]);
+    // ...and a box trace uses the non-zero-extent flag, which is still set.
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [2.0, 2.0, 2.0])
+        .unwrap();
+    assert_eq!(hit, Some(target));
+}
+
+/// [`MockWorld`] whose world hits name an actor, like the map adapter's per-source label.
+struct NamedHitWorld {
+    inner: MockWorld,
+    actor: String,
+}
+
+impl WorldPhysics for NamedHitWorld {
+    fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
+        self.inner.trace(start, end, extent)
+    }
+
+    fn trace_with_mover(
+        &mut self,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+    ) -> (Option<WorldHit>, Option<String>) {
+        let hit = self.inner.trace(start, end, extent);
+        let actor = hit.map(|_| self.actor.clone());
+        (hit, actor)
+    }
+
+    fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        self.inner.move_box(start, delta, extent)
+    }
+
+    fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool {
+        self.inner.point_free(location, extent)
+    }
+}
+
+#[test]
+fn world_hit_on_a_non_mover_actor_source_still_returns_the_level() {
+    // item40e: only a mover's geometry turns a world hit into an actor hit (UE2 movers are
+    // collision-hash actors); geometry labelled with any other actor (a placed static mesh)
+    // keeps the existing level result, so scripts testing `Other == Level` are unchanged.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(NamedHitWorld {
+        inner: MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
+        actor: "Prop".to_owned(),
+    }));
+    let level = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    let prop = phys_actor(&mut vm, &set, "Prop", [105.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    set_collision_fields(&mut vm, prop, true, true);
+    // Keep the prop's own cylinder off the line so only the world hit can report it.
+    vm.set_property(prop, "Location", 0, Value::Vector([105.0, 500.0, 0.0]));
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(level));
+    assert!((location[0] - 100.0).abs() < 1e-3, "{location:?}");
+}
+
+#[test]
 fn exact_contact_boundary_overlaps() {
     let set = phys_set();
     let mut vm = Vm::new(&set, VmLimits::default());
@@ -4438,6 +4882,10 @@ fn trace_hits_nearer_of_world_and_actor_and_fasttrace_ignores_actors() {
     // into traces and `bProjTarget=true` is the trace filter's collision role.
     set_collision_fields(&mut vm, b, true, true);
     vm.set_property(b, "bProjTarget", 0, Value::Bool(true));
+    // item40e: a zero-extent actor check needs `bCollideActors` (collision hash) and
+    // `bBlockZeroExtentTraces` (Engine.dll `FCollisionHash::ActorLineCheck` tests bit 0x400 of
+    // the actor flags at 0x10349E90); a non-blocking `B` would not be hit.
+    set_collision_fields(&mut vm, b, true, true);
 
     // Actor closer than the wall -> the actor is returned.
     let mut args = vec![
@@ -4768,6 +5216,16 @@ fn anim_fixture() -> Vec<u8> {
     let banim_finished = b.reserve(IMP_BOOLPROP, actor, "bAnimFinished");
     let mesh = b.reserve(IMP_OBJECTPROP, actor, "Mesh");
     let counter = b.reserve(IMP_INTPROP, actor, "Counter");
+    let attachment_bone = b.reserve(IMP_NAMEPROP, actor, "AttachmentBone");
+    let base = b.reserve(IMP_OBJECTPROP, actor, "Base");
+    let static_mesh = b.reserve(IMP_OBJECTPROP, actor, "StaticMesh");
+
+    let selected = b.reserve(IMP_OBJECTPROP, actor, "Selected");
+    let pending = b.reserve(IMP_OBJECTPROP, actor, "Pending");
+    let switching = b.reserve(IMP_STATE, actor, "Switching");
+    let begin_switch = b.reserve(IMP_FUNCTION, switching, "BeginState");
+    let end_switch = b.reserve(IMP_FUNCTION, switching, "AnimEnd");
+    let end_channel = b.reserve(IMP_INTPROP, end_switch, "Channel");
 
     let link = b.reserve(IMP_FUNCTION, actor, "LinkSkelAnim");
     let link_anim = b.reserve(IMP_OBJECTPROP, link, "Anim");
@@ -4804,7 +5262,12 @@ fn anim_fixture() -> Vec<u8> {
     b.prop(anim_frame, banim_finished, 0);
     b.prop(banim_finished, mesh, 0);
     b.prop_with(mesh, counter, 0, &object_extra);
-    b.prop(counter, link, 0);
+    b.prop(counter, attachment_bone, 0);
+    b.prop(attachment_bone, base, 0);
+    b.prop_with(base, static_mesh, 0, &object_extra);
+    b.prop_with(static_mesh, selected, 0, &object_extra);
+    b.prop_with(selected, pending, 0, &object_extra);
+    b.prop_with(pending, link, 0, &object_extra);
 
     b.prop_with(link_anim, 0, PARM, &object_extra);
     b.func(link, play, link_anim, &[], 0, 413, FINAL | NATIVE | STATIC);
@@ -4869,7 +5332,49 @@ fn anim_fixture() -> Vec<u8> {
     anim_code.extend([0x0F, 0x01, rc, 0x26]);
     anim_code.push(0x08);
     anim_code.extend([0x0C, begin, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    b.state(animating, 0, &anim_code, 0x24, 0x13);
+    b.state(animating, switching, &anim_code, 0x24, 0x13);
+
+    // Authored synthetic example: start a finite Down clip on state entry; selection changes
+    // only in the state-aware animation callback. No retail bytecode is embedded here.
+    let down = b.name("Down") as u8;
+    let mut select_code = vec![0x61, 0x03, 0x21, down, 0x1E];
+    select_code.extend(1.0f32.to_le_bytes());
+    select_code.push(0x1E);
+    select_code.extend(0.0f32.to_le_bytes());
+    select_code.extend([0x25, 0x16, 0x04, 0x0B]);
+    b.func(
+        begin_switch,
+        end_switch,
+        0,
+        &select_code,
+        21,
+        0,
+        EVENT | DEFINED,
+    );
+    b.prop(end_channel, 0, PARM);
+    let end_code = [
+        0x0F,
+        0x01,
+        selected as u8,
+        0x01,
+        pending as u8,
+        0x0F,
+        0x01,
+        counter as u8,
+        0x26,
+        0x04,
+        0x0B,
+    ];
+    b.func(
+        end_switch,
+        0,
+        end_channel,
+        &end_code,
+        20,
+        0,
+        EVENT | DEFINED,
+    );
+    b.state_children(switching, 0, begin_switch, &[0x08], 1, 0xFFFF);
 
     b.prop_with(view_target, svt, 0, &object_extra);
     b.prop_with(svt_param, 0, PARM, &object_extra);
@@ -4928,8 +5433,8 @@ fn play_anim_fires_anim_end_once_at_the_right_tick() {
     vm.set_active(a, true);
     play_anim(&mut vm, a, "Walk", 1.0, 0);
 
-    // 4 frames at 1 fps with a 0.5 s step: 8 ticks exactly.
-    for _ in 0..7 {
+    // Four frames indexed 0..3 at 1 fps: completion after 3 seconds (DLL end=1-1/N).
+    for _ in 0..5 {
         vm.tick(0.5).unwrap();
     }
     assert!(
@@ -4944,9 +5449,67 @@ fn play_anim_fires_anim_end_once_at_the_right_tick() {
         vm.get_property(a, "bAnimFinished"),
         Some(&Value::Bool(true))
     );
-    assert_eq!(vm.get_property(a, "AnimFrame"), Some(&Value::Float(4.0)));
+    assert_eq!(vm.get_property(a, "AnimFrame"), Some(&Value::Float(0.75)));
     // Further ticks do not fire it again.
     vm.tick(0.5).unwrap();
+    assert_eq!(anim_end_count(&vm), 1);
+}
+
+#[test]
+fn item49_deferred_selection_waits_for_clip_end_and_uses_latest_pending() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(11, 10.0)));
+    let weapon = vm.spawn(sg(&set, "Actor"), "Weapon").unwrap();
+    let old = vm.spawn(sg(&set, "Actor"), "Old").unwrap();
+    let next = vm.spawn(sg(&set, "Actor"), "Next").unwrap();
+    let latest = vm.spawn(sg(&set, "Actor"), "Latest").unwrap();
+    let reference = |id| Value::Object(Some(ObjRef::Instance(id)));
+    vm.set_property(weapon, "Selected", 0, reference(old));
+    vm.set_property(weapon, "Pending", 0, reference(next));
+    vm.set_active(weapon, true);
+    vm.goto_state(weapon, "Switching", None).unwrap();
+    // Repeated small steps must not switch early, and retargeting an in-flight selection
+    // must use the latest pending value when the callback actually runs.
+    for _ in 0..9 {
+        vm.tick(0.1).unwrap();
+        assert_eq!(vm.get_property(weapon, "Selected"), Some(&reference(old)));
+    }
+    vm.set_property(weapon, "Pending", 0, reference(latest));
+    vm.tick(0.11).unwrap();
+    assert_eq!(
+        vm.get_property(weapon, "Selected"),
+        Some(&reference(latest))
+    );
+    assert_eq!(vm.get_property(weapon, "Counter"), Some(&Value::Int(1)));
+    assert_eq!(anim_end_count(&vm), 1);
+    vm.set_property(weapon, "Counter", 0, Value::Int(0));
+    vm.tick(2.0).unwrap();
+    assert_eq!(vm.get_property(weapon, "Counter"), Some(&Value::Int(0)));
+    assert_eq!(
+        anim_end_count(&vm),
+        1,
+        "completed clip cannot deliver twice"
+    );
+}
+
+#[test]
+fn item49_interrupted_down_clip_cannot_complete_old_selection() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(11, 10.0)));
+    let weapon = vm.spawn(sg(&set, "Actor"), "Weapon").unwrap();
+    vm.set_active(weapon, true);
+    vm.goto_state(weapon, "Switching", None).unwrap();
+    vm.tick(0.8).unwrap();
+    play_anim(&mut vm, weapon, "Replacement", 1.0, 0);
+    vm.tick(0.3).unwrap();
+    assert_eq!(
+        anim_end_count(&vm),
+        0,
+        "the interrupted Down end must be cancelled"
+    );
+    vm.tick(0.71).unwrap();
     assert_eq!(anim_end_count(&vm), 1);
 }
 
@@ -4980,7 +5543,7 @@ fn actor_animation_view_reports_sequence_frame_and_looping() {
 }
 
 #[test]
-fn loop_anim_loops_without_anim_end_and_reports_is_animating() {
+fn loop_anim_reports_end_at_last_frame_and_keeps_animating() {
     let set = anim_set();
     let mut vm = Vm::new(&set, VmLimits::default());
     vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(4, 1.0)));
@@ -5003,7 +5566,11 @@ fn loop_anim_loops_without_anim_end_and_reports_is_animating() {
     for _ in 0..20 {
         vm.tick(0.5).unwrap();
     }
-    assert_eq!(anim_end_count(&vm), 0, "LoopAnim never ends");
+    assert_eq!(
+        anim_end_count(&vm),
+        2,
+        "DLL sends loop AnimEnd at frames 3 and 7 before wraps at 4 and 8"
+    );
     assert!(vm.anim_channel_active(a, 0));
 
     let mut args = [Value::Int(0)];
@@ -5927,9 +6494,10 @@ fn weapon_attachment_cast_reaches_third_person_effects() {
 }
 
 #[test]
-fn suspended_actor_calls_are_counted_and_traced() {
+fn diagnostic_scope_suspended_calls_are_counted_and_traced() {
     let set = set_of(weapon_attachment_fixture());
     let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_diagnostic_call_scope(true);
     let caller = vm.spawn(g(&set, "Caller"), "Weapon").unwrap();
     let attach = vm.spawn(g(&set, "WeaponAttachment"), "Attach").unwrap();
     vm.set_active(caller, true);
@@ -6548,6 +7116,457 @@ fn line_of_sight_to_uses_the_pawn_eyes_and_reports_the_blocking_wall() {
         &mut args2,
     );
     assert_eq!(clear, NativeOutcome::Value(Value::Bool(true)));
+}
+
+// ---------------------------------------------------------------------------------------
+// item27m: the decoded Engine.dll LineOfSightTo (VA 0x1036ac70) and SeePawn/CanSee
+// (VA 0x1036dc40) semantics. Fixture: Controller with Pawn/Enemy/ViewTarget, Pawn with
+// BaseEyeHeight/SightRadius/PeripheralVision, Actor with CollisionHeight and a Visibility byte.
+
+fn los_fixture() -> Vec<u8> {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "Controller");
+    let player_controller = b.reserve(0, 0, "PlayerController");
+
+    let object_extra = compact(0);
+    let vector_extra = compact(IMP_STRUCT);
+
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let collision_height = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
+    let visibility = b.reserve(IMP_BYTEPROP, actor, "Visibility");
+
+    let eye = b.reserve(IMP_FLOATPROP, pawn, "BaseEyeHeight");
+    let sight_radius = b.reserve(IMP_FLOATPROP, pawn, "SightRadius");
+    let peripheral = b.reserve(IMP_FLOATPROP, pawn, "PeripheralVision");
+
+    let c_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
+    let c_enemy = b.reserve(IMP_OBJECTPROP, controller, "Enemy");
+    let c_view_target = b.reserve(IMP_OBJECTPROP, controller, "ViewTarget");
+
+    b.prop_with(location, collision_height, 0, &vector_extra);
+    b.prop(collision_height, visibility, 0);
+    b.prop_with(visibility, 0, 0, &object_extra);
+    b.prop(eye, sight_radius, 0);
+    b.prop(sight_radius, peripheral, 0);
+    b.prop(peripheral, 0, 0);
+    b.prop_with(c_pawn, c_enemy, 0, &object_extra);
+    b.prop_with(c_enemy, c_view_target, 0, &object_extra);
+    b.prop_with(c_view_target, 0, 0, &object_extra);
+
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, location, 0);
+    b.class(pawn, actor, eye, 0);
+    b.class(controller, actor, c_pawn, 0);
+    b.class(player_controller, controller, 0, 0);
+    b.build()
+}
+
+fn los_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Test",
+        los_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+/// A controller at the origin with a pawn whose eye is 100 above the base, plus an `other`
+/// actor at `loc` with the given BaseEyeHeight/CollisionHeight.
+fn los_pair(
+    vm: &mut Vm<'_>,
+    set: &ScriptSet,
+    other_class: &str,
+    loc: [f32; 3],
+    other_eye: f32,
+    other_height: f32,
+) -> (ObjectId, ObjectId, ObjectId) {
+    let pawn = spawn_at(vm, set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(100.0));
+    let ctrl = vm.spawn(pg(set, "Controller"), "C").unwrap();
+    vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    let other = spawn_at(vm, set, other_class, "O", loc);
+    vm.set_property(other, "BaseEyeHeight", 0, Value::Float(other_eye));
+    vm.set_property(other, "CollisionHeight", 0, Value::Float(other_height));
+    // The Engine.u Pawn default (the fixture leaves the byte at 0).
+    vm.set_property(other, "Visibility", 0, Value::Int(128));
+    (ctrl, pawn, other)
+}
+
+/// The base line (view point -> target base) is blocked by a low wall; the decoded retry for a
+/// non-Enemy target goes to `Location.Z + 0.8*CollisionHeight` (Engine.dll 0x1036b020) and clears
+/// above the wall: LineOfSightTo is true. A lower target top is blocked by the same wall: false.
+/// The old single eye-to-eye trace answered the opposite for the first case (the eye line clears
+/// above the wall).
+#[test]
+fn line_of_sight_to_tries_the_base_then_the_top_point() {
+    let set = los_set();
+    // Wall ("counter") x in [50,51], z in [40,80]: the descending base line (eye z=100 -> base
+    // z=0) is blocked at z=50; the eye-to-eye line at z=100 is NOT blocked.
+    let wall = ([50.0, -10.0, 40.0], [51.0, 10.0, 80.0]);
+
+    // Target top 0.8*100 = 80: the retry line (z 100 -> 80) passes above the wall (z=90 there).
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new().with_wall(wall.0, wall.1)));
+    let (ctrl, _pawn, other) = los_pair(&mut vm, &set, "Pawn", [100.0, 0.0, 0.0], 100.0, 100.0);
+    let mut args = [Value::Object(Some(ObjRef::Instance(other)))];
+    let out = call_native(
+        &mut vm,
+        "Engine.Controller.LineOfSightTo",
+        ctrl,
+        &[false],
+        &mut args,
+    );
+    assert_eq!(out, NativeOutcome::Value(Value::Bool(true)));
+
+    // Target top 0.8*25 = 20: the retry line (z 100 -> 20) crosses the wall at z=60 -> blocked.
+    let mut vm2 = Vm::new(&set, VmLimits::default());
+    vm2.set_physics(Box::new(MockWorld::new().with_wall(wall.0, wall.1)));
+    let (ctrl2, _pawn2, other2) = los_pair(&mut vm2, &set, "Pawn", [100.0, 0.0, 0.0], 100.0, 25.0);
+    let mut args2 = [Value::Object(Some(ObjRef::Instance(other2)))];
+    let out2 = call_native(
+        &mut vm2,
+        "Engine.Controller.LineOfSightTo",
+        ctrl2,
+        &[false],
+        &mut args2,
+    );
+    assert_eq!(out2, NativeOutcome::Value(Value::Bool(false)));
+}
+
+/// The 8000^2 (0x1047c878) and 2000^2 (0x1047c874) limits gate only the RETRY: a clear base line
+/// is visible at any distance, while a blocked base line falls back to the retry only inside the
+/// limits. The `Enemy` branch (0x1036ad39) has no limits and retries at the eye point.
+#[test]
+fn line_of_sight_to_distance_limits_gate_only_the_retry() {
+    let set = los_set();
+    // Wall between viewer and target blocking the descending base line (z at the wall is 73)
+    // but not the higher retry lines. Per distance, the wall sits at 0.27*dist.
+    for (dist, expected) in [(1500.0, true), (2500.0, false), (3000.0, false)] {
+        let wx = 0.27 * dist;
+        let mut vm = Vm::new(&set, VmLimits::default());
+        vm.set_physics(Box::new(
+            MockWorld::new().with_wall([wx, -10.0, 40.0], [wx + 1.0, 10.0, 80.0]),
+        ));
+        let (ctrl, _pawn, other) = los_pair(&mut vm, &set, "Pawn", [dist, 0.0, 0.0], 100.0, 100.0);
+        let mut args = [Value::Object(Some(ObjRef::Instance(other)))];
+        let out = call_native(
+            &mut vm,
+            "Engine.Controller.LineOfSightTo",
+            ctrl,
+            &[false],
+            &mut args,
+        );
+        assert_eq!(
+            out,
+            NativeOutcome::Value(Value::Bool(expected)),
+            "dist {dist}"
+        );
+    }
+
+    // The same far, wall-blocked geometry as Enemy: retry at the eye point (z=100, above the
+    // wall), no distance limits -> visible even at 9e6 squared distance.
+    let mut vm2 = Vm::new(&set, VmLimits::default());
+    vm2.set_physics(Box::new(
+        MockWorld::new().with_wall([810.0, -10.0, 40.0], [811.0, 10.0, 80.0]),
+    ));
+    let (ctrl2, _pawn2, other2) =
+        los_pair(&mut vm2, &set, "Pawn", [3000.0, 0.0, 0.0], 100.0, 100.0);
+    vm2.set_property(
+        ctrl2,
+        "Enemy",
+        0,
+        Value::Object(Some(ObjRef::Instance(other2))),
+    );
+    let mut args2 = [Value::Object(Some(ObjRef::Instance(other2)))];
+    let out2 = call_native(
+        &mut vm2,
+        "Engine.Controller.LineOfSightTo",
+        ctrl2,
+        &[false],
+        &mut args2,
+    );
+    assert_eq!(out2, NativeOutcome::Value(Value::Bool(true)));
+
+    // Enemy whose BaseEyeHeight does not raise the retry over the wall: the eye retry is the
+    // blocked base line -> false (the branch's second line is what clears, not the branch).
+    let mut vm3 = Vm::new(&set, VmLimits::default());
+    vm3.set_physics(Box::new(
+        MockWorld::new().with_wall([810.0, -10.0, 40.0], [811.0, 10.0, 80.0]),
+    ));
+    let (ctrl3, _pawn3, other3) = los_pair(&mut vm3, &set, "Pawn", [3000.0, 0.0, 0.0], 0.0, 100.0);
+    vm3.set_property(
+        ctrl3,
+        "Enemy",
+        0,
+        Value::Object(Some(ObjRef::Instance(other3))),
+    );
+    let mut args3 = [Value::Object(Some(ObjRef::Instance(other3)))];
+    let out3 = call_native(
+        &mut vm3,
+        "Engine.Controller.LineOfSightTo",
+        ctrl3,
+        &[false],
+        &mut args3,
+    );
+    assert_eq!(out3, NativeOutcome::Value(Value::Bool(false)));
+}
+
+/// A PlayerController traces from its `ViewTarget` (Engine.dll 0x10368040), raising the view
+/// point by BaseEyeHeight only when the view target is its own pawn (0x1036ace6).
+#[test]
+fn line_of_sight_to_uses_the_player_controller_view_target() {
+    let set = los_set();
+    // Wall from the ground up to z=100: a trace at z=0 is blocked, traces descending from the
+    // pawn eye (z=100) are blocked on the base line, retries can clear above.
+    let wall = ([50.0, -10.0, -10.0], [51.0, 10.0, 100.0]);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new().with_wall(wall.0, wall.1)));
+    let pc = vm.spawn(pg(&set, "PlayerController"), "PC").unwrap();
+    let pawn = spawn_at(&mut vm, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(100.0));
+    vm.set_property(pc, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    // ViewTarget = a camera at z=0 (not the pawn): no eye raise -> the base line to a target
+    // base at z=0 runs horizontally through the wall -> blocked, and the top retry
+    // (0.8*40=32) also descends into the wall -> false.
+    let camera = spawn_at(&mut vm, &set, "Actor", "Cam", [0.0, 0.0, 0.0]);
+    vm.set_property(
+        pc,
+        "ViewTarget",
+        0,
+        Value::Object(Some(ObjRef::Instance(camera))),
+    );
+    let other = spawn_at(&mut vm, &set, "Pawn", "O", [100.0, 0.0, 0.0]);
+    let mut args = [Value::Object(Some(ObjRef::Instance(other)))];
+    let out = call_native(
+        &mut vm,
+        "Engine.Controller.LineOfSightTo",
+        pc,
+        &[false],
+        &mut args,
+    );
+    assert_eq!(out, NativeOutcome::Value(Value::Bool(false)));
+
+    // ViewTarget = the pawn itself: the eye raise applies (z=100), the base line descends into
+    // the wall, and the top retry to 0.8*200=160 climbs above it (z=130 at the wall) -> true.
+    vm.set_property(
+        pc,
+        "ViewTarget",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    vm.set_property(other, "CollisionHeight", 0, Value::Float(200.0));
+    let mut args2 = [Value::Object(Some(ObjRef::Instance(other)))];
+    let out2 = call_native(
+        &mut vm,
+        "Engine.Controller.LineOfSightTo",
+        pc,
+        &[false],
+        &mut args2,
+    );
+    assert_eq!(out2, NativeOutcome::Value(Value::Bool(true)));
+}
+
+/// CanSee (SeePawn, Engine.dll 0x1036dc40) adds the SightRadius/Visibility range gate and the
+/// decoded `|delta| > PeripheralVision` check; LineOfSightTo has neither.
+#[test]
+fn can_see_range_and_peripheral_gates_differ_from_line_of_sight_to() {
+    let set = los_set();
+
+    // Clear world: LineOfSightTo ignores SightRadius, CanSee enforces it.
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let pawn = spawn_at(&mut vm, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    vm.set_property(pawn, "SightRadius", 0, Value::Float(500.0));
+    let ctrl = vm.spawn(pg(&set, "Controller"), "C").unwrap();
+    vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    let other = spawn_at(&mut vm, &set, "Pawn", "O", [600.0, 0.0, 0.0]);
+    vm.set_property(other, "Visibility", 0, Value::Int(128));
+    let mut args = [Value::Object(Some(ObjRef::Instance(other)))];
+    let los = call_native(
+        &mut vm,
+        "Engine.Controller.LineOfSightTo",
+        ctrl,
+        &[false],
+        &mut args,
+    );
+    assert_eq!(los, NativeOutcome::Value(Value::Bool(true)));
+    let mut args2 = [Value::Object(Some(ObjRef::Instance(other)))];
+    let see = call_native(
+        &mut vm,
+        "Engine.Controller.CanSee",
+        ctrl,
+        &[false],
+        &mut args2,
+    );
+    assert_eq!(see, NativeOutcome::Value(Value::Bool(false)));
+
+    // Within SightRadius: visible. Visibility scales the range: 64 halves it (250).
+    let closer = spawn_at(&mut vm, &set, "Pawn", "O2", [400.0, 0.0, 0.0]);
+    vm.set_property(closer, "Visibility", 0, Value::Int(128));
+    let mut args3 = [Value::Object(Some(ObjRef::Instance(closer)))];
+    let see2 = call_native(
+        &mut vm,
+        "Engine.Controller.CanSee",
+        ctrl,
+        &[false],
+        &mut args3,
+    );
+    assert_eq!(see2, NativeOutcome::Value(Value::Bool(true)));
+    vm.set_property(closer, "Visibility", 0, Value::Int(64));
+    let mut args4 = [Value::Object(Some(ObjRef::Instance(closer)))];
+    let see3 = call_native(
+        &mut vm,
+        "Engine.Controller.CanSee",
+        ctrl,
+        &[false],
+        &mut args4,
+    );
+    assert_eq!(see3, NativeOutcome::Value(Value::Bool(false)));
+    let nearest = spawn_at(&mut vm, &set, "Pawn", "O3", [200.0, 0.0, 0.0]);
+    vm.set_property(nearest, "Visibility", 0, Value::Int(64));
+    let _ = &nearest;
+    let mut args5 = [Value::Object(Some(ObjRef::Instance(nearest)))];
+    let see4 = call_native(
+        &mut vm,
+        "Engine.Controller.CanSee",
+        ctrl,
+        &[false],
+        &mut args5,
+    );
+    assert_eq!(see4, NativeOutcome::Value(Value::Bool(true)));
+
+    // PeripheralVision is compared as a distance in the decoded binary (dot(delta,
+    // SafeNormal(delta)) = |delta|): 360 rejects inside 360 UU; the Engine.u default 0 and
+    // the XIII -1 convention pass.
+    for (pv, dist, expected) in [
+        (360.0, 100.0, false),
+        (0.0, 100.0, true),
+        (-1.0, 100.0, true),
+    ] {
+        let mut vm2 = Vm::new(&set, VmLimits::default());
+        vm2.set_physics(Box::new(MockWorld::new()));
+        let pawn2 = spawn_at(&mut vm2, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+        vm2.set_property(pawn2, "PeripheralVision", 0, Value::Float(pv));
+        let ctrl2 = vm2.spawn(pg(&set, "Controller"), "C").unwrap();
+        vm2.set_property(
+            ctrl2,
+            "Pawn",
+            0,
+            Value::Object(Some(ObjRef::Instance(pawn2))),
+        );
+        let other2 = spawn_at(&mut vm2, &set, "Pawn", "O", [dist, 0.0, 0.0]);
+        vm2.set_property(other2, "Visibility", 0, Value::Int(128));
+        let mut args6 = [Value::Object(Some(ObjRef::Instance(other2)))];
+        let out = call_native(
+            &mut vm2,
+            "Engine.Controller.CanSee",
+            ctrl2,
+            &[false],
+            &mut args6,
+        );
+        assert_eq!(out, NativeOutcome::Value(Value::Bool(expected)), "pv {pv}");
+    }
+
+    // CanSee on the controller's Enemy is exactly LineOfSightTo: no range gate.
+    let mut vm3 = Vm::new(&set, VmLimits::default());
+    vm3.set_physics(Box::new(MockWorld::new()));
+    let pawn3 = spawn_at(&mut vm3, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    vm3.set_property(pawn3, "SightRadius", 0, Value::Float(500.0));
+    let ctrl3 = vm3.spawn(pg(&set, "Controller"), "C").unwrap();
+    vm3.set_property(
+        ctrl3,
+        "Pawn",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn3))),
+    );
+    let far = spawn_at(&mut vm3, &set, "Pawn", "O", [3000.0, 0.0, 0.0]);
+    vm3.set_property(far, "Visibility", 0, Value::Int(128));
+    vm3.set_property(
+        ctrl3,
+        "Enemy",
+        0,
+        Value::Object(Some(ObjRef::Instance(far))),
+    );
+    let mut args7 = [Value::Object(Some(ObjRef::Instance(far)))];
+    let see5 = call_native(
+        &mut vm3,
+        "Engine.Controller.CanSee",
+        ctrl3,
+        &[false],
+        &mut args7,
+    );
+    assert_eq!(see5, NativeOutcome::Value(Value::Bool(true)));
+}
+
+/// Degenerate inputs: no pawn, missing view/other locations, zero distance.
+#[test]
+fn can_see_and_line_of_sight_to_degenerate_inputs() {
+    let set = los_set();
+    // No pawn on the controller: CanSee is false (SeePawn's first gate), LineOfSightTo still
+    // traces from the controller itself (AController::GetViewTarget returns `this`).
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let ctrl = vm.spawn(pg(&set, "Controller"), "C").unwrap();
+    let other = spawn_at(&mut vm, &set, "Pawn", "O", [100.0, 0.0, 0.0]);
+    let mut args = [Value::Object(Some(ObjRef::Instance(other)))];
+    let see = call_native(
+        &mut vm,
+        "Engine.Controller.CanSee",
+        ctrl,
+        &[false],
+        &mut args,
+    );
+    assert_eq!(see, NativeOutcome::Value(Value::Bool(false)));
+    let mut args2 = [Value::Object(Some(ObjRef::Instance(other)))];
+    let los = call_native(
+        &mut vm,
+        "Engine.Controller.LineOfSightTo",
+        ctrl,
+        &[false],
+        &mut args2,
+    );
+    assert_eq!(los, NativeOutcome::Value(Value::Bool(true)));
+
+    // Controller and target exactly overlapping: the decoded PeripheralVision check (pass
+    // requires |delta| > PeripheralVision strictly) rejects CanSee at distance 0.
+    let mut vm2 = Vm::new(&set, VmLimits::default());
+    vm2.set_physics(Box::new(MockWorld::new()));
+    let pawn2 = spawn_at(&mut vm2, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    let ctrl2 = vm2.spawn(pg(&set, "Controller"), "C").unwrap();
+    vm2.set_property(
+        ctrl2,
+        "Pawn",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn2))),
+    );
+    let same = spawn_at(&mut vm2, &set, "Pawn", "O", [0.0, 0.0, 0.0]);
+    vm2.set_property(same, "Visibility", 0, Value::Int(128));
+    let mut args3 = [Value::Object(Some(ObjRef::Instance(same)))];
+    let see2 = call_native(
+        &mut vm2,
+        "Engine.Controller.CanSee",
+        ctrl2,
+        &[false],
+        &mut args3,
+    );
+    assert_eq!(see2, NativeOutcome::Value(Value::Bool(false)));
+    let mut args4 = [Value::Object(Some(ObjRef::Instance(same)))];
+    let los2 = call_native(
+        &mut vm2,
+        "Engine.Controller.LineOfSightTo",
+        ctrl2,
+        &[false],
+        &mut args4,
+    );
+    assert_eq!(los2, NativeOutcome::Value(Value::Bool(true)));
 }
 
 #[test]
@@ -7335,7 +8354,9 @@ fn inventory_package() -> Vec<u8> {
     let inv_inv = b.reserve(IMP_OBJPROP, inventory, "Inventory");
     let inv_owner = b.reserve(IMP_OBJPROP, inventory, "Owner");
     b.prop_with(inv_inv, inv_owner, 0, &compact(0));
-    b.prop_with(inv_owner, 0, 0, &compact(0));
+    let give = b.reserve(IMP_FUNCTION, inventory, "GiveTo");
+    let destroyed = b.reserve(IMP_FUNCTION, inventory, "Destroyed");
+    b.prop_with(inv_owner, give, 0, &compact(0));
     // Native object operators the script calls (declared so `resolve_native_index` finds them).
     let native_op = ff::FINAL | ff::NATIVE | ff::OPERATOR | ff::STATIC;
     let neq = b.reserve(IMP_FUNCTION, object, "NotEqual_ObjectObject");
@@ -7381,7 +8402,91 @@ fn inventory_package() -> Vec<u8> {
         0x0F, 0x19, 0x00, rl, 0xFF, 0xFF, 0x00, 0x01, pi, 0x00, rn,           // 0050 Last.Inventory = NewItem
         0x04, 0x27,                                                             // 0064 return true
     ];
-    b.func(add, 0, newitem, &code, 102, 0, ff::DEFINED);
+    let delete = b.reserve(IMP_FUNCTION, pawn, "DeleteInventory");
+    b.func(add, delete, newitem, &code, 102, 0, ff::DEFINED);
+    let other = b.reserve(IMP_OBJPROP, give, "Other");
+    let give_ret = b.reserve(IMP_INTPROP, give, "ReturnValue");
+    b.prop_with(other, give_ret, pf::PARM, &compact(0));
+    b.prop(give_ret, 0, pf::PARM | pf::RETURN_PARM);
+    let add_name = b.name("AddInventory");
+    // Owner = Other; return Other.AddInventory(self). Exercises a return-valued nested
+    // script call on an unticked/suspended owner, rather than a host call_function on it.
+    let give_code = [
+        0x0F,
+        0x01,
+        inv_owner as u8,
+        0x00,
+        other as u8,
+        0x04,
+        0x19,
+        0x00,
+        other as u8,
+        0xFF,
+        0xFF,
+        0,
+        0x1B,
+    ]
+    .into_iter()
+    .chain(compact(add_name))
+    .chain([0x17, 0x16])
+    .collect::<Vec<_>>();
+    b.func(give, destroyed, other, &give_code, 28, 0, ff::DEFINED);
+    let delete_name = b.name("DeleteInventory");
+    // Destroyed -> Owner.DeleteInventory(self). No native inventory repair is allowed.
+    let destroyed_code = [0x19, 0x01, inv_owner as u8, 0xFF, 0xFF, 0, 0x1B]
+        .into_iter()
+        .chain(compact(delete_name))
+        .chain([0x17, 0x16, 0x04, 0x0B])
+        .collect::<Vec<_>>();
+    b.func(
+        destroyed,
+        0,
+        0,
+        &destroyed_code,
+        18,
+        0,
+        ff::DEFINED | ff::EVENT,
+    );
+    let item = b.reserve(IMP_OBJPROP, delete, "Item");
+    b.prop_with(item, 0, pf::PARM, &compact(0));
+    // Minimal head unlink authored for this fixture: Inventory = Item.Inventory;
+    // Item.Inventory = None; Item.Owner = None. The tests delete the current head.
+    let delete_code = vec![
+        0x0F,
+        0x01,
+        pi,
+        0x19,
+        0x00,
+        item as u8,
+        0xFF,
+        0xFF,
+        0,
+        0x01,
+        pi,
+        0x0F,
+        0x19,
+        0x00,
+        item as u8,
+        0xFF,
+        0xFF,
+        0,
+        0x01,
+        pi,
+        0x2A,
+        0x0F,
+        0x19,
+        0x00,
+        item as u8,
+        0xFF,
+        0xFF,
+        0,
+        0x01,
+        inv_owner as u8,
+        0x2A,
+        0x04,
+        0x0B,
+    ];
+    b.func(delete, 0, item, &delete_code, 54, 0, ff::DEFINED);
     b.class(object, 0, neq);
     b.class(inventory, object, inv_inv);
     b.class(ammo, inventory, 0);
@@ -7489,6 +8594,88 @@ fn synthetic_add_inventory_links_the_chain_and_rejects_duplicates() {
         Some(&Value::Object(None)),
         "the tail's link stays None"
     );
+}
+
+/// Tick suspension must not interrupt synchronous GiveTo/AddInventory or the Destroyed
+/// callback to the owner. Duplicate items, an inactive owner and disabled Destroyed probes
+/// expose the old call gate and the native unlink workaround independently.
+#[test]
+fn item49b_inventory_callbacks_run_on_inactive_and_suspended_owners() {
+    let set = set_of(inventory_package());
+    for suspended in [false, true] {
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let owner = vm.spawn(g(&set, "Pawn"), "Corpse").unwrap();
+        vm.objects[owner as usize].suspended = suspended;
+        let first = vm.spawn(g(&set, "Inventory"), "First").unwrap();
+        let key = vm.spawn(g(&set, "Inventory"), "Key").unwrap();
+        let give = g(&set, "Inventory.GiveTo");
+        for item in [first, key] {
+            let result = vm
+                .call_function(
+                    give,
+                    item,
+                    vec![Value::Object(Some(ObjRef::Instance(owner)))],
+                )
+                .unwrap();
+            assert_eq!(result, Value::Bool(true));
+        }
+        assert_eq!(obj_prop(&vm, owner, "Inventory"), Some(first));
+        assert_eq!(obj_prop(&vm, first, "Inventory"), Some(key));
+        assert_eq!(
+            vm.call_function(
+                give,
+                key,
+                vec![Value::Object(Some(ObjRef::Instance(owner)))]
+            )
+            .unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            obj_prop(&vm, key, "Inventory"),
+            None,
+            "duplicate must not form a cycle"
+        );
+        vm.destroy(first).unwrap();
+        assert_eq!(
+            obj_prop(&vm, owner, "Inventory"),
+            Some(key),
+            "Destroyed must call unticked owner"
+        );
+        assert_eq!(obj_prop(&vm, first, "Owner"), None);
+        vm.destroy(key).unwrap();
+        assert_eq!(obj_prop(&vm, owner, "Inventory"), None);
+        assert!(
+            !vm.objects[owner as usize].active,
+            "a direct call must not enable scheduled ticking"
+        );
+        assert_eq!(vm.objects[owner as usize].suspended, suspended);
+        assert_eq!(vm.suspended_deferred_calls(), 0);
+        assert!(
+            !vm.trace
+                .iter()
+                .any(|e| matches!(e.kind, TraceKind::Deferred { .. }))
+        );
+    }
+}
+
+#[test]
+fn item49b_destroy_without_inventory_callback_does_not_repair_chain() {
+    let set = set_of(inventory_package());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let owner = vm.spawn(g(&set, "Pawn"), "Owner").unwrap();
+    let item = vm.spawn(g(&set, "Inventory"), "Item").unwrap();
+    vm.call_function(
+        g(&set, "Inventory.GiveTo"),
+        item,
+        vec![Value::Object(Some(ObjRef::Instance(owner)))],
+    )
+    .unwrap();
+    // Disabling Destroyed intentionally prevents the script unlink. DestroyActor must not
+    // silently synthesize inventory semantics when the callback is absent.
+    vm.disable_probe(item, "All", true);
+    vm.destroy(item).unwrap();
+    assert_eq!(obj_prop(&vm, owner, "Inventory"), Some(item));
+    assert_eq!(obj_prop(&vm, item, "Owner"), Some(owner));
 }
 
 /// Synthetic package with a `Pickup` class carrying `Location` (`Core.Struct` `Vector`),
@@ -8038,6 +9225,8 @@ fn trace_package() -> Vec<u8> {
     let proj_target = b.reserve(B_BOOLPROP, actor, "bProjTarget");
     let bzero = b.reserve(B_BOOLPROP, actor, "bBlockZeroExtentTraces");
     let bnz = b.reserve(B_BOOLPROP, actor, "bBlockNonZeroExtentTraces");
+    let bblocka = b.reserve(B_BOOLPROP, actor, "bBlockActors");
+    let bblockp = b.reserve(B_BOOLPROP, actor, "bBlockPlayers");
     b.prop_with(loc, rot, 0, &compact(vector));
     b.prop_with(rot, radius, 0, &compact(rotator));
     b.prop(radius, height, 0);
@@ -8045,7 +9234,9 @@ fn trace_package() -> Vec<u8> {
     b.prop(collide, proj_target, 0);
     b.prop(proj_target, bzero, 0);
     b.prop(bzero, bnz, 0);
-    b.prop(bnz, 0, 0);
+    b.prop(bnz, bblocka, 0);
+    b.prop(bblocka, bblockp, 0);
+    b.prop(bblockp, 0, 0);
     b.class(object, 0, 0);
     b.class(actor, object, loc);
     b.build()
@@ -8079,9 +9270,16 @@ fn synthetic_trace_hits_the_nearest_pawn_before_world_geometry() {
         vm.set_property(id, "Location", 0, Value::Vector([x, 0.0, 0.0]));
         vm.set_property(id, "CollisionRadius", 0, Value::Float(40.0));
         vm.set_property(id, "CollisionHeight", 0, Value::Float(40.0));
+        // Decoded engine filter: hash membership (`bCollideActors`) plus the extent prefilter
+        // (`bBlockZeroExtentTraces`) plus `ShouldTrace` admission (block flags).
+        vm.set_property(id, "bCollideActors", 0, Value::Bool(true));
+        vm.set_property(id, "bBlockActors", 0, Value::Bool(true));
+        vm.set_property(id, "bBlockPlayers", 0, Value::Bool(true));
         vm.set_property(id, "bBlockZeroExtentTraces", 0, Value::Bool(true));
         // Measured Plage01 pawn shape: `bCollideActors=false` with `bProjTarget=true`.
         vm.set_property(id, "bProjTarget", 0, Value::Bool(true));
+        // item40e: only collision-hash actors (`bCollideActors`) can be hit.
+        vm.set_property(id, "bCollideActors", 0, Value::Bool(true));
         vm.set_active(id, true);
     }
     let mut args = trace_args();
@@ -8878,6 +10076,10 @@ fn stop_animating_clears_every_channel() {
             looping: true,
             active: true,
             tween_remaining: 0.0,
+            tween_duration: 0.0,
+            tween_only: false,
+            loop_end_sent: false,
+            tween_source: None,
             notifies: Vec::new(),
             notify_idx: 0,
         },
@@ -9233,6 +10435,343 @@ fn delegate_values_are_equatable_and_none_is_distinct() {
     assert!(!crate::vm::values_equal(&d, &same));
     assert!(crate::vm::values_equal(&d, &d.clone()));
     assert!(!crate::vm::values_equal(&Value::Delegate(None), &d));
+}
+
+#[test]
+fn tween_only_holds_first_frame_and_captures_interrupted_source() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(4, 2.0)));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    play_anim(&mut vm, a, "Walk", 1.0, 0);
+    vm.tick(0.5).unwrap();
+    let mut args = [Value::Name("Idle".into()), Value::Float(1.0), Value::Int(0)];
+    try_native(&mut vm, "Engine.Actor.TweenAnim", a, &[false; 3], &mut args).unwrap();
+    vm.tick(0.25).unwrap();
+    let view = vm.actor_animation(a).unwrap();
+    let c = &view.channels[0];
+    assert_eq!(c.frame, 0.0);
+    assert_eq!(c.rate, 0.0);
+    assert_eq!(c.tween_remaining, 0.75);
+    assert_eq!(c.tween_source.as_ref().unwrap().frame, 1.0);
+    assert_eq!(c.tween_source.as_ref().unwrap().sequence, "Walk");
+    args[0] = Value::Name("Run".into());
+    try_native(&mut vm, "Engine.Actor.TweenAnim", a, &[false; 3], &mut args).unwrap();
+    let c = vm.actor_animation(a).unwrap().channels.remove(0);
+    assert_eq!(c.tween_source.as_ref().unwrap().tween_remaining, 0.75);
+    vm.tick(1.25).unwrap();
+    assert_eq!(anim_end_count(&vm), 1);
+    vm.tick(2.0).unwrap();
+    let c = vm.actor_animation(a).unwrap().channels.remove(0);
+    assert_eq!(c.frame, 0.0);
+    assert!(!c.active);
+    assert!(c.tween_source.is_none());
+}
+
+#[test]
+fn blend_to_alpha_preserves_subtree_and_is_independent_of_step_size() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(100, 1.0)));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    vm.anim_blend_params(a, 1, 0.2, 0.5, 0.25, Some("Arm".into()));
+    vm.anim_blend_to_alpha(a, 1, 0.8, 1.0);
+    for _ in 0..4 {
+        vm.tick(0.125).unwrap();
+    }
+    let p = vm.objects[a as usize].anim.blend_params.get(&1).unwrap();
+    assert!((p.blend_alpha - 0.5).abs() < 1e-6);
+    assert_eq!(p.bone_name.as_deref(), Some("Arm"));
+    assert_eq!(p.in_time, 0.5);
+    vm.tick(1.0).unwrap();
+    assert!((vm.objects[a as usize].anim.blend_params[&1].blend_alpha - 0.8).abs() < 1e-6);
+    vm.anim_blend_to_alpha(a, 1, 0.0, 0.0);
+    assert_eq!(
+        vm.objects[a as usize].anim.blend_params[&1].blend_alpha,
+        0.0
+    );
+    vm.anim_blend_params(a, 0, 0.0, 0.0, 0.0, None);
+    assert!(!vm.objects[a as usize].anim.blend_params.contains_key(&0));
+}
+
+#[test]
+fn channel_params_return_requested_sequence_and_loop_notifies_survive_multiple_wraps() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(ScriptedAnim {
+        frames: 4,
+        rate: 1.0,
+        notifies: vec![(0.25, "Foot".into()), (0.75, "Foot".into())],
+    }));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    play_anim(&mut vm, a, "Walk", 1.0, 0);
+    play_anim(&mut vm, a, "Aim", 1.0, 1);
+    let mut args = [
+        Value::Int(0),
+        Value::Name("None".into()),
+        Value::Float(0.0),
+        Value::Float(0.0),
+    ];
+    try_native(
+        &mut vm,
+        "Engine.Actor.GetAnimParams",
+        a,
+        &[false; 4],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(args[1], Value::Name("Walk".into()));
+    assert_eq!(args[3], Value::Float(0.25));
+    assert_eq!(
+        vm.get_property(a, "AnimSequence"),
+        Some(&Value::Name("Walk".into()))
+    );
+    let st = vm.objects[a as usize].anim.channels.get_mut(&0).unwrap();
+    st.looping = true;
+    vm.tick(9.5).unwrap();
+    assert_eq!(vm.objects[a as usize].anim.channels[&0].frame, 1.5);
+    let count = vm
+        .trace
+        .iter()
+        .filter(|e| matches!(e.kind, TraceKind::AnimNotify { channel: 0, .. }))
+        .count();
+    assert_eq!(count, 5);
+    assert_eq!(vm.anim_channel_params(a, 0), Some((0.375, 0.25)));
+    assert_eq!(
+        vm.get_property(a, "bAnimFinished"),
+        Some(&Value::Bool(false))
+    );
+}
+
+#[test]
+fn repeated_bone_controls_replace_previous_request() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    for yaw in 0..1000 {
+        vm.add_bone_rotation(a, "Arm".into(), [0, yaw, 0], 0, 1.0);
+    }
+    let bs = vm.bone_state(a).unwrap();
+    assert_eq!(bs.rotations.len(), 1);
+    assert_eq!(bs.rotations[0].turn[1], 999);
+}
+
+#[test]
+fn animation_rejects_nonfinite_and_interruptions_stay_bounded() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(4, 2.0)));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    assert!(
+        vm.start_animation(a, "Walk", f32::NAN, 0.0, 0, false)
+            .is_err()
+    );
+    assert!(
+        vm.start_animation(a, "Walk", 1.0, f32::INFINITY, 0, false)
+            .is_err()
+    );
+    // Authored cine scripts re-run `LoopAnim` on the same channel every tick (measured:
+    // Plage01 `CineController2` -> `Cine2.CineInit.PlayMoving`). The tween source freezes
+    // one level instead of growing an unbounded interruption chain, so repeated tweened
+    // starts on one actor keep working and sampling stays bounded.
+    for _ in 0..200 {
+        vm.start_animation(a, "Walk", 1.0, 1.0, 0, false).unwrap();
+    }
+    vm.tick(1.0).unwrap();
+    vm.start_animation(a, "Walk", 1.0, 0.0, 0, true).unwrap();
+    assert!(vm.tick(10000.0).is_err());
+}
+
+#[test]
+fn attach_to_bone_writes_the_reflected_attachment_bone_field() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let parent = vm.spawn(sg(&set, "Actor"), "Parent").unwrap();
+    let child = vm.spawn(sg(&set, "Actor"), "Child").unwrap();
+    let mut args = [
+        Value::Object(Some(ObjRef::Instance(child))),
+        Value::Name("Arm".into()),
+    ];
+    let out = try_native(
+        &mut vm,
+        "Engine.Actor.AttachToBone",
+        parent,
+        &[false; 2],
+        &mut args,
+    )
+    .unwrap();
+    assert!(matches!(out, NativeOutcome::Value(Value::Bool(true))));
+    assert_eq!(
+        vm.get_property(child, "AttachmentBone"),
+        Some(&Value::Name("Arm".into()))
+    );
+    assert_eq!(
+        vm.get_property(child, "Base"),
+        Some(&Value::Object(Some(ObjRef::Instance(parent))))
+    );
+    args[0] = Value::Object(None);
+    assert!(matches!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.AttachToBone",
+            parent,
+            &[false; 2],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(false))
+    ));
+}
+
+/// item49b regression: Banque01's ending flow stalled because `CineMalletteSM.Trigger`
+/// (0x00E3) calls `Actor.DetachFromBone` (native 403), which used to be unimplemented; the
+/// error suspended the mallette actor and the escape controller's action never advanced. The
+/// detach must clear exactly the link `AttachToBone` recorded, refuse actors based elsewhere,
+/// and survive a repeated detach on an already world-based actor.
+#[test]
+fn detach_from_bone_clears_the_attach_link_and_refuses_foreign_bases() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let parent = vm.spawn(sg(&set, "Actor"), "Parent").unwrap();
+    let child = vm.spawn(sg(&set, "Actor"), "Child").unwrap();
+    let other = vm.spawn(sg(&set, "Actor"), "Other").unwrap();
+    let mut args = [
+        Value::Object(Some(ObjRef::Instance(child))),
+        Value::Name("Arm".into()),
+    ];
+    assert!(matches!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.AttachToBone",
+            parent,
+            &[false; 2],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(true))
+    ));
+    // Detaching from a different actor must refuse and leave the link untouched.
+    assert!(matches!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.DetachFromBone",
+            other,
+            &[false; 1],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(false))
+    ));
+    assert_eq!(
+        vm.get_property(child, "Base"),
+        Some(&Value::Object(Some(ObjRef::Instance(parent))))
+    );
+    // The real detach: clears Base and the recorded bone.
+    assert!(matches!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.DetachFromBone",
+            parent,
+            &[false; 1],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(true))
+    ));
+    assert_eq!(vm.get_property(child, "Base"), Some(&Value::Object(None)));
+    assert_eq!(
+        vm.get_property(child, "AttachmentBone"),
+        Some(&Value::Name("None".into()))
+    );
+    // A second detach is a no-op refusal (the engine has nothing to undo).
+    assert!(matches!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.DetachFromBone",
+            parent,
+            &[false; 1],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(false))
+    ));
+    // A None attachment is refused, not a silent success.
+    args[0] = Value::Object(None);
+    assert!(matches!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.DetachFromBone",
+            parent,
+            &[false; 1],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(false))
+    ));
+}
+
+/// Synthetic recursion fixture: `Actor.Run()` calls itself virtually and never returns, so only
+/// the interpreter's call-depth guard can stop it. This is the shape of the Amos01
+/// campaign-start recursion (`xiii.u XIIIPlayerController.SwitchWeapon` 0x00FC -> 0x00FC).
+/// The guard limit itself follows the engine: Core.dll `UObject::ProcessInternal` compares
+/// the runaway counter against 250 (`cmp $0xfa` at VA 0x101166e0) and logs "Infinite script
+/// recursion (%i calls) detected" (string VA 0x10178cd8) past it.
+fn recursion_package() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let run = b.reserve(IMP_FUNCTION, actor, "Run");
+    // Run(): Run(); return;  — a virtual self-call with no arguments. A name operand is 1 byte
+    // on disk but NAME_MEMORY_SIZE (4) in memory, so the code is 8 memory bytes.
+    let mut code = Vec::new();
+    code.push(0x1B); // VirtualFunction
+    code.extend(compact(b.name("Run")));
+    code.push(0x16); // EndFunctionParms
+    code.push(0x04); // Return
+    code.push(0x0B); // Nothing
+    b.func(run, 0, 0, &code, 8, 0, ff::DEFINED);
+    b.class(object, 0, 0);
+    b.class(actor, object, run);
+    b.build()
+}
+
+/// The unbounded-recursion property at the engine's own limit: at `VmLimits::default()` (250,
+/// the Core.dll `ProcessInternal` constant) the guard aborts with `CallDepthExceeded` **inside
+/// a 2 MiB thread stack** — the libtest default (`RUST_MIN_STACK`), i.e. the budget every test
+/// already runs on, with no wrapper needed. The measured interpreter cost is ~4.4 KiB per
+/// interpreted frame (debug build), so 250 frames need ~1.1 MiB: the guard fires at roughly
+/// half the budget. If the default limit is ever raised past what that budget supports, this
+/// thread dies with a stack overflow and the test (loudly) fails. The shipped host entry
+/// points run their VM-driving code on an explicit 64 MiB stack instead (see xiii-app
+/// `vmstack`, which exists for the binary's 1 MiB main thread).
+#[test]
+fn recursion_guard_fits_a_2mib_stack() {
+    let package = recursion_package();
+    let limit = VmLimits::default().max_call_depth;
+    let outcome = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let set = set_of(package);
+            let mut vm = Vm::new(&set, VmLimits::default());
+            let actor = vm.spawn(g(&set, "Actor"), "Rec").unwrap();
+            vm.set_active(actor, true);
+            match vm.call_function(g(&set, "Actor.Run"), actor, vec![]) {
+                Err(e) => format!("{:?}", e.kind),
+                Ok(_) => "no error".to_owned(),
+            }
+        })
+        .expect("spawn the 2 MiB probe thread")
+        .join()
+        .expect("the recursion must abort inside a 2 MiB stack, not overflow it");
+    assert_eq!(
+        outcome,
+        format!("CallDepthExceeded {{ limit: {limit} }}"),
+        "the engine-limit call-depth guard (250) must fire before a 2 MiB stack is exhausted"
+    );
 }
 
 // ---------------------------------------------------------------------------------------

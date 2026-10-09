@@ -125,15 +125,28 @@ impl MoverCollision {
 
     /// Writes every live mover's current VM pose into the collision world. Returns the number of
     /// objects updated.
+    ///
+    /// item40e: an installed mover that is no longer live (destroyed, e.g. a broken
+    /// `BreakableMover`) or that no longer blocks the player (`bCollideActors && bBlockPlayers`
+    /// cleared by `SetCollision`) is disabled; it is re-enabled when the flags are set again. In
+    /// UE2 such an actor is out of the collision hash, so the player walks through it.
     pub fn update(&self, world: &mut CollisionWorld, movers: &[MoverState]) -> usize {
-        let mut updated = 0;
+        let mut live: Vec<Option<&MoverState>> = vec![None; self.actors.len()];
         for m in movers {
-            let Some(&slot) = self.by_name.get(&m.name.to_ascii_lowercase()) else {
+            if let Some(&slot) = self.by_name.get(&m.name.to_ascii_lowercase()) {
+                live[slot] = Some(m);
+            }
+        }
+        let mut updated = 0;
+        for (slot, state) in self.actors.iter().zip(live) {
+            let enabled = state.is_some_and(|m| m.blocks_players);
+            world.set_moving_enabled(slot.index, enabled);
+            let Some(m) = state.filter(|_| enabled) else {
                 continue;
             };
             let center = to_bevy_position(m.location);
             let rows = rotation_rows(m.rotation);
-            if world.set_moving_transform(self.actors[slot].index, center, rows) {
+            if world.set_moving_transform(slot.index, center, rows) {
                 updated += 1;
             }
         }
@@ -144,6 +157,63 @@ impl MoverCollision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn grille_state(blocks_players: bool) -> MoverState {
+        MoverState {
+            name: "BreakAbleMover16".to_owned(),
+            location: [0.0; 3],
+            rotation: [0; 3],
+            base_pos: [0.0; 3],
+            base_rot: [0; 3],
+            key_num: 0,
+            phys_alpha: 0.0,
+            phys_rate: 0.0,
+            interpolating: false,
+            blocks_players,
+        }
+    }
+
+    #[test]
+    fn destroyed_or_non_blocking_mover_stops_colliding_and_comes_back() {
+        // item40e: a grille broken by the chair (destroyed: absent from the live list) must stop
+        // blocking the player; SetCollision(false) does the same; restoring the flags restores it.
+        let wall: Vec<Triangle> = vec![
+            [[0.0, -1.0, -1.0], [0.0, 1.0, -1.0], [0.0, 1.0, 1.0]],
+            [[0.0, -1.0, -1.0], [0.0, 1.0, 1.0], [0.0, -1.0, 1.0]],
+        ];
+        let mut world = CollisionWorld::new(std::iter::empty());
+        let index = world.add_moving(MovingObject::from_world_triangles(
+            wall,
+            3,
+            [0.0; 3],
+            rotation_rows([0, 0, 0]),
+        ));
+        let movers = MoverCollision {
+            actors: vec![ActorSlot {
+                name: "BreakAbleMover16".to_owned(),
+                index,
+            }],
+            by_name: HashMap::from([("breakablemover16".to_owned(), 0)]),
+        };
+        let (a, b, half) = ([-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.1; 3]);
+        assert_eq!(movers.update(&mut world, &[grille_state(true)]), 1);
+        assert!(world.sweep(a, b, half).is_some(), "intact grille blocks");
+        assert_eq!(movers.update(&mut world, &[]), 0);
+        assert!(
+            world.sweep(a, b, half).is_none(),
+            "destroyed grille still blocks"
+        );
+        movers.update(&mut world, &[grille_state(false)]);
+        assert!(
+            world.sweep(a, b, half).is_none(),
+            "non-blocking mover still blocks"
+        );
+        movers.update(&mut world, &[grille_state(true)]);
+        assert!(
+            world.sweep(a, b, half).is_some(),
+            "re-enabled mover must block again"
+        );
+    }
 
     #[test]
     fn identity_rotation_rows_are_identity() {

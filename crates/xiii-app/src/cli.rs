@@ -20,6 +20,8 @@ pub enum Mode {
     Menu,
     /// Bink cutscene playback: `--video FILE` + `--game-dir`.
     Video,
+    /// Campaign start survey (item45): `--survey` + `--game-dir`. Headless only.
+    Survey,
 }
 
 /// Viewer baked-lighting mode.
@@ -98,6 +100,13 @@ pub struct Options {
     pub benchmark: Option<u32>,
     /// `--benchmark`: warm-up frames discarded before the measured frames.
     pub benchmark_warmup: u32,
+    /// `--survey`: explicit comma-separated map list (case-insensitive stems), overriding the
+    /// discovered `NextMapLevelWithUnr` campaign order.
+    pub maps: Option<String>,
+    /// `--survey-child` (internal): run exactly one map and print machine-readable result
+    /// lines. The `--survey` parent spawns one child per map so a process-fatal failure
+    /// (Rust stack overflow) is contained to that map instead of ending the sweep.
+    pub survey_child: bool,
 }
 
 /// Audio playback toggle for `--play`.
@@ -162,6 +171,8 @@ impl Default for Options {
             perf_natives: false,
             benchmark: None,
             benchmark_warmup: 0,
+            maps: None,
+            survey_child: false,
         }
     }
 }
@@ -179,6 +190,7 @@ xiii-app --menu --game-dir DIR [--menu-script FILE]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH]
 xiii-app --video FILE --game-dir DIR [--video-track N]
           [--exit-after-secs S] [--screenshot PATH] [--size WxH]
+xiii-app --survey --game-dir DIR [--maps a,b,..] [--exit-after-secs S]
 xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
          [--exit-after-secs S] [--screenshot PATH] [--size WxH]
 
@@ -205,12 +217,19 @@ xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
   --menu               Front-end menu: load the entry map and run the game's menu classes
                        (`XIDInterf.XIIIRootWindow` / `XIIIMenu`) through the VM, draw them
                        through the Canvas path. Requires --game-dir.
-  --menu-script FILE   Deterministic menu input script (headless without --screenshot).
-                       Lines: `t=<secs> key <up|down|left|right|enter|escape>` |
-                       `focus N` | `click N` | `open Package.Class` |
-                       `newgame` (focus + Enter on the New game entry).
-                       Selecting New game reaches the game's ClientTravel to Plage00 request;
-                       the host then starts --play on the requested map.
+   --menu-script FILE   Deterministic menu input script (headless without --screenshot).
+                        Lines: `t=<secs> key <up|down|left|right|enter|escape>` |
+                        `focus N` | `click N` | `open Package.Class` |
+                        `newgame` (focus + Enter on the New game entry).
+                        Selecting New game reaches the game's ClientTravel to Plage00 request;
+                        the host then starts --play on the requested map.
+   --survey             Campaign start survey (item45, headless): for every campaign map in
+                        MapInfo.NextMapLevelWithUnr order, open the real session (login chain)
+                        and run 90 simulated seconds with no player input, then report the
+                        player-controller state timeline, when control returned, unfinished
+                        Cine2/CineController2 actors with their wait flags, script failures,
+                        objectives and wall time. `--maps a,b,..` overrides the discovered
+                        order; `--exit-after-secs` overrides the 90 s budget.
    --play-script FILE   Drive --play from a text input script; headless without --screenshot.
                         Lines: `t=<secs> forward|back|right|left V | walk on/off | crouch on/off |
                         jump | yaw DEG | turn DEG | pitch DEG | use | teleport X Y Z` (teleport
@@ -329,6 +348,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
                 opts.video_track = Some(n);
             }
             "--menu" => opts.mode = Mode::Menu,
+            "--survey" => opts.mode = Mode::Survey,
+            "--maps" => opts.maps = Some(value("--maps")?),
+            "--survey-child" => {
+                opts.mode = Mode::Survey;
+                opts.survey_child = true;
+            }
             "--menu-script" => {
                 opts.menu_script = Some(PathBuf::from(value("--menu-script")?));
                 if opts.mode == Mode::Smoke {
@@ -530,6 +555,17 @@ mod tests {
             Some(std::path::Path::new("s.txt"))
         );
         assert!(p(&["--menu-script"]).is_err());
+    }
+
+    #[test]
+    fn parses_survey_flags() {
+        let o = p(&["--survey", "--game-dir", "G"]).unwrap();
+        assert_eq!(o.mode, Mode::Survey);
+        assert!(o.maps.is_none());
+        let o = p(&["--survey", "--maps", "Plage00,amos01"]).unwrap();
+        assert_eq!(o.mode, Mode::Survey);
+        assert_eq!(o.maps.as_deref(), Some("Plage00,amos01"));
+        assert!(p(&["--survey", "--maps"]).is_err());
     }
 
     #[test]

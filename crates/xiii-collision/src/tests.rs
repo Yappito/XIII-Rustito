@@ -1177,6 +1177,96 @@ fn moving_wall_blocks_then_unblocks_a_sweep() {
 }
 
 #[test]
+fn disabled_moving_object_is_ignored_by_every_query_until_re_enabled() {
+    // item40e: a destroyed/non-colliding mover (a broken grille) stays installed but must not
+    // block sweeps, rays or overlaps; re-enabling restores it at its current pose.
+    let mut w = CollisionWorld::new(std::iter::empty());
+    let idx = w.add_moving(MovingObject::from_world_triangles(
+        wall_x(0.0),
+        7,
+        [0.0; 3],
+        ID,
+    ));
+    let (start, end, half) = ([-2.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.1, 0.1, 0.1]);
+    assert!(w.sweep(start, end, half).is_some());
+    assert!(w.set_moving_enabled(idx, false));
+    assert!(!w.moving(idx).unwrap().is_enabled());
+    assert!(
+        w.sweep(start, end, half).is_none(),
+        "disabled mover blocked a sweep"
+    );
+    assert!(w.ray(start, end).is_none(), "disabled mover blocked a ray");
+    assert!(
+        !w.overlaps_aabb([0.0; 3], [0.1; 3]),
+        "disabled mover overlapped"
+    );
+    assert!(w.overlap_aabb([0.0; 3], [0.1; 3]).is_empty());
+    assert!(w.set_moving_enabled(idx, true));
+    assert_eq!(w.sweep(start, end, half).map(|h| h.source), Some(7));
+    assert!(
+        !w.set_moving_enabled(idx + 1, false),
+        "out-of-range index must report false"
+    );
+}
+
+#[test]
+fn box_resting_on_a_coplanar_floor_crosses_a_triangle_edge_flush_with_its_front() {
+    // item40e (Amos01 duct mouth): a box resting exactly on y = 0 whose front face lies exactly
+    // on the leading edge of the next coplanar floor triangle must move onto it. Before, the
+    // zero-depth contact on the static y axis counted as overlap, so the edge returned a
+    // horizontal hit at t = 0 and the box stalled (step-up had no headroom under a duct roof).
+    let tris: Vec<(Triangle, u32)> = vec![
+        ([[0.5, 0.0, -1.0], [0.4, 0.0, 1.0], [0.5, 0.0, 1.0]], 1),
+        ([[-3.0, 0.0, -1.0], [0.5, 0.0, -1.0], [-3.0, 0.0, 1.0]], 1),
+    ];
+    let w = world(tris);
+    let half = [0.5, 0.5, 0.5];
+    let start = [1.0, 0.5, 0.0]; // front face x = 0.5, bottom y = 0
+    assert!(
+        w.sweep(start, [-2.0, 0.5, 0.0], half).is_none(),
+        "a coplanar floor edge flush with the box front must not block"
+    );
+    // A flush wall alongside the motion behaves the same way (side face exactly on z = 0.5).
+    let wall: Vec<(Triangle, u32)> = vec![
+        ([[0.5, 0.0, 1.0], [0.5, 1.0, 1.0], [-3.0, 1.0, 1.0]], 2),
+        ([[0.5, 0.0, 1.0], [-3.0, 1.0, 1.0], [-3.0, 0.0, 1.0]], 2),
+    ];
+    let w = world(wall);
+    assert!(
+        w.sweep([1.0, 0.5, 0.5], [-2.0, 0.5, 0.5], half).is_none(),
+        "a wall flush with the box side must not block motion along it"
+    );
+}
+
+#[test]
+fn a_real_overlap_on_the_static_axis_still_blocks() {
+    // Guard for the touching rule: a 1 cm slab top above the box bottom is a genuine obstacle
+    // (overlap far above the 1e-5 m contact tolerance) and must stop the sweep at its face.
+    let slab = box_tris([-1.0, -0.2, -1.0], [0.0, 0.01, 1.0], 3);
+    let w = world(slab);
+    let hit = w
+        .sweep([1.0, 0.5, 0.0], [-2.0, 0.5, 0.0], [0.5, 0.5, 0.5])
+        .expect("the raised slab must block");
+    assert!((hit.t - 0.5 / 3.0).abs() < 1e-3, "t={}", hit.t);
+    assert!(hit.normal[0] > 0.9, "normal {:?}", hit.normal);
+    // A flat sheet 0.005 mm above the box bottom (below the tolerance) is a touching contact.
+    let sheet: Vec<(Triangle, u32)> = quad(
+        [-1.0, 0.000_005, -1.0],
+        [0.0, 0.000_005, -1.0],
+        [0.0, 0.000_005, 1.0],
+        [-1.0, 0.000_005, 1.0],
+    )
+    .into_iter()
+    .map(|t| (t, 3))
+    .collect();
+    assert!(
+        world(sheet)
+            .sweep([1.0, 0.5, 0.0], [-2.0, 0.5, 0.0], [0.5, 0.5, 0.5])
+            .is_none()
+    );
+}
+
+#[test]
 fn a_door_rotating_open_clears_a_doorway() {
     // Static wall in the x = 0 plane, y in [0,2], with a doorway gap for z in [-1, 1]; the
     // door leaf is a dynamic box hinged at (0, 0, -1) that fills the gap when closed.
@@ -1266,11 +1356,8 @@ fn walking_into_a_moving_wall_is_blocked_and_clears_when_it_moves() {
 
 #[test]
 fn sweep_discard_start_penetration_lets_a_wedged_mover_escape() {
-    // The engine's `ULevel::MoveActor` discards world hits inside the 2-UU back-off behind
-    // the start (Engine.dll 0x1038a89a-0x1038ac05, item27k): for this crate's continuous sweep
-    // that reduces to discarding start-penetrating hits. A box overlapping a wall and moving
-    // into it must NOT be reported as blocked when the discard is on (walk movement), while
-    // the default still blocks (the plain tests above).
+    // Explicit overlap-recovery approximation, not the engine's MoveActor back-off:
+    // a box genuinely embedded in a wall may escape it, but clear geometry still blocks.
     let mut tris: Vec<(Triangle, u32)> = wall_x(0.0).into_iter().map(|t| (t, 4)).collect();
     // A second wall the box reaches while clear of the first.
     tris.extend(wall_x(1.0).into_iter().map(|t| (t, 5)));
@@ -1281,7 +1368,7 @@ fn sweep_discard_start_penetration_lets_a_wedged_mover_escape() {
         walkable_floor_z: Some(0.7),
         ..SweepParams::default()
     };
-    // The flush first wall is discarded...
+    // The genuinely penetrated first wall is discarded...
     assert!(
         sweep_aabb(
             &w,
@@ -1307,11 +1394,72 @@ fn sweep_discard_start_penetration_lets_a_wedged_mover_escape() {
 }
 
 #[test]
+fn sweep_overlap_recovery_does_not_discard_a_touching_wall() {
+    let half = [0.25, 0.5, 0.25];
+    let start = [-half[0], half[1], 0.0];
+    let params = SweepParams {
+        discard_start_penetration: true,
+        ..Default::default()
+    };
+    for dynamic in [false, true] {
+        let mut w = if dynamic {
+            world([])
+        } else {
+            world(wall_x(0.0).into_iter().map(|t| (t, 7)))
+        };
+        if dynamic {
+            w.add_moving(MovingObject::from_world_triangles(
+                wall_x(0.0),
+                7,
+                [0.0; 3],
+                ID,
+            ));
+        }
+        let hit = sweep_aabb(&w, start, add(start, [0.1, 0.0, 0.0]), half, &params)
+            .expect("touching is not embedded: pushing into the wall must block");
+        assert_eq!(hit.source, 7);
+        assert_eq!(hit.t, 0.0);
+        assert!(hit.normal[0] < -0.9);
+        assert!(
+            sweep_aabb(&w, start, add(start, [-0.1, 0.0, 0.0]), half, &params).is_none(),
+            "retreating from the touching wall must be free"
+        );
+        assert!(
+            sweep_aabb(&w, start, add(start, [0.0, 0.0, 0.1]), half, &params).is_none(),
+            "tangential motion must be free"
+        );
+    }
+}
+
+#[test]
+fn walk_repeated_pushes_from_exact_wall_contact_do_not_tunnel() {
+    let mut tris: Vec<_> = big_floor(0.0).into_iter().map(|t| (t, 1)).collect();
+    tris.extend(wall_x(0.0).into_iter().map(|t| (t, 7)));
+    let w = world(tris);
+    for height in [0.5, 0.25] {
+        let half = [0.25, height, 0.25];
+        let start = [-half[0], half[1], 0.0];
+        let mut pos = start;
+        for _ in 0..60 {
+            let result = walk_move(&w, pos, [0.05, 0.0, 0.0], half, &walk_params(0.2));
+            assert!(result.blocked, "a tall wall is not a step");
+            assert!(result.on_floor && !result.falling);
+            assert!(
+                (result.position[0] - start[0]).abs() < 1e-6,
+                "a touching box must not become embedded and then tunnel: {:?}",
+                result.position
+            );
+            pos = result.position;
+        }
+    }
+}
+
+#[test]
 fn walk_repeated_steps_along_a_flush_wall_do_not_deadlock() {
     // Regression (item27k B-2): a pawn overlapping a wall and steering diagonally into it used
     // to make zero progress on every tick (the slide's float residual re-classified the same
-    // start-penetrating contact as blocking forever). The engine's back-off discard lets each
-    // step proceed; the pawn must advance along the wall.
+    // start-penetrating contact as blocking forever). The explicit overlap-recovery policy lets
+    // each step proceed; the pawn must advance along the wall.
     let mut tris: Vec<(Triangle, u32)> = big_floor(0.0).into_iter().map(|t| (t, 1)).collect();
     tris.extend(wall_x(0.0).into_iter().map(|t| (t, 4)));
     let w = world(tris);
@@ -1343,8 +1491,8 @@ fn jones_safe_wedge_synthetic_repro_walks_free() {
     // Synthetic reconstruction of the item27k B-2 deadlock (Banque01's safe desk): a wedge
     // whose front face is slanted (normal ~(0, 0.994, 0.112) in Unreal axes, the angle the
     // real blocker reports) with a pawn box (34,34,75 UU) overlapping the face band by ~8 UU
-    // and steering into it. Before the back-off fix `walk_move` made zero progress forever on
-    // the real soup (measured: 966 identical rejected steps, local/re/item27k/); the pawn must
+    // and steering into it. Before the overlap-recovery approximation `walk_move` made zero
+    // progress forever on the real soup (measured: 966 identical rejected steps, local/re/item27k/); the pawn must
     // now advance every tick. All coordinates are synthetic.
     const S: f32 = 90.0;
     let to_bevy = |u: [f32; 3]| [u[1] / S, u[2] / S, -u[0] / S];

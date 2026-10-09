@@ -334,14 +334,22 @@ fn run_inner(map: &str, game_dir: &std::path::Path) -> Result<(), String> {
     }
 
     let spawn = place_spawn(&world, player_start, half)?;
-    println!(
-        "[collision-test] spawn placement (UE2 FindSpot approximation): raise {:.3} m = {:.1} UU, final center {:?}; box bottom {:.3} m, floor below {:.3} m",
-        spawn.raise,
-        spawn.raise * UNREAL_UNITS_PER_METER,
-        spawn.position,
-        spawn.position[1] - half[1],
-        spawn.floor
-    );
+    if spawn.airborne {
+        println!(
+            "[collision-test] spawn placement: no floor within the drop cap below the PlayerStart; \
+             pawn spawns at the start spot and falls (PHYS_Falling), raise {:.3} m",
+            spawn.raise
+        );
+    } else {
+        println!(
+            "[collision-test] spawn placement (UE2 FindSpot approximation): raise {:.3} m = {:.1} UU, final center {:?}; box bottom {:.3} m, floor below {:.3} m",
+            spawn.raise,
+            spawn.raise * UNREAL_UNITS_PER_METER,
+            spawn.position,
+            spawn.position[1] - half[1],
+            spawn.floor
+        );
+    }
 
     // ---- UE2 step-height evidence (before using the upstream constant) -------------------
     report_step_height_evidence(&set);
@@ -1124,15 +1132,23 @@ fn measure_opening(
 pub(crate) struct Spawn {
     /// Final box center (Bevy metres).
     pub position: Vec3,
-    /// Floor height under the box.
+    /// Floor height under the box (box bottom when airborne).
     pub floor: f32,
     /// Vertical raise applied to clear an initial overlap (metres).
     pub raise: f32,
+    /// True when no floor was found within the drop cap below the PlayerStart. The engine
+    /// spawns the pawn at `StartSpot.Location` (`engine.GameInfo.RestartPlayer` 0x01A0/0x022F
+    /// pass it straight to `Spawn`, no downward search) and lets it fall under PHYS_Falling;
+    /// measured on USA01, whose PlayerStart sits 14 m above the BSP floor. The caller must
+    /// start the sim airborne (`sim.grounded = false`) so the pawn falls and lands.
+    pub airborne: bool,
 }
 
 /// Places the player extent box at the PlayerStart, approximating UE2 spawn `FindSpot`:
 /// start with the box bottom at the PlayerStart; if it overlaps anything, raise it in small
-/// increments until free (cap `2*H`); then sweep straight down onto the floor.
+/// increments until free (cap `2*H`); then sweep straight down onto the floor. When no floor
+/// is found within the drop cap the box stays at the PlayerStart and `airborne` is set
+/// (the engine's pawn falls from the spawn spot; [`Spawn::airborne`]).
 pub(crate) fn place_spawn(
     world: &CollisionWorld,
     player_start: Vec3,
@@ -1160,9 +1176,15 @@ pub(crate) fn place_spawn(
     let center = [base_center[0], y, base_center[2]];
     // Sweep straight down from the free position onto the floor.
     let target = [player_start[0], player_start[1] - 3.0, player_start[2]];
-    let hit = world
-        .sweep(center, target, half)
-        .ok_or_else(|| "no floor was found below the PlayerStart".to_string())?;
+    let hit = world.sweep(center, target, half);
+    let Some(hit) = hit else {
+        return Ok(Spawn {
+            position: Vec3::from(center),
+            floor: y - half[1],
+            raise,
+            airborne: true,
+        });
+    };
     if hit.normal[1] <= 0.5 {
         return Err(format!(
             "drop to floor hit a non-floor surface (normal {:?})",
@@ -1171,9 +1193,10 @@ pub(crate) fn place_spawn(
     }
     let landed = add(center, scale(sub(target, center), hit.t));
     Ok(Spawn {
-        position: landed,
+        position: Vec3::from(landed),
         floor: landed[1] - half[1],
         raise,
+        airborne: false,
     })
 }
 

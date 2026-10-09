@@ -6,6 +6,7 @@
 //! the interactive window uses.
 //!
 //! Supported commands:
+//! - `switch_weapon <byte>` / `next_weapon`: normal controller weapon selection execs.
 //! - `forward <v>` / `back <v>`: set the forward axis (`back` negates `v`).
 //! - `right <v>` / `left <v>`: set the strafe axis (`left` negates `v`).
 //! - `walk <0|1|on|off>`: set the Shift walk modifier.
@@ -19,8 +20,6 @@
 //!   host runs the VM's mover lock/unlock/open chain (`Session::use_mover`).
 //! - `use <ActorName>`: use/interact with a named actor directly (edges around hidden interaction
 //!   doors and dynamic pawns the camera ray cannot pick).
-//! - `search <ActorName>`: search a named dead pawn's inventory through the game's own
-//!   `PlayerController.SearchPawn` (the corpse-search half of `Grab`).
 //! - `take_control` (alias `assume_control`): explicit diagnostic command that runs the
 //!   controller's own `EnterStartState` with `bOkForMoving = true`. No normal interactive or
 //!   campaign route issues this command; it is available only in a supplied `--play-script`.
@@ -74,13 +73,10 @@ pub enum Command {
     /// Request one use/interact action (edge-triggered; the VM `Grab`/use chain). Ray-based: the
     /// host picks the actor in front of the camera.
     Use,
-    /// Use/interact with a named actor directly (edge-triggered). Needed for invisible interaction
-    /// doors (Plage01 `Porte1`) and to search a named corpse; the ray cannot pick a hidden door or
-    /// a dynamic pawn.
+    /// Named use (edge-triggered); deco pickups require the game's current aimed TargetActor.
+    /// Needed for invisible interaction
+    /// doors (Plage01 `Porte1`); corpses and pickups require the game's aimed TargetActor.
     UseNamed(String),
-    /// Search a named dead pawn's inventory (the game's own `PlayerController.SearchPawn`); the
-    /// corpse-search half of the engine's `Grab` interaction.
-    Search(String),
     /// Request one fire action (edge-triggered; routed to the player's weapon, item14).
     Fire,
     /// Grant the player the named `Package.Class` weapon (item14 diagnostic bootstrap; the
@@ -96,9 +92,10 @@ pub enum Command {
     /// the same game function the goal trigger calls, so `TestGoalComplete`/`DoTravel`/`EndGame`/
     /// `ServerTravel` all run through the game's code. Labelled a bridge in the report.
     SetGoal(i32),
-    /// Equip the best weapon the player already carries in the game's own inventory chain (the
-    /// `BringUp`/`ChangedWeapon` path), e.g. after walking onto a map weapon pickup (item14b).
-    Equip,
+    /// Normal player controller SwitchWeapon exec, selecting a carried inventory group.
+    SwitchWeapon(u8),
+    /// Normal player controller NextWeapon exec.
+    NextWeapon,
     /// item18 diagnostic command: give the local player control by running the game's own
     /// `XIIIPlayerController.EnterStartState` with `bOkForMoving = true` (the HUD's normal
     /// "first display done" transition). Needed because the decoded Plage01 intro leaves the
@@ -187,12 +184,6 @@ impl Script {
                     Some(target) => Command::UseNamed(target.to_owned()),
                     None => Command::Use,
                 },
-                "search" | "loot" => {
-                    let target = it
-                        .next()
-                        .ok_or_else(|| format!("line {n}: search needs an actor name"))?;
-                    Command::Search(target.to_owned())
-                }
                 "fire" | "shoot" => Command::Fire,
                 "weapon" | "grant" => {
                     let path = it
@@ -212,7 +203,23 @@ impl Script {
                         .map_err(|_| format!("line {n}: bad objective number"))?;
                     Command::SetGoal(n)
                 }
-                "equip" | "select" => Command::Equip,
+                "switch_weapon" => {
+                    let group = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: switch_weapon needs a byte"))?
+                        .parse::<u8>()
+                        .map_err(|_| format!("line {n}: invalid weapon group"))?;
+                    if it.next().is_some() {
+                        return Err(format!("line {n}: unexpected switch_weapon argument"));
+                    }
+                    Command::SwitchWeapon(group)
+                }
+                "next_weapon" => {
+                    if it.next().is_some() {
+                        return Err(format!("line {n}: next_weapon takes no arguments"));
+                    }
+                    Command::NextWeapon
+                }
                 "take_control" | "take-control" | "assume_control" => Command::TakeControl,
                 other => return Err(format!("line {n}: unknown command {other:?}")),
             };
@@ -254,14 +261,11 @@ pub struct Drive {
     jump_pending: bool,
     use_pending: bool,
     fire_pending: bool,
-    /// `equip` requested (edge-triggered) and not yet applied by the host.
-    equip_pending: bool,
+    weapon_inputs: Vec<Option<u8>>,
     /// Weapons requested (`weapon <Package.Class>`) and not yet applied by the host.
     weapons: Vec<String>,
     /// Named `use <ActorName>` targets not yet applied by the host.
     use_named: Vec<String>,
-    /// Named `search <ActorName>` targets not yet applied by the host.
-    search: Vec<String>,
     /// Active `goto` waypoint (Unreal units), if any.
     goto: Option<[f32; 3]>,
     /// Set by `wait_travel`; blocks further events until the host calls [`Drive::notify_travel`].
@@ -287,10 +291,9 @@ impl Drive {
             jump_pending: false,
             use_pending: false,
             fire_pending: false,
-            equip_pending: false,
+            weapon_inputs: Vec::new(),
             weapons: Vec::new(),
             use_named: Vec::new(),
-            search: Vec::new(),
             goto: None,
             waiting_travel: false,
             goals: Vec::new(),
@@ -315,11 +318,6 @@ impl Drive {
     /// Drains the named `use <ActorName>` targets due so far.
     pub fn take_use_named(&mut self) -> Vec<String> {
         std::mem::take(&mut self.use_named)
-    }
-
-    /// Drains the named `search <ActorName>` targets due so far.
-    pub fn take_search(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.search)
     }
 
     /// Takes the pending `take_control` request (edge-triggered).
@@ -349,9 +347,9 @@ impl Drive {
         self.waiting_travel = false;
     }
 
-    /// Takes the pending `equip` request (edge-triggered).
-    pub fn take_equip(&mut self) -> bool {
-        std::mem::take(&mut self.equip_pending)
+    /// Drains normal weapon-selection inputs, preserving repeated commands in order.
+    pub fn take_weapon_inputs(&mut self) -> Vec<Option<u8>> {
+        std::mem::take(&mut self.weapon_inputs)
     }
 
     /// Applies every event due at or before `elapsed` and returns this tick's input.
@@ -384,7 +382,6 @@ impl Drive {
                 &Command::Goto(p) => self.goto = Some(p),
                 Command::Use => self.use_pending = true,
                 Command::UseNamed(target) => self.use_named.push(target.clone()),
-                Command::Search(target) => self.search.push(target.clone()),
                 Command::Fire => self.fire_pending = true,
                 Command::Weapon(path) => self.weapons.push(path.clone()),
                 &Command::SetGoal(n) => self.goals.push(n),
@@ -394,7 +391,8 @@ impl Drive {
                     self.cursor += 1;
                     break;
                 }
-                Command::Equip => self.equip_pending = true,
+                &Command::SwitchWeapon(group) => self.weapon_inputs.push(Some(group)),
+                Command::NextWeapon => self.weapon_inputs.push(None),
                 Command::TakeControl => self.control_pending = true,
             }
             self.cursor += 1;
@@ -442,6 +440,24 @@ impl Drive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_weapon_input_preserves_order_and_does_not_request_diagnostic_equip() {
+        let script =
+            Script::parse("t=1 switch_weapon 2\nt=1 next_weapon\nt=1 switch_weapon 20\n").unwrap();
+        let mut drive = Drive::new(&script);
+        let mut sim = PlayerSim::new([0.0; 3], 0.0);
+        drive.advance(0.9, &mut sim);
+        assert!(drive.take_weapon_inputs().is_empty());
+        drive.advance(1.0, &mut sim);
+        assert_eq!(drive.take_weapon_inputs(), [Some(2), None, Some(20)]);
+        assert!(drive.take_weapon_inputs().is_empty());
+        assert!(Script::parse("t=0 equip").is_err());
+        assert!(Script::parse("t=0 next_weapon extra").is_err());
+        for invalid in ["-1", "256", "NaN", "2 extra", ""] {
+            assert!(Script::parse(&format!("t=0 switch_weapon {invalid}")).is_err());
+        }
+    }
 
     #[test]
     fn parses_and_applies_events_in_order() {
@@ -515,12 +531,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_named_use_search_and_take_control() {
-        let s = Script::parse(
-            "t=0.0 take_control\nt=0.5 use Porte1\nt=1.0 search BaseSoldier6\nt=1.5 use\n",
-        )
-        .unwrap();
-        assert_eq!(s.events.len(), 4);
+    fn parses_named_use_and_take_control_and_rejects_removed_bridges() {
+        let s = Script::parse("t=0.0 take_control\nt=0.5 use Porte1\nt=1.5 use\n").unwrap();
+        assert_eq!(s.events.len(), 3);
         let mut sim = PlayerSim::new([0.0; 3], 0.0);
         let mut d = Drive::new(&s);
         let _ = d.advance(0.0, &mut sim);
@@ -528,12 +541,18 @@ mod tests {
         assert!(!d.take_control());
         let _ = d.advance(0.5, &mut sim);
         assert_eq!(d.take_use_named(), vec!["Porte1".to_owned()]);
-        let _ = d.advance(1.0, &mut sim);
-        assert_eq!(d.take_search(), vec!["BaseSoldier6".to_owned()]);
         // A bare `use` is still the ray-based action.
         let i = d.advance(1.5, &mut sim);
         assert!(i.use_action);
         assert!(d.take_use_named().is_empty());
+        for command in [
+            "search BaseSoldier6",
+            "loot BaseSoldier6",
+            "wake BaseSoldier6",
+            "wake",
+        ] {
+            assert!(Script::parse(&format!("t=0.0 {command}\n")).is_err());
+        }
     }
 
     #[test]

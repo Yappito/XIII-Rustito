@@ -8,9 +8,9 @@
 //! per-tick step budget.
 //!
 //! No filesystem access and no engine dependency: the caller loads packages into the set and
-//! decides which actors are *active* (executed). Script calls into inactive actors are
-//! recorded as [`TraceKind::Deferred`] and not executed (an error if the call needs a return
-//! value). Unsupported tokens, unimplemented natives, budget overruns and bad values fail with
+//! decides which actors are *active* (ticked). Direct script calls run independently of ticking.
+//! The diagnostic harness can explicitly restrict calls to its selected scope; skipped calls
+//! are traced, and return-valued calls fail. Unsupported tokens and unimplemented natives fail with
 //! [`VmError`] carrying a script stack trace. Nothing is stubbed silently.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -53,6 +53,17 @@ impl Default for VmLimits {
     fn default() -> Self {
         Self {
             max_steps: 1_000_000,
+            // The engine's own script recursion limit: Core.dll `UObject::ProcessInternal`
+            // increments the global runaway counter (VA 0x101939e4) per interpreted call and
+            // compares against 0xFA = 250 (cmp at 0x101166e0); past 250 it logs
+            // "Infinite script recursion (%i calls) detected" (string 0x10178cd8, message
+            // pushed with the 250 constant at 0x101166f3). `GInitRunaway` (0x10115dc0) resets
+            // the counter to 0. 250 frames at the measured ~4.4 KiB interpreter stack per
+            // script frame (debug build) is ~1.1 MiB, which overflows the binary's 1 MiB
+            // main thread, so the shipped VM-driving host entry points run on an explicit
+            // 64 MiB stack (see xiii-app vmstack); the ~2 MiB test-thread default fits with
+            // ~2x margin and needs no wrapper.
+            // `vm_tests::recursion_guard_fits_a_2mib_stack` pins the property.
             max_call_depth: 250,
             max_type_depth: 16,
             rng_seed: 0x9E37_79B9_7F4A_7C15,
@@ -436,6 +447,8 @@ pub struct MoverState {
     pub phys_rate: f32,
     /// True while a `PHYS_MovingBrush` interpolation is in progress.
     pub interpolating: bool,
+    /// `bCollideActors && bBlockPlayers`: the mover currently blocks the player pawn.
+    pub blocks_players: bool,
 }
 
 /// Per-channel animation playback state owned by the VM.
@@ -449,12 +462,16 @@ pub(crate) struct AnimChannel {
     pub(crate) rate: f32,
     /// Current position in frames.
     pub(crate) frame: f32,
-    /// Loop when reaching the end (no `AnimEnd`).
+    /// Loop at the sequence boundary; `AnimEnd` is sent at its final frame.
     pub(crate) looping: bool,
     /// Still playing.
     pub(crate) active: bool,
     /// Seconds still to be spent tweening in before playback advances.
     pub(crate) tween_remaining: f32,
+    pub(crate) tween_duration: f32,
+    pub(crate) tween_source: Option<Box<AnimChannelState>>,
+    pub(crate) tween_only: bool,
+    pub(crate) loop_end_sent: bool,
     /// Script notifies as `(time01, function)`.
     pub(crate) notifies: Vec<(f32, String)>,
     /// Index of the next notify not yet fired.
@@ -488,6 +505,7 @@ pub(crate) struct AnimBlendParams {
     pub(crate) out_time: f32,
     /// Bone filter (`None` = `BoneName` was omitted or `None`).
     pub(crate) bone_name: Option<String>,
+    pub(crate) alpha_target: Option<(f32, f32)>,
 }
 
 /// `Pawn.SpineYawControl(bool IsControlled, int MaxValue, float RotationSpeed)` parameters.
@@ -597,10 +615,27 @@ pub struct AnimChannelState {
     pub rate: f32,
     /// Total frames of the sequence.
     pub frames: u32,
-    /// Whether the sequence loops (no `AnimEnd`).
+    /// Whether the sequence loops (AnimEnd at the final frame, wrap one frame later).
     pub looping: bool,
     /// Still advancing (false once a non-looping sequence ended).
     pub active: bool,
+    /// Frozen previous channel pose (one cached level, like the engine's per-channel cache;
+    /// the frozen state's own `tween_source` is always `None`).
+    pub tween_source: Option<Box<AnimChannelState>>,
+    /// Seconds of tweening left and initial duration.
+    pub tween_remaining: f32,
+    /// Initial tween duration.
+    pub tween_duration: f32,
+    /// TweenAnim holds the target frame after completion.
+    pub tween_only: bool,
+    /// Current alpha of this channel (channel zero is authoritative).
+    pub blend_alpha: f32,
+    /// Blend-in fraction of sequence length, as decoded in GetFrame.
+    pub blend_in: f32,
+    /// Stored OutTime; no use was found in this PC GetFrame path.
+    pub blend_out: f32,
+    /// First bone of the blended subtree.
+    pub blend_bone: Option<String>,
 }
 
 /// Read-only per-actor animation view for the host: the candidate animation sources (the
@@ -1068,11 +1103,10 @@ pub struct Instance {
     /// All probes of the actor were disabled (`AActor+0x34` bit 0x1, `bProbesDisabled`). Read from
     /// the serialized property `bProbesDisabled` at spawn/layout time; `Disable`/`Enable` update it.
     probes_disabled: bool,
-    /// Executed by the VM (in scope).
+    /// Receives scheduled ticks, state code and timers. Does not gate direct script calls.
     pub active: bool,
-    /// Suspended after a script error (`active` was cleared by [`Vm::suspend_for_error`]). A
-    /// non-static call to a suspended actor is dropped; item14c records that visibly (see
-    /// [`Vm::suspended_deferred_calls`]) instead of silently no-oping.
+    /// Scheduled execution suspended after a script error. Direct calls still execute and
+    /// propagate any error; suspension never supplies a successful replacement result.
     pub suspended: bool,
     /// Derives from `Actor`.
     pub is_actor: bool,
@@ -1319,6 +1353,12 @@ pub struct Vm<'s> {
     rng: u64,
     /// Native functions called (path -> (index, count)).
     pub natives_used: std::collections::BTreeMap<String, (Option<u16>, u64)>,
+    /// First actual script stack for each invoked native (bounded by native paths).
+    pub natives_first_caller: BTreeMap<String, Vec<StackEntry>>,
+    /// Calls reached under weapon Fire or AI NotifyFiring, for opt-in combat diagnostics.
+    pub combat_natives: BTreeMap<String, (u64, Vec<StackEntry>)>,
+    /// Opt-in collection of firing-path call stacks (off during ordinary play).
+    pub collect_combat_natives: bool,
     /// Survey mode: unimplemented natives are counted and skipped instead of failing.
     pub survey: bool,
     /// Distinct unimplemented natives seen in survey mode (path -> record, first-hit order).
@@ -1327,6 +1367,8 @@ pub struct Vm<'s> {
     /// World-collision provider (movement/trace natives). `None` = every collision native
     /// fails with [`VmErrorKind::NoPhysicsProvider`].
     pub(crate) physics: Option<Box<dyn WorldPhysics>>,
+    /// Last mover collision state sent to `physics` ([`Vm::sync_mover_collision`]).
+    mover_collision_sent: HashMap<ObjectId, bool>,
     /// Animation-sequence provider (animation natives). `None` = every native that needs
     /// sequence data fails with [`VmErrorKind::NoAnimationProvider`].
     pub(crate) animation: Option<Box<dyn AnimationData>>,
@@ -1400,6 +1442,8 @@ pub struct Vm<'s> {
     /// out of the executed scope). Every such drop also records a trace note; this counter makes
     /// the total visible to the host/report so a suspended actor's silent no-ops cannot hide.
     suspended_deferred_calls: u64,
+    /// Explicit partial-execution diagnostic policy, never used by normal gameplay.
+    diagnostic_call_scope: bool,
     /// item18: Bink video durations in seconds, keyed by lowercased file stem. The host registers
     /// them (the VM deliberately has no filesystem access); an entry is absent when the Bink header
     /// could not be read, in which case `VideoPlayer.GetStatus` keeps the old "finished" Partial.
@@ -1541,10 +1585,14 @@ impl<'s> Vm<'s> {
             load_warnings: Vec::new(),
             rng: limits.rng_seed,
             natives_used: Default::default(),
+            natives_first_caller: Default::default(),
+            combat_natives: Default::default(),
+            collect_combat_natives: false,
             survey: false,
             missing_natives: Default::default(),
             pending_latent: None,
             physics: None,
+            mover_collision_sent: HashMap::new(),
             animation: None,
             navigation: None,
             hit_zones: None,
@@ -1570,6 +1618,7 @@ impl<'s> Vm<'s> {
             profile: NativeProfile::default(),
             ai_visible: HashMap::new(),
             suspended_deferred_calls: 0,
+            diagnostic_call_scope: false,
             video_durations: HashMap::new(),
             video: None,
             video_host: None,
@@ -1688,6 +1737,8 @@ impl<'s> Vm<'s> {
     /// need collision; without one those natives fail explicitly.
     pub fn set_physics(&mut self, provider: Box<dyn WorldPhysics>) {
         self.physics = Some(provider);
+        // A new provider starts with every mover enabled; resend the actual states.
+        self.mover_collision_sent.clear();
     }
 
     /// True when a world-physics provider is available.
@@ -3138,7 +3189,13 @@ impl<'s> Vm<'s> {
             .is_some_and(|o| o.layout.chain_names.iter().any(|n| n.contains(needle)))
     }
 
-    /// Marks an object as executed (in scope).
+    /// Restricts direct calls to active objects for a partial-execution diagnostic.
+    /// This is a harness policy, not an UnrealScript rule. Normal gameplay leaves it disabled.
+    pub fn set_diagnostic_call_scope(&mut self, enabled: bool) {
+        self.diagnostic_call_scope = enabled;
+    }
+
+    /// Marks an object for scheduled execution (ticks, timers and state code).
     pub fn set_active(&mut self, id: ObjectId, active: bool) {
         if let Some(o) = self.objects.get_mut(id as usize) {
             o.active = active;
@@ -3186,7 +3243,16 @@ impl<'s> Vm<'s> {
     /// it can decode the object. Both an exported (static) and a dynamically constructed
     /// (instance) `Mesh` are handled.
     pub fn mesh_object(&self, id: ObjectId) -> Option<(String, String)> {
-        let r = match self.get_property(id, "Mesh") {
+        self.mesh_property_object(id, "Mesh")
+    }
+
+    /// Resolved StaticMesh for native third-person InventoryAttachment actors.
+    pub fn static_mesh_object(&self, id: ObjectId) -> Option<(String, String)> {
+        self.mesh_property_object(id, "StaticMesh")
+    }
+
+    fn mesh_property_object(&self, id: ObjectId, property: &str) -> Option<(String, String)> {
+        let r = match self.get_property(id, property) {
             Some(Value::Object(Some(r))) => *r,
             _ => return None,
         };
@@ -3223,6 +3289,30 @@ impl<'s> Vm<'s> {
                 frames: c.frames,
                 looping: c.looping,
                 active: c.active,
+                tween_source: c.tween_source.clone(),
+                tween_remaining: c.tween_remaining,
+                tween_duration: c.tween_duration,
+                tween_only: c.tween_only,
+                blend_alpha: o
+                    .anim
+                    .blend_params
+                    .get(&i32::from(channel))
+                    .map_or(if channel == 0 { 1.0 } else { 0.0 }, |p| p.blend_alpha),
+                blend_in: o
+                    .anim
+                    .blend_params
+                    .get(&i32::from(channel))
+                    .map_or(0.0, |p| p.in_time),
+                blend_out: o
+                    .anim
+                    .blend_params
+                    .get(&i32::from(channel))
+                    .map_or(0.0, |p| p.out_time),
+                blend_bone: o
+                    .anim
+                    .blend_params
+                    .get(&i32::from(channel))
+                    .and_then(|p| p.bone_name.clone()),
             })
             .collect();
         Some(ActorAnimation {
@@ -3258,6 +3348,9 @@ impl<'s> Vm<'s> {
         alpha: f32,
     ) {
         if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone
+                .directions
+                .retain(|c| !(c.bone.eq_ignore_ascii_case(&bone)));
             o.bone.directions.push(BoneDirection {
                 bone,
                 turn,
@@ -3276,6 +3369,7 @@ impl<'s> Vm<'s> {
         bone: String,
     ) {
         if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone.scales.retain(|c| c.slot != slot);
             o.bone.scales.push(BoneScale { slot, scale, bone });
         }
     }
@@ -3290,6 +3384,9 @@ impl<'s> Vm<'s> {
         alpha: f32,
     ) {
         if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone
+                .rotations
+                .retain(|c| !(c.bone.eq_ignore_ascii_case(&bone)));
             o.bone.rotations.push(BoneRotation {
                 bone,
                 turn,
@@ -3308,6 +3405,9 @@ impl<'s> Vm<'s> {
         alpha: f32,
     ) {
         if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone
+                .locations
+                .retain(|c| !(c.bone.eq_ignore_ascii_case(&bone)));
             o.bone.locations.push(BoneLocation { bone, trans, alpha });
         }
     }
@@ -4355,6 +4455,8 @@ impl<'s> Vm<'s> {
     /// Suspends the actor that should stop after a failing tick: the innermost object on the
     /// error stack when it can be resolved, otherwise the actor being ticked. Returns the id.
     fn suspend_for_error(&mut self, ticked: ObjectId, e: &VmError) -> ObjectId {
+        #[cfg(test)]
+        eprintln!("[item47 temporary suspension diagnostic] {e}");
         let id = e
             .stack
             .last()
@@ -4367,8 +4469,8 @@ impl<'s> Vm<'s> {
         id
     }
 
-    /// item14c: number of non-static calls dropped because the target actor was suspended after a
-    /// script error. Every drop also records a `Note`; this is the cumulative count for reports.
+    /// Diagnostic-scope calls dropped on suspended objects. Normal dispatch never drops
+    /// calls for tick suspension, so gameplay leaves this counter at zero.
     pub fn suspended_deferred_calls(&self) -> u64 {
         self.suspended_deferred_calls
     }
@@ -4842,17 +4944,14 @@ impl<'s> Vm<'s> {
             };
         }
         let layout = self.func_layout(func);
-        // A class-default object (`Default__Class`) is never `active`, and a `static` function
-        // dispatches on the class default object; UE2 runs both regardless of instance scope
-        // (`MessageClass.default.GetColor`, `Message.static.GetString`). Only non-static calls
-        // on *placed* actors outside the executed scope are deferred.
-        // A call through a just-destroyed actor runs in the engine: `execFinalFunction`/
-        // `execVirtualFunction` reach `CallFunction` directly, which has no `bDeleteMe` guard (see
-        // `bypass_context_none`). The VM's `deleted`/`destroying` flags stand in for that, so such
-        // a call is never treated as an out-of-scope deferral.
+        // Core.dll execVirtualFunction (0x10117490) / execFinalFunction (0x101174d0)
+        // dispatch directly to CallFunction (0x1011e650), which does not test actor tick
+        // activity, state latency, probes or bDeleteMe. The active-set restriction below is
+        // exclusively the partial-execution diagnostic harness's opt-in policy.
         let destroyed_target =
             self.objects[target as usize].deleted || self.objects[target as usize].destroying;
-        if !self.objects[target as usize].active
+        if self.diagnostic_call_scope
+            && !self.objects[target as usize].active
             && !self.objects[target as usize].name.starts_with("Default__")
             && !f.is_static()
             && !destroyed_target
@@ -5214,6 +5313,21 @@ impl<'s> Vm<'s> {
             .entry(path.clone())
             .or_insert((declared, 0));
         e.1 += 1;
+        if !self.natives_first_caller.contains_key(&path) {
+            self.natives_first_caller
+                .insert(path.clone(), self.stack.clone());
+        }
+        if self.collect_combat_natives
+            && self.stack.iter().any(|s| {
+                s.function.ends_with("XIIIWeapon.Fire") || s.function.ends_with("NotifyFiring")
+            })
+        {
+            let entry = self
+                .combat_natives
+                .entry(path.clone())
+                .or_insert_with(|| (0, self.stack.clone()));
+            entry.0 += 1;
+        }
         let before: Vec<String> = if self.trace_natives {
             args.iter().map(|a| self.value_text(a)).collect()
         } else {
@@ -6770,26 +6884,15 @@ impl<'s> Vm<'s> {
             rotation.or_else(|| self.rotator_prop(spawner, "Rotation")),
         );
         self.set_property(id, "Owner", 0, Value::Object(owner.map(ObjRef::Instance)));
-        // Engine.dll evidence for the spawned actor's `Instigator`: `AActor::execSpawn`
-        // (0x103e56b0) reads the *calling* actor's `Instigator` (this+0x88) and pushes it as the
-        // first push, i.e. the last argument of `ULevel::SpawnActor` (call at 0x103e57e3 through
-        // XLevel vtable slot 0x2c); `ULevel::SpawnActor` (0x10388a20, mangled signature ends
-        // `PAVAPawn@@`) stores that argument directly into the new actor's `Instigator`
-        // (0x10388d91: `movl 0x38(%ebp),%ecx; movl %ecx,0x88(%esi)`), before
-        // `AActor::SetOwner` (0x10388d86..0x10388d8c passes [ebp+0x34]; `SetOwner` at
-        // 0x10352e30 writes only `Owner` (new actor offset 0x70) and flags, never
-        // `Instigator`). So a spawned actor's `Instigator` is the *spawning actor's*
-        // `Instigator` regardless of the explicit `SpawnOwner` argument - e.g. the ammunition
-        // spawned inside `Weapon.GiveAmmo` inherits the weapon's `Instigator` (the pawn after
-        // `GiveTo`).
-        if let Some(instigator) = self.obj_prop(spawner, "Instigator") {
-            self.set_property(
-                id,
-                "Instigator",
-                0,
-                Value::Object(Some(ObjRef::Instance(instigator))),
-            );
-        }
+        // Engine.dll execSpawn 0x103e5785 passes this->Instigator (+0x88), and
+        // ULevel::SpawnActor 0x10388d91..0x10388d96 stores it before lifecycle callbacks.
+        // Owner is independent: ammo spawned by a pawn must retain that pawn as Instigator
+        // so its Transfer can unlink from the corpse before GiveTo changes ownership.
+        let instigator = self
+            .get_property(spawner, "Instigator")
+            .cloned()
+            .unwrap_or(Value::Object(None));
+        self.set_property(id, "Instigator", 0, instigator);
         self.set_property(
             id,
             "Tag",
@@ -6908,7 +7011,38 @@ impl<'s> Vm<'s> {
             phys_alpha: self.f32_prop(id, "PhysAlpha"),
             phys_rate: self.f32_prop(id, "PhysRate"),
             interpolating: self.bool_prop(id, "bInterpolating"),
+            blocks_players: self.bool_prop(id, "bCollideActors")
+                && self.bool_prop(id, "bBlockPlayers"),
         })
+    }
+
+    /// item40e: propagates every mover's collision state to the world-physics provider. A mover
+    /// that was destroyed (e.g. `BreakableMover.Breaked` -> `Destroy`) or whose `bCollideActors`
+    /// was cleared (`SetCollision`) leaves UE2's collision hash (`AActor::SetCollision` @
+    /// 0x103527D0 removes it; `FCollisionHash::AddActor` @ 0x10349980 requires
+    /// `bCollideActors`), so the VM's own `Move`/`Trace` must stop hitting its geometry; setting
+    /// the flag again restores it. Only changes are sent. Call once per tick after the VM ran.
+    pub fn sync_mover_collision(&mut self) {
+        if self.physics.is_none() {
+            return;
+        }
+        let mut changes: Vec<(String, bool)> = Vec::new();
+        for (i, o) in self.objects.iter().enumerate() {
+            if !o.is_actor || !o.layout.is_mover_class || o.name.starts_with("Default__") {
+                continue;
+            }
+            let id = i as ObjectId;
+            let enabled = !o.deleted && self.bool_prop(id, "bCollideActors");
+            if self.mover_collision_sent.get(&id) != Some(&enabled) {
+                self.mover_collision_sent.insert(id, enabled);
+                changes.push((o.name.clone(), enabled));
+            }
+        }
+        if let Some(p) = self.physics.as_mut() {
+            for (name, enabled) in changes {
+                p.set_mover_collision(&name, enabled);
+            }
+        }
     }
 
     /// First live `LevelInfo` instance, if the map has one (it is normally not in the executed
@@ -7039,59 +7173,12 @@ impl<'s> Vm<'s> {
         result?;
         self.objects[id as usize].active = false;
         self.objects[id as usize].timers = [None, None, None];
-        // Leave a clean inventory chain. `Inventory.Destroyed` unlinks the item via
-        // `Instigator/Owner.DeleteInventory`, but that call is on another actor and can be
-        // deferred (out of the executed scope), leaving the destroyed item reachable from the
-        // owner. A stale head then makes `PlayerController.SearchPawn`'s `while (i = P.Inventory)`
-        // loop forever (measured: the corpse-search BudgetExceeded). Removing it here is what
-        // UE2's `AActor::Destroy` guarantees; it is a no-op when the script already unlinked it.
-        if self.is_a(id, "inventory") {
-            for owner_prop in ["Instigator", "Owner"] {
-                if let Some(Value::Object(Some(ObjRef::Instance(owner)))) =
-                    self.get_property(id, owner_prop).cloned()
-                {
-                    self.unlink_inventory(owner, id);
-                }
-            }
-        }
         let actor = self.objects[id as usize].name.clone();
         self.note(TraceKind::Destroyed {
             actor,
             result: true,
         });
         Ok(true)
-    }
-
-    /// Removes `item` from `owner`'s `Inventory` singly-linked chain (or from `item`'s
-    /// predecessor in it). Used by [`Vm::destroy`] and the host corpse-search bridge to guarantee
-    /// a clean chain when the script's `Inventory.Destroyed`/`DeleteInventory` unlink was deferred
-    /// (a call on an out-of-scope actor). No-op when `item` is not linked.
-    pub fn unlink_inventory(&mut self, owner: ObjectId, item: ObjectId) {
-        let mut cur = owner;
-        let mut guard = 0;
-        loop {
-            guard += 1;
-            if guard > 1024 {
-                return;
-            }
-            let next = match self.get_property(cur, "Inventory").cloned() {
-                Some(Value::Object(Some(ObjRef::Instance(n)))) => n,
-                _ => return,
-            };
-            if next == item {
-                let after = self
-                    .get_property(item, "Inventory")
-                    .cloned()
-                    .unwrap_or(Value::Object(None));
-                let _ = self.set_property(cur, "Inventory", 0, after);
-                let _ = self.set_property(item, "Inventory", 0, Value::Object(None));
-                return;
-            }
-            cur = next;
-            if cur == owner {
-                return;
-            }
-        }
     }
 
     /// First live (not deleted) object with a name (case-insensitive).
@@ -7803,6 +7890,30 @@ impl<'s> Vm<'s> {
         Ok(true)
     }
 
+    /// Whether actor `b` can be returned by an actor line/box check of the given extent kind.
+    ///
+    /// From `Engine.dll` (item40e): an actor check only walks the level's collision hash
+    /// (`FCollisionHash::ActorLineCheck` @ 0x10349C60), `FCollisionHash::AddActor` @ 0x10349980
+    /// asserts that the added actor has `bCollideActors`, and `AActor::SetCollision` @ 0x103527D0
+    /// removes the actor from the hash before the flags change and adds it back only when the new
+    /// `bCollideActors` is set. So an actor with `bCollideActors=false` (lights, nav points, hidden
+    /// info actors with the `Actor` defaults `bBlockZeroExtentTraces=true`) is never hit. Among
+    /// hash members a zero-extent check also needs `bBlockZeroExtentTraces`: `ActorLineCheck`
+    /// tests bit 0x400 of the actor's collision bitfield at 0x10349E90 / 0x10349FDC, the bit
+    /// after `bProjTarget` (bit 0x200, `AActor::ShouldTrace` @ 0x10354640) in `Actor`'s
+    /// declaration order. The non-zero-extent flag `bBlockNonZeroExtentTraces` for box checks is
+    /// upstream UE2 (not located in the disassembly).
+    fn actor_blocks_trace(&self, b: ObjectId, nonzero_extent: bool) -> bool {
+        if !self.bool_prop(b, "bCollideActors") {
+            return false;
+        }
+        if nonzero_extent {
+            self.bool_prop(b, "bBlockNonZeroExtentTraces")
+        } else {
+            self.bool_prop(b, "bBlockZeroExtentTraces")
+        }
+    }
+
     /// World-only actor trace for `Actor.Trace` when `bTraceActors` is set. Returns the
     /// nearest hit as `(time, actor, normal)`; grown cylinders approximate the extent box.
     fn trace_actors(
@@ -7812,45 +7923,24 @@ impl<'s> Vm<'s> {
         end: [f32; 3],
         extent: [f32; 3],
     ) -> Option<(f32, ObjectId, [f32; 3])> {
+        self.trace_actors_flags(id, start, end, extent, 0xbf)
+    }
+
+    fn trace_actors_flags(
+        &self,
+        id: ObjectId,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+        flags: u32,
+    ) -> Option<(f32, ObjectId, [f32; 3])> {
         let mut best: Option<(f32, ObjectId, [f32; 3])> = None;
-        // UE2 selects actor hits by the trace extent: a zero-extent (line) trace needs
-        // `bBlockZeroExtentTraces`, a swept box needs `bBlockNonZeroExtentTraces`. A pawn may have
-        // `bCollideActors=false` yet still block hitscan traces (measured: `BaseSoldier6`), so the
-        // extent flag is the correct gate here.
         let nonzero = extent[0] + extent[1] + extent[2] > 0.0;
         for b in 0..self.objects.len() as ObjectId {
             if b == id || !self.is_live_actor(b) {
                 continue;
             }
-            let gate = if nonzero {
-                self.bool_prop(b, "bBlockNonZeroExtentTraces")
-            } else {
-                self.bool_prop(b, "bBlockZeroExtentTraces")
-            };
-            // The engine's actor-trace reaches actors in the collision list even without the
-            // extent flag, and - measured on Plage01 - `BaseSoldier6` blocks hitscan traces with
-            // `bCollideActors=false` and `bBlockZeroExtentTraces=true`: the extent flag is the
-            // operative gate, refined by the actor's collision role. The game's own data marks
-            // every shootable actor `bProjTarget=true` (pawns, `DecoBouteille` bottles) while
-            // triggers and pure effects are not: the muzzle-flash `MuzzleLight` inherits
-            // `bBlockZeroExtentTraces=true` but is `bCollideActors=false` + `bProjTarget=false`
-            // (`XIIIWeaponAttachment.MuzzleAttach` 0x0082 spawns it at the muzzle on every
-            // equip), and `TouchTrigger7` - measured in the merged-tree Plage01 fight - is
-            // `bCollideActors=true` + `bProjTarget=false` + `bBlockZeroExtentTraces=true` with a
-            // map-sized radius and ate every bullet aimed at `BaseSoldier6`'s post. Shootability
-            // is `bProjTarget`: world geometry (including `bWorldGeometry` movers) blocks through
-            // the world provider instead.
-            if !gate || !self.bool_prop(b, "bProjTarget") {
-                continue;
-            }
-            // A trace must ignore both the tracer's owners and its owned attachments. UE2's
-            // TraceFirstHit/IsOwnedBy filtering is target-relative: the candidate hit actor is
-            // ignored when its Owner chain contains the tracer. The reverse check also excludes
-            // owner-chain actors (for example the player pawn when the weapon traces).
-            // item18 B11 measured the missing direction: `XIII.M60`'s line hit its own
-            // `StarFPMF` (`Owner=m601`) and classified that first-person mesh's bone, so
-            // `ProcessTraceHit` received the attachment instead of the soldier.
-            if self.is_owned_by(b, id) || self.is_owned_by(id, b) {
+            if !self.trace_admits_actor_flags(b, id, nonzero, flags) {
                 continue;
             }
             let (lb, rb, hb) = self.actor_cylinder(b);
@@ -7866,6 +7956,93 @@ impl<'s> Vm<'s> {
             }
         }
         best
+    }
+
+    /// The engine's actor-trace candidate filter, decoded from Engine.dll.
+    ///
+    /// 1. Hash membership: a candidate must be in the collision hash. Every insert/remove site
+    ///    gates on `bCollideActors` (`ULevel::SpawnActor` VA 0x10388d3f/0x10388e50,
+    ///    `ULevel::SetActorCollision` VA 0x10391b0c, `ULevel::FarMoveActor` VA 0x1038a4b9/0x1038a6df,
+    ///    `AActor::SetCollision` VA 0x103527d0, the runtime re-add at VA 0x103536ce): the map-load
+    ///    walk and every spawn/move path add an actor only while `byte [actor+0x34] & 0x20` holds.
+    ///    `FCollisionHash::ActorLineCheck` (VA 0x10349c60) walks hash buckets only, so an actor
+    ///    with `bCollideActors=false` is never a candidate. XIII's own scripts use this: a pawn
+    ///    parked by `IAController.faction.BeginState` gets `SetCollision(false,false,false)` and
+    ///    is invisible (`SetDrawType(0)`) until its controller leaves the state
+    ///    (`faction.EndState` restores `SetCollision(true,true,true)`).
+    /// 2. Extent prefilter: the hash walk (`ActorLineCheck` VAs 0x10349e90/0x10349fdc) and the
+    ///    octree zero-extent path (VA 0x103a439b) require bit 10 (`bBlockZeroExtentTraces`); the
+    ///    octree non-zero-extent path (VA 0x103a47f1) requires bit 11
+    ///    (`bBlockNonZeroExtentTraces`).
+    /// 3. `ShouldTrace` (`AActor::ShouldTrace` VA 0x10354640): for the script-trace flag word
+    ///    (`execTrace` VA 0x103e8abf composes `0x86`/`0xBF | extra`, `SingleLineCheck` forces
+    ///    `| 0x400`; bullets add `0x4040` from `XIIIWeapon.RealTraceFire`):
+    ///    - `APawn::ShouldTrace` (VA 0x10305d20) returns `TraceFlags & 1` — always set for
+    ///      script traces, so an in-hash pawn is always admitted;
+    ///    - `AMover`/`ADecoration::ShouldTrace` (shared VA 0x10306c70) return `TraceFlags & 2` —
+    ///      also always set, so in-hash movers/decorations are admitted;
+    ///    - other actors: a world-geometry actor (bit 30 of `+0x2c`, same bit `IsBlockedBy`
+    ///      VA 0x10315620 tests) is admitted because `TraceFlags & 0x80` is set; otherwise
+    ///      `TraceFlags & 0x10` and `TraceFlags & 0x20` are both set, which returns
+    ///      `bProjTarget || (bBlockActors && bBlockPlayers)`. (`bProjTarget` is bit 9 of
+    ///      `+0x34`; the name is an inference from the C++ bitfield order and the
+    ///      `execPickTarget` bit-9 gate, not from an Engine.dll string.)
+    ///
+    /// `bHidden` is deliberately NOT tested: it appears nowhere in the hash insert/remove paths,
+    /// the hash walk, or any `ShouldTrace` override. A carried first-person weapon does not block
+    /// because its class defaults clear `bCollideActors` (`xiii.Fists`, measured).
+    fn trace_admits_actor(&self, candidate: ObjectId, tracer: ObjectId, nonzero: bool) -> bool {
+        self.trace_admits_actor_flags(candidate, tracer, nonzero, 0xbf)
+    }
+
+    fn trace_admits_actor_flags(
+        &self,
+        candidate: ObjectId,
+        tracer: ObjectId,
+        nonzero: bool,
+        flags: u32,
+    ) -> bool {
+        if !self.bool_prop(candidate, "bCollideActors") {
+            return false;
+        }
+        let extent_gate = if nonzero {
+            self.bool_prop(candidate, "bBlockNonZeroExtentTraces")
+        } else {
+            self.bool_prop(candidate, "bBlockZeroExtentTraces")
+        };
+        if !extent_gate {
+            return false;
+        }
+        // UE2's trace ignores both the tracer's owners and its owned attachments
+        // (`SingleLineCheck` calls `IsOwnedBy` at VA 0x1038ba1c; item18 B11 measured the
+        // tracer-owned direction: `XIII.M60`'s line hit its own `StarFPMF` first-person mesh).
+        if self.is_owned_by(candidate, tracer) || self.is_owned_by(tracer, candidate) {
+            return false;
+        }
+        if self.class_chain_contains(candidate, "pawn") {
+            return flags & 1 != 0;
+        }
+        if self.class_chain_contains(candidate, "mover")
+            || self.class_chain_contains(candidate, "decoration")
+        {
+            return flags & 2 != 0;
+        }
+        if self.bool_prop(candidate, "bWorldGeometry") {
+            return flags & 0x80 != 0;
+        }
+        if flags & 0x10 == 0 {
+            return false;
+        }
+        if flags & 0x20 != 0 {
+            return self.bool_prop(candidate, "bProjTarget")
+                || (self.bool_prop(candidate, "bBlockActors")
+                    && self.bool_prop(candidate, "bBlockPlayers"));
+        }
+        // 0x103546e2: all other actors when neither projectile-only nor blocking-only.
+        if flags & 0x40 == 0 {
+            return true;
+        }
+        self.bool_prop(candidate, "bBlockActors") && self.bool_prop(candidate, "bBlockPlayers")
     }
 
     pub(crate) fn vm_trace_actors(
@@ -7893,18 +8070,7 @@ impl<'s> Vm<'s> {
             if base.is_some_and(|class| !self.objects[id as usize].layout.chain.contains(&class)) {
                 continue;
             }
-            let gate = if nonzero {
-                self.bool_prop(id, "bBlockNonZeroExtentTraces")
-            } else {
-                self.bool_prop(id, "bBlockZeroExtentTraces")
-            };
-            // Same filter as [`Vm::trace_actors`]: the extent flag refined by `bProjTarget` -
-            // see the measured evidence there (`BaseSoldier6` vs the muzzle-flash `MuzzleLight`
-            // and the map-sized `TouchTrigger7`).
-            if !gate || !self.bool_prop(id, "bProjTarget") {
-                continue;
-            }
-            if self.is_owned_by(id, caller) || self.is_owned_by(caller, id) {
+            if !self.trace_admits_actor(id, caller, nonzero) {
                 continue;
             }
             let (loc, radius, height) = self.actor_cylinder(id);
@@ -7930,6 +8096,7 @@ impl<'s> Vm<'s> {
     /// world hits return the map's `LevelInfo` (upstream), no hit returns `None`.
     /// Fills `(hit_actor, hit_location, hit_normal)`.
     #[allow(clippy::type_complexity)]
+    #[cfg(test)]
     pub(crate) fn vm_trace(
         &mut self,
         id: ObjectId,
@@ -7938,18 +8105,43 @@ impl<'s> Vm<'s> {
         b_trace_actors: bool,
         extent: [f32; 3],
     ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
-        let world = match self.physics.as_mut() {
-            Some(p) => p.trace(start, end, extent),
+        self.vm_trace_flags(
+            id,
+            start,
+            end,
+            if b_trace_actors { 0xbf } else { 0x86 },
+            extent,
+        )
+    }
+
+    /// Script Trace's composed flags; pawn/mover category bits remain effective even when
+    /// bTraceActors was false. Special BSP/material filtering remains Partial.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn vm_trace_flags(
+        &mut self,
+        id: ObjectId,
+        start: [f32; 3],
+        end: [f32; 3],
+        flags: u32,
+        extent: [f32; 3],
+    ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
+        let (world, mover) = match self.physics.as_mut() {
+            Some(p) => p.trace_with_mover(start, end, extent),
             None => {
                 return Err(self.err(VmErrorKind::NoPhysicsProvider {
                     native: "Actor.Trace".into(),
                 }));
             }
         };
+        // item40e: a hit on a registered mover's geometry returns that mover (a collision-hash
+        // actor in UE2) when it blocks this kind of trace; other world hits return the level.
+        let nonzero = extent.iter().any(|v| *v != 0.0);
+        let mover = mover
+            .and_then(|name| self.find_live_object(&name))
+            .filter(|&m| m != id && self.is_mover(m) && self.actor_blocks_trace(m, nonzero));
         let mut best: Option<(f32, Option<ObjectId>, [f32; 3])> =
-            world.map(|h| (h.time, None, h.normal));
-        if b_trace_actors
-            && let Some((t, b, n)) = self.trace_actors(id, start, end, extent)
+            world.map(|h| (h.time, mover, h.normal));
+        if let Some((t, b, n)) = self.trace_actors_flags(id, start, end, extent, flags)
             && best.is_none_or(|(bt, _, _)| t <= bt)
         {
             best = Some((t, Some(b), n));
@@ -7968,7 +8160,7 @@ impl<'s> Vm<'s> {
         // ray is the exact trace segment, not the hit point, because a body's boxes can be
         // smaller than the cylinder.
         self.last_trace_bone = match out.0 {
-            Some(b) if !self.is_a(b, "levelinfo") => self
+            Some(b) if !self.is_a(b, "levelinfo") && !self.is_mover(b) => self
                 .hit_zones
                 .as_ref()
                 .and_then(|z| z.ray_bone(b, start, end))
@@ -8166,8 +8358,19 @@ impl<'s> Vm<'s> {
         Ok(self.nav_point_actor(idx as u32))
     }
 
-    /// `Controller.LineOfSightTo`: world line trace between the controller pawn's eye and
-    /// `other`'s eye. Actor occlusion is not modelled; the no-provider case fails explicitly.
+    /// `Controller.LineOfSightTo` (Engine.dll `?LineOfSightTo@AController@@QAEKPAVAActor@@H@Z`
+    /// VA 0x1036ac70, item27m): the view location comes from `GetViewTarget` (a PlayerController's
+    /// `ViewTarget`, otherwise the pawn or the controller itself), raised by the view actor's
+    /// `BaseEyeHeight` only when the view target is this controller's own pawn. The engine traces
+    /// more than one line: first to `Other->Location` (the base), and only when that is blocked
+    /// tries the eye point (`+BaseEyeHeight`) when `Other` is the controller's `Enemy`, or
+    /// `Location.Z + 0.8*CollisionHeight` otherwise — the latter two guarded by distance limits
+    /// (>= 8000^2 and >= 2000^2 reject; the 2000^2 exception `IsA(APawn::StaticClass())` never
+    /// holds for a controller). Blocked-by-the-target counts as visible upstream, which the
+    /// world-geometry-only provider cannot express (no actor occlusion, the standing convention);
+    /// the `int` flag argument is always 0 from script (`execLineOfSightTo` literal,
+    /// `execCanSee`->`SeePawn`), so its extra rejection is not reachable. No `bHidden` check:
+    /// XIII's binary does not have the upstream one. The no-provider case fails explicitly.
     pub(crate) fn nav_line_of_sight_to(
         &mut self,
         controller: ObjectId,
@@ -8181,17 +8384,110 @@ impl<'s> Vm<'s> {
         )? {
             return Ok(false);
         }
-        let (Some(pawn), Some(other_pawn)) = (self.obj_prop(controller, "Pawn"), Some(other))
-        else {
+        let view = self.los_view_location(controller);
+        let Some(target) = self.vector_prop(other, "Location") else {
             return Ok(false);
         };
-        let a = self.eye_location(pawn);
-        let b = self.eye_location(other_pawn);
-        let world_hit = self.physics.as_mut().and_then(|p| p.trace(a, b, [0.0; 3]));
-        if world_hit.is_some() {
+        if self.world_line(view, target).is_none() {
+            return Ok(true);
+        }
+        let enemy = self.obj_prop(controller, "Enemy");
+        let top = if enemy == Some(other) {
+            // Enemy: no distance limits, retry at the target's eye point.
+            Some(self.f32_prop(other, "BaseEyeHeight"))
+        } else {
+            let d = [
+                target[0] - view[0],
+                target[1] - view[1],
+                target[2] - view[2],
+            ];
+            let dist_sq = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            // 8000^2 and 2000^2 reject (float constants at 0x1047c878 / 0x1047c874).
+            if dist_sq >= 6_400_000.0 || dist_sq >= 4_000_000.0 {
+                return Ok(false);
+            }
+            Some(0.8 * self.f32_prop(other, "CollisionHeight"))
+        };
+        let Some(raise) = top else {
+            return Ok(false);
+        };
+        let raised = [target[0], target[1], target[2] + raise];
+        Ok(self.world_line(view, raised).is_none())
+    }
+
+    /// `GetViewTarget` result and its trace start point: a PlayerController uses its `ViewTarget`
+    /// (Engine.dll 0x10368040), a plain controller its pawn or itself (0x10368030); the pawn's
+    /// `BaseEyeHeight` is added only when the view target is the controller's own pawn.
+    fn los_view_location(&self, controller: ObjectId) -> [f32; 3] {
+        let view = if self.is_a(controller, "playercontroller") {
+            self.obj_prop(controller, "ViewTarget")
+        } else {
+            None
+        }
+        .or_else(|| self.obj_prop(controller, "Pawn"))
+        .unwrap_or(controller);
+        let mut loc = self.vector_prop(view, "Location").unwrap_or([0.0; 3]);
+        if Some(view) == self.obj_prop(controller, "Pawn") {
+            loc[2] += self.f32_prop(view, "BaseEyeHeight");
+        }
+        loc
+    }
+
+    /// `Controller.CanSee(Pawn Other)` — Engine.dll `AController::SeePawn`
+    /// (`?SeePawn@AController@@QAEKPAVAPawn@@H@Z` VA 0x1036dc40, item27m). `execCanSee`
+    /// (0x1036f070) calls this with the second argument 0 — XIII's `CanSee` is not a plain
+    /// `LineOfSightTo` forward: for the controller's `Enemy` it is exactly `LineOfSightTo`,
+    /// otherwise it adds the retail range gate
+    /// `DistSq <= (min(1.0, Other.Visibility/128.0) * Pawn.SightRadius)^2` (strictly greater
+    /// rejects; `Visibility` byte at Pawn+0x227, `SightRadius` at Pawn+0x238) and the decoded
+    /// `|delta| > Pawn.PeripheralVision` check (the binary computes `dot(delta,
+    /// SafeNormal(delta))` and compares with Pawn+0x23c; with the Engine.u default
+    /// `PeripheralVision = 0` this degenerates to a not-exactly-overlapping guard, and XIII
+    /// pawns store raw degrees or -1 here). The no-provider case fails explicitly.
+    pub(crate) fn nav_can_see(&mut self, controller: ObjectId, other: ObjectId) -> VmResult<bool> {
+        let Some(pawn) = self.obj_prop(controller, "Pawn") else {
+            return Ok(false);
+        };
+        if self.obj_prop(controller, "Enemy") == Some(other) {
+            return self.nav_line_of_sight_to(controller, other);
+        }
+        let Some(pawn_loc) = self.vector_prop(pawn, "Location") else {
+            return Ok(false);
+        };
+        let Some(other_loc) = self.vector_prop(other, "Location") else {
+            return Ok(false);
+        };
+        let d = [
+            other_loc[0] - pawn_loc[0],
+            other_loc[1] - pawn_loc[1],
+            other_loc[2] - pawn_loc[2],
+        ];
+        let dist_sq = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        // Range gate: min(1.0, Visibility/128) * SightRadius (float 1.0 @0x1046da0c, float
+        // 0.0078125 @0x104794b0). Visibility is a byte property; 128 is the Engine.u Pawn
+        // default (the fallback for synthetic objects without the property). SightRadius
+        // defaults to 5000 (Engine.u Pawn defaults).
+        let visibility = match self.get_property(other, "Visibility") {
+            Some(Value::Byte(b)) => f32::from(*b),
+            Some(Value::Int(i)) => *i as f32,
+            _ => 128.0,
+        } * 0.0078125;
+        let scale = visibility.min(1.0);
+        let sight = {
+            let s = self.f32_prop(pawn, "SightRadius");
+            if s > 0.0 { s } else { 5000.0 }
+        };
+        let range = scale * sight;
+        if dist_sq > range * range {
             return Ok(false);
         }
-        Ok(true)
+        // dot(delta, SafeNormal(delta)) = |delta| must be strictly greater than PeripheralVision
+        // (Engine.u default 0; XIII pawns use raw degrees or -1).
+        let peripheral = self.f32_prop(pawn, "PeripheralVision");
+        if dist_sq.sqrt() <= peripheral {
+            return Ok(false);
+        }
+        self.nav_line_of_sight_to(controller, other)
     }
 
     /// `Actor.Location + Actor.BaseEyeHeight` (the eye point upstream traces between).
@@ -8930,20 +9226,48 @@ impl<'s> Vm<'s> {
         out_time: f32,
         bone_name: Option<String>,
     ) {
+        if !(1..=255).contains(&stage) {
+            return;
+        }
         self.objects[id as usize].anim.blend_params.insert(
             stage,
             AnimBlendParams {
                 blend_alpha,
-                in_time,
-                out_time,
+                in_time: in_time.min(1.0),
+                out_time: out_time.min(1.0),
                 bone_name,
+                alpha_target: None,
             },
         );
     }
 
-    /// `Actor.PlayAnim`/`LoopAnim`/`TweenAnim`: start `sequence` on `channel`. `rate <= 0`
-    /// falls back to the provider's rate; `tween_time` holds the sequence at frame 0 before it
-    /// advances. The `None` sequence stops the channel. Unknown sequences are an explicit error.
+    /// BlendToAlpha preserves the subtree and uses a remaining seconds interval.
+    pub(crate) fn anim_blend_to_alpha(&mut self, id: ObjectId, stage: i32, target: f32, time: f32) {
+        if !(1..=255).contains(&stage) {
+            return;
+        }
+        let p = self.objects[id as usize]
+            .anim
+            .blend_params
+            .entry(stage)
+            .or_insert(AnimBlendParams {
+                blend_alpha: 0.0,
+                in_time: 0.0,
+                out_time: 0.0,
+                bone_name: None,
+                alpha_target: None,
+            });
+        if time <= 0.0 {
+            p.blend_alpha = target;
+            p.alpha_target = None;
+        } else {
+            p.alpha_target = Some((target, time));
+        }
+    }
+
+    /// `Actor.PlayAnim`/`LoopAnim`/`TweenAnim`: start `sequence` on `channel`. Zero rate
+    /// holds frame zero; negative velocity-dependent rates remain Partial. Tween time holds
+    /// frame zero before playback. Unknown sequences produce a visible no-op.
     pub(crate) fn start_animation(
         &mut self,
         id: ObjectId,
@@ -8955,14 +9279,24 @@ impl<'s> Vm<'s> {
     ) -> VmResult<()> {
         if sequence.eq_ignore_ascii_case("None") {
             self.objects[id as usize].anim.channels.remove(&channel);
-            self.set_property(id, "AnimSequence", 0, Value::Name("None".into()));
-            self.set_property(id, "AnimRate", 0, Value::Float(0.0));
-            self.set_property(id, "AnimFrame", 0, Value::Float(0.0));
+            if channel == 0 {
+                self.set_property(id, "AnimSequence", 0, Value::Name("None".into()));
+                self.set_property(id, "AnimRate", 0, Value::Float(0.0));
+                self.set_property(id, "AnimFrame", 0, Value::Float(0.0));
+                self.set_property(id, "bAnimFinished", 0, Value::Bool(true));
+            }
             return Ok(());
         }
         if self.animation.is_none() {
             return Err(self.err(VmErrorKind::NoAnimationProvider {
                 native: "Actor.PlayAnim".into(),
+            }));
+        }
+        if !rate.is_finite() || !tween_time.is_finite() {
+            return Err(self.err(VmErrorKind::AnimationDataError {
+                source: self.animation_sources(id).join(", "),
+                sequence: sequence.to_owned(),
+                message: "nonfinite animation rate or tween duration".into(),
             }));
         }
         // UE2 `AActor::PlayAnim` returns immediately when `Mesh == NULL` (Engine.dll
@@ -8992,17 +9326,46 @@ impl<'s> Vm<'s> {
             )));
             return Ok(());
         };
+        if !info.rate.is_finite() || (rate > 0.0 && !(rate * info.rate).is_finite()) {
+            return Err(self.err(VmErrorKind::AnimationDataError {
+                source: self.animation_sources(id).join(", "),
+                sequence: sequence.to_owned(),
+                message: "nonfinite decoded or multiplied animation rate".into(),
+            }));
+        }
         // UE2 `AActor::PlayAnim`/`LoopAnim` pass `Rate` as a **multiplier** of the sequence's own
         // authored rate (`Engine.dll ?execPlayAnim@AActor` RVA 0xDF990 pushes the default `1.0`;
         // the mesh instance advances `AnimRate * Seq->Rate` frames per second). The provider's
         // `SeqInfo.rate` is that authored rate (30 fps for the decoded MeshAnimation clips), so a
-        // script rate of `1.0` must play at 30 fps, not 1. `rate <= 0` means "use the authored
-        // rate" (`LoopAnim(DefaultAnim)` and `PlayAnim(seq, 0.0, ...)`). Without the multiply every
-        // scripted animation ran ~30x slow, which delayed the Plage01 intro past its dialogue cues.
+        // script rate of `1.0` must play at 30 fps, not 1. Omitted native Rate defaults to 1.0;
+        // explicit zero enters the retail hold/tween branch. Negative rates remain Partial.
         let natural = if info.rate > 0.0 { info.rate } else { 1.0 };
-        let rate = if rate > 0.0 { rate * natural } else { natural };
+        // Retail skeletal PlayAnim's zero-rate branch 0x103f5d2f clears channel playback
+        // rate and holds frame zero. An omitted native argument is 1.0, not explicit zero.
+        let rate = if rate >= 0.0 { rate * natural } else { natural };
         let mut notifies = info.notifies;
         notifies.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Engine.dll `PlayAnim` keeps ONE cached previous pose per channel (channel+0x58
+        // previous tween frame, +0x5c cached pose; see item47's report) and overwrites it on
+        // every new tweened start. Authored scripts rely on that bound:
+        // `xidcine.Cine2.CineInit.PlayMoving` re-runs `LoopAnim(WaitAnim, none, 0.2)` from
+        // `PlayingSequence.Tick` every tick, so a chain that froze each interrupted tween
+        // recursively grew without limit and failed the whole cutscene. The frozen source is
+        // therefore the channel's current state with its own frozen source dropped — a single
+        // cached level, like the engine. Whether the engine's cache holds the channel's blended
+        // in-progress pose or its target pose is not fully decoded (the report labels it a
+        // hypothesis); this freeze keeps the interrupted tween's frame and remaining time.
+        let tween_source = if tween_time > 0.0 {
+            let mut source = self
+                .actor_animation(id)
+                .and_then(|a| a.channels.into_iter().find(|c| c.channel == channel));
+            if let Some(source) = source.as_mut() {
+                source.tween_source = None;
+            }
+            source.map(Box::new)
+        } else {
+            None
+        };
         self.objects[id as usize].anim.channels.insert(
             channel,
             AnimChannel {
@@ -9013,15 +9376,49 @@ impl<'s> Vm<'s> {
                 looping,
                 active: info.frames > 0,
                 tween_remaining: tween_time.max(0.0),
+                tween_duration: tween_time.max(0.0),
+                tween_source,
+                tween_only: false,
+                loop_end_sent: false,
                 notifies,
                 notify_idx: 0,
             },
         );
-        self.set_property(id, "AnimSequence", 0, Value::Name(sequence.to_owned()));
-        self.set_property(id, "AnimRate", 0, Value::Float(rate));
-        self.set_property(id, "AnimFrame", 0, Value::Float(0.0));
-        self.set_property(id, "bAnimFinished", 0, Value::Bool(false));
+        self.mirror_base_animation(id);
         Ok(())
+    }
+
+    /// TweenAnim reaches the first frame then holds; it never starts clip playback.
+    pub(crate) fn mark_tween_only(&mut self, id: ObjectId, channel: u8) {
+        if let Some(c) = self.objects[id as usize].anim.channels.get_mut(&channel) {
+            c.tween_only = true;
+            c.rate = 0.0;
+            c.active = c.tween_remaining > 0.0;
+        }
+        self.mirror_base_animation(id);
+    }
+
+    /// Actor properties mirror channel zero in the DLL's normalized sequence units.
+    fn mirror_base_animation(&mut self, id: ObjectId) {
+        let Some(c) = self.objects[id as usize].anim.channels.get(&0) else {
+            return;
+        };
+        let sequence = c.sequence.clone();
+        let finished = !c.active;
+        let (frame, rate) = self.anim_channel_params(id, 0).unwrap_or((0.0, 0.0));
+        self.set_property(id, "AnimSequence", 0, Value::Name(sequence));
+        self.set_property(id, "AnimRate", 0, Value::Float(rate));
+        self.set_property(id, "AnimFrame", 0, Value::Float(frame));
+        self.set_property(id, "bAnimFinished", 0, Value::Bool(finished));
+    }
+
+    pub(crate) fn anim_channel_sequence(&self, id: ObjectId, channel: u8) -> Option<&str> {
+        self.objects
+            .get(id as usize)?
+            .anim
+            .channels
+            .get(&channel)
+            .map(|c| c.sequence.as_str())
     }
 
     /// `Actor.StopAnimating` (native 417): stop every animation channel and clear the animation
@@ -9080,12 +9477,21 @@ impl<'s> Vm<'s> {
             .is_some_and(|o| o.anim.channels.get(&channel).is_some_and(|c| c.active))
     }
 
-    /// `(frame, rate)` of `channel`'s current animation, if the channel exists.
+    /// `(normalized frame, normalized rate)` as exported by GetAnimParams (Engine.dll
+    /// GetAnimFrame 0x103ee9a9 reads channel+0x10 directly). Tween frames are negative.
     pub(crate) fn anim_channel_params(&self, id: ObjectId, channel: u8) -> Option<(f32, f32)> {
         self.objects
             .get(id as usize)
             .and_then(|o| o.anim.channels.get(&channel))
-            .map(|c| (c.frame, c.rate))
+            .map(|c| {
+                let n = c.frames.max(1) as f32;
+                let frame = if c.tween_duration > 0.0 && c.tween_remaining > 0.0 {
+                    -c.tween_remaining / (c.tween_duration * n)
+                } else {
+                    c.frame / n
+                };
+                (frame, if c.active { c.rate / n } else { 0.0 })
+            })
     }
 
     /// `Actor.FinishAnim`: suspend state code until `channel` ends. Returns `false` (no latent)
@@ -9103,6 +9509,10 @@ impl<'s> Vm<'s> {
             return Err(self.err(VmErrorKind::LatentOutsideState {
                 path: "Actor.FinishAnim".into(),
             }));
+        }
+        // execFinishAnim stops loop playback so the current cycle can finish.
+        if let Some(c) = self.objects[id as usize].anim.channels.get_mut(&channel) {
+            c.looping = false;
         }
         self.pending_latent = Some(Latent::AnimEnd {
             channel,
@@ -9256,6 +9666,17 @@ impl<'s> Vm<'s> {
         if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
             return Ok(());
         }
+        if self.objects[id as usize].anim.channels.values().any(|c| {
+            c.looping
+                && c.frames > 0
+                && (!((c.rate * dt).is_finite()) || c.rate * dt / c.frames as f32 > 4096.0)
+        }) {
+            return Err(self.err(VmErrorKind::AnimationDataError {
+                source: self.animation_sources(id).join(", "),
+                sequence: "<advance>".into(),
+                message: "animation step exceeds 4096 loop wraps".into(),
+            }));
+        }
         // The actor name is only needed when a notify or animation end fires; the old code
         // cloned it unconditionally, allocating a string for every active actor every tick
         // (most have no active channel).
@@ -9263,45 +9684,82 @@ impl<'s> Vm<'s> {
         let mut ended: Vec<(u8, f32)> = Vec::new();
         {
             let o = &mut self.objects[id as usize];
+            for p in o.anim.blend_params.values_mut() {
+                if let Some((target, remaining)) = p.alpha_target {
+                    p.blend_alpha += (target - p.blend_alpha) * (dt / remaining).min(1.0);
+                    p.alpha_target = if remaining > dt {
+                        Some((target, remaining - dt))
+                    } else {
+                        None
+                    };
+                }
+            }
             for (&channel, st) in o.anim.channels.iter_mut() {
                 if !st.active {
                     continue;
                 }
                 let step_dt = if st.tween_remaining > 0.0 {
-                    st.tween_remaining -= dt;
+                    let spent = dt.min(st.tween_remaining);
+                    st.tween_remaining -= spent;
                     if st.tween_remaining > 0.0 {
                         continue;
                     }
-                    -st.tween_remaining
+                    st.tween_source = None;
+                    if st.tween_only {
+                        st.active = false;
+                        ended.push((channel, 0.0));
+                        continue;
+                    }
+                    dt - spent
                 } else {
                     dt
                 };
-                let old = st.frame;
-                st.frame += (st.rate * step_dt).max(0.0);
-                while st.notify_idx < st.notifies.len() {
-                    let (t, name) = st.notifies[st.notify_idx].clone();
-                    let target = t.clamp(0.0, 1.0) * st.frames as f32;
-                    if old < target && st.frame >= target {
-                        notifies.push((channel, name));
+                if st.tween_only {
+                    continue;
+                }
+                let length = st.frames as f32;
+                let end = if st.looping { length } else { length - 1.0 };
+                let mut remaining = (st.rate * step_dt).max(0.0);
+                loop {
+                    let old = st.frame;
+                    let next = (old + remaining).min(end.max(0.0));
+                    while st.notify_idx < st.notifies.len() {
+                        let (t, name) = &st.notifies[st.notify_idx];
+                        let target = *t * length;
+                        if target > next {
+                            break;
+                        }
+                        if old < target && target >= 0.0 {
+                            notifies.push((channel, name.clone()));
+                        }
                         st.notify_idx += 1;
-                    } else if old >= target {
-                        st.notify_idx += 1;
-                    } else {
+                    }
+                    if st.looping && !st.loop_end_sent && old < length - 1.0 && next >= length - 1.0
+                    {
+                        ended.push((channel, length - 1.0));
+                        st.loop_end_sent = true;
+                    }
+                    st.frame = next;
+                    remaining -= next - old;
+                    if st.frame < end {
                         break;
                     }
-                }
-                if st.frames > 0 && st.frame + 1e-4 >= st.frames as f32 {
-                    if st.looping {
-                        st.frame %= st.frames as f32;
+                    if st.looping && length > 0.0 {
+                        st.frame = 0.0;
                         st.notify_idx = 0;
+                        st.loop_end_sent = false;
+                        if remaining <= 0.0 {
+                            break;
+                        }
                     } else {
-                        st.frame = st.frames as f32;
                         st.active = false;
                         ended.push((channel, st.frame));
+                        break;
                     }
                 }
             }
         }
+        self.mirror_base_animation(id);
         for (channel, function) in notifies {
             let actor = self.objects[id as usize].name.clone();
             self.note(TraceKind::AnimNotify {
@@ -9311,9 +9769,7 @@ impl<'s> Vm<'s> {
             });
             self.send_event(id, &function, Vec::new())?;
         }
-        for (channel, frame) in ended {
-            self.set_property(id, "AnimFrame", 0, Value::Float(frame));
-            self.set_property(id, "bAnimFinished", 0, Value::Bool(true));
+        for (channel, _frame) in ended {
             let actor = self.objects[id as usize].name.clone();
             self.note(TraceKind::AnimEnd { actor, channel });
             // UE2 `APawn::NotifyAnimEnd` (Engine.dll RVA 0xB0A00) sends `AnimEnd(Channel)` to the
@@ -9460,19 +9916,18 @@ impl<'s> Vm<'s> {
         self.time
     }
 
-    /// Deterministic PRNG step (splitmix64). Used by `Rand`/`FRand`; the engine's own RNG
-    /// sequence is not reproduced (see the registry status).
+    /// Retail PC CRT rand (MSVCR70.dll 0x7c02836d), shared by appRand/appFrand.
+    /// Uses the low 32 bits of the configured seed and unsigned wrapping arithmetic.
     pub(crate) fn next_random(&mut self) -> u64 {
-        self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.rng;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
+        let state = (self.rng as u32).wrapping_mul(214013).wrapping_add(2531011);
+        self.rng = u64::from(state);
+        u64::from((state >> 16) & 0x7fff)
     }
 
-    /// `FRand`: a deterministic float in `[0, 1)`.
+    /// Core.dll appFrand 0x1010ffd0: CRT rand times float bits 0x38000100.
+    /// Both endpoints are possible.
     pub(crate) fn rand_float(&mut self) -> f32 {
-        (self.next_random() >> 40) as f32 / (1u64 << 24) as f32
+        self.next_random() as f32 * f32::from_bits(0x38000100)
     }
 
     /// `Rand(Max)`: a deterministic int in `[0, Max)` (0 when `Max <= 0`).
