@@ -30,7 +30,7 @@ use crate::localize::{LocalizationData, placeholder};
 use crate::navigation::{
     NavEdgeInfo, NavPointInfo, NavigationData, find_path, move_step, nearest_point, point_fits,
 };
-use crate::physics::{HitZones, WorldPhysics};
+use crate::physics::{HitZones, WorldHit, WorldPhysics};
 use crate::reflect::{Property, PropertyKind, ScriptObject, function_flags, property_flags};
 use crate::registry::{NativeCtx, NativeDef, NativeOutcome, Registry};
 use crate::value::{Delegate, ObjRef, ObjectId, Ty, Value};
@@ -1216,6 +1216,73 @@ impl NativeProfile {
     }
 }
 
+/// `HearNoise` probe bit: Engine.dll passes `FName(EName 0x156)` (342) to `IsProbing`, and
+/// Core.dll `UObject::IsProbing` maps probe names 300..363 to mask bit `name - 300` (item41c).
+const HEAR_NOISE_PROBE_BIT: u32 = 342 - 300;
+
+/// Squared distance of two float vectors evaluated in double precision, standing in for the
+/// x87 extended-precision `FVector::SizeSquared` the engine computes before storing or comparing.
+fn dist_sq_f64(a: [f32; 3], b: [f32; 3]) -> f64 {
+    let d = |i: usize| f64::from(a[i]) - f64::from(b[i]);
+    d(0) * d(0) + d(1) * d(1) + d(2) * d(2)
+}
+
+/// Engine.dll 0x103db640 (upstream name `FSortedPathList::addPath`), used by `CanHear`'s
+/// around-corner branch: up to 32 nodes in ascending key order. The insertion point comes from a
+/// coarse binary step (count > 8: half, count > 16: an extra quarter step) followed by a linear
+/// scan to the first key `>=` the new one; when full, the last entry falls off. Every entry
+/// shifted down one slot has its key truncated to an integer (the decoded `_ftol` + `fild`).
+#[derive(Debug, Default)]
+struct SortedPathList {
+    nodes: [ObjectId; 32],
+    dist: [f32; 32],
+    count: usize,
+}
+
+impl SortedPathList {
+    fn add(&mut self, node: ObjectId, key: f32) {
+        let n = self.count;
+        let mut i = 0;
+        if n > 8 {
+            let half = n / 2;
+            let step = if key > self.dist[half] {
+                i = half;
+                (n > 16).then_some(n / 4 + half)
+            } else {
+                (n > 16).then_some(n / 4)
+            };
+            if let Some(j) = step
+                && key > self.dist[j]
+            {
+                i = j;
+            }
+        }
+        while i < n && key > self.dist[i] {
+            i += 1;
+        }
+        if i >= 32 {
+            return;
+        }
+        let mut moved_node = self.nodes[i];
+        let mut moved_dist = self.dist[i];
+        self.nodes[i] = node;
+        self.dist[i] = key;
+        if self.count < 32 {
+            self.count += 1;
+        }
+        i += 1;
+        while i < self.count {
+            let (next_node, next_dist) = (self.nodes[i], self.dist[i]);
+            self.nodes[i] = moved_node;
+            // `_ftol` truncates toward zero; only the low 32 bits are reloaded with `fild`.
+            self.dist[i] = (moved_dist as i64) as i32 as f32;
+            moved_node = next_node;
+            moved_dist = next_dist;
+            i += 1;
+        }
+    }
+}
+
 /// The interpreter.
 pub struct Vm<'s> {
     set: &'s ScriptSet,
@@ -1260,6 +1327,8 @@ pub struct Vm<'s> {
     /// Hit-zone provider for `Actor.GetLastTraceBone` (item14). `None` = the default
     /// [`crate::physics::CylinderZones`] is used.
     hit_zones: Option<Box<dyn HitZones>>,
+    /// Partial `CanHear` branches already reported with a trace note (item41c; once per VM).
+    hearing_partials: HashSet<&'static str>,
     /// Bone name recorded by the most recent `Actor.Trace` actor hit, returned by
     /// `Actor.GetLastTraceBone` (`XIIIPawn.LastBoneHit`). `"None"` when the last trace hit world
     /// geometry (or nothing).
@@ -1470,6 +1539,7 @@ impl<'s> Vm<'s> {
             animation: None,
             navigation: None,
             hit_zones: None,
+            hearing_partials: HashSet::new(),
             last_trace_bone: "None".to_owned(),
             voice_duration: None,
             save_slots: None,
@@ -7477,16 +7547,333 @@ impl<'s> Vm<'s> {
             end = out.end;
             world_hit = out.hit.is_some();
         }
-        let mut blocked_actor = false;
+        let mut blocked_actor = None;
         if self.bool_prop(id, "bCollideActors")
-            && let Some((t, _)) = self.sweep_blocking_actor(id, start, end)
+            && let Some((t, other)) = self.sweep_blocking_actor(id, start, end)
         {
             end = lerp3(start, end, t);
-            blocked_actor = true;
+            blocked_actor = Some(other);
         }
         self.set_property(id, "Location", 0, Value::Vector(end));
+        // ULevel::MoveActor's captured disassembly is truncated before its Bump event dispatch,
+        // so do not infer a recipient or event order from this incomplete artifact.
         self.refresh_touching(id, true)?;
-        Ok(!world_hit && !blocked_actor)
+        Ok(!world_hit && blocked_actor.is_none())
+    }
+
+    /// Engine.dll `AActor::execMakeNoise` (0x103aff40): `CheckNoiseHearing(Loudness)` runs only
+    /// when `Level.NetMode != NM_Client` (3) and the actor has an `Instigator`. No loudness
+    /// validation happens anywhere on the engine path (a NaN or negative loudness flows into the
+    /// same comparisons), so the VM performs none either.
+    pub(crate) fn vm_make_noise(&mut self, source: ObjectId, loudness: f32) -> VmResult<()> {
+        if !self.is_live_actor(source) {
+            return Ok(());
+        }
+        let net_mode = self
+            .obj_prop(source, "Level")
+            .map_or(0, |level| self.byte_prop(level, "NetMode"));
+        if net_mode == 3 || self.obj_prop(source, "Instigator").is_none() {
+            return Ok(());
+        }
+        self.check_noise_hearing(source, loudness)
+    }
+
+    /// Engine.dll `AActor::CheckNoiseHearing` (0x1036b6d0), decoded in full (item41c). Order:
+    /// instigator/controller gate, the two per-instigator
+    /// noise slots (0.2 s / 50 uu / 90 % suppression, 0.18 s reuse), then the
+    /// `Level.ControllerList` walk delivering `HearNoise(Loudness, self)` to every probing
+    /// controller that is not the instigator's and whose `CanHear` passes. When the instigator
+    /// is not a player and its controller's `Enemy` is not a player either, only controllers
+    /// with the noise maker's `Tag` or a player pawn are considered.
+    fn check_noise_hearing(&mut self, source: ObjectId, loudness: f32) -> VmResult<()> {
+        let Some(instigator) = self.obj_prop(source, "Instigator") else {
+            return Ok(());
+        };
+        let Some(inst_controller) = self.obj_prop(instigator, "Controller") else {
+            return Ok(());
+        };
+        let location = self.vector_prop(source, "Location").unwrap_or([0.0; 3]);
+        // `XLevel+0xd0` is a double; the VM's level clock is `Vm::time`.
+        let now = self.time;
+        let near = |spot: [f32; 3]| dist_sq_f64(spot, location) < 2500.0;
+        let slot = |vm: &Self, n: u8| {
+            (
+                vm.vector_prop(instigator, &format!("noise{n}spot"))
+                    .unwrap_or([0.0; 3]),
+                f64::from(vm.f32_prop(instigator, &format!("noise{n}time"))),
+                f64::from(vm.f32_prop(instigator, &format!("noise{n}loudness"))),
+            )
+        };
+        let (spot1, time1, loud1) = slot(self, 1);
+        let (spot2, time2, loud2) = slot(self, 2);
+        let l = f64::from(loudness);
+        let recent = now - f64::from(0.2f32);
+        let louder = f64::from(0.9f32) * l;
+        if recent < time1 && near(spot1) && louder <= loud1 {
+            return Ok(());
+        }
+        if recent < time2 && near(spot2) && louder <= loud2 {
+            return Ok(());
+        }
+        let reuse = now - f64::from(0.18f32);
+        let target = if reuse > time1 {
+            Some(1)
+        } else if reuse > time2 {
+            Some(2)
+        } else if near(spot1) && loud1 <= l {
+            Some(1)
+        } else if loud2 <= l {
+            // The fourth case writes slot 1 as well (decoded: stores at +0x2c4/+0x2d0/+0x2d8).
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(n) = target {
+            self.set_property(
+                instigator,
+                &format!("noise{n}spot"),
+                0,
+                Value::Vector(location),
+            );
+            self.set_property(
+                instigator,
+                &format!("noise{n}time"),
+                0,
+                Value::Float(now as f32),
+            );
+            self.set_property(
+                instigator,
+                &format!("noise{n}loudness"),
+                0,
+                Value::Float(loudness),
+            );
+        }
+
+        let broadcast = self.pawn_is_player(instigator)
+            || self
+                .obj_prop(inst_controller, "Enemy")
+                .is_some_and(|enemy| self.pawn_is_player(enemy));
+        let source_tag = self.name_prop(source, "Tag");
+        let Some(level) = self.obj_prop(source, "Level") else {
+            return Ok(());
+        };
+        let mut next = self.obj_prop(level, "ControllerList");
+        let mut walked = 0usize;
+        while let Some(controller) = next {
+            walked += 1;
+            if walked > self.objects.len() {
+                return Err(self.err(VmErrorKind::Unresolved {
+                    what: "Actor.MakeNoise: Level.ControllerList does not terminate (cycle)".into(),
+                }));
+            }
+            let pawn = self.obj_prop(controller, "Pawn");
+            if pawn != Some(instigator)
+                && self.is_probing(controller, "HearNoise", HEAR_NOISE_PROBE_BIT)
+                && (broadcast
+                    || self
+                        .name_prop(controller, "Tag")
+                        .eq_ignore_ascii_case(&source_tag)
+                    || pawn.is_some_and(|p| self.pawn_is_player(p)))
+                && self.controller_can_hear(controller, location, loudness, source)?
+            {
+                self.send_event(
+                    controller,
+                    "HearNoise",
+                    vec![
+                        Value::Float(loudness),
+                        Value::Object(Some(ObjRef::Instance(source))),
+                    ],
+                )?;
+            }
+            // The engine reads `nextController` after the event, as here.
+            next = self.obj_prop(controller, "NextController");
+        }
+        Ok(())
+    }
+
+    /// Engine.dll `APawn::IsPlayer` (0x103aff00): `Controller != None && Controller.bIsPlayer`.
+    fn pawn_is_player(&self, pawn: ObjectId) -> bool {
+        self.obj_prop(pawn, "Controller")
+            .is_some_and(|c| self.bool_prop(c, "bIsPlayer"))
+    }
+
+    /// `name` property text, or `"None"` when absent.
+    fn name_prop(&self, id: ObjectId, name: &str) -> String {
+        match self.get_property(id, name) {
+            Some(Value::Name(n)) => n.clone(),
+            _ => "None".to_owned(),
+        }
+    }
+
+    /// Core.dll `UObject::IsProbing` (0x10102da0) for a probe name (EName 300..363): bit
+    /// `name - 300` of the state frame's probe mask, which `UObject::GotoState` (0x1011eb10) sets
+    /// to `(Class.ProbeMask | Node.ProbeMask) & Node.IgnoreMask` with `Node` = the current state
+    /// (the class itself without one). The stored masks are already cumulative over super classes
+    /// (measured, item41c). A `Disable(probe)` recorded by the VM also clears the probe.
+    pub(crate) fn is_probing(&self, id: ObjectId, probe: &str, bit: u32) -> bool {
+        let Some(o) = self.objects.get(id as usize) else {
+            return false;
+        };
+        if o.disabled.contains(&lower(probe)) {
+            return false;
+        }
+        let masks = |g: GlobalRef| match self.set.object(g) {
+            Some(ScriptObject::Class(c)) => Some((c.state.probe_mask, c.state.ignore_mask)),
+            Some(ScriptObject::State(s)) => Some((s.state.probe_mask, s.state.ignore_mask)),
+            _ => None,
+        };
+        let (class_probe, class_ignore) = masks(o.class).unwrap_or((0, u64::MAX));
+        let (node_probe, node_ignore) = o
+            .state
+            .and_then(masks)
+            .unwrap_or((class_probe, class_ignore));
+        ((class_probe | node_probe) & node_ignore) >> bit & 1 != 0
+    }
+
+    /// Engine.dll `AController::CanHear(NoiseLoc, Loudness, Other)` (0x1036b0f0). Every branch
+    /// is decoded; the parts the VM cannot evaluate exactly are labelled Partial below and
+    /// reported once per VM with a trace note (never silently).
+    fn controller_can_hear(
+        &mut self,
+        controller: ObjectId,
+        noise: [f32; 3],
+        loudness: f32,
+        other: ObjectId,
+    ) -> VmResult<bool> {
+        let other_controller = self
+            .obj_prop(other, "Instigator")
+            .and_then(|i| self.obj_prop(i, "Controller"));
+        let Some(pawn) = self.obj_prop(controller, "Pawn") else {
+            return Ok(false);
+        };
+        if other_controller.is_none() {
+            return Ok(false);
+        }
+        let pawn_loc = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let dist_sq = dist_sq_f64(pawn_loc, noise) as f32;
+        let threshold = f64::from(self.f32_prop(pawn, "HearingThreshold"));
+        let alert = f64::from(self.f32_prop(pawn, "Alertness")) + 1.0;
+        let alert = if 0.0 < alert { alert } else { 0.0 };
+        let perceived_ext = threshold * threshold * f64::from(loudness) * alert;
+        // `Perceived < DistSq` returns 0; a NaN Perceived passes (decoded flag test).
+        if perceived_ext < f64::from(dist_sq) {
+            return Ok(false);
+        }
+        let perceived = perceived_ext as f32;
+
+        if self.bool_prop(pawn, "bSameZoneHearing") || self.bool_prop(pawn, "bAdjacentZoneHearing")
+        {
+            // Partial: the engine compares `Region.Zone` of the listener pawn and the noise
+            // maker, then (bAdjacentZoneHearing) the BSP zone connectivity mask. The VM keeps no
+            // zone model (Region is not updated as actors move), so the zone test is treated as
+            // "different, unconnected zones" and the remaining branches decide.
+            self.hearing_partial(
+                "zone",
+                "CanHear zone hearing (bSameZoneHearing/bAdjacentZoneHearing) is not modelled: \
+                 the VM has no zone model, the zone test is treated as different unconnected zones",
+            );
+        }
+        if !self.bool_prop(pawn, "bLOSHearing") {
+            return Ok(false);
+        }
+        let eye = self.f32_prop(pawn, "BaseEyeHeight");
+        let view = [pawn_loc[0], pawn_loc[1], pawn_loc[2] + eye];
+        if !self.physics_ready("Actor.MakeNoise", Some(512), controller, Value::Void)? {
+            return Ok(false);
+        }
+        // SingleLineCheck(End = NoiseLoc, Start = ViewLoc, TRACE_World | TRACE_StopAtFirstHit):
+        // world geometry including movers, no pawns. The provider's world trace is that query.
+        let world_hit = self.world_line(view, noise);
+        if world_hit.is_none() {
+            return Ok(true);
+        }
+
+        if self.bool_prop(pawn, "bMuffledHearing") && perceived > 4.0 * dist_sq {
+            // Partial: the engine's two wall traces use TRACE_Level (BSP only); the provider has
+            // no BSP-only query, so its world trace stands in. On a miss the reused
+            // FCheckResult keeps its previous Location ((0,0,0) from the constructor at first;
+            // hypothesis: SingleLineCheck does not write Location on a miss).
+            self.hearing_partial(
+                "muffled",
+                "CanHear bMuffledHearing wall traces use the world trace in place of the engine's \
+                 BSP-only TRACE_Level check",
+            );
+            let mut hit_location = [0.0f32; 3];
+            if let Some(h) = self.world_line(view, noise) {
+                hit_location = h.location;
+            }
+            let first = hit_location;
+            if let Some(h) = self.world_line(noise, view) {
+                hit_location = h.location;
+            }
+            // `FVector::SizeSquared` stays on the x87 stack (not rounded to float) and is then
+            // squared again: the decoded test is `Perceived > W*W + 4*DistSq` with W = |A-B|^2.
+            let wall = dist_sq_f64(first, hit_location);
+            if f64::from(perceived) > wall * wall + f64::from(4.0 * dist_sq) {
+                return Ok(true);
+            }
+        }
+
+        if !self.bool_prop(pawn, "bAroundCornerHearing") {
+            return Ok(false);
+        }
+        let corner = perceived * 0.125;
+        let other_loc = self.vector_prop(other, "Location").unwrap_or([0.0; 3]);
+        let mut list = SortedPathList::default();
+        let level = self.obj_prop(controller, "Level");
+        let mut next = level.and_then(|l| self.obj_prop(l, "NavigationPointList"));
+        let mut walked = 0usize;
+        while let Some(nav) = next {
+            walked += 1;
+            if walked > self.objects.len() {
+                return Err(self.err(VmErrorKind::Unresolved {
+                    what: "Actor.MakeNoise: Level.NavigationPointList does not terminate (cycle)"
+                        .into(),
+                }));
+            }
+            if self.bool_prop(nav, "bPropagatesSound") {
+                let nav_loc = self.vector_prop(nav, "Location").unwrap_or([0.0; 3]);
+                let d1 = dist_sq_f64(nav_loc, pawn_loc) as f32;
+                let d2 = dist_sq_f64(nav_loc, other_loc) as f32;
+                if d1 < corner && d2 < corner {
+                    list.add(nav, d2 + d1);
+                }
+            }
+            next = self.obj_prop(nav, "nextNavigationPoint");
+        }
+        if list.count == 0 {
+            return Ok(false);
+        }
+        // Partial: `UModel::FastLineCheck` is a BSP-only line test; the provider's world trace
+        // (which also sees static meshes, terrain and movers) stands in for it.
+        self.hearing_partial(
+            "corner",
+            "CanHear bAroundCornerHearing uses the world trace in place of the engine's BSP-only \
+             FastLineCheck",
+        );
+        for &nav in &list.nodes[..list.count] {
+            let nav_loc = self.vector_prop(nav, "Location").unwrap_or([0.0; 3]);
+            if self.world_line(noise, nav_loc).is_none() && self.world_line(view, nav_loc).is_none()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Zero-extent world line trace through the installed provider (callers check
+    /// [`Vm::physics_ready`] first).
+    fn world_line(&mut self, start: [f32; 3], end: [f32; 3]) -> Option<WorldHit> {
+        self.physics
+            .as_mut()
+            .and_then(|p| p.trace(start, end, [0.0; 3]))
+    }
+
+    /// Records a Partial hearing branch once per VM as a visible trace note.
+    fn hearing_partial(&mut self, key: &'static str, text: &str) {
+        if self.hearing_partials.insert(key) {
+            self.note(TraceKind::Note(format!("Partial: {text}")));
+        }
     }
 
     /// `Actor.SetLocation`: teleport when the destination is free of world geometry and not
@@ -7901,8 +8288,11 @@ impl<'s> Vm<'s> {
         };
         let a = self.eye_location(pawn);
         let b = self.eye_location(other_pawn);
-        let hit = self.physics.as_mut().and_then(|p| p.trace(a, b, [0.0; 3]));
-        Ok(hit.is_none())
+        let world_hit = self.physics.as_mut().and_then(|p| p.trace(a, b, [0.0; 3]));
+        if world_hit.is_some() {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// `Actor.Location + Actor.BaseEyeHeight` (the eye point upstream traces between).
@@ -9157,5 +9547,78 @@ mod stack_name_tests {
             Some(1)
         );
         assert!(l.slot_by_name("missing").is_none());
+    }
+}
+
+#[cfg(test)]
+mod sorted_path_list_tests {
+    use super::SortedPathList;
+
+    fn keys(l: &SortedPathList) -> Vec<f32> {
+        l.dist[..l.count].to_vec()
+    }
+
+    /// Ascending order; an equal key goes before the existing one; entries shifted down have
+    /// their keys truncated to integers (the decoded `_ftol` reload), the inserted key does not.
+    #[test]
+    fn inserts_in_order_and_truncates_shifted_keys() {
+        let mut l = SortedPathList::default();
+        l.add(1, 30.5);
+        l.add(2, 10.25);
+        assert_eq!(keys(&l), [10.25, 30.0]);
+        assert_eq!(&l.nodes[..2], [2, 1]);
+        l.add(3, 10.25);
+        assert_eq!(
+            &l.nodes[..3],
+            [3, 2, 1],
+            "ties insert before the existing key"
+        );
+        assert_eq!(keys(&l), [10.25, 10.0, 30.0]);
+        l.add(4, 99.9);
+        assert_eq!(
+            keys(&l),
+            [10.25, 10.0, 30.0, 99.9],
+            "an append shifts nothing"
+        );
+    }
+
+    /// Capacity 32: inserting into a full list drops the largest; a key larger than all 32 is
+    /// not inserted.
+    #[test]
+    fn is_capped_at_32_entries() {
+        let mut l = SortedPathList::default();
+        for i in 0..32 {
+            l.add(i, (i * 10) as f32);
+        }
+        assert_eq!(l.count, 32);
+        l.add(100, 1000.0);
+        assert_eq!(l.count, 32);
+        assert!(!l.nodes.contains(&100));
+        l.add(200, 5.0);
+        assert_eq!(l.count, 32);
+        assert_eq!(&l.nodes[..3], [0, 200, 1]);
+        assert_eq!(l.nodes[31], 30, "the former last entry (31) fell off");
+    }
+
+    /// With more than 8 (and 16) entries the scan starts at the coarse binary step; for sorted
+    /// content that gives the same position as a full linear scan.
+    #[test]
+    fn binary_step_finds_the_linear_position() {
+        for n in [9usize, 16, 17, 31] {
+            for probe in [-1.0f32, 0.0, 5.0, 45.0, 80.0, 155.0, 1000.0] {
+                let mut l = SortedPathList::default();
+                for i in 0..n {
+                    l.add(i as u32, (i * 10) as f32);
+                }
+                let expected = (0..n).position(|i| probe <= (i * 10) as f32).unwrap_or(n);
+                l.add(999, probe);
+                let at = l.nodes[..l.count].iter().position(|&x| x == 999);
+                assert_eq!(
+                    at,
+                    Some(expected).filter(|&e| e < 32),
+                    "n {n} probe {probe}"
+                );
+            }
+        }
     }
 }

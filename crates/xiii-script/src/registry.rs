@@ -2254,12 +2254,14 @@ fn set_view_target(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<
     val(Value::Void)
 }
 
-/// `Actor.MakeNoise`: UE2 notifies nearby AI (`Pawn.HearNoise`) of a noise at the actor's
-/// location. The VM has no AI hearing/perception model, so the call is accepted and discarded
-/// (registered `Partial` with that reason; `GameInfo.PlayTeleportEffect` calls it on the
-/// player-login path).
-fn make_noise(vm: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
-    let _ = vm;
+/// Engine.dll `AActor::execMakeNoise` (0x103aff40) -> `AActor::CheckNoiseHearing` (0x1036b6d0)
+/// -> `AController::CanHear` (0x1036b0f0) -> `eventHearNoise(Loudness, NoiseMaker)` (item41c,
+/// decoded in full; see `Vm::vm_make_noise`). Partial only where the VM lacks the engine's data:
+/// zone hearing (no zone model) and the BSP-only traces of the muffled/around-corner branches
+/// (the provider's world trace stands in); each is reported once with a trace note.
+fn make_noise(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let loudness = float(vm, a, 0)?;
+    vm.vm_make_noise(c.this, loudness)?;
     val(Value::Void)
 }
 
@@ -4396,12 +4398,12 @@ fn builtin_defs() -> Vec<NativeDef> {
         ),
         NativeDef {
             status: NativeStatus::Partial(
-                "no AI hearing/perception model: the call is accepted and discarded, AI `HearNoise` is not invoked",
+                "decoded CheckNoiseHearing/CanHear (noise slots, ControllerList walk, IsProbing, tag/player filter, HearingThreshold^2*Loudness*Alertness range, eye line trace); zone hearing is not modelled and the muffled/around-corner BSP-only traces use the world trace (trace note once per VM)",
             ),
             ..def(
                 "Engine.Actor.MakeNoise",
                 "native(512) final native static function MakeNoise(float Loudness)",
-                "engine.u Actor.MakeNoise decoded (float Loudness; native 512); UE2 notifies nearby AI; Engine.dll ?execMakeNoise@AActor",
+                "engine.u Actor.MakeNoise decoded (float Loudness; native 512); Engine.dll execMakeNoise 0x103aff40, CheckNoiseHearing 0x1036b6d0, CanHear 0x1036b0f0 (item41c)",
                 make_noise,
             )
         },
@@ -4466,7 +4468,7 @@ fn builtin_defs() -> Vec<NativeDef> {
         },
         NativeDef {
             status: NativeStatus::Partial(
-                "world move via the physics provider (move_box, no sliding); actor blocking is a cylinder-sweep stop; no Bump/EncroachingOn events; player/projectile bBlockPlayers pairing is inferred from class names (XIII has no bIsPlayerPawn field)",
+                "world move via physics provider; cylinder blocking dispatches Bump to the blocking actor, then refreshes Touch/UnTouch; encroachment events and exact native ordering remain unverified; player/projectile bBlockPlayers pairing inferred from class names",
             ),
             ..def(
                 "Engine.Actor.Move",
@@ -4806,7 +4808,7 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "world line trace between the pawn eyes; actor occlusion is not modelled",
+            "world line trace between pawn eyes; actor occlusion not modelled (engine disassembly notes unavailable for verification)",
         ),
         ..def(
             "Engine.Controller.LineOfSightTo",
