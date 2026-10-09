@@ -1682,6 +1682,16 @@ impl Session {
         let game_info = self
             .game_info
             .ok_or("GameInfo is not available for AcceptInventory")?;
+        // AcceptInventory computes Max(P.Health, ThingsToSave.Health). Its P input must be
+        // the imported travel pawn, not the fresh login pawn's default 150 health.
+        let health = match self.vm.get_property(self.player, "Health") {
+            Some(Value::Int(_)) => Value::Int(save.health.round() as i32),
+            Some(Value::Float(_)) => Value::Float(save.health),
+            _ => return Err("checkpoint pawn has no numeric Health property".into()),
+        };
+        if !self.vm.set_property(self.player, "Health", 0, health) {
+            return Err("checkpoint pawn Health is not writable".into());
+        }
         self.vm
             .send_event(
                 game_info,

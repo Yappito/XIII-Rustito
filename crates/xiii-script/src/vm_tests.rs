@@ -3303,6 +3303,11 @@ fn item46_set() -> ScriptSet {
         "WeaponStartTrace",
         "LastSeenPos",
         "WeaponEndTrace",
+        "DirectionTir",
+        "EnemyTargetPos",
+        "EnemyTargetVelocity",
+        "FireOffset",
+        "Rotation",
         "Velocity",
         "Acceleration",
     ] {
@@ -3321,6 +3326,11 @@ fn item46_set() -> ScriptSet {
         "GroundFriction",
         "MoveTimer",
         "TacticalOffset",
+        "EyeHeight",
+        "CrouchHeight",
+        "Angle_Visee",
+        "Temps_RefreshEnemyPos",
+        "DrawScale",
     ] {
         fields.push((b.reserve(IMP_FLOATPROP, actor, name), vec![]));
     }
@@ -3339,6 +3349,8 @@ fn item46_set() -> ScriptSet {
         "bAdjusting",
         "bAdvancedTactics",
         "bPreparingMove",
+        "bZoomed",
+        "bTirSurConeMax",
     ] {
         fields.push((b.reserve(IMP_BOOLPROP, actor, name), vec![]));
     }
@@ -3358,10 +3370,14 @@ fn item46_set() -> ScriptSet {
         "NavigationPointList",
         "NextNavigationPoint",
         "NextMoveTarget",
+        "Owner",
+        "Instigator",
     ] {
         fields.push((b.reserve(IMP_OBJECTPROP, actor, name), compact(actor)));
     }
     fields.push((b.reserve(IMP_BYTEPROP, actor, "Physics"), compact(0)));
+    fields.push((b.reserve(IMP_BYTEPROP, actor, "WHand"), compact(0)));
+    fields.push((b.reserve(IMP_INTPROP, actor, "Skill"), vec![]));
     fields.push((b.reserve(IMP_NAMEPROP, actor, "Alliance"), vec![]));
     fields.push((
         b.reserve(IMP_ARRAYPROP, actor, "MusicVars"),
@@ -3648,7 +3664,7 @@ fn item46_stake_out_excludes_boundaries_preserves_failure_and_detects_cycles() {
 }
 
 #[test]
-fn item46_line_of_fire_classifies_ally_hostile_dead_and_shoot_through() {
+fn item51b_line_of_fire_uses_direction_point_and_classifies_obstacles() {
     let set = item46_set();
     let mut vm = Vm::new(&set, VmLimits::default());
     vm.set_physics(Box::new(MockWorld::new()));
@@ -3677,7 +3693,9 @@ fn item46_line_of_fire_classifies_ally_hostile_dead_and_shoot_through() {
         0,
         Value::Object(Some(ObjRef::Instance(ammo))),
     );
-    vm.set_property(ctrl, "WeaponEndTrace", 0, Value::Vector([200.0, 0.0, 0.0]));
+    vm.set_property(ctrl, "DirectionTir", 0, Value::Vector([200.0, 0.0, 0.0]));
+    // Deliberately different: the retail class has no WeaponEndTrace property.
+    vm.set_property(ctrl, "WeaponEndTrace", 0, Value::Vector([0.0, 200.0, 0.0]));
     let other = vm.spawn(pg(&set, "Pawn"), "Other").unwrap();
     vm.set_property(other, "Location", 0, Value::Vector([100.0, 0.0, 0.0]));
     vm.set_property(other, "CollisionRadius", 0, Value::Float(10.0));
@@ -3794,6 +3812,216 @@ fn item46_line_of_fire_classifies_ally_hostile_dead_and_shoot_through() {
             &mut []
         ),
         NativeOutcome::Value(Value::Int(0))
+    );
+}
+
+#[test]
+fn item51b_aim_is_a_sampled_world_point_and_refreshes_native_start() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let (ctrl, pawn) = item46_pair(&mut vm, &set);
+    let enemy = vm.spawn(pg(&set, "Pawn"), "Enemy").unwrap();
+    let weapon = vm.spawn(pg(&set, "Actor"), "Weapon").unwrap();
+    let ammo = vm.spawn(pg(&set, "Actor"), "Ammo").unwrap();
+    for (id, name, value) in [
+        (ctrl, "Enemy", enemy),
+        (pawn, "Weapon", weapon),
+        (weapon, "AmmoType", ammo),
+    ] {
+        vm.set_property(id, name, 0, Value::Object(Some(ObjRef::Instance(value))));
+    }
+    vm.set_property(pawn, "Location", 0, Value::Vector([4000.0, -2000.0, 300.0]));
+    vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(60.0));
+    vm.set_property(pawn, "Skill", 0, Value::Int(1));
+    vm.set_property(
+        enemy,
+        "Location",
+        0,
+        Value::Vector([4100.0, -2000.0, 300.0]),
+    );
+    vm.set_property(
+        ctrl,
+        "EnemyTargetPos",
+        0,
+        Value::Vector([4090.0, -2000.0, 300.0]),
+    );
+    vm.set_property(ctrl, "Rotation", 0, Value::Rotator([0, 0, 0]));
+    vm.set_property(weapon, "FireOffset", 0, Value::Vector([10.0, 20.0, 30.0]));
+    vm.set_property(weapon, "WHand", 0, Value::Byte(1));
+    vm.set_property(ammo, "bInstantHit", 0, Value::Bool(true));
+    let point = call_native(&mut vm, "IAController.DirectionDuTir", ctrl, &[], &mut []);
+    assert_eq!(
+        point,
+        NativeOutcome::Value(Value::Vector([4090.0, -2000.0, 265.0]))
+    );
+    assert_eq!(
+        vm.vector_prop(ctrl, "WeaponStartTrace"),
+        Some([4026.0, -1980.0, 390.0])
+    );
+    assert_eq!(
+        vm.vector_prop(ctrl, "DirectionTir"),
+        Some([4090.0, -2000.0, 265.0])
+    );
+    // Repeated calls after translation must translate both products, not normalize a point.
+    vm.set_property(pawn, "Location", 0, Value::Vector([5000.0, -2000.0, 300.0]));
+    vm.set_property(
+        enemy,
+        "Location",
+        0,
+        Value::Vector([5100.0, -2000.0, 300.0]),
+    );
+    vm.set_property(
+        ctrl,
+        "EnemyTargetPos",
+        0,
+        Value::Vector([5090.0, -2000.0, 300.0]),
+    );
+    assert_eq!(
+        call_native(&mut vm, "IAController.DirectionDuTir", ctrl, &[], &mut []),
+        NativeOutcome::Value(Value::Vector([5090.0, -2000.0, 265.0]))
+    );
+    assert_eq!(
+        vm.vector_prop(ctrl, "WeaponStartTrace"),
+        Some([5026.0, -1980.0, 390.0])
+    );
+    vm.set_property(ctrl, "Angle_Visee", 0, Value::Float(14.0));
+    vm.set_property(ctrl, "bTirSurConeMax", 0, Value::Bool(true));
+    for _ in 0..50 {
+        let NativeOutcome::Value(Value::Vector(point)) =
+            call_native(&mut vm, "IAController.DirectionDuTir", ctrl, &[], &mut [])
+        else {
+            panic!("aim vector");
+        };
+        let lateral = ((point[1] + 2000.0).powi(2) + (point[2] - 265.0).powi(2)).sqrt();
+        assert!((lateral - 100.0 * 14.0_f32.to_radians().tan()).abs() < 0.002);
+        assert_eq!(
+            point[0], 5090.0,
+            "cone offset is perpendicular, not normalized world position"
+        );
+    }
+    vm.set_property(ctrl, "EnemyTargetPos", 0, Value::Vector([0.0; 3]));
+    assert_eq!(
+        call_native(&mut vm, "IAController.DirectionDuTir", ctrl, &[], &mut []),
+        NativeOutcome::Value(Value::Vector([0.0; 3]))
+    );
+    vm.set_property(ctrl, "BaseS", 0, Value::Object(None));
+    assert_eq!(
+        call_native(&mut vm, "IAController.DirectionDuTir", ctrl, &[], &mut []),
+        NativeOutcome::Value(Value::Vector([0.0; 3]))
+    );
+}
+
+#[test]
+fn item51b_fire_start_rotates_offsets_zoom_and_owner_fallback() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pawn = vm.spawn(pg(&set, "Pawn"), "Pawn").unwrap();
+    let weapon = vm.spawn(pg(&set, "Actor"), "Weapon").unwrap();
+    vm.set_property(pawn, "Location", 0, Value::Vector([100.0, 200.0, 300.0]));
+    vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(60.0));
+    vm.set_property(pawn, "EyeHeight", 0, Value::Float(50.0));
+    vm.set_property(
+        weapon,
+        "Owner",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    vm.set_property(weapon, "FireOffset", 0, Value::Vector([10.0, 20.0, 30.0]));
+    let mut axes = [
+        Value::Vector([0.0, 1.0, 0.0]),
+        Value::Vector([-1.0, 0.0, 0.0]),
+        Value::Vector([0.0, 0.0, 1.0]),
+    ];
+    assert_eq!(
+        call_native(&mut vm, "Weapon.GetFireStart", weapon, &[], &mut axes),
+        NativeOutcome::Value(Value::Vector([80.0, 210.0, 380.0]))
+    );
+    assert_eq!(vm.obj_prop(weapon, "Instigator"), Some(pawn));
+    vm.set_property(weapon, "bZoomed", 0, Value::Bool(true));
+    assert_eq!(
+        call_native(&mut vm, "Weapon.GetFireStart", weapon, &[], &mut axes),
+        NativeOutcome::Value(Value::Vector([100.0, 210.0, 350.0]))
+    );
+    assert_eq!(
+        call_native(&mut vm, "BaseSoldier.EyePosition", pawn, &[], &mut []),
+        NativeOutcome::Value(Value::Vector([0.0, 0.0, 60.0]))
+    );
+    vm.set_property(weapon, "Instigator", 0, Value::Object(None));
+    vm.set_property(
+        weapon,
+        "Owner",
+        0,
+        Value::Object(Some(ObjRef::Instance(weapon))),
+    );
+    assert_eq!(
+        call_native(&mut vm, "Weapon.GetFireStart", weapon, &[], &mut axes),
+        NativeOutcome::Value(Value::Vector([0.0; 3]))
+    );
+}
+
+#[test]
+fn item51b_blood_flow_grows_reprojects_and_uses_strict_unclamped_threshold() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let blood = vm.spawn(pg(&set, "Actor"), "Blood").unwrap();
+    vm.set_property(blood, "DrawScale", 0, Value::Float(0.05));
+    for _ in 0..60 {
+        assert_eq!(
+            call_native(
+                &mut vm,
+                "BloodFlow.GrowBloodFlow",
+                blood,
+                &[],
+                &mut [Value::Float(1.0 / 60.0)]
+            ),
+            NativeOutcome::Value(Value::Bool(false))
+        );
+    }
+    assert!((vm.f32_prop(blood, "DrawScale") - 0.1).abs() < 1e-6);
+    let events = vm.drain_events();
+    assert_eq!(events.len(), 120);
+    assert!(matches!(
+        &events[0],
+        crate::PresentationEvent::ProjectorDetach { force: true, .. }
+    ));
+    assert!(matches!(
+        &events[1],
+        crate::PresentationEvent::ProjectorAttach { .. }
+    ));
+    vm.set_property(blood, "DrawScale", 0, Value::Float(0.35));
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "BloodFlow.GrowBloodFlow",
+            blood,
+            &[],
+            &mut [Value::Float(0.0)]
+        ),
+        NativeOutcome::Value(Value::Bool(false))
+    );
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "BloodFlow.GrowBloodFlow",
+            blood,
+            &[],
+            &mut [Value::Float(10.0)]
+        ),
+        NativeOutcome::Value(Value::Bool(true))
+    );
+    assert!(
+        vm.f32_prop(blood, "DrawScale") > 0.8,
+        "overshoot is not clamped"
+    );
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "BloodFlow.GrowBloodFlow",
+            blood,
+            &[],
+            &mut [Value::Float(-20.0)]
+        ),
+        NativeOutcome::Value(Value::Bool(false))
     );
 }
 

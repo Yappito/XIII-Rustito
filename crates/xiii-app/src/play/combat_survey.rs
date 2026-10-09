@@ -123,6 +123,56 @@ fn opt_in_item51_combat_survey() {
         let mut player_shots = 0;
         for event in &vm.trace {
             match &event.kind {
+                TraceKind::Native {
+                    path,
+                    this,
+                    args,
+                    result,
+                    ..
+                } if matches!(
+                    path.as_str(),
+                    "IAController.DirectionDuTir"
+                        | "IAController.LineOfFireObstacle"
+                        | "Weapon.GetFireStart"
+                        | "Pawn.GetViewRotation"
+                        | "Actor.Trace"
+                ) =>
+                {
+                    println!(
+                        "[combat-ray-native] {map} t={:.3} {this} {path} {args:?} -> {result}",
+                        event.time
+                    );
+                }
+                TraceKind::Note(note) if note.starts_with("combat-ray") => {
+                    println!("[combat-ray] {map} t={:.3} {note}", event.time);
+                }
+                TraceKind::Event {
+                    target,
+                    function,
+                    args,
+                } if [
+                    "SeePlayer",
+                    "SeePawn",
+                    "HearNoise",
+                    "Fire",
+                    "NotifyFiring",
+                    "EndGame",
+                    "GameEnded",
+                    "Trigger",
+                    "CauseGoal",
+                    "SetGoalComplete",
+                    "SetGoalFailed",
+                    "PoteDeclencheAlarme",
+                    "ChercheAlarme",
+                ]
+                .iter()
+                .any(|f| function.ends_with(&format!(".{f}"))) =>
+                {
+                    println!(
+                        "[combat-chain] {map} t={:.3} {target} {function} {args:?}",
+                        event.time
+                    );
+                }
                 TraceKind::Native { path, this, .. } if path == "Weapon.PlayFiringSound" => {
                     let instigator =
                         vm.find_object(this)

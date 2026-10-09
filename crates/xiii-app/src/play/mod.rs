@@ -4588,6 +4588,14 @@ mod tests {
         let health = s.actor_health(soldier);
         let dead = s.actor_is_dead(soldier);
         let weapon = s.player_weapon();
+        if std::env::var("XIII_SURVEY").as_deref() == Ok("1") {
+            for event in &s.vm().trace {
+                if event.time >= 60.0 && matches!(&event.kind,
+                    xiii_script::TraceKind::Note(n) if n.starts_with("combat-ray")) {
+                    println!("[item51b-kill-ray] {event:?}");
+                }
+            }
+        }
         println!(
             "[fight test] player weapon {:?}, BaseSoldier6 health {health:?} dead={dead}",
             weapon.map(|w| s.vm().objects[w as usize].name.clone())
