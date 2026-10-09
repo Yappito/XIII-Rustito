@@ -1,12 +1,37 @@
 # Handoff for the next implementation agent
 
-Updated: **2026-10-07 (morning, coordinator handover)**. Research phase (2026-10-04), M0, M1 and the M2 first passes are done; the second 2026-10-05 session added collision, placement, BSP zones and the script VM's spawn/lifecycle/physics layer. Start with **"Next session: start here"** below.
+Updated: **2026-10-09 (coordinator session)**. Research phase (2026-10-04), M0, M1 and the M2 first passes are done; the second 2026-10-05 session added collision, placement, BSP zones and the script VM's spawn/lifecycle/physics layer. Start with **"Next session: start here"** below.
 
 ## Next session: start here
 
-State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `a6e1abd` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
+State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `7fe4712` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
-### Coordinator handover (2026-10-07 morning) — read this first
+### Session 2026-10-09 — read this first
+
+Everything verified is on `origin/main` (`7fe4712`, 902 tests passed, Plage00 `--trace`
+byte-identical). Open work (git-ignored worktrees under `P:/AI/XIII/local/wt/*`):
+
+| Worktree / branch | State | What to do |
+|---|---|---|
+| `audio` / `item30-plage01-walk` | Plage01 route walked with **no teleports** (hut, beach ReachSpec walk incl. running jump, back route, truck), fights with the level's Beretta; `Spawn` gives spawned actors the spawner's `Instigator` (Engine.dll `execSpawn` 0x103e5785 -> `SpawnActor` 0x10388d91), host corpse-chain fix-up removed. After merging main (AI natives/hearing/collision) the killer fight broke; agent (EUM session `ses_edf337fa8ffenQlC3lX0mOQCqu`) re-authoring it. | Review, merge origin/main again (item47 decoded trace filter supersedes the branch's `bCollideActors||bProjTarget` tweak), verify, push. |
+| `sweep` / `item40f-amos01-duct` | Amos01: route reaches the zone-26 duct (item40e on main). Agent finding how to pass grille `BreakAbleMover17` and reach TT39. | Review, verify, push. |
+| `ai` / `item48-missing-natives` | Parked (OpenAI limit): disassembly notes only (`local/re/item48/`). `AdjustAimForDisplay` landed as Partial in item47b; remaining `VisibleDamageableActors` (HurtRadius, explosive barrels) and `WaveHasPosition` (DialogueManager.Speak). | Resume when a provider is free; rerun the survey after. |
+
+**Providers (2026-10-09, user's instructions):** opencode `eum/glm-5.3-flash` (EUM provider, up to
+4 concurrent sessions), opencode `zai-coding-plan/glm-5.3-flash` (5-hour limit), opencode
+`openai/gpt-6.1-sol` (one session; hit its limit), Codex CLI `gpt-6.1-sol`
+(`CODEX_MODEL=gpt-6.1-sol bash local/codex-run-model.sh`; out of credits after ~485k tokens),
+Opus sub-agents for hard RE (used for AI hearing and the Amos01 doorway). `local/oc-launch.sh` now
+tells agents to read game data through bash (the Read tool denies the `XIII_Game` junction as an
+external directory) and to run verify with a long bash timeout.
+
+**Review lessons this session:** delegates left ungated `println!` diagnostics in library code
+and claimed "no leftovers"; one added a host bridge that hid a VM defect (`Spawn` Instigator);
+one lowered the call-depth limit to fit the host stack; two parallel branches decoded the same
+trace/inventory mechanism differently — check script bytecode yourself (`xiii-tool script disasm`)
+when agents disagree. Delegates cannot view images: take and look at screenshots yourself.
+
+### Earlier coordinator handover (2026-10-07 morning, historical)
 
 The coordinating Claude session ran out of weekly usage. Everything verified is on `origin/main`
 (`a6e1abd`). Open work lives on local branches in `P:/AI/XIII/local/wt/*` (git-ignored worktrees on
@@ -73,7 +98,7 @@ Launch through Bash `run_in_background` with `timeout: 7200000`.
 ### Environment notes
 
 - cargo/rustc in `C:\Users\ZoliBen\.cargo\bin` (Git Bash: `export PATH="$HOME/.cargo/bin:$PATH"`). Rust 1.99.0 pinned, MSVC 14.44. No `gh` CLI.
-- Full verification (about 2-4 minutes warm): `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && XIII_GOG_DIR=P:/AI/XIII/XIII_Game XIII_STEAM_DIR="P:/SteamLibrary/steamapps/common/XIII - Classic" cargo test --workspace`. Last result (`a6e1abd`): **829 passed, 0 failed**. Use `bash P:/AI/XIII/local/verify.sh` (git-ignored helper: fmt + clippy + full tests with real exit status) before every push; piping cargo into `tail`/`awk` once masked a compile failure and broke main. Use absolute paths: some older opt-in tests resolve relative `XIII_GOG_DIR` against the crate directory.
+- Full verification (about 2-4 minutes warm): `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && XIII_GOG_DIR=P:/AI/XIII/XIII_Game XIII_STEAM_DIR="P:/SteamLibrary/steamapps/common/XIII - Classic" cargo test --workspace`. Last result (`7fe4712`): **902 passed, 0 failed**. Use `bash P:/AI/XIII/local/verify.sh` (git-ignored helper: fmt + clippy + full tests with real exit status) before every push; piping cargo into `tail`/`awk` once masked a compile failure and broke main. Use absolute paths: some older opt-in tests resolve relative `XIII_GOG_DIR` against the crate directory.
 - Viewer: `cargo run -p xiii-app --release -- --map Plage01 --game-dir XIII_Game` (`--exit-after-secs N --screenshot <png>`, `--dump`, `--collision-test`, `--reach-test`, `--lighting off|baked`). Character: `--model xiiipersos.XIIIM --anim Walk`. Movement + VM prototype: `--play --map Plage01 [--play-script <file>]` (E = use). Headless VM: `xiii-tool script run --game-dir XIII_Game --map Plage00 --begin-play --physics map --anim map --nav map --events`.
 - Disassembler (user-approved): `llvm-objdump` from `rustup component add llvm-tools`, at `C:/Users/ZoliBen/.rustup/toolchains/1.99.0-x86_64-pc-windows-msvc/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-objdump.exe`. DLLs are read only; disassembly output stays in git-ignored `local/re/`, never committed or pasted into code.
 - Launch parallel opencode runs a few seconds apart: simultaneous starts fail with `database is locked`.
@@ -81,7 +106,7 @@ Launch through Bash `run_in_background` with `timeout: 7200000`.
 
 ### In flight
 
-Nothing is running. See the coordinator handover table above.
+See the 2026-10-09 table above (item30c, item40f running when this was written; item48 parked).
 
 ## User intent
 
@@ -199,6 +224,46 @@ Per-task reports with all numbers and commands: `local/reports/item1-collision.m
 - **Presentation:** HUD via script `PostRender` + 27 Canvas/HUD natives + decoded fonts; localisation (`xiii-locale`, XIII `localized` flag is `0x00400000`); audio: Sound -> HX by GUID resource reference (96.7%), music streamed from `.hsc`, ambient emitters with XIII roll-off; materials (blend/two-sided/animated UVs); baked vertex lighting (static meshes, terrain); particles (815 systems; triggered emitters start inactive per `TrigerredEmitter.PostBeginPlay`); BSP Model tail decoded from `UModel::Serialize` (6,396/7,194 byte-exact; `LightMap` empty in 7,192).
 - **Performance:** VM tick 2.6 ms -> 0.36-0.52 ms (Banque01, ~900 actors); all maps > 240 FPS release on the RTX 4090.
 - **Scale:** 90 UU/m (user-approved estimate).
+
+### Eighth block (2026-10-09, up to `7fe4712`) — measured, prototype, not a playable mission
+
+- **AI hearing (item41c, Engine.dll):** `execMakeNoise` (0x103aff40) -> `CheckNoiseHearing`
+  (0x1036b6d0: two per-instigator noise slots with 0.2 s / 50 UU repeat suppression, listener
+  selection by player/Tag, `ControllerList` walk with `IsProbing(HearNoise)`) -> `CanHear`
+  (0x1036b0f0: `HearingThreshold^2*Loudness*(Alertness+1)` range, eye-line LOS, muffled and
+  around-corner branches). Zone hearing and the BSP-only traces are Partial. Base01: a soldier hears
+  a Beretta shot from 300 UU behind and goes `Acquisition` -> `Attaque` by the game's scripts.
+- **AI natives (item46, XIDPawn.dll):** `LineOfFireObstacle`, `FindNewStakeOutDir`,
+  `FindBestPathTo`, `IncAttaque`/`DecAttaque`, `PseudoSteering` retail gate, `MoveTo`/`MoveToward`
+  through `setMoveTimer` speed + acceleration. All still Partial with precise reasons.
+- **Sight (item27m):** `CanSee`/`SeePawn`/`LineOfSightTo` decoded (base-Location trace, Enemy
+  eye retry, 8000/2000 UU gates, SightRadius). `TriggerEvent` is tag-matched.
+- **Collision (item27k, item40e):** movers' static base-pose copy removed when they move; start-
+  penetrating hits discarded like `ULevel::MoveActor`'s 2 UU back-off (0x1038a981/0x1038aba8);
+  destroyed/non-colliding movers stop colliding; traces that hit mover geometry return the mover;
+  coplanar-edge separation in the box sweep.
+- **Traces/inventory (item47b):** actor traces follow the decoded filter (collision hash =
+  `bCollideActors`; `ShouldTrace` per actor type; `bHidden` is not a criterion);
+  `AcceptInventory` at every map entry (`ULevel::SpawnPlayActor` 0x1038d6c5) gives the default
+  Fists (`bMeleeWeapon` -> `AddAmmo(PickupAmmoCount=1)`), which ends the campaign-start
+  `SwitchWeapon(0)` recursion; `AdjustAimForDisplay` (native 498, 0x1036e2e0) Partial (no
+  snap-to-target), which unblocked the HUD `PostRender` and Banque01's cartoon gate.
+- **Animation (item47):** per-channel tween (one cached pose), channel blending with bone
+  subtrees, loop wrap interpolation, bone controllers, `AttachToBone` (`AttachmentBone`) transforms:
+  soldiers draw their weapons in their hands (checked on a Base01 screenshot).
+- **Script VM:** recursion limit 250 as Core.dll `UObject::ProcessInternal` (0x101166e0);
+  VM-driving binary entry points run on a 64 MiB stack (the 1 MiB main thread overflowed first).
+- **Routes:** Banque01 completes both objectives through the game's chains without `set_goal` and
+  travels to Amos01 (~182 s); 9 of 14 legs walked, 5 labelled teleports remain (strongroom entry
+  and escape touches: no nav path / measured walker wedges). Amos01: the "sealed doorway" is a wall
+  cupboard; the real exit `Porte17` opens, a grabbed chair breaks a vent grille, the route reaches
+  the duct (rooftop not yet). Plage01 walked without teleports is on a branch (see table).
+- **Campaign survey (item45):** `xiii-app --survey` runs every campaign map's real login for 90 s:
+  34/35 return control (MapCredits is the credits screen), 0 crashes, USA01 spawns airborne from a
+  high PlayerStart. Remaining per-map failures before item47: `AdjustAimForDisplay` (now Partial),
+  `VisibleDamageableActors` (2 maps), `WaveHasPosition` (2), `IAController.Init`'s
+  `WaitForLanding` on Plage01 (lands with item30c).
+- Full verification at `7fe4712`: 902 passed; Plage00 `--trace` byte-identical.
 
 ### Seventh block (2026-10-07 night, up to `a6e1abd`) — measured, prototype, not a playable mission
 
@@ -327,15 +392,20 @@ Native Windows reports an RTX 4090. Rust/Cargo were not found on the inspected W
 
 ## Exact next work
 
-1. **Banque01 without bridges:** author the cutscene-following route (spec
-   `local/tasks/item27j-banque-story-route.md`, findings above), remove the two `set_goal` lines.
-2. **Plage01 without teleports:** assemble item30's walked segments (`audio` branch), then the
-   windowed run.
-3. **Merge item44** (tests) after your own verify.
-4. **Amos01:** route to "Rejoin the soldier on the rooftops" and travel to `Toits01`.
-5. **AI hearing:** decode `CheckNoiseHearing`/`CanHear` before any `MakeNoise` dispatch.
-6. **Performance:** benchmark item39 on a quiet machine; `vm_step` still dominates busy maps.
-7. **Menus/rendering:** menu backdrop and comic outline need retail reference captures from the user.
+1. **Plage01 walked route** (item30c, `audio` branch): finish the fight against the now more
+   engine-accurate AI, merge (resolve the trace filter in favour of item47's decoded rule).
+2. **Amos01** (item40f): duct -> rooftop objective -> travel to Toits01.
+3. **Missing natives** (item48): `VisibleDamageableActors` (HurtRadius), `WaveHasPosition`;
+   `AdjustAimForDisplay` snap-to-target path.
+4. **Banque01 residual teleports:** the five strongroom/escape teleports (measured walker wedges at
+   x=-7010, y=-2046, x=964 may be walker defects; the original nav graph has no path there).
+5. **Survey-driven:** rerun `xiii-app --survey` after each batch; next campaign maps after
+   Toits01 in `NextMapLevelWithUnr` order.
+6. **Host bridges still in use:** route `equip`/`wake`/`set_goal`/`take_control` diagnostic
+   commands, deco-pickup `TargetActor` assignment (item40e), `search_corpse` fix-up (item30c says
+   it covers a deferred-call orphan). Each needs its engine path.
+7. **Performance:** benchmark item39 on a quiet machine; `vm_step` dominates busy maps.
+8. **Menus/rendering:** menu backdrop and comic outline need retail reference captures from the user.
 
 Do not report playable progress from the viewer, the `--play` prototype or headless traces until a mission can be completed by the game's own logic without host shortcuts.
 
