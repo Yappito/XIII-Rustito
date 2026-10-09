@@ -6687,6 +6687,26 @@ impl<'s> Vm<'s> {
             rotation.or_else(|| self.rotator_prop(spawner, "Rotation")),
         );
         self.set_property(id, "Owner", 0, Value::Object(owner.map(ObjRef::Instance)));
+        // Engine.dll evidence for the spawned actor's `Instigator`: `AActor::execSpawn`
+        // (0x103e56b0) reads the *calling* actor's `Instigator` (this+0x88) and pushes it as the
+        // first push, i.e. the last argument of `ULevel::SpawnActor` (call at 0x103e57e3 through
+        // XLevel vtable slot 0x2c); `ULevel::SpawnActor` (0x10388a20, mangled signature ends
+        // `PAVAPawn@@`) stores that argument directly into the new actor's `Instigator`
+        // (0x10388d91: `movl 0x38(%ebp),%ecx; movl %ecx,0x88(%esi)`), before
+        // `AActor::SetOwner` (0x10388d86..0x10388d8c passes [ebp+0x34]; `SetOwner` at
+        // 0x10352e30 writes only `Owner` (new actor offset 0x70) and flags, never
+        // `Instigator`). So a spawned actor's `Instigator` is the *spawning actor's*
+        // `Instigator` regardless of the explicit `SpawnOwner` argument - e.g. the ammunition
+        // spawned inside `Weapon.GiveAmmo` inherits the weapon's `Instigator` (the pawn after
+        // `GiveTo`).
+        if let Some(instigator) = self.obj_prop(spawner, "Instigator") {
+            self.set_property(
+                id,
+                "Instigator",
+                0,
+                Value::Object(Some(ObjRef::Instance(instigator))),
+            );
+        }
         self.set_property(
             id,
             "Tag",
@@ -7724,10 +7744,16 @@ impl<'s> Vm<'s> {
             } else {
                 self.bool_prop(b, "bBlockZeroExtentTraces")
             };
-            // The engine's actor-trace also reaches actors in the collision list (`bCollideActors`)
-            // even when they do not set the extent flag (a traced pawn may clear `bCollideActors`
-            // but still block a hitscan through `bBlockZeroExtentTraces`); accept either.
-            if !gate && !self.bool_prop(b, "bCollideActors") {
+            // The engine's actor-trace reaches actors in the collision list even without the
+            // extent flag, and - measured on Plage01 - `BaseSoldier6` blocks hitscan traces with
+            // `bCollideActors=false` and `bBlockZeroExtentTraces=true`: the extent flag is the
+            // operative gate, refined by the actor's collision role. The game's own data marks
+            // every shootable actor `bProjTarget=true` (pawns, `DecoBouteille` bottles) while
+            // pure effects are not: the muzzle-flash `MuzzleLight` inherits
+            // `bBlockZeroExtentTraces=true` but is `bCollideActors=false` + `bProjTarget=false`,
+            // and `XIIIWeaponAttachment.MuzzleAttach` 0x0082 spawns it at the muzzle on every
+            // equip - it must not stop the next bullet trace.
+            if !gate || !(self.bool_prop(b, "bCollideActors") || self.bool_prop(b, "bProjTarget")) {
                 continue;
             }
             // A trace must ignore both the tracer's owners and its owned attachments. UE2's
@@ -7785,7 +7811,11 @@ impl<'s> Vm<'s> {
             } else {
                 self.bool_prop(id, "bBlockZeroExtentTraces")
             };
-            if !gate && !self.bool_prop(id, "bCollideActors") {
+            // Same filter as [`Vm::trace_actors`]: the extent flag refined by the actor's
+            // collision role (`bCollideActors` or `bProjTarget`) - see the measured evidence
+            // there (`BaseSoldier6` vs the muzzle-flash `MuzzleLight`).
+            if !gate || !(self.bool_prop(id, "bCollideActors") || self.bool_prop(id, "bProjTarget"))
+            {
                 continue;
             }
             if self.is_owned_by(id, caller) || self.is_owned_by(caller, id) {

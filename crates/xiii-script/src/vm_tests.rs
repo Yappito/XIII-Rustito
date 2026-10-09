@@ -1090,6 +1090,7 @@ fn spawn_fixture() -> Vec<u8> {
     let vector_extra = compact(vector_struct);
     let rotator_extra = compact(rotator_struct);
     let owner = b.reserve(IMP_OBJECTPROP, actor, "Owner");
+    let instigator = b.reserve(IMP_OBJECTPROP, actor, "Instigator");
     let level = b.reserve(IMP_OBJECTPROP, actor, "Level");
     let tag = b.reserve(IMP_NAMEPROP, actor, "Tag");
     let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
@@ -1098,7 +1099,8 @@ fn spawn_fixture() -> Vec<u8> {
     let bstatic = b.reserve(IMP_BOOLPROP, actor, "bStatic");
     let deleted = b.reserve(IMP_BOOLPROP, actor, "bDeleteMe");
     let spawned = b.reserve(IMP_FUNCTION, actor, "Spawned");
-    b.prop_with(owner, level, 0, &object_extra);
+    b.prop_with(owner, instigator, 0, &object_extra);
+    b.prop_with(instigator, level, 0, &object_extra);
     b.prop_with(level, tag, 0, &object_extra);
     b.prop(tag, location, 0);
     b.prop_with(location, rotation, 0, &vector_extra);
@@ -1371,6 +1373,64 @@ fn spawn_sets_defaults_owner_tag_and_location() {
     assert_eq!(
         vm.get_property(id2, "Tag"),
         Some(&Value::Name("Child".into()))
+    );
+}
+
+#[test]
+fn spawned_actor_inherits_the_spawners_instigator() {
+    // Engine.dll: `AActor::execSpawn` (0x103e56b0) passes the calling actor's `Instigator`
+    // (this+0x88) as `ULevel::SpawnActor`'s last argument, and `SpawnActor` (0x10388a20) stores
+    // that argument directly into the new actor's `Instigator` field (0x10388d91 stores
+    // [ebp+0x38] to [newactor+0x88]) - `SetOwner` (0x10352e30) never touches `Instigator`. So
+    // the spawned actor's `Instigator` is the *spawning actor's* `Instigator` even when an
+    // explicit `SpawnOwner` is supplied (the Weapon.GiveAmmo ammo case: the ammo inherits the
+    // weapon's Instigator - the pawn after GiveTo - while its Owner is the weapon).
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pawn = vm.spawn(sg(&set, "Actor"), "Pawn").unwrap();
+    let spawner = vm.spawn(sg(&set, "Actor"), "Spawner").unwrap();
+    vm.set_property(
+        spawner,
+        "Instigator",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    let explicit_owner = vm.spawn(sg(&set, "Actor"), "ExplicitOwner").unwrap();
+    // An explicit SpawnOwner does not change the inherited Instigator.
+    let id = vm
+        .spawn_actor(
+            spawner,
+            Some(sg(&set, "Child")),
+            Some(explicit_owner),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("spawned with owner");
+    assert_eq!(
+        vm.get_property(id, "Owner"),
+        Some(&Value::Object(Some(ObjRef::Instance(explicit_owner))))
+    );
+    assert_eq!(
+        vm.get_property(id, "Instigator"),
+        Some(&Value::Object(Some(ObjRef::Instance(pawn))))
+    );
+    // A spawner without an Instigator leaves the field None (LevelInfo-level spawns).
+    let id2 = vm
+        .spawn_actor(
+            explicit_owner,
+            Some(sg(&set, "Child")),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("spawned without owner");
+    assert_eq!(
+        vm.get_property(id2, "Instigator"),
+        Some(&Value::Object(None))
     );
 }
 
@@ -3440,6 +3500,61 @@ fn host_written_location_drives_touch_refresh() {
 }
 
 #[test]
+fn trace_extent_flag_needs_the_actor_collision_role() {
+    // Measured on Plage01 (item30c): `BaseSoldier6` blocks hitscan traces with
+    // `bCollideActors=false` + `bBlockZeroExtentTraces=true` + `bProjTarget=true`, while the
+    // muzzle-flash `MuzzleLight` (spawned at the muzzle by `MuzzleAttach` once the spawn fix
+    // gives the weapon attachment an Instigator) has the same extent flag but
+    // `bCollideActors=false` + `bProjTarget=false` and must not stop the bullet. The extent
+    // flag is the gate; the collision role (`bCollideActors` or `bProjTarget`) qualifies it.
+    let set = set_of(trace_package());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let light = vm.spawn(g(&set, "Actor"), "MuzzleLight").unwrap();
+    let pawn = vm.spawn(g(&set, "Actor"), "Pawn").unwrap();
+    // The tracer is a third actor off the ray, spawned last like the sibling tests.
+    let shooter = vm.spawn(g(&set, "Actor"), "Shooter").unwrap();
+    vm.set_active(shooter, true);
+    for (id, x) in [(light, 50.0), (pawn, 100.0)] {
+        vm.set_property(id, "Location", 0, Value::Vector([x, 0.0, 0.0]));
+        vm.set_property(id, "CollisionRadius", 0, Value::Float(24.0));
+        vm.set_property(id, "CollisionHeight", 0, Value::Float(24.0));
+        vm.set_property(id, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+        vm.set_property(id, "bProjTarget", 0, Value::Bool(id == pawn));
+        vm.set_active(id, true);
+    }
+    // The muzzle light: no collision role -> not a trace candidate; the pawn wins.
+    let mut args = trace_args();
+    let hit = call_native(
+        &mut vm,
+        "Actor.Trace",
+        shooter,
+        &[false, false, false, false, false, false],
+        &mut args,
+    );
+    assert_eq!(
+        hit,
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(pawn)))),
+        "a non-colliding non-proj-target actor must not block the bullet trace"
+    );
+    // Give the light the pawn's role and it becomes the nearer hit.
+    vm.set_property(light, "bProjTarget", 0, Value::Bool(true));
+    let mut args = trace_args();
+    let hit = call_native(
+        &mut vm,
+        "Actor.Trace",
+        shooter,
+        &[false, false, false, false, false, false],
+        &mut args,
+    );
+    assert_eq!(
+        hit,
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(light)))),
+        "the same actor with a collision role blocks the trace again"
+    );
+}
+
+#[test]
 fn trace_skips_weapon_owned_first_person_muzzle_flash() {
     // item18 B11: `M60.TraceFire` could hit its own `StarFPMF` attachment before the pawn. The
     // attachment has `bCollideActors=false` but `bBlockZeroExtentTraces=true`; UE2's owner-chain
@@ -3592,7 +3707,9 @@ fn trace_hits_nearer_of_world_and_actor_and_fasttrace_ignores_actors() {
     let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
     set_collision_fields(&mut vm, tracer, true, false);
     let b = phys_actor(&mut vm, &set, "B", [40.0, 0.0, 0.0]);
-    set_collision_fields(&mut vm, b, true, false);
+    // Blocking shape as measured on the game's shootable actors: the extent flag opts the actor
+    // into traces (`set_collision_fields` writes it with `blocking=true`).
+    set_collision_fields(&mut vm, b, true, true);
 
     // Actor closer than the wall -> the actor is returned.
     let mut args = vec![
@@ -7125,13 +7242,15 @@ fn trace_package() -> Vec<u8> {
     let radius = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
     let height = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
     let collide = b.reserve(B_BOOLPROP, actor, "bCollideActors");
+    let proj_target = b.reserve(B_BOOLPROP, actor, "bProjTarget");
     let bzero = b.reserve(B_BOOLPROP, actor, "bBlockZeroExtentTraces");
     let bnz = b.reserve(B_BOOLPROP, actor, "bBlockNonZeroExtentTraces");
     b.prop_with(loc, rot, 0, &compact(vector));
     b.prop_with(rot, radius, 0, &compact(rotator));
     b.prop(radius, height, 0);
     b.prop(height, collide, 0);
-    b.prop(collide, bzero, 0);
+    b.prop(collide, proj_target, 0);
+    b.prop(proj_target, bzero, 0);
     b.prop(bzero, bnz, 0);
     b.prop(bnz, 0, 0);
     b.class(object, 0, 0);
@@ -7168,6 +7287,8 @@ fn synthetic_trace_hits_the_nearest_pawn_before_world_geometry() {
         vm.set_property(id, "CollisionRadius", 0, Value::Float(40.0));
         vm.set_property(id, "CollisionHeight", 0, Value::Float(40.0));
         vm.set_property(id, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+        // Measured Plage01 pawn shape: `bCollideActors=false` with `bProjTarget=true`.
+        vm.set_property(id, "bProjTarget", 0, Value::Bool(true));
         vm.set_active(id, true);
     }
     let mut args = trace_args();
