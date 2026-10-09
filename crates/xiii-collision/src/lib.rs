@@ -111,6 +111,11 @@ impl MovingObject {
         self.local.len()
     }
 
+    /// The object's triangles in world space at the current pose (diagnostics).
+    pub fn world_triangles(&self) -> impl Iterator<Item = Triangle> + '_ {
+        (0..self.local.len()).map(|i| self.world_triangle(i))
+    }
+
     /// World-space AABB of the current pose.
     pub fn bounds(&self) -> Aabb {
         self.bounds
@@ -337,6 +342,34 @@ impl CollisionWorld {
             consider_overlap(&mut out, center, half_extents, &t, u32::MAX, source);
         });
         out
+    }
+
+    /// Removes every static triangle with `source` and rebuilds the broad-phase. Returns the
+    /// number of triangles removed. Moving objects are untouched. Used when a collision source's
+    /// triangles move into a [`MovingObject`] (a UE2 `Mover` registration): the static base-pose
+    /// copy must not stay behind, or every query keeps hitting the closed-pose brush after the
+    /// mover has left it.
+    pub fn remove_static_source(&mut self, source: u32) -> usize {
+        let before = self.triangles.len();
+        let mut kept_triangles = Vec::with_capacity(before);
+        let mut kept_sources = Vec::with_capacity(before);
+        let mut kept_origins = Vec::with_capacity(before);
+        for (i, &s) in self.sources.iter().enumerate() {
+            if s == source {
+                continue;
+            }
+            kept_triangles.push(self.triangles[i]);
+            kept_sources.push(s);
+            kept_origins.push(self.origins[i]);
+        }
+        let removed = before - kept_triangles.len();
+        if removed > 0 {
+            self.triangles = kept_triangles;
+            self.sources = kept_sources;
+            self.origins = kept_origins;
+            self.bvh = Bvh::build(&self.triangles);
+        }
+        removed
     }
 
     /// True when any (static or moving) triangle overlaps `(center, half_extents)`.
@@ -665,6 +698,11 @@ fn try_step(
     } else {
         None
     }
+}
+
+/// Public static overlap test between an AABB and one triangle (diagnostics/dumps).
+pub fn aabb_overlaps_triangle(center: Vec3, half: Vec3, t: &Triangle) -> bool {
+    aabb_triangle_overlap(center, half, t).is_some()
 }
 
 /// Static overlap test between an AABB and a triangle with the separating-axis theorem.

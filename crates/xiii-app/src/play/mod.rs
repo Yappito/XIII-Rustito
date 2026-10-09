@@ -3496,13 +3496,22 @@ mod tests {
         let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/banque01_route.script");
         let script = script::Script::load(&route_path).expect("load item24 banque01 route");
+        // 185 s: the item27l walked schedule needs it — the route walks to the vault door
+        // (touches t~88), teleports to DetectionVolume12 at t~90, and Jones then reaches
+        // Cine15's [34] "wait player 300" at t~114.3 (his scene's dialogue/anims run ~24 s
+        // after the DV12 touch; the teleport route reached it at t~69.1 because its DV12 touch
+        // fired at t~47). fin_flash lands at t~118.5, the escape-flow touches run to t~136, and
+        // Cine11's `playerevent fin_map` fires at t~143.7 (measured in
+        // local/re/item27l/route-final4.log). The map-outro video then runs its full 33.92 s
+        // headless before `PlayingVideo.PlayerTick` issues the `ServerTravel` (measured
+        // GameEndedSuccess t~96 -> travel t~131.2 in local/re/item27k/route-final.log).
         let outcome = run_script_with_cinematic_input(
             &game_dir,
             "banque01",
             &script,
             &resolved.params,
             &scene,
-            90.0,
+            185.0,
         )
         .expect("run banque01 route");
         let banque = outcome
@@ -4453,6 +4462,89 @@ mod tests {
         assert!(
             dead || health.is_some_and(|h| h <= 0.0),
             "BaseSoldier6 did not die: health {health:?}, dead {dead}"
+        );
+    }
+
+    /// item44: collect the placed Beretta through the map pickup and verify its ammunition class
+    /// and authored damage path. The teleport only positions the player on the pickup; no weapon
+    /// grant command is used.
+    #[test]
+    fn opt_in_plage01_beretta_pickup_uses_nine_mm_and_damages_soldier() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let script = script::Script::parse(
+            "t=48.00 teleport -737.654 -511.886 1254.94\n\
+             t=49.00 teleport 1802.4131 -12992.034 1070.843\n\
+             t=49.00 yaw 90\nt=49.00 pitch 5\n\
+             t=49.20 fire\nt=49.80 fire\nt=50.40 fire\nt=51.00 fire\nt=51.60 fire\n",
+        )
+        .expect("parse pickup combat route");
+        let outcome = run_script(
+            &game_dir,
+            "Plage01",
+            &script,
+            &resolved.params,
+            &scene,
+            54.0,
+        )
+        .expect("run pickup combat route");
+        let session = &outcome.session;
+        let weapon = session
+            .player_weapon()
+            .expect("map pickup must equip the Beretta");
+        let vm = session.vm();
+        let pickup = vm
+            .objects
+            .iter()
+            .position(|object| object.name.eq_ignore_ascii_case("BerettaPick0"))
+            .expect("Plage01 BerettaPick0") as xiii_script::ObjectId;
+        println!(
+            "[item44] BerettaPick0.InventoryType={} picked weapon.AmmoName={}",
+            vm.obj_path(
+                vm.get_property(pickup, "InventoryType")
+                    .expect("BerettaPick0 InventoryType")
+            )
+            .unwrap_or_else(|| "<None>".to_owned()),
+            vm.obj_path(
+                vm.get_property(weapon, "AmmoName")
+                    .expect("picked Beretta AmmoName")
+            )
+            .unwrap_or_else(|| "<None>".to_owned())
+        );
+        assert!(
+            vm.is_a(weapon, "Beretta"),
+            "expected picked Beretta, got {} ({})",
+            vm.objects[weapon as usize].name,
+            vm.class_path_of(vm.objects[weapon as usize].class)
+                .unwrap_or_default()
+        );
+        let ammo_type = match vm.get_property(weapon, "AmmoType") {
+            Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(ammo)))) => *ammo,
+            other => panic!("picked Beretta AmmoType is not an ammo actor: {other:?}"),
+        };
+        let ammo_name = vm.objects[ammo_type as usize].name.clone();
+        println!("[item44] picked Beretta AmmoType={ammo_name}");
+        assert!(
+            vm.is_a(ammo_type, "c9mmAmmo"),
+            "picked Beretta's AmmoType {ammo_name} is not a c9mmAmmo"
+        );
+        let soldier = vm
+            .find_object("BaseSoldier6")
+            .expect("Plage01 BaseSoldier6");
+        let health = session.actor_health(soldier);
+        println!("[item44] BaseSoldier6 health after picked Beretta shots: {health:?}");
+        assert!(
+            health.is_some_and(|health| health < 550.0),
+            "a shot from the picked Beretta must damage BaseSoldier6"
         );
     }
 

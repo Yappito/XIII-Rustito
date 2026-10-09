@@ -1263,3 +1263,209 @@ fn walking_into_a_moving_wall_is_blocked_and_clears_when_it_moves() {
         clear.position
     );
 }
+
+#[test]
+fn sweep_discard_start_penetration_lets_a_wedged_mover_escape() {
+    // The engine's `ULevel::MoveActor` discards world hits inside the 2-UU back-off behind
+    // the start (Engine.dll 0x1038a89a-0x1038ac05, item27k): for this crate's continuous sweep
+    // that reduces to discarding start-penetrating hits. A box overlapping a wall and moving
+    // into it must NOT be reported as blocked when the discard is on (walk movement), while
+    // the default still blocks (the plain tests above).
+    let mut tris: Vec<(Triangle, u32)> = wall_x(0.0).into_iter().map(|t| (t, 4)).collect();
+    // A second wall the box reaches while clear of the first.
+    tris.extend(wall_x(1.0).into_iter().map(|t| (t, 5)));
+    let w = world(tris);
+    let start = [-0.3 + 1e-4, 0.0, 0.0];
+    let params = SweepParams {
+        discard_start_penetration: true,
+        walkable_floor_z: Some(0.7),
+        ..SweepParams::default()
+    };
+    // The flush first wall is discarded...
+    assert!(
+        sweep_aabb(
+            &w,
+            start,
+            [start[0] + 0.5, 0.0, 0.0],
+            [0.3, 0.5, 0.3],
+            &params
+        )
+        .is_none(),
+        "a start-penetrating contact must not block with the discard on"
+    );
+    // ...but geometry reached from a clear box still blocks, with its own hit.
+    let hit = sweep_aabb(
+        &w,
+        start,
+        [start[0] + 2.0, 0.0, 0.0],
+        [0.3, 0.5, 0.3],
+        &params,
+    )
+    .expect("the second wall must still block");
+    assert!(!hit.start_penetrating, "{hit:?}");
+    assert!(hit.source == 5 && hit.normal[0] < -0.9, "{hit:?}");
+}
+
+#[test]
+fn walk_repeated_steps_along_a_flush_wall_do_not_deadlock() {
+    // Regression (item27k B-2): a pawn overlapping a wall and steering diagonally into it used
+    // to make zero progress on every tick (the slide's float residual re-classified the same
+    // start-penetrating contact as blocking forever). The engine's back-off discard lets each
+    // step proceed; the pawn must advance along the wall.
+    let mut tris: Vec<(Triangle, u32)> = big_floor(0.0).into_iter().map(|t| (t, 1)).collect();
+    tris.extend(wall_x(0.0).into_iter().map(|t| (t, 4)));
+    let w = world(tris);
+    let half = [0.3, 0.5, 0.3];
+    let params = walk_params(0.25);
+    // Flush against the wall (penetrating by 1e-4 m), steering into it and along it.
+    let mut pos = [-0.3 + 1e-4, 0.5, 0.0];
+    let start_x = pos[0];
+    for i in 0..20 {
+        let r = walk_move(&w, pos, [0.05, 0.0, 0.05], half, &params);
+        assert!(
+            r.position[2] > pos[2] + 1e-4,
+            "tick {i} made no progress along the wall: {:?}",
+            r.position
+        );
+        pos = r.position;
+    }
+    assert!(
+        pos[2] > 0.5,
+        "must advance along the wall: x={} z={}",
+        pos[0],
+        pos[2]
+    );
+    let _ = start_x;
+}
+
+#[test]
+fn jones_safe_wedge_synthetic_repro_walks_free() {
+    // Synthetic reconstruction of the item27k B-2 deadlock (Banque01's safe desk): a wedge
+    // whose front face is slanted (normal ~(0, 0.994, 0.112) in Unreal axes, the angle the
+    // real blocker reports) with a pawn box (34,34,75 UU) overlapping the face band by ~8 UU
+    // and steering into it. Before the back-off fix `walk_move` made zero progress forever on
+    // the real soup (measured: 966 identical rejected steps, local/re/item27k/); the pawn must
+    // now advance every tick. All coordinates are synthetic.
+    const S: f32 = 90.0;
+    let to_bevy = |u: [f32; 3]| [u[1] / S, u[2] / S, -u[0] / S];
+    // Wedge in Unreal axes: slanted front face from (y=0, z=-30) rising to (y=-22.4, z=200),
+    // flat back at y=60, x in [-100,100]; its bottom (z=-30) sits below the pawn's box bottom
+    // (z=0) like the real safe's bottom sits below the desk-standing pawn. The pawn stands in
+    // front (+y), its box overlapping the slanted face band by ~8 UU at its bottom tapering to
+    // 0 (the real overlap shape), and steers with delta (-2.2, -1.17, 0) UU (into the face,
+    // along -x).
+    let (x0, x1, yb, z0, z1) = (-100.0f32, 100.0f32, 60.0f32, -30.0f32, 200.0f32);
+    let face_y = |z: f32| -z * (0.112f32 / 0.994);
+    let ya = face_y(z1); // -22.4
+    let c = [
+        [x0, face_y(z0), z0], // 0 front-bottom-left
+        [x1, face_y(z0), z0], // 1 front-bottom-right
+        [x1, ya, z1],         // 2 front-top-right
+        [x0, ya, z1],         // 3 front-top-left
+        [x0, yb, z0],         // 4 back-bottom-left
+        [x1, yb, z0],         // 5 back-bottom-right
+        [x1, yb, z1],         // 6 back-top-right
+        [x0, yb, z1],         // 7 back-top-left
+    ];
+    let f = [
+        [0, 1, 2],
+        [0, 2, 3], // slanted front face
+        [4, 6, 5],
+        [4, 7, 6], // back face
+        [0, 4, 5],
+        [0, 5, 1], // bottom
+        [3, 2, 6],
+        [3, 6, 7], // top
+        [0, 3, 7],
+        [0, 7, 4], // left wall
+        [1, 5, 6],
+        [1, 6, 2], // right wall
+    ];
+    let raw: Vec<[[f32; 3]; 3]> = f.map(|t| t.map(|i| c[i])).to_vec();
+    let world = CollisionWorld::new(raw.into_iter().map(|t| (t.map(to_bevy), 0u32)));
+    let half = [34.0 / S, 75.0 / S, 34.0 / S];
+    let params = WalkParams {
+        skin: 0.001,
+        max_iterations: 4,
+        max_step_height: 35.0 / S,
+        min_floor_z: 0.7,
+    };
+    // Spawn with the box overlapping the face band by ~8 UU (the real pawn overlapped by 7.9).
+    let start_uu = [0.0f32, 26.0, 75.0];
+    // Unreal x is -Bevy z after the importer's axis mapping.
+    let ux = |p: [f32; 3]| -p[2] * S;
+    let mut pos = to_bevy(start_uu);
+    let start = ux(pos);
+    for i in 0..12 {
+        let r = walk_move(&world, pos, to_bevy([-2.2, -1.17, 0.0]), half, &params);
+        assert!(
+            ux(r.position) < ux(pos) - 1e-3,
+            "tick {i} made no progress: {:?}",
+            r.position
+        );
+        pos = r.position;
+    }
+    // 12 ticks x 2.2 UU = 26.4 UU of advance along -x (was exactly 0 before the fix); the
+    // pawn advances until the wedge's left wall blocks the -x push and it slides along it.
+    assert!(start - ux(pos) > 10.0, "net advance {}", start - ux(pos));
+}
+
+#[test]
+fn remove_static_source_drops_only_that_source_and_rebuilds() {
+    let mut tris: Vec<(Triangle, u32)> = floor_y(0.0).into_iter().map(|t| (t, 1)).collect();
+    tris.extend(wall_x(0.0).into_iter().map(|t| (t, 4)));
+    tris.extend(wall_x(1.0).into_iter().map(|t| (t, 5)));
+    let mut w = world(tris);
+    let half = [0.3, 0.5, 0.3];
+    // Box riding above the floor (bottom at y=0.1) sweeping the corridor along +x.
+    let sweep = |w: &CollisionWorld| w.sweep([-2.0, 0.6, 0.0], [3.0, 0.6, 0.0], half);
+    // Before: both walls block.
+    assert!(sweep(&w).is_some());
+    let removed = w.remove_static_source(4);
+    assert_eq!(removed, 2, "wall_x is a 2-triangle quad");
+    // The remaining wall still blocks; the removed one no longer does.
+    let hit = sweep(&w).expect("the surviving wall must block");
+    assert_eq!(hit.source, 5, "the surviving wall must be the blocker");
+    let removed5 = w.remove_static_source(5);
+    assert_eq!(removed5, 2);
+    assert_eq!(w.remove_static_source(4), 0, "removing twice is a no-op");
+    assert!(
+        sweep(&w).is_none(),
+        "the corridor must be clear with both walls removed"
+    );
+}
+
+#[test]
+fn dbg_corner_deadlock() {
+    // Floor + two walls forming an interior corner; the pawn box overlaps both walls slightly
+    // and steers diagonally into the corner.
+    let mut tris: Vec<(Triangle, u32)> = big_floor(0.0).into_iter().map(|t| (t, 1)).collect();
+    tris.extend(wall_x(0.0).into_iter().map(|t| (t, 4)));
+    // A wall in the z = const plane (x,y span): blocking the +z direction... use a z-wall via quad.
+    let wall_z = |z: f32| -> Vec<Triangle> {
+        quad(
+            [-5.0, -5.0, z],
+            [5.0, -5.0, z],
+            [5.0, 5.0, z],
+            [-5.0, 5.0, z],
+        )
+    };
+    tris.extend(wall_z(0.0).into_iter().map(|t| (t, 5)));
+    let w = world(tris);
+    let half = [0.3, 0.5, 0.3];
+    let params = walk_params(0.25);
+    // Overlap wall_x by 1e-4 and wall_z by 1e-4: spawn at (-0.3+1e-4, 0.5, 0.3-1e-4).
+    let mut pos = [-0.3 + 1e-4, 0.5, 0.3 - 1e-4];
+    for i in 0..8 {
+        let r = walk_move(&w, pos, [-0.05, 0.0, -0.05], half, &params);
+        println!(
+            "tick {i}: pos=({:.6},{:.6},{:.6}) blocked={} contacts={}",
+            r.position[0],
+            r.position[1],
+            r.position[2],
+            r.blocked,
+            r.contacts.len()
+        );
+        pos = r.position;
+    }
+}
