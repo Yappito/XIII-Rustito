@@ -30,7 +30,7 @@ use crate::localize::{LocalizationData, placeholder};
 use crate::navigation::{
     NavEdgeInfo, NavPointInfo, NavigationData, find_path, move_step, nearest_point, point_fits,
 };
-use crate::physics::{HitZones, WorldPhysics};
+use crate::physics::{HitZones, WorldHit, WorldPhysics};
 use crate::reflect::{Property, PropertyKind, ScriptObject, function_flags, property_flags};
 use crate::registry::{NativeCtx, NativeDef, NativeOutcome, Registry};
 use crate::value::{Delegate, ObjRef, ObjectId, Ty, Value};
@@ -1038,6 +1038,15 @@ fn vm_move_trace_enabled() -> bool {
     })
 }
 
+/// item27k diagnostic: with `XIII_VM_MOVE_TRACE`, also dump the world primitives overlapping a
+/// blocked pawn's move box (`XIII_VM_MOVE_DUMP`), naming each triangle's source.
+fn vm_move_dump_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("XIII_VM_MOVE_DUMP").is_some_and(|value| value != "0" && !value.is_empty())
+    })
+}
+
 fn cine_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -1226,6 +1235,73 @@ impl NativeProfile {
     }
 }
 
+/// `HearNoise` probe bit: Engine.dll passes `FName(EName 0x156)` (342) to `IsProbing`, and
+/// Core.dll `UObject::IsProbing` maps probe names 300..363 to mask bit `name - 300` (item41c).
+const HEAR_NOISE_PROBE_BIT: u32 = 342 - 300;
+
+/// Squared distance of two float vectors evaluated in double precision, standing in for the
+/// x87 extended-precision `FVector::SizeSquared` the engine computes before storing or comparing.
+fn dist_sq_f64(a: [f32; 3], b: [f32; 3]) -> f64 {
+    let d = |i: usize| f64::from(a[i]) - f64::from(b[i]);
+    d(0) * d(0) + d(1) * d(1) + d(2) * d(2)
+}
+
+/// Engine.dll 0x103db640 (upstream name `FSortedPathList::addPath`), used by `CanHear`'s
+/// around-corner branch: up to 32 nodes in ascending key order. The insertion point comes from a
+/// coarse binary step (count > 8: half, count > 16: an extra quarter step) followed by a linear
+/// scan to the first key `>=` the new one; when full, the last entry falls off. Every entry
+/// shifted down one slot has its key truncated to an integer (the decoded `_ftol` + `fild`).
+#[derive(Debug, Default)]
+struct SortedPathList {
+    nodes: [ObjectId; 32],
+    dist: [f32; 32],
+    count: usize,
+}
+
+impl SortedPathList {
+    fn add(&mut self, node: ObjectId, key: f32) {
+        let n = self.count;
+        let mut i = 0;
+        if n > 8 {
+            let half = n / 2;
+            let step = if key > self.dist[half] {
+                i = half;
+                (n > 16).then_some(n / 4 + half)
+            } else {
+                (n > 16).then_some(n / 4)
+            };
+            if let Some(j) = step
+                && key > self.dist[j]
+            {
+                i = j;
+            }
+        }
+        while i < n && key > self.dist[i] {
+            i += 1;
+        }
+        if i >= 32 {
+            return;
+        }
+        let mut moved_node = self.nodes[i];
+        let mut moved_dist = self.dist[i];
+        self.nodes[i] = node;
+        self.dist[i] = key;
+        if self.count < 32 {
+            self.count += 1;
+        }
+        i += 1;
+        while i < self.count {
+            let (next_node, next_dist) = (self.nodes[i], self.dist[i]);
+            self.nodes[i] = moved_node;
+            // `_ftol` truncates toward zero; only the low 32 bits are reloaded with `fild`.
+            self.dist[i] = (moved_dist as i64) as i32 as f32;
+            moved_node = next_node;
+            moved_dist = next_dist;
+            i += 1;
+        }
+    }
+}
+
 /// The interpreter.
 pub struct Vm<'s> {
     set: &'s ScriptSet,
@@ -1270,6 +1346,8 @@ pub struct Vm<'s> {
     /// Hit-zone provider for `Actor.GetLastTraceBone` (item14). `None` = the default
     /// [`crate::physics::CylinderZones`] is used.
     hit_zones: Option<Box<dyn HitZones>>,
+    /// Partial `CanHear` branches already reported with a trace note (item41c; once per VM).
+    hearing_partials: HashSet<&'static str>,
     /// Bone name recorded by the most recent `Actor.Trace` actor hit, returned by
     /// `Actor.GetLastTraceBone` (`XIIIPawn.LastBoneHit`). `"None"` when the last trace hit world
     /// geometry (or nothing).
@@ -1480,6 +1558,7 @@ impl<'s> Vm<'s> {
             animation: None,
             navigation: None,
             hit_zones: None,
+            hearing_partials: HashSet::new(),
             last_trace_bone: "None".to_owned(),
             voice_duration: None,
             save_slots: None,
@@ -3361,6 +3440,35 @@ impl<'s> Vm<'s> {
         new_value
     }
 
+    /// Engine.dll 0x103e4750/0x103e4870: indexed MusicVars[2].Value, not a name search.
+    /// The native uses integer wrapping and does not clamp unbalanced decrements.
+    pub(crate) fn adjust_attack_music_var(&mut self, id: ObjectId, delta: i32) -> VmResult<()> {
+        let Some(Value::Array(mut entries)) = self.get_property(id, "MusicVars").cloned() else {
+            return Err(self.err(VmErrorKind::Other(
+                "LevelInfo attack counter requires MusicVars[2].Value".into(),
+            )));
+        };
+        let value = entries.get_mut(2).and_then(|entry| match entry {
+            Value::Struct(fields) => fields.iter_mut().find_map(|(name, value)| {
+                if name.eq_ignore_ascii_case("value") {
+                    Some(value)
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        });
+        let Some(Value::Int(value)) = value else {
+            return Err(self.err(VmErrorKind::Other(
+                "LevelInfo attack counter requires integer MusicVars[2].Value".into(),
+            )));
+        };
+        *value = value.wrapping_add(delta);
+        self.set_property(id, "MusicVars", 0, Value::Array(entries));
+        self.note(TraceKind::Note("LevelInfo attack MusicVars updated; audio-device SetMusicVar/attack-mode transition not bridged".into()));
+        Ok(())
+    }
+
     /// Name of the current state.
     pub fn state_name(&self, id: ObjectId) -> Option<String> {
         self.objects
@@ -4157,6 +4265,7 @@ impl<'s> Vm<'s> {
         }
         if let Some(pawn) = pawn {
             let location = self.vector_prop(pawn, "Location");
+            waits.push(format!("pawn-location={location:?}"));
             for property in ["Target", "NextTarget"] {
                 if let Some(target) = self.obj_prop(id, property) {
                     let target_name = self.objects[target as usize].name.clone();
@@ -4466,8 +4575,49 @@ impl<'s> Vm<'s> {
                 }) => {
                     // `Controller.MoveTo`/`MoveToward`: move the pawn each tick; resume when it
                     // arrives or the budget runs out (upstream `MoveTimer`).
-                    let arrived = self.move_pawn_step(pawn, destination, speed, dt)?;
+                    if self.obj_prop(id, "Pawn") != Some(pawn)
+                        || (native == "Controller.MoveToward"
+                            && self.obj_prop(id, "MoveTarget").is_none())
+                    {
+                        if let Some(code) = self.objects[id as usize].state_code.as_mut() {
+                            code.latent = None;
+                        }
+                        continue;
+                    }
+                    let destination = if native == "Controller.MoveToward" {
+                        self.obj_prop(id, "MoveTarget")
+                            .and_then(|target| self.vector_prop(target, "Location"))
+                            .unwrap_or(destination)
+                    } else {
+                        self.vector_prop(id, "Destination").unwrap_or(destination)
+                    };
+                    self.set_property(id, "Destination", 0, Value::Vector(destination));
+                    // execPollMoveTo/MoveToward call UpdateTactics after a strict 0.5 s
+                    // interval, unless steering toward AdjustLoc or preparing a path move.
+                    if self.bool_prop(id, "bAdvancedTactics")
+                        && !self.bool_prop(id, "bAdjusting")
+                        && !self.bool_prop(id, "bPreparingMove")
+                        && self.time - 0.5 > f64::from(self.f32_prop(id, "TacticalOffset"))
+                    {
+                        self.set_property(id, "TacticalOffset", 0, Value::Float(self.time as f32));
+                        let generation = self.objects[id as usize].generation;
+                        self.send_event(id, "UpdateTactics", Vec::new())?;
+                        if self.objects[id as usize].generation != generation {
+                            return Ok(());
+                        }
+                    }
+                    let destination = self.vector_prop(id, "Destination").unwrap_or(destination);
+                    let arrived = if self.bool_prop(id, "bPreparingMove") {
+                        false
+                    } else {
+                        self.controller_move_step(id, pawn, destination, dt)?
+                    };
+                    let remaining = match self.get_property(id, "MoveTimer") {
+                        Some(Value::Float(timer)) => *timer,
+                        _ => remaining,
+                    };
                     let left = remaining - dt;
+                    self.set_property(id, "MoveTimer", 0, Value::Float(left));
                     if !arrived && left >= 0.5 * dt {
                         if let Some(c) = self.objects[id as usize].state_code.as_mut() {
                             c.latent = Some(Latent::Move {
@@ -4484,6 +4634,7 @@ impl<'s> Vm<'s> {
                     if let Some(c) = self.objects[id as usize].state_code.as_mut() {
                         c.latent = None;
                     }
+                    self.set_property(pawn, "bWalking", 0, Value::Bool(false));
                     let actor = self.objects[id as usize].name.clone();
                     self.note(TraceKind::LatentResume {
                         actor,
@@ -7266,16 +7417,333 @@ impl<'s> Vm<'s> {
             end = out.end;
             world_hit = out.hit.is_some();
         }
-        let mut blocked_actor = false;
+        let mut blocked_actor = None;
         if self.bool_prop(id, "bCollideActors")
-            && let Some((t, _)) = self.sweep_blocking_actor(id, start, end)
+            && let Some((t, other)) = self.sweep_blocking_actor(id, start, end)
         {
             end = lerp3(start, end, t);
-            blocked_actor = true;
+            blocked_actor = Some(other);
         }
         self.set_property(id, "Location", 0, Value::Vector(end));
+        // ULevel::MoveActor's captured disassembly is truncated before its Bump event dispatch,
+        // so do not infer a recipient or event order from this incomplete artifact.
         self.refresh_touching(id, true)?;
-        Ok(!world_hit && !blocked_actor)
+        Ok(!world_hit && blocked_actor.is_none())
+    }
+
+    /// Engine.dll `AActor::execMakeNoise` (0x103aff40): `CheckNoiseHearing(Loudness)` runs only
+    /// when `Level.NetMode != NM_Client` (3) and the actor has an `Instigator`. No loudness
+    /// validation happens anywhere on the engine path (a NaN or negative loudness flows into the
+    /// same comparisons), so the VM performs none either.
+    pub(crate) fn vm_make_noise(&mut self, source: ObjectId, loudness: f32) -> VmResult<()> {
+        if !self.is_live_actor(source) {
+            return Ok(());
+        }
+        let net_mode = self
+            .obj_prop(source, "Level")
+            .map_or(0, |level| self.byte_prop(level, "NetMode"));
+        if net_mode == 3 || self.obj_prop(source, "Instigator").is_none() {
+            return Ok(());
+        }
+        self.check_noise_hearing(source, loudness)
+    }
+
+    /// Engine.dll `AActor::CheckNoiseHearing` (0x1036b6d0), decoded in full (item41c). Order:
+    /// instigator/controller gate, the two per-instigator
+    /// noise slots (0.2 s / 50 uu / 90 % suppression, 0.18 s reuse), then the
+    /// `Level.ControllerList` walk delivering `HearNoise(Loudness, self)` to every probing
+    /// controller that is not the instigator's and whose `CanHear` passes. When the instigator
+    /// is not a player and its controller's `Enemy` is not a player either, only controllers
+    /// with the noise maker's `Tag` or a player pawn are considered.
+    fn check_noise_hearing(&mut self, source: ObjectId, loudness: f32) -> VmResult<()> {
+        let Some(instigator) = self.obj_prop(source, "Instigator") else {
+            return Ok(());
+        };
+        let Some(inst_controller) = self.obj_prop(instigator, "Controller") else {
+            return Ok(());
+        };
+        let location = self.vector_prop(source, "Location").unwrap_or([0.0; 3]);
+        // `XLevel+0xd0` is a double; the VM's level clock is `Vm::time`.
+        let now = self.time;
+        let near = |spot: [f32; 3]| dist_sq_f64(spot, location) < 2500.0;
+        let slot = |vm: &Self, n: u8| {
+            (
+                vm.vector_prop(instigator, &format!("noise{n}spot"))
+                    .unwrap_or([0.0; 3]),
+                f64::from(vm.f32_prop(instigator, &format!("noise{n}time"))),
+                f64::from(vm.f32_prop(instigator, &format!("noise{n}loudness"))),
+            )
+        };
+        let (spot1, time1, loud1) = slot(self, 1);
+        let (spot2, time2, loud2) = slot(self, 2);
+        let l = f64::from(loudness);
+        let recent = now - f64::from(0.2f32);
+        let louder = f64::from(0.9f32) * l;
+        if recent < time1 && near(spot1) && louder <= loud1 {
+            return Ok(());
+        }
+        if recent < time2 && near(spot2) && louder <= loud2 {
+            return Ok(());
+        }
+        let reuse = now - f64::from(0.18f32);
+        let target = if reuse > time1 {
+            Some(1)
+        } else if reuse > time2 {
+            Some(2)
+        } else if near(spot1) && loud1 <= l {
+            Some(1)
+        } else if loud2 <= l {
+            // The fourth case writes slot 1 as well (decoded: stores at +0x2c4/+0x2d0/+0x2d8).
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(n) = target {
+            self.set_property(
+                instigator,
+                &format!("noise{n}spot"),
+                0,
+                Value::Vector(location),
+            );
+            self.set_property(
+                instigator,
+                &format!("noise{n}time"),
+                0,
+                Value::Float(now as f32),
+            );
+            self.set_property(
+                instigator,
+                &format!("noise{n}loudness"),
+                0,
+                Value::Float(loudness),
+            );
+        }
+
+        let broadcast = self.pawn_is_player(instigator)
+            || self
+                .obj_prop(inst_controller, "Enemy")
+                .is_some_and(|enemy| self.pawn_is_player(enemy));
+        let source_tag = self.name_prop(source, "Tag");
+        let Some(level) = self.obj_prop(source, "Level") else {
+            return Ok(());
+        };
+        let mut next = self.obj_prop(level, "ControllerList");
+        let mut walked = 0usize;
+        while let Some(controller) = next {
+            walked += 1;
+            if walked > self.objects.len() {
+                return Err(self.err(VmErrorKind::Unresolved {
+                    what: "Actor.MakeNoise: Level.ControllerList does not terminate (cycle)".into(),
+                }));
+            }
+            let pawn = self.obj_prop(controller, "Pawn");
+            if pawn != Some(instigator)
+                && self.is_probing(controller, "HearNoise", HEAR_NOISE_PROBE_BIT)
+                && (broadcast
+                    || self
+                        .name_prop(controller, "Tag")
+                        .eq_ignore_ascii_case(&source_tag)
+                    || pawn.is_some_and(|p| self.pawn_is_player(p)))
+                && self.controller_can_hear(controller, location, loudness, source)?
+            {
+                self.send_event(
+                    controller,
+                    "HearNoise",
+                    vec![
+                        Value::Float(loudness),
+                        Value::Object(Some(ObjRef::Instance(source))),
+                    ],
+                )?;
+            }
+            // The engine reads `nextController` after the event, as here.
+            next = self.obj_prop(controller, "NextController");
+        }
+        Ok(())
+    }
+
+    /// Engine.dll `APawn::IsPlayer` (0x103aff00): `Controller != None && Controller.bIsPlayer`.
+    fn pawn_is_player(&self, pawn: ObjectId) -> bool {
+        self.obj_prop(pawn, "Controller")
+            .is_some_and(|c| self.bool_prop(c, "bIsPlayer"))
+    }
+
+    /// `name` property text, or `"None"` when absent.
+    fn name_prop(&self, id: ObjectId, name: &str) -> String {
+        match self.get_property(id, name) {
+            Some(Value::Name(n)) => n.clone(),
+            _ => "None".to_owned(),
+        }
+    }
+
+    /// Core.dll `UObject::IsProbing` (0x10102da0) for a probe name (EName 300..363): bit
+    /// `name - 300` of the state frame's probe mask, which `UObject::GotoState` (0x1011eb10) sets
+    /// to `(Class.ProbeMask | Node.ProbeMask) & Node.IgnoreMask` with `Node` = the current state
+    /// (the class itself without one). The stored masks are already cumulative over super classes
+    /// (measured, item41c). A `Disable(probe)` recorded by the VM also clears the probe.
+    pub(crate) fn is_probing(&self, id: ObjectId, probe: &str, bit: u32) -> bool {
+        let Some(o) = self.objects.get(id as usize) else {
+            return false;
+        };
+        if o.disabled.contains(&lower(probe)) {
+            return false;
+        }
+        let masks = |g: GlobalRef| match self.set.object(g) {
+            Some(ScriptObject::Class(c)) => Some((c.state.probe_mask, c.state.ignore_mask)),
+            Some(ScriptObject::State(s)) => Some((s.state.probe_mask, s.state.ignore_mask)),
+            _ => None,
+        };
+        let (class_probe, class_ignore) = masks(o.class).unwrap_or((0, u64::MAX));
+        let (node_probe, node_ignore) = o
+            .state
+            .and_then(masks)
+            .unwrap_or((class_probe, class_ignore));
+        ((class_probe | node_probe) & node_ignore) >> bit & 1 != 0
+    }
+
+    /// Engine.dll `AController::CanHear(NoiseLoc, Loudness, Other)` (0x1036b0f0). Every branch
+    /// is decoded; the parts the VM cannot evaluate exactly are labelled Partial below and
+    /// reported once per VM with a trace note (never silently).
+    fn controller_can_hear(
+        &mut self,
+        controller: ObjectId,
+        noise: [f32; 3],
+        loudness: f32,
+        other: ObjectId,
+    ) -> VmResult<bool> {
+        let other_controller = self
+            .obj_prop(other, "Instigator")
+            .and_then(|i| self.obj_prop(i, "Controller"));
+        let Some(pawn) = self.obj_prop(controller, "Pawn") else {
+            return Ok(false);
+        };
+        if other_controller.is_none() {
+            return Ok(false);
+        }
+        let pawn_loc = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let dist_sq = dist_sq_f64(pawn_loc, noise) as f32;
+        let threshold = f64::from(self.f32_prop(pawn, "HearingThreshold"));
+        let alert = f64::from(self.f32_prop(pawn, "Alertness")) + 1.0;
+        let alert = if 0.0 < alert { alert } else { 0.0 };
+        let perceived_ext = threshold * threshold * f64::from(loudness) * alert;
+        // `Perceived < DistSq` returns 0; a NaN Perceived passes (decoded flag test).
+        if perceived_ext < f64::from(dist_sq) {
+            return Ok(false);
+        }
+        let perceived = perceived_ext as f32;
+
+        if self.bool_prop(pawn, "bSameZoneHearing") || self.bool_prop(pawn, "bAdjacentZoneHearing")
+        {
+            // Partial: the engine compares `Region.Zone` of the listener pawn and the noise
+            // maker, then (bAdjacentZoneHearing) the BSP zone connectivity mask. The VM keeps no
+            // zone model (Region is not updated as actors move), so the zone test is treated as
+            // "different, unconnected zones" and the remaining branches decide.
+            self.hearing_partial(
+                "zone",
+                "CanHear zone hearing (bSameZoneHearing/bAdjacentZoneHearing) is not modelled: \
+                 the VM has no zone model, the zone test is treated as different unconnected zones",
+            );
+        }
+        if !self.bool_prop(pawn, "bLOSHearing") {
+            return Ok(false);
+        }
+        let eye = self.f32_prop(pawn, "BaseEyeHeight");
+        let view = [pawn_loc[0], pawn_loc[1], pawn_loc[2] + eye];
+        if !self.physics_ready("Actor.MakeNoise", Some(512), controller, Value::Void)? {
+            return Ok(false);
+        }
+        // SingleLineCheck(End = NoiseLoc, Start = ViewLoc, TRACE_World | TRACE_StopAtFirstHit):
+        // world geometry including movers, no pawns. The provider's world trace is that query.
+        let world_hit = self.world_line(view, noise);
+        if world_hit.is_none() {
+            return Ok(true);
+        }
+
+        if self.bool_prop(pawn, "bMuffledHearing") && perceived > 4.0 * dist_sq {
+            // Partial: the engine's two wall traces use TRACE_Level (BSP only); the provider has
+            // no BSP-only query, so its world trace stands in. On a miss the reused
+            // FCheckResult keeps its previous Location ((0,0,0) from the constructor at first;
+            // hypothesis: SingleLineCheck does not write Location on a miss).
+            self.hearing_partial(
+                "muffled",
+                "CanHear bMuffledHearing wall traces use the world trace in place of the engine's \
+                 BSP-only TRACE_Level check",
+            );
+            let mut hit_location = [0.0f32; 3];
+            if let Some(h) = self.world_line(view, noise) {
+                hit_location = h.location;
+            }
+            let first = hit_location;
+            if let Some(h) = self.world_line(noise, view) {
+                hit_location = h.location;
+            }
+            // `FVector::SizeSquared` stays on the x87 stack (not rounded to float) and is then
+            // squared again: the decoded test is `Perceived > W*W + 4*DistSq` with W = |A-B|^2.
+            let wall = dist_sq_f64(first, hit_location);
+            if f64::from(perceived) > wall * wall + f64::from(4.0 * dist_sq) {
+                return Ok(true);
+            }
+        }
+
+        if !self.bool_prop(pawn, "bAroundCornerHearing") {
+            return Ok(false);
+        }
+        let corner = perceived * 0.125;
+        let other_loc = self.vector_prop(other, "Location").unwrap_or([0.0; 3]);
+        let mut list = SortedPathList::default();
+        let level = self.obj_prop(controller, "Level");
+        let mut next = level.and_then(|l| self.obj_prop(l, "NavigationPointList"));
+        let mut walked = 0usize;
+        while let Some(nav) = next {
+            walked += 1;
+            if walked > self.objects.len() {
+                return Err(self.err(VmErrorKind::Unresolved {
+                    what: "Actor.MakeNoise: Level.NavigationPointList does not terminate (cycle)"
+                        .into(),
+                }));
+            }
+            if self.bool_prop(nav, "bPropagatesSound") {
+                let nav_loc = self.vector_prop(nav, "Location").unwrap_or([0.0; 3]);
+                let d1 = dist_sq_f64(nav_loc, pawn_loc) as f32;
+                let d2 = dist_sq_f64(nav_loc, other_loc) as f32;
+                if d1 < corner && d2 < corner {
+                    list.add(nav, d2 + d1);
+                }
+            }
+            next = self.obj_prop(nav, "nextNavigationPoint");
+        }
+        if list.count == 0 {
+            return Ok(false);
+        }
+        // Partial: `UModel::FastLineCheck` is a BSP-only line test; the provider's world trace
+        // (which also sees static meshes, terrain and movers) stands in for it.
+        self.hearing_partial(
+            "corner",
+            "CanHear bAroundCornerHearing uses the world trace in place of the engine's BSP-only \
+             FastLineCheck",
+        );
+        for &nav in &list.nodes[..list.count] {
+            let nav_loc = self.vector_prop(nav, "Location").unwrap_or([0.0; 3]);
+            if self.world_line(noise, nav_loc).is_none() && self.world_line(view, nav_loc).is_none()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Zero-extent world line trace through the installed provider (callers check
+    /// [`Vm::physics_ready`] first).
+    fn world_line(&mut self, start: [f32; 3], end: [f32; 3]) -> Option<WorldHit> {
+        self.physics
+            .as_mut()
+            .and_then(|p| p.trace(start, end, [0.0; 3]))
+    }
+
+    /// Records a Partial hearing branch once per VM as a visible trace note.
+    fn hearing_partial(&mut self, key: &'static str, text: &str) {
+        if self.hearing_partials.insert(key) {
+            self.note(TraceKind::Note(format!("Partial: {text}")));
+        }
     }
 
     /// `Actor.SetLocation`: teleport when the destination is free of world geometry and not
@@ -7725,8 +8193,11 @@ impl<'s> Vm<'s> {
         };
         let a = self.eye_location(pawn);
         let b = self.eye_location(other_pawn);
-        let hit = self.physics.as_mut().and_then(|p| p.trace(a, b, [0.0; 3]));
-        Ok(hit.is_none())
+        let world_hit = self.physics.as_mut().and_then(|p| p.trace(a, b, [0.0; 3]));
+        if world_hit.is_some() {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// `Actor.Location + Actor.BaseEyeHeight` (the eye point upstream traces between).
@@ -7837,6 +8308,196 @@ impl<'s> Vm<'s> {
         self.nav_line_of_sight_to(ctrl, player).unwrap_or(false)
     }
 
+    /// Retail XIDPawn 0x11903ea0: scan the actual linked NavigationPointList in list order.
+    /// Strictly better alignment wins; preserve LastSeenPos when there is no eligible node.
+    pub(crate) fn ai_stake_out_dir(&mut self, controller: ObjectId) -> VmResult<()> {
+        let Some(enemy) = self.obj_prop(controller, "Enemy") else {
+            return Ok(());
+        };
+        let Some(pawn) = self.obj_prop(controller, "Pawn") else {
+            return Err(self.err(VmErrorKind::Other(
+                "FindNewStakeOutDir requires Pawn when Enemy is set".into(),
+            )));
+        };
+        let loc = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let enemy_dir = normalize3(sub3(
+            self.vector_prop(enemy, "Location").unwrap_or(loc),
+            loc,
+        ));
+        let mut node = self
+            .obj_prop(controller, "Level")
+            .or_else(|| self.find_level_info())
+            .and_then(|level| self.obj_prop(level, "NavigationPointList"));
+        let mut seen = HashSet::new();
+        let mut best_dot = -1.0;
+        let mut best = None;
+        while let Some(id) = node {
+            if !seen.insert(id) {
+                return Err(self.err(VmErrorKind::Other(
+                    "FindNewStakeOutDir: cycle in NavigationPointList".into(),
+                )));
+            }
+            let delta = sub3(self.vector_prop(id, "Location").unwrap_or(loc), loc);
+            let distance = dot3(delta, delta).sqrt();
+            if distance > 100.0 && distance < 800.0 {
+                let alignment = dot3(enemy_dir, scale3(delta, distance.recip()));
+                if alignment > best_dot && self.nav_line_of_sight_to(controller, id)? {
+                    best_dot = alignment;
+                    best = Some(id);
+                }
+            }
+            node = self.obj_prop(id, "NextNavigationPoint");
+        }
+        if let Some(best) = best {
+            let mut focal = self.vector_prop(best, "Location").unwrap_or(loc);
+            focal[2] += 0.5 * self.f32_prop(pawn, "CollisionHeight");
+            self.set_property(controller, "LastSeenPos", 0, Value::Vector(focal));
+        }
+        Ok(())
+    }
+
+    /// XIDPawn 0x11903230. The x87 equality gate at 0x119033a6 etc. really
+    /// rejects unequal or unordered components: ordinary nonzero separation returns zero. Do not
+    /// replace this surprising retail behavior with a conventional steering algorithm.
+    pub(crate) fn ai_pseudo_steering(&mut self, controller: ObjectId) -> VmResult<[f32; 3]> {
+        let Some(group) = self.obj_prop(controller, "GenAlerte") else {
+            return Ok([0.0; 3]);
+        };
+        let Some(pawn) = self.obj_prop(controller, "Pawn") else {
+            return Err(self.err(VmErrorKind::Other(
+                "PseudoSteering requires Pawn when GenAlerte is set".into(),
+            )));
+        };
+        let Some(Value::Array(members)) = self.get_property(group, "SoldierInFightList").cloned()
+        else {
+            return Err(self.err(VmErrorKind::Other(
+                "PseudoSteering requires SoldierInFightList".into(),
+            )));
+        };
+        let loc = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let mut sum = [0.0; 3];
+        let mut last = None;
+        for member in members {
+            let Value::Object(Some(ObjRef::Instance(id))) = member else {
+                return Err(self.err(VmErrorKind::Other(
+                    "PseudoSteering: null/non-instance fight-list entry".into(),
+                )));
+            };
+            last = Some(id);
+            if id != pawn {
+                let delta = sub3(loc, self.vector_prop(id, "Location").unwrap_or(loc));
+                sum = add3(sum, scale3(delta, dot3(delta, delta).recip()));
+            }
+        }
+        if sum.iter().any(|component| *component != 0.0) {
+            return Ok([0.0; 3]);
+        }
+        let Some(last) = last else {
+            return Err(self.err(VmErrorKind::Other(
+                "PseudoSteering: empty fight list reaches a null dereference in retail".into(),
+            )));
+        };
+        let last_loc = self.vector_prop(last, "Location").unwrap_or(loc);
+        let mut direction = normalize3(sum);
+        let mut start = loc;
+        start[2] -= 30.0;
+        let mut end = add3(last_loc, scale3(direction, 4000.0));
+        end[2] -= 30.0;
+        // TRACE_AllBlocking (0x86); world/actor geometry comes through the existing provider.
+        let Some(provider) = self.physics.as_mut() else {
+            return Err(self.err(VmErrorKind::NoPhysicsProvider {
+                native: "IAController.PseudoSteering".into(),
+            }));
+        };
+        let mut hit = provider.trace(start, end, [0.0; 3]);
+        if let Some((time, _, normal)) = self.trace_actors(controller, start, end, [0.0; 3])
+            && hit.is_none_or(|world| time <= world.time)
+        {
+            hit = Some(crate::physics::WorldHit {
+                time,
+                normal,
+                location: lerp3(start, end, time),
+            });
+        }
+        if let Some(hit) = hit {
+            let denominator = dot3(sub3(loc, last_loc), sub3(loc, last_loc));
+            sum = add3(sum, scale3(sub3(loc, hit.location), denominator.recip()));
+            direction = normalize3(sum);
+        }
+        sum = scale3(sum, 50000.0);
+        let size_sq = dot3(sum, sum);
+        Ok(if size_sq > 16000000.0 {
+            scale3(direction, 4000.0)
+        } else if size_sq > 2500.0 {
+            sum
+        } else {
+            [0.0; 3]
+        })
+    }
+
+    /// First actor on WeaponStartTrace -> WeaponEndTrace, with XIII shooting-through flags.
+    /// A world hit terminates the line but classifies as zero; no hit-zone state is modified.
+    pub(crate) fn ai_fire_obstacle(&mut self, controller: ObjectId) -> VmResult<Option<ObjectId>> {
+        let Some(pawn_id) = self.obj_prop(controller, "Pawn") else {
+            return Err(self.err(VmErrorKind::Other(
+                "LineOfFireObstacle requires Pawn.Weapon.AmmoType".into(),
+            )));
+        };
+        let Some(ammo) = self
+            .obj_prop(pawn_id, "Weapon")
+            .and_then(|id| self.obj_prop(id, "AmmoType"))
+        else {
+            return Err(self.err(VmErrorKind::Other(
+                "LineOfFireObstacle requires Pawn.Weapon.AmmoType".into(),
+            )));
+        };
+        let pawn = Some(pawn_id);
+        let instant = self.bool_prop(ammo, "bInstantHit");
+        let through = if instant {
+            "bCanShootThroughWithRayCastingWeapon"
+        } else {
+            "bCanShootThroughWithProjectileWeapon"
+        };
+        let start = self
+            .vector_prop(controller, "WeaponStartTrace")
+            .unwrap_or([0.0; 3]);
+        let end = self
+            .vector_prop(controller, "WeaponEndTrace")
+            .unwrap_or(start);
+        let Some(provider) = self.physics.as_mut() else {
+            return Err(self.err(VmErrorKind::NoPhysicsProvider {
+                native: "IAController.LineOfFireObstacle".into(),
+            }));
+        };
+        let world = provider.trace(start, end, [0.0; 3]);
+        let mut best = world.map_or(1.0, |hit| hit.time);
+        let mut actor = None;
+        for id in 0..self.objects.len() as ObjectId {
+            if id == controller
+                || !self.is_live_actor(id)
+                || self.bool_prop(id, through)
+                || (!self.bool_prop(id, "bCollideActors")
+                    && !self.bool_prop(id, "bBlockZeroExtentTraces"))
+                || self.is_owned_by(id, controller)
+                || self.is_owned_by(controller, id)
+            {
+                continue;
+            }
+            let (loc, radius, height) = self.actor_cylinder(id);
+            if let Some((time, _)) = segment_cylinder_hit(start, end, loc, radius, height)
+                && time <= best
+            {
+                best = time;
+                actor = Some(id);
+            }
+        }
+        Ok(actor.filter(|id| {
+            Some(*id) != pawn
+                && Some(*id) != self.obj_prop(controller, "Enemy")
+                && !self.is_a(*id, "LevelInfo")
+        }))
+    }
+
     /// `Controller.pointReachable`: the point is directly reachable (clear pawn trace) and a
     /// navigation neighbourhood exists near it.
     pub(crate) fn nav_point_reachable(
@@ -7906,17 +8567,49 @@ impl<'s> Vm<'s> {
             return Ok(false);
         };
         let loc = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
-        let speed = if speed > 0.0 {
-            speed
-        } else {
-            self.f32_prop(pawn, "GroundSpeed")
+        // Engine.dll 0x1036a758: Speed is a fraction, default 1, not UU/s.
+        let walking_pct = self.f32_prop(pawn, "WalkingPct");
+        let max_desired = self.f32_prop(pawn, "MaxDesiredSpeed");
+        if !speed.is_finite()
+            || !walking_pct.is_finite()
+            || !max_desired.is_finite()
+            || (speed <= walking_pct && walking_pct == 0.0)
+        {
+            return Err(self.err(VmErrorKind::Other(format!(
+                "{native}: non-finite speed or zero WalkingPct in walking-speed division"
+            ))));
+        }
+        let walking = speed <= walking_pct;
+        let requested = if walking { speed / walking_pct } else { speed };
+        let desired = max_desired.max(0.0).min(requested);
+        self.set_property(pawn, "bWalking", 0, Value::Bool(walking));
+        self.set_property(pawn, "bReducedSpeed", 0, Value::Bool(false));
+        self.set_property(pawn, "DesiredSpeed", 0, Value::Float(desired));
+        let timer_base_speed = match self.byte_prop(pawn, "Physics") {
+            PHYS_WALKING | 2 | 9 => self.f32_prop(pawn, "GroundSpeed"), // falling/spider
+            3 => self.f32_prop(pawn, "WaterSpeed"),
+            4 => self.f32_prop(pawn, "AirSpeed"),
+            _ => 200.0,
         };
-        let distance = horizontal_distance(loc, destination);
-        let travel = if speed > 0.0 { distance / speed } else { 0.0 };
-        // Upstream MoveTo's `MoveTimer` fail-safe: give the pawn twice the nominal travel time
-        // plus a second before the latent ends even if it is stuck.
-        let budget = travel * 2.0 + 1.0;
+        let speed = timer_base_speed * desired;
+        let delta = sub3(destination, loc);
+        let distance = dot3(delta, delta).sqrt();
+        // APawn::setMoveTimer 0x103affb0: zero speed gets 0.5 s, otherwise 1+2*D/S.
+        let budget = if native == "Controller.MoveToward"
+            && self
+                .obj_prop(controller, "MoveTarget")
+                .is_some_and(|target| self.is_a(target, "Pawn"))
+        {
+            1.2
+        } else if speed == 0.0 {
+            0.5
+        } else {
+            1.0 + 2.0 * distance / speed
+        };
         self.set_property(controller, "Destination", 0, Value::Vector(destination));
+        self.set_property(controller, "MoveTimer", 0, Value::Float(budget));
+        self.set_property(controller, "bAdjusting", 0, Value::Bool(false));
+        let _ = self.controller_move_step(controller, pawn, destination, 0.0)?;
         self.pending_latent = Some(Latent::Move {
             pawn,
             destination,
@@ -7928,9 +8621,99 @@ impl<'s> Vm<'s> {
         Ok(true)
     }
 
-    /// One tick of a `Latent::Move`: move the pawn toward its destination using the world
-    /// provider, returning whether it arrived. Extracted so tests can step the movement without
-    /// a full state frame.
+    /// Controller movement is acceleration-driven, unlike XIDCine's direct Steering.
+    /// Engine moveToward 0x103b3950 -> Acceleration (+0xf0), physWalking 0x103bdac0
+    /// -> calcVelocity 0x103ba250 -> swept displacement. Non-walking modes are left
+    /// to their physics handler; PHYS_None must not be moved by the latent poll.
+    pub(crate) fn controller_move_step(
+        &mut self,
+        controller: ObjectId,
+        pawn: ObjectId,
+        destination: [f32; 3],
+        dt: f32,
+    ) -> VmResult<bool> {
+        let loc = self.vector_prop(pawn, "Location").unwrap_or(destination);
+        let mut delta = sub3(destination, loc);
+        let walking = self.byte_prop(pawn, "Physics") == PHYS_WALKING;
+        if walking {
+            delta[2] = 0.0;
+        }
+        let distance = dot3(delta, delta).sqrt();
+        let radius = self.f32_prop(pawn, "CollisionRadius");
+        // The full ReachedDestination navigation/height rules remain Partial; do not
+        // turn a vertically distant target into horizontal arrival.
+        let target_radius = self
+            .obj_prop(controller, "MoveTarget")
+            .map_or(0.0, |target| self.f32_prop(target, "CollisionRadius"));
+        if distance <= radius + target_radius
+            && (destination[2] - loc[2]).abs() <= self.f32_prop(pawn, "CollisionHeight")
+        {
+            self.set_property(pawn, "Acceleration", 0, Value::Vector([0.0; 3]));
+            return Ok(true);
+        }
+        let direction = normalize3(delta);
+        let mut acceleration = scale3(direction, self.f32_prop(pawn, "AccelRate"));
+        self.set_property(pawn, "Acceleration", 0, Value::Vector(acceleration));
+        if !walking || dt <= 0.0 {
+            return Ok(false);
+        }
+        // calcVelocity 0x103ba5b4: both bWalking and bIsCrouched use WalkingPct
+        // for the acceleration cap (CrouchingPct is a separate velocity cap).
+        if self.bool_prop(pawn, "bWalking") || self.bool_prop(pawn, "bIsCrouched") {
+            let cap = self.f32_prop(pawn, "AccelRate") * self.f32_prop(pawn, "WalkingPct");
+            if dot3(acceleration, acceleration) > cap * cap {
+                acceleration = scale3(normalize3(acceleration), cap);
+                self.set_property(pawn, "Acceleration", 0, Value::Vector(acceleration));
+            }
+        }
+        let mut velocity = self.vector_prop(pawn, "Velocity").unwrap_or([0.0; 3]);
+        velocity[2] = 0.0;
+        let speed = dot3(velocity, velocity).sqrt();
+        let friction = self
+            .obj_prop(pawn, "PhysicsVolume")
+            .map_or(0.0, |volume| self.f32_prop(volume, "GroundFriction"));
+        // calcVelocity's directional friction uses the old speed; it is not drag.
+        velocity = sub3(
+            velocity,
+            scale3(sub3(velocity, scale3(direction, speed)), dt * friction),
+        );
+        velocity = add3(velocity, scale3(acceleration, dt));
+        let mut limit = self.f32_prop(pawn, "GroundSpeed") * self.f32_prop(pawn, "DesiredSpeed");
+        if self.bool_prop(pawn, "bIsCrouched") {
+            limit *= self.f32_prop(pawn, "CrouchingPct");
+        } else if self.bool_prop(pawn, "bWalking") {
+            limit *= self.f32_prop(pawn, "WalkingPct");
+        }
+        let size_sq = dot3(velocity, velocity);
+        if size_sq > limit * limit {
+            velocity = scale3(normalize3(velocity), limit);
+        }
+        let displacement = scale3(velocity, dt);
+        let extent = self.actor_extent(pawn);
+        let collides_world = self.bool_prop(pawn, "bCollideWorld");
+        let end = if collides_world {
+            let Some(provider) = self.physics.as_mut() else {
+                return Err(self.err(VmErrorKind::NoPhysicsProvider {
+                    native: "Controller movement".into(),
+                }));
+            };
+            provider.walk_box(loc, displacement, extent).end
+        } else {
+            add3(loc, displacement)
+        };
+        self.set_property(pawn, "Location", 0, Value::Vector(end));
+        self.set_property(
+            pawn,
+            "Velocity",
+            0,
+            Value::Vector(scale3(sub3(end, loc), dt.recip())),
+        );
+        Ok(false)
+    }
+
+    /// Test-only direct-step adapter for the shared cinematic collision walker. Controller
+    /// latents use controller_move_step; XIDCine supplies its own arrival radius below.
+    #[cfg(test)]
     pub(crate) fn move_pawn_step(
         &mut self,
         pawn: ObjectId,
@@ -7942,7 +8725,7 @@ impl<'s> Vm<'s> {
         self.move_pawn_step_within(pawn, destination, speed, dt, radius)
     }
 
-    /// [`Vm::move_pawn_step`] with an explicit stop radius: the pawn stops moving (and reports
+    /// Direct cinematic movement with an explicit stop radius: the pawn stops moving (and reports
     /// arrival) once its horizontal distance to `destination` is within `radius`. Cine steering
     /// passes 0, since its arrival test is `IsTargetReached`, not the pawn's collision radius.
     pub(crate) fn move_pawn_step_within(
@@ -7999,6 +8782,16 @@ impl<'s> Vm<'s> {
                 hit.time,
                 hit.normal
             );
+            if vm_move_dump_enabled()
+                && let Some(p) = self.physics.as_mut()
+            {
+                for (i, record) in p.dump_overlap(location, extent).iter().enumerate().take(8) {
+                    println!(
+                        "[vm-pawn-move-dump] #{i} {} source={} triangle={:?}",
+                        record.kind, record.source, record.triangle
+                    );
+                }
+            }
         }
         let end = outcome.map_or_else(|| add3(location, delta), |o| o.end);
         self.set_property(pawn, "Location", 0, Value::Vector(end));
@@ -8800,6 +9593,23 @@ fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn scale3(a: [f32; 3], scale: f32) -> [f32; 3] {
+    a.map(|component| component * scale)
+}
+
+fn normalize3(a: [f32; 3]) -> [f32; 3] {
+    let size_sq = dot3(a, a);
+    if size_sq == 0.0 {
+        [0.0; 3]
+    } else {
+        scale3(a, size_sq.sqrt().recip())
+    }
+}
+
 fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [
         a[0] + (b[0] - a[0]) * t,
@@ -9086,5 +9896,78 @@ mod stack_name_tests {
             Some(1)
         );
         assert!(l.slot_by_name("missing").is_none());
+    }
+}
+
+#[cfg(test)]
+mod sorted_path_list_tests {
+    use super::SortedPathList;
+
+    fn keys(l: &SortedPathList) -> Vec<f32> {
+        l.dist[..l.count].to_vec()
+    }
+
+    /// Ascending order; an equal key goes before the existing one; entries shifted down have
+    /// their keys truncated to integers (the decoded `_ftol` reload), the inserted key does not.
+    #[test]
+    fn inserts_in_order_and_truncates_shifted_keys() {
+        let mut l = SortedPathList::default();
+        l.add(1, 30.5);
+        l.add(2, 10.25);
+        assert_eq!(keys(&l), [10.25, 30.0]);
+        assert_eq!(&l.nodes[..2], [2, 1]);
+        l.add(3, 10.25);
+        assert_eq!(
+            &l.nodes[..3],
+            [3, 2, 1],
+            "ties insert before the existing key"
+        );
+        assert_eq!(keys(&l), [10.25, 10.0, 30.0]);
+        l.add(4, 99.9);
+        assert_eq!(
+            keys(&l),
+            [10.25, 10.0, 30.0, 99.9],
+            "an append shifts nothing"
+        );
+    }
+
+    /// Capacity 32: inserting into a full list drops the largest; a key larger than all 32 is
+    /// not inserted.
+    #[test]
+    fn is_capped_at_32_entries() {
+        let mut l = SortedPathList::default();
+        for i in 0..32 {
+            l.add(i, (i * 10) as f32);
+        }
+        assert_eq!(l.count, 32);
+        l.add(100, 1000.0);
+        assert_eq!(l.count, 32);
+        assert!(!l.nodes.contains(&100));
+        l.add(200, 5.0);
+        assert_eq!(l.count, 32);
+        assert_eq!(&l.nodes[..3], [0, 200, 1]);
+        assert_eq!(l.nodes[31], 30, "the former last entry (31) fell off");
+    }
+
+    /// With more than 8 (and 16) entries the scan starts at the coarse binary step; for sorted
+    /// content that gives the same position as a full linear scan.
+    #[test]
+    fn binary_step_finds_the_linear_position() {
+        for n in [9usize, 16, 17, 31] {
+            for probe in [-1.0f32, 0.0, 5.0, 45.0, 80.0, 155.0, 1000.0] {
+                let mut l = SortedPathList::default();
+                for i in 0..n {
+                    l.add(i as u32, (i * 10) as f32);
+                }
+                let expected = (0..n).position(|i| probe <= (i * 10) as f32).unwrap_or(n);
+                l.add(999, probe);
+                let at = l.nodes[..l.count].iter().position(|&x| x == 999);
+                assert_eq!(
+                    at,
+                    Some(expected).filter(|&e| e < 32),
+                    "n {n} probe {probe}"
+                );
+            }
+        }
     }
 }

@@ -3499,13 +3499,22 @@ mod tests {
         let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/banque01_route.script");
         let script = script::Script::load(&route_path).expect("load item24 banque01 route");
+        // 185 s: the item27l walked schedule needs it — the route walks to the vault door
+        // (touches t~88), teleports to DetectionVolume12 at t~90, and Jones then reaches
+        // Cine15's [34] "wait player 300" at t~114.3 (his scene's dialogue/anims run ~24 s
+        // after the DV12 touch; the teleport route reached it at t~69.1 because its DV12 touch
+        // fired at t~47). fin_flash lands at t~118.5, the escape-flow touches run to t~136, and
+        // Cine11's `playerevent fin_map` fires at t~143.7 (measured in
+        // local/re/item27l/route-final4.log). The map-outro video then runs its full 33.92 s
+        // headless before `PlayingVideo.PlayerTick` issues the `ServerTravel` (measured
+        // GameEndedSuccess t~96 -> travel t~131.2 in local/re/item27k/route-final.log).
         let outcome = run_script_with_cinematic_input(
             &game_dir,
             "banque01",
             &script,
             &resolved.params,
             &scene,
-            90.0,
+            185.0,
         )
         .expect("run banque01 route");
         let banque = outcome

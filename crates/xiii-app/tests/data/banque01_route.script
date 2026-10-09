@@ -1,35 +1,131 @@
-# item24: Banque01 route. The end-of-level travel is the game's own
-# MapInfo.SetGoalComplete -> TestGoalComplete -> DoTravel -> XIIIGameInfo.EndGame ->
-# XIIIPlayerController.GameEnded -> GameEndedSuccess -> PlayingVideo (EndMapVideo "cine02", real
-# Bink duration) -> PlayingVideo.PlayerTick -> Level.ServerTravel("Amos01.unr") chain.
+# item27l: Banque01 story route, walked. Replaces the item27j/item27k teleport route with walked
+# legs wherever the walk measurably works; the remaining teleports each carry a measured cause
+# (probe logs in local/re/item27l/). Objective 0 "Access the strongroom." still completes through
+# the game's own chain (Cine15 Jones scene -> `event fin_flash` -> XIIIDispatcher4 ->
+# GT_quitterbanque -> XIIIGoalTrigger0) and objective 1 "Escape from the bank." through Cine11's
+# `playerevent fin_map` -> XIIIGoalTrigger2 -> DoTravel -> Amos01, exactly as in item24/item27k.
 #
-# Teleports below are explicitly diagnostic movement shortcuts: the route volumes span the whole
-# bank (~13,000 UU wide) and the port does not path between them. Walking onto each volume still
-# delivers the volume's own engine `Touch`, so every `TouchTrigger`/`DetectionVolume`/`GoalTrigger`
-# touch recorded by the run is the game's own code.
-#
-# `set_goal` is a labelled host bridge (prints "set_goal N via Banque0.SetGoalComplete"): Banque01
-# promotes its objectives from three scripted bank scenes that the port cannot complete (blockers
-# B1-B3 in the item24 report); the bridge calls the map's own `MapInfo.SetGoalComplete`, exactly
-# what the cutscene `playerevent`/`ev` chains would call. No teleport or bridge changes objective
-# state silently.
+# Walked story chain (all measured in probe-u/probe-t runs, cine trace):
+#   - spawn -> DetectionVolume1 (touch starts Cine1, the teller scene).
+#   - walk to the counter spot (-330,-2133): Cine1[12] "wait player 300" (vs the teller at
+#     (-494,-2133)) passes; the customer queue maze is walkable (probe-m).
+#   - Cine1[16] "wait event recoit_cle" then needs Banque0.STA_DonneCle.Tick to see
+#     VSize2D(teller-player)<300 && CanSee(teller). From the customer side CanSee measurably
+#     fails (the counter blocks the eye line; probe-m sat at (-330,-2133) for 10+ s with no
+#     release), and the staff side is sealed by Porte7 until the teller herself opens it at
+#     action[29] — which requires recoit_cle. Measured cause for the ONE remaining lobby
+#     teleport: spot E (-494,-2383), the only position that releases the key.
+#   - walk the staff corridor north to (-540,-1350): the teller's Cine1[32] "wait player 500"
+#     (vs her at (-567,-1284) after `opendoor porte7`) passes.
+#   - walk west to (-1560,-1290) and WAIT: the double armored door XIIIMover14/15
+#     ("bankporteblindee1") opens only for the teller's Cine1[39] `playerevent porteblindee1`
+#     (t~37.4); pushing it earlier wedges (probe-t v2).
+#   - follow the teller's own measured waypoints down the stair corridor ((-1717,-1440) ->
+#     (-1772,-1940) -> (-1818,-2250), z 107 -> -149): Cine1[43] "wait player 1500", Cine6[4]
+#     "wait player 700" (James at (-1859,-2574)) and Cine1[51] "wait player 400" (vs the teller
+#     at (-1974,-2418)) all pass on foot. Her chain then fires `event coffre`/`event choatoi`
+#     (the vault key), `event toto` (t~50.6, unlocks the vault door Porte8) and Cine6[17]
+#     `event coffreserrure` (t~53.7) which OPENS Porte12 (the "coffreentree" door, alpha 0.946
+#     by t~59.5) — the item27k-era blocker, gone because the player stays with her.
+#   - walk the whole vault corridor on foot: through Porte12, down the ramp to z=-149, around
+#     the bankescaroulant block (east side), south along x~=-2300, west along y~=-6100, to the
+#     vault door (-2840,-6397). Touches fire the game's own actors: Porte12, Trigger15,
+#     BreakableMover0, Porte8, TriggerSound6/11/14, XIIIMover6/27, and XIIIDispatcher5 (the
+#     briefcase `debut_flash` chain); Porte20/21 (the vault door panels) open by themselves.
+#     The t=44 vault teleport of the old route is gone entirely.
+#   - Teleport to DetectionVolume12 (-7616,-2784,1456) — measured cause: there is NO floor
+#     connection between the vault level (z=-174 feet) and the strongroom (z 838-1456); the
+#     basement corridor terminates at x~=-3550 (slices in local/re/item27l/), and the game's own
+#     bomb-flash transition (`debut_flash`/`fin_flash`) covers the move in the original.
+#   - walk the strongroom interior: fall from the DV12 platform to the safe level (z=875,
+#     Cine15[3] "wait player 300" vs Jones at the safe passes at (-7161,-2141)), then walk the
+#     walkway to (-7883,-2648) where Cine15[34] "wait player 300" passes (Jones at
+#     (-7885,-2647,875)). Both t=48/t=70 teleports of the old route are gone.
+#   - the escape TouchTriggers stay teleports — measured cause: the strongroom's only eastward
+#     exit at the walkway level is sealed by XIIIMover5 (Staticbanque.bankmurcoffre); the walk
+#     wedges at (-7646,-2749,875) and the `fin_flash` -> `explocoffre` chain drives no mover in
+#     the runtime (no mover event ever fires after fin_flash in the accepted runs).
 
-# Game's own touches: walk each trigger volume the end-of-level sequence depends on.
-t=1.00 teleport -428 -2312 80       # diagnostic: DetectionVolume1 (Event julien_cine, bank teller scene)
-t=5.00 teleport 1300.03 -1917.39 1478  # diagnostic: TouchTrigger5 (Event vignracaille -> Dispatcher2)
-t=9.00 teleport 865 -4075 1530      # diagnostic: TouchTrigger2 (Event arrivee_fbi)
-t=13.00 teleport 1134 -4222 480     # diagnostic: TouchTrigger3 (Event fbi_dial2)
-t=17.00 teleport 1148 -4063 380     # diagnostic: TouchTrigger4 (Event arrivee_amos)
-t=20.00 teleport 1014.38 -4309 620  # diagnostic: TouchTrigger10 (Event CarOut)
-t=23.00 teleport -182 -1338 130     # diagnostic: TouchTrigger12 (Event gardien_cine)
-t=26.00 teleport 1341.37 -4019.51 380  # diagnostic: XIIIGoalTrigger2 (Tag fin_map, GoalNumber 1)
+# Leave the intro camera (WaitForFirstDisplay).
+t=0.50 forward 1
+t=1.50 forward 0
 
-# Bridged objectives (blockers B1-B3): objective 0 "Access the strongroom" is promoted by Cine1's
-# `ev vignclefbanque` and completed by Cine15's `event fin_flash` -> XIIIDispatcher4 ->
-# `GT_quitterbanque`; objective 1 "Escape from the bank" is completed by Cine11's
-# `playerevent fin_map`. None of the three scenes reaches its label (the host does not run the
-# cinematic sequence latents/anim notifies), so the route invokes the same `MapInfo.SetGoalComplete`
-# those events call. Labelled bridge, never silent.
-t=30.00 set_goal 0
-t=31.00 set_goal 1
-t=32.00 wait_travel
+# Bank teller scene (Cine1): walked onto DetectionVolume1 (Event julien_cine); the run delivers
+# the volume's own engine Touch.
+t=3.00 goto -428 -2312
+
+# Cine1[12] "wait player 300" (vs the teller at (-494,-2133)); the walk through the customer
+# queue maze is measured walkable (probe-m).
+t=6.00 goto -330 -2133
+
+# flow spot (measured cause above): the only position where Banque0.STA_DonneCle releases
+# `recoit_cle` (VSize2D<300 && CanSee(teller)); customer-side CanSee measurably fails and the
+# staff corridor is sealed by Porte7 until the teller opens it (circular without the teleport).
+t=13.00 teleport -494 -2383 80
+
+# Walk the staff corridor north behind the teller to her Cine1[32] "wait player 500" spot.
+t=15.00 goto -560 -2100
+t=18.50 goto -560 -1500
+t=21.50 goto -540 -1350
+
+# Walk to the armored double door and wait: XIIIMover14/15 open for the teller's
+# Cine1[39] `playerevent porteblindee1` (t~37.4), not for the player (probe-t v2 wedge).
+t=25.00 goto -1560 -1290
+
+# Follow the teller's measured waypoints down the stair corridor to the basement; her Cine1[43]
+# "wait player 1500", James's Cine6[4] "wait player 700" and Cine1[51] "wait player 400" pass on
+# foot, and her chain fires `event toto` (Porte8 unlock) and `event coffreserrure` (opens
+# Porte12 by t~59).
+t=40.00 goto -1717 -1440
+t=42.50 goto -1740 -1650
+t=45.00 goto -1772 -1940
+t=47.50 goto -1818 -2250
+t=50.00 goto -1900 -2350
+t=52.50 forward 0
+
+# Walk the vault corridor after Porte12 opens (t~59): through the door, down the ramp, around
+# the bankescaroulant block on its east side, south along x~=-2300, west along y~=-6100, to the
+# vault door. The old t=44 vault teleport is replaced by this walk.
+t=60.00 goto -2200 -2700
+t=63.00 goto -2230 -3140
+t=66.00 goto -2320 -3900
+t=69.00 goto -2320 -4300
+t=72.00 goto -2570 -4620
+t=74.50 goto -2650 -5000
+t=77.50 goto -2300 -5150
+t=80.00 goto -2300 -5600
+t=82.50 goto -2300 -5900
+t=85.00 goto -2843 -6100
+t=87.50 goto -2840 -6397
+
+# flow transition (measured cause above): the strongroom is not connected to the vault level by
+# any floor; the game's own bomb-flash transition covers the move. DetectionVolume12's Touch
+# starts Cine15 (Jones) through the game's own code.
+t=90.00 teleport -7616 -2784 1456
+
+# Walked strongroom interior: fall from the DV12 platform to the safe level (Cine15[3] "wait
+# player 300" vs Jones at the safe), then walk the walkway for Cine15[34] "wait player 300"
+# (Jones at (-7885,-2647,875)). The old t=48/t=70 teleports are replaced by this walk.
+t=93.00 goto -7161 -2141
+t=98.00 goto -7883 -2648
+# Hold at the walkway through Jones's finale: Cine15[34] "wait player 300" passes at t~114.3 and
+# his scene then runs dialogue/anims to `event fin_flash` at t~121 (measured; the [43] "wait
+# player 200" also passes from the walkway, ~30 UU from Jones). The escape teleports below start
+# only AFTER fin_flash: a cutscene started earlier pauses Cine15 (flagsPaused=0x1, measured in
+# local/re/item27l/route-final3.log) and his `wait player 200` never resumes, killing the
+# end-of-level chain.
+t=101.00 forward 0
+
+# Escape flow volumes (measured cause above: the strongroom's east wall XIIIMover5
+# "bankmurcoffre" seals the walkway-level exit and the explosion chain drives no mover). The run
+# delivers each volume's own engine Touch; every touch is the game's own code. They wait for
+# fin_flash (see hold above) but may safely overlap the 13 s XIIIDispatcher4 delay that turns
+# fin_flash into the objective-0 promotion.
+t=124.00 teleport 1300.03 -1917.39 1478  # flow touch: TouchTrigger5 (Event vignracaille)
+t=127.00 teleport 865 -4075 1530         # flow touch: TouchTrigger2 (Event arrivee_fbi)
+t=130.00 teleport 1134 -4222 480         # flow touch: TouchTrigger3 (Event fbi_dial2)
+t=133.00 teleport 1148 -4063 380         # flow touch: TouchTrigger4 (Event arrivee_amos)
+t=136.00 teleport 1014.38 -4309 620      # flow touch: TouchTrigger10 (Event CarOut)
+
+# Wait for the game's own travel (Amos01 via the end-of-level chain).
+t=139.00 wait_travel
