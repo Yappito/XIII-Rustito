@@ -115,66 +115,99 @@ t=309.50 goto 1282.4 -12591.3
 # onto it. `equip` re-selects the picked-up Beretta: the scripted T8 scene had left `Fists`
 # selected (measured: without it the fires were fist swings - weapon Fists3, bone None).
 t=326.00 equip
-t=326.40 goto 1282.4 -12591.3
+# ---- the chase (measured on the merged tree, scratch item30c_e18/e19): the killer leaves his
+# post at ~333 and walks the map's own nav path (FindBestPathTo chain, MoveTarget samples)
+# AttackPoint47 -> PathNode48 -> PathNode47 -> PathNode51 -> PathNode10 -> PathNode44 ->
+# PathNode12 -> TeleportCheat1 -> PathNode41 -> PathNode43 -> PathNode39 -> PathNode17 ->
+# PathNode37 -> AttackPoint14 -> PathNode36 -> AttackPoint26, parking at (-5582,-9821) from
+# ~370 s. The player follows the same walkable legs (the parking wall blocks a direct
+# southbound line - the shots hit it 40 UU out, scratch item30c_e21b) and fights him at his
+# stake-out: the Beretta's damage (c9mmAmmo.ProcessTraceHit 0x0039, decoded) decays with
+# VSize(HitLocation - W.Location) and is zero beyond ~73 UU, so the kill happens at contact
+# distance where the pawn cylinders overlap. `equip` re-selects the picked-up Beretta: the
+# scripted T8 scene had left `Fists` selected. The game's own switch is
+# `PendingWeapon = new; ChangedWeapon()` (Engine.u Weapon.ClientWeaponSet 0x004F..0x0082);
+# `BringUp` alone is the engine's own no-op shadow (Weapon.Active.BringUp decodes to
+# `bRendered = true; return`).
 t=333.00 goto 770.5 -12990.7
-t=340.50 goto 1282.8 -13568.0
-t=348.50 goto 1771.0 -13200.0
-t=355.00 track BaseSoldier6
-# Beretta burst: 35 Spine1 hits kill (18 hp each, measured, scratch e7e); 40 shots at
-# 0.55 s give margin. The semi-auto cadence is slower than the m60 burst, so the
-# tail of the route shifts by +15 s.
-t=355.50 fire
-t=356.05 fire
-t=356.60 fire
-t=357.15 fire
-t=357.70 fire
-t=358.25 fire
-t=358.80 fire
-t=359.35 fire
-t=359.90 fire
-t=360.45 fire
-t=361.00 fire
-t=361.55 fire
-t=362.10 fire
-t=362.65 fire
-t=363.20 fire
-t=363.75 fire
-t=364.30 fire
-t=364.85 fire
-t=365.40 fire
-t=365.95 fire
-t=366.50 fire
-t=367.05 fire
-t=367.60 fire
-t=368.15 fire
-t=368.70 fire
-t=369.25 fire
-t=369.80 fire
-t=370.35 fire
-t=370.90 fire
-t=371.45 fire
-t=372.00 fire
-t=372.55 fire
-t=373.10 fire
-t=373.65 fire
-t=374.20 fire
-t=374.75 fire
-t=375.30 fire
-t=375.85 fire
-t=376.40 fire
-t=376.95 fire
-t=381.00 search BaseSoldier6
+t=342.00 goto 1282.8 -13568.0
+t=351.00 goto 643.2 -14174.5
+t=361.00 goto -366.7 -13757.3
+t=369.00 goto -1191.2 -13523.4
+t=378.00 goto -2029.2 -13286.1
+t=388.00 goto -2941.9 -12662.5
+t=396.00 goto -3602.7 -12453.4
+t=402.00 goto -4011.9 -12352.8
+t=409.00 goto -4557.0 -12080.8
+t=416.00 goto -5103.0 -11821.9
+t=424.00 goto -5445.3 -11461.0
+t=431.00 goto -5738.4 -11048.0
+t=437.00 goto -5839.7 -10664.2
+t=442.00 goto -5902.0 -10424.5
+# Stand-off ~59 UU from the parked killer (-5582.3,-9821.0, measured e11/e12): inside his
+# r=34 collision cylinder a downward ray exits through the floor before leaving the cylinder
+# and some shots hit the ground instead of him (scratch item30c_e35).
+t=446.00 goto -5568.0 -9793.0
+t=450.00 goto -5540.0 -9780.0
+t=450.50 track BaseSoldier6
+# The full 26-round Beretta burst at contact distance (the killer sits at his stake-out,
+# Enemy=None; the hearing range does not reach - measured: he stayed put through a 60-shot
+# barrage from 5 km, e17). The armour absorbs the first ~8 rounds (item30c_e22).
+t=456.00 fire
+t=456.55 fire
+t=457.10 fire
+t=457.65 fire
+t=458.20 fire
+t=458.75 fire
+t=459.30 fire
+t=459.85 fire
+t=460.40 fire
+t=460.95 fire
+t=461.50 fire
+t=462.05 fire
+t=462.60 fire
+t=463.15 fire
+t=463.70 fire
+t=464.25 fire
+t=464.80 fire
+t=465.35 fire
+t=465.90 fire
+t=466.45 fire
+t=467.00 fire
+t=467.55 fire
+t=468.10 fire
+t=468.65 fire
+t=469.20 fire
+# One more round empties the weapon (the clip and the reserve): the game's own empty-weapon
+# behaviour switches back to Fists a few seconds later, which the item33 checkpoint fixture
+# records. The kill itself lands on fire 25 (measured item30c_e39); the shore soldiers woken
+# by the gunfire (item41c hearing) close in - they chase along the nav path and their
+# crossfire killed the player in scratch e24.
+t=469.75 fire
+t=469.00 search BaseSoldier6
 
-# ---- Segment D: walked return legs (fight spot -> PathNode48 -> PathNode47 -> PathNode18
-# -> AttackPoint43), then the truck staging point -------------------------------------------
-t=382.0 goto 1282.8 -13568.0
-t=389.5 goto 643.2 -14174.5
-t=398.0 goto 1235.0 -14319.0
-t=404.5 goto 1391.8 -14279.6
-t=407.5 goto 1215.0 -14000.0
+# ---- Segment D: the walked return along the same nav legs (stake-out -> PathNode36 ->
+# AttackPoint14 -> ... -> PathNode48 -> PathNode47 -> PathNode18 -> AttackPoint43), then the
+# truck staging point ----------------------------------------------------------------------------
+t=479.00 goto -5902.0 -10424.5
+t=472.00 goto -5839.7 -10664.2
+t=476.00 goto -5738.4 -11048.0
+t=482.00 goto -5445.3 -11461.0
+t=489.00 goto -5103.0 -11821.9
+t=495.00 goto -4557.0 -12080.8
+t=501.00 goto -4011.9 -12352.8
+t=505.00 goto -3602.7 -12453.4
+t=511.00 goto -2941.9 -12662.5
+t=520.00 goto -2029.2 -13286.1
+t=528.00 goto -1191.2 -13523.4
+t=536.00 goto -366.7 -13757.3
+t=545.00 goto 643.2 -14174.5
+t=553.00 goto 1235.0 -14319.0
+t=559.00 goto 1391.8 -14279.6
+t=562.00 goto 1215.0 -14000.0
 # Porte1 is interaction-hidden, so the named use is required; two uses (Unlocked + Triggered).
-t=412.0 yaw 270.0
-t=412.1 use Porte1
-t=413.1 use Porte1
-t=413.6 wait_travel
-t=415.6 forward 0
+t=567.00 yaw 270.0
+t=567.10 use Porte1
+t=568.10 use Porte1
+t=568.60 wait_travel
+t=570.60 forward 0

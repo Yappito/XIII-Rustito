@@ -4856,6 +4856,7 @@ impl<'s> Vm<'s> {
             && !self.objects[target as usize].name.starts_with("Default__")
             && !f.is_static()
             && !destroyed_target
+            && layout.ret.is_none()
         {
             // item14c: a **suspended** actor (cleared by `suspend_for_error`) is not the same as
             // a placed actor outside the executed scope. Dropping its call silently would hide a
@@ -4871,12 +4872,6 @@ impl<'s> Vm<'s> {
                     self.short_path(func)
                 )));
             }
-            if layout.ret.is_some() {
-                return Err(self.err(VmErrorKind::DeferredWithReturnValue {
-                    target: tname,
-                    function: set.path(func),
-                }));
-            }
             // Arguments are still evaluated (side effects, Accessed None) as in a real call.
             for a in &call.args {
                 self.eval(frame, a)?;
@@ -4889,6 +4884,13 @@ impl<'s> Vm<'s> {
             drop(class);
             return Ok(Value::Void);
         }
+        // A call whose return value the executing code needs can never be deferred: the engine's
+        // `execVirtualFunction -> UObject::CallFunction` runs the callee's frame synchronously on
+        // any context, active or not (measured: `XIIIBulletsAmmo.ProcessTraceHit` xiii.u 0x029D
+        // calls `XIIIPawn(Other).GetDamageLocation(...)` on a parked, non-active soldier, and the
+        // old deferral error aborted the whole bullet chain before `Other.TakeDamage` - scratch
+        // item30c_e34). Non-active targets therefore fall through and run right here.
+
         let mut locals = Vec::with_capacity(layout.size);
         for s in &layout.slots {
             for _ in 0..s.dim {
@@ -7830,11 +7832,15 @@ impl<'s> Vm<'s> {
             // `bCollideActors=false` and `bBlockZeroExtentTraces=true`: the extent flag is the
             // operative gate, refined by the actor's collision role. The game's own data marks
             // every shootable actor `bProjTarget=true` (pawns, `DecoBouteille` bottles) while
-            // pure effects are not: the muzzle-flash `MuzzleLight` inherits
-            // `bBlockZeroExtentTraces=true` but is `bCollideActors=false` + `bProjTarget=false`,
-            // and `XIIIWeaponAttachment.MuzzleAttach` 0x0082 spawns it at the muzzle on every
-            // equip - it must not stop the next bullet trace.
-            if !gate || !(self.bool_prop(b, "bCollideActors") || self.bool_prop(b, "bProjTarget")) {
+            // triggers and pure effects are not: the muzzle-flash `MuzzleLight` inherits
+            // `bBlockZeroExtentTraces=true` but is `bCollideActors=false` + `bProjTarget=false`
+            // (`XIIIWeaponAttachment.MuzzleAttach` 0x0082 spawns it at the muzzle on every
+            // equip), and `TouchTrigger7` - measured in the merged-tree Plage01 fight - is
+            // `bCollideActors=true` + `bProjTarget=false` + `bBlockZeroExtentTraces=true` with a
+            // map-sized radius and ate every bullet aimed at `BaseSoldier6`'s post. Shootability
+            // is `bProjTarget`: world geometry (including `bWorldGeometry` movers) blocks through
+            // the world provider instead.
+            if !gate || !self.bool_prop(b, "bProjTarget") {
                 continue;
             }
             // A trace must ignore both the tracer's owners and its owned attachments. UE2's
@@ -7892,11 +7898,10 @@ impl<'s> Vm<'s> {
             } else {
                 self.bool_prop(id, "bBlockZeroExtentTraces")
             };
-            // Same filter as [`Vm::trace_actors`]: the extent flag refined by the actor's
-            // collision role (`bCollideActors` or `bProjTarget`) - see the measured evidence
-            // there (`BaseSoldier6` vs the muzzle-flash `MuzzleLight`).
-            if !gate || !(self.bool_prop(id, "bCollideActors") || self.bool_prop(id, "bProjTarget"))
-            {
+            // Same filter as [`Vm::trace_actors`]: the extent flag refined by `bProjTarget` -
+            // see the measured evidence there (`BaseSoldier6` vs the muzzle-flash `MuzzleLight`
+            // and the map-sized `TouchTrigger7`).
+            if !gate || !self.bool_prop(id, "bProjTarget") {
                 continue;
             }
             if self.is_owned_by(id, caller) || self.is_owned_by(caller, id) {
@@ -9042,6 +9047,30 @@ impl<'s> Vm<'s> {
             }));
         }
         Ok(self.sequence_info(id, sequence)?.is_some())
+    }
+
+    /// `Actor.AnimIsInGroup`: whether `channel`'s active sequence belongs to `group`. The
+    /// decoded `SeqInfo` carries frames/rate/notifies but no sequence group, so the VM cannot
+    /// compare groups and reports `false` - the engine's own "not in that group" answer - once
+    /// per VM as a visible note. Measured caller: `XIIIPawn.ChangedWeapon` (xiii.u) branches on
+    /// it while switching weapons; either answer continues the switch, `false` takes its else
+    /// path.
+    pub(crate) fn anim_is_in_group(&mut self, id: ObjectId, channel: u8, group: &str) -> bool {
+        let active = self
+            .objects
+            .get(id as usize)
+            .and_then(|o| o.anim.channels.get(&channel))
+            .filter(|c| c.active)
+            .map(|c| c.sequence.clone());
+        self.hearing_partial(
+            "AnimIsInGroup",
+            &format!(
+                "Actor.AnimIsInGroup({channel}, '{group}') on {}: decoded SeqInfo has no group data; answering false{}",
+                self.objects.get(id as usize).map(|o| o.name.clone()).unwrap_or_default(),
+                active.as_deref().map(|s| format!(" (channel '{s}' active)")).unwrap_or_default(),
+            ),
+        );
+        false
     }
 
     /// True when `channel` currently has an active animation.

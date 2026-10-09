@@ -737,8 +737,9 @@ fn registry_entries_are_documented() {
     // save-slot declarations; item40c adds the headless Interaction.Initialize and ForceFeedback
     // viewport/device Partials; item43 adds Actor.TraceActors; item30b adds the latent
     // Engine.Controller.WaitForLanding (527) and item30c the BaseSoldier.EyePosition override
-    // (both from the item30 Plage01 walk). Must equal `Registry::builtin().defs().count()`.
-    assert_eq!(defs.len(), 333);
+    // (both from the item30 Plage01 walk) plus the item30 walk's Actor.AnimIsInGroup (395).
+    // Must equal `Registry::builtin().defs().count()`.
+    assert_eq!(defs.len(), 334);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -2881,6 +2882,7 @@ fn phys_fixture() -> Vec<u8> {
     let collide_placing = b.reserve(IMP_BOOLPROP, actor, "bCollideWhenPlacing");
     let block_actors = b.reserve(IMP_BOOLPROP, actor, "bBlockActors");
     let block_players = b.reserve(IMP_BOOLPROP, actor, "bBlockPlayers");
+    let proj_target = b.reserve(IMP_BOOLPROP, actor, "bProjTarget");
     let block_zero = b.reserve(IMP_BOOLPROP, actor, "bBlockZeroExtentTraces");
     let block_nonzero = b.reserve(IMP_BOOLPROP, actor, "bBlockNonZeroExtentTraces");
     let movable = b.reserve(IMP_BOOLPROP, actor, "bMovable");
@@ -2902,7 +2904,8 @@ fn phys_fixture() -> Vec<u8> {
     b.prop(collide_world, collide_placing, 0);
     b.prop(collide_placing, block_actors, 0);
     b.prop(block_actors, block_players, 0);
-    b.prop(block_players, block_zero, 0);
+    b.prop(block_players, proj_target, 0);
+    b.prop(proj_target, block_zero, 0);
     b.prop(block_zero, block_nonzero, 0);
     b.prop(block_nonzero, movable, 0);
     b.prop(movable, bstatic, 0);
@@ -4019,6 +4022,10 @@ fn trace_actors_orders_hits_filters_class_and_returns_all_outs() {
     vm.set_property(near, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
     set_collision_fields(&mut vm, far, true, true);
     set_collision_fields(&mut vm, near, true, true);
+    // Measured game shape (Plage01): a trace-blocking actor is a projectile target.
+    for id in [far, near] {
+        vm.set_property(id, "bProjTarget", 0, Value::Bool(true));
+    }
     let rows = vm
         .vm_trace_actors(
             caller,
@@ -4196,13 +4203,14 @@ fn host_written_location_drives_touch_refresh() {
 }
 
 #[test]
-fn trace_extent_flag_needs_the_actor_collision_role() {
+fn trace_extent_flag_needs_bprojtarget() {
     // Measured on Plage01 (item30c): `BaseSoldier6` blocks hitscan traces with
     // `bCollideActors=false` + `bBlockZeroExtentTraces=true` + `bProjTarget=true`, while the
     // muzzle-flash `MuzzleLight` (spawned at the muzzle by `MuzzleAttach` once the spawn fix
     // gives the weapon attachment an Instigator) has the same extent flag but
     // `bCollideActors=false` + `bProjTarget=false` and must not stop the bullet. The extent
-    // flag is the gate; the collision role (`bCollideActors` or `bProjTarget`) qualifies it.
+    // flag is the gate; `bProjTarget` - the game's own shootability marker, set on every
+    // shootable actor and clear on triggers and effects - qualifies it.
     let set = set_of(trace_package());
     let mut vm = Vm::new(&set, VmLimits::default());
     vm.set_physics(Box::new(MockWorld::new()));
@@ -4233,8 +4241,28 @@ fn trace_extent_flag_needs_the_actor_collision_role() {
         NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(pawn)))),
         "a non-colliding non-proj-target actor must not block the bullet trace"
     );
+    // The measured `TouchTrigger7` shape (merged-tree Plage01): `bCollideActors=true` with a
+    // map-sized radius but `bProjTarget=false` - it must not stop the bullet either.
+    vm.set_property(light, "bCollideActors", 0, Value::Bool(true));
+    vm.set_property(light, "CollisionRadius", 0, Value::Float(2000.0));
+    vm.set_property(light, "CollisionHeight", 0, Value::Float(2000.0));
+    let mut args = trace_args();
+    let hit = call_native(
+        &mut vm,
+        "Actor.Trace",
+        shooter,
+        &[false, false, false, false, false, false],
+        &mut args,
+    );
+    assert_eq!(
+        hit,
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(pawn)))),
+        "a colliding non-proj-target trigger must not block the bullet trace"
+    );
     // Give the light the pawn's role and it becomes the nearer hit.
     vm.set_property(light, "bProjTarget", 0, Value::Bool(true));
+    vm.set_property(light, "CollisionRadius", 0, Value::Float(24.0));
+    vm.set_property(light, "CollisionHeight", 0, Value::Float(24.0));
     let mut args = trace_args();
     let hit = call_native(
         &mut vm,
@@ -4264,6 +4292,9 @@ fn trace_skips_weapon_owned_first_person_muzzle_flash() {
     set_collision_fields(&mut vm, weapon, true, false);
     set_collision_fields(&mut vm, flash, false, true);
     set_collision_fields(&mut vm, soldier, true, true);
+    // Measured game shape (Plage01): the shootable soldier is a projectile target; the
+    // muzzle-flash attachment is not (`bProjTarget=false`).
+    vm.set_property(soldier, "bProjTarget", 0, Value::Bool(true));
     vm.set_property(
         flash,
         "Owner",
@@ -4404,8 +4435,9 @@ fn trace_hits_nearer_of_world_and_actor_and_fasttrace_ignores_actors() {
     set_collision_fields(&mut vm, tracer, true, false);
     let b = phys_actor(&mut vm, &set, "B", [40.0, 0.0, 0.0]);
     // Blocking shape as measured on the game's shootable actors: the extent flag opts the actor
-    // into traces (`set_collision_fields` writes it with `blocking=true`).
+    // into traces and `bProjTarget=true` is the trace filter's collision role.
     set_collision_fields(&mut vm, b, true, true);
+    vm.set_property(b, "bProjTarget", 0, Value::Bool(true));
 
     // Actor closer than the wall -> the actor is returned.
     let mut args = vec![
@@ -4977,6 +5009,32 @@ fn loop_anim_loops_without_anim_end_and_reports_is_animating() {
     let mut args = [Value::Int(0)];
     let r = try_native(&mut vm, "Engine.Actor.IsAnimating", a, &[false], &mut args).unwrap();
     assert_eq!(r, NativeOutcome::Value(Value::Bool(true)));
+}
+
+#[test]
+fn anim_is_in_group_answers_false_and_leaves_a_visible_note() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(4, 1.0)));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    let mut args = [Value::Int(0), Value::Name("Standing".into())];
+    let r = try_native(
+        &mut vm,
+        "Engine.Actor.AnimIsInGroup",
+        a,
+        &[false, false],
+        &mut args,
+    )
+    .unwrap();
+    // The decoded SeqInfo carries no sequence group, so the VM answers the engine's "not in
+    // that group" and never silently claims membership.
+    assert_eq!(r, NativeOutcome::Value(Value::Bool(false)));
+    assert!(
+        vm.trace.iter().any(|e| matches!(&e.kind, TraceKind::Note(text) if text.contains("AnimIsInGroup(0, 'Standing')") && text.contains("no group data"))),
+        "AnimIsInGroup must leave a visible note: {:?}",
+        vm.trace.iter().map(|e| format!("{:?}", e.kind)).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -8245,6 +8303,24 @@ fn static_on_default_fixture() -> Vec<u8> {
     b.class(thing, object, get);
     b.class(object, 0, call);
     b.build()
+}
+
+#[test]
+fn return_valued_call_on_inactive_placed_actor_runs_synchronously() {
+    let set = set_of(list_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let caller = vm.spawn(sg(&set, "Actor"), "Caller").unwrap();
+    vm.set_active(caller, true);
+    let target = vm.spawn(sg(&set, "Actor"), "Target").unwrap();
+    // The target is a placed actor outside the executed scope: a call that must return a value
+    // can never be deferred (the engine's `execVirtualFunction -> CallFunction` runs the callee
+    // frame synchronously). Measured caller: `XIIIBulletsAmmo.ProcessTraceHit` (xiii.u 0x029D)
+    // reads `XIIIPawn(Other).GetDamageLocation(...)` on a parked, non-active soldier; the old
+    // deferral error aborted the bullet chain before `Other.TakeDamage`.
+    let value = vm
+        .call_function(sg(&set, "Actor.Echo"), target, vec![Value::Int(41)])
+        .expect("a return-valued call on a non-active placed actor must run synchronously");
+    assert_eq!(value, Value::Int(41));
 }
 
 #[test]

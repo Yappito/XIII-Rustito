@@ -2277,6 +2277,12 @@ fn is_animating(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nat
     val(Value::Bool(vm.anim_channel_active(c.this, ch)))
 }
 
+fn anim_is_in_group(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let ch = channel(vm, a, 0, c.omitted(0))?;
+    let group = name(vm, a, 1)?;
+    val(Value::Bool(vm.anim_is_in_group(c.this, ch, &group)))
+}
+
 fn has_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     if !vm.animation_ready("Actor.HasAnim", Some(263), c.this, Value::Bool(false))? {
         return val(Value::Bool(false));
@@ -4686,6 +4692,12 @@ fn builtin_defs() -> Vec<NativeDef> {
         "native(282) final function bool IsAnimating(int Channel)",
         "engine.u Actor.IsAnimating decoded (Channel, bool); true while the channel has an active sequence",
         is_animating,
+    ));
+    v.push(def(
+        "Engine.Actor.AnimIsInGroup",
+        "native(395) final function bool AnimIsInGroup(int Channel, name GroupName)",
+        "engine.u Actor.AnimIsInGroup decoded (Channel, GroupName, bool); the channel's active sequence's group check - the decoded SeqInfo carries no group, so the VM compares nothing and reports false with a visible note (the XIIIPawn.ChangedWeapon caller only branches on it)",
+        anim_is_in_group,
     ));
     v.push(def(
         "Engine.Actor.HasAnim",

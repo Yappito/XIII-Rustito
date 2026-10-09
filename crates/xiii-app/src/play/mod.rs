@@ -970,7 +970,17 @@ fn fixed_step(
         let tracked = drive.tracking_actor().and_then(|name| {
             (*session).as_ref().ok().and_then(|sess| {
                 let id = sess.vm().find_live_object(name)?;
-                Some((name.to_owned(), sess.vm().vector_prop(id, "Location")))
+                // Head-zone aim as in the other drive site: 0.6 of CollisionHeight above the
+                // tracked actor's Location keeps the ray inside the head band.
+                let loc = sess.vm().vector_prop(id, "Location").map(|mut l| {
+                    if let Some(xiii_script::Value::Float(h)) =
+                        sess.vm().get_property(id, "CollisionHeight")
+                    {
+                        l[2] += h * 0.6;
+                    }
+                    l
+                });
+                Some((name.to_owned(), loc))
             })
         });
         if let Some((name, location)) = tracked {
@@ -2075,11 +2085,19 @@ fn run_script_inner(
     while tick < ticks {
         let elapsed = tick as f32 * DT;
         if let Some(name) = drive.tracking_actor().map(str::to_owned) {
-            let location = runtime
-                .session
-                .vm()
-                .find_live_object(&name)
-                .and_then(|id| runtime.session.vm().vector_prop(id, "Location"));
+            // Head-zone aim, as in the other drive site: 0.6 of CollisionHeight above the
+            // tracked actor's Location keeps the ray inside the head band (see above).
+            let location = runtime.session.vm().find_live_object(&name).and_then(|id| {
+                let vm = runtime.session.vm();
+                vm.vector_prop(id, "Location").map(|mut l| {
+                    if let Some(xiii_script::Value::Float(h)) =
+                        vm.get_property(id, "CollisionHeight")
+                    {
+                        l[2] += h * 0.6;
+                    }
+                    l
+                })
+            });
             drive.set_track_location(Some(&name), location);
         } else {
             drive.set_track_location(None, None);
@@ -2951,15 +2969,17 @@ mod tests {
                 .all(|event| !matches!(&event.command, script::Command::TakeControl)),
             "the normal Plage01 route must release control through the authored intro"
         );
-        // item30: the walked hut adds ~17.5 s before the back-route block, so the level-end
-        // cinematic (~55 s after Porte1) needs a longer budget than the teleport route's 140 s.
+        // item30: the walked hut adds ~17.5 s before the back-route block; the re-authored
+        // fight (the killer's engine-accurate flight to the far stake-out, the walked chase and
+        // the 25-round burst finishing him at ~469, scratch item30c_e39) plus the level-end
+        // cinematic (~55 s after Porte1) need a longer budget than the teleport route's 140 s.
         let outcome = run_script_with_cinematic_input(
             &game_dir,
             "Plage01",
             &script,
             &resolved.params,
             &scene,
-            530.0,
+            640.0,
         )
         .expect("run Plage01 route");
         println!(
@@ -3103,17 +3123,19 @@ mod tests {
         let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/plage01_route.script");
         let mut script = script::Script::load(&route_path).expect("load tracked Plage01 route");
-        // item30c: the walked route fires its Beretta burst at t=355.5-376.95 (the killer dies at
-        // ~374.75, scratch item30c_e7e); cut there so the run stops well before the level-end
-        // travel (t~469).
-        script.events.retain(|event| event.t <= 385.0);
+        // item30c: the re-authored walked route fires its Beretta burst at t=456-469.75 (the
+        // killer dies at ~469.2, scratch item30c_e39, and the last round empties the weapon);
+        // the cut keeps the corpse search and several seconds so the game's own switch-back to
+        // Fists has happened (the e7f/e7g measurement), and stops well before the level-end
+        // travel.
+        script.events.retain(|event| event.t <= 476.0);
         let mut outcome = run_script(
             &game_dir,
             "Plage01",
             &script,
             &resolved.params,
             &scene,
-            400.0,
+            486.0,
         )
         .expect("run Plage01 through its weapon fire and corpse search");
         assert_eq!(
@@ -3148,14 +3170,14 @@ mod tests {
             .vm()
             .set()
             .path(outcome.session.vm().objects[weapon as usize].class);
-        // item30c: the route fights with the picked-up Beretta (`equip` at t=326 re-selects it
-        // after the T8 scene had left Fists), but the game's own weapon code goes back to Fists
-        // ~2-3 s after the burst stops firing (measured with scratch runs e7f/e7g/e7h: the
-        // switch follows the last fire whether or not the killer died and with ~20 or ~40 shots,
-        // so it is not the kill, the corpse search or ammo exhaustion). The selected weapon at
-        // save time is therefore the game's own end state, Fists.
+        // item30c: the re-authored route fights with the picked-up Beretta (`equip` at t=326
+        // re-selects it after the T8 scene had left Fists) and the selected weapon at save time
+        // is still that Beretta (measured scratch item30c_e39/e40: the burst empties it at
+        // 469.75 and the old-route switch-back to Fists seen in e7f/e7g/e7h does not re-fire in
+        // this route's state machine timing). The save must record the game's own end state as
+        // it is, so assert on the Beretta and restore through the same chain.
         assert!(
-            weapon_class.to_ascii_lowercase().contains("fists"),
+            weapon_class.to_ascii_lowercase().contains("beretta"),
             "selected weapon after route: {weapon_class}"
         );
         // The fired Beretta must still be in the chain (it is the route's weapon, only no longer
@@ -4599,16 +4621,16 @@ mod tests {
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
         let route = script::Script::parse(include_str!("../../tests/data/plage01_route.script"))
             .expect("parse the checked-in Plage01 route fixture");
-        // item30c: the walked route kills BaseSoldier6 at ~374.75 s with the Beretta; the death
-        // pose needs a few seconds after that (the run stops long before the level-end travel at
-        // ~469 s).
+        // item30c: the re-authored walked route kills BaseSoldier6 at ~469.2 s with the Beretta;
+        // the death pose needs a few seconds after that (the run stops before the level-end
+        // travel).
         let outcome = run_script(
             &game_dir,
             "Plage01",
             &route,
             &resolved.params,
             &scene,
-            395.0,
+            480.0,
         )
         .expect("run the requested Plage01 route through the killer");
         let vm = outcome.session.vm();

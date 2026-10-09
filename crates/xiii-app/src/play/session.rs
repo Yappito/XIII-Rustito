@@ -2119,8 +2119,19 @@ impl Session {
                 break;
             }
             if self.vm.is_a(id, "weapon") {
-                // Prefer a real gun over the starting `Fists`.
-                if best.is_none() || !self.vm.is_a(id, "fists") {
+                // Prefer a real gun over the starting `Fists`, and skip weapons the game's own
+                // cycle skips: `Weapon.NextWeapon` (Engine.u decoded 0x0000) only offers weapons
+                // with `HasAmmo()`, so a dry weapon is never the game's own best choice. The
+                // route's second equip runs after its Beretta burst emptied the c9mm reserve and
+                // must land on the knife rather than re-select the dry Beretta.
+                let has_ammo = self
+                    .vm
+                    .send_event(id, "HasAmmo", Vec::new())
+                    .ok()
+                    .flatten()
+                    .map(|v| !matches!(v, Value::Bool(false)))
+                    .unwrap_or(true);
+                if has_ammo && (best.is_none() || !self.vm.is_a(id, "fists")) {
                     best = Some(id);
                 }
             }
@@ -2130,10 +2141,24 @@ impl Session {
             return Err("no weapon in the inventory chain".to_owned());
         };
         let name = self.vm.objects[weapon as usize].name.clone();
-        // `Weapon.BringUp` sets `Instigator.PendingWeapon` and calls `ChangedWeapon`.
-        match self.vm.send_event(weapon, "BringUp", Vec::new()) {
+        // The game's own weapon switch is `PendingWeapon = new; ChangedWeapon()` - the exact
+        // pair `Weapon.ClientWeaponSet` runs (Engine.u decoded 0x004F..0x0082) when
+        // `Instigator.Weapon == None`, and the pair `grant_weapon` already runs for the same
+        // reason. `BringUp` is not a switch: the effective `engine.Weapon.BringUp` decodes to
+        // `PlaySelect(); bRendered = true; GotoState('Active')` and its state shadow
+        // `Weapon.Active.BringUp` (0x0000..0x0008) decodes to `bRendered = true; return` - the
+        // engine declines to re-arm a weapon that is already in `Active`. An equip that goes
+        // through `BringUp` alone therefore leaves the starting `Fists` selected (measured on
+        // the merged tree: `Pawn.Weapon` stayed `Fists3` and the route fires were fist swings).
+        self.vm.set_property(
+            self.player,
+            "PendingWeapon",
+            0,
+            Value::Object(Some(ObjRef::Instance(weapon))),
+        );
+        match self.vm.send_event(self.player, "ChangedWeapon", Vec::new()) {
             Ok(_) => Ok(name),
-            Err(e) => Err(format!("{name} BringUp: {e}")),
+            Err(e) => Err(format!("{name} ChangedWeapon: {e}")),
         }
     }
 
