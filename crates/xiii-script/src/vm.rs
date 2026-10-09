@@ -596,7 +596,8 @@ pub struct AnimChannelState {
     pub looping: bool,
     /// Still advancing (false once a non-looping sequence ended).
     pub active: bool,
-    /// Frozen previous channel pose, including an interrupted tween.
+    /// Frozen previous channel pose (one cached level, like the engine's per-channel cache;
+    /// the frozen state's own `tween_source` is always `None`).
     pub tween_source: Option<Box<AnimChannelState>>,
     /// Seconds of tweening left and initial duration.
     pub tween_remaining: f32,
@@ -7358,6 +7359,13 @@ impl<'s> Vm<'s> {
             if self.is_owned_by(b, id) || self.is_owned_by(id, b) {
                 continue;
             }
+            // UE2's line check skips hidden actors (`bHidden`): the carried first-person weapon
+            // sits exactly at the trace start (`XIIIWeapon.Active.BeginState` places it at the
+            // pawn's eye via `CalcDrawOffset`) and measured `BaseSoldier6` traces died inside it
+            // when it was equipped but not the tracer. The real game's shots pass it.
+            if self.bool_prop(b, "bHidden") {
+                continue;
+            }
             let (lb, rb, hb) = self.actor_cylinder(b);
             if let Some((t, n)) = segment_cylinder_hit(
                 start,
@@ -7407,6 +7415,10 @@ impl<'s> Vm<'s> {
                 continue;
             }
             if self.is_owned_by(id, caller) || self.is_owned_by(caller, id) {
+                continue;
+            }
+            // Hidden actors do not block traces (UE2 line check; see `trace_actors`).
+            if self.bool_prop(id, "bHidden") {
                 continue;
             }
             let (loc, radius, height) = self.actor_cylinder(id);
@@ -8225,29 +8237,24 @@ impl<'s> Vm<'s> {
         let rate = if rate > 0.0 { rate * natural } else { natural };
         let mut notifies = info.notifies;
         notifies.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        if tween_time > 0.0 {
-            let mut depth = 0;
-            let mut source = self.objects[id as usize]
-                .anim
-                .channels
-                .get(&channel)
-                .and_then(|c| c.tween_source.as_deref());
-            while let Some(c) = source {
-                depth += 1;
-                if depth >= 64 {
-                    return Err(self.err(VmErrorKind::AnimationDataError {
-                        source: self.animation_sources(id).join(", "),
-                        sequence: sequence.to_owned(),
-                        message: "more than 64 interrupted tweens".into(),
-                    }));
-                }
-                source = c.tween_source.as_deref();
-            }
-        }
+        // Engine.dll `PlayAnim` keeps ONE cached previous pose per channel (channel+0x58
+        // previous tween frame, +0x5c cached pose; see item47's report) and overwrites it on
+        // every new tweened start. Authored scripts rely on that bound:
+        // `xidcine.Cine2.CineInit.PlayMoving` re-runs `LoopAnim(WaitAnim, none, 0.2)` from
+        // `PlayingSequence.Tick` every tick, so a chain that froze each interrupted tween
+        // recursively grew without limit and failed the whole cutscene. The frozen source is
+        // therefore the channel's current state with its own frozen source dropped — a single
+        // cached level, like the engine. Whether the engine's cache holds the channel's blended
+        // in-progress pose or its target pose is not fully decoded (the report labels it a
+        // hypothesis); this freeze keeps the interrupted tween's frame and remaining time.
         let tween_source = if tween_time > 0.0 {
-            self.actor_animation(id)
-                .and_then(|a| a.channels.into_iter().find(|c| c.channel == channel))
-                .map(Box::new)
+            let mut source = self
+                .actor_animation(id)
+                .and_then(|a| a.channels.into_iter().find(|c| c.channel == channel));
+            if let Some(source) = source.as_mut() {
+                source.tween_source = None;
+            }
+            source.map(Box::new)
         } else {
             None
         };

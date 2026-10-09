@@ -366,6 +366,28 @@ impl Session {
             // bytecode 0x037A). `Plage00.FirstFrame`'s guard at 0x0013 then skips re-applying
             // the wounded intro Health when it reads "LOAD". Set it here, once, after spawn.
             vm.set_start_spot_event(event);
+        } else if let Some(gi) = game_info {
+            // Native map-entry inventory setup. The decoded script has no other default-weapon
+            // granter on a fresh campaign load: `XIIIGameInfo.RestartPlayer` (xiii.u bytecode
+            // 0x0000-0x03B5) omits stock UE2's `AddDefaultInventory` call, and these maps carry
+            // no MapInfo whose `InitialInv`/`SetUpInitialInventory` could grant one. The engine
+            // binary itself references the `AcceptInventory` event name (three occurrences in
+            // Engine.dll .rdata), and authored code depends on its products: the cutscene
+            // handoff `CineController2.PlayingSequence.Tick` 0x0065 restores the player weapon
+            // through `XIIIPlayerController.SwitchWeapon`, whose `WeaponChange` walk terminates
+            // only on the group-0 `Fists` item (XIIISoloMutator.DefaultWeaponName). With no
+            // travel data the authored event grants exactly the defaults: `Fists` (Spawn+GiveTo,
+            // its `FistsAmmo` linked at amount 0 by the authored `Weapon.GiveAmmo`) and
+            // `XIIILeftHand` (0x0844-0x08A0). Checkpoint resumes skip this here and run the
+            // same event through `restore_checkpoint` with the saved travel inventory instead,
+            // mirroring the engine's travel-data load.
+            if let Err(e) = vm.send_event(
+                gi,
+                "AcceptInventory",
+                vec![Value::Object(Some(ObjRef::Instance(player)))],
+            ) {
+                blocked.push(format!("GameInfo.AcceptInventory: {e}"));
+            }
         }
 
         let dispatcher = vm.find_object("XIIIDispatcher0");
@@ -2105,10 +2127,10 @@ impl Session {
     }
 
     /// Equips the best weapon the player already carries in the game's own `Inventory` chain,
-    /// through the game's own `Weapon.BringUp` -> `Instigator.ChangedWeapon()` path (item14b).
-    /// This is the normal weapon-switch action; it never spawns or grants a weapon. Used after
-    /// walking onto a map weapon pickup. Returns the equipped weapon name, or an error naming the
-    /// reason (no weapon carried, or the script raised).
+    /// through the game's own switch sequence (item14b). This is the normal weapon-switch
+    /// action; it never spawns or grants a weapon. Used after walking onto a map weapon pickup.
+    /// Returns the equipped weapon name, or an error naming the reason (no weapon carried, or
+    /// the script raised).
     pub fn equip_inventory_weapon(&mut self) -> Result<String, String> {
         let mut cur = self.inventory_head(self.player);
         let mut best: Option<ObjectId> = None;
@@ -2130,11 +2152,33 @@ impl Session {
             return Err("no weapon in the inventory chain".to_owned());
         };
         let name = self.vm.objects[weapon as usize].name.clone();
-        // `Weapon.BringUp` sets `Instigator.PendingWeapon` and calls `ChangedWeapon`.
-        match self.vm.send_event(weapon, "BringUp", Vec::new()) {
-            Ok(_) => Ok(name),
-            Err(e) => Err(format!("{name} BringUp: {e}")),
+        // The authored manual switch (`XIIIPlayerController.SwitchWeapon` 0x0140) sets
+        // `Pawn.PendingWeapon` and defers to `Weapon.PutDown()`'s state machine; the immediate
+        // completion is the pawn's own `XIIIPawn.ChangedWeapon` (0x024D: `Weapon =
+        // PendingWeapon`, `AttachToPawn`, `Controller.ChangedWeapon`). `Weapon.BringUp`
+        // (engine.u 0x0087) only runs `PlaySelect`/`GotoState('Active')` and never touches
+        // `PendingWeapon`, so the bridge composes `PendingWeapon` + `BringUp` +
+        // `ChangedWeapon` — the same immediate switch `ClientWeaponSet` (0x0073) runs when the
+        // pawn has no weapon. The PutDown-deferred state machine is not simulated here.
+        self.vm.set_property(
+            self.player,
+            "PendingWeapon",
+            0,
+            Value::Object(Some(ObjRef::Instance(weapon))),
+        );
+        if let Err(e) = self.vm.send_event(weapon, "BringUp", Vec::new()) {
+            return Err(format!("{name} BringUp: {e}"));
         }
+        if let Err(e) = self.vm.send_event(self.player, "ChangedWeapon", Vec::new()) {
+            return Err(format!("{name} ChangedWeapon: {e}"));
+        }
+        if self.player_weapon() != Some(weapon) {
+            return Err(format!(
+                "{name} ChangedWeapon left Pawn.Weapon at {:?}",
+                self.player_weapon()
+            ));
+        }
+        Ok(name)
     }
 
     /// The player weapon's first-person mesh path: the decoded `MeshName` string

@@ -3263,14 +3263,18 @@ mod tests {
                 .vm()
                 .get_property(checkpoint, "SoundToLaunch")
         );
+        // The chain now begins with the authored entry defaults (`Fists` -> `FistsAmmo` -> ...),
+        // so "the first ammo item" is no longer the route weapon's ammunition. Compare the
+        // selected weapon's own ammo class end to end.
         let ammo = saved
             .inventory
             .iter()
-            .find_map(|item| {
+            .find(|item| item.class_path.eq_ignore_ascii_case("XIII.M60Ammo"))
+            .and_then(|item| {
                 item.ammo_amount
                     .map(|amount| (item.class_path.clone(), amount))
             })
-            .expect("saved travel inventory includes ammunition");
+            .expect("saved travel inventory includes the selected weapon's ammunition");
         assert!(ammo.1 >= 0, "invalid saved ammo count: {ammo:?}");
         println!(
             "[item33 route] checkpoint={} weapon={} ammo={ammo:?} health={} objectives={:?} sound={:?}",
@@ -3369,10 +3373,25 @@ mod tests {
             remaining.remove(at);
         }
         remaining.sort();
+        // Authored `XIIIGameInfo.AcceptInventory` adds exactly three classes beyond the saved
+        // travel inventory, and only when the restored chain lacks them (all measured script):
+        // the default weapon `Fists` (`AddDefaultInventory` 0x04CF ->
+        // `BaseMutator.GetDefaultWeapon` -> `XIIISoloMutator.DefaultWeaponName`="XIII.Fists",
+        // Spawn+GiveTo; `Weapon.GiveAmmo` links `FistsAmmo` at amount 0) and `XIIILeftHand`
+        // (0x0844-0x08A0, Spawn+GiveTo when `FindInventoryType` misses). A fresh-start route
+        // save legitimately lacks them because `XIIIGameInfo.RestartPlayer` omits stock UE2's
+        // `AddDefaultInventory` and these maps carry no MapInfo `InitialInv`; a save that
+        // already holds the defaults must be restored without duplicates.
+        let mut expected_extras: Vec<String> = Vec::new();
+        for class in ["xiii.fists", "xiii.fistsammo", "xiii.xiiilefthand"] {
+            if !saved_classes.iter().any(|c| c == class) {
+                expected_extras.push(class.to_owned());
+            }
+        }
+        expected_extras.sort();
         assert_eq!(
-            remaining,
-            ["xiii.fistsammo", "xiii.xiiilefthand"],
-            "only AcceptInventory's authored default ammo/left-hand entries should be added"
+            remaining, expected_extras,
+            "only AcceptInventory's authored default weapon/ammo/left-hand entries may be added"
         );
         let mut saved_ammo_state = saved
             .inventory
@@ -4422,7 +4441,10 @@ mod tests {
 
     /// item44: collect the placed Beretta through the map pickup and verify its ammunition class
     /// and authored damage path. The teleport only positions the player on the pickup; no weapon
-    /// grant command is used.
+    /// grant command is used. The authored entry defaults equip `Fists` (`AcceptInventory` at
+    /// map entry), and the authored `Weapon.ClientWeaponSet(True)` deliberately does not switch
+    /// a human-controlled pawn that already holds a weapon (bytecode 0x0084), so the route
+    /// equips the picked-up Beretta through the game's own `BringUp` switch, as a player would.
     #[test]
     fn opt_in_plage01_beretta_pickup_uses_nine_mm_and_damages_soldier() {
         let Some(game_dir) = opt_in_root() else {
@@ -4440,6 +4462,7 @@ mod tests {
             "t=48.00 teleport -737.654 -511.886 1254.94\n\
              t=49.00 teleport 1802.4131 -12992.034 1070.843\n\
              t=49.00 yaw 90\nt=49.00 pitch 5\n\
+             t=49.10 equip\n\
              t=49.20 fire\nt=49.80 fire\nt=50.40 fire\nt=51.00 fire\nt=51.60 fire\n",
         )
         .expect("parse pickup combat route");

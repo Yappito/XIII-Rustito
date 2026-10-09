@@ -8438,7 +8438,7 @@ fn repeated_bone_controls_replace_previous_request() {
 }
 
 #[test]
-fn animation_rejects_nonfinite_and_unbounded_interruptions_or_wrap_work() {
+fn animation_rejects_nonfinite_and_interruptions_stay_bounded() {
     let set = anim_set();
     let mut vm = Vm::new(&set, VmLimits::default());
     vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(4, 2.0)));
@@ -8452,11 +8452,14 @@ fn animation_rejects_nonfinite_and_unbounded_interruptions_or_wrap_work() {
         vm.start_animation(a, "Walk", 1.0, f32::INFINITY, 0, false)
             .is_err()
     );
-    for _ in 0..65 {
+    // Authored cine scripts re-run `LoopAnim` on the same channel every tick (measured:
+    // Plage01 `CineController2` -> `Cine2.CineInit.PlayMoving`). The tween source freezes
+    // one level instead of growing an unbounded interruption chain, so repeated tweened
+    // starts on one actor keep working and sampling stays bounded.
+    for _ in 0..200 {
         vm.start_animation(a, "Walk", 1.0, 1.0, 0, false).unwrap();
     }
-    // A further frozen recipe would exceed the sampler recursion bound.
-    assert!(vm.start_animation(a, "Walk", 1.0, 1.0, 0, false).is_err());
+    vm.tick(1.0).unwrap();
     vm.start_animation(a, "Walk", 1.0, 0.0, 0, true).unwrap();
     assert!(vm.tick(10000.0).is_err());
 }
@@ -8467,11 +8470,37 @@ fn attach_to_bone_writes_the_reflected_attachment_bone_field() {
     let mut vm = Vm::new(&set, VmLimits::default());
     let parent = vm.spawn(sg(&set, "Actor"), "Parent").unwrap();
     let child = vm.spawn(sg(&set, "Actor"), "Child").unwrap();
-    let mut args = [Value::Object(Some(ObjRef::Instance(child))), Value::Name("Arm".into())];
-    let out = try_native(&mut vm, "Engine.Actor.AttachToBone", parent, &[false; 2], &mut args).unwrap();
+    let mut args = [
+        Value::Object(Some(ObjRef::Instance(child))),
+        Value::Name("Arm".into()),
+    ];
+    let out = try_native(
+        &mut vm,
+        "Engine.Actor.AttachToBone",
+        parent,
+        &[false; 2],
+        &mut args,
+    )
+    .unwrap();
     assert!(matches!(out, NativeOutcome::Value(Value::Bool(true))));
-    assert_eq!(vm.get_property(child, "AttachmentBone"), Some(&Value::Name("Arm".into())));
-    assert_eq!(vm.get_property(child, "Base"), Some(&Value::Object(Some(ObjRef::Instance(parent)))));
+    assert_eq!(
+        vm.get_property(child, "AttachmentBone"),
+        Some(&Value::Name("Arm".into()))
+    );
+    assert_eq!(
+        vm.get_property(child, "Base"),
+        Some(&Value::Object(Some(ObjRef::Instance(parent))))
+    );
     args[0] = Value::Object(None);
-    assert!(matches!(try_native(&mut vm, "Engine.Actor.AttachToBone", parent, &[false; 2], &mut args).unwrap(), NativeOutcome::Value(Value::Bool(false))));
+    assert!(matches!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.AttachToBone",
+            parent,
+            &[false; 2],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(false))
+    ));
 }

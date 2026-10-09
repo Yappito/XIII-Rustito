@@ -307,7 +307,7 @@ fn load_render_model(cache: &mut PackageCache, spec: &str) -> Result<LoadedModel
             first_index: indices.len() as u32,
             index_count: source.len() as u32,
         });
-        for t in source.chunks_exact(3) {
+        for t in source.as_chunks::<3>().0 {
             indices.extend([u32::from(t[0]), u32::from(t[2]), u32::from(t[1])]);
         }
     }
@@ -1116,15 +1116,23 @@ mod tests {
 
     #[test]
     fn opt_in_item47_temporary_suspension_diagnostic() {
-        let Some(root) = opt_in_root() else { return; };
+        let Some(root) = opt_in_root() else {
+            return;
+        };
         for map in ["Amos01", "Plage01"] {
             let mut session = Session::open(&root, map).unwrap();
             let loc = session.player_location().unwrap();
             for _ in 0..1800 {
                 session.drive_render_phase();
-                session.step(1.0 / 60.0, loc, 0.0, [0.0; 3], &super::super::session::PlayerVMModes::default());
+                session.step(
+                    1.0 / 60.0,
+                    loc,
+                    0.0,
+                    [0.0; 3],
+                    &super::super::session::PlayerVMModes::default(),
+                );
             }
-            println!("item47 diagnostic {map} failures={:?}",session.failures);
+            println!("item47 diagnostic {map} failures={:?}", session.failures);
         }
     }
 

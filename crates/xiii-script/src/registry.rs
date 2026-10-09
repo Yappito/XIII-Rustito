@@ -2807,9 +2807,29 @@ fn set_owner(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Native
 }
 
 fn is_player_pawn(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
-    // UE2 `APawn::IsPlayerPawn`: true for a player pawn. XIII has no `bIsPlayerPawn` field
-    // (measured), so this is the class-chain test (the same approximation as `is_player_or_projectile`).
-    val(Value::Bool(vm.is_a(c.this, "PlayerPawn")))
+    // UE2 `APawn::IsPlayerPawn` (upstream): the pawn's `Controller` is a `PlayerController`.
+    // The old class-chain test `IsA('PlayerPawn')` was always false in XIII: Engine.u has no
+    // `PlayerPawn` class (measured; the player pawn chain is
+    // `xiiiplayerpawn <- xiiipawn <- pawn <- actor <- object`), so every authored
+    // `IsPlayerPawn()` branch took the AI path. Measured consequence: `Weapon.GiveTo`'s
+    // ammo-fill guard read `!IsPlayerPawn()` as true and ran `AmmoType.AddAmmo(ReloadCount)`
+    // for the player, and `Weapon.GiveAmmo`'s zero-fill lost its player branch. The engine's
+    // own marker is `Controller.bIsPlayer` (default false on `Controller`, true on
+    // `PlayerController`, measured), which also covers controller classes that predate the
+    // class-chain check.
+    let player = match vm.obj_prop(c.this, "Controller") {
+        Some(ctrl) => {
+            vm.bool_prop(ctrl, "bIsPlayer")
+                || vm.objects.get(ctrl as usize).is_some_and(|o| {
+                    o.layout
+                        .chain_names
+                        .iter()
+                        .any(|n| n.eq_ignore_ascii_case("playercontroller"))
+                })
+        }
+        None => false,
+    };
+    val(Value::Bool(player))
 }
 
 fn find_inventory_type(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -4253,7 +4273,7 @@ fn builtin_defs() -> Vec<NativeDef> {
         def(
             "Engine.Pawn.IsPlayerPawn",
             "native(0) final function bool IsPlayerPawn()",
-            "engine.u Pawn.IsPlayerPawn decoded (bool); class-chain test (XIII has no bIsPlayerPawn field; measured)",
+            "engine.u Pawn.IsPlayerPawn decoded (bool); UE2 upstream: the Controller is a PlayerController (Controller.bIsPlayer, measured default true only on PlayerController)",
             is_player_pawn,
         ),
         def(
