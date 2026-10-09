@@ -3050,6 +3050,702 @@ fn ai_set() -> ScriptSet {
     set
 }
 
+/// Redistributable item46 fixture: real property types, no installation bytes.
+fn item46_set() -> ScriptSet {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "IAController");
+    let controller_base = b.reserve(0, 0, "Controller");
+    let move_toward = b.reserve(IMP_FUNCTION, controller_base, "MoveToward");
+    let new_target = b.reserve(IMP_OBJECTPROP, move_toward, "NewTarget");
+    let view_focus = b.reserve(IMP_OBJECTPROP, move_toward, "ViewFocus");
+    let speed_arg = b.reserve(IMP_FLOATPROP, move_toward, "Speed");
+    let next_target = b.reserve(IMP_OBJECTPROP, move_toward, "NextTarget");
+    b.prop_with(new_target, view_focus, pf::PARM, &compact(actor));
+    b.prop_with(
+        view_focus,
+        speed_arg,
+        pf::PARM | pf::OPTIONAL_PARM,
+        &compact(actor),
+    );
+    b.prop(speed_arg, next_target, pf::PARM | pf::OPTIONAL_PARM);
+    b.prop_with(
+        next_target,
+        0,
+        pf::PARM | pf::OPTIONAL_PARM,
+        &compact(actor),
+    );
+    b.func(
+        move_toward,
+        0,
+        new_target,
+        &[],
+        0,
+        502,
+        ff::FINAL | ff::NATIVE | ff::LATENT,
+    );
+    let moving = b.reserve(IMP_STATE, controller, "Moving");
+    let level = b.reserve(0, 0, "LevelInfo");
+    let node = b.reserve(0, 0, "NavigationPoint");
+    let music_entry = b.reserve(IMP_STRUCT_CLASS, 0, "MusicEntry");
+    let music_value = b.reserve(IMP_INTPROP, music_entry, "Value");
+    b.prop(music_value, 0, 0);
+    b.strukt(music_entry, music_value);
+    let music_inner = b.reserve(IMP_STRUCTPROP, actor, "MusicInner");
+    b.prop_with(music_inner, 0, 0, &compact(music_entry));
+    let soldier_inner = b.reserve(IMP_OBJECTPROP, actor, "SoldierInner");
+    b.prop_with(soldier_inner, 0, 0, &compact(pawn));
+    let alliance_entry_ref = b.reserve(IMP_STRUCT_CLASS, 0, "AllianceEntry");
+    let alliance_name_ref = b.reserve(IMP_NAMEPROP, alliance_entry_ref, "AllianceName");
+    let alliance_level_ref = b.reserve(IMP_FLOATPROP, alliance_entry_ref, "AllianceLevel");
+    b.prop(alliance_name_ref, alliance_level_ref, 0);
+    b.prop(alliance_level_ref, 0, 0);
+    b.strukt(alliance_entry_ref, alliance_name_ref);
+    let mut fields = Vec::new();
+    for name in [
+        "Location",
+        "Destination",
+        "FocalPoint",
+        "WeaponStartTrace",
+        "LastSeenPos",
+        "WeaponEndTrace",
+        "Velocity",
+        "Acceleration",
+    ] {
+        fields.push((b.reserve(IMP_STRUCTPROP, actor, name), compact(IMP_STRUCT)));
+    }
+    for name in [
+        "CollisionRadius",
+        "CollisionHeight",
+        "BaseEyeHeight",
+        "GroundSpeed",
+        "WalkingPct",
+        "CrouchingPct",
+        "DesiredSpeed",
+        "MaxDesiredSpeed",
+        "AccelRate",
+        "GroundFriction",
+        "MoveTimer",
+        "TacticalOffset",
+    ] {
+        fields.push((b.reserve(IMP_FLOATPROP, actor, name), vec![]));
+    }
+    for name in [
+        "bCollideActors",
+        "bCollideWorld",
+        "bBlockZeroExtentTraces",
+        "bIsDead",
+        "bCanSeeThrough",
+        "bInstantHit",
+        "bCanShootThroughWithRayCastingWeapon",
+        "bCanShootThroughWithProjectileWeapon",
+        "bWalking",
+        "bReducedSpeed",
+        "bIsCrouched",
+        "bAdjusting",
+        "bAdvancedTactics",
+        "bPreparingMove",
+    ] {
+        fields.push((b.reserve(IMP_BOOLPROP, actor, name), vec![]));
+    }
+    for name in [
+        "Pawn",
+        "Enemy",
+        "Level",
+        "BaseS",
+        "XIII",
+        "GenAlerte",
+        "Pote",
+        "Weapon",
+        "AmmoType",
+        "MoveTarget",
+        "Focus",
+        "PhysicsVolume",
+        "NavigationPointList",
+        "NextNavigationPoint",
+        "NextMoveTarget",
+    ] {
+        fields.push((b.reserve(IMP_OBJECTPROP, actor, name), compact(actor)));
+    }
+    fields.push((b.reserve(IMP_BYTEPROP, actor, "Physics"), compact(0)));
+    fields.push((b.reserve(IMP_NAMEPROP, actor, "Alliance"), vec![]));
+    fields.push((
+        b.reserve(IMP_ARRAYPROP, actor, "MusicVars"),
+        compact(music_inner),
+    ));
+    fields.push((
+        b.reserve(IMP_ARRAYPROP, actor, "SoldierInFightList"),
+        compact(soldier_inner),
+    ));
+    let alliances = b.reserve(IMP_STRUCTPROP, actor, "InitialAlliances");
+    for (i, (field, extra)) in fields.iter().enumerate() {
+        b.prop_with(
+            *field,
+            fields.get(i + 1).map_or(alliances, |next| next.0),
+            0,
+            extra,
+        );
+    }
+    b.prop_array_dim(alliances, 0, 0, alliance_entry_ref, 4);
+    let target_ref = fields
+        .iter()
+        .find(|(id, _)| b.names[b.exports[*id as usize - 1].name as usize] == "MoveTarget")
+        .unwrap()
+        .0;
+    let mut code = vec![0x61, 0xf6, 0x01];
+    code.extend(compact(target_ref));
+    code.extend([0x0b, 0x0b, 0x0b, 0x16, 0x08, 0x0c]);
+    code.extend(compact(b.name("Begin")));
+    code.extend(0u32.to_le_bytes());
+    code.extend(compact(0));
+    code.extend(0u32.to_le_bytes());
+    b.state(moving, 0, &code, 29, 12);
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, fields[0].0, 0);
+    b.class(controller_base, actor, move_toward, 0);
+    b.class(controller, controller_base, moving, 0);
+    for class in [pawn, level, node] {
+        b.class(class, actor, 0, 0);
+    }
+    let p = ScriptPackage::load(
+        "Test",
+        b.build(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("synthetic package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+fn item46_pair(vm: &mut Vm<'_>, set: &ScriptSet) -> (ObjectId, ObjectId) {
+    let ctrl = vm.spawn(pg(set, "IAController"), "Controller").unwrap();
+    let pawn = vm.spawn(pg(set, "Pawn"), "Soldier").unwrap();
+    vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    vm.set_property(
+        ctrl,
+        "BaseS",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    vm.set_property(pawn, "Location", 0, Value::Vector([0.0; 3]));
+    vm.set_property(pawn, "CollisionRadius", 0, Value::Float(1.0));
+    vm.set_property(pawn, "CollisionHeight", 0, Value::Float(40.0));
+    (ctrl, pawn)
+}
+
+#[test]
+fn item46_attack_counters_are_indexed_wrapping_and_reject_missing_records() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let level = vm.spawn(pg(&set, "LevelInfo"), "Level").unwrap();
+    let record = |n| Value::Struct(vec![("value".into(), Value::Int(n))]);
+    vm.set_property(
+        level,
+        "MusicVars",
+        0,
+        Value::Array(vec![record(12), record(34), record(0)]),
+    );
+    for (native, expected) in [
+        ("Engine.LevelInfo.DecAttaque", -1),
+        ("Engine.LevelInfo.IncAttaque", 0),
+    ] {
+        call_native(&mut vm, native, level, &[], &mut []);
+        assert_eq!(
+            vm.get_property(level, "MusicVars"),
+            Some(&Value::Array(vec![
+                record(12),
+                record(34),
+                record(expected)
+            ]))
+        );
+    }
+    vm.set_property(
+        level,
+        "MusicVars",
+        0,
+        Value::Array(vec![record(12), record(34), record(i32::MAX)]),
+    );
+    call_native(&mut vm, "Engine.LevelInfo.IncAttaque", level, &[], &mut []);
+    assert_eq!(
+        vm.get_property(level, "MusicVars"),
+        Some(&Value::Array(vec![
+            record(12),
+            record(34),
+            record(i32::MIN)
+        ]))
+    );
+    vm.set_property(level, "MusicVars", 0, Value::Array(vec![]));
+    for native in ["Engine.LevelInfo.IncAttaque", "Engine.LevelInfo.DecAttaque"] {
+        assert!(try_native(&mut vm, native, level, &[], &mut []).is_err());
+    }
+}
+
+#[test]
+fn item46_pseudo_steering_preserves_retail_equality_gate_and_symmetric_trace_correction() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([50.0, -100.0, -100.0], [51.0, 100.0, 100.0]),
+    ));
+    let (ctrl, pawn) = item46_pair(&mut vm, &set);
+    assert_eq!(
+        call_native(&mut vm, "IAController.PseudoSteering", ctrl, &[], &mut []),
+        NativeOutcome::Value(Value::Vector([0.0; 3]))
+    );
+    let group = vm.spawn(pg(&set, "Actor"), "Group").unwrap();
+    vm.set_property(
+        ctrl,
+        "GenAlerte",
+        0,
+        Value::Object(Some(ObjRef::Instance(group))),
+    );
+    let left = vm.spawn(pg(&set, "Pawn"), "Left").unwrap();
+    let right = vm.spawn(pg(&set, "Pawn"), "Right").unwrap();
+    vm.set_property(left, "Location", 0, Value::Vector([-200.0, 0.0, 0.0]));
+    vm.set_property(right, "Location", 0, Value::Vector([200.0, 0.0, 0.0]));
+    let members = |ids: &[ObjectId]| {
+        Value::Array(
+            ids.iter()
+                .map(|id| Value::Object(Some(ObjRef::Instance(*id))))
+                .collect(),
+        )
+    };
+    vm.set_property(group, "SoldierInFightList", 0, members(&[right]));
+    assert_eq!(
+        call_native(&mut vm, "IAController.PseudoSteering", ctrl, &[], &mut []),
+        NativeOutcome::Value(Value::Vector([0.0; 3]))
+    );
+    vm.set_property(
+        group,
+        "SoldierInFightList",
+        0,
+        members(&[left, pawn, right]),
+    );
+    let NativeOutcome::Value(Value::Vector(result)) =
+        call_native(&mut vm, "IAController.PseudoSteering", ctrl, &[], &mut [])
+    else {
+        panic!("vector");
+    };
+    for (actual, expected) in result.into_iter().zip([-62.5, 0.0, 37.5]) {
+        assert!((actual - expected).abs() < 0.001, "{result:?}");
+    }
+    // Coincident member causes an unordered sum, rejected by the same equality gate.
+    vm.set_property(right, "Location", 0, Value::Vector([0.0; 3]));
+    vm.set_property(group, "SoldierInFightList", 0, members(&[right]));
+    assert_eq!(
+        call_native(&mut vm, "IAController.PseudoSteering", ctrl, &[], &mut []),
+        NativeOutcome::Value(Value::Vector([0.0; 3]))
+    );
+    vm.set_property(group, "SoldierInFightList", 0, members(&[]));
+    assert!(try_native(&mut vm, "IAController.PseudoSteering", ctrl, &[], &mut []).is_err());
+}
+
+#[test]
+fn item46_stake_out_excludes_boundaries_preserves_failure_and_detects_cycles() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let (ctrl, pawn) = item46_pair(&mut vm, &set);
+    vm.set_property(ctrl, "LastSeenPos", 0, Value::Vector([7.0; 3]));
+    vm.set_property(ctrl, "FocalPoint", 0, Value::Vector([9.0; 3]));
+    call_native(
+        &mut vm,
+        "IAController.FindNewStakeOutDir",
+        ctrl,
+        &[],
+        &mut [],
+    );
+    assert_eq!(vm.vector_prop(ctrl, "LastSeenPos"), Some([7.0; 3]));
+    let enemy = vm.spawn(pg(&set, "Pawn"), "Enemy").unwrap();
+    vm.set_property(enemy, "Location", 0, Value::Vector([1000.0, 0.0, 0.0]));
+    vm.set_property(
+        ctrl,
+        "Enemy",
+        0,
+        Value::Object(Some(ObjRef::Instance(enemy))),
+    );
+    let level = vm.spawn(pg(&set, "LevelInfo"), "Level").unwrap();
+    vm.set_property(
+        ctrl,
+        "Level",
+        0,
+        Value::Object(Some(ObjRef::Instance(level))),
+    );
+    let mut nodes = Vec::new();
+    for (i, location) in [
+        [100.0, 0.0, 0.0],
+        [800.0, 0.0, 0.0],
+        [200.0, 100.0, 0.0],
+        [200.0, 0.0, 0.0],
+        [300.0, 0.0, 0.0],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let node = vm
+            .spawn(pg(&set, "NavigationPoint"), &format!("Node{i}"))
+            .unwrap();
+        vm.set_property(node, "Location", 0, Value::Vector(location));
+        if let Some(previous) = nodes.last() {
+            vm.set_property(
+                *previous,
+                "NextNavigationPoint",
+                0,
+                Value::Object(Some(ObjRef::Instance(node))),
+            );
+        }
+        nodes.push(node);
+    }
+    vm.set_property(
+        level,
+        "NavigationPointList",
+        0,
+        Value::Object(Some(ObjRef::Instance(nodes[0]))),
+    );
+    call_native(
+        &mut vm,
+        "IAController.FindNewStakeOutDir",
+        ctrl,
+        &[],
+        &mut [],
+    );
+    // First equally aligned eligible node wins; neither excluded endpoint wins.
+    assert_eq!(
+        vm.vector_prop(ctrl, "LastSeenPos"),
+        Some([200.0, 0.0, 20.0])
+    );
+    vm.set_property(
+        nodes[4],
+        "NextNavigationPoint",
+        0,
+        Value::Object(Some(ObjRef::Instance(nodes[0]))),
+    );
+    assert!(
+        try_native(
+            &mut vm,
+            "IAController.FindNewStakeOutDir",
+            ctrl,
+            &[],
+            &mut []
+        )
+        .is_err()
+    );
+    vm.set_property(nodes[4], "NextNavigationPoint", 0, Value::Object(None));
+    vm.set_property(pawn, "Location", 0, Value::Vector([5000.0, 0.0, 0.0]));
+    call_native(
+        &mut vm,
+        "IAController.FindNewStakeOutDir",
+        ctrl,
+        &[],
+        &mut [],
+    );
+    assert_eq!(
+        vm.vector_prop(ctrl, "LastSeenPos"),
+        Some([200.0, 0.0, 20.0])
+    );
+    assert_eq!(
+        vm.vector_prop(ctrl, "FocalPoint"),
+        Some([9.0; 3]),
+        "stake-out changes remembered target, not FocalPoint"
+    );
+}
+
+#[test]
+fn item46_line_of_fire_classifies_ally_hostile_dead_and_shoot_through() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let (ctrl, pawn) = item46_pair(&mut vm, &set);
+    assert!(
+        try_native(
+            &mut vm,
+            "IAController.LineOfFireObstacle",
+            ctrl,
+            &[],
+            &mut []
+        )
+        .is_err()
+    );
+    let weapon = vm.spawn(pg(&set, "Actor"), "Weapon").unwrap();
+    let ammo = vm.spawn(pg(&set, "Actor"), "Ammo").unwrap();
+    vm.set_property(
+        pawn,
+        "Weapon",
+        0,
+        Value::Object(Some(ObjRef::Instance(weapon))),
+    );
+    vm.set_property(
+        weapon,
+        "AmmoType",
+        0,
+        Value::Object(Some(ObjRef::Instance(ammo))),
+    );
+    vm.set_property(ctrl, "WeaponEndTrace", 0, Value::Vector([200.0, 0.0, 0.0]));
+    let other = vm.spawn(pg(&set, "Pawn"), "Other").unwrap();
+    vm.set_property(other, "Location", 0, Value::Vector([100.0, 0.0, 0.0]));
+    vm.set_property(other, "CollisionRadius", 0, Value::Float(10.0));
+    vm.set_property(other, "CollisionHeight", 0, Value::Float(40.0));
+    vm.set_property(other, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "IAController.LineOfFireObstacle",
+            ctrl,
+            &[],
+            &mut []
+        ),
+        NativeOutcome::Value(Value::Int(1))
+    );
+    assert_eq!(vm.obj_prop(ctrl, "Pote"), Some(other));
+    vm.set_property(other, "bIsDead", 0, Value::Bool(true));
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "IAController.LineOfFireObstacle",
+            ctrl,
+            &[],
+            &mut []
+        ),
+        NativeOutcome::Value(Value::Int(0))
+    );
+    assert_eq!(vm.obj_prop(ctrl, "Pote"), Some(other)); // zeros do not clear Pote
+    vm.set_property(other, "bIsDead", 0, Value::Bool(false));
+    vm.set_property(other, "Alliance", 0, Value::Name("Hostile".into()));
+    vm.set_property(pawn, "InitialAlliances", 0, alliance_entry("Hostile", -1.0));
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "IAController.LineOfFireObstacle",
+            ctrl,
+            &[],
+            &mut []
+        ),
+        NativeOutcome::Value(Value::Int(0))
+    );
+    vm.set_property(other, "bBlockZeroExtentTraces", 0, Value::Bool(false));
+    let obstacle = vm.spawn(pg(&set, "Actor"), "Glass").unwrap();
+    for name in ["Location", "CollisionRadius", "CollisionHeight"] {
+        vm.set_property(
+            obstacle,
+            name,
+            0,
+            vm.get_property(other, name).unwrap().clone(),
+        );
+    }
+    vm.set_property(obstacle, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "IAController.LineOfFireObstacle",
+            ctrl,
+            &[],
+            &mut []
+        ),
+        NativeOutcome::Value(Value::Int(2))
+    );
+    vm.set_property(obstacle, "bCanSeeThrough", 0, Value::Bool(true));
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "IAController.LineOfFireObstacle",
+            ctrl,
+            &[],
+            &mut []
+        ),
+        NativeOutcome::Value(Value::Int(0))
+    );
+    vm.set_property(obstacle, "bCanSeeThrough", 0, Value::Bool(false));
+    vm.set_property(
+        obstacle,
+        "bCanShootThroughWithProjectileWeapon",
+        0,
+        Value::Bool(true),
+    );
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "IAController.LineOfFireObstacle",
+            ctrl,
+            &[],
+            &mut []
+        ),
+        NativeOutcome::Value(Value::Int(0))
+    );
+    vm.set_property(ammo, "bInstantHit", 0, Value::Bool(true));
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "IAController.LineOfFireObstacle",
+            ctrl,
+            &[],
+            &mut []
+        ),
+        NativeOutcome::Value(Value::Int(2))
+    );
+    vm.set_property(
+        obstacle,
+        "bCanShootThroughWithRayCastingWeapon",
+        0,
+        Value::Bool(true),
+    );
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "IAController.LineOfFireObstacle",
+            ctrl,
+            &[],
+            &mut []
+        ),
+        NativeOutcome::Value(Value::Int(0))
+    );
+}
+
+#[test]
+fn item46_move_to_fractional_speed_accelerates_and_none_physics_does_not_teleport() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let (ctrl, pawn) = item46_pair(&mut vm, &set);
+    for (name, value) in [
+        ("GroundSpeed", 100.0),
+        ("AccelRate", 100.0),
+        ("WalkingPct", 0.5),
+        ("MaxDesiredSpeed", 1.0),
+    ] {
+        vm.set_property(pawn, name, 0, Value::Float(value));
+    }
+    let destination = [300.0, 0.0, 0.0];
+    vm.set_property(pawn, "Physics", 0, Value::Byte(1));
+    let mut args = [
+        Value::Vector(destination),
+        Value::Object(None),
+        Value::Float(0.25),
+    ];
+    call_native_stateful(
+        &mut vm,
+        "Engine.Controller.MoveTo",
+        ctrl,
+        &[false; 3],
+        &mut args,
+    );
+    assert_eq!(vm.get_property(pawn, "bWalking"), Some(&Value::Bool(true)));
+    assert_eq!(vm.f32_prop(pawn, "DesiredSpeed"), 0.5);
+    assert_eq!(vm.f32_prop(ctrl, "MoveTimer"), 13.0);
+    vm.set_property(pawn, "Physics", 0, Value::Byte(0));
+    assert!(
+        !vm.controller_move_step(ctrl, pawn, destination, 0.1)
+            .unwrap()
+    );
+    assert_eq!(vm.vector_prop(pawn, "Location"), Some([0.0; 3]));
+    assert_eq!(
+        vm.vector_prop(pawn, "Acceleration"),
+        Some([100.0, 0.0, 0.0])
+    );
+    vm.set_property(pawn, "Physics", 0, Value::Byte(1));
+    vm.controller_move_step(ctrl, pawn, destination, 0.1)
+        .unwrap();
+    assert_eq!(vm.vector_prop(pawn, "Location"), Some([0.5, 0.0, 0.0]));
+    assert_eq!(vm.vector_prop(pawn, "Acceleration"), Some([50.0, 0.0, 0.0]));
+    for _ in 0..20 {
+        vm.controller_move_step(ctrl, pawn, destination, 0.1)
+            .unwrap();
+    }
+    assert_eq!(vm.vector_prop(pawn, "Velocity"), Some([25.0, 0.0, 0.0]));
+    // Explicit zero is not an omitted Speed; it has a finite half-second timer.
+    args[2] = Value::Float(0.0);
+    call_native_stateful(
+        &mut vm,
+        "Engine.Controller.MoveTo",
+        ctrl,
+        &[false; 3],
+        &mut args,
+    );
+    assert_eq!(vm.f32_prop(pawn, "DesiredSpeed"), 0.0);
+    assert_eq!(vm.f32_prop(ctrl, "MoveTimer"), 0.5);
+    args[2] = Value::Float(0.5);
+    call_native_stateful(
+        &mut vm,
+        "Engine.Controller.MoveTo",
+        ctrl,
+        &[false; 3],
+        &mut args,
+    );
+    assert_eq!(
+        vm.get_property(pawn, "bWalking"),
+        Some(&Value::Bool(true)),
+        "Speed == WalkingPct is walking in the DLL"
+    );
+    assert_eq!(vm.f32_prop(pawn, "DesiredSpeed"), 1.0);
+    assert!(
+        vm.start_move(ctrl, destination, f32::NAN, "Controller.MoveTo", true)
+            .is_err()
+    );
+    vm.set_property(pawn, "WalkingPct", 0, Value::Float(0.0));
+    assert!(
+        vm.start_move(ctrl, destination, 0.0, "Controller.MoveTo", true)
+            .is_err()
+    );
+}
+
+#[test]
+fn item46_move_toward_polls_moving_target_and_cancels_when_target_destroyed() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let (ctrl, pawn) = item46_pair(&mut vm, &set);
+    for (name, value) in [
+        ("GroundSpeed", 100.0),
+        ("AccelRate", 100.0),
+        ("WalkingPct", 0.5),
+        ("MaxDesiredSpeed", 1.0),
+    ] {
+        vm.set_property(pawn, name, 0, Value::Float(value));
+    }
+    vm.set_property(pawn, "Physics", 0, Value::Byte(1));
+    let target = vm.spawn(pg(&set, "Pawn"), "Target").unwrap();
+    vm.set_property(target, "Location", 0, Value::Vector([300.0, 0.0, 0.0]));
+    vm.set_property(
+        ctrl,
+        "MoveTarget",
+        0,
+        Value::Object(Some(ObjRef::Instance(target))),
+    );
+    vm.set_active(ctrl, true);
+    vm.goto_state(ctrl, "Moving", None).unwrap();
+    vm.tick(0.1).unwrap();
+    assert_eq!(vm.f32_prop(ctrl, "MoveTimer"), 1.2, "{:?}", vm.trace);
+    assert_eq!(vm.obj_prop(ctrl, "Focus"), Some(target));
+    vm.set_property(target, "Location", 0, Value::Vector([0.0, 300.0, 0.0]));
+    vm.tick(0.1).unwrap();
+    assert_eq!(vm.vector_prop(ctrl, "Destination"), Some([0.0, 300.0, 0.0]));
+    assert_eq!(vm.vector_prop(pawn, "Location"), Some([0.0, 1.0, 0.0]));
+    vm.destroy(target).unwrap();
+    vm.tick(0.1).unwrap();
+    assert!(vm.trace.iter().any(
+        |event| matches!(&event.kind, TraceKind::StateStop { actor } if actor == "Controller")
+    ));
+    // Explicit None view-focus differs from an omitted argument.
+    let replacement = vm.spawn(pg(&set, "Actor"), "Replacement").unwrap();
+    vm.set_property(replacement, "Location", 0, Value::Vector([500.0, 0.0, 0.0]));
+    let mut args = [
+        Value::Object(Some(ObjRef::Instance(replacement))),
+        Value::Object(None),
+    ];
+    call_native_stateful(
+        &mut vm,
+        "Engine.Controller.MoveToward",
+        ctrl,
+        &[false, false, true, true],
+        &mut args,
+    );
+    assert_eq!(vm.obj_prop(ctrl, "Focus"), None);
+}
+
 /// Test navigation graph: Nav0 -500-> Nav1 -500-> Nav2, in Unreal space.
 struct MockNav {
     points: Vec<NavPointInfo>,
@@ -4483,9 +5179,11 @@ fn levelinfo_get_local_url_returns_the_configured_url() {
 
 #[test]
 fn levelinfo_dec_attaque_records_partial_counter_decrement() {
-    let set = anim_set();
+    let set = item46_set();
     let mut vm = Vm::new(&set, VmLimits::default());
-    let level = vm.spawn(sg(&set, "Actor"), "LevelInfoFixture").unwrap();
+    let level = vm.spawn(pg(&set, "LevelInfo"), "LevelInfoFixture").unwrap();
+    let record = Value::Struct(vec![("value".into(), Value::Int(0))]);
+    vm.set_property(level, "MusicVars", 0, Value::Array(vec![record.clone(); 3]));
     let mut args = [];
     assert_eq!(
         try_native(
@@ -4500,7 +5198,7 @@ fn levelinfo_dec_attaque_records_partial_counter_decrement() {
     );
     assert!(vm.trace.iter().any(|event| matches!(
         &event.kind,
-        TraceKind::Note(note) if note.contains("DecAttaque") && note.contains("decrement")
+        TraceKind::Note(note) if note.contains("MusicVars") && note.contains("audio-device")
     )));
     assert!(
         crate::registry::Registry::builtin()
@@ -4508,6 +5206,43 @@ fn levelinfo_dec_attaque_records_partial_counter_decrement() {
             .is_some_and(|def| matches!(def.status, crate::registry::NativeStatus::Partial(_)))
     );
     assert!(!vm.missing_natives.contains_key("LevelInfo.DecAttaque"));
+}
+
+#[test]
+fn item46_find_best_path_sets_target_on_success_and_preserves_it_on_failure() {
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let _ = spawn_at(&mut vm, &set, "Actor", "Nav0", [0.0, 0.0, 0.0]);
+    let first = spawn_at(&mut vm, &set, "Actor", "Nav1", [500.0, 0.0, 0.0]);
+    let _ = spawn_at(&mut vm, &set, "Actor", "Nav2", [1000.0, 0.0, 0.0]);
+    let (ctrl, _) = nav_actor_pair(&mut vm, &set, 40.0, 80.0, 100.0);
+    vm.set_navigation(Box::new(MockNav::line()));
+    let mut args = [Value::Vector([1000.0, 0.0, 0.0])];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "IAController.FindBestPathTo",
+            ctrl,
+            &[false],
+            &mut args
+        ),
+        NativeOutcome::Value(Value::Bool(true))
+    );
+    assert_eq!(vm.obj_prop(ctrl, "MoveTarget"), Some(first));
+    assert_eq!(vm.vector_prop(ctrl, "Destination"), Some([500.0, 0.0, 0.0]));
+    vm.set_navigation(Box::new(crate::navigation::EmptyNavigation));
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "IAController.FindBestPathTo",
+            ctrl,
+            &[false],
+            &mut args
+        ),
+        NativeOutcome::Value(Value::Bool(false))
+    );
+    assert_eq!(vm.obj_prop(ctrl, "MoveTarget"), Some(first));
+    assert_eq!(vm.vector_prop(ctrl, "Destination"), Some([500.0, 0.0, 0.0]));
 }
 
 #[test]
