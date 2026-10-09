@@ -2233,11 +2233,11 @@ fn set_view_target(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<
     val(Value::Void)
 }
 
-/// Engine.dll `AActor::execMakeNoise` (RVA 0xAFF40) forwards Loudness to
-/// `AActor::CheckNoiseHearing` (RVA 0x6B6D0), which calls `AController::CanHear` (RVA 0x6B0F0)
-/// and dispatches `HearNoise(Loudness, NoiseMaker)` to eligible controllers. The VM reproduces
-/// the controller/pawn/range/world-occlusion path; XIII's native sound-slot and team filters are
-/// not represented in the VM and remain an explicit partial.
+/// Engine.dll `AActor::execMakeNoise` (0x103aff40) -> `AActor::CheckNoiseHearing` (0x1036b6d0)
+/// -> `AController::CanHear` (0x1036b0f0) -> `eventHearNoise(Loudness, NoiseMaker)` (item41c,
+/// decoded in full; see `Vm::vm_make_noise`). Partial only where the VM lacks the engine's data:
+/// zone hearing (no zone model) and the BSP-only traces of the muffled/around-corner branches
+/// (the provider's world trace stands in); each is reported once with a trace note.
 fn make_noise(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let loudness = float(vm, a, 0)?;
     vm.vm_make_noise(c.this, loudness)?;
@@ -4363,12 +4363,12 @@ fn builtin_defs() -> Vec<NativeDef> {
         ),
         NativeDef {
             status: NativeStatus::Partial(
-                "dispatches by pawn HearingThreshold, loudness-scaled distance and clear world trace; engine sound-slot, team and controller CanHear filters remain unmodelled",
+                "decoded CheckNoiseHearing/CanHear (noise slots, ControllerList walk, IsProbing, tag/player filter, HearingThreshold^2*Loudness*Alertness range, eye line trace); zone hearing is not modelled and the muffled/around-corner BSP-only traces use the world trace (trace note once per VM)",
             ),
             ..def(
                 "Engine.Actor.MakeNoise",
                 "native(512) final native static function MakeNoise(float Loudness)",
-                "engine.u Actor.MakeNoise decoded (float Loudness; native 512); UE2 notifies nearby AI; Engine.dll ?execMakeNoise@AActor",
+                "engine.u Actor.MakeNoise decoded (float Loudness; native 512); Engine.dll execMakeNoise 0x103aff40, CheckNoiseHearing 0x1036b6d0, CanHear 0x1036b0f0 (item41c)",
                 make_noise,
             )
         },
