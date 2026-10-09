@@ -1,34 +1,32 @@
-# item27j: Banque01 story route. Follows the map's own cutscene flow by player input; there are
-# no `set_goal` bridges. Objective 0 "Access the strongroom." must complete through the game's own
-# chain (Cine1 teller scene -> Cine15 Jones scene -> `event fin_flash` -> XIIIDispatcher4 ->
+# item27j/item27k: Banque01 story route. Follows the map's own cutscene flow by player input; there
+# are no `set_goal` bridges. Objective 0 "Access the strongroom." must complete through the game's
+# own chain (Cine1 teller scene -> Cine15 Jones scene -> `event fin_flash` -> XIIIDispatcher4 ->
 # GT_quitterbanque -> XIIIGoalTrigger0), which promotes objective 1, and objective 1 "Escape from
 # the bank." completes through Cine11's `playerevent fin_map` -> XIIIGoalTrigger2 (GoalNumber 1)
 # -> DoTravel -> Amos01.
 #
-# Two measured VM blockers stall that flow (probes in local/re/item27j/, report
-# local/reports/item27j-banque-route.md):
-#   - VM blocker 1: Cine1's `movseqb w 13 w 14 w 16 w 63` (action[46], from t=38.5) never moves the
-#     teller past the armored door the player opened (`playerevent porteblindee1`, action[39]): the
-#     pawn's move is rejected by a door-panel brush at x=-1600.9 (hit normal [1,0,0]) even though
-#     the same door lets the player through after the event. Cine1 therefore never reaches its
-#     `event toto` (action[59]) that unlocks Porte8, and `use Porte8` stays "Locked" (measured).
-#   - VM blocker 2: Cine15's `movseqb sp 0.25 w 33 w 34` (action[20]) is rejected at hit_time=0.0
-#     (normal [0,0.994,0.112]) on every steering step at Jones's own position (-7142,-1974), so
-#     `event fin_flash` (action[45]) never fires, objective 0 never completes and no travel is
-#     requested. The player teleported to the same spot walks freely in all directions, so the
-#     block is specific to the pawn's taller move box (extent [34,34,75]).
-# The route still performs every player-reachable step of the flow so the run exercises as much of
-# the game's own chain as the VM allows; where the flow is stalled the route continues with
-# labelled diagnostic teleports and records the stalled state in the log.
+# item27k fixed the two VM pawn-move blockers (B-1: the adapter kept a mover's base-pose triangles
+# in the static soup; B-2: the walker deadlocked on start-penetrating contacts — the engine's
+# MoveActor discards hits within the 2-UU back-off behind the start). Measured after the fix (cine
+# trace in local/re/item27k/): Cine1 completes its whole chain (movseqb [26][35][40][46],
+# `event toto` [59] at t=58.15 -> Porte8 unlocks; the vault movement-gap teleport is gone) and
+# Cine15 walks its old blocker `movseqb sp 0.25 w 33 w 34` [20] and continues to action[34]
+# "wait player 300" (t=69.1), where Jones stands at (-7885.1,-2647.3,875.0) (pawn-location in the
+# cine trace). The wait's measured bytecode (XIDCine CineController2.Interpret case "Player"):
+# SetCollisionSize(300, h) then keep waiting while VSize2D(pawn - player) > 300 or
+# |pawn.z - player.z| > pawn.CollisionHeight (75) — the player must be near JONES, not near the
+# action's Target position info. The t=70 teleport below satisfies it (the player falls to the
+# walkway at z=875, ~2 UU from Jones).
 #
 # Teleport classes used below:
 #   - "flow touch": teleport onto a trigger volume the flow depends on; the run delivers the
 #     volume's own engine `Touch`, so every touch is the game's own code.
 #   - "measured recipe": the D->E re-entry around DetectionVolume1. Banque0's STA_DonneCle tick
 #     released `recoit_cle` 0.1 s after the player RE-ENTERED DV1 in every probe that used it, and
-#     never while the player sat inside from the start (mechanism unresolved; measured probes 2-5).
-#   - "movement gap": a labelled teleport across an obstacle the flow opens but this VM cannot
-#     (Porte8 locked by VM blocker 1; the strongroom approach has no verified walkable path).
+#     never while the player sat inside from the start (mechanism unresolved; measured probes 2-5;
+#     item27k revisits this below).
+#   - "flow spot": a position a cinema's measured `wait player N` needs (near the pawn, not the
+#     action's target marker).
 
 # Leave the intro camera (WaitForFirstDisplay).
 t=0.50 forward 1
@@ -38,42 +36,43 @@ t=1.50 forward 0
 # Touch. flow touch.
 t=3.00 teleport -428 -2312 80
 
-# Measured recipe: leave DV1 after Cine1's `event choatoi` (action[14], t=10.95) and re-enter, so
-# Banque0's STA_DonneCle tick releases `recoit_cle` (arrives ~0.1 s after the re-entry touch) and
-# Cine1 continues past `wait event recoit_cle` (action[16]).
-t=11.00 teleport -544 -2183 80      # measured recipe: out of DV1 (no-fire spot D)
-t=11.50 teleport -494 -2383 80      # measured recipe: re-enter DV1 -> recoit_cle
+# item27k: `recoit_cle` releases when Banque0.STA_DonneCle.Tick sees
+# VSize2D(teller - player) < fDistanceBanquier (300) && XPC.CanSee(teller) (measured bytecode).
+# The old "leave DV1 and re-enter" recipe is not the mechanism: a single teleport to spot E
+# (-494,-2383,80) — within 300 UU of the teller with a clear eye line — releases it. (The DV1
+# touch at t=3 already started the scene; spot E itself is outside DV1 and fires nothing.)
+t=11.00 teleport -494 -2383 80      # flow spot: within the teller's fDistanceBanquier + CanSee
 
 # The teller walks to the counter and opens the staff gate (fixed ~24 s of scene actions after
 # recoit_cle; her `wait player 500`, action[32], passed with the player here in the probes).
 t=23.00 teleport -540 -1350 80      # flow: within the teller's wait-player radius
 
 # Cine1 `event james` (action[45]) starts Cine6 (James); his `wait player 700` (action[4]) needs
-# the player this close for the dialogue, then `event ajulien` fires (unconsumed: Cine1 is stalled
-# by VM blocker 1 at action[46]).
+# the player this close for the dialogue, then `event ajulien` fires.
 t=40.00 teleport -1760 -2480 -80    # flow: within James's wait-player radius
 
-# Vault door Porte8: the flow unlocks it with the key via Cine1's `event toto`, which VM blocker 1
-# prevents. The `use` below records the measured "Locked" state in the log.
-t=44.00 teleport -2843 -6380 -150   # flow: to the vault door (armored door opened by Cine1[39])
-t=45.00 use Porte8                  # diagnostic: measured "use Porte8: Locked" (VM blocker 1)
-t=46.00 teleport -3000 -6300 -150   # movement gap: past locked Porte8 (key never granted)
+# Vault door Porte8: unlocked by the game itself at t=58.15 (Cine1[59] `event toto`, measured) —
+# no movement-gap teleport needed since item27k's B-1 fix.
+t=44.00 teleport -2843 -6380 -150   # flow: to the vault door
 
 # Strongroom: DetectionVolume12's Touch starts Cine15 (Jones). flow touch.
 t=47.00 teleport -7616 -2784 1456   # flow touch: DetectionVolume12 (starts Cine15)
-t=48.00 teleport -7142 -2100 880    # flow: within Jones's wait-player radii ([3] 300, [19] away 70)
+t=48.00 teleport -7142 -2100 880    # flow spot: Cine15[3] "wait player 300" (Jones at the safe)
 
-# Cine15 plays its anims (~11 s), reaches `movseqb sp 0.25 w 33 w 34` (action[20]) and stalls there
-# (VM blocker 2): `event fin_flash` (action[45]) never fires, so objective 0 cannot complete and
-# objective 1 is never promoted. The run continues with the escape-flow volumes below so the log
-# shows the route state when the 90 s budget ends.
-t=55.00 teleport 1300.03 -1917.39 1478  # flow touch: TouchTrigger5 (Event vignracaille)
-t=58.00 teleport 865 -4075 1530         # flow touch: TouchTrigger2 (Event arrivee_fbi)
-t=61.00 teleport 1134 -4222 480         # flow touch: TouchTrigger3 (Event fbi_dial2)
-t=64.00 teleport 1148 -4063 380         # flow touch: TouchTrigger4 (Event arrivee_amos)
-t=67.00 teleport 1014.38 -4309 620      # flow touch: TouchTrigger10 (Event CarOut)
-t=70.00 teleport 1341.37 -4019.51 380   # flow touch: XIIIGoalTrigger2 (Tag fin_map, GoalNumber 1)
+# Jones plays the briefcase scene, walks his waypoints (w33/w34 [20], w35/w36/w25/w23 [22], w58
+# [27]) and reaches [34] "wait player 300" at t~69.1 (measured), standing at
+# (-7885.1,-2647.3,875.0). flow spot: the player falls to the walkway at z=875, ~2 UU from Jones.
+t=70.00 teleport -7883 -2648 990
 
-# Wait for the game's own travel (Amos01 via the end-of-level chain). With VM blocker 2 the
-# objective assertions in the route test fail before this matters.
-t=73.00 wait_travel
+# The scene should run to `event fin_flash` (action[45]) with the player beside Jones; then the
+# objective-0 chain (XIIIDispatcher4 -> GT_quitterbanque -> XIIIGoalTrigger0) completes objective 0
+# and promotes objective 1. The escape-flow volumes below drive the escape cinemas -> Cine11
+# `playerevent fin_map` -> XIIIGoalTrigger2 (GoalNumber 1) -> DoTravel -> Amos01.
+t=76.00 teleport 1300.03 -1917.39 1478  # flow touch: TouchTrigger5 (Event vignracaille)
+t=79.00 teleport 865 -4075 1530         # flow touch: TouchTrigger2 (Event arrivee_fbi)
+t=82.00 teleport 1134 -4222 480         # flow touch: TouchTrigger3 (Event fbi_dial2)
+t=85.00 teleport 1148 -4063 380         # flow touch: TouchTrigger4 (Event arrivee_amos)
+t=88.00 teleport 1014.38 -4309 620      # flow touch: TouchTrigger10 (Event CarOut)
+
+# Wait for the game's own travel (Amos01 via the end-of-level chain).
+t=91.00 wait_travel

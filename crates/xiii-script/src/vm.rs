@@ -1016,6 +1016,15 @@ fn vm_move_trace_enabled() -> bool {
     })
 }
 
+/// item27k diagnostic: with `XIII_VM_MOVE_TRACE`, also dump the world primitives overlapping a
+/// blocked pawn's move box (`XIII_VM_MOVE_DUMP`), naming each triangle's source.
+fn vm_move_dump_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("XIII_VM_MOVE_DUMP").is_some_and(|value| value != "0" && !value.is_empty())
+    })
+}
+
 fn cine_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -4092,6 +4101,7 @@ impl<'s> Vm<'s> {
         }
         if let Some(pawn) = pawn {
             let location = self.vector_prop(pawn, "Location");
+            waits.push(format!("pawn-location={location:?}"));
             for property in ["Target", "NextTarget"] {
                 if let Some(target) = self.obj_prop(id, property) {
                     let target_name = self.objects[target as usize].name.clone();
@@ -7897,6 +7907,16 @@ impl<'s> Vm<'s> {
                 hit.time,
                 hit.normal
             );
+            if vm_move_dump_enabled()
+                && let Some(p) = self.physics.as_mut()
+            {
+                for (i, record) in p.dump_overlap(location, extent).iter().enumerate().take(8) {
+                    println!(
+                        "[vm-pawn-move-dump] #{i} {} source={} triangle={:?}",
+                        record.kind, record.source, record.triangle
+                    );
+                }
+            }
         }
         let end = outcome.map_or_else(|| add3(location, delta), |o| o.end);
         self.set_property(pawn, "Location", 0, Value::Vector(end));

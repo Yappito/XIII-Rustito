@@ -21,7 +21,14 @@
 //!   is at struct offset `0x14` and `Time` at `0x24`.
 //! - `APawn::physWalking`/`stepUp` sweep with the pawn's extent box; `AActor::stepUp`
 //!   (`0x103bb0a0`) is the same shape without the ground logic.
-//! - `ULevel::MoveActor` (`0x1038a770`) moves the box, then checks blocking actors.
+//! - `ULevel::MoveActor` (`0x1038a770`) moves the box, then checks blocking actors. item27k
+//!   measured its world-check back-off: the check segment is extended 2 UU behind the start
+//!   (`+2.0` at `0x1038a981`, unit dir from `1.0/|delta|`) and a world hit inside that back-off
+//!   (`(2+|delta|)*t_hit <= 2`, branch at `0x1038aba8`) is discarded (`0x1038abaf`) instead of
+//!   stopping the move — a mover escapes geometry it starts flush with/inside. For this crate's
+//!   continuous sweep that reduces exactly to discarding start-penetrating hits, which walk
+//!   enables via `SweepParams::discard_start_penetration` (walkable floors are exempt: the
+//!   engine rides slopes through its own floor machinery, not the move back-off).
 //! - `ATerrainInfo::LineCheck` (`0x10409eb0`) clamps the ray to the base heightmap and indexes
 //!   `Vertices[HeightmapX*y + x]`; `UModel::LineCheck` (`0x10419b80`) is a BSP ray/segment with
 //!   extent; `UStaticMesh::LineCheck` (`0x10402e00`) dispatches to the per-polygon or simplified
@@ -64,6 +71,24 @@ use crate::{
 /// **Hypothesis:** that the engine uses this value as a floor check whose result gates `stepUp`
 /// is not proven here (no such branch was located); see [`probe_floor`].
 pub const FLOOR_PROBE_RATIO: f32 = 37.0 / 35.0;
+
+/// Sweep parameters for walk movement. The engine's `ULevel::MoveActor` runs its world check
+/// along a segment extended 2 UU behind the start and discards hits inside that back-off
+/// (Engine.dll 0x1038a89a-0x1038ac05); for this crate's continuous sweep that reduces to
+/// discarding start-penetrating hits (see [`SweepParams::discard_start_penetration`]), so a
+/// walker never deadlocks against geometry it starts flush with/inside. Walk turns it on for
+/// every sub-sweep; `move_slide` (plain blocking moves) keeps the default.
+fn walk_sweep_params(
+    ignore_resting_floor_z: Option<f32>,
+    walkable_floor_z: Option<f32>,
+) -> SweepParams {
+    SweepParams {
+        ignore_resting_floor_z,
+        discard_start_penetration: true,
+        walkable_floor_z,
+        ..SweepParams::default()
+    }
+}
 
 /// Parameters for [`walk_move`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -116,7 +141,13 @@ pub fn walk_move(
         }
         let dir = mul(remaining, 1.0 / travel);
         let target = add(pos, remaining);
-        let hit = match sweep_aabb(world, pos, target, half_extents, &SweepParams::default()) {
+        let hit = match sweep_aabb(
+            world,
+            pos,
+            target,
+            half_extents,
+            &walk_sweep_params(None, Some(params.min_floor_z)),
+        ) {
             Some(h) => h,
             None => {
                 pos = target;
@@ -239,10 +270,7 @@ fn try_step_walk(
     // box is already touching, otherwise on a slightly inclined floor the grazing `t = 0`
     // contact blocks the up-sweep and the whole step fails. The down-sweep keeps the default
     // behaviour so it still finds the landing floor. This is not a proven engine rule.
-    let step_params = SweepParams {
-        ignore_resting_floor_z: Some(params.min_floor_z),
-        ..SweepParams::default()
-    };
+    let step_params = walk_sweep_params(Some(params.min_floor_z), Some(params.min_floor_z));
     let up = [0.0, params.max_step_height, 0.0];
     let up_target = add(pos, up);
     // UE2 `stepUp` sweeps up by `MAXSTEPHEIGHT`; a blocked sweep lifts by the swept fraction
