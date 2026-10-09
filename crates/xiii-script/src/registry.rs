@@ -40,8 +40,8 @@ impl NativeCtx {
 pub enum NativeOutcome {
     /// Return value (`Void` for none). A latent native also sets the VM's pending latent.
     Value(Value),
-    /// Iterator items (the first `out` parameter receives each one).
-    Iterate(Vec<Value>),
+    /// Iterator rows; each row supplies the iterator's out parameters in declaration order.
+    Iterate(Vec<Vec<Value>>),
 }
 
 /// Native implementation.
@@ -1033,12 +1033,14 @@ fn all_actors(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<Nativ
         Some(Value::Name(n)) if !n.eq_ignore_ascii_case("None") => Some(n.clone()),
         _ => None,
     };
-    let items = vm
+    let items: Vec<Value> = vm
         .all_actors(base, tag.as_deref())
         .into_iter()
         .map(|i| Value::Object(Some(ObjRef::Instance(i))))
         .collect();
-    Ok(NativeOutcome::Iterate(items))
+    Ok(NativeOutcome::Iterate(
+        items.into_iter().map(|v| vec![v]).collect(),
+    ))
 }
 
 /// `Actor.CollidingActors` (native 321): actors of `BaseClass` near the caller. **Partial**: the
@@ -1061,12 +1063,14 @@ fn colliding_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult
     } else {
         vector2(vm, a, 3)?
     };
-    let items = vm
+    let items: Vec<Value> = vm
         .radius_actors(base, radius, loc)
         .into_iter()
         .map(|i| Value::Object(Some(ObjRef::Instance(i))))
         .collect();
-    Ok(NativeOutcome::Iterate(items))
+    Ok(NativeOutcome::Iterate(
+        items.into_iter().map(|v| vec![v]).collect(),
+    ))
 }
 
 fn radius_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -1085,12 +1089,14 @@ fn radius_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Na
     } else {
         vector2(vm, a, 3)?
     };
-    let items = vm
+    let items: Vec<Value> = vm
         .radius_actors(base, radius, loc)
         .into_iter()
         .map(|i| Value::Object(Some(ObjRef::Instance(i))))
         .collect();
-    Ok(NativeOutcome::Iterate(items))
+    Ok(NativeOutcome::Iterate(
+        items.into_iter().map(|v| vec![v]).collect(),
+    ))
 }
 
 fn eq_ss(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -2042,6 +2048,44 @@ fn actor_trace(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nati
     })
 }
 
+fn actor_trace_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let base = match object(vm, a, 0)? {
+        Some(ObjRef::Static(class)) => Some(class),
+        None => None,
+        Some(_) => {
+            return Err(vm.err(VmErrorKind::Other(
+                "TraceActors BaseClass is not a class".into(),
+            )));
+        }
+    };
+    let end = vector2(vm, a, 4)?;
+    let start = if c.omitted(5) {
+        vm.vector_prop(c.this, "Location").unwrap_or([0.0; 3])
+    } else {
+        vector2(vm, a, 5)?
+    };
+    let extent = if c.omitted(6) {
+        [0.0; 3]
+    } else {
+        vector2(vm, a, 6)?
+    };
+    if !vm.physics_ready("Actor.TraceActors", Some(309), c.this, Value::Void)? {
+        return Ok(NativeOutcome::Iterate(Vec::new()));
+    }
+    let rows = vm.vm_trace_actors(c.this, base, start, end, extent)?;
+    Ok(NativeOutcome::Iterate(
+        rows.into_iter()
+            .map(|(actor, loc, normal)| {
+                vec![
+                    Value::Object(Some(ObjRef::Instance(actor))),
+                    Value::Vector(loc),
+                    Value::Vector(normal),
+                ]
+            })
+            .collect(),
+    ))
+}
+
 fn actor_fast_trace(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     // Params: 0 TraceEnd, 1 TraceStart, 2 AdditionalTraceType, 3 DiscardedHitMask(out).
     let end = vector2(vm, a, 0)?;
@@ -2104,13 +2148,15 @@ fn actor_touching_actors(
             )));
         }
     };
-    let items = vm
+    let items: Vec<Value> = vm
         .touching_list(c.this)
         .into_iter()
         .filter(|id| base.is_none_or(|b| vm.objects[*id as usize].layout.chain.contains(&b)))
         .map(|i| Value::Object(Some(ObjRef::Instance(i))))
         .collect();
-    Ok(NativeOutcome::Iterate(items))
+    Ok(NativeOutcome::Iterate(
+        items.into_iter().map(|v| vec![v]).collect(),
+    ))
 }
 
 fn channel(vm: &Vm<'_>, a: &[Value], i: usize, omitted: bool) -> VmResult<u8> {
@@ -3221,12 +3267,14 @@ fn dynamic_actors(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<N
         Some(Value::Name(n)) if !n.eq_ignore_ascii_case("None") => Some(n.clone()),
         _ => None,
     };
-    let items = vm
+    let items: Vec<Value> = vm
         .dynamic_actors(base, tag.as_deref())
         .into_iter()
         .map(|i| Value::Object(Some(ObjRef::Instance(i))))
         .collect();
-    Ok(NativeOutcome::Iterate(items))
+    Ok(NativeOutcome::Iterate(
+        items.into_iter().map(|v| vec![v]).collect(),
+    ))
 }
 
 const UE2_OP: &str = "UE2 operator semantics; declaration and index decoded from core.u; Core.dll exports the operator thunks";
@@ -3351,6 +3399,12 @@ fn item18_defs() -> Vec<NativeDef> {
             )
         },
         def(
+            "Engine.Actor.TraceActors",
+            "native(309) final iterator function TraceActors(class<Actor> BaseClass, out Actor Actor, out vector HitLoc, out vector HitNorm, vector End, optional vector Start, optional vector Extent)",
+            "Actor.TraceActors UE2 iterator: trace actor cylinders in segment order and return per-hit Actor/HitLoc/HitNorm; requires world trace provider",
+            actor_trace_actors,
+        ),
+        def(
             "Object.Normalize",
             "native(198) final native static function Rotator Normalize(Rotator Rot)",
             "core.u Object.Normalize decoded; xiii.XIIIWeapon.RenderOverlays (m60 first-person draw) 0x0391",
@@ -3445,8 +3499,78 @@ fn trail_reset(_: &mut Vm<'_>, _: &NativeCtx, _: &mut [Value]) -> VmResult<Nativ
     val(Value::Void)
 }
 
+/// Headless counterpart of `UInteraction::Initialize`: native viewport/input registration is
+/// unavailable, while the script-owned AddInteraction sequence still owns array membership,
+/// Master, MyPC and Level. Keep this operation explicit in traces instead of silently accepting
+/// an unknown native.
+fn interaction_initialize(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    vm.note(TraceKind::Note(format!(
+        "{}: headless Interaction.Initialize (no viewport input device)",
+        vm.objects[c.this as usize].name
+    )));
+    val(Value::Void)
+}
+
+/// Force-feedback devices are not exposed by the headless VM; retain the controller state and
+/// make the unavailable hardware side effect visible in the trace.
+fn force_feedback_enable(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let enabled = boolean(vm, a, 0)?;
+    vm.note(TraceKind::Note(format!(
+        "{}: headless ForceFeedbackController.EnableForceFeedback({enabled}) (device unavailable)",
+        vm.objects[c.this as usize].name
+    )));
+    val(Value::Void)
+}
+
+fn force_feedback_is_enabled(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    vm.note(TraceKind::Note(format!(
+        "{}: headless ForceFeedbackController.IsForceFeedbackEnable=false (device unavailable)",
+        vm.objects[c.this as usize].name
+    )));
+    val(Value::Bool(false))
+}
+
 fn builtin_defs() -> Vec<NativeDef> {
     let mut v = vec![
+        NativeDef {
+            status: NativeStatus::Partial("headless runtime has no force-feedback device"),
+            ..def(
+                "ForceFeedbackController.EnableForceFeedback",
+                "native(0) function EnableForceFeedback(bool bEnable)",
+                "Engine.ForceFeedbackController native declaration; device output unavailable in headless runtime",
+                force_feedback_enable,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial("headless runtime has no force-feedback device"),
+            ..def(
+                "ForceFeedbackController.IsForceFeedbackEnable",
+                "native(0) function bool IsForceFeedbackEnable()",
+                "Engine.ForceFeedbackController native declaration; no device reports disabled",
+                force_feedback_is_enabled,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial("headless viewport/input registration unavailable"),
+            ..def(
+                "Interaction.Initialize",
+                "native(0) function Interaction.Initialize()",
+                "Engine.Interaction.Initialize declaration; headless runtime supplies Player/Console/InteractionMaster but no UViewport input device",
+                interaction_initialize,
+            )
+        },
         def(
             "Object.Not_PreBool",
             "native(129) preoperator bool !(bool A)",

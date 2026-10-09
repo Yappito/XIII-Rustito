@@ -1,0 +1,6 @@
+# item40: Amos01 route attempt. Player input only; deliberately no teleport, set_goal,
+# take_control, weapon grant, or other host bridge. `forward` is sampled while the authored
+# opening cinematic is active; wait_travel marks the requested completion point.
+t=0.00 forward 1
+t=119.90 forward 0
+t=119.90 wait_travel

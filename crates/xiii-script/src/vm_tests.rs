@@ -734,8 +734,9 @@ fn registry_entries_are_documented() {
     // item19 added `CineController2.Steering`, Trail presentation Partials, cutscene bone-query
     // Partials and the visible Partial for `LevelInfo.DecAttaque` (588); item14c added four
     // trail/particle Partials (SpawnParticle is shared with item18); item20 adds ten decoded GUI
-    // save-slot declarations. Must equal `Registry::builtin().defs().count()`.
-    assert_eq!(defs.len(), 327);
+    // save-slot declarations; item40c adds the headless Interaction.Initialize and ForceFeedback
+    // viewport/device Partials; item43 adds Actor.TraceActors. Must equal `Registry::builtin().defs().count()`.
+    assert_eq!(defs.len(), 331);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -3248,6 +3249,43 @@ fn phys_actor(vm: &mut Vm<'_>, set: &ScriptSet, name: &str, loc: [f32; 3]) -> Ob
     id
 }
 
+#[test]
+fn trace_actors_orders_hits_filters_class_and_returns_all_outs() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let caller = phys_actor(&mut vm, &set, "Caller", [0.0; 3]);
+    let far = vm.spawn(pg(&set, "Child"), "Far").unwrap();
+    vm.set_property(far, "Location", 0, Value::Vector([80.0, 0.0, 0.0]));
+    let near = vm.spawn(pg(&set, "Child"), "Near").unwrap();
+    vm.set_property(near, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, far, true, true);
+    set_collision_fields(&mut vm, near, true, true);
+    let rows = vm
+        .vm_trace_actors(
+            caller,
+            Some(pg(&set, "Child")),
+            [0.0; 3],
+            [120.0, 0.0, 0.0],
+            [0.0; 3],
+        )
+        .unwrap();
+    assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), [near, far]);
+    assert!(rows[0].1[0] < rows[1].1[0]);
+    assert!(rows.iter().all(|r| r.2[0] < 0.0));
+    assert!(
+        vm.vm_trace_actors(
+            caller,
+            Some(pg(&set, "Child")),
+            [0.0; 3],
+            [5.0, 0.0, 0.0],
+            [0.0; 3]
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
 fn set_collision_fields(vm: &mut Vm<'_>, id: ObjectId, colliding: bool, blocking: bool) {
     vm.set_property(id, "bCollideActors", 0, Value::Bool(colliding));
     vm.set_property(id, "bCollideWorld", 0, Value::Bool(true));
@@ -3755,7 +3793,7 @@ fn touching_actors_iterator_filters_by_base_class() {
         other => panic!("{other:?}"),
     };
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0], Value::Object(Some(ObjRef::Instance(b))));
+    assert_eq!(items[0][0], Value::Object(Some(ObjRef::Instance(b))));
 }
 
 // ---------------------------------------------------------------------------------------

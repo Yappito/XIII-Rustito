@@ -1102,11 +1102,13 @@ enum Place {
 }
 
 struct IterState {
-    items: Vec<Value>,
+    items: Vec<Vec<Value>>,
     idx: usize,
-    place: Option<Place>,
+    places: Vec<Option<Place>>,
     body: usize,
 }
+
+type ActorTraceHit = (ObjectId, [f32; 3], [f32; 3]);
 
 struct Frame<'s> {
     pkg: usize,
@@ -5072,7 +5074,7 @@ impl<'s> Vm<'s> {
                 frame.iters.push(IterState {
                     items: Vec::new(),
                     idx: 0,
-                    place: None,
+                    places: Vec::new(),
                     body: 0,
                 });
             }
@@ -5144,16 +5146,17 @@ impl<'s> Vm<'s> {
         }
         if let NativeOutcome::Iterate(items) = outcome {
             // The out parameter receives each item; remember its place for the loop.
-            let place = layout
+            let places = layout
                 .params
                 .iter()
                 .enumerate()
-                .find(|(_, p)| p.out)
-                .and_then(|(i, _)| places.get(i).cloned().flatten());
+                .filter(|(_, p)| p.out)
+                .map(|(i, _)| places.get(i).cloned().flatten())
+                .collect();
             frame.iters.push(IterState {
                 items: items.clone(),
                 idx: 0,
-                place,
+                places,
                 body: 0,
             });
             return Ok(NativeOutcome::Iterate(items));
@@ -5365,7 +5368,14 @@ impl<'s> Vm<'s> {
                 Flow::Next
             }
             K::Iterator { expr, end } => {
-                let (func, call, index) = match &expr.kind {
+                // `foreach Obj.AllActors(...)`: the iterator call can sit inside a `Context`
+                // token (e.g. `XIIIPlayerInteraction.MyPCPostRender` iterates
+                // `MyPC.AllActors`); the native then runs with the context object as `this`.
+                let (call_expr, context) = match &expr.kind {
+                    K::Context(c) => (c.member.as_ref(), Some(c.object.as_ref())),
+                    _ => (expr.as_ref(), None),
+                };
+                let (func, call, index) = match &call_expr.kind {
                     K::NativeCall { index, call } => (
                         self.resolve_native_index(*index, call.args.len())?,
                         call,
@@ -5382,15 +5392,41 @@ impl<'s> Vm<'s> {
                     ),
                     _ => {
                         return Err(self.err(VmErrorKind::UnsupportedToken {
-                            opcode: expr.opcode,
+                            opcode: call_expr.opcode,
                             name: "Iterator over a non-native call",
                         }));
                     }
                 };
-                let this = frame.this;
+                let this = match context {
+                    None => frame.this,
+                    Some(object) => match self.eval(frame, object)? {
+                        Value::Object(Some(ObjRef::Instance(id)))
+                            if self.objects.get(id as usize).is_some_and(|o| !o.deleted) =>
+                        {
+                            id
+                        }
+                        _ => {
+                            // Accessed None: no iteration. Push an empty iterator frame so the
+                            // `IteratorPop` at `end` stays balanced.
+                            frame.iters.push(IterState {
+                                items: Vec::new(),
+                                idx: 0,
+                                places: Vec::new(),
+                                body: pc + 1,
+                            });
+                            return Ok(Flow::Goto(self.goto_offset(frame, u32::from(*end))?));
+                        }
+                    },
+                };
                 match self.native_from_tokens(frame, func, call, this, index)? {
                     NativeOutcome::Iterate(items) => {
-                        let found = items.iter().map(|v| self.value_text(v)).collect();
+                        let found = items
+                            .iter()
+                            .map(|row| {
+                                row.first()
+                                    .map_or_else(|| "()".into(), |v| self.value_text(v))
+                            })
+                            .collect();
                         self.note(TraceKind::Iterator {
                             native: self.short_path(func),
                             found,
@@ -5400,9 +5436,12 @@ impl<'s> Vm<'s> {
                         if items.is_empty() {
                             Flow::Goto(self.goto_offset(frame, u32::from(*end))?)
                         } else {
-                            let place = st.place.clone();
-                            if let Some(pl) = place {
-                                self.write(frame, &pl, items[0].clone())?;
+                            let values = st.items[0].clone();
+                            let places = st.places.clone();
+                            for (place, value) in places.into_iter().zip(values) {
+                                if let Some(place) = place {
+                                    self.write(frame, &place, value)?;
+                                }
                             }
                             Flow::Next
                         }
@@ -5423,9 +5462,12 @@ impl<'s> Vm<'s> {
                 };
                 st.idx += 1;
                 if st.idx < st.items.len() {
-                    let (v, place, body) = (st.items[st.idx].clone(), st.place.clone(), st.body);
-                    if let Some(pl) = place {
-                        self.write(frame, &pl, v)?;
+                    let (values, places, body) =
+                        (st.items[st.idx].clone(), st.places.clone(), st.body);
+                    for (place, value) in places.into_iter().zip(values) {
+                        if let Some(place) = place {
+                            self.write(frame, &place, value)?;
+                        }
                     }
                     Flow::Goto(body)
                 } else {
@@ -7547,6 +7589,61 @@ impl<'s> Vm<'s> {
         best
     }
 
+    pub(crate) fn vm_trace_actors(
+        &mut self,
+        caller: ObjectId,
+        base: Option<GlobalRef>,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+    ) -> VmResult<Vec<ActorTraceHit>> {
+        let Some(provider) = self.physics.as_mut() else {
+            return Err(self.err(VmErrorKind::NoPhysicsProvider {
+                native: "Actor.TraceActors".into(),
+            }));
+        };
+        // UE2's iterator returns actors intersected by the swept trace; world geometry occludes
+        // candidates at or beyond the first world hit.
+        let world_t = provider.trace(start, end, extent).map(|hit| hit.time);
+        let nonzero = extent.iter().any(|v| *v != 0.0);
+        let mut hits = Vec::new();
+        for id in 0..self.objects.len() as ObjectId {
+            if id == caller || !self.is_live_actor(id) {
+                continue;
+            }
+            if base.is_some_and(|class| !self.objects[id as usize].layout.chain.contains(&class)) {
+                continue;
+            }
+            let gate = if nonzero {
+                self.bool_prop(id, "bBlockNonZeroExtentTraces")
+            } else {
+                self.bool_prop(id, "bBlockZeroExtentTraces")
+            };
+            if !gate && !self.bool_prop(id, "bCollideActors") {
+                continue;
+            }
+            if self.is_owned_by(id, caller) || self.is_owned_by(caller, id) {
+                continue;
+            }
+            let (loc, radius, height) = self.actor_cylinder(id);
+            if let Some((t, normal)) = segment_cylinder_hit(
+                start,
+                end,
+                loc,
+                radius + extent[0].max(0.0),
+                height + extent[2].max(0.0),
+            ) && world_t.is_none_or(|limit| t < limit)
+            {
+                hits.push((t, id, normal));
+            }
+        }
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        Ok(hits
+            .into_iter()
+            .map(|(t, id, normal)| (id, lerp3(start, end, t), normal))
+            .collect())
+    }
+
     /// `Actor.Trace`: nearest of world (provider) and, when `bTraceActors`, actor cylinders;
     /// world hits return the map's `LevelInfo` (upstream), no hit returns `None`.
     /// Fills `(hit_actor, hit_location, hit_normal)`.
@@ -8021,8 +8118,22 @@ impl<'s> Vm<'s> {
         speed: f32,
         dt: f32,
     ) -> VmResult<bool> {
-        let location = self.vector_prop(pawn, "Location").unwrap_or(destination);
         let radius = self.f32_prop(pawn, "CollisionRadius");
+        self.move_pawn_step_within(pawn, destination, speed, dt, radius)
+    }
+
+    /// [`Vm::move_pawn_step`] with an explicit stop radius: the pawn stops moving (and reports
+    /// arrival) once its horizontal distance to `destination` is within `radius`. Cine steering
+    /// passes 0, since its arrival test is `IsTargetReached`, not the pawn's collision radius.
+    pub(crate) fn move_pawn_step_within(
+        &mut self,
+        pawn: ObjectId,
+        destination: [f32; 3],
+        speed: f32,
+        dt: f32,
+        radius: f32,
+    ) -> VmResult<bool> {
+        let location = self.vector_prop(pawn, "Location").unwrap_or(destination);
         let speed = if speed > 0.0 {
             speed
         } else {
