@@ -749,10 +749,7 @@ fn setup_inner(
         if pawn_scene.attachments.is_empty() {
             String::new()
         } else {
-            format!(
-                "; attachments not rendered: {}",
-                pawn_scene.attachments.join(", ")
-            )
+            format!("; bone attachments: {}", pawn_scene.attachments.join(", "))
         }
     );
     if pawn_scene.bone_controls_not_applied > 0 {

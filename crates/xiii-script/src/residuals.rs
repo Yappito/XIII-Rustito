@@ -235,7 +235,7 @@ pub fn residual_defs() -> Vec<NativeDef> {
             ortho_rotation,
         ),
         partial(
-            "the request is recorded per actor for the renderer; no skeletal transform is evaluated",
+            "CPU evaluator applies Space=0 relative rotations with scaled integer angles; nonzero Space and exact inverse-coordinate multiplication remain unresolved",
             "Engine.Actor.SetBoneRotation",
             "native(397) final native static function SetBoneRotation(name BoneName, \
              struct<Rotator> BoneTurn, int Space, float Alpha)",
@@ -244,7 +244,7 @@ pub fn residual_defs() -> Vec<NativeDef> {
             set_bone_rotation,
         ),
         partial(
-            "the request is recorded per actor for the renderer; no skeletal transform is evaluated",
+            "CPU evaluator applies alpha-weighted local translation after scale; simultaneous rotation/location request coupling needs parity validation",
             "Engine.Actor.SetBoneLocation",
             "native(398) final native static function SetBoneLocation(name BoneName, \
              struct<Vector> BoneTrans, float Alpha)",
@@ -252,7 +252,7 @@ pub fn residual_defs() -> Vec<NativeDef> {
             set_bone_location,
         ),
         partial(
-            "the request is recorded per actor for the renderer; no skeletal transform is evaluated",
+            "CPU evaluator applies uniform local basis scale by slot; slot disable and invalid-bone return semantics need parity validation",
             "Engine.Actor.SetBoneScale",
             "native(401) final native static function SetBoneScale(int Slot, float BoneScale, \
              name BoneName)",

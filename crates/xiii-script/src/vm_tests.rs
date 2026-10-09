@@ -3921,6 +3921,9 @@ fn anim_fixture() -> Vec<u8> {
     let banim_finished = b.reserve(IMP_BOOLPROP, actor, "bAnimFinished");
     let mesh = b.reserve(IMP_OBJECTPROP, actor, "Mesh");
     let counter = b.reserve(IMP_INTPROP, actor, "Counter");
+    let attachment_bone = b.reserve(IMP_NAMEPROP, actor, "AttachmentBone");
+    let base = b.reserve(IMP_OBJECTPROP, actor, "Base");
+    let static_mesh = b.reserve(IMP_OBJECTPROP, actor, "StaticMesh");
 
     let link = b.reserve(IMP_FUNCTION, actor, "LinkSkelAnim");
     let link_anim = b.reserve(IMP_OBJECTPROP, link, "Anim");
@@ -3957,7 +3960,10 @@ fn anim_fixture() -> Vec<u8> {
     b.prop(anim_frame, banim_finished, 0);
     b.prop(banim_finished, mesh, 0);
     b.prop_with(mesh, counter, 0, &object_extra);
-    b.prop(counter, link, 0);
+    b.prop(counter, attachment_bone, 0);
+    b.prop(attachment_bone, base, 0);
+    b.prop_with(base, static_mesh, 0, &object_extra);
+    b.prop_with(static_mesh, link, 0, &object_extra);
 
     b.prop_with(link_anim, 0, PARM, &object_extra);
     b.func(link, play, link_anim, &[], 0, 413, FINAL | NATIVE | STATIC);
@@ -4081,8 +4087,8 @@ fn play_anim_fires_anim_end_once_at_the_right_tick() {
     vm.set_active(a, true);
     play_anim(&mut vm, a, "Walk", 1.0, 0);
 
-    // 4 frames at 1 fps with a 0.5 s step: 8 ticks exactly.
-    for _ in 0..7 {
+    // Four frames indexed 0..3 at 1 fps: completion after 3 seconds (DLL end=1-1/N).
+    for _ in 0..5 {
         vm.tick(0.5).unwrap();
     }
     assert!(
@@ -4097,7 +4103,7 @@ fn play_anim_fires_anim_end_once_at_the_right_tick() {
         vm.get_property(a, "bAnimFinished"),
         Some(&Value::Bool(true))
     );
-    assert_eq!(vm.get_property(a, "AnimFrame"), Some(&Value::Float(4.0)));
+    assert_eq!(vm.get_property(a, "AnimFrame"), Some(&Value::Float(0.75)));
     // Further ticks do not fire it again.
     vm.tick(0.5).unwrap();
     assert_eq!(anim_end_count(&vm), 1);
@@ -4133,7 +4139,7 @@ fn actor_animation_view_reports_sequence_frame_and_looping() {
 }
 
 #[test]
-fn loop_anim_loops_without_anim_end_and_reports_is_animating() {
+fn loop_anim_reports_end_at_last_frame_and_keeps_animating() {
     let set = anim_set();
     let mut vm = Vm::new(&set, VmLimits::default());
     vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(4, 1.0)));
@@ -4156,7 +4162,11 @@ fn loop_anim_loops_without_anim_end_and_reports_is_animating() {
     for _ in 0..20 {
         vm.tick(0.5).unwrap();
     }
-    assert_eq!(anim_end_count(&vm), 0, "LoopAnim never ends");
+    assert_eq!(
+        anim_end_count(&vm),
+        2,
+        "DLL sends loop AnimEnd at frames 3 and 7 before wraps at 4 and 8"
+    );
     assert!(vm.anim_channel_active(a, 0));
 
     let mut args = [Value::Int(0)];
@@ -7944,6 +7954,10 @@ fn stop_animating_clears_every_channel() {
             looping: true,
             active: true,
             tween_remaining: 0.0,
+            tween_duration: 0.0,
+            tween_only: false,
+            loop_end_sent: false,
+            tween_source: None,
             notifies: Vec::new(),
             notify_idx: 0,
         },
@@ -8299,4 +8313,165 @@ fn delegate_values_are_equatable_and_none_is_distinct() {
     assert!(!crate::vm::values_equal(&d, &same));
     assert!(crate::vm::values_equal(&d, &d.clone()));
     assert!(!crate::vm::values_equal(&Value::Delegate(None), &d));
+}
+
+#[test]
+fn tween_only_holds_first_frame_and_captures_interrupted_source() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(4, 2.0)));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    play_anim(&mut vm, a, "Walk", 1.0, 0);
+    vm.tick(0.5).unwrap();
+    let mut args = [Value::Name("Idle".into()), Value::Float(1.0), Value::Int(0)];
+    try_native(&mut vm, "Engine.Actor.TweenAnim", a, &[false; 3], &mut args).unwrap();
+    vm.tick(0.25).unwrap();
+    let view = vm.actor_animation(a).unwrap();
+    let c = &view.channels[0];
+    assert_eq!(c.frame, 0.0);
+    assert_eq!(c.rate, 0.0);
+    assert_eq!(c.tween_remaining, 0.75);
+    assert_eq!(c.tween_source.as_ref().unwrap().frame, 1.0);
+    assert_eq!(c.tween_source.as_ref().unwrap().sequence, "Walk");
+    args[0] = Value::Name("Run".into());
+    try_native(&mut vm, "Engine.Actor.TweenAnim", a, &[false; 3], &mut args).unwrap();
+    let c = vm.actor_animation(a).unwrap().channels.remove(0);
+    assert_eq!(c.tween_source.as_ref().unwrap().tween_remaining, 0.75);
+    vm.tick(1.25).unwrap();
+    assert_eq!(anim_end_count(&vm), 1);
+    vm.tick(2.0).unwrap();
+    let c = vm.actor_animation(a).unwrap().channels.remove(0);
+    assert_eq!(c.frame, 0.0);
+    assert!(!c.active);
+    assert!(c.tween_source.is_none());
+}
+
+#[test]
+fn blend_to_alpha_preserves_subtree_and_is_independent_of_step_size() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(100, 1.0)));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    vm.anim_blend_params(a, 1, 0.2, 0.5, 0.25, Some("Arm".into()));
+    vm.anim_blend_to_alpha(a, 1, 0.8, 1.0);
+    for _ in 0..4 {
+        vm.tick(0.125).unwrap();
+    }
+    let p = vm.objects[a as usize].anim.blend_params.get(&1).unwrap();
+    assert!((p.blend_alpha - 0.5).abs() < 1e-6);
+    assert_eq!(p.bone_name.as_deref(), Some("Arm"));
+    assert_eq!(p.in_time, 0.5);
+    vm.tick(1.0).unwrap();
+    assert!((vm.objects[a as usize].anim.blend_params[&1].blend_alpha - 0.8).abs() < 1e-6);
+    vm.anim_blend_to_alpha(a, 1, 0.0, 0.0);
+    assert_eq!(
+        vm.objects[a as usize].anim.blend_params[&1].blend_alpha,
+        0.0
+    );
+    vm.anim_blend_params(a, 0, 0.0, 0.0, 0.0, None);
+    assert!(!vm.objects[a as usize].anim.blend_params.contains_key(&0));
+}
+
+#[test]
+fn channel_params_return_requested_sequence_and_loop_notifies_survive_multiple_wraps() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(ScriptedAnim {
+        frames: 4,
+        rate: 1.0,
+        notifies: vec![(0.25, "Foot".into()), (0.75, "Foot".into())],
+    }));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    play_anim(&mut vm, a, "Walk", 1.0, 0);
+    play_anim(&mut vm, a, "Aim", 1.0, 1);
+    let mut args = [
+        Value::Int(0),
+        Value::Name("None".into()),
+        Value::Float(0.0),
+        Value::Float(0.0),
+    ];
+    try_native(
+        &mut vm,
+        "Engine.Actor.GetAnimParams",
+        a,
+        &[false; 4],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(args[1], Value::Name("Walk".into()));
+    assert_eq!(args[3], Value::Float(0.25));
+    assert_eq!(
+        vm.get_property(a, "AnimSequence"),
+        Some(&Value::Name("Walk".into()))
+    );
+    let st = vm.objects[a as usize].anim.channels.get_mut(&0).unwrap();
+    st.looping = true;
+    vm.tick(9.5).unwrap();
+    assert_eq!(vm.objects[a as usize].anim.channels[&0].frame, 1.5);
+    let count = vm
+        .trace
+        .iter()
+        .filter(|e| matches!(e.kind, TraceKind::AnimNotify { channel: 0, .. }))
+        .count();
+    assert_eq!(count, 5);
+    assert_eq!(vm.anim_channel_params(a, 0), Some((0.375, 0.25)));
+    assert_eq!(
+        vm.get_property(a, "bAnimFinished"),
+        Some(&Value::Bool(false))
+    );
+}
+
+#[test]
+fn repeated_bone_controls_replace_previous_request() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    for yaw in 0..1000 {
+        vm.add_bone_rotation(a, "Arm".into(), [0, yaw, 0], 0, 1.0);
+    }
+    let bs = vm.bone_state(a).unwrap();
+    assert_eq!(bs.rotations.len(), 1);
+    assert_eq!(bs.rotations[0].turn[1], 999);
+}
+
+#[test]
+fn animation_rejects_nonfinite_and_unbounded_interruptions_or_wrap_work() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(4, 2.0)));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    assert!(
+        vm.start_animation(a, "Walk", f32::NAN, 0.0, 0, false)
+            .is_err()
+    );
+    assert!(
+        vm.start_animation(a, "Walk", 1.0, f32::INFINITY, 0, false)
+            .is_err()
+    );
+    for _ in 0..65 {
+        vm.start_animation(a, "Walk", 1.0, 1.0, 0, false).unwrap();
+    }
+    // A further frozen recipe would exceed the sampler recursion bound.
+    assert!(vm.start_animation(a, "Walk", 1.0, 1.0, 0, false).is_err());
+    vm.start_animation(a, "Walk", 1.0, 0.0, 0, true).unwrap();
+    assert!(vm.tick(10000.0).is_err());
+}
+
+#[test]
+fn attach_to_bone_writes_the_reflected_attachment_bone_field() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let parent = vm.spawn(sg(&set, "Actor"), "Parent").unwrap();
+    let child = vm.spawn(sg(&set, "Actor"), "Child").unwrap();
+    let mut args = [Value::Object(Some(ObjRef::Instance(child))), Value::Name("Arm".into())];
+    let out = try_native(&mut vm, "Engine.Actor.AttachToBone", parent, &[false; 2], &mut args).unwrap();
+    assert!(matches!(out, NativeOutcome::Value(Value::Bool(true))));
+    assert_eq!(vm.get_property(child, "AttachmentBone"), Some(&Value::Name("Arm".into())));
+    assert_eq!(vm.get_property(child, "Base"), Some(&Value::Object(Some(ObjRef::Instance(parent)))));
+    args[0] = Value::Object(None);
+    assert!(matches!(try_native(&mut vm, "Engine.Actor.AttachToBone", parent, &[false; 2], &mut args).unwrap(), NativeOutcome::Value(Value::Bool(false))));
 }

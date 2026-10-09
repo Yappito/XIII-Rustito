@@ -2204,6 +2204,7 @@ fn tween_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nativ
     let time = if c.omitted(1) { 0.0 } else { float(vm, a, 1)? };
     let ch = channel(vm, a, 2, c.omitted(2))?;
     vm.start_animation(c.this, &seq, 0.0, time, ch, false)?;
+    vm.mark_tween_only(c.this, ch);
     val(Value::Void)
 }
 
@@ -2969,7 +2970,7 @@ fn attach_to_bone(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<N
     if !c.omitted(1)
         && let Some(Value::Name(n)) = a.get(1)
     {
-        vm.set_property(id, "AttachBone", 0, Value::Name(n.clone()));
+        vm.set_property(id, "AttachmentBone", 0, Value::Name(n.clone()));
     }
     val(Value::Bool(true))
 }
@@ -2978,7 +2979,7 @@ fn anim_blend_to_alpha(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmRes
     let stage = int(vm, a, 0)?;
     let target = float(vm, a, 1)?;
     let time = float(vm, a, 2)?;
-    vm.anim_blend_params(c.this, stage, target, time, 0.0, None);
+    vm.anim_blend_to_alpha(c.this, stage, target, time);
     val(Value::Void)
 }
 
@@ -3022,14 +3023,13 @@ fn weapon_has_ammo(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<
 }
 
 fn get_anim_params(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
-    // `Actor.GetAnimParams(int Channel, out name OutSeqName, out float OutAnimFrame,
-    // out float OutAnimRate)`: the VM's channel state holds the frame/rate; the sequence name
-    // is the actor's `AnimSequence` property (the channel itself does not store the name).
+    // Read the requested channel, independent of the actor's last started sequence.
     let ch = channel(vm, a, 0, c.omitted(0))?;
-    let name = vm
-        .get_property(c.this, "AnimSequence")
-        .cloned()
-        .unwrap_or_else(|| Value::Name("None".to_owned()));
+    let name = Value::Name(
+        vm.anim_channel_sequence(c.this, ch)
+            .unwrap_or("None")
+            .to_owned(),
+    );
     let (frame, rate) = vm.anim_channel_params(c.this, ch).unwrap_or((0.0, 0.0));
     if a.len() > 1 {
         a[1] = name;
@@ -4288,12 +4288,12 @@ fn builtin_defs() -> Vec<NativeDef> {
         ),
         NativeDef {
             status: NativeStatus::Partial(
-                "the channel state stores frame/rate but not the sequence name; OutSeqName is the actor's AnimSequence property",
+                "requested channel sequence and normalized frame/rate supported; velocity-derived negative rates and exact interrupted tween/global cache semantics remain unimplemented",
             ),
             ..def(
                 "Engine.Actor.GetAnimParams",
                 "native(396) final static function GetAnimParams(int Channel, out name OutSeqName, out float OutAnimFrame, out float OutAnimRate)",
-                "engine.u Actor.GetAnimParams decoded; fills the channel's sequence name (the AnimSequence property) and the VM's frame/rate",
+                "engine.u Actor.GetAnimParams decoded; fills the requested channel sequence, normalized frame (negative during tween) and normalized rate; channel-zero Actor mirrors stay independent of higher stages",
                 get_anim_params,
             )
         },
@@ -4412,15 +4412,20 @@ fn builtin_defs() -> Vec<NativeDef> {
             "engine.u Actor.SetDrawScale3D decoded (vector, void); stores the DrawScale3D property",
             set_draw_scale3d,
         ),
-        def(
-            "Engine.Actor.AttachToBone",
-            "native(404) final static function bool AttachToBone(object<Actor> Attachment, name BoneName)",
-            "engine.u Actor.AttachToBone decoded (Attachment, BoneName, bool); bases the attachment on self and records the bone; no skeletal transform (headless)",
-            attach_to_bone,
-        ),
         NativeDef {
             status: NativeStatus::Partial(
-                "stores the target blend alpha/time like the other animation channel parameters; no skeletal blending is evaluated",
+                "renderer follows evaluated bones and relative transforms; mesh attachment aliases and VM collision/location propagation remain unimplemented",
+            ),
+            ..def(
+                "Engine.Actor.AttachToBone",
+                "native(404) final static function bool AttachToBone(object<Actor> Attachment, name BoneName)",
+                "engine.u Actor.AttachToBone decoded (Attachment, BoneName, bool); bases attachment on self; play renderer evaluates bone coordinates with RelativeLocation/RelativeRotation; attach aliases and VM collision following remain unimplemented",
+                attach_to_bone,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial(
+                "advances alpha in seconds and preserves subtree; zero/negative intervals and invalid stages still need original-engine validation",
             ),
             ..def(
                 "Engine.Actor.AnimBlendToAlpha",
@@ -4558,7 +4563,7 @@ fn builtin_defs() -> Vec<NativeDef> {
     ));
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "stores the per-channel blend parameters (BlendAlpha/InTime/OutTime and the optional BoneName); no skeletal blending is evaluated and the BoneName bone filter is not applied",
+            "shared CPU evaluator blends stages in ascending order over named subtrees with normalized InTime; OutTime use not found in PC GetFrame; special cached/global pose paths unimplemented",
         ),
         ..def(
             "Engine.Actor.AnimBlendParams",
@@ -4569,7 +4574,7 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "sequence length/notify times come from the AnimationData provider; no skeletal evaluation; playback is frames/second and tween holds frame 0",
+            "authored rate multiplier, last-frame completion, frozen-source tween and CPU channel sampling; velocity-dependent negative rates, automatic TweenTime and callback reentrancy remain unimplemented",
         ),
         ..def(
             "Engine.Actor.PlayAnim",
@@ -4580,18 +4585,18 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "sequence length/notify times come from the AnimationData provider; no skeletal evaluation; playback is frames/second and tween holds frame 0",
+            "authored rate multiplier, last-frame completion, frozen-source tween and CPU channel sampling; velocity-dependent negative rates, automatic TweenTime and callback reentrancy remain unimplemented",
         ),
         ..def(
             "Engine.Actor.LoopAnim",
             "native(260) final function LoopAnim(name Sequence, float Rate, float TweenTime, int Channel)",
-            "engine.u Actor.LoopAnim decoded (Sequence, Rate, TweenTime, Channel); UE1 AActor::LoopAnim (loops, never fires AnimEnd)",
+            "engine.u Actor.LoopAnim decoded (Sequence, Rate, TweenTime, Channel); Engine.dll UpdateAnimation (loop AnimEnd at final frame; wrap at N)",
             loop_anim,
         )
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "is PlayAnim with the sequence held at frame 0 until Time elapses; exact XIII tween blending is not modelled and needs the decoded mesh",
+            "frozen-source pose tween to frame zero then hold, with AnimEnd at tween completion; original cached-pose/global-pose optimizations and automatic negative TweenTime unimplemented",
         ),
         ..def(
             "Engine.Actor.TweenAnim",
@@ -5037,7 +5042,7 @@ fn builtin_defs() -> Vec<NativeDef> {
     ));
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "parameters are stored per actor for the renderer; no skeletal bone control is evaluated",
+            "parameters retained; spine-bone selection, speed/max clamp and world-space yaw conversion remain undecoded; renderer reports active requests",
         ),
         ..def(
             "Engine.Pawn.SpineYawControl",
@@ -5048,7 +5053,7 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "the request is recorded per actor for the renderer; no skeletal transform is evaluated",
+            "CPU evaluator applies per-axis local scale by slot; slot disabling/invalid bones and shear after rotated nonuniform scale need parity validation",
         ),
         ..def(
             "Engine.Actor.SetBoneScalePerAxis",
@@ -5059,7 +5064,7 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "the request is recorded per actor for the renderer; no skeletal transform is evaluated",
+            "request retained per bone; post-hierarchy inverse mesh/world-space rotation and translation alignment at GetFrame 0x103f324d remain undecoded; renderer reports active requests",
         ),
         ..def(
             "Engine.Actor.SetBoneDirection",

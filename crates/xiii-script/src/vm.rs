@@ -439,12 +439,16 @@ pub(crate) struct AnimChannel {
     pub(crate) rate: f32,
     /// Current position in frames.
     pub(crate) frame: f32,
-    /// Loop when reaching the end (no `AnimEnd`).
+    /// Loop at the sequence boundary; `AnimEnd` is sent at its final frame.
     pub(crate) looping: bool,
     /// Still playing.
     pub(crate) active: bool,
     /// Seconds still to be spent tweening in before playback advances.
     pub(crate) tween_remaining: f32,
+    pub(crate) tween_duration: f32,
+    pub(crate) tween_source: Option<Box<AnimChannelState>>,
+    pub(crate) tween_only: bool,
+    pub(crate) loop_end_sent: bool,
     /// Script notifies as `(time01, function)`.
     pub(crate) notifies: Vec<(f32, String)>,
     /// Index of the next notify not yet fired.
@@ -478,6 +482,7 @@ pub(crate) struct AnimBlendParams {
     pub(crate) out_time: f32,
     /// Bone filter (`None` = `BoneName` was omitted or `None`).
     pub(crate) bone_name: Option<String>,
+    pub(crate) alpha_target: Option<(f32, f32)>,
 }
 
 /// `Pawn.SpineYawControl(bool IsControlled, int MaxValue, float RotationSpeed)` parameters.
@@ -587,10 +592,26 @@ pub struct AnimChannelState {
     pub rate: f32,
     /// Total frames of the sequence.
     pub frames: u32,
-    /// Whether the sequence loops (no `AnimEnd`).
+    /// Whether the sequence loops (AnimEnd at the final frame, wrap one frame later).
     pub looping: bool,
     /// Still advancing (false once a non-looping sequence ended).
     pub active: bool,
+    /// Frozen previous channel pose, including an interrupted tween.
+    pub tween_source: Option<Box<AnimChannelState>>,
+    /// Seconds of tweening left and initial duration.
+    pub tween_remaining: f32,
+    /// Initial tween duration.
+    pub tween_duration: f32,
+    /// TweenAnim holds the target frame after completion.
+    pub tween_only: bool,
+    /// Current alpha of this channel (channel zero is authoritative).
+    pub blend_alpha: f32,
+    /// Blend-in fraction of sequence length, as decoded in GetFrame.
+    pub blend_in: f32,
+    /// Stored OutTime; no use was found in this PC GetFrame path.
+    pub blend_out: f32,
+    /// First bone of the blended subtree.
+    pub blend_bone: Option<String>,
 }
 
 /// Read-only per-actor animation view for the host: the candidate animation sources (the
@@ -3095,7 +3116,16 @@ impl<'s> Vm<'s> {
     /// it can decode the object. Both an exported (static) and a dynamically constructed
     /// (instance) `Mesh` are handled.
     pub fn mesh_object(&self, id: ObjectId) -> Option<(String, String)> {
-        let r = match self.get_property(id, "Mesh") {
+        self.mesh_property_object(id, "Mesh")
+    }
+
+    /// Resolved StaticMesh for native third-person InventoryAttachment actors.
+    pub fn static_mesh_object(&self, id: ObjectId) -> Option<(String, String)> {
+        self.mesh_property_object(id, "StaticMesh")
+    }
+
+    fn mesh_property_object(&self, id: ObjectId, property: &str) -> Option<(String, String)> {
+        let r = match self.get_property(id, property) {
             Some(Value::Object(Some(r))) => *r,
             _ => return None,
         };
@@ -3132,6 +3162,30 @@ impl<'s> Vm<'s> {
                 frames: c.frames,
                 looping: c.looping,
                 active: c.active,
+                tween_source: c.tween_source.clone(),
+                tween_remaining: c.tween_remaining,
+                tween_duration: c.tween_duration,
+                tween_only: c.tween_only,
+                blend_alpha: o
+                    .anim
+                    .blend_params
+                    .get(&i32::from(channel))
+                    .map_or(if channel == 0 { 1.0 } else { 0.0 }, |p| p.blend_alpha),
+                blend_in: o
+                    .anim
+                    .blend_params
+                    .get(&i32::from(channel))
+                    .map_or(0.0, |p| p.in_time),
+                blend_out: o
+                    .anim
+                    .blend_params
+                    .get(&i32::from(channel))
+                    .map_or(0.0, |p| p.out_time),
+                blend_bone: o
+                    .anim
+                    .blend_params
+                    .get(&i32::from(channel))
+                    .and_then(|p| p.bone_name.clone()),
             })
             .collect();
         Some(ActorAnimation {
@@ -3167,6 +3221,9 @@ impl<'s> Vm<'s> {
         alpha: f32,
     ) {
         if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone
+                .directions
+                .retain(|c| !(c.bone.eq_ignore_ascii_case(&bone)));
             o.bone.directions.push(BoneDirection {
                 bone,
                 turn,
@@ -3185,6 +3242,7 @@ impl<'s> Vm<'s> {
         bone: String,
     ) {
         if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone.scales.retain(|c| c.slot != slot);
             o.bone.scales.push(BoneScale { slot, scale, bone });
         }
     }
@@ -3199,6 +3257,9 @@ impl<'s> Vm<'s> {
         alpha: f32,
     ) {
         if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone
+                .rotations
+                .retain(|c| !(c.bone.eq_ignore_ascii_case(&bone)));
             o.bone.rotations.push(BoneRotation {
                 bone,
                 turn,
@@ -3217,6 +3278,9 @@ impl<'s> Vm<'s> {
         alpha: f32,
     ) {
         if let Some(o) = self.objects.get_mut(id as usize) {
+            o.bone
+                .locations
+                .retain(|c| !(c.bone.eq_ignore_ascii_case(&bone)));
             o.bone.locations.push(BoneLocation { bone, trans, alpha });
         }
     }
@@ -4215,6 +4279,8 @@ impl<'s> Vm<'s> {
     /// Suspends the actor that should stop after a failing tick: the innermost object on the
     /// error stack when it can be resolved, otherwise the actor being ticked. Returns the id.
     fn suspend_for_error(&mut self, ticked: ObjectId, e: &VmError) -> ObjectId {
+        #[cfg(test)]
+        eprintln!("[item47 temporary suspension diagnostic] {e}");
         let id = e
             .stack
             .last()
@@ -8041,15 +8107,43 @@ impl<'s> Vm<'s> {
         out_time: f32,
         bone_name: Option<String>,
     ) {
+        if !(1..=255).contains(&stage) {
+            return;
+        }
         self.objects[id as usize].anim.blend_params.insert(
             stage,
             AnimBlendParams {
                 blend_alpha,
-                in_time,
-                out_time,
+                in_time: in_time.min(1.0),
+                out_time: out_time.min(1.0),
                 bone_name,
+                alpha_target: None,
             },
         );
+    }
+
+    /// BlendToAlpha preserves the subtree and uses a remaining seconds interval.
+    pub(crate) fn anim_blend_to_alpha(&mut self, id: ObjectId, stage: i32, target: f32, time: f32) {
+        if !(1..=255).contains(&stage) {
+            return;
+        }
+        let p = self.objects[id as usize]
+            .anim
+            .blend_params
+            .entry(stage)
+            .or_insert(AnimBlendParams {
+                blend_alpha: 0.0,
+                in_time: 0.0,
+                out_time: 0.0,
+                bone_name: None,
+                alpha_target: None,
+            });
+        if time <= 0.0 {
+            p.blend_alpha = target;
+            p.alpha_target = None;
+        } else {
+            p.alpha_target = Some((target, time));
+        }
     }
 
     /// `Actor.PlayAnim`/`LoopAnim`/`TweenAnim`: start `sequence` on `channel`. `rate <= 0`
@@ -8066,14 +8160,24 @@ impl<'s> Vm<'s> {
     ) -> VmResult<()> {
         if sequence.eq_ignore_ascii_case("None") {
             self.objects[id as usize].anim.channels.remove(&channel);
-            self.set_property(id, "AnimSequence", 0, Value::Name("None".into()));
-            self.set_property(id, "AnimRate", 0, Value::Float(0.0));
-            self.set_property(id, "AnimFrame", 0, Value::Float(0.0));
+            if channel == 0 {
+                self.set_property(id, "AnimSequence", 0, Value::Name("None".into()));
+                self.set_property(id, "AnimRate", 0, Value::Float(0.0));
+                self.set_property(id, "AnimFrame", 0, Value::Float(0.0));
+                self.set_property(id, "bAnimFinished", 0, Value::Bool(true));
+            }
             return Ok(());
         }
         if self.animation.is_none() {
             return Err(self.err(VmErrorKind::NoAnimationProvider {
                 native: "Actor.PlayAnim".into(),
+            }));
+        }
+        if !rate.is_finite() || !tween_time.is_finite() {
+            return Err(self.err(VmErrorKind::AnimationDataError {
+                source: self.animation_sources(id).join(", "),
+                sequence: sequence.to_owned(),
+                message: "nonfinite animation rate or tween duration".into(),
             }));
         }
         // UE2 `AActor::PlayAnim` returns immediately when `Mesh == NULL` (Engine.dll
@@ -8103,6 +8207,13 @@ impl<'s> Vm<'s> {
             )));
             return Ok(());
         };
+        if !info.rate.is_finite() || (rate > 0.0 && !(rate * info.rate).is_finite()) {
+            return Err(self.err(VmErrorKind::AnimationDataError {
+                source: self.animation_sources(id).join(", "),
+                sequence: sequence.to_owned(),
+                message: "nonfinite decoded or multiplied animation rate".into(),
+            }));
+        }
         // UE2 `AActor::PlayAnim`/`LoopAnim` pass `Rate` as a **multiplier** of the sequence's own
         // authored rate (`Engine.dll ?execPlayAnim@AActor` RVA 0xDF990 pushes the default `1.0`;
         // the mesh instance advances `AnimRate * Seq->Rate` frames per second). The provider's
@@ -8114,6 +8225,32 @@ impl<'s> Vm<'s> {
         let rate = if rate > 0.0 { rate * natural } else { natural };
         let mut notifies = info.notifies;
         notifies.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        if tween_time > 0.0 {
+            let mut depth = 0;
+            let mut source = self.objects[id as usize]
+                .anim
+                .channels
+                .get(&channel)
+                .and_then(|c| c.tween_source.as_deref());
+            while let Some(c) = source {
+                depth += 1;
+                if depth >= 64 {
+                    return Err(self.err(VmErrorKind::AnimationDataError {
+                        source: self.animation_sources(id).join(", "),
+                        sequence: sequence.to_owned(),
+                        message: "more than 64 interrupted tweens".into(),
+                    }));
+                }
+                source = c.tween_source.as_deref();
+            }
+        }
+        let tween_source = if tween_time > 0.0 {
+            self.actor_animation(id)
+                .and_then(|a| a.channels.into_iter().find(|c| c.channel == channel))
+                .map(Box::new)
+        } else {
+            None
+        };
         self.objects[id as usize].anim.channels.insert(
             channel,
             AnimChannel {
@@ -8124,15 +8261,49 @@ impl<'s> Vm<'s> {
                 looping,
                 active: info.frames > 0,
                 tween_remaining: tween_time.max(0.0),
+                tween_duration: tween_time.max(0.0),
+                tween_source,
+                tween_only: false,
+                loop_end_sent: false,
                 notifies,
                 notify_idx: 0,
             },
         );
-        self.set_property(id, "AnimSequence", 0, Value::Name(sequence.to_owned()));
-        self.set_property(id, "AnimRate", 0, Value::Float(rate));
-        self.set_property(id, "AnimFrame", 0, Value::Float(0.0));
-        self.set_property(id, "bAnimFinished", 0, Value::Bool(false));
+        self.mirror_base_animation(id);
         Ok(())
+    }
+
+    /// TweenAnim reaches the first frame then holds; it never starts clip playback.
+    pub(crate) fn mark_tween_only(&mut self, id: ObjectId, channel: u8) {
+        if let Some(c) = self.objects[id as usize].anim.channels.get_mut(&channel) {
+            c.tween_only = true;
+            c.rate = 0.0;
+            c.active = c.tween_remaining > 0.0;
+        }
+        self.mirror_base_animation(id);
+    }
+
+    /// Actor properties mirror channel zero in the DLL's normalized sequence units.
+    fn mirror_base_animation(&mut self, id: ObjectId) {
+        let Some(c) = self.objects[id as usize].anim.channels.get(&0) else {
+            return;
+        };
+        let sequence = c.sequence.clone();
+        let finished = !c.active;
+        let (frame, rate) = self.anim_channel_params(id, 0).unwrap_or((0.0, 0.0));
+        self.set_property(id, "AnimSequence", 0, Value::Name(sequence));
+        self.set_property(id, "AnimRate", 0, Value::Float(rate));
+        self.set_property(id, "AnimFrame", 0, Value::Float(frame));
+        self.set_property(id, "bAnimFinished", 0, Value::Bool(finished));
+    }
+
+    pub(crate) fn anim_channel_sequence(&self, id: ObjectId, channel: u8) -> Option<&str> {
+        self.objects
+            .get(id as usize)?
+            .anim
+            .channels
+            .get(&channel)
+            .map(|c| c.sequence.as_str())
     }
 
     /// `Actor.StopAnimating` (native 417): stop every animation channel and clear the animation
@@ -8167,12 +8338,21 @@ impl<'s> Vm<'s> {
             .is_some_and(|o| o.anim.channels.get(&channel).is_some_and(|c| c.active))
     }
 
-    /// `(frame, rate)` of `channel`'s current animation, if the channel exists.
+    /// `(normalized frame, normalized rate)` as exported by GetAnimParams (Engine.dll
+    /// GetAnimFrame 0x103ee9a9 reads channel+0x10 directly). Tween frames are negative.
     pub(crate) fn anim_channel_params(&self, id: ObjectId, channel: u8) -> Option<(f32, f32)> {
         self.objects
             .get(id as usize)
             .and_then(|o| o.anim.channels.get(&channel))
-            .map(|c| (c.frame, c.rate))
+            .map(|c| {
+                let n = c.frames.max(1) as f32;
+                let frame = if c.tween_duration > 0.0 && c.tween_remaining > 0.0 {
+                    -c.tween_remaining / (c.tween_duration * n)
+                } else {
+                    c.frame / n
+                };
+                (frame, if c.active { c.rate / n } else { 0.0 })
+            })
     }
 
     /// `Actor.FinishAnim`: suspend state code until `channel` ends. Returns `false` (no latent)
@@ -8190,6 +8370,10 @@ impl<'s> Vm<'s> {
             return Err(self.err(VmErrorKind::LatentOutsideState {
                 path: "Actor.FinishAnim".into(),
             }));
+        }
+        // execFinishAnim stops loop playback so the current cycle can finish.
+        if let Some(c) = self.objects[id as usize].anim.channels.get_mut(&channel) {
+            c.looping = false;
         }
         self.pending_latent = Some(Latent::AnimEnd {
             channel,
@@ -8289,6 +8473,17 @@ impl<'s> Vm<'s> {
         if self.objects.get(id as usize).is_none_or(|o| o.deleted) {
             return Ok(());
         }
+        if self.objects[id as usize].anim.channels.values().any(|c| {
+            c.looping
+                && c.frames > 0
+                && (!((c.rate * dt).is_finite()) || c.rate * dt / c.frames as f32 > 4096.0)
+        }) {
+            return Err(self.err(VmErrorKind::AnimationDataError {
+                source: self.animation_sources(id).join(", "),
+                sequence: "<advance>".into(),
+                message: "animation step exceeds 4096 loop wraps".into(),
+            }));
+        }
         // The actor name is only needed when a notify or animation end fires; the old code
         // cloned it unconditionally, allocating a string for every active actor every tick
         // (most have no active channel).
@@ -8296,45 +8491,82 @@ impl<'s> Vm<'s> {
         let mut ended: Vec<(u8, f32)> = Vec::new();
         {
             let o = &mut self.objects[id as usize];
+            for p in o.anim.blend_params.values_mut() {
+                if let Some((target, remaining)) = p.alpha_target {
+                    p.blend_alpha += (target - p.blend_alpha) * (dt / remaining).min(1.0);
+                    p.alpha_target = if remaining > dt {
+                        Some((target, remaining - dt))
+                    } else {
+                        None
+                    };
+                }
+            }
             for (&channel, st) in o.anim.channels.iter_mut() {
                 if !st.active {
                     continue;
                 }
                 let step_dt = if st.tween_remaining > 0.0 {
-                    st.tween_remaining -= dt;
+                    let spent = dt.min(st.tween_remaining);
+                    st.tween_remaining -= spent;
                     if st.tween_remaining > 0.0 {
                         continue;
                     }
-                    -st.tween_remaining
+                    st.tween_source = None;
+                    if st.tween_only {
+                        st.active = false;
+                        ended.push((channel, 0.0));
+                        continue;
+                    }
+                    dt - spent
                 } else {
                     dt
                 };
-                let old = st.frame;
-                st.frame += (st.rate * step_dt).max(0.0);
-                while st.notify_idx < st.notifies.len() {
-                    let (t, name) = st.notifies[st.notify_idx].clone();
-                    let target = t.clamp(0.0, 1.0) * st.frames as f32;
-                    if old < target && st.frame >= target {
-                        notifies.push((channel, name));
+                if st.tween_only {
+                    continue;
+                }
+                let length = st.frames as f32;
+                let end = if st.looping { length } else { length - 1.0 };
+                let mut remaining = (st.rate * step_dt).max(0.0);
+                loop {
+                    let old = st.frame;
+                    let next = (old + remaining).min(end.max(0.0));
+                    while st.notify_idx < st.notifies.len() {
+                        let (t, name) = &st.notifies[st.notify_idx];
+                        let target = *t * length;
+                        if target > next {
+                            break;
+                        }
+                        if old < target && target >= 0.0 {
+                            notifies.push((channel, name.clone()));
+                        }
                         st.notify_idx += 1;
-                    } else if old >= target {
-                        st.notify_idx += 1;
-                    } else {
+                    }
+                    if st.looping && !st.loop_end_sent && old < length - 1.0 && next >= length - 1.0
+                    {
+                        ended.push((channel, length - 1.0));
+                        st.loop_end_sent = true;
+                    }
+                    st.frame = next;
+                    remaining -= next - old;
+                    if st.frame < end {
                         break;
                     }
-                }
-                if st.frames > 0 && st.frame + 1e-4 >= st.frames as f32 {
-                    if st.looping {
-                        st.frame %= st.frames as f32;
+                    if st.looping && length > 0.0 {
+                        st.frame = 0.0;
                         st.notify_idx = 0;
+                        st.loop_end_sent = false;
+                        if remaining <= 0.0 {
+                            break;
+                        }
                     } else {
-                        st.frame = st.frames as f32;
                         st.active = false;
                         ended.push((channel, st.frame));
+                        break;
                     }
                 }
             }
         }
+        self.mirror_base_animation(id);
         for (channel, function) in notifies {
             let actor = self.objects[id as usize].name.clone();
             self.note(TraceKind::AnimNotify {
@@ -8344,9 +8576,7 @@ impl<'s> Vm<'s> {
             });
             self.send_event(id, &function, Vec::new())?;
         }
-        for (channel, frame) in ended {
-            self.set_property(id, "AnimFrame", 0, Value::Float(frame));
-            self.set_property(id, "bAnimFinished", 0, Value::Bool(true));
+        for (channel, _frame) in ended {
             let actor = self.objects[id as usize].name.clone();
             self.note(TraceKind::AnimEnd { actor, channel });
             // UE2 `APawn::NotifyAnimEnd` (Engine.dll RVA 0xB0A00) sends `AnimEnd(Channel)` to the
