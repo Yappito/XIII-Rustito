@@ -2054,8 +2054,16 @@ fn actor_trace(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nati
     if !vm.physics_ready("Actor.Trace", Some(277), c.this, Value::Object(None))? {
         return val(Value::Object(None));
     }
+    // Engine.dll execTrace 0x103e8ac7: (bTraceActors ? 0xBF : 0x86) | extra.
+    // AdditionalTraceType is additive, so it can admit pawns even with bTraceActors=false.
+    let additional = if a.len() <= 7 || c.omitted(7) {
+        0
+    } else {
+        int(vm, a, 7)? as u32
+    };
+    let flags = (if b_trace_actors { 0xbf } else { 0x86 }) | additional;
     let (hit_actor, hit_location, hit_normal) =
-        vm.vm_trace(c.this, start, end, b_trace_actors, extent)?;
+        vm.vm_trace_flags(c.this, start, end, flags, extent)?;
     a[0] = Value::Vector(hit_location);
     a[1] = Value::Vector(hit_normal);
     if a.len() > 6 && !c.omitted(6) {
@@ -2222,7 +2230,7 @@ fn play_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Native
         return val(Value::Void);
     }
     let seq = name(vm, a, 0)?;
-    let rate = if c.omitted(1) { 0.0 } else { float(vm, a, 1)? };
+    let rate = if c.omitted(1) { 1.0 } else { float(vm, a, 1)? };
     let tween = if c.omitted(2) { 0.0 } else { float(vm, a, 2)? };
     let ch = channel(vm, a, 3, c.omitted(3))?;
     vm.start_animation(c.this, &seq, rate, tween, ch, false)?;
@@ -2234,7 +2242,7 @@ fn loop_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Native
         return val(Value::Void);
     }
     let seq = name(vm, a, 0)?;
-    let rate = if c.omitted(1) { 0.0 } else { float(vm, a, 1)? };
+    let rate = if c.omitted(1) { 1.0 } else { float(vm, a, 1)? };
     let tween = if c.omitted(2) { 0.0 } else { float(vm, a, 2)? };
     let ch = channel(vm, a, 3, c.omitted(3))?;
     vm.start_animation(c.this, &seq, rate, tween, ch, true)?;
@@ -3074,6 +3082,24 @@ fn attach_to_bone(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<N
     {
         vm.set_property(id, "AttachmentBone", 0, Value::Name(n.clone()));
     }
+    val(Value::Bool(true))
+}
+
+fn detach_from_bone(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    // UE2 `AActor::DetachFromBone(AActor* Attachment)`: the counterpart of AttachToBone — the
+    // attachment stops being based on this actor and returns to world space. The VM clears the
+    // recorded Base/AttachmentBone link; the world transform the engine recomputes from the bone
+    // is not evaluated (no skeletal transforms headless), which is safe for the campaign flows
+    // that call it: `xidmaps.CineMalletteSM.Trigger` 0x00E3..0x0148 sets Location/Rotation
+    // explicitly right after every detach.
+    let Some(ObjRef::Instance(id)) = object(vm, a, 0)? else {
+        return val(Value::Bool(false));
+    };
+    if vm.obj_prop(id, "Base") != Some(c.this) {
+        return val(Value::Bool(false));
+    }
+    vm.set_property(id, "Base", 0, Value::Object(None));
+    vm.set_property(id, "AttachmentBone", 0, Value::Name("None".to_owned()));
     val(Value::Bool(true))
 }
 
@@ -4105,28 +4131,18 @@ fn builtin_defs() -> Vec<NativeDef> {
             "UE2: component-wise scale; Core.dll operator thunk",
             multiply_fv,
         ),
-        NativeDef {
-            status: NativeStatus::Partial(
-                "deterministic seeded PRNG (splitmix64); the engine RNG sequence is not reproduced",
-            ),
-            ..def(
-                "Object.FRand",
-                "native(195) final static function float FRand()",
-                "UE2: pseudo-random float in [0,1); Core.dll ?execFRand@UObject",
-                f_rand,
-            )
-        },
-        NativeDef {
-            status: NativeStatus::Partial(
-                "deterministic seeded PRNG (splitmix64); the engine RNG sequence is not reproduced",
-            ),
-            ..def(
-                "Object.Rand",
-                "native(167) final static function int Rand(int Max)",
-                "UE2: pseudo-random int in [0,Max); Core.dll ?execRand@UObject",
-                rand_i,
-            )
-        },
+        def(
+            "Object.FRand",
+            "native(195) final static function float FRand()",
+            "Core.dll execFRand 0x1011a950 -> appFrand 0x1010ffd0: MSVCR70 rand * float 0x38000100 (inclusive 0..1); CRT rand 0x7c02836d uses 32-bit LCG 214013*s+2531011, bits 16..30",
+            f_rand,
+        ),
+        def(
+            "Object.Rand",
+            "native(167) final static function int Rand(int Max)",
+            "Core.dll execRand 0x101197f0: Max<=0 returns 0 without consuming RNG; otherwise same CRT rand stream modulo Max",
+            rand_i,
+        ),
         def(
             "Engine.Actor.SetRotation",
             "native(299) final function bool SetRotation(rotator NewRotation)",
@@ -4527,6 +4543,17 @@ fn builtin_defs() -> Vec<NativeDef> {
         },
         NativeDef {
             status: NativeStatus::Partial(
+                "the bone-space world transform the engine restores on detach is not evaluated headless; callers set Location/Rotation explicitly (xidmaps.CineMalletteSM.Trigger 0x00E3..0x0148)",
+            ),
+            ..def(
+                "Engine.Actor.DetachFromBone",
+                "native(403) final static function bool DetachFromBone(object<Actor> Attachment)",
+                "engine.u Actor.DetachFromBone decoded (Attachment, bool); clears the attachment's Base/AttachmentBone when it is based on self, false otherwise",
+                detach_from_bone,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial(
                 "advances alpha in seconds and preserves subtree; zero/negative intervals and invalid stages still need original-engine validation",
             ),
             ..def(
@@ -4560,7 +4587,7 @@ fn builtin_defs() -> Vec<NativeDef> {
         },
         NativeDef {
             status: NativeStatus::Partial(
-                "actor hits use ray-vs-grown-cylinder, owned actors are skipped; Material out-param is None and DiscardedHitMask 0 (no material/hit-mask model); AdditionalTraceType and mover brush geometry are not modelled; world hits return the map LevelInfo (upstream)",
+                "AdditionalTraceType is ORed into actor category flags; actor hits use ray-vs-grown-cylinder; Material out-param is None and DiscardedHitMask 0 (no material/hit-mask model); special world filtering bits remain unmodelled; mover geometry comes from the physics provider",
             ),
             ..def(
                 "Engine.Actor.Trace",

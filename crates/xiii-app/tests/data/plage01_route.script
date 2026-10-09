@@ -38,8 +38,7 @@ t=58.50 teleport 1093.0 -13854.0 1113.0 # diagnostic: approach tueur_conducteur 
 
 # Diagnostic weapon bootstrap; the actual fire/death/inventory transfer are the game's code.
 t=59.00 weapon XIII.m60
-# grant_weapon directly wires and brings up this diagnostic weapon; `equip` would walk the
-# inventory chain, where the game's AddInventory HUD notification is currently deferred.
+# This fixture retains its labelled weapon grant; carried-weapon input uses switch_weapon.
 t=60.00 teleport 1802.0 -12700.0 1100.0 # diagnostic: approach killer
 t=60.00 track BaseSoldier6
 t=60.10 fire
@@ -61,9 +60,12 @@ t=63.10 fire
 t=63.30 fire
 t=63.50 fire
 t=63.60 track off
-t=64.00 search BaseSoldier6
+# Negative probe (item49b): a named use must never search a corpse through host code. The
+# game's targeting refuses at this instant (measured PickupRefused); the game's own tick path
+# drains the corpse afterwards (measured SearchPawn(BaseSoldier6) at t=64.35 into the player).
+t=64.00 use BaseSoldier6
 
-# Search the dead killer for the game's ClefPickup and use it on the truck's Porte1.
+# Walk to the truck and use Porte1; the key taken from the killer's corpse unlocks it.
 t=66.00 teleport 1215.0 -14000.0 1105.0 # diagnostic: approach truck door
 t=66.00 yaw 270
 t=66.50 use Porte1

@@ -1,4 +1,4 @@
-# item27m: Banque01 story route, walked. Replaces the item27l route's remaining teleports where
+# item27n: Banque01 story route, walked. Replaces the item27l route's remaining teleports where
 # the decoded engine behavior measurably supports the walk; any kept teleport carries a measured
 # cause. Objective 0 "Access the strongroom." completes through the game's own chain (Cine15
 # Jones scene -> `event fin_flash` -> XIIIDispatcher4 -> GT_quitterbanque -> XIIIGoalTrigger0) and
@@ -17,11 +17,8 @@
 #   - walk to the counter spot (-330,-2133): Cine1[12] "wait player 300" (vs the teller at
 #     (-494,-2133)) passes; the customer queue maze is walkable (probe-m).
 #   - Cine1[16] "wait event recoit_cle" then needs Banque0.STA_DonneCle.Tick to see
-#     VSize2D(teller-player)<300 && CanSee(teller). From the customer side CanSee measurably
-#     fails (the counter blocks the eye line; probe-m sat at (-330,-2133) for 10+ s with no
-#     release), and the staff side is sealed by Porte7 until the teller herself opens it at
-#     action[29] — which requires recoit_cle. Measured cause for the ONE remaining lobby
-#     teleport: spot E (-494,-2383), the only position that releases the key.
+#     VSize2D(teller-player)<300 && CanSee(teller). The item27m engine sight fix releases the
+#     key from the walked customer side; no lobby teleport remains.
 #   - walk the staff corridor north to (-540,-1350): the teller's Cine1[32] "wait player 500"
 #     (vs her at (-567,-1284) after `opendoor porte7`) passes.
 #   - walk west to (-1560,-1290) and WAIT: the double armored door XIIIMover14/15
@@ -45,20 +42,29 @@
 #     basement corridor terminates at x~=-3550 (slices in local/re/item27l/), the original nav
 #     graph has NO PATH for that leg (local/re/item27l/plan-paths.txt leg 5), and probing east
 #     along the strongroom platform descends the interior stair and wedges at x~=-7010
-#     (local/re/item27m/probe-j.log). No map actor relocates the player either: the flash chain's
+#     (local/re/item27m/probe-j.log). item27n identifies node 222/surf 815 of Model69: wall
+#     x=-6976, floor z=800, ceiling z=1312. Radius 34 stops at x=-7010; neither a 35 UU step
+#     nor crouching clears this 512 UU wall. No map actor relocates the player either: the flash chain's
 #     SoundFlashOn/Off receivers are TriggerSound cues and DV12's Event is 'jones_dial' (starts
-#     the Jones dialogue, not a move). The game's own bomb-flash transition covers the move in
-#     the original; the teleport delivers DV12's own engine Touch, which fires 'jones_dial'.
+#     the Jones dialogue, not a move). A flash-masked relocation in the original is a hypothesis,
+#     not a decoded movement operation; this diagnostic teleport delivers DV12's Touch.
 #   - walk the strongroom interior: fall from the DV12 platform to the safe level (z=875,
 #     Cine15[3] "wait player 300" vs Jones at the safe passes at (-7161,-2141)), then walk the
 #     walkway to (-7883,-2648) where Cine15[34] "wait player 300" passes (Jones at
 #     (-7885,-2647,875)). Both t=48/t=70 teleports of the old route are gone.
-#   - the escape TouchTriggers stay teleports — measured causes (item27m): the volumes are
+#   - selected escape TouchTriggers stay teleports — measured causes (item27m): the volumes are
 #     cutscene beats off the AI nav graph (plan-paths.txt leg 8 has NO PATH walkway -> TT5).
-#     TT5's spot lands on a terrace whose south edge blocks all movement at y~-2046
-#     (probes k/l: the player wedges at (1170..1330,-2046,1322) with southward velocity); the
-#     TT2 spot's landing wedges at x~964 with the parking floor ~800 UU below and no measured
-#     route down (probe-m); TT3/TT4/TT10 are the fbi_dial2/arrivee_amos/CarOut cutscene beats.
+#     item27n: TT5 lands on LiftCage0's ROOF at z=1247, not a plaza terrace. BSP shaft wall
+#     y=-2080 (nodes 685/687, z=1008..1968) stops the radius-34 box at y=-2046, also crouched.
+#     TT2's landing is inside the simplified parking stair/ramp collision: StaticMeshActor1089
+#     -> Staticbanque.banksortiescasecour side x=998.2275 stops the box at x=964.2275. Its
+#     walkable ramp normal is (0,0.565,0.825); a 35 UU step/crouch does not clear the high side.
+#     An authored LadderVolume1 exists at (896,-4512,1120), so absence of a route down is NOT
+#     proven by these direct pushes. TT3/TT4/TT10 are fbi_dial2/arrivee_amos/CarOut cutscene beats.
+#     The TT4 teleport is redundant: after TT3 the natural fall to the lower yard's BSP floor
+#     z=272 touches TT4 at t=133.350. Its cutscene then sets NoControl; no extra walk is needed.
+#     TT10 is elevated: centre z=609.458, half-height 50 requires player centre >=484.458;
+#     from this floor standing centre 347 plus JumpZ^2/(2*950)=92.842 cannot touch it.
 #     Engine notes decoded this round: TriggerEvent is TAG-matched (engine.Actor.TriggerEvent
 #     foreaches DynamicActors(.., EventName)); XIIIMover26 (bankmurcoffreKsable, Tag
 #     'explocoffre_bis') has no sender anywhere in the map data, and Trigger27 ('bombe',
@@ -134,8 +140,8 @@ t=85.50 goto -2300 -5900
 t=88.00 goto -2843 -6100
 t=90.50 goto -2840 -6397
 
-# flow transition (measured cause above): the strongroom is not connected to the vault level by
-# any floor; the game's own bomb-flash transition covers the move. DetectionVolume12's Touch
+# Diagnostic flow transition (measured no nav path; direct platform exit is a 512 UU BSP wall).
+# A flash-masked original relocation is unverified. DetectionVolume12's Touch
 # starts Cine15 (Jones) through the game's own code.
 t=93.00 teleport -7616 -2784 1456
 
@@ -152,16 +158,16 @@ t=101.00 goto -7883 -2648
 # end-of-level chain.
 t=104.00 forward 0
 
-# Escape flow volumes (measured cause above: the strongroom's east wall XIIIMover5
-# "bankmurcoffre" seals the walkway-level exit and the explosion chain drives no mover). The run
+# Escape flow volumes (measured causes above: BSP strongroom wall, lift roof/shaft wall, parking
+# stair side; not XIIIMover5). The run
 # delivers each volume's own engine Touch; every touch is the game's own code. They wait for
 # fin_flash (see hold above) but may safely overlap the 13 s XIIIDispatcher4 delay that turns
 # fin_flash into the objective-0 promotion. (+3.0 shift vs the item27l route.)
-t=127.00 teleport 1300.03 -1917.39 1478  # flow touch: TouchTrigger5 (Event vignracaille)
-t=130.00 teleport 865 -4075 1530         # flow touch: TouchTrigger2 (Event arrivee_fbi)
-t=133.00 teleport 1134 -4222 480         # flow touch: TouchTrigger3 (Event fbi_dial2)
-t=136.00 teleport 1148 -4063 380         # flow touch: TouchTrigger4 (Event arrivee_amos)
-t=139.00 teleport 1014.38 -4309 620      # flow touch: TouchTrigger10 (Event CarOut)
+t=127.00 teleport 1300.03 -1917.39 1478  # TT5: no nav path from strongroom; shaft wall blocks roof exit
+t=130.00 teleport 865 -4075 1530         # TT2: TT5 roof's y=-2080 BSP wall blocks direct south walk
+t=133.00 teleport 1134 -4222 480         # TT3: parking stair side x=998.2275 blocks direct east walk
+t=136.00 forward 0                     # TT4 already touched on the natural fall at t=133.350
+t=139.00 teleport 1014.38 -4309 620      # TT10: elevated CarOut touch; floor+jump cannot reach its vertical span
 
 # Wait for the game's own travel (Amos01 via the end-of-level chain).
 t=142.00 wait_travel

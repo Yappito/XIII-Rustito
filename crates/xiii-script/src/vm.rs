@@ -8,9 +8,9 @@
 //! per-tick step budget.
 //!
 //! No filesystem access and no engine dependency: the caller loads packages into the set and
-//! decides which actors are *active* (executed). Script calls into inactive actors are
-//! recorded as [`TraceKind::Deferred`] and not executed (an error if the call needs a return
-//! value). Unsupported tokens, unimplemented natives, budget overruns and bad values fail with
+//! decides which actors are *active* (ticked). Direct script calls run independently of ticking.
+//! The diagnostic harness can explicitly restrict calls to its selected scope; skipped calls
+//! are traced, and return-valued calls fail. Unsupported tokens and unimplemented natives fail with
 //! [`VmError`] carrying a script stack trace. Nothing is stubbed silently.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1091,11 +1091,10 @@ pub struct Instance {
     /// All probes of the actor were disabled (`AActor+0x34` bit 0x1, `bProbesDisabled`). Read from
     /// the serialized property `bProbesDisabled` at spawn/layout time; `Disable`/`Enable` update it.
     probes_disabled: bool,
-    /// Executed by the VM (in scope).
+    /// Receives scheduled ticks, state code and timers. Does not gate direct script calls.
     pub active: bool,
-    /// Suspended after a script error (`active` was cleared by [`Vm::suspend_for_error`]). A
-    /// non-static call to a suspended actor is dropped; item14c records that visibly (see
-    /// [`Vm::suspended_deferred_calls`]) instead of silently no-oping.
+    /// Scheduled execution suspended after a script error. Direct calls still execute and
+    /// propagate any error; suspension never supplies a successful replacement result.
     pub suspended: bool,
     /// Derives from `Actor`.
     pub is_actor: bool,
@@ -1342,6 +1341,12 @@ pub struct Vm<'s> {
     rng: u64,
     /// Native functions called (path -> (index, count)).
     pub natives_used: std::collections::BTreeMap<String, (Option<u16>, u64)>,
+    /// First actual script stack for each invoked native (bounded by native paths).
+    pub natives_first_caller: BTreeMap<String, Vec<StackEntry>>,
+    /// Calls reached under weapon Fire or AI NotifyFiring, for opt-in combat diagnostics.
+    pub combat_natives: BTreeMap<String, (u64, Vec<StackEntry>)>,
+    /// Opt-in collection of firing-path call stacks (off during ordinary play).
+    pub collect_combat_natives: bool,
     /// Survey mode: unimplemented natives are counted and skipped instead of failing.
     pub survey: bool,
     /// Distinct unimplemented natives seen in survey mode (path -> record, first-hit order).
@@ -1425,6 +1430,8 @@ pub struct Vm<'s> {
     /// out of the executed scope). Every such drop also records a trace note; this counter makes
     /// the total visible to the host/report so a suspended actor's silent no-ops cannot hide.
     suspended_deferred_calls: u64,
+    /// Explicit partial-execution diagnostic policy, never used by normal gameplay.
+    diagnostic_call_scope: bool,
     /// item18: Bink video durations in seconds, keyed by lowercased file stem. The host registers
     /// them (the VM deliberately has no filesystem access); an entry is absent when the Bink header
     /// could not be read, in which case `VideoPlayer.GetStatus` keeps the old "finished" Partial.
@@ -1566,6 +1573,9 @@ impl<'s> Vm<'s> {
             load_warnings: Vec::new(),
             rng: limits.rng_seed,
             natives_used: Default::default(),
+            natives_first_caller: Default::default(),
+            combat_natives: Default::default(),
+            collect_combat_natives: false,
             survey: false,
             missing_natives: Default::default(),
             pending_latent: None,
@@ -1596,6 +1606,7 @@ impl<'s> Vm<'s> {
             profile: NativeProfile::default(),
             ai_visible: HashMap::new(),
             suspended_deferred_calls: 0,
+            diagnostic_call_scope: false,
             video_durations: HashMap::new(),
             video: None,
             video_host: None,
@@ -3166,7 +3177,13 @@ impl<'s> Vm<'s> {
             .is_some_and(|o| o.layout.chain_names.iter().any(|n| n.contains(needle)))
     }
 
-    /// Marks an object as executed (in scope).
+    /// Restricts direct calls to active objects for a partial-execution diagnostic.
+    /// This is a harness policy, not an UnrealScript rule. Normal gameplay leaves it disabled.
+    pub fn set_diagnostic_call_scope(&mut self, enabled: bool) {
+        self.diagnostic_call_scope = enabled;
+    }
+
+    /// Marks an object for scheduled execution (ticks, timers and state code).
     pub fn set_active(&mut self, id: ObjectId, active: bool) {
         if let Some(o) = self.objects.get_mut(id as usize) {
             o.active = active;
@@ -4421,8 +4438,8 @@ impl<'s> Vm<'s> {
         id
     }
 
-    /// item14c: number of non-static calls dropped because the target actor was suspended after a
-    /// script error. Every drop also records a `Note`; this is the cumulative count for reports.
+    /// Diagnostic-scope calls dropped on suspended objects. Normal dispatch never drops
+    /// calls for tick suspension, so gameplay leaves this counter at zero.
     pub fn suspended_deferred_calls(&self) -> u64 {
         self.suspended_deferred_calls
     }
@@ -4872,17 +4889,14 @@ impl<'s> Vm<'s> {
             };
         }
         let layout = self.func_layout(func);
-        // A class-default object (`Default__Class`) is never `active`, and a `static` function
-        // dispatches on the class default object; UE2 runs both regardless of instance scope
-        // (`MessageClass.default.GetColor`, `Message.static.GetString`). Only non-static calls
-        // on *placed* actors outside the executed scope are deferred.
-        // A call through a just-destroyed actor runs in the engine: `execFinalFunction`/
-        // `execVirtualFunction` reach `CallFunction` directly, which has no `bDeleteMe` guard (see
-        // `bypass_context_none`). The VM's `deleted`/`destroying` flags stand in for that, so such
-        // a call is never treated as an out-of-scope deferral.
+        // Core.dll execVirtualFunction (0x10117490) / execFinalFunction (0x101174d0)
+        // dispatch directly to CallFunction (0x1011e650), which does not test actor tick
+        // activity, state latency, probes or bDeleteMe. The active-set restriction below is
+        // exclusively the partial-execution diagnostic harness's opt-in policy.
         let destroyed_target =
             self.objects[target as usize].deleted || self.objects[target as usize].destroying;
-        if !self.objects[target as usize].active
+        if self.diagnostic_call_scope
+            && !self.objects[target as usize].active
             && !self.objects[target as usize].name.starts_with("Default__")
             && !f.is_static()
             && !destroyed_target
@@ -5241,6 +5255,21 @@ impl<'s> Vm<'s> {
             .entry(path.clone())
             .or_insert((declared, 0));
         e.1 += 1;
+        if !self.natives_first_caller.contains_key(&path) {
+            self.natives_first_caller
+                .insert(path.clone(), self.stack.clone());
+        }
+        if self.collect_combat_natives
+            && self.stack.iter().any(|s| {
+                s.function.ends_with("XIIIWeapon.Fire") || s.function.ends_with("NotifyFiring")
+            })
+        {
+            let entry = self
+                .combat_natives
+                .entry(path.clone())
+                .or_insert_with(|| (0, self.stack.clone()));
+            entry.0 += 1;
+        }
         let before: Vec<String> = if self.trace_natives {
             args.iter().map(|a| self.value_text(a)).collect()
         } else {
@@ -6797,6 +6826,15 @@ impl<'s> Vm<'s> {
             rotation.or_else(|| self.rotator_prop(spawner, "Rotation")),
         );
         self.set_property(id, "Owner", 0, Value::Object(owner.map(ObjRef::Instance)));
+        // Engine.dll execSpawn 0x103e5785 passes this->Instigator (+0x88), and
+        // ULevel::SpawnActor 0x10388d91..0x10388d96 stores it before lifecycle callbacks.
+        // Owner is independent: ammo spawned by a pawn must retain that pawn as Instigator
+        // so its Transfer can unlink from the corpse before GiveTo changes ownership.
+        let instigator = self
+            .get_property(spawner, "Instigator")
+            .cloned()
+            .unwrap_or(Value::Object(None));
+        self.set_property(id, "Instigator", 0, instigator);
         self.set_property(
             id,
             "Tag",
@@ -7077,59 +7115,12 @@ impl<'s> Vm<'s> {
         result?;
         self.objects[id as usize].active = false;
         self.objects[id as usize].timers = [None, None, None];
-        // Leave a clean inventory chain. `Inventory.Destroyed` unlinks the item via
-        // `Instigator/Owner.DeleteInventory`, but that call is on another actor and can be
-        // deferred (out of the executed scope), leaving the destroyed item reachable from the
-        // owner. A stale head then makes `PlayerController.SearchPawn`'s `while (i = P.Inventory)`
-        // loop forever (measured: the corpse-search BudgetExceeded). Removing it here is what
-        // UE2's `AActor::Destroy` guarantees; it is a no-op when the script already unlinked it.
-        if self.is_a(id, "inventory") {
-            for owner_prop in ["Instigator", "Owner"] {
-                if let Some(Value::Object(Some(ObjRef::Instance(owner)))) =
-                    self.get_property(id, owner_prop).cloned()
-                {
-                    self.unlink_inventory(owner, id);
-                }
-            }
-        }
         let actor = self.objects[id as usize].name.clone();
         self.note(TraceKind::Destroyed {
             actor,
             result: true,
         });
         Ok(true)
-    }
-
-    /// Removes `item` from `owner`'s `Inventory` singly-linked chain (or from `item`'s
-    /// predecessor in it). Used by [`Vm::destroy`] and the host corpse-search bridge to guarantee
-    /// a clean chain when the script's `Inventory.Destroyed`/`DeleteInventory` unlink was deferred
-    /// (a call on an out-of-scope actor). No-op when `item` is not linked.
-    pub fn unlink_inventory(&mut self, owner: ObjectId, item: ObjectId) {
-        let mut cur = owner;
-        let mut guard = 0;
-        loop {
-            guard += 1;
-            if guard > 1024 {
-                return;
-            }
-            let next = match self.get_property(cur, "Inventory").cloned() {
-                Some(Value::Object(Some(ObjRef::Instance(n)))) => n,
-                _ => return,
-            };
-            if next == item {
-                let after = self
-                    .get_property(item, "Inventory")
-                    .cloned()
-                    .unwrap_or(Value::Object(None));
-                let _ = self.set_property(cur, "Inventory", 0, after);
-                let _ = self.set_property(item, "Inventory", 0, Value::Object(None));
-                return;
-            }
-            cur = next;
-            if cur == owner {
-                return;
-            }
-        }
     }
 
     /// First live (not deleted) object with a name (case-insensitive).
@@ -7869,13 +7860,24 @@ impl<'s> Vm<'s> {
         end: [f32; 3],
         extent: [f32; 3],
     ) -> Option<(f32, ObjectId, [f32; 3])> {
+        self.trace_actors_flags(id, start, end, extent, 0xbf)
+    }
+
+    fn trace_actors_flags(
+        &self,
+        id: ObjectId,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+        flags: u32,
+    ) -> Option<(f32, ObjectId, [f32; 3])> {
         let mut best: Option<(f32, ObjectId, [f32; 3])> = None;
         let nonzero = extent[0] + extent[1] + extent[2] > 0.0;
         for b in 0..self.objects.len() as ObjectId {
             if b == id || !self.is_live_actor(b) {
                 continue;
             }
-            if !self.trace_admits_actor(b, id, nonzero) {
+            if !self.trace_admits_actor_flags(b, id, nonzero, flags) {
                 continue;
             }
             let (lb, rb, hb) = self.actor_cylinder(b);
@@ -7927,6 +7929,16 @@ impl<'s> Vm<'s> {
     /// the hash walk, or any `ShouldTrace` override. A carried first-person weapon does not block
     /// because its class defaults clear `bCollideActors` (`xiii.Fists`, measured).
     fn trace_admits_actor(&self, candidate: ObjectId, tracer: ObjectId, nonzero: bool) -> bool {
+        self.trace_admits_actor_flags(candidate, tracer, nonzero, 0xbf)
+    }
+
+    fn trace_admits_actor_flags(
+        &self,
+        candidate: ObjectId,
+        tracer: ObjectId,
+        nonzero: bool,
+        flags: u32,
+    ) -> bool {
         if !self.bool_prop(candidate, "bCollideActors") {
             return false;
         }
@@ -7944,18 +7956,30 @@ impl<'s> Vm<'s> {
         if self.is_owned_by(candidate, tracer) || self.is_owned_by(tracer, candidate) {
             return false;
         }
-        if self.class_chain_contains(candidate, "pawn")
-            || self.class_chain_contains(candidate, "mover")
+        if self.class_chain_contains(candidate, "pawn") {
+            return flags & 1 != 0;
+        }
+        if self.class_chain_contains(candidate, "mover")
             || self.class_chain_contains(candidate, "decoration")
         {
-            return true;
+            return flags & 2 != 0;
         }
         if self.bool_prop(candidate, "bWorldGeometry") {
+            return flags & 0x80 != 0;
+        }
+        if flags & 0x10 == 0 {
+            return false;
+        }
+        if flags & 0x20 != 0 {
+            return self.bool_prop(candidate, "bProjTarget")
+                || (self.bool_prop(candidate, "bBlockActors")
+                    && self.bool_prop(candidate, "bBlockPlayers"));
+        }
+        // 0x103546e2: all other actors when neither projectile-only nor blocking-only.
+        if flags & 0x40 == 0 {
             return true;
         }
-        self.bool_prop(candidate, "bProjTarget")
-            || (self.bool_prop(candidate, "bBlockActors")
-                && self.bool_prop(candidate, "bBlockPlayers"))
+        self.bool_prop(candidate, "bBlockActors") && self.bool_prop(candidate, "bBlockPlayers")
     }
 
     pub(crate) fn vm_trace_actors(
@@ -8009,12 +8033,33 @@ impl<'s> Vm<'s> {
     /// world hits return the map's `LevelInfo` (upstream), no hit returns `None`.
     /// Fills `(hit_actor, hit_location, hit_normal)`.
     #[allow(clippy::type_complexity)]
+    #[cfg(test)]
     pub(crate) fn vm_trace(
         &mut self,
         id: ObjectId,
         start: [f32; 3],
         end: [f32; 3],
         b_trace_actors: bool,
+        extent: [f32; 3],
+    ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
+        self.vm_trace_flags(
+            id,
+            start,
+            end,
+            if b_trace_actors { 0xbf } else { 0x86 },
+            extent,
+        )
+    }
+
+    /// Script Trace's composed flags; pawn/mover category bits remain effective even when
+    /// bTraceActors was false. Special BSP/material filtering remains Partial.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn vm_trace_flags(
+        &mut self,
+        id: ObjectId,
+        start: [f32; 3],
+        end: [f32; 3],
+        flags: u32,
         extent: [f32; 3],
     ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
         let (world, mover) = match self.physics.as_mut() {
@@ -8033,8 +8078,7 @@ impl<'s> Vm<'s> {
             .filter(|&m| m != id && self.is_mover(m) && self.actor_blocks_trace(m, nonzero));
         let mut best: Option<(f32, Option<ObjectId>, [f32; 3])> =
             world.map(|h| (h.time, mover, h.normal));
-        if b_trace_actors
-            && let Some((t, b, n)) = self.trace_actors(id, start, end, extent)
+        if let Some((t, b, n)) = self.trace_actors_flags(id, start, end, extent, flags)
             && best.is_none_or(|(bt, _, _)| t <= bt)
         {
             best = Some((t, Some(b), n));
@@ -9158,9 +9202,9 @@ impl<'s> Vm<'s> {
         }
     }
 
-    /// `Actor.PlayAnim`/`LoopAnim`/`TweenAnim`: start `sequence` on `channel`. `rate <= 0`
-    /// falls back to the provider's rate; `tween_time` holds the sequence at frame 0 before it
-    /// advances. The `None` sequence stops the channel. Unknown sequences are an explicit error.
+    /// `Actor.PlayAnim`/`LoopAnim`/`TweenAnim`: start `sequence` on `channel`. Zero rate
+    /// holds frame zero; negative velocity-dependent rates remain Partial. Tween time holds
+    /// frame zero before playback. Unknown sequences produce a visible no-op.
     pub(crate) fn start_animation(
         &mut self,
         id: ObjectId,
@@ -9230,11 +9274,12 @@ impl<'s> Vm<'s> {
         // authored rate (`Engine.dll ?execPlayAnim@AActor` RVA 0xDF990 pushes the default `1.0`;
         // the mesh instance advances `AnimRate * Seq->Rate` frames per second). The provider's
         // `SeqInfo.rate` is that authored rate (30 fps for the decoded MeshAnimation clips), so a
-        // script rate of `1.0` must play at 30 fps, not 1. `rate <= 0` means "use the authored
-        // rate" (`LoopAnim(DefaultAnim)` and `PlayAnim(seq, 0.0, ...)`). Without the multiply every
-        // scripted animation ran ~30x slow, which delayed the Plage01 intro past its dialogue cues.
+        // script rate of `1.0` must play at 30 fps, not 1. Omitted native Rate defaults to 1.0;
+        // explicit zero enters the retail hold/tween branch. Negative rates remain Partial.
         let natural = if info.rate > 0.0 { info.rate } else { 1.0 };
-        let rate = if rate > 0.0 { rate * natural } else { natural };
+        // Retail skeletal PlayAnim's zero-rate branch 0x103f5d2f clears channel playback
+        // rate and holds frame zero. An omitted native argument is 1.0, not explicit zero.
+        let rate = if rate >= 0.0 { rate * natural } else { natural };
         let mut notifies = info.notifies;
         notifies.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         // Engine.dll `PlayAnim` keeps ONE cached previous pose per channel (channel+0x58
@@ -9730,19 +9775,18 @@ impl<'s> Vm<'s> {
         self.time
     }
 
-    /// Deterministic PRNG step (splitmix64). Used by `Rand`/`FRand`; the engine's own RNG
-    /// sequence is not reproduced (see the registry status).
+    /// Retail PC CRT rand (MSVCR70.dll 0x7c02836d), shared by appRand/appFrand.
+    /// Uses the low 32 bits of the configured seed and unsigned wrapping arithmetic.
     pub(crate) fn next_random(&mut self) -> u64 {
-        self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.rng;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
+        let state = (self.rng as u32).wrapping_mul(214013).wrapping_add(2531011);
+        self.rng = u64::from(state);
+        u64::from((state >> 16) & 0x7fff)
     }
 
-    /// `FRand`: a deterministic float in `[0, 1)`.
+    /// Core.dll appFrand 0x1010ffd0: CRT rand times float bits 0x38000100.
+    /// Both endpoints are possible.
     pub(crate) fn rand_float(&mut self) -> f32 {
-        (self.next_random() >> 40) as f32 / (1u64 << 24) as f32
+        self.next_random() as f32 * f32::from_bits(0x38000100)
     }
 
     /// `Rand(Max)`: a deterministic int in `[0, Max)` (0 when `Max <= 0`).
