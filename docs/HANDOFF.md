@@ -238,8 +238,10 @@ Per-task reports with all numbers and commands: `local/reports/item1-collision.m
   through `setMoveTimer` speed + acceleration. All still Partial with precise reasons.
 - **Sight (item27m):** `CanSee`/`SeePawn`/`LineOfSightTo` decoded (base-Location trace, Enemy
   eye retry, 8000/2000 UU gates, SightRadius). `TriggerEvent` is tag-matched.
-- **Collision (item27k, item40e):** movers' static base-pose copy removed when they move; start-
-  penetrating hits discarded like `ULevel::MoveActor`'s 2 UU back-off (0x1038a981/0x1038aba8);
+- **Collision (item27k, item40e):** movers' static base-pose copy removed when they move; an overlap-recovery
+  approximation for boxes that start embedded in triangle-soup geometry (item27n: `ULevel::MoveActor`
+  extends the check 2 UU **forward**, `Delta + 2*dir` at 0x1038a97a-0x1038a9aa, and stops short; it
+  does not discard hits — item27k's "back-off discard" reading was wrong; touching walls block again);
   destroyed/non-colliding movers stop colliding; traces that hit mover geometry return the mover;
   coplanar-edge separation in the box sweep.
 - **Traces/inventory (item47b):** actor traces follow the decoded filter (collision hash =
