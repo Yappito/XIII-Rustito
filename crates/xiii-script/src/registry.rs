@@ -2776,6 +2776,41 @@ fn calc_first_person_view(
     val(Value::Void)
 }
 
+/// `PlayerController.AdjustAimForDisplay(object<Ammunition> FiredAmmunition, struct<Vector> projStart) -> Rotator`
+/// (native 498).
+///
+/// Decoded from Engine.dll (all measured, ImageBase 0x10300000): the export
+/// `?execAdjustAimForDisplay@APlayerController@@QAEXAAUFFrame@@QAX@Z` registers native 0x1f2 with
+/// thunk slot VA 0x1051aac8 whose .data slot holds the implementation VA 0x1036e2e0
+/// (`execCalcFirstPersonView`, native 497, resolves the same way to 0x10368340 and is already
+/// implemented). Structure at 0x1036e2e0:
+/// - null `FiredAmmunition` fast path -> convert `Rotation` (controller+0xd8) and call
+///   `APlayerController::SmoothedAim(FRotator)` (0x1036c720) -> Result;
+/// - target-scan path gated on `[controller+0x3b0] > [controller+0x3ac]` (scan cooldown) and
+///   `byte [ammunition+0x270] & 0x10 == 0`; the scan (camera axes from the WeaponBob helper,
+///   FCheckResult init Item=None/1.0f/-1, target loop, vector->rotator) ends in
+///   `SmoothedAim(<snapped rotator>)` -> Result;
+/// - every epilogue writes `SmoothedAim(...)` into the Result buffer.
+///
+/// `SmoothedAim` blends the engine's internal smoothed-aim cache (controller+0x5c0..+0x5fc,
+/// display state the VM does not model); with no snap applied it converges to the input rotation.
+/// The snap exists only for the crosshair display: the script consumer
+/// (`xiii.XIIIPlayerInteraction.MyPCPostRender` 0x032D) feeds the returned rotator into the
+/// crosshair ray (`FiringTargHitLoc`) and `AmmoType.WarnTarget` — the un-snapped view rotation is
+/// the faithful unsnapped value there. Partial: no aim-assist snap decode (the ~0x800-byte target
+/// loop is presentation-only in the headless VM).
+fn adjust_aim_for_display(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let rot = match vm.get_property(c.this, "Rotation") {
+        Some(Value::Rotator(r)) => *r,
+        _ => [0; 3],
+    };
+    val(Value::Rotator(rot))
+}
+
 fn replace_texture_by_another(
     vm: &mut Vm<'_>,
     c: &NativeCtx,
@@ -5468,6 +5503,18 @@ fn builtin_defs() -> Vec<NativeDef> {
             "native(497) final native static function CalcFirstPersonView(out struct<Vector> CameraLocation, out struct<Rotator> CameraRotation)",
             "engine.u PlayerController.CalcFirstPersonView decoded (native 497); reachable from XIIIGameInfo.EndGame -> GameEnded.BeginState -> global.PlayerCalcView on the level-complete path",
             calc_first_person_view,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no renderer: returns the un-snapped SmoothedAim(Rotation) (the aim-assist target-scan \
+             is crosshair display only); the returned rotator is the controller view rotation",
+        ),
+        ..def(
+            "PlayerController.AdjustAimForDisplay",
+            "native(498) final native static function Rotator AdjustAimForDisplay(object<Ammunition> FiredAmmunition, struct<Vector> projStart)",
+            "Engine.dll execAdjustAimForDisplay 0x1036e2e0 decoded (native 498, registration thunk 0x1051aac8); every epilogue returns SmoothedAim(0x1036c720) of the rotation, snap path gated on a scan cooldown + ammunition+0x270 bit 0x10; consumer XIIIPlayerInteraction.MyPCPostRender 0x032D (crosshair ray + WarnTarget)",
+            adjust_aim_for_display,
         )
     });
     // item3p: the missing rotator operators, reached by the campaign survey. `Multiply_RotatorFloat`
