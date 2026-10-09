@@ -4,9 +4,12 @@
 //! one interpreted frame is ~4.4 KiB in a debug build, and the VM's call-depth guard follows
 //! the engine's own limit of 250 interpreted calls (Core.dll `UObject::ProcessInternal`
 //! compares the runaway counter against `0xFA` at VA 0x101166e0). 250 x ~4.4 KiB is ~1.1 MiB,
-//! which overflows a 1 MiB main-thread stack before the guard fires, so every VM-driving
-//! entry point (the `--play` loop, the `--survey` child, the headless `--play-script` helper
-//! and the test harness) runs its work on this explicit stack instead.
+//! which overflows a **1 MiB** main-thread stack before the guard fires — the constrained case
+//! is the binary's main thread (the Windows GUI-subsystem default), so the `--play` loop, the
+//! `--survey` child and the headless `--play-script` helper run their work on this explicit
+//! stack instead. Test threads already get the ~2 MiB default (`RUST_MIN_STACK`), which fits
+//! the guarded maximum with ~2x margin; they do not need this wrapper
+//! (`vm_tests::recursion_guard_fits_a_2mib_stack` pins that margin).
 
 /// 64 MiB leaves ~50x margin over the guarded maximum plus nested native re-entry.
 pub const VM_STACK_SIZE: usize = 64 * 1024 * 1024;

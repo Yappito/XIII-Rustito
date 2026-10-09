@@ -8274,18 +8274,20 @@ fn recursion_package() -> Vec<u8> {
 }
 
 /// The unbounded-recursion property at the engine's own limit: at `VmLimits::default()` (250,
-/// the Core.dll `ProcessInternal` constant) the guard aborts with `CallDepthExceeded`
-/// **inside a default test-thread stack** — libtest spawns each test on a thread with the
-/// platform default (~2 MiB on Windows) and no explicit stack. Runs the recursion on a thread
-/// with no explicit `stack_size`; if the default limit is ever raised past what that budget
-/// supports, this thread dies with a stack overflow and the test (loudly) fails. The shipped
-/// host entry points run their VM-driving code on an explicit 64 MiB stack instead (see
-/// xiii-app `vmstack`).
+/// the Core.dll `ProcessInternal` constant) the guard aborts with `CallDepthExceeded` **inside
+/// a 2 MiB thread stack** — the libtest default (`RUST_MIN_STACK`), i.e. the budget every test
+/// already runs on, with no wrapper needed. The measured interpreter cost is ~4.4 KiB per
+/// interpreted frame (debug build), so 250 frames need ~1.1 MiB: the guard fires at roughly
+/// half the budget. If the default limit is ever raised past what that budget supports, this
+/// thread dies with a stack overflow and the test (loudly) fails. The shipped host entry
+/// points run their VM-driving code on an explicit 64 MiB stack instead (see xiii-app
+/// `vmstack`, which exists for the binary's 1 MiB main thread).
 #[test]
-fn recursion_guard_fits_the_default_test_stack() {
+fn recursion_guard_fits_a_2mib_stack() {
     let package = recursion_package();
     let limit = VmLimits::default().max_call_depth;
     let outcome = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
         .spawn(move || {
             let set = set_of(package);
             let mut vm = Vm::new(&set, VmLimits::default());
@@ -8296,12 +8298,12 @@ fn recursion_guard_fits_the_default_test_stack() {
                 Ok(_) => "no error".to_owned(),
             }
         })
-        .expect("spawn the default-stack probe thread")
+        .expect("spawn the 2 MiB probe thread")
         .join()
-        .expect("the recursion must abort inside the default test stack, not overflow it");
+        .expect("the recursion must abort inside a 2 MiB stack, not overflow it");
     assert_eq!(
         outcome,
         format!("CallDepthExceeded {{ limit: {limit} }}"),
-        "the engine-limit call-depth guard (250) must fire before a default test stack is exhausted"
+        "the engine-limit call-depth guard (250) must fire before a 2 MiB stack is exhausted"
     );
 }
