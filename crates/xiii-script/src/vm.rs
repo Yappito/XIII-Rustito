@@ -1028,6 +1028,15 @@ fn vm_move_trace_enabled() -> bool {
     })
 }
 
+/// item27k diagnostic: with `XIII_VM_MOVE_TRACE`, also dump the world primitives overlapping a
+/// blocked pawn's move box (`XIII_VM_MOVE_DUMP`), naming each triangle's source.
+fn vm_move_dump_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("XIII_VM_MOVE_DUMP").is_some_and(|value| value != "0" && !value.is_empty())
+    })
+}
+
 fn cine_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -3378,6 +3387,35 @@ impl<'s> Vm<'s> {
         new_value
     }
 
+    /// Engine.dll 0x103e4750/0x103e4870: indexed MusicVars[2].Value, not a name search.
+    /// The native uses integer wrapping and does not clamp unbalanced decrements.
+    pub(crate) fn adjust_attack_music_var(&mut self, id: ObjectId, delta: i32) -> VmResult<()> {
+        let Some(Value::Array(mut entries)) = self.get_property(id, "MusicVars").cloned() else {
+            return Err(self.err(VmErrorKind::Other(
+                "LevelInfo attack counter requires MusicVars[2].Value".into(),
+            )));
+        };
+        let value = entries.get_mut(2).and_then(|entry| match entry {
+            Value::Struct(fields) => fields.iter_mut().find_map(|(name, value)| {
+                if name.eq_ignore_ascii_case("value") {
+                    Some(value)
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        });
+        let Some(Value::Int(value)) = value else {
+            return Err(self.err(VmErrorKind::Other(
+                "LevelInfo attack counter requires integer MusicVars[2].Value".into(),
+            )));
+        };
+        *value = value.wrapping_add(delta);
+        self.set_property(id, "MusicVars", 0, Value::Array(entries));
+        self.note(TraceKind::Note("LevelInfo attack MusicVars updated; audio-device SetMusicVar/attack-mode transition not bridged".into()));
+        Ok(())
+    }
+
     /// Name of the current state.
     pub fn state_name(&self, id: ObjectId) -> Option<String> {
         self.objects
@@ -4193,6 +4231,7 @@ impl<'s> Vm<'s> {
         }
         if let Some(pawn) = pawn {
             let location = self.vector_prop(pawn, "Location");
+            waits.push(format!("pawn-location={location:?}"));
             for property in ["Target", "NextTarget"] {
                 if let Some(target) = self.obj_prop(id, property) {
                     let target_name = self.objects[target as usize].name.clone();
@@ -4519,8 +4558,49 @@ impl<'s> Vm<'s> {
                 }) => {
                     // `Controller.MoveTo`/`MoveToward`: move the pawn each tick; resume when it
                     // arrives or the budget runs out (upstream `MoveTimer`).
-                    let arrived = self.move_pawn_step(pawn, destination, speed, dt)?;
+                    if self.obj_prop(id, "Pawn") != Some(pawn)
+                        || (native == "Controller.MoveToward"
+                            && self.obj_prop(id, "MoveTarget").is_none())
+                    {
+                        if let Some(code) = self.objects[id as usize].state_code.as_mut() {
+                            code.latent = None;
+                        }
+                        continue;
+                    }
+                    let destination = if native == "Controller.MoveToward" {
+                        self.obj_prop(id, "MoveTarget")
+                            .and_then(|target| self.vector_prop(target, "Location"))
+                            .unwrap_or(destination)
+                    } else {
+                        self.vector_prop(id, "Destination").unwrap_or(destination)
+                    };
+                    self.set_property(id, "Destination", 0, Value::Vector(destination));
+                    // execPollMoveTo/MoveToward call UpdateTactics after a strict 0.5 s
+                    // interval, unless steering toward AdjustLoc or preparing a path move.
+                    if self.bool_prop(id, "bAdvancedTactics")
+                        && !self.bool_prop(id, "bAdjusting")
+                        && !self.bool_prop(id, "bPreparingMove")
+                        && self.time - 0.5 > f64::from(self.f32_prop(id, "TacticalOffset"))
+                    {
+                        self.set_property(id, "TacticalOffset", 0, Value::Float(self.time as f32));
+                        let generation = self.objects[id as usize].generation;
+                        self.send_event(id, "UpdateTactics", Vec::new())?;
+                        if self.objects[id as usize].generation != generation {
+                            return Ok(());
+                        }
+                    }
+                    let destination = self.vector_prop(id, "Destination").unwrap_or(destination);
+                    let arrived = if self.bool_prop(id, "bPreparingMove") {
+                        false
+                    } else {
+                        self.controller_move_step(id, pawn, destination, dt)?
+                    };
+                    let remaining = match self.get_property(id, "MoveTimer") {
+                        Some(Value::Float(timer)) => *timer,
+                        _ => remaining,
+                    };
                     let left = remaining - dt;
+                    self.set_property(id, "MoveTimer", 0, Value::Float(left));
                     if !arrived && left >= 0.5 * dt {
                         if let Some(c) = self.objects[id as usize].state_code.as_mut() {
                             c.latent = Some(Latent::Move {
@@ -4537,6 +4617,7 @@ impl<'s> Vm<'s> {
                     if let Some(c) = self.objects[id as usize].state_code.as_mut() {
                         c.latent = None;
                     }
+                    self.set_property(pawn, "bWalking", 0, Value::Bool(false));
                     let actor = self.objects[id as usize].name.clone();
                     self.note(TraceKind::LatentResume {
                         actor,
@@ -8216,6 +8297,196 @@ impl<'s> Vm<'s> {
         self.nav_line_of_sight_to(ctrl, player).unwrap_or(false)
     }
 
+    /// Retail XIDPawn 0x11903ea0: scan the actual linked NavigationPointList in list order.
+    /// Strictly better alignment wins; preserve LastSeenPos when there is no eligible node.
+    pub(crate) fn ai_stake_out_dir(&mut self, controller: ObjectId) -> VmResult<()> {
+        let Some(enemy) = self.obj_prop(controller, "Enemy") else {
+            return Ok(());
+        };
+        let Some(pawn) = self.obj_prop(controller, "Pawn") else {
+            return Err(self.err(VmErrorKind::Other(
+                "FindNewStakeOutDir requires Pawn when Enemy is set".into(),
+            )));
+        };
+        let loc = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let enemy_dir = normalize3(sub3(
+            self.vector_prop(enemy, "Location").unwrap_or(loc),
+            loc,
+        ));
+        let mut node = self
+            .obj_prop(controller, "Level")
+            .or_else(|| self.find_level_info())
+            .and_then(|level| self.obj_prop(level, "NavigationPointList"));
+        let mut seen = HashSet::new();
+        let mut best_dot = -1.0;
+        let mut best = None;
+        while let Some(id) = node {
+            if !seen.insert(id) {
+                return Err(self.err(VmErrorKind::Other(
+                    "FindNewStakeOutDir: cycle in NavigationPointList".into(),
+                )));
+            }
+            let delta = sub3(self.vector_prop(id, "Location").unwrap_or(loc), loc);
+            let distance = dot3(delta, delta).sqrt();
+            if distance > 100.0 && distance < 800.0 {
+                let alignment = dot3(enemy_dir, scale3(delta, distance.recip()));
+                if alignment > best_dot && self.nav_line_of_sight_to(controller, id)? {
+                    best_dot = alignment;
+                    best = Some(id);
+                }
+            }
+            node = self.obj_prop(id, "NextNavigationPoint");
+        }
+        if let Some(best) = best {
+            let mut focal = self.vector_prop(best, "Location").unwrap_or(loc);
+            focal[2] += 0.5 * self.f32_prop(pawn, "CollisionHeight");
+            self.set_property(controller, "LastSeenPos", 0, Value::Vector(focal));
+        }
+        Ok(())
+    }
+
+    /// XIDPawn 0x11903230. The x87 equality gate at 0x119033a6 etc. really
+    /// rejects unequal or unordered components: ordinary nonzero separation returns zero. Do not
+    /// replace this surprising retail behavior with a conventional steering algorithm.
+    pub(crate) fn ai_pseudo_steering(&mut self, controller: ObjectId) -> VmResult<[f32; 3]> {
+        let Some(group) = self.obj_prop(controller, "GenAlerte") else {
+            return Ok([0.0; 3]);
+        };
+        let Some(pawn) = self.obj_prop(controller, "Pawn") else {
+            return Err(self.err(VmErrorKind::Other(
+                "PseudoSteering requires Pawn when GenAlerte is set".into(),
+            )));
+        };
+        let Some(Value::Array(members)) = self.get_property(group, "SoldierInFightList").cloned()
+        else {
+            return Err(self.err(VmErrorKind::Other(
+                "PseudoSteering requires SoldierInFightList".into(),
+            )));
+        };
+        let loc = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let mut sum = [0.0; 3];
+        let mut last = None;
+        for member in members {
+            let Value::Object(Some(ObjRef::Instance(id))) = member else {
+                return Err(self.err(VmErrorKind::Other(
+                    "PseudoSteering: null/non-instance fight-list entry".into(),
+                )));
+            };
+            last = Some(id);
+            if id != pawn {
+                let delta = sub3(loc, self.vector_prop(id, "Location").unwrap_or(loc));
+                sum = add3(sum, scale3(delta, dot3(delta, delta).recip()));
+            }
+        }
+        if sum.iter().any(|component| *component != 0.0) {
+            return Ok([0.0; 3]);
+        }
+        let Some(last) = last else {
+            return Err(self.err(VmErrorKind::Other(
+                "PseudoSteering: empty fight list reaches a null dereference in retail".into(),
+            )));
+        };
+        let last_loc = self.vector_prop(last, "Location").unwrap_or(loc);
+        let mut direction = normalize3(sum);
+        let mut start = loc;
+        start[2] -= 30.0;
+        let mut end = add3(last_loc, scale3(direction, 4000.0));
+        end[2] -= 30.0;
+        // TRACE_AllBlocking (0x86); world/actor geometry comes through the existing provider.
+        let Some(provider) = self.physics.as_mut() else {
+            return Err(self.err(VmErrorKind::NoPhysicsProvider {
+                native: "IAController.PseudoSteering".into(),
+            }));
+        };
+        let mut hit = provider.trace(start, end, [0.0; 3]);
+        if let Some((time, _, normal)) = self.trace_actors(controller, start, end, [0.0; 3])
+            && hit.is_none_or(|world| time <= world.time)
+        {
+            hit = Some(crate::physics::WorldHit {
+                time,
+                normal,
+                location: lerp3(start, end, time),
+            });
+        }
+        if let Some(hit) = hit {
+            let denominator = dot3(sub3(loc, last_loc), sub3(loc, last_loc));
+            sum = add3(sum, scale3(sub3(loc, hit.location), denominator.recip()));
+            direction = normalize3(sum);
+        }
+        sum = scale3(sum, 50000.0);
+        let size_sq = dot3(sum, sum);
+        Ok(if size_sq > 16000000.0 {
+            scale3(direction, 4000.0)
+        } else if size_sq > 2500.0 {
+            sum
+        } else {
+            [0.0; 3]
+        })
+    }
+
+    /// First actor on WeaponStartTrace -> WeaponEndTrace, with XIII shooting-through flags.
+    /// A world hit terminates the line but classifies as zero; no hit-zone state is modified.
+    pub(crate) fn ai_fire_obstacle(&mut self, controller: ObjectId) -> VmResult<Option<ObjectId>> {
+        let Some(pawn_id) = self.obj_prop(controller, "Pawn") else {
+            return Err(self.err(VmErrorKind::Other(
+                "LineOfFireObstacle requires Pawn.Weapon.AmmoType".into(),
+            )));
+        };
+        let Some(ammo) = self
+            .obj_prop(pawn_id, "Weapon")
+            .and_then(|id| self.obj_prop(id, "AmmoType"))
+        else {
+            return Err(self.err(VmErrorKind::Other(
+                "LineOfFireObstacle requires Pawn.Weapon.AmmoType".into(),
+            )));
+        };
+        let pawn = Some(pawn_id);
+        let instant = self.bool_prop(ammo, "bInstantHit");
+        let through = if instant {
+            "bCanShootThroughWithRayCastingWeapon"
+        } else {
+            "bCanShootThroughWithProjectileWeapon"
+        };
+        let start = self
+            .vector_prop(controller, "WeaponStartTrace")
+            .unwrap_or([0.0; 3]);
+        let end = self
+            .vector_prop(controller, "WeaponEndTrace")
+            .unwrap_or(start);
+        let Some(provider) = self.physics.as_mut() else {
+            return Err(self.err(VmErrorKind::NoPhysicsProvider {
+                native: "IAController.LineOfFireObstacle".into(),
+            }));
+        };
+        let world = provider.trace(start, end, [0.0; 3]);
+        let mut best = world.map_or(1.0, |hit| hit.time);
+        let mut actor = None;
+        for id in 0..self.objects.len() as ObjectId {
+            if id == controller
+                || !self.is_live_actor(id)
+                || self.bool_prop(id, through)
+                || (!self.bool_prop(id, "bCollideActors")
+                    && !self.bool_prop(id, "bBlockZeroExtentTraces"))
+                || self.is_owned_by(id, controller)
+                || self.is_owned_by(controller, id)
+            {
+                continue;
+            }
+            let (loc, radius, height) = self.actor_cylinder(id);
+            if let Some((time, _)) = segment_cylinder_hit(start, end, loc, radius, height)
+                && time <= best
+            {
+                best = time;
+                actor = Some(id);
+            }
+        }
+        Ok(actor.filter(|id| {
+            Some(*id) != pawn
+                && Some(*id) != self.obj_prop(controller, "Enemy")
+                && !self.is_a(*id, "LevelInfo")
+        }))
+    }
+
     /// `Controller.pointReachable`: the point is directly reachable (clear pawn trace) and a
     /// navigation neighbourhood exists near it.
     pub(crate) fn nav_point_reachable(
@@ -8285,17 +8556,49 @@ impl<'s> Vm<'s> {
             return Ok(false);
         };
         let loc = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
-        let speed = if speed > 0.0 {
-            speed
-        } else {
-            self.f32_prop(pawn, "GroundSpeed")
+        // Engine.dll 0x1036a758: Speed is a fraction, default 1, not UU/s.
+        let walking_pct = self.f32_prop(pawn, "WalkingPct");
+        let max_desired = self.f32_prop(pawn, "MaxDesiredSpeed");
+        if !speed.is_finite()
+            || !walking_pct.is_finite()
+            || !max_desired.is_finite()
+            || (speed <= walking_pct && walking_pct == 0.0)
+        {
+            return Err(self.err(VmErrorKind::Other(format!(
+                "{native}: non-finite speed or zero WalkingPct in walking-speed division"
+            ))));
+        }
+        let walking = speed <= walking_pct;
+        let requested = if walking { speed / walking_pct } else { speed };
+        let desired = max_desired.max(0.0).min(requested);
+        self.set_property(pawn, "bWalking", 0, Value::Bool(walking));
+        self.set_property(pawn, "bReducedSpeed", 0, Value::Bool(false));
+        self.set_property(pawn, "DesiredSpeed", 0, Value::Float(desired));
+        let timer_base_speed = match self.byte_prop(pawn, "Physics") {
+            PHYS_WALKING | 2 | 9 => self.f32_prop(pawn, "GroundSpeed"), // falling/spider
+            3 => self.f32_prop(pawn, "WaterSpeed"),
+            4 => self.f32_prop(pawn, "AirSpeed"),
+            _ => 200.0,
         };
-        let distance = horizontal_distance(loc, destination);
-        let travel = if speed > 0.0 { distance / speed } else { 0.0 };
-        // Upstream MoveTo's `MoveTimer` fail-safe: give the pawn twice the nominal travel time
-        // plus a second before the latent ends even if it is stuck.
-        let budget = travel * 2.0 + 1.0;
+        let speed = timer_base_speed * desired;
+        let delta = sub3(destination, loc);
+        let distance = dot3(delta, delta).sqrt();
+        // APawn::setMoveTimer 0x103affb0: zero speed gets 0.5 s, otherwise 1+2*D/S.
+        let budget = if native == "Controller.MoveToward"
+            && self
+                .obj_prop(controller, "MoveTarget")
+                .is_some_and(|target| self.is_a(target, "Pawn"))
+        {
+            1.2
+        } else if speed == 0.0 {
+            0.5
+        } else {
+            1.0 + 2.0 * distance / speed
+        };
         self.set_property(controller, "Destination", 0, Value::Vector(destination));
+        self.set_property(controller, "MoveTimer", 0, Value::Float(budget));
+        self.set_property(controller, "bAdjusting", 0, Value::Bool(false));
+        let _ = self.controller_move_step(controller, pawn, destination, 0.0)?;
         self.pending_latent = Some(Latent::Move {
             pawn,
             destination,
@@ -8307,9 +8610,99 @@ impl<'s> Vm<'s> {
         Ok(true)
     }
 
-    /// One tick of a `Latent::Move`: move the pawn toward its destination using the world
-    /// provider, returning whether it arrived. Extracted so tests can step the movement without
-    /// a full state frame.
+    /// Controller movement is acceleration-driven, unlike XIDCine's direct Steering.
+    /// Engine moveToward 0x103b3950 -> Acceleration (+0xf0), physWalking 0x103bdac0
+    /// -> calcVelocity 0x103ba250 -> swept displacement. Non-walking modes are left
+    /// to their physics handler; PHYS_None must not be moved by the latent poll.
+    pub(crate) fn controller_move_step(
+        &mut self,
+        controller: ObjectId,
+        pawn: ObjectId,
+        destination: [f32; 3],
+        dt: f32,
+    ) -> VmResult<bool> {
+        let loc = self.vector_prop(pawn, "Location").unwrap_or(destination);
+        let mut delta = sub3(destination, loc);
+        let walking = self.byte_prop(pawn, "Physics") == PHYS_WALKING;
+        if walking {
+            delta[2] = 0.0;
+        }
+        let distance = dot3(delta, delta).sqrt();
+        let radius = self.f32_prop(pawn, "CollisionRadius");
+        // The full ReachedDestination navigation/height rules remain Partial; do not
+        // turn a vertically distant target into horizontal arrival.
+        let target_radius = self
+            .obj_prop(controller, "MoveTarget")
+            .map_or(0.0, |target| self.f32_prop(target, "CollisionRadius"));
+        if distance <= radius + target_radius
+            && (destination[2] - loc[2]).abs() <= self.f32_prop(pawn, "CollisionHeight")
+        {
+            self.set_property(pawn, "Acceleration", 0, Value::Vector([0.0; 3]));
+            return Ok(true);
+        }
+        let direction = normalize3(delta);
+        let mut acceleration = scale3(direction, self.f32_prop(pawn, "AccelRate"));
+        self.set_property(pawn, "Acceleration", 0, Value::Vector(acceleration));
+        if !walking || dt <= 0.0 {
+            return Ok(false);
+        }
+        // calcVelocity 0x103ba5b4: both bWalking and bIsCrouched use WalkingPct
+        // for the acceleration cap (CrouchingPct is a separate velocity cap).
+        if self.bool_prop(pawn, "bWalking") || self.bool_prop(pawn, "bIsCrouched") {
+            let cap = self.f32_prop(pawn, "AccelRate") * self.f32_prop(pawn, "WalkingPct");
+            if dot3(acceleration, acceleration) > cap * cap {
+                acceleration = scale3(normalize3(acceleration), cap);
+                self.set_property(pawn, "Acceleration", 0, Value::Vector(acceleration));
+            }
+        }
+        let mut velocity = self.vector_prop(pawn, "Velocity").unwrap_or([0.0; 3]);
+        velocity[2] = 0.0;
+        let speed = dot3(velocity, velocity).sqrt();
+        let friction = self
+            .obj_prop(pawn, "PhysicsVolume")
+            .map_or(0.0, |volume| self.f32_prop(volume, "GroundFriction"));
+        // calcVelocity's directional friction uses the old speed; it is not drag.
+        velocity = sub3(
+            velocity,
+            scale3(sub3(velocity, scale3(direction, speed)), dt * friction),
+        );
+        velocity = add3(velocity, scale3(acceleration, dt));
+        let mut limit = self.f32_prop(pawn, "GroundSpeed") * self.f32_prop(pawn, "DesiredSpeed");
+        if self.bool_prop(pawn, "bIsCrouched") {
+            limit *= self.f32_prop(pawn, "CrouchingPct");
+        } else if self.bool_prop(pawn, "bWalking") {
+            limit *= self.f32_prop(pawn, "WalkingPct");
+        }
+        let size_sq = dot3(velocity, velocity);
+        if size_sq > limit * limit {
+            velocity = scale3(normalize3(velocity), limit);
+        }
+        let displacement = scale3(velocity, dt);
+        let extent = self.actor_extent(pawn);
+        let collides_world = self.bool_prop(pawn, "bCollideWorld");
+        let end = if collides_world {
+            let Some(provider) = self.physics.as_mut() else {
+                return Err(self.err(VmErrorKind::NoPhysicsProvider {
+                    native: "Controller movement".into(),
+                }));
+            };
+            provider.walk_box(loc, displacement, extent).end
+        } else {
+            add3(loc, displacement)
+        };
+        self.set_property(pawn, "Location", 0, Value::Vector(end));
+        self.set_property(
+            pawn,
+            "Velocity",
+            0,
+            Value::Vector(scale3(sub3(end, loc), dt.recip())),
+        );
+        Ok(false)
+    }
+
+    /// Test-only direct-step adapter for the shared cinematic collision walker. Controller
+    /// latents use controller_move_step; XIDCine supplies its own arrival radius below.
+    #[cfg(test)]
     pub(crate) fn move_pawn_step(
         &mut self,
         pawn: ObjectId,
@@ -8321,7 +8714,7 @@ impl<'s> Vm<'s> {
         self.move_pawn_step_within(pawn, destination, speed, dt, radius)
     }
 
-    /// [`Vm::move_pawn_step`] with an explicit stop radius: the pawn stops moving (and reports
+    /// Direct cinematic movement with an explicit stop radius: the pawn stops moving (and reports
     /// arrival) once its horizontal distance to `destination` is within `radius`. Cine steering
     /// passes 0, since its arrival test is `IsTargetReached`, not the pawn's collision radius.
     pub(crate) fn move_pawn_step_within(
@@ -8378,6 +8771,16 @@ impl<'s> Vm<'s> {
                 hit.time,
                 hit.normal
             );
+            if vm_move_dump_enabled()
+                && let Some(p) = self.physics.as_mut()
+            {
+                for (i, record) in p.dump_overlap(location, extent).iter().enumerate().take(8) {
+                    println!(
+                        "[vm-pawn-move-dump] #{i} {} source={} triangle={:?}",
+                        record.kind, record.source, record.triangle
+                    );
+                }
+            }
         }
         let end = outcome.map_or_else(|| add3(location, delta), |o| o.end);
         self.set_property(pawn, "Location", 0, Value::Vector(end));
@@ -9072,6 +9475,23 @@ fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 
 fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn scale3(a: [f32; 3], scale: f32) -> [f32; 3] {
+    a.map(|component| component * scale)
+}
+
+fn normalize3(a: [f32; 3]) -> [f32; 3] {
+    let size_sq = dot3(a, a);
+    if size_sq == 0.0 {
+        [0.0; 3]
+    } else {
+        scale3(a, size_sq.sqrt().recip())
+    }
 }
 
 fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {

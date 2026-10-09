@@ -27,6 +27,19 @@ pub struct MoveOutcome {
     pub hit: Option<WorldHit>,
 }
 
+/// One world primitive a diagnostic box-overlap dump found at a location
+/// ([`WorldPhysics::dump_overlap`]). Everything is Unreal units/axes; the source label is the
+/// provider's own naming (for the map adapter: `"<actor> -> <mesh>"`, or the mover actor's name).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverlapRecord {
+    /// `"static"` (world soup) or `"moving"` (registered mover brush).
+    pub kind: &'static str,
+    /// Provider-specific source label.
+    pub source: String,
+    /// The overlapping triangle's vertices (Unreal units).
+    pub triangle: [[f32; 3]; 3],
+}
+
 /// World collision the VM calls into. Implemented by the host (Bevy app, tests, diagnostics);
 /// the VM only holds `Box<dyn WorldPhysics>`.
 pub trait WorldPhysics {
@@ -66,6 +79,13 @@ pub trait WorldPhysics {
 
     /// Updates a registered mover's pose (Unreal units/rotators). Default no-op.
     fn set_mover(&mut self, _actor: &str, _location: [f32; 3], _rotation: [i32; 3]) {}
+
+    /// Diagnostic (item27k): every world primitive overlapping the box `(location, extent)`,
+    /// with its kind, source label and triangle. Empty by default; providers backed by a
+    /// triangle soup implement it so a blocked pawn move can name what it hit.
+    fn dump_overlap(&mut self, _location: [f32; 3], _extent: [f32; 3]) -> Vec<OverlapRecord> {
+        Vec::new()
+    }
 }
 
 /// Hit-zone resolution for `Actor.GetLastTraceBone` (item14).

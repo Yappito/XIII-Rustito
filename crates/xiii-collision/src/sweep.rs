@@ -25,6 +25,24 @@ pub struct SweepParams {
     /// grazing `t = 0` contact is the nearest hit and hides the real obstacle behind it
     /// (item1k: the walkable-ledge stall). `None` (default) keeps the plain behaviour.
     pub ignore_resting_floor_z: Option<f32>,
+    /// When true, a triangle the box already overlaps/touches at `t = 0` **never blocks** —
+    /// the sweep continues and reports only geometry the box reaches while clear. This is the
+    /// engine's measured `ULevel::MoveActor` behaviour (Engine.dll 0x1038a89a-0x1038ac05): the
+    /// world check runs along a segment extended 2 UU behind the start (`+2.0` at 0x1038a981)
+    /// and a hit inside that back-off — `(2+|delta|)*t_hit <= 2`, branch at 0x1038aba8 — is
+    /// discarded (0x1038abaf) instead of stopping the move, letting a mover escape geometry it
+    /// starts flush with/inside. For a true continuous sweep this reduces exactly to discarding
+    /// start-penetrating hits: any `t = 0` contact lies at/behind the start box, i.e. within
+    /// the back-off, while every hit found from a clear box maps to a contact strictly ahead of
+    /// the start and still blocks. A surface whose normal up-component reaches
+    /// [`Self::walkable_floor_z`] is exempt: the engine rides walkable floors through its own
+    /// floor machinery (`physWalking`'s floor snap), not through the move back-off. `false`
+    /// (default) keeps the plain behaviour; walk movement turns it on.
+    pub discard_start_penetration: bool,
+    /// Walkability threshold for [`Self::discard_start_penetration`] exemptions: a
+    /// start-penetrating contact with `normal.y >= z` follows the plain (non-discarding) rules
+    /// so ramp/slope riding keeps working. `None` discards every start-penetrating contact.
+    pub walkable_floor_z: Option<f32>,
 }
 
 impl Default for SweepParams {
@@ -32,6 +50,8 @@ impl Default for SweepParams {
         Self {
             skip_start_penetration: true,
             ignore_resting_floor_z: None,
+            discard_start_penetration: false,
+            walkable_floor_z: None,
         }
     }
 }
@@ -110,6 +130,14 @@ fn consider_sweep_hit(
     tri: &Triangle,
 ) {
     if h.start_penetrating {
+        // The engine's MoveActor discards hits within the 2-UU back-off behind the start
+        // (see `SweepParams::discard_start_penetration`): the mover escapes geometry it starts
+        // flush with/inside instead of deadlocking against it.
+        if params.discard_start_penetration
+            && params.walkable_floor_z.is_none_or(|z| h.normal[1] < z)
+        {
+            return;
+        }
         if params.skip_start_penetration && !start_drives_into(d, start, tri) {
             return;
         }

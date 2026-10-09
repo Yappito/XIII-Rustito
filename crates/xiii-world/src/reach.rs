@@ -1113,7 +1113,12 @@ mod tests {
         };
         for (map, min_pass, want_missing_floor, want_mover, want_movement) in [
             ("Plage00", 12usize, 0usize, 0usize, 0usize),
-            ("Plage01", 294usize, 0usize, 5usize, 0usize),
+            // Plage01 mover-blocked 6 (was 5 pre-item27k): the engine's measured MoveActor
+            // back-off discard (Engine.dll 0x1038a89a-0x1038ac05) lets the walk leave a
+            // start-penetrating static contact, so one doorpoint edge now advances until the
+            // real closed lunch-room door (Porte5/6/7 set) and classifies as mover-blocked.
+            // Passes rose to 296; no edge regressed.
+            ("Plage01", 294usize, 0usize, 6usize, 0usize),
             ("Banque01", 631usize, 0usize, 20usize, 0usize),
         ] {
             let report = analyze(map, &path).expect("reach analyze");
@@ -1171,8 +1176,17 @@ mod tests {
             return;
         };
         for (map, min_pass, eligible, max_missing_floor, want_mover, want_movement) in [
-            ("Hual01b", 753usize, 808usize, 3usize, 2usize, 8usize),
-            ("Hual04c", 435usize, 437usize, 0usize, 0usize, 0usize),
+            // Hual01b mover-blocked 3 (was 2 pre-item27k) and Hual04c min-pass 434 (was 435):
+            // the engine's measured MoveActor back-off discard (Engine.dll 0x1038a89a-0x1038ac05,
+            // hits within 2 UU behind the start do not stop the move) changes walks whose spawn
+            // node is embedded in collision: they leave the contact instead of step-up-climbing
+            // over it. On Hual01b one more embedded-spawn edge now reaches the real closed door
+            // (mover-blocked); on Hual04c the straight-line walk out of TelepheriquePoint3
+            // (embedded in the TLcabine_cassee cabin mesh) no longer step-up-climbs the cabin
+            // and stops short/falls instead — the harness walks straight lines, not engine AI
+            // steering, and the discarded contact is what a real MoveActor does.
+            ("Hual01b", 753usize, 808usize, 3usize, 3usize, 8usize),
+            ("Hual04c", 434usize, 437usize, 0usize, 0usize, 0usize),
             ("Kello01a", 1459usize, 1488usize, 15usize, 0usize, 0usize),
             ("PRock04a", 702usize, 721usize, 16usize, 0usize, 0usize),
         ] {
