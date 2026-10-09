@@ -1,35 +1,79 @@
-# item24: Banque01 route. The end-of-level travel is the game's own
-# MapInfo.SetGoalComplete -> TestGoalComplete -> DoTravel -> XIIIGameInfo.EndGame ->
-# XIIIPlayerController.GameEnded -> GameEndedSuccess -> PlayingVideo (EndMapVideo "cine02", real
-# Bink duration) -> PlayingVideo.PlayerTick -> Level.ServerTravel("Amos01.unr") chain.
+# item27j: Banque01 story route. Follows the map's own cutscene flow by player input; there are
+# no `set_goal` bridges. Objective 0 "Access the strongroom." must complete through the game's own
+# chain (Cine1 teller scene -> Cine15 Jones scene -> `event fin_flash` -> XIIIDispatcher4 ->
+# GT_quitterbanque -> XIIIGoalTrigger0), which promotes objective 1, and objective 1 "Escape from
+# the bank." completes through Cine11's `playerevent fin_map` -> XIIIGoalTrigger2 (GoalNumber 1)
+# -> DoTravel -> Amos01.
 #
-# Teleports below are explicitly diagnostic movement shortcuts: the route volumes span the whole
-# bank (~13,000 UU wide) and the port does not path between them. Walking onto each volume still
-# delivers the volume's own engine `Touch`, so every `TouchTrigger`/`DetectionVolume`/`GoalTrigger`
-# touch recorded by the run is the game's own code.
+# Two measured VM blockers stall that flow (probes in local/re/item27j/, report
+# local/reports/item27j-banque-route.md):
+#   - VM blocker 1: Cine1's `movseqb w 13 w 14 w 16 w 63` (action[46], from t=38.5) never moves the
+#     teller past the armored door the player opened (`playerevent porteblindee1`, action[39]): the
+#     pawn's move is rejected by a door-panel brush at x=-1600.9 (hit normal [1,0,0]) even though
+#     the same door lets the player through after the event. Cine1 therefore never reaches its
+#     `event toto` (action[59]) that unlocks Porte8, and `use Porte8` stays "Locked" (measured).
+#   - VM blocker 2: Cine15's `movseqb sp 0.25 w 33 w 34` (action[20]) is rejected at hit_time=0.0
+#     (normal [0,0.994,0.112]) on every steering step at Jones's own position (-7142,-1974), so
+#     `event fin_flash` (action[45]) never fires, objective 0 never completes and no travel is
+#     requested. The player teleported to the same spot walks freely in all directions, so the
+#     block is specific to the pawn's taller move box (extent [34,34,75]).
+# The route still performs every player-reachable step of the flow so the run exercises as much of
+# the game's own chain as the VM allows; where the flow is stalled the route continues with
+# labelled diagnostic teleports and records the stalled state in the log.
 #
-# `set_goal` is a labelled host bridge (prints "set_goal N via Banque0.SetGoalComplete"): Banque01
-# promotes its objectives from three scripted bank scenes that the port cannot complete (blockers
-# B1-B3 in the item24 report); the bridge calls the map's own `MapInfo.SetGoalComplete`, exactly
-# what the cutscene `playerevent`/`ev` chains would call. No teleport or bridge changes objective
-# state silently.
+# Teleport classes used below:
+#   - "flow touch": teleport onto a trigger volume the flow depends on; the run delivers the
+#     volume's own engine `Touch`, so every touch is the game's own code.
+#   - "measured recipe": the D->E re-entry around DetectionVolume1. Banque0's STA_DonneCle tick
+#     released `recoit_cle` 0.1 s after the player RE-ENTERED DV1 in every probe that used it, and
+#     never while the player sat inside from the start (mechanism unresolved; measured probes 2-5).
+#   - "movement gap": a labelled teleport across an obstacle the flow opens but this VM cannot
+#     (Porte8 locked by VM blocker 1; the strongroom approach has no verified walkable path).
 
-# Game's own touches: walk each trigger volume the end-of-level sequence depends on.
-t=1.00 teleport -428 -2312 80       # diagnostic: DetectionVolume1 (Event julien_cine, bank teller scene)
-t=5.00 teleport 1300.03 -1917.39 1478  # diagnostic: TouchTrigger5 (Event vignracaille -> Dispatcher2)
-t=9.00 teleport 865 -4075 1530      # diagnostic: TouchTrigger2 (Event arrivee_fbi)
-t=13.00 teleport 1134 -4222 480     # diagnostic: TouchTrigger3 (Event fbi_dial2)
-t=17.00 teleport 1148 -4063 380     # diagnostic: TouchTrigger4 (Event arrivee_amos)
-t=20.00 teleport 1014.38 -4309 620  # diagnostic: TouchTrigger10 (Event CarOut)
-t=23.00 teleport -182 -1338 130     # diagnostic: TouchTrigger12 (Event gardien_cine)
-t=26.00 teleport 1341.37 -4019.51 380  # diagnostic: XIIIGoalTrigger2 (Tag fin_map, GoalNumber 1)
+# Leave the intro camera (WaitForFirstDisplay).
+t=0.50 forward 1
+t=1.50 forward 0
 
-# Bridged objectives (blockers B1-B3): objective 0 "Access the strongroom" is promoted by Cine1's
-# `ev vignclefbanque` and completed by Cine15's `event fin_flash` -> XIIIDispatcher4 ->
-# `GT_quitterbanque`; objective 1 "Escape from the bank" is completed by Cine11's
-# `playerevent fin_map`. None of the three scenes reaches its label (the host does not run the
-# cinematic sequence latents/anim notifies), so the route invokes the same `MapInfo.SetGoalComplete`
-# those events call. Labelled bridge, never silent.
-t=30.00 set_goal 0
-t=31.00 set_goal 1
-t=32.00 wait_travel
+# Bank teller scene (Cine1): DetectionVolume1 (Event julien_cine) starts it through the game's own
+# Touch. flow touch.
+t=3.00 teleport -428 -2312 80
+
+# Measured recipe: leave DV1 after Cine1's `event choatoi` (action[14], t=10.95) and re-enter, so
+# Banque0's STA_DonneCle tick releases `recoit_cle` (arrives ~0.1 s after the re-entry touch) and
+# Cine1 continues past `wait event recoit_cle` (action[16]).
+t=11.00 teleport -544 -2183 80      # measured recipe: out of DV1 (no-fire spot D)
+t=11.50 teleport -494 -2383 80      # measured recipe: re-enter DV1 -> recoit_cle
+
+# The teller walks to the counter and opens the staff gate (fixed ~24 s of scene actions after
+# recoit_cle; her `wait player 500`, action[32], passed with the player here in the probes).
+t=23.00 teleport -540 -1350 80      # flow: within the teller's wait-player radius
+
+# Cine1 `event james` (action[45]) starts Cine6 (James); his `wait player 700` (action[4]) needs
+# the player this close for the dialogue, then `event ajulien` fires (unconsumed: Cine1 is stalled
+# by VM blocker 1 at action[46]).
+t=40.00 teleport -1760 -2480 -80    # flow: within James's wait-player radius
+
+# Vault door Porte8: the flow unlocks it with the key via Cine1's `event toto`, which VM blocker 1
+# prevents. The `use` below records the measured "Locked" state in the log.
+t=44.00 teleport -2843 -6380 -150   # flow: to the vault door (armored door opened by Cine1[39])
+t=45.00 use Porte8                  # diagnostic: measured "use Porte8: Locked" (VM blocker 1)
+t=46.00 teleport -3000 -6300 -150   # movement gap: past locked Porte8 (key never granted)
+
+# Strongroom: DetectionVolume12's Touch starts Cine15 (Jones). flow touch.
+t=47.00 teleport -7616 -2784 1456   # flow touch: DetectionVolume12 (starts Cine15)
+t=48.00 teleport -7142 -2100 880    # flow: within Jones's wait-player radii ([3] 300, [19] away 70)
+
+# Cine15 plays its anims (~11 s), reaches `movseqb sp 0.25 w 33 w 34` (action[20]) and stalls there
+# (VM blocker 2): `event fin_flash` (action[45]) never fires, so objective 0 cannot complete and
+# objective 1 is never promoted. The run continues with the escape-flow volumes below so the log
+# shows the route state when the 90 s budget ends.
+t=55.00 teleport 1300.03 -1917.39 1478  # flow touch: TouchTrigger5 (Event vignracaille)
+t=58.00 teleport 865 -4075 1530         # flow touch: TouchTrigger2 (Event arrivee_fbi)
+t=61.00 teleport 1134 -4222 480         # flow touch: TouchTrigger3 (Event fbi_dial2)
+t=64.00 teleport 1148 -4063 380         # flow touch: TouchTrigger4 (Event arrivee_amos)
+t=67.00 teleport 1014.38 -4309 620      # flow touch: TouchTrigger10 (Event CarOut)
+t=70.00 teleport 1341.37 -4019.51 380   # flow touch: XIIIGoalTrigger2 (Tag fin_map, GoalNumber 1)
+
+# Wait for the game's own travel (Amos01 via the end-of-level chain). With VM blocker 2 the
+# objective assertions in the route test fail before this matters.
+t=73.00 wait_travel
