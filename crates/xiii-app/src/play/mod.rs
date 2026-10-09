@@ -20,6 +20,7 @@ pub mod pawns;
 pub mod script;
 pub mod session;
 pub mod sim;
+pub mod survey;
 pub mod travel;
 pub mod voice;
 pub mod weapons;
@@ -248,16 +249,16 @@ impl Plugin for PlayPlugin {
 }
 
 /// Resolved player parameters plus the startup report lines.
-struct ResolvedParams {
-    params: PlayerParams,
-    lines: Vec<String>,
+pub(crate) struct ResolvedParams {
+    pub params: PlayerParams,
+    pub lines: Vec<String>,
 }
 
 /// Resolves the player parameters from the inherited class defaults of the pawn class named by
 /// `Default.ini` -> GameInfo `DefaultPlayerClassName` (the same resolution `--collision-test`
 /// uses), and gravity from the decoded `Engine.PhysicsVolume.Gravity` class default. Every
 /// value is reported with its source; missing optional values are reported as such.
-fn resolve_params(game_dir: &Path) -> Result<ResolvedParams, String> {
+pub(crate) fn resolve_params(game_dir: &Path) -> Result<ResolvedParams, String> {
     let install = Installation::open(game_dir, &OpenOptions::default())
         .map_err(|e| format!("opening installation for class defaults: {e}"))?;
     let (set, gameinfo, pawn_path) = collision::resolve_player_class(&install)?;
@@ -565,13 +566,24 @@ fn setup_inner(
     let sources = scene.collision_sources.clone();
     let (ps_bevy, rot) = scene.player_start.ok_or("map has no PlayerStart")?;
     let spawn = collision::place_spawn(&world, ps_bevy, params.half_extents_bevy())?;
-    println!(
-        "[play] spawn: PlayerStart {:?} UU -> box centre {:?} UU, raise {:.2} UU, floor {:.2} UU below the centre",
-        bevy_to_unreal_position(ps_bevy),
-        bevy_to_unreal_position(spawn.position),
-        spawn.raise * UNREAL_UNITS_PER_METER,
-        (spawn.position[1] - spawn.floor) * UNREAL_UNITS_PER_METER
-    );
+    if spawn.airborne {
+        // Engine-faithful: `RestartPlayer` spawns the pawn at StartSpot.Location and
+        // PHYS_Falling brings it down (USA01's PlayerStart is 14 m above the BSP floor).
+        println!(
+            "[play] spawn: no floor within the drop cap below the PlayerStart {:?} UU; \
+             the pawn spawns at the start spot and falls (PHYS_Falling), raise {:.2} UU",
+            bevy_to_unreal_position(ps_bevy),
+            spawn.raise * UNREAL_UNITS_PER_METER
+        );
+    } else {
+        println!(
+            "[play] spawn: PlayerStart {:?} UU -> box centre {:?} UU, raise {:.2} UU, floor {:.2} UU below the centre",
+            bevy_to_unreal_position(ps_bevy),
+            bevy_to_unreal_position(spawn.position),
+            spawn.raise * UNREAL_UNITS_PER_METER,
+            (spawn.position[1] - spawn.floor) * UNREAL_UNITS_PER_METER
+        );
+    }
     // The host movement simulation owns the player pawn's `Location`/`Velocity`/`Rotation`.
     // The script login chain (when it ran) created the pawn at the PlayerStart; the position
     // comes from the host's FindSpot placement (the raw PlayerStart overlaps the floor) and the
@@ -610,7 +622,7 @@ fn setup_inner(
     }
     let yaw = start_rot[1] as f32 * std::f32::consts::TAU / 65536.0;
     let mut sim = PlayerSim::new(start_center, yaw);
-    sim.grounded = true;
+    sim.grounded = !spawn.airborne;
 
     // Optional deterministic script.
     let (drive, script_last) = match &opts.play_script {
@@ -1863,13 +1875,16 @@ fn format_trace(tick: u64, t: f32, sim: &PlayerSim) -> String {
 /// map, spawns the player, replays the script through the same [`PlayerSim`], prints a trace
 /// every [`TRACE_EVERY`] ticks and exits. No window is opened.
 pub fn run_headless(opts: &Options) -> AppExit {
-    match run_headless_inner(opts) {
+    // The scripted run drives the VM; run it on the explicit VM host stack (see vmstack) so
+    // the engine-limit recursion guard fires before the thread runs out of stack.
+    let owned = opts.clone();
+    crate::vmstack::run_on_vm_stack(move || match run_headless_inner(&owned) {
         Ok(()) => AppExit::Success,
         Err(e) => {
             eprintln!("error: {e}");
             AppExit::error()
         }
-    }
+    })
 }
 
 /// Outcome of a headless scripted run: the VM session (after the run), the movement trace and
@@ -1975,12 +1990,21 @@ fn open_map_runtime(
     let sources = scene.collision_sources.clone();
     let (ps_bevy, rot) = scene.player_start.ok_or("map has no PlayerStart")?;
     let spawn = collision::place_spawn(&world, ps_bevy, params.half_extents_bevy())?;
-    println!(
-        "[play] spawn: PlayerStart {:?} UU -> box centre {:?} UU, raise {:.2} UU",
-        bevy_to_unreal_position(ps_bevy),
-        bevy_to_unreal_position(spawn.position),
-        spawn.raise * UNREAL_UNITS_PER_METER
-    );
+    if spawn.airborne {
+        println!(
+            "[play] spawn: no floor within the drop cap below the PlayerStart {:?} UU; \
+             the pawn spawns at the start spot and falls (PHYS_Falling), raise {:.2} UU",
+            bevy_to_unreal_position(ps_bevy),
+            spawn.raise * UNREAL_UNITS_PER_METER
+        );
+    } else {
+        println!(
+            "[play] spawn: PlayerStart {:?} UU -> box centre {:?} UU, raise {:.2} UU",
+            bevy_to_unreal_position(ps_bevy),
+            bevy_to_unreal_position(spawn.position),
+            spawn.raise * UNREAL_UNITS_PER_METER
+        );
+    }
     // The script login chain (item3h) created the pawn at the PlayerStart; the host owns its
     // movement fields (item8a rule), so the position comes from the host's FindSpot placement
     // and the facing from the pawn's script-set Rotation when the login path ran.
@@ -1989,7 +2013,7 @@ fn open_map_runtime(
         _ => rot[1] as f32 * std::f32::consts::TAU / 65536.0,
     };
     let mut sim = PlayerSim::new(bevy_to_unreal_position(spawn.position), start_yaw);
-    sim.grounded = true;
+    sim.grounded = !spawn.airborne;
     let volumes = match xiii_world::movement_volumes::MovementVolumes::import(game_dir, map) {
         Ok(v) => {
             println!("[play] movement volumes: {}", v.summary());
@@ -2643,7 +2667,7 @@ mod tests {
             bevy_to_unreal_position(spawn.position),
             rot[1] as f32 * std::f32::consts::TAU / 65536.0,
         );
-        sim.grounded = true;
+        sim.grounded = !spawn.airborne;
         let start = sim.location;
         for _ in 0..120 {
             sim.step(
@@ -3482,17 +3506,22 @@ mod tests {
         let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/banque01_route.script");
         let script = script::Script::load(&route_path).expect("load item24 banque01 route");
-        // 140 s: the measured item27k schedule needs it — Cine15's [34] "wait player 300" starts
-        // at t~69.1 (Jones walked his waypoints), the escape-flow touches run to t~88, and the
-        // map-outro video cine02 (33.92 s, measured host note) must finish before
-        // `PlayingVideo.PlayerTick` runs `ServerTravel` (see tests/data/banque01_route.script).
+        // 185 s: the item27l walked schedule needs it — the route walks to the vault door
+        // (touches t~88), teleports to DetectionVolume12 at t~90, and Jones then reaches
+        // Cine15's [34] "wait player 300" at t~114.3 (his scene's dialogue/anims run ~24 s
+        // after the DV12 touch; the teleport route reached it at t~69.1 because its DV12 touch
+        // fired at t~47). fin_flash lands at t~118.5, the escape-flow touches run to t~136, and
+        // Cine11's `playerevent fin_map` fires at t~143.7 (measured in
+        // local/re/item27l/route-final4.log). The map-outro video then runs its full 33.92 s
+        // headless before `PlayingVideo.PlayerTick` issues the `ServerTravel` (measured
+        // GameEndedSuccess t~96 -> travel t~131.2 in local/re/item27k/route-final.log).
         let outcome = run_script_with_cinematic_input(
             &game_dir,
             "banque01",
             &script,
             &resolved.params,
             &scene,
-            140.0,
+            185.0,
         )
         .expect("run banque01 route");
         let banque = outcome

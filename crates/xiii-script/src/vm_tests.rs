@@ -9136,6 +9136,66 @@ fn delegate_values_are_equatable_and_none_is_distinct() {
     assert!(!crate::vm::values_equal(&Value::Delegate(None), &d));
 }
 
+/// Synthetic recursion fixture: `Actor.Run()` calls itself virtually and never returns, so only
+/// the interpreter's call-depth guard can stop it. This is the shape of the Amos01
+/// campaign-start recursion (`xiii.u XIIIPlayerController.SwitchWeapon` 0x00FC -> 0x00FC).
+/// The guard limit itself follows the engine: Core.dll `UObject::ProcessInternal` compares
+/// the runaway counter against 250 (`cmp $0xfa` at VA 0x101166e0) and logs "Infinite script
+/// recursion (%i calls) detected" (string VA 0x10178cd8) past it.
+fn recursion_package() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let run = b.reserve(IMP_FUNCTION, actor, "Run");
+    // Run(): Run(); return;  — a virtual self-call with no arguments. A name operand is 1 byte
+    // on disk but NAME_MEMORY_SIZE (4) in memory, so the code is 8 memory bytes.
+    let mut code = Vec::new();
+    code.push(0x1B); // VirtualFunction
+    code.extend(compact(b.name("Run")));
+    code.push(0x16); // EndFunctionParms
+    code.push(0x04); // Return
+    code.push(0x0B); // Nothing
+    b.func(run, 0, 0, &code, 8, 0, ff::DEFINED);
+    b.class(object, 0, 0);
+    b.class(actor, object, run);
+    b.build()
+}
+
+/// The unbounded-recursion property at the engine's own limit: at `VmLimits::default()` (250,
+/// the Core.dll `ProcessInternal` constant) the guard aborts with `CallDepthExceeded` **inside
+/// a 2 MiB thread stack** — the libtest default (`RUST_MIN_STACK`), i.e. the budget every test
+/// already runs on, with no wrapper needed. The measured interpreter cost is ~4.4 KiB per
+/// interpreted frame (debug build), so 250 frames need ~1.1 MiB: the guard fires at roughly
+/// half the budget. If the default limit is ever raised past what that budget supports, this
+/// thread dies with a stack overflow and the test (loudly) fails. The shipped host entry
+/// points run their VM-driving code on an explicit 64 MiB stack instead (see xiii-app
+/// `vmstack`, which exists for the binary's 1 MiB main thread).
+#[test]
+fn recursion_guard_fits_a_2mib_stack() {
+    let package = recursion_package();
+    let limit = VmLimits::default().max_call_depth;
+    let outcome = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let set = set_of(package);
+            let mut vm = Vm::new(&set, VmLimits::default());
+            let actor = vm.spawn(g(&set, "Actor"), "Rec").unwrap();
+            vm.set_active(actor, true);
+            match vm.call_function(g(&set, "Actor.Run"), actor, vec![]) {
+                Err(e) => format!("{:?}", e.kind),
+                Ok(_) => "no error".to_owned(),
+            }
+        })
+        .expect("spawn the 2 MiB probe thread")
+        .join()
+        .expect("the recursion must abort inside a 2 MiB stack, not overflow it");
+    assert_eq!(
+        outcome,
+        format!("CallDepthExceeded {{ limit: {limit} }}"),
+        "the engine-limit call-depth guard (250) must fire before a 2 MiB stack is exhausted"
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // item41c: Actor.MakeNoise -> CheckNoiseHearing -> CanHear -> HearNoise (Engine.dll decoded)
 

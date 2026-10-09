@@ -53,6 +53,17 @@ impl Default for VmLimits {
     fn default() -> Self {
         Self {
             max_steps: 1_000_000,
+            // The engine's own script recursion limit: Core.dll `UObject::ProcessInternal`
+            // increments the global runaway counter (VA 0x101939e4) per interpreted call and
+            // compares against 0xFA = 250 (cmp at 0x101166e0); past 250 it logs
+            // "Infinite script recursion (%i calls) detected" (string 0x10178cd8, message
+            // pushed with the 250 constant at 0x101166f3). `GInitRunaway` (0x10115dc0) resets
+            // the counter to 0. 250 frames at the measured ~4.4 KiB interpreter stack per
+            // script frame (debug build) is ~1.1 MiB, which overflows the binary's 1 MiB
+            // main thread, so the shipped VM-driving host entry points run on an explicit
+            // 64 MiB stack (see xiii-app vmstack); the ~2 MiB test-thread default fits with
+            // ~2x margin and needs no wrapper.
+            // `vm_tests::recursion_guard_fits_a_2mib_stack` pins the property.
             max_call_depth: 250,
             max_type_depth: 16,
             rng_seed: 0x9E37_79B9_7F4A_7C15,
