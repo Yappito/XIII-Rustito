@@ -2221,6 +2221,19 @@ impl Session {
         let class = runtime::resolve_class_path(self.vm.set(), class_path)
             .ok_or_else(|| format!("weapon class {class_path} is not loaded"))?;
         let pawn = self.player;
+        // Match diagnostic fire's execution scope: a cinematic may have parked the pawn.
+        // GiveTo/ChangedWeapon must run, rather than defer and report an unequipped grant.
+        self.vm.set_active(pawn, true);
+        if let Some(controller) = self.controller {
+            // Diagnostic grant explicitly selects weapon mode. XIIIPawn.ChangedWeapon
+            // copies bWaitForWeaponMode and clears Weapon when bWeaponBlock is true
+            // (retail xiii.u code 0x0010..0x0151). A skipped intro may retain that lock.
+            // Do not assign Pawn.Weapon: the normal GiveTo/ChangedWeapon chain still equips it.
+            self.vm
+                .set_property(controller, "bWaitForWeaponMode", 0, Value::Bool(true));
+            self.vm
+                .set_property(controller, "bWeaponBlock", 0, Value::Bool(false));
+        }
         // `spawn_actor` runs the weapon's own PreBeginPlay/BeginPlay/PostBeginPlay lifecycle.
         let loc = self.vm.vector_prop(pawn, "Location");
         let id = self
@@ -2229,13 +2242,42 @@ impl Session {
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("spawning {class_path} returned None"))?;
         let p = Value::Object(Some(ObjRef::Instance(pawn)));
+        self.vm.set_active(id, true);
         // `GiveTo`/`ClientWeaponSet` read `Owner` (the engine's `Spawn` sets it) and `Instigator`.
         self.vm.set_property(id, "Instigator", 0, p.clone());
         self.vm.set_property(id, "Owner", 0, p.clone());
         // The game's own pickup entry point: adds to the inventory chain, creates the ammo and
         // (only when the pawn has no active weapon) runs `ClientWeaponSet` -> `ChangedWeapon`.
         let give = self.vm.send_event(id, "GiveTo", vec![p.clone()]);
-        let active_after_give = self.player_weapon() == Some(id);
+        // Weapon.GiveTo merges duplicate-class ammo into the carried weapon and destroys
+        // the newly spawned instance (engine.u 0x0305..0x042B). Select that carried instance,
+        // never the destroyed donor. This is a diagnostic inventory grant, not a new weapon
+        // pointer bypassing the script chain.
+        let equipped_id = if self.vm.objects[id as usize].deleted {
+            match self
+                .vm
+                .send_event(
+                    pawn,
+                    "FindInventoryType",
+                    vec![Value::Object(Some(ObjRef::Static(class)))],
+                )
+                .map_err(|e| e.to_string())?
+            {
+                Some(Value::Object(Some(ObjRef::Instance(existing))))
+                    if !self.vm.objects[existing as usize].deleted =>
+                {
+                    existing
+                }
+                other => {
+                    return Err(format!(
+                        "GiveTo destroyed {class_path} donor but no carried replacement was found: {other:?}"
+                    ));
+                }
+            }
+        } else {
+            id
+        };
+        let active_after_give = self.player_weapon() == Some(equipped_id);
         // When the pawn already had a weapon, run the game's own switch: set the field the engine
         // sets and call the pawn's `ChangedWeapon` (the same call `ClientWeaponSet` makes).
         let changed = if active_after_give {
@@ -2245,7 +2287,7 @@ impl Session {
                 pawn,
                 "PendingWeapon",
                 0,
-                Value::Object(Some(ObjRef::Instance(id))),
+                Value::Object(Some(ObjRef::Instance(equipped_id))),
             );
             Some(self.vm.send_event(pawn, "ChangedWeapon", Vec::new()))
         };
@@ -2260,6 +2302,11 @@ impl Session {
                 .push(format!("grant_weapon {name} ChangedWeapon: {e}"));
         }
         let weapon = self.player_weapon();
+        if weapon != Some(equipped_id) {
+            return Err(format!(
+                "diagnostic grant {name} did not equip {equipped_id}: GiveTo {give:?}, ChangedWeapon {changed:?}, Pawn.Weapon={weapon:?}"
+            ));
+        }
         let attach = weapon.and_then(|w| instance_prop(&self.vm, w, "ThirdPersonActor"));
         Ok(format!(
             "granted {name} ({class_path}) via GiveTo; GiveTo {give:?}, \

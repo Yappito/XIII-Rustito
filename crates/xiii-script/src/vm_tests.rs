@@ -1838,12 +1838,129 @@ fn rng_is_deterministic_and_seeded() {
     let mut d = Vm::new(&set, VmLimits::default());
     for _ in 0..1000 {
         let f = d.rand_float();
-        assert!((0.0..1.0).contains(&f), "{f}");
+        assert!((0.0..=1.0).contains(&f), "{f}");
         let i = d.rand_int(7);
         assert!((0..7).contains(&i), "{i}");
     }
     assert_eq!(d.rand_int(0), 0);
     assert_eq!(d.rand_int(-5), 0);
+}
+
+#[test]
+fn item51_retail_frand_stream_includes_endpoint_and_rand_shares_state() {
+    let set = spawn_set();
+    let mut vm = Vm::new(
+        &set,
+        VmLimits {
+            rng_seed: 1,
+            ..VmLimits::default()
+        },
+    );
+    // MSVCR70's seed-1 sequence. Rand(nonpositive) must not consume a step.
+    assert_eq!(vm.rand_int(0), 0);
+    assert_eq!(vm.rand_int(-1), 0);
+    assert_eq!(vm.next_random(), 41);
+    assert_eq!(vm.rand_float(), 18467.0 * f32::from_bits(0x38000100));
+    assert_eq!(vm.rand_int(100), 6334 % 100);
+    // This seed reaches the maximum CRT result on the next step; FRand can be 1.0.
+    let mut endpoint = Vm::new(
+        &set,
+        VmLimits {
+            rng_seed: 0x1_f01b_f641,
+            ..VmLimits::default()
+        },
+    );
+    assert_eq!(endpoint.rand_float(), 1.0);
+    let mut zero = Vm::new(
+        &set,
+        VmLimits {
+            rng_seed: 0xa170_f641,
+            ..VmLimits::default()
+        },
+    );
+    assert_eq!(zero.rand_float(), 0.0);
+}
+
+#[test]
+fn item51_playanim_omitted_rate_moves_but_explicit_zero_holds_through_small_steps() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(30, 30.0)));
+    let actor = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(actor, true);
+    let mut args = [
+        Value::Name("Walk".into()),
+        Value::Float(0.0),
+        Value::Float(0.0),
+        Value::Int(0),
+    ];
+    try_native(
+        &mut vm,
+        "Engine.Actor.PlayAnim",
+        actor,
+        &[false, true, true, true],
+        &mut args,
+    )
+    .unwrap();
+    vm.tick(0.1).unwrap();
+    assert!((vm.objects[actor as usize].anim.channels[&0].frame - 3.0).abs() < 1e-5);
+    try_native(
+        &mut vm,
+        "Engine.Actor.PlayAnim",
+        actor,
+        &[false; 4],
+        &mut args,
+    )
+    .unwrap();
+    for _ in 0..600 {
+        vm.tick(1.0 / 60.0).unwrap();
+    }
+    assert_eq!(vm.objects[actor as usize].anim.channels[&0].frame, 0.0);
+    assert_eq!(vm.objects[actor as usize].anim.channels[&0].rate, 0.0);
+    assert!(
+        !vm.trace
+            .iter()
+            .any(|e| matches!(e.kind, TraceKind::AnimEnd { .. }))
+    );
+}
+
+#[test]
+fn item51_trace_additional_categories_work_when_traceactors_is_false() {
+    let set = set_of(trace_package());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let shooter = vm.spawn(g(&set, "Actor"), "Shooter").unwrap();
+    let target = vm.spawn(g(&set, "Actor"), "Target").unwrap();
+    vm.set_active(target, true);
+    vm.set_property(target, "Location", 0, Value::Vector([100.0, 0.0, 0.0]));
+    vm.set_property(target, "CollisionRadius", 0, Value::Float(20.0));
+    vm.set_property(target, "CollisionHeight", 0, Value::Float(20.0));
+    for p in [
+        "bCollideActors",
+        "bBlockActors",
+        "bBlockPlayers",
+        "bBlockZeroExtentTraces",
+    ] {
+        vm.set_property(target, p, 0, Value::Bool(true));
+    }
+    let mut args = trace_args();
+    args[4] = Value::Bool(false);
+    args.extend([Value::Object(None), Value::Int(0)]);
+    assert_eq!(
+        call_native(&mut vm, "Actor.Trace", shooter, &[false; 8], &mut args),
+        NativeOutcome::Value(Value::Object(None))
+    );
+    args[7] = Value::Int(0x30);
+    assert_eq!(
+        call_native(&mut vm, "Actor.Trace", shooter, &[false; 8], &mut args),
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(target))))
+    );
+    // Additional category flags cannot bypass collision-hash membership.
+    vm.set_property(target, "bCollideActors", 0, Value::Bool(false));
+    assert_eq!(
+        call_native(&mut vm, "Actor.Trace", shooter, &[false; 8], &mut args),
+        NativeOutcome::Value(Value::Object(None))
+    );
 }
 
 #[test]

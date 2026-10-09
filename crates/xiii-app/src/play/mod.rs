@@ -11,6 +11,8 @@
 
 pub mod cartoon;
 pub mod cinematics;
+#[cfg(test)]
+mod combat_survey;
 pub mod cutscene;
 pub mod footsteps;
 pub mod hud;
@@ -2124,6 +2126,10 @@ fn run_script_inner(
     let mut travel = Vec::new();
     let mut map_objectives = Vec::new();
     let mut runtime = open_map_runtime(game_dir, map, scene, params)?;
+    #[cfg(test)]
+    if std::env::var("XIII_SURVEY").as_deref() == Ok("1") {
+        runtime.session.vm_mut().collect_combat_natives = true;
+    }
     // Accumulated unresolved voice names across maps (the provider is re-installed per map).
     let mut voice_unresolved_total = 0u64;
     // Player footsteps (item6e): the same notify-free synthesis `fixed_step` uses, so the
@@ -2145,7 +2151,7 @@ fn run_script_inner(
             drive.set_track_location(None, None);
         }
         let mut input = drive.advance(elapsed, &mut runtime.sim);
-        let mut weapons = drive.take_weapons();
+        let weapons = drive.take_weapons();
         let goals = drive.take_goals();
         let mut weapon_inputs = drive.take_weapon_inputs();
         let mut use_named = drive.take_use_named();
@@ -2159,7 +2165,8 @@ fn run_script_inner(
         // labels them as such.
         if respect_cinematic_input && cinematics::input_suppressed(&runtime.session) {
             input = Input::default();
-            weapons.clear();
+            // A diagnostic weapon grant is a host command, like wake/set_goal, rather than
+            // a player action. Keep it available while an authored cinematic owns input.
             weapon_inputs.clear();
             use_named.clear();
             search.clear();

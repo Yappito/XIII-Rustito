@@ -1342,6 +1342,12 @@ pub struct Vm<'s> {
     rng: u64,
     /// Native functions called (path -> (index, count)).
     pub natives_used: std::collections::BTreeMap<String, (Option<u16>, u64)>,
+    /// First actual script stack for each invoked native (bounded by native paths).
+    pub natives_first_caller: BTreeMap<String, Vec<StackEntry>>,
+    /// Calls reached under weapon Fire or AI NotifyFiring, for opt-in combat diagnostics.
+    pub combat_natives: BTreeMap<String, (u64, Vec<StackEntry>)>,
+    /// Opt-in collection of firing-path call stacks (off during ordinary play).
+    pub collect_combat_natives: bool,
     /// Survey mode: unimplemented natives are counted and skipped instead of failing.
     pub survey: bool,
     /// Distinct unimplemented natives seen in survey mode (path -> record, first-hit order).
@@ -1566,6 +1572,9 @@ impl<'s> Vm<'s> {
             load_warnings: Vec::new(),
             rng: limits.rng_seed,
             natives_used: Default::default(),
+            natives_first_caller: Default::default(),
+            combat_natives: Default::default(),
+            collect_combat_natives: false,
             survey: false,
             missing_natives: Default::default(),
             pending_latent: None,
@@ -5241,6 +5250,21 @@ impl<'s> Vm<'s> {
             .entry(path.clone())
             .or_insert((declared, 0));
         e.1 += 1;
+        if !self.natives_first_caller.contains_key(&path) {
+            self.natives_first_caller
+                .insert(path.clone(), self.stack.clone());
+        }
+        if self.collect_combat_natives
+            && self.stack.iter().any(|s| {
+                s.function.ends_with("XIIIWeapon.Fire") || s.function.ends_with("NotifyFiring")
+            })
+        {
+            let entry = self
+                .combat_natives
+                .entry(path.clone())
+                .or_insert_with(|| (0, self.stack.clone()));
+            entry.0 += 1;
+        }
         let before: Vec<String> = if self.trace_natives {
             args.iter().map(|a| self.value_text(a)).collect()
         } else {
@@ -7869,13 +7893,24 @@ impl<'s> Vm<'s> {
         end: [f32; 3],
         extent: [f32; 3],
     ) -> Option<(f32, ObjectId, [f32; 3])> {
+        self.trace_actors_flags(id, start, end, extent, 0xbf)
+    }
+
+    fn trace_actors_flags(
+        &self,
+        id: ObjectId,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+        flags: u32,
+    ) -> Option<(f32, ObjectId, [f32; 3])> {
         let mut best: Option<(f32, ObjectId, [f32; 3])> = None;
         let nonzero = extent[0] + extent[1] + extent[2] > 0.0;
         for b in 0..self.objects.len() as ObjectId {
             if b == id || !self.is_live_actor(b) {
                 continue;
             }
-            if !self.trace_admits_actor(b, id, nonzero) {
+            if !self.trace_admits_actor_flags(b, id, nonzero, flags) {
                 continue;
             }
             let (lb, rb, hb) = self.actor_cylinder(b);
@@ -7927,6 +7962,16 @@ impl<'s> Vm<'s> {
     /// the hash walk, or any `ShouldTrace` override. A carried first-person weapon does not block
     /// because its class defaults clear `bCollideActors` (`xiii.Fists`, measured).
     fn trace_admits_actor(&self, candidate: ObjectId, tracer: ObjectId, nonzero: bool) -> bool {
+        self.trace_admits_actor_flags(candidate, tracer, nonzero, 0xbf)
+    }
+
+    fn trace_admits_actor_flags(
+        &self,
+        candidate: ObjectId,
+        tracer: ObjectId,
+        nonzero: bool,
+        flags: u32,
+    ) -> bool {
         if !self.bool_prop(candidate, "bCollideActors") {
             return false;
         }
@@ -7944,18 +7989,30 @@ impl<'s> Vm<'s> {
         if self.is_owned_by(candidate, tracer) || self.is_owned_by(tracer, candidate) {
             return false;
         }
-        if self.class_chain_contains(candidate, "pawn")
-            || self.class_chain_contains(candidate, "mover")
+        if self.class_chain_contains(candidate, "pawn") {
+            return flags & 1 != 0;
+        }
+        if self.class_chain_contains(candidate, "mover")
             || self.class_chain_contains(candidate, "decoration")
         {
-            return true;
+            return flags & 2 != 0;
         }
         if self.bool_prop(candidate, "bWorldGeometry") {
+            return flags & 0x80 != 0;
+        }
+        if flags & 0x10 == 0 {
+            return false;
+        }
+        if flags & 0x20 != 0 {
+            return self.bool_prop(candidate, "bProjTarget")
+                || (self.bool_prop(candidate, "bBlockActors")
+                    && self.bool_prop(candidate, "bBlockPlayers"));
+        }
+        // 0x103546e2: all other actors when neither projectile-only nor blocking-only.
+        if flags & 0x40 == 0 {
             return true;
         }
-        self.bool_prop(candidate, "bProjTarget")
-            || (self.bool_prop(candidate, "bBlockActors")
-                && self.bool_prop(candidate, "bBlockPlayers"))
+        self.bool_prop(candidate, "bBlockActors") && self.bool_prop(candidate, "bBlockPlayers")
     }
 
     pub(crate) fn vm_trace_actors(
@@ -8009,12 +8066,33 @@ impl<'s> Vm<'s> {
     /// world hits return the map's `LevelInfo` (upstream), no hit returns `None`.
     /// Fills `(hit_actor, hit_location, hit_normal)`.
     #[allow(clippy::type_complexity)]
+    #[cfg(test)]
     pub(crate) fn vm_trace(
         &mut self,
         id: ObjectId,
         start: [f32; 3],
         end: [f32; 3],
         b_trace_actors: bool,
+        extent: [f32; 3],
+    ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
+        self.vm_trace_flags(
+            id,
+            start,
+            end,
+            if b_trace_actors { 0xbf } else { 0x86 },
+            extent,
+        )
+    }
+
+    /// Script Trace's composed flags; pawn/mover category bits remain effective even when
+    /// bTraceActors was false. Special BSP/material filtering remains Partial.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn vm_trace_flags(
+        &mut self,
+        id: ObjectId,
+        start: [f32; 3],
+        end: [f32; 3],
+        flags: u32,
         extent: [f32; 3],
     ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
         let (world, mover) = match self.physics.as_mut() {
@@ -8033,8 +8111,7 @@ impl<'s> Vm<'s> {
             .filter(|&m| m != id && self.is_mover(m) && self.actor_blocks_trace(m, nonzero));
         let mut best: Option<(f32, Option<ObjectId>, [f32; 3])> =
             world.map(|h| (h.time, mover, h.normal));
-        if b_trace_actors
-            && let Some((t, b, n)) = self.trace_actors(id, start, end, extent)
+        if let Some((t, b, n)) = self.trace_actors_flags(id, start, end, extent, flags)
             && best.is_none_or(|(bt, _, _)| t <= bt)
         {
             best = Some((t, Some(b), n));
@@ -9158,9 +9235,9 @@ impl<'s> Vm<'s> {
         }
     }
 
-    /// `Actor.PlayAnim`/`LoopAnim`/`TweenAnim`: start `sequence` on `channel`. `rate <= 0`
-    /// falls back to the provider's rate; `tween_time` holds the sequence at frame 0 before it
-    /// advances. The `None` sequence stops the channel. Unknown sequences are an explicit error.
+    /// `Actor.PlayAnim`/`LoopAnim`/`TweenAnim`: start `sequence` on `channel`. Zero rate
+    /// holds frame zero; negative velocity-dependent rates remain Partial. Tween time holds
+    /// frame zero before playback. Unknown sequences produce a visible no-op.
     pub(crate) fn start_animation(
         &mut self,
         id: ObjectId,
@@ -9230,11 +9307,12 @@ impl<'s> Vm<'s> {
         // authored rate (`Engine.dll ?execPlayAnim@AActor` RVA 0xDF990 pushes the default `1.0`;
         // the mesh instance advances `AnimRate * Seq->Rate` frames per second). The provider's
         // `SeqInfo.rate` is that authored rate (30 fps for the decoded MeshAnimation clips), so a
-        // script rate of `1.0` must play at 30 fps, not 1. `rate <= 0` means "use the authored
-        // rate" (`LoopAnim(DefaultAnim)` and `PlayAnim(seq, 0.0, ...)`). Without the multiply every
-        // scripted animation ran ~30x slow, which delayed the Plage01 intro past its dialogue cues.
+        // script rate of `1.0` must play at 30 fps, not 1. Omitted native Rate defaults to 1.0;
+        // explicit zero enters the retail hold/tween branch. Negative rates remain Partial.
         let natural = if info.rate > 0.0 { info.rate } else { 1.0 };
-        let rate = if rate > 0.0 { rate * natural } else { natural };
+        // Retail skeletal PlayAnim's zero-rate branch 0x103f5d2f clears channel playback
+        // rate and holds frame zero. An omitted native argument is 1.0, not explicit zero.
+        let rate = if rate >= 0.0 { rate * natural } else { natural };
         let mut notifies = info.notifies;
         notifies.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         // Engine.dll `PlayAnim` keeps ONE cached previous pose per channel (channel+0x58
@@ -9730,19 +9808,18 @@ impl<'s> Vm<'s> {
         self.time
     }
 
-    /// Deterministic PRNG step (splitmix64). Used by `Rand`/`FRand`; the engine's own RNG
-    /// sequence is not reproduced (see the registry status).
+    /// Retail PC CRT rand (MSVCR70.dll 0x7c02836d), shared by appRand/appFrand.
+    /// Uses the low 32 bits of the configured seed and unsigned wrapping arithmetic.
     pub(crate) fn next_random(&mut self) -> u64 {
-        self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.rng;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
+        let state = (self.rng as u32).wrapping_mul(214013).wrapping_add(2531011);
+        self.rng = u64::from(state);
+        u64::from((state >> 16) & 0x7fff)
     }
 
-    /// `FRand`: a deterministic float in `[0, 1)`.
+    /// Core.dll appFrand 0x1010ffd0: CRT rand times float bits 0x38000100.
+    /// Both endpoints are possible.
     pub(crate) fn rand_float(&mut self) -> f32 {
-        (self.next_random() >> 40) as f32 / (1u64 << 24) as f32
+        self.next_random() as f32 * f32::from_bits(0x38000100)
     }
 
     /// `Rand(Max)`: a deterministic int in `[0, Max)` (0 when `Max <= 0`).
