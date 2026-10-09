@@ -2080,18 +2080,6 @@ fn run_script_inner(
                 .vm()
                 .find_live_object(&name)
                 .and_then(|id| runtime.session.vm().vector_prop(id, "Location"));
-            // item30 temporary: tracked-actor positions over time (removed with the
-            // killer-scene investigation).
-            if tick.is_multiple_of(TRACE_EVERY) {
-                if let Some(loc) = location {
-                    println!(
-                        "[track] t={elapsed:.3}s {name} at ({:.1},{:.1},{:.1})",
-                        loc[0], loc[1], loc[2]
-                    );
-                } else {
-                    println!("[track] t={elapsed:.3}s {name} not live");
-                }
-            }
             drive.set_track_location(Some(&name), location);
         } else {
             drive.set_track_location(None, None);
@@ -2559,11 +2547,6 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
     }
     if let Some(first) = session.first_error() {
         println!("[play] first script error: {first}");
-    }
-    // item30 temporary: every recorded script failure with its actor (removed with the
-    // killer-scene investigation).
-    for (name, error) in session.failures.iter() {
-        println!("[play] failure {name}: {error}");
     }
     // Footstep summary and the full ordered list (requirement 3: count and names on Plage01).
     let mut by_sound: std::collections::BTreeMap<String, (usize, Option<String>)> =
@@ -3099,7 +3082,8 @@ mod tests {
         );
     }
 
-    /// item33 acceptance: execute the tracked Plage01 route through the M60 fire burst, deliver
+    /// item33 acceptance: execute the tracked Plage01 route through the picked-up Beretta's fire
+    /// burst, deliver
     /// Touch to the map's real checkpoint trigger (which runs GoSaving.DoSave), persist that
     /// checkpoint and reload it through AcceptInventory. The trigger Touch is harness-delivered;
     /// the save/restore and weapon/ammo/objective work is the authored game path.
@@ -3119,16 +3103,17 @@ mod tests {
         let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/plage01_route.script");
         let mut script = script::Script::load(&route_path).expect("load tracked Plage01 route");
-        // item30c: the walked route fires its M60 burst at t=355.5-362.25 (the killer dies at
-        // ~360.5); cut there so the run stops well before the level-end travel (t~454).
-        script.events.retain(|event| event.t <= 370.0);
+        // item30c: the walked route fires its Beretta burst at t=355.5-376.95 (the killer dies at
+        // ~374.75, scratch item30c_e7e); cut there so the run stops well before the level-end
+        // travel (t~469).
+        script.events.retain(|event| event.t <= 385.0);
         let mut outcome = run_script(
             &game_dir,
             "Plage01",
             &script,
             &resolved.params,
             &scene,
-            380.0,
+            400.0,
         )
         .expect("run Plage01 through its weapon fire and corpse search");
         assert_eq!(
@@ -3151,7 +3136,7 @@ mod tests {
             .expect("route killer");
         assert!(
             outcome.session.actor_is_dead(target),
-            "tracked route's fired M60 did not kill BaseSoldier6"
+            "tracked route's fired Beretta did not kill BaseSoldier6"
         );
 
         let weapon = outcome
@@ -3163,11 +3148,25 @@ mod tests {
             .vm()
             .set()
             .path(outcome.session.vm().objects[weapon as usize].class);
+        // item30c: the route fights with the picked-up Beretta (`equip` at t=326 re-selects it
+        // after the T8 scene had left Fists), but the game's own weapon code goes back to Fists
+        // ~2-3 s after the burst stops firing (measured with scratch runs e7f/e7g/e7h: the
+        // switch follows the last fire whether or not the killer died and with ~20 or ~40 shots,
+        // so it is not the kill, the corpse search or ammo exhaustion). The selected weapon at
+        // save time is therefore the game's own end state, Fists.
         assert!(
-            weapon_class.to_ascii_lowercase().contains("m60"),
+            weapon_class.to_ascii_lowercase().contains("fists"),
             "selected weapon after route: {weapon_class}"
         );
+        // The fired Beretta must still be in the chain (it is the route's weapon, only no longer
+        // selected), and the selected Fists must be a real chain entry.
         let before_inventory = outcome.session.inventory_items();
+        assert!(
+            before_inventory
+                .iter()
+                .any(|(_, class)| class.eq_ignore_ascii_case("xiii.beretta")),
+            "the picked-up Beretta is absent from the inventory chain: {before_inventory:?}"
+        );
         assert!(
             before_inventory
                 .iter()
@@ -3384,11 +3383,11 @@ mod tests {
         let restored_weapon = resumed.player_weapon().expect("restored selected weapon");
         let restored_ammo_id = match resumed.vm().get_property(restored_weapon, "AmmoType") {
             Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => *id,
-            other => panic!("restored M60 has no instance AmmoType: {other:?}"),
+            other => panic!("restored selected weapon has no instance AmmoType: {other:?}"),
         };
         let restored_ammo_count = match resumed.vm().get_property(restored_ammo_id, "AmmoAmount") {
             Some(xiii_script::Value::Int(n)) => *n,
-            other => panic!("restored M60 AmmoType has no int AmmoAmount: {other:?}"),
+            other => panic!("restored selected weapon's ammo has no int AmmoAmount: {other:?}"),
         };
         let restored_ammo = (
             resumed
@@ -3426,9 +3425,9 @@ mod tests {
         }
         remaining.sort();
         // item30c: AcceptInventory's authored defaults are the fists ammo and the left hand.
-        // The walked route's save already contains a FistsAmmo item (the picked-up Beretta's
-        // mis-wired ammo, amount 1), so that default is consumed by the saved-class matching
-        // above and only the genuinely-absent defaults remain.
+        // The walked route's save already contains a FistsAmmo item (the fists' own ammo), so
+        // that default is consumed by the saved-class matching above and only the
+        // genuinely-absent defaults remain.
         let expected_leftovers: Vec<String> = ["xiii.fistsammo", "xiii.xiiilefthand"]
             .iter()
             .filter(|class| !saved_classes.contains(&class.to_string()))
@@ -3465,27 +3464,32 @@ mod tests {
             restored_ammo_state, saved_ammo_state,
             "each travel Ammunition.AmmoAmount must survive the restore"
         );
-        let saved_m60 = saved
+        // The route's fired Beretta is in the saved+restored chain (not the selected weapon -
+        // the game's own post-burst switch left Fists selected), so AcceptInventory must
+        // preserve its saved clip; the BringUp ReloadCount clamp at restore applies only to the
+        // selected weapon.
+        let saved_beretta = saved
             .inventory
             .iter()
-            .find(|item| item.class_path.eq_ignore_ascii_case("XIII.m60"))
-            .expect("saved M60 actor");
-        let m60_ammo = saved
-            .inventory
+            .find(|item| item.class_path.eq_ignore_ascii_case("XIII.Beretta"))
+            .expect("saved Beretta actor");
+        let restored_beretta = restored_inventory
             .iter()
-            .find(|item| item.class_path.eq_ignore_ascii_case("XIII.M60Ammo"))
-            .and_then(|item| item.ammo_amount)
-            .expect("saved M60 ammunition actor");
-        let saved_clip = saved_m60.reload_count.expect("saved M60 ReloadCount");
-        let expected_clip = saved_clip.min(m60_ammo);
-        let loaded_clip = match resumed.vm().get_property(restored_weapon, "ReloadCount") {
-            Some(xiii_script::Value::Int(v)) => *v,
-            Some(xiii_script::Value::Byte(v)) => i32::from(*v),
-            other => panic!("restored M60 ReloadCount missing/unsupported: {other:?}"),
-        };
+            .find(|item| item.class_path.eq_ignore_ascii_case("XIII.Beretta"))
+            .expect("restored Beretta actor");
         assert_eq!(
-            loaded_clip, expected_clip,
-            "XIIIWeapon.Active.BeginState clamps ReloadCount to the remaining AmmoAmount on BringUp"
+            restored_beretta.reload_count, saved_beretta.reload_count,
+            "the saved Beretta's ReloadCount must survive the restore"
+        );
+        let saved_c9mm = saved
+            .inventory
+            .iter()
+            .find(|item| item.class_path.eq_ignore_ascii_case("XIII.c9mmAmmo"))
+            .and_then(|item| item.ammo_amount)
+            .expect("saved Beretta ammunition actor");
+        assert!(
+            saved_c9mm >= 0,
+            "invalid saved c9mm ammo count: {saved_c9mm}"
         );
         assert!(
             resumed.events.iter().any(|(_, event)| matches!(event,
@@ -4586,15 +4590,16 @@ mod tests {
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
         let route = script::Script::parse(include_str!("../../tests/data/plage01_route.script"))
             .expect("parse the checked-in Plage01 route fixture");
-        // item30c: the walked route kills BaseSoldier6 at ~360.5 s; the death pose needs a few
-        // seconds after that (the run stops long before the level-end travel at ~454 s).
+        // item30c: the walked route kills BaseSoldier6 at ~374.75 s with the Beretta; the death
+        // pose needs a few seconds after that (the run stops long before the level-end travel at
+        // ~469 s).
         let outcome = run_script(
             &game_dir,
             "Plage01",
             &route,
             &resolved.params,
             &scene,
-            375.0,
+            395.0,
         )
         .expect("run the requested Plage01 route through the killer");
         let vm = outcome.session.vm();

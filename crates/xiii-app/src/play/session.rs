@@ -637,13 +637,6 @@ impl Session {
                         0,
                         Value::Object(Some(ObjRef::Instance(touched))),
                     );
-                    let item_name = self.vm.objects[item as usize].name.clone();
-                    let pawn_name = self.vm.objects[touched as usize].name.clone();
-                    println!(
-                        "[play] t={:.3}s corpse-chain bridge: {} on dead {} gets Instigator={} \
-                         (the game's SearchPawn drain needs the chain owner)",
-                        self.vm.time, item_name, pawn_name, pawn_name
-                    );
                 }
                 cur = instance_prop(&self.vm, item, "Inventory");
             }
@@ -2384,14 +2377,6 @@ impl Session {
     }
 
     fn record_failure(&mut self, name: &str, e: &VmError) {
-        // item30 temporary: suspension visibility (removed with the investigation).
-        if self.failures.len() + self.suspended.len() < 200 {
-            println!(
-                "[play] suspend t={:.3}s {name}: {}",
-                self.vm.time,
-                e.to_string().split('\n').next().unwrap_or("")
-            );
-        }
         if !self.suspended.iter().any(|s| s == name) {
             self.suspended.push(name.to_owned());
         }

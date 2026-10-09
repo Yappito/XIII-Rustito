@@ -2,10 +2,13 @@
 # walks from local/reports/item30-plage01-walk.md (hut, beach nav walk incl. the running jump
 # over the crate wall, TouchTrigger8/7 + killer, truck return legs + Porte1).
 #
-# The `weapon XIII.m60` grant is a diagnostic weapon bootstrap that stays: the level's own
-# picked-up Beretta is mis-wired to the pawn's fists ammo by the game's decoded pickup chain
-# (zero damage; see the report's "Weapon decision"), and fixing that mis-wiring is a separate
-# task. The fire/death/corpse-search/inventory work is the game's own code.
+# No weapon is granted: the player fights with the level's own picked-up Beretta. The `equip`
+# after the T8 scene handback re-selects it through the game's own `Weapon.BringUp` ->
+# `ChangedWeapon` switch, because the scripted scene had left `Fists` selected. Measured on the
+# merged branch (scratch item30c_e7e): the walked-up Beretta fires c9mmAmmo and kills the parked
+# killer with 35 Spine1 hits (18 hp each) - origin/main's
+# opt_in_plage01_beretta_pickup_uses_nine_mm_and_damages_soldier covers the same pickup damage
+# path from the north pose. The fire/death/corpse-search/inventory work is the game's own code.
 #
 # The killer (BaseSoldier6) walks while attacking, so the view is tracked onto it around the
 # firing (`track BaseSoldier6` / `track off`).
@@ -44,8 +47,15 @@ t=73.30 forward 0
 t=73.50 goto -307.0 -1400.0
 
 # ---- beach: nav polyline southwest to the truck shore ------------------------------------
-# Waypoints are the map's decoded ReachSpec polyline; each goto fires at distance/150 + 2 s
-# (the slowest measured shore pace), so the driver never runs ahead of the player. The crate
+# Waypoints are the map's decoded ReachSpec polyline. The distance/150 + 2 s per goto is a
+# lead-time SCHEDULE, not a speed claim: the player walks at the sim's decoded GroundSpeed
+# 472 UU/s (measured max sample 472.2 in the route run; AccelRate 2048 reaches it in 0.23 s),
+# median 352.6 UU/s while moving over the shore legs (per-leg re-acceleration and cornering),
+# and 150 UU/s is 2.3x below that, so the waypoint is always reached before the next command
+# fires (the route then stands at the waypoint: 66% of the shore window is scheduled waiting,
+# longest spans 5.5-7 s match the schedule gaps). The margin exists because earlier walked
+# segments measured per-leg stalls (ramps, corners, the crate-wall notch) at 143-180 UU/s
+# leg pace; the schedule keeps the route robust to them. The crate
 # wall at the west end (stack top 1132 vs the 1067 passerelle shelf) is crossed with a running
 # jump - UE2 movement: 65 UU is above the 35 UU step and below the 92.8 UU jump apex.
 t=77.70 goto 643.3 -2397.5
@@ -101,44 +111,70 @@ t=309.50 goto 1282.4 -12591.3
 # he parks at ~(1771,-13026) (measured with track, scratch item30c_e3/e5/e6). The north firing
 # pose and a 372 UU southern spot deal zero damage (the wall blocks; measured), so the player
 # walks down the proven nav legs after the T8 handback (~13 s scene hold) and fights from
-# (1771,-13200), 174 UU south of him - measured kill in 12 m60 shots + CorpseSearched there
-# (scratch item30c_e6). The killer walks while attacking, so the view is tracked onto it.
-t=326.00 weapon XIII.m60
+# (1771,-13200), 174 UU south of him. The killer walks while attacking, so the view is tracked
+# onto it. `equip` re-selects the picked-up Beretta: the scripted T8 scene had left `Fists`
+# selected (measured: without it the fires were fist swings - weapon Fists3, bone None).
+t=326.00 equip
 t=326.40 goto 1282.4 -12591.3
 t=333.00 goto 770.5 -12990.7
 t=340.50 goto 1282.8 -13568.0
 t=348.50 goto 1771.0 -13200.0
 t=355.00 track BaseSoldier6
-# m60 burst: 12 Spine1 hits kill (56 hp each, measured); 16 shots give margin. Spacing 0.45 s
-# is the weapon's own fire cadence.
+# Beretta burst: 35 Spine1 hits kill (18 hp each, measured, scratch e7e); 40 shots at
+# 0.55 s give margin. The semi-auto cadence is slower than the m60 burst, so the
+# tail of the route shifts by +15 s.
 t=355.50 fire
-t=355.95 fire
-t=356.40 fire
-t=356.85 fire
-t=357.30 fire
-t=357.75 fire
-t=358.20 fire
-t=358.65 fire
-t=359.10 fire
-t=359.55 fire
-t=360.00 fire
+t=356.05 fire
+t=356.60 fire
+t=357.15 fire
+t=357.70 fire
+t=358.25 fire
+t=358.80 fire
+t=359.35 fire
+t=359.90 fire
 t=360.45 fire
-t=360.90 fire
-t=361.35 fire
-t=361.80 fire
-t=362.25 fire
-t=366.00 search BaseSoldier6
+t=361.00 fire
+t=361.55 fire
+t=362.10 fire
+t=362.65 fire
+t=363.20 fire
+t=363.75 fire
+t=364.30 fire
+t=364.85 fire
+t=365.40 fire
+t=365.95 fire
+t=366.50 fire
+t=367.05 fire
+t=367.60 fire
+t=368.15 fire
+t=368.70 fire
+t=369.25 fire
+t=369.80 fire
+t=370.35 fire
+t=370.90 fire
+t=371.45 fire
+t=372.00 fire
+t=372.55 fire
+t=373.10 fire
+t=373.65 fire
+t=374.20 fire
+t=374.75 fire
+t=375.30 fire
+t=375.85 fire
+t=376.40 fire
+t=376.95 fire
+t=381.00 search BaseSoldier6
 
 # ---- Segment D: walked return legs (fight spot -> PathNode48 -> PathNode47 -> PathNode18
 # -> AttackPoint43), then the truck staging point -------------------------------------------
-t=367.00 goto 1282.8 -13568.0
-t=374.50 goto 643.2 -14174.5
-t=383.00 goto 1235.0 -14319.0
-t=389.50 goto 1391.8 -14279.6
-t=392.50 goto 1215.0 -14000.0
+t=382.0 goto 1282.8 -13568.0
+t=389.5 goto 643.2 -14174.5
+t=398.0 goto 1235.0 -14319.0
+t=404.5 goto 1391.8 -14279.6
+t=407.5 goto 1215.0 -14000.0
 # Porte1 is interaction-hidden, so the named use is required; two uses (Unlocked + Triggered).
-t=397.00 yaw 270.0
-t=397.10 use Porte1
-t=398.10 use Porte1
-t=398.60 wait_travel
-t=400.60 forward 0
+t=412.0 yaw 270.0
+t=412.1 use Porte1
+t=413.1 use Porte1
+t=413.6 wait_travel
+t=415.6 forward 0
