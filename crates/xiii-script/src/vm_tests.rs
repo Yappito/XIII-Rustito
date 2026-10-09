@@ -737,9 +737,10 @@ fn registry_entries_are_documented() {
     // save-slot declarations; item40c adds the headless Interaction.Initialize and ForceFeedback
     // viewport/device Partials; item43 adds Actor.TraceActors; the item47b banque01 regression
     // fix adds `PlayerController.AdjustAimForDisplay` (498); item49b adds
-    // `Actor.DetachFromBone` (403). Must equal
+    // `Actor.DetachFromBone` (403); item51b adds the decoded `BaseSoldier.EyePosition`
+    // (XIDPawn.dll 0x119012b0) and `BloodFlow.GrowBloodFlow` (Xiii.dll 0x11b01000). Must equal
     // `Registry::builtin().defs().count()`.
-    assert_eq!(defs.len(), 333);
+    assert_eq!(defs.len(), 335);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),

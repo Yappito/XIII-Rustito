@@ -4556,6 +4556,17 @@ mod tests {
         // turns the player to him; then the aim is raised to his head (pitch +5 deg, as before:
         // a body-centre aim is a chest hit and the clip runs out before he dies). The battle is
         // entirely script-driven (no host damage).
+        //
+        // item51b: the decoded `Weapon.GetFireStart` (Engine.dll 0x10386ea0) now adds the rotated
+        // `FireOffset` to the eye position. That moves the Beretta muzzle ~10.6 UU forward, out of
+        // the soldier's posed head box that the old eye-position start overlapped (the teleported
+        // player touches BaseSoldier6), so hits classify `X Spine1` (~31 damage, measured) instead
+        // of `X Head` (~67.5 damage, measured at the old point-blank start). 625 HP therefore
+        // needs 21 body hits: the burst is extended to 24 shots (tolerating 3 misses, e.g. the
+        // first shot before the wake-up restores his collision) with the same cadence and aim.
+        // The granted Beretta carries only its default ammunition (12 measured hits); the
+        // mid-burst re-grant runs the game's own GiveTo ammo merge (engine.u 0x0305..0x042B)
+        // instead of a host-side ammo write.
         let script = script::Script::parse(&format!(
             "{}t=59.00 weapon XIII.Beretta\n\
              t=60.00 teleport 1802.0 -12700.0 1100.0\n\
@@ -4563,7 +4574,10 @@ mod tests {
              t=60.05 track off\n\
              t=60.05 pitch 5\n\
              t=60.10 fire\nt=60.70 fire\nt=61.30 fire\nt=61.90 fire\nt=62.50 fire\nt=63.10 fire\n\
-             t=63.70 fire\nt=64.30 fire\nt=64.90 fire\nt=65.50 fire\nt=66.10 fire\n",
+             t=63.70 fire\nt=64.30 fire\nt=64.90 fire\nt=65.50 fire\nt=66.10 fire\nt=66.70 fire\n\
+             t=67.00 weapon XIII.Beretta\n\
+             t=67.30 fire\nt=67.90 fire\nt=68.50 fire\nt=69.10 fire\nt=69.70 fire\nt=70.30 fire\n\
+             t=70.90 fire\nt=71.50 fire\nt=72.10 fire\nt=72.70 fire\nt=73.30 fire\nt=73.90 fire\n",
             plage01_killer_awake_prefix()
         ))
         .unwrap();
@@ -4573,7 +4587,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            68.0,
+            78.0,
         )
         .expect("run Plage01 fight");
         let s = &outcome.session;
@@ -4590,8 +4604,10 @@ mod tests {
         let weapon = s.player_weapon();
         if std::env::var("XIII_SURVEY").as_deref() == Ok("1") {
             for event in &s.vm().trace {
-                if event.time >= 60.0 && matches!(&event.kind,
-                    xiii_script::TraceKind::Note(n) if n.starts_with("combat-ray")) {
+                if event.time >= 60.0
+                    && matches!(&event.kind,
+                    xiii_script::TraceKind::Note(n) if n.starts_with("combat-ray"))
+                {
                     println!("[item51b-kill-ray] {event:?}");
                 }
             }
