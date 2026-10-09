@@ -3992,6 +3992,40 @@ fn trace_actors_orders_hits_filters_class_and_returns_all_outs() {
     );
 }
 
+#[test]
+fn item49_view_target_requires_aim_range_and_clear_world_segment() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let caller = phys_actor(&mut vm, &set, "Viewer", [0.0, 0.0, 40.0]);
+    let target = phys_actor(&mut vm, &set, "Pickup", [100.0, 0.0, 40.0]);
+    set_collision_fields(&mut vm, target, true, true);
+    let start = [0.0, 0.0, 40.0];
+    let trace = |vm: &mut Vm<'_>, end| {
+        vm.vm_trace_actors(caller, None, start, end, [0.0; 3])
+            .unwrap()
+    };
+    assert_eq!(trace(&mut vm, [160.0, 0.0, 40.0])[0].0, target);
+    assert!(
+        trace(&mut vm, [-160.0, 0.0, 40.0]).is_empty(),
+        "looking away cannot target a named pickup"
+    );
+    vm.set_property(target, "Location", 0, Value::Vector([200.0, 0.0, 40.0]));
+    assert!(
+        trace(&mut vm, [160.0, 0.0, 40.0]).is_empty(),
+        "out-of-reach pickup"
+    );
+    // An explicit synthetic floor occludes the pickup below it.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([-100.0, -100.0, -1.0], [100.0, 100.0, 1.0]),
+    ));
+    vm.set_property(target, "Location", 0, Value::Vector([0.0, 0.0, -40.0]));
+    assert!(
+        trace(&mut vm, [0.0, 0.0, -120.0]).is_empty(),
+        "world geometry occludes interaction"
+    );
+}
+
 /// Item47b: the decoded engine actor-trace filter (`trace_admits_actor`). Each case maps to a
 /// measured Engine.dll behavior cited in the function's documentation.
 #[test]
@@ -4851,6 +4885,13 @@ fn anim_fixture() -> Vec<u8> {
     let base = b.reserve(IMP_OBJECTPROP, actor, "Base");
     let static_mesh = b.reserve(IMP_OBJECTPROP, actor, "StaticMesh");
 
+    let selected = b.reserve(IMP_OBJECTPROP, actor, "Selected");
+    let pending = b.reserve(IMP_OBJECTPROP, actor, "Pending");
+    let switching = b.reserve(IMP_STATE, actor, "Switching");
+    let begin_switch = b.reserve(IMP_FUNCTION, switching, "BeginState");
+    let end_switch = b.reserve(IMP_FUNCTION, switching, "AnimEnd");
+    let end_channel = b.reserve(IMP_INTPROP, end_switch, "Channel");
+
     let link = b.reserve(IMP_FUNCTION, actor, "LinkSkelAnim");
     let link_anim = b.reserve(IMP_OBJECTPROP, link, "Anim");
     let play = b.reserve(IMP_FUNCTION, actor, "PlayAnim");
@@ -4889,7 +4930,9 @@ fn anim_fixture() -> Vec<u8> {
     b.prop(counter, attachment_bone, 0);
     b.prop(attachment_bone, base, 0);
     b.prop_with(base, static_mesh, 0, &object_extra);
-    b.prop_with(static_mesh, link, 0, &object_extra);
+    b.prop_with(static_mesh, selected, 0, &object_extra);
+    b.prop_with(selected, pending, 0, &object_extra);
+    b.prop_with(pending, link, 0, &object_extra);
 
     b.prop_with(link_anim, 0, PARM, &object_extra);
     b.func(link, play, link_anim, &[], 0, 413, FINAL | NATIVE | STATIC);
@@ -4954,7 +4997,49 @@ fn anim_fixture() -> Vec<u8> {
     anim_code.extend([0x0F, 0x01, rc, 0x26]);
     anim_code.push(0x08);
     anim_code.extend([0x0C, begin, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    b.state(animating, 0, &anim_code, 0x24, 0x13);
+    b.state(animating, switching, &anim_code, 0x24, 0x13);
+
+    // Authored synthetic example: start a finite Down clip on state entry; selection changes
+    // only in the state-aware animation callback. No retail bytecode is embedded here.
+    let down = b.name("Down") as u8;
+    let mut select_code = vec![0x61, 0x03, 0x21, down, 0x1E];
+    select_code.extend(1.0f32.to_le_bytes());
+    select_code.push(0x1E);
+    select_code.extend(0.0f32.to_le_bytes());
+    select_code.extend([0x25, 0x16, 0x04, 0x0B]);
+    b.func(
+        begin_switch,
+        end_switch,
+        0,
+        &select_code,
+        21,
+        0,
+        EVENT | DEFINED,
+    );
+    b.prop(end_channel, 0, PARM);
+    let end_code = [
+        0x0F,
+        0x01,
+        selected as u8,
+        0x01,
+        pending as u8,
+        0x0F,
+        0x01,
+        counter as u8,
+        0x26,
+        0x04,
+        0x0B,
+    ];
+    b.func(
+        end_switch,
+        0,
+        end_channel,
+        &end_code,
+        20,
+        0,
+        EVENT | DEFINED,
+    );
+    b.state_children(switching, 0, begin_switch, &[0x08], 1, 0xFFFF);
 
     b.prop_with(view_target, svt, 0, &object_extra);
     b.prop_with(svt_param, 0, PARM, &object_extra);
@@ -5032,6 +5117,64 @@ fn play_anim_fires_anim_end_once_at_the_right_tick() {
     assert_eq!(vm.get_property(a, "AnimFrame"), Some(&Value::Float(0.75)));
     // Further ticks do not fire it again.
     vm.tick(0.5).unwrap();
+    assert_eq!(anim_end_count(&vm), 1);
+}
+
+#[test]
+fn item49_deferred_selection_waits_for_clip_end_and_uses_latest_pending() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(11, 10.0)));
+    let weapon = vm.spawn(sg(&set, "Actor"), "Weapon").unwrap();
+    let old = vm.spawn(sg(&set, "Actor"), "Old").unwrap();
+    let next = vm.spawn(sg(&set, "Actor"), "Next").unwrap();
+    let latest = vm.spawn(sg(&set, "Actor"), "Latest").unwrap();
+    let reference = |id| Value::Object(Some(ObjRef::Instance(id)));
+    vm.set_property(weapon, "Selected", 0, reference(old));
+    vm.set_property(weapon, "Pending", 0, reference(next));
+    vm.set_active(weapon, true);
+    vm.goto_state(weapon, "Switching", None).unwrap();
+    // Repeated small steps must not switch early, and retargeting an in-flight selection
+    // must use the latest pending value when the callback actually runs.
+    for _ in 0..9 {
+        vm.tick(0.1).unwrap();
+        assert_eq!(vm.get_property(weapon, "Selected"), Some(&reference(old)));
+    }
+    vm.set_property(weapon, "Pending", 0, reference(latest));
+    vm.tick(0.11).unwrap();
+    assert_eq!(
+        vm.get_property(weapon, "Selected"),
+        Some(&reference(latest))
+    );
+    assert_eq!(vm.get_property(weapon, "Counter"), Some(&Value::Int(1)));
+    assert_eq!(anim_end_count(&vm), 1);
+    vm.set_property(weapon, "Counter", 0, Value::Int(0));
+    vm.tick(2.0).unwrap();
+    assert_eq!(vm.get_property(weapon, "Counter"), Some(&Value::Int(0)));
+    assert_eq!(
+        anim_end_count(&vm),
+        1,
+        "completed clip cannot deliver twice"
+    );
+}
+
+#[test]
+fn item49_interrupted_down_clip_cannot_complete_old_selection() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(11, 10.0)));
+    let weapon = vm.spawn(sg(&set, "Actor"), "Weapon").unwrap();
+    vm.set_active(weapon, true);
+    vm.goto_state(weapon, "Switching", None).unwrap();
+    vm.tick(0.8).unwrap();
+    play_anim(&mut vm, weapon, "Replacement", 1.0, 0);
+    vm.tick(0.3).unwrap();
+    assert_eq!(
+        anim_end_count(&vm),
+        0,
+        "the interrupted Down end must be cancelled"
+    );
+    vm.tick(0.71).unwrap();
     assert_eq!(anim_end_count(&vm), 1);
 }
 

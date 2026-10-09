@@ -990,14 +990,13 @@ fn fixed_step(
     }
     // Always advance the script so an explicit `take_control` diagnostic can be read even while a cutscene
     // suppresses input; the axis input and the other command queues are dropped when suppressed.
-    let (mut input, weapons, goals, equip, use_named, search) = match script.drive.as_mut() {
+    let (mut input, weapons, goals, use_named, search) = match script.drive.as_mut() {
         Some(drive) => {
             let input = drive.advance(elapsed, &mut sim.0);
             (
                 input,
                 drive.take_weapons(),
                 drive.take_goals(),
-                drive.take_equip(),
                 drive.take_use_named(),
                 drive.take_search(),
             )
@@ -1006,11 +1005,39 @@ fn fixed_step(
             read_keyboard(&keys, &buttons),
             Vec::new(),
             Vec::new(),
-            false,
             Vec::new(),
             Vec::new(),
         ),
     };
+    let mut weapon_inputs = if let Some(drive) = script.drive.as_mut() {
+        drive.take_weapon_inputs()
+    } else {
+        let groups = [0, 1, 2, 3, 4, 6, 9, 11, 14, 15];
+        let digits = [
+            KeyCode::Digit0,
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+            KeyCode::Digit5,
+            KeyCode::Digit6,
+            KeyCode::Digit7,
+            KeyCode::Digit8,
+            KeyCode::Digit9,
+        ];
+        let mut inputs: Vec<_> = digits
+            .into_iter()
+            .zip(groups)
+            .filter_map(|(key, group)| keys.just_pressed(key).then_some(Some(group)))
+            .collect();
+        if keys.just_pressed(KeyCode::KeyX) || keys.just_pressed(KeyCode::PageUp) {
+            inputs.push(None);
+        }
+        inputs
+    };
+    if suppressed {
+        weapon_inputs.clear();
+    }
     let wake: Vec<String> = script
         .drive
         .as_mut()
@@ -1023,10 +1050,10 @@ fn fixed_step(
     if suppressed {
         input = Input::default();
     }
-    let (weapons, goals, equip, use_named, search) = if suppressed {
-        (Vec::new(), Vec::new(), false, Vec::new(), Vec::new())
+    let (weapons, goals, use_named, search) = if suppressed {
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
     } else {
-        (weapons, goals, equip, use_named, search)
+        (weapons, goals, use_named, search)
     };
     let use_action = input.use_action;
     let fire = input.fire;
@@ -1073,6 +1100,7 @@ fn fixed_step(
             floor_normal: sim.0.floor_normal,
         };
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
+        sess.sync_view_rotation(sim.0.yaw, sim.0.pitch);
         if let Some((location, yaw, velocity)) = sess.script_pawn_pose() {
             sim.0.location = location;
             sim.0.yaw = yaw;
@@ -1132,10 +1160,9 @@ fn fixed_step(
                 println!("[play] set_goal {n} failed: {e}");
             }
         }
-        if equip {
-            match sess.equip_inventory_weapon() {
-                Ok(msg) => println!("[play] equip {msg}"),
-                Err(e) => println!("[play] equip failed: {e}"),
+        for group in weapon_inputs {
+            if let Err(e) = sess.weapon_input(group) {
+                sess.blocked.push(format!("weapon input {group:?}: {e}"));
             }
         }
         if control {
@@ -2120,7 +2147,7 @@ fn run_script_inner(
         let mut input = drive.advance(elapsed, &mut runtime.sim);
         let mut weapons = drive.take_weapons();
         let goals = drive.take_goals();
-        let mut equip = drive.take_equip();
+        let mut weapon_inputs = drive.take_weapon_inputs();
         let mut use_named = drive.take_use_named();
         let mut search = drive.take_search();
         let wake = drive.take_wake();
@@ -2133,7 +2160,7 @@ fn run_script_inner(
         if respect_cinematic_input && cinematics::input_suppressed(&runtime.session) {
             input = Input::default();
             weapons.clear();
-            equip = false;
+            weapon_inputs.clear();
             use_named.clear();
             search.clear();
             // `wake` is a host bridge like `set_goal`, not a player input: it stays available
@@ -2173,7 +2200,6 @@ fn run_script_inner(
             landed_velocity_z: runtime.sim.landed.then_some(runtime.sim.land_velocity_z),
             floor_normal: runtime.sim.floor_normal,
         };
-        runtime.session.drive_render_phase();
         runtime.session.step(
             DT,
             runtime.sim.location,
@@ -2181,6 +2207,10 @@ fn run_script_inner(
             runtime.sim.velocity,
             &modes,
         );
+        runtime
+            .session
+            .sync_view_rotation(runtime.sim.yaw, runtime.sim.pitch);
+        runtime.session.drive_render_phase();
         if let Some((location, yaw, velocity)) = runtime.session.script_pawn_pose() {
             runtime.sim.location = location;
             runtime.sim.yaw = yaw;
@@ -2205,10 +2235,9 @@ fn run_script_inner(
                 println!("[play] set_goal {n} failed: {e}");
             }
         }
-        if equip {
-            match runtime.session.equip_inventory_weapon() {
-                Ok(msg) => println!("[play] equip {msg}"),
-                Err(e) => println!("[play] equip failed: {e}"),
+        for group in weapon_inputs {
+            if let Err(e) = runtime.session.weapon_input(group) {
+                return Err(format!("weapon input {group:?}: {e}"));
             }
         }
         if control {
@@ -4007,6 +4036,15 @@ mod tests {
         // the player ends crouched inside the duct, west of the broken grille.
         let vm = outcome.session.vm();
         assert!(
+            vm.trace.iter().any(|event| {
+                (123.0..123.1).contains(&event.time)
+                    && matches!(&event.kind,
+                xiii_script::TraceKind::Event { function, .. }
+                    if function.ends_with("XIIIPlayerController.Grab"))
+            }),
+            "the chair must be grabbed by the controller script, not a host Touch bridge"
+        );
+        assert!(
             vm.find_live_object("BreakAbleMover16").is_none(),
             "the chair swing must break (destroy) the duct grille BreakAbleMover16"
         );
@@ -4538,7 +4576,8 @@ mod tests {
     /// grant command is used. The authored entry defaults equip `Fists` (`AcceptInventory` at
     /// map entry), and the authored `Weapon.ClientWeaponSet(True)` deliberately does not switch
     /// a human-controlled pawn that already holds a weapon (bytecode 0x0084), so the route
-    /// equips the picked-up Beretta through the game's own `BringUp` switch, as a player would.
+    /// selects the picked-up Beretta through SwitchWeapon(2), which waits for the old weapon's
+    /// decoded Down animation before ChangedWeapon brings up the new weapon.
     /// The route wakes `BaseSoldier6` first: the map parks him in `IAController.faction`
     /// (invisible, `bCollideActors=false`) until a scripted trigger fires his controller.
     #[test]
@@ -4566,7 +4605,7 @@ mod tests {
              t=60.00 teleport 1802.0 -12700.0 1100.0\n\
              t=60.00 track BaseSoldier6\n\
              t=60.05 track off\nt=60.05 pitch 5\n\
-             t=60.10 equip\n\
+             t=60.10 switch_weapon 2\n\
              t=60.20 fire\nt=60.80 fire\nt=61.40 fire\nt=62.00 fire\nt=62.60 fire\n",
         )
         .expect("parse pickup combat route");
@@ -4584,6 +4623,39 @@ mod tests {
             .player_weapon()
             .expect("map pickup must equip the Beretta");
         let vm = session.vm();
+        let down = vm
+            .trace
+            .iter()
+            .find(|event| {
+                event.time >= 60.1
+                    && matches!(&event.kind,
+                xiii_script::TraceKind::StateChange { actor, to: Some(state), .. }
+                    if actor.starts_with("Fists") && state == "DownWeapon")
+            })
+            .expect("SwitchWeapon must lower the old Fists through DownWeapon");
+        let ended = vm
+            .trace
+            .iter()
+            .find(|event| {
+                event.time > down.time
+                    && matches!(&event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target.starts_with("Fists") && function.ends_with("DownWeapon.AnimEnd"))
+            })
+            .expect("decoded Down clip must deliver the state-scoped AnimEnd later");
+        assert!(
+            vm.trace.iter().any(|event| {
+                event.time == ended.time
+                    && matches!(&event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target == &session.player_name && function.ends_with("ChangedWeapon"))
+            }),
+            "the old weapon's AnimEnd must call Pawn.ChangedWeapon"
+        );
+        println!(
+            "[item49] Fists DownWeapon at {:.3}s -> AnimEnd/ChangedWeapon at {:.3}s",
+            down.time, ended.time
+        );
         let pickup = vm
             .objects
             .iter()
