@@ -5032,4 +5032,115 @@ mod tests {
             "no low-clearance spot (100..148 UU) where standing is blocked and crouch fits was found"
         );
     }
+
+    /// Opt-in corpus test (item50): a player-input route across Toits01 from the start roof to
+    /// TouchTrigger10 at the pad. The route fires the game's own Touch on TT10, but goal 0 does
+    /// not complete: XIII's TouchTrigger.Touch requires `self.bActif`, and TT10 is authored
+    /// `bActif=false` (`bActivableParTrigger=true`, Tag `PorteDebloquee`) - it arms only when
+    /// BreakableMover12 (the generator, Health 50) is destroyed, and the generator's yard is
+    /// sealed against the route's input in the current sim. Goals 1 and 2 are unreachable for
+    /// the independent demo-wedge reason (the CineController2 grapple demonstration can never
+    /// complete, so the scene blocks forever at `wait event JonesHookEnd`). This test pins the
+    /// measured state so the blockers cannot silently regress.
+    #[test]
+    fn opt_in_toits01_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Toits01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Toits01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/toits01_route.script");
+        let script = script::Script::load(&route_path).expect("load item50 Toits01 route");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Toits01",
+            &script,
+            &resolved.params,
+            &scene,
+            300.0,
+        )
+        .expect("run Toits01 route");
+        let session = &outcome.session;
+        let objectives = session.objective_states();
+        println!(
+            "[toits01 route] objectives={objectives:?} travel={:?} final_map={}",
+            outcome.travel, outcome.final_map
+        );
+        assert_eq!(outcome.final_map, "Toits01");
+        assert!(
+            outcome.travel.is_empty(),
+            "route unexpectedly travelled: {:?}",
+            outcome.travel
+        );
+        // The route completes the level's walk with the player alive.
+        let health = session
+            .player_health()
+            .expect("the player must stay alive across the route");
+        assert!(health > 0.0, "the player must not die on the route");
+        // Goal 3 (Jones must not die) completes; goals 0/1/2 do not.
+        for o in &objectives {
+            match o.index {
+                3 => assert!(o.completed, "the survival objective must complete: {o:?}"),
+                0..=2 => assert!(
+                    !o.completed,
+                    "objective {} must stay incomplete in this fixture (measured blockers): {o:?}",
+                    o.index
+                ),
+                _ => {}
+            }
+        }
+        // The route fires the game's own Touch on TouchTrigger10 with the player pawn.
+        let vm = session.vm();
+        let tt10_touched = vm.trace.iter().any(|event| {
+            matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, args }
+                    if target.eq_ignore_ascii_case("TouchTrigger10")
+                        && function.ends_with("TouchTrigger.Touch")
+                        && args.iter().any(|a| a.contains("XIIIPlayerPawn"))
+            )
+        });
+        assert!(
+            tt10_touched,
+            "the route must reach and touch TouchTrigger10 (the game's own trigger)"
+        );
+        // The measured blocker, pinned: TT10 stays disarmed (bActif=false) because the
+        // generator BreakableMover12 that drives the PorteDebloquee chain is never destroyed;
+        // and goals 1/2's scene stays blocked at the grapple-demo wait.
+        let tt10 = vm
+            .objects
+            .iter()
+            .enumerate()
+            .position(|(i, o)| {
+                vm.set().path(o.class).ends_with("TouchTrigger")
+                    && vm
+                        .get_property(i as u32, "Event")
+                        .map(|v| v.to_string().contains("RenfortHelico02"))
+                        .unwrap_or(false)
+            })
+            .expect("TouchTrigger10 (Event RenfortHelico02) must exist on Toits01");
+        assert_eq!(
+            vm.get_property(tt10 as u32, "bActif"),
+            Some(&xiii_script::Value::Bool(false)),
+            "TouchTrigger10 must stay disarmed: the generator chain never ran"
+        );
+        let generator = vm
+            .find_object("BreakableMover12")
+            .expect("the generator BreakableMover12 must exist");
+        assert_eq!(
+            vm.get_property(generator, "Health"),
+            Some(&xiii_script::Value::Int(50)),
+            "the generator must be undamaged: the route's input cannot reach it (the yard's              ForeverLocked door line blocks every walk line and the through-window shot never              lands; see local/reports/item50-toits01-route.md)"
+        );
+        println!(
+            "[toits01 route] blockers pinned: TT10.bActif=false (generator Health 50 intact),              goals 1/2 blocked by the scene's grapple-demo wedge; goal 0's Touch fired but its              XIII TouchTrigger.Touch guard requires bActif"
+        );
+    }
 }
