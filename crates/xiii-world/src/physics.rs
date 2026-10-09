@@ -136,6 +136,17 @@ impl WorldPhysicsAdapter {
     /// Shared implementation of [`WorldPhysics::trace`] and [`WorldPhysics::move_box`]: a
     /// swept (or zero-extent ray) query in Unreal space, returned as a [`WorldHit`].
     fn swept_hit(&self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
+        self.swept_hit_source(start, end, extent)
+            .map(|(hit, _)| hit)
+    }
+
+    /// [`Self::swept_hit`] plus the collision source id of the hit triangle.
+    fn swept_hit_source(
+        &self,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+    ) -> Option<(WorldHit, u32)> {
         let s = to_bevy_position(start);
         let e = to_bevy_position(end);
         let half = unreal_extent_to_bevy(extent);
@@ -152,17 +163,48 @@ impl WorldPhysicsAdapter {
             s[1] + (e[1] - s[1]) * t,
             s[2] + (e[2] - s[2]) * t,
         ];
-        Some(WorldHit {
-            location: bevy_to_unreal_position(point),
-            normal: bevy_to_unreal_direction(hit.normal),
-            time: t,
-        })
+        Some((
+            WorldHit {
+                location: bevy_to_unreal_position(point),
+                normal: bevy_to_unreal_direction(hit.normal),
+                time: t,
+            },
+            hit.source,
+        ))
     }
 }
 
 impl WorldPhysics for WorldPhysicsAdapter {
     fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
         self.swept_hit(start, end, extent)
+    }
+
+    fn trace_with_mover(
+        &mut self,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+    ) -> (Option<WorldHit>, Option<String>) {
+        match self.swept_hit_source(start, end, extent) {
+            Some((hit, source)) => {
+                // A registered (moving) mover by its name; otherwise the actor part of the static
+                // `"<actor> -> <mesh>"` source label (a mover still at its base pose keeps its
+                // triangles in the static soup until it first moves). The VM decides whether the
+                // named actor is a mover that blocks the trace.
+                let actor = self
+                    .mover_names_by_source
+                    .get(&source)
+                    .cloned()
+                    .or_else(|| {
+                        self.source_names
+                            .get(source as usize)
+                            .and_then(|label| label.split_once(" -> "))
+                            .map(|(actor, _)| actor.to_owned())
+                    });
+                (Some(hit), actor)
+            }
+            None => (None, None),
+        }
     }
 
     fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
@@ -314,6 +356,15 @@ impl WorldPhysics for WorldPhysicsAdapter {
         self.movers.push((box_index, line_index));
     }
 
+    fn set_mover_collision(&mut self, actor: &str, enabled: bool) {
+        let Some(&i) = self.mover_by_name.get(&actor.to_ascii_lowercase()) else {
+            return;
+        };
+        let (box_index, line_index) = self.movers[i];
+        self.box_world.set_moving_enabled(box_index, enabled);
+        self.line_world.set_moving_enabled(line_index, enabled);
+    }
+
     fn set_mover(&mut self, actor: &str, location: [f32; 3], rotation: [i32; 3]) {
         let Some(&i) = self.mover_by_name.get(&actor.to_ascii_lowercase()) else {
             return;
@@ -456,6 +507,42 @@ mod tests {
         assert!(moved.hit.is_some(), "the brush at its new pose must block");
         // The brush's near face is now at y = 90; the pawn's half-extent is 34.
         assert!(moved.end[1] < 56.0 + 1.0, "{moved:?}");
+    }
+
+    #[test]
+    fn mover_trace_names_the_mover_and_disabled_collision_clears_it() {
+        // item40e: a world hit on a registered mover's geometry names that mover (the VM then
+        // returns the mover actor, as UE2 traces return collision-hash actors), and a mover
+        // whose actor was destroyed or stopped colliding no longer blocks traces or boxes.
+        let mut p = WorldPhysicsAdapter::from_entries(
+            Vec::<(Triangle, u32)>::new(),
+            Vec::<(Triangle, u32)>::new(),
+        );
+        let wall_u: Vec<[[f32; 3]; 3]> = vec![
+            [
+                [0.0, -100.0, -100.0],
+                [0.0, 100.0, -100.0],
+                [0.0, 100.0, 100.0],
+            ],
+            [
+                [0.0, -100.0, -100.0],
+                [0.0, 100.0, 100.0],
+                [0.0, -100.0, 100.0],
+            ],
+        ];
+        p.register_mover("Grille", 4, &wall_u, [0.0; 3], [0, 0, 0]);
+        let (start, end) = ([-200.0, 0.0, 0.0], [200.0, 0.0, 0.0]);
+        let (hit, actor) = p.trace_with_mover(start, end, [0.0; 3]);
+        assert!(hit.is_some());
+        assert_eq!(actor.as_deref(), Some("grille"));
+        p.set_mover_collision("Grille", false);
+        assert_eq!(p.trace_with_mover(start, end, [0.0; 3]), (None, None));
+        assert!(p.point_free([0.0; 3], [10.0, 10.0, 10.0]));
+        p.set_mover_collision("grille", true);
+        assert!(p.trace(start, end, [5.0, 5.0, 5.0]).is_some());
+        // Unknown names are ignored, not a panic.
+        p.set_mover_collision("NoSuchMover", false);
+        assert!(p.trace(start, end, [0.0; 3]).is_some());
     }
 
     #[test]

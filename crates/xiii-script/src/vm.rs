@@ -426,6 +426,8 @@ pub struct MoverState {
     pub phys_rate: f32,
     /// True while a `PHYS_MovingBrush` interpolation is in progress.
     pub interpolating: bool,
+    /// `bCollideActors && bBlockPlayers`: the mover currently blocks the player pawn.
+    pub blocks_players: bool,
 }
 
 /// Per-channel animation playback state owned by the VM.
@@ -1315,6 +1317,8 @@ pub struct Vm<'s> {
     /// World-collision provider (movement/trace natives). `None` = every collision native
     /// fails with [`VmErrorKind::NoPhysicsProvider`].
     pub(crate) physics: Option<Box<dyn WorldPhysics>>,
+    /// Last mover collision state sent to `physics` ([`Vm::sync_mover_collision`]).
+    mover_collision_sent: HashMap<ObjectId, bool>,
     /// Animation-sequence provider (animation natives). `None` = every native that needs
     /// sequence data fails with [`VmErrorKind::NoAnimationProvider`].
     pub(crate) animation: Option<Box<dyn AnimationData>>,
@@ -1533,6 +1537,7 @@ impl<'s> Vm<'s> {
             missing_natives: Default::default(),
             pending_latent: None,
             physics: None,
+            mover_collision_sent: HashMap::new(),
             animation: None,
             navigation: None,
             hit_zones: None,
@@ -1676,6 +1681,8 @@ impl<'s> Vm<'s> {
     /// need collision; without one those natives fail explicitly.
     pub fn set_physics(&mut self, provider: Box<dyn WorldPhysics>) {
         self.physics = Some(provider);
+        // A new provider starts with every mover enabled; resend the actual states.
+        self.mover_collision_sent.clear();
     }
 
     /// True when a world-physics provider is available.
@@ -6830,7 +6837,38 @@ impl<'s> Vm<'s> {
             phys_alpha: self.f32_prop(id, "PhysAlpha"),
             phys_rate: self.f32_prop(id, "PhysRate"),
             interpolating: self.bool_prop(id, "bInterpolating"),
+            blocks_players: self.bool_prop(id, "bCollideActors")
+                && self.bool_prop(id, "bBlockPlayers"),
         })
+    }
+
+    /// item40e: propagates every mover's collision state to the world-physics provider. A mover
+    /// that was destroyed (e.g. `BreakableMover.Breaked` -> `Destroy`) or whose `bCollideActors`
+    /// was cleared (`SetCollision`) leaves UE2's collision hash (`AActor::SetCollision` @
+    /// 0x103527D0 removes it; `FCollisionHash::AddActor` @ 0x10349980 requires
+    /// `bCollideActors`), so the VM's own `Move`/`Trace` must stop hitting its geometry; setting
+    /// the flag again restores it. Only changes are sent. Call once per tick after the VM ran.
+    pub fn sync_mover_collision(&mut self) {
+        if self.physics.is_none() {
+            return;
+        }
+        let mut changes: Vec<(String, bool)> = Vec::new();
+        for (i, o) in self.objects.iter().enumerate() {
+            if !o.is_actor || !o.layout.is_mover_class || o.name.starts_with("Default__") {
+                continue;
+            }
+            let id = i as ObjectId;
+            let enabled = !o.deleted && self.bool_prop(id, "bCollideActors");
+            if self.mover_collision_sent.get(&id) != Some(&enabled) {
+                self.mover_collision_sent.insert(id, enabled);
+                changes.push((o.name.clone(), enabled));
+            }
+        }
+        if let Some(p) = self.physics.as_mut() {
+            for (name, enabled) in changes {
+                p.set_mover_collision(&name, enabled);
+            }
+        }
     }
 
     /// First live `LevelInfo` instance, if the map has one (it is normally not in the executed
@@ -7720,6 +7758,30 @@ impl<'s> Vm<'s> {
         Ok(true)
     }
 
+    /// Whether actor `b` can be returned by an actor line/box check of the given extent kind.
+    ///
+    /// From `Engine.dll` (item40e): an actor check only walks the level's collision hash
+    /// (`FCollisionHash::ActorLineCheck` @ 0x10349C60), `FCollisionHash::AddActor` @ 0x10349980
+    /// asserts that the added actor has `bCollideActors`, and `AActor::SetCollision` @ 0x103527D0
+    /// removes the actor from the hash before the flags change and adds it back only when the new
+    /// `bCollideActors` is set. So an actor with `bCollideActors=false` (lights, nav points, hidden
+    /// info actors with the `Actor` defaults `bBlockZeroExtentTraces=true`) is never hit. Among
+    /// hash members a zero-extent check also needs `bBlockZeroExtentTraces`: `ActorLineCheck`
+    /// tests bit 0x400 of the actor's collision bitfield at 0x10349E90 / 0x10349FDC, the bit
+    /// after `bProjTarget` (bit 0x200, `AActor::ShouldTrace` @ 0x10354640) in `Actor`'s
+    /// declaration order. The non-zero-extent flag `bBlockNonZeroExtentTraces` for box checks is
+    /// upstream UE2 (not located in the disassembly).
+    fn actor_blocks_trace(&self, b: ObjectId, nonzero_extent: bool) -> bool {
+        if !self.bool_prop(b, "bCollideActors") {
+            return false;
+        }
+        if nonzero_extent {
+            self.bool_prop(b, "bBlockNonZeroExtentTraces")
+        } else {
+            self.bool_prop(b, "bBlockZeroExtentTraces")
+        }
+    }
+
     /// World-only actor trace for `Actor.Trace` when `bTraceActors` is set. Returns the
     /// nearest hit as `(time, actor, normal)`; grown cylinders approximate the extent box.
     fn trace_actors(
@@ -7730,24 +7792,12 @@ impl<'s> Vm<'s> {
         extent: [f32; 3],
     ) -> Option<(f32, ObjectId, [f32; 3])> {
         let mut best: Option<(f32, ObjectId, [f32; 3])> = None;
-        // UE2 selects actor hits by the trace extent: a zero-extent (line) trace needs
-        // `bBlockZeroExtentTraces`, a swept box needs `bBlockNonZeroExtentTraces`. A pawn may have
-        // `bCollideActors=false` yet still block hitscan traces (measured: `BaseSoldier6`), so the
-        // extent flag is the correct gate here.
         let nonzero = extent[0] + extent[1] + extent[2] > 0.0;
         for b in 0..self.objects.len() as ObjectId {
             if b == id || !self.is_live_actor(b) {
                 continue;
             }
-            let gate = if nonzero {
-                self.bool_prop(b, "bBlockNonZeroExtentTraces")
-            } else {
-                self.bool_prop(b, "bBlockZeroExtentTraces")
-            };
-            // The engine's actor-trace also reaches actors in the collision list (`bCollideActors`)
-            // even when they do not set the extent flag (a traced pawn may clear `bCollideActors`
-            // but still block a hitscan through `bBlockZeroExtentTraces`); accept either.
-            if !gate && !self.bool_prop(b, "bCollideActors") {
+            if !self.actor_blocks_trace(b, nonzero) {
                 continue;
             }
             // A trace must ignore both the tracer's owners and its owned attachments. UE2's
@@ -7800,12 +7850,7 @@ impl<'s> Vm<'s> {
             if base.is_some_and(|class| !self.objects[id as usize].layout.chain.contains(&class)) {
                 continue;
             }
-            let gate = if nonzero {
-                self.bool_prop(id, "bBlockNonZeroExtentTraces")
-            } else {
-                self.bool_prop(id, "bBlockZeroExtentTraces")
-            };
-            if !gate && !self.bool_prop(id, "bCollideActors") {
+            if !self.actor_blocks_trace(id, nonzero) {
                 continue;
             }
             if self.is_owned_by(id, caller) || self.is_owned_by(caller, id) {
@@ -7842,16 +7887,22 @@ impl<'s> Vm<'s> {
         b_trace_actors: bool,
         extent: [f32; 3],
     ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
-        let world = match self.physics.as_mut() {
-            Some(p) => p.trace(start, end, extent),
+        let (world, mover) = match self.physics.as_mut() {
+            Some(p) => p.trace_with_mover(start, end, extent),
             None => {
                 return Err(self.err(VmErrorKind::NoPhysicsProvider {
                     native: "Actor.Trace".into(),
                 }));
             }
         };
+        // item40e: a hit on a registered mover's geometry returns that mover (a collision-hash
+        // actor in UE2) when it blocks this kind of trace; other world hits return the level.
+        let nonzero = extent.iter().any(|v| *v != 0.0);
+        let mover = mover
+            .and_then(|name| self.find_live_object(&name))
+            .filter(|&m| m != id && self.is_mover(m) && self.actor_blocks_trace(m, nonzero));
         let mut best: Option<(f32, Option<ObjectId>, [f32; 3])> =
-            world.map(|h| (h.time, None, h.normal));
+            world.map(|h| (h.time, mover, h.normal));
         if b_trace_actors
             && let Some((t, b, n)) = self.trace_actors(id, start, end, extent)
             && best.is_none_or(|(bt, _, _)| t <= bt)
@@ -7872,7 +7923,7 @@ impl<'s> Vm<'s> {
         // ray is the exact trace segment, not the hit point, because a body's boxes can be
         // smaller than the cylinder.
         self.last_trace_bone = match out.0 {
-            Some(b) if !self.is_a(b, "levelinfo") => self
+            Some(b) if !self.is_a(b, "levelinfo") && !self.is_mover(b) => self
                 .hit_zones
                 .as_ref()
                 .and_then(|z| z.ray_bone(b, start, end))

@@ -9,6 +9,10 @@
 
 use crate::{Aabb, CollisionWorld, Triangle, Vec3, cross, dot, length, mul, normalize, sub};
 
+/// Interval overlap below which a contact on an axis the box does not move along counts as
+/// touching (separated), in metres (0.0009 UU; well below the movement skin of 0.05 UU).
+const TOUCH_EPS: f32 = 1e-5;
+
 /// Sweep options.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SweepParams {
@@ -227,7 +231,20 @@ pub(crate) fn sweep_triangle(
         let lo = tmin0 - cb - rb;
         let hi = tmax0 - cb + rb;
         let (enter, exit) = if vd.abs() < 1e-12 {
-            if lo <= 0.0 && hi >= 0.0 {
+            // No motion along this axis. A triangle lying flat in a plane perpendicular to the
+            // axis (a floor coplanar with the box bottom, a wall flush with a box side) that only
+            // touches the box face is separated: otherwise a box resting on a floor made of
+            // several coplanar triangles "hits" the next triangle's leading edge with a
+            // horizontal normal and stalls where the step-up has no headroom (item40e: crouching
+            // into a 128-UU duct). Any other touching contact keeps the inclusive test (a step
+            // landing flush with a deck edge still finds the deck).
+            let flat = tmax0 - tmin0 <= TOUCH_EPS;
+            let overlapping = if flat {
+                lo < -TOUCH_EPS && hi > TOUCH_EPS
+            } else {
+                lo <= 0.0 && hi >= 0.0
+            };
+            if overlapping {
                 (f32::NEG_INFINITY, f32::INFINITY)
             } else {
                 return None;

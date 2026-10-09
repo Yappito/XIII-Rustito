@@ -1098,6 +1098,7 @@ fn fixed_step(
         // player step collides with the moved brush.
         let wr = &mut *world;
         let t0 = Instant::now();
+        sess.vm_mut().sync_mover_collision();
         let mover_states = sess.mover_states();
         if sess.vm().native_profile().enabled {
             let micros = t0.elapsed().as_micros() as u64;
@@ -2155,6 +2156,7 @@ fn run_script_inner(
         if let Some(h) = runtime.video_host.as_ref() {
             h.advance_virtual_all(f64::from(DT));
         }
+        runtime.session.vm_mut().sync_mover_collision();
         let states = runtime.session.mover_states();
         runtime.mover_collision.update(&mut runtime.world, &states);
         for path in &weapons {
@@ -2588,6 +2590,23 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// item40e: the authored Plage01 opening of `tests/data/plage01_route.script` up to (not
+    /// including) its `t=59.00` weapon line: hut escape, objective promotion and the
+    /// TouchTrigger8 -> XIIIDispatcher3 -> `tueur_conducteur` chain that wakes BaseSoldier6 (the
+    /// killer) out of his IAController `faction` stasis (`SetCollision(false)`, DrawType none).
+    /// UE2 traces only reach collision-hash actors (`bCollideActors`), so the combat probes
+    /// shoot the awake killer, as the route does.
+    fn plage01_killer_awake_prefix() -> String {
+        let route = include_str!("../../tests/data/plage01_route.script");
+        let mut out = route
+            .lines()
+            .take_while(|l| !l.starts_with("t=59.00"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        out.push('\n');
+        out
+    }
 
     /// `XIII_GOG_DIR` resolved against the workspace root, or `None` in CI.
     fn opt_in_root() -> Option<std::path::PathBuf> {
@@ -3777,9 +3796,12 @@ mod tests {
         }
     }
 
-    /// item40 route attempt: player input only for 120 seconds, with no teleports/bridges. The
-    /// route is considered blocked only when the decoded opening cine still owns the controller
-    /// and the primary rooftop goal remains incomplete; otherwise this test requires travel.
+    /// item40/item40e route: player input plus named use/grab of map actors (no teleports,
+    /// goal bridges or weapon grants). item40e extends it past the office: Jones's scene is
+    /// finished by walking to him, the office door `Porte17` is opened by use, a chair is
+    /// grabbed (the `Grab` deco-pickup branch), its swing breaks the duct grille
+    /// `BreakAbleMover16`, and the player crawls the 128-UU duct to its far grille. The rooftop
+    /// objective and the Toits01 travel are not reached yet (PARTIAL, see the item40e report).
     #[test]
     fn opt_in_amos01_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -3802,9 +3824,9 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            120.0,
+            150.0,
         )
-        .expect("run Amos01 opening probe");
+        .expect("run Amos01 route");
         let pc = outcome
             .session
             .controller
@@ -3913,7 +3935,27 @@ mod tests {
             .expect("rooftop objective");
         assert!(
             rooftop.primary && !rooftop.completed,
-            "this forward-only fixture does not yet reach the rooftop goal: {rooftop:?}"
+            "this fixture does not yet reach the rooftop goal: {rooftop:?}"
+        );
+        // item40e milestones. The office door was opened by the route's use action (it swings
+        // open and back; its own OpeningEvent fired), the chair swing destroyed the grille, and
+        // the player ends crouched inside the duct, west of the broken grille.
+        let vm = outcome.session.vm();
+        assert!(
+            vm.find_live_object("BreakAbleMover16").is_none(),
+            "the chair swing must break (destroy) the duct grille BreakAbleMover16"
+        );
+        let opened_door = vm.trace.iter().any(|event| {
+            matches!(&event.kind, xiii_script::TraceKind::Event { target, function, .. }
+                if target.eq_ignore_ascii_case("XIIIDispatcher6") && function.ends_with("Trigger"))
+        });
+        let finish = outcome.trace.last().expect("player trace").2;
+        println!(
+            "[amos01 route] final position {finish:?}; dialamos3tempo dispatcher triggered: {opened_door}"
+        );
+        assert!(
+            finish[0] < -400.0 && (finish[1] + 1198.0).abs() < 40.0 && finish[2] < 60.0,
+            "the player must end crouched inside the zone-26 duct west of the broken grille              (a destroyed mover must leave the player collision; coplanar duct-floor edges must              not stall the crouched box): {finish:?}"
         );
         let first_after_intro_state = outcome
             .trace
@@ -3921,13 +3963,12 @@ mod tests {
             .find(|sample| sample.1 >= 0.5)
             .expect("post-cutscene-state player trace")
             .2;
-        let finish = outcome.trace.last().expect("player trace").2;
         assert_ne!(
             first_after_intro_state, finish,
             "the returned PlayerWalking controller must accept the route's forward input"
         );
         println!(
-            "[amos01 route] PARTIAL: InitInputSystem returns the controller to PlayerWalking and forward input moves it; the forward-only fixture does not reach the rooftop objective or request Toits01 travel."
+            "[amos01 route] PARTIAL: office door, chair grab, grille break and duct crawl pass; the rooftop objective and Toits01 travel are not reached (next: the far grille BreakAbleMover17 faces out of the duct; the north route via duct 14 is blocked by breakable cartons)."
         );
     }
 
@@ -4379,21 +4420,21 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        // BaseSoldier6 is at (1802.4, -12832.0, 1070.8). Place the player 160 UU in -Y facing +Y
-        // (yaw 90) and aim at the top of the head (pitch +5 deg). With the decoded per-bone hit
-        // boxes (item14b) the large `X Spine1` box overlaps the lower head, so a point-blank
-        // horizontal shot is a chest hit; the head needs the ray to clear the torso first. The
-        // battle is entirely script-driven (no host damage).
-        // Start 3 s after the old 45 s mark: with the engine's cine arrival rule
-        // (XIDCine IsTargetReached) the Plage01 intro returns control at ~46.5 s, not ~44.5 s.
-        let script = script::Script::parse(
-            "t=48.00 weapon XIII.Beretta\n\
-             t=48.20 teleport 1802.4131 -12992.034 1070.843\n\
-             t=48.20 yaw 90\n\
-             t=48.20 pitch 5\n\
-             t=48.30 fire\nt=48.90 fire\nt=49.50 fire\nt=50.10 fire\nt=50.70 fire\nt=51.30 fire\n\
-             t=51.90 fire\nt=52.50 fire\nt=53.10 fire\nt=53.70 fire\nt=54.30 fire\n",
-        )
+        // item40e: BaseSoldier6 sits in IAController `faction` stasis (no collision, not drawn)
+        // until the authored chain wakes him; shoot him after the route's own wake-up. `track`
+        // turns the player to him; then the aim is raised to his head (pitch +5 deg, as before:
+        // a body-centre aim is a chest hit and the clip runs out before he dies). The battle is
+        // entirely script-driven (no host damage).
+        let script = script::Script::parse(&format!(
+            "{}t=59.00 weapon XIII.Beretta\n\
+             t=60.00 teleport 1802.0 -12700.0 1100.0\n\
+             t=60.00 track BaseSoldier6\n\
+             t=60.05 track off\n\
+             t=60.05 pitch 5\n\
+             t=60.10 fire\nt=60.70 fire\nt=61.30 fire\nt=61.90 fire\nt=62.50 fire\nt=63.10 fire\n\
+             t=63.70 fire\nt=64.30 fire\nt=64.90 fire\nt=65.50 fire\nt=66.10 fire\n",
+            plage01_killer_awake_prefix()
+        ))
         .unwrap();
         let outcome = run_script(
             &game_dir,
@@ -4401,7 +4442,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            56.0,
+            68.0,
         )
         .expect("run Plage01 fight");
         let s = &outcome.session;
@@ -4443,11 +4484,19 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        // item40e: BaseSoldier6 is in IAController `faction` stasis (no collision, not drawn)
+        // until the authored chain wakes him, so after the pickup touch the route's triggers:
+        // the objective-0 trigger (after Cine2's promotion), TouchTrigger8 (XIIIDispatcher3 ->
+        // `tueur_conducteur`) and TouchTrigger7, then aim at his head as before.
         let script = script::Script::parse(
             "t=48.00 teleport -737.654 -511.886 1254.94\n\
-             t=49.00 teleport 1802.4131 -12992.034 1070.843\n\
-             t=49.00 yaw 90\nt=49.00 pitch 5\n\
-             t=49.20 fire\nt=49.80 fire\nt=50.40 fire\nt=51.00 fire\nt=51.60 fire\n",
+             t=53.50 teleport -307.0 -1500.0 1311.0\n\
+             t=58.00 teleport 1227.0 -12624.0 1100.0\n\
+             t=58.50 teleport 1093.0 -13854.0 1113.0\n\
+             t=60.00 teleport 1802.0 -12700.0 1100.0\n\
+             t=60.00 track BaseSoldier6\n\
+             t=60.05 track off\nt=60.05 pitch 5\n\
+             t=60.20 fire\nt=60.80 fire\nt=61.40 fire\nt=62.00 fire\nt=62.60 fire\n",
         )
         .expect("parse pickup combat route");
         let outcome = run_script(
@@ -4456,7 +4505,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            54.0,
+            64.0,
         )
         .expect("run pickup combat route");
         let session = &outcome.session;
@@ -4578,15 +4627,24 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let script = script::Script::parse(
-            "t=0.00 weapon XIII.M60\n\
-             t=0.20 teleport 1802.4131 -12992.034 1070.843\n\
-             t=0.20 yaw 90\nt=0.20 pitch 5\n\
-             t=0.30 fire\nt=0.90 fire\nt=1.50 fire\nt=2.10 fire\nt=2.70 fire\n",
-        )
+        // item40e: fire at the awake killer (see `plage01_killer_awake_prefix`).
+        let script = script::Script::parse(&format!(
+            "{}t=59.00 weapon XIII.M60\n\
+             t=60.00 teleport 1802.0 -12700.0 1100.0\n\
+             t=60.00 track BaseSoldier6\n\
+             t=60.10 fire\nt=60.70 fire\nt=61.30 fire\nt=61.90 fire\nt=62.50 fire\n",
+            plage01_killer_awake_prefix()
+        ))
         .expect("parse M60 fight script");
-        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 4.0)
-            .expect("run Plage01 M60 fight");
+        let outcome = run_script(
+            &game_dir,
+            "Plage01",
+            &script,
+            &resolved.params,
+            &scene,
+            63.0,
+        )
+        .expect("run Plage01 M60 fight");
         let soldier = outcome
             .session
             .vm()

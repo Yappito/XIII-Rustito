@@ -4169,6 +4169,101 @@ fn trace_skips_weapon_owned_first_person_muzzle_flash() {
 }
 
 #[test]
+fn trace_ignores_actors_outside_the_collision_hash() {
+    // item40e: `Engine.dll` only puts `bCollideActors` actors in the collision hash
+    // (`FCollisionHash::AddActor` asserts it; `AActor::SetCollision` removes/re-adds on change),
+    // so an actor with the `Actor` default `bBlockZeroExtentTraces=true` but
+    // `bCollideActors=false` (a hidden `TriggerLight` in front of an Amos01 grille) must not stop
+    // a weapon trace. The colliding actor behind it is hit.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    let light = phys_actor(&mut vm, &set, "TriggerLight2", [50.0, 0.0, 0.0]);
+    let target = phys_actor(&mut vm, &set, "Target", [120.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    set_collision_fields(&mut vm, light, false, true);
+    set_collision_fields(&mut vm, target, true, true);
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(
+        hit,
+        Some(target),
+        "a non-colliding actor must not block Trace"
+    );
+
+    // Collision-hash membership alone is not enough: the extent flag still selects line traces.
+    vm.set_property(target, "bBlockZeroExtentTraces", 0, Value::Bool(false));
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, None, "no zero-extent blocker left on the line");
+    assert_eq!(location, [200.0, 0.0, 0.0]);
+    // ...and a box trace uses the non-zero-extent flag, which is still set.
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [2.0, 2.0, 2.0])
+        .unwrap();
+    assert_eq!(hit, Some(target));
+}
+
+/// [`MockWorld`] whose world hits name an actor, like the map adapter's per-source label.
+struct NamedHitWorld {
+    inner: MockWorld,
+    actor: String,
+}
+
+impl WorldPhysics for NamedHitWorld {
+    fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
+        self.inner.trace(start, end, extent)
+    }
+
+    fn trace_with_mover(
+        &mut self,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+    ) -> (Option<WorldHit>, Option<String>) {
+        let hit = self.inner.trace(start, end, extent);
+        let actor = hit.map(|_| self.actor.clone());
+        (hit, actor)
+    }
+
+    fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        self.inner.move_box(start, delta, extent)
+    }
+
+    fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool {
+        self.inner.point_free(location, extent)
+    }
+}
+
+#[test]
+fn world_hit_on_a_non_mover_actor_source_still_returns_the_level() {
+    // item40e: only a mover's geometry turns a world hit into an actor hit (UE2 movers are
+    // collision-hash actors); geometry labelled with any other actor (a placed static mesh)
+    // keeps the existing level result, so scripts testing `Other == Level` are unchanged.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(NamedHitWorld {
+        inner: MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
+        actor: "Prop".to_owned(),
+    }));
+    let level = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    let prop = phys_actor(&mut vm, &set, "Prop", [105.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    set_collision_fields(&mut vm, prop, true, true);
+    // Keep the prop's own cylinder off the line so only the world hit can report it.
+    vm.set_property(prop, "Location", 0, Value::Vector([105.0, 500.0, 0.0]));
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(level));
+    assert!((location[0] - 100.0).abs() < 1e-3, "{location:?}");
+}
+
+#[test]
 fn exact_contact_boundary_overlaps() {
     let set = phys_set();
     let mut vm = Vm::new(&set, VmLimits::default());
@@ -4286,7 +4381,10 @@ fn trace_hits_nearer_of_world_and_actor_and_fasttrace_ignores_actors() {
     let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
     set_collision_fields(&mut vm, tracer, true, false);
     let b = phys_actor(&mut vm, &set, "B", [40.0, 0.0, 0.0]);
-    set_collision_fields(&mut vm, b, true, false);
+    // item40e: a zero-extent actor check needs `bCollideActors` (collision hash) and
+    // `bBlockZeroExtentTraces` (Engine.dll `FCollisionHash::ActorLineCheck` tests bit 0x400 of
+    // the actor flags at 0x10349E90); a non-blocking `B` would not be hit.
+    set_collision_fields(&mut vm, b, true, true);
 
     // Actor closer than the wall -> the actor is returned.
     let mut args = vec![
@@ -7901,6 +7999,8 @@ fn synthetic_trace_hits_the_nearest_pawn_before_world_geometry() {
         vm.set_property(id, "CollisionRadius", 0, Value::Float(40.0));
         vm.set_property(id, "CollisionHeight", 0, Value::Float(40.0));
         vm.set_property(id, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+        // item40e: only collision-hash actors (`bCollideActors`) can be hit.
+        vm.set_property(id, "bCollideActors", 0, Value::Bool(true));
         vm.set_active(id, true);
     }
     let mut args = trace_args();
