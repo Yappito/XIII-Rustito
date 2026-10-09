@@ -1430,7 +1430,21 @@ fn auto_position(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<N
 
 fn move_to(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let destination = vector2(vm, a, 0)?;
-    let speed = if c.omitted(2) { 0.0 } else { float(vm, a, 2)? };
+    let speed = if c.omitted(2) { 1.0 } else { float(vm, a, 2)? };
+    let focus = if c.omitted(1) {
+        None
+    } else {
+        instance_arg(vm, a, 1)?
+    };
+    vm.set_property(
+        c.this,
+        "Focus",
+        0,
+        Value::Object(focus.map(ObjRef::Instance)),
+    );
+    if focus.is_none() {
+        vm.set_property(c.this, "FocalPoint", 0, Value::Vector(destination));
+    }
     vm.set_property(c.this, "MoveTarget", 0, Value::Object(None));
     vm.start_move(
         c.this,
@@ -1446,7 +1460,29 @@ fn move_toward(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nati
     let Some(target) = instance_arg(vm, a, 0)? else {
         return val(Value::Void);
     };
-    let speed = if c.omitted(2) { 0.0 } else { float(vm, a, 2)? };
+    let speed = if c.omitted(2) { 1.0 } else { float(vm, a, 2)? };
+    let focus = if c.omitted(1) {
+        Some(target)
+    } else {
+        instance_arg(vm, a, 1)?
+    };
+    vm.set_property(
+        c.this,
+        "Focus",
+        0,
+        Value::Object(focus.map(ObjRef::Instance)),
+    );
+    let next = if c.omitted(3) {
+        None
+    } else {
+        instance_arg(vm, a, 3)?
+    };
+    vm.set_property(
+        c.this,
+        "NextMoveTarget",
+        0,
+        Value::Object(next.map(ObjRef::Instance)),
+    );
     let destination = vm.vector_prop(target, "Location").unwrap_or([0.0; 3]);
     vm.set_property(
         c.this,
@@ -1681,18 +1717,14 @@ fn pick_start_point(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResul
 ///
 /// Decoded declaration: `native(589) final native static function IncAttaque()` (engine.u,
 /// 1-byte body). `IAController.s_incattaque` calls `self.Level.IncAttaque()` on entering
-/// `Attaque.BeginState`; the engine increments the level's attack/alarm counter that
-/// `GenAlerte`/`ChercheAlarme` read. The headless VM has no alarm network, so the call is
-/// recorded as a visible trace note (never a silent success) and returns.
+/// `Attaque.BeginState`. Engine.dll VA 0x103e4750 increments MusicVars[2].Value;
+/// the optional audio-device notification is not yet bridged.
 fn level_info_inc_attaque(
     vm: &mut Vm<'_>,
-    _c: &NativeCtx,
+    c: &NativeCtx,
     _a: &mut [Value],
 ) -> VmResult<NativeOutcome> {
-    vm.note(TraceKind::Note(
-        "LevelInfo.IncAttaque (native 589): level attack counter; the VM has no alarm network"
-            .into(),
-    ));
+    vm.adjust_attack_music_var(c.this, 1)?;
     val(Value::Void)
 }
 
@@ -1713,19 +1745,15 @@ fn level_info_get_plate_forme(
 /// `[Core.System] PlateForm` of the shipped PC `Default.ini` (read by `GetPlateForme`).
 const PLATFORM_PC: i32 = 0;
 
-/// `LevelInfo.DecAttaque()` (native 588, static). The matching `IncAttaque` implementation is
-/// item14b's visible Partial; this records the inverse counter operation at the exact decoded
-/// call site. The game's shared alarm/attack counter is not modelled, so this is deliberately a
-/// diagnostic Partial rather than a silent success stub.
+/// `LevelInfo.DecAttaque()` (native 588, static).
+/// Engine.dll VA 0x103e4870 decrements MusicVars[2].Value without clamping.
+/// The optional audio-device notification is not yet bridged.
 fn level_info_dec_attaque(
     vm: &mut Vm<'_>,
-    _c: &NativeCtx,
+    c: &NativeCtx,
     _a: &mut [Value],
 ) -> VmResult<NativeOutcome> {
-    vm.note(TraceKind::Note(
-        "LevelInfo.DecAttaque (native 588): level attack counter decrement; the VM has no alarm network"
-            .into(),
-    ));
+    vm.adjust_attack_music_var(c.this, -1)?;
     val(Value::Void)
 }
 
@@ -1784,60 +1812,76 @@ fn ligne_visee(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nati
 /// `IAController.PseudoSteering() -> vector`.
 ///
 /// Disassembly evidence (XIDPawn.dll `?execPseudoSteering@AIAController` RVA 0x3230): the combat
-/// steering vector used by `Attaque.UpdateTactics`. The exact steering field is not named in the
-/// decoded reflection; the VM returns `vect(0,0,0)` ("no steering") with a visible note
-/// (documented `Partial`).
+/// steering vector used by `Attaque.UpdateTactics`, over GenAlerte.SoldierInFightList.
+/// See Vm::ai_pseudo_steering for the unusual equality gate present in the retail DLL.
 fn pseudo_steering(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
-    vm.note(TraceKind::Note(format!(
-        "IAController.PseudoSteering on {}: no steering modelled (0,0,0)",
-        vm.objects[c.this as usize].name
-    )));
-    val(Value::Vector([0.0; 3]))
+    val(Value::Vector(vm.ai_pseudo_steering(c.this)?))
 }
 
 /// `IAController.LineOfFireObstacle() -> int`.
 ///
 /// Disassembly evidence (XIDPawn.dll `?execLineOfFireObstacle@AIAController` RVA 0x40D0): returns
-/// an obstacle classification for the current firing line. The VM's trace has no actor/material
-/// obstacle classification, so it returns `0` (no obstacle) with a visible note.
+/// 0 for no obstacle/enemy/self/world/dead/hostile pawn, 1 for a living ally (writes Pote),
+/// 2 for a non-pawn that cannot be seen through. Trace flags depend on AmmoType.bInstantHit.
 fn line_of_fire_obstacle(
     vm: &mut Vm<'_>,
     c: &NativeCtx,
     _a: &mut [Value],
 ) -> VmResult<NativeOutcome> {
-    vm.note(TraceKind::Note(format!(
-        "IAController.LineOfFireObstacle on {}: returns 0 (no obstacle classification)",
-        vm.objects[c.this as usize].name
-    )));
-    val(Value::Int(0))
+    let Some(hit) = vm.ai_fire_obstacle(c.this)? else {
+        return val(Value::Int(0));
+    };
+    if vm.is_a(hit, "Pawn") {
+        if vm.bool_prop(hit, "bIsDead") {
+            return val(Value::Int(0));
+        }
+        let mut args = [Value::Object(Some(ObjRef::Instance(hit)))];
+        if matches!(alliance_level(vm, c, &mut args)?, NativeOutcome::Value(Value::Int(n)) if n >= 0)
+        {
+            vm.set_property(c.this, "Pote", 0, args[0].clone());
+            return val(Value::Int(1));
+        }
+        return val(Value::Int(0));
+    }
+    val(Value::Int(if vm.bool_prop(hit, "bCanSeeThrough") {
+        0
+    } else {
+        2
+    }))
 }
 
 /// `IAController.FindBestPathTo(vector desti) -> bool`.
 ///
-/// Disassembly evidence (XIDPawn.dll `?execFindBestPathTo@AIAController` RVA 0x3A90): runs the
-/// engine A* from the controller pawn to `desti` and fills `RouteCache`. The VM reuses the decoded
-/// ReachSpec path (`Vm::nav_find_path_to`, which also fills `RouteCache`/`RouteDist`) and returns
-/// whether a path was found (documented `Partial`).
+/// XIDPawn.dll VA 0x11903a90 calls FindPath(desti,None,1), assigning MoveTarget and Destination
+/// only on success. The shared ReachSpec search remains Partial: native anchor, cost and endpoint
+/// checks have not been ported.
 fn find_best_path_to(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let goal = vector2(vm, a, 0)?;
     let first = vm.nav_find_path_to(c.this, goal)?;
+    if let Some(first) = first {
+        vm.set_property(
+            c.this,
+            "MoveTarget",
+            0,
+            Value::Object(Some(ObjRef::Instance(first))),
+        );
+        if let Some(location) = vm.vector_prop(first, "Location") {
+            vm.set_property(c.this, "Destination", 0, Value::Vector(location));
+        }
+    }
     val(Value::Bool(first.is_some()))
 }
 
 /// `IAController.FindNewStakeOutDir()`.
 ///
-/// Disassembly evidence (XIDPawn.dll `?execFindNewStakeOutDir@AIAController` RVA 0x3EA0): chooses a
-/// new stake-out direction. The stake-out network is not decoded; the call is recorded as a
-/// visible trace note and returns.
+/// XIDPawn.dll VA 0x11903ea0 updates LastSeenPos from the most aligned visible
+/// navigation point at distance (100,800).
 fn find_new_stake_out_dir(
     vm: &mut Vm<'_>,
     c: &NativeCtx,
     _a: &mut [Value],
 ) -> VmResult<NativeOutcome> {
-    vm.note(TraceKind::Note(format!(
-        "IAController.FindNewStakeOutDir on {}: no stake-out network modelled",
-        vm.objects[c.this as usize].name
-    )));
+    vm.ai_stake_out_dir(c.this)?;
     val(Value::Void)
 }
 
@@ -4782,23 +4826,23 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "latent horizontal movement at GroundSpeed (or the Speed argument) using the physics move_box; no acceleration, path following or footstep/floor logic; ends on arrival or after a travel-time budget",
+            "decoded fractional Speed/DesiredSpeed, Acceleration, walking velocity and UpdateTactics polling; ReachedDestination margins, bAdjusting, non-walking modes and full physWalking volume/ledge/braking branches remain incomplete",
         ),
         ..def(
             "Engine.Controller.MoveTo",
             "native(500) final latent function MoveTo(vector NewDestination, optional actor ViewFocus, optional float Speed)",
-            "engine.u Controller.MoveTo decoded; UE2 AController::MoveTo (latent) sets Destination and moves the pawn; Engine.dll ?execMoveTo@AController",
+            "Engine.dll execMoveTo VA 0x1036a6e0, poll 0x1036a8e0 -> APawn::moveToward 0x103b3950; physWalking 0x103bdac0 -> calcVelocity 0x103ba250; Speed default 1 is fractional",
             move_to,
         )
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "latent horizontal movement toward the target's Location; same movement model as MoveTo",
+            "decoded fractional Speed, Focus/NextMoveTarget, moving-target/UpdateTactics polling and walking acceleration; navigation preparation/ReachSpec blending, bAdjusting, non-walking modes and full ReachedDestination/braking rules remain incomplete",
         ),
         ..def(
             "Engine.Controller.MoveToward",
             "native(502) final latent function MoveToward(actor NewTarget, optional actor ViewFocus, optional float Speed, optional actor NextTarget)",
-            "engine.u Controller.MoveToward decoded; UE2 AController::MoveToward (latent); Engine.dll ?execMoveToward@AController",
+            "Engine.dll execMoveToward VA 0x1036d8c0, poll 0x1036a9c0 updates Destination from MoveTarget.Location -> moveToward 0x103b3950",
             move_toward,
         )
     });
@@ -4924,14 +4968,12 @@ fn builtin_defs() -> Vec<NativeDef> {
     // soldier's `Attaque.BeginState` calls; the rest are used by the attack/steering states.
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "no alarm network: the level attack counter is not modelled; the call is recorded as a \
-             visible trace note and the state continues",
+            "MusicVars[2].Value increments with wrapping; optional audio-device SetMusicVar and attack-mode transition (vtable +0xc4/+0xcc) not bridged",
         ),
         ..def(
             "Engine.LevelInfo.IncAttaque",
             "native(589) final native static function IncAttaque()",
-            "engine.u LevelInfo.IncAttaque decoded (native 589, 1-byte body); \
-             IAController.s_incattaque calls self.Level.IncAttaque() on Attaque.BeginState",
+            "Engine.dll execIncAttaque VA 0x103e4750 increments LevelInfo+0x3dc MusicVars index 2 +0x0c Value; IAController.s_incattaque calls it on Attaque.BeginState",
             level_info_inc_attaque,
         )
     });
@@ -4942,15 +4984,15 @@ fn builtin_defs() -> Vec<NativeDef> {
         level_info_get_plate_forme,
     ));
     // item19: complete the BaseSoldier.Died alert-level-2 path paired with item14b's IncAttaque.
-    // The VM records the decrement visibly while the retail alarm counter/network is unresolved.
+    // Both operations update the authoritative MusicVars record, not a separate AI counter.
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "records the level attack counter decrement; the shared alarm/attack bookkeeping is not modelled",
+            "MusicVars[2].Value decrements without clamping; optional audio-device notification and delayed music-mode transition not bridged",
         ),
         ..def(
             "Engine.LevelInfo.DecAttaque",
             "native(588) final native static function DecAttaque()",
-            "engine.u LevelInfo.DecAttaque decoded (native 588, 1-byte body); XIDPawn.dll XIDPawn.BaseSoldier.Died calls it when IAController.NiveauALerte == 2 (local/re/item15/d_Cine2.txt)",
+            "Engine.dll execDecAttaque VA 0x103e4870 decrements MusicVars[2].Value; BaseSoldier.Died calls it when IAController.NiveauALerte == 2",
             level_info_dec_attaque,
         )
     });
@@ -4981,27 +5023,26 @@ fn builtin_defs() -> Vec<NativeDef> {
         )
     });
     v.push(NativeDef {
-        status: NativeStatus::Partial("returns vect(0,0,0) (no steering) with a visible note"),
+        status: NativeStatus::Partial("retail fight-list/equality gate and trace correction; Core.appRSqrt precision/zero behavior and engine TRACE_AllBlocking filtering not reproduced exactly; malformed null lists fail explicitly"),
         ..def(
             "IAController.PseudoSteering",
             "native(0) function vector PseudoSteering()",
-            "XIDPawn.dll ?execPseudoSteering@AIAController RVA 0x3230 (combat movement steering)",
+            "XIDPawn.dll execPseudoSteering VA 0x11903230: GenAlerte+0x20c SoldierInFightList, inverse-distance separation; equality-only gate 0x119033a6, correction scale 50000 and output thresholds 50/4000 UU",
             pseudo_steering,
         )
     });
     v.push(NativeDef {
-        status: NativeStatus::Partial("returns 0 (no obstacle classification modelled)"),
+        status: NativeStatus::Partial("decoded 0/1/2 classification and Pote assignment; shared world provider cannot filter shoot-through triangle geometry, actor traces use cylinders, AllianceLevel's unnamed Level flag remains Partial"),
         ..def(
             "IAController.LineOfFireObstacle",
             "native(0) function int LineOfFireObstacle()",
-            "XIDPawn.dll ?execLineOfFireObstacle@AIAController RVA 0x40D0 (obstacle along the firing line)",
+            "XIDPawn.dll execLineOfFireObstacle VA 0x119040d0: WeaponStartTrace/WeaponEndTrace, AmmoType.bInstantHit selects 0x4083/0x8083; nonnegative AllianceLevel writes Pote and returns 1, nonpawn bCanSeeThrough controls 0/2",
             line_of_fire_obstacle,
         )
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "reuses the decoded ReachSpec path (Vm::nav_find_path_to) and fills RouteCache; the \
-             engine's A* goal margins are not reproduced",
+             "decoded wrapper sets MoveTarget/Destination only on success; shared ReachSpec search still differs from Engine.FindPath/findPathToward anchor selection, cost/capability checks and endpoint reachability",
         ),
         ..def(
             "IAController.FindBestPathTo",
@@ -5012,11 +5053,11 @@ fn builtin_defs() -> Vec<NativeDef> {
         )
     });
     v.push(NativeDef {
-        status: NativeStatus::Partial("no stake-out network modelled; recorded as a visible note"),
+        status: NativeStatus::Partial("decoded linked-list selection, distance bounds and LastSeenPos height; shared LineOfSightTo is world-only and Core.appRSqrt precision is not bit-identical"),
         ..def(
             "IAController.FindNewStakeOutDir",
             "native(0) function FindNewStakeOutDir()",
-            "XIDPawn.dll ?execFindNewStakeOutDir@AIAController RVA 0x3EA0",
+            "XIDPawn.dll execFindNewStakeOutDir VA 0x11903ea0: NavigationPointList/NextNavigationPoint, (100,800) UU, greatest strictly improving direction dot with LineOfSightTo(node,0); LastSeenPos(+0x24c)=node.Location+(0,0,CollisionHeight/2)",
             find_new_stake_out_dir,
         )
     });
