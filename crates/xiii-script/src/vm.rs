@@ -53,7 +53,15 @@ impl Default for VmLimits {
     fn default() -> Self {
         Self {
             max_steps: 1_000_000,
-            max_call_depth: 250,
+            // Call-depth guard sized to the 1 MiB Windows main-thread stack, measured on the
+            // Amos01 campaign-start survey (item45): an unbounded `SwitchWeapon` self-recursion
+            // (xiii.u `XIIIPlayerController.SwitchWeapon` 0x00FC -> 0x00FC) overflowed the
+            // process stack at the old 250-frame limit (debug build, ~4.4 KiB interpreter stack
+            // per script frame; 250 frames > 1 MiB) and killed the runtime before the guard
+            // could fire. 128 survives the same recursion with ~45% margin and aborts the
+            // actor with `CallDepthExceeded` (the full campaign survey reruns clean at 128);
+            // `vm_tests::recursion_guard_fits_a_1mib_main_stack` pins the property.
+            max_call_depth: 128,
             max_type_depth: 16,
             rng_seed: 0x9E37_79B9_7F4A_7C15,
         }

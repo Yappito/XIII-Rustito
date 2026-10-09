@@ -56,6 +56,12 @@ fn main() -> AppExit {
         return play::run_headless(&opts);
     }
 
+    // `--survey` (item45) is headless only: it opens one real session per campaign map and
+    // never builds a window.
+    if opts.mode == cli::Mode::Survey {
+        return play::survey::run(&opts);
+    }
+
     // `--menu` runs the front-end. When the game's own New game path reaches
     // `PlayerController.ClientTravel`, the host performs the travel step: it starts `--play`
     // on the requested map.
@@ -182,6 +188,7 @@ fn build_app(opts: cli::Options) -> App {
                 }
                 cli::Mode::Menu => "XIII Classic runtime - front-end menu (item16)".into(),
                 cli::Mode::Video => "XIII Classic runtime - Bink cutscene".into(),
+                cli::Mode::Survey => "XIII Classic runtime - campaign start survey (item45)".into(),
             },
             resolution: (opts.width, opts.height).into(),
             present_mode,
@@ -212,6 +219,9 @@ fn build_app(opts: cli::Options) -> App {
         }
         cli::Mode::Video => {
             app.add_plugins(video::VideoPlugin { options: opts });
+        }
+        cli::Mode::Survey => {
+            // Handled before `build_app` (headless only; never builds a window).
         }
     }
 

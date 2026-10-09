@@ -20,6 +20,7 @@ pub mod pawns;
 pub mod script;
 pub mod session;
 pub mod sim;
+pub mod survey;
 pub mod travel;
 pub mod voice;
 pub mod weapons;
@@ -248,16 +249,16 @@ impl Plugin for PlayPlugin {
 }
 
 /// Resolved player parameters plus the startup report lines.
-struct ResolvedParams {
-    params: PlayerParams,
-    lines: Vec<String>,
+pub(crate) struct ResolvedParams {
+    pub params: PlayerParams,
+    pub lines: Vec<String>,
 }
 
 /// Resolves the player parameters from the inherited class defaults of the pawn class named by
 /// `Default.ini` -> GameInfo `DefaultPlayerClassName` (the same resolution `--collision-test`
 /// uses), and gravity from the decoded `Engine.PhysicsVolume.Gravity` class default. Every
 /// value is reported with its source; missing optional values are reported as such.
-fn resolve_params(game_dir: &Path) -> Result<ResolvedParams, String> {
+pub(crate) fn resolve_params(game_dir: &Path) -> Result<ResolvedParams, String> {
     let install = Installation::open(game_dir, &OpenOptions::default())
         .map_err(|e| format!("opening installation for class defaults: {e}"))?;
     let (set, gameinfo, pawn_path) = collision::resolve_player_class(&install)?;
