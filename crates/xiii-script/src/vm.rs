@@ -8070,8 +8070,19 @@ impl<'s> Vm<'s> {
         Ok(self.nav_point_actor(idx as u32))
     }
 
-    /// `Controller.LineOfSightTo`: world line trace between the controller pawn's eye and
-    /// `other`'s eye. Actor occlusion is not modelled; the no-provider case fails explicitly.
+    /// `Controller.LineOfSightTo` (Engine.dll `?LineOfSightTo@AController@@QAEKPAVAActor@@H@Z`
+    /// VA 0x1036ac70, item27m): the view location comes from `GetViewTarget` (a PlayerController's
+    /// `ViewTarget`, otherwise the pawn or the controller itself), raised by the view actor's
+    /// `BaseEyeHeight` only when the view target is this controller's own pawn. The engine traces
+    /// more than one line: first to `Other->Location` (the base), and only when that is blocked
+    /// tries the eye point (`+BaseEyeHeight`) when `Other` is the controller's `Enemy`, or
+    /// `Location.Z + 0.8*CollisionHeight` otherwise — the latter two guarded by distance limits
+    /// (>= 8000^2 and >= 2000^2 reject; the 2000^2 exception `IsA(APawn::StaticClass())` never
+    /// holds for a controller). Blocked-by-the-target counts as visible upstream, which the
+    /// world-geometry-only provider cannot express (no actor occlusion, the standing convention);
+    /// the `int` flag argument is always 0 from script (`execLineOfSightTo` literal,
+    /// `execCanSee`->`SeePawn`), so its extra rejection is not reachable. No `bHidden` check:
+    /// XIII's binary does not have the upstream one. The no-provider case fails explicitly.
     pub(crate) fn nav_line_of_sight_to(
         &mut self,
         controller: ObjectId,
@@ -8085,17 +8096,110 @@ impl<'s> Vm<'s> {
         )? {
             return Ok(false);
         }
-        let (Some(pawn), Some(other_pawn)) = (self.obj_prop(controller, "Pawn"), Some(other))
-        else {
+        let view = self.los_view_location(controller);
+        let Some(target) = self.vector_prop(other, "Location") else {
             return Ok(false);
         };
-        let a = self.eye_location(pawn);
-        let b = self.eye_location(other_pawn);
-        let world_hit = self.physics.as_mut().and_then(|p| p.trace(a, b, [0.0; 3]));
-        if world_hit.is_some() {
+        if self.world_line(view, target).is_none() {
+            return Ok(true);
+        }
+        let enemy = self.obj_prop(controller, "Enemy");
+        let top = if enemy == Some(other) {
+            // Enemy: no distance limits, retry at the target's eye point.
+            Some(self.f32_prop(other, "BaseEyeHeight"))
+        } else {
+            let d = [
+                target[0] - view[0],
+                target[1] - view[1],
+                target[2] - view[2],
+            ];
+            let dist_sq = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            // 8000^2 and 2000^2 reject (float constants at 0x1047c878 / 0x1047c874).
+            if dist_sq >= 6_400_000.0 || dist_sq >= 4_000_000.0 {
+                return Ok(false);
+            }
+            Some(0.8 * self.f32_prop(other, "CollisionHeight"))
+        };
+        let Some(raise) = top else {
+            return Ok(false);
+        };
+        let raised = [target[0], target[1], target[2] + raise];
+        Ok(self.world_line(view, raised).is_none())
+    }
+
+    /// `GetViewTarget` result and its trace start point: a PlayerController uses its `ViewTarget`
+    /// (Engine.dll 0x10368040), a plain controller its pawn or itself (0x10368030); the pawn's
+    /// `BaseEyeHeight` is added only when the view target is the controller's own pawn.
+    fn los_view_location(&self, controller: ObjectId) -> [f32; 3] {
+        let view = if self.is_a(controller, "playercontroller") {
+            self.obj_prop(controller, "ViewTarget")
+        } else {
+            None
+        }
+        .or_else(|| self.obj_prop(controller, "Pawn"))
+        .unwrap_or(controller);
+        let mut loc = self.vector_prop(view, "Location").unwrap_or([0.0; 3]);
+        if Some(view) == self.obj_prop(controller, "Pawn") {
+            loc[2] += self.f32_prop(view, "BaseEyeHeight");
+        }
+        loc
+    }
+
+    /// `Controller.CanSee(Pawn Other)` — Engine.dll `AController::SeePawn`
+    /// (`?SeePawn@AController@@QAEKPAVAPawn@@H@Z` VA 0x1036dc40, item27m). `execCanSee`
+    /// (0x1036f070) calls this with the second argument 0 — XIII's `CanSee` is not a plain
+    /// `LineOfSightTo` forward: for the controller's `Enemy` it is exactly `LineOfSightTo`,
+    /// otherwise it adds the retail range gate
+    /// `DistSq <= (min(1.0, Other.Visibility/128.0) * Pawn.SightRadius)^2` (strictly greater
+    /// rejects; `Visibility` byte at Pawn+0x227, `SightRadius` at Pawn+0x238) and the decoded
+    /// `|delta| > Pawn.PeripheralVision` check (the binary computes `dot(delta,
+    /// SafeNormal(delta))` and compares with Pawn+0x23c; with the Engine.u default
+    /// `PeripheralVision = 0` this degenerates to a not-exactly-overlapping guard, and XIII
+    /// pawns store raw degrees or -1 here). The no-provider case fails explicitly.
+    pub(crate) fn nav_can_see(&mut self, controller: ObjectId, other: ObjectId) -> VmResult<bool> {
+        let Some(pawn) = self.obj_prop(controller, "Pawn") else {
+            return Ok(false);
+        };
+        if self.obj_prop(controller, "Enemy") == Some(other) {
+            return self.nav_line_of_sight_to(controller, other);
+        }
+        let Some(pawn_loc) = self.vector_prop(pawn, "Location") else {
+            return Ok(false);
+        };
+        let Some(other_loc) = self.vector_prop(other, "Location") else {
+            return Ok(false);
+        };
+        let d = [
+            other_loc[0] - pawn_loc[0],
+            other_loc[1] - pawn_loc[1],
+            other_loc[2] - pawn_loc[2],
+        ];
+        let dist_sq = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        // Range gate: min(1.0, Visibility/128) * SightRadius (float 1.0 @0x1046da0c, float
+        // 0.0078125 @0x104794b0). Visibility is a byte property; 128 is the Engine.u Pawn
+        // default (the fallback for synthetic objects without the property). SightRadius
+        // defaults to 5000 (Engine.u Pawn defaults).
+        let visibility = match self.get_property(other, "Visibility") {
+            Some(Value::Byte(b)) => f32::from(*b),
+            Some(Value::Int(i)) => *i as f32,
+            _ => 128.0,
+        } * 0.0078125;
+        let scale = visibility.min(1.0);
+        let sight = {
+            let s = self.f32_prop(pawn, "SightRadius");
+            if s > 0.0 { s } else { 5000.0 }
+        };
+        let range = scale * sight;
+        if dist_sq > range * range {
             return Ok(false);
         }
-        Ok(true)
+        // dot(delta, SafeNormal(delta)) = |delta| must be strictly greater than PeripheralVision
+        // (Engine.u default 0; XIII pawns use raw degrees or -1).
+        let peripheral = self.f32_prop(pawn, "PeripheralVision");
+        if dist_sq.sqrt() <= peripheral {
+            return Ok(false);
+        }
+        self.nav_line_of_sight_to(controller, other)
     }
 
     /// `Actor.Location + Actor.BaseEyeHeight` (the eye point upstream traces between).

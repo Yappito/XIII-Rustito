@@ -1324,14 +1324,15 @@ fn line_of_sight_to(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult
     val(Value::Bool(vm.nav_line_of_sight_to(c.this, other)?))
 }
 
-/// `Controller.CanSee(Pawn Other) -> bool` (native 533): UE2 `AController::execCanSee` forwards to
-/// `LineOfSightTo(Other)`. Implemented as the same world line trace between the two eyes (no actor
-/// occlusion, the `LineOfSightTo` convention).
+/// `Controller.CanSee(Pawn Other) -> bool` (native 533): Engine.dll `execCanSee` (VA 0x1036f070)
+/// calls `AController::SeePawn(Other, 0)` (VA 0x1036dc40) — LOS-only for the controller's `Enemy`,
+/// otherwise the SightRadius/Visibility range gate and the decoded `|delta| > PeripheralVision`
+/// check on top of `LineOfSightTo(Other, 0)`.
 fn controller_can_see(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let Some(other) = instance_arg(vm, a, 0)? else {
         return val(Value::Bool(false));
     };
-    val(Value::Bool(vm.nav_line_of_sight_to(c.this, other)?))
+    val(Value::Bool(vm.nav_can_see(c.this, other)?))
 }
 
 /// `Pawn.PressingFire() -> bool` (native 0): Engine.dll `APawn::execPressingFire` returns false
@@ -4817,12 +4818,15 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "world line trace between pawn eyes; actor occlusion not modelled (engine disassembly notes unavailable for verification)",
+            "decoded multi-line trace (base Location first, then Enemy eye point without distance \
+             limits or 0.8*CollisionHeight top with 8000^2/2000^2 limits) from the view target; \
+             actor occlusion not modelled, so blocked-by-the-target cannot count as visible",
         ),
         ..def(
             "Engine.Controller.LineOfSightTo",
             "native(514) final function bool LineOfSightTo(actor Other, return bool ReturnValue)",
-            "engine.u Controller.LineOfSightTo decoded; UE2 AController::LineOfSightTo traces eye-to-eye; Engine.dll ?execLineOfSightTo@AController",
+            "engine.u Controller.LineOfSightTo decoded; Engine.dll ?LineOfSightTo@AController VA \
+             0x1036ac70 and ?execLineOfSightTo@AController VA 0x1036d860 (item27m)",
             line_of_sight_to,
         )
     });
@@ -5063,13 +5067,20 @@ fn builtin_defs() -> Vec<NativeDef> {
             find_new_stake_out_dir,
         )
     });
-    v.push(def(
-        "Engine.Controller.CanSee",
-        "native(533) final function bool CanSee(Pawn Other)",
-        "engine.u Controller.CanSee decoded (533, object Other, return bool); UE2 forwards to \
-         LineOfSightTo; used by the behaviour scripts to check a clear line to the enemy",
-        controller_can_see,
-    ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "decoded SeePawn (VA 0x1036dc40): LOS-only for Enemy, else SightRadius/Visibility \
+             range gate and the decoded |delta| > PeripheralVision check before LineOfSightTo; \
+             actor occlusion not modelled",
+        ),
+        ..def(
+            "Engine.Controller.CanSee",
+            "native(533) final function bool CanSee(Pawn Other)",
+            "engine.u Controller.CanSee decoded (533, object Other, return bool); Engine.dll \
+             ?execCanSee@AController VA 0x1036f070 -> ?SeePawn@AController VA 0x1036dc40 (item27m)",
+            controller_can_see,
+        )
+    });
     v.push(def(
         "Engine.Pawn.PressingFire",
         "native(0) final simulated native function bool PressingFire()",

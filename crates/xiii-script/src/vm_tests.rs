@@ -6373,6 +6373,457 @@ fn line_of_sight_to_uses_the_pawn_eyes_and_reports_the_blocking_wall() {
     assert_eq!(clear, NativeOutcome::Value(Value::Bool(true)));
 }
 
+// ---------------------------------------------------------------------------------------
+// item27m: the decoded Engine.dll LineOfSightTo (VA 0x1036ac70) and SeePawn/CanSee
+// (VA 0x1036dc40) semantics. Fixture: Controller with Pawn/Enemy/ViewTarget, Pawn with
+// BaseEyeHeight/SightRadius/PeripheralVision, Actor with CollisionHeight and a Visibility byte.
+
+fn los_fixture() -> Vec<u8> {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "Controller");
+    let player_controller = b.reserve(0, 0, "PlayerController");
+
+    let object_extra = compact(0);
+    let vector_extra = compact(IMP_STRUCT);
+
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let collision_height = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
+    let visibility = b.reserve(IMP_BYTEPROP, actor, "Visibility");
+
+    let eye = b.reserve(IMP_FLOATPROP, pawn, "BaseEyeHeight");
+    let sight_radius = b.reserve(IMP_FLOATPROP, pawn, "SightRadius");
+    let peripheral = b.reserve(IMP_FLOATPROP, pawn, "PeripheralVision");
+
+    let c_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
+    let c_enemy = b.reserve(IMP_OBJECTPROP, controller, "Enemy");
+    let c_view_target = b.reserve(IMP_OBJECTPROP, controller, "ViewTarget");
+
+    b.prop_with(location, collision_height, 0, &vector_extra);
+    b.prop(collision_height, visibility, 0);
+    b.prop_with(visibility, 0, 0, &object_extra);
+    b.prop(eye, sight_radius, 0);
+    b.prop(sight_radius, peripheral, 0);
+    b.prop(peripheral, 0, 0);
+    b.prop_with(c_pawn, c_enemy, 0, &object_extra);
+    b.prop_with(c_enemy, c_view_target, 0, &object_extra);
+    b.prop_with(c_view_target, 0, 0, &object_extra);
+
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, location, 0);
+    b.class(pawn, actor, eye, 0);
+    b.class(controller, actor, c_pawn, 0);
+    b.class(player_controller, controller, 0, 0);
+    b.build()
+}
+
+fn los_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Test",
+        los_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+/// A controller at the origin with a pawn whose eye is 100 above the base, plus an `other`
+/// actor at `loc` with the given BaseEyeHeight/CollisionHeight.
+fn los_pair(
+    vm: &mut Vm<'_>,
+    set: &ScriptSet,
+    other_class: &str,
+    loc: [f32; 3],
+    other_eye: f32,
+    other_height: f32,
+) -> (ObjectId, ObjectId, ObjectId) {
+    let pawn = spawn_at(vm, set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(100.0));
+    let ctrl = vm.spawn(pg(set, "Controller"), "C").unwrap();
+    vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    let other = spawn_at(vm, set, other_class, "O", loc);
+    vm.set_property(other, "BaseEyeHeight", 0, Value::Float(other_eye));
+    vm.set_property(other, "CollisionHeight", 0, Value::Float(other_height));
+    // The Engine.u Pawn default (the fixture leaves the byte at 0).
+    vm.set_property(other, "Visibility", 0, Value::Int(128));
+    (ctrl, pawn, other)
+}
+
+/// The base line (view point -> target base) is blocked by a low wall; the decoded retry for a
+/// non-Enemy target goes to `Location.Z + 0.8*CollisionHeight` (Engine.dll 0x1036b020) and clears
+/// above the wall: LineOfSightTo is true. A lower target top is blocked by the same wall: false.
+/// The old single eye-to-eye trace answered the opposite for the first case (the eye line clears
+/// above the wall).
+#[test]
+fn line_of_sight_to_tries_the_base_then_the_top_point() {
+    let set = los_set();
+    // Wall ("counter") x in [50,51], z in [40,80]: the descending base line (eye z=100 -> base
+    // z=0) is blocked at z=50; the eye-to-eye line at z=100 is NOT blocked.
+    let wall = ([50.0, -10.0, 40.0], [51.0, 10.0, 80.0]);
+
+    // Target top 0.8*100 = 80: the retry line (z 100 -> 80) passes above the wall (z=90 there).
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new().with_wall(wall.0, wall.1)));
+    let (ctrl, _pawn, other) = los_pair(&mut vm, &set, "Pawn", [100.0, 0.0, 0.0], 100.0, 100.0);
+    let mut args = [Value::Object(Some(ObjRef::Instance(other)))];
+    let out = call_native(
+        &mut vm,
+        "Engine.Controller.LineOfSightTo",
+        ctrl,
+        &[false],
+        &mut args,
+    );
+    assert_eq!(out, NativeOutcome::Value(Value::Bool(true)));
+
+    // Target top 0.8*25 = 20: the retry line (z 100 -> 20) crosses the wall at z=60 -> blocked.
+    let mut vm2 = Vm::new(&set, VmLimits::default());
+    vm2.set_physics(Box::new(MockWorld::new().with_wall(wall.0, wall.1)));
+    let (ctrl2, _pawn2, other2) = los_pair(&mut vm2, &set, "Pawn", [100.0, 0.0, 0.0], 100.0, 25.0);
+    let mut args2 = [Value::Object(Some(ObjRef::Instance(other2)))];
+    let out2 = call_native(
+        &mut vm2,
+        "Engine.Controller.LineOfSightTo",
+        ctrl2,
+        &[false],
+        &mut args2,
+    );
+    assert_eq!(out2, NativeOutcome::Value(Value::Bool(false)));
+}
+
+/// The 8000^2 (0x1047c878) and 2000^2 (0x1047c874) limits gate only the RETRY: a clear base line
+/// is visible at any distance, while a blocked base line falls back to the retry only inside the
+/// limits. The `Enemy` branch (0x1036ad39) has no limits and retries at the eye point.
+#[test]
+fn line_of_sight_to_distance_limits_gate_only_the_retry() {
+    let set = los_set();
+    // Wall between viewer and target blocking the descending base line (z at the wall is 73)
+    // but not the higher retry lines. Per distance, the wall sits at 0.27*dist.
+    for (dist, expected) in [(1500.0, true), (2500.0, false), (3000.0, false)] {
+        let wx = 0.27 * dist;
+        let mut vm = Vm::new(&set, VmLimits::default());
+        vm.set_physics(Box::new(
+            MockWorld::new().with_wall([wx, -10.0, 40.0], [wx + 1.0, 10.0, 80.0]),
+        ));
+        let (ctrl, _pawn, other) = los_pair(&mut vm, &set, "Pawn", [dist, 0.0, 0.0], 100.0, 100.0);
+        let mut args = [Value::Object(Some(ObjRef::Instance(other)))];
+        let out = call_native(
+            &mut vm,
+            "Engine.Controller.LineOfSightTo",
+            ctrl,
+            &[false],
+            &mut args,
+        );
+        assert_eq!(
+            out,
+            NativeOutcome::Value(Value::Bool(expected)),
+            "dist {dist}"
+        );
+    }
+
+    // The same far, wall-blocked geometry as Enemy: retry at the eye point (z=100, above the
+    // wall), no distance limits -> visible even at 9e6 squared distance.
+    let mut vm2 = Vm::new(&set, VmLimits::default());
+    vm2.set_physics(Box::new(
+        MockWorld::new().with_wall([810.0, -10.0, 40.0], [811.0, 10.0, 80.0]),
+    ));
+    let (ctrl2, _pawn2, other2) =
+        los_pair(&mut vm2, &set, "Pawn", [3000.0, 0.0, 0.0], 100.0, 100.0);
+    vm2.set_property(
+        ctrl2,
+        "Enemy",
+        0,
+        Value::Object(Some(ObjRef::Instance(other2))),
+    );
+    let mut args2 = [Value::Object(Some(ObjRef::Instance(other2)))];
+    let out2 = call_native(
+        &mut vm2,
+        "Engine.Controller.LineOfSightTo",
+        ctrl2,
+        &[false],
+        &mut args2,
+    );
+    assert_eq!(out2, NativeOutcome::Value(Value::Bool(true)));
+
+    // Enemy whose BaseEyeHeight does not raise the retry over the wall: the eye retry is the
+    // blocked base line -> false (the branch's second line is what clears, not the branch).
+    let mut vm3 = Vm::new(&set, VmLimits::default());
+    vm3.set_physics(Box::new(
+        MockWorld::new().with_wall([810.0, -10.0, 40.0], [811.0, 10.0, 80.0]),
+    ));
+    let (ctrl3, _pawn3, other3) = los_pair(&mut vm3, &set, "Pawn", [3000.0, 0.0, 0.0], 0.0, 100.0);
+    vm3.set_property(
+        ctrl3,
+        "Enemy",
+        0,
+        Value::Object(Some(ObjRef::Instance(other3))),
+    );
+    let mut args3 = [Value::Object(Some(ObjRef::Instance(other3)))];
+    let out3 = call_native(
+        &mut vm3,
+        "Engine.Controller.LineOfSightTo",
+        ctrl3,
+        &[false],
+        &mut args3,
+    );
+    assert_eq!(out3, NativeOutcome::Value(Value::Bool(false)));
+}
+
+/// A PlayerController traces from its `ViewTarget` (Engine.dll 0x10368040), raising the view
+/// point by BaseEyeHeight only when the view target is its own pawn (0x1036ace6).
+#[test]
+fn line_of_sight_to_uses_the_player_controller_view_target() {
+    let set = los_set();
+    // Wall from the ground up to z=100: a trace at z=0 is blocked, traces descending from the
+    // pawn eye (z=100) are blocked on the base line, retries can clear above.
+    let wall = ([50.0, -10.0, -10.0], [51.0, 10.0, 100.0]);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new().with_wall(wall.0, wall.1)));
+    let pc = vm.spawn(pg(&set, "PlayerController"), "PC").unwrap();
+    let pawn = spawn_at(&mut vm, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(100.0));
+    vm.set_property(pc, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    // ViewTarget = a camera at z=0 (not the pawn): no eye raise -> the base line to a target
+    // base at z=0 runs horizontally through the wall -> blocked, and the top retry
+    // (0.8*40=32) also descends into the wall -> false.
+    let camera = spawn_at(&mut vm, &set, "Actor", "Cam", [0.0, 0.0, 0.0]);
+    vm.set_property(
+        pc,
+        "ViewTarget",
+        0,
+        Value::Object(Some(ObjRef::Instance(camera))),
+    );
+    let other = spawn_at(&mut vm, &set, "Pawn", "O", [100.0, 0.0, 0.0]);
+    let mut args = [Value::Object(Some(ObjRef::Instance(other)))];
+    let out = call_native(
+        &mut vm,
+        "Engine.Controller.LineOfSightTo",
+        pc,
+        &[false],
+        &mut args,
+    );
+    assert_eq!(out, NativeOutcome::Value(Value::Bool(false)));
+
+    // ViewTarget = the pawn itself: the eye raise applies (z=100), the base line descends into
+    // the wall, and the top retry to 0.8*200=160 climbs above it (z=130 at the wall) -> true.
+    vm.set_property(
+        pc,
+        "ViewTarget",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    vm.set_property(other, "CollisionHeight", 0, Value::Float(200.0));
+    let mut args2 = [Value::Object(Some(ObjRef::Instance(other)))];
+    let out2 = call_native(
+        &mut vm,
+        "Engine.Controller.LineOfSightTo",
+        pc,
+        &[false],
+        &mut args2,
+    );
+    assert_eq!(out2, NativeOutcome::Value(Value::Bool(true)));
+}
+
+/// CanSee (SeePawn, Engine.dll 0x1036dc40) adds the SightRadius/Visibility range gate and the
+/// decoded `|delta| > PeripheralVision` check; LineOfSightTo has neither.
+#[test]
+fn can_see_range_and_peripheral_gates_differ_from_line_of_sight_to() {
+    let set = los_set();
+
+    // Clear world: LineOfSightTo ignores SightRadius, CanSee enforces it.
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let pawn = spawn_at(&mut vm, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    vm.set_property(pawn, "SightRadius", 0, Value::Float(500.0));
+    let ctrl = vm.spawn(pg(&set, "Controller"), "C").unwrap();
+    vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    let other = spawn_at(&mut vm, &set, "Pawn", "O", [600.0, 0.0, 0.0]);
+    vm.set_property(other, "Visibility", 0, Value::Int(128));
+    let mut args = [Value::Object(Some(ObjRef::Instance(other)))];
+    let los = call_native(
+        &mut vm,
+        "Engine.Controller.LineOfSightTo",
+        ctrl,
+        &[false],
+        &mut args,
+    );
+    assert_eq!(los, NativeOutcome::Value(Value::Bool(true)));
+    let mut args2 = [Value::Object(Some(ObjRef::Instance(other)))];
+    let see = call_native(
+        &mut vm,
+        "Engine.Controller.CanSee",
+        ctrl,
+        &[false],
+        &mut args2,
+    );
+    assert_eq!(see, NativeOutcome::Value(Value::Bool(false)));
+
+    // Within SightRadius: visible. Visibility scales the range: 64 halves it (250).
+    let closer = spawn_at(&mut vm, &set, "Pawn", "O2", [400.0, 0.0, 0.0]);
+    vm.set_property(closer, "Visibility", 0, Value::Int(128));
+    let mut args3 = [Value::Object(Some(ObjRef::Instance(closer)))];
+    let see2 = call_native(
+        &mut vm,
+        "Engine.Controller.CanSee",
+        ctrl,
+        &[false],
+        &mut args3,
+    );
+    assert_eq!(see2, NativeOutcome::Value(Value::Bool(true)));
+    vm.set_property(closer, "Visibility", 0, Value::Int(64));
+    let mut args4 = [Value::Object(Some(ObjRef::Instance(closer)))];
+    let see3 = call_native(
+        &mut vm,
+        "Engine.Controller.CanSee",
+        ctrl,
+        &[false],
+        &mut args4,
+    );
+    assert_eq!(see3, NativeOutcome::Value(Value::Bool(false)));
+    let nearest = spawn_at(&mut vm, &set, "Pawn", "O3", [200.0, 0.0, 0.0]);
+    vm.set_property(nearest, "Visibility", 0, Value::Int(64));
+    let _ = &nearest;
+    let mut args5 = [Value::Object(Some(ObjRef::Instance(nearest)))];
+    let see4 = call_native(
+        &mut vm,
+        "Engine.Controller.CanSee",
+        ctrl,
+        &[false],
+        &mut args5,
+    );
+    assert_eq!(see4, NativeOutcome::Value(Value::Bool(true)));
+
+    // PeripheralVision is compared as a distance in the decoded binary (dot(delta,
+    // SafeNormal(delta)) = |delta|): 360 rejects inside 360 UU; the Engine.u default 0 and
+    // the XIII -1 convention pass.
+    for (pv, dist, expected) in [
+        (360.0, 100.0, false),
+        (0.0, 100.0, true),
+        (-1.0, 100.0, true),
+    ] {
+        let mut vm2 = Vm::new(&set, VmLimits::default());
+        vm2.set_physics(Box::new(MockWorld::new()));
+        let pawn2 = spawn_at(&mut vm2, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+        vm2.set_property(pawn2, "PeripheralVision", 0, Value::Float(pv));
+        let ctrl2 = vm2.spawn(pg(&set, "Controller"), "C").unwrap();
+        vm2.set_property(
+            ctrl2,
+            "Pawn",
+            0,
+            Value::Object(Some(ObjRef::Instance(pawn2))),
+        );
+        let other2 = spawn_at(&mut vm2, &set, "Pawn", "O", [dist, 0.0, 0.0]);
+        vm2.set_property(other2, "Visibility", 0, Value::Int(128));
+        let mut args6 = [Value::Object(Some(ObjRef::Instance(other2)))];
+        let out = call_native(
+            &mut vm2,
+            "Engine.Controller.CanSee",
+            ctrl2,
+            &[false],
+            &mut args6,
+        );
+        assert_eq!(out, NativeOutcome::Value(Value::Bool(expected)), "pv {pv}");
+    }
+
+    // CanSee on the controller's Enemy is exactly LineOfSightTo: no range gate.
+    let mut vm3 = Vm::new(&set, VmLimits::default());
+    vm3.set_physics(Box::new(MockWorld::new()));
+    let pawn3 = spawn_at(&mut vm3, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    vm3.set_property(pawn3, "SightRadius", 0, Value::Float(500.0));
+    let ctrl3 = vm3.spawn(pg(&set, "Controller"), "C").unwrap();
+    vm3.set_property(
+        ctrl3,
+        "Pawn",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn3))),
+    );
+    let far = spawn_at(&mut vm3, &set, "Pawn", "O", [3000.0, 0.0, 0.0]);
+    vm3.set_property(far, "Visibility", 0, Value::Int(128));
+    vm3.set_property(
+        ctrl3,
+        "Enemy",
+        0,
+        Value::Object(Some(ObjRef::Instance(far))),
+    );
+    let mut args7 = [Value::Object(Some(ObjRef::Instance(far)))];
+    let see5 = call_native(
+        &mut vm3,
+        "Engine.Controller.CanSee",
+        ctrl3,
+        &[false],
+        &mut args7,
+    );
+    assert_eq!(see5, NativeOutcome::Value(Value::Bool(true)));
+}
+
+/// Degenerate inputs: no pawn, missing view/other locations, zero distance.
+#[test]
+fn can_see_and_line_of_sight_to_degenerate_inputs() {
+    let set = los_set();
+    // No pawn on the controller: CanSee is false (SeePawn's first gate), LineOfSightTo still
+    // traces from the controller itself (AController::GetViewTarget returns `this`).
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let ctrl = vm.spawn(pg(&set, "Controller"), "C").unwrap();
+    let other = spawn_at(&mut vm, &set, "Pawn", "O", [100.0, 0.0, 0.0]);
+    let mut args = [Value::Object(Some(ObjRef::Instance(other)))];
+    let see = call_native(
+        &mut vm,
+        "Engine.Controller.CanSee",
+        ctrl,
+        &[false],
+        &mut args,
+    );
+    assert_eq!(see, NativeOutcome::Value(Value::Bool(false)));
+    let mut args2 = [Value::Object(Some(ObjRef::Instance(other)))];
+    let los = call_native(
+        &mut vm,
+        "Engine.Controller.LineOfSightTo",
+        ctrl,
+        &[false],
+        &mut args2,
+    );
+    assert_eq!(los, NativeOutcome::Value(Value::Bool(true)));
+
+    // Controller and target exactly overlapping: the decoded PeripheralVision check (pass
+    // requires |delta| > PeripheralVision strictly) rejects CanSee at distance 0.
+    let mut vm2 = Vm::new(&set, VmLimits::default());
+    vm2.set_physics(Box::new(MockWorld::new()));
+    let pawn2 = spawn_at(&mut vm2, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+    let ctrl2 = vm2.spawn(pg(&set, "Controller"), "C").unwrap();
+    vm2.set_property(
+        ctrl2,
+        "Pawn",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn2))),
+    );
+    let same = spawn_at(&mut vm2, &set, "Pawn", "O", [0.0, 0.0, 0.0]);
+    vm2.set_property(same, "Visibility", 0, Value::Int(128));
+    let mut args3 = [Value::Object(Some(ObjRef::Instance(same)))];
+    let see2 = call_native(
+        &mut vm2,
+        "Engine.Controller.CanSee",
+        ctrl2,
+        &[false],
+        &mut args3,
+    );
+    assert_eq!(see2, NativeOutcome::Value(Value::Bool(false)));
+    let mut args4 = [Value::Object(Some(ObjRef::Instance(same)))];
+    let los2 = call_native(
+        &mut vm2,
+        "Engine.Controller.LineOfSightTo",
+        ctrl2,
+        &[false],
+        &mut args4,
+    );
+    assert_eq!(los2, NativeOutcome::Value(Value::Bool(true)));
+}
+
 #[test]
 fn vrand_is_a_unit_vector() {
     let set = spawn_set();
