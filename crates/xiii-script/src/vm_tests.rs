@@ -1090,6 +1090,8 @@ fn spawn_fixture() -> Vec<u8> {
     let vector_extra = compact(vector_struct);
     let rotator_extra = compact(rotator_struct);
     let owner = b.reserve(IMP_OBJECTPROP, actor, "Owner");
+    let instigator = b.reserve(IMP_OBJECTPROP, actor, "Instigator");
+    let seen_instigator = b.reserve(IMP_OBJECTPROP, actor, "SeenInstigator");
     let level = b.reserve(IMP_OBJECTPROP, actor, "Level");
     let tag = b.reserve(IMP_NAMEPROP, actor, "Tag");
     let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
@@ -1098,7 +1100,9 @@ fn spawn_fixture() -> Vec<u8> {
     let bstatic = b.reserve(IMP_BOOLPROP, actor, "bStatic");
     let deleted = b.reserve(IMP_BOOLPROP, actor, "bDeleteMe");
     let spawned = b.reserve(IMP_FUNCTION, actor, "Spawned");
-    b.prop_with(owner, level, 0, &object_extra);
+    b.prop_with(owner, instigator, 0, &object_extra);
+    b.prop_with(instigator, seen_instigator, 0, &object_extra);
+    b.prop_with(seen_instigator, level, 0, &object_extra);
     b.prop_with(level, tag, 0, &object_extra);
     b.prop(tag, location, 0);
     b.prop_with(location, rotation, 0, &vector_extra);
@@ -1124,7 +1128,20 @@ fn spawn_fixture() -> Vec<u8> {
         ];
         b.func(r, next, 0, &code, 0x10, 0, DEFINED);
     };
-    bump(&mut b, spawned, pre);
+    let mut spawned_code = vec![0x0F, 0x01, seen_instigator as u8, 0x01, instigator as u8];
+    spawned_code.extend([
+        0x0F,
+        0x01,
+        calls as u8,
+        0x92,
+        0x00,
+        calls as u8,
+        0x26,
+        0x16,
+        0x04,
+        0x0B,
+    ]);
+    b.func(spawned, pre, 0, &spawned_code, 0x1B, 0, DEFINED);
     bump(&mut b, pre, begin);
     bump(&mut b, begin, post);
     bump(&mut b, post, net);
@@ -1399,6 +1416,53 @@ fn spawn_none_class_returns_none_and_abstract_refused() {
     assert!(vm.trace.iter().any(
         |e| matches!(&e.kind, TraceKind::SpawnRefused { reason } if reason.contains("abstract"))
     ));
+}
+
+#[test]
+fn item49b_spawn_inherits_instigator_before_spawned_independently_of_owner() {
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pawn = vm.spawn(sg(&set, "Actor"), "Pawn").unwrap();
+    let proxy = vm.spawn(sg(&set, "Actor"), "Weapon").unwrap();
+    let other_owner = vm.spawn(sg(&set, "Actor"), "OtherOwner").unwrap();
+    vm.set_property(
+        proxy,
+        "Instigator",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    for owner in [None, Some(other_owner)] {
+        let ammo = vm
+            .spawn_actor(proxy, Some(sg(&set, "Child")), owner, None, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(obj_prop(&vm, ammo, "Instigator"), Some(pawn));
+        assert_eq!(
+            obj_prop(&vm, ammo, "SeenInstigator"),
+            Some(pawn),
+            "Spawned must see inherited instigator"
+        );
+        assert_eq!(obj_prop(&vm, ammo, "Owner"), owner);
+        let nested = vm
+            .spawn_actor(ammo, Some(sg(&set, "Child")), None, None, None, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(obj_prop(&vm, nested, "SeenInstigator"), Some(pawn));
+    }
+    // A spawner without an Instigator must not substitute itself or its Owner.
+    let no_instigator = vm
+        .spawn_actor(
+            other_owner,
+            Some(sg(&set, "Child")),
+            Some(pawn),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(obj_prop(&vm, no_instigator, "Instigator"), None);
+    assert_eq!(obj_prop(&vm, no_instigator, "SeenInstigator"), None);
 }
 
 #[test]
@@ -6133,9 +6197,10 @@ fn weapon_attachment_cast_reaches_third_person_effects() {
 }
 
 #[test]
-fn suspended_actor_calls_are_counted_and_traced() {
+fn diagnostic_scope_suspended_calls_are_counted_and_traced() {
     let set = set_of(weapon_attachment_fixture());
     let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_diagnostic_call_scope(true);
     let caller = vm.spawn(g(&set, "Caller"), "Weapon").unwrap();
     let attach = vm.spawn(g(&set, "WeaponAttachment"), "Attach").unwrap();
     vm.set_active(caller, true);
@@ -7992,7 +8057,9 @@ fn inventory_package() -> Vec<u8> {
     let inv_inv = b.reserve(IMP_OBJPROP, inventory, "Inventory");
     let inv_owner = b.reserve(IMP_OBJPROP, inventory, "Owner");
     b.prop_with(inv_inv, inv_owner, 0, &compact(0));
-    b.prop_with(inv_owner, 0, 0, &compact(0));
+    let give = b.reserve(IMP_FUNCTION, inventory, "GiveTo");
+    let destroyed = b.reserve(IMP_FUNCTION, inventory, "Destroyed");
+    b.prop_with(inv_owner, give, 0, &compact(0));
     // Native object operators the script calls (declared so `resolve_native_index` finds them).
     let native_op = ff::FINAL | ff::NATIVE | ff::OPERATOR | ff::STATIC;
     let neq = b.reserve(IMP_FUNCTION, object, "NotEqual_ObjectObject");
@@ -8038,7 +8105,91 @@ fn inventory_package() -> Vec<u8> {
         0x0F, 0x19, 0x00, rl, 0xFF, 0xFF, 0x00, 0x01, pi, 0x00, rn,           // 0050 Last.Inventory = NewItem
         0x04, 0x27,                                                             // 0064 return true
     ];
-    b.func(add, 0, newitem, &code, 102, 0, ff::DEFINED);
+    let delete = b.reserve(IMP_FUNCTION, pawn, "DeleteInventory");
+    b.func(add, delete, newitem, &code, 102, 0, ff::DEFINED);
+    let other = b.reserve(IMP_OBJPROP, give, "Other");
+    let give_ret = b.reserve(IMP_INTPROP, give, "ReturnValue");
+    b.prop_with(other, give_ret, pf::PARM, &compact(0));
+    b.prop(give_ret, 0, pf::PARM | pf::RETURN_PARM);
+    let add_name = b.name("AddInventory");
+    // Owner = Other; return Other.AddInventory(self). Exercises a return-valued nested
+    // script call on an unticked/suspended owner, rather than a host call_function on it.
+    let give_code = [
+        0x0F,
+        0x01,
+        inv_owner as u8,
+        0x00,
+        other as u8,
+        0x04,
+        0x19,
+        0x00,
+        other as u8,
+        0xFF,
+        0xFF,
+        0,
+        0x1B,
+    ]
+    .into_iter()
+    .chain(compact(add_name))
+    .chain([0x17, 0x16])
+    .collect::<Vec<_>>();
+    b.func(give, destroyed, other, &give_code, 28, 0, ff::DEFINED);
+    let delete_name = b.name("DeleteInventory");
+    // Destroyed -> Owner.DeleteInventory(self). No native inventory repair is allowed.
+    let destroyed_code = [0x19, 0x01, inv_owner as u8, 0xFF, 0xFF, 0, 0x1B]
+        .into_iter()
+        .chain(compact(delete_name))
+        .chain([0x17, 0x16, 0x04, 0x0B])
+        .collect::<Vec<_>>();
+    b.func(
+        destroyed,
+        0,
+        0,
+        &destroyed_code,
+        18,
+        0,
+        ff::DEFINED | ff::EVENT,
+    );
+    let item = b.reserve(IMP_OBJPROP, delete, "Item");
+    b.prop_with(item, 0, pf::PARM, &compact(0));
+    // Minimal head unlink authored for this fixture: Inventory = Item.Inventory;
+    // Item.Inventory = None; Item.Owner = None. The tests delete the current head.
+    let delete_code = vec![
+        0x0F,
+        0x01,
+        pi,
+        0x19,
+        0x00,
+        item as u8,
+        0xFF,
+        0xFF,
+        0,
+        0x01,
+        pi,
+        0x0F,
+        0x19,
+        0x00,
+        item as u8,
+        0xFF,
+        0xFF,
+        0,
+        0x01,
+        pi,
+        0x2A,
+        0x0F,
+        0x19,
+        0x00,
+        item as u8,
+        0xFF,
+        0xFF,
+        0,
+        0x01,
+        inv_owner as u8,
+        0x2A,
+        0x04,
+        0x0B,
+    ];
+    b.func(delete, 0, item, &delete_code, 54, 0, ff::DEFINED);
     b.class(object, 0, neq);
     b.class(inventory, object, inv_inv);
     b.class(ammo, inventory, 0);
@@ -8146,6 +8297,88 @@ fn synthetic_add_inventory_links_the_chain_and_rejects_duplicates() {
         Some(&Value::Object(None)),
         "the tail's link stays None"
     );
+}
+
+/// Tick suspension must not interrupt synchronous GiveTo/AddInventory or the Destroyed
+/// callback to the owner. Duplicate items, an inactive owner and disabled Destroyed probes
+/// expose the old call gate and the native unlink workaround independently.
+#[test]
+fn item49b_inventory_callbacks_run_on_inactive_and_suspended_owners() {
+    let set = set_of(inventory_package());
+    for suspended in [false, true] {
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let owner = vm.spawn(g(&set, "Pawn"), "Corpse").unwrap();
+        vm.objects[owner as usize].suspended = suspended;
+        let first = vm.spawn(g(&set, "Inventory"), "First").unwrap();
+        let key = vm.spawn(g(&set, "Inventory"), "Key").unwrap();
+        let give = g(&set, "Inventory.GiveTo");
+        for item in [first, key] {
+            let result = vm
+                .call_function(
+                    give,
+                    item,
+                    vec![Value::Object(Some(ObjRef::Instance(owner)))],
+                )
+                .unwrap();
+            assert_eq!(result, Value::Bool(true));
+        }
+        assert_eq!(obj_prop(&vm, owner, "Inventory"), Some(first));
+        assert_eq!(obj_prop(&vm, first, "Inventory"), Some(key));
+        assert_eq!(
+            vm.call_function(
+                give,
+                key,
+                vec![Value::Object(Some(ObjRef::Instance(owner)))]
+            )
+            .unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            obj_prop(&vm, key, "Inventory"),
+            None,
+            "duplicate must not form a cycle"
+        );
+        vm.destroy(first).unwrap();
+        assert_eq!(
+            obj_prop(&vm, owner, "Inventory"),
+            Some(key),
+            "Destroyed must call unticked owner"
+        );
+        assert_eq!(obj_prop(&vm, first, "Owner"), None);
+        vm.destroy(key).unwrap();
+        assert_eq!(obj_prop(&vm, owner, "Inventory"), None);
+        assert!(
+            !vm.objects[owner as usize].active,
+            "a direct call must not enable scheduled ticking"
+        );
+        assert_eq!(vm.objects[owner as usize].suspended, suspended);
+        assert_eq!(vm.suspended_deferred_calls(), 0);
+        assert!(
+            !vm.trace
+                .iter()
+                .any(|e| matches!(e.kind, TraceKind::Deferred { .. }))
+        );
+    }
+}
+
+#[test]
+fn item49b_destroy_without_inventory_callback_does_not_repair_chain() {
+    let set = set_of(inventory_package());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let owner = vm.spawn(g(&set, "Pawn"), "Owner").unwrap();
+    let item = vm.spawn(g(&set, "Inventory"), "Item").unwrap();
+    vm.call_function(
+        g(&set, "Inventory.GiveTo"),
+        item,
+        vec![Value::Object(Some(ObjRef::Instance(owner)))],
+    )
+    .unwrap();
+    // Disabling Destroyed intentionally prevents the script unlink. DestroyActor must not
+    // silently synthesize inventory semantics when the callback is absent.
+    vm.disable_probe(item, "All", true);
+    vm.destroy(item).unwrap();
+    assert_eq!(obj_prop(&vm, owner, "Inventory"), Some(item));
+    assert_eq!(obj_prop(&vm, item, "Owner"), Some(owner));
 }
 
 /// Synthetic package with a `Pickup` class carrying `Location` (`Core.Struct` `Vector`),

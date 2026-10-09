@@ -8,9 +8,9 @@
 //! per-tick step budget.
 //!
 //! No filesystem access and no engine dependency: the caller loads packages into the set and
-//! decides which actors are *active* (executed). Script calls into inactive actors are
-//! recorded as [`TraceKind::Deferred`] and not executed (an error if the call needs a return
-//! value). Unsupported tokens, unimplemented natives, budget overruns and bad values fail with
+//! decides which actors are *active* (ticked). Direct script calls run independently of ticking.
+//! The diagnostic harness can explicitly restrict calls to its selected scope; skipped calls
+//! are traced, and return-valued calls fail. Unsupported tokens and unimplemented natives fail with
 //! [`VmError`] carrying a script stack trace. Nothing is stubbed silently.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1091,11 +1091,10 @@ pub struct Instance {
     /// All probes of the actor were disabled (`AActor+0x34` bit 0x1, `bProbesDisabled`). Read from
     /// the serialized property `bProbesDisabled` at spawn/layout time; `Disable`/`Enable` update it.
     probes_disabled: bool,
-    /// Executed by the VM (in scope).
+    /// Receives scheduled ticks, state code and timers. Does not gate direct script calls.
     pub active: bool,
-    /// Suspended after a script error (`active` was cleared by [`Vm::suspend_for_error`]). A
-    /// non-static call to a suspended actor is dropped; item14c records that visibly (see
-    /// [`Vm::suspended_deferred_calls`]) instead of silently no-oping.
+    /// Scheduled execution suspended after a script error. Direct calls still execute and
+    /// propagate any error; suspension never supplies a successful replacement result.
     pub suspended: bool,
     /// Derives from `Actor`.
     pub is_actor: bool,
@@ -1425,6 +1424,8 @@ pub struct Vm<'s> {
     /// out of the executed scope). Every such drop also records a trace note; this counter makes
     /// the total visible to the host/report so a suspended actor's silent no-ops cannot hide.
     suspended_deferred_calls: u64,
+    /// Explicit partial-execution diagnostic policy, never used by normal gameplay.
+    diagnostic_call_scope: bool,
     /// item18: Bink video durations in seconds, keyed by lowercased file stem. The host registers
     /// them (the VM deliberately has no filesystem access); an entry is absent when the Bink header
     /// could not be read, in which case `VideoPlayer.GetStatus` keeps the old "finished" Partial.
@@ -1596,6 +1597,7 @@ impl<'s> Vm<'s> {
             profile: NativeProfile::default(),
             ai_visible: HashMap::new(),
             suspended_deferred_calls: 0,
+            diagnostic_call_scope: false,
             video_durations: HashMap::new(),
             video: None,
             video_host: None,
@@ -1827,7 +1829,7 @@ impl<'s> Vm<'s> {
     /// checks before re-applying the wounded intro health; XIII's only script writer is
     /// `XIIIGameInfo.RestartPlayer` 0x037A, which copies `StartSpot.Event`, so the retail
     /// "LOAD" value must come from the engine's native checkpoint-load path after the login
-    /// chain — the front-end host presents a resume by setting it at that same point).
+    /// chain â€” the front-end host presents a resume by setting it at that same point).
     pub fn set_start_spot_event(&mut self, value: impl Into<String>) {
         let id = (0..self.objects.len() as ObjectId).find(|&id| {
             let o = &self.objects[id as usize];
@@ -2044,7 +2046,7 @@ impl<'s> Vm<'s> {
     /// `Engine.VideoPlayer.Open(name)`: records the clip. Returns `true` when the clip is timed
     /// (the host decodes it, or a Bink-header duration is registered as the labelled fallback)
     /// and `false` when it is not (the call is still accepted, and `GetStatus` reports
-    /// finished — the labelled Partial). A new `Open` stops any clip the host is still playing.
+    /// finished â€” the labelled Partial). A new `Open` stops any clip the host is still playing.
     pub fn video_open(&mut self, name: &str) -> bool {
         let stem = video_stem(name);
         if self
@@ -3166,7 +3168,13 @@ impl<'s> Vm<'s> {
             .is_some_and(|o| o.layout.chain_names.iter().any(|n| n.contains(needle)))
     }
 
-    /// Marks an object as executed (in scope).
+    /// Restricts direct calls to active objects for a partial-execution diagnostic.
+    /// This is a harness policy, not an UnrealScript rule. Normal gameplay leaves it disabled.
+    pub fn set_diagnostic_call_scope(&mut self, enabled: bool) {
+        self.diagnostic_call_scope = enabled;
+    }
+
+    /// Marks an object for scheduled execution (ticks, timers and state code).
     pub fn set_active(&mut self, id: ObjectId, active: bool) {
         if let Some(o) = self.objects.get_mut(id as usize) {
             o.active = active;
@@ -3424,7 +3432,7 @@ impl<'s> Vm<'s> {
     }
 
     /// Adjust the `value` member of the `MusicVars` entry named `name` (case-insensitive) by
-    /// `delta`, returning the new value. `None` when the property or entry is absent — the
+    /// `delta`, returning the new value. `None` when the property or entry is absent â€” the
     /// `LevelInfo.{Inc,Dec}{Attente,Alerte}` counters live there.
     pub(crate) fn adjust_music_var(&mut self, id: ObjectId, name: &str, delta: i32) -> Option<i32> {
         let arr = match self.get_property(id, "MusicVars")? {
@@ -3757,7 +3765,7 @@ impl<'s> Vm<'s> {
     /// page/control `__OnPreDraw__`/`__OnDraw__` delegates this way).
     ///
     /// Reads the delegate `property` from `context`. A bound delegate calls its own
-    /// `(object, function)`; an unbound/absent one calls `declared` on `context` — the same
+    /// `(object, function)`; an unbound/absent one calls `declared` on `context` â€” the same
     /// fallback as the `DelegateFunction` (`0x43`) opcode. Fails explicitly when the target
     /// function does not exist; it never silently draws nothing.
     pub fn call_delegate(
@@ -4354,7 +4362,7 @@ impl<'s> Vm<'s> {
     /// reaches the engine movement natives `CheckBob` (#504) and `FindStairRotation` (#524), which
     /// the port replaces and does not register. Running it would double-move the pawn and suspend
     /// the controller. So this dispatches `PlayerTick` only when the controller's **current state**
-    /// defines it — exactly the script the host does not own.
+    /// defines it â€” exactly the script the host does not own.
     fn dispatch_player_ticks(&mut self, dt: f32) -> VmResult<()> {
         for id in 0..self.objects.len() as ObjectId {
             if self.player_tick_overridden(id) {
@@ -4421,8 +4429,8 @@ impl<'s> Vm<'s> {
         id
     }
 
-    /// item14c: number of non-static calls dropped because the target actor was suspended after a
-    /// script error. Every drop also records a `Note`; this is the cumulative count for reports.
+    /// Diagnostic-scope calls dropped on suspended objects. Normal dispatch never drops
+    /// calls for tick suspension, so gameplay leaves this counter at zero.
     pub fn suspended_deferred_calls(&self) -> u64 {
         self.suspended_deferred_calls
     }
@@ -4872,17 +4880,14 @@ impl<'s> Vm<'s> {
             };
         }
         let layout = self.func_layout(func);
-        // A class-default object (`Default__Class`) is never `active`, and a `static` function
-        // dispatches on the class default object; UE2 runs both regardless of instance scope
-        // (`MessageClass.default.GetColor`, `Message.static.GetString`). Only non-static calls
-        // on *placed* actors outside the executed scope are deferred.
-        // A call through a just-destroyed actor runs in the engine: `execFinalFunction`/
-        // `execVirtualFunction` reach `CallFunction` directly, which has no `bDeleteMe` guard (see
-        // `bypass_context_none`). The VM's `deleted`/`destroying` flags stand in for that, so such
-        // a call is never treated as an out-of-scope deferral.
+        // Core.dll execVirtualFunction (0x10117490) / execFinalFunction (0x101174d0)
+        // dispatch directly to CallFunction (0x1011e650), which does not test actor tick
+        // activity, state latency, probes or bDeleteMe. The active-set restriction below is
+        // exclusively the partial-execution diagnostic harness's opt-in policy.
         let destroyed_target =
             self.objects[target as usize].deleted || self.objects[target as usize].destroying;
-        if !self.objects[target as usize].active
+        if self.diagnostic_call_scope
+            && !self.objects[target as usize].active
             && !self.objects[target as usize].name.starts_with("Default__")
             && !f.is_static()
             && !destroyed_target
@@ -5583,7 +5588,7 @@ impl<'s> Vm<'s> {
     /// `bDeleteMe` actor skips. `ULevel::DestroyActor` runs `Destroyed` **before** setting
     /// `bDeleteMe` (`0x1038965a`), and `ULevel::CleanupDestroyed` (`0x10387ae0`) only nulls
     /// references once at least 128 (`0x80` at `0x10387b63`) destroyed actors are pending, so a
-    /// just-destroyed actor stays readable/writable — this is why `XIIIGameInfo.EndGame` +0x0322
+    /// just-destroyed actor stays readable/writable â€” this is why `XIIIGameInfo.EndGame` +0x0322
     /// `P = P.nextController` still walks a destroyed AI controller.
     ///
     /// The `member` operand is kept for the callers' clarity; the bypass is per-actor, so the same
@@ -5658,7 +5663,7 @@ impl<'s> Vm<'s> {
             K::BoolVariable(_) => return Value::Bool(false),
             // `None.ArrayProp[i]` continues the Accessed-None chain with the element type's zero
             // (UE2 logs Accessed None and reads the element zero). Without this the chain
-            // produced `void`, and the next context raised TypeMismatch instead — measured:
+            // produced `void`, and the next context raised TypeMismatch instead â€” measured:
             // `self.Tatata.Emitters[0].RespawnDeadParticles = true` with `Tatata == None`
             // (`xidcine.ScriptedImpacts.Burst.Timer2` 0x0000) suspended the whole scripted
             // machine-gun chain that ends the Plage01 intro.
@@ -5926,7 +5931,7 @@ impl<'s> Vm<'s> {
                 flags,
                 class,
             } => {
-                // UE2 `FFrame::execNew`: `New (Outer, Name, Flags) Class` — operands in that
+                // UE2 `FFrame::execNew`: `New (Outer, Name, Flags) Class` â€” operands in that
                 // order. Actors may not be constructed with `new`.
                 let outer_v = self.eval_in(frame, outer, target)?;
                 let name_v = self.eval_in(frame, name, target)?;
@@ -6797,6 +6802,15 @@ impl<'s> Vm<'s> {
             rotation.or_else(|| self.rotator_prop(spawner, "Rotation")),
         );
         self.set_property(id, "Owner", 0, Value::Object(owner.map(ObjRef::Instance)));
+        // Engine.dll execSpawn 0x103e5785 passes this->Instigator (+0x88), and
+        // ULevel::SpawnActor 0x10388d91..0x10388d96 stores it before lifecycle callbacks.
+        // Owner is independent: ammo spawned by a pawn must retain that pawn as Instigator
+        // so its Transfer can unlink from the corpse before GiveTo changes ownership.
+        let instigator = self
+            .get_property(spawner, "Instigator")
+            .cloned()
+            .unwrap_or(Value::Object(None));
+        self.set_property(id, "Instigator", 0, instigator);
         self.set_property(
             id,
             "Tag",
@@ -7077,59 +7091,12 @@ impl<'s> Vm<'s> {
         result?;
         self.objects[id as usize].active = false;
         self.objects[id as usize].timers = [None, None, None];
-        // Leave a clean inventory chain. `Inventory.Destroyed` unlinks the item via
-        // `Instigator/Owner.DeleteInventory`, but that call is on another actor and can be
-        // deferred (out of the executed scope), leaving the destroyed item reachable from the
-        // owner. A stale head then makes `PlayerController.SearchPawn`'s `while (i = P.Inventory)`
-        // loop forever (measured: the corpse-search BudgetExceeded). Removing it here is what
-        // UE2's `AActor::Destroy` guarantees; it is a no-op when the script already unlinked it.
-        if self.is_a(id, "inventory") {
-            for owner_prop in ["Instigator", "Owner"] {
-                if let Some(Value::Object(Some(ObjRef::Instance(owner)))) =
-                    self.get_property(id, owner_prop).cloned()
-                {
-                    self.unlink_inventory(owner, id);
-                }
-            }
-        }
         let actor = self.objects[id as usize].name.clone();
         self.note(TraceKind::Destroyed {
             actor,
             result: true,
         });
         Ok(true)
-    }
-
-    /// Removes `item` from `owner`'s `Inventory` singly-linked chain (or from `item`'s
-    /// predecessor in it). Used by [`Vm::destroy`] and the host corpse-search bridge to guarantee
-    /// a clean chain when the script's `Inventory.Destroyed`/`DeleteInventory` unlink was deferred
-    /// (a call on an out-of-scope actor). No-op when `item` is not linked.
-    pub fn unlink_inventory(&mut self, owner: ObjectId, item: ObjectId) {
-        let mut cur = owner;
-        let mut guard = 0;
-        loop {
-            guard += 1;
-            if guard > 1024 {
-                return;
-            }
-            let next = match self.get_property(cur, "Inventory").cloned() {
-                Some(Value::Object(Some(ObjRef::Instance(n)))) => n,
-                _ => return,
-            };
-            if next == item {
-                let after = self
-                    .get_property(item, "Inventory")
-                    .cloned()
-                    .unwrap_or(Value::Object(None));
-                let _ = self.set_property(cur, "Inventory", 0, after);
-                let _ = self.set_property(item, "Inventory", 0, Value::Object(None));
-                return;
-            }
-            cur = next;
-            if cur == owner {
-                return;
-            }
-        }
     }
 
     /// First live (not deleted) object with a name (case-insensitive).
@@ -7912,9 +7879,9 @@ impl<'s> Vm<'s> {
     /// 3. `ShouldTrace` (`AActor::ShouldTrace` VA 0x10354640): for the script-trace flag word
     ///    (`execTrace` VA 0x103e8abf composes `0x86`/`0xBF | extra`, `SingleLineCheck` forces
     ///    `| 0x400`; bullets add `0x4040` from `XIIIWeapon.RealTraceFire`):
-    ///    - `APawn::ShouldTrace` (VA 0x10305d20) returns `TraceFlags & 1` — always set for
+    ///    - `APawn::ShouldTrace` (VA 0x10305d20) returns `TraceFlags & 1` â€” always set for
     ///      script traces, so an in-hash pawn is always admitted;
-    ///    - `AMover`/`ADecoration::ShouldTrace` (shared VA 0x10306c70) return `TraceFlags & 2` —
+    ///    - `AMover`/`ADecoration::ShouldTrace` (shared VA 0x10306c70) return `TraceFlags & 2` â€”
     ///      also always set, so in-hash movers/decorations are admitted;
     ///    - other actors: a world-geometry actor (bit 30 of `+0x2c`, same bit `IsBlockedBy`
     ///      VA 0x10315620 tests) is admitted because `TraceFlags & 0x80` is set; otherwise
@@ -8257,7 +8224,7 @@ impl<'s> Vm<'s> {
     /// `BaseEyeHeight` only when the view target is this controller's own pawn. The engine traces
     /// more than one line: first to `Other->Location` (the base), and only when that is blocked
     /// tries the eye point (`+BaseEyeHeight`) when `Other` is the controller's `Enemy`, or
-    /// `Location.Z + 0.8*CollisionHeight` otherwise — the latter two guarded by distance limits
+    /// `Location.Z + 0.8*CollisionHeight` otherwise â€” the latter two guarded by distance limits
     /// (>= 8000^2 and >= 2000^2 reject; the 2000^2 exception `IsA(APawn::StaticClass())` never
     /// holds for a controller). Blocked-by-the-target counts as visible upstream, which the
     /// world-geometry-only provider cannot express (no actor occlusion, the standing convention);
@@ -8326,9 +8293,9 @@ impl<'s> Vm<'s> {
         loc
     }
 
-    /// `Controller.CanSee(Pawn Other)` — Engine.dll `AController::SeePawn`
+    /// `Controller.CanSee(Pawn Other)` â€” Engine.dll `AController::SeePawn`
     /// (`?SeePawn@AController@@QAEKPAVAPawn@@H@Z` VA 0x1036dc40, item27m). `execCanSee`
-    /// (0x1036f070) calls this with the second argument 0 — XIII's `CanSee` is not a plain
+    /// (0x1036f070) calls this with the second argument 0 â€” XIII's `CanSee` is not a plain
     /// `LineOfSightTo` forward: for the controller's `Enemy` it is exactly `LineOfSightTo`,
     /// otherwise it adds the retail range gate
     /// `DistSq <= (min(1.0, Other.Visibility/128.0) * Pawn.SightRadius)^2` (strictly greater
@@ -9243,7 +9210,7 @@ impl<'s> Vm<'s> {
         // `xidcine.Cine2.CineInit.PlayMoving` re-runs `LoopAnim(WaitAnim, none, 0.2)` from
         // `PlayingSequence.Tick` every tick, so a chain that froze each interrupted tween
         // recursively grew without limit and failed the whole cutscene. The frozen source is
-        // therefore the channel's current state with its own frozen source dropped — a single
+        // therefore the channel's current state with its own frozen source dropped â€” a single
         // cached level, like the engine. Whether the engine's cache holds the channel's blended
         // in-progress pose or its target pose is not fully decoded (the report labels it a
         // hypothesis); this freeze keeps the interrupted tween's frame and remaining time.
@@ -10054,7 +10021,7 @@ mod stack_name_tests {
     #[test]
     fn slot_lookup_case_insensitive_short_long_and_non_ascii() {
         let long = "A".repeat(80);
-        let l = layout_with(&["LoCaTiOn", "bCollideActors", &long, "café", "tail"]);
+        let l = layout_with(&["LoCaTiOn", "bCollideActors", &long, "cafĂ©", "tail"]);
         // Short ASCII: every case spelling maps to the same slot.
         assert_eq!(l.slot_by_name("LOCATION").map(|s| s.base), Some(0));
         assert_eq!(l.slot_by_name("location").map(|s| s.base), Some(0));
@@ -10065,7 +10032,7 @@ mod stack_name_tests {
             Some(2)
         );
         // Non-ASCII: fallback path, exact bytes match.
-        assert_eq!(l.slot_by_name("café").map(|s| s.base), Some(3));
+        assert_eq!(l.slot_by_name("cafĂ©").map(|s| s.base), Some(3));
         // The 64/65-byte boundary: both are stored lowercased and found.
         let n64 = "b".repeat(64);
         let n65 = format!("{}c", "b".repeat(64));

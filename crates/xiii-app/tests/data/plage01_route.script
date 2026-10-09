@@ -60,7 +60,7 @@ t=63.10 fire
 t=63.30 fire
 t=63.50 fire
 t=63.60 track off
-t=64.00 search BaseSoldier6
+t=64.00 use BaseSoldier6
 
 # Search the dead killer for the game's ClefPickup and use it on the truck's Porte1.
 t=66.00 teleport 1215.0 -14000.0 1105.0 # diagnostic: approach truck door

@@ -990,7 +990,7 @@ fn fixed_step(
     }
     // Always advance the script so an explicit `take_control` diagnostic can be read even while a cutscene
     // suppresses input; the axis input and the other command queues are dropped when suppressed.
-    let (mut input, weapons, goals, use_named, search) = match script.drive.as_mut() {
+    let (mut input, weapons, goals, use_named) = match script.drive.as_mut() {
         Some(drive) => {
             let input = drive.advance(elapsed, &mut sim.0);
             (
@@ -998,12 +998,10 @@ fn fixed_step(
                 drive.take_weapons(),
                 drive.take_goals(),
                 drive.take_use_named(),
-                drive.take_search(),
             )
         }
         None => (
             read_keyboard(&keys, &buttons),
-            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1038,11 +1036,6 @@ fn fixed_step(
     if suppressed {
         weapon_inputs.clear();
     }
-    let wake: Vec<String> = script
-        .drive
-        .as_mut()
-        .map(script::Drive::take_wake)
-        .unwrap_or_default();
     let control = script
         .drive
         .as_mut()
@@ -1050,10 +1043,10 @@ fn fixed_step(
     if suppressed {
         input = Input::default();
     }
-    let (weapons, goals, use_named, search) = if suppressed {
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+    let (weapons, goals, use_named) = if suppressed {
+        (Vec::new(), Vec::new(), Vec::new())
     } else {
-        (weapons, goals, use_named, search)
+        (weapons, goals, use_named)
     };
     let use_action = input.use_action;
     let fire = input.fire;
@@ -1177,16 +1170,6 @@ fn fixed_step(
         for target in &use_named {
             let outcome = sess.use_target(target);
             println!("[play] use {target}: {outcome:?}");
-        }
-        for target in &search {
-            let outcome = sess.search_corpse(target);
-            println!("[play] search {target}: {outcome:?}");
-        }
-        for target in &wake {
-            match sess.wake_actor(target) {
-                Ok(msg) => println!("[play] wake {msg}"),
-                Err(e) => println!("[play] wake failed: {e}"),
-            }
         }
         if fire {
             match sess.fire(sim.0.yaw, sim.0.pitch) {
@@ -2149,8 +2132,6 @@ fn run_script_inner(
         let goals = drive.take_goals();
         let mut weapon_inputs = drive.take_weapon_inputs();
         let mut use_named = drive.take_use_named();
-        let mut search = drive.take_search();
-        let wake = drive.take_wake();
         let control = drive.take_control();
         // Match the interactive fixed_step: FPC/FPL/CameraView/PlayingVideo own the pawn while
         // the authored cinematic runs. The headless route must still advance its script cursor,
@@ -2162,9 +2143,6 @@ fn run_script_inner(
             weapons.clear();
             weapon_inputs.clear();
             use_named.clear();
-            search.clear();
-            // `wake` is a host bridge like `set_goal`, not a player input: it stays available
-            // while an authored cinematic suppresses the player axes.
         }
         let fired = input.fire;
         if runtime.volumes.is_empty() {
@@ -2258,16 +2236,6 @@ fn run_script_inner(
         for target in &use_named {
             let outcome = runtime.session.use_target(target);
             println!("[play] use {target}: {outcome:?}");
-        }
-        for target in &search {
-            let outcome = runtime.session.search_corpse(target);
-            println!("[play] search {target}: {outcome:?}");
-        }
-        for target in &wake {
-            match runtime.session.wake_actor(target) {
-                Ok(msg) => println!("[play] wake {msg}"),
-                Err(e) => println!("[play] wake failed: {e}"),
-            }
         }
         if fired {
             match runtime.session.fire(runtime.sim.yaw, runtime.sim.pitch) {
