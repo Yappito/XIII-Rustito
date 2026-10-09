@@ -279,7 +279,7 @@ impl Session {
         // parses a `?load=` option (`XIIIGameInfo.InitGame` 0x0006..0x004D reads
         // Name/Class/Team; `Engine.GameInfo.InitGame` reads Difficulty/GameSpeed/AccessControl/
         // AdminPassword/GameRules), so the retail `?load=9` option of
-        // `PlayerController.QuickLoad` is consumed by the engine's native load path â€” the port
+        // `PlayerController.QuickLoad` is consumed by the engine's native load path — the port
         // presents the resume through the post-login `StartSpotEvent` set below instead.
         runtime::configure_local_url(&mut vm, game_dir, map);
 
@@ -369,7 +369,7 @@ impl Session {
         initialize_headless_input_system(&mut vm, set, controller)?;
         if let Some(event) = start_event {
             // The engine's checkpoint-load path sets GameInfo.StartSpotEvent after the login
-            // chain (XIII's own `RestartPlayer` copies `StartSpot.Event` into it first â€”
+            // chain (XIII's own `RestartPlayer` copies `StartSpot.Event` into it first —
             // bytecode 0x037A). `Plage00.FirstFrame`'s guard at 0x0013 then skips re-applying
             // the wounded intro Health when it reads "LOAD". Set it here, once, after spawn.
             vm.set_start_spot_event(event);
@@ -2081,7 +2081,7 @@ impl Session {
     }
 
     /// Diagnostic weapon bootstrap for `--play-script` (item14/item14c): spawn `class_path` and
-    /// run the **game's own** give/equip path â€” `Weapon.GiveTo(Pawn)` (inventory + ammo +
+    /// run the **game's own** give/equip path — `Weapon.GiveTo(Pawn)` (inventory + ammo +
     /// `ClientWeaponSet`) and, when the pawn already carries a weapon, `Pawn.ChangedWeapon` (the
     /// same switch the game runs for the first weapon or a manual change), which sets
     /// `Pawn.Weapon`, calls `Weapon.BringUp` and `Weapon.AttachToPawn`. Nothing wires
@@ -2275,7 +2275,7 @@ impl Session {
     /// Reproduces the engine's `Trigger.Touch` for the one decoded actor that starts a level end
     /// but has no decoded starter: `XIDCine.BeachFinalFall` (its `Event` names the goal trigger,
     /// but it derives from `Engine.Triggers`, which has no `Touch`, and no script or native fires
-    /// its `'Fall'` tag â€” see the report). The allow-list is by class name, so no other actor
+    /// its `'Fall'` tag — see the report). The allow-list is by class name, so no other actor
     /// ever invents an event. Visible in the log on every firing.
     fn fire_touch_event_bridge(&mut self, actor: ObjectId) {
         const ALLOW: &[&str] = &["beachfinalfall"];
@@ -2443,7 +2443,7 @@ pub fn render_delta(previous: [f32; 3], current: [f32; 3]) -> [f32; 3] {
 /// VM (`Vm::set_video_duration`). Returns `(clips found, clips timed)`.
 ///
 /// The Bink 1 header is fixed and cheap to read (header layout: `BIK` + revision at 0; frame count
-/// at 8; width at 20; height at 24; fps numerator at 28; fps denominator at 32 â€” see
+/// at 8; width at 20; height at 24; fps numerator at 28; fps denominator at 32 — see
 /// `crates/xiii-video/src/container.rs` in the item17a worktree and the public Bink container
 /// documentation). Duration = frame_count / (fps_num / fps_den). Only the first 36 bytes are read,
 /// so registering all clips costs a handful of small reads, not the multi-megabyte files.
@@ -3772,7 +3772,7 @@ mod tests {
             .expect("Plage00 has at least one objective");
         first_objective.completed = !first_objective.completed;
         first_objective.primary = !first_objective.primary;
-        // One restore, before the first ticked step â€” the same point the `--play` host applies
+        // One restore, before the first ticked step — the same point the `--play` host applies
         // it (`setup_inner`, after `Session::open`). FirstFrame runs later, on the MapInfo's
         // first Timer tick, and must not overwrite the restored fields.
         let location = saved.location;
@@ -3835,7 +3835,7 @@ mod tests {
         );
         // `RestartPlayer`'s own `TriggerEvent(StartSpot.Event)` re-arms the level's
         // Tag='Debut' `XIIISaveGameTrigger`, whose `GoSaving.DoSave` (0x0191) increments the
-        // checkpoint again during resumed play â€” the game's own re-save, measured 7 -> 8.
+        // checkpoint again during resumed play — the game's own re-save, measured 7 -> 8.
         let checkpoint_now = session.vm().get_property(game_info, "CheckpointNumber");
         assert!(
             matches!(checkpoint_now, Some(Value::Int(n)) if *n >= 7),

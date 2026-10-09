@@ -1829,7 +1829,7 @@ impl<'s> Vm<'s> {
     /// checks before re-applying the wounded intro health; XIII's only script writer is
     /// `XIIIGameInfo.RestartPlayer` 0x037A, which copies `StartSpot.Event`, so the retail
     /// "LOAD" value must come from the engine's native checkpoint-load path after the login
-    /// chain â€” the front-end host presents a resume by setting it at that same point).
+    /// chain — the front-end host presents a resume by setting it at that same point).
     pub fn set_start_spot_event(&mut self, value: impl Into<String>) {
         let id = (0..self.objects.len() as ObjectId).find(|&id| {
             let o = &self.objects[id as usize];
@@ -2046,7 +2046,7 @@ impl<'s> Vm<'s> {
     /// `Engine.VideoPlayer.Open(name)`: records the clip. Returns `true` when the clip is timed
     /// (the host decodes it, or a Bink-header duration is registered as the labelled fallback)
     /// and `false` when it is not (the call is still accepted, and `GetStatus` reports
-    /// finished â€” the labelled Partial). A new `Open` stops any clip the host is still playing.
+    /// finished — the labelled Partial). A new `Open` stops any clip the host is still playing.
     pub fn video_open(&mut self, name: &str) -> bool {
         let stem = video_stem(name);
         if self
@@ -3432,7 +3432,7 @@ impl<'s> Vm<'s> {
     }
 
     /// Adjust the `value` member of the `MusicVars` entry named `name` (case-insensitive) by
-    /// `delta`, returning the new value. `None` when the property or entry is absent â€” the
+    /// `delta`, returning the new value. `None` when the property or entry is absent — the
     /// `LevelInfo.{Inc,Dec}{Attente,Alerte}` counters live there.
     pub(crate) fn adjust_music_var(&mut self, id: ObjectId, name: &str, delta: i32) -> Option<i32> {
         let arr = match self.get_property(id, "MusicVars")? {
@@ -3765,7 +3765,7 @@ impl<'s> Vm<'s> {
     /// page/control `__OnPreDraw__`/`__OnDraw__` delegates this way).
     ///
     /// Reads the delegate `property` from `context`. A bound delegate calls its own
-    /// `(object, function)`; an unbound/absent one calls `declared` on `context` â€” the same
+    /// `(object, function)`; an unbound/absent one calls `declared` on `context` — the same
     /// fallback as the `DelegateFunction` (`0x43`) opcode. Fails explicitly when the target
     /// function does not exist; it never silently draws nothing.
     pub fn call_delegate(
@@ -4362,7 +4362,7 @@ impl<'s> Vm<'s> {
     /// reaches the engine movement natives `CheckBob` (#504) and `FindStairRotation` (#524), which
     /// the port replaces and does not register. Running it would double-move the pawn and suspend
     /// the controller. So this dispatches `PlayerTick` only when the controller's **current state**
-    /// defines it â€” exactly the script the host does not own.
+    /// defines it — exactly the script the host does not own.
     fn dispatch_player_ticks(&mut self, dt: f32) -> VmResult<()> {
         for id in 0..self.objects.len() as ObjectId {
             if self.player_tick_overridden(id) {
@@ -5588,7 +5588,7 @@ impl<'s> Vm<'s> {
     /// `bDeleteMe` actor skips. `ULevel::DestroyActor` runs `Destroyed` **before** setting
     /// `bDeleteMe` (`0x1038965a`), and `ULevel::CleanupDestroyed` (`0x10387ae0`) only nulls
     /// references once at least 128 (`0x80` at `0x10387b63`) destroyed actors are pending, so a
-    /// just-destroyed actor stays readable/writable â€” this is why `XIIIGameInfo.EndGame` +0x0322
+    /// just-destroyed actor stays readable/writable — this is why `XIIIGameInfo.EndGame` +0x0322
     /// `P = P.nextController` still walks a destroyed AI controller.
     ///
     /// The `member` operand is kept for the callers' clarity; the bypass is per-actor, so the same
@@ -5663,7 +5663,7 @@ impl<'s> Vm<'s> {
             K::BoolVariable(_) => return Value::Bool(false),
             // `None.ArrayProp[i]` continues the Accessed-None chain with the element type's zero
             // (UE2 logs Accessed None and reads the element zero). Without this the chain
-            // produced `void`, and the next context raised TypeMismatch instead â€” measured:
+            // produced `void`, and the next context raised TypeMismatch instead — measured:
             // `self.Tatata.Emitters[0].RespawnDeadParticles = true` with `Tatata == None`
             // (`xidcine.ScriptedImpacts.Burst.Timer2` 0x0000) suspended the whole scripted
             // machine-gun chain that ends the Plage01 intro.
@@ -5931,7 +5931,7 @@ impl<'s> Vm<'s> {
                 flags,
                 class,
             } => {
-                // UE2 `FFrame::execNew`: `New (Outer, Name, Flags) Class` â€” operands in that
+                // UE2 `FFrame::execNew`: `New (Outer, Name, Flags) Class` — operands in that
                 // order. Actors may not be constructed with `new`.
                 let outer_v = self.eval_in(frame, outer, target)?;
                 let name_v = self.eval_in(frame, name, target)?;
@@ -7879,9 +7879,9 @@ impl<'s> Vm<'s> {
     /// 3. `ShouldTrace` (`AActor::ShouldTrace` VA 0x10354640): for the script-trace flag word
     ///    (`execTrace` VA 0x103e8abf composes `0x86`/`0xBF | extra`, `SingleLineCheck` forces
     ///    `| 0x400`; bullets add `0x4040` from `XIIIWeapon.RealTraceFire`):
-    ///    - `APawn::ShouldTrace` (VA 0x10305d20) returns `TraceFlags & 1` â€” always set for
+    ///    - `APawn::ShouldTrace` (VA 0x10305d20) returns `TraceFlags & 1` — always set for
     ///      script traces, so an in-hash pawn is always admitted;
-    ///    - `AMover`/`ADecoration::ShouldTrace` (shared VA 0x10306c70) return `TraceFlags & 2` â€”
+    ///    - `AMover`/`ADecoration::ShouldTrace` (shared VA 0x10306c70) return `TraceFlags & 2` —
     ///      also always set, so in-hash movers/decorations are admitted;
     ///    - other actors: a world-geometry actor (bit 30 of `+0x2c`, same bit `IsBlockedBy`
     ///      VA 0x10315620 tests) is admitted because `TraceFlags & 0x80` is set; otherwise
@@ -8224,7 +8224,7 @@ impl<'s> Vm<'s> {
     /// `BaseEyeHeight` only when the view target is this controller's own pawn. The engine traces
     /// more than one line: first to `Other->Location` (the base), and only when that is blocked
     /// tries the eye point (`+BaseEyeHeight`) when `Other` is the controller's `Enemy`, or
-    /// `Location.Z + 0.8*CollisionHeight` otherwise â€” the latter two guarded by distance limits
+    /// `Location.Z + 0.8*CollisionHeight` otherwise — the latter two guarded by distance limits
     /// (>= 8000^2 and >= 2000^2 reject; the 2000^2 exception `IsA(APawn::StaticClass())` never
     /// holds for a controller). Blocked-by-the-target counts as visible upstream, which the
     /// world-geometry-only provider cannot express (no actor occlusion, the standing convention);
@@ -8293,9 +8293,9 @@ impl<'s> Vm<'s> {
         loc
     }
 
-    /// `Controller.CanSee(Pawn Other)` â€” Engine.dll `AController::SeePawn`
+    /// `Controller.CanSee(Pawn Other)` — Engine.dll `AController::SeePawn`
     /// (`?SeePawn@AController@@QAEKPAVAPawn@@H@Z` VA 0x1036dc40, item27m). `execCanSee`
-    /// (0x1036f070) calls this with the second argument 0 â€” XIII's `CanSee` is not a plain
+    /// (0x1036f070) calls this with the second argument 0 — XIII's `CanSee` is not a plain
     /// `LineOfSightTo` forward: for the controller's `Enemy` it is exactly `LineOfSightTo`,
     /// otherwise it adds the retail range gate
     /// `DistSq <= (min(1.0, Other.Visibility/128.0) * Pawn.SightRadius)^2` (strictly greater
@@ -9210,7 +9210,7 @@ impl<'s> Vm<'s> {
         // `xidcine.Cine2.CineInit.PlayMoving` re-runs `LoopAnim(WaitAnim, none, 0.2)` from
         // `PlayingSequence.Tick` every tick, so a chain that froze each interrupted tween
         // recursively grew without limit and failed the whole cutscene. The frozen source is
-        // therefore the channel's current state with its own frozen source dropped â€” a single
+        // therefore the channel's current state with its own frozen source dropped — a single
         // cached level, like the engine. Whether the engine's cache holds the channel's blended
         // in-progress pose or its target pose is not fully decoded (the report labels it a
         // hypothesis); this freeze keeps the interrupted tween's frame and remaining time.
@@ -10021,7 +10021,7 @@ mod stack_name_tests {
     #[test]
     fn slot_lookup_case_insensitive_short_long_and_non_ascii() {
         let long = "A".repeat(80);
-        let l = layout_with(&["LoCaTiOn", "bCollideActors", &long, "cafĂ©", "tail"]);
+        let l = layout_with(&["LoCaTiOn", "bCollideActors", &long, "café", "tail"]);
         // Short ASCII: every case spelling maps to the same slot.
         assert_eq!(l.slot_by_name("LOCATION").map(|s| s.base), Some(0));
         assert_eq!(l.slot_by_name("location").map(|s| s.base), Some(0));
@@ -10032,7 +10032,7 @@ mod stack_name_tests {
             Some(2)
         );
         // Non-ASCII: fallback path, exact bytes match.
-        assert_eq!(l.slot_by_name("cafĂ©").map(|s| s.base), Some(3));
+        assert_eq!(l.slot_by_name("café").map(|s| s.base), Some(3));
         // The 64/65-byte boundary: both are stored lowercased and found.
         let n64 = "b".repeat(64);
         let n65 = format!("{}c", "b".repeat(64));

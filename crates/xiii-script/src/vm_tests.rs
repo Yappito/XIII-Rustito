@@ -736,9 +736,10 @@ fn registry_entries_are_documented() {
     // trail/particle Partials (SpawnParticle is shared with item18); item20 adds ten decoded GUI
     // save-slot declarations; item40c adds the headless Interaction.Initialize and ForceFeedback
     // viewport/device Partials; item43 adds Actor.TraceActors; the item47b banque01 regression
-    // fix adds `PlayerController.AdjustAimForDisplay` (498). Must equal
+    // fix adds `PlayerController.AdjustAimForDisplay` (498); item49b adds
+    // `Actor.DetachFromBone` (403). Must equal
     // `Registry::builtin().defs().count()`.
-    assert_eq!(defs.len(), 332);
+    assert_eq!(defs.len(), 333);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -10301,6 +10302,93 @@ fn attach_to_bone_writes_the_reflected_attachment_bone_field() {
             "Engine.Actor.AttachToBone",
             parent,
             &[false; 2],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(false))
+    ));
+}
+
+/// item49b regression: Banque01's ending flow stalled because `CineMalletteSM.Trigger`
+/// (0x00E3) calls `Actor.DetachFromBone` (native 403), which used to be unimplemented; the
+/// error suspended the mallette actor and the escape controller's action never advanced. The
+/// detach must clear exactly the link `AttachToBone` recorded, refuse actors based elsewhere,
+/// and survive a repeated detach on an already world-based actor.
+#[test]
+fn detach_from_bone_clears_the_attach_link_and_refuses_foreign_bases() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let parent = vm.spawn(sg(&set, "Actor"), "Parent").unwrap();
+    let child = vm.spawn(sg(&set, "Actor"), "Child").unwrap();
+    let other = vm.spawn(sg(&set, "Actor"), "Other").unwrap();
+    let mut args = [
+        Value::Object(Some(ObjRef::Instance(child))),
+        Value::Name("Arm".into()),
+    ];
+    assert!(matches!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.AttachToBone",
+            parent,
+            &[false; 2],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(true))
+    ));
+    // Detaching from a different actor must refuse and leave the link untouched.
+    assert!(matches!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.DetachFromBone",
+            other,
+            &[false; 1],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(false))
+    ));
+    assert_eq!(
+        vm.get_property(child, "Base"),
+        Some(&Value::Object(Some(ObjRef::Instance(parent))))
+    );
+    // The real detach: clears Base and the recorded bone.
+    assert!(matches!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.DetachFromBone",
+            parent,
+            &[false; 1],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(true))
+    ));
+    assert_eq!(vm.get_property(child, "Base"), Some(&Value::Object(None)));
+    assert_eq!(
+        vm.get_property(child, "AttachmentBone"),
+        Some(&Value::Name("None".into()))
+    );
+    // A second detach is a no-op refusal (the engine has nothing to undo).
+    assert!(matches!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.DetachFromBone",
+            parent,
+            &[false; 1],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(false))
+    ));
+    // A None attachment is refused, not a silent success.
+    args[0] = Value::Object(None);
+    assert!(matches!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.DetachFromBone",
+            parent,
+            &[false; 1],
             &mut args
         )
         .unwrap(),

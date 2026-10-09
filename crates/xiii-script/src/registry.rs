@@ -3077,6 +3077,24 @@ fn attach_to_bone(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<N
     val(Value::Bool(true))
 }
 
+fn detach_from_bone(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    // UE2 `AActor::DetachFromBone(AActor* Attachment)`: the counterpart of AttachToBone — the
+    // attachment stops being based on this actor and returns to world space. The VM clears the
+    // recorded Base/AttachmentBone link; the world transform the engine recomputes from the bone
+    // is not evaluated (no skeletal transforms headless), which is safe for the campaign flows
+    // that call it: `xidmaps.CineMalletteSM.Trigger` 0x00E3..0x0148 sets Location/Rotation
+    // explicitly right after every detach.
+    let Some(ObjRef::Instance(id)) = object(vm, a, 0)? else {
+        return val(Value::Bool(false));
+    };
+    if vm.obj_prop(id, "Base") != Some(c.this) {
+        return val(Value::Bool(false));
+    }
+    vm.set_property(id, "Base", 0, Value::Object(None));
+    vm.set_property(id, "AttachmentBone", 0, Value::Name("None".to_owned()));
+    val(Value::Bool(true))
+}
+
 fn anim_blend_to_alpha(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let stage = int(vm, a, 0)?;
     let target = float(vm, a, 1)?;
@@ -4523,6 +4541,17 @@ fn builtin_defs() -> Vec<NativeDef> {
                 "native(404) final static function bool AttachToBone(object<Actor> Attachment, name BoneName)",
                 "engine.u Actor.AttachToBone decoded (Attachment, BoneName, bool); bases attachment on self; play renderer evaluates bone coordinates with RelativeLocation/RelativeRotation; attach aliases and VM collision following remain unimplemented",
                 attach_to_bone,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial(
+                "the bone-space world transform the engine restores on detach is not evaluated headless; callers set Location/Rotation explicitly (xidmaps.CineMalletteSM.Trigger 0x00E3..0x0148)",
+            ),
+            ..def(
+                "Engine.Actor.DetachFromBone",
+                "native(403) final static function bool DetachFromBone(object<Actor> Attachment)",
+                "engine.u Actor.DetachFromBone decoded (Attachment, bool); clears the attachment's Base/AttachmentBone when it is based on self, false otherwise",
+                detach_from_bone,
             )
         },
         NativeDef {
