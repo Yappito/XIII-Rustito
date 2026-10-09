@@ -1473,111 +1473,162 @@ mod tests {
     /// counts by reason for both.
     #[test]
     fn opt_in_plage00_emitted_sound_events_resolve() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        use xiii_package::Limits;
-        use xiii_script::{ObjRef, ScriptSet, Value, Vm, VmLimits};
-        use xiii_world::audio::LevelAudio;
-        use xiii_world::runtime;
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            use xiii_package::Limits;
+            use xiii_script::{ObjRef, ScriptSet, Value, Vm, VmLimits};
+            use xiii_world::audio::LevelAudio;
+            use xiii_world::runtime;
 
-        let mut lib = SoundLibrary::scan(&game_dir);
-        let stats = lib.stats();
-        assert!(
-            stats.banks_parsed > 0,
-            "no HX banks parsed under the install"
-        );
-        {
-            use crate::play::script::{Drive, Script};
-            use crate::play::sim::PlayerSim;
-            let mut session =
-                crate::play::session::Session::open(&game_dir, "Plage00").expect("session");
-            let mut sim = PlayerSim::new([3380.0, -44620.2, 4918.0], 0.0);
-            sim.grounded = true;
-            let script =
-                Script::parse("t=0.0 forward 1\nt=0.5 forward 0\nt=1.0 jump\nt=2.0 jump\n")
-                    .unwrap();
-            let mut drive = Drive::new(&script);
-            let dt = 1.0 / 60.0f32;
-            for tick in 0..1800 {
-                let elapsed = tick as f32 * dt;
-                let _ = drive.advance(elapsed, &mut sim);
-                session.step(
-                    dt,
-                    sim.location,
-                    sim.yaw,
-                    sim.velocity,
-                    &crate::play::session::PlayerVMModes::default(),
+            let mut lib = SoundLibrary::scan(&game_dir);
+            let stats = lib.stats();
+            assert!(
+                stats.banks_parsed > 0,
+                "no HX banks parsed under the install"
+            );
+            {
+                use crate::play::script::{Drive, Script};
+                use crate::play::sim::PlayerSim;
+                let mut session =
+                    crate::play::session::Session::open(&game_dir, "Plage00").expect("session");
+                let mut sim = PlayerSim::new([3380.0, -44620.2, 4918.0], 0.0);
+                sim.grounded = true;
+                let script =
+                    Script::parse("t=0.0 forward 1\nt=0.5 forward 0\nt=1.0 jump\nt=2.0 jump\n")
+                        .unwrap();
+                let mut drive = Drive::new(&script);
+                let dt = 1.0 / 60.0f32;
+                for tick in 0..1800 {
+                    let elapsed = tick as f32 * dt;
+                    let _ = drive.advance(elapsed, &mut sim);
+                    session.step(
+                        dt,
+                        sim.location,
+                        sim.yaw,
+                        sim.velocity,
+                        &crate::play::session::PlayerVMModes::default(),
+                    );
+                }
+                let prod_sound = session
+                    .events
+                    .iter()
+                    .filter(|(_, ev)| {
+                        matches!(
+                            ev,
+                            PresentationEvent::PlaySound(_)
+                                | PresentationEvent::PlayMusic(_)
+                                | PresentationEvent::PlayRolloffSound(_)
+                        )
+                    })
+                    .count();
+                println!(
+                    "[audio test] production Plage00 session (30 s): {prod_sound} sound events emitted"
                 );
             }
-            let prod_sound = session
-                .events
-                .iter()
-                .filter(|(_, ev)| {
-                    matches!(
+
+            let (mut set, failures) = runtime::load_install(&game_dir).expect("load install");
+            assert!(failures.is_empty(), "script load failures: {failures:?}");
+            let install =
+                xiii_install::Installation::open(&game_dir, &xiii_install::OpenOptions::default())
+                    .expect("open install");
+            let mut uax = 0usize;
+            for entry in install.packages() {
+                if entry.kind != xiii_install::PackageKind::Sound {
+                    continue;
+                }
+                let data = std::fs::read(&entry.path).expect("read uax");
+                let p = xiii_script::ScriptPackage::load(
+                    &entry.name,
+                    data,
+                    &xiii_script::ScriptLimits::default(),
+                    &Limits::default(),
+                )
+                .expect("parse uax");
+                set.add(p);
+                uax += 1;
+            }
+            println!("[audio test] loaded {uax} .uax sound packages");
+            let map_path = runtime::find_map(&game_dir, "Plage00")
+                .expect("find map")
+                .expect("map present");
+            let map_data = std::fs::read(&map_path).expect("read map");
+            let map_pkg = xiii_script::ScriptPackage::load(
+                "Plage00",
+                map_data,
+                &xiii_script::ScriptLimits::default(),
+                &Limits::default(),
+            )
+            .expect("parse map");
+            let map_idx = set.add(map_pkg);
+            let set: &'static ScriptSet = Box::leak(Box::new(set));
+            let mut vm = Vm::new(set, VmLimits::default());
+            let actors = vm
+                .load_level(map_idx, &Limits::default())
+                .expect("load level");
+            for &id in &actors {
+                vm.set_active(id, true);
+            }
+            let default_game = runtime::default_game_from_ini(&game_dir).expect("DefaultGame");
+            let game_class = runtime::resolve_class_path(set, &default_game).expect("game class");
+            let _ = runtime::begin_play_all(&mut vm, &actors, game_class);
+            let mut with_path = 0usize;
+            let mut resolved = 0usize;
+            let mut failed: HashMap<&'static str, usize> = HashMap::new();
+            for _ in 0..600 {
+                let _ = vm.tick_suspending(0.05);
+                for ev in vm.drain_events() {
+                    if !matches!(
                         ev,
                         PresentationEvent::PlaySound(_)
                             | PresentationEvent::PlayMusic(_)
                             | PresentationEvent::PlayRolloffSound(_)
-                    )
-                })
-                .count();
-            println!(
-                "[audio test] production Plage00 session (30 s): {prod_sound} sound events emitted"
-            );
-        }
-
-        let (mut set, failures) = runtime::load_install(&game_dir).expect("load install");
-        assert!(failures.is_empty(), "script load failures: {failures:?}");
-        let install =
-            xiii_install::Installation::open(&game_dir, &xiii_install::OpenOptions::default())
-                .expect("open install");
-        let mut uax = 0usize;
-        for entry in install.packages() {
-            if entry.kind != xiii_install::PackageKind::Sound {
-                continue;
+                    ) {
+                        continue;
+                    }
+                    let req = SoundRequest::from_event(&ev, SoundKind::Sound);
+                    if let Some(path) = &req.sound {
+                        with_path += 1;
+                        match lib.resolve_path(path) {
+                            Some(r) => match lib.load(&r.entry) {
+                                Ok(_) => resolved += 1,
+                                Err(e) => *failed.entry(e.as_str()).or_default() += 1,
+                            },
+                            None => {
+                                *failed
+                                    .entry(ResolveFailure::NoNameMatch.as_str())
+                                    .or_default() += 1
+                            }
+                        }
+                    }
+                }
             }
-            let data = std::fs::read(&entry.path).expect("read uax");
-            let p = xiii_script::ScriptPackage::load(
-                &entry.name,
-                data,
-                &xiii_script::ScriptLimits::default(),
-                &Limits::default(),
-            )
-            .expect("parse uax");
-            set.add(p);
-            uax += 1;
-        }
-        println!("[audio test] loaded {uax} .uax sound packages");
-        let map_path = runtime::find_map(&game_dir, "Plage00")
-            .expect("find map")
-            .expect("map present");
-        let map_data = std::fs::read(&map_path).expect("read map");
-        let map_pkg = xiii_script::ScriptPackage::load(
-            "Plage00",
-            map_data,
-            &xiii_script::ScriptLimits::default(),
-            &Limits::default(),
-        )
-        .expect("parse map");
-        let map_idx = set.add(map_pkg);
-        let set: &'static ScriptSet = Box::leak(Box::new(set));
-        let mut vm = Vm::new(set, VmLimits::default());
-        let actors = vm
-            .load_level(map_idx, &Limits::default())
-            .expect("load level");
-        for &id in &actors {
-            vm.set_active(id, true);
-        }
-        let default_game = runtime::default_game_from_ini(&game_dir).expect("DefaultGame");
-        let game_class = runtime::resolve_class_path(set, &default_game).expect("game class");
-        let _ = runtime::begin_play_all(&mut vm, &actors, game_class);
-        let mut with_path = 0usize;
-        let mut resolved = 0usize;
-        let mut failed: HashMap<&'static str, usize> = HashMap::new();
-        for _ in 0..600 {
-            let _ = vm.tick_suspending(0.05);
+            println!(
+                "[audio test] Plage00 with .uax loaded (30 s): {with_path} sound events with a path, \
+             {resolved} resolved/decoded, failures {failed:?}"
+            );
+            assert_eq!(
+                resolved, with_path,
+                "every emitted sound event with a path must resolve: failures {failed:?}"
+            );
+
+            // ---- forced TriggerSound0 event (map property Sound'XIIISound.Interface.EndBig') ----
+            let ts = vm
+                .find_object("TriggerSound0")
+                .expect("Plage00 has TriggerSound0");
+            let pawn = vm
+                .spawn(
+                    runtime::find_class(set, "xiii", "XIIIPlayerPawn").expect("player class"),
+                    "XIIIPlayerPawn(item6c)",
+                )
+                .expect("spawn test pawn");
+            let arg = || Value::Object(Some(ObjRef::Instance(pawn)));
+            vm.send_event(ts, "Trigger", vec![arg(), arg()])
+                .expect("TriggerSound0.Trigger");
+            let mut forced = 0usize;
+            let mut forced_resolved = 0usize;
             for ev in vm.drain_events() {
                 if !matches!(
                     ev,
@@ -1587,121 +1638,72 @@ mod tests {
                 ) {
                     continue;
                 }
+                forced += 1;
                 let req = SoundRequest::from_event(&ev, SoundKind::Sound);
-                if let Some(path) = &req.sound {
-                    with_path += 1;
-                    match lib.resolve_path(path) {
-                        Some(r) => match lib.load(&r.entry) {
-                            Ok(_) => resolved += 1,
-                            Err(e) => *failed.entry(e.as_str()).or_default() += 1,
-                        },
-                        None => {
-                            *failed
-                                .entry(ResolveFailure::NoNameMatch.as_str())
-                                .or_default() += 1
-                        }
-                    }
+                if let Some(path) = &req.sound
+                    && let Some(r) = lib.resolve_path(path)
+                    && lib.load(&r.entry).is_ok()
+                {
+                    forced_resolved += 1;
+                    println!("[audio test] forced TriggerSound0 resolved {path}");
                 }
             }
-        }
-        println!(
-            "[audio test] Plage00 with .uax loaded (30 s): {with_path} sound events with a path, \
-             {resolved} resolved/decoded, failures {failed:?}"
-        );
-        assert_eq!(
-            resolved, with_path,
-            "every emitted sound event with a path must resolve: failures {failed:?}"
-        );
+            assert!(forced > 0, "TriggerSound0.Trigger emitted no sound event");
+            assert_eq!(
+                forced_resolved, forced,
+                "the real TriggerSound0 event must resolve through the HX banks"
+            );
 
-        // ---- forced TriggerSound0 event (map property Sound'XIIISound.Interface.EndBig') ----
-        let ts = vm
-            .find_object("TriggerSound0")
-            .expect("Plage00 has TriggerSound0");
-        let pawn = vm
-            .spawn(
-                runtime::find_class(set, "xiii", "XIIIPlayerPawn").expect("player class"),
-                "XIIIPlayerPawn(item6c)",
-            )
-            .expect("spawn test pawn");
-        let arg = || Value::Object(Some(ObjRef::Instance(pawn)));
-        vm.send_event(ts, "Trigger", vec![arg(), arg()])
-            .expect("TriggerSound0.Trigger");
-        let mut forced = 0usize;
-        let mut forced_resolved = 0usize;
-        for ev in vm.drain_events() {
-            if !matches!(
-                ev,
-                PresentationEvent::PlaySound(_)
-                    | PresentationEvent::PlayMusic(_)
-                    | PresentationEvent::PlayRolloffSound(_)
-            ) {
-                continue;
+            // ---- item6d: level audio discovery (ambients + music) resolves through the library ----
+            let level = LevelAudio::discover(&game_dir, "Plage00").expect("level audio");
+            println!(
+                "[audio test] level audio Plage00: {} ambient(s), music {:?}",
+                level.ambients.len(),
+                level.music.as_ref().map(|m| m.sound.as_str())
+            );
+            assert!(
+                !level.ambients.is_empty(),
+                "Plage00 must have placed ambient emitters"
+            );
+            for amb in &level.ambients {
+                let sound = amb.sound.as_deref().expect("non-null AmbientSound");
+                let r = lib
+                    .resolve_path(sound)
+                    .unwrap_or_else(|| panic!("ambient {sound} did not resolve"));
+                let stream = lib
+                    .open_stream(&r.entry)
+                    .unwrap_or_else(|e| panic!("ambient {sound} stream: {e:?}"));
+                println!(
+                    "[audio test] ambient {} -> {} ({} ch {} Hz, {} frames)",
+                    amb.actor,
+                    sound,
+                    stream.channels(),
+                    stream.sample_rate(),
+                    stream.total_frames()
+                );
             }
-            forced += 1;
-            let req = SoundRequest::from_event(&ev, SoundKind::Sound);
-            if let Some(path) = &req.sound
-                && let Some(r) = lib.resolve_path(path)
-                && lib.load(&r.entry).is_ok()
-            {
-                forced_resolved += 1;
-                println!("[audio test] forced TriggerSound0 resolved {path}");
-            }
-        }
-        assert!(forced > 0, "TriggerSound0.Trigger emitted no sound event");
-        assert_eq!(
-            forced_resolved, forced,
-            "the real TriggerSound0 event must resolve through the HX banks"
-        );
-
-        // ---- item6d: level audio discovery (ambients + music) resolves through the library ----
-        let level = LevelAudio::discover(&game_dir, "Plage00").expect("level audio");
-        println!(
-            "[audio test] level audio Plage00: {} ambient(s), music {:?}",
-            level.ambients.len(),
-            level.music.as_ref().map(|m| m.sound.as_str())
-        );
-        assert!(
-            !level.ambients.is_empty(),
-            "Plage00 must have placed ambient emitters"
-        );
-        for amb in &level.ambients {
-            let sound = amb.sound.as_deref().expect("non-null AmbientSound");
+            let music = level.music.as_ref().expect("a music cue");
             let r = lib
-                .resolve_path(sound)
-                .unwrap_or_else(|| panic!("ambient {sound} did not resolve"));
+                .resolve_path(&music.sound)
+                .unwrap_or_else(|| panic!("music {} did not resolve", music.sound));
             let stream = lib
                 .open_stream(&r.entry)
-                .unwrap_or_else(|e| panic!("ambient {sound} stream: {e:?}"));
+                .unwrap_or_else(|e| panic!("music stream: {e:?}"));
             println!(
-                "[audio test] ambient {} -> {} ({} ch {} Hz, {} frames)",
-                amb.actor,
-                sound,
+                "[audio test] music {} (source {}) -> {}#{} ({} ch {} Hz, {} frames)",
+                music.sound,
+                music.source.as_str(),
+                r.entry.bank.display(),
+                r.entry.entry,
                 stream.channels(),
                 stream.sample_rate(),
-                stream.total_frames()
+                stream.total_frames(),
             );
-        }
-        let music = level.music.as_ref().expect("a music cue");
-        let r = lib
-            .resolve_path(&music.sound)
-            .unwrap_or_else(|| panic!("music {} did not resolve", music.sound));
-        let stream = lib
-            .open_stream(&r.entry)
-            .unwrap_or_else(|e| panic!("music stream: {e:?}"));
-        println!(
-            "[audio test] music {} (source {}) -> {}#{} ({} ch {} Hz, {} frames)",
-            music.sound,
-            music.source.as_str(),
-            r.entry.bank.display(),
-            r.entry.entry,
-            stream.channels(),
-            stream.sample_rate(),
-            stream.total_frames(),
-        );
-        assert!(
-            stream.total_frames() > 0,
-            "level music decoded to zero frames"
-        );
+            assert!(
+                stream.total_frames() > 0,
+                "level music decoded to zero frames"
+            );
+        })
     }
 
     /// The pump forwards only sound/music events, once each, even when the retained event window

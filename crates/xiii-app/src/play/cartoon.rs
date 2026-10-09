@@ -524,66 +524,68 @@ mod tests {
     /// dial_debut` action speaks "I can't remember a thing..." through `DialogueManager0`.
     #[test]
     fn opt_in_plage00_end_cartoon_effect_and_intro_dialogue() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00 session");
-        let mut images = Assets::<Image>::default();
-        let hud = super::super::hud::setup(&mut session, &game_dir, &mut images)
-            .expect("set up the script HUD");
-        let canvas = hud.canvas.expect("HUD canvas");
-        let hud_id = hud.hud.expect("live HUD actor");
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00 session");
+            let mut images = Assets::<Image>::default();
+            let hud = super::super::hud::setup(&mut session, &game_dir, &mut images)
+                .expect("set up the script HUD");
+            let canvas = hud.canvas.expect("HUD canvas");
+            let hud_id = hud.hud.expect("live HUD actor");
 
-        let mut seen = 0u64;
-        let mut lines: Vec<String> = Vec::new();
-        let mut end_time = None;
-        let mut loc = session.player_location().unwrap_or([0.0; 3]);
-        // 90 s at the fixed 60 Hz step.
-        for _ in 0..5400 {
-            session.step(
-                1.0 / 60.0,
-                loc,
-                0.0,
-                [0.0; 3],
-                &crate::play::session::PlayerVMModes::default(),
+            let mut seen = 0u64;
+            let mut lines: Vec<String> = Vec::new();
+            let mut end_time = None;
+            let mut loc = session.player_location().unwrap_or([0.0; 3]);
+            // 90 s at the fixed 60 Hz step.
+            for _ in 0..5400 {
+                session.step(
+                    1.0 / 60.0,
+                    loc,
+                    0.0,
+                    [0.0; 3],
+                    &crate::play::session::PlayerVMModes::default(),
+                );
+                {
+                    let vm = session.vm_mut();
+                    vm.set_property(canvas, "ClipX", 0, Value::Float(1280.0));
+                    vm.set_property(canvas, "ClipY", 0, Value::Float(720.0));
+                    let arg = Value::Object(Some(ObjRef::Instance(canvas)));
+                    let _ = vm.send_event(hud_id, "PostRender", vec![arg]);
+                }
+                for d in session.new_dialogues(&mut seen) {
+                    if d.text.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+                        lines.push(format!("[{:.3}s] {} text={:?}", d.time, d.sound, d.text));
+                    }
+                }
+                if end_time.is_none() {
+                    let vm = session.vm();
+                    let end = session
+                        .game_info
+                        .and_then(|gi| instance_object(vm, gi, "MapInfo"))
+                        .and_then(|mi| bool_prop(vm, mi, "EndCartoonEffect"))
+                        .unwrap_or(false);
+                    if end {
+                        end_time = Some(session.vm_time());
+                    }
+                }
+                loc = session.player_location().unwrap_or(loc);
+            }
+            println!(
+                "[cartoon test] EndCartoonEffect at {end_time:?}; {} dialogue(s) with text: {lines:?}",
+                lines.len()
             );
-            {
-                let vm = session.vm_mut();
-                vm.set_property(canvas, "ClipX", 0, Value::Float(1280.0));
-                vm.set_property(canvas, "ClipY", 0, Value::Float(720.0));
-                let arg = Value::Object(Some(ObjRef::Instance(canvas)));
-                let _ = vm.send_event(hud_id, "PostRender", vec![arg]);
-            }
-            for d in session.new_dialogues(&mut seen) {
-                if d.text.as_deref().is_some_and(|t| !t.trim().is_empty()) {
-                    lines.push(format!("[{:.3}s] {} text={:?}", d.time, d.sound, d.text));
-                }
-            }
-            if end_time.is_none() {
-                let vm = session.vm();
-                let end = session
-                    .game_info
-                    .and_then(|gi| instance_object(vm, gi, "MapInfo"))
-                    .and_then(|mi| bool_prop(vm, mi, "EndCartoonEffect"))
-                    .unwrap_or(false);
-                if end {
-                    end_time = Some(session.vm_time());
-                }
-            }
-            loc = session.player_location().unwrap_or(loc);
-        }
-        println!(
-            "[cartoon test] EndCartoonEffect at {end_time:?}; {} dialogue(s) with text: {lines:?}",
-            lines.len()
-        );
-        assert!(
-            end_time.is_some(),
-            "Plage00 never set MapInfo.EndCartoonEffect"
-        );
-        assert!(
-            !lines.is_empty(),
-            "the opening emitted no dialogue with resolved text"
-        );
+            assert!(
+                end_time.is_some(),
+                "Plage00 never set MapInfo.EndCartoonEffect"
+            );
+            assert!(
+                !lines.is_empty(),
+                "the opening emitted no dialogue with resolved text"
+            );
+        })
     }
 }

@@ -53,15 +53,17 @@ impl Default for VmLimits {
     fn default() -> Self {
         Self {
             max_steps: 1_000_000,
-            // Call-depth guard sized to the 1 MiB Windows main-thread stack, measured on the
-            // Amos01 campaign-start survey (item45): an unbounded `SwitchWeapon` self-recursion
-            // (xiii.u `XIIIPlayerController.SwitchWeapon` 0x00FC -> 0x00FC) overflowed the
-            // process stack at the old 250-frame limit (debug build, ~4.4 KiB interpreter stack
-            // per script frame; 250 frames > 1 MiB) and killed the runtime before the guard
-            // could fire. 128 survives the same recursion with ~45% margin and aborts the
-            // actor with `CallDepthExceeded` (the full campaign survey reruns clean at 128);
-            // `vm_tests::recursion_guard_fits_a_1mib_main_stack` pins the property.
-            max_call_depth: 128,
+            // The engine's own script recursion limit: Core.dll `UObject::ProcessInternal`
+            // increments the global runaway counter (VA 0x101939e4) per interpreted call and
+            // compares against 0xFA = 250 (cmp at 0x101166e0); past 250 it logs
+            // "Infinite script recursion (%i calls) detected" (string 0x10178cd8, message
+            // pushed with the 250 constant at 0x101166f3). `GInitRunaway` (0x10115dc0) resets
+            // the counter to 0. 250 frames at the measured ~4.4 KiB interpreter stack per
+            // script frame (debug build) is ~1.1 MiB, which overflows a 1 MiB main thread, so
+            // every VM-driving host entry point runs on an explicit large stack (see
+            // xiii-app main/survey/play) and tests get `RUST_MINSTACK` via .cargo/config.toml;
+            // `vm_tests::recursion_guard_fits_the_default_test_stack` pins the property.
+            max_call_depth: 250,
             max_type_depth: 16,
             rng_seed: 0x9E37_79B9_7F4A_7C15,
         }

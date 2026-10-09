@@ -360,6 +360,25 @@ impl Session {
             "script login created the player pawn without a PlayerController".to_owned()
         })?;
         initialize_headless_input_system(&mut vm, set, controller)?;
+        // UE2 hands an entering player its inventory through the GameInfo's `AcceptInventory`
+        // event once the pawn exists (measured in the port: the event ran only on the
+        // checkpoint-restore path, so a fresh login left the campaign pawn unarmed).
+        // `XIIIGameInfo.AcceptInventory` applies checkpoint/objective state, then calls
+        // `AddDefaultInventory(PlayerPawn)` (its bytecode 0x04CF), which spawns the default
+        // weapon through `BaseMutator.GetDefaultWeapon()` — `XIIISoloMutator` defaults
+        // `DefaultWeaponName="XIII.Fists"` — and `Weapon.GiveTo` tops the ammo up through its
+        // melee branch (`default.ReloadCount == 0` -> `AmmoType.AddAmmo(PickupAmmoCount)` =
+        // `FistsAmmo.AmmoAmount = 1`). Without the Fists, a cine unfreeze runs
+        // `XIIIPlayerController.SwitchWeapon(OldWeap=0)` whose `WeaponChange(0)` finds no
+        // group-0 weapon and re-calls `SwitchWeapon(0)` unguarded (0x00FC) — the measured
+        // campaign-start recursion. The event is the game's own code; a failure is reported in
+        // `blocked`, never swallowed.
+        if let Some(gi) = game_info {
+            let arg = Value::Object(Some(ObjRef::Instance(player)));
+            if let Err(e) = vm.send_event(gi, "AcceptInventory", vec![arg]) {
+                blocked.push(format!("GameInfo.AcceptInventory: {e}"));
+            }
+        }
         if let Some(event) = start_event {
             // The engine's checkpoint-load path sets GameInfo.StartSpotEvent after the login
             // chain (XIII's own `RestartPlayer` copies `StartSpot.Event` into it first —
@@ -2615,65 +2634,130 @@ mod tests {
         })
     }
 
+    /// Opt-in regression (item45): the fresh login must hand the player the game's own
+    /// default inventory through `GameInfo.AcceptInventory` -> `AddDefaultInventory` ->
+    /// `XIII.Fists` (via `XIIISoloMutator`'s `DefaultWeaponName`) with
+    /// `FistsAmmo.AmmoAmount = 1` (`Weapon.GiveTo`'s melee branch). Amos01 is a mid-campaign
+    /// map whose `MapInfo.InitialInv` does not list the Fists, so before this the pawn stayed
+    /// unarmed and the cine unfreeze (`CineController2.PlayingSequence.Tick` 0x0065 ->
+    /// `SwitchWeapon(0)`) recursed unguarded to the call-depth limit.
+    #[test]
+    fn opt_in_acceptinventory_login_gives_the_default_weapon() {
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let session = Session::open(&game_dir, "Amos01").expect("open Amos01 session");
+            assert!(
+                !session.bootstrap_note.contains("harness bootstrap"),
+                "the normal login path must run: {}",
+                session.bootstrap_note
+            );
+            let vm = session.vm();
+            let pawn = session.player;
+            let weapon = match vm.get_property(pawn, "Weapon") {
+                Some(Value::Object(Some(ObjRef::Instance(id)))) => Some(*id),
+                other => {
+                    panic!("fresh-login Pawn.Weapon must be the Fists instance, got {other:?}")
+                }
+            };
+            let weapon = weapon.expect("fresh-login Pawn.Weapon must be set");
+            assert!(
+                vm.is_a(weapon, "fists"),
+                "fresh-login Pawn.Weapon must be xiii.Fists, got {}",
+                vm.set().path(vm.objects[weapon as usize].class)
+            );
+            let ammo = match vm.get_property(weapon, "AmmoType") {
+                Some(Value::Object(Some(ObjRef::Instance(id)))) => Some(*id),
+                other => {
+                    panic!("Fists.AmmoType must be the live FistsAmmo instance, got {other:?}")
+                }
+            };
+            let ammo = ammo.expect("Fists.AmmoType must be set");
+            assert!(
+                vm.is_a(ammo, "fistsammo"),
+                "Fists.AmmoType must be xiii.FistsAmmo, got {}",
+                vm.set().path(vm.objects[ammo as usize].class)
+            );
+            match vm.get_property(ammo, "AmmoAmount") {
+                Some(Value::Int(1)) => {}
+                other => panic!(
+                    "FistsAmmo.AmmoAmount must be 1 at login (Weapon.GiveTo melee branch), got {other:?}"
+                ),
+            }
+            assert!(
+                !session
+                    .blocked
+                    .iter()
+                    .any(|b| b.contains("AcceptInventory")),
+                "AcceptInventory must not fail: {:?}",
+                session.blocked
+            );
+        })
+    }
+
     /// Corpus regression for the authored `SPADS02b` `Explo02` particle event. `Cine9.Event` and
     /// `TrigerredEmitter2.Tag` both decode as `Explo02`; the real VM Trigger state must change the
     /// map-exported `SpriteEmitter` objects, and their VM state must start the decoded simulator.
     #[test]
     fn opt_in_spads02b_explo02_emitter_uses_vm_owned_particle_state() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let scene = viewer::load_scene(&Options {
-            map: Some("SPADS02b".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        })
-        .expect("import SPADS02b");
-        let system = scene
-            .particle_systems
-            .iter()
-            .find(|system| system.path.ends_with("TrigerredEmitter2"))
-            .expect("SPADS02b has TrigerredEmitter2");
-        let mut session = Session::open(&game_dir, "SPADS02b").expect("open SPADS02b VM");
-        let vm = session.vm_mut();
-        let actor = vm
-            .find_export_instance(&system.path)
-            .expect("VM owns the map emitter actor");
-        let mut simulations = Vec::new();
-        for desc in &system.emitters {
-            let id = vm
-                .find_export_instance(&desc.name)
-                .unwrap_or_else(|| panic!("VM owns map sub-emitter {}", desc.name));
-            assert_eq!(
-                vm.get_property(id, "Disabled"),
-                Some(&Value::Bool(true)),
-                "Explo02 emitter starts disabled before its authored event"
-            );
-            simulations.push((
-                id,
-                desc,
-                xiii_world::particles::EmitterSim::new(simulations.len()),
-            ));
-        }
-        vm.send_event(actor, "Trigger", Vec::new())
-            .expect("deliver the map emitter's Trigger event");
-        let mut live = 0;
-        for (id, desc, mut sim) in simulations {
-            let Some(Value::Bool(disabled)) = vm.get_property(id, "Disabled") else {
-                panic!("{} has a VM-owned Disabled property", desc.name);
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
             };
-            assert!(!disabled, "Explo02 must enable {}", desc.name);
-            sim.set_enabled(!disabled);
-            for _ in 0..60 {
-                sim.step(desc, 1.0 / 60.0);
+            let scene = viewer::load_scene(&Options {
+                map: Some("SPADS02b".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            })
+            .expect("import SPADS02b");
+            let system = scene
+                .particle_systems
+                .iter()
+                .find(|system| system.path.ends_with("TrigerredEmitter2"))
+                .expect("SPADS02b has TrigerredEmitter2");
+            let mut session = Session::open(&game_dir, "SPADS02b").expect("open SPADS02b VM");
+            let vm = session.vm_mut();
+            let actor = vm
+                .find_export_instance(&system.path)
+                .expect("VM owns the map emitter actor");
+            let mut simulations = Vec::new();
+            for desc in &system.emitters {
+                let id = vm
+                    .find_export_instance(&desc.name)
+                    .unwrap_or_else(|| panic!("VM owns map sub-emitter {}", desc.name));
+                assert_eq!(
+                    vm.get_property(id, "Disabled"),
+                    Some(&Value::Bool(true)),
+                    "Explo02 emitter starts disabled before its authored event"
+                );
+                simulations.push((
+                    id,
+                    desc,
+                    xiii_world::particles::EmitterSim::new(simulations.len()),
+                ));
             }
-            live += sim.active();
-        }
-        println!(
-            "[particle event test] map=SPADS02b emitter=TrigerredEmitter2 event=Explo02 live={live}"
-        );
-        assert!(live > 0, "the VM-owned event must start particle emission");
+            vm.send_event(actor, "Trigger", Vec::new())
+                .expect("deliver the map emitter's Trigger event");
+            let mut live = 0;
+            for (id, desc, mut sim) in simulations {
+                let Some(Value::Bool(disabled)) = vm.get_property(id, "Disabled") else {
+                    panic!("{} has a VM-owned Disabled property", desc.name);
+                };
+                assert!(!disabled, "Explo02 must enable {}", desc.name);
+                sim.set_enabled(!disabled);
+                for _ in 0..60 {
+                    sim.step(desc, 1.0 / 60.0);
+                }
+                live += sim.active();
+            }
+            println!(
+                "[particle event test] map=SPADS02b emitter=TrigerredEmitter2 event=Explo02 live={live}"
+            );
+            assert!(live > 0, "the VM-owned event must start particle emission");
+        })
     }
 
     /// item18: the Bink header duration used by `VideoPlayer.GetStatus` (frames / fps).
@@ -2702,90 +2786,92 @@ mod tests {
     /// (`XIIIPlayerController.SetInitialState`).
     #[test]
     fn opt_in_plage00_login_creates_script_controller_and_pawn() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let session = Session::open(&game_dir, "Plage00").expect("open Plage00 session");
-        println!("[login test] {}", session.bootstrap_note);
-        println!("[login test] blocked: {:?}", session.blocked);
-        assert_eq!(
-            session.login_script,
-            1,
-            "the script login path must create the pawn (blocked: {})",
-            session.blocked.join("; ")
-        );
-        assert!(
-            !session.bootstrap_note.contains("harness bootstrap"),
-            "normal session setup must use the script login path: {}",
-            session.bootstrap_note
-        );
-        let pc = session.controller.expect("a script player controller");
-        let interaction = match session.vm.get_property(pc, "MyInteraction") {
-            Some(Value::Object(Some(ObjRef::Instance(id)))) => *id,
-            other => panic!("InitInputSystem MyInteraction is {other:?}"),
-        };
-        assert!(
-            matches!(session.vm.get_property(interaction, "MyPC"),
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let session = Session::open(&game_dir, "Plage00").expect("open Plage00 session");
+            println!("[login test] {}", session.bootstrap_note);
+            println!("[login test] blocked: {:?}", session.blocked);
+            assert_eq!(
+                session.login_script,
+                1,
+                "the script login path must create the pawn (blocked: {})",
+                session.blocked.join("; ")
+            );
+            assert!(
+                !session.bootstrap_note.contains("harness bootstrap"),
+                "normal session setup must use the script login path: {}",
+                session.bootstrap_note
+            );
+            let pc = session.controller.expect("a script player controller");
+            let interaction = match session.vm.get_property(pc, "MyInteraction") {
+                Some(Value::Object(Some(ObjRef::Instance(id)))) => *id,
+                other => panic!("InitInputSystem MyInteraction is {other:?}"),
+            };
+            assert!(
+                matches!(session.vm.get_property(interaction, "MyPC"),
                 Some(Value::Object(Some(ObjRef::Instance(id)))) if *id == pc),
-            "the script-created interaction must point back to its player controller"
-        );
-        assert!(
-            session.vm.trace.iter().any(|event| matches!(
-                &event.kind,
-                TraceKind::Event { target, function, .. }
-                    if target == "XIIIPlayerController"
-                        && function.ends_with("XIIIPlayerController.InitInputSystem")
-            )),
-            "the VM trace must record PlayerController.InitInputSystem"
-        );
-        assert!(
-            session.vm.trace.iter().any(|event| matches!(
-                &event.kind,
-                TraceKind::Event { function, .. }
-                    if function.ends_with("InteractionMaster.AddInteraction")
-            )),
-            "the VM trace must record the script's InteractionMaster.AddInteraction call"
-        );
-        assert!(
-            session.vm.trace.iter().any(|event| matches!(
-                &event.kind,
-                TraceKind::NewObject { class, .. }
-                    if class.to_ascii_lowercase().ends_with("xiii.xiiiplayerinteraction")
-            )),
-            "the interaction must be allocated by script new in InteractionMaster.AddInteraction"
-        );
-        println!(
-            "[InitInputSystem test] interaction={} MyPC={} trace=InitInputSystem",
-            session.vm.objects[interaction as usize].name, session.vm.objects[pc as usize].name
-        );
-        assert!(
-            session.vm.is_a(pc, "XIIIPlayerController"),
-            "controller is {}",
-            session.vm.set().path(session.vm.objects[pc as usize].class)
-        );
-        assert!(
-            session.vm.is_a(session.player, "XIIIPlayerPawn"),
-            "pawn is {}",
-            session
-                .vm
-                .set()
-                .path(session.vm.objects[session.player as usize].class)
-        );
-        let (start, _) = find_player_start(&session.vm).expect("Plage00 has a PlayerStart");
-        let pawn = session
-            .player_location()
-            .expect("player pawn has a Location");
-        assert_eq!(
-            pawn, start,
-            "the pawn must spawn at the PlayerStart, not the bootstrap pose"
-        );
-        println!(
-            "[login test] path=script player={} controller={} at {:?} UU",
-            session.player_name,
-            session.vm.set().path(session.vm.objects[pc as usize].class),
-            pawn
-        );
+                "the script-created interaction must point back to its player controller"
+            );
+            assert!(
+                session.vm.trace.iter().any(|event| matches!(
+                    &event.kind,
+                    TraceKind::Event { target, function, .. }
+                        if target == "XIIIPlayerController"
+                            && function.ends_with("XIIIPlayerController.InitInputSystem")
+                )),
+                "the VM trace must record PlayerController.InitInputSystem"
+            );
+            assert!(
+                session.vm.trace.iter().any(|event| matches!(
+                    &event.kind,
+                    TraceKind::Event { function, .. }
+                        if function.ends_with("InteractionMaster.AddInteraction")
+                )),
+                "the VM trace must record the script's InteractionMaster.AddInteraction call"
+            );
+            assert!(
+                session.vm.trace.iter().any(|event| matches!(
+                    &event.kind,
+                    TraceKind::NewObject { class, .. }
+                        if class.to_ascii_lowercase().ends_with("xiii.xiiiplayerinteraction")
+                )),
+                "the interaction must be allocated by script new in InteractionMaster.AddInteraction"
+            );
+            println!(
+                "[InitInputSystem test] interaction={} MyPC={} trace=InitInputSystem",
+                session.vm.objects[interaction as usize].name, session.vm.objects[pc as usize].name
+            );
+            assert!(
+                session.vm.is_a(pc, "XIIIPlayerController"),
+                "controller is {}",
+                session.vm.set().path(session.vm.objects[pc as usize].class)
+            );
+            assert!(
+                session.vm.is_a(session.player, "XIIIPlayerPawn"),
+                "pawn is {}",
+                session
+                    .vm
+                    .set()
+                    .path(session.vm.objects[session.player as usize].class)
+            );
+            let (start, _) = find_player_start(&session.vm).expect("Plage00 has a PlayerStart");
+            let pawn = session
+                .player_location()
+                .expect("player pawn has a Location");
+            assert_eq!(
+                pawn, start,
+                "the pawn must spawn at the PlayerStart, not the bootstrap pose"
+            );
+            println!(
+                "[login test] path=script player={} controller={} at {:?} UU",
+                session.player_name,
+                session.vm.set().path(session.vm.objects[pc as usize].class),
+                pawn
+            );
+        })
     }
 
     /// Opt-in corpus test (Part B): on Plage01 the pawn **walks** onto the hut key (autopilot
@@ -2801,74 +2887,76 @@ mod tests {
     /// the key.
     #[test]
     fn opt_in_plage01_key_pickup_without_host_grant_opens_porte6() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Plage01".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Plage01");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        // Start 3 s after the old 45 s mark: with the engine's cine arrival rule
-        // (XIDCine IsTargetReached) the Plage01 intro returns control at ~46.5 s, not ~44.5 s.
-        let script = script::Script::parse(
-            "t=48.00 teleport -491.8 -414.1 1265.0\n\
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("Plage01".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import Plage01");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            // Start 3 s after the old 45 s mark: with the engine's cine arrival rule
+            // (XIDCine IsTargetReached) the Plage01 intro returns control at ~46.5 s, not ~44.5 s.
+            let script = script::Script::parse(
+                "t=48.00 teleport -491.8 -414.1 1265.0\n\
              t=48.10 goto -491.84 -314.14\nt=48.30 jump\nt=48.80 jump\nt=49.30 jump\nt=49.80 jump\n\
              t=50.30 jump\nt=50.80 forward 0\n\
              t=51.20 teleport -742.1444 -808.429 1311.0449\n\
              t=51.20 yaw 312.891\nt=51.20 turn 2\nt=51.20 forward 1\n\
              t=52.80 turn -45\nt=53.50 forward 0\nt=53.80 use\nt=54.80 use\nt=55.00 forward 1\n\
              t=56.00 forward 0\n",
-        )
-        .unwrap();
-        let outcome = run_script(
-            &game_dir,
-            "Plage01",
-            &script,
-            &resolved.params,
-            &scene,
-            57.0,
-        )
-        .expect("run Plage01 key+door walk");
-        let s = &outcome.session;
-        let inv = s.inventory_items();
-        println!("[key test] inventory: {inv:?}");
-        assert!(
-            inv.iter()
-                .any(|(_, c)| c.eq_ignore_ascii_case("xidmaps.Plage01CahuteKey")),
-            "the hut key must be in the pawn's inventory through the real pickup chain: {inv:?}"
-        );
-        let door = s
-            .mover_states()
-            .into_iter()
-            .find(|m| m.name.eq_ignore_ascii_case("Porte6"))
-            .expect("Plage01 has a live Porte6");
-        assert_eq!(
-            door.key_num, 1,
-            "Porte6 did not reach its open key: {door:?}"
-        );
-        assert_ne!(
-            door.rotation, door.base_rot,
-            "Porte6 rotation did not change (the door did not swing)"
-        );
-        let (_, _, pos, _) = outcome.trace.last().expect("trace sample");
-        let pos = *pos;
-        let base = door.base_pos;
-        let yaw = door.base_rot[1] as f32 * std::f32::consts::TAU / 65536.0;
-        let fwd = [yaw.cos(), yaw.sin()];
-        let dist = (pos[0] - base[0]) * fwd[0] + (pos[1] - base[1]) * fwd[1];
-        println!(
-            "[key test] Porte6 key={} rot={:?} (base {:?}), player {:?} UU, {dist:.1} UU outside",
-            door.key_num, door.rotation, door.base_rot, pos
-        );
-        assert!(
-            dist >= 2.0 * UNREAL_UNITS_PER_METER,
-            "player only {dist:.1} UU outside the door plane (need >= {:.0})",
-            2.0 * UNREAL_UNITS_PER_METER
-        );
+            )
+            .unwrap();
+            let outcome = run_script(
+                &game_dir,
+                "Plage01",
+                &script,
+                &resolved.params,
+                &scene,
+                57.0,
+            )
+            .expect("run Plage01 key+door walk");
+            let s = &outcome.session;
+            let inv = s.inventory_items();
+            println!("[key test] inventory: {inv:?}");
+            assert!(
+                inv.iter()
+                    .any(|(_, c)| c.eq_ignore_ascii_case("xidmaps.Plage01CahuteKey")),
+                "the hut key must be in the pawn's inventory through the real pickup chain: {inv:?}"
+            );
+            let door = s
+                .mover_states()
+                .into_iter()
+                .find(|m| m.name.eq_ignore_ascii_case("Porte6"))
+                .expect("Plage01 has a live Porte6");
+            assert_eq!(
+                door.key_num, 1,
+                "Porte6 did not reach its open key: {door:?}"
+            );
+            assert_ne!(
+                door.rotation, door.base_rot,
+                "Porte6 rotation did not change (the door did not swing)"
+            );
+            let (_, _, pos, _) = outcome.trace.last().expect("trace sample");
+            let pos = *pos;
+            let base = door.base_pos;
+            let yaw = door.base_rot[1] as f32 * std::f32::consts::TAU / 65536.0;
+            let fwd = [yaw.cos(), yaw.sin()];
+            let dist = (pos[0] - base[0]) * fwd[0] + (pos[1] - base[1]) * fwd[1];
+            println!(
+                "[key test] Porte6 key={} rot={:?} (base {:?}), player {:?} UU, {dist:.1} UU outside",
+                door.key_num, door.rotation, door.base_rot, pos
+            );
+            assert!(
+                dist >= 2.0 * UNREAL_UNITS_PER_METER,
+                "player only {dist:.1} UU outside the door plane (need >= {:.0})",
+                2.0 * UNREAL_UNITS_PER_METER
+            );
+        })
     }
 
     /// Opt-in corpus (item14b requirement 2, re-measured by item14c): the map's real
@@ -2887,47 +2975,49 @@ mod tests {
     /// contact dump and the touch-shape probe.
     #[test]
     fn opt_in_plage01_beretta_pickup_is_not_reachable_early() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Plage01".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Plage01");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let script = script::Script::parse(
-            "t=0.00 teleport -637.654 -511.886 1265.0\n\
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("Plage01".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import Plage01");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            let script = script::Script::parse(
+                "t=0.00 teleport -637.654 -511.886 1265.0\n\
              t=0.10 goto -737.654 -511.886\n\
              t=4.00 forward 0\n",
-        )
-        .unwrap();
-        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 6.0)
-            .expect("run Plage01 Beretta walk");
-        let s = &outcome.session;
-        let (_, _, pos, _) = outcome.trace.last().expect("trace sample");
-        let pick = s
-            .vm()
-            .find_object("BerettaPick0")
-            .and_then(|p| s.vm().vector_prop(p, "Location"))
-            .expect("Plage01 has BerettaPick0");
-        let d = ((pos[0] - pick[0]).powi(2) + (pos[1] - pick[1]).powi(2)).sqrt();
-        println!(
-            "[beretta test] player end ({:.1},{:.1}), BerettaPick0 ({:.1},{:.1}), horizontal gap {d:.1} UU",
-            pos[0], pos[1], pick[0], pick[1]
-        );
-        assert!(
-            d > 64.0,
-            "the Beretta is now reachable early ({d:.1} UU): update the item14b demonstration to walk to it"
-        );
-        assert!(
-            !s.inventory_items()
-                .iter()
-                .any(|(_, c)| c.to_ascii_lowercase().contains("beretta")),
-            "the Beretta was picked up without a reachable walk"
-        );
+            )
+            .unwrap();
+            let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 6.0)
+                .expect("run Plage01 Beretta walk");
+            let s = &outcome.session;
+            let (_, _, pos, _) = outcome.trace.last().expect("trace sample");
+            let pick = s
+                .vm()
+                .find_object("BerettaPick0")
+                .and_then(|p| s.vm().vector_prop(p, "Location"))
+                .expect("Plage01 has BerettaPick0");
+            let d = ((pos[0] - pick[0]).powi(2) + (pos[1] - pick[1]).powi(2)).sqrt();
+            println!(
+                "[beretta test] player end ({:.1},{:.1}), BerettaPick0 ({:.1},{:.1}), horizontal gap {d:.1} UU",
+                pos[0], pos[1], pick[0], pick[1]
+            );
+            assert!(
+                d > 64.0,
+                "the Beretta is now reachable early ({d:.1} UU): update the item14b demonstration to walk to it"
+            );
+            assert!(
+                !s.inventory_items()
+                    .iter()
+                    .any(|(_, c)| c.to_ascii_lowercase().contains("beretta")),
+                "the Beretta was picked up without a reachable walk"
+            );
+        })
     }
 
     /// Opt-in diagnostic + regression (item14c requirement 3): what blocks the player near
@@ -2943,154 +3033,156 @@ mod tests {
     /// below records.
     #[test]
     fn opt_in_plage01_beretta_blocking_contacts() {
-        use xiii_collision::{CollisionWorld, MoveParams, move_slide};
-        use xiii_decode::common::to_bevy_position;
-        use xiii_world::physics::{bevy_to_unreal_direction, bevy_to_unreal_position};
+        crate::vmstack::run_on_vm_stack(|| {
+            use xiii_collision::{CollisionWorld, MoveParams, move_slide};
+            use xiii_decode::common::to_bevy_position;
+            use xiii_world::physics::{bevy_to_unreal_direction, bevy_to_unreal_position};
 
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Plage01".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Plage01");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let params = &resolved.params;
-        let session = Session::open(&game_dir, "Plage01").expect("open Plage01");
-        let pick = session
-            .vm()
-            .find_object("BerettaPick0")
-            .expect("BerettaPick0");
-        let ploc = session
-            .vm()
-            .vector_prop(pick, "Location")
-            .expect("pickup location");
-        let radius = match session.vm().get_property(pick, "CollisionRadius") {
-            Some(Value::Float(f)) => *f,
-            other => panic!("BerettaPick0.CollisionRadius = {other:?}"),
-        };
-        let height = match session.vm().get_property(pick, "CollisionHeight") {
-            Some(Value::Float(f)) => *f,
-            other => panic!("BerettaPick0.CollisionHeight = {other:?}"),
-        };
-        println!(
-            "[beretta test] BerettaPick0 loc ({:.2},{:.2},{:.2}) UU, cylinder r{radius} h{height}, \
-             bCollideActors={:?} bBlockActors={:?} bBlockPlayers={:?}",
-            ploc[0],
-            ploc[1],
-            ploc[2],
-            session.vm().get_property(pick, "bCollideActors"),
-            session.vm().get_property(pick, "bBlockActors"),
-            session.vm().get_property(pick, "bBlockPlayers"),
-        );
-        assert_eq!((radius, height), (30.0, 10.0), "pickup cylinder changed");
-        assert!(
-            matches!(
-                session.vm().get_property(pick, "bCollideActors"),
-                Some(Value::Bool(true))
-            ),
-            "the pickup must be touchable (bCollideActors)"
-        );
-        assert!(
-            matches!(
-                session.vm().get_property(pick, "bBlockActors"),
-                Some(Value::Bool(false))
-            ),
-            "the pickup must not block actors"
-        );
-        let threshold = params.radius_uu + radius;
-        // Swept walk from the item14b teleport point toward the pickup: dump every contact.
-        let world = CollisionWorld::new(scene.box_collision());
-        let half = params.half_extents_bevy();
-        let start = to_bevy_position([-637.654, -511.886, 1265.0]);
-        let end = to_bevy_position([ploc[0], ploc[1], ploc[2]]);
-        let mv = MoveParams {
-            max_step_height: 0.0,
-            ..MoveParams::default()
-        };
-        let res = move_slide(
-            &world,
-            start,
-            [end[0] - start[0], 0.0, end[2] - start[2]],
-            half,
-            &mv,
-        );
-        let final_uu = bevy_to_unreal_position(res.position);
-        let gap = ((final_uu[0] - ploc[0]).powi(2) + (final_uu[1] - ploc[1]).powi(2)).sqrt();
-        println!(
-            "[beretta test] teleport-side walk: end ({:.1},{:.1},{:.1}) UU, gap {gap:.1} UU \
-             (touch threshold {threshold:.0}), {} contact(s)",
-            final_uu[0],
-            final_uu[1],
-            final_uu[2],
-            res.contacts.len()
-        );
-        let mut contact_sources = Vec::new();
-        for c in &res.contacts {
-            let src = scene
-                .collision_sources
-                .get(c.source as usize)
-                .map(String::as_str)
-                .unwrap_or("?");
-            let n = bevy_to_unreal_direction(c.normal);
-            let p = bevy_to_unreal_position(c.position);
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("Plage01".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import Plage01");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            let params = &resolved.params;
+            let session = Session::open(&game_dir, "Plage01").expect("open Plage01");
+            let pick = session
+                .vm()
+                .find_object("BerettaPick0")
+                .expect("BerettaPick0");
+            let ploc = session
+                .vm()
+                .vector_prop(pick, "Location")
+                .expect("pickup location");
+            let radius = match session.vm().get_property(pick, "CollisionRadius") {
+                Some(Value::Float(f)) => *f,
+                other => panic!("BerettaPick0.CollisionRadius = {other:?}"),
+            };
+            let height = match session.vm().get_property(pick, "CollisionHeight") {
+                Some(Value::Float(f)) => *f,
+                other => panic!("BerettaPick0.CollisionHeight = {other:?}"),
+            };
             println!(
-                "[beretta test]   contact src {src} tri {} normal ({:.2},{:.2},{:.2}) at \
-                 ({:.1},{:.1},{:.1}) UU",
-                c.triangle, n[0], n[1], n[2], p[0], p[1], p[2]
+                "[beretta test] BerettaPick0 loc ({:.2},{:.2},{:.2}) UU, cylinder r{radius} h{height}, \
+             bCollideActors={:?} bBlockActors={:?} bBlockPlayers={:?}",
+                ploc[0],
+                ploc[1],
+                ploc[2],
+                session.vm().get_property(pick, "bCollideActors"),
+                session.vm().get_property(pick, "bBlockActors"),
+                session.vm().get_property(pick, "bBlockPlayers"),
             );
-            contact_sources.push(src.to_owned());
-        }
-        assert!(
-            contact_sources
-                .iter()
-                .any(|s| s.contains("StaticPlage2.GR_interieur02")),
-            "the measured blocker changed: {contact_sources:?}"
-        );
-        assert!(
-            gap > threshold,
-            "the pickup is now within touch range ({gap:.1} <= {threshold:.0}): update the walk"
-        );
-        // Natural walk from the actual PlayerStart (no teleport) confirms the spawn-side block.
-        let natural =
-            script::Script::parse("t=0.00 goto -737.654 -511.886\nt=8.00 forward 0\n").unwrap();
-        let outcome = run_script(&game_dir, "Plage01", &natural, params, &scene, 10.0)
-            .expect("run natural walk");
-        let (_, _, npos, _) = outcome.trace.last().expect("trace sample");
-        let ngap = ((npos[0] - ploc[0]).powi(2) + (npos[1] - ploc[1]).powi(2)).sqrt();
-        println!(
-            "[beretta test] natural walk from PlayerStart: end ({:.1},{:.1},{:.1}) UU, gap {ngap:.1} UU",
-            npos[0], npos[1], npos[2]
-        );
-        assert!(
-            ngap > threshold,
-            "the PlayerStart walk now reaches the pickup ({ngap:.1}): update the regression"
-        );
-        // Shape probe: the cylinder test must collect the pickup when the player is on it. This
-        // is a touch-shape check, not a walk.
-        let mut probe = Session::open(&game_dir, "Plage01").expect("open probe");
-        let player = probe.player;
-        let before = probe.inventory_items();
-        probe
-            .vm_mut()
-            .set_property(player, "Location", 0, Value::Vector(ploc));
-        let _ = probe.vm_mut().refresh_touching_of(player);
-        let after = probe.inventory_items();
-        println!(
-            "[beretta test] overlap probe: inventory before {} item(s), after {} item(s): {:?}",
-            before.len(),
-            after.len(),
-            after
-        );
-        assert!(
-            after
-                .iter()
-                .any(|(_, c)| c.to_ascii_lowercase().contains("beretta")),
-            "the cylinder-vs-cylinder touch did not collect the overlapping pickup: {after:?}"
-        );
+            assert_eq!((radius, height), (30.0, 10.0), "pickup cylinder changed");
+            assert!(
+                matches!(
+                    session.vm().get_property(pick, "bCollideActors"),
+                    Some(Value::Bool(true))
+                ),
+                "the pickup must be touchable (bCollideActors)"
+            );
+            assert!(
+                matches!(
+                    session.vm().get_property(pick, "bBlockActors"),
+                    Some(Value::Bool(false))
+                ),
+                "the pickup must not block actors"
+            );
+            let threshold = params.radius_uu + radius;
+            // Swept walk from the item14b teleport point toward the pickup: dump every contact.
+            let world = CollisionWorld::new(scene.box_collision());
+            let half = params.half_extents_bevy();
+            let start = to_bevy_position([-637.654, -511.886, 1265.0]);
+            let end = to_bevy_position([ploc[0], ploc[1], ploc[2]]);
+            let mv = MoveParams {
+                max_step_height: 0.0,
+                ..MoveParams::default()
+            };
+            let res = move_slide(
+                &world,
+                start,
+                [end[0] - start[0], 0.0, end[2] - start[2]],
+                half,
+                &mv,
+            );
+            let final_uu = bevy_to_unreal_position(res.position);
+            let gap = ((final_uu[0] - ploc[0]).powi(2) + (final_uu[1] - ploc[1]).powi(2)).sqrt();
+            println!(
+                "[beretta test] teleport-side walk: end ({:.1},{:.1},{:.1}) UU, gap {gap:.1} UU \
+             (touch threshold {threshold:.0}), {} contact(s)",
+                final_uu[0],
+                final_uu[1],
+                final_uu[2],
+                res.contacts.len()
+            );
+            let mut contact_sources = Vec::new();
+            for c in &res.contacts {
+                let src = scene
+                    .collision_sources
+                    .get(c.source as usize)
+                    .map(String::as_str)
+                    .unwrap_or("?");
+                let n = bevy_to_unreal_direction(c.normal);
+                let p = bevy_to_unreal_position(c.position);
+                println!(
+                    "[beretta test]   contact src {src} tri {} normal ({:.2},{:.2},{:.2}) at \
+                 ({:.1},{:.1},{:.1}) UU",
+                    c.triangle, n[0], n[1], n[2], p[0], p[1], p[2]
+                );
+                contact_sources.push(src.to_owned());
+            }
+            assert!(
+                contact_sources
+                    .iter()
+                    .any(|s| s.contains("StaticPlage2.GR_interieur02")),
+                "the measured blocker changed: {contact_sources:?}"
+            );
+            assert!(
+                gap > threshold,
+                "the pickup is now within touch range ({gap:.1} <= {threshold:.0}): update the walk"
+            );
+            // Natural walk from the actual PlayerStart (no teleport) confirms the spawn-side block.
+            let natural =
+                script::Script::parse("t=0.00 goto -737.654 -511.886\nt=8.00 forward 0\n").unwrap();
+            let outcome = run_script(&game_dir, "Plage01", &natural, params, &scene, 10.0)
+                .expect("run natural walk");
+            let (_, _, npos, _) = outcome.trace.last().expect("trace sample");
+            let ngap = ((npos[0] - ploc[0]).powi(2) + (npos[1] - ploc[1]).powi(2)).sqrt();
+            println!(
+                "[beretta test] natural walk from PlayerStart: end ({:.1},{:.1},{:.1}) UU, gap {ngap:.1} UU",
+                npos[0], npos[1], npos[2]
+            );
+            assert!(
+                ngap > threshold,
+                "the PlayerStart walk now reaches the pickup ({ngap:.1}): update the regression"
+            );
+            // Shape probe: the cylinder test must collect the pickup when the player is on it. This
+            // is a touch-shape check, not a walk.
+            let mut probe = Session::open(&game_dir, "Plage01").expect("open probe");
+            let player = probe.player;
+            let before = probe.inventory_items();
+            probe
+                .vm_mut()
+                .set_property(player, "Location", 0, Value::Vector(ploc));
+            let _ = probe.vm_mut().refresh_touching_of(player);
+            let after = probe.inventory_items();
+            println!(
+                "[beretta test] overlap probe: inventory before {} item(s), after {} item(s): {:?}",
+                before.len(),
+                after.len(),
+                after
+            );
+            assert!(
+                after
+                    .iter()
+                    .any(|(_, c)| c.to_ascii_lowercase().contains("beretta")),
+                "the cylinder-vs-cylinder touch did not collect the overlapping pickup: {after:?}"
+            );
+        })
     }
 
     /// Opt-in corpus regression (item3j Part A): the script login leaves **exactly one**
@@ -3099,30 +3191,32 @@ mod tests {
     /// pawns at the PlayerStart on each map. Checked at open and after 120 fixed ticks.
     #[test]
     fn opt_in_single_player_login_spawns_one_player_pawn() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        for map in ["Plage00", "Plage01"] {
-            let mut session = Session::open(&game_dir, map).expect("open session");
-            let at_open = session.player_pawn_actors();
-            assert_eq!(
-                at_open.len(),
-                1,
-                "{map}: expected one XIIIPlayerPawn at login, got {at_open:?}"
-            );
-            for _ in 0..120 {
-                let loc = session.player_location().unwrap_or([0.0; 3]);
-                session.step(1.0 / 60.0, loc, 0.0, [0.0; 3], &PlayerVMModes::default());
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            for map in ["Plage00", "Plage01"] {
+                let mut session = Session::open(&game_dir, map).expect("open session");
+                let at_open = session.player_pawn_actors();
+                assert_eq!(
+                    at_open.len(),
+                    1,
+                    "{map}: expected one XIIIPlayerPawn at login, got {at_open:?}"
+                );
+                for _ in 0..120 {
+                    let loc = session.player_location().unwrap_or([0.0; 3]);
+                    session.step(1.0 / 60.0, loc, 0.0, [0.0; 3], &PlayerVMModes::default());
+                }
+                let after = session.player_pawn_actors();
+                assert_eq!(
+                    after.len(),
+                    1,
+                    "{map}: expected one XIIIPlayerPawn after 120 ticks, got {after:?}"
+                );
+                println!("[dupe test] {map}: one player pawn {:?}", after[0].1);
             }
-            let after = session.player_pawn_actors();
-            assert_eq!(
-                after.len(),
-                1,
-                "{map}: expected one XIIIPlayerPawn after 120 ticks, got {after:?}"
-            );
-            println!("[dupe test] {map}: one player pawn {:?}", after[0].1);
-        }
+        })
     }
 
     /// Opt-in: falling damage comes from the pawn's own VM code. A published impact velocity
@@ -3131,33 +3225,35 @@ mod tests {
     /// error (if any) is recorded and printed.
     #[test]
     fn opt_in_banque01_falling_damage_through_vm() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = Session::open(&game_dir, "Banque01").expect("open Banque01");
-        let h0 = session.player_health();
-        let loc = session.player_location().expect("player location");
-        // Land from a terminal fall: the game decides the damage.
-        let modes = PlayerVMModes {
-            landed_velocity_z: Some(-1500.0),
-            floor_normal: [0.0, 0.0, 1.0],
-            ..Default::default()
-        };
-        session.step(1.0 / 60.0, loc, 0.0, [0.0, 0.0, 0.0], &modes);
-        let h1 = session.player_health();
-        println!(
-            "[fall test] Banque01 Health {h0:?} -> {h1:?}; Landed error: {}",
-            session.first_error().unwrap_or("none")
-        );
-        let (Some(h0), Some(h1)) = (h0, h1) else {
-            panic!("the pawn has no health property");
-        };
-        assert!(
-            h1 < h0,
-            "the VM's fall damage did not reduce Health ({h0} -> {h1}); first error: {:?}",
-            session.first_error()
-        );
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = Session::open(&game_dir, "Banque01").expect("open Banque01");
+            let h0 = session.player_health();
+            let loc = session.player_location().expect("player location");
+            // Land from a terminal fall: the game decides the damage.
+            let modes = PlayerVMModes {
+                landed_velocity_z: Some(-1500.0),
+                floor_normal: [0.0, 0.0, 1.0],
+                ..Default::default()
+            };
+            session.step(1.0 / 60.0, loc, 0.0, [0.0, 0.0, 0.0], &modes);
+            let h1 = session.player_health();
+            println!(
+                "[fall test] Banque01 Health {h0:?} -> {h1:?}; Landed error: {}",
+                session.first_error().unwrap_or("none")
+            );
+            let (Some(h0), Some(h1)) = (h0, h1) else {
+                panic!("the pawn has no health property");
+            };
+            assert!(
+                h1 < h0,
+                "the VM's fall damage did not reduce Health ({h0} -> {h1}); first error: {:?}",
+                session.first_error()
+            );
+        })
     }
     /// Opt-in corpus (item14b requirement 4): a soldier that is in its own active state
     /// (`Base01` `BaseSoldier17`, order `Tenir`) detects the player through the host sight bridge
@@ -3167,136 +3263,138 @@ mod tests {
     /// ordered to the scripted `faction` (stasis) state and never fight.
     #[test]
     fn opt_in_base01_soldier_fights_back() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = Session::open(&game_dir, "Base01").expect("open Base01");
-        let soldier = session
-            .vm()
-            .find_object("BaseSoldier17")
-            .expect("BaseSoldier17");
-        let sloc = session
-            .vm()
-            .vector_prop(soldier, "Location")
-            .expect("soldier location");
-        // Warm the soldier to `Tenir` (its `Init` runs, it receives a weapon) for 6 s.
-        let ploc0 = session.player_location().unwrap_or([0.0; 3]);
-        for _ in 0..360 {
-            session.step(1.0 / 60.0, ploc0, 0.0, [0.0; 3], &PlayerVMModes::default());
-        }
-        let ctrl = instance_prop(session.vm(), soldier, "Controller").expect("controller");
-        let warm_state = session.vm().state_name(ctrl);
-        assert_eq!(
-            warm_state.as_deref(),
-            Some("Tenir"),
-            "BaseSoldier17 did not reach Tenir (state {warm_state:?})"
-        );
-        // Put the player in front of the soldier, in the open, facing it.
-        let srot = session.vm().rotation_prop(soldier).unwrap_or([0; 3]);
-        let k = std::f32::consts::TAU / 65536.0;
-        let (sp, cp) = ((srot[0] as f32) * k).sin_cos();
-        let (sy, cy) = ((srot[1] as f32) * k).sin_cos();
-        let fwd = [cp * cy, cp * sy, sp];
-        let ploc = [
-            sloc[0] + fwd[0] * 70.0,
-            sloc[1] + fwd[1] * 70.0,
-            sloc[2] + 20.0,
-        ];
-        let yaw_to_soldier = (-fwd[1]).atan2(-fwd[0]);
-        println!(
-            "[item38 Base01] BaseSoldier17 at {sloc:?}, test player at {ploc:?}, yaw {yaw_to_soldier:.4}"
-        );
-        let hp0 = session.player_health().expect("player health");
-        let mut first_attack = None;
-        let mut hp_low = hp0;
-        for t in 0..420u32 {
-            session.step(
-                1.0 / 60.0,
-                ploc,
-                yaw_to_soldier,
-                [0.0; 3],
-                &PlayerVMModes::default(),
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = Session::open(&game_dir, "Base01").expect("open Base01");
+            let soldier = session
+                .vm()
+                .find_object("BaseSoldier17")
+                .expect("BaseSoldier17");
+            let sloc = session
+                .vm()
+                .vector_prop(soldier, "Location")
+                .expect("soldier location");
+            // Warm the soldier to `Tenir` (its `Init` runs, it receives a weapon) for 6 s.
+            let ploc0 = session.player_location().unwrap_or([0.0; 3]);
+            for _ in 0..360 {
+                session.step(1.0 / 60.0, ploc0, 0.0, [0.0; 3], &PlayerVMModes::default());
+            }
+            let ctrl = instance_prop(session.vm(), soldier, "Controller").expect("controller");
+            let warm_state = session.vm().state_name(ctrl);
+            assert_eq!(
+                warm_state.as_deref(),
+                Some("Tenir"),
+                "BaseSoldier17 did not reach Tenir (state {warm_state:?})"
             );
-            let st = session.vm().state_name(ctrl);
-            if first_attack.is_none() && st.as_deref() == Some("Attaque") {
-                first_attack = Some(t as f32 / 60.0);
-            }
-            if let Some(h) = session.player_health() {
-                hp_low = hp_low.min(h);
-            }
-        }
-        let hp1 = session.player_health().expect("player health");
-        println!("[ai test] perception: {:?}", session.perception_log);
-        let weapon = instance_prop(session.vm(), soldier, "Weapon").expect("weapon");
-        let combat_events: Vec<_> = session
-            .vm()
-            .trace
-            .iter()
-            .filter_map(|event| match &event.kind {
-                xiii_script::TraceKind::Event {
-                    target, function, ..
-                } if target == &session.vm().objects[ctrl as usize].name
-                    && (function.ends_with(".Timer") || function.ends_with(".AnimEnd")) =>
-                {
-                    Some((event.time, function.clone()))
+            // Put the player in front of the soldier, in the open, facing it.
+            let srot = session.vm().rotation_prop(soldier).unwrap_or([0; 3]);
+            let k = std::f32::consts::TAU / 65536.0;
+            let (sp, cp) = ((srot[0] as f32) * k).sin_cos();
+            let (sy, cy) = ((srot[1] as f32) * k).sin_cos();
+            let fwd = [cp * cy, cp * sy, sp];
+            let ploc = [
+                sloc[0] + fwd[0] * 70.0,
+                sloc[1] + fwd[1] * 70.0,
+                sloc[2] + 20.0,
+            ];
+            let yaw_to_soldier = (-fwd[1]).atan2(-fwd[0]);
+            println!(
+                "[item38 Base01] BaseSoldier17 at {sloc:?}, test player at {ploc:?}, yaw {yaw_to_soldier:.4}"
+            );
+            let hp0 = session.player_health().expect("player health");
+            let mut first_attack = None;
+            let mut hp_low = hp0;
+            for t in 0..420u32 {
+                session.step(
+                    1.0 / 60.0,
+                    ploc,
+                    yaw_to_soldier,
+                    [0.0; 3],
+                    &PlayerVMModes::default(),
+                );
+                let st = session.vm().state_name(ctrl);
+                if first_attack.is_none() && st.as_deref() == Some("Attaque") {
+                    first_attack = Some(t as f32 / 60.0);
                 }
-                xiii_script::TraceKind::StateChange {
-                    actor, from, to, ..
-                } if actor == &session.vm().objects[weapon as usize].name => {
-                    Some((event.time, format!("weapon {from:?}->{to:?}")))
+                if let Some(h) = session.player_health() {
+                    hp_low = hp_low.min(h);
                 }
-                _ => None,
-            })
-            .collect();
-        println!(
-            "[ai test] player Health {hp0} -> {hp1} (low {hp_low}), first Attaque at {first_attack:?}s; combat events={combat_events:?}, final bTire={:?} bFire={:?}, weapon state={:?}, ReloadCount={:?}",
-            session.vm().get_property(ctrl, "bTire"),
-            session.vm().get_property(ctrl, "bFire"),
-            session.vm().state_name(weapon),
-            session.vm().get_property(weapon, "ReloadCount"),
-        );
-        // The soldier's own state machine acquired the enemy.
-        assert!(
-            session
-                .perception_log
+            }
+            let hp1 = session.player_health().expect("player health");
+            println!("[ai test] perception: {:?}", session.perception_log);
+            let weapon = instance_prop(session.vm(), soldier, "Weapon").expect("weapon");
+            let combat_events: Vec<_> = session
+                .vm()
+                .trace
                 .iter()
-                .any(|(_, c, e)| c == "IAController1" && e == "SeePlayer"),
-            "the sight bridge did not dispatch SeePlayer to IAController1"
-        );
-        assert!(
-            first_attack.is_some(),
-            "the soldier never entered Attaque (perception {:?})",
-            session.perception_log
-        );
-        // The game's own damage chain reduced the player's Health.
-        assert!(
-            hp1 < hp0,
-            "the soldier's fire did not reduce the player's Health ({hp0} -> {hp1}); first error {:?}",
-            session.first_error()
-        );
-        let controller = session.controller.expect("Base01 player controller");
-        let hud = instance_prop(session.vm(), controller, "myHUD")
-            .expect("XIIIPlayerController.ClientSetHUD creates myHUD");
-        let warning = session.vm().get_property(hud, "bDrawDamageWarn");
-        let timers: Vec<_> = (0..4)
-            .map(|i| {
+                .filter_map(|event| match &event.kind {
+                    xiii_script::TraceKind::Event {
+                        target, function, ..
+                    } if target == &session.vm().objects[ctrl as usize].name
+                        && (function.ends_with(".Timer") || function.ends_with(".AnimEnd")) =>
+                    {
+                        Some((event.time, function.clone()))
+                    }
+                    xiii_script::TraceKind::StateChange {
+                        actor, from, to, ..
+                    } if actor == &session.vm().objects[weapon as usize].name => {
+                        Some((event.time, format!("weapon {from:?}->{to:?}")))
+                    }
+                    _ => None,
+                })
+                .collect();
+            println!(
+                "[ai test] player Health {hp0} -> {hp1} (low {hp_low}), first Attaque at {first_attack:?}s; combat events={combat_events:?}, final bTire={:?} bFire={:?}, weapon state={:?}, ReloadCount={:?}",
+                session.vm().get_property(ctrl, "bTire"),
+                session.vm().get_property(ctrl, "bFire"),
+                session.vm().state_name(weapon),
+                session.vm().get_property(weapon, "ReloadCount"),
+            );
+            // The soldier's own state machine acquired the enemy.
+            assert!(
                 session
-                    .vm()
-                    .get_property_elem(hud, "fDrawDamageWarnTimer", i)
-                    .cloned()
-            })
-            .collect();
-        let active_timer = timers.iter().any(|v| match v {
-            Some(Value::Float(x)) => *x > 0.0,
-            Some(Value::Int(x)) => *x > 0,
-            _ => false,
-        });
-        println!("[item38 Base01] XIIIBaseHud bDrawDamageWarn={warning:?}, timers={timers:?}");
-        assert!(
-            matches!(warning, Some(Value::Bool(true))) && active_timer,
-            "BaseSoldier17's script-driven player hit must set the XIIIBaseHud flag and a live directional timer"
-        );
+                    .perception_log
+                    .iter()
+                    .any(|(_, c, e)| c == "IAController1" && e == "SeePlayer"),
+                "the sight bridge did not dispatch SeePlayer to IAController1"
+            );
+            assert!(
+                first_attack.is_some(),
+                "the soldier never entered Attaque (perception {:?})",
+                session.perception_log
+            );
+            // The game's own damage chain reduced the player's Health.
+            assert!(
+                hp1 < hp0,
+                "the soldier's fire did not reduce the player's Health ({hp0} -> {hp1}); first error {:?}",
+                session.first_error()
+            );
+            let controller = session.controller.expect("Base01 player controller");
+            let hud = instance_prop(session.vm(), controller, "myHUD")
+                .expect("XIIIPlayerController.ClientSetHUD creates myHUD");
+            let warning = session.vm().get_property(hud, "bDrawDamageWarn");
+            let timers: Vec<_> = (0..4)
+                .map(|i| {
+                    session
+                        .vm()
+                        .get_property_elem(hud, "fDrawDamageWarnTimer", i)
+                        .cloned()
+                })
+                .collect();
+            let active_timer = timers.iter().any(|v| match v {
+                Some(Value::Float(x)) => *x > 0.0,
+                Some(Value::Int(x)) => *x > 0,
+                _ => false,
+            });
+            println!("[item38 Base01] XIIIBaseHud bDrawDamageWarn={warning:?}, timers={timers:?}");
+            assert!(
+                matches!(warning, Some(Value::Bool(true))) && active_timer,
+                "BaseSoldier17's script-driven player hit must set the XIIIBaseHud flag and a live directional timer"
+            );
+        })
     }
 
     /// Opt-in Plage01 combat: deliver the authored `TouchTrigger7` (`Event=tueur_conducteur`)
@@ -3304,182 +3402,185 @@ mod tests {
     /// and fires at a stationary player. This also pins the current compiled-script no-fire path.
     #[test]
     fn opt_in_plage01_authored_cue_soldier_combat_or_measured_no_fire_path() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = Session::open(&game_dir, "Plage01").expect("open Plage01");
-        let soldier = session.vm().find_object("BaseSoldier6").expect("soldier");
-        let cue = session
-            .vm()
-            .find_object("TouchTrigger7")
-            .expect("authored cue");
-        let trigger_event = session.vm().get_property(cue, "Event").cloned();
-        assert_eq!(trigger_event, Some(Value::Name("tueur_conducteur".into())));
-        let warm_player = session.player_location().expect("player location");
-        for _ in 0..360 {
-            session.step(
-                1.0 / 60.0,
-                warm_player,
-                0.0,
-                [0.0; 3],
-                &PlayerVMModes::default(),
-            );
-        }
-        // Deliver the map's own Touch event with the player's actual spawn position. Touch
-        // dispatches the authored Event through its configured targets into the AI controller.
-        let player = session.player;
-        let player_location = session.player_location().expect("player location");
-        session
-            .vm_mut()
-            .send_event(
-                cue,
-                "Touch",
-                vec![Value::Object(Some(ObjRef::Instance(player)))],
-            )
-            .expect("deliver authored TouchTrigger7.Touch");
-        assert!(
-            session.vm().trace.iter().any(|event| {
-                matches!(
-                    &event.kind,
-                    xiii_script::TraceKind::Event { target, function, args }
-                        if target == "TouchTrigger7"
-                            && function.ends_with(".Touch")
-                            && args.iter().any(|arg| arg == &session.player_name)
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = Session::open(&game_dir, "Plage01").expect("open Plage01");
+            let soldier = session.vm().find_object("BaseSoldier6").expect("soldier");
+            let cue = session
+                .vm()
+                .find_object("TouchTrigger7")
+                .expect("authored cue");
+            let trigger_event = session.vm().get_property(cue, "Event").cloned();
+            assert_eq!(trigger_event, Some(Value::Name("tueur_conducteur".into())));
+            let warm_player = session.player_location().expect("player location");
+            for _ in 0..360 {
+                session.step(
+                    1.0 / 60.0,
+                    warm_player,
+                    0.0,
+                    [0.0; 3],
+                    &PlayerVMModes::default(),
+                );
+            }
+            // Deliver the map's own Touch event with the player's actual spawn position. Touch
+            // dispatches the authored Event through its configured targets into the AI controller.
+            let player = session.player;
+            let player_location = session.player_location().expect("player location");
+            session
+                .vm_mut()
+                .send_event(
+                    cue,
+                    "Touch",
+                    vec![Value::Object(Some(ObjRef::Instance(player)))],
                 )
-            }),
-            "the player's authored TouchTrigger7 cue was not delivered"
-        );
-        let controller = instance_prop(session.vm(), soldier, "Controller").expect("AI controller");
-        let weapon = instance_prop(session.vm(), soldier, "Weapon").expect("soldier weapon");
-        assert_eq!(
-            session.vm().state_name(controller).as_deref(),
-            Some("AttaqueScriptee")
-        );
-        let cue_enemy = instance_prop(session.vm(), controller, "Enemy");
-        let cue_enemy_name = cue_enemy.map(|id| session.vm().objects[id as usize].name.clone());
-        let initial_rotation = session.vm().rotation_prop(soldier).unwrap_or([0; 3]);
-        let health_before = session.player_health().expect("player health");
-        let soldier_location = session
-            .vm()
-            .vector_prop(soldier, "Location")
-            .expect("soldier location");
-        let sight_radius = match session.vm().get_property(soldier, "SightRadius") {
-            Some(Value::Float(radius)) => *radius,
-            other => panic!("BaseSoldier6 SightRadius is not a float: {other:?}"),
-        };
-        let player_distance = ((player_location[0] - soldier_location[0]).powi(2)
-            + (player_location[1] - soldier_location[1]).powi(2)
-            + (player_location[2] - soldier_location[2]).powi(2))
-        .sqrt();
-        let mut scripted_attack_seen = false;
-        let mut controller_attack_seen = false;
-        let mut held_fire_seen = false;
-        let mut fire_request_seen = false;
-        for _ in 0..900 {
-            session.step(
-                1.0 / 60.0,
-                player_location,
-                0.0,
-                [0.0; 3],
-                &PlayerVMModes::default(),
+                .expect("deliver authored TouchTrigger7.Touch");
+            assert!(
+                session.vm().trace.iter().any(|event| {
+                    matches!(
+                        &event.kind,
+                        xiii_script::TraceKind::Event { target, function, args }
+                            if target == "TouchTrigger7"
+                                && function.ends_with(".Touch")
+                                && args.iter().any(|arg| arg == &session.player_name)
+                    )
+                }),
+                "the player's authored TouchTrigger7 cue was not delivered"
             );
-            scripted_attack_seen |=
-                session.vm().state_name(controller).as_deref() == Some("AttaqueScriptee");
-            controller_attack_seen |=
-                session.vm().state_name(controller).as_deref() == Some("Attaque");
-            held_fire_seen |= matches!(
+            let controller =
+                instance_prop(session.vm(), soldier, "Controller").expect("AI controller");
+            let weapon = instance_prop(session.vm(), soldier, "Weapon").expect("soldier weapon");
+            assert_eq!(
+                session.vm().state_name(controller).as_deref(),
+                Some("AttaqueScriptee")
+            );
+            let cue_enemy = instance_prop(session.vm(), controller, "Enemy");
+            let cue_enemy_name = cue_enemy.map(|id| session.vm().objects[id as usize].name.clone());
+            let initial_rotation = session.vm().rotation_prop(soldier).unwrap_or([0; 3]);
+            let health_before = session.player_health().expect("player health");
+            let soldier_location = session
+                .vm()
+                .vector_prop(soldier, "Location")
+                .expect("soldier location");
+            let sight_radius = match session.vm().get_property(soldier, "SightRadius") {
+                Some(Value::Float(radius)) => *radius,
+                other => panic!("BaseSoldier6 SightRadius is not a float: {other:?}"),
+            };
+            let player_distance = ((player_location[0] - soldier_location[0]).powi(2)
+                + (player_location[1] - soldier_location[1]).powi(2)
+                + (player_location[2] - soldier_location[2]).powi(2))
+            .sqrt();
+            let mut scripted_attack_seen = false;
+            let mut controller_attack_seen = false;
+            let mut held_fire_seen = false;
+            let mut fire_request_seen = false;
+            for _ in 0..900 {
+                session.step(
+                    1.0 / 60.0,
+                    player_location,
+                    0.0,
+                    [0.0; 3],
+                    &PlayerVMModes::default(),
+                );
+                scripted_attack_seen |=
+                    session.vm().state_name(controller).as_deref() == Some("AttaqueScriptee");
+                controller_attack_seen |=
+                    session.vm().state_name(controller).as_deref() == Some("Attaque");
+                held_fire_seen |= matches!(
+                    session.vm().get_property(controller, "bTire"),
+                    Some(Value::Bool(true))
+                );
+                fire_request_seen |= [
+                    (controller, "bFire"),
+                    (controller, "bAltFire"),
+                    (soldier, "bFire"),
+                    (soldier, "bAltFire"),
+                    (weapon, "bFire"),
+                    (weapon, "bAltFire"),
+                ]
+                .into_iter()
+                .any(|(actor, property)| {
+                    matches!(
+                        session.vm().get_property(actor, property),
+                        Some(Value::Bool(true))
+                    )
+                }) || held_fire_seen;
+            }
+            let state = session.vm().state_name(soldier);
+            let controller_state = session.vm().state_name(controller);
+            let final_rotation = session.vm().rotation_prop(soldier).unwrap_or([0; 3]);
+            let health_after = session.player_health().expect("player health");
+            let wants_fire = matches!(
                 session.vm().get_property(controller, "bTire"),
                 Some(Value::Bool(true))
             );
-            fire_request_seen |= [
-                (controller, "bFire"),
-                (controller, "bAltFire"),
-                (soldier, "bFire"),
-                (soldier, "bAltFire"),
-                (weapon, "bFire"),
-                (weapon, "bAltFire"),
-            ]
-            .into_iter()
-            .any(|(actor, property)| {
-                matches!(
-                    session.vm().get_property(actor, property),
-                    Some(Value::Bool(true))
-                )
-            }) || held_fire_seen;
-        }
-        let state = session.vm().state_name(soldier);
-        let controller_state = session.vm().state_name(controller);
-        let final_rotation = session.vm().rotation_prop(soldier).unwrap_or([0; 3]);
-        let health_after = session.player_health().expect("player health");
-        let wants_fire = matches!(
-            session.vm().get_property(controller, "bTire"),
-            Some(Value::Bool(true))
-        );
-        let final_enemy = instance_prop(session.vm(), controller, "Enemy")
-            .map(|id| session.vm().objects[id as usize].name.clone());
-        let scripted_states: Vec<_> = session
-            .vm()
-            .trace
-            .iter()
-            .filter_map(|event| match &event.kind {
-                xiii_script::TraceKind::StateChange {
-                    actor, from, to, ..
-                } if actor == &session.vm().objects[controller as usize].name => {
-                    Some((from.clone(), to.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        let can_see: Vec<_> = session
-            .vm()
-            .trace
-            .iter()
-            .filter_map(|event| match &event.kind {
-                xiii_script::TraceKind::Native {
-                    path,
-                    this,
-                    args,
-                    result,
-                    ..
-                } if path.ends_with("Controller.CanSee")
-                    && this == &session.vm().objects[controller as usize].name =>
-                {
-                    Some((event.time, args.clone(), result.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        let left_scripted_attack = scripted_states.iter().any(|(from, to)| {
-            from.as_deref() == Some("AttaqueScriptee") && to.as_deref() == Some("temporise")
-        });
-        println!(
-            "[Plage01 combat] cue=TouchTrigger7 event={trigger_event:?}, player={player_location:?}, soldier={soldier_location:?}, distance={player_distance:.1}, SightRadius={sight_radius}, cue Enemy={cue_enemy_name:?}, final Enemy={final_enemy:?}, scripted={scripted_attack_seen}, combat={controller_attack_seen}, held-fire-seen={held_fire_seen}, fire-request-seen={fire_request_seen}, bTire={wants_fire}, soldier state={state:?}, controller state={controller_state:?}, controller states={scripted_states:?}, CanSee={can_see:?}, rotation {initial_rotation:?}->{final_rotation:?}, Health {health_before}->{health_after}; suspended={:?}",
-            session.suspended
-        );
-        assert!(
-            scripted_attack_seen,
-            "the authored cue did not release the soldier"
-        );
-        assert!(
-            player_distance > sight_radius
-                && can_see.iter().any(|(_, _, result)| result == "false"),
-            "the actual player position should be outside SightRadius with a measured failed CanSee: distance={player_distance}, SightRadius={sight_radius}, CanSee={can_see:?}"
-        );
-        // Whether this authored map cue yields combat is determined by the map's own dispatch,
-        // AI state chain, and LOS result at the player's actual spawn location.
-        assert!(
-            cue_enemy == Some(player)
-                && final_enemy.is_none()
-                && left_scripted_attack
-                && controller_state.as_deref() == Some("Patrouille")
-                && !controller_attack_seen
-                && !held_fire_seen
-                && !fire_request_seen
-                && !wants_fire
-                && health_after == health_before,
-            "unexpected combat result: Health {health_before}->{health_after}, bTire={wants_fire}"
-        );
+            let final_enemy = instance_prop(session.vm(), controller, "Enemy")
+                .map(|id| session.vm().objects[id as usize].name.clone());
+            let scripted_states: Vec<_> = session
+                .vm()
+                .trace
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    xiii_script::TraceKind::StateChange {
+                        actor, from, to, ..
+                    } if actor == &session.vm().objects[controller as usize].name => {
+                        Some((from.clone(), to.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let can_see: Vec<_> = session
+                .vm()
+                .trace
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    xiii_script::TraceKind::Native {
+                        path,
+                        this,
+                        args,
+                        result,
+                        ..
+                    } if path.ends_with("Controller.CanSee")
+                        && this == &session.vm().objects[controller as usize].name =>
+                    {
+                        Some((event.time, args.clone(), result.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let left_scripted_attack = scripted_states.iter().any(|(from, to)| {
+                from.as_deref() == Some("AttaqueScriptee") && to.as_deref() == Some("temporise")
+            });
+            println!(
+                "[Plage01 combat] cue=TouchTrigger7 event={trigger_event:?}, player={player_location:?}, soldier={soldier_location:?}, distance={player_distance:.1}, SightRadius={sight_radius}, cue Enemy={cue_enemy_name:?}, final Enemy={final_enemy:?}, scripted={scripted_attack_seen}, combat={controller_attack_seen}, held-fire-seen={held_fire_seen}, fire-request-seen={fire_request_seen}, bTire={wants_fire}, soldier state={state:?}, controller state={controller_state:?}, controller states={scripted_states:?}, CanSee={can_see:?}, rotation {initial_rotation:?}->{final_rotation:?}, Health {health_before}->{health_after}; suspended={:?}",
+                session.suspended
+            );
+            assert!(
+                scripted_attack_seen,
+                "the authored cue did not release the soldier"
+            );
+            assert!(
+                player_distance > sight_radius
+                    && can_see.iter().any(|(_, _, result)| result == "false"),
+                "the actual player position should be outside SightRadius with a measured failed CanSee: distance={player_distance}, SightRadius={sight_radius}, CanSee={can_see:?}"
+            );
+            // Whether this authored map cue yields combat is determined by the map's own dispatch,
+            // AI state chain, and LOS result at the player's actual spawn location.
+            assert!(
+                cue_enemy == Some(player)
+                    && final_enemy.is_none()
+                    && left_scripted_attack
+                    && controller_state.as_deref() == Some("Patrouille")
+                    && !controller_attack_seen
+                    && !held_fire_seen
+                    && !fire_request_seen
+                    && !wants_fire
+                    && health_after == health_before,
+                "unexpected combat result: Health {health_before}->{health_after}, bTire={wants_fire}"
+            );
+        })
     }
 
     /// Opt-in corpus regression (item3o): the Plage00 level-start checkpoint path runs the
@@ -3491,160 +3592,164 @@ mod tests {
     /// `WaitForFirstDisplay`, which this headless harness does not drive).
     #[test]
     fn opt_in_plage00_checkpoint_save_event() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00");
-        // The save trigger fires when the host delivers the player's Touch after the first steps.
-        for _ in 0..120 {
-            if session.save_total >= 1 {
-                break;
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00");
+            // The save trigger fires when the host delivers the player's Touch after the first steps.
+            for _ in 0..120 {
+                if session.save_total >= 1 {
+                    break;
+                }
+                let loc = session.player_location().unwrap_or([0.0; 3]);
+                session.step(1.0 / 60.0, loc, 0.0, [0.0; 3], &PlayerVMModes::default());
             }
-            let loc = session.player_location().unwrap_or([0.0; 3]);
-            session.step(1.0 / 60.0, loc, 0.0, [0.0; 3], &PlayerVMModes::default());
-        }
-        assert!(
-            session.save_total >= 1,
-            "the level-start checkpoint save did not run (suspended: {:?})",
-            session.suspended
-        );
-        let save = session
-            .saves
-            .front()
-            .expect("a SaveCheckpoint event")
-            .1
-            .clone();
-        assert_eq!(save.teleporter_name, "PlayerStart");
-        assert_eq!(save.description, "Brighton Beach 1");
-        println!(
-            "[save test] checkpoint {:?} teleporter={:?} description={:?}",
-            save.actor, save.teleporter_name, save.description
-        );
+            assert!(
+                session.save_total >= 1,
+                "the level-start checkpoint save did not run (suspended: {:?})",
+                session.suspended
+            );
+            let save = session
+                .saves
+                .front()
+                .expect("a SaveCheckpoint event")
+                .1
+                .clone();
+            assert_eq!(save.teleporter_name, "PlayerStart");
+            assert_eq!(save.description, "Brighton Beach 1");
+            println!(
+                "[save test] checkpoint {:?} teleporter={:?} description={:?}",
+                save.actor, save.teleporter_name, save.description
+            );
+        })
     }
 
     #[test]
     fn opt_in_plage00_checkpoint_resume_retains_health_for_ten_seconds() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session =
-            Session::open_checkpoint(&game_dir, "Plage00").expect("open Plage00 resume");
-        // The port presents the resume the way the engine's native checkpoint-load path does:
-        // after the login chain (`XIIIGameInfo.RestartPlayer` 0x037A has already copied
-        // `StartSpot.Event`), GameInfo.StartSpotEvent is "LOAD", so the level's own
-        // `Plage00.FirstFrame` guard (0x0013) skips re-applying the wounded intro Health.
-        let game_info = session.game_info.expect("GameInfo");
-        assert_eq!(
-            session.vm().get_property(game_info, "StartSpotEvent"),
-            Some(&Value::Name("LOAD".into())),
-            "open_checkpoint must leave StartSpotEvent=LOAD after the login chain"
-        );
-        let mut saved = crate::save::SaveFile {
-            map: "Plage00".into(),
-            teleporter: "PlayerStart".into(),
-            save_trigger_tag: "Debut".into(),
-            description: "corpus resume regression".into(),
-            health: 150.0,
-            speed_factor_limit: 1.0,
-            checkpoint_number: 7,
-            location: session.player_location().expect("player location"),
-            rotation: session.player_rotation().unwrap_or([0; 3]),
-            objectives: session
-                .objective_states()
-                .into_iter()
-                .map(|o| crate::save::Objective {
-                    completed: o.completed,
-                    primary: o.primary,
-                    anti_goal: o.anti_goal,
-                })
-                .collect(),
-            inventory: Vec::new(),
-            sound_to_launch: Some("XIIIsound.Music__Plage01.Plage01__hMusicInit2".into()),
-            selected_weapon: None,
-            music_vars: Vec::new(),
-        };
-        let first_objective = saved
-            .objectives
-            .first_mut()
-            .expect("Plage00 has at least one objective");
-        first_objective.completed = !first_objective.completed;
-        first_objective.primary = !first_objective.primary;
-        // One restore, before the first ticked step — the same point the `--play` host applies
-        // it (`setup_inner`, after `Session::open`). FirstFrame runs later, on the MapInfo's
-        // first Timer tick, and must not overwrite the restored fields.
-        let location = saved.location;
-        session
-            .restore_checkpoint(&saved)
-            .expect("apply checkpoint once before the first step");
-        assert!(
-            session.events.iter().any(|(_, event)| matches!(
-                event,
-                xiii_script::PresentationEvent::PlayMusic(music)
-                    if music.sound.as_deref() == saved.sound_to_launch.as_deref()
-            )),
-            "AcceptInventory did not emit saved SoundToLaunch={:?}: {:?}",
-            saved.sound_to_launch,
-            session.events
-        );
-        assert_eq!(
-            session.vm().get_property(game_info, "CheckpointNumber"),
-            Some(&Value::Int(7)),
-            "the restore must set the saved CheckpointNumber before play resumes"
-        );
-        let mut health_min = f32::MAX;
-        for _ in 0..660 {
-            session.step(
-                1.0 / 60.0,
-                location,
-                0.0,
-                [0.0; 3],
-                &PlayerVMModes::default(),
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session =
+                Session::open_checkpoint(&game_dir, "Plage00").expect("open Plage00 resume");
+            // The port presents the resume the way the engine's native checkpoint-load path does:
+            // after the login chain (`XIIIGameInfo.RestartPlayer` 0x037A has already copied
+            // `StartSpot.Event`), GameInfo.StartSpotEvent is "LOAD", so the level's own
+            // `Plage00.FirstFrame` guard (0x0013) skips re-applying the wounded intro Health.
+            let game_info = session.game_info.expect("GameInfo");
+            assert_eq!(
+                session.vm().get_property(game_info, "StartSpotEvent"),
+                Some(&Value::Name("LOAD".into())),
+                "open_checkpoint must leave StartSpotEvent=LOAD after the login chain"
             );
-            if let Some(h) = session.player_health() {
-                health_min = health_min.min(h);
-            }
-        }
-        assert!(
-            session.vm_time() >= 10.0,
-            "did not simulate ten seconds (t={})",
-            session.vm_time()
-        );
-        assert_eq!(
-            session.player_health(),
-            Some(150.0),
-            "FirstFrame re-applied the wounded intro health over the restored value"
-        );
-        assert!(
-            (health_min - 150.0).abs() < f32::EPSILON,
-            "health dropped below the restored 150 during ten seconds (min {health_min})"
-        );
-        assert_eq!(
-            session
-                .objective_states()
-                .iter()
-                .map(|o| (o.completed, o.primary, o.anti_goal))
-                .collect::<Vec<_>>(),
-            saved
+            let mut saved = crate::save::SaveFile {
+                map: "Plage00".into(),
+                teleporter: "PlayerStart".into(),
+                save_trigger_tag: "Debut".into(),
+                description: "corpus resume regression".into(),
+                health: 150.0,
+                speed_factor_limit: 1.0,
+                checkpoint_number: 7,
+                location: session.player_location().expect("player location"),
+                rotation: session.player_rotation().unwrap_or([0; 3]),
+                objectives: session
+                    .objective_states()
+                    .into_iter()
+                    .map(|o| crate::save::Objective {
+                        completed: o.completed,
+                        primary: o.primary,
+                        anti_goal: o.anti_goal,
+                    })
+                    .collect(),
+                inventory: Vec::new(),
+                sound_to_launch: Some("XIIIsound.Music__Plage01.Plage01__hMusicInit2".into()),
+                selected_weapon: None,
+                music_vars: Vec::new(),
+            };
+            let first_objective = saved
                 .objectives
-                .iter()
-                .map(|o| (o.completed, o.primary, o.anti_goal))
-                .collect::<Vec<_>>()
-        );
-        // `RestartPlayer`'s own `TriggerEvent(StartSpot.Event)` re-arms the level's
-        // Tag='Debut' `XIIISaveGameTrigger`, whose `GoSaving.DoSave` (0x0191) increments the
-        // checkpoint again during resumed play — the game's own re-save, measured 7 -> 8.
-        let checkpoint_now = session.vm().get_property(game_info, "CheckpointNumber");
-        assert!(
-            matches!(checkpoint_now, Some(Value::Int(n)) if *n >= 7),
-            "CheckpointNumber regressed below the restored 7 ({checkpoint_now:?})"
-        );
-        println!(
-            "[save corpus] Plage00 Health={} checkpoint={checkpoint_now:?} after {:.3}s of resumed play",
-            session.player_health().unwrap_or(-1.0),
-            session.vm_time()
-        );
+                .first_mut()
+                .expect("Plage00 has at least one objective");
+            first_objective.completed = !first_objective.completed;
+            first_objective.primary = !first_objective.primary;
+            // One restore, before the first ticked step — the same point the `--play` host applies
+            // it (`setup_inner`, after `Session::open`). FirstFrame runs later, on the MapInfo's
+            // first Timer tick, and must not overwrite the restored fields.
+            let location = saved.location;
+            session
+                .restore_checkpoint(&saved)
+                .expect("apply checkpoint once before the first step");
+            assert!(
+                session.events.iter().any(|(_, event)| matches!(
+                    event,
+                    xiii_script::PresentationEvent::PlayMusic(music)
+                        if music.sound.as_deref() == saved.sound_to_launch.as_deref()
+                )),
+                "AcceptInventory did not emit saved SoundToLaunch={:?}: {:?}",
+                saved.sound_to_launch,
+                session.events
+            );
+            assert_eq!(
+                session.vm().get_property(game_info, "CheckpointNumber"),
+                Some(&Value::Int(7)),
+                "the restore must set the saved CheckpointNumber before play resumes"
+            );
+            let mut health_min = f32::MAX;
+            for _ in 0..660 {
+                session.step(
+                    1.0 / 60.0,
+                    location,
+                    0.0,
+                    [0.0; 3],
+                    &PlayerVMModes::default(),
+                );
+                if let Some(h) = session.player_health() {
+                    health_min = health_min.min(h);
+                }
+            }
+            assert!(
+                session.vm_time() >= 10.0,
+                "did not simulate ten seconds (t={})",
+                session.vm_time()
+            );
+            assert_eq!(
+                session.player_health(),
+                Some(150.0),
+                "FirstFrame re-applied the wounded intro health over the restored value"
+            );
+            assert!(
+                (health_min - 150.0).abs() < f32::EPSILON,
+                "health dropped below the restored 150 during ten seconds (min {health_min})"
+            );
+            assert_eq!(
+                session
+                    .objective_states()
+                    .iter()
+                    .map(|o| (o.completed, o.primary, o.anti_goal))
+                    .collect::<Vec<_>>(),
+                saved
+                    .objectives
+                    .iter()
+                    .map(|o| (o.completed, o.primary, o.anti_goal))
+                    .collect::<Vec<_>>()
+            );
+            // `RestartPlayer`'s own `TriggerEvent(StartSpot.Event)` re-arms the level's
+            // Tag='Debut' `XIIISaveGameTrigger`, whose `GoSaving.DoSave` (0x0191) increments the
+            // checkpoint again during resumed play — the game's own re-save, measured 7 -> 8.
+            let checkpoint_now = session.vm().get_property(game_info, "CheckpointNumber");
+            assert!(
+                matches!(checkpoint_now, Some(Value::Int(n)) if *n >= 7),
+                "CheckpointNumber regressed below the restored 7 ({checkpoint_now:?})"
+            );
+            println!(
+                "[save corpus] Plage00 Health={} checkpoint={checkpoint_now:?} after {:.3}s of resumed play",
+                session.player_health().unwrap_or(-1.0),
+                session.vm_time()
+            );
+        })
     }
 
     /// Opt-in corpus regression (coordinator requirement): a normal (non-checkpoint) Plage00
@@ -3653,38 +3758,40 @@ mod tests {
     /// PlayerStart's own `Event` (`'Debut'`), not "LOAD".
     #[test]
     fn opt_in_plage00_normal_start_applies_the_wounded_intro_health() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00");
-        assert_eq!(
-            session
-                .vm()
-                .get_property(session.game_info.expect("GameInfo"), "StartSpotEvent"),
-            Some(&Value::Name("Debut".into())),
-            "a normal start must leave RestartPlayer's StartSpot.Event value in place"
-        );
-        let location = session.player_location().expect("player location");
-        for _ in 0..30 {
-            session.step(
-                1.0 / 60.0,
-                location,
-                0.0,
-                [0.0; 3],
-                &PlayerVMModes::default(),
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00");
+            assert_eq!(
+                session
+                    .vm()
+                    .get_property(session.game_info.expect("GameInfo"), "StartSpotEvent"),
+                Some(&Value::Name("Debut".into())),
+                "a normal start must leave RestartPlayer's StartSpot.Event value in place"
             );
-        }
-        assert_eq!(
-            session.player_health(),
-            Some(75.0),
-            "FirstFrame's wounded-intro Health write (default 150 * 0.5) did not run"
-        );
-        println!(
-            "[save corpus] normal Plage00 start: Health={} after {:.3}s",
-            session.player_health().unwrap_or(-1.0),
-            session.vm_time()
-        );
+            let location = session.player_location().expect("player location");
+            for _ in 0..30 {
+                session.step(
+                    1.0 / 60.0,
+                    location,
+                    0.0,
+                    [0.0; 3],
+                    &PlayerVMModes::default(),
+                );
+            }
+            assert_eq!(
+                session.player_health(),
+                Some(75.0),
+                "FirstFrame's wounded-intro Health write (default 150 * 0.5) did not run"
+            );
+            println!(
+                "[save corpus] normal Plage00 start: Health={} after {:.3}s",
+                session.player_health().unwrap_or(-1.0),
+                session.vm_time()
+            );
+        })
     }
 
     /// Opt-in corpus (item14c requirement 4): the diagnostic grant uses the game's own
@@ -3698,156 +3805,161 @@ mod tests {
     /// more: the `MuzzleLight` actor and its `LT_Steady` flash are the game's own code.
     #[test]
     fn opt_in_plage01_give_to_attaches_and_fires_the_muzzle_light() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = Session::open(&game_dir, "Plage01").expect("open Plage01");
-        let msg = session.grant_weapon("XIII.Beretta").expect("grant Beretta");
-        println!("[muzzle test] {msg}");
-        let weapon = session
-            .player_weapon()
-            .expect("the game's GiveTo path must set Pawn.Weapon");
-        assert!(
-            session.vm().is_a(weapon, "weapon"),
-            "Pawn.Weapon is not a weapon"
-        );
-        let attach = instance_prop(session.vm(), weapon, "ThirdPersonActor")
-            .expect("GiveTo/ChangedWeapon must set ThirdPersonActor");
-        assert!(
-            session.vm().is_a(attach, "weaponattachment"),
-            "ThirdPersonActor is not a WeaponAttachment: {}",
-            session
-                .vm()
-                .set()
-                .path(session.vm().objects[attach as usize].class)
-        );
-        let count_muzzle = |s: &Session| -> usize {
-            (0..s.vm().objects.len())
-                .filter(|&i| {
-                    !s.vm().objects[i].deleted && s.vm().is_a(i as ObjectId, "MuzzleLight")
-                })
-                .count()
-        };
-        assert_eq!(
-            count_muzzle(&session),
-            0,
-            "a MuzzleLight already exists before any shot"
-        );
-        // Fire through the same entry point the host uses (`class_function(weapon, "Fire")`).
-        let outcome = session.fire(0.0, 0.0);
-        assert_eq!(outcome, FireOutcome::Fired, "the weapon did not fire");
-        // `ThirdPersonEffects` runs inside the fire call, so `MuzzleAttach`/`MFSmallAttach` and
-        // its `MFLight` must already exist.
-        let mf = instance_prop(session.vm(), attach, "MuzzleFlash")
-            .expect("ThirdPersonEffects must spawn MuzzleFlash");
-        assert!(
-            session.vm().is_a(mf, "muzzleflashattachment"),
-            "MuzzleFlash is not a MuzzleFlashAttachment"
-        );
-        let light = instance_prop(session.vm(), mf, "MFLight")
-            .expect("MFSmallAttach.PostBeginPlay must spawn MFLight");
-        assert!(
-            session.vm().is_a(light, "muzzlelight"),
-            "MFLight is not a MuzzleLight"
-        );
-        // The first `Visible` state runs with `DrawType == 8` (set by
-        // `InventoryAttachment.PostNetBeginPlay`), so its `Visible.Tick` guard cannot fire; when
-        // it ends, `Visible.EndState` sets `DrawType = 0`. The next fire's `MuzzleFlash.Flash()`
-        // re-enters `Visible` with `DrawType == 0`, and its `Visible.Tick` calls
-        // `MFLight.Flash` at `TickCount > 3` (this is the retail repeated-fire path). Fire a few
-        // shots, ticking each, and sample `LightType` to catch the `LT_Steady` (1) flash before
-        // `MuzzleLight.Tick` turns it back off.
-        let mut muzzle_ids: Vec<ObjectId> = Vec::new();
-        let mut flash_seen = false;
-        for shot in 0..3 {
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = Session::open(&game_dir, "Plage01").expect("open Plage01");
+            let msg = session.grant_weapon("XIII.Beretta").expect("grant Beretta");
+            println!("[muzzle test] {msg}");
+            let weapon = session
+                .player_weapon()
+                .expect("the game's GiveTo path must set Pawn.Weapon");
+            assert!(
+                session.vm().is_a(weapon, "weapon"),
+                "Pawn.Weapon is not a weapon"
+            );
+            let attach = instance_prop(session.vm(), weapon, "ThirdPersonActor")
+                .expect("GiveTo/ChangedWeapon must set ThirdPersonActor");
+            assert!(
+                session.vm().is_a(attach, "weaponattachment"),
+                "ThirdPersonActor is not a WeaponAttachment: {}",
+                session
+                    .vm()
+                    .set()
+                    .path(session.vm().objects[attach as usize].class)
+            );
+            let count_muzzle = |s: &Session| -> usize {
+                (0..s.vm().objects.len())
+                    .filter(|&i| {
+                        !s.vm().objects[i].deleted && s.vm().is_a(i as ObjectId, "MuzzleLight")
+                    })
+                    .count()
+            };
+            assert_eq!(
+                count_muzzle(&session),
+                0,
+                "a MuzzleLight already exists before any shot"
+            );
+            // Fire through the same entry point the host uses (`class_function(weapon, "Fire")`).
             let outcome = session.fire(0.0, 0.0);
-            assert_eq!(outcome, FireOutcome::Fired, "shot {shot} did not fire");
-            for _ in 0..14 {
-                let loc = session.player_location().unwrap_or([0.0; 3]);
-                session.step(1.0 / 60.0, loc, 0.0, [0.0; 3], &PlayerVMModes::default());
-                for i in 0..session.vm().objects.len() {
-                    let id = i as ObjectId;
-                    if !session.vm().objects[i].deleted && session.vm().is_a(id, "MuzzleLight") {
-                        if !muzzle_ids.contains(&id) {
-                            muzzle_ids.push(id);
+            assert_eq!(outcome, FireOutcome::Fired, "the weapon did not fire");
+            // `ThirdPersonEffects` runs inside the fire call, so `MuzzleAttach`/`MFSmallAttach` and
+            // its `MFLight` must already exist.
+            let mf = instance_prop(session.vm(), attach, "MuzzleFlash")
+                .expect("ThirdPersonEffects must spawn MuzzleFlash");
+            assert!(
+                session.vm().is_a(mf, "muzzleflashattachment"),
+                "MuzzleFlash is not a MuzzleFlashAttachment"
+            );
+            let light = instance_prop(session.vm(), mf, "MFLight")
+                .expect("MFSmallAttach.PostBeginPlay must spawn MFLight");
+            assert!(
+                session.vm().is_a(light, "muzzlelight"),
+                "MFLight is not a MuzzleLight"
+            );
+            // The first `Visible` state runs with `DrawType == 8` (set by
+            // `InventoryAttachment.PostNetBeginPlay`), so its `Visible.Tick` guard cannot fire; when
+            // it ends, `Visible.EndState` sets `DrawType = 0`. The next fire's `MuzzleFlash.Flash()`
+            // re-enters `Visible` with `DrawType == 0`, and its `Visible.Tick` calls
+            // `MFLight.Flash` at `TickCount > 3` (this is the retail repeated-fire path). Fire a few
+            // shots, ticking each, and sample `LightType` to catch the `LT_Steady` (1) flash before
+            // `MuzzleLight.Tick` turns it back off.
+            let mut muzzle_ids: Vec<ObjectId> = Vec::new();
+            let mut flash_seen = false;
+            for shot in 0..3 {
+                let outcome = session.fire(0.0, 0.0);
+                assert_eq!(outcome, FireOutcome::Fired, "shot {shot} did not fire");
+                for _ in 0..14 {
+                    let loc = session.player_location().unwrap_or([0.0; 3]);
+                    session.step(1.0 / 60.0, loc, 0.0, [0.0; 3], &PlayerVMModes::default());
+                    for i in 0..session.vm().objects.len() {
+                        let id = i as ObjectId;
+                        if !session.vm().objects[i].deleted && session.vm().is_a(id, "MuzzleLight")
+                        {
+                            if !muzzle_ids.contains(&id) {
+                                muzzle_ids.push(id);
+                            }
+                            flash_seen |=
+                                session.vm().get_property(id, "LightType") == Some(&Value::Byte(1));
                         }
-                        flash_seen |=
-                            session.vm().get_property(id, "LightType") == Some(&Value::Byte(1));
                     }
                 }
             }
-        }
-        println!(
-            "[muzzle test] MuzzleLight actors {:?}; game Flash reached LT_Steady: {flash_seen}",
-            muzzle_ids
-        );
-        assert!(
-            !muzzle_ids.is_empty(),
-            "firing did not spawn the game's MuzzleLight"
-        );
-        assert!(
-            flash_seen,
-            "the game's MuzzleFlashAttachment.Visible.Tick never called MuzzleLight.Flash"
-        );
+            println!(
+                "[muzzle test] MuzzleLight actors {:?}; game Flash reached LT_Steady: {flash_seen}",
+                muzzle_ids
+            );
+            assert!(
+                !muzzle_ids.is_empty(),
+                "firing did not spawn the game's MuzzleLight"
+            );
+            assert!(
+                flash_seen,
+                "the game's MuzzleFlashAttachment.Visible.Tick never called MuzzleLight.Flash"
+            );
+        })
     }
 
     /// Opt-in checkpoint persistence/restore through the same map and named teleporter used by
     /// Plage00's `DoSave`; this deliberately uses a temporary user directory, not game data.
     #[test]
     fn opt_in_plage00_checkpoint_file_restores_decoded_state() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut source = Session::open(&game_dir, "Plage00").expect("open source Plage00");
-        for _ in 0..120 {
-            if source.save_total > 0 {
-                break;
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut source = Session::open(&game_dir, "Plage00").expect("open source Plage00");
+            for _ in 0..120 {
+                if source.save_total > 0 {
+                    break;
+                }
+                let loc = source.player_location().unwrap_or([0.; 3]);
+                source.step(1.0 / 60.0, loc, 0., [0.; 3], &PlayerVMModes::default());
             }
-            let loc = source.player_location().unwrap_or([0.; 3]);
-            source.step(1.0 / 60.0, loc, 0., [0.; 3], &PlayerVMModes::default());
-        }
-        let event = source.saves.back().expect("checkpoint event").1.clone();
-        let saved = source
-            .checkpoint_snapshot(
-                "Plage00",
-                &event,
-                source.player_location().expect("live player position"),
-                source.player_rotation().expect("live player rotation"),
-            )
-            .expect("snapshot checkpoint save");
-        let dir = std::env::temp_dir().join(format!("xiii-corpus-save-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        crate::save::write(&dir, 0, &saved).expect("write checkpoint file");
-        let disk = crate::save::read(&dir, 0).expect("read checkpoint file");
-        let mut restored = Session::open(&game_dir, &disk.map).expect("open load map");
-        let checkpoint_position = restored
-            .restore_checkpoint(&disk)
-            .expect("restore checkpoint");
-        assert_eq!(restored.player_health(), Some(disk.health));
-        assert_eq!(
-            restored
-                .objective_states()
-                .iter()
-                .map(|x| (x.completed, x.primary, x.anti_goal))
-                .collect::<Vec<_>>(),
-            disk.objectives
-                .iter()
-                .map(|x| (x.completed, x.primary, x.anti_goal))
-                .collect::<Vec<_>>()
-        );
-        assert!(checkpoint_position.iter().all(|v| v.is_finite()));
-        assert_eq!(disk.map, "Plage00");
-        assert_eq!(disk.teleporter, "PlayerStart");
-        let _ = std::fs::remove_dir_all(dir);
-        println!(
-            "[save test] restored map={} teleporter={} health={} objectives={}",
-            disk.map,
-            disk.teleporter,
-            disk.health,
-            disk.objectives.len()
-        );
+            let event = source.saves.back().expect("checkpoint event").1.clone();
+            let saved = source
+                .checkpoint_snapshot(
+                    "Plage00",
+                    &event,
+                    source.player_location().expect("live player position"),
+                    source.player_rotation().expect("live player rotation"),
+                )
+                .expect("snapshot checkpoint save");
+            let dir = std::env::temp_dir().join(format!("xiii-corpus-save-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            crate::save::write(&dir, 0, &saved).expect("write checkpoint file");
+            let disk = crate::save::read(&dir, 0).expect("read checkpoint file");
+            let mut restored = Session::open(&game_dir, &disk.map).expect("open load map");
+            let checkpoint_position = restored
+                .restore_checkpoint(&disk)
+                .expect("restore checkpoint");
+            assert_eq!(restored.player_health(), Some(disk.health));
+            assert_eq!(
+                restored
+                    .objective_states()
+                    .iter()
+                    .map(|x| (x.completed, x.primary, x.anti_goal))
+                    .collect::<Vec<_>>(),
+                disk.objectives
+                    .iter()
+                    .map(|x| (x.completed, x.primary, x.anti_goal))
+                    .collect::<Vec<_>>()
+            );
+            assert!(checkpoint_position.iter().all(|v| v.is_finite()));
+            assert_eq!(disk.map, "Plage00");
+            assert_eq!(disk.teleporter, "PlayerStart");
+            let _ = std::fs::remove_dir_all(dir);
+            println!(
+                "[save test] restored map={} teleporter={} health={} objectives={}",
+                disk.map,
+                disk.teleporter,
+                disk.health,
+                disk.objectives.len()
+            );
+        })
     }
 
     /// Opt-in corpus probe (item3o requirement 2): the player message path through
@@ -3859,47 +3971,49 @@ mod tests {
     /// `Ok` and that a `HudMessage` is spawned on the HUD's `HudMsg`.
     #[test]
     fn opt_in_plage00_generic_hud_message_path_does_not_suspend() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00");
-        let pawn = session.player_pawn_actors()[0].0;
-        let mut errors = Vec::new();
-        {
-            let vm = session.vm_mut();
-            for path in [
-                "xiii.XIIIDeathMessage",
-                "xiii.XIIISoloMessage",
-                "engine.GameMessage",
-            ] {
-                let Some(class) = runtime::resolve_class_path(vm.set(), path) else {
-                    errors.push(format!("{path}: class not found"));
-                    continue;
-                };
-                for switch in 0..4 {
-                    let args = vec![
-                        Value::Object(Some(ObjRef::Static(class))),
-                        Value::Int(switch),
-                        Value::Object(None),
-                        Value::Object(None),
-                        Value::Object(None),
-                    ];
-                    if let Err(e) = vm.send_event(pawn, "ReceiveLocalizedMessage", args) {
-                        errors.push(format!("{path} switch={switch}: {e}"));
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00");
+            let pawn = session.player_pawn_actors()[0].0;
+            let mut errors = Vec::new();
+            {
+                let vm = session.vm_mut();
+                for path in [
+                    "xiii.XIIIDeathMessage",
+                    "xiii.XIIISoloMessage",
+                    "engine.GameMessage",
+                ] {
+                    let Some(class) = runtime::resolve_class_path(vm.set(), path) else {
+                        errors.push(format!("{path}: class not found"));
+                        continue;
+                    };
+                    for switch in 0..4 {
+                        let args = vec![
+                            Value::Object(Some(ObjRef::Static(class))),
+                            Value::Int(switch),
+                            Value::Object(None),
+                            Value::Object(None),
+                            Value::Object(None),
+                        ];
+                        if let Err(e) = vm.send_event(pawn, "ReceiveLocalizedMessage", args) {
+                            errors.push(format!("{path} switch={switch}: {e}"));
+                        }
                     }
                 }
             }
-        }
-        assert!(errors.is_empty(), "message path suspended: {errors:?}");
-        let spawned = session
-            .vm()
-            .find_object("XIIIBaseHud")
-            .and_then(|hud| session.vm().get_property(hud, "HudMsg").cloned());
-        assert!(
-            matches!(spawned, Some(Value::Object(Some(ObjRef::Instance(_))))),
-            "no HudMessage was spawned through the generic path: {spawned:?}"
-        );
-        println!("[hud test] generic message path Ok; HudMsg={spawned:?}");
+            assert!(errors.is_empty(), "message path suspended: {errors:?}");
+            let spawned = session
+                .vm()
+                .find_object("XIIIBaseHud")
+                .and_then(|hud| session.vm().get_property(hud, "HudMsg").cloned());
+            assert!(
+                matches!(spawned, Some(Value::Object(Some(ObjRef::Instance(_))))),
+                "no HudMessage was spawned through the generic path: {spawned:?}"
+            );
+            println!("[hud test] generic message path Ok; HudMsg={spawned:?}");
+        })
     }
 }

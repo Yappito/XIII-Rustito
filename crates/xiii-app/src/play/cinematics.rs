@@ -524,61 +524,63 @@ mod tests {
     /// must carry resolved text.
     #[test]
     fn opt_in_plage00_start_dialogue_diagnostic() {
-        use xiii_script::Value;
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00 session");
-        let mut seen = 0u64;
-        let mut lines: Vec<String> = Vec::new();
-        let mut with_text = 0usize;
-        let mut loc = session.player_location().unwrap_or([0.0; 3]);
-        for _ in 0..3600 {
-            session.step(
-                1.0 / 60.0,
-                loc,
-                0.0,
-                [0.0; 3],
-                &crate::play::session::PlayerVMModes::default(),
-            );
-            with_text += collect_dialogues(&mut session, &mut seen, &mut lines);
-            loc = session.player_location().unwrap_or(loc);
-        }
-        println!(
-            "[cine test] Plage00 map start, 60 s no input: {} dialogue(s), {} with text: {lines:?}",
-            lines.len(),
-            with_text
-        );
-        let c0 = session.vm().find_object("Cine0").expect("Cine0");
-        let vm = session.vm();
-        let end_cartoon = match vm.get_property(c0, "MI") {
-            Some(Value::Object(Some(xiii_script::ObjRef::Instance(mi)))) => {
-                vm.get_property(*mi, "EndCartoonEffect").cloned()
+        crate::vmstack::run_on_vm_stack(|| {
+            use xiii_script::Value;
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00 session");
+            let mut seen = 0u64;
+            let mut lines: Vec<String> = Vec::new();
+            let mut with_text = 0usize;
+            let mut loc = session.player_location().unwrap_or([0.0; 3]);
+            for _ in 0..3600 {
+                session.step(
+                    1.0 / 60.0,
+                    loc,
+                    0.0,
+                    [0.0; 3],
+                    &crate::play::session::PlayerVMModes::default(),
+                );
+                with_text += collect_dialogues(&mut session, &mut seen, &mut lines);
+                loc = session.player_location().unwrap_or(loc);
             }
-            _ => None,
-        };
-        println!(
-            "[cine test] gate: Cine0 state={:?} bInitialized={:?} EndCartoonEffect={:?}; first error {:?}",
-            vm.state_name(c0),
-            vm.get_property(c0, "bInitialized"),
-            end_cartoon,
-            session
-                .first_error()
-                .map(|e| e.lines().next().unwrap_or(""))
-        );
-        if lines.is_empty() {
             println!(
-                "[cine test] BLOCKED (expected): Cine0 waits in CineInit for \
+                "[cine test] Plage00 map start, 60 s no input: {} dialogue(s), {} with text: {lines:?}",
+                lines.len(),
+                with_text
+            );
+            let c0 = session.vm().find_object("Cine0").expect("Cine0");
+            let vm = session.vm();
+            let end_cartoon = match vm.get_property(c0, "MI") {
+                Some(Value::Object(Some(xiii_script::ObjRef::Instance(mi)))) => {
+                    vm.get_property(*mi, "EndCartoonEffect").cloned()
+                }
+                _ => None,
+            };
+            println!(
+                "[cine test] gate: Cine0 state={:?} bInitialized={:?} EndCartoonEffect={:?}; first error {:?}",
+                vm.state_name(c0),
+                vm.get_property(c0, "bInitialized"),
+                end_cartoon,
+                session
+                    .first_error()
+                    .map(|e| e.lines().next().unwrap_or(""))
+            );
+            if lines.is_empty() {
+                println!(
+                    "[cine test] BLOCKED (expected): Cine0 waits in CineInit for \
                  MapInfo.EndCartoonEffect (set by the opening cartoon presentation, not modelled); \
                  the dialogue natives themselves resolve text (see the forced-dialogue test)."
+                );
+                return;
+            }
+            assert!(
+                with_text >= 1,
+                "a dialogue fired but none carried resolved text: {lines:?}"
             );
-            return;
-        }
-        assert!(
-            with_text >= 1,
-            "a dialogue fired but none carried resolved text: {lines:?}"
-        );
+        })
     }
 
     /// Opt-in corpus test: `TouchTrigger1` (which carries `Event = 'XIII_approche'`) spawns
@@ -587,48 +589,50 @@ mod tests {
     /// sequence (no dialogue) until some other trigger calls its `Trigger`.
     #[test]
     fn opt_in_plage00_inactive_touchtrigger_does_not_start_the_cine() {
-        use xiii_script::Value;
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00 session");
-        let tt = session
-            .vm()
-            .find_object("TouchTrigger1")
-            .expect("TouchTrigger1");
-        assert_eq!(
-            session.vm().get_property(tt, "bActif"),
-            Some(&Value::Bool(false)),
-            "TouchTrigger1 must spawn inactive (bActivableParTrigger)"
-        );
-        let mut seen = 0u64;
-        let mut lines = Vec::new();
-        let loc = [6746.321, -474.648, 830.0];
-        for _ in 0..600 {
-            session.step(
-                1.0 / 60.0,
-                loc,
-                0.0,
-                [0.0; 3],
-                &crate::play::session::PlayerVMModes::default(),
+        crate::vmstack::run_on_vm_stack(|| {
+            use xiii_script::Value;
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00 session");
+            let tt = session
+                .vm()
+                .find_object("TouchTrigger1")
+                .expect("TouchTrigger1");
+            assert_eq!(
+                session.vm().get_property(tt, "bActif"),
+                Some(&Value::Bool(false)),
+                "TouchTrigger1 must spawn inactive (bActivableParTrigger)"
             );
-            collect_dialogues(&mut session, &mut seen, &mut lines);
-        }
-        assert_eq!(
-            session.vm().get_property(tt, "bActif"),
-            Some(&Value::Bool(false)),
-            "Touch must not activate an inactive TouchTrigger"
-        );
-        assert!(
-            lines.is_empty(),
-            "an inactive TouchTrigger started the cine: {lines:?}"
-        );
-        println!(
-            "[cine test] inactive TouchTrigger1 touched at {:?}; no dialogue ({} touches)",
-            session.touches(),
-            session.touches().len()
-        );
+            let mut seen = 0u64;
+            let mut lines = Vec::new();
+            let loc = [6746.321, -474.648, 830.0];
+            for _ in 0..600 {
+                session.step(
+                    1.0 / 60.0,
+                    loc,
+                    0.0,
+                    [0.0; 3],
+                    &crate::play::session::PlayerVMModes::default(),
+                );
+                collect_dialogues(&mut session, &mut seen, &mut lines);
+            }
+            assert_eq!(
+                session.vm().get_property(tt, "bActif"),
+                Some(&Value::Bool(false)),
+                "Touch must not activate an inactive TouchTrigger"
+            );
+            assert!(
+                lines.is_empty(),
+                "an inactive TouchTrigger started the cine: {lines:?}"
+            );
+            println!(
+                "[cine test] inactive TouchTrigger1 touched at {:?}; no dialogue ({} touches)",
+                session.touches(),
+                session.touches().len()
+            );
+        })
     }
 
     /// Opt-in corpus test (requirement 5, mechanism): forcing the map's own opening
@@ -636,45 +640,47 @@ mod tests {
     /// emits a dialogue event whose text resolved from `Speakers[..].Sentences[..]`.
     #[test]
     fn opt_in_plage00_forced_start_dialogue_resolves_text() {
-        use xiii_script::Value;
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00 session");
-        let dm = session
-            .vm()
-            .find_object("DialogueManager0")
-            .expect("Plage00 has DialogueManager0");
-        session
-            .vm_mut()
-            .send_event(dm, "StartDialogue", vec![Value::Int(0)])
-            .expect("DialogueManager0.StartDialogue");
-        let mut seen = 0u64;
-        let mut lines = Vec::new();
-        let mut with_text = 0usize;
-        let mut loc = session.player_location().unwrap_or([0.0; 3]);
-        for _ in 0..600 {
-            session.step(
-                1.0 / 60.0,
-                loc,
-                0.0,
-                [0.0; 3],
-                &crate::play::session::PlayerVMModes::default(),
-            );
-            with_text += collect_dialogues(&mut session, &mut seen, &mut lines);
-            loc = session.player_location().unwrap_or(loc);
-        }
-        println!("[cine test] forced DialogueManager0 lines: {lines:?}");
-        println!(
-            "[cine test] forced first error: {:?}",
+        crate::vmstack::run_on_vm_stack(|| {
+            use xiii_script::Value;
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = Session::open(&game_dir, "Plage00").expect("open Plage00 session");
+            let dm = session
+                .vm()
+                .find_object("DialogueManager0")
+                .expect("Plage00 has DialogueManager0");
             session
-                .first_error()
-                .map(|e| e.lines().next().unwrap_or(""))
-        );
-        assert!(
-            with_text >= 1,
-            "the forced DialogueManager0 produced no dialogue with resolved text: {lines:?}"
-        );
+                .vm_mut()
+                .send_event(dm, "StartDialogue", vec![Value::Int(0)])
+                .expect("DialogueManager0.StartDialogue");
+            let mut seen = 0u64;
+            let mut lines = Vec::new();
+            let mut with_text = 0usize;
+            let mut loc = session.player_location().unwrap_or([0.0; 3]);
+            for _ in 0..600 {
+                session.step(
+                    1.0 / 60.0,
+                    loc,
+                    0.0,
+                    [0.0; 3],
+                    &crate::play::session::PlayerVMModes::default(),
+                );
+                with_text += collect_dialogues(&mut session, &mut seen, &mut lines);
+                loc = session.player_location().unwrap_or(loc);
+            }
+            println!("[cine test] forced DialogueManager0 lines: {lines:?}");
+            println!(
+                "[cine test] forced first error: {:?}",
+                session
+                    .first_error()
+                    .map(|e| e.lines().next().unwrap_or(""))
+            );
+            assert!(
+                with_text >= 1,
+                "the forced DialogueManager0 produced no dialogue with resolved text: {lines:?}"
+            );
+        })
     }
 }

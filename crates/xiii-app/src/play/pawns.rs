@@ -638,76 +638,78 @@ mod tests {
     /// selection and decode path `setup_pawns` uses is exercised.
     #[test]
     fn opt_in_plage00_soldier_pawns_resolve_meshes() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let session = Session::open(&game_dir, "Plage00").expect("open Plage00 session");
-        let vm = session.vm();
-        let selection = select(vm, session.player);
-        let soldiers: Vec<&PawnSource> = selection
-            .pawns
-            .iter()
-            .filter(|p| vm.is_a(p.id, "basesoldier"))
-            .collect();
-        println!(
-            "[pawn test] Plage00: {} pawns selected ({} soldier), {} meshes to decode; skipped {:?}; attachments {:?}",
-            selection.pawns.len(),
-            soldiers.len(),
-            selection
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let session = Session::open(&game_dir, "Plage00").expect("open Plage00 session");
+            let vm = session.vm();
+            let selection = select(vm, session.player);
+            let soldiers: Vec<&PawnSource> = selection
                 .pawns
                 .iter()
-                .map(|p| p.mesh_path.as_str())
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            selection.skipped,
-            selection.attachments
-        );
-        assert!(!soldiers.is_empty(), "no BaseSoldier pawns selected");
+                .filter(|p| vm.is_a(p.id, "basesoldier"))
+                .collect();
+            println!(
+                "[pawn test] Plage00: {} pawns selected ({} soldier), {} meshes to decode; skipped {:?}; attachments {:?}",
+                selection.pawns.len(),
+                soldiers.len(),
+                selection
+                    .pawns
+                    .iter()
+                    .map(|p| p.mesh_path.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                selection.skipped,
+                selection.attachments
+            );
+            assert!(!soldiers.is_empty(), "no BaseSoldier pawns selected");
 
-        // Expected: every live soldier with a SkeletalMesh Mesh (regardless of the visibility
-        // rules, which are the `select` filter being tested).
-        let expected = (0..vm.objects.len())
-            .filter(|&i| {
-                let id = i as ObjectId;
-                vm.objects[i].is_actor
-                    && !vm.objects[i].deleted
-                    && !vm.objects[i].name.starts_with("Default__")
-                    && vm.is_a(id, "basesoldier")
-                    && vm.mesh_object(id).is_some_and(|(_, c)| {
-                        c.rsplit('.')
-                            .next()
-                            .is_some_and(|s| s.eq_ignore_ascii_case("SkeletalMesh"))
-                    })
-            })
-            .count();
-        let mut cache = PackageCache::open(&game_dir).expect("open install");
-        let mut resolved = 0usize;
-        for p in &soldiers {
-            match load_model(&mut cache, &p.mesh_path) {
-                Ok(m) => {
-                    resolved += 1;
-                    println!(
-                        "[pawn test]   soldier {} mesh {} -> {} bones, {} clips",
-                        p.name,
-                        p.mesh_path,
-                        m.skeleton.bones.len(),
-                        m.anims.as_ref().map_or(0, |a| a.clips.len())
-                    );
+            // Expected: every live soldier with a SkeletalMesh Mesh (regardless of the visibility
+            // rules, which are the `select` filter being tested).
+            let expected = (0..vm.objects.len())
+                .filter(|&i| {
+                    let id = i as ObjectId;
+                    vm.objects[i].is_actor
+                        && !vm.objects[i].deleted
+                        && !vm.objects[i].name.starts_with("Default__")
+                        && vm.is_a(id, "basesoldier")
+                        && vm.mesh_object(id).is_some_and(|(_, c)| {
+                            c.rsplit('.')
+                                .next()
+                                .is_some_and(|s| s.eq_ignore_ascii_case("SkeletalMesh"))
+                        })
+                })
+                .count();
+            let mut cache = PackageCache::open(&game_dir).expect("open install");
+            let mut resolved = 0usize;
+            for p in &soldiers {
+                match load_model(&mut cache, &p.mesh_path) {
+                    Ok(m) => {
+                        resolved += 1;
+                        println!(
+                            "[pawn test]   soldier {} mesh {} -> {} bones, {} clips",
+                            p.name,
+                            p.mesh_path,
+                            m.skeleton.bones.len(),
+                            m.anims.as_ref().map_or(0, |a| a.clips.len())
+                        );
+                    }
+                    Err(e) => panic!(
+                        "soldier {} mesh {} did not decode: {e}",
+                        p.name, p.mesh_path
+                    ),
                 }
-                Err(e) => panic!(
-                    "soldier {} mesh {} did not decode: {e}",
-                    p.name, p.mesh_path
-                ),
             }
-        }
-        println!(
-            "[pawn test] spawned soldier pawns with SkeletalMesh: {expected}, resolved {resolved}"
-        );
-        assert!(expected >= 1, "expected at least one soldier pawn");
-        assert!(
-            resolved >= expected,
-            "renderer selected {resolved} soldiers with resolved meshes but the VM has {expected}"
-        );
+            println!(
+                "[pawn test] spawned soldier pawns with SkeletalMesh: {expected}, resolved {resolved}"
+            );
+            assert!(expected >= 1, "expected at least one soldier pawn");
+            assert!(
+                resolved >= expected,
+                "renderer selected {resolved} soldiers with resolved meshes but the VM has {expected}"
+            );
+        })
     }
 }

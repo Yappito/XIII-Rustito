@@ -8250,9 +8250,10 @@ fn delegate_values_are_equatable_and_none_is_distinct() {
 
 /// Synthetic recursion fixture: `Actor.Run()` calls itself virtually and never returns, so only
 /// the interpreter's call-depth guard can stop it. This is the shape of the Amos01
-/// campaign-start recursion (`xiii.u XIIIPlayerController.SwitchWeapon` 0x00FC -> 0x00FC),
-/// which at the old 250-frame limit overflowed the 1 MiB Windows main-thread stack and killed
-/// the process before the guard could fire (item45).
+/// campaign-start recursion (`xiii.u XIIIPlayerController.SwitchWeapon` 0x00FC -> 0x00FC).
+/// The guard limit itself follows the engine: Core.dll `UObject::ProcessInternal` compares
+/// the runaway counter against 250 (`cmp $0xfa` at VA 0x101166e0) and logs "Infinite script
+/// recursion (%i calls) detected" (string VA 0x10178cd8) past it.
 fn recursion_package() -> Vec<u8> {
     let mut b = B::new();
     let object = b.reserve(0, 0, "Object");
@@ -8272,16 +8273,19 @@ fn recursion_package() -> Vec<u8> {
     b.build()
 }
 
-/// The unbounded-recursion property: at `VmLimits::default()` the guard aborts with
-/// `CallDepthExceeded` **inside a 1 MiB stack** — the Windows main-thread budget. Runs the
-/// recursion on a 1 MiB thread; if the default limit is ever raised past what that budget
-/// supports, this thread dies with a stack overflow and the test (loudly) fails.
+/// The unbounded-recursion property at the engine's own limit: at `VmLimits::default()` (250,
+/// the Core.dll `ProcessInternal` constant) the guard aborts with `CallDepthExceeded`
+/// **inside a default test-thread stack** — libtest spawns each test on a thread with the
+/// platform default (~2 MiB on Windows) and no explicit stack. Runs the recursion on a thread
+/// with no explicit `stack_size`; if the default limit is ever raised past what that budget
+/// supports, this thread dies with a stack overflow and the test (loudly) fails. The shipped
+/// host entry points run their VM-driving code on an explicit 64 MiB stack instead (see
+/// xiii-app `vmstack`).
 #[test]
-fn recursion_guard_fits_a_1mib_main_stack() {
+fn recursion_guard_fits_the_default_test_stack() {
     let package = recursion_package();
     let limit = VmLimits::default().max_call_depth;
     let outcome = std::thread::Builder::new()
-        .stack_size(1024 * 1024)
         .spawn(move || {
             let set = set_of(package);
             let mut vm = Vm::new(&set, VmLimits::default());
@@ -8292,12 +8296,12 @@ fn recursion_guard_fits_a_1mib_main_stack() {
                 Ok(_) => "no error".to_owned(),
             }
         })
-        .expect("spawn the 1 MiB probe thread")
+        .expect("spawn the default-stack probe thread")
         .join()
-        .expect("the recursion must abort inside 1 MiB, not overflow the stack");
+        .expect("the recursion must abort inside the default test stack, not overflow it");
     assert_eq!(
         outcome,
         format!("CallDepthExceeded {{ limit: {limit} }}"),
-        "the default call-depth guard must fire before a 1 MiB main stack is exhausted"
+        "the engine-limit call-depth guard (250) must fire before a default test stack is exhausted"
     );
 }

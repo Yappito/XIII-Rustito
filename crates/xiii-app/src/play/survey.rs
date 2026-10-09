@@ -685,8 +685,15 @@ fn child_run(opts: &Options) -> AppExit {
         }
     };
     let started = Instant::now();
-    let survey = match std::panic::catch_unwind(AssertUnwindSafe(|| {
-        run_one_map(&game_dir, map, &resolved.params, duration)
+    // run_one_map drives the VM for the whole login chain; run it on the explicit VM host
+    // stack (see vmstack) so the engine-limit recursion guard fires before the thread runs
+    // out of stack. The map survey is plain data and crosses back through the join.
+    let params = resolved.params;
+    let map_name = map.clone();
+    let survey = match std::panic::catch_unwind(AssertUnwindSafe(move || {
+        crate::vmstack::run_on_vm_stack(move || {
+            run_one_map(&game_dir, &map_name, &params, duration)
+        })
     })) {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {

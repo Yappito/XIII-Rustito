@@ -566,13 +566,24 @@ fn setup_inner(
     let sources = scene.collision_sources.clone();
     let (ps_bevy, rot) = scene.player_start.ok_or("map has no PlayerStart")?;
     let spawn = collision::place_spawn(&world, ps_bevy, params.half_extents_bevy())?;
-    println!(
-        "[play] spawn: PlayerStart {:?} UU -> box centre {:?} UU, raise {:.2} UU, floor {:.2} UU below the centre",
-        bevy_to_unreal_position(ps_bevy),
-        bevy_to_unreal_position(spawn.position),
-        spawn.raise * UNREAL_UNITS_PER_METER,
-        (spawn.position[1] - spawn.floor) * UNREAL_UNITS_PER_METER
-    );
+    if spawn.airborne {
+        // Engine-faithful: `RestartPlayer` spawns the pawn at StartSpot.Location and
+        // PHYS_Falling brings it down (USA01's PlayerStart is 14 m above the BSP floor).
+        println!(
+            "[play] spawn: no floor within the drop cap below the PlayerStart {:?} UU; \
+             the pawn spawns at the start spot and falls (PHYS_Falling), raise {:.2} UU",
+            bevy_to_unreal_position(ps_bevy),
+            spawn.raise * UNREAL_UNITS_PER_METER
+        );
+    } else {
+        println!(
+            "[play] spawn: PlayerStart {:?} UU -> box centre {:?} UU, raise {:.2} UU, floor {:.2} UU below the centre",
+            bevy_to_unreal_position(ps_bevy),
+            bevy_to_unreal_position(spawn.position),
+            spawn.raise * UNREAL_UNITS_PER_METER,
+            (spawn.position[1] - spawn.floor) * UNREAL_UNITS_PER_METER
+        );
+    }
     // The host movement simulation owns the player pawn's `Location`/`Velocity`/`Rotation`.
     // The script login chain (when it ran) created the pawn at the PlayerStart; the position
     // comes from the host's FindSpot placement (the raw PlayerStart overlaps the floor) and the
@@ -611,7 +622,7 @@ fn setup_inner(
     }
     let yaw = start_rot[1] as f32 * std::f32::consts::TAU / 65536.0;
     let mut sim = PlayerSim::new(start_center, yaw);
-    sim.grounded = true;
+    sim.grounded = !spawn.airborne;
 
     // Optional deterministic script.
     let (drive, script_last) = match &opts.play_script {
@@ -1863,13 +1874,16 @@ fn format_trace(tick: u64, t: f32, sim: &PlayerSim) -> String {
 /// map, spawns the player, replays the script through the same [`PlayerSim`], prints a trace
 /// every [`TRACE_EVERY`] ticks and exits. No window is opened.
 pub fn run_headless(opts: &Options) -> AppExit {
-    match run_headless_inner(opts) {
+    // The scripted run drives the VM; run it on the explicit VM host stack (see vmstack) so
+    // the engine-limit recursion guard fires before the thread runs out of stack.
+    let owned = opts.clone();
+    crate::vmstack::run_on_vm_stack(move || match run_headless_inner(&owned) {
         Ok(()) => AppExit::Success,
         Err(e) => {
             eprintln!("error: {e}");
             AppExit::error()
         }
-    }
+    })
 }
 
 /// Outcome of a headless scripted run: the VM session (after the run), the movement trace and
@@ -1975,12 +1989,21 @@ fn open_map_runtime(
     let sources = scene.collision_sources.clone();
     let (ps_bevy, rot) = scene.player_start.ok_or("map has no PlayerStart")?;
     let spawn = collision::place_spawn(&world, ps_bevy, params.half_extents_bevy())?;
-    println!(
-        "[play] spawn: PlayerStart {:?} UU -> box centre {:?} UU, raise {:.2} UU",
-        bevy_to_unreal_position(ps_bevy),
-        bevy_to_unreal_position(spawn.position),
-        spawn.raise * UNREAL_UNITS_PER_METER
-    );
+    if spawn.airborne {
+        println!(
+            "[play] spawn: no floor within the drop cap below the PlayerStart {:?} UU; \
+             the pawn spawns at the start spot and falls (PHYS_Falling), raise {:.2} UU",
+            bevy_to_unreal_position(ps_bevy),
+            spawn.raise * UNREAL_UNITS_PER_METER
+        );
+    } else {
+        println!(
+            "[play] spawn: PlayerStart {:?} UU -> box centre {:?} UU, raise {:.2} UU",
+            bevy_to_unreal_position(ps_bevy),
+            bevy_to_unreal_position(spawn.position),
+            spawn.raise * UNREAL_UNITS_PER_METER
+        );
+    }
     // The script login chain (item3h) created the pawn at the PlayerStart; the host owns its
     // movement fields (item8a rule), so the position comes from the host's FindSpot placement
     // and the facing from the pawn's script-set Rotation when the login path ran.
@@ -1989,7 +2012,7 @@ fn open_map_runtime(
         _ => rot[1] as f32 * std::f32::consts::TAU / 65536.0,
     };
     let mut sim = PlayerSim::new(bevy_to_unreal_position(spawn.position), start_yaw);
-    sim.grounded = true;
+    sim.grounded = !spawn.airborne;
     let volumes = match xiii_world::movement_volumes::MovementVolumes::import(game_dir, map) {
         Ok(v) => {
             println!("[play] movement volumes: {}", v.summary());
@@ -2625,7 +2648,7 @@ mod tests {
             bevy_to_unreal_position(spawn.position),
             rot[1] as f32 * std::f32::consts::TAU / 65536.0,
         );
-        sim.grounded = true;
+        sim.grounded = !spawn.airborne;
         let start = sim.location;
         for _ in 0..120 {
             sim.step(
@@ -2690,63 +2713,65 @@ mod tests {
     /// interior texture carries `XIIIPlage.PLmeub05` -> `XIIIsound.Footsteps__XIIIFSBoi.…`.
     #[test]
     fn opt_in_plage01_scripted_walk_plays_surface_footsteps() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Plage01".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Plage01");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let script = script::Script::parse(
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("Plage01".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import Plage01");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            let script = script::Script::parse(
             "t=45.0 forward 1\nt=46.5 forward -1\nt=48.0 forward 1\nt=49.5 forward -1\nt=51.0 forward 1\nt=52.5 forward -1\nt=54.0 forward 0\n",
         )
         .unwrap();
-        let outcome = run_script_with_cinematic_input(
-            &game_dir,
-            "Plage01",
-            &script,
-            &resolved.params,
-            &scene,
-            55.0,
-        )
-        .expect("run Plage01 shuttle walk");
-        assert!(
-            !outcome.footsteps.is_empty(),
-            "a 9 s scripted walk on Plage01 must emit footsteps"
-        );
-        // Every footstep names a real `XIIIFootStepSound` wrapper and a floor material path.
-        for (t, sound, material) in &outcome.footsteps {
+            let outcome = run_script_with_cinematic_input(
+                &game_dir,
+                "Plage01",
+                &script,
+                &resolved.params,
+                &scene,
+                55.0,
+            )
+            .expect("run Plage01 shuttle walk");
             assert!(
-                sound.to_ascii_lowercase().contains("footsteps__xiiifs"),
-                "footstep [{t:.3}s] sound {sound} is not a player footstep wrapper"
+                !outcome.footsteps.is_empty(),
+                "a 9 s scripted walk on Plage01 must emit footsteps"
             );
-            assert!(
-                material.is_some(),
-                "footstep [{t:.3}s] {sound} has no floor material path"
-            );
-        }
-        let mut names: Vec<&str> = outcome
-            .footsteps
-            .iter()
-            .map(|(_, s, _)| s.as_str())
-            .collect();
-        names.sort_unstable();
-        names.dedup();
-        println!(
-            "[steps test] Plage01 {} footsteps, {} distinct: {:?}; materials {:?}",
-            outcome.footsteps.len(),
-            names.len(),
-            names,
-            outcome
+            // Every footstep names a real `XIIIFootStepSound` wrapper and a floor material path.
+            for (t, sound, material) in &outcome.footsteps {
+                assert!(
+                    sound.to_ascii_lowercase().contains("footsteps__xiiifs"),
+                    "footstep [{t:.3}s] sound {sound} is not a player footstep wrapper"
+                );
+                assert!(
+                    material.is_some(),
+                    "footstep [{t:.3}s] {sound} has no floor material path"
+                );
+            }
+            let mut names: Vec<&str> = outcome
                 .footsteps
                 .iter()
-                .filter_map(|(_, _, m)| m.clone())
-                .collect::<std::collections::BTreeSet<_>>()
-        );
+                .map(|(_, s, _)| s.as_str())
+                .collect();
+            names.sort_unstable();
+            names.dedup();
+            println!(
+                "[steps test] Plage01 {} footsteps, {} distinct: {:?}; materials {:?}",
+                outcome.footsteps.len(),
+                names.len(),
+                names,
+                outcome
+                    .footsteps
+                    .iter()
+                    .filter_map(|(_, _, m)| m.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+            );
+        })
     }
 
     /// item32 opt-in regression: the authored Plage01 trigger wakes BaseSoldier6 from faction.
@@ -2755,94 +2780,96 @@ mod tests {
     /// sets it first, so `Trigger` engages the real player.
     #[test]
     fn opt_in_plage01_faction_trigger_cue_enters_scripted_attack() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = session::Session::open(&game_dir, "Plage01").expect("open Plage01");
-        let soldier = session
-            .vm()
-            .find_object("BaseSoldier6")
-            .expect("BaseSoldier6");
-        let controller = match session.vm().get_property(soldier, "Controller") {
-            Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => *id,
-            _ => panic!("BaseSoldier6 has no controller"),
-        };
-        let player = session.player;
-        let player_loc = session
-            .vm()
-            .vector_prop(player, "Location")
-            .expect("player location");
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = session::Session::open(&game_dir, "Plage01").expect("open Plage01");
+            let soldier = session
+                .vm()
+                .find_object("BaseSoldier6")
+                .expect("BaseSoldier6");
+            let controller = match session.vm().get_property(soldier, "Controller") {
+                Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => *id,
+                _ => panic!("BaseSoldier6 has no controller"),
+            };
+            let player = session.player;
+            let player_loc = session
+                .vm()
+                .vector_prop(player, "Location")
+                .expect("player location");
 
-        for _ in 0..120 {
-            session.step(
-                1.0 / 60.0,
-                player_loc,
-                0.0,
-                [0.0; 3],
-                &session::PlayerVMModes::default(),
-            );
-        }
-        let map_info = session.map_info().expect("Plage01 MapInfo");
-        assert_eq!(
-            session.vm().get_property(map_info, "XIIIPawn"),
-            Some(&xiii_script::Value::Object(Some(
-                xiii_script::ObjRef::Instance(player)
-            ))),
-            "MapInfo.FirstFrame (MapInfo.Timer after checkTime 0.1 s) must have set XIIIPawn to the logged-in pawn"
-        );
-        assert_eq!(
-            session.vm().state_name(controller).as_deref(),
-            Some("faction"),
-            "BaseSoldier6 should begin in the map-authored faction order"
-        );
-
-        // Deliver the real trigger event with the logged-in pawn. The map dispatcher and the
-        // soldier's own Pawn.Trigger -> IAController.Trigger chain perform the state transition.
-        let touch = session
-            .vm()
-            .find_object("TouchTrigger8")
-            .expect("TouchTrigger8");
-        session
-            .vm_mut()
-            .send_event(
-                touch,
-                "Touch",
-                vec![xiii_script::Value::Object(Some(
-                    xiii_script::ObjRef::Instance(player),
-                ))],
-            )
-            .expect("TouchTrigger8.Touch");
-
-        let mut engagement = None;
-        for tick in 0..600u32 {
-            session.step(
-                1.0 / 60.0,
-                player_loc,
-                0.0,
-                [0.0; 3],
-                &session::PlayerVMModes::default(),
-            );
-            let state = session.vm().state_name(controller);
-            if matches!(
-                state.as_deref(),
-                Some("Acquisition" | "Attaque" | "AttaqueScriptee")
-            ) {
-                engagement = Some((tick as f32 / 60.0, state));
-                break;
+            for _ in 0..120 {
+                session.step(
+                    1.0 / 60.0,
+                    player_loc,
+                    0.0,
+                    [0.0; 3],
+                    &session::PlayerVMModes::default(),
+                );
             }
-        }
-        println!(
-            "[item32] cue TouchTrigger8 -> XIIIDispatcher3.OutEvents('tueur_conducteur'); \
+            let map_info = session.map_info().expect("Plage01 MapInfo");
+            assert_eq!(
+                session.vm().get_property(map_info, "XIIIPawn"),
+                Some(&xiii_script::Value::Object(Some(
+                    xiii_script::ObjRef::Instance(player)
+                ))),
+                "MapInfo.FirstFrame (MapInfo.Timer after checkTime 0.1 s) must have set XIIIPawn to the logged-in pawn"
+            );
+            assert_eq!(
+                session.vm().state_name(controller).as_deref(),
+                Some("faction"),
+                "BaseSoldier6 should begin in the map-authored faction order"
+            );
+
+            // Deliver the real trigger event with the logged-in pawn. The map dispatcher and the
+            // soldier's own Pawn.Trigger -> IAController.Trigger chain perform the state transition.
+            let touch = session
+                .vm()
+                .find_object("TouchTrigger8")
+                .expect("TouchTrigger8");
+            session
+                .vm_mut()
+                .send_event(
+                    touch,
+                    "Touch",
+                    vec![xiii_script::Value::Object(Some(
+                        xiii_script::ObjRef::Instance(player),
+                    ))],
+                )
+                .expect("TouchTrigger8.Touch");
+
+            let mut engagement = None;
+            for tick in 0..600u32 {
+                session.step(
+                    1.0 / 60.0,
+                    player_loc,
+                    0.0,
+                    [0.0; 3],
+                    &session::PlayerVMModes::default(),
+                );
+                let state = session.vm().state_name(controller);
+                if matches!(
+                    state.as_deref(),
+                    Some("Acquisition" | "Attaque" | "AttaqueScriptee")
+                ) {
+                    engagement = Some((tick as f32 / 60.0, state));
+                    break;
+                }
+            }
+            println!(
+                "[item32] cue TouchTrigger8 -> XIIIDispatcher3.OutEvents('tueur_conducteur'); \
              BaseSoldier6 engagement {engagement:?}"
-        );
-        assert!(
-            engagement.is_some(),
-            "the authored tueur_conducteur cue did not move BaseSoldier6 from faction to \
+            );
+            assert!(
+                engagement.is_some(),
+                "the authored tueur_conducteur cue did not move BaseSoldier6 from faction to \
              Acquisition/Attaque/AttaqueScriptee; current state {:?}, first error {:?}",
-            session.vm().state_name(controller),
-            session.first_error()
-        );
+                session.vm().state_name(controller),
+                session.first_error()
+            );
+        })
     }
 
     /// Opt-in corpus test (requirement 6): the Plage01 script run opens the locked hut door
@@ -2850,78 +2877,80 @@ mod tests {
     /// the door plane, along the door's own forward axis. No teleport.
     #[test]
     fn opt_in_plage01_door_opens_and_player_walks_out() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Plage01".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Plage01");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        // Item3i: the door key is no longer host-granted. The pawn walks onto the hut key
-        // through the game's own pickup chain (autopilot `goto` + jumps; approached from the
-        // key's open -Y side), then walks to `Porte6` and uses the carried key.
-        // Start 3 s after the old 45 s mark: with the engine's cine arrival rule
-        // (XIDCine IsTargetReached) the Plage01 intro returns control at ~46.5 s, not ~44.5 s.
-        let script = script::Script::parse(
-            "t=48.00 teleport -491.8 -414.1 1265.0\n\
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("Plage01".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import Plage01");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            // Item3i: the door key is no longer host-granted. The pawn walks onto the hut key
+            // through the game's own pickup chain (autopilot `goto` + jumps; approached from the
+            // key's open -Y side), then walks to `Porte6` and uses the carried key.
+            // Start 3 s after the old 45 s mark: with the engine's cine arrival rule
+            // (XIDCine IsTargetReached) the Plage01 intro returns control at ~46.5 s, not ~44.5 s.
+            let script = script::Script::parse(
+                "t=48.00 teleport -491.8 -414.1 1265.0\n\
              t=48.10 goto -491.84 -314.14\nt=48.30 jump\nt=48.80 jump\nt=49.30 jump\nt=49.80 jump\n\
              t=50.30 jump\nt=50.80 forward 0\n\
              t=51.20 teleport -742.1444 -808.429 1311.0449\n\
              t=51.20 yaw 312.891\nt=51.20 turn 2\nt=51.20 forward 1\n\
              t=52.80 turn -45\nt=53.50 forward 0\nt=53.80 use\nt=54.80 use\nt=55.00 forward 1\n\
              t=56.00 forward 0\n",
-        )
-        .unwrap();
-        let outcome = run_script_with_cinematic_input(
-            &game_dir,
-            "Plage01",
-            &script,
-            &resolved.params,
-            &scene,
-            57.0,
-        )
-        .expect("run Plage01 door walk");
-        let s = &outcome.session;
-        assert!(
-            s.inventory_items()
-                .iter()
-                .any(|(_, c)| c.eq_ignore_ascii_case("xidmaps.Plage01CahuteKey")),
-            "the carried key must come from the pickup chain, not a host grant: {:?}",
-            s.inventory_items()
-        );
-        let door = s
-            .mover_states()
-            .into_iter()
-            .find(|m| m.name.eq_ignore_ascii_case("Porte6"))
-            .expect("Plage01 has a live Porte6");
-        assert_eq!(
-            door.key_num, 1,
-            "Porte6 did not reach its open key: {door:?}"
-        );
-        assert_ne!(
-            door.rotation, door.base_rot,
-            "Porte6 rotation did not change (door did not swing)"
-        );
-        let (_, _, pos, _) = outcome.trace.last().expect("trace sample");
-        let pos = *pos;
-        let base = door.base_pos;
-        let yaw = door.base_rot[1] as f32 * std::f32::consts::TAU / 65536.0;
-        let fwd = [yaw.cos(), yaw.sin()];
-        let dist = (pos[0] - base[0]) * fwd[0] + (pos[1] - base[1]) * fwd[1];
-        println!(
-            "[play test] Plage01 door walk: Porte6 key={} rot={:?} (base {:?}), player {:?} UU, \
+            )
+            .unwrap();
+            let outcome = run_script_with_cinematic_input(
+                &game_dir,
+                "Plage01",
+                &script,
+                &resolved.params,
+                &scene,
+                57.0,
+            )
+            .expect("run Plage01 door walk");
+            let s = &outcome.session;
+            assert!(
+                s.inventory_items()
+                    .iter()
+                    .any(|(_, c)| c.eq_ignore_ascii_case("xidmaps.Plage01CahuteKey")),
+                "the carried key must come from the pickup chain, not a host grant: {:?}",
+                s.inventory_items()
+            );
+            let door = s
+                .mover_states()
+                .into_iter()
+                .find(|m| m.name.eq_ignore_ascii_case("Porte6"))
+                .expect("Plage01 has a live Porte6");
+            assert_eq!(
+                door.key_num, 1,
+                "Porte6 did not reach its open key: {door:?}"
+            );
+            assert_ne!(
+                door.rotation, door.base_rot,
+                "Porte6 rotation did not change (door did not swing)"
+            );
+            let (_, _, pos, _) = outcome.trace.last().expect("trace sample");
+            let pos = *pos;
+            let base = door.base_pos;
+            let yaw = door.base_rot[1] as f32 * std::f32::consts::TAU / 65536.0;
+            let fwd = [yaw.cos(), yaw.sin()];
+            let dist = (pos[0] - base[0]) * fwd[0] + (pos[1] - base[1]) * fwd[1];
+            println!(
+                "[play test] Plage01 door walk: Porte6 key={} rot={:?} (base {:?}), player {:?} UU, \
              {dist:.1} UU outside the door plane",
-            door.key_num, door.rotation, door.base_rot, pos
-        );
-        assert!(
-            dist >= 2.0 * UNREAL_UNITS_PER_METER,
-            "player only {dist:.1} UU outside the door plane (need >= {:.0})",
-            2.0 * UNREAL_UNITS_PER_METER
-        );
+                door.key_num, door.rotation, door.base_rot, pos
+            );
+            assert!(
+                dist >= 2.0 * UNREAL_UNITS_PER_METER,
+                "player only {dist:.1} UU outside the door plane (need >= {:.0})",
+                2.0 * UNREAL_UNITS_PER_METER
+            );
+        })
     }
 
     /// item19 opt-in corpus test: follow Plage01 without `take_control`/`set_goal`. The intro and
@@ -2930,155 +2959,156 @@ mod tests {
     /// doors, damage/death, corpse search, goal completion and travel use the game's own code.
     #[test]
     fn opt_in_plage01_route_objectives_and_travel() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Plage01".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Plage01");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        // Tracked fixture (our own route commands; no game data).
-        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/data/plage01_route.script");
-        let script = script::Script::load(&route_path).expect("load item19 Plage01 route");
-        assert!(
-            script
-                .events
-                .iter()
-                .all(|event| !matches!(&event.command, script::Command::TakeControl)),
-            "the normal Plage01 route must release control through the authored intro"
-        );
-        let outcome = run_script_with_cinematic_input(
-            &game_dir,
-            "Plage01",
-            &script,
-            &resolved.params,
-            &scene,
-            140.0,
-        )
-        .expect("run Plage01 route");
-        println!(
-            "[route] player inventory after route: {:?}",
-            outcome.session.inventory_items()
-        );
-        for (i, object) in outcome.session.vm().objects.iter().enumerate() {
-            let id = i as xiii_script::ObjectId;
-            if !object.deleted && outcome.session.vm().is_a(id, "keys") {
-                println!(
-                    "[route] key {} active={} Instigator={:?} Owner={:?} Inventory={:?} KeyCodeName={:?} ItemName={:?}",
-                    object.name,
-                    object.active,
-                    outcome.session.vm().get_property(id, "Instigator"),
-                    outcome.session.vm().get_property(id, "Owner"),
-                    outcome.session.vm().get_property(id, "Inventory"),
-                    outcome.session.vm().get_property(id, "KeyCodeName"),
-                    outcome.session.vm().get_property(id, "ItemName"),
-                );
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("Plage01".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import Plage01");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            // Tracked fixture (our own route commands; no game data).
+            let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/data/plage01_route.script");
+            let script = script::Script::load(&route_path).expect("load item19 Plage01 route");
+            assert!(
+                script
+                    .events
+                    .iter()
+                    .all(|event| !matches!(&event.command, script::Command::TakeControl)),
+                "the normal Plage01 route must release control through the authored intro"
+            );
+            let outcome = run_script_with_cinematic_input(
+                &game_dir,
+                "Plage01",
+                &script,
+                &resolved.params,
+                &scene,
+                140.0,
+            )
+            .expect("run Plage01 route");
+            println!(
+                "[route] player inventory after route: {:?}",
+                outcome.session.inventory_items()
+            );
+            for (i, object) in outcome.session.vm().objects.iter().enumerate() {
+                let id = i as xiii_script::ObjectId;
+                if !object.deleted && outcome.session.vm().is_a(id, "keys") {
+                    println!(
+                        "[route] key {} active={} Instigator={:?} Owner={:?} Inventory={:?} KeyCodeName={:?} ItemName={:?}",
+                        object.name,
+                        object.active,
+                        outcome.session.vm().get_property(id, "Instigator"),
+                        outcome.session.vm().get_property(id, "Owner"),
+                        outcome.session.vm().get_property(id, "Inventory"),
+                        outcome.session.vm().get_property(id, "KeyCodeName"),
+                        outcome.session.vm().get_property(id, "ItemName"),
+                    );
+                }
             }
-        }
-        println!("[route] map objectives: {:?}", outcome.map_objectives);
-        println!(
-            "[route] end state: game_ended={:?}, controller={:?}, controller_state={:?}, controller_active={:?}",
-            outcome.session.game_info.and_then(|gi| outcome
-                .session
-                .vm()
-                .get_property(gi, "bGameEnded")
-                .cloned()),
-            outcome
-                .session
-                .controller
-                .map(|c| outcome.session.vm().objects[c as usize].name.clone()),
-            outcome
-                .session
-                .controller
-                .and_then(|c| outcome.session.vm().state_name(c)),
-            outcome
-                .session
-                .controller
-                .map(|c| outcome.session.vm().objects[c as usize].active),
-        );
-        let level = outcome.session.vm().find_level_info();
-        let mut listed = Vec::new();
-        let mut current =
-            level.and_then(
-                |id| match outcome.session.vm().get_property(id, "ControllerList") {
+            println!("[route] map objectives: {:?}", outcome.map_objectives);
+            println!(
+                "[route] end state: game_ended={:?}, controller={:?}, controller_state={:?}, controller_active={:?}",
+                outcome.session.game_info.and_then(|gi| outcome
+                    .session
+                    .vm()
+                    .get_property(gi, "bGameEnded")
+                    .cloned()),
+                outcome
+                    .session
+                    .controller
+                    .map(|c| outcome.session.vm().objects[c as usize].name.clone()),
+                outcome
+                    .session
+                    .controller
+                    .and_then(|c| outcome.session.vm().state_name(c)),
+                outcome
+                    .session
+                    .controller
+                    .map(|c| outcome.session.vm().objects[c as usize].active),
+            );
+            let level = outcome.session.vm().find_level_info();
+            let mut listed = Vec::new();
+            let mut current = level.and_then(|id| {
+                match outcome.session.vm().get_property(id, "ControllerList") {
                     Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(next)))) => {
                         Some(*next)
                     }
                     _ => None,
-                },
-            );
-        for _ in 0..64 {
-            let Some(id) = current else { break };
-            listed.push(outcome.session.vm().objects[id as usize].name.clone());
-            current = match outcome.session.vm().get_property(id, "NextController") {
-                Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(next)))) => {
-                    Some(*next)
                 }
-                _ => None,
-            };
-        }
-        println!("[route] LevelInfo={level:?} ControllerList={listed:?}");
-        for ev in &outcome.session.vm().trace {
-            let rendered = format!("{:?}", ev.kind);
-            if rendered.contains("ClientGameEnded")
-                || rendered.contains("GameEndedSuccess")
-                || rendered.contains("ServerTravel")
-                || rendered.contains("AddController")
-                || rendered.contains("RemoveController")
-            {
-                println!("[route] ending trace t={:.3}: {rendered}", ev.time);
+            });
+            for _ in 0..64 {
+                let Some(id) = current else { break };
+                listed.push(outcome.session.vm().objects[id as usize].name.clone());
+                current = match outcome.session.vm().get_property(id, "NextController") {
+                    Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(next)))) => {
+                        Some(*next)
+                    }
+                    _ => None,
+                };
             }
-        }
-        println!(
-            "[route] travel: {:?}, final map {}",
-            outcome.travel, outcome.final_map
-        );
-        let (plage, states) = outcome
-            .map_objectives
-            .first()
-            .expect("Plage01 objective states");
-        assert_eq!(plage, "Plage01");
-        assert!(
-            states.len() >= 2,
-            "Plage01 MapInfo must expose its objectives: {states:?}"
-        );
-        assert!(
-            states[0].primary && states[0].completed,
-            "objective 0 (escape) must be promoted and completed: {:?}",
-            states[0]
-        );
-        assert!(
-            states[1].primary && states[1].completed,
-            "objective 1 (truck) must be promoted and completed: {:?}",
-            states[1]
-        );
-        // PlayerTick dispatch is what turns `PlayingVideo` into `ServerTravel`; the route reaches
-        // it because `PlayerTick` now runs and `VideoPlayer.GetStatus` times `Cine01`.
-        assert!(
-            !outcome.travel.is_empty(),
-            "the level must travel; blocked actors: {:?}",
-            outcome.session.suspended
-        );
-        assert_eq!(outcome.final_map, "banque01");
-        assert_eq!(outcome.travel[0].to, "banque01");
-        assert!(
-            !outcome
-                .session
-                .failures
-                .iter()
-                .any(|(_, error)| error.to_ascii_lowercase().contains("bcompleted")),
-            "Plage01 checkpoint save hit the old bcompleted struct error: {:?}",
-            outcome.session.failures
-        );
-        assert!(
-            outcome.session.save_total > 0,
-            "the game's checkpoint trigger must emit a SaveAtCheckpoint event"
-        );
+            println!("[route] LevelInfo={level:?} ControllerList={listed:?}");
+            for ev in &outcome.session.vm().trace {
+                let rendered = format!("{:?}", ev.kind);
+                if rendered.contains("ClientGameEnded")
+                    || rendered.contains("GameEndedSuccess")
+                    || rendered.contains("ServerTravel")
+                    || rendered.contains("AddController")
+                    || rendered.contains("RemoveController")
+                {
+                    println!("[route] ending trace t={:.3}: {rendered}", ev.time);
+                }
+            }
+            println!(
+                "[route] travel: {:?}, final map {}",
+                outcome.travel, outcome.final_map
+            );
+            let (plage, states) = outcome
+                .map_objectives
+                .first()
+                .expect("Plage01 objective states");
+            assert_eq!(plage, "Plage01");
+            assert!(
+                states.len() >= 2,
+                "Plage01 MapInfo must expose its objectives: {states:?}"
+            );
+            assert!(
+                states[0].primary && states[0].completed,
+                "objective 0 (escape) must be promoted and completed: {:?}",
+                states[0]
+            );
+            assert!(
+                states[1].primary && states[1].completed,
+                "objective 1 (truck) must be promoted and completed: {:?}",
+                states[1]
+            );
+            // PlayerTick dispatch is what turns `PlayingVideo` into `ServerTravel`; the route reaches
+            // it because `PlayerTick` now runs and `VideoPlayer.GetStatus` times `Cine01`.
+            assert!(
+                !outcome.travel.is_empty(),
+                "the level must travel; blocked actors: {:?}",
+                outcome.session.suspended
+            );
+            assert_eq!(outcome.final_map, "banque01");
+            assert_eq!(outcome.travel[0].to, "banque01");
+            assert!(
+                !outcome
+                    .session
+                    .failures
+                    .iter()
+                    .any(|(_, error)| error.to_ascii_lowercase().contains("bcompleted")),
+                "Plage01 checkpoint save hit the old bcompleted struct error: {:?}",
+                outcome.session.failures
+            );
+            assert!(
+                outcome.session.save_total > 0,
+                "the game's checkpoint trigger must emit a SaveAtCheckpoint event"
+            );
+        })
     }
 
     /// item33 acceptance: execute the tracked Plage01 route through the M60 fire burst, deliver
@@ -3087,354 +3117,368 @@ mod tests {
     /// the save/restore and weapon/ammo/objective work is the authored game path.
     #[test]
     fn opt_in_plage01_checkpoint_restores_route_inventory_ammo_weapon_and_music() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Plage01".into()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Plage01");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/data/plage01_route.script");
-        let mut script = script::Script::load(&route_path).expect("load tracked Plage01 route");
-        script.events.retain(|event| event.t <= 64.0);
-        let mut outcome = run_script(
-            &game_dir,
-            "Plage01",
-            &script,
-            &resolved.params,
-            &scene,
-            65.0,
-        )
-        .expect("run Plage01 through its weapon fire and corpse search");
-        assert_eq!(
-            outcome.final_map, "Plage01",
-            "route must stop before its travel command"
-        );
-        let requested_shots = script
-            .events
-            .iter()
-            .filter(|event| matches!(event.command, script::Command::Fire))
-            .count();
-        assert!(
-            requested_shots >= 10,
-            "tracked route must fire a burst, got {requested_shots} fire commands"
-        );
-        let target = outcome
-            .session
-            .vm()
-            .find_object("BaseSoldier6")
-            .expect("route killer");
-        assert!(
-            outcome.session.actor_is_dead(target),
-            "tracked route's fired M60 did not kill BaseSoldier6"
-        );
-
-        let weapon = outcome
-            .session
-            .player_weapon()
-            .expect("route leaves a selected weapon");
-        let weapon_class = outcome
-            .session
-            .vm()
-            .set()
-            .path(outcome.session.vm().objects[weapon as usize].class);
-        assert!(
-            weapon_class.to_ascii_lowercase().contains("m60"),
-            "selected weapon after route: {weapon_class}"
-        );
-        let before_inventory = outcome.session.inventory_items();
-        assert!(
-            before_inventory
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("Plage01".into()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import Plage01");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/data/plage01_route.script");
+            let mut script = script::Script::load(&route_path).expect("load tracked Plage01 route");
+            script.events.retain(|event| event.t <= 64.0);
+            let mut outcome = run_script(
+                &game_dir,
+                "Plage01",
+                &script,
+                &resolved.params,
+                &scene,
+                65.0,
+            )
+            .expect("run Plage01 through its weapon fire and corpse search");
+            assert_eq!(
+                outcome.final_map, "Plage01",
+                "route must stop before its travel command"
+            );
+            let requested_shots = script
+                .events
                 .iter()
-                .any(|(_, class)| class.eq_ignore_ascii_case(&weapon_class)),
-            "selected weapon is absent from inventory chain: {before_inventory:?}"
-        );
+                .filter(|event| matches!(event.command, script::Command::Fire))
+                .count();
+            assert!(
+                requested_shots >= 10,
+                "tracked route must fire a burst, got {requested_shots} fire commands"
+            );
+            let target = outcome
+                .session
+                .vm()
+                .find_object("BaseSoldier6")
+                .expect("route killer");
+            assert!(
+                outcome.session.actor_is_dead(target),
+                "tracked route's fired M60 did not kill BaseSoldier6"
+            );
 
-        let checkpoint = outcome.session.vm().objects.iter().enumerate().find_map(|(i, actor)| {
+            let weapon = outcome
+                .session
+                .player_weapon()
+                .expect("route leaves a selected weapon");
+            let weapon_class = outcome
+                .session
+                .vm()
+                .set()
+                .path(outcome.session.vm().objects[weapon as usize].class);
+            assert!(
+                weapon_class.to_ascii_lowercase().contains("m60"),
+                "selected weapon after route: {weapon_class}"
+            );
+            let before_inventory = outcome.session.inventory_items();
+            assert!(
+                before_inventory
+                    .iter()
+                    .any(|(_, class)| class.eq_ignore_ascii_case(&weapon_class)),
+                "selected weapon is absent from inventory chain: {before_inventory:?}"
+            );
+
+            let checkpoint = outcome.session.vm().objects.iter().enumerate().find_map(|(i, actor)| {
             let id = i as xiii_script::ObjectId;
             (actor.is_actor && outcome.session.vm().is_a(id, "xiiisavegametrigger")
                 && matches!(outcome.session.vm().get_property(id, "Tag"), Some(xiii_script::Value::Name(tag)) if tag.eq_ignore_ascii_case("CP1")))
                 .then_some(id)
         }).expect("Plage01 CP1 save trigger");
-        let player = outcome.session.player;
-        let trigger_class = outcome.session.vm().objects[checkpoint as usize].class;
-        let trigger_loc = outcome.session.player_location().expect("player location");
-        let save_trigger = outcome
-            .session
-            .vm_mut()
-            .spawn_actor(
-                player,
-                Some(trigger_class),
-                Some(player),
-                None,
-                Some(trigger_loc),
-                None,
-            )
-            .expect("spawn a fresh instance of the map's checkpoint trigger class")
-            .expect("checkpoint trigger spawn returned None");
-        outcome.session.vm_mut().set_property(
-            save_trigger,
-            "Tag",
-            0,
-            xiii_script::Value::Name("CP1".into()),
-        );
-        outcome.session.vm_mut().set_property(
-            save_trigger,
-            "TeleporterName",
-            0,
-            xiii_script::Value::Str("teleporte_apres_lit".into()),
-        );
-        outcome.session.vm_mut().set_property(
-            save_trigger,
-            "SaveDescription",
-            0,
-            xiii_script::Value::Str("item33 Plage01 route".into()),
-        );
-        if let Some(sound) = outcome
-            .session
-            .vm()
-            .get_property(checkpoint, "SoundToLaunch")
-            .cloned()
-        {
-            assert!(
-                outcome
-                    .session
-                    .vm_mut()
-                    .set_property(save_trigger, "SoundToLaunch", 0, sound),
-                "fresh checkpoint trigger could not receive SoundToLaunch"
-            );
-        }
-        outcome
-            .session
-            .vm_mut()
-            .send_event(
+            let player = outcome.session.player;
+            let trigger_class = outcome.session.vm().objects[checkpoint as usize].class;
+            let trigger_loc = outcome.session.player_location().expect("player location");
+            let save_trigger = outcome
+                .session
+                .vm_mut()
+                .spawn_actor(
+                    player,
+                    Some(trigger_class),
+                    Some(player),
+                    None,
+                    Some(trigger_loc),
+                    None,
+                )
+                .expect("spawn a fresh instance of the map's checkpoint trigger class")
+                .expect("checkpoint trigger spawn returned None");
+            outcome.session.vm_mut().set_property(
                 save_trigger,
-                "Touch",
-                vec![xiii_script::Value::Object(Some(
-                    xiii_script::ObjRef::Instance(player),
-                ))],
-            )
-            .expect("deliver player Touch to checkpoint trigger");
-        let loc = outcome.session.player_location().expect("player location");
-        for _ in 0..120 {
-            outcome.session.step(
-                1.0 / 60.0,
-                loc,
-                0.0,
-                [0.0; 3],
-                &session::PlayerVMModes::default(),
+                "Tag",
+                0,
+                xiii_script::Value::Name("CP1".into()),
             );
-            if outcome.session.save_total > 0 {
-                break;
-            }
-        }
-        assert!(
-            outcome.session.save_total > 0,
-            "CP1 Touch did not run GoSaving.DoSave: {:?}",
-            outcome.session.failures
-        );
-        let event = outcome
-            .session
-            .saves
-            .back()
-            .expect("game-emitted SaveCheckpoint event")
-            .1
-            .clone();
-        assert_eq!(event.teleporter_name, "teleporte_apres_lit");
-        let saved = outcome
-            .session
-            .checkpoint_snapshot(
-                "Plage01",
-                &event,
-                loc,
-                outcome.session.player_rotation().unwrap_or([0; 3]),
-            )
-            .expect("snapshot route checkpoint");
-        assert_eq!(
-            saved.save_trigger_tag, "CP1",
-            "snapshot must retain XIIISaveGameTrigger.Tag"
-        );
-        assert!(
-            saved.sound_to_launch.is_some(),
-            "CP1 SoundToLaunch must be captured: event={event:?}, saved={saved:?}, original={:?}",
-            outcome
+            outcome.session.vm_mut().set_property(
+                save_trigger,
+                "TeleporterName",
+                0,
+                xiii_script::Value::Str("teleporte_apres_lit".into()),
+            );
+            outcome.session.vm_mut().set_property(
+                save_trigger,
+                "SaveDescription",
+                0,
+                xiii_script::Value::Str("item33 Plage01 route".into()),
+            );
+            if let Some(sound) = outcome
                 .session
                 .vm()
                 .get_property(checkpoint, "SoundToLaunch")
-        );
-        let ammo = saved
-            .inventory
-            .iter()
-            .find_map(|item| {
-                item.ammo_amount
-                    .map(|amount| (item.class_path.clone(), amount))
-            })
-            .expect("saved travel inventory includes ammunition");
-        assert!(ammo.1 >= 0, "invalid saved ammo count: {ammo:?}");
-        println!(
-            "[item33 route] checkpoint={} weapon={} ammo={ammo:?} health={} objectives={:?} sound={:?}",
-            saved.checkpoint_number,
-            saved.selected_weapon.as_deref().unwrap_or("<none>"),
-            saved.health,
-            saved.objectives,
-            saved.sound_to_launch
-        );
-
-        let temp_dir = std::env::temp_dir();
-        if let Ok(entries) = std::fs::read_dir(&temp_dir) {
-            for entry in entries.flatten() {
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("xiii-item33-route-")
-                {
-                    let _ = std::fs::remove_dir_all(entry.path());
+                .cloned()
+            {
+                assert!(
+                    outcome
+                        .session
+                        .vm_mut()
+                        .set_property(save_trigger, "SoundToLaunch", 0, sound),
+                    "fresh checkpoint trigger could not receive SoundToLaunch"
+                );
+            }
+            outcome
+                .session
+                .vm_mut()
+                .send_event(
+                    save_trigger,
+                    "Touch",
+                    vec![xiii_script::Value::Object(Some(
+                        xiii_script::ObjRef::Instance(player),
+                    ))],
+                )
+                .expect("deliver player Touch to checkpoint trigger");
+            let loc = outcome.session.player_location().expect("player location");
+            for _ in 0..120 {
+                outcome.session.step(
+                    1.0 / 60.0,
+                    loc,
+                    0.0,
+                    [0.0; 3],
+                    &session::PlayerVMModes::default(),
+                );
+                if outcome.session.save_total > 0 {
+                    break;
                 }
             }
-        }
-        let save_dir = temp_dir.join(format!("xiii-item33-route-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&save_dir);
-        crate::save::write(&save_dir, 0, &saved).expect("write route checkpoint");
-        let loaded = crate::save::read(&save_dir, 0).expect("read route checkpoint");
-        let mut resumed =
-            session::Session::open_checkpoint(&game_dir, "Plage01").expect("open checkpoint map");
-        resumed
-            .restore_checkpoint(&loaded)
-            .expect("run AcceptInventory restore path");
-        assert_eq!(resumed.player_health(), Some(saved.health));
-        assert_eq!(
-            resumed.player_weapon().map(|id| resumed
-                .vm()
-                .set()
-                .path(resumed.vm().objects[id as usize].class)),
-            saved.selected_weapon
-        );
-        let restored_inventory = resumed
-            .inventory_snapshot()
-            .expect("snapshot restored inventory for assertions");
-        let restored_objectives = resumed
-            .objective_states()
-            .into_iter()
-            .map(|objective| crate::save::Objective {
-                completed: objective.completed,
-                primary: objective.primary,
-                anti_goal: objective.anti_goal,
-            })
-            .collect::<Vec<_>>();
-        let restored_music_vars = resumed
-            .music_variable_snapshot()
-            .expect("snapshot restored LevelInfo music variables");
-        let restored_weapon = resumed.player_weapon().expect("restored selected weapon");
-        let restored_ammo_id = match resumed.vm().get_property(restored_weapon, "AmmoType") {
-            Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => *id,
-            other => panic!("restored M60 has no instance AmmoType: {other:?}"),
-        };
-        let restored_ammo_count = match resumed.vm().get_property(restored_ammo_id, "AmmoAmount") {
-            Some(xiii_script::Value::Int(n)) => *n,
-            other => panic!("restored M60 AmmoType has no int AmmoAmount: {other:?}"),
-        };
-        let restored_ammo = (
-            resumed
-                .vm()
-                .set()
-                .path(resumed.vm().objects[restored_ammo_id as usize].class),
-            restored_ammo_count,
-        );
-        assert_eq!(restored_ammo, ammo, "ammo must match the saved count");
-        assert_eq!(restored_objectives, saved.objectives);
-        assert_eq!(
-            restored_music_vars, saved.music_vars,
-            "LevelInfo music-variable state must restore"
-        );
-        let mut saved_classes = saved
-            .inventory
-            .iter()
-            .map(|i| i.class_path.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-        let mut restored_classes = restored_inventory
-            .iter()
-            .map(|i| i.class_path.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-        saved_classes.sort();
-        restored_classes.sort();
-        let mut remaining = restored_classes.clone();
-        for class in &saved_classes {
-            let at = remaining
+            assert!(
+                outcome.session.save_total > 0,
+                "CP1 Touch did not run GoSaving.DoSave: {:?}",
+                outcome.session.failures
+            );
+            let event = outcome
+                .session
+                .saves
+                .back()
+                .expect("game-emitted SaveCheckpoint event")
+                .1
+                .clone();
+            assert_eq!(event.teleporter_name, "teleporte_apres_lit");
+            let saved = outcome
+                .session
+                .checkpoint_snapshot(
+                    "Plage01",
+                    &event,
+                    loc,
+                    outcome.session.player_rotation().unwrap_or([0; 3]),
+                )
+                .expect("snapshot route checkpoint");
+            assert_eq!(
+                saved.save_trigger_tag, "CP1",
+                "snapshot must retain XIIISaveGameTrigger.Tag"
+            );
+            assert!(
+                saved.sound_to_launch.is_some(),
+                "CP1 SoundToLaunch must be captured: event={event:?}, saved={saved:?}, original={:?}",
+                outcome
+                    .session
+                    .vm()
+                    .get_property(checkpoint, "SoundToLaunch")
+            );
+            // The route equips the M60; its ammo item must save and restore with the same count.
+            // (The login `AcceptInventory` now also gives the Fists, so the chain's first ammo
+            // entry is FistsAmmo, not the selected weapon's.)
+            let ammo = saved
+                .inventory
                 .iter()
-                .position(|restored| restored == class)
-                .unwrap_or_else(|| {
-                    panic!("saved inventory class {class} missing after load: {restored_classes:?}")
-                });
-            remaining.remove(at);
-        }
-        remaining.sort();
-        assert_eq!(
-            remaining,
-            ["xiii.fistsammo", "xiii.xiiilefthand"],
-            "only AcceptInventory's authored default ammo/left-hand entries should be added"
-        );
-        let mut saved_ammo_state = saved
-            .inventory
-            .iter()
-            .filter_map(|item| {
-                item.ammo_amount
-                    .map(|amount| (item.class_path.to_ascii_lowercase(), amount))
-            })
-            .collect::<Vec<_>>();
-        let mut restored_ammo_state = restored_inventory
-            .iter()
-            .filter(|item| {
-                saved
-                    .inventory
+                .find_map(|item| {
+                    item.class_path
+                        .eq_ignore_ascii_case("xiii.M60Ammo")
+                        .then(|| {
+                            (
+                                item.class_path.clone(),
+                                item.ammo_amount.expect("M60Ammo saves an AmmoAmount"),
+                            )
+                        })
+                })
+                .expect("saved travel inventory includes the M60 ammunition");
+            println!(
+                "[item33 route] checkpoint={} weapon={} ammo={ammo:?} health={} objectives={:?} sound={:?}",
+                saved.checkpoint_number,
+                saved.selected_weapon.as_deref().unwrap_or("<none>"),
+                saved.health,
+                saved.objectives,
+                saved.sound_to_launch
+            );
+
+            let temp_dir = std::env::temp_dir();
+            if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+                for entry in entries.flatten() {
+                    if entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("xiii-item33-route-")
+                    {
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
+            let save_dir = temp_dir.join(format!("xiii-item33-route-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&save_dir);
+            crate::save::write(&save_dir, 0, &saved).expect("write route checkpoint");
+            let loaded = crate::save::read(&save_dir, 0).expect("read route checkpoint");
+            let mut resumed = session::Session::open_checkpoint(&game_dir, "Plage01")
+                .expect("open checkpoint map");
+            resumed
+                .restore_checkpoint(&loaded)
+                .expect("run AcceptInventory restore path");
+            assert_eq!(resumed.player_health(), Some(saved.health));
+            assert_eq!(
+                resumed.player_weapon().map(|id| resumed
+                    .vm()
+                    .set()
+                    .path(resumed.vm().objects[id as usize].class)),
+                saved.selected_weapon
+            );
+            let restored_inventory = resumed
+                .inventory_snapshot()
+                .expect("snapshot restored inventory for assertions");
+            let restored_objectives = resumed
+                .objective_states()
+                .into_iter()
+                .map(|objective| crate::save::Objective {
+                    completed: objective.completed,
+                    primary: objective.primary,
+                    anti_goal: objective.anti_goal,
+                })
+                .collect::<Vec<_>>();
+            let restored_music_vars = resumed
+                .music_variable_snapshot()
+                .expect("snapshot restored LevelInfo music variables");
+            let restored_weapon = resumed.player_weapon().expect("restored selected weapon");
+            let restored_ammo_id = match resumed.vm().get_property(restored_weapon, "AmmoType") {
+                Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => *id,
+                other => panic!("restored M60 has no instance AmmoType: {other:?}"),
+            };
+            let restored_ammo_count =
+                match resumed.vm().get_property(restored_ammo_id, "AmmoAmount") {
+                    Some(xiii_script::Value::Int(n)) => *n,
+                    other => panic!("restored M60 AmmoType has no int AmmoAmount: {other:?}"),
+                };
+            let restored_ammo = (
+                resumed
+                    .vm()
+                    .set()
+                    .path(resumed.vm().objects[restored_ammo_id as usize].class),
+                restored_ammo_count,
+            );
+            assert_eq!(restored_ammo, ammo, "ammo must match the saved count");
+            assert_eq!(restored_objectives, saved.objectives);
+            assert_eq!(
+                restored_music_vars, saved.music_vars,
+                "LevelInfo music-variable state must restore"
+            );
+            let mut saved_classes = saved
+                .inventory
+                .iter()
+                .map(|i| i.class_path.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            let mut restored_classes = restored_inventory
+                .iter()
+                .map(|i| i.class_path.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            saved_classes.sort();
+            restored_classes.sort();
+            let mut remaining = restored_classes.clone();
+            for class in &saved_classes {
+                let at = remaining
                     .iter()
-                    .any(|original| original.class_path.eq_ignore_ascii_case(&item.class_path))
-            })
-            .filter_map(|item| {
-                item.ammo_amount
-                    .map(|amount| (item.class_path.to_ascii_lowercase(), amount))
-            })
-            .collect::<Vec<_>>();
-        saved_ammo_state.sort();
-        restored_ammo_state.sort();
-        assert_eq!(
-            restored_ammo_state, saved_ammo_state,
-            "each travel Ammunition.AmmoAmount must survive the restore"
-        );
-        let saved_m60 = saved
-            .inventory
-            .iter()
-            .find(|item| item.class_path.eq_ignore_ascii_case("XIII.m60"))
-            .expect("saved M60 actor");
-        let m60_ammo = saved
-            .inventory
-            .iter()
-            .find(|item| item.class_path.eq_ignore_ascii_case("XIII.M60Ammo"))
-            .and_then(|item| item.ammo_amount)
-            .expect("saved M60 ammunition actor");
-        let saved_clip = saved_m60.reload_count.expect("saved M60 ReloadCount");
-        let expected_clip = saved_clip.min(m60_ammo);
-        let loaded_clip = match resumed.vm().get_property(restored_weapon, "ReloadCount") {
-            Some(xiii_script::Value::Int(v)) => *v,
-            Some(xiii_script::Value::Byte(v)) => i32::from(*v),
-            other => panic!("restored M60 ReloadCount missing/unsupported: {other:?}"),
-        };
-        assert_eq!(
-            loaded_clip, expected_clip,
-            "XIIIWeapon.Active.BeginState clamps ReloadCount to the remaining AmmoAmount on BringUp"
-        );
-        assert!(
-            resumed.events.iter().any(|(_, event)| matches!(event,
+                    .position(|restored| restored == class)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "saved inventory class {class} missing after load: {restored_classes:?}"
+                        )
+                    });
+                remaining.remove(at);
+            }
+            remaining.sort();
+            let expected_remaining: Vec<String> = Vec::new();
+            assert_eq!(
+                remaining, expected_remaining,
+                "every restored inventory entry must come from the save (the login AcceptInventory \
+             default entries are part of the saved chain now, so nothing extra may be added)"
+            );
+            let mut saved_ammo_state = saved
+                .inventory
+                .iter()
+                .filter_map(|item| {
+                    item.ammo_amount
+                        .map(|amount| (item.class_path.to_ascii_lowercase(), amount))
+                })
+                .collect::<Vec<_>>();
+            let mut restored_ammo_state = restored_inventory
+                .iter()
+                .filter(|item| {
+                    saved
+                        .inventory
+                        .iter()
+                        .any(|original| original.class_path.eq_ignore_ascii_case(&item.class_path))
+                })
+                .filter_map(|item| {
+                    item.ammo_amount
+                        .map(|amount| (item.class_path.to_ascii_lowercase(), amount))
+                })
+                .collect::<Vec<_>>();
+            saved_ammo_state.sort();
+            restored_ammo_state.sort();
+            assert_eq!(
+                restored_ammo_state, saved_ammo_state,
+                "each travel Ammunition.AmmoAmount must survive the restore"
+            );
+            let saved_m60 = saved
+                .inventory
+                .iter()
+                .find(|item| item.class_path.eq_ignore_ascii_case("XIII.m60"))
+                .expect("saved M60 actor");
+            let m60_ammo = saved
+                .inventory
+                .iter()
+                .find(|item| item.class_path.eq_ignore_ascii_case("XIII.M60Ammo"))
+                .and_then(|item| item.ammo_amount)
+                .expect("saved M60 ammunition actor");
+            let saved_clip = saved_m60.reload_count.expect("saved M60 ReloadCount");
+            let expected_clip = saved_clip.min(m60_ammo);
+            let loaded_clip = match resumed.vm().get_property(restored_weapon, "ReloadCount") {
+                Some(xiii_script::Value::Int(v)) => *v,
+                Some(xiii_script::Value::Byte(v)) => i32::from(*v),
+                other => panic!("restored M60 ReloadCount missing/unsupported: {other:?}"),
+            };
+            assert_eq!(
+                loaded_clip, expected_clip,
+                "XIIIWeapon.Active.BeginState clamps ReloadCount to the remaining AmmoAmount on BringUp"
+            );
+            assert!(
+                resumed.events.iter().any(|(_, event)| matches!(event,
             xiii_script::PresentationEvent::PlayMusic(music)
                 if music.sound.as_deref() == saved.sound_to_launch.as_deref())),
-            "AcceptInventory did not play saved SoundToLaunch {:?}",
-            saved.sound_to_launch
-        );
-        let _ = std::fs::remove_dir_all(save_dir);
+                "AcceptInventory did not play saved SoundToLaunch {:?}",
+                saved.sound_to_launch
+            );
+            let _ = std::fs::remove_dir_all(save_dir);
+        })
     }
 
     /// item24 opt-in corpus test: follow Banque01 to its end through the game's own chain.
@@ -3450,127 +3494,131 @@ mod tests {
     /// play.
     #[test]
     fn opt_in_banque01_route_objectives_and_travel() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("banque01".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import banque01");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/data/banque01_route.script");
-        let script = script::Script::load(&route_path).expect("load item24 banque01 route");
-        let outcome = run_script_with_cinematic_input(
-            &game_dir,
-            "banque01",
-            &script,
-            &resolved.params,
-            &scene,
-            90.0,
-        )
-        .expect("run banque01 route");
-        let banque = outcome
-            .map_objectives
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("banque01"))
-            .expect("banque01 objective states");
-        println!("[route] banque01 objectives: {:?}", banque.1);
-        for obj in &banque.1 {
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("banque01".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import banque01");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/data/banque01_route.script");
+            let script = script::Script::load(&route_path).expect("load item24 banque01 route");
+            let outcome = run_script_with_cinematic_input(
+                &game_dir,
+                "banque01",
+                &script,
+                &resolved.params,
+                &scene,
+                90.0,
+            )
+            .expect("run banque01 route");
+            let banque = outcome
+                .map_objectives
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("banque01"))
+                .expect("banque01 objective states");
+            println!("[route] banque01 objectives: {:?}", banque.1);
+            for obj in &banque.1 {
+                println!(
+                    "[route]   [{}] primary={} completed={} anti_goal={} {:?}",
+                    obj.index, obj.primary, obj.completed, obj.anti_goal, obj.text
+                );
+            }
             println!(
-                "[route]   [{}] primary={} completed={} anti_goal={} {:?}",
-                obj.index, obj.primary, obj.completed, obj.anti_goal, obj.text
+                "[route] travel: {:?}, final map {}",
+                outcome.travel, outcome.final_map
             );
-        }
-        println!(
-            "[route] travel: {:?}, final map {}",
-            outcome.travel, outcome.final_map
-        );
-        assert!(
-            banque.1.len() >= 3,
-            "Banque01 MapInfo must expose its objectives: {:?}",
-            banque.1
-        );
-        // Objective 0 "Access the strongroom." must be primary and completed.
-        assert!(
-            banque.1[0].primary && banque.1[0].completed,
-            "objective 0 (strongroom) must be promoted and completed: {:?}",
-            banque.1[0]
-        );
-        // Objective 1 "Escape from the bank." must be primary and completed.
-        assert!(
-            banque.1[1].primary && banque.1[1].completed,
-            "objective 1 (escape) must be promoted and completed: {:?}",
-            banque.1[1]
-        );
-        // Objective 2 "Do not kill the bank staff." is the anti-goal, completed at level start
-        // and still completed (the route kills no teller).
-        assert!(
-            banque.1[2].anti_goal,
-            "objective 2 must be the anti-goal: {:?}",
-            banque.1[2]
-        );
-        assert!(
-            banque.1[2].completed,
-            "the bank-staff anti-goal must remain completed: {:?}",
-            banque.1[2]
-        );
-        // The game's own `TestGoalComplete`/`DoTravel`/`EndGame`/`ServerTravel` chain must run.
-        // (`outcome.session` is the map the run travelled *to*, so the Banque01 touch log is only
-        // in the run's stdout; the objective states above are captured as the run left Banque01.)
-        assert!(
-            !outcome.travel.is_empty(),
-            "the level must travel; blocked actors: {:?}",
-            outcome.session.suspended
-        );
-        assert_eq!(outcome.final_map, "Amos01");
-        assert_eq!(outcome.travel[0].from, "banque01");
-        assert_eq!(outcome.travel[0].to, "Amos01");
-        assert_eq!(outcome.travel[0].url, "Amos01.unr");
+            assert!(
+                banque.1.len() >= 3,
+                "Banque01 MapInfo must expose its objectives: {:?}",
+                banque.1
+            );
+            // Objective 0 "Access the strongroom." must be primary and completed.
+            assert!(
+                banque.1[0].primary && banque.1[0].completed,
+                "objective 0 (strongroom) must be promoted and completed: {:?}",
+                banque.1[0]
+            );
+            // Objective 1 "Escape from the bank." must be primary and completed.
+            assert!(
+                banque.1[1].primary && banque.1[1].completed,
+                "objective 1 (escape) must be promoted and completed: {:?}",
+                banque.1[1]
+            );
+            // Objective 2 "Do not kill the bank staff." is the anti-goal, completed at level start
+            // and still completed (the route kills no teller).
+            assert!(
+                banque.1[2].anti_goal,
+                "objective 2 must be the anti-goal: {:?}",
+                banque.1[2]
+            );
+            assert!(
+                banque.1[2].completed,
+                "the bank-staff anti-goal must remain completed: {:?}",
+                banque.1[2]
+            );
+            // The game's own `TestGoalComplete`/`DoTravel`/`EndGame`/`ServerTravel` chain must run.
+            // (`outcome.session` is the map the run travelled *to*, so the Banque01 touch log is only
+            // in the run's stdout; the objective states above are captured as the run left Banque01.)
+            assert!(
+                !outcome.travel.is_empty(),
+                "the level must travel; blocked actors: {:?}",
+                outcome.session.suspended
+            );
+            assert_eq!(outcome.final_map, "Amos01");
+            assert_eq!(outcome.travel[0].from, "banque01");
+            assert_eq!(outcome.travel[0].to, "Amos01");
+            assert_eq!(outcome.travel[0].url, "Amos01.unr");
+        })
     }
 
     #[test]
     fn opt_in_banque01_postrender_completes_while_player_moves() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = session::Session::open(&game_dir, "Banque01").expect("open Banque01");
-        let dt = 1.0f32 / 30.0;
-        let mut location = session.player_location().expect("player location");
-        let velocity = [1.0, 0.0, 0.0];
-        for _ in 0..90 {
-            session.drive_render_phase();
-            location[0] += velocity[0] * dt;
-            session.step(
-                dt,
-                location,
-                0.0,
-                velocity,
-                &session::PlayerVMModes::default(),
-            );
-            if let Some(pose) = session.script_pawn_pose() {
-                location = pose.0;
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = session::Session::open(&game_dir, "Banque01").expect("open Banque01");
+            let dt = 1.0f32 / 30.0;
+            let mut location = session.player_location().expect("player location");
+            let velocity = [1.0, 0.0, 0.0];
+            for _ in 0..90 {
+                session.drive_render_phase();
+                location[0] += velocity[0] * dt;
+                session.step(
+                    dt,
+                    location,
+                    0.0,
+                    velocity,
+                    &session::PlayerVMModes::default(),
+                );
+                if let Some(pose) = session.script_pawn_pose() {
+                    location = pose.0;
+                }
             }
-        }
-        assert!(
-            session.failures.is_empty(),
-            "render/step failures: {:?}",
-            session.failures
-        );
-        let mi = session.map_info().expect("MapInfo");
-        assert_eq!(
-            session.vm().get_property(mi, "EndCartoonEffect"),
-            Some(&xiii_script::Value::Bool(true))
-        );
-        let cine = session.vm().find_live_object("Cine1").expect("Cine1 actor");
-        assert_eq!(
-            session.vm().get_property(cine, "bInitialized"),
-            Some(&xiii_script::Value::Bool(true))
-        );
+            assert!(
+                session.failures.is_empty(),
+                "render/step failures: {:?}",
+                session.failures
+            );
+            let mi = session.map_info().expect("MapInfo");
+            assert_eq!(
+                session.vm().get_property(mi, "EndCartoonEffect"),
+                Some(&xiii_script::Value::Bool(true))
+            );
+            let cine = session.vm().find_live_object("Cine1").expect("Cine1 actor");
+            assert_eq!(
+                session.vm().get_property(cine, "bInitialized"),
+                Some(&xiii_script::Value::Bool(true))
+            );
+        })
     }
 
     /// item18 opt-in VM/session test for the `PlayerTick` dispatch itself: putting the real
@@ -3580,29 +3628,31 @@ mod tests {
     /// forever and no request appears.
     #[test]
     fn opt_in_plage01_player_tick_reaches_server_travel() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = session::Session::open(&game_dir, "Plage01").expect("open Plage01");
-        let ctrl = session.controller.expect("player controller");
-        session
-            .vm_mut()
-            .goto_state(ctrl, "PlayingVideo", None)
-            .expect("enter PlayingVideo");
-        assert_eq!(
-            session.vm().state_name(ctrl).as_deref(),
-            Some("PlayingVideo")
-        );
-        // Use the app's tolerant tick: an unrelated suspended save trigger
-        // (`XIIISaveGameTrigger.DoSave`'s undecoded save struct) must not abort the dispatch test.
-        let _ = session.vm_mut().tick_suspending(0.05);
-        let req = session.vm_mut().take_travel_request();
-        assert!(
-            req.as_ref()
-                .is_some_and(|r| r.url.eq_ignore_ascii_case("banque01.unr")),
-            "PlayingVideo.PlayerTick must request banque01; got {req:?}"
-        );
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = session::Session::open(&game_dir, "Plage01").expect("open Plage01");
+            let ctrl = session.controller.expect("player controller");
+            session
+                .vm_mut()
+                .goto_state(ctrl, "PlayingVideo", None)
+                .expect("enter PlayingVideo");
+            assert_eq!(
+                session.vm().state_name(ctrl).as_deref(),
+                Some("PlayingVideo")
+            );
+            // Use the app's tolerant tick: an unrelated suspended save trigger
+            // (`XIIISaveGameTrigger.DoSave`'s undecoded save struct) must not abort the dispatch test.
+            let _ = session.vm_mut().tick_suspending(0.05);
+            let req = session.vm_mut().take_travel_request();
+            assert!(
+                req.as_ref()
+                    .is_some_and(|r| r.url.eq_ignore_ascii_case("banque01.unr")),
+                "PlayingVideo.PlayerTick must request banque01; got {req:?}"
+            );
+        })
     }
 
     /// item21 opt-in corpus test (requirement 4): a `PlayingVideo` with `cine01` reports
@@ -3618,147 +3668,152 @@ mod tests {
     /// (1358 frames / 25 fps ≈ 54.32 s).
     #[test]
     fn opt_in_plage01_playingvideo_completes_when_decoded_frames_elapse() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = session::Session::open(&game_dir, "Plage01").expect("open Plage01");
-        let host = crate::video::VideoHostHandle::new(game_dir.clone(), false);
-        session.vm_mut().set_video_host(Box::new(host.clone()));
-        let dt = 1.0f64 / 30.0;
-        let intro_steps = (46.0 / dt) as usize;
-        let mut location = session.player_location().expect("player location");
-        let mut yaw = 0.0;
-        let mut velocity = [0.0; 3];
-        for _ in 0..intro_steps {
-            session.drive_render_phase();
-            session.step(
-                dt as f32,
-                location,
-                yaw,
-                velocity,
-                &session::PlayerVMModes::default(),
-            );
-            if let Some((script_location, script_yaw, script_velocity)) = session.script_pawn_pose()
-            {
-                location = script_location;
-                yaw = script_yaw;
-                velocity = script_velocity;
-            }
-        }
-        let controller = session.controller.expect("player controller");
-        assert_ne!(
-            session.vm().state_name(controller).as_deref(),
-            Some("NoControl"),
-            "Plage01's authored intro must release the player through its own script sequence"
-        );
-        let gi = session.game_info.expect("GameInfo");
-        session
-            .vm_mut()
-            .send_event(
-                gi,
-                "EndGame",
-                vec![
-                    xiii_script::Value::Object(None),
-                    xiii_script::Value::Str("GoalComplete".to_owned()),
-                ],
-            )
-            .expect("EndGame(GoalComplete)");
-        // Step until the chain's `PlayingVideo` state starts the host playback, then until the
-        // game's own `PlayerTick` requests the travel. The host advances with the VM's time, so
-        // travel can only be requested once every frame is decoded.
-        let max_steps = (64.0f64 / dt).ceil() as usize;
-        let mut duration_opt: Option<f64> = None;
-        let mut started_at = None;
-        let mut status_before_end = None;
-        let mut travel_at = None;
-        let t0 = std::time::Instant::now();
-        for _i in 0..max_steps {
-            session.step(
-                dt as f32,
-                [0.0; 3],
-                0.0,
-                [0.0; 3],
-                &session::PlayerVMModes::default(),
-            );
-            if started_at.is_none() && host.is_playing() {
-                started_at = Some(session.vm_time());
-                duration_opt = Some(
-                    host.frame_count().expect("open clip") as f64 / host.fps().expect("open clip"),
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = session::Session::open(&game_dir, "Plage01").expect("open Plage01");
+            let host = crate::video::VideoHostHandle::new(game_dir.clone(), false);
+            session.vm_mut().set_video_host(Box::new(host.clone()));
+            let dt = 1.0f64 / 30.0;
+            let intro_steps = (46.0 / dt) as usize;
+            let mut location = session.player_location().expect("player location");
+            let mut yaw = 0.0;
+            let mut velocity = [0.0; 3];
+            for _ in 0..intro_steps {
+                session.drive_render_phase();
+                session.step(
+                    dt as f32,
+                    location,
+                    yaw,
+                    velocity,
+                    &session::PlayerVMModes::default(),
                 );
-                assert_eq!(
-                    session.vm().video_status(),
-                    1,
-                    "the host playback just started; GetStatus must report playing"
-                );
-                assert_eq!(
-                    session.vm().video_timing(),
-                    Some(xiii_script::VideoTiming::Host),
-                    "cine01 must be host-decoded, not duration-timed"
-                );
-            }
-            if travel_at.is_none()
-                && let Some(req) = session.take_travel_request()
-            {
-                assert!(
-                    req.url.eq_ignore_ascii_case("banque01.unr"),
-                    "PlayingVideo.PlayerTick must request banque01; got {:?}",
-                    req.url
-                );
-                travel_at = Some(session.vm_time());
-                break;
-            }
-            host.advance_virtual_all(dt);
-            if let (Some(start), Some(dur), false) = (started_at, duration_opt, travel_at.is_some())
-            {
-                let played = session.vm_time() - start;
-                if played >= dur - 1.0 && played < dur && status_before_end.is_none() {
-                    status_before_end = Some(session.vm().video_status());
+                if let Some((script_location, script_yaw, script_velocity)) =
+                    session.script_pawn_pose()
+                {
+                    location = script_location;
+                    yaw = script_yaw;
+                    velocity = script_velocity;
                 }
             }
-        }
-        let wall = t0.elapsed().as_secs_f32();
-        let start = started_at.unwrap_or_else(|| {
-            panic!("the game's end chain must start the cutscene playback");
-        });
-        let duration = duration_opt.unwrap_or_else(|| {
-            panic!("the clip must still be open when travel ends the state");
-        });
-        let Some(travel_at) = travel_at else {
-            panic!(
-                "PlayingVideo must end in travel once the decoded frames elapsed \
+            let controller = session.controller.expect("player controller");
+            assert_ne!(
+                session.vm().state_name(controller).as_deref(),
+                Some("NoControl"),
+                "Plage01's authored intro must release the player through its own script sequence"
+            );
+            let gi = session.game_info.expect("GameInfo");
+            session
+                .vm_mut()
+                .send_event(
+                    gi,
+                    "EndGame",
+                    vec![
+                        xiii_script::Value::Object(None),
+                        xiii_script::Value::Str("GoalComplete".to_owned()),
+                    ],
+                )
+                .expect("EndGame(GoalComplete)");
+            // Step until the chain's `PlayingVideo` state starts the host playback, then until the
+            // game's own `PlayerTick` requests the travel. The host advances with the VM's time, so
+            // travel can only be requested once every frame is decoded.
+            let max_steps = (64.0f64 / dt).ceil() as usize;
+            let mut duration_opt: Option<f64> = None;
+            let mut started_at = None;
+            let mut status_before_end = None;
+            let mut travel_at = None;
+            let t0 = std::time::Instant::now();
+            for _i in 0..max_steps {
+                session.step(
+                    dt as f32,
+                    [0.0; 3],
+                    0.0,
+                    [0.0; 3],
+                    &session::PlayerVMModes::default(),
+                );
+                if started_at.is_none() && host.is_playing() {
+                    started_at = Some(session.vm_time());
+                    duration_opt = Some(
+                        host.frame_count().expect("open clip") as f64
+                            / host.fps().expect("open clip"),
+                    );
+                    assert_eq!(
+                        session.vm().video_status(),
+                        1,
+                        "the host playback just started; GetStatus must report playing"
+                    );
+                    assert_eq!(
+                        session.vm().video_timing(),
+                        Some(xiii_script::VideoTiming::Host),
+                        "cine01 must be host-decoded, not duration-timed"
+                    );
+                }
+                if travel_at.is_none()
+                    && let Some(req) = session.take_travel_request()
+                {
+                    assert!(
+                        req.url.eq_ignore_ascii_case("banque01.unr"),
+                        "PlayingVideo.PlayerTick must request banque01; got {:?}",
+                        req.url
+                    );
+                    travel_at = Some(session.vm_time());
+                    break;
+                }
+                host.advance_virtual_all(dt);
+                if let (Some(start), Some(dur), false) =
+                    (started_at, duration_opt, travel_at.is_some())
+                {
+                    let played = session.vm_time() - start;
+                    if played >= dur - 1.0 && played < dur && status_before_end.is_none() {
+                        status_before_end = Some(session.vm().video_status());
+                    }
+                }
+            }
+            let wall = t0.elapsed().as_secs_f32();
+            let start = started_at.unwrap_or_else(|| {
+                panic!("the game's end chain must start the cutscene playback");
+            });
+            let duration = duration_opt.unwrap_or_else(|| {
+                panic!("the clip must still be open when travel ends the state");
+            });
+            let Some(travel_at) = travel_at else {
+                panic!(
+                    "PlayingVideo must end in travel once the decoded frames elapsed \
                  ({duration:.3}s of playback, started at VM {start:.3}, decoded {:?}/{:?})",
+                    host.decoded(),
+                    host.frame_count(),
+                );
+            };
+            let waited = travel_at - start;
+            println!(
+                "[item21 test] cine01: {:?} frames, travel after {waited:.3}s of VM playback \
+             ({duration:.3}s clip); decoded {:?}; wall {wall:.2}s",
+                host.frame_count(),
+                host.decoded(),
+            );
+            assert_eq!(
+                status_before_end,
+                Some(1),
+                "GetStatus must still report playing 1 s before the clip ends"
+            );
+            assert!(
+                waited >= duration - 2.0 * dt,
+                "travel came too early: {waited:.3}s < duration {duration:.3}s (the clip must not \
+             end before every frame is decoded)"
+            );
+            assert!(
+                waited <= duration + 2.0 * dt,
+                "travel came too late: {waited:.3}s > duration {duration:.3}s (GetStatus must \
+             follow the host playback, not a longer timer)"
+            );
+            assert_eq!(
                 host.decoded(),
                 host.frame_count(),
+                "the travel tick must have decoded every frame"
             );
-        };
-        let waited = travel_at - start;
-        println!(
-            "[item21 test] cine01: {:?} frames, travel after {waited:.3}s of VM playback \
-             ({duration:.3}s clip); decoded {:?}; wall {wall:.2}s",
-            host.frame_count(),
-            host.decoded(),
-        );
-        assert_eq!(
-            status_before_end,
-            Some(1),
-            "GetStatus must still report playing 1 s before the clip ends"
-        );
-        assert!(
-            waited >= duration - 2.0 * dt,
-            "travel came too early: {waited:.3}s < duration {duration:.3}s (the clip must not \
-             end before every frame is decoded)"
-        );
-        assert!(
-            waited <= duration + 2.0 * dt,
-            "travel came too late: {waited:.3}s > duration {duration:.3}s (GetStatus must \
-             follow the host playback, not a longer timer)"
-        );
-        assert_eq!(
-            host.decoded(),
-            host.frame_count(),
-            "the travel tick must have decoded every frame"
-        );
+        })
     }
 
     /// Opt-in diagnostic probe (item15 evidence): prints the map's `MapInfo.Objectif` struct
@@ -3779,153 +3834,155 @@ mod tests {
     /// and the primary rooftop goal remains incomplete; otherwise this test requires travel.
     #[test]
     fn opt_in_amos01_route_objectives_and_travel() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Amos01".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Amos01");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let route_path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/amos01_route.script");
-        let script = script::Script::load(&route_path).expect("load item40 Amos01 route");
-        let outcome = run_script_with_cinematic_input(
-            &game_dir,
-            "Amos01",
-            &script,
-            &resolved.params,
-            &scene,
-            120.0,
-        )
-        .expect("run Amos01 opening probe");
-        let pc = outcome
-            .session
-            .controller
-            .expect("Amos01 player controller");
-        let player_state = outcome.session.vm().state_name(pc);
-        let objectives = outcome.session.objective_states();
-        println!(
-            "[amos01 route] player={} final_state={player_state:?} inventory={:?} bWeaponMode={:?} OldWeap={:?} objectives={objectives:?} travel={:?}",
-            outcome.session.vm().objects[pc as usize].name,
-            outcome.session.inventory_items(),
-            outcome.session.vm().get_property(pc, "bWeaponMode"),
-            outcome.session.vm().get_property(pc, "OldWeap"),
-            outcome.travel
-        );
-        for event in &outcome.session.vm().trace {
-            if let xiii_script::TraceKind::StateChange {
-                actor, from, to, ..
-            } = &event.kind
-                && actor.eq_ignore_ascii_case("XIIIPlayerController")
-            {
-                println!("[amos01 control] t={:.3} {from:?} -> {to:?}", event.time);
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("Amos01".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import Amos01");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/data/amos01_route.script");
+            let script = script::Script::load(&route_path).expect("load item40 Amos01 route");
+            let outcome = run_script_with_cinematic_input(
+                &game_dir,
+                "Amos01",
+                &script,
+                &resolved.params,
+                &scene,
+                120.0,
+            )
+            .expect("run Amos01 opening probe");
+            let pc = outcome
+                .session
+                .controller
+                .expect("Amos01 player controller");
+            let player_state = outcome.session.vm().state_name(pc);
+            let objectives = outcome.session.objective_states();
+            println!(
+                "[amos01 route] player={} final_state={player_state:?} inventory={:?} bWeaponMode={:?} OldWeap={:?} objectives={objectives:?} travel={:?}",
+                outcome.session.vm().objects[pc as usize].name,
+                outcome.session.inventory_items(),
+                outcome.session.vm().get_property(pc, "bWeaponMode"),
+                outcome.session.vm().get_property(pc, "OldWeap"),
+                outcome.travel
+            );
+            for event in &outcome.session.vm().trace {
+                if let xiii_script::TraceKind::StateChange {
+                    actor, from, to, ..
+                } = &event.kind
+                    && actor.eq_ignore_ascii_case("XIIIPlayerController")
+                {
+                    println!("[amos01 control] t={:.3} {from:?} -> {to:?}", event.time);
+                }
+                if let xiii_script::TraceKind::Event {
+                    target,
+                    function,
+                    args,
+                } = &event.kind
+                    && (target.eq_ignore_ascii_case("Amos0") || function.ends_with(".Trigger"))
+                {
+                    println!(
+                        "[amos01 event] t={:.3} {target}.{function}{args:?}",
+                        event.time
+                    );
+                }
             }
-            if let xiii_script::TraceKind::Event {
-                target,
-                function,
-                args,
-            } = &event.kind
-                && (target.eq_ignore_ascii_case("Amos0") || function.ends_with(".Trigger"))
-            {
+            for (i, object) in outcome.session.vm().objects.iter().enumerate() {
+                let id = i as xiii_script::ObjectId;
+                if object.deleted || !object.suspended {
+                    continue;
+                }
                 println!(
-                    "[amos01 event] t={:.3} {target}.{function}{args:?}",
-                    event.time
+                    "[amos01 suspended] {} state={:?} class={:?}",
+                    object.name,
+                    outcome.session.vm().state_name(id),
+                    object.class
                 );
             }
-        }
-        for (i, object) in outcome.session.vm().objects.iter().enumerate() {
-            let id = i as xiii_script::ObjectId;
-            if object.deleted || !object.suspended {
-                continue;
+            for (i, object) in outcome.session.vm().objects.iter().enumerate() {
+                let id = i as xiii_script::ObjectId;
+                if object.deleted || !outcome.session.vm().is_a(id, "XIIIGoalTrigger") {
+                    continue;
+                }
+                let number = outcome.session.vm().get_property(id, "GoalNumber");
+                if !matches!(number, Some(xiii_script::Value::Int(1))) {
+                    continue;
+                }
+                let vm = outcome.session.vm();
+                println!(
+                    "[amos01 goal] {} GoalNumber={number:?} Event={:?} Tag={:?} Location={:?}",
+                    object.name,
+                    vm.get_property(id, "Event"),
+                    vm.get_property(id, "Tag"),
+                    vm.vector_prop(id, "Location")
+                );
             }
-            println!(
-                "[amos01 suspended] {} state={:?} class={:?}",
-                object.name,
-                outcome.session.vm().state_name(id),
-                object.class
-            );
-        }
-        for (i, object) in outcome.session.vm().objects.iter().enumerate() {
-            let id = i as xiii_script::ObjectId;
-            if object.deleted || !outcome.session.vm().is_a(id, "XIIIGoalTrigger") {
-                continue;
-            }
-            let number = outcome.session.vm().get_property(id, "GoalNumber");
-            if !matches!(number, Some(xiii_script::Value::Int(1))) {
-                continue;
-            }
-            let vm = outcome.session.vm();
-            println!(
-                "[amos01 goal] {} GoalNumber={number:?} Event={:?} Tag={:?} Location={:?}",
-                object.name,
-                vm.get_property(id, "Event"),
-                vm.get_property(id, "Tag"),
-                vm.vector_prop(id, "Location")
-            );
-        }
-        for (i, object) in outcome.session.vm().objects.iter().enumerate() {
-            let id = i as xiii_script::ObjectId;
-            if object.deleted || !outcome.session.vm().is_a(id, "TouchTrigger") {
-                continue;
-            }
-            if !matches!(outcome.session.vm().get_property(id, "Event"),
+            for (i, object) in outcome.session.vm().objects.iter().enumerate() {
+                let id = i as xiii_script::ObjectId;
+                if object.deleted || !outcome.session.vm().is_a(id, "TouchTrigger") {
+                    continue;
+                }
+                if !matches!(outcome.session.vm().get_property(id, "Event"),
                 Some(xiii_script::Value::Name(name)) if name.eq_ignore_ascii_case("findemap"))
-            {
-                continue;
+                {
+                    continue;
+                }
+                let vm = outcome.session.vm();
+                println!(
+                    "[amos01 goal-source] {} Event=findemap Location={:?}",
+                    object.name,
+                    vm.vector_prop(id, "Location")
+                );
             }
-            let vm = outcome.session.vm();
-            println!(
-                "[amos01 goal-source] {} Event=findemap Location={:?}",
-                object.name,
-                vm.vector_prop(id, "Location")
+            assert_eq!(outcome.final_map, "Amos01");
+            assert!(
+                outcome.travel.is_empty(),
+                "route unexpectedly travelled: {:?}",
+                outcome.travel
             );
-        }
-        assert_eq!(outcome.final_map, "Amos01");
-        assert!(
-            outcome.travel.is_empty(),
-            "route unexpectedly travelled: {:?}",
-            outcome.travel
-        );
-        assert_eq!(
-            player_state.as_deref(),
-            Some("PlayerWalking"),
-            "the authored cutscene must return control through the initialized interaction path"
-        );
-        assert!(
-            matches!(
-                outcome.session.vm().get_property(pc, "MyInteraction"),
-                Some(xiii_script::Value::Object(Some(
-                    xiii_script::ObjRef::Instance(_)
-                )))
-            ),
-            "InitInputSystem must provide MyInteraction"
-        );
-        let rooftop = objectives
-            .iter()
-            .find(|o| o.index == 1)
-            .expect("rooftop objective");
-        assert!(
-            rooftop.primary && !rooftop.completed,
-            "this forward-only fixture does not yet reach the rooftop goal: {rooftop:?}"
-        );
-        let first_after_intro_state = outcome
-            .trace
-            .iter()
-            .find(|sample| sample.1 >= 0.5)
-            .expect("post-cutscene-state player trace")
-            .2;
-        let finish = outcome.trace.last().expect("player trace").2;
-        assert_ne!(
-            first_after_intro_state, finish,
-            "the returned PlayerWalking controller must accept the route's forward input"
-        );
-        println!(
-            "[amos01 route] PARTIAL: InitInputSystem returns the controller to PlayerWalking and forward input moves it; the forward-only fixture does not reach the rooftop objective or request Toits01 travel."
-        );
+            assert_eq!(
+                player_state.as_deref(),
+                Some("PlayerWalking"),
+                "the authored cutscene must return control through the initialized interaction path"
+            );
+            assert!(
+                matches!(
+                    outcome.session.vm().get_property(pc, "MyInteraction"),
+                    Some(xiii_script::Value::Object(Some(
+                        xiii_script::ObjRef::Instance(_)
+                    )))
+                ),
+                "InitInputSystem must provide MyInteraction"
+            );
+            let rooftop = objectives
+                .iter()
+                .find(|o| o.index == 1)
+                .expect("rooftop objective");
+            assert!(
+                rooftop.primary && !rooftop.completed,
+                "this forward-only fixture does not yet reach the rooftop goal: {rooftop:?}"
+            );
+            let first_after_intro_state = outcome
+                .trace
+                .iter()
+                .find(|sample| sample.1 >= 0.5)
+                .expect("post-cutscene-state player trace")
+                .2;
+            let finish = outcome.trace.last().expect("player trace").2;
+            assert_ne!(
+                first_after_intro_state, finish,
+                "the returned PlayerWalking controller must accept the route's forward input"
+            );
+            println!(
+                "[amos01 route] PARTIAL: InitInputSystem returns the controller to PlayerWalking and forward input moves it; the forward-only fixture does not reach the rooftop objective or request Toits01 travel."
+            );
+        })
     }
 
     fn probe_objectifs(game_dir: &std::path::Path, map: &str) {
@@ -3955,50 +4012,52 @@ mod tests {
     /// a travel request, and the host loads the next map (Plage01) with a spawned player.
     #[test]
     fn opt_in_plage00_goal_trigger_requests_travel_to_plage01() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Plage00".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Plage00");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        // `XIDCine.BeachFinalFall0` (Event `objectif0`, Tag `Fall`) at (5504.6, -1360.3, 867)
-        // is the beach end trigger: `Engine.Trigger.Touch` fires `TriggerEvent('objectif0')`,
-        // which calls `XIIIGoalTrigger5.Trigger`. Teleport next to it and walk in, then wait for
-        // the game's own travel request.
-        let script = script::Script::parse(
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("Plage00".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import Plage00");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            // `XIDCine.BeachFinalFall0` (Event `objectif0`, Tag `Fall`) at (5504.6, -1360.3, 867)
+            // is the beach end trigger: `Engine.Trigger.Touch` fires `TriggerEvent('objectif0')`,
+            // which calls `XIIIGoalTrigger5.Trigger`. Teleport next to it and walk in, then wait for
+            // the game's own travel request.
+            let script = script::Script::parse(
             "t=0.0 teleport 5420 -1360.3 880\nt=0.0 yaw 0\nt=0.0 forward 1\nt=2.0 forward 0\nt=2.0 wait_travel\n",
         )
         .unwrap();
-        let outcome = run_script(
-            &game_dir,
-            "Plage00",
-            &script,
-            &resolved.params,
-            &scene,
-            40.0,
-        )
-        .expect("run Plage00 goal walk");
-        println!(
-            "[probe] travel hops: {:?}, final map {}",
-            outcome.travel, outcome.final_map
-        );
-        assert!(
-            !outcome.travel.is_empty(),
-            "the goal trigger did not request travel; touches: {:?}, suspended: {:?}",
-            outcome.session.touches(),
-            outcome.session.suspended
-        );
-        assert_eq!(outcome.final_map, "Plage01");
-        assert_eq!(outcome.travel[0].to, "Plage01");
-        assert!(
-            outcome.session.player_location().is_some(),
-            "the next map must have a spawned player"
-        );
+            let outcome = run_script(
+                &game_dir,
+                "Plage00",
+                &script,
+                &resolved.params,
+                &scene,
+                40.0,
+            )
+            .expect("run Plage00 goal walk");
+            println!(
+                "[probe] travel hops: {:?}, final map {}",
+                outcome.travel, outcome.final_map
+            );
+            assert!(
+                !outcome.travel.is_empty(),
+                "the goal trigger did not request travel; touches: {:?}, suspended: {:?}",
+                outcome.session.touches(),
+                outcome.session.suspended
+            );
+            assert_eq!(outcome.final_map, "Plage01");
+            assert_eq!(outcome.travel[0].to, "Plage01");
+            assert!(
+                outcome.session.player_location().is_some(),
+                "the next map must have a spawned player"
+            );
+        })
     }
 
     /// Opt-in corpus test (item15): the game's own level-complete chain requests travel when the
@@ -4008,51 +4067,53 @@ mod tests {
     /// request. The walk-in test below exercises the same chain from a scripted walk.
     #[test]
     fn opt_in_plage00_goal_completion_chain_requests_travel() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = session::Session::open(&game_dir, "Plage00").expect("open Plage00");
-        let gt5 = session
-            .vm()
-            .find_object("XIIIGoalTrigger5")
-            .expect("XIIIGoalTrigger5");
-        let beach = session
-            .vm()
-            .find_object("BeachFinalFall0")
-            .expect("BeachFinalFall0");
-        let pawn = session.player;
-        let args = vec![
-            xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(beach))),
-            xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(pawn))),
-        ];
-        session
-            .vm_mut()
-            .send_event(gt5, "Trigger", args)
-            .expect("XIIIGoalTrigger5.Trigger");
-        for _ in 0..300 {
-            let loc = session.player_location().unwrap_or([0.0; 3]);
-            session.step(
-                1.0 / 60.0,
-                loc,
-                0.0,
-                [0.0; 3],
-                &session::PlayerVMModes::default(),
-            );
-            if let Some(req) = session.take_travel_request() {
-                println!(
-                    "[probe] goal chain travel request from {:?}: {} -> {}",
-                    req.source, req.url, req.mode
-                );
-                assert_eq!(req.url, "Plage01.unr");
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
                 return;
+            };
+            let mut session = session::Session::open(&game_dir, "Plage00").expect("open Plage00");
+            let gt5 = session
+                .vm()
+                .find_object("XIIIGoalTrigger5")
+                .expect("XIIIGoalTrigger5");
+            let beach = session
+                .vm()
+                .find_object("BeachFinalFall0")
+                .expect("BeachFinalFall0");
+            let pawn = session.player;
+            let args = vec![
+                xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(beach))),
+                xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(pawn))),
+            ];
+            session
+                .vm_mut()
+                .send_event(gt5, "Trigger", args)
+                .expect("XIIIGoalTrigger5.Trigger");
+            for _ in 0..300 {
+                let loc = session.player_location().unwrap_or([0.0; 3]);
+                session.step(
+                    1.0 / 60.0,
+                    loc,
+                    0.0,
+                    [0.0; 3],
+                    &session::PlayerVMModes::default(),
+                );
+                if let Some(req) = session.take_travel_request() {
+                    println!(
+                        "[probe] goal chain travel request from {:?}: {} -> {}",
+                        req.source, req.url, req.mode
+                    );
+                    assert_eq!(req.url, "Plage01.unr");
+                    return;
+                }
             }
-        }
-        panic!(
-            "goal chain did not request travel; suspended {:?}; first error {:?}",
-            session.suspended,
-            session.first_error()
-        );
+            panic!(
+                "goal chain did not request travel; suspended {:?}; first error {:?}",
+                session.suspended,
+                session.first_error()
+            );
+        })
     }
 
     /// Opt-in corpus test: walking (from a harness-placed start) into Plage00's `TouchTrigger2`
@@ -4062,49 +4123,51 @@ mod tests {
     /// calling `refresh_touching_of`.
     #[test]
     fn opt_in_plage00_walking_into_trigger_fires_dispatcher() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Plage00".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Plage00");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        // Walk from just short of TouchTrigger2 (3635.5, -44620.2, 4918) into its 130 UU cylinder.
-        let script = script::Script::parse(
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("Plage00".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import Plage00");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            // Walk from just short of TouchTrigger2 (3635.5, -44620.2, 4918) into its 130 UU cylinder.
+            let script = script::Script::parse(
             "t=0.0 teleport 3380 -44620.2 4918\nt=0.0 yaw 0\nt=0.0 forward 1\nt=0.5 forward 0\n",
         )
         .unwrap();
-        let outcome = run_script(&game_dir, "Plage00", &script, &resolved.params, &scene, 8.0)
-            .expect("run Plage00 trigger walk");
-        let s = &outcome.session;
-        let touch = s.touches().into_iter().find(|(_, a)| a == "TouchTrigger2");
-        let (t, actor) = touch.unwrap_or_else(|| {
-            panic!(
-                "TouchTrigger2 was not touched from walking: {:?}",
-                s.touches()
-            )
-        });
-        assert_eq!(actor, "TouchTrigger2");
-        assert!(
-            (0.0..2.0).contains(&t),
-            "touch time {t}s is not from the scripted walk"
-        );
-        assert_eq!(
-            s.dispatcher_state().as_deref(),
-            Some("Fin"),
-            "dispatcher did not reach Fin (state {:?})",
-            s.dispatcher_state()
-        );
-        println!(
-            "[play test] Plage00 trigger walk: touch {actor} at {t:.3}s, dispatcher {:?}, player {} active, suspended {}",
-            s.dispatcher_state(),
-            s.active_actors(),
-            s.suspended.len()
-        );
+            let outcome = run_script(&game_dir, "Plage00", &script, &resolved.params, &scene, 8.0)
+                .expect("run Plage00 trigger walk");
+            let s = &outcome.session;
+            let touch = s.touches().into_iter().find(|(_, a)| a == "TouchTrigger2");
+            let (t, actor) = touch.unwrap_or_else(|| {
+                panic!(
+                    "TouchTrigger2 was not touched from walking: {:?}",
+                    s.touches()
+                )
+            });
+            assert_eq!(actor, "TouchTrigger2");
+            assert!(
+                (0.0..2.0).contains(&t),
+                "touch time {t}s is not from the scripted walk"
+            );
+            assert_eq!(
+                s.dispatcher_state().as_deref(),
+                Some("Fin"),
+                "dispatcher did not reach Fin (state {:?})",
+                s.dispatcher_state()
+            );
+            println!(
+                "[play test] Plage00 trigger walk: touch {actor} at {t:.3}s, dispatcher {:?}, player {} active, suspended {}",
+                s.dispatcher_state(),
+                s.active_actors(),
+                s.suspended.len()
+            );
+        })
     }
 
     /// Opt-in corpus test (Part B): the level-start message/objective path creates real HUD
@@ -4113,128 +4176,131 @@ mod tests {
     /// `XIIIBaseHud`, `MapInfo.Timer` runs `FirstFrame`, and the HUD message path completes.
     #[test]
     fn opt_in_plage00_hud_widgets_appear_after_level_start() {
-        const WIDGETS: [&str; 8] = [
-            "HudMsg",
-            "HudObjMsg",
-            "HudMPMsg",
-            "HudEndMsg",
-            "HudDlg",
-            "HudWnd",
-            "HudFoc",
-            "HudStt",
-        ];
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = session::Session::open(&game_dir, "Plage00").expect("open Plage00");
-        let hud = {
-            let vm = session.vm();
-            session
-                .controller
-                .and_then(|c| match vm.get_property(c, "myHUD") {
-                    Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(p)))) => {
-                        Some(*p)
-                    }
-                    _ => None,
-                })
-                .or_else(|| hud::find_hud(vm))
-                .expect("the script login must create a live HUD actor")
-        };
-        let mut found: Vec<(String, xiii_script::ObjectId)> = Vec::new();
-        for _ in 0..180 {
-            let loc = session.player_location().unwrap_or([0.0; 3]);
-            session.step(
-                1.0 / 60.0,
-                loc,
-                0.0,
-                [0.0; 3],
-                &crate::play::session::PlayerVMModes::default(),
-            );
-        }
-        {
-            let vm = session.vm();
-            for name in WIDGETS {
-                if let Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(id)))) =
-                    vm.get_property(hud, name)
-                {
-                    let live = vm.objects.get(*id as usize).is_some_and(|o| !o.deleted);
-                    println!(
-                        "[play test] HUD widget {name} -> {}{}",
-                        vm.objects[*id as usize].name,
-                        if live { "" } else { " (deleted)" }
-                    );
-                    if live {
-                        found.push((name.to_owned(), *id));
+        crate::vmstack::run_on_vm_stack(|| {
+            const WIDGETS: [&str; 8] = [
+                "HudMsg",
+                "HudObjMsg",
+                "HudMPMsg",
+                "HudEndMsg",
+                "HudDlg",
+                "HudWnd",
+                "HudFoc",
+                "HudStt",
+            ];
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = session::Session::open(&game_dir, "Plage00").expect("open Plage00");
+            let hud = {
+                let vm = session.vm();
+                session
+                    .controller
+                    .and_then(|c| match vm.get_property(c, "myHUD") {
+                        Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(
+                            p,
+                        )))) => Some(*p),
+                        _ => None,
+                    })
+                    .or_else(|| hud::find_hud(vm))
+                    .expect("the script login must create a live HUD actor")
+            };
+            let mut found: Vec<(String, xiii_script::ObjectId)> = Vec::new();
+            for _ in 0..180 {
+                let loc = session.player_location().unwrap_or([0.0; 3]);
+                session.step(
+                    1.0 / 60.0,
+                    loc,
+                    0.0,
+                    [0.0; 3],
+                    &crate::play::session::PlayerVMModes::default(),
+                );
+            }
+            {
+                let vm = session.vm();
+                for name in WIDGETS {
+                    if let Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(
+                        id,
+                    )))) = vm.get_property(hud, name)
+                    {
+                        let live = vm.objects.get(*id as usize).is_some_and(|o| !o.deleted);
+                        println!(
+                            "[play test] HUD widget {name} -> {}{}",
+                            vm.objects[*id as usize].name,
+                            if live { "" } else { " (deleted)" }
+                        );
+                        if live {
+                            found.push((name.to_owned(), *id));
+                        }
                     }
                 }
             }
-        }
-        println!(
-            "[play test] HUD {} widgets live after 3s: {:?}",
-            found.len(),
-            found.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
-        );
-        assert!(
-            !found.is_empty(),
-            "the HUD must create at least one widget after level start"
-        );
-        // The class-default object of the goal message must no longer be suspended by the
-        // static `GetString` call.
-        assert!(
-            !session
-                .suspended
-                .iter()
-                .any(|s| s == "Default__XIIIGoalMessage"),
-            "Default__XIIIGoalMessage must not be suspended: {:?}",
-            session.suspended
-        );
-
-        // Drive one `HUD.PostRender` with the live widgets and assert the retail draw commands
-        // (player info + the live widget) are recorded, using the synthetic font provider.
-        let canvas_class =
-            xiii_world::runtime::resolve_class_path(session.vm().set(), "Engine.Canvas")
-                .expect("Engine.Canvas class");
-        let canvas = session
-            .vm_mut()
-            .spawn(canvas_class, "WidgetTestCanvas")
-            .expect("spawn Canvas");
-        let selected =
-            hud::initialize_canvas_fonts(session.vm_mut(), canvas).expect("Canvas native fonts");
-        assert!(
-            selected[0].ends_with(".PoliceF16") && selected[1].ends_with(".PoliceF20"),
-            "Canvas fonts must match Engine.Canvas.Init: {selected:?}"
-        );
-        for (prop, path) in [("SmallFont", &selected[0]), ("MedFont", &selected[1])] {
-            assert_eq!(
-                session.vm().get_property(canvas, prop),
-                Some(&xiii_script::Value::Name(path.clone())),
-                "Canvas.{prop} must match the Engine.Canvas.Init font"
+            println!(
+                "[play test] HUD {} widgets live after 3s: {:?}",
+                found.len(),
+                found.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
             );
-        }
-        let vm = session.vm_mut();
-        vm.set_property(canvas, "ClipX", 0, xiii_script::Value::Float(1280.0));
-        vm.set_property(canvas, "ClipY", 0, xiii_script::Value::Float(720.0));
-        vm.set_property(canvas, "Style", 0, xiii_script::Value::Byte(1));
-        vm.set_canvas_fonts(Box::new(DummyFonts));
-        let arg = xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(canvas)));
-        session
-            .vm_mut()
-            .send_event(hud, "PostRender", vec![arg])
-            .expect("HUD.PostRender with live widgets");
-        let commands = session.vm_mut().drain_canvas();
-        println!(
-            "[play test] HUD.PostRender after level start: {} draw command(s)",
-            commands.len()
-        );
-        for c in commands.iter().take(8) {
-            println!("[play test]   {c:?}");
-        }
-        assert!(
-            commands.len() >= 2,
-            "HUD.PostRender must draw more than the player-info line once widgets are live: {}",
-            commands.len()
-        );
+            assert!(
+                !found.is_empty(),
+                "the HUD must create at least one widget after level start"
+            );
+            // The class-default object of the goal message must no longer be suspended by the
+            // static `GetString` call.
+            assert!(
+                !session
+                    .suspended
+                    .iter()
+                    .any(|s| s == "Default__XIIIGoalMessage"),
+                "Default__XIIIGoalMessage must not be suspended: {:?}",
+                session.suspended
+            );
+
+            // Drive one `HUD.PostRender` with the live widgets and assert the retail draw commands
+            // (player info + the live widget) are recorded, using the synthetic font provider.
+            let canvas_class =
+                xiii_world::runtime::resolve_class_path(session.vm().set(), "Engine.Canvas")
+                    .expect("Engine.Canvas class");
+            let canvas = session
+                .vm_mut()
+                .spawn(canvas_class, "WidgetTestCanvas")
+                .expect("spawn Canvas");
+            let selected = hud::initialize_canvas_fonts(session.vm_mut(), canvas)
+                .expect("Canvas native fonts");
+            assert!(
+                selected[0].ends_with(".PoliceF16") && selected[1].ends_with(".PoliceF20"),
+                "Canvas fonts must match Engine.Canvas.Init: {selected:?}"
+            );
+            for (prop, path) in [("SmallFont", &selected[0]), ("MedFont", &selected[1])] {
+                assert_eq!(
+                    session.vm().get_property(canvas, prop),
+                    Some(&xiii_script::Value::Name(path.clone())),
+                    "Canvas.{prop} must match the Engine.Canvas.Init font"
+                );
+            }
+            let vm = session.vm_mut();
+            vm.set_property(canvas, "ClipX", 0, xiii_script::Value::Float(1280.0));
+            vm.set_property(canvas, "ClipY", 0, xiii_script::Value::Float(720.0));
+            vm.set_property(canvas, "Style", 0, xiii_script::Value::Byte(1));
+            vm.set_canvas_fonts(Box::new(DummyFonts));
+            let arg = xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(canvas)));
+            session
+                .vm_mut()
+                .send_event(hud, "PostRender", vec![arg])
+                .expect("HUD.PostRender with live widgets");
+            let commands = session.vm_mut().drain_canvas();
+            println!(
+                "[play test] HUD.PostRender after level start: {} draw command(s)",
+                commands.len()
+            );
+            for c in commands.iter().take(8) {
+                println!("[play test]   {c:?}");
+            }
+            assert!(
+                commands.len() >= 2,
+                "HUD.PostRender must draw more than the player-info line once widgets are live: {}",
+                commands.len()
+            );
+        })
     }
 
     /// A synthetic `CanvasFonts` provider for any font: 4 units per character, 8 tall.
@@ -4251,111 +4317,113 @@ mod tests {
     /// synthetic one above, so the test covers the script + native path only.
     #[test]
     fn opt_in_plage00_hud_postrender_records_commands() {
-        use xiii_script::Value;
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let mut session = session::Session::open(&game_dir, "Plage00").expect("open Plage00");
-        assert_eq!(session.login_script, 1, "script login must create the HUD");
-        let controller = session.controller;
+        crate::vmstack::run_on_vm_stack(|| {
+            use xiii_script::Value;
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let mut session = session::Session::open(&game_dir, "Plage00").expect("open Plage00");
+            assert_eq!(session.login_script, 1, "script login must create the HUD");
+            let controller = session.controller;
 
-        // Host-side Canvas (the same setup `hud::setup` performs), minus the Bevy textures.
-        let canvas_class =
-            xiii_world::runtime::resolve_class_path(session.vm().set(), "Engine.Canvas")
-                .expect("Engine.Canvas class");
-        let canvas = session
-            .vm_mut()
-            .spawn(canvas_class, "TestCanvas")
-            .expect("spawn Canvas");
-        let player = session.player;
-        let missing_font = hud::initialize_canvas_fonts(session.vm_mut(), player)
-            .expect_err("a pawn must not be accepted as an Engine.Canvas");
-        assert!(
-            missing_font.contains("has no SmallFont property"),
-            "unexpected Engine.Canvas initialization error: {missing_font}"
-        );
-        let vm = session.vm_mut();
-        vm.set_property(
-            canvas,
-            "DrawColor",
-            0,
-            Value::Struct(vec![
-                ("b".to_owned(), Value::Byte(255)),
-                ("g".to_owned(), Value::Byte(255)),
-                ("r".to_owned(), Value::Byte(255)),
-                ("a".to_owned(), Value::Byte(255)),
-            ]),
-        );
-        vm.set_property(canvas, "ClipX", 0, Value::Float(1280.0));
-        vm.set_property(canvas, "ClipY", 0, Value::Float(720.0));
-        vm.set_property(canvas, "Style", 0, Value::Byte(1));
-        vm.set_canvas_fonts(Box::new(DummyFonts));
+            // Host-side Canvas (the same setup `hud::setup` performs), minus the Bevy textures.
+            let canvas_class =
+                xiii_world::runtime::resolve_class_path(session.vm().set(), "Engine.Canvas")
+                    .expect("Engine.Canvas class");
+            let canvas = session
+                .vm_mut()
+                .spawn(canvas_class, "TestCanvas")
+                .expect("spawn Canvas");
+            let player = session.player;
+            let missing_font = hud::initialize_canvas_fonts(session.vm_mut(), player)
+                .expect_err("a pawn must not be accepted as an Engine.Canvas");
+            assert!(
+                missing_font.contains("has no SmallFont property"),
+                "unexpected Engine.Canvas initialization error: {missing_font}"
+            );
+            let vm = session.vm_mut();
+            vm.set_property(
+                canvas,
+                "DrawColor",
+                0,
+                Value::Struct(vec![
+                    ("b".to_owned(), Value::Byte(255)),
+                    ("g".to_owned(), Value::Byte(255)),
+                    ("r".to_owned(), Value::Byte(255)),
+                    ("a".to_owned(), Value::Byte(255)),
+                ]),
+            );
+            vm.set_property(canvas, "ClipX", 0, Value::Float(1280.0));
+            vm.set_property(canvas, "ClipY", 0, Value::Float(720.0));
+            vm.set_property(canvas, "Style", 0, Value::Byte(1));
+            vm.set_canvas_fonts(Box::new(DummyFonts));
 
-        // The HUD is the controller's `myHUD` (or the first live HUD actor).
-        let hud = {
+            // The HUD is the controller's `myHUD` (or the first live HUD actor).
+            let hud = {
+                let vm = session.vm();
+                controller
+                    .and_then(|c| match vm.get_property(c, "myHUD") {
+                        Some(Value::Object(Some(xiii_script::ObjRef::Instance(p)))) => Some(*p),
+                        _ => None,
+                    })
+                    .or_else(|| hud::find_hud(vm))
+            }
+            .expect("Plage00 has a live HUD");
+            let selected = hud::initialize_canvas_fonts(session.vm_mut(), canvas)
+                .expect("Canvas native fonts");
+            assert_eq!(
+                session.vm().get_property(canvas, "SmallFont"),
+                Some(&Value::Name(selected[0].clone()))
+            );
+            assert_eq!(
+                session.vm().get_property(canvas, "MedFont"),
+                Some(&Value::Name(selected[1].clone()))
+            );
+            let vm = session.vm_mut();
+            let arg = Value::Object(Some(xiii_script::ObjRef::Instance(canvas)));
+            match vm.send_event(hud, "PostRender", vec![arg]) {
+                Ok(_) => {}
+                Err(e) => panic!("HUD.PostRender failed: {e}"),
+            }
+            let commands = session.vm_mut().drain_canvas();
+            let hud_class = session
+                .vm()
+                .set()
+                .path(session.vm().objects[hud as usize].class);
+            assert!(
+                session.vm().objects[hud as usize].active,
+                "the HUD must not be suspended by PostRender"
+            );
+            println!(
+                "[play test] Plage00 HUD.PostRender: class {hud_class}, {} draw command(s)",
+                commands.len()
+            );
+            for c in commands.iter().take(6) {
+                println!("[play test]   {c:?}");
+            }
+            println!(
+                "[play test]   HUD widgets: HudMsg={:?} HudWnd={:?} DrawnWeapon={:?}",
+                session.vm().get_property(hud, "HudMsg"),
+                session.vm().get_property(hud, "HudWnd"),
+                session.vm().get_property(hud, "DrawnWeapon"),
+            );
+            // Survey of the Canvas/HUD natives this PostRender path called (requirement 1).
             let vm = session.vm();
-            controller
-                .and_then(|c| match vm.get_property(c, "myHUD") {
-                    Some(Value::Object(Some(xiii_script::ObjRef::Instance(p)))) => Some(*p),
-                    _ => None,
-                })
-                .or_else(|| hud::find_hud(vm))
-        }
-        .expect("Plage00 has a live HUD");
-        let selected =
-            hud::initialize_canvas_fonts(session.vm_mut(), canvas).expect("Canvas native fonts");
-        assert_eq!(
-            session.vm().get_property(canvas, "SmallFont"),
-            Some(&Value::Name(selected[0].clone()))
-        );
-        assert_eq!(
-            session.vm().get_property(canvas, "MedFont"),
-            Some(&Value::Name(selected[1].clone()))
-        );
-        let vm = session.vm_mut();
-        let arg = Value::Object(Some(xiii_script::ObjRef::Instance(canvas)));
-        match vm.send_event(hud, "PostRender", vec![arg]) {
-            Ok(_) => {}
-            Err(e) => panic!("HUD.PostRender failed: {e}"),
-        }
-        let commands = session.vm_mut().drain_canvas();
-        let hud_class = session
-            .vm()
-            .set()
-            .path(session.vm().objects[hud as usize].class);
-        assert!(
-            session.vm().objects[hud as usize].active,
-            "the HUD must not be suspended by PostRender"
-        );
-        println!(
-            "[play test] Plage00 HUD.PostRender: class {hud_class}, {} draw command(s)",
-            commands.len()
-        );
-        for c in commands.iter().take(6) {
-            println!("[play test]   {c:?}");
-        }
-        println!(
-            "[play test]   HUD widgets: HudMsg={:?} HudWnd={:?} DrawnWeapon={:?}",
-            session.vm().get_property(hud, "HudMsg"),
-            session.vm().get_property(hud, "HudWnd"),
-            session.vm().get_property(hud, "DrawnWeapon"),
-        );
-        // Survey of the Canvas/HUD natives this PostRender path called (requirement 1).
-        let vm = session.vm();
-        let mut used: Vec<(&String, &(Option<u16>, u64))> = vm
-            .natives_used
-            .iter()
-            .filter(|(p, _)| p.starts_with("Canvas.") || p.starts_with("HUD."))
-            .collect();
-        used.sort_by(|a, b| a.0.cmp(b.0));
-        for (path, (idx, count)) in used {
-            println!("[play test]   native {path} index={idx:?} calls={count}");
-        }
-        assert!(
-            !commands.is_empty(),
-            "Plage00 HUD.PostRender produced no draw commands"
-        );
+            let mut used: Vec<(&String, &(Option<u16>, u64))> = vm
+                .natives_used
+                .iter()
+                .filter(|(p, _)| p.starts_with("Canvas.") || p.starts_with("HUD."))
+                .collect();
+            used.sort_by(|a, b| a.0.cmp(b.0));
+            for (path, (idx, count)) in used {
+                println!("[play test]   native {path} index={idx:?} calls={count}");
+            }
+            assert!(
+                !commands.is_empty(),
+                "Plage00 HUD.PostRender produced no draw commands"
+            );
+        })
     }
 
     /// Opt-in corpus fight (item14): on Plage01 the player's granted Beretta fires through the
@@ -4365,63 +4433,65 @@ mod tests {
     /// fall and `bIsDead` become true.
     #[test]
     fn opt_in_plage01_player_fires_and_kills_soldier() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Plage01".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Plage01");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        // BaseSoldier6 is at (1802.4, -12832.0, 1070.8). Place the player 160 UU in -Y facing +Y
-        // (yaw 90) and aim at the top of the head (pitch +5 deg). With the decoded per-bone hit
-        // boxes (item14b) the large `X Spine1` box overlaps the lower head, so a point-blank
-        // horizontal shot is a chest hit; the head needs the ray to clear the torso first. The
-        // battle is entirely script-driven (no host damage).
-        // Start 3 s after the old 45 s mark: with the engine's cine arrival rule
-        // (XIDCine IsTargetReached) the Plage01 intro returns control at ~46.5 s, not ~44.5 s.
-        let script = script::Script::parse(
-            "t=48.00 weapon XIII.Beretta\n\
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("Plage01".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import Plage01");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            // BaseSoldier6 is at (1802.4, -12832.0, 1070.8). Place the player 160 UU in -Y facing +Y
+            // (yaw 90) and aim at the top of the head (pitch +5 deg). With the decoded per-bone hit
+            // boxes (item14b) the large `X Spine1` box overlaps the lower head, so a point-blank
+            // horizontal shot is a chest hit; the head needs the ray to clear the torso first. The
+            // battle is entirely script-driven (no host damage).
+            // Start 3 s after the old 45 s mark: with the engine's cine arrival rule
+            // (XIDCine IsTargetReached) the Plage01 intro returns control at ~46.5 s, not ~44.5 s.
+            let script = script::Script::parse(
+                "t=48.00 weapon XIII.Beretta\n\
              t=48.20 teleport 1802.4131 -12992.034 1070.843\n\
              t=48.20 yaw 90\n\
              t=48.20 pitch 5\n\
              t=48.30 fire\nt=48.90 fire\nt=49.50 fire\nt=50.10 fire\nt=50.70 fire\nt=51.30 fire\n\
              t=51.90 fire\nt=52.50 fire\nt=53.10 fire\nt=53.70 fire\nt=54.30 fire\n",
-        )
-        .unwrap();
-        let outcome = run_script(
-            &game_dir,
-            "Plage01",
-            &script,
-            &resolved.params,
-            &scene,
-            56.0,
-        )
-        .expect("run Plage01 fight");
-        let s = &outcome.session;
-        let soldier = (0..s.vm().objects.len())
-            .find(|&i| {
-                s.vm().objects[i].is_actor
-                    && !s.vm().objects[i].deleted
-                    && s.vm().objects[i].name.eq_ignore_ascii_case("BaseSoldier6")
-            })
-            .expect("Plage01 has a live BaseSoldier6")
-            as xiii_script::ObjectId;
-        let health = s.actor_health(soldier);
-        let dead = s.actor_is_dead(soldier);
-        let weapon = s.player_weapon();
-        println!(
-            "[fight test] player weapon {:?}, BaseSoldier6 health {health:?} dead={dead}",
-            weapon.map(|w| s.vm().objects[w as usize].name.clone())
-        );
-        assert!(weapon.is_some(), "the player must hold the granted weapon");
-        assert!(
-            dead || health.is_some_and(|h| h <= 0.0),
-            "BaseSoldier6 did not die: health {health:?}, dead {dead}"
-        );
+            )
+            .unwrap();
+            let outcome = run_script(
+                &game_dir,
+                "Plage01",
+                &script,
+                &resolved.params,
+                &scene,
+                56.0,
+            )
+            .expect("run Plage01 fight");
+            let s = &outcome.session;
+            let soldier = (0..s.vm().objects.len())
+                .find(|&i| {
+                    s.vm().objects[i].is_actor
+                        && !s.vm().objects[i].deleted
+                        && s.vm().objects[i].name.eq_ignore_ascii_case("BaseSoldier6")
+                })
+                .expect("Plage01 has a live BaseSoldier6")
+                as xiii_script::ObjectId;
+            let health = s.actor_health(soldier);
+            let dead = s.actor_is_dead(soldier);
+            let weapon = s.player_weapon();
+            println!(
+                "[fight test] player weapon {:?}, BaseSoldier6 health {health:?} dead={dead}",
+                weapon.map(|w| s.vm().objects[w as usize].name.clone())
+            );
+            assert!(weapon.is_some(), "the player must hold the granted weapon");
+            assert!(
+                dead || health.is_some_and(|h| h <= 0.0),
+                "BaseSoldier6 did not die: health {health:?}, dead {dead}"
+            );
+        })
     }
 
     /// Item38 acceptance: run the authored Plage01 route fixture, then verify the VM selected a
@@ -4430,50 +4500,53 @@ mod tests {
     /// inactive, so the same state produces the corpse pose rather than a host-selected pose.
     #[test]
     fn opt_in_item38_plage01_route_killer_finishes_in_scripted_death_pose() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Plage01".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Plage01");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let route = script::Script::parse(include_str!("../../tests/data/plage01_route.script"))
-            .expect("parse the checked-in Plage01 route fixture");
-        let outcome = run_script(&game_dir, "Plage01", &route, &resolved.params, &scene, 65.0)
-            .expect("run the requested Plage01 route through the killer");
-        let vm = outcome.session.vm();
-        let killer = vm
-            .find_object("BaseSoldier6")
-            .expect("Plage01 BaseSoldier6 remains addressable as a corpse");
-        assert!(
-            outcome.session.actor_is_dead(killer),
-            "the route must kill BaseSoldier6"
-        );
-        let animation = vm
-            .actor_animation(killer)
-            .expect("the dead pawn keeps its VM animation channels");
-        println!(
-            "[item38 Plage01] BaseSoldier6 animation channels: {:?}",
-            animation.channels
-        );
-        let death = animation
-            .channels
-            .iter()
-            .find(|c| c.sequence.to_ascii_lowercase().starts_with("death"))
-            .expect("XIIIPawn.PlayDyingAnim must select a Death* sequence");
-        println!(
-            "[item38 Plage01] BaseSoldier6 bIsDead=true, death sequence {} frame {:.2}/{} active={}",
-            death.sequence, death.frame, death.frames, death.active
-        );
-        assert!(!death.looping, "a corpse death sequence must not loop");
-        assert!(
-            !death.active && death.frame >= death.frames.saturating_sub(1) as f32,
-            "the dying pose must remain at the sequence's final frame: {death:?}"
-        );
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("Plage01".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import Plage01");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            let route =
+                script::Script::parse(include_str!("../../tests/data/plage01_route.script"))
+                    .expect("parse the checked-in Plage01 route fixture");
+            let outcome = run_script(&game_dir, "Plage01", &route, &resolved.params, &scene, 65.0)
+                .expect("run the requested Plage01 route through the killer");
+            let vm = outcome.session.vm();
+            let killer = vm
+                .find_object("BaseSoldier6")
+                .expect("Plage01 BaseSoldier6 remains addressable as a corpse");
+            assert!(
+                outcome.session.actor_is_dead(killer),
+                "the route must kill BaseSoldier6"
+            );
+            let animation = vm
+                .actor_animation(killer)
+                .expect("the dead pawn keeps its VM animation channels");
+            println!(
+                "[item38 Plage01] BaseSoldier6 animation channels: {:?}",
+                animation.channels
+            );
+            let death = animation
+                .channels
+                .iter()
+                .find(|c| c.sequence.to_ascii_lowercase().starts_with("death"))
+                .expect("XIIIPawn.PlayDyingAnim must select a Death* sequence");
+            println!(
+                "[item38 Plage01] BaseSoldier6 bIsDead=true, death sequence {} frame {:.2}/{} active={}",
+                death.sequence, death.frame, death.frames, death.active
+            );
+            assert!(!death.looping, "a corpse death sequence must not loop");
+            assert!(
+                !death.active && death.frame >= death.frames.saturating_sub(1) as f32,
+                "the dying pose must remain at the sequence's final frame: {death:?}"
+            );
+        })
     }
 
     /// Opt-in item18 B11 regression: the M60's decoded `RumbleFX` calls float `%` before its
@@ -4481,53 +4554,55 @@ mod tests {
     /// `ProcessTraceHit` -> `TakeDamage` instead of aborting in `IncrementFlashCount`.
     #[test]
     fn opt_in_plage01_m60_fires_through_rumblefx_and_damages_soldier() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Plage01".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Plage01");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let script = script::Script::parse(
-            "t=0.00 weapon XIII.M60\n\
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("Plage01".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import Plage01");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            let script = script::Script::parse(
+                "t=0.00 weapon XIII.M60\n\
              t=0.20 teleport 1802.4131 -12992.034 1070.843\n\
              t=0.20 yaw 90\nt=0.20 pitch 5\n\
              t=0.30 fire\nt=0.90 fire\nt=1.50 fire\nt=2.10 fire\nt=2.70 fire\n",
-        )
-        .expect("parse M60 fight script");
-        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 4.0)
-            .expect("run Plage01 M60 fight");
-        let soldier = outcome
-            .session
-            .vm()
-            .find_object("BaseSoldier6")
-            .expect("Plage01 BaseSoldier6");
-        let health = outcome.session.actor_health(soldier);
-        let ammo_amount = outcome.session.player_weapon().and_then(|w| {
-            match outcome.session.vm().get_property(w, "AmmoType") {
-                Some(Value::Object(Some(xiii_script::ObjRef::Instance(a)))) => {
-                    match outcome.session.vm().get_property(*a, "AmmoAmount") {
-                        Some(Value::Int(n)) => Some(*n),
-                        _ => None,
+            )
+            .expect("parse M60 fight script");
+            let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 4.0)
+                .expect("run Plage01 M60 fight");
+            let soldier = outcome
+                .session
+                .vm()
+                .find_object("BaseSoldier6")
+                .expect("Plage01 BaseSoldier6");
+            let health = outcome.session.actor_health(soldier);
+            let ammo_amount = outcome.session.player_weapon().and_then(|w| {
+                match outcome.session.vm().get_property(w, "AmmoType") {
+                    Some(Value::Object(Some(xiii_script::ObjRef::Instance(a)))) => {
+                        match outcome.session.vm().get_property(*a, "AmmoAmount") {
+                            Some(Value::Int(n)) => Some(*n),
+                            _ => None,
+                        }
                     }
+                    _ => None,
                 }
-                _ => None,
-            }
-        });
-        println!(
-            "[M60 test] BaseSoldier6 health {:?}, bone {:?}, M60 ammo {:?}",
-            health,
-            outcome.session.vm().get_property(soldier, "LastBoneHit"),
-            ammo_amount
-        );
-        assert!(
-            health.is_some_and(|h| h < 625.0),
-            "M60 fire stopped before damaging BaseSoldier6 (Health {health:?})"
-        );
+            });
+            println!(
+                "[M60 test] BaseSoldier6 health {:?}, bone {:?}, M60 ammo {:?}",
+                health,
+                outcome.session.vm().get_property(soldier, "LastBoneHit"),
+                ammo_amount
+            );
+            assert!(
+                health.is_some_and(|h| h < 625.0),
+                "M60 fire stopped before damaging BaseSoldier6 (Health {health:?})"
+            );
+        })
     }
 
     /// Opt-in item18 B11 comparison: use the same Base01 clear-line M60 script as the windowed
@@ -4536,39 +4611,41 @@ mod tests {
     /// `run_script` path too, proving `Session::fire`/`ProcessTraceHit` agree across drivers.
     #[test]
     fn opt_in_base01_m60_run_script_damages_actual_trace_target() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Base01".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Base01");
-        let resolved = resolve_params(&game_dir).expect("resolve parameters");
-        let script = script::Script::parse(
-            "t=0.00 weapon XIII.M60\nt=0.20 teleport -10347.6 6904.2 867.0\
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("Base01".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import Base01");
+            let resolved = resolve_params(&game_dir).expect("resolve parameters");
+            let script = script::Script::parse(
+                "t=0.00 weapon XIII.M60\nt=0.20 teleport -10347.6 6904.2 867.0\
              \nt=0.20 yaw -90\nt=0.20 pitch 0\nt=0.40 fire\nt=1.00 fire\
              \nt=1.60 fire\nt=2.20 fire\nt=2.80 fire\n",
-        )
-        .expect("parse clear-line M60 script");
-        let outcome = run_script(&game_dir, "Base01", &script, &resolved.params, &scene, 4.0)
-            .expect("run Base01 clear-line M60 script");
-        let target = outcome
-            .session
-            .vm()
-            .find_object("BaseSoldier3")
-            .expect("the ray's first pawn target");
-        let health = outcome.session.actor_health(target);
-        println!(
-            "[B11 comparison] run_script BaseSoldier3 Health={health:?}, LastBoneHit={:?}",
-            outcome.session.vm().get_property(target, "LastBoneHit")
-        );
-        assert!(
-            health.is_some_and(|h| h < 750.0),
-            "the actual trace target did not take M60 damage: {health:?}"
-        );
+            )
+            .expect("parse clear-line M60 script");
+            let outcome = run_script(&game_dir, "Base01", &script, &resolved.params, &scene, 4.0)
+                .expect("run Base01 clear-line M60 script");
+            let target = outcome
+                .session
+                .vm()
+                .find_object("BaseSoldier3")
+                .expect("the ray's first pawn target");
+            let health = outcome.session.actor_health(target);
+            println!(
+                "[B11 comparison] run_script BaseSoldier3 Health={health:?}, LastBoneHit={:?}",
+                outcome.session.vm().get_property(target, "LastBoneHit")
+            );
+            assert!(
+                health.is_some_and(|h| h < 750.0),
+                "the actual trace target did not take M60 damage: {health:?}"
+            );
+        })
     }
 
     /// Opt-in corpus test (requirement 5): on Banque01 the host walks the player onto the
@@ -4577,63 +4654,66 @@ mod tests {
     /// use) and then *only* holds forward; the climb is the simulation's, not a teleport.
     #[test]
     fn opt_in_banque01_ladder_climb() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Banque01".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Banque01");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let volumes = xiii_world::movement_volumes::MovementVolumes::import(&game_dir, "Banque01")
-            .expect("import Banque01 volumes");
-        let lv = volumes
-            .volumes
-            .iter()
-            .find(|v| {
-                v.kind == xiii_world::movement_volumes::VolumeKind::Ladder
-                    && v.name.eq_ignore_ascii_case("LadderVolume5")
-            })
-            .expect("Banque01 places LadderVolume5");
-        let cx = (lv.min_uu[0] + lv.max_uu[0]) * 0.5;
-        let cy = (lv.min_uu[1] + lv.max_uu[1]) * 0.5;
-        let start_z = lv.min_uu[2] + resolved.params.height_uu;
-        let script = script::Script::parse(&format!(
-            "t=0.0 teleport {cx} {cy} {start_z}\nt=0.0 forward 1\nt=6.0 forward 0\n"
-        ))
-        .unwrap();
-        let outcome = run_script(
-            &game_dir,
-            "Banque01",
-            &script,
-            &resolved.params,
-            &scene,
-            8.0,
-        )
-        .expect("run Banque01 ladder climb");
-        let max_z = outcome
-            .trace
-            .iter()
-            .map(|(_, _, p, _)| p[2])
-            .fold(f32::MIN, f32::max);
-        println!(
-            "[ladder test] LadderVolume5 {:?} size {:?}; player climbed from {} to {max_z} UU (Health {})",
-            lv.min_uu,
-            lv.size_uu(),
-            start_z,
-            outcome
-                .session
-                .player_health()
-                .map(|h| h.to_string())
-                .unwrap_or_else(|| "-".into())
-        );
-        assert!(
-            max_z > start_z + 200.0,
-            "walking onto the ladder only raised the player to {max_z} UU (start {start_z})"
-        );
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let opts = Options {
+                map: Some("Banque01".to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).expect("import Banque01");
+            let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+            let volumes =
+                xiii_world::movement_volumes::MovementVolumes::import(&game_dir, "Banque01")
+                    .expect("import Banque01 volumes");
+            let lv = volumes
+                .volumes
+                .iter()
+                .find(|v| {
+                    v.kind == xiii_world::movement_volumes::VolumeKind::Ladder
+                        && v.name.eq_ignore_ascii_case("LadderVolume5")
+                })
+                .expect("Banque01 places LadderVolume5");
+            let cx = (lv.min_uu[0] + lv.max_uu[0]) * 0.5;
+            let cy = (lv.min_uu[1] + lv.max_uu[1]) * 0.5;
+            let start_z = lv.min_uu[2] + resolved.params.height_uu;
+            let script = script::Script::parse(&format!(
+                "t=0.0 teleport {cx} {cy} {start_z}\nt=0.0 forward 1\nt=6.0 forward 0\n"
+            ))
+            .unwrap();
+            let outcome = run_script(
+                &game_dir,
+                "Banque01",
+                &script,
+                &resolved.params,
+                &scene,
+                8.0,
+            )
+            .expect("run Banque01 ladder climb");
+            let max_z = outcome
+                .trace
+                .iter()
+                .map(|(_, _, p, _)| p[2])
+                .fold(f32::MIN, f32::max);
+            println!(
+                "[ladder test] LadderVolume5 {:?} size {:?}; player climbed from {} to {max_z} UU (Health {})",
+                lv.min_uu,
+                lv.size_uu(),
+                start_z,
+                outcome
+                    .session
+                    .player_health()
+                    .map(|h| h.to_string())
+                    .unwrap_or_else(|| "-".into())
+            );
+            assert!(
+                max_z > start_z + 200.0,
+                "walking onto the ladder only raised the player to {max_z} UU (start {start_z})"
+            );
+        })
     }
 
     /// Opt-in corpus test (requirement 5): Banque01's `WaterVolume0` brush is found by the host

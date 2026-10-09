@@ -1900,15 +1900,23 @@ pub fn build_menu_app(options: Options) -> App {
         PresentMode::AutoVsync
     };
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "XIII Classic runtime - front-end menu (item16)".into(),
-            resolution: (options.width, options.height).into(),
-            present_mode,
-            ..default()
-        }),
-        ..default()
-    }));
+    // The menu app runs on the explicit VM host stack (see crate::vmstack); allow the winit
+    // event loop to be created off the main thread (supported on Windows).
+    app.add_plugins(
+        DefaultPlugins
+            .set(bevy::winit::WinitPlugin {
+                run_on_any_thread: true,
+            })
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "XIII Classic runtime - front-end menu (item16)".into(),
+                    resolution: (options.width, options.height).into(),
+                    present_mode,
+                    ..default()
+                }),
+                ..default()
+            }),
+    );
     app.insert_resource(MenuState {
         tick: 0,
         start: Instant::now(),
@@ -2192,58 +2200,60 @@ mod tests {
     /// entry reaches the game's own `ClientTravel("Plage00")` map request.
     #[test]
     fn opt_in_menu_spawns_and_newgame_requests_the_map() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let script = MenuScript::parse("t=0.1 newgame\n").unwrap();
-        let storage = TestStorage::new("newgame");
-        let mut session = MenuSession::open_configured(
-            &game_dir,
-            storage.save_dir(),
-            &storage.config_dir(),
-            Some(script),
-        )
-        .expect("open the front-end menu");
-        assert_eq!(
-            session.controls.len(),
-            XIIIMENU_CONTROL_COUNT,
-            "XIIIMenu.Created must build {:?}",
-            session.control_labels
-        );
-        assert_eq!(session.control_labels[4], "newgame");
-        for c in &session.controls {
-            assert!(
-                session.vm.is_a(*c, "XIIITextureButton"),
-                "control is {}",
-                session.vm.set().path(session.vm.objects[*c as usize].class)
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let script = MenuScript::parse("t=0.1 newgame\n").unwrap();
+            let storage = TestStorage::new("newgame");
+            let mut session = MenuSession::open_configured(
+                &game_dir,
+                storage.save_dir(),
+                &storage.config_dir(),
+                Some(script),
+            )
+            .expect("open the front-end menu");
+            assert_eq!(
+                session.controls.len(),
+                XIIIMENU_CONTROL_COUNT,
+                "XIIIMenu.Created must build {:?}",
+                session.control_labels
             );
-        }
-        // Advance past the action and drive the `PlayingVideo` state until `EndOfVideo`
-        // travels.
-        for _ in 0..40 {
-            session.clip = [1280.0, 720.0];
-            session.advance(0.05);
-            session.refresh_commands();
-            if session.travel.is_some() {
-                break;
+            assert_eq!(session.control_labels[4], "newgame");
+            for c in &session.controls {
+                assert!(
+                    session.vm.is_a(*c, "XIIITextureButton"),
+                    "control is {}",
+                    session.vm.set().path(session.vm.objects[*c as usize].class)
+                );
             }
-        }
-        assert!(
-            session.errors.is_empty(),
-            "menu spawned with no suspensions; errors: {:?}",
-            session.errors
-        );
-        let req = travel(&session).expect("New game reaches ClientTravel");
-        assert_eq!(req.map, "plage00");
-        assert_eq!(req.url, "Plage00");
-        println!(
-            "[menu test] controls={:?} travel={} url={} paint_error={:?}",
-            session.control_labels,
-            req.map,
-            req.url,
-            session.errors.first()
-        );
+            // Advance past the action and drive the `PlayingVideo` state until `EndOfVideo`
+            // travels.
+            for _ in 0..40 {
+                session.clip = [1280.0, 720.0];
+                session.advance(0.05);
+                session.refresh_commands();
+                if session.travel.is_some() {
+                    break;
+                }
+            }
+            assert!(
+                session.errors.is_empty(),
+                "menu spawned with no suspensions; errors: {:?}",
+                session.errors
+            );
+            let req = travel(&session).expect("New game reaches ClientTravel");
+            assert_eq!(req.map, "plage00");
+            assert_eq!(req.url, "Plage00");
+            println!(
+                "[menu test] controls={:?} travel={} url={} paint_error={:?}",
+                session.control_labels,
+                req.map,
+                req.url,
+                session.errors.first()
+            );
+        })
     }
 
     /// Opt-in corpus test: after the game's own `InitComponent` builds the main menu, every
@@ -2253,73 +2263,75 @@ mod tests {
     /// is what makes `AfterPaint` draw its caption.
     #[test]
     fn opt_in_menu_control_and_caption_rects_fit_the_screen() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let storage = TestStorage::new("controls");
-        let mut session = MenuSession::open_configured(
-            &game_dir,
-            storage.save_dir(),
-            &storage.config_dir(),
-            None,
-        )
-        .expect("open the front-end menu");
-        session.clip = [1280.0, 720.0];
-        session.refresh_commands();
-        let clip = session.clip;
-        assert_eq!(session.controls.len(), XIIIMENU_CONTROL_COUNT);
-        let mut controls = Vec::new();
-        for c in &session.controls {
-            let win = [
-                vm_f32(&session.vm, *c, "WinLeft"),
-                vm_f32(&session.vm, *c, "WinTop"),
-                vm_f32(&session.vm, *c, "WinWidth"),
-                vm_f32(&session.vm, *c, "WinHeight"),
-            ];
-            let r = map_menu_control_rect(win, clip);
-            assert!(
-                rect_inside(r, clip),
-                "control {} rect {r:?} outside {clip:?}",
-                session.control_labels[controls.len()]
-            );
-            controls.push(r);
-        }
-        let mut captions = Vec::new();
-        let mut names = Vec::new();
-        for prop in XIIIMENU_LABEL_PROPS {
-            let design = label_rect(&session.vm, session.page, prop);
-            let r = map_menu_label_rect(design, clip);
-            assert!(rect_inside(r, clip), "{prop} rect {r:?} outside {clip:?}");
-            captions.push(r);
-            names.push(prop);
-        }
-        for i in 0..captions.len() {
-            for j in (i + 1)..captions.len() {
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let storage = TestStorage::new("controls");
+            let mut session = MenuSession::open_configured(
+                &game_dir,
+                storage.save_dir(),
+                &storage.config_dir(),
+                None,
+            )
+            .expect("open the front-end menu");
+            session.clip = [1280.0, 720.0];
+            session.refresh_commands();
+            let clip = session.clip;
+            assert_eq!(session.controls.len(), XIIIMENU_CONTROL_COUNT);
+            let mut controls = Vec::new();
+            for c in &session.controls {
+                let win = [
+                    vm_f32(&session.vm, *c, "WinLeft"),
+                    vm_f32(&session.vm, *c, "WinTop"),
+                    vm_f32(&session.vm, *c, "WinWidth"),
+                    vm_f32(&session.vm, *c, "WinHeight"),
+                ];
+                let r = map_menu_control_rect(win, clip);
                 assert!(
-                    !rects_overlap(captions[i], captions[j]),
-                    "captions {} {:?} and {} {:?} overlap",
-                    names[i],
-                    captions[i],
-                    names[j],
-                    captions[j]
+                    rect_inside(r, clip),
+                    "control {} rect {r:?} outside {clip:?}",
+                    session.control_labels[controls.len()]
                 );
+                controls.push(r);
             }
-        }
-        // The first control is focused (GUIPage.InitComponent -> FocusFirst) and its delegate
-        // highlight is on, so `XIIIMenu.AfterPaint` draws its caption.
-        let focused = session.controls[0];
-        assert!(
-            matches!(
-                session.vm.get_property(focused, "bDisplayTex"),
-                Some(Value::Bool(true))
-            ),
-            "the focused control's MouseEnter delegate must set bDisplayTex"
-        );
-        println!(
-            "[menu test] control_rects={controls:?} caption_rects={captions:?} focused={}",
-            session.control_labels[0]
-        );
+            let mut captions = Vec::new();
+            let mut names = Vec::new();
+            for prop in XIIIMENU_LABEL_PROPS {
+                let design = label_rect(&session.vm, session.page, prop);
+                let r = map_menu_label_rect(design, clip);
+                assert!(rect_inside(r, clip), "{prop} rect {r:?} outside {clip:?}");
+                captions.push(r);
+                names.push(prop);
+            }
+            for i in 0..captions.len() {
+                for j in (i + 1)..captions.len() {
+                    assert!(
+                        !rects_overlap(captions[i], captions[j]),
+                        "captions {} {:?} and {} {:?} overlap",
+                        names[i],
+                        captions[i],
+                        names[j],
+                        captions[j]
+                    );
+                }
+            }
+            // The first control is focused (GUIPage.InitComponent -> FocusFirst) and its delegate
+            // highlight is on, so `XIIIMenu.AfterPaint` draws its caption.
+            let focused = session.controls[0];
+            assert!(
+                matches!(
+                    session.vm.get_property(focused, "bDisplayTex"),
+                    Some(Value::Bool(true))
+                ),
+                "the focused control's MouseEnter delegate must set bDisplayTex"
+            );
+            println!(
+                "[menu test] control_rects={controls:?} caption_rects={captions:?} focused={}",
+                session.control_labels[0]
+            );
+        })
     }
 
     /// Opt-in corpus check for the retail audio page's master-volume persistence. It advances
@@ -2327,45 +2339,47 @@ mod tests {
     /// Enter through the page handler, then starts a fresh VM and reads the saved value.
     #[test]
     fn opt_in_audio_page_master_volume_survives_restart() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let base =
-            std::env::temp_dir().join(format!("xiii-menu-music-persist-{}", std::process::id()));
-        let config_dir = base.join("config");
-        let save_dir = base.join("saves");
-        let _ = std::fs::remove_dir_all(&base);
-        let mut session =
-            MenuSession::open_configured(&game_dir, save_dir.clone(), &config_dir, None)
-                .expect("open menu with disposable configuration");
-        let initial = session.vm.canvas.menu.as_ref().unwrap().master_db;
-        session
-            .open_page("XIDInterf.XIIIMenuAudioClientWindow")
-            .expect("open retail audio page");
-        session.dispatch_key(40).expect("focus Sound Volume slider");
-        session
-            .dispatch_key(37)
-            .expect("decrease Sound Volume slider one step from its upper endpoint");
-        session.dispatch_key(13).expect("apply audio page options");
-        session.advance(1.0 / 60.0);
-        let saved = config::load(
-            &game_dir,
-            &config::user_path(&game_dir, &config_dir).unwrap(),
-        )
-        .expect("read persisted settings");
-        assert_ne!(
-            saved.master_db, initial,
-            "the audio slider change must persist"
-        );
+        crate::vmstack::run_on_vm_stack(|| {
+            let Some(game_dir) = opt_in_root() else {
+                println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+                return;
+            };
+            let base = std::env::temp_dir()
+                .join(format!("xiii-menu-music-persist-{}", std::process::id()));
+            let config_dir = base.join("config");
+            let save_dir = base.join("saves");
+            let _ = std::fs::remove_dir_all(&base);
+            let mut session =
+                MenuSession::open_configured(&game_dir, save_dir.clone(), &config_dir, None)
+                    .expect("open menu with disposable configuration");
+            let initial = session.vm.canvas.menu.as_ref().unwrap().master_db;
+            session
+                .open_page("XIDInterf.XIIIMenuAudioClientWindow")
+                .expect("open retail audio page");
+            session.dispatch_key(40).expect("focus Sound Volume slider");
+            session
+                .dispatch_key(37)
+                .expect("decrease Sound Volume slider one step from its upper endpoint");
+            session.dispatch_key(13).expect("apply audio page options");
+            session.advance(1.0 / 60.0);
+            let saved = config::load(
+                &game_dir,
+                &config::user_path(&game_dir, &config_dir).unwrap(),
+            )
+            .expect("read persisted settings");
+            assert_ne!(
+                saved.master_db, initial,
+                "the audio slider change must persist"
+            );
 
-        let restarted = MenuSession::open_configured(&game_dir, save_dir, &config_dir, None)
-            .expect("restart menu VM");
-        assert_eq!(
-            restarted.vm.canvas.menu.as_ref().unwrap().master_db,
-            saved.master_db
-        );
-        let _ = std::fs::remove_dir_all(base);
+            let restarted = MenuSession::open_configured(&game_dir, save_dir, &config_dir, None)
+                .expect("restart menu VM");
+            assert_eq!(
+                restarted.vm.canvas.menu.as_ref().unwrap().master_db,
+                saved.master_db
+            );
+            let _ = std::fs::remove_dir_all(base);
+        })
     }
 
     #[test]
