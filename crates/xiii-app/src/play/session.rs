@@ -739,68 +739,117 @@ impl Session {
         }
     }
 
-    /// Drive render-phase callbacks in the deterministic headless harness. The actual windowed
-    /// app calls `HUD.PostRender` from `hud::refresh`; this mirrors that engine callback until the
-    /// script HUD opens the one-way `MapInfo.EndCartoonEffect` gate.
+    /// Run the script callbacks needed by headless gameplay. HUD.PostRender drives the opening
+    /// cartoon gate; MyPCPostRender owns interaction targeting throughout play. Weapon drawing
+    /// belongs to the presentation renderer, so the headless driver does not render weapons.
     pub fn drive_render_phase(&mut self) {
+        let canvas = if let Some(canvas) = self.render_canvas {
+            canvas
+        } else {
+            let Some(class) = runtime::resolve_class_path(self.vm.set(), "Engine.Canvas") else {
+                self.blocked
+                    .push("headless render: Engine.Canvas class not loaded".into());
+                return;
+            };
+            let canvas = match self.vm.spawn(class, "HUDCanvas(headless)") {
+                Ok(canvas) => canvas,
+                Err(e) => {
+                    self.record_failure("headless render Canvas", &e);
+                    return;
+                }
+            };
+            for (prop, value) in [
+                ("ClipX", Value::Float(1280.0)),
+                ("ClipY", Value::Float(720.0)),
+                ("CurX", Value::Float(0.0)),
+                ("CurY", Value::Float(0.0)),
+                ("OrgX", Value::Float(0.0)),
+                ("OrgY", Value::Float(0.0)),
+                ("Style", Value::Byte(1)),
+            ] {
+                if !self.vm.set_property(canvas, prop, 0, value) {
+                    self.blocked
+                        .push(format!("headless Canvas.{prop} is not writable"));
+                    return;
+                }
+            }
+            self.render_canvas = Some(canvas);
+            canvas
+        };
+        let arg = Value::Object(Some(ObjRef::Instance(canvas)));
         let end_cartoon = self.map_info().is_some_and(|mi| {
             matches!(
                 self.vm.get_property(mi, "EndCartoonEffect"),
                 Some(Value::Bool(true))
             )
         });
-        if !end_cartoon {
-            let hud = self
+        if !end_cartoon
+            && let Some(hud) = self
                 .controller
                 .and_then(|pc| instance_prop(&self.vm, pc, "myHUD"))
-                .or_else(|| crate::play::hud::find_hud(&self.vm));
-            if let Some(hud) = hud {
-                let canvas = if let Some(canvas) = self.render_canvas {
-                    canvas
-                } else {
-                    let Some(class) = runtime::resolve_class_path(self.vm.set(), "Engine.Canvas")
-                    else {
-                        self.blocked
-                            .push("headless HUD gate: Engine.Canvas class not loaded".into());
-                        return;
-                    };
-                    let canvas = match self.vm.spawn(class, "HUDCanvas(headless)") {
-                        Ok(canvas) => canvas,
-                        Err(e) => {
-                            self.record_failure("headless HUD Canvas", &e);
-                            return;
-                        }
-                    };
-                    for (prop, value) in [
-                        ("ClipX", Value::Float(1280.0)),
-                        ("ClipY", Value::Float(720.0)),
-                        ("CurX", Value::Float(0.0)),
-                        ("CurY", Value::Float(0.0)),
-                        ("OrgX", Value::Float(0.0)),
-                        ("OrgY", Value::Float(0.0)),
-                        ("Style", Value::Byte(1)),
-                    ] {
-                        let _ = self.vm.set_property(canvas, prop, 0, value);
-                    }
-                    self.render_canvas = Some(canvas);
-                    canvas
-                };
-                let arg = Value::Object(Some(ObjRef::Instance(canvas)));
-                if let Err(e) = self.vm.send_event(hud, "PostRender", vec![arg]) {
-                    self.record_failure("headless HUD.PostRender", &e);
-                }
-                self.vm.drain_canvas();
-                self.drain_events();
-            }
-        }
-        if let Some(pc) = self.controller
-            && self.vm.is_in_state(pc, "WaitForFirstDisplay")
-            && let Err(e) = self
-                .vm
-                .send_event(pc, "RenderOverlays", vec![Value::Object(None)])
+                .or_else(|| crate::play::hud::find_hud(&self.vm))
+            && let Err(e) = self.vm.send_event(hud, "PostRender", vec![arg.clone()])
         {
-            self.record_failure("headless PlayerController.RenderOverlays", &e);
+            self.record_failure("headless HUD.PostRender", &e);
         }
+        self.render_interaction(canvas);
+        self.vm.drain_canvas();
+        self.drain_events();
+    }
+
+    /// The game's interaction render event is a gameplay producer as well as HUD presentation:
+    /// it computes TargetActor and the available Grab actions. Keep it in both play drivers.
+    pub fn render_interaction(&mut self, canvas: ObjectId) {
+        let Some(pc) = self.controller else {
+            return;
+        };
+        let arg = Value::Object(Some(ObjRef::Instance(canvas)));
+        if self.vm.is_in_state(pc, "WaitForFirstDisplay") {
+            if let Err(e) = self.vm.send_event(pc, "RenderOverlays", vec![arg]) {
+                self.record_failure("PlayerController.RenderOverlays", &e);
+            }
+        } else if let Some(interaction) = instance_prop(&self.vm, pc, "MyInteraction") {
+            if let Err(e) = self.vm.send_event(interaction, "MyPCPostRender", vec![arg]) {
+                self.record_failure("XIIIPlayerInteraction.MyPCPostRender", &e);
+            }
+        } else {
+            self.blocked
+                .push("player controller has no MyInteraction for render targeting".into());
+        }
+    }
+
+    /// Publish the host camera orientation before render-phase traces read Controller.Rotation.
+    pub fn sync_view_rotation(&mut self, yaw: f32, pitch: f32) {
+        if self.script_owns_player_pawn() {
+            return;
+        }
+        let units =
+            |angle: f32| (angle / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN).round() as i32;
+        if let Some(pc) = self.controller {
+            self.vm.set_property(
+                pc,
+                "Rotation",
+                0,
+                Value::Rotator([units(pitch), units(yaw), 0]),
+            );
+        }
+    }
+
+    /// Dispatch a normal controller weapon-selection exec; completion belongs to the weapon
+    /// state machine and decoded animation/timer callbacks, so this does not complete a switch.
+    pub fn weapon_input(&mut self, group: Option<u8>) -> Result<(), String> {
+        let pc = self
+            .controller
+            .ok_or_else(|| "no player controller".to_owned())?;
+        let (function, args) = match group {
+            Some(group) => ("SwitchWeapon", vec![Value::Byte(group)]),
+            None => ("NextWeapon", Vec::new()),
+        };
+        self.vm
+            .send_event(pc, function, args)
+            .map_err(|e| e.to_string())?;
+        self.drain_events();
+        Ok(())
     }
 
     /// Host movement ownership is temporarily ceded by the Plage01 wake-up script. While this is
@@ -1365,83 +1414,40 @@ impl Session {
         }
     }
 
-    /// item40e: host grab of a deco pickup. Mirrors the `MyInteraction.bCanPickup` branch of the
-    /// game's `XIIIPlayerController.Grab` (XIII.u, bytecode 0x03F1..0x0495): when the target is
-    /// an `XIIIDecoPickup` and the pawn's `Weapon` or `PendingWeapon` is already a `DecoWeapon`,
-    /// `Grab` returns; otherwise it sets `bPickingUp`, calls the target's `Touch(Pawn)` and then
-    /// clears `bPickingUp` and `MyInteraction.TargetActor`. The pickup's own
-    /// `Pickup.ValidTouch` requires both `bPickingUp` and `MyInteraction.TargetActor == self`,
-    /// which is why walking into a chair never takes it. The host has no crosshair interaction
-    /// targeting, so it assigns `MyInteraction.TargetActor` to the named actor (labelled bridge:
-    /// the HUD interaction would set it from the view trace); everything else is the game's
-    /// code. A non-deco target returns [`UseOutcome::NotAMover`].
+    /// Named deco use validates the target chosen by the game's view trace and then executes
+    /// the controller's Grab. Naming an actor never supplies TargetActor or bypasses aiming.
     pub fn grab_deco_pickup(&mut self, target_name: &str) -> UseOutcome {
-        let Some(target) = self.vm.find_object(target_name) else {
+        let Some(target) = self.vm.find_live_object(target_name) else {
             return UseOutcome::NotAMover;
         };
         if !self.vm.is_a(target, "XIIIDecoPickup") {
             return UseOutcome::NotAMover;
         }
-        let pawn = self.player;
         let Some(controller) = self.controller else {
             return UseOutcome::Error("no player controller".to_owned());
         };
-        let holds_deco = ["Weapon", "PendingWeapon"].iter().any(|slot| {
-            instance_prop(&self.vm, pawn, slot).is_some_and(|w| self.vm.is_a(w, "DecoWeapon"))
-        });
-        if holds_deco {
-            return UseOutcome::DecoAlreadyHeld;
-        }
         let Some(interaction) = instance_prop(&self.vm, controller, "MyInteraction") else {
             return UseOutcome::Error("controller has no MyInteraction".to_owned());
         };
-        self.vm.set_active(pawn, true);
-        self.vm.set_active(controller, true);
-        self.vm.set_active(target, true);
-        // The pickup's `SpawnCopy -> GiveTo` reads and updates the pawn's own inventory (e.g.
-        // `Weapon.GiveTo` -> `FindInventoryType(AmmoName).AddAmmo`), so the carried items are
-        // live participants of this action like the pawn itself (same scope rule as
-        // `search_corpse`): a deferred call on a suspended item would abort the pickup.
-        let mut cur = self.inventory_head(pawn);
-        let mut guard = 0;
-        while let Some(item) = cur {
-            guard += 1;
-            if guard > 256 {
-                break;
-            }
-            self.vm.set_active(item, true);
-            cur = self.inventory_head(item);
+        if ["Weapon", "PendingWeapon"].iter().any(|slot| {
+            instance_prop(&self.vm, self.player, slot)
+                .is_some_and(|w| self.vm.is_a(w, "DecoWeapon"))
+        }) {
+            return UseOutcome::DecoAlreadyHeld;
         }
-        let target_ref = Value::Object(Some(ObjRef::Instance(target)));
-        if !self
-            .vm
-            .set_property(interaction, "TargetActor", 0, target_ref)
-            || !self
-                .vm
-                .set_property(controller, "bPickingUp", 0, Value::Bool(true))
+        if instance_prop(&self.vm, interaction, "TargetActor") != Some(target)
+            || !matches!(
+                self.vm.get_property(interaction, "bCanPickup"),
+                Some(Value::Bool(true))
+            )
         {
-            return UseOutcome::Error(
-                "MyInteraction.TargetActor / bPickingUp not writable".to_owned(),
-            );
+            return UseOutcome::PickupRefused;
         }
         let before = self.inventory_items();
-        let touched = self.vm.send_event(
-            target,
-            "Touch",
-            vec![Value::Object(Some(ObjRef::Instance(pawn)))],
-        );
-        // `Grab` clears both after the touch whatever its result.
-        let _ = self
-            .vm
-            .set_property(controller, "bPickingUp", 0, Value::Bool(false));
-        let _ = self
-            .vm
-            .set_property(interaction, "TargetActor", 0, Value::Object(None));
-        if let Err(e) = touched {
+        if let Err(e) = self.vm.send_event(controller, "Grab", Vec::new()) {
             return UseOutcome::Error(e.to_string());
         }
         self.drain_events();
-        // Taken when the game's chain added an inventory item (`SpawnCopy` -> `GiveTo`).
         if self.inventory_items().len() > before.len() {
             UseOutcome::PickedUp
         } else {
@@ -2260,61 +2266,6 @@ impl Session {
              active-after-GiveTo={active_after_give}, ChangedWeapon {changed:?}, \
              Pawn.Weapon={weapon:?}, ThirdPersonActor={attach:?}"
         ))
-    }
-
-    /// Equips the best weapon the player already carries in the game's own `Inventory` chain,
-    /// through the game's own switch sequence (item14b). This is the normal weapon-switch
-    /// action; it never spawns or grants a weapon. Used after walking onto a map weapon pickup.
-    /// Returns the equipped weapon name, or an error naming the reason (no weapon carried, or
-    /// the script raised).
-    pub fn equip_inventory_weapon(&mut self) -> Result<String, String> {
-        let mut cur = self.inventory_head(self.player);
-        let mut best: Option<ObjectId> = None;
-        let mut guard = 0;
-        while let Some(id) = cur {
-            guard += 1;
-            if guard > 256 {
-                break;
-            }
-            if self.vm.is_a(id, "weapon") {
-                // Prefer a real gun over the starting `Fists`.
-                if best.is_none() || !self.vm.is_a(id, "fists") {
-                    best = Some(id);
-                }
-            }
-            cur = self.inventory_head(id);
-        }
-        let Some(weapon) = best else {
-            return Err("no weapon in the inventory chain".to_owned());
-        };
-        let name = self.vm.objects[weapon as usize].name.clone();
-        // The authored manual switch (`XIIIPlayerController.SwitchWeapon` 0x0140) sets
-        // `Pawn.PendingWeapon` and defers to `Weapon.PutDown()`'s state machine; the immediate
-        // completion is the pawn's own `XIIIPawn.ChangedWeapon` (0x024D: `Weapon =
-        // PendingWeapon`, `AttachToPawn`, `Controller.ChangedWeapon`). `Weapon.BringUp`
-        // (engine.u 0x0087) only runs `PlaySelect`/`GotoState('Active')` and never touches
-        // `PendingWeapon`, so the bridge composes `PendingWeapon` + `BringUp` +
-        // `ChangedWeapon` — the same immediate switch `ClientWeaponSet` (0x0073) runs when the
-        // pawn has no weapon. The PutDown-deferred state machine is not simulated here.
-        self.vm.set_property(
-            self.player,
-            "PendingWeapon",
-            0,
-            Value::Object(Some(ObjRef::Instance(weapon))),
-        );
-        if let Err(e) = self.vm.send_event(weapon, "BringUp", Vec::new()) {
-            return Err(format!("{name} BringUp: {e}"));
-        }
-        if let Err(e) = self.vm.send_event(self.player, "ChangedWeapon", Vec::new()) {
-            return Err(format!("{name} ChangedWeapon: {e}"));
-        }
-        if self.player_weapon() != Some(weapon) {
-            return Err(format!(
-                "{name} ChangedWeapon left Pawn.Weapon at {:?}",
-                self.player_weapon()
-            ));
-        }
-        Ok(name)
     }
 
     /// The player weapon's first-person mesh path: the decoded `MeshName` string

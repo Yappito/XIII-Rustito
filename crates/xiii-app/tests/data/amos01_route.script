@@ -25,8 +25,10 @@ t=110.50 use
 t=114.00 goto 72 -700
 t=118.00 goto 288 -1000
 t=121.00 goto 156 -1053
+t=122.50 track ChaiseDeco2
 t=123.00 use ChaiseDeco2
-t=123.50 equip
+t=123.10 track off
+t=123.50 switch_weapon 20
 # Break the duct grille BreakAbleMover16 with the chair swing.
 t=125.00 goto 175 -1198
 t=127.00 track BreakAbleMover16

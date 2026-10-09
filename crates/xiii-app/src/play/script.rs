@@ -6,6 +6,7 @@
 //! the interactive window uses.
 //!
 //! Supported commands:
+//! - `switch_weapon <byte>` / `next_weapon`: normal controller weapon selection execs.
 //! - `forward <v>` / `back <v>`: set the forward axis (`back` negates `v`).
 //! - `right <v>` / `left <v>`: set the strafe axis (`left` negates `v`).
 //! - `walk <0|1|on|off>`: set the Shift walk modifier.
@@ -76,7 +77,8 @@ pub enum Command {
     /// Request one use/interact action (edge-triggered; the VM `Grab`/use chain). Ray-based: the
     /// host picks the actor in front of the camera.
     Use,
-    /// Use/interact with a named actor directly (edge-triggered). Needed for invisible interaction
+    /// Named use (edge-triggered); deco pickups require the game's current aimed TargetActor.
+    /// Needed for invisible interaction
     /// doors (Plage01 `Porte1`) and to search a named corpse; the ray cannot pick a hidden door or
     /// a dynamic pawn.
     UseNamed(String),
@@ -98,9 +100,10 @@ pub enum Command {
     /// the same game function the goal trigger calls, so `TestGoalComplete`/`DoTravel`/`EndGame`/
     /// `ServerTravel` all run through the game's code. Labelled a bridge in the report.
     SetGoal(i32),
-    /// Equip the best weapon the player already carries in the game's own inventory chain (the
-    /// `BringUp`/`ChangedWeapon` path), e.g. after walking onto a map weapon pickup (item14b).
-    Equip,
+    /// Normal player controller SwitchWeapon exec, selecting a carried inventory group.
+    SwitchWeapon(u8),
+    /// Normal player controller NextWeapon exec.
+    NextWeapon,
     /// item18 diagnostic command: give the local player control by running the game's own
     /// `XIIIPlayerController.EnterStartState` with `bOkForMoving = true` (the HUD's normal
     /// "first display done" transition). Needed because the decoded Plage01 intro leaves the
@@ -220,7 +223,23 @@ impl Script {
                         .map_err(|_| format!("line {n}: bad objective number"))?;
                     Command::SetGoal(n)
                 }
-                "equip" | "select" => Command::Equip,
+                "switch_weapon" => {
+                    let group = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: switch_weapon needs a byte"))?
+                        .parse::<u8>()
+                        .map_err(|_| format!("line {n}: invalid weapon group"))?;
+                    if it.next().is_some() {
+                        return Err(format!("line {n}: unexpected switch_weapon argument"));
+                    }
+                    Command::SwitchWeapon(group)
+                }
+                "next_weapon" => {
+                    if it.next().is_some() {
+                        return Err(format!("line {n}: next_weapon takes no arguments"));
+                    }
+                    Command::NextWeapon
+                }
                 "take_control" | "take-control" | "assume_control" => Command::TakeControl,
                 "wake" => {
                     let target = it
@@ -268,8 +287,7 @@ pub struct Drive {
     jump_pending: bool,
     use_pending: bool,
     fire_pending: bool,
-    /// `equip` requested (edge-triggered) and not yet applied by the host.
-    equip_pending: bool,
+    weapon_inputs: Vec<Option<u8>>,
     /// Weapons requested (`weapon <Package.Class>`) and not yet applied by the host.
     weapons: Vec<String>,
     /// Named `use <ActorName>` targets not yet applied by the host.
@@ -303,7 +321,7 @@ impl Drive {
             jump_pending: false,
             use_pending: false,
             fire_pending: false,
-            equip_pending: false,
+            weapon_inputs: Vec::new(),
             weapons: Vec::new(),
             use_named: Vec::new(),
             search: Vec::new(),
@@ -366,9 +384,9 @@ impl Drive {
         self.waiting_travel = false;
     }
 
-    /// Takes the pending `equip` request (edge-triggered).
-    pub fn take_equip(&mut self) -> bool {
-        std::mem::take(&mut self.equip_pending)
+    /// Drains normal weapon-selection inputs, preserving repeated commands in order.
+    pub fn take_weapon_inputs(&mut self) -> Vec<Option<u8>> {
+        std::mem::take(&mut self.weapon_inputs)
     }
 
     /// Takes the pending `wake <ActorName>` targets.
@@ -416,7 +434,8 @@ impl Drive {
                     self.cursor += 1;
                     break;
                 }
-                Command::Equip => self.equip_pending = true,
+                &Command::SwitchWeapon(group) => self.weapon_inputs.push(Some(group)),
+                Command::NextWeapon => self.weapon_inputs.push(None),
                 Command::TakeControl => self.control_pending = true,
                 Command::Wake(target) => self.wake.push(target.clone()),
             }
@@ -465,6 +484,24 @@ impl Drive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_weapon_input_preserves_order_and_does_not_request_diagnostic_equip() {
+        let script =
+            Script::parse("t=1 switch_weapon 2\nt=1 next_weapon\nt=1 switch_weapon 20\n").unwrap();
+        let mut drive = Drive::new(&script);
+        let mut sim = PlayerSim::new([0.0; 3], 0.0);
+        drive.advance(0.9, &mut sim);
+        assert!(drive.take_weapon_inputs().is_empty());
+        drive.advance(1.0, &mut sim);
+        assert_eq!(drive.take_weapon_inputs(), [Some(2), None, Some(20)]);
+        assert!(drive.take_weapon_inputs().is_empty());
+        assert!(Script::parse("t=0 equip").is_err());
+        assert!(Script::parse("t=0 next_weapon extra").is_err());
+        for invalid in ["-1", "256", "NaN", "2 extra", ""] {
+            assert!(Script::parse(&format!("t=0 switch_weapon {invalid}")).is_err());
+        }
+    }
 
     #[test]
     fn parses_and_applies_events_in_order() {
