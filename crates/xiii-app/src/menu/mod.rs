@@ -1900,15 +1900,23 @@ pub fn build_menu_app(options: Options) -> App {
         PresentMode::AutoVsync
     };
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "XIII Classic runtime - front-end menu (item16)".into(),
-            resolution: (options.width, options.height).into(),
-            present_mode,
-            ..default()
-        }),
-        ..default()
-    }));
+    // The menu app runs on the explicit VM host stack (see crate::vmstack); allow the winit
+    // event loop to be created off the main thread (supported on Windows).
+    app.add_plugins(
+        DefaultPlugins
+            .set(bevy::winit::WinitPlugin {
+                run_on_any_thread: true,
+            })
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "XIII Classic runtime - front-end menu (item16)".into(),
+                    resolution: (options.width, options.height).into(),
+                    present_mode,
+                    ..default()
+                }),
+                ..default()
+            }),
+    );
     app.insert_resource(MenuState {
         tick: 0,
         start: Instant::now(),

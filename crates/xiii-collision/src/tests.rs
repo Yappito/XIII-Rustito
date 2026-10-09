@@ -1177,6 +1177,96 @@ fn moving_wall_blocks_then_unblocks_a_sweep() {
 }
 
 #[test]
+fn disabled_moving_object_is_ignored_by_every_query_until_re_enabled() {
+    // item40e: a destroyed/non-colliding mover (a broken grille) stays installed but must not
+    // block sweeps, rays or overlaps; re-enabling restores it at its current pose.
+    let mut w = CollisionWorld::new(std::iter::empty());
+    let idx = w.add_moving(MovingObject::from_world_triangles(
+        wall_x(0.0),
+        7,
+        [0.0; 3],
+        ID,
+    ));
+    let (start, end, half) = ([-2.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.1, 0.1, 0.1]);
+    assert!(w.sweep(start, end, half).is_some());
+    assert!(w.set_moving_enabled(idx, false));
+    assert!(!w.moving(idx).unwrap().is_enabled());
+    assert!(
+        w.sweep(start, end, half).is_none(),
+        "disabled mover blocked a sweep"
+    );
+    assert!(w.ray(start, end).is_none(), "disabled mover blocked a ray");
+    assert!(
+        !w.overlaps_aabb([0.0; 3], [0.1; 3]),
+        "disabled mover overlapped"
+    );
+    assert!(w.overlap_aabb([0.0; 3], [0.1; 3]).is_empty());
+    assert!(w.set_moving_enabled(idx, true));
+    assert_eq!(w.sweep(start, end, half).map(|h| h.source), Some(7));
+    assert!(
+        !w.set_moving_enabled(idx + 1, false),
+        "out-of-range index must report false"
+    );
+}
+
+#[test]
+fn box_resting_on_a_coplanar_floor_crosses_a_triangle_edge_flush_with_its_front() {
+    // item40e (Amos01 duct mouth): a box resting exactly on y = 0 whose front face lies exactly
+    // on the leading edge of the next coplanar floor triangle must move onto it. Before, the
+    // zero-depth contact on the static y axis counted as overlap, so the edge returned a
+    // horizontal hit at t = 0 and the box stalled (step-up had no headroom under a duct roof).
+    let tris: Vec<(Triangle, u32)> = vec![
+        ([[0.5, 0.0, -1.0], [0.4, 0.0, 1.0], [0.5, 0.0, 1.0]], 1),
+        ([[-3.0, 0.0, -1.0], [0.5, 0.0, -1.0], [-3.0, 0.0, 1.0]], 1),
+    ];
+    let w = world(tris);
+    let half = [0.5, 0.5, 0.5];
+    let start = [1.0, 0.5, 0.0]; // front face x = 0.5, bottom y = 0
+    assert!(
+        w.sweep(start, [-2.0, 0.5, 0.0], half).is_none(),
+        "a coplanar floor edge flush with the box front must not block"
+    );
+    // A flush wall alongside the motion behaves the same way (side face exactly on z = 0.5).
+    let wall: Vec<(Triangle, u32)> = vec![
+        ([[0.5, 0.0, 1.0], [0.5, 1.0, 1.0], [-3.0, 1.0, 1.0]], 2),
+        ([[0.5, 0.0, 1.0], [-3.0, 1.0, 1.0], [-3.0, 0.0, 1.0]], 2),
+    ];
+    let w = world(wall);
+    assert!(
+        w.sweep([1.0, 0.5, 0.5], [-2.0, 0.5, 0.5], half).is_none(),
+        "a wall flush with the box side must not block motion along it"
+    );
+}
+
+#[test]
+fn a_real_overlap_on_the_static_axis_still_blocks() {
+    // Guard for the touching rule: a 1 cm slab top above the box bottom is a genuine obstacle
+    // (overlap far above the 1e-5 m contact tolerance) and must stop the sweep at its face.
+    let slab = box_tris([-1.0, -0.2, -1.0], [0.0, 0.01, 1.0], 3);
+    let w = world(slab);
+    let hit = w
+        .sweep([1.0, 0.5, 0.0], [-2.0, 0.5, 0.0], [0.5, 0.5, 0.5])
+        .expect("the raised slab must block");
+    assert!((hit.t - 0.5 / 3.0).abs() < 1e-3, "t={}", hit.t);
+    assert!(hit.normal[0] > 0.9, "normal {:?}", hit.normal);
+    // A flat sheet 0.005 mm above the box bottom (below the tolerance) is a touching contact.
+    let sheet: Vec<(Triangle, u32)> = quad(
+        [-1.0, 0.000_005, -1.0],
+        [0.0, 0.000_005, -1.0],
+        [0.0, 0.000_005, 1.0],
+        [-1.0, 0.000_005, 1.0],
+    )
+    .into_iter()
+    .map(|t| (t, 3))
+    .collect();
+    assert!(
+        world(sheet)
+            .sweep([1.0, 0.5, 0.0], [-2.0, 0.5, 0.0], [0.5, 0.5, 0.5])
+            .is_none()
+    );
+}
+
+#[test]
 fn a_door_rotating_open_clears_a_doorway() {
     // Static wall in the x = 0 plane, y in [0,2], with a doorway gap for z in [-1, 1]; the
     // door leaf is a dynamic box hinged at (0, 0, -1) that fills the gap when closed.
