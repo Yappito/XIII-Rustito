@@ -1,10 +1,54 @@
 # Handoff for the next implementation agent
 
-Updated: **2026-10-06 (evening)**. Research phase (2026-10-04), M0, M1 and the M2 first passes are done; the second 2026-10-05 session added collision, placement, BSP zones and the script VM's spawn/lifecycle/physics layer. Start with **"Next session: start here"** below.
+Updated: **2026-10-07 (morning, coordinator handover)**. Research phase (2026-10-04), M0, M1 and the M2 first passes are done; the second 2026-10-05 session added collision, placement, BSP zones and the script VM's spawn/lifecycle/physics layer. Start with **"Next session: start here"** below.
 
 ## Next session: start here
 
-State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `4ac6308` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
+State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `a6e1abd` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
+
+### Coordinator handover (2026-10-07 morning) — read this first
+
+The coordinating Claude session ran out of weekly usage. Everything verified is on `origin/main`
+(`a6e1abd`). Open work lives on local branches in `P:/AI/XIII/local/wt/*` (git-ignored worktrees on
+the user's machine), committed as WIP so nothing is uncommitted:
+
+| Worktree / branch | State | What to do |
+|---|---|---|
+| `fx` / `item44-pickup-ammo` (`01b3f2b`) | Tests only: `FindInventoryType` exact-class unit test; opt-in Plage01 test that the walked-up `BerettaPick0` gets `c9mmAmmo` and damages BaseSoldier6. Agent ran verify (831 passed). | Merge `origin/main`, run `bash local/verify.sh` + Plage00 trace cmp yourself, push. |
+| `audio` / `item30-plage01-walk` (`1978089`) | Plage01 route without teleports, **not assembled**. Report `local/wt/audio/local/reports/item30-plage01-walk.md`: segments A (hut: key, Beretta, `Porte6`, TouchTrigger9), B (beach walk along the decoded ReachSpec graph, ~21,100 UU, running jump over the crate wall at x -4270..-4050) and C (TouchTrigger8/7, killer approach `PathNode45 -> AttackPoint47`) measured in scratch scripts under `local/scratch/item30/`; D (truck: return legs, `Porte1`) pending. Also adds `PHYS_Falling` advance + `Controller.WaitForLanding` latent for script pawns (labelled Partial, upstream-UE2 evidence only). Fixture still has 8 teleport lines. | Assemble A-D into `crates/xiii-app/tests/data/plage01_route.script` with no teleports, `track BaseSoldier6` around the firing, run `opt_in_plage01_route_objectives_and_travel`; review the falling/landing code before merging. Spec: `local/tasks/item30c-plage01-assemble.md`. |
+| `steam` / `item27-cine-latents` | = main. | Banque01 story route (below). Spec: `local/tasks/item27j-banque-story-route.md`. |
+| `codex1` / `item41-ai-senses` (`59b602a`) | Parked: `MakeNoise -> HearNoise` approximation (radius `HearingThreshold*Loudness`, clear trace). Not evidenced. | Decode `AActor::CheckNoiseHearing` (Engine.dll `0x1036b6d0`, ~1 KB x87) and `CanHear` first; do not merge as is. |
+| `viewer` / `item39-vm-perf-2` (`cfc7721`) | Parked: allocation-free `Tick` args, `IAController` perception index. Benchmarks were noisy (machine loaded). | Benchmark on a quiet machine (`--play --benchmark 300 --benchmark-warmup 60 --no-vsync`, 3 runs, main vs branch) before merging. |
+
+**Banque01 without the `set_goal` bridges — where it stands (measured on `a6e1abd`).** The engine
+side now works: the HUD ends the level-start cartoon when the player moves, `Cine2` pawns
+initialize, cine moves arrive. With the route start `t=0.50 forward 1`, `t=1.50 forward 0`,
+`t=3.00 teleport -428 -2312 80` (DetectionVolume1) and the two `set_goal` lines removed, Cine1
+plays 26 actions and stops at `wait player 300` (the route teleports away); objective 0 is
+promoted but not completed; Cine15 never starts because nothing enters `DetectionVolume12`
+(Event `jones_dial`, Location (-7616,-2784,1456)); Cine11 reaches `playerevent fin_map`; Cine16
+`wait player 200`, Cine6 `wait event james`. What remains is authoring the route by the level's
+intended flow (stay within each `wait player N` radius, enter DetectionVolume12 at the right
+point), then removing the bridges. Key mechanisms, all decoded: `Cine2.CineInit` waits for
+`MapInfo.EndCartoonEffect` (while `CheckpointNumber < 2`) before `bInitialized`; `Cine2.Play`
+drops triggers before `bInitialized`; `DetectionVolume.Detection.Touch` fires once
+(`bActivated`); `XIIIBaseHud.DrawCartoonWindowBis` sets `EndCartoonEffect` when
+`PawnOwner.Velocity != 0` or when the slide-out finishes.
+
+**Amos01** (`opt_in_amos01_route_objectives_and_travel`, fixture `amos01_route.script`): control
+returns after the intro; objective "Rejoin the soldier on the rooftops" not reached yet; next
+map `Toits01`.
+
+**Provider notes (2026-10-07).** Z.AI (`zai-coding-plan/glm-5.3-flash`) hit its 5-hour limit at
+~08:50 (reset 17:40); it is the only delegate that reliably authors routes, slowly. opencode
+`openai/gpt-6-luna` implements precise specs but tends to end its turn without doing reverse
+engineering or route authoring. The Codex CLI workspace (second OpenAI subscription, always
+`-m gpt-6-luna`) was out of credits. Do not use Ollama Cloud or the local model. Launch opencode
+with `local/oc-launch.sh <worktree> <title> <spec> <model>`: it copies the spec into the worktree
+(agents resolve relative paths against the attached file and the sandbox denies paths outside the
+worktree), states the absolute worktree root, and retries when opencode hangs at startup without
+creating a session (this happens often). Fresh sessions only: resumed long sessions stall.
+Launch through Bash `run_in_background` with `timeout: 7200000`.
 
 ### How the user wants work organized
 
@@ -29,20 +73,15 @@ State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XII
 ### Environment notes
 
 - cargo/rustc in `C:\Users\ZoliBen\.cargo\bin` (Git Bash: `export PATH="$HOME/.cargo/bin:$PATH"`). Rust 1.99.0 pinned, MSVC 14.44. No `gh` CLI.
-- Full verification (about 2-4 minutes warm): `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && XIII_GOG_DIR=P:/AI/XIII/XIII_Game XIII_STEAM_DIR="P:/SteamLibrary/steamapps/common/XIII - Classic" cargo test --workspace`. Last result (`4ac6308`): **804 passed, 0 failed**. Use `bash P:/AI/XIII/local/verify.sh` (git-ignored helper: fmt + clippy + full tests with real exit status) before every push; piping cargo into `tail`/`awk` once masked a compile failure and broke main. Use absolute paths: some older opt-in tests resolve relative `XIII_GOG_DIR` against the crate directory.
+- Full verification (about 2-4 minutes warm): `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && XIII_GOG_DIR=P:/AI/XIII/XIII_Game XIII_STEAM_DIR="P:/SteamLibrary/steamapps/common/XIII - Classic" cargo test --workspace`. Last result (`a6e1abd`): **829 passed, 0 failed**. Use `bash P:/AI/XIII/local/verify.sh` (git-ignored helper: fmt + clippy + full tests with real exit status) before every push; piping cargo into `tail`/`awk` once masked a compile failure and broke main. Use absolute paths: some older opt-in tests resolve relative `XIII_GOG_DIR` against the crate directory.
 - Viewer: `cargo run -p xiii-app --release -- --map Plage01 --game-dir XIII_Game` (`--exit-after-secs N --screenshot <png>`, `--dump`, `--collision-test`, `--reach-test`, `--lighting off|baked`). Character: `--model xiiipersos.XIIIM --anim Walk`. Movement + VM prototype: `--play --map Plage01 [--play-script <file>]` (E = use). Headless VM: `xiii-tool script run --game-dir XIII_Game --map Plage00 --begin-play --physics map --anim map --nav map --events`.
 - Disassembler (user-approved): `llvm-objdump` from `rustup component add llvm-tools`, at `C:/Users/ZoliBen/.rustup/toolchains/1.99.0-x86_64-pc-windows-msvc/lib/rustlib/x86_64-pc-windows-msvc/bin/llvm-objdump.exe`. DLLs are read only; disassembly output stays in git-ignored `local/re/`, never committed or pasted into code.
 - Launch parallel opencode runs a few seconds apart: simultaneous starts fail with `database is locked`.
 - Reports and screenshots of each task: `local/reports/` (git-ignored; proprietary-derived outputs never committed).
 
-### In flight when this was written (2026-10-06, ~22:00)
+### In flight
 
-- `item27b` VM-driven pawns walk with `PHYS_Walking` (shared walker `xiii_collision::walk_move`) so Banque01's Cine11 reaches `PositionInfo38` and the two `set_goal` bridges can go (worktree `local/wt/steam`, opencode luna session `item27b-vm-pawn-walking`). The first pass regressed the Plage01 route; it was sent back.
-- `item30` Plage01 route without the six diagnostic teleports and the `XIII.m60` grant, plus a windowed run (worktree `local/wt/audio`, opencode Z.AI session `item30-plage01-walk`).
-- `item33` save/load restores what the game restores (worktree `local/wt/sweep`, opencode luna session `item33-save-inventory`). Measured so far: `DoSave`/`AcceptInventory` handle health, speed limit, checkpoint, objectives and `SoundToLaunch`; `AcceptInventory` rebuilds the inventory, refreshes ammo and brings up the weapon. Sent back to implement it and to measure the native `SaveAtCheckpoint`.
-- `item35` AI weapon refire and focus rotation natively, removing both combat host bridges (worktree `local/wt/codex1`, Codex luna).
-- `item36` remove `Vm::settle_pickups` and the particle-trigger host bridge (worktree `local/wt/fx`, Codex luna). VM-owned emitter state works. Without the settle, the Plage01 hut key is no longer picked up: its centre is 2.3 UU under the plank, so `Pickup.ValidTouch`'s `FastTrace` is blocked. Sent back to compare our line check with the engine's (start-in-solid, backface).
-- Specs in `P:/AI/XIII/local/tasks/`; logs in `P:/AI/XIII/local/logs/`; reports in each worktree's `local/reports/`.
+Nothing is running. See the coordinator handover table above.
 
 ## User intent
 
@@ -161,6 +200,40 @@ Per-task reports with all numbers and commands: `local/reports/item1-collision.m
 - **Performance:** VM tick 2.6 ms -> 0.36-0.52 ms (Banque01, ~900 actors); all maps > 240 FPS release on the RTX 4090.
 - **Scale:** 90 UU/m (user-approved estimate).
 
+### Seventh block (2026-10-07 night, up to `a6e1abd`) — measured, prototype, not a playable mission
+
+- **Combat (item35):** AI refire is the game's script chain (`IAController.FireEnemy` ->
+  `IAController.Timer` -> weapon `Fire`); `APawn::execPressingFire` (Engine.dll `0x103afc50`) reads
+  only `Controller.bFire`; focus rotation follows `AController::Tick` -> `APawn::rotateToward` ->
+  `APawn::physicsRotation` (`0x103b8200`). Both combat host bridges removed. Base01's soldier now
+  fires on the script cadence (150 -> 147 HP; the old bridge over-fired).
+- **Runtime bridges (item36/37):** pickups keep their authored placement (`settle_pickups`
+  removed; static-mesh line checks are one-sided like `UStaticMesh::LineCheck` `0x10402E00`);
+  VM-owned particle emitter state and `SpawnParticle` requests; no game-end cutscene stop; Canvas
+  fonts as `UCanvas::Init` (`0x10364390`, PoliceF16/F20); the player only from the login chain;
+  `take_control` diagnostic-only.
+- **Save/load v2 (item33):** loads run the game's `XIIIGameInfo.AcceptInventory`; ammo, reload
+  count, selected weapon, `SoundToLaunch` (played on load) persisted; native `SaveAtCheckpoint`
+  -> `USaveGameDevice::SaveAtCheckpoint` -> `UGameEngine::ExportTravel` (travel actors, not a
+  world snapshot). HXAudio saver variables not implemented.
+- **Death/damage (item38):** standalone deaths get `PlayDying` from
+  `APawn::UpdateMovementAnimation` (`0x103b5c70`, `bTearOff && !bPlayedDeath`); script death
+  camera; HUD damage warning. `LevelInfo.GetPlateForme` returns 0 (PC; `GSys+0x7c`).
+- **VM pawn walking (item27b/c):** PHYS_Walking pawns with world collision use the shared walker
+  (step-up, wall slide); route command `track <actor>`.
+- **Cine arrival (b946202):** XIDCine `IsTargetReached` (`0x10001d40`) is 2D: passed when the
+  target is behind the controller's `Plane` (or within `DetectionDistance`); `execSteering`
+  (`0x100021a0`) tests arrival before moving; steering moves full `speed*dt` steps. Plage01's
+  intro now returns control at ~46.5 s (tests shifted +3 s).
+- **Player interaction (item40c):** `XIIIPlayerController.InitInputSystem` creates it via
+  `InteractionMaster.AddInteraction` (host builds only Player/InteractionMaster/Console).
+- **HUD PostRender (item43, a6e1abd):** `foreach Obj.AllActors(...)` through a Context, and the
+  `Actor.TraceActors` iterator (native 309): PostRender completes again (it aborted every frame
+  since ea19201, which kept the level-start cartoon from ending).
+- **Menu tests** use temp save/config dirs; delegates must never touch `%APPDATA%` (rule added).
+  The user's `%APPDATA%\xiii-rustito\saves` holds slots written by earlier agent runs.
+- Full verification at `a6e1abd`: 829 passed; Plage00 `--trace` byte-identical.
+
 ### Sixth block (2026-10-06 evening, up to `4ac6308`) — measured, prototype, not a playable mission
 
 - **Save/load:** checkpoint loads set `StartSpotEvent='LOAD'` after login, so the level's own `FirstFrame` guard keeps the saved state (no timing bridge). Menu Load game/Continue go through a host `SaveSlotProvider`.
@@ -254,13 +327,15 @@ Native Windows reports an RTX 4090. Rust/Cargo were not found on the inspected W
 
 ## Exact next work
 
-1. **Toward a completable Plage00/Plage01/Banque01 with the player in control:** land item30 (Plage01 without teleports or grant, windowed run) and item27b (VM pawn walking, bridge-free Banque01). Then play the Plage00 -> Plage01 -> Banque01 chain in a window by input only.
-2. **Combat:** item35 (AI refire and rotation natively); then damage/death presentation.
-3. **Save/load:** item33 (`AcceptInventory` as a unit, `SoundToLaunch`, ammo and selected weapon per the native save evidence).
-4. **Runtime bridges:** item36 (pickup settle, particle triggers). Remaining labelled bridges: the `take_control` diagnostic, the HUD font, tick-scope restores and the game-end cutscene stop.
-5. **Menus:** the backdrop needs a retail reference screenshot from the user (branch `item16d-menu-backdrop`, not merged).
-6. **Rendering:** the comic outline look (needs reference captures).
-7. **Performance:** `vm_step` is still the largest per-frame cost on busy maps (Hual02 ~5.7 ms); profile spans are in `--perf-natives`.
+1. **Banque01 without bridges:** author the cutscene-following route (spec
+   `local/tasks/item27j-banque-story-route.md`, findings above), remove the two `set_goal` lines.
+2. **Plage01 without teleports:** assemble item30's walked segments (`audio` branch), then the
+   windowed run.
+3. **Merge item44** (tests) after your own verify.
+4. **Amos01:** route to "Rejoin the soldier on the rooftops" and travel to `Toits01`.
+5. **AI hearing:** decode `CheckNoiseHearing`/`CanHear` before any `MakeNoise` dispatch.
+6. **Performance:** benchmark item39 on a quiet machine; `vm_step` still dominates busy maps.
+7. **Menus/rendering:** menu backdrop and comic outline need retail reference captures from the user.
 
 Do not report playable progress from the viewer, the `--play` prototype or headless traces until a mission can be completed by the game's own logic without host shortcuts.
 
