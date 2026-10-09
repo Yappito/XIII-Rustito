@@ -16,7 +16,7 @@ use xiii_collision::{
 use xiii_decode::common::{
     UNREAL_UNITS_PER_METER, to_bevy_direction, to_bevy_position, to_bevy_scale,
 };
-use xiii_script::physics::{MoveOutcome, WorldHit, WorldPhysics};
+use xiii_script::physics::{MoveOutcome, OverlapRecord, WorldHit, WorldPhysics};
 
 /// Rotation-matrix rows in Bevy space of an Unreal rotator (roll X / pitch Y / yaw Z), the
 /// axis-permutation conjugate `P R P^-1` of `FRotationMatrix`. Shared by the moving-brush
@@ -78,6 +78,10 @@ pub struct WorldPhysicsAdapter {
     /// Per registered mover: `(box moving-object index, line moving-object index)`.
     movers: Vec<(usize, usize)>,
     mover_by_name: HashMap<String, usize>,
+    /// Collision-source labels (`"<actor> -> <mesh>"`) by source id, for the overlap dump.
+    source_names: Vec<String>,
+    /// Registered mover actor names by their collision source id (reverse of `mover_by_name`).
+    mover_names_by_source: HashMap<u32, String>,
 }
 
 impl WorldPhysicsAdapter {
@@ -93,6 +97,8 @@ impl WorldPhysicsAdapter {
             line_one_sided_sources: Vec::new(),
             movers: Vec::new(),
             mover_by_name: HashMap::new(),
+            source_names: Vec::new(),
+            mover_names_by_source: HashMap::new(),
         }
     }
 
@@ -103,6 +109,7 @@ impl WorldPhysicsAdapter {
             .iter()
             .map(|path| path.contains(" -> "))
             .collect();
+        physics.source_names = scene.collision_sources.clone();
         physics
     }
 
@@ -219,6 +226,54 @@ impl WorldPhysics for WorldPhysicsAdapter {
         !overlaps
     }
 
+    fn dump_overlap(&mut self, location: [f32; 3], extent: [f32; 3]) -> Vec<OverlapRecord> {
+        let center = to_bevy_position(location);
+        let half = unreal_extent_to_bevy(extent);
+        if half.iter().all(|x| x.abs() < 1e-9) {
+            return Vec::new();
+        }
+        let name = |source: u32| -> String {
+            if let Some(mover) = self.mover_names_by_source.get(&source) {
+                mover.clone()
+            } else {
+                self.source_names
+                    .get(source as usize)
+                    .cloned()
+                    .unwrap_or_else(|| format!("<source {source}>"))
+            }
+        };
+        let mut out = Vec::new();
+        for hit in self.box_world.overlap_aabb(center, half) {
+            if hit.triangle == u32::MAX {
+                // A moving-object hit: `Hit` carries only the source, so re-test that mover's
+                // world triangles against the box and report each overlapping one.
+                let mover = self.movers.iter().find_map(|(b, _)| {
+                    self.box_world
+                        .moving(*b)
+                        .filter(|m| m.source() == hit.source)
+                });
+                if let Some(m) = mover {
+                    for tri in m.world_triangles() {
+                        if xiii_collision::aabb_overlaps_triangle(center, half, &tri) {
+                            out.push(OverlapRecord {
+                                kind: "moving",
+                                source: name(hit.source),
+                                triangle: tri.map(bevy_to_unreal_position),
+                            });
+                        }
+                    }
+                }
+            } else {
+                out.push(OverlapRecord {
+                    kind: "static",
+                    source: name(hit.source),
+                    triangle: (*self.box_world.triangle(hit.triangle)).map(bevy_to_unreal_position),
+                });
+            }
+        }
+        out
+    }
+
     fn register_mover(
         &mut self,
         actor: &str,
@@ -230,6 +285,12 @@ impl WorldPhysics for WorldPhysicsAdapter {
         if triangles.is_empty() {
             return;
         }
+        // The mover's triangles must exist in exactly one place (the same invariant the host's
+        // `movers::partition` applies to the player world): drop the static base-pose copies from
+        // both query soups, otherwise every pawn move/trace keeps hitting a frozen copy of the
+        // closed brush after the mover has left its base pose (item27k blocker B-1).
+        self.box_world.remove_static_source(source);
+        self.line_world.remove_static_source(source);
         let bevy: Vec<Triangle> = triangles.iter().map(|t| t.map(to_bevy_position)).collect();
         let center = to_bevy_position(origin);
         let rows = rotation_rows(rotation);
@@ -246,6 +307,8 @@ impl WorldPhysics for WorldPhysicsAdapter {
             .add_moving(MovingObject::from_world_triangles(
                 bevy, source, center, rows,
             ));
+        self.mover_names_by_source
+            .insert(source, actor.to_ascii_lowercase());
         self.mover_by_name
             .insert(actor.to_ascii_lowercase(), self.movers.len());
         self.movers.push((box_index, line_index));
@@ -320,6 +383,79 @@ mod tests {
     /// Unreal coordinates of a Bevy point (via the adapter's public inverse).
     fn u(p: [f32; 3]) -> [f32; 3] {
         bevy_to_unreal_position(p)
+    }
+
+    #[test]
+    fn register_mover_removes_the_stale_static_base_pose_copy() {
+        // item27k blocker B-1: the adapter used to keep a mover's base-pose triangles in the
+        // static soups AND add them as moving objects, so a pawn kept hitting a frozen closed
+        // brush after the mover had left its base pose. `register_mover` must drop the static
+        // copies; the brush must then block only where it currently is.
+        // A slab across the corridor in Unreal space: x in [-100,100], y in [-10,10],
+        // z in [0,200] (a 6-face closed box), collision source id 3.
+        let slab = |source: u32| -> Vec<(Triangle, u32)> {
+            let c = [
+                [-100.0, -10.0, 0.0],
+                [100.0, -10.0, 0.0],
+                [100.0, 10.0, 0.0],
+                [-100.0, 10.0, 0.0],
+                [-100.0, -10.0, 200.0],
+                [100.0, -10.0, 200.0],
+                [100.0, 10.0, 200.0],
+                [-100.0, 10.0, 200.0],
+            ];
+            let f = [
+                [0, 3, 2],
+                [0, 2, 1],
+                [4, 5, 6],
+                [4, 6, 7],
+                [0, 1, 5],
+                [0, 5, 4],
+                [2, 3, 7],
+                [2, 7, 6],
+                [1, 2, 6],
+                [1, 6, 5],
+                [0, 4, 7],
+                [0, 7, 3],
+            ];
+            f.map(|t| (t.map(|i| to_bevy_position(c[i])), source))
+                .to_vec()
+        };
+        let world_tris: Vec<[[[f32; 3]; 3]; 12]> = vec![];
+        let _ = world_tris;
+        let slab_unreal: Vec<Triangle> = slab(3)
+            .iter()
+            .map(|(t, _)| t.map(bevy_to_unreal_position))
+            .collect();
+        let mut p = WorldPhysicsAdapter::from_entries(slab(3), slab(3));
+        let start = [0.0, -225.0, 100.0];
+        let extent = [34.0, 34.0, 75.0];
+        let delta = [0.0, 450.0, 0.0];
+        // Before registration the static base-pose copy blocks the corridor.
+        assert!(
+            p.move_box(start, delta, extent).hit.is_some(),
+            "the static slab must block before registration"
+        );
+        p.register_mover("XIIIMover14", 3, &slab_unreal, [0.0, 0.0, 0.0], [0, 0, 0]);
+        // Still blocked: the moving object sits at the same base pose.
+        assert!(
+            p.move_box(start, delta, extent).hit.is_some(),
+            "the brush at its base pose must still block"
+        );
+        // After the brush leaves its base pose the corridor must be clear: with the stale
+        // static copy this used to stay blocked forever (B-1).
+        p.set_mover("XIIIMover14", [0.0, 0.0, 1000.0], [0, 0, 0]);
+        let clear = p.move_box(start, delta, extent);
+        assert!(
+            clear.hit.is_none(),
+            "stale static copy still blocks: {clear:?}"
+        );
+        // The brush blocks where it currently is.
+        p.set_mover("XIIIMover14", [0.0, 100.0, 0.0], [0, 0, 0]);
+        let moved = p.move_box(start, delta, extent);
+        assert!(moved.hit.is_some(), "the brush at its new pose must block");
+        // The brush's near face is now at y = 90; the pawn's half-extent is 34.
+        assert!(moved.end[1] < 56.0 + 1.0, "{moved:?}");
     }
 
     #[test]

@@ -3463,13 +3463,17 @@ mod tests {
         let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/banque01_route.script");
         let script = script::Script::load(&route_path).expect("load item24 banque01 route");
+        // 140 s: the measured item27k schedule needs it — Cine15's [34] "wait player 300" starts
+        // at t~69.1 (Jones walked his waypoints), the escape-flow touches run to t~88, and the
+        // map-outro video cine02 (33.92 s, measured host note) must finish before
+        // `PlayingVideo.PlayerTick` runs `ServerTravel` (see tests/data/banque01_route.script).
         let outcome = run_script_with_cinematic_input(
             &game_dir,
             "banque01",
             &script,
             &resolved.params,
             &scene,
-            90.0,
+            140.0,
         )
         .expect("run banque01 route");
         let banque = outcome

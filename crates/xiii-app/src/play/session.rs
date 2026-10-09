@@ -3299,6 +3299,146 @@ mod tests {
         );
     }
 
+    /// Opt-in corpus measurement (item41c): the decoded `MakeNoise -> CheckNoiseHearing ->
+    /// CanHear -> HearNoise` path on a real map. Base01 `BaseSoldier17` is warmed to its `Tenir`
+    /// order (as in `opt_in_base01_soldier_fights_back`); the player stands 300 UU *behind* it,
+    /// facing away, and fires a granted Beretta once. Only the game's own scripts make the noise
+    /// (`XIIIWeapon` fire -> `MakeNoise(FireNoise)`) and react to it (`Tenir.HearNoise ->
+    /// TestSonEntendu -> EnemyAcquired`). The test records what happens and asserts only the
+    /// decoded engine contract: a noise instigated by the player reaches the probing soldier
+    /// controller with the weapon as `NoiseMaker` when it is within `HearingThreshold^2 *
+    /// Loudness` and the eye line is clear.
+    #[test]
+    fn opt_in_base01_soldier_hears_player_gunfire_from_behind() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Base01").expect("open Base01");
+        let soldier = session
+            .vm()
+            .find_object("BaseSoldier17")
+            .expect("BaseSoldier17");
+        let sloc = session
+            .vm()
+            .vector_prop(soldier, "Location")
+            .expect("soldier location");
+        let ploc0 = session.player_location().unwrap_or([0.0; 3]);
+        for _ in 0..360 {
+            session.step(1.0 / 60.0, ploc0, 0.0, [0.0; 3], &PlayerVMModes::default());
+        }
+        let ctrl = instance_prop(session.vm(), soldier, "Controller").expect("controller");
+        let ctrl_name = session.vm().objects[ctrl as usize].name.clone();
+        let warm_state = session.vm().state_name(ctrl);
+        assert_eq!(warm_state.as_deref(), Some("Tenir"), "warm-up state");
+        // Behind the soldier, facing away from it.
+        let srot = session.vm().rotation_prop(soldier).unwrap_or([0; 3]);
+        let yaw = (srot[1] as f32) * std::f32::consts::TAU / 65536.0;
+        let (sy, cy) = yaw.sin_cos();
+        let ploc = [sloc[0] - cy * 300.0, sloc[1] - sy * 300.0, sloc[2]];
+        let away = (-sy).atan2(-cy);
+        for _ in 0..60 {
+            session.step(1.0 / 60.0, ploc, away, [0.0; 3], &PlayerVMModes::default());
+        }
+        let before_fire = session.vm().state_name(ctrl);
+        let grant = session.grant_weapon("XIII.Beretta").expect("grant Beretta");
+        println!("[item41c Base01] {grant}");
+        for _ in 0..30 {
+            session.step(1.0 / 60.0, ploc, away, [0.0; 3], &PlayerVMModes::default());
+        }
+        let weapon = session.player_weapon().expect("player weapon");
+        let fire_noise = session.vm().get_property(weapon, "FireNoise").cloned();
+        let weapon_loc = session.vm().vector_prop(weapon, "Location");
+        let hearing = |s: &Session| -> f32 {
+            match s.vm().get_property(soldier, "HearingThreshold") {
+                Some(Value::Float(v)) => *v,
+                _ => f32::NAN,
+            }
+        };
+        let threshold = hearing(&session);
+        let trace_start = session.vm().trace.len();
+        let fired = session.fire(away, 0.0);
+        let mut states = Vec::new();
+        for i in 0..120 {
+            session.step(1.0 / 60.0, ploc, away, [0.0; 3], &PlayerVMModes::default());
+            let st = session.vm().state_name(ctrl);
+            if states.last().map(|(_, s)| s) != Some(&st) {
+                states.push((i, st));
+            }
+        }
+        let heard: Vec<(f64, Vec<String>)> = session.vm().trace[trace_start..]
+            .iter()
+            .filter_map(|e| match &e.kind {
+                xiii_script::TraceKind::Event {
+                    target,
+                    function,
+                    args,
+                } if target == &ctrl_name && function.ends_with("HearNoise") => {
+                    Some((e.time, args.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let notes: Vec<String> = session.vm().trace[trace_start..]
+            .iter()
+            .filter_map(|e| match &e.kind {
+                xiii_script::TraceKind::Note(n) if n.contains("CanHear") => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        println!(
+            "[item41c Base01] soldier {sloc:?} yaw {yaw:.3}, player {ploc:?}; state before fire \
+             {before_fire:?}; fire {fired:?}; weapon {} at {weapon_loc:?} FireNoise {fire_noise:?}; \
+             soldier HearingThreshold {threshold}; HearNoise to {ctrl_name}: {heard:?}; \
+             state changes after fire (frame, state): {states:?}; CanHear notes {notes:?}; \
+             perception {:?}; first error {:?}",
+            session.vm().objects[weapon as usize].name,
+            session.perception_log,
+            session.first_error(),
+        );
+        // Which listeners carry the zone / around-corner flags whose branches are Partial.
+        let vm = session.vm();
+        let mut flagged = Vec::new();
+        let mut next =
+            instance_prop(vm, ctrl, "Level").and_then(|l| instance_prop(vm, l, "ControllerList"));
+        while let Some(c) = next {
+            if let Some(p) = instance_prop(vm, c, "Pawn") {
+                let flags: Vec<&str> = [
+                    "bSameZoneHearing",
+                    "bAdjacentZoneHearing",
+                    "bMuffledHearing",
+                    "bAroundCornerHearing",
+                ]
+                .into_iter()
+                .filter(|f| matches!(vm.get_property(p, f), Some(Value::Bool(true))))
+                .collect();
+                if !flags.is_empty() {
+                    flagged.push((
+                        vm.objects[c as usize].name.clone(),
+                        vm.objects[p as usize].name.clone(),
+                        flags,
+                    ));
+                }
+            }
+            next = instance_prop(vm, c, "NextController");
+        }
+        println!("[item41c Base01] listeners with zone/muffled/corner flags: {flagged:?}");
+        assert!(matches!(fired, FireOutcome::Fired), "fire: {fired:?}");
+        assert!(
+            !heard.is_empty(),
+            "the player's shot 300 UU behind BaseSoldier17 did not reach {ctrl_name}.HearNoise"
+        );
+        let weapon_label = session
+            .vm()
+            .value_text(&Value::Object(Some(ObjRef::Instance(weapon))));
+        assert!(
+            heard
+                .iter()
+                .any(|(_, args)| args.get(1) == Some(&weapon_label)),
+            "the NoiseMaker is the weapon that called MakeNoise: {heard:?}"
+        );
+    }
+
     /// Opt-in Plage01 combat: deliver the authored `TouchTrigger7` (`Event=tueur_conducteur`)
     /// cue to BaseSoldier6's controller, then record whether the game's scripted attack targets
     /// and fires at a stationary player. This also pins the current compiled-script no-fire path.

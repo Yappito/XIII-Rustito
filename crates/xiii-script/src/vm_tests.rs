@@ -9035,3 +9035,628 @@ fn delegate_values_are_equatable_and_none_is_distinct() {
     assert!(crate::vm::values_equal(&d, &d.clone()));
     assert!(!crate::vm::values_equal(&Value::Delegate(None), &d));
 }
+
+// ---------------------------------------------------------------------------------------
+// item41c: Actor.MakeNoise -> CheckNoiseHearing -> CanHear -> HearNoise (Engine.dll decoded)
+
+/// `HearNoise` probe bit (EName 342 - 300).
+const HEAR_BIT: u64 = 1 << 42;
+
+impl SpawnB {
+    /// A `Core.Class` with explicit stored `ProbeMask` / `IgnoreMask`.
+    fn class_masks(&mut self, r: i32, sup: i32, children: i32, probe: u64, ignore: u64) {
+        let friendly = self.exports[(r - 1) as usize].name;
+        let system = self.name("System");
+        let mut p = self.header(sup, 0, children, friendly, &[], 0);
+        p.extend(probe.to_le_bytes());
+        p.extend(ignore.to_le_bytes());
+        p.extend(0xFFFFu16.to_le_bytes());
+        p.extend(0u16.to_le_bytes());
+        p.extend(0u16.to_le_bytes());
+        p.extend([0u8; 16]);
+        p.extend(compact(0));
+        p.extend(compact(0));
+        p.extend(compact(0));
+        p.extend(compact(system));
+        p.extend(compact(0));
+        p.extend(compact(0));
+        self.set(r, p);
+    }
+
+    /// A code-less `Core.State` with explicit stored `ProbeMask` / `IgnoreMask`.
+    fn state_masks(&mut self, r: i32, next: i32, probe: u64, ignore: u64) {
+        let friendly = self.exports[(r - 1) as usize].name;
+        let mut p = compact(0);
+        p.extend(self.header(0, next, 0, friendly, &[], 0));
+        p.extend(probe.to_le_bytes());
+        p.extend(ignore.to_le_bytes());
+        p.extend(0xFFFFu16.to_le_bytes());
+        p.extend(0u16.to_le_bytes());
+        self.set(r, p);
+    }
+}
+
+/// Synthetic Engine-shaped hierarchy: `Actor` (Level, Tag, Location, Instigator), `LevelInfo`
+/// (NetMode, NavigationPointList, ControllerList), `Pawn` (hearing fields and noise slots),
+/// `Controller` (no HearNoise body, probe mask 0), `AIController` (a `HearNoise` event body,
+/// class probe bit 42, and a `Deaf` state that ignores it) and `NavigationPoint`.
+fn hearing_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let level_info = b.reserve(0, 0, "LevelInfo");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "Controller");
+    let ai = b.reserve(0, 0, "AIController");
+    let nav = b.reserve(0, 0, "NavigationPoint");
+    let obj = compact(0);
+    let vec = compact(IMP_STRUCT);
+
+    let level = b.reserve(IMP_OBJECTPROP, actor, "Level");
+    let tag = b.reserve(IMP_NAMEPROP, actor, "Tag");
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let instigator = b.reserve(IMP_OBJECTPROP, actor, "Instigator");
+    b.prop_with(level, tag, 0, &obj);
+    b.prop(tag, location, 0);
+    b.prop_with(location, instigator, 0, &vec);
+    b.prop_with(instigator, 0, 0, &obj);
+
+    let net_mode = b.reserve(IMP_BYTEPROP, level_info, "NetMode");
+    let nav_list = b.reserve(IMP_OBJECTPROP, level_info, "NavigationPointList");
+    let ctrl_list = b.reserve(IMP_OBJECTPROP, level_info, "ControllerList");
+    b.prop_with(net_mode, nav_list, 0, &obj);
+    b.prop_with(nav_list, ctrl_list, 0, &obj);
+    b.prop_with(ctrl_list, 0, 0, &obj);
+
+    // Pawn fields, chained in declaration order.
+    let pawn_fields: Vec<(i32, &str, Vec<u8>)> = vec![
+        (IMP_OBJECTPROP, "Controller", obj.clone()),
+        (IMP_BOOLPROP, "bLOSHearing", Vec::new()),
+        (IMP_BOOLPROP, "bSameZoneHearing", Vec::new()),
+        (IMP_BOOLPROP, "bAdjacentZoneHearing", Vec::new()),
+        (IMP_BOOLPROP, "bMuffledHearing", Vec::new()),
+        (IMP_BOOLPROP, "bAroundCornerHearing", Vec::new()),
+        (IMP_FLOATPROP, "HearingThreshold", Vec::new()),
+        (IMP_FLOATPROP, "Alertness", Vec::new()),
+        (IMP_FLOATPROP, "BaseEyeHeight", Vec::new()),
+        (IMP_STRUCTPROP, "noise1spot", vec.clone()),
+        (IMP_FLOATPROP, "noise1time", Vec::new()),
+        (IMP_FLOATPROP, "noise1loudness", Vec::new()),
+        (IMP_STRUCTPROP, "noise2spot", vec.clone()),
+        (IMP_FLOATPROP, "noise2time", Vec::new()),
+        (IMP_FLOATPROP, "noise2loudness", Vec::new()),
+    ];
+    let refs: Vec<i32> = pawn_fields
+        .iter()
+        .map(|(class, name, _)| b.reserve(*class, pawn, name))
+        .collect();
+    for (i, (_, _, extra)) in pawn_fields.iter().enumerate() {
+        b.prop_with(refs[i], refs.get(i + 1).copied().unwrap_or(0), 0, extra);
+    }
+
+    let c_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
+    let is_player = b.reserve(IMP_BOOLPROP, controller, "bIsPlayer");
+    let next_controller = b.reserve(IMP_OBJECTPROP, controller, "NextController");
+    let enemy = b.reserve(IMP_OBJECTPROP, controller, "Enemy");
+    b.prop_with(c_pawn, is_player, 0, &obj);
+    b.prop(is_player, next_controller, 0);
+    b.prop_with(next_controller, enemy, 0, &obj);
+    b.prop_with(enemy, 0, 0, &obj);
+
+    let hear = b.reserve(IMP_FUNCTION, ai, "HearNoise");
+    let deaf = b.reserve(IMP_STATE, ai, "Deaf");
+    let hear_l = b.reserve(IMP_FLOATPROP, hear, "Loudness");
+    let hear_m = b.reserve(IMP_OBJECTPROP, hear, "NoiseMaker");
+    b.prop(hear_l, hear_m, PARM);
+    b.prop_with(hear_m, 0, PARM, &obj);
+    // `return;` (Return + Nothing).
+    b.func(hear, deaf, hear_l, &[0x04, 0x0B], 2, 0, DEFINED | EVENT);
+    b.state_masks(deaf, 0, 0, !HEAR_BIT);
+
+    let next_nav = b.reserve(IMP_OBJECTPROP, nav, "nextNavigationPoint");
+    let propagates = b.reserve(IMP_BOOLPROP, nav, "bPropagatesSound");
+    b.prop_with(next_nav, propagates, 0, &obj);
+    b.prop(propagates, 0, 0);
+
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, level, 0);
+    b.class(level_info, actor, net_mode, 0);
+    b.class(pawn, actor, refs[0], 0);
+    b.class(controller, actor, c_pawn, 0);
+    b.class_masks(ai, controller, hear, HEAR_BIT, u64::MAX);
+    b.class(nav, actor, next_nav, 0);
+    b.build()
+}
+
+fn hearing_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Test",
+        hearing_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+fn inst(id: ObjectId) -> Value {
+    Value::Object(Some(ObjRef::Instance(id)))
+}
+
+/// A level with an optional world, plus helpers to place pawns/controllers on its lists.
+struct HearWorld<'s> {
+    vm: Vm<'s>,
+    set: &'s ScriptSet,
+    level: ObjectId,
+}
+
+impl<'s> HearWorld<'s> {
+    fn new(set: &'s ScriptSet, world: Option<MockWorld>) -> Self {
+        let mut vm = Vm::new(set, VmLimits::default());
+        if let Some(w) = world {
+            vm.set_physics(Box::new(w));
+        }
+        let level = vm.spawn(sg(set, "LevelInfo"), "Level").unwrap();
+        Self { vm, set, level }
+    }
+
+    /// A pawn at `at` with `HearingThreshold`, LOS hearing on, eye height 0, Instigator = self.
+    fn pawn(&mut self, name: &str, at: [f32; 3], threshold: f32) -> ObjectId {
+        let p = self.vm.spawn(sg(self.set, "Pawn"), name).unwrap();
+        let vm = &mut self.vm;
+        vm.set_property(p, "Level", 0, inst(self.level));
+        vm.set_property(p, "Location", 0, Value::Vector(at));
+        vm.set_property(p, "Instigator", 0, inst(p));
+        vm.set_property(p, "HearingThreshold", 0, Value::Float(threshold));
+        vm.set_property(p, "bLOSHearing", 0, Value::Bool(true));
+        p
+    }
+
+    /// A controller of `class` possessing `pawn`, pushed at the head of `ControllerList`.
+    fn controller(&mut self, class: &str, name: &str, pawn: Option<ObjectId>) -> ObjectId {
+        let c = self.vm.spawn(sg(self.set, class), name).unwrap();
+        let vm = &mut self.vm;
+        vm.set_property(c, "Level", 0, inst(self.level));
+        if let Some(p) = pawn {
+            vm.set_property(c, "Pawn", 0, inst(p));
+            vm.set_property(p, "Controller", 0, inst(c));
+        }
+        let head = vm.get_property(self.level, "ControllerList").cloned();
+        if let Some(head) = head {
+            vm.set_property(c, "NextController", 0, head);
+        }
+        vm.set_property(self.level, "ControllerList", 0, inst(c));
+        c
+    }
+
+    /// A pawn + controller pair; returns the pawn.
+    fn listener(&mut self, class: &str, name: &str, at: [f32; 3], threshold: f32) -> ObjectId {
+        let p = self.pawn(&format!("{name}Pawn"), at, threshold);
+        self.controller(class, name, Some(p));
+        p
+    }
+
+    /// The player: a `Controller` (no HearNoise probe) with `bIsPlayer`; returns the pawn.
+    fn player(&mut self, at: [f32; 3]) -> ObjectId {
+        let p = self.pawn("PlayerPawn", at, 1000.0);
+        let c = self.controller("Controller", "Player", Some(p));
+        self.vm.set_property(c, "bIsPlayer", 0, Value::Bool(true));
+        p
+    }
+
+    fn noise(&mut self, source: ObjectId, loudness: f32) {
+        self.vm.trace.clear();
+        call_native(
+            &mut self.vm,
+            "Engine.Actor.MakeNoise",
+            source,
+            &[false],
+            &mut [Value::Float(loudness)],
+        );
+    }
+
+    /// `(controller name, args)` of every `HearNoise` delivered by the last noise.
+    fn heard(&self) -> Vec<(String, Vec<String>)> {
+        self.vm
+            .trace
+            .iter()
+            .filter_map(|e| match &e.kind {
+                TraceKind::Event {
+                    target,
+                    function,
+                    args,
+                } if function.ends_with("HearNoise") => Some((target.clone(), args.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn heard_by(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.heard().into_iter().map(|(t, _)| t).collect();
+        names.sort();
+        names
+    }
+
+    fn notes(&self, needle: &str) -> usize {
+        self.vm
+            .trace
+            .iter()
+            .filter(|e| matches!(&e.kind, TraceKind::Note(n) if n.contains(needle)))
+            .count()
+    }
+
+    fn f(&self, id: ObjectId, name: &str) -> f32 {
+        match self.vm.get_property(id, name) {
+            Some(Value::Float(v)) => *v,
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+
+    fn v(&self, id: ObjectId, name: &str) -> [f32; 3] {
+        match self.vm.get_property(id, name) {
+            Some(Value::Vector(v)) => *v,
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+}
+
+/// Range: `HearingThreshold^2 * Loudness * max(0, Alertness + 1) >= DistSq` (inclusive, Z
+/// included), and the event carries `(Loudness, NoiseMaker)`.
+#[test]
+fn make_noise_range_is_threshold_squared_times_loudness_and_alertness() {
+    let set = hearing_set();
+    let mut w = HearWorld::new(&set, Some(MockWorld::new()));
+    let player = w.player([0.0, 0.0, 0.0]);
+    let at = w.listener("AIController", "At", [1000.0, 0.0, 0.0], 1000.0);
+    w.listener("AIController", "Beyond", [0.0, 1000.5, 0.0], 1000.0);
+    // Z counts: (600, 0, 800) is exactly 1000 away.
+    w.listener("AIController", "Diag", [600.0, 0.0, 800.0], 1000.0);
+    w.noise(player, 1.0);
+    assert_eq!(
+        w.heard_by(),
+        ["At", "Diag"],
+        "the boundary is inclusive, 1000.5 is out"
+    );
+    let (_, args) = &w.heard()[0];
+    assert_eq!(args.len(), 2);
+    assert_eq!(args[0], Value::Float(1.0).to_string());
+    assert_eq!(args[1], w.vm.value_text(&inst(player)));
+
+    // Loudness scales the squared range linearly: 1000.5^2 needs Loudness >= 1.001.
+    w.vm.time += 1.0;
+    w.noise(player, 1.002);
+    assert_eq!(w.heard_by(), ["At", "Beyond", "Diag"]);
+
+    // Alertness -1 zeroes perception; +1 doubles it.
+    w.vm.set_property(at, "Alertness", 0, Value::Float(-1.0));
+    w.vm.time += 1.0;
+    w.noise(player, 1.0);
+    assert_eq!(w.heard_by(), ["Diag"]);
+    w.vm.set_property(at, "Alertness", 0, Value::Float(1.0));
+    w.vm.set_property(at, "Location", 0, Value::Vector([1414.0, 0.0, 0.0]));
+    w.vm.time += 1.0;
+    w.noise(player, 1.0);
+    assert_eq!(w.heard_by(), ["At", "Diag"], "2e6 >= 1414^2");
+}
+
+/// The line check runs from the listener's eye (`Location + BaseEyeHeight`) to the noise; a wall
+/// that only crosses the eye line blocks hearing. Without a physics provider the native fails
+/// explicitly once the line check is needed.
+#[test]
+fn make_noise_is_occluded_on_the_eye_line_and_needs_a_provider() {
+    let set = hearing_set();
+    // The eye line z = 100 from x 0 to 500 crosses the wall; the pawn-centre line to the noise
+    // at (500, 0, 100) is at z = 50 at x = 250, below it.
+    let wall = MockWorld::new().with_wall([240.0, -50.0, 80.0], [260.0, 50.0, 120.0]);
+    let mut w = HearWorld::new(&set, Some(wall));
+    let player = w.player([500.0, 0.0, 100.0]);
+    let ear = w.listener("AIController", "Ear", [0.0, 0.0, 0.0], 1000.0);
+    w.noise(player, 1.0);
+    assert_eq!(
+        w.heard_by(),
+        ["Ear"],
+        "eye height 0: the centre line is clear"
+    );
+    w.vm.set_property(ear, "BaseEyeHeight", 0, Value::Float(100.0));
+    w.vm.time += 1.0;
+    w.noise(player, 1.0);
+    assert!(w.heard().is_empty(), "the eye line is blocked");
+    w.vm.set_property(ear, "bLOSHearing", 0, Value::Bool(false));
+    w.vm.set_property(ear, "BaseEyeHeight", 0, Value::Float(0.0));
+    w.vm.time += 1.0;
+    w.noise(player, 1.0);
+    assert!(
+        w.heard().is_empty(),
+        "no bLOSHearing and no other mode: deaf"
+    );
+
+    let mut bare = HearWorld::new(&set, None);
+    let player = bare.player([0.0, 0.0, 0.0]);
+    bare.listener("AIController", "Ear", [100.0, 0.0, 0.0], 1000.0);
+    let def = native("Engine.Actor.MakeNoise");
+    let err = (def.f)(
+        &mut bare.vm,
+        &ctx(player, &[false], "Engine.Actor.MakeNoise"),
+        &mut [Value::Float(1.0)],
+    )
+    .expect_err("no provider");
+    assert!(
+        matches!(err.kind, VmErrorKind::NoPhysicsProvider { .. }),
+        "{err:?}"
+    );
+}
+
+/// Who can hear: never the instigator's own controller, nor a controller that does not probe
+/// `HearNoise` (no body, a state that ignores it, `Disable`), nor one without a pawn; no
+/// instigator, an instigator without a controller and client net mode deliver nothing.
+#[test]
+fn make_noise_listener_filters() {
+    let set = hearing_set();
+    let mut w = HearWorld::new(&set, Some(MockWorld::new()));
+    let player = w.player([0.0, 0.0, 0.0]);
+    w.listener("AIController", "Ear", [100.0, 0.0, 0.0], 1000.0);
+    w.listener("Controller", "Plain", [100.0, 0.0, 0.0], 1000.0);
+    let deaf_pawn = w.listener("AIController", "Deaf", [100.0, 0.0, 0.0], 1000.0);
+    let deaf = w.vm.obj_prop(deaf_pawn, "Controller").unwrap();
+    w.vm.goto_state(deaf, "Deaf", None).unwrap();
+    let disabled_pawn = w.listener("AIController", "Disabled", [100.0, 0.0, 0.0], 1000.0);
+    let disabled = w.vm.obj_prop(disabled_pawn, "Controller").unwrap();
+    w.vm.disable_probe(disabled, "HearNoise", true);
+    w.controller("AIController", "NoPawn", None);
+    w.noise(player, 1.0);
+    assert_eq!(w.heard_by(), ["Ear"]);
+
+    // Leaving the ignoring state restores the class probe.
+    w.vm.goto_state(deaf, "None", None).unwrap();
+    w.vm.time += 1.0;
+    w.noise(player, 1.0);
+    assert_eq!(w.heard_by(), ["Deaf", "Ear"]);
+
+    // The noise maker's own controller never hears it, even when it probes.
+    let selfish = w.listener("AIController", "Selfish", [0.0, 0.0, 0.0], 1000.0);
+    w.vm.time += 1.0;
+    w.noise(selfish, 1.0);
+    assert_eq!(w.heard_by(), ["Deaf", "Ear"]);
+
+    // No instigator / an instigator without a controller: nothing, and no slot is written.
+    let rock = w.pawn("Rock", [0.0, 0.0, 0.0], 0.0);
+    w.vm.set_property(rock, "Instigator", 0, Value::Object(None));
+    w.vm.time += 1.0;
+    w.noise(rock, 1.0);
+    assert!(w.heard().is_empty());
+    w.vm.set_property(rock, "Instigator", 0, inst(rock));
+    w.noise(rock, 1.0);
+    assert!(w.heard().is_empty());
+    assert_eq!(
+        w.f(rock, "noise1time"),
+        0.0,
+        "no controller: returns before the slots"
+    );
+
+    // NM_Client (3): MakeNoise does nothing.
+    w.vm.set_property(w.level, "NetMode", 0, Value::Byte(3));
+    w.vm.time += 1.0;
+    w.noise(player, 1.0);
+    assert!(w.heard().is_empty());
+    assert_eq!(
+        w.f(player, "noise1time"),
+        1.0,
+        "the client-mode noise left no slot"
+    );
+}
+
+/// A noise whose instigator is not a player and whose controller's enemy is not a player only
+/// reaches controllers with the noise maker's Tag or a player pawn; a player enemy makes it
+/// reach everyone.
+#[test]
+fn make_noise_non_player_noise_is_limited_to_tag_or_player() {
+    let set = hearing_set();
+    let mut w = HearWorld::new(&set, Some(MockWorld::new()));
+    let soldier = w.listener("AIController", "Soldier", [0.0, 0.0, 0.0], 1000.0);
+    let soldier_c = w.vm.obj_prop(soldier, "Controller").unwrap();
+    // The pawn carries the tag here, its controller does not.
+    let other = w.listener("AIController", "OtherTag", [100.0, 0.0, 0.0], 1000.0);
+    let same = w.listener("AIController", "SameTag", [100.0, 0.0, 0.0], 1000.0);
+    let same_c = w.vm.obj_prop(same, "Controller").unwrap();
+    // A probing controller flagged bIsPlayer counts as a player listener.
+    let human = w.listener("AIController", "Human", [100.0, 0.0, 0.0], 1000.0);
+    let human_c = w.vm.obj_prop(human, "Controller").unwrap();
+    w.vm.set_property(human_c, "bIsPlayer", 0, Value::Bool(true));
+    for id in [soldier, same_c, other] {
+        w.vm.set_property(id, "Tag", 0, Value::Name("Squad".into()));
+    }
+    w.noise(soldier, 1.0);
+    assert_eq!(
+        w.heard_by(),
+        ["Human", "SameTag"],
+        "the listener controller's Tag is compared with the noise maker's"
+    );
+
+    let player = w.player([5000.0, 0.0, 0.0]);
+    w.vm.set_property(soldier_c, "Enemy", 0, inst(player));
+    w.vm.time += 1.0;
+    w.noise(soldier, 1.0);
+    assert_eq!(w.heard_by(), ["Human", "OtherTag", "SameTag"]);
+}
+
+/// The two noise slots: a repeat within 0.2 s, within 50 uu and not more than 1/0.9 louder is
+/// dropped entirely; otherwise the noise is stored (slot 1 when older than 0.18 s, else slot 2,
+/// else the louder-than rules, the last of which writes slot 1).
+#[test]
+fn make_noise_slots_suppress_repeats_and_store_like_the_engine() {
+    let set = hearing_set();
+    let mut w = HearWorld::new(&set, Some(MockWorld::new()));
+    let player = w.player([0.0, 0.0, 0.0]);
+    w.listener("AIController", "Ear", [100.0, 0.0, 0.0], 1000.0);
+    w.vm.time = 10.0;
+    w.noise(player, 1.0);
+    assert_eq!(w.heard().len(), 1);
+    assert_eq!(w.f(player, "noise1time"), 10.0);
+    assert_eq!(w.f(player, "noise1loudness"), 1.0);
+    assert_eq!(w.v(player, "noise1spot"), [0.0, 0.0, 0.0]);
+
+    // 0.1 s later, 49 uu away, 1.11x louder (0.9 * 1.11 <= 1): suppressed by slot 1.
+    w.vm.time = 10.1;
+    w.vm.set_property(player, "Location", 0, Value::Vector([49.0, 0.0, 0.0]));
+    w.noise(player, 1.11);
+    assert!(w.heard().is_empty(), "suppressed by slot 1");
+    // 1.12x louder (0.9 * 1.12 > 1): heard and stored in slot 2 (slot 1 is younger than 0.18 s).
+    w.noise(player, 1.12);
+    assert_eq!(w.heard().len(), 1);
+    assert_eq!(w.f(player, "noise1time"), 10.0);
+    assert_eq!(w.f(player, "noise2time"), 10.1f64 as f32);
+    assert_eq!(w.f(player, "noise2loudness"), 1.12);
+    // 51 uu from slot 1 and 2 uu from slot 2: slot 2 suppresses it.
+    w.vm.set_property(player, "Location", 0, Value::Vector([51.0, 0.0, 0.0]));
+    w.noise(player, 1.0);
+    assert!(w.heard().is_empty(), "suppressed by slot 2");
+
+    // Both slots fresh and a far noise: slot 1 is not near, slot 2 is not louder than this one
+    // (1.12 <= 1.5), so the engine overwrites slot 1, not slot 2.
+    w.vm.time = 10.15;
+    w.vm.set_property(player, "Location", 0, Value::Vector([500.0, 0.0, 0.0]));
+    w.noise(player, 1.5);
+    assert_eq!(w.heard().len(), 1);
+    assert_eq!(w.v(player, "noise1spot"), [500.0, 0.0, 0.0]);
+    assert_eq!(w.f(player, "noise1loudness"), 1.5);
+    assert_eq!(w.f(player, "noise2loudness"), 1.12, "slot 2 untouched");
+
+    // Both fresh, far and quieter than both: delivered (0.7e6 >= 800^2), nothing stored.
+    w.vm.time = 10.2;
+    w.vm.set_property(player, "Location", 0, Value::Vector([900.0, 0.0, 0.0]));
+    w.noise(player, 0.7);
+    assert_eq!(w.heard().len(), 1);
+    assert_eq!(w.v(player, "noise1spot"), [500.0, 0.0, 0.0]);
+    assert_eq!(w.f(player, "noise1loudness"), 1.5);
+
+    // The window is strict: 0.25 s after slot 1, the same noise at the same spot is heard.
+    w.vm.time = 10.4;
+    w.vm.set_property(player, "Location", 0, Value::Vector([500.0, 0.0, 0.0]));
+    w.noise(player, 1.5);
+    assert_eq!(w.heard().len(), 1, "slot 1 is older than 0.2 s");
+}
+
+/// bMuffledHearing: through a wall the noise is still heard when
+/// `Perceived > W*W + 4*DistSq`, W being the squared span between the two wall hits.
+#[test]
+fn make_noise_muffled_hearing_through_a_thin_wall() {
+    let set = hearing_set();
+    // A 10 uu wall: W = 100, W^2 = 1e4. DistSq = 300^2 = 9e4, 4*DistSq = 3.6e5.
+    let thin = MockWorld::new().with_wall([145.0, -50.0, -50.0], [155.0, 50.0, 50.0]);
+    let mut w = HearWorld::new(&set, Some(thin));
+    let player = w.player([300.0, 0.0, 0.0]);
+    let ear = w.listener("AIController", "Ear", [0.0, 0.0, 0.0], 700.0);
+    w.noise(player, 1.0);
+    assert!(w.heard().is_empty(), "occluded, no muffled hearing");
+    w.vm.set_property(ear, "bMuffledHearing", 0, Value::Bool(true));
+    w.vm.time += 1.0;
+    w.noise(player, 1.0);
+    assert_eq!(w.heard().len(), 1, "4.9e5 > 1e4 + 3.6e5");
+    assert_eq!(
+        w.notes("bMuffledHearing"),
+        1,
+        "the BSP-only stand-in is reported"
+    );
+    w.vm.time += 1.0;
+    w.noise(player, 1.0);
+    assert_eq!(w.heard().len(), 1);
+    assert_eq!(w.notes("bMuffledHearing"), 0, "reported once per VM");
+    // HearingThreshold 610: 3.721e5 > 3.7e5: heard; 608: 3.69664e5 < 3.7e5: not heard.
+    w.vm.set_property(ear, "HearingThreshold", 0, Value::Float(610.0));
+    w.vm.time += 1.0;
+    w.noise(player, 1.0);
+    assert_eq!(w.heard().len(), 1);
+    w.vm.set_property(ear, "HearingThreshold", 0, Value::Float(608.0));
+    w.vm.time += 1.0;
+    w.noise(player, 1.0);
+    assert!(w.heard().is_empty());
+
+    // A 20 uu wall: W = 400, W^2 + 4*DistSq = 1.6e5 + 3.6e5 = 5.2e5 > 4.9e5: not heard.
+    let thick = MockWorld::new().with_wall([140.0, -50.0, -50.0], [160.0, 50.0, 50.0]);
+    let mut w = HearWorld::new(&set, Some(thick));
+    let player = w.player([300.0, 0.0, 0.0]);
+    let ear = w.listener("AIController", "Ear", [0.0, 0.0, 0.0], 700.0);
+    w.vm.set_property(ear, "bMuffledHearing", 0, Value::Bool(true));
+    w.noise(player, 1.0);
+    assert!(w.heard().is_empty());
+}
+
+/// bAroundCornerHearing: a sound-propagating navigation point within `Perceived / 8` (squared)
+/// of both ends, with clear lines to the noise and to the eye, carries the noise around a wall.
+#[test]
+fn make_noise_around_corner_via_navigation_points() {
+    let set = hearing_set();
+    // Wall between the ear (0,0,0) and the noise (300,0,0); a nav point at (150,200,0) sees both.
+    let wall = MockWorld::new().with_wall([140.0, -100.0, -50.0], [160.0, 100.0, 50.0]);
+    let mut w = HearWorld::new(&set, Some(wall));
+    let player = w.player([300.0, 0.0, 0.0]);
+    let ear = w.listener("AIController", "Ear", [0.0, 0.0, 0.0], 1000.0);
+    w.vm.set_property(ear, "bAroundCornerHearing", 0, Value::Bool(true));
+    let nav = w.vm.spawn(sg(&set, "NavigationPoint"), "Nav").unwrap();
+    w.vm.set_property(nav, "Location", 0, Value::Vector([150.0, 200.0, 0.0]));
+    w.noise(player, 1.0);
+    assert!(
+        w.heard().is_empty(),
+        "the nav point is not on the level list"
+    );
+
+    w.vm.set_property(w.level, "NavigationPointList", 0, inst(nav));
+    w.vm.time += 1.0;
+    w.noise(player, 1.0);
+    assert!(w.heard().is_empty(), "bPropagatesSound is false");
+
+    w.vm.set_property(nav, "bPropagatesSound", 0, Value::Bool(true));
+    w.vm.time += 1.0;
+    w.noise(player, 1.0);
+    assert_eq!(w.heard().len(), 1);
+    assert_eq!(w.notes("bAroundCornerHearing"), 1);
+
+    // Each leg is 150^2 + 200^2 = 62500; Perceived / 8 must exceed it: HearingThreshold 707
+    // gives 499849 / 8 = 62481.1: not heard.
+    w.vm.set_property(ear, "HearingThreshold", 0, Value::Float(707.0));
+    w.vm.time += 1.0;
+    w.noise(player, 1.0);
+    assert!(w.heard().is_empty());
+    // A blocked leg (the nav point inside the wall's span) also fails.
+    w.vm.set_property(ear, "HearingThreshold", 0, Value::Float(1000.0));
+    w.vm.set_property(nav, "Location", 0, Value::Vector([150.0, 90.0, 0.0]));
+    w.vm.time += 1.0;
+    w.noise(player, 1.0);
+    assert!(w.heard().is_empty());
+}
+
+/// Zone hearing flags are decoded but the VM has no zone model: the zone test is reported once
+/// and the LOS branch still decides.
+#[test]
+fn make_noise_zone_hearing_is_reported_partial() {
+    let set = hearing_set();
+    let wall = MockWorld::new().with_wall([45.0, -50.0, -50.0], [55.0, 50.0, 50.0]);
+    let mut w = HearWorld::new(&set, Some(wall));
+    let player = w.player([100.0, 0.0, 0.0]);
+    let ear = w.listener("AIController", "Ear", [0.0, 0.0, 0.0], 1000.0);
+    w.vm.set_property(ear, "bSameZoneHearing", 0, Value::Bool(true));
+    w.noise(player, 1.0);
+    assert!(w.heard().is_empty(), "zone test unavailable, LOS blocked");
+    assert_eq!(w.notes("zone hearing"), 1);
+}
+
+/// A NaN loudness makes `Perceived` NaN, which passes the engine's `Perceived < DistSq` reject
+/// test (x87 unordered compare); the decoded behaviour is kept rather than filtered. A negative
+/// loudness is never heard at a distance.
+#[test]
+fn make_noise_nan_and_negative_loudness_follow_the_x87_compares() {
+    let set = hearing_set();
+    let mut w = HearWorld::new(&set, Some(MockWorld::new()));
+    let player = w.player([0.0, 0.0, 0.0]);
+    w.listener("AIController", "Ear", [900.0, 0.0, 0.0], 1.0);
+    w.noise(player, f32::NAN);
+    assert_eq!(w.heard_by(), ["Ear"]);
+    w.vm.time += 1.0;
+    w.noise(player, -1.0);
+    assert!(w.heard().is_empty());
+}

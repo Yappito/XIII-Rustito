@@ -1,35 +1,78 @@
-# item24: Banque01 route. The end-of-level travel is the game's own
-# MapInfo.SetGoalComplete -> TestGoalComplete -> DoTravel -> XIIIGameInfo.EndGame ->
-# XIIIPlayerController.GameEnded -> GameEndedSuccess -> PlayingVideo (EndMapVideo "cine02", real
-# Bink duration) -> PlayingVideo.PlayerTick -> Level.ServerTravel("Amos01.unr") chain.
+# item27j/item27k: Banque01 story route. Follows the map's own cutscene flow by player input; there
+# are no `set_goal` bridges. Objective 0 "Access the strongroom." must complete through the game's
+# own chain (Cine1 teller scene -> Cine15 Jones scene -> `event fin_flash` -> XIIIDispatcher4 ->
+# GT_quitterbanque -> XIIIGoalTrigger0), which promotes objective 1, and objective 1 "Escape from
+# the bank." completes through Cine11's `playerevent fin_map` -> XIIIGoalTrigger2 (GoalNumber 1)
+# -> DoTravel -> Amos01.
 #
-# Teleports below are explicitly diagnostic movement shortcuts: the route volumes span the whole
-# bank (~13,000 UU wide) and the port does not path between them. Walking onto each volume still
-# delivers the volume's own engine `Touch`, so every `TouchTrigger`/`DetectionVolume`/`GoalTrigger`
-# touch recorded by the run is the game's own code.
+# item27k fixed the two VM pawn-move blockers (B-1: the adapter kept a mover's base-pose triangles
+# in the static soup; B-2: the walker deadlocked on start-penetrating contacts — the engine's
+# MoveActor discards hits within the 2-UU back-off behind the start). Measured after the fix (cine
+# trace in local/re/item27k/): Cine1 completes its whole chain (movseqb [26][35][40][46],
+# `event toto` [59] at t=58.15 -> Porte8 unlocks; the vault movement-gap teleport is gone) and
+# Cine15 walks its old blocker `movseqb sp 0.25 w 33 w 34` [20] and continues to action[34]
+# "wait player 300" (t=69.1), where Jones stands at (-7885.1,-2647.3,875.0) (pawn-location in the
+# cine trace). The wait's measured bytecode (XIDCine CineController2.Interpret case "Player"):
+# SetCollisionSize(300, h) then keep waiting while VSize2D(pawn - player) > 300 or
+# |pawn.z - player.z| > pawn.CollisionHeight (75) — the player must be near JONES, not near the
+# action's Target position info. The t=70 teleport below satisfies it (the player falls to the
+# walkway at z=875, ~2 UU from Jones).
 #
-# `set_goal` is a labelled host bridge (prints "set_goal N via Banque0.SetGoalComplete"): Banque01
-# promotes its objectives from three scripted bank scenes that the port cannot complete (blockers
-# B1-B3 in the item24 report); the bridge calls the map's own `MapInfo.SetGoalComplete`, exactly
-# what the cutscene `playerevent`/`ev` chains would call. No teleport or bridge changes objective
-# state silently.
+# Teleport classes used below:
+#   - "flow touch": teleport onto a trigger volume the flow depends on; the run delivers the
+#     volume's own engine `Touch`, so every touch is the game's own code.
+#   - "measured recipe": the D->E re-entry around DetectionVolume1. Banque0's STA_DonneCle tick
+#     released `recoit_cle` 0.1 s after the player RE-ENTERED DV1 in every probe that used it, and
+#     never while the player sat inside from the start (mechanism unresolved; measured probes 2-5;
+#     item27k revisits this below).
+#   - "flow spot": a position a cinema's measured `wait player N` needs (near the pawn, not the
+#     action's target marker).
 
-# Game's own touches: walk each trigger volume the end-of-level sequence depends on.
-t=1.00 teleport -428 -2312 80       # diagnostic: DetectionVolume1 (Event julien_cine, bank teller scene)
-t=5.00 teleport 1300.03 -1917.39 1478  # diagnostic: TouchTrigger5 (Event vignracaille -> Dispatcher2)
-t=9.00 teleport 865 -4075 1530      # diagnostic: TouchTrigger2 (Event arrivee_fbi)
-t=13.00 teleport 1134 -4222 480     # diagnostic: TouchTrigger3 (Event fbi_dial2)
-t=17.00 teleport 1148 -4063 380     # diagnostic: TouchTrigger4 (Event arrivee_amos)
-t=20.00 teleport 1014.38 -4309 620  # diagnostic: TouchTrigger10 (Event CarOut)
-t=23.00 teleport -182 -1338 130     # diagnostic: TouchTrigger12 (Event gardien_cine)
-t=26.00 teleport 1341.37 -4019.51 380  # diagnostic: XIIIGoalTrigger2 (Tag fin_map, GoalNumber 1)
+# Leave the intro camera (WaitForFirstDisplay).
+t=0.50 forward 1
+t=1.50 forward 0
 
-# Bridged objectives (blockers B1-B3): objective 0 "Access the strongroom" is promoted by Cine1's
-# `ev vignclefbanque` and completed by Cine15's `event fin_flash` -> XIIIDispatcher4 ->
-# `GT_quitterbanque`; objective 1 "Escape from the bank" is completed by Cine11's
-# `playerevent fin_map`. None of the three scenes reaches its label (the host does not run the
-# cinematic sequence latents/anim notifies), so the route invokes the same `MapInfo.SetGoalComplete`
-# those events call. Labelled bridge, never silent.
-t=30.00 set_goal 0
-t=31.00 set_goal 1
-t=32.00 wait_travel
+# Bank teller scene (Cine1): DetectionVolume1 (Event julien_cine) starts it through the game's own
+# Touch. flow touch.
+t=3.00 teleport -428 -2312 80
+
+# item27k: `recoit_cle` releases when Banque0.STA_DonneCle.Tick sees
+# VSize2D(teller - player) < fDistanceBanquier (300) && XPC.CanSee(teller) (measured bytecode).
+# The old "leave DV1 and re-enter" recipe is not the mechanism: a single teleport to spot E
+# (-494,-2383,80) — within 300 UU of the teller with a clear eye line — releases it. (The DV1
+# touch at t=3 already started the scene; spot E itself is outside DV1 and fires nothing.)
+t=11.00 teleport -494 -2383 80      # flow spot: within the teller's fDistanceBanquier + CanSee
+
+# The teller walks to the counter and opens the staff gate (fixed ~24 s of scene actions after
+# recoit_cle; her `wait player 500`, action[32], passed with the player here in the probes).
+t=23.00 teleport -540 -1350 80      # flow: within the teller's wait-player radius
+
+# Cine1 `event james` (action[45]) starts Cine6 (James); his `wait player 700` (action[4]) needs
+# the player this close for the dialogue, then `event ajulien` fires.
+t=40.00 teleport -1760 -2480 -80    # flow: within James's wait-player radius
+
+# Vault door Porte8: unlocked by the game itself at t=58.15 (Cine1[59] `event toto`, measured) —
+# no movement-gap teleport needed since item27k's B-1 fix.
+t=44.00 teleport -2843 -6380 -150   # flow: to the vault door
+
+# Strongroom: DetectionVolume12's Touch starts Cine15 (Jones). flow touch.
+t=47.00 teleport -7616 -2784 1456   # flow touch: DetectionVolume12 (starts Cine15)
+t=48.00 teleport -7142 -2100 880    # flow spot: Cine15[3] "wait player 300" (Jones at the safe)
+
+# Jones plays the briefcase scene, walks his waypoints (w33/w34 [20], w35/w36/w25/w23 [22], w58
+# [27]) and reaches [34] "wait player 300" at t~69.1 (measured), standing at
+# (-7885.1,-2647.3,875.0). flow spot: the player falls to the walkway at z=875, ~2 UU from Jones.
+t=70.00 teleport -7883 -2648 990
+
+# The scene should run to `event fin_flash` (action[45]) with the player beside Jones; then the
+# objective-0 chain (XIIIDispatcher4 -> GT_quitterbanque -> XIIIGoalTrigger0) completes objective 0
+# and promotes objective 1. The escape-flow volumes below drive the escape cinemas -> Cine11
+# `playerevent fin_map` -> XIIIGoalTrigger2 (GoalNumber 1) -> DoTravel -> Amos01.
+t=76.00 teleport 1300.03 -1917.39 1478  # flow touch: TouchTrigger5 (Event vignracaille)
+t=79.00 teleport 865 -4075 1530         # flow touch: TouchTrigger2 (Event arrivee_fbi)
+t=82.00 teleport 1134 -4222 480         # flow touch: TouchTrigger3 (Event fbi_dial2)
+t=85.00 teleport 1148 -4063 380         # flow touch: TouchTrigger4 (Event arrivee_amos)
+t=88.00 teleport 1014.38 -4309 620      # flow touch: TouchTrigger10 (Event CarOut)
+
+# Wait for the game's own travel (Amos01 via the end-of-level chain).
+t=91.00 wait_travel
