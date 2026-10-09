@@ -992,7 +992,7 @@ fn fixed_step(
     }
     // Always advance the script so an explicit `take_control` diagnostic can be read even while a cutscene
     // suppresses input; the axis input and the other command queues are dropped when suppressed.
-    let (mut input, weapons, goals, use_named, search) = match script.drive.as_mut() {
+    let (mut input, weapons, goals, use_named) = match script.drive.as_mut() {
         Some(drive) => {
             let input = drive.advance(elapsed, &mut sim.0);
             (
@@ -1000,12 +1000,10 @@ fn fixed_step(
                 drive.take_weapons(),
                 drive.take_goals(),
                 drive.take_use_named(),
-                drive.take_search(),
             )
         }
         None => (
             read_keyboard(&keys, &buttons),
-            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1040,11 +1038,6 @@ fn fixed_step(
     if suppressed {
         weapon_inputs.clear();
     }
-    let wake: Vec<String> = script
-        .drive
-        .as_mut()
-        .map(script::Drive::take_wake)
-        .unwrap_or_default();
     let control = script
         .drive
         .as_mut()
@@ -1052,10 +1045,10 @@ fn fixed_step(
     if suppressed {
         input = Input::default();
     }
-    let (weapons, goals, use_named, search) = if suppressed {
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+    let (weapons, goals, use_named) = if suppressed {
+        (Vec::new(), Vec::new(), Vec::new())
     } else {
-        (weapons, goals, use_named, search)
+        (weapons, goals, use_named)
     };
     let use_action = input.use_action;
     let fire = input.fire;
@@ -1179,16 +1172,6 @@ fn fixed_step(
         for target in &use_named {
             let outcome = sess.use_target(target);
             println!("[play] use {target}: {outcome:?}");
-        }
-        for target in &search {
-            let outcome = sess.search_corpse(target);
-            println!("[play] search {target}: {outcome:?}");
-        }
-        for target in &wake {
-            match sess.wake_actor(target) {
-                Ok(msg) => println!("[play] wake {msg}"),
-                Err(e) => println!("[play] wake failed: {e}"),
-            }
         }
         if fire {
             match sess.fire(sim.0.yaw, sim.0.pitch) {
@@ -2155,8 +2138,6 @@ fn run_script_inner(
         let goals = drive.take_goals();
         let mut weapon_inputs = drive.take_weapon_inputs();
         let mut use_named = drive.take_use_named();
-        let mut search = drive.take_search();
-        let wake = drive.take_wake();
         let control = drive.take_control();
         // Match the interactive fixed_step: FPC/FPL/CameraView/PlayingVideo own the pawn while
         // the authored cinematic runs. The headless route must still advance its script cursor,
@@ -2169,9 +2150,6 @@ fn run_script_inner(
             // a player action. Keep it available while an authored cinematic owns input.
             weapon_inputs.clear();
             use_named.clear();
-            search.clear();
-            // `wake` is a host bridge like `set_goal`, not a player input: it stays available
-            // while an authored cinematic suppresses the player axes.
         }
         let fired = input.fire;
         if runtime.volumes.is_empty() {
@@ -2265,16 +2243,6 @@ fn run_script_inner(
         for target in &use_named {
             let outcome = runtime.session.use_target(target);
             println!("[play] use {target}: {outcome:?}");
-        }
-        for target in &search {
-            let outcome = runtime.session.search_corpse(target);
-            println!("[play] search {target}: {outcome:?}");
-        }
-        for target in &wake {
-            match runtime.session.wake_actor(target) {
-                Ok(msg) => println!("[play] wake {msg}"),
-                Err(e) => println!("[play] wake failed: {e}"),
-            }
         }
         if fired {
             match runtime.session.fire(runtime.sim.yaw, runtime.sim.pitch) {
@@ -3075,6 +3043,30 @@ mod tests {
                 );
             }
         }
+        // item49b acceptance, post-travel half: the truck key taken from the killer's corpse
+        // must survive the `items=true` server travel inside the player's inventory. The
+        // pre-travel corpse-search leg is asserted by
+        // `opt_in_item49b_plage01_corpse_search_runs_game_path`.
+        assert!(
+            outcome
+                .session
+                .vm()
+                .objects
+                .iter()
+                .enumerate()
+                .any(|(i, o)| {
+                    let id = i as xiii_script::ObjectId;
+                    !o.deleted
+                        && outcome.session.vm().is_a(id, "keys")
+                        && matches!(
+                            outcome.session.vm().get_property(id, "Owner"),
+                            Some(xiii_script::Value::Object(Some(
+                                xiii_script::ObjRef::Instance(owner),
+                            ))) if *owner == outcome.session.player
+                        )
+                }),
+            "a live truck key must still be carried by the player after the travel"
+        );
         println!("[route] map objectives: {:?}", outcome.map_objectives);
         println!(
             "[route] end state: game_ended={:?}, controller={:?}, controller_state={:?}, controller_active={:?}",
@@ -3125,6 +3117,10 @@ mod tests {
                 || rendered.contains("ServerTravel")
                 || rendered.contains("AddController")
                 || rendered.contains("RemoveController")
+                || rendered.contains("SearchPawn")
+                || rendered.contains(".Transfer")
+                || rendered.contains("AddInventory")
+                || rendered.contains("Grab")
             {
                 println!("[route] ending trace t={:.3}: {rendered}", ev.time);
             }
@@ -3607,6 +3603,31 @@ mod tests {
                 "[route]   [{}] primary={} completed={} anti_goal={} {:?}",
                 obj.index, obj.primary, obj.completed, obj.anti_goal, obj.text
             );
+        }
+        // item49b diagnostics for the ending flow (CarOut -> goal completion -> fin_map video ->
+        // ServerTravel); bounded prints, kept visible for route forensics.
+        println!("[route] banque01 failures: {:?}", outcome.session.failures);
+        for (i, o) in outcome.session.vm().objects.iter().enumerate() {
+            if o.suspended && !o.deleted {
+                println!("[route] banque01 suspended actor: #{} {}", i, o.name);
+            }
+        }
+        let mut endflow = 0;
+        for ev in outcome.session.vm().trace.iter() {
+            let rendered = format!("{:?}", ev.kind);
+            // Script events, state changes and timers only: the per-tick native polling is noise.
+            let event_like = rendered.starts_with("Event")
+                || rendered.starts_with("StateChange")
+                || rendered.starts_with("Timer")
+                || rendered.starts_with("Latent");
+            let interesting = event_like && ev.time >= 138.0;
+            if interesting {
+                println!("[route] banque endflow t={:.3}: {rendered}", ev.time);
+                endflow += 1;
+                if endflow > 200 {
+                    break;
+                }
+            }
         }
         println!(
             "[route] travel: {:?}, final map {}",
@@ -4138,7 +4159,7 @@ mod tests {
         )
         .expect("run Plage00 goal walk");
         println!(
-            "[probe] travel hops: {:?}, final map {}",
+            "[route] travel: {:?}, final map {}",
             outcome.travel, outcome.final_map
         );
         assert!(
@@ -4786,8 +4807,12 @@ mod tests {
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
         let route = script::Script::parse(include_str!("../../tests/data/plage01_route.script"))
             .expect("parse the checked-in Plage01 route fixture");
-        let outcome = run_script(&game_dir, "Plage01", &route, &resolved.params, &scene, 65.0)
+        let outcome = run_script(&game_dir, "Plage01", &route, &resolved.params, &scene, 67.0)
             .expect("run the requested Plage01 route through the killer");
+        // The window is 67.0s because the executed death sequence is the game's pick and moved
+        // from `DeathEpauleGauche` (51 frames, done before 65.0) to `DeathDos` (83 frames,
+        // ~2.77s, ends ~65.3) once the VM stopped dropping cross-object calls (item49b); the
+        // pose assertions below are unchanged.
         let vm = outcome.session.vm();
         let killer = vm
             .find_object("BaseSoldier6")
@@ -4816,6 +4841,84 @@ mod tests {
         assert!(
             !death.active && death.frame >= death.frames.saturating_sub(1) as f32,
             "the dying pose must remain at the sequence's final frame: {death:?}"
+        );
+    }
+
+    /// item49b acceptance, pre-travel half: the Plage01 killer's truck key must reach the player
+    /// through the game's own corpse search — the `XIIIPlayerPawn.Tick` auto-search
+    /// (0x017B..0x024F) or the controller's `Grab` -> `SearchPawn` -> `Inventory.Transfer` —
+    /// never a host inventory bridge. Asserts the game-path fingerprint in the VM trace
+    /// (`SearchPawn` on the corpse) plus the drained corpse chain and the carried key.
+    #[test]
+    fn opt_in_item49b_plage01_corpse_search_runs_game_path() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let route = script::Script::parse(include_str!("../../tests/data/plage01_route.script"))
+            .expect("parse the checked-in Plage01 route fixture");
+        // Stop before the truck-door ending so the VM trace still covers Plage01 (a server
+        // travel resets it for the next map).
+        let outcome = run_script(&game_dir, "Plage01", &route, &resolved.params, &scene, 65.0)
+            .expect("run the requested Plage01 route through the killer");
+        let vm = outcome.session.vm();
+        let corpse = vm
+            .find_object("BaseSoldier6")
+            .expect("Plage01 BaseSoldier6 remains addressable as a corpse");
+        assert!(
+            outcome.session.actor_is_dead(corpse),
+            "the route must kill BaseSoldier6"
+        );
+        let mut search_events = Vec::new();
+        for ev in vm.trace.iter().filter(|e| e.time >= 55.0) {
+            let rendered = format!("{:?}", ev.kind);
+            if rendered.contains("SearchPawn")
+                || rendered.contains(".Grab\"")
+                || rendered.contains(".Transfer")
+                || rendered.contains("AddInventory")
+                || rendered.contains("DeleteInventory")
+            {
+                println!("[item49b corpse] t={:.3}: {rendered}", ev.time);
+                if rendered.contains("SearchPawn") {
+                    search_events.push(rendered);
+                }
+            }
+        }
+        assert!(
+            !search_events.is_empty(),
+            "the game's SearchPawn must run on the killer's corpse; no host bridge may replace it"
+        );
+        assert!(
+            search_events
+                .iter()
+                .any(|e| e.to_ascii_lowercase().contains("basesoldier6")),
+            "SearchPawn must target the killer's corpse: {search_events:?}"
+        );
+        assert_eq!(
+            vm.get_property(corpse, "Inventory"),
+            Some(&xiii_script::Value::Object(None)),
+            "SearchPawn -> Transfer must drain the killer's chain"
+        );
+        assert!(
+            vm.objects.iter().enumerate().any(|(i, o)| {
+                let id = i as xiii_script::ObjectId;
+                !o.deleted
+                    && vm.is_a(id, "keys")
+                    && matches!(
+                        vm.get_property(id, "Owner"),
+                        Some(xiii_script::Value::Object(Some(
+                            xiii_script::ObjRef::Instance(owner),
+                        ))) if *owner == outcome.session.player
+                    )
+            }),
+            "the truck key must be carried by the player after the corpse search"
         );
     }
 

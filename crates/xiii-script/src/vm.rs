@@ -8,9 +8,9 @@
 //! per-tick step budget.
 //!
 //! No filesystem access and no engine dependency: the caller loads packages into the set and
-//! decides which actors are *active* (executed). Script calls into inactive actors are
-//! recorded as [`TraceKind::Deferred`] and not executed (an error if the call needs a return
-//! value). Unsupported tokens, unimplemented natives, budget overruns and bad values fail with
+//! decides which actors are *active* (ticked). Direct script calls run independently of ticking.
+//! The diagnostic harness can explicitly restrict calls to its selected scope; skipped calls
+//! are traced, and return-valued calls fail. Unsupported tokens and unimplemented natives fail with
 //! [`VmError`] carrying a script stack trace. Nothing is stubbed silently.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1091,11 +1091,10 @@ pub struct Instance {
     /// All probes of the actor were disabled (`AActor+0x34` bit 0x1, `bProbesDisabled`). Read from
     /// the serialized property `bProbesDisabled` at spawn/layout time; `Disable`/`Enable` update it.
     probes_disabled: bool,
-    /// Executed by the VM (in scope).
+    /// Receives scheduled ticks, state code and timers. Does not gate direct script calls.
     pub active: bool,
-    /// Suspended after a script error (`active` was cleared by [`Vm::suspend_for_error`]). A
-    /// non-static call to a suspended actor is dropped; item14c records that visibly (see
-    /// [`Vm::suspended_deferred_calls`]) instead of silently no-oping.
+    /// Scheduled execution suspended after a script error. Direct calls still execute and
+    /// propagate any error; suspension never supplies a successful replacement result.
     pub suspended: bool,
     /// Derives from `Actor`.
     pub is_actor: bool,
@@ -1431,6 +1430,8 @@ pub struct Vm<'s> {
     /// out of the executed scope). Every such drop also records a trace note; this counter makes
     /// the total visible to the host/report so a suspended actor's silent no-ops cannot hide.
     suspended_deferred_calls: u64,
+    /// Explicit partial-execution diagnostic policy, never used by normal gameplay.
+    diagnostic_call_scope: bool,
     /// item18: Bink video durations in seconds, keyed by lowercased file stem. The host registers
     /// them (the VM deliberately has no filesystem access); an entry is absent when the Bink header
     /// could not be read, in which case `VideoPlayer.GetStatus` keeps the old "finished" Partial.
@@ -1605,6 +1606,7 @@ impl<'s> Vm<'s> {
             profile: NativeProfile::default(),
             ai_visible: HashMap::new(),
             suspended_deferred_calls: 0,
+            diagnostic_call_scope: false,
             video_durations: HashMap::new(),
             video: None,
             video_host: None,
@@ -3175,7 +3177,13 @@ impl<'s> Vm<'s> {
             .is_some_and(|o| o.layout.chain_names.iter().any(|n| n.contains(needle)))
     }
 
-    /// Marks an object as executed (in scope).
+    /// Restricts direct calls to active objects for a partial-execution diagnostic.
+    /// This is a harness policy, not an UnrealScript rule. Normal gameplay leaves it disabled.
+    pub fn set_diagnostic_call_scope(&mut self, enabled: bool) {
+        self.diagnostic_call_scope = enabled;
+    }
+
+    /// Marks an object for scheduled execution (ticks, timers and state code).
     pub fn set_active(&mut self, id: ObjectId, active: bool) {
         if let Some(o) = self.objects.get_mut(id as usize) {
             o.active = active;
@@ -4430,8 +4438,8 @@ impl<'s> Vm<'s> {
         id
     }
 
-    /// item14c: number of non-static calls dropped because the target actor was suspended after a
-    /// script error. Every drop also records a `Note`; this is the cumulative count for reports.
+    /// Diagnostic-scope calls dropped on suspended objects. Normal dispatch never drops
+    /// calls for tick suspension, so gameplay leaves this counter at zero.
     pub fn suspended_deferred_calls(&self) -> u64 {
         self.suspended_deferred_calls
     }
@@ -4881,17 +4889,14 @@ impl<'s> Vm<'s> {
             };
         }
         let layout = self.func_layout(func);
-        // A class-default object (`Default__Class`) is never `active`, and a `static` function
-        // dispatches on the class default object; UE2 runs both regardless of instance scope
-        // (`MessageClass.default.GetColor`, `Message.static.GetString`). Only non-static calls
-        // on *placed* actors outside the executed scope are deferred.
-        // A call through a just-destroyed actor runs in the engine: `execFinalFunction`/
-        // `execVirtualFunction` reach `CallFunction` directly, which has no `bDeleteMe` guard (see
-        // `bypass_context_none`). The VM's `deleted`/`destroying` flags stand in for that, so such
-        // a call is never treated as an out-of-scope deferral.
+        // Core.dll execVirtualFunction (0x10117490) / execFinalFunction (0x101174d0)
+        // dispatch directly to CallFunction (0x1011e650), which does not test actor tick
+        // activity, state latency, probes or bDeleteMe. The active-set restriction below is
+        // exclusively the partial-execution diagnostic harness's opt-in policy.
         let destroyed_target =
             self.objects[target as usize].deleted || self.objects[target as usize].destroying;
-        if !self.objects[target as usize].active
+        if self.diagnostic_call_scope
+            && !self.objects[target as usize].active
             && !self.objects[target as usize].name.starts_with("Default__")
             && !f.is_static()
             && !destroyed_target
@@ -6821,6 +6826,15 @@ impl<'s> Vm<'s> {
             rotation.or_else(|| self.rotator_prop(spawner, "Rotation")),
         );
         self.set_property(id, "Owner", 0, Value::Object(owner.map(ObjRef::Instance)));
+        // Engine.dll execSpawn 0x103e5785 passes this->Instigator (+0x88), and
+        // ULevel::SpawnActor 0x10388d91..0x10388d96 stores it before lifecycle callbacks.
+        // Owner is independent: ammo spawned by a pawn must retain that pawn as Instigator
+        // so its Transfer can unlink from the corpse before GiveTo changes ownership.
+        let instigator = self
+            .get_property(spawner, "Instigator")
+            .cloned()
+            .unwrap_or(Value::Object(None));
+        self.set_property(id, "Instigator", 0, instigator);
         self.set_property(
             id,
             "Tag",
@@ -7101,59 +7115,12 @@ impl<'s> Vm<'s> {
         result?;
         self.objects[id as usize].active = false;
         self.objects[id as usize].timers = [None, None, None];
-        // Leave a clean inventory chain. `Inventory.Destroyed` unlinks the item via
-        // `Instigator/Owner.DeleteInventory`, but that call is on another actor and can be
-        // deferred (out of the executed scope), leaving the destroyed item reachable from the
-        // owner. A stale head then makes `PlayerController.SearchPawn`'s `while (i = P.Inventory)`
-        // loop forever (measured: the corpse-search BudgetExceeded). Removing it here is what
-        // UE2's `AActor::Destroy` guarantees; it is a no-op when the script already unlinked it.
-        if self.is_a(id, "inventory") {
-            for owner_prop in ["Instigator", "Owner"] {
-                if let Some(Value::Object(Some(ObjRef::Instance(owner)))) =
-                    self.get_property(id, owner_prop).cloned()
-                {
-                    self.unlink_inventory(owner, id);
-                }
-            }
-        }
         let actor = self.objects[id as usize].name.clone();
         self.note(TraceKind::Destroyed {
             actor,
             result: true,
         });
         Ok(true)
-    }
-
-    /// Removes `item` from `owner`'s `Inventory` singly-linked chain (or from `item`'s
-    /// predecessor in it). Used by [`Vm::destroy`] and the host corpse-search bridge to guarantee
-    /// a clean chain when the script's `Inventory.Destroyed`/`DeleteInventory` unlink was deferred
-    /// (a call on an out-of-scope actor). No-op when `item` is not linked.
-    pub fn unlink_inventory(&mut self, owner: ObjectId, item: ObjectId) {
-        let mut cur = owner;
-        let mut guard = 0;
-        loop {
-            guard += 1;
-            if guard > 1024 {
-                return;
-            }
-            let next = match self.get_property(cur, "Inventory").cloned() {
-                Some(Value::Object(Some(ObjRef::Instance(n)))) => n,
-                _ => return,
-            };
-            if next == item {
-                let after = self
-                    .get_property(item, "Inventory")
-                    .cloned()
-                    .unwrap_or(Value::Object(None));
-                let _ = self.set_property(cur, "Inventory", 0, after);
-                let _ = self.set_property(item, "Inventory", 0, Value::Object(None));
-                return;
-            }
-            cur = next;
-            if cur == owner {
-                return;
-            }
-        }
     }
 
     /// First live (not deleted) object with a name (case-insensitive).
