@@ -10,6 +10,16 @@
 #   - The ground-floor ducts are entered through breakable floor-level grilles
 #     (XIDCine.BreakableMover, AMaeraplaq); the player starts without fists, so a deco pickup
 #     (ChaiseDeco -> DecoChair, one swing) breaks a grille.
+#
+# item40f (local/reports/item40f-amos01-duct.md): the duct is a dead end for the objective
+# (BreakAbleMover17's walkable face points into the FBI office, item 1); the route crawls back
+# out and takes the authored west/ground loop: corridor (zone 22) -> zone 23 (east gap around
+# the AMtabloreso table) -> zone 17 -> hall 20/45 (clabataille opens Porte6) -> zone 57
+# (Porte7) -> 49 -> 56 -> sliver 59 -> zone 58 ground room -> AMescalier01 switchback stairs
+# (StaticMeshActor677) -> landing -> strip stairs to the 53-58 portal (Porte48) -> zone 53 ->
+# 52 (porte41/Porte38) -> 43 (Porte35) -> 39 ring -> slope down to zone 7 -> 6 -> nav chain
+# 6/8/12/33 -> 32 corridor (y=-1360 band) -> 32-38 portal -> TouchTrigger39 (-1999,-553,524):
+# objective 1 completes and the map travels to Toits01.
 t=0.50 forward 1
 t=1.50 forward 0
 # Control returns after the intro (~t=84). Jones (Cine3) waits "wait player 192" behind the
@@ -37,4 +47,141 @@ t=130.00 crouch on
 t=130.50 goto 60 -1198
 t=133.00 goto -300 -1198
 t=137.00 goto -505 -1198
-t=150.00 wait_travel
+# item40f: crawl back out (BM17 is one-sided: item 1) and take the west loop.
+t=141.00 goto -300 -1198
+t=145.00 goto 60 -1198
+t=149.00 goto 175 -1198
+t=152.00 crouch off
+# Zone 25 -> corridor (zone 22) west.
+t=155.00 goto 280 -930
+t=161.00 goto 64 -747
+t=168.00 goto -309 -789
+t=175.00 goto -720 -833
+t=182.00 goto -1000 -800
+t=187.00 goto -1088 -620
+t=188.00 use Porte1
+t=192.00 goto -1088 -500
+# Zone 23: pass the AMtabloreso table (x -1152..-1024) on its east side.
+t=196.00 goto -950 -440
+t=200.00 goto -950 -250
+t=204.00 goto -1080 -140
+t=208.00 goto -1090 0
+# Zone 17 corridor north.
+t=216.00 goto -1090 500
+t=224.00 goto -1090 1000
+t=232.00 goto -1050 1500
+t=239.00 goto -1010 1850
+t=244.00 goto -1010 2100
+t=249.00 goto -1250 2200
+t=255.00 goto -1400 2450
+t=261.00 goto -1500 2750
+t=267.00 goto -1490 3100
+t=272.00 goto -1500 3150
+# Zone 45 west; Porte6 is opened by Cine5 (clabataille) - do not toggle it.
+t=278.00 goto -1800 3300
+t=287.00 goto -2300 3450
+t=296.00 goto -2620 3560
+t=300.00 goto -2700 3620
+# Zone 57 north to Porte7.
+t=306.00 goto -2500 3800
+t=312.00 goto -2400 4300
+t=320.00 goto -2368 4656
+t=321.00 use Porte7
+# Zone 49 west, then zone 56 north.
+t=326.00 goto -2600 4850
+t=332.00 goto -2900 4900
+t=338.00 goto -2950 5060
+t=344.00 goto -2950 5300
+t=352.00 goto -2900 5800
+t=360.00 goto -2800 6100
+t=365.00 goto -2650 6170
+# Sliver 59 into the zone 58 ground room; AMescalier01 switchback stairs.
+t=369.00 goto -2560 6180
+t=373.00 goto -2400 6180
+t=378.00 goto -2250 6180
+t=383.00 goto -2190 6150
+t=388.00 goto -2190 6080
+t=393.00 goto -2180 6020
+t=398.00 goto -2170 5960
+t=403.00 goto -2160 5910
+t=406.00 use Porte48
+t=411.00 goto -2110 5860
+t=416.00 goto -2110 5750
+# Zone 53 elevated west walk (nav chain), through 52 (porte41/Porte38) and 43 (Porte35).
+t=422.00 goto -2245 5736
+t=432.00 goto -3060 5549
+t=444.00 goto -3020 5117
+t=450.00 use porte41
+t=451.00 use Porte38
+t=455.00 goto -3014 4727
+t=461.00 goto -2831 4584
+t=467.00 goto -3152 4395
+t=474.00 goto -2623 4327
+t=480.00 goto -2457 4217
+t=486.00 goto -2405 3942
+t=492.00 goto -2280 3800
+t=496.00 use Porte35
+t=500.00 goto -2110 3540
+t=506.00 goto -2225 3573
+t=512.00 goto -2411 3218
+t=519.00 goto -2567 3018
+t=526.00 goto -2543 2638
+t=532.00 goto -2349 2569
+t=537.00 goto -2343 2539
+# Zone 39 ring: west block (TouchTrigger24), north strip, east strip top.
+t=544.00 goto -1800 2700
+t=553.00 goto -1250 2750
+t=559.00 goto -1000 2750
+t=566.00 goto -800 2900
+t=573.00 goto -700 3200
+t=580.00 goto -700 3500
+t=588.00 goto -300 3520
+t=596.00 goto 300 3520
+t=604.00 goto 480 3300
+t=614.00 goto 478 2930
+# SW slope from the strip top down to zone 7's roof (r8/r9-validated slide line).
+t=620.00 goto 400 1990
+# Zone 7 west, 7-6 portal, zone 6, nav chain 6/8/12/33.
+t=626.00 goto 400 2000
+t=633.00 goto -400 1900
+t=640.00 goto -768 1900
+t=646.00 goto -1000 1890
+t=652.00 goto -1249 1891
+t=658.00 goto -1014 1753
+t=664.00 goto -1285 1586
+t=669.00 goto -1286 1436
+t=676.00 goto -1348 1111
+t=683.00 goto -1469 992
+t=689.00 goto -1356 757
+t=695.00 goto -1369 561
+t=701.00 goto -1340 428
+t=707.00 goto -1300 61
+t=714.00 goto -1275 -179
+t=720.00 goto -1287 -286
+t=727.00 goto -1227 -608
+t=734.00 goto -1141 -677
+t=740.00 goto -1041 -751
+t=746.00 goto -1210 -865
+t=753.00 goto -998 -889
+t=759.00 goto -828 -898
+t=765.00 goto -728 -903
+t=772.00 goto -350 -829
+t=779.00 goto -30 -827
+t=785.00 goto 84 -832
+t=792.00 goto 259 -936
+# Zone 33 -> 32 corridor (walk the y=-1360 band: AMtourporte2/BreakAbleMover48 at x~192).
+t=799.00 goto 288 -1100
+t=805.00 goto 288 -1260
+t=811.00 goto 250 -1360
+t=817.00 goto 0 -1360
+t=827.00 goto -500 -1360
+t=837.00 goto -1000 -1360
+t=847.00 goto -1500 -1350
+t=856.00 goto -1900 -1330
+t=862.00 goto -1980 -1300
+# 32-38 portal, then north through zone 38 to TouchTrigger39.
+t=868.00 goto -1980 -1250
+t=876.00 goto -1990 -1000
+t=884.00 goto -1999 -700
+t=891.00 goto -1999 -553
+t=911.00 wait_travel
