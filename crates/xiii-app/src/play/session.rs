@@ -12,7 +12,7 @@
 //! makes a play window survive the still-partial native layer.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::Read;
 use std::path::Path;
 use std::rc::Rc;
@@ -21,16 +21,12 @@ use std::time::Instant;
 use xiii_package::Limits;
 use xiii_script::vm::MoverState;
 use xiii_script::{
-    DialogueEvent, ObjRef, ObjectId, PresentationEvent, SaveCheckpointEvent, ScriptSet,
+    DialogueEvent, ObjRef, ObjectId, PresentationEvent, SaveCheckpointEvent, ScriptSet, TraceKind,
     TravelRequest, Value, Vm, VmError, VmLimits,
 };
 use xiii_world::runtime::{self, ProviderSpec};
 
 use crate::collision;
-
-/// Fallback player pawn class when the GameInfo default cannot be read (never a silent swap: the
-/// reason is recorded in [`Session::blocked`]).
-const PLAYER_PAWN_FALLBACK: &str = "XIII.XIIIPlayerPawn";
 
 /// Unreal rotator units per full turn (UE1/UE2).
 const ROTATOR_UNITS_PER_TURN: f32 = 65536.0;
@@ -53,8 +49,6 @@ pub struct Session {
     pub bootstrap_note: String,
     /// 1 when the script login chain created the player pawn, 0 otherwise.
     pub login_script: u32,
-    /// 1 when the explicit harness bootstrap created the player pawn, 0 otherwise.
-    pub login_bootstrap: u32,
     /// Script path attempts that failed before the bootstrap (native + stack).
     pub blocked: Vec<String>,
     /// Suspended actor names (unimplemented native or other code failure).
@@ -110,13 +104,10 @@ pub struct Session {
     /// AI perception events dispatched by the host sight bridge (item14b): `(time, controller,
     /// event)`, oldest first (bounded). `SeePlayer`/`EnemyNotVisible` only.
     pub perception_log: VecDeque<(f64, String, String)>,
+    /// Pawns whose native tear-off `PlayDying` was delivered (see `finish_tearoff_deaths`).
+    tearoff_death_callbacks: HashSet<ObjectId>,
     /// Fixed steps run.
     pub tick_count: u64,
-    /// Set once the end-game has stopped the active cutscene controllers (item15 bridge): the
-    /// decoded `CineController2.Interpret` keeps `GotoState('NoControl')`-ing the player, which
-    /// would clobber `XIIIPlayerController.GameEndedSuccess` if the intro were still running when
-    /// the level ends.
-    cine_stopped: bool,
     /// Minimal Canvas used only by the headless route to drive the engine's render-phase script
     /// gates. The windowed renderer owns its own Canvas through `hud::setup`.
     render_canvas: Option<ObjectId>,
@@ -202,8 +193,8 @@ pub enum FireOutcome {
 
 impl Session {
     /// Loads the map's script set, builds and installs the real map providers, activates every
-    /// map actor, runs the level start tolerantly and creates the player pawn (script path when
-    /// it works, explicit harness bootstrap otherwise).
+    /// map actor, runs the level start tolerantly and requires the game's Login/RestartPlayer
+    /// chain to create the player pawn and controller.
     pub fn open(game_dir: &Path, map: &str) -> Result<Session, String> {
         Self::open_inner(game_dir, map, None)
     }
@@ -262,6 +253,19 @@ impl Session {
         let game_class = runtime::resolve_class_path(set, &default_game).ok_or_else(|| {
             format!("DefaultGame {default_game} did not resolve to a loaded class")
         })?;
+        let default_pawn =
+            collision::class_own_string_default(set, &default_game, "DefaultPlayerClassName")
+                .map_err(|e| format!("reading {default_game}.DefaultPlayerClassName: {e}"))?
+                .ok_or_else(|| format!("{default_game}.DefaultPlayerClassName is missing"))?;
+        let player_class = runtime::resolve_class_path(set, &default_pawn)
+            .ok_or_else(|| format!("DefaultPlayerClassName {default_pawn} is not loaded"))?;
+        // Read the pawn's own ControllerClass default for diagnostics. The local player is
+        // created by GameInfo.Login as XIIIPlayerController; this default governs the Pawn's
+        // engine-controlled restart cases and must not replace the player controller.
+        let pawn_controller_default = collision::class_layout_of(set, &default_pawn, None)
+            .ok()
+            .and_then(|layout| collision::layout_class(&layout, "ControllerClass"))
+            .ok_or_else(|| format!("{default_pawn} has no resolvable ControllerClass default"))?;
 
         // The runtime owns the single-player URL; `LevelInfo.GetLocalURL` and
         // `GameInfo.InitGame`/`Login` read it before any actor begins play. No decoded script
@@ -285,27 +289,10 @@ impl Session {
             .collect::<Vec<_>>();
         let game_info = begin.game_info;
 
-        let default_pawn =
-            collision::class_own_string_default(set, &default_game, "DefaultPlayerClassName")
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| {
-                    blocked.push(format!(
-                    "{default_game}.DefaultPlayerClassName missing; using {PLAYER_PAWN_FALLBACK}"
-                ));
-                    PLAYER_PAWN_FALLBACK.to_owned()
-                });
-        let player_class = runtime::resolve_class_path(set, &default_pawn)
-            .ok_or_else(|| format!("player class {default_pawn} not loaded"))?;
-
-        let (start_loc, start_rot) = find_player_start(&vm).unwrap_or(([0.0; 3], [0; 3]));
-
         // --- script path: GameInfo.Login -> PostLogin -> RestartPlayer ---------------------
         let mut player: Option<ObjectId> = None;
         let mut controller: Option<ObjectId> = None;
         let mut login_script = 0u32;
-        let mut login_bootstrap = 0u32;
-        let script_note: String;
         if let Some(gi) = game_info {
             // UE2 `ULevel::SpawnPlayActor`: `GameInfo.Login(Portal, Options, Error)` with the
             // map URL's options, then `GameInfo.PostLogin(NewPlayer)`. `XIIIGameInfo.Login`
@@ -344,62 +331,35 @@ impl Session {
             blocked.push("no GameInfo was spawned (InitGame failed)".to_owned());
         }
 
-        let player_name;
-        if let Some(p) = player {
-            player_name = vm.objects[p as usize].name.clone();
-            script_note = format!(
-                "player pawn {player_name} created by the script login chain \
-                 (GameInfo.Login/RestartPlayer; PostLogin attempted, login_script={login_script})"
-            );
-            // Keep any controller the script path produced (Login returned one in most cases).
-            if controller.is_none() {
-                controller = instance_prop(&vm, p, "Controller");
-            }
-        } else {
-            // Explicit bootstrap: spawn the pawn and its controller at the PlayerStart. This is
-            // labelled as a harness bootstrap everywhere it is reported.
-            let p = vm
-                .spawn(player_class, "XIIIPlayerPawn(play)")
-                .map_err(|e| e.to_string())?;
-            vm.set_property(p, "Location", 0, Value::Vector(start_loc));
-            vm.set_property(p, "Rotation", 0, Value::Rotator(start_rot));
-            vm.set_active(p, true);
-            let ctrl_class = collision::class_layout_of(set, &default_pawn, None)
-                .ok()
-                .and_then(|l| collision::layout_class(&l, "ControllerClass"))
-                .or_else(|| {
-                    collision::class_own_string_default(
-                        set,
-                        &default_game,
-                        "PlayerControllerClassName",
-                    )
-                    .ok()
-                    .flatten()
-                    .and_then(|path| runtime::resolve_class_path(set, &path))
-                });
-            if let Some(cc) = ctrl_class {
-                let c = vm
-                    .spawn(cc, "XIIIPlayerController(play)")
-                    .map_err(|e| e.to_string())?;
-                vm.set_property(c, "Pawn", 0, Value::Object(Some(ObjRef::Instance(p))));
-                vm.set_property(p, "Controller", 0, Value::Object(Some(ObjRef::Instance(c))));
-                vm.set_active(c, true);
-                controller = Some(c);
-            }
-            player_name = vm.objects[p as usize].name.clone();
-            player = Some(p);
-            login_bootstrap = 1;
+        let player = player.ok_or_else(|| {
             let why = if blocked.is_empty() {
-                "Login/RestartPlayer returned no pawn".to_owned()
+                "GameInfo.Login/RestartPlayer returned no pawn".to_owned()
             } else {
                 blocked.join("; ")
             };
-            script_note = format!(
-                "harness bootstrap: spawned {default_pawn} + controller at the PlayerStart \
-                 (script path blocked: {why})"
-            );
+            format!("script login did not create a player pawn: {why}")
+        })?;
+        if !vm.is_child_of_class(vm.objects[player as usize].class, player_class) {
+            return Err(format!(
+                "GameInfo.Login created {}, expected DefaultPlayerClassName {default_pawn}",
+                vm.set().path(vm.objects[player as usize].class)
+            ));
         }
-        let player = player.expect("player created above");
+        let player_name = vm.objects[player as usize].name.clone();
+        let script_note = format!(
+            "player pawn {player_name} created by the script login chain \
+             (GameInfo.Login/RestartPlayer; PostLogin attempted, DefaultPlayerClassName={default_pawn}, \
+             Pawn.ControllerClass={}, login_script={login_script})",
+            vm.set().path(pawn_controller_default)
+        );
+        // Keep any controller the script path produced (Login returned one in most cases).
+        if controller.is_none() {
+            controller = instance_prop(&vm, player, "Controller");
+        }
+        let controller = controller.ok_or_else(|| {
+            "script login created the player pawn without a PlayerController".to_owned()
+        })?;
+        initialize_headless_input_system(&mut vm, set, controller)?;
         if let Some(event) = start_event {
             // The engine's checkpoint-load path sets GameInfo.StartSpotEvent after the login
             // chain (XIII's own `RestartPlayer` copies `StartSpot.Event` into it first —
@@ -435,11 +395,10 @@ impl Session {
             vm,
             player,
             player_name,
-            controller,
+            controller: Some(controller),
             game_info,
             bootstrap_note: script_note,
             login_script,
-            login_bootstrap,
             blocked,
             suspended,
             failures: Vec::new(),
@@ -464,8 +423,8 @@ impl Session {
             hitbox_dropped,
             hitbox_errors,
             perception_log: VecDeque::new(),
+            tearoff_death_callbacks: HashSet::new(),
             tick_count: 0,
-            cine_stopped: false,
             render_canvas: None,
             script_pawn_sync: None,
         };
@@ -657,6 +616,12 @@ impl Session {
         for (id, e) in self.vm.tick_suspending(dt) {
             self.suspend(id, &e);
         }
+        // In NM_Standalone, XIIIPawn.Died sets bTearOff instead of calling PlayDying (xiii.u
+        // XIIIPawn.Died 0x01C5-0x01E9). The engine then delivers it natively:
+        // APawn::UpdateMovementAnimation (Engine.dll 0x103b5c70) calls eventPlayDying(
+        // HitDamageType, TakeHitLocation) at 0x103b5e2a while bTearOff is set and bPlayedDeath is
+        // not. The death clip choice stays in XIIIPawn.PlayDying / PlayDyingAnim.
+        self.finish_tearoff_deaths();
         // item14b: drive the engine's own AI perception. The host performs the sight test (range /
         // facing / line of sight) and dispatches `SeePlayer`/`EnemyNotVisible`; the soldier's own
         // `IAController` states react (acquire, turn, fire). Run after the VM tick so the
@@ -675,9 +640,6 @@ impl Session {
         let t0 = Instant::now();
         self.drain_events();
         self.update_touches();
-        // Stop the cutscene controllers the moment the end-game starts, before the next tick can
-        // re-assert `NoControl`/`NoMove` over `GameEndedSuccess`.
-        self.stop_cutscenes_if_ended();
         if profiling {
             self.vm.native_profile_mut().events_micros += t0.elapsed().as_micros() as u64;
         }
@@ -698,6 +660,53 @@ impl Session {
         }
         if profiling {
             self.vm.native_profile_mut().sync_micros += t0.elapsed().as_micros() as u64;
+        }
+    }
+
+    /// The engine's native `PlayDying` delivery for torn-off pawns (`APawn::UpdateMovementAnimation`,
+    /// Engine.dll 0x103b5c70: `bTearOff && !bPlayedDeath`). The set only stops a failing script
+    /// `PlayDying` from being retried every tick.
+    fn finish_tearoff_deaths(&mut self) {
+        let dying: Vec<(ObjectId, Value, Value)> = self
+            .vm
+            .objects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, object)| {
+                let id = index as ObjectId;
+                if !object.is_actor
+                    || object.deleted
+                    || self.tearoff_death_callbacks.contains(&(index as ObjectId))
+                    || !matches!(
+                        self.vm.get_property(id, "bTearOff"),
+                        Some(Value::Bool(true))
+                    )
+                    || matches!(
+                        self.vm.get_property(id, "bPlayedDeath"),
+                        Some(Value::Bool(true))
+                    )
+                {
+                    return None;
+                }
+                let damage_type = self.vm.get_property(id, "HitDamageType")?.clone();
+                let hit_location = self.vm.get_property(id, "TakeHitLocation")?.clone();
+                Some((id, damage_type, hit_location))
+            })
+            .collect();
+        for (id, damage_type, hit_location) in dying {
+            let actor = self.vm.objects[id as usize].name.clone();
+            self.tearoff_death_callbacks.insert(id);
+            match self
+                .vm
+                .send_event(id, "PlayDying", vec![damage_type, hit_location])
+            {
+                Ok(_) => {
+                    self.vm.note(TraceKind::Note(format!(
+                        "{actor}.PlayDying delivered for standalone bTearOff death"
+                    )));
+                }
+                Err(e) => self.record_failure(&format!("{actor}.PlayDying"), &e),
+            }
         }
     }
 
@@ -788,40 +797,9 @@ impl Session {
         self.vm.time
     }
 
-    /// Host bridge (item15): once `GameInfo.bGameEnded` is set, suspend the cutscene controllers.
-    /// The decoded `CineController2.Interpret` calls `PC.GotoState('NoControl')`/`'NoMove'` when
-    /// its sequence commands run; while a level-start cine is still playing it would clobber
-    /// `XIIIPlayerController.GameEndedSuccess` and the level would never travel. The real engine
-    /// finishes the intro before the level ends; this restores that ordering for a direct
-    /// level-completion call. Visible in the log, never silent.
-    fn stop_cutscenes_if_ended(&mut self) {
-        if self.cine_stopped {
-            return;
-        }
-        let ended = self.game_info.is_some_and(|gi| {
-            matches!(
-                self.vm.get_property(gi, "bGameEnded"),
-                Some(Value::Bool(true))
-            )
-        });
-        if !ended {
-            return;
-        }
-        self.cine_stopped = true;
-        let stopped = self.stop_cutscene_actors();
-        if !stopped.is_empty() {
-            println!(
-                "[play] game ended: stopped {} cutscene controller(s): {}",
-                stopped.len(),
-                stopped.join(", ")
-            );
-        }
-    }
-
-    /// Suspends every active cutscene actor (`class_chain_contains("cine")`/`"beachinbed"`). The
-    /// decoded `CineController2.Interpret` re-asserts `PC.GotoState('NoControl')` each time its
-    /// sequence runs, so a stuck level-start cine keeps freezing the player; both the level-end
-    /// bridge and the item18 `take_control` bridge stop them. Returns the stopped names.
+    /// Suspends active cutscene actors only for the explicit `take_control` diagnostic command.
+    /// Ordinary play advances the decoded cutscene sequence and uses its own `RPC`/release logic.
+    /// Returns the stopped names.
     fn stop_cutscene_actors(&mut self) -> Vec<String> {
         let mut stopped = Vec::new();
         for i in 0..self.vm.objects.len() {
@@ -1951,7 +1929,6 @@ impl Session {
             .send_event(map_info, "SetGoalComplete", vec![Value::Int(n)])
             .map_err(|e| e.to_string())?;
         self.drain_events();
-        self.stop_cutscenes_if_ended();
         let complete = matches!(
             self.vm.get_property(map_info, "bLevelComplete"),
             Some(Value::Bool(true))
@@ -1960,12 +1937,10 @@ impl Session {
         Ok(())
     }
 
-    /// item18 host bridge: hand the local player control by running the game's own
-    /// `XIIIPlayerController.EnterStartState` with `bOkForMoving = true`. In the retail game the
-    /// HUD sets `bOkForMoving` once the first frame is displayed; the decoded Plage01 intro
-    /// instead leaves the controller frozen in `NoControl` (the host does not play its cutscene
-    /// sequence), so a windowed run cannot move. This calls the same game function the HUD path
-    /// uses; the resulting state is returned. Labelled a bridge in the report, never silent.
+    /// item18 diagnostic action: hand control to the local player through the game's own
+    /// `XIIIPlayerController.EnterStartState` with `bOkForMoving = true`. It is reached only by
+    /// an explicit `take_control` command in a supplied `--play-script`; the normal campaign
+    /// path runs the authored cutscene release sequence instead.
     pub fn take_control(&mut self) -> Result<String, String> {
         let c = self
             .controller
@@ -1990,7 +1965,7 @@ impl Session {
         }
         if !stopped.is_empty() {
             println!(
-                "[play] take_control: stopped {} cutscene controller(s): {}",
+                "[play] take_control diagnostic: stopped {} cutscene controller(s): {}",
                 stopped.len(),
                 stopped.join(", ")
             );
@@ -2376,6 +2351,79 @@ impl Session {
     }
 }
 
+/// Builds the engine-owned Player/InteractionMaster/Console object graph which a windowed
+/// viewport supplies, then runs the retail controller callback. Interaction creation itself is
+/// deliberately left to XIIIPlayerController.InitInputSystem -> InteractionMaster.AddInteraction.
+fn initialize_headless_input_system(
+    vm: &mut Vm<'static>,
+    set: &ScriptSet,
+    pc: ObjectId,
+) -> Result<(), String> {
+    let object = |path: &str| -> Result<xiii_script::GlobalRef, String> {
+        let (package_name, object_path) = path
+            .split_once('.')
+            .ok_or_else(|| format!("invalid engine class path {path:?}"))?;
+        let package = set
+            .package_index(package_name)
+            .ok_or_else(|| format!("engine class package {package_name:?} is not loaded"))?;
+        let export = set.packages[package]
+            .export_by_path(object_path)
+            .ok_or_else(|| format!("engine class {path:?} is not loaded"))?;
+        Ok(xiii_script::GlobalRef { package, export })
+    };
+    let player = vm
+        .spawn(object("Engine.Player")?, "Player(headless)")
+        .map_err(|e| format!("spawn Engine.Player: {e}"))?;
+    let master = vm
+        .spawn(
+            object("Engine.InteractionMaster")?,
+            "InteractionMaster(headless)",
+        )
+        .map_err(|e| format!("spawn Engine.InteractionMaster: {e}"))?;
+    // The master is a real live runtime object: AddInteraction has a return value and VM calls
+    // through inactive spawned objects correctly defer that result rather than inventing one.
+    vm.set_active(master, true);
+    let console = vm
+        .spawn(object("Engine.Console")?, "Console(headless)")
+        .map_err(|e| format!("spawn Engine.Console: {e}"))?;
+    let link = |vm: &mut Vm<'static>, owner, field: &str, target| {
+        if vm.set_property(
+            owner,
+            field,
+            0,
+            Value::Object(Some(ObjRef::Instance(target))),
+        ) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} has no {field} property",
+                vm.objects[owner as usize].name
+            ))
+        }
+    };
+    link(vm, player, "InteractionMaster", master)?;
+    link(vm, player, "Console", console)?;
+    link(vm, master, "Console", console)?;
+    link(vm, console, "ViewportOwner", player)?;
+    link(vm, pc, "Player", player)?;
+    vm.send_event(pc, "InitInputSystem", Vec::new())
+        .map_err(|e| format!("PlayerController.InitInputSystem: {e}"))?;
+    let interaction = match vm.get_property(pc, "MyInteraction") {
+        Some(Value::Object(Some(ObjRef::Instance(id)))) => *id,
+        other => {
+            return Err(format!(
+                "InitInputSystem did not assign MyInteraction: {other:?}"
+            ));
+        }
+    };
+    let my_pc = matches!(vm.get_property(interaction, "MyPC"),
+        Some(Value::Object(Some(ObjRef::Instance(id)))) if *id == pc);
+    if !my_pc {
+        return Err("InitInputSystem interaction MyPC does not reference the controller".into());
+    }
+    Ok(())
+}
+
 /// Unreal-space delta between two VM `Location`s. The host converts it with the single
 /// coordinate policy and adds it to the render entity's translation, so a VM-moved actor's
 /// render transform follows the VM one way (an unmoved actor gives a zero delta).
@@ -2457,6 +2505,7 @@ fn bink_duration_secs(header: &[u8; 36]) -> Option<f32> {
 }
 
 /// First live `PlayerStart` in the map: `(Location, Rotation)` in Unreal units.
+#[cfg(test)]
 fn find_player_start(vm: &Vm) -> Option<([f32; 3], [i32; 3])> {
     for (i, o) in vm.objects.iter().enumerate() {
         if !o.is_actor || o.deleted || !vm.is_a(i as ObjectId, "playerstart") {
@@ -2666,11 +2715,50 @@ mod tests {
             "the script login path must create the pawn (blocked: {})",
             session.blocked.join("; ")
         );
-        assert_eq!(
-            session.login_bootstrap, 0,
-            "the explicit harness bootstrap must not run"
+        assert!(
+            !session.bootstrap_note.contains("harness bootstrap"),
+            "normal session setup must use the script login path: {}",
+            session.bootstrap_note
         );
         let pc = session.controller.expect("a script player controller");
+        let interaction = match session.vm.get_property(pc, "MyInteraction") {
+            Some(Value::Object(Some(ObjRef::Instance(id)))) => *id,
+            other => panic!("InitInputSystem MyInteraction is {other:?}"),
+        };
+        assert!(
+            matches!(session.vm.get_property(interaction, "MyPC"),
+                Some(Value::Object(Some(ObjRef::Instance(id)))) if *id == pc),
+            "the script-created interaction must point back to its player controller"
+        );
+        assert!(
+            session.vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                TraceKind::Event { target, function, .. }
+                    if target == "XIIIPlayerController"
+                        && function.ends_with("XIIIPlayerController.InitInputSystem")
+            )),
+            "the VM trace must record PlayerController.InitInputSystem"
+        );
+        assert!(
+            session.vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                TraceKind::Event { function, .. }
+                    if function.ends_with("InteractionMaster.AddInteraction")
+            )),
+            "the VM trace must record the script's InteractionMaster.AddInteraction call"
+        );
+        assert!(
+            session.vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                TraceKind::NewObject { class, .. }
+                    if class.to_ascii_lowercase().ends_with("xiii.xiiiplayerinteraction")
+            )),
+            "the interaction must be allocated by script new in InteractionMaster.AddInteraction"
+        );
+        println!(
+            "[InitInputSystem test] interaction={} MyPC={} trace=InitInputSystem",
+            session.vm.objects[interaction as usize].name, session.vm.objects[pc as usize].name
+        );
         assert!(
             session.vm.is_a(pc, "XIIIPlayerController"),
             "controller is {}",
@@ -2724,14 +2812,16 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        // Start 3 s after the old 45 s mark: with the engine's cine arrival rule
+        // (XIDCine IsTargetReached) the Plage01 intro returns control at ~46.5 s, not ~44.5 s.
         let script = script::Script::parse(
-            "t=45.00 teleport -491.8 -414.1 1265.0\n\
-             t=45.10 goto -491.84 -314.14\nt=45.30 jump\nt=45.80 jump\nt=46.30 jump\nt=46.80 jump\n\
-             t=47.30 jump\nt=47.80 forward 0\n\
-             t=48.20 teleport -742.1444 -808.429 1311.0449\n\
-             t=48.20 yaw 312.891\nt=48.20 turn 2\nt=48.20 forward 1\n\
-             t=49.80 turn -45\nt=50.50 forward 0\nt=50.80 use\nt=51.80 use\nt=52.00 forward 1\n\
-             t=53.00 forward 0\n",
+            "t=48.00 teleport -491.8 -414.1 1265.0\n\
+             t=48.10 goto -491.84 -314.14\nt=48.30 jump\nt=48.80 jump\nt=49.30 jump\nt=49.80 jump\n\
+             t=50.30 jump\nt=50.80 forward 0\n\
+             t=51.20 teleport -742.1444 -808.429 1311.0449\n\
+             t=51.20 yaw 312.891\nt=51.20 turn 2\nt=51.20 forward 1\n\
+             t=52.80 turn -45\nt=53.50 forward 0\nt=53.80 use\nt=54.80 use\nt=55.00 forward 1\n\
+             t=56.00 forward 0\n",
         )
         .unwrap();
         let outcome = run_script(
@@ -2740,7 +2830,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            54.0,
+            57.0,
         )
         .expect("run Plage01 key+door walk");
         let s = &outcome.session;
@@ -3114,6 +3204,9 @@ mod tests {
             sloc[2] + 20.0,
         ];
         let yaw_to_soldier = (-fwd[1]).atan2(-fwd[0]);
+        println!(
+            "[item38 Base01] BaseSoldier17 at {sloc:?}, test player at {ploc:?}, yaw {yaw_to_soldier:.4}"
+        );
         let hp0 = session.player_health().expect("player health");
         let mut first_attack = None;
         let mut hp_low = hp0;
@@ -3181,6 +3274,28 @@ mod tests {
             hp1 < hp0,
             "the soldier's fire did not reduce the player's Health ({hp0} -> {hp1}); first error {:?}",
             session.first_error()
+        );
+        let controller = session.controller.expect("Base01 player controller");
+        let hud = instance_prop(session.vm(), controller, "myHUD")
+            .expect("XIIIPlayerController.ClientSetHUD creates myHUD");
+        let warning = session.vm().get_property(hud, "bDrawDamageWarn");
+        let timers: Vec<_> = (0..4)
+            .map(|i| {
+                session
+                    .vm()
+                    .get_property_elem(hud, "fDrawDamageWarnTimer", i)
+                    .cloned()
+            })
+            .collect();
+        let active_timer = timers.iter().any(|v| match v {
+            Some(Value::Float(x)) => *x > 0.0,
+            Some(Value::Int(x)) => *x > 0,
+            _ => false,
+        });
+        println!("[item38 Base01] XIIIBaseHud bDrawDamageWarn={warning:?}, timers={timers:?}");
+        assert!(
+            matches!(warning, Some(Value::Bool(true))) && active_timer,
+            "BaseSoldier17's script-driven player hit must set the XIIIBaseHud flag and a live directional timer"
         );
     }
 
