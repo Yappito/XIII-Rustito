@@ -4489,13 +4489,11 @@ mod tests {
             Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(ammo)))) => *ammo,
             other => panic!("picked Beretta AmmoType is not an ammo actor: {other:?}"),
         };
-        // AmmoType references the spawned UClass object itself (whose metaclass is Core.Class),
-        // so its object name, rather than the metaclass path, identifies the ammo class.
-        let ammo_class = vm.objects[ammo_type as usize].name.clone();
-        println!("[item44] picked Beretta AmmoType={ammo_class}");
+        let ammo_name = vm.objects[ammo_type as usize].name.clone();
+        println!("[item44] picked Beretta AmmoType={ammo_name}");
         assert!(
-            ammo_class.eq_ignore_ascii_case("c9mmAmmo1"),
-            "picked Beretta resolved the wrong ammunition class: {ammo_class}"
+            vm.is_a(ammo_type, "c9mmAmmo"),
+            "picked Beretta's AmmoType {ammo_name} is not a c9mmAmmo"
         );
         let soldier = vm
             .find_object("BaseSoldier6")
