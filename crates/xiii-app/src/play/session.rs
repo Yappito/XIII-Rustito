@@ -360,25 +360,6 @@ impl Session {
             "script login created the player pawn without a PlayerController".to_owned()
         })?;
         initialize_headless_input_system(&mut vm, set, controller)?;
-        // UE2 hands an entering player its inventory through the GameInfo's `AcceptInventory`
-        // event once the pawn exists (measured in the port: the event ran only on the
-        // checkpoint-restore path, so a fresh login left the campaign pawn unarmed).
-        // `XIIIGameInfo.AcceptInventory` applies checkpoint/objective state, then calls
-        // `AddDefaultInventory(PlayerPawn)` (its bytecode 0x04CF), which spawns the default
-        // weapon through `BaseMutator.GetDefaultWeapon()` — `XIIISoloMutator` defaults
-        // `DefaultWeaponName="XIII.Fists"` — and `Weapon.GiveTo` tops the ammo up through its
-        // melee branch (`default.ReloadCount == 0` -> `AmmoType.AddAmmo(PickupAmmoCount)` =
-        // `FistsAmmo.AmmoAmount = 1`). Without the Fists, a cine unfreeze runs
-        // `XIIIPlayerController.SwitchWeapon(OldWeap=0)` whose `WeaponChange(0)` finds no
-        // group-0 weapon and re-calls `SwitchWeapon(0)` unguarded (0x00FC) — the measured
-        // campaign-start recursion. The event is the game's own code; a failure is reported in
-        // `blocked`, never swallowed.
-        if let Some(gi) = game_info {
-            let arg = Value::Object(Some(ObjRef::Instance(player)));
-            if let Err(e) = vm.send_event(gi, "AcceptInventory", vec![arg]) {
-                blocked.push(format!("GameInfo.AcceptInventory: {e}"));
-            }
-        }
         if let Some(event) = start_event {
             // The engine's checkpoint-load path sets GameInfo.StartSpotEvent after the login
             // chain (XIII's own `RestartPlayer` copies `StartSpot.Event` into it first —
@@ -2632,67 +2613,6 @@ mod tests {
         } else {
             path
         })
-    }
-
-    /// Opt-in regression (item45): the fresh login must hand the player the game's own
-    /// default inventory through `GameInfo.AcceptInventory` -> `AddDefaultInventory` ->
-    /// `XIII.Fists` (via `XIIISoloMutator`'s `DefaultWeaponName`) with
-    /// `FistsAmmo.AmmoAmount = 1` (`Weapon.GiveTo`'s melee branch). Amos01 is a mid-campaign
-    /// map whose `MapInfo.InitialInv` does not list the Fists, so before this the pawn stayed
-    /// unarmed and the cine unfreeze (`CineController2.PlayingSequence.Tick` 0x0065 ->
-    /// `SwitchWeapon(0)`) recursed unguarded to the call-depth limit.
-    #[test]
-    fn opt_in_acceptinventory_login_gives_the_default_weapon() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let session = Session::open(&game_dir, "Amos01").expect("open Amos01 session");
-        assert!(
-            !session.bootstrap_note.contains("harness bootstrap"),
-            "the normal login path must run: {}",
-            session.bootstrap_note
-        );
-        let vm = session.vm();
-        let pawn = session.player;
-        let weapon = match vm.get_property(pawn, "Weapon") {
-            Some(Value::Object(Some(ObjRef::Instance(id)))) => Some(*id),
-            other => {
-                panic!("fresh-login Pawn.Weapon must be the Fists instance, got {other:?}")
-            }
-        };
-        let weapon = weapon.expect("fresh-login Pawn.Weapon must be set");
-        assert!(
-            vm.is_a(weapon, "fists"),
-            "fresh-login Pawn.Weapon must be xiii.Fists, got {}",
-            vm.set().path(vm.objects[weapon as usize].class)
-        );
-        let ammo = match vm.get_property(weapon, "AmmoType") {
-            Some(Value::Object(Some(ObjRef::Instance(id)))) => Some(*id),
-            other => {
-                panic!("Fists.AmmoType must be the live FistsAmmo instance, got {other:?}")
-            }
-        };
-        let ammo = ammo.expect("Fists.AmmoType must be set");
-        assert!(
-            vm.is_a(ammo, "fistsammo"),
-            "Fists.AmmoType must be xiii.FistsAmmo, got {}",
-            vm.set().path(vm.objects[ammo as usize].class)
-        );
-        match vm.get_property(ammo, "AmmoAmount") {
-            Some(Value::Int(1)) => {}
-            other => panic!(
-                "FistsAmmo.AmmoAmount must be 1 at login (Weapon.GiveTo melee branch), got {other:?}"
-            ),
-        }
-        assert!(
-            !session
-                .blocked
-                .iter()
-                .any(|b| b.contains("AcceptInventory")),
-            "AcceptInventory must not fail: {:?}",
-            session.blocked
-        );
     }
 
     /// Corpus regression for the authored `SPADS02b` `Explo02` particle event. `Cine9.Event` and

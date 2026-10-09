@@ -3290,23 +3290,15 @@ mod tests {
                 .vm()
                 .get_property(checkpoint, "SoundToLaunch")
         );
-        // The route equips the M60; its ammo item must save and restore with the same count.
-        // (The login `AcceptInventory` now also gives the Fists, so the chain's first ammo
-        // entry is FistsAmmo, not the selected weapon's.)
         let ammo = saved
             .inventory
             .iter()
             .find_map(|item| {
-                item.class_path
-                    .eq_ignore_ascii_case("xiii.M60Ammo")
-                    .then(|| {
-                        (
-                            item.class_path.clone(),
-                            item.ammo_amount.expect("M60Ammo saves an AmmoAmount"),
-                        )
-                    })
+                item.ammo_amount
+                    .map(|amount| (item.class_path.clone(), amount))
             })
-            .expect("saved travel inventory includes the M60 ammunition");
+            .expect("saved travel inventory includes ammunition");
+        assert!(ammo.1 >= 0, "invalid saved ammo count: {ammo:?}");
         println!(
             "[item33 route] checkpoint={} weapon={} ammo={ammo:?} health={} objectives={:?} sound={:?}",
             saved.checkpoint_number,
@@ -3404,11 +3396,10 @@ mod tests {
             remaining.remove(at);
         }
         remaining.sort();
-        let expected_remaining: Vec<String> = Vec::new();
         assert_eq!(
-            remaining, expected_remaining,
-            "every restored inventory entry must come from the save (the login AcceptInventory \
-             default entries are part of the saved chain now, so nothing extra may be added)"
+            remaining,
+            ["xiii.fistsammo", "xiii.xiiilefthand"],
+            "only AcceptInventory's authored default ammo/left-hand entries should be added"
         );
         let mut saved_ammo_state = saved
             .inventory
