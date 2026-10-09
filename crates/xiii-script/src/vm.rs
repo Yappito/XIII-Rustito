@@ -7329,41 +7329,12 @@ impl<'s> Vm<'s> {
         extent: [f32; 3],
     ) -> Option<(f32, ObjectId, [f32; 3])> {
         let mut best: Option<(f32, ObjectId, [f32; 3])> = None;
-        // UE2 selects actor hits by the trace extent: a zero-extent (line) trace needs
-        // `bBlockZeroExtentTraces`, a swept box needs `bBlockNonZeroExtentTraces`. A pawn may have
-        // `bCollideActors=false` yet still block hitscan traces (measured: `BaseSoldier6`), so the
-        // extent flag is the correct gate here.
         let nonzero = extent[0] + extent[1] + extent[2] > 0.0;
         for b in 0..self.objects.len() as ObjectId {
             if b == id || !self.is_live_actor(b) {
                 continue;
             }
-            let gate = if nonzero {
-                self.bool_prop(b, "bBlockNonZeroExtentTraces")
-            } else {
-                self.bool_prop(b, "bBlockZeroExtentTraces")
-            };
-            // The engine's actor-trace also reaches actors in the collision list (`bCollideActors`)
-            // even when they do not set the extent flag (a traced pawn may clear `bCollideActors`
-            // but still block a hitscan through `bBlockZeroExtentTraces`); accept either.
-            if !gate && !self.bool_prop(b, "bCollideActors") {
-                continue;
-            }
-            // A trace must ignore both the tracer's owners and its owned attachments. UE2's
-            // TraceFirstHit/IsOwnedBy filtering is target-relative: the candidate hit actor is
-            // ignored when its Owner chain contains the tracer. The reverse check also excludes
-            // owner-chain actors (for example the player pawn when the weapon traces).
-            // item18 B11 measured the missing direction: `XIII.M60`'s line hit its own
-            // `StarFPMF` (`Owner=m601`) and classified that first-person mesh's bone, so
-            // `ProcessTraceHit` received the attachment instead of the soldier.
-            if self.is_owned_by(b, id) || self.is_owned_by(id, b) {
-                continue;
-            }
-            // UE2's line check skips hidden actors (`bHidden`): the carried first-person weapon
-            // sits exactly at the trace start (`XIIIWeapon.Active.BeginState` places it at the
-            // pawn's eye via `CalcDrawOffset`) and measured `BaseSoldier6` traces died inside it
-            // when it was equipped but not the tracer. The real game's shots pass it.
-            if self.bool_prop(b, "bHidden") {
+            if !self.trace_admits_actor(b, id, nonzero) {
                 continue;
             }
             let (lb, rb, hb) = self.actor_cylinder(b);
@@ -7379,6 +7350,71 @@ impl<'s> Vm<'s> {
             }
         }
         best
+    }
+
+    /// The engine's actor-trace candidate filter, decoded from Engine.dll.
+    ///
+    /// 1. Hash membership: a candidate must be in the collision hash. Every insert/remove site
+    ///    gates on `bCollideActors` (`ULevel::SpawnActor` VA 0x10388d3f/0x10388e50,
+    ///    `ULevel::SetActorCollision` VA 0x10391b0c, `ULevel::FarMoveActor` VA 0x1038a4b9/0x1038a6df,
+    ///    `AActor::SetCollision` VA 0x103527d0, the runtime re-add at VA 0x103536ce): the map-load
+    ///    walk and every spawn/move path add an actor only while `byte [actor+0x34] & 0x20` holds.
+    ///    `FCollisionHash::ActorLineCheck` (VA 0x10349c60) walks hash buckets only, so an actor
+    ///    with `bCollideActors=false` is never a candidate. XIII's own scripts use this: a pawn
+    ///    parked by `IAController.faction.BeginState` gets `SetCollision(false,false,false)` and
+    ///    is invisible (`SetDrawType(0)`) until its controller leaves the state
+    ///    (`faction.EndState` restores `SetCollision(true,true,true)`).
+    /// 2. Extent prefilter: the hash walk (`ActorLineCheck` VAs 0x10349e90/0x10349fdc) and the
+    ///    octree zero-extent path (VA 0x103a439b) require bit 10 (`bBlockZeroExtentTraces`); the
+    ///    octree non-zero-extent path (VA 0x103a47f1) requires bit 11
+    ///    (`bBlockNonZeroExtentTraces`).
+    /// 3. `ShouldTrace` (`AActor::ShouldTrace` VA 0x10354640): for the script-trace flag word
+    ///    (`execTrace` VA 0x103e8abf composes `0x86`/`0xBF | extra`, `SingleLineCheck` forces
+    ///    `| 0x400`; bullets add `0x4040` from `XIIIWeapon.RealTraceFire`):
+    ///    - `APawn::ShouldTrace` (VA 0x10305d20) returns `TraceFlags & 1` — always set for
+    ///      script traces, so an in-hash pawn is always admitted;
+    ///    - `AMover`/`ADecoration::ShouldTrace` (shared VA 0x10306c70) return `TraceFlags & 2` —
+    ///      also always set, so in-hash movers/decorations are admitted;
+    ///    - other actors: a world-geometry actor (bit 30 of `+0x2c`, same bit `IsBlockedBy`
+    ///      VA 0x10315620 tests) is admitted because `TraceFlags & 0x80` is set; otherwise
+    ///      `TraceFlags & 0x10` and `TraceFlags & 0x20` are both set, which returns
+    ///      `bProjTarget || (bBlockActors && bBlockPlayers)`. (`bProjTarget` is bit 9 of
+    ///      `+0x34`; the name is an inference from the C++ bitfield order and the
+    ///      `execPickTarget` bit-9 gate, not from an Engine.dll string.)
+    ///
+    /// `bHidden` is deliberately NOT tested: it appears nowhere in the hash insert/remove paths,
+    /// the hash walk, or any `ShouldTrace` override. A carried first-person weapon does not block
+    /// because its class defaults clear `bCollideActors` (`xiii.Fists`, measured).
+    fn trace_admits_actor(&self, candidate: ObjectId, tracer: ObjectId, nonzero: bool) -> bool {
+        if !self.bool_prop(candidate, "bCollideActors") {
+            return false;
+        }
+        let extent_gate = if nonzero {
+            self.bool_prop(candidate, "bBlockNonZeroExtentTraces")
+        } else {
+            self.bool_prop(candidate, "bBlockZeroExtentTraces")
+        };
+        if !extent_gate {
+            return false;
+        }
+        // UE2's trace ignores both the tracer's owners and its owned attachments
+        // (`SingleLineCheck` calls `IsOwnedBy` at VA 0x1038ba1c; item18 B11 measured the
+        // tracer-owned direction: `XIII.M60`'s line hit its own `StarFPMF` first-person mesh).
+        if self.is_owned_by(candidate, tracer) || self.is_owned_by(tracer, candidate) {
+            return false;
+        }
+        if self.class_chain_contains(candidate, "pawn")
+            || self.class_chain_contains(candidate, "mover")
+            || self.class_chain_contains(candidate, "decoration")
+        {
+            return true;
+        }
+        if self.bool_prop(candidate, "bWorldGeometry") {
+            return true;
+        }
+        self.bool_prop(candidate, "bProjTarget")
+            || (self.bool_prop(candidate, "bBlockActors")
+                && self.bool_prop(candidate, "bBlockPlayers"))
     }
 
     pub(crate) fn vm_trace_actors(
@@ -7406,19 +7442,7 @@ impl<'s> Vm<'s> {
             if base.is_some_and(|class| !self.objects[id as usize].layout.chain.contains(&class)) {
                 continue;
             }
-            let gate = if nonzero {
-                self.bool_prop(id, "bBlockNonZeroExtentTraces")
-            } else {
-                self.bool_prop(id, "bBlockZeroExtentTraces")
-            };
-            if !gate && !self.bool_prop(id, "bCollideActors") {
-                continue;
-            }
-            if self.is_owned_by(id, caller) || self.is_owned_by(caller, id) {
-                continue;
-            }
-            // Hidden actors do not block traces (UE2 line check; see `trace_actors`).
-            if self.bool_prop(id, "bHidden") {
+            if !self.trace_admits_actor(id, caller, nonzero) {
                 continue;
             }
             let (loc, radius, height) = self.actor_cylinder(id);

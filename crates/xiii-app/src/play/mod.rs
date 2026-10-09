@@ -999,6 +999,11 @@ fn fixed_step(
             Vec::new(),
         ),
     };
+    let wake: Vec<String> = script
+        .drive
+        .as_mut()
+        .map(script::Drive::take_wake)
+        .unwrap_or_default();
     let control = script
         .drive
         .as_mut()
@@ -1136,6 +1141,12 @@ fn fixed_step(
         for target in &search {
             let outcome = sess.search_corpse(target);
             println!("[play] search {target}: {outcome:?}");
+        }
+        for target in &wake {
+            match sess.wake_actor(target) {
+                Ok(msg) => println!("[play] wake {msg}"),
+                Err(e) => println!("[play] wake failed: {e}"),
+            }
         }
         if fire {
             match sess.fire(sim.0.yaw, sim.0.pitch) {
@@ -2087,6 +2098,7 @@ fn run_script_inner(
         let mut equip = drive.take_equip();
         let mut use_named = drive.take_use_named();
         let mut search = drive.take_search();
+        let wake = drive.take_wake();
         let control = drive.take_control();
         // Match the interactive fixed_step: FPC/FPL/CameraView/PlayingVideo own the pawn while
         // the authored cinematic runs. The headless route must still advance its script cursor,
@@ -2099,6 +2111,8 @@ fn run_script_inner(
             equip = false;
             use_named.clear();
             search.clear();
+            // `wake` is a host bridge like `set_goal`, not a player input: it stays available
+            // while an authored cinematic suppresses the player axes.
         }
         let fired = input.fire;
         if runtime.volumes.is_empty() {
@@ -2193,6 +2207,12 @@ fn run_script_inner(
         for target in &search {
             let outcome = runtime.session.search_corpse(target);
             println!("[play] search {target}: {outcome:?}");
+        }
+        for target in &wake {
+            match runtime.session.wake_actor(target) {
+                Ok(msg) => println!("[play] wake {msg}"),
+                Err(e) => println!("[play] wake failed: {e}"),
+            }
         }
         if fired {
             match runtime.session.fire(runtime.sim.yaw, runtime.sim.pitch) {
@@ -4403,6 +4423,7 @@ mod tests {
              t=48.20 teleport 1802.4131 -12992.034 1070.843\n\
              t=48.20 yaw 90\n\
              t=48.20 pitch 5\n\
+             t=48.25 wake BaseSoldier6\n\
              t=48.30 fire\nt=48.90 fire\nt=49.50 fire\nt=50.10 fire\nt=50.70 fire\nt=51.30 fire\n\
              t=51.90 fire\nt=52.50 fire\nt=53.10 fire\nt=53.70 fire\nt=54.30 fire\n",
         )
@@ -4445,6 +4466,8 @@ mod tests {
     /// map entry), and the authored `Weapon.ClientWeaponSet(True)` deliberately does not switch
     /// a human-controlled pawn that already holds a weapon (bytecode 0x0084), so the route
     /// equips the picked-up Beretta through the game's own `BringUp` switch, as a player would.
+    /// The route wakes `BaseSoldier6` first: the map parks him in `IAController.faction`
+    /// (invisible, `bCollideActors=false`) until a scripted trigger fires his controller.
     #[test]
     fn opt_in_plage01_beretta_pickup_uses_nine_mm_and_damages_soldier() {
         let Some(game_dir) = opt_in_root() else {
@@ -4463,6 +4486,7 @@ mod tests {
              t=49.00 teleport 1802.4131 -12992.034 1070.843\n\
              t=49.00 yaw 90\nt=49.00 pitch 5\n\
              t=49.10 equip\n\
+             t=49.15 wake BaseSoldier6\n\
              t=49.20 fire\nt=49.80 fire\nt=50.40 fire\nt=51.00 fire\nt=51.60 fire\n",
         )
         .expect("parse pickup combat route");
@@ -4523,6 +4547,64 @@ mod tests {
         assert!(
             health.is_some_and(|health| health < 550.0),
             "a shot from the picked Beretta must damage BaseSoldier6"
+        );
+    }
+
+    /// Item47b continuation (A): with the engine's decoded actor-trace filter, a parked soldier
+    /// (`IAController.faction`: `SetCollision(false,false,false)`, `SetDrawType(0)`, `bStasis`)
+    /// does not block hitscan bullets — it is not in the collision hash. Two otherwise identical
+    /// Plage01 runs: one fires five Beretta shots at the parked `BaseSoldier6`, one does not
+    /// fire. Both must report the same `Health`. The pre-decode "extent OR bCollideActors"
+    /// heuristic made the parked soldier shootable, contradicting the engine's hash gating
+    /// (`ULevel::SpawnActor`/`SetActorCollision`/`FarMoveActor` all insert only while
+    /// `bCollideActors` holds). The woken case is covered by the Beretta pickup test above.
+    #[test]
+    fn opt_in_plage01_parked_soldier_does_not_block_bullets() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let health_for = |fires: &str| -> Option<f32> {
+            let script = script::Script::parse(&format!(
+                "t=48.00 weapon XIII.Beretta\n\
+                 t=48.20 teleport 1802.4131 -12992.034 1070.843\n\
+                 t=48.20 yaw 90\nt=48.20 pitch 5\n\
+                 {fires}"
+            ))
+            .expect("parse parked-soldier route");
+            let outcome = run_script(
+                &game_dir,
+                "Plage01",
+                &script,
+                &resolved.params,
+                &scene,
+                52.0,
+            )
+            .expect("run parked-soldier route");
+            let soldier = outcome
+                .session
+                .vm()
+                .find_object("BaseSoldier6")
+                .expect("Plage01 BaseSoldier6");
+            outcome.session.actor_health(soldier)
+        };
+        let no_shots = health_for("").expect("control-run health");
+        let five_shots =
+            health_for("t=49.20 fire\nt=49.80 fire\nt=50.40 fire\nt=50.90 fire\nt=51.30 fire\n");
+        println!(
+            "[parked test] BaseSoldier6 health: no shots {no_shots:?}, five shots at the parked soldier {five_shots:?}"
+        );
+        assert_eq!(
+            Some(no_shots),
+            five_shots,
+            "bullets must pass through the parked (bCollideActors=false) soldier"
         );
     }
 
@@ -4598,6 +4680,7 @@ mod tests {
             "t=0.00 weapon XIII.M60\n\
              t=0.20 teleport 1802.4131 -12992.034 1070.843\n\
              t=0.20 yaw 90\nt=0.20 pitch 5\n\
+             t=0.25 wake BaseSoldier6\n\
              t=0.30 fire\nt=0.90 fire\nt=1.50 fire\nt=2.10 fire\nt=2.70 fire\n",
         )
         .expect("parse M60 fight script");

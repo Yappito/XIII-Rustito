@@ -2000,6 +2000,39 @@ impl Session {
         instance_prop(&self.vm, self.player, "Weapon")
     }
 
+    /// Activates a named parked pawn through its controller's authored `Trigger` event — the same
+    /// event a map's scripted trigger sends. `IAController.faction.BeginState` parks soldiers
+    /// invisible and non-colliding (`SetCollision(false,false,false)`, `SetDrawType(0)`,
+    /// `bStasis`); leaving the state via `faction.EndState` restores
+    /// `SetCollision(true,true,true)` and `SetDrawType(2)`. The method verifies the pawn actually
+    /// became colliding and errors loudly otherwise (never a silent success).
+    pub fn wake_actor(&mut self, target_name: &str) -> Result<String, String> {
+        let soldier = self
+            .vm
+            .find_object(target_name)
+            .ok_or_else(|| format!("wake: no live actor named {target_name:?}"))?;
+        let controller = instance_prop(&self.vm, soldier, "Controller")
+            .ok_or_else(|| format!("wake: {target_name:?} has no live Controller"))?;
+        let arg = || Value::Object(Some(ObjRef::Instance(soldier)));
+        self.vm
+            .send_event(controller, "Trigger", vec![arg(), arg()])
+            .map_err(|e| format!("wake: {target_name:?} controller Trigger failed: {e}"))?;
+        self.drain_events();
+        let flags = (
+            self.vm.get_property(soldier, "bCollideActors").cloned(),
+            self.vm.get_property(soldier, "DrawType").cloned(),
+        );
+        match flags {
+            (Some(Value::Bool(true)), Some(Value::Byte(2))) => Ok(format!(
+                "{target_name} woken (collision restored, mesh drawn)"
+            )),
+            other => Err(format!(
+                "wake: {target_name:?} Trigger left the pawn parked \
+                 (bCollideActors/DrawType = {other:?})"
+            )),
+        }
+    }
+
     /// `Fire` on the player's weapon through the game's own entry point: the controller's exec
     /// `Fire(1.0)` (`XIIIPlayerController.Fire` -> `Pawn.Weapon.Fire`), or the weapon directly
     /// when the pawn has no controller. The weapon runs its own `ServerFire` ->

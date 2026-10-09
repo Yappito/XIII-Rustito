@@ -2777,6 +2777,7 @@ fn phys_fixture() -> Vec<u8> {
     let object = b.reserve(0, 0, "Object");
     let actor = b.reserve(0, 0, "Actor");
     let child = b.reserve(0, 0, "Child");
+    let decoration = b.reserve(0, 0, "Decoration");
     let levelinfo = b.reserve(0, 0, "LevelInfo");
 
     let add = b.reserve(IMP_FUNCTION, object, "Add_IntInt");
@@ -2823,6 +2824,9 @@ fn phys_fixture() -> Vec<u8> {
     let block_nonzero = b.reserve(IMP_BOOLPROP, actor, "bBlockNonZeroExtentTraces");
     let movable = b.reserve(IMP_BOOLPROP, actor, "bMovable");
     let bstatic = b.reserve(IMP_BOOLPROP, actor, "bStatic");
+    let proj_target = b.reserve(IMP_BOOLPROP, actor, "bProjTarget");
+    let hidden = b.reserve(IMP_BOOLPROP, actor, "bHidden");
+    let world_geometry = b.reserve(IMP_BOOLPROP, actor, "bWorldGeometry");
     let touches = b.reserve(IMP_INTPROP, actor, "Touches");
     let untouches = b.reserve(IMP_INTPROP, actor, "UnTouches");
     let touching = b.reserve(IMP_ARRAYPROP, actor, "Touching");
@@ -2842,7 +2846,10 @@ fn phys_fixture() -> Vec<u8> {
     b.prop(block_actors, block_players, 0);
     b.prop(block_players, block_zero, 0);
     b.prop(block_zero, block_nonzero, 0);
-    b.prop(block_nonzero, movable, 0);
+    b.prop(block_nonzero, proj_target, 0);
+    b.prop(proj_target, hidden, 0);
+    b.prop(hidden, world_geometry, 0);
+    b.prop(world_geometry, movable, 0);
     b.prop(movable, bstatic, 0);
     b.prop(bstatic, touches, 0);
     b.prop(touches, untouches, 0);
@@ -2878,6 +2885,7 @@ fn phys_fixture() -> Vec<u8> {
     b.class(object, 0, add, 0);
     b.class(actor, object, owner, 0);
     b.class(child, actor, 0, 0);
+    b.class(decoration, actor, 0, 0);
     b.class(levelinfo, actor, 0, 0);
     b.build()
 }
@@ -3286,6 +3294,128 @@ fn trace_actors_orders_hits_filters_class_and_returns_all_outs() {
     );
 }
 
+/// Item47b: the decoded engine actor-trace filter (`trace_admits_actor`). Each case maps to a
+/// measured Engine.dll behavior cited in the function's documentation.
+#[test]
+fn trace_filter_parked_actor_with_extent_flag_is_not_hit() {
+    // `IAController.faction.BeginState` parks a pawn with `SetCollision(false,false,false)` while
+    // its `bBlockZeroExtentTraces` stays true (measured on Plage01 `BaseSoldier6`). Hash
+    // membership (`bCollideActors`) gates candidacy — the old "extent OR bCollideActors"
+    // heuristic wrongly let parked soldiers block bullets.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let parked = phys_actor(&mut vm, &set, "Parked", [40.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, parked, false, true);
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 0.0], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(
+        None, hit,
+        "a parked (bCollideActors=false) actor must not block"
+    );
+    assert!(
+        (location[0] - 200.0).abs() < 0.01,
+        "the ray must pass through: {location:?}"
+    );
+}
+
+#[test]
+fn trace_filter_projtarget_actor_is_hit_without_block_flags() {
+    // `AActor::ShouldTrace` (VA 0x10354640): with the script-trace flag word, an in-hash,
+    // extent-blocking actor is admitted when `bProjTarget` is set even without block flags.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let target = phys_actor(&mut vm, &set, "Target", [40.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, target, true, false);
+    vm.set_property(target, "bProjTarget", 0, Value::Bool(true));
+    vm.set_property(target, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 0.0], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(Some(target), hit);
+}
+
+#[test]
+fn trace_filter_membership_and_extent_without_shouldtrace_passes_through() {
+    // Membership plus the extent prefilter without `ShouldTrace` admission (no `bProjTarget`,
+    // no `bBlockActors && bBlockPlayers`) is not enough — the third decoded stage rejects.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let ghost = phys_actor(&mut vm, &set, "Ghost", [40.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, ghost, true, false);
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 0.0], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(None, hit);
+}
+
+#[test]
+fn trace_filter_hidden_colliding_actor_still_blocks() {
+    // `bHidden` is tested nowhere in the decoded trace path (hash insert/remove, hash walk,
+    // every `ShouldTrace` override). A colliding hidden actor blocks — the carried first-person
+    // weapon passes only because its class clears `bCollideActors` (`xiii.Fists`, measured).
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let hidden = phys_actor(&mut vm, &set, "Hidden", [40.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, hidden, true, true);
+    vm.set_property(hidden, "bHidden", 0, Value::Bool(true));
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 0.0], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(Some(hidden), hit);
+}
+
+#[test]
+fn trace_filter_decoration_chain_admits_without_block_flags() {
+    // `AMover`/`ADecoration::ShouldTrace` (shared VA 0x10306c70) returns `TraceFlags & 2`, which
+    // the script-trace flag word always sets: an in-hash decoration is admitted regardless of its
+    // block flags.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let prop = vm.spawn(pg(&set, "Decoration"), "Prop").unwrap();
+    vm.set_property(prop, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, prop, true, false);
+    vm.set_property(prop, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 0.0], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(Some(prop), hit);
+}
+
+#[test]
+fn trace_filter_world_geometry_actor_is_hit_without_block_flags() {
+    // World-geometry actors are admitted by the `TraceFlags & 0x80` branch of
+    // `AActor::ShouldTrace` (`IsBlockedBy` bit 30 of `+0x2c`).
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let blocker = phys_actor(&mut vm, &set, "Blocker", [40.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, blocker, true, false);
+    vm.set_property(blocker, "bWorldGeometry", 0, Value::Bool(true));
+    vm.set_property(blocker, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 0.0], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(Some(blocker), hit);
+}
+
 fn set_collision_fields(vm: &mut Vm<'_>, id: ObjectId, colliding: bool, blocking: bool) {
     vm.set_property(id, "bCollideActors", 0, Value::Bool(colliding));
     vm.set_property(id, "bCollideWorld", 0, Value::Bool(true));
@@ -3590,7 +3720,7 @@ fn trace_hits_nearer_of_world_and_actor_and_fasttrace_ignores_actors() {
     let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
     set_collision_fields(&mut vm, tracer, true, false);
     let b = phys_actor(&mut vm, &set, "B", [40.0, 0.0, 0.0]);
-    set_collision_fields(&mut vm, b, true, false);
+    set_collision_fields(&mut vm, b, true, true);
 
     // Actor closer than the wall -> the actor is returned.
     let mut args = vec![
@@ -7135,13 +7265,17 @@ fn trace_package() -> Vec<u8> {
     let collide = b.reserve(B_BOOLPROP, actor, "bCollideActors");
     let bzero = b.reserve(B_BOOLPROP, actor, "bBlockZeroExtentTraces");
     let bnz = b.reserve(B_BOOLPROP, actor, "bBlockNonZeroExtentTraces");
+    let bblocka = b.reserve(B_BOOLPROP, actor, "bBlockActors");
+    let bblockp = b.reserve(B_BOOLPROP, actor, "bBlockPlayers");
     b.prop_with(loc, rot, 0, &compact(vector));
     b.prop_with(rot, radius, 0, &compact(rotator));
     b.prop(radius, height, 0);
     b.prop(height, collide, 0);
     b.prop(collide, bzero, 0);
     b.prop(bzero, bnz, 0);
-    b.prop(bnz, 0, 0);
+    b.prop(bnz, bblocka, 0);
+    b.prop(bblocka, bblockp, 0);
+    b.prop(bblockp, 0, 0);
     b.class(object, 0, 0);
     b.class(actor, object, loc);
     b.build()
@@ -7175,6 +7309,11 @@ fn synthetic_trace_hits_the_nearest_pawn_before_world_geometry() {
         vm.set_property(id, "Location", 0, Value::Vector([x, 0.0, 0.0]));
         vm.set_property(id, "CollisionRadius", 0, Value::Float(40.0));
         vm.set_property(id, "CollisionHeight", 0, Value::Float(40.0));
+        // Decoded engine filter: hash membership (`bCollideActors`) plus the extent prefilter
+        // (`bBlockZeroExtentTraces`) plus `ShouldTrace` admission (block flags).
+        vm.set_property(id, "bCollideActors", 0, Value::Bool(true));
+        vm.set_property(id, "bBlockActors", 0, Value::Bool(true));
+        vm.set_property(id, "bBlockPlayers", 0, Value::Bool(true));
         vm.set_property(id, "bBlockZeroExtentTraces", 0, Value::Bool(true));
         vm.set_active(id, true);
     }
