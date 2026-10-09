@@ -1302,4 +1302,115 @@ mod tests {
             params.height_uu
         );
     }
+
+    /// Real-data regression: repeated small pushes must not tunnel through the three
+    /// reported Banque01 barriers, including when crouched. No extracted fixtures are used.
+    #[test]
+    fn opt_in_banque01_wedge_boxes() {
+        let Some(root) = std::env::var_os("XIII_GOG_DIR") else {
+            println!("SKIPPED: set XIII_GOG_DIR to run Banque01 wedge probes");
+            return;
+        };
+        let root = std::path::Path::new(&root);
+        let mut cache = xiii_world::PackageCache::open(root).expect("installation");
+        let scene = xiii_world::import_map(&mut cache, "Banque01").expect("map");
+        let world = CollisionWorld::new(scene.box_collision());
+        let params = crate::play::resolve_params(root)
+            .expect("player defaults")
+            .params;
+        println!("[wedge] params {params:?}");
+        for (name, start, yaw, axis, limit, sign) in [
+            ("platform", [-7015.0, -2718.0, 875.0], 0.0, 0, -7010.0, 1.0),
+            (
+                "terrace",
+                [1300.0, -2040.0, 1322.0],
+                -std::f32::consts::FRAC_PI_2,
+                1,
+                -2046.0,
+                -1.0,
+            ),
+            ("parking", [960.0, -4109.6, 1298.0], 0.0, 0, 964.2, 1.0),
+        ] {
+            for crouch in [false, true] {
+                let mut sim = PlayerSim::new(start, yaw);
+                for tick in 0..120 {
+                    let before = sim.location;
+                    sim.step(
+                        1.0 / 60.0,
+                        &world,
+                        &params,
+                        Input {
+                            forward: 1.0,
+                            crouch,
+                            ..Default::default()
+                        },
+                        &scene.collision_sources,
+                    );
+                    if tick < 16 || tick % 30 == 29 {
+                        println!(
+                            "[wedge] {name} crouch={crouch} tick={tick} {before:?} -> {:?} velocity={:?} grounded={} floor={:?} source={:?}",
+                            sim.location,
+                            sim.velocity,
+                            sim.grounded,
+                            sim.floor_normal,
+                            sim.last_source
+                        );
+                    }
+                    if tick == 15 {
+                        let center = to_bevy_position(sim.location);
+                        let half = sim.half_extents_bevy(&params);
+                        let floor = world.sweep(
+                            center,
+                            [
+                                center[0],
+                                center[1] - 37.0 / UNREAL_UNITS_PER_METER,
+                                center[2],
+                            ],
+                            half,
+                        );
+                        let result = walk_move(
+                            &world,
+                            center,
+                            to_bevy_position([sim.velocity[0] / 60.0, sim.velocity[1] / 60.0, 0.0]),
+                            half,
+                            &WalkParams {
+                                skin: SKIN_UU / UNREAL_UNITS_PER_METER,
+                                max_iterations: MAX_ITERATIONS,
+                                max_step_height: MAXSTEPHEIGHT_UU / UNREAL_UNITS_PER_METER,
+                                min_floor_z: MINFLOORZ,
+                            },
+                        );
+                        println!(
+                            "[wedge sweeps] {name} crouch={crouch} floor={floor:?} result={result:?}"
+                        );
+                    }
+                    assert!(
+                        sign * (sim.location[axis] - limit) < 0.2,
+                        "{name} tunneled: {:?}",
+                        sim.location
+                    );
+                }
+                assert!(
+                    (sim.location[axis] - limit).abs() < 0.2,
+                    "{name} must reach the measured barrier, not stall before it: {:?}",
+                    sim.location
+                );
+                assert!(
+                    sim.grounded && sim.last_source.is_some(),
+                    "{name} must remain supported at the barrier"
+                );
+                let expected_z = start[2]
+                    - if crouch {
+                        params.height_uu - params.crouch_height_uu
+                    } else {
+                        0.0
+                    };
+                assert!(
+                    (sim.location[2] - expected_z).abs() < 0.2,
+                    "{name} must not oscillate or sink on its supporting floor: {:?}",
+                    sim.location
+                );
+            }
+        }
+    }
 }
