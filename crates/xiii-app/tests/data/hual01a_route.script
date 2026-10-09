@@ -1,0 +1,126 @@
+# item52: Hual01a story route, walked. Replaces no prior fixture (first route on this map).
+#
+# Both MapInfo objectives complete through the game's own chains and the level requests the
+# campaign travel to Hual01b (NextMapLevelWithUnr), exactly as decoded:
+#   - objective 1 "Re-connect the power supply": the EDF-panel handle `Porte6`
+#     (XIDCine.Porte, bEaseInteract, Event 'Goal_Manette_EDF') is used in the camp's
+#     south-east corner; `TriggerEvent('Goal_Manette_EDF')` reaches XIIIGoalTrigger3
+#     (GoalNumber 666) and `XIIIGoalTrigger.CauseGoal` calls MapInfo.SetGoalComplete(666);
+#     the map's own override `xidmaps.Hual01a.SetGoalComplete` decodes to: case 666 sets
+#     `bYaDuJus = true`, promotes `Objectif[1].bPrimary = true` and calls
+#     `SetGoalComplete(1)` - so objective 1 is promoted and completed by game code.
+#   - the dam bridge: `TouchTrigger8` ('touchmanette') arms `CWndFocusTrigger3`, whose
+#     `WaitForBeingSeen.Timer` starts the comic-strip focus on `CWndTarget1` (the lever
+#     sight-line trace must be clear) and hands off via `self.Tag = self.EventFinFocus`
+#     ('PontA'). The binary's own HUD/input layer consumes the dismiss press and fires that
+#     Tag; the host bridge in `session.dismiss_cartoon_focus` reproduces only that input
+#     consumption (logged on every firing) - the route's `fire` at t=155 delivers it and the
+#     `PontA` receivers (XIIIMover0/5, TriggerToggle) slide the crest panels closed through
+#     the game's own mover code. (The decoded alternative closer - pulling the bridge lever
+#     a second time so `xidmaps.Hual01a.SetGoalComplete` case 555 fires `CloseBridgeEvent` -
+#     is gated on the licence-layer flag `TGSDummy == 546`, which the binary's licence layer
+#     sets and the port does not emulate; with the port's default 0 the lever plays the demo
+#     message "IF YOU WANT TO CLOSE THE BRIDGE, BUY THE GAME" and locks.)
+#   - objective 0 "Penetrate the base enclosure": the end trigger `Trigger2`
+#     (Engine.Trigger, Event 'End_of_level') sits inside the sealed dam-base shaft
+#     (8426,-6708,-491); touching it fires XIIIGoalTrigger1 (GoalNumber 0, primary) ->
+#     CauseGoal -> SetGoalComplete(0) -> TestGoalComplete (both objectives completed) ->
+#     DoTravel -> EndGame("GoalComplete") -> GameEndedSuccess -> ServerTravel.
+#
+# The two labelled teleports cover measured movement gaps of the route driver (both verified
+# with xiii-tool box-probe):
+#   - t=160: walking west out of the lever cabanon wedges the box on the room's interior
+#     partition and the swung-open door leaf (route-v6/v8/v9 logs); the entry walk is unaided.
+#   - t=194: the dam-base shaft is sealed at every horizontal approach at trigger height
+#     (cliff faces y=-6512/-6520 and y=-6920/-6928, the GR_passage tube walls); retail descends
+#     it from the cache gallery above. The teleport places the player inside the shaft top so
+#     the fall delivers the game's own `Trigger2` touch; the player lands on the tube floor
+#     at z=-925 (measured, health intact).
+#
+# No take_control, no set_goal, no weapon grant (the fresh-login inventory from Hual01a's
+# InitialInv/AcceptInventory - Fists, Beretta, FusilPompe, arbalete, LockPick, Hook,
+# StunningSkill - is untouched; no objective needs a weapon).
+t=0.50 forward 1
+t=1.50 forward 0
+# Ski slope from the spawn (-4523,3674) down to the base yard (nav-graph line, measured).
+t=2.00 goto -4000 3300
+t=6.00 goto -3100 2950
+t=10.00 goto -2143 3021
+t=13.50 goto -2294 2549
+t=16.00 goto -2478 2540
+t=18.50 goto -2661 2536
+t=21.00 goto -2831 2310
+t=23.50 goto -2600 1930
+t=26.00 goto -2568 1709
+t=28.00 goto -2419 1606
+t=30.00 goto -2256 1490
+t=32.00 goto -2324 1080
+t=34.50 goto -2120 782
+t=36.50 goto -2185 621
+t=38.50 goto -2095 180
+t=40.50 goto -2350 -59
+# East side of the yard, past the guard speeches (DetectionVolumes 5/7) ...
+t=43.50 goto -1232 48
+t=47.50 goto 245 39
+t=51.00 goto 981 -35
+t=54.50 goto 1678 -430
+# ... and down the east descent path into the valley (PathNode56..AttackPoint80).
+t=58.00 goto 1777 -1039
+t=61.50 goto 1833 -1606
+t=64.50 goto 1682 -1848
+t=67.00 goto 1577 -2044
+t=69.00 goto 1513 -2181
+t=71.50 goto 1579 -2402
+t=74.00 goto 1357 -3022
+t=77.50 goto 1182 -3496
+t=81.00 goto 1224 -4002
+t=84.50 goto 1006 -4459
+# Valley bottom east past StrategicPoint45 to the camp's north-east door.
+t=88.50 goto 2067 -4674
+t=92.50 goto 2438 -5505
+t=96.00 goto 1872 -5739
+t=99.00 goto 1868 -6028
+# Camp: over the M16/armor corner (pickups grabbed by touch) to the EDF panel handle.
+t=102.50 goto 2186 -7145
+t=106.50 goto 2322 -7282
+t=109.50 goto 1523 -7577
+# Use the EDF handle Porte6: 'Goal_Manette_EDF' -> goal 666 -> the map override promotes and
+# completes objective 1 (the vigncab1 comic strip fires on the crest en route later).
+t=112.00 use Porte6
+# Back out of the camp and east to the dam west abutment (TalkieWalkieSpeech DV9 en route).
+t=116.00 goto 1872 -5739
+t=121.00 goto 2546 -4813
+t=125.00 goto 3115 -4669
+t=128.50 goto 3591 -4759
+t=132.00 goto 3965 -5248
+# Into the lever cabanon (cabanon1/Porte3, bumped open) up to the lever sight spot.
+t=135.50 goto 4060 -5440
+t=138.50 goto 4150 -5380
+t=140.50 yaw 90
+t=141.00 goto 4195 -5371
+t=144.00 use Porte3
+t=145.50 goto 4230 -5375
+t=147.50 goto 4406 -5430
+# 'touchmanette' (TT8, crossed at t~136) has armed CWndFocusTrigger3; from this spot the
+# sight-line trace to CWndTarget1 is clear, the focus window starts, and the dismiss press
+# fires its 'PontA' Tag: XIIIMover0/5 slide the crest panels closed (MoveTime 4 s).
+t=155.00 fire
+# Labelled teleport (measured cabanon-exit wedge, see header), then north around the poste
+# and east across the CLOSED bridge (x 4765..6232 panels + static GR_pont ramps).
+t=160.00 teleport 4150 -5380 -97
+t=163.00 goto 4150 -5180
+t=166.50 goto 4560 -5030
+t=170.00 goto 5500 -4960
+t=173.50 goto 6300 -4960
+t=177.00 goto 6650 -4960
+# East platform (GR_bidons04) around the stilt baraque_fin building.
+t=180.50 goto 7100 -5250
+t=184.00 goto 7500 -5350
+t=187.50 goto 7900 -5400
+t=191.00 goto 8150 -5800
+# Labelled teleport into the sealed dam-base shaft top (measured seal, see header): the fall
+# delivers Trigger2's touch -> 'End_of_level' -> objective 0 -> TestGoalComplete -> DoTravel
+# -> the game's own Hual01b travel request (measured at t=196.5 in the item52 runs).
+t=194.00 teleport 8416 -6720 -380
+# Wait for the game's own travel (Hual01b via the end-of-level chain).
+t=202.00 wait_travel

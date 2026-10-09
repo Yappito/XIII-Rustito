@@ -8008,6 +8008,15 @@ impl<'s> Vm<'s> {
     /// `Actor.Trace`: nearest of world (provider) and, when `bTraceActors`, actor cylinders;
     /// world hits return the map's `LevelInfo` (upstream), no hit returns `None`.
     /// Fills `(hit_actor, hit_location, hit_normal)`.
+    ///
+    /// item52: a mover whose `bUseCylinderCollision` is set collides through its collision
+    /// cylinder (Engine.dll `AMover`/`AActor` cylinder collision), not through its placed mesh;
+    /// the provider's line world carries the mesh, so a mesh-only hit on such a mover is skipped
+    /// and the trace re-queries past it. Measured need: Hual01a's `CWndFocusTrigger3`
+    /// bridge-focus sight trace (`XIII.u` bytecode 0x01BA) from the player to `CWndTarget1`
+    /// (4474,-5437,-50) grazed the lever `XIIIMover6` mesh (pivot (4489,-5437), cylinder
+    /// r=10/h=50 — the target sits 15.4 UU short of that cylinder, so retail admits the line);
+    /// the mesh hit suspended the focus and the map's only `PontA` bridge-close never fired.
     #[allow(clippy::type_complexity)]
     pub(crate) fn vm_trace(
         &mut self,
@@ -8017,22 +8026,71 @@ impl<'s> Vm<'s> {
         b_trace_actors: bool,
         extent: [f32; 3],
     ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
-        let (world, mover) = match self.physics.as_mut() {
-            Some(p) => p.trace_with_mover(start, end, extent),
-            None => {
-                return Err(self.err(VmErrorKind::NoPhysicsProvider {
-                    native: "Actor.Trace".into(),
-                }));
+        const MAX_MOVER_MESH_SKIPS: usize = 8;
+        let nonzero = extent.iter().any(|v| *v != 0.0);
+        let d = sub3(end, start);
+        let total = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let mut cursor = start;
+        let mut advance = 0.0f32;
+        let mut world: Option<super::physics::WorldHit> = None;
+        let mut mover: Option<ObjectId> = None;
+        for _ in 0..=MAX_MOVER_MESH_SKIPS {
+            let remaining = total - advance;
+            if remaining <= 1e-3 {
+                break;
             }
-        };
+            let (w, mv) = match self.physics.as_mut() {
+                Some(p) => p.trace_with_mover(cursor, end, extent),
+                None => {
+                    return Err(self.err(VmErrorKind::NoPhysicsProvider {
+                        native: "Actor.Trace".into(),
+                    }));
+                }
+            };
+            let Some(hit) = w else {
+                break;
+            };
+            let named = mv
+                .and_then(|name| self.find_live_object(&name))
+                .filter(|&m| m != id && self.is_mover(m));
+            let cylinder_mover = named
+                .filter(|&m| self.actor_blocks_trace(m, nonzero))
+                .filter(|&m| self.bool_prop(m, "bUseCylinderCollision"));
+            let hit_global = advance + hit.time * remaining;
+            match cylinder_mover {
+                Some(m) => {
+                    let (c, r, hh) = self.actor_cylinder(m);
+                    match segment_cylinder_hit(start, end, c, r, hh) {
+                        // The cylinder also blocks at/before the mesh hit: keep it.
+                        Some((t, _)) if t * total <= hit_global + 1.0 => {
+                            world = Some(hit);
+                            mover = named;
+                            break;
+                        }
+                        // The mesh alone blocks: skip past the mesh hit and re-query.
+                        other => {
+                            let skip = hit_global + 1.0;
+                            if skip >= total {
+                                break;
+                            }
+                            cursor = lerp3(start, end, skip / total);
+                            advance = skip;
+                            let _ = other;
+                        }
+                    }
+                }
+                None => {
+                    world = Some(hit);
+                    mover = named;
+                    break;
+                }
+            }
+        }
         // item40e: a hit on a registered mover's geometry returns that mover (a collision-hash
         // actor in UE2) when it blocks this kind of trace; other world hits return the level.
-        let nonzero = extent.iter().any(|v| *v != 0.0);
-        let mover = mover
-            .and_then(|name| self.find_live_object(&name))
-            .filter(|&m| m != id && self.is_mover(m) && self.actor_blocks_trace(m, nonzero));
+        let mover = mover.filter(|&m| self.actor_blocks_trace(m, nonzero));
         let mut best: Option<(f32, Option<ObjectId>, [f32; 3])> =
-            world.map(|h| (h.time, mover, h.normal));
+            world.map(|h| (advance + h.time * (total - advance), mover, h.normal));
         if b_trace_actors
             && let Some((t, b, n)) = self.trace_actors(id, start, end, extent)
             && best.is_none_or(|(bt, _, _)| t <= bt)
@@ -9882,7 +9940,18 @@ fn segment_cylinder_contact(
 }
 
 /// Ray `start -> end` vs a finite vertical cylinder. Returns `(fraction, unit normal)` of the
-/// first intersection in `[0, 1]`; the normal is radial on the side and `+/-Z` on the caps.
+/// first ENTRY intersection in `[0, 1]`; the normal is radial on the side and `+/-Z` on the caps.
+///
+/// A segment starting inside the volume has no entry point and hits nothing, which is the
+/// engine's actor-line-check behaviour: `FCollisionHash::ActorLineCheck` (Engine.dll VA
+/// 0x10349c60) admits the candidate (for the CWndFocusTrigger.WaitForBeingSeen.Timer trace the
+/// pawn is admitted — `APawn::ShouldTrace` VA 0x10305d20 returns `TraceFlags & 1` and the
+/// composed script-trace flags 0x86|0x39|0x2000 set bit 0), but the actor's own line check only
+/// reports an intersection with a non-negative entry time; a trace starting inside the
+/// candidate's cylinder has none. Retail requires this: that timer (XIII.u bytecode 0x01BA)
+/// traces from `XPP.Location` — inside the player pawn — to the focus target and only starts the
+/// focus when the trace returns `None`/the target, and the Hual01a bridge-closing chain
+/// (`CWndFocusTrigger3` -> `PontA`) is the map's only bridge closer.
 fn segment_cylinder_hit(
     start: [f32; 3],
     end: [f32; 3],
@@ -9901,6 +9970,10 @@ fn segment_cylinder_hit(
         start[1] - center[1],
         start[2] - center[2],
     );
+    if px * px + py * py < radius * radius && pz.abs() < half_height {
+        // The start is inside the solid: no entry intersection exists.
+        return None;
+    }
     let a = dir[0] * dir[0] + dir[1] * dir[1];
     let mut hits: Vec<f32> = Vec::new();
     if a > f32::EPSILON {
