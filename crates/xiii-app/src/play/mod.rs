@@ -20,6 +20,7 @@ pub mod pawns;
 pub mod script;
 pub mod session;
 pub mod sim;
+pub mod survey;
 pub mod travel;
 pub mod voice;
 pub mod weapons;
@@ -248,16 +249,16 @@ impl Plugin for PlayPlugin {
 }
 
 /// Resolved player parameters plus the startup report lines.
-struct ResolvedParams {
-    params: PlayerParams,
-    lines: Vec<String>,
+pub(crate) struct ResolvedParams {
+    pub params: PlayerParams,
+    pub lines: Vec<String>,
 }
 
 /// Resolves the player parameters from the inherited class defaults of the pawn class named by
 /// `Default.ini` -> GameInfo `DefaultPlayerClassName` (the same resolution `--collision-test`
 /// uses), and gravity from the decoded `Engine.PhysicsVolume.Gravity` class default. Every
 /// value is reported with its source; missing optional values are reported as such.
-fn resolve_params(game_dir: &Path) -> Result<ResolvedParams, String> {
+pub(crate) fn resolve_params(game_dir: &Path) -> Result<ResolvedParams, String> {
     let install = Installation::open(game_dir, &OpenOptions::default())
         .map_err(|e| format!("opening installation for class defaults: {e}"))?;
     let (set, gameinfo, pawn_path) = collision::resolve_player_class(&install)?;
@@ -565,13 +566,24 @@ fn setup_inner(
     let sources = scene.collision_sources.clone();
     let (ps_bevy, rot) = scene.player_start.ok_or("map has no PlayerStart")?;
     let spawn = collision::place_spawn(&world, ps_bevy, params.half_extents_bevy())?;
-    println!(
-        "[play] spawn: PlayerStart {:?} UU -> box centre {:?} UU, raise {:.2} UU, floor {:.2} UU below the centre",
-        bevy_to_unreal_position(ps_bevy),
-        bevy_to_unreal_position(spawn.position),
-        spawn.raise * UNREAL_UNITS_PER_METER,
-        (spawn.position[1] - spawn.floor) * UNREAL_UNITS_PER_METER
-    );
+    if spawn.airborne {
+        // Engine-faithful: `RestartPlayer` spawns the pawn at StartSpot.Location and
+        // PHYS_Falling brings it down (USA01's PlayerStart is 14 m above the BSP floor).
+        println!(
+            "[play] spawn: no floor within the drop cap below the PlayerStart {:?} UU; \
+             the pawn spawns at the start spot and falls (PHYS_Falling), raise {:.2} UU",
+            bevy_to_unreal_position(ps_bevy),
+            spawn.raise * UNREAL_UNITS_PER_METER
+        );
+    } else {
+        println!(
+            "[play] spawn: PlayerStart {:?} UU -> box centre {:?} UU, raise {:.2} UU, floor {:.2} UU below the centre",
+            bevy_to_unreal_position(ps_bevy),
+            bevy_to_unreal_position(spawn.position),
+            spawn.raise * UNREAL_UNITS_PER_METER,
+            (spawn.position[1] - spawn.floor) * UNREAL_UNITS_PER_METER
+        );
+    }
     // The host movement simulation owns the player pawn's `Location`/`Velocity`/`Rotation`.
     // The script login chain (when it ran) created the pawn at the PlayerStart; the position
     // comes from the host's FindSpot placement (the raw PlayerStart overlaps the floor) and the
@@ -610,7 +622,7 @@ fn setup_inner(
     }
     let yaw = start_rot[1] as f32 * std::f32::consts::TAU / 65536.0;
     let mut sim = PlayerSim::new(start_center, yaw);
-    sim.grounded = true;
+    sim.grounded = !spawn.airborne;
 
     // Optional deterministic script.
     let (drive, script_last) = match &opts.play_script {
@@ -749,10 +761,7 @@ fn setup_inner(
         if pawn_scene.attachments.is_empty() {
             String::new()
         } else {
-            format!(
-                "; attachments not rendered: {}",
-                pawn_scene.attachments.join(", ")
-            )
+            format!("; bone attachments: {}", pawn_scene.attachments.join(", "))
         }
     );
     if pawn_scene.bone_controls_not_applied > 0 {
@@ -1002,6 +1011,11 @@ fn fixed_step(
             Vec::new(),
         ),
     };
+    let wake: Vec<String> = script
+        .drive
+        .as_mut()
+        .map(script::Drive::take_wake)
+        .unwrap_or_default();
     let control = script
         .drive
         .as_mut()
@@ -1098,6 +1112,7 @@ fn fixed_step(
         // player step collides with the moved brush.
         let wr = &mut *world;
         let t0 = Instant::now();
+        sess.vm_mut().sync_mover_collision();
         let mover_states = sess.mover_states();
         if sess.vm().native_profile().enabled {
             let micros = t0.elapsed().as_micros() as u64;
@@ -1139,6 +1154,12 @@ fn fixed_step(
         for target in &search {
             let outcome = sess.search_corpse(target);
             println!("[play] search {target}: {outcome:?}");
+        }
+        for target in &wake {
+            match sess.wake_actor(target) {
+                Ok(msg) => println!("[play] wake {msg}"),
+                Err(e) => println!("[play] wake failed: {e}"),
+            }
         }
         if fire {
             match sess.fire(sim.0.yaw, sim.0.pitch) {
@@ -1862,13 +1883,16 @@ fn format_trace(tick: u64, t: f32, sim: &PlayerSim) -> String {
 /// map, spawns the player, replays the script through the same [`PlayerSim`], prints a trace
 /// every [`TRACE_EVERY`] ticks and exits. No window is opened.
 pub fn run_headless(opts: &Options) -> AppExit {
-    match run_headless_inner(opts) {
+    // The scripted run drives the VM; run it on the explicit VM host stack (see vmstack) so
+    // the engine-limit recursion guard fires before the thread runs out of stack.
+    let owned = opts.clone();
+    crate::vmstack::run_on_vm_stack(move || match run_headless_inner(&owned) {
         Ok(()) => AppExit::Success,
         Err(e) => {
             eprintln!("error: {e}");
             AppExit::error()
         }
-    }
+    })
 }
 
 /// Outcome of a headless scripted run: the VM session (after the run), the movement trace and
@@ -1974,12 +1998,21 @@ fn open_map_runtime(
     let sources = scene.collision_sources.clone();
     let (ps_bevy, rot) = scene.player_start.ok_or("map has no PlayerStart")?;
     let spawn = collision::place_spawn(&world, ps_bevy, params.half_extents_bevy())?;
-    println!(
-        "[play] spawn: PlayerStart {:?} UU -> box centre {:?} UU, raise {:.2} UU",
-        bevy_to_unreal_position(ps_bevy),
-        bevy_to_unreal_position(spawn.position),
-        spawn.raise * UNREAL_UNITS_PER_METER
-    );
+    if spawn.airborne {
+        println!(
+            "[play] spawn: no floor within the drop cap below the PlayerStart {:?} UU; \
+             the pawn spawns at the start spot and falls (PHYS_Falling), raise {:.2} UU",
+            bevy_to_unreal_position(ps_bevy),
+            spawn.raise * UNREAL_UNITS_PER_METER
+        );
+    } else {
+        println!(
+            "[play] spawn: PlayerStart {:?} UU -> box centre {:?} UU, raise {:.2} UU",
+            bevy_to_unreal_position(ps_bevy),
+            bevy_to_unreal_position(spawn.position),
+            spawn.raise * UNREAL_UNITS_PER_METER
+        );
+    }
     // The script login chain (item3h) created the pawn at the PlayerStart; the host owns its
     // movement fields (item8a rule), so the position comes from the host's FindSpot placement
     // and the facing from the pawn's script-set Rotation when the login path ran.
@@ -1988,7 +2021,7 @@ fn open_map_runtime(
         _ => rot[1] as f32 * std::f32::consts::TAU / 65536.0,
     };
     let mut sim = PlayerSim::new(bevy_to_unreal_position(spawn.position), start_yaw);
-    sim.grounded = true;
+    sim.grounded = !spawn.airborne;
     let volumes = match xiii_world::movement_volumes::MovementVolumes::import(game_dir, map) {
         Ok(v) => {
             println!("[play] movement volumes: {}", v.summary());
@@ -2090,6 +2123,7 @@ fn run_script_inner(
         let mut equip = drive.take_equip();
         let mut use_named = drive.take_use_named();
         let mut search = drive.take_search();
+        let wake = drive.take_wake();
         let control = drive.take_control();
         // Match the interactive fixed_step: FPC/FPL/CameraView/PlayingVideo own the pawn while
         // the authored cinematic runs. The headless route must still advance its script cursor,
@@ -2102,6 +2136,8 @@ fn run_script_inner(
             equip = false;
             use_named.clear();
             search.clear();
+            // `wake` is a host bridge like `set_goal`, not a player input: it stays available
+            // while an authored cinematic suppresses the player axes.
         }
         let fired = input.fire;
         if runtime.volumes.is_empty() {
@@ -2155,6 +2191,7 @@ fn run_script_inner(
         if let Some(h) = runtime.video_host.as_ref() {
             h.advance_virtual_all(f64::from(DT));
         }
+        runtime.session.vm_mut().sync_mover_collision();
         let states = runtime.session.mover_states();
         runtime.mover_collision.update(&mut runtime.world, &states);
         for path in &weapons {
@@ -2196,6 +2233,12 @@ fn run_script_inner(
         for target in &search {
             let outcome = runtime.session.search_corpse(target);
             println!("[play] search {target}: {outcome:?}");
+        }
+        for target in &wake {
+            match runtime.session.wake_actor(target) {
+                Ok(msg) => println!("[play] wake {msg}"),
+                Err(e) => println!("[play] wake failed: {e}"),
+            }
         }
         if fired {
             match runtime.session.fire(runtime.sim.yaw, runtime.sim.pitch) {
@@ -2589,6 +2632,23 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// item40e: the authored Plage01 opening of `tests/data/plage01_route.script` up to (not
+    /// including) its `t=59.00` weapon line: hut escape, objective promotion and the
+    /// TouchTrigger8 -> XIIIDispatcher3 -> `tueur_conducteur` chain that wakes BaseSoldier6 (the
+    /// killer) out of his IAController `faction` stasis (`SetCollision(false)`, DrawType none).
+    /// UE2 traces only reach collision-hash actors (`bCollideActors`), so the combat probes
+    /// shoot the awake killer, as the route does.
+    fn plage01_killer_awake_prefix() -> String {
+        let route = include_str!("../../tests/data/plage01_route.script");
+        let mut out = route
+            .lines()
+            .take_while(|l| !l.starts_with("t=59.00"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        out.push('\n');
+        out
+    }
+
     /// `XIII_GOG_DIR` resolved against the workspace root, or `None` in CI.
     fn opt_in_root() -> Option<std::path::PathBuf> {
         let root = std::env::var_os("XIII_GOG_DIR")?;
@@ -2624,7 +2684,7 @@ mod tests {
             bevy_to_unreal_position(spawn.position),
             rot[1] as f32 * std::f32::consts::TAU / 65536.0,
         );
-        sim.grounded = true;
+        sim.grounded = !spawn.airborne;
         let start = sim.location;
         for _ in 0..120 {
             sim.step(
@@ -3266,14 +3326,18 @@ mod tests {
                 .vm()
                 .get_property(checkpoint, "SoundToLaunch")
         );
+        // The chain now begins with the authored entry defaults (`Fists` -> `FistsAmmo` -> ...),
+        // so "the first ammo item" is no longer the route weapon's ammunition. Compare the
+        // selected weapon's own ammo class end to end.
         let ammo = saved
             .inventory
             .iter()
-            .find_map(|item| {
+            .find(|item| item.class_path.eq_ignore_ascii_case("XIII.M60Ammo"))
+            .and_then(|item| {
                 item.ammo_amount
                     .map(|amount| (item.class_path.clone(), amount))
             })
-            .expect("saved travel inventory includes ammunition");
+            .expect("saved travel inventory includes the selected weapon's ammunition");
         assert!(ammo.1 >= 0, "invalid saved ammo count: {ammo:?}");
         println!(
             "[item33 route] checkpoint={} weapon={} ammo={ammo:?} health={} objectives={:?} sound={:?}",
@@ -3372,10 +3436,25 @@ mod tests {
             remaining.remove(at);
         }
         remaining.sort();
+        // Authored `XIIIGameInfo.AcceptInventory` adds exactly three classes beyond the saved
+        // travel inventory, and only when the restored chain lacks them (all measured script):
+        // the default weapon `Fists` (`AddDefaultInventory` 0x04CF ->
+        // `BaseMutator.GetDefaultWeapon` -> `XIIISoloMutator.DefaultWeaponName`="XIII.Fists",
+        // Spawn+GiveTo; `Weapon.GiveAmmo` links `FistsAmmo` at amount 0) and `XIIILeftHand`
+        // (0x0844-0x08A0, Spawn+GiveTo when `FindInventoryType` misses). A fresh-start route
+        // save legitimately lacks them because `XIIIGameInfo.RestartPlayer` omits stock UE2's
+        // `AddDefaultInventory` and these maps carry no MapInfo `InitialInv`; a save that
+        // already holds the defaults must be restored without duplicates.
+        let mut expected_extras: Vec<String> = Vec::new();
+        for class in ["xiii.fists", "xiii.fistsammo", "xiii.xiiilefthand"] {
+            if !saved_classes.iter().any(|c| c == class) {
+                expected_extras.push(class.to_owned());
+            }
+        }
+        expected_extras.sort();
         assert_eq!(
-            remaining,
-            ["xiii.fistsammo", "xiii.xiiilefthand"],
-            "only AcceptInventory's authored default ammo/left-hand entries should be added"
+            remaining, expected_extras,
+            "only AcceptInventory's authored default weapon/ammo/left-hand entries may be added"
         );
         let mut saved_ammo_state = saved
             .inventory
@@ -3782,9 +3861,12 @@ mod tests {
         }
     }
 
-    /// item40 route attempt: player input only for 120 seconds, with no teleports/bridges. The
-    /// route is considered blocked only when the decoded opening cine still owns the controller
-    /// and the primary rooftop goal remains incomplete; otherwise this test requires travel.
+    /// item40/item40e route: player input plus named use/grab of map actors (no teleports,
+    /// goal bridges or weapon grants). item40e extends it past the office: Jones's scene is
+    /// finished by walking to him, the office door `Porte17` is opened by use, a chair is
+    /// grabbed (the `Grab` deco-pickup branch), its swing breaks the duct grille
+    /// `BreakAbleMover16`, and the player crawls the 128-UU duct to its far grille. The rooftop
+    /// objective and the Toits01 travel are not reached yet (PARTIAL, see the item40e report).
     #[test]
     fn opt_in_amos01_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -3807,9 +3889,9 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            120.0,
+            150.0,
         )
-        .expect("run Amos01 opening probe");
+        .expect("run Amos01 route");
         let pc = outcome
             .session
             .controller
@@ -3918,7 +4000,27 @@ mod tests {
             .expect("rooftop objective");
         assert!(
             rooftop.primary && !rooftop.completed,
-            "this forward-only fixture does not yet reach the rooftop goal: {rooftop:?}"
+            "this fixture does not yet reach the rooftop goal: {rooftop:?}"
+        );
+        // item40e milestones. The office door was opened by the route's use action (it swings
+        // open and back; its own OpeningEvent fired), the chair swing destroyed the grille, and
+        // the player ends crouched inside the duct, west of the broken grille.
+        let vm = outcome.session.vm();
+        assert!(
+            vm.find_live_object("BreakAbleMover16").is_none(),
+            "the chair swing must break (destroy) the duct grille BreakAbleMover16"
+        );
+        let opened_door = vm.trace.iter().any(|event| {
+            matches!(&event.kind, xiii_script::TraceKind::Event { target, function, .. }
+                if target.eq_ignore_ascii_case("XIIIDispatcher6") && function.ends_with("Trigger"))
+        });
+        let finish = outcome.trace.last().expect("player trace").2;
+        println!(
+            "[amos01 route] final position {finish:?}; dialamos3tempo dispatcher triggered: {opened_door}"
+        );
+        assert!(
+            finish[0] < -400.0 && (finish[1] + 1198.0).abs() < 40.0 && finish[2] < 60.0,
+            "the player must end crouched inside the zone-26 duct west of the broken grille              (a destroyed mover must leave the player collision; coplanar duct-floor edges must              not stall the crouched box): {finish:?}"
         );
         let first_after_intro_state = outcome
             .trace
@@ -3926,13 +4028,12 @@ mod tests {
             .find(|sample| sample.1 >= 0.5)
             .expect("post-cutscene-state player trace")
             .2;
-        let finish = outcome.trace.last().expect("player trace").2;
         assert_ne!(
             first_after_intro_state, finish,
             "the returned PlayerWalking controller must accept the route's forward input"
         );
         println!(
-            "[amos01 route] PARTIAL: InitInputSystem returns the controller to PlayerWalking and forward input moves it; the forward-only fixture does not reach the rooftop objective or request Toits01 travel."
+            "[amos01 route] PARTIAL: office door, chair grab, grille break and duct crawl pass; the rooftop objective and Toits01 travel are not reached (next: the far grille BreakAbleMover17 faces out of the duct; the north route via duct 14 is blocked by breakable cartons)."
         );
     }
 
@@ -4384,21 +4485,21 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        // BaseSoldier6 is at (1802.4, -12832.0, 1070.8). Place the player 160 UU in -Y facing +Y
-        // (yaw 90) and aim at the top of the head (pitch +5 deg). With the decoded per-bone hit
-        // boxes (item14b) the large `X Spine1` box overlaps the lower head, so a point-blank
-        // horizontal shot is a chest hit; the head needs the ray to clear the torso first. The
-        // battle is entirely script-driven (no host damage).
-        // Start 3 s after the old 45 s mark: with the engine's cine arrival rule
-        // (XIDCine IsTargetReached) the Plage01 intro returns control at ~46.5 s, not ~44.5 s.
-        let script = script::Script::parse(
-            "t=48.00 weapon XIII.Beretta\n\
-             t=48.20 teleport 1802.4131 -12992.034 1070.843\n\
-             t=48.20 yaw 90\n\
-             t=48.20 pitch 5\n\
-             t=48.30 fire\nt=48.90 fire\nt=49.50 fire\nt=50.10 fire\nt=50.70 fire\nt=51.30 fire\n\
-             t=51.90 fire\nt=52.50 fire\nt=53.10 fire\nt=53.70 fire\nt=54.30 fire\n",
-        )
+        // item40e: BaseSoldier6 sits in IAController `faction` stasis (no collision, not drawn)
+        // until the authored chain wakes him; shoot him after the route's own wake-up. `track`
+        // turns the player to him; then the aim is raised to his head (pitch +5 deg, as before:
+        // a body-centre aim is a chest hit and the clip runs out before he dies). The battle is
+        // entirely script-driven (no host damage).
+        let script = script::Script::parse(&format!(
+            "{}t=59.00 weapon XIII.Beretta\n\
+             t=60.00 teleport 1802.0 -12700.0 1100.0\n\
+             t=60.00 track BaseSoldier6\n\
+             t=60.05 track off\n\
+             t=60.05 pitch 5\n\
+             t=60.10 fire\nt=60.70 fire\nt=61.30 fire\nt=61.90 fire\nt=62.50 fire\nt=63.10 fire\n\
+             t=63.70 fire\nt=64.30 fire\nt=64.90 fire\nt=65.50 fire\nt=66.10 fire\n",
+            plage01_killer_awake_prefix()
+        ))
         .unwrap();
         let outcome = run_script(
             &game_dir,
@@ -4406,7 +4507,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            56.0,
+            68.0,
         )
         .expect("run Plage01 fight");
         let s = &outcome.session;
@@ -4434,7 +4535,12 @@ mod tests {
 
     /// item44: collect the placed Beretta through the map pickup and verify its ammunition class
     /// and authored damage path. The teleport only positions the player on the pickup; no weapon
-    /// grant command is used.
+    /// grant command is used. The authored entry defaults equip `Fists` (`AcceptInventory` at
+    /// map entry), and the authored `Weapon.ClientWeaponSet(True)` deliberately does not switch
+    /// a human-controlled pawn that already holds a weapon (bytecode 0x0084), so the route
+    /// equips the picked-up Beretta through the game's own `BringUp` switch, as a player would.
+    /// The route wakes `BaseSoldier6` first: the map parks him in `IAController.faction`
+    /// (invisible, `bCollideActors=false`) until a scripted trigger fires his controller.
     #[test]
     fn opt_in_plage01_beretta_pickup_uses_nine_mm_and_damages_soldier() {
         let Some(game_dir) = opt_in_root() else {
@@ -4448,11 +4554,20 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        // item40e: BaseSoldier6 is in IAController `faction` stasis (no collision, not drawn)
+        // until the authored chain wakes him, so after the pickup touch the route's triggers:
+        // the objective-0 trigger (after Cine2's promotion), TouchTrigger8 (XIIIDispatcher3 ->
+        // `tueur_conducteur`) and TouchTrigger7, then aim at his head as before.
         let script = script::Script::parse(
             "t=48.00 teleport -737.654 -511.886 1254.94\n\
-             t=49.00 teleport 1802.4131 -12992.034 1070.843\n\
-             t=49.00 yaw 90\nt=49.00 pitch 5\n\
-             t=49.20 fire\nt=49.80 fire\nt=50.40 fire\nt=51.00 fire\nt=51.60 fire\n",
+             t=53.50 teleport -307.0 -1500.0 1311.0\n\
+             t=58.00 teleport 1227.0 -12624.0 1100.0\n\
+             t=58.50 teleport 1093.0 -13854.0 1113.0\n\
+             t=60.00 teleport 1802.0 -12700.0 1100.0\n\
+             t=60.00 track BaseSoldier6\n\
+             t=60.05 track off\nt=60.05 pitch 5\n\
+             t=60.10 equip\n\
+             t=60.20 fire\nt=60.80 fire\nt=61.40 fire\nt=62.00 fire\nt=62.60 fire\n",
         )
         .expect("parse pickup combat route");
         let outcome = run_script(
@@ -4461,7 +4576,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            54.0,
+            64.0,
         )
         .expect("run pickup combat route");
         let session = &outcome.session;
@@ -4512,6 +4627,64 @@ mod tests {
         assert!(
             health.is_some_and(|health| health < 550.0),
             "a shot from the picked Beretta must damage BaseSoldier6"
+        );
+    }
+
+    /// Item47b continuation (A): with the engine's decoded actor-trace filter, a parked soldier
+    /// (`IAController.faction`: `SetCollision(false,false,false)`, `SetDrawType(0)`, `bStasis`)
+    /// does not block hitscan bullets — it is not in the collision hash. Two otherwise identical
+    /// Plage01 runs: one fires five Beretta shots at the parked `BaseSoldier6`, one does not
+    /// fire. Both must report the same `Health`. The pre-decode "extent OR bCollideActors"
+    /// heuristic made the parked soldier shootable, contradicting the engine's hash gating
+    /// (`ULevel::SpawnActor`/`SetActorCollision`/`FarMoveActor` all insert only while
+    /// `bCollideActors` holds). The woken case is covered by the Beretta pickup test above.
+    #[test]
+    fn opt_in_plage01_parked_soldier_does_not_block_bullets() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Plage01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Plage01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let health_for = |fires: &str| -> Option<f32> {
+            let script = script::Script::parse(&format!(
+                "t=48.00 weapon XIII.Beretta\n\
+                 t=48.20 teleport 1802.4131 -12992.034 1070.843\n\
+                 t=48.20 yaw 90\nt=48.20 pitch 5\n\
+                 {fires}"
+            ))
+            .expect("parse parked-soldier route");
+            let outcome = run_script(
+                &game_dir,
+                "Plage01",
+                &script,
+                &resolved.params,
+                &scene,
+                52.0,
+            )
+            .expect("run parked-soldier route");
+            let soldier = outcome
+                .session
+                .vm()
+                .find_object("BaseSoldier6")
+                .expect("Plage01 BaseSoldier6");
+            outcome.session.actor_health(soldier)
+        };
+        let no_shots = health_for("").expect("control-run health");
+        let five_shots =
+            health_for("t=49.20 fire\nt=49.80 fire\nt=50.40 fire\nt=50.90 fire\nt=51.30 fire\n");
+        println!(
+            "[parked test] BaseSoldier6 health: no shots {no_shots:?}, five shots at the parked soldier {five_shots:?}"
+        );
+        assert_eq!(
+            Some(no_shots),
+            five_shots,
+            "bullets must pass through the parked (bCollideActors=false) soldier"
         );
     }
 
@@ -4583,15 +4756,24 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let script = script::Script::parse(
-            "t=0.00 weapon XIII.M60\n\
-             t=0.20 teleport 1802.4131 -12992.034 1070.843\n\
-             t=0.20 yaw 90\nt=0.20 pitch 5\n\
-             t=0.30 fire\nt=0.90 fire\nt=1.50 fire\nt=2.10 fire\nt=2.70 fire\n",
-        )
+        // item40e: fire at the awake killer (see `plage01_killer_awake_prefix`).
+        let script = script::Script::parse(&format!(
+            "{}t=59.00 weapon XIII.M60\n\
+             t=60.00 teleport 1802.0 -12700.0 1100.0\n\
+             t=60.00 track BaseSoldier6\n\
+             t=60.10 fire\nt=60.70 fire\nt=61.30 fire\nt=61.90 fire\nt=62.50 fire\n",
+            plage01_killer_awake_prefix()
+        ))
         .expect("parse M60 fight script");
-        let outcome = run_script(&game_dir, "Plage01", &script, &resolved.params, &scene, 4.0)
-            .expect("run Plage01 M60 fight");
+        let outcome = run_script(
+            &game_dir,
+            "Plage01",
+            &script,
+            &resolved.params,
+            &scene,
+            63.0,
+        )
+        .expect("run Plage01 M60 fight");
         let soldier = outcome
             .session
             .vm()

@@ -28,6 +28,8 @@ pub const COMMANDS: &[&str] = &[
     "zones",
     "terrain",
     "material-survey",
+    "nav",
+    "box-probe",
 ];
 
 /// Usage text appended to the main help.
@@ -44,13 +46,31 @@ pub const USAGE: &str = "\
       Decode one static mesh and print its layout summary; optionally write OBJ (source
       coordinates, source winding).
 
-  xiii-tool bsp <map-file> [--export <index|path>]
-      Decode the level BSP model (or the given Model) and its surfaces.
+  xiii-tool bsp <map-file> [--export <index|path>] [--region x0,y0,z0,x1,y1,z1] [--point x,y,z]
+      Decode the level BSP model (or the given Model) and its surfaces. --region lists every
+      node polygon whose bounds touch the source-space box (node, node flags, surface,
+      PolyFlags, material, plane, vertices). --point prints the leaf/zone reached by the BSP
+      walk and the CSG side sequence of the nodes on the path (diagnostic). --grid
+      x0,y0,x1,y1,z,step prints a top-down map of the zone reached at height z (rows +Y
+      downward... see the legend line; '#' = solid, '.' = no zone).
 
   xiii-tool zones <map-file> [--export <index|path>]
       Decode the level BSP model (or the given Model) and list its zones: index, ZoneActor
       export path and class, whether the zone is a sky zone, per-zone leaf count (derived
       from the nodes' iLeaf/iZone pairs) and the connectivity/visibility masks.
+
+  xiii-tool nav <map-name> --game-dir <install-root>
+      Decode the map's NavigationPoints and ReachSpec edges and list them (index, class,
+      name, location; per edge: start/end index, CollisionRadius/Height, reach flags,
+      distance), followed by the connected components over all edges.
+
+  xiii-tool box-probe <map-name> --game-dir <install-root> --from x,y,z --to x,y,z
+                     [--half radius,halfheight] [--samples N]
+      Import the map's box collision soup (the static set the player sim starts from) and
+      move an axis-aligned box (default 34,75: the player) from --from to --to (Unreal
+      units). Prints the first swept hit, then every distinct triangle the box overlaps at N
+      evenly spaced centres (default 64) with its source path, Unreal-space vertices and
+      normal.
 
   xiii-tool terrain <map-file> --game-dir <install-root>
       Decode TerrainInfo/TerrainSector exports and their heightmap.
@@ -83,6 +103,8 @@ pub fn run(cmd: &str, args: &[String]) -> ExitCode {
         "zones" => zones_cmd(args),
         "terrain" => terrain_cmd(args),
         "material-survey" => material_survey_cmd(args),
+        "nav" => nav_cmd(args),
+        "box-probe" => box_probe_cmd(args),
         _ => usage_error(&format!("unknown command '{cmd}'")),
     }
 }
@@ -709,7 +731,7 @@ fn mesh_cmd(args: &[String]) -> ExitCode {
 }
 
 fn bsp_cmd(args: &[String]) -> ExitCode {
-    let a = match parse_args(args, &["export"]) {
+    let a = match parse_args(args, &["export", "region", "point", "grid"]) {
         Ok(a) => a,
         Err(e) => return usage_error(&e),
     };
@@ -737,9 +759,44 @@ fn bsp_cmd(args: &[String]) -> ExitCode {
             }
         }
     };
+    let region = match a
+        .options
+        .get("region")
+        .map(|v| parse_floats::<6>(v, "region"))
+    {
+        Some(Err(e)) => return usage_error(&e),
+        Some(Ok(v)) => Some(v),
+        None => None,
+    };
+    let grid = match a.options.get("grid").map(|v| parse_floats::<6>(v, "grid")) {
+        Some(Err(e)) => return usage_error(&e),
+        Some(Ok(v)) if v[5] > 0.0 => Some(v),
+        Some(Ok(_)) => return usage_error("--grid step must be > 0"),
+        None => None,
+    };
+    let point = match a
+        .options
+        .get("point")
+        .map(|v| parse_floats::<3>(v, "point"))
+    {
+        Some(Err(e)) => return usage_error(&e),
+        Some(Ok(v)) => Some(v),
+        None => None,
+    };
     match model::decode_model(&package, &data, i) {
         Ok(m) => {
-            emit(&model::summary_text(&package, i, &m));
+            if let Some(g) = grid {
+                emit(&bsp_grid_text(&m, g));
+            }
+            if region.is_none() && point.is_none() && grid.is_none() {
+                emit(&model::summary_text(&package, i, &m));
+            }
+            if let Some(r) = region {
+                emit(&bsp_region_text(&package, &m, r));
+            }
+            if let Some(p) = point {
+                emit(&bsp_point_text(&m, p));
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -747,6 +804,351 @@ fn bsp_cmd(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn parse_floats<const N: usize>(v: &str, name: &str) -> Result<[f32; N], String> {
+    let parts: Vec<f32> = v
+        .split(',')
+        .map(|x| x.trim().parse::<f32>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| format!("invalid --{name} {v:?}"))?;
+    parts
+        .try_into()
+        .map_err(|_| format!("--{name} needs {N} comma-separated numbers, got {v:?}"))
+}
+
+/// Node polygons whose axis-aligned bounds touch the source-space box `r` (x0,y0,z0,x1,y1,z1).
+fn bsp_region_text(package: &Package, m: &model::Model, r: [f32; 6]) -> String {
+    let mut s = String::new();
+    let lo = [r[0].min(r[3]), r[1].min(r[4]), r[2].min(r[5])];
+    let hi = [r[0].max(r[3]), r[1].max(r[4]), r[2].max(r[5])];
+    let mut count = 0usize;
+    for poly in m.polygons() {
+        let mut pmin = [f32::INFINITY; 3];
+        let mut pmax = [f32::NEG_INFINITY; 3];
+        for v in &poly.vertices {
+            for k in 0..3 {
+                pmin[k] = pmin[k].min(v[k]);
+                pmax[k] = pmax[k].max(v[k]);
+            }
+        }
+        if (0..3).any(|k| pmax[k] < lo[k] || pmin[k] > hi[k]) {
+            continue;
+        }
+        count += 1;
+        let n = &m.nodes[poly.node];
+        let (flags, material) = match m.surfs.get(poly.surf) {
+            Some(surf) => (
+                surf.poly_flags,
+                package
+                    .object_path(surf.material)
+                    .unwrap_or("None")
+                    .to_owned(),
+            ),
+            None => (0, "<bad surf>".to_owned()),
+        };
+        let _ = writeln!(
+            s,
+            "node {} nodeflags 0x{:02x} surf {} polyflags 0x{flags:08x} material {material}              plane ({:.3},{:.3},{:.3},{:.1}) zone {:?} leaf {:?} front {} back {} coplanar {}",
+            poly.node,
+            n.flags,
+            poly.surf,
+            n.plane[0],
+            n.plane[1],
+            n.plane[2],
+            n.plane[3],
+            n.zone,
+            n.leaf,
+            n.front,
+            n.back,
+            n.coplanar
+        );
+        let verts: Vec<String> = poly
+            .vertices
+            .iter()
+            .map(|v| format!("({:.0},{:.0},{:.0})", v[0], v[1], v[2]))
+            .collect();
+        let _ = writeln!(s, "    verts {}", verts.join(" "));
+    }
+    let _ = writeln!(s, "region polygons: {count}");
+    s
+}
+
+/// BSP walk of a source-space point: each visited node's side and flags, the reached
+/// leaf/zone, and the UE-style CSG `Outside` value (front of a CSG node is outside, back is
+/// inside, a node with `NF_NotCsg` (0x01) or `NF_IsNew` (0x20) keeps the parent's value; the
+/// root starts at `RootOutside`). The rule is a labelled diagnostic, not used by the importer.
+fn bsp_grid_text(m: &model::Model, g: [f32; 6]) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let map = xiii_world::zones::ZoneMap::new(m);
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "grid z {} step {}: rows from y {} (top) to y {}, columns from x {} (left) to x {};          zone digit 0-9a-zA-Z (zone index base 62), '#' CSG inside (solid), '.' no zone",
+        g[4], g[5], g[1], g[3], g[0], g[2]
+    );
+    let mut y = g[1];
+    while y <= g[3] {
+        let mut row = String::new();
+        let mut x = g[0];
+        while x <= g[2] {
+            let p = [x, y, g[4]];
+            let c = if !csg_outside(m, map.root(), p) {
+                '#'
+            } else {
+                match map.zone_of_point(&m.nodes, p) {
+                    Some(z) => DIGITS.get(usize::from(z)).map_or('?', |&b| b as char),
+                    None => '.',
+                }
+            };
+            row.push(c);
+            x += g[5];
+        }
+        let _ = writeln!(s, "{y:>7.0} {row}");
+        y += g[5];
+    }
+    s
+}
+
+/// UE-style CSG side of a point (see [`bsp_point_text`]); diagnostic only.
+fn csg_outside(m: &model::Model, root: usize, p: [f32; 3]) -> bool {
+    let mut i = root;
+    let mut outside = m.root_outside != 0;
+    for _ in 0..=m.nodes.len() {
+        let Some(n) = m.nodes.get(i) else {
+            break;
+        };
+        let d = n.plane[0] * p[0] + n.plane[1] * p[1] + n.plane[2] * p[2] - n.plane[3];
+        let front = d >= 0.0;
+        if n.num_vertices > 0 && n.flags & (0x01 | 0x20) == 0 {
+            outside = front;
+        }
+        let child = if front { n.front } else { n.back };
+        if child < 0 {
+            break;
+        }
+        i = child as usize;
+    }
+    outside
+}
+
+fn bsp_point_text(m: &model::Model, p: [f32; 3]) -> String {
+    let mut s = String::new();
+    let map = xiii_world::zones::ZoneMap::new(m);
+    let mut i = map.root();
+    let mut outside = m.root_outside != 0;
+    let mut steps = 0usize;
+    let _ = writeln!(
+        s,
+        "point ({},{},{}) root_outside {}",
+        p[0], p[1], p[2], m.root_outside
+    );
+    loop {
+        let Some(n) = m.nodes.get(i) else {
+            let _ = writeln!(s, "  bad node index {i}");
+            break;
+        };
+        let d = n.plane[0] * p[0] + n.plane[1] * p[1] + n.plane[2] * p[2] - n.plane[3];
+        let front = d >= 0.0;
+        let csg = n.num_vertices > 0 && n.flags & (0x01 | 0x20) == 0;
+        if csg {
+            outside = front;
+        }
+        let child = if front { n.front } else { n.back };
+        steps += 1;
+        if child < 0 || steps > m.nodes.len() {
+            let leaf = if front { n.leaf[1] } else { n.leaf[0] };
+            let zone = if front { n.zone[1] } else { n.zone[0] };
+            let _ = writeln!(
+                s,
+                "  end node {i} side {} dist {d:.2} leaf {leaf} zone {zone} csg_outside {outside}                  (steps {steps})",
+                if front { "front" } else { "back" }
+            );
+            break;
+        }
+        i = child as usize;
+    }
+    s
+}
+
+fn box_probe_cmd(args: &[String]) -> ExitCode {
+    use xiii_decode::common::{UNREAL_UNITS_PER_METER, to_bevy_position};
+    let a = match parse_args(args, &["game-dir", "from", "to", "half", "samples"]) {
+        Ok(a) => a,
+        Err(e) => return usage_error(&e),
+    };
+    let (Some(map), Some(root)) = (a.positional.first(), a.options.get("game-dir")) else {
+        return usage_error("box-probe needs a map name and --game-dir");
+    };
+    let parse3 = |k: &str| a.options.get(k).map(|v| parse_floats::<3>(v, k));
+    let (Some(Ok(from)), Some(Ok(to))) = (parse3("from"), parse3("to")) else {
+        return usage_error("box-probe needs --from x,y,z and --to x,y,z");
+    };
+    let half = match a.options.get("half").map(|v| parse_floats::<2>(v, "half")) {
+        None => [34.0, 75.0],
+        Some(Ok(h)) => h,
+        Some(Err(e)) => return usage_error(&e),
+    };
+    let samples: usize = match a.options.get("samples").map(|v| v.parse::<usize>()) {
+        None => 64,
+        Some(Ok(n)) if n >= 2 => n,
+        _ => return usage_error("--samples must be an integer >= 2"),
+    };
+    let scene = match xiii_world::PackageCache::open(Path::new(root))
+        .and_then(|mut cache| xiii_world::import_map(&mut cache, map))
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let world = xiii_collision::CollisionWorld::new(scene.box_collision());
+    let s_m = 1.0 / UNREAL_UNITS_PER_METER;
+    // Unreal (r, r, h) -> Bevy (y, z, x) axes.
+    let half_b = [half[0] * s_m, half[1] * s_m, half[0] * s_m];
+    let to_unreal = |b: [f32; 3]| {
+        [
+            -b[2] * UNREAL_UNITS_PER_METER,
+            b[0] * UNREAL_UNITS_PER_METER,
+            b[1] * UNREAL_UNITS_PER_METER,
+        ]
+    };
+    let fmt3 = |v: [f32; 3]| format!("({:.1},{:.1},{:.1})", v[0], v[1], v[2]);
+    let source_path = |id: u32| {
+        scene
+            .collision_sources
+            .get(id as usize)
+            .map_or("<unknown source>", String::as_str)
+            .to_owned()
+    };
+    let mut s = String::new();
+    let (bf, bt) = (to_bevy_position(from), to_bevy_position(to));
+    match world.sweep(bf, bt, half_b) {
+        Some(h) => {
+            let t = world.triangle(h.triangle);
+            let n = h.normal;
+            let _ = writeln!(
+                s,
+                "sweep hit t {:.4} at {} source {} start_penetrating {} normal(unreal) ({:.3},{:.3},{:.3}) tri {} {} {}",
+                h.t,
+                fmt3(std::array::from_fn(|k| from[k] + (to[k] - from[k]) * h.t)),
+                source_path(h.source),
+                h.start_penetrating,
+                -n[2],
+                n[0],
+                n[1],
+                fmt3(to_unreal(t[0])),
+                fmt3(to_unreal(t[1])),
+                fmt3(to_unreal(t[2]))
+            );
+        }
+        None => {
+            let _ = writeln!(s, "sweep: no hit");
+        }
+    }
+    let mut seen: BTreeMap<u32, usize> = BTreeMap::new();
+    for i in 0..samples {
+        let f = i as f32 / (samples - 1) as f32;
+        let c: [f32; 3] = std::array::from_fn(|k| from[k] + (to[k] - from[k]) * f);
+        for hit in world.overlap_aabb(to_bevy_position(c), half_b) {
+            seen.entry(hit.triangle).or_insert(i);
+        }
+    }
+    for (tri, first) in &seen {
+        let t = world.triangle(*tri);
+        let e1: [f32; 3] = std::array::from_fn(|k| t[1][k] - t[0][k]);
+        let e2: [f32; 3] = std::array::from_fn(|k| t[2][k] - t[0][k]);
+        let n = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12);
+        let _ = writeln!(
+            s,
+            "overlap tri {tri} first-sample {first} source {} verts {} {} {} normal(unreal) ({:.3},{:.3},{:.3})",
+            source_path(world.source(*tri)),
+            fmt3(to_unreal(t[0])),
+            fmt3(to_unreal(t[1])),
+            fmt3(to_unreal(t[2])),
+            -n[2] / len,
+            n[0] / len,
+            n[1] / len
+        );
+    }
+    let _ = writeln!(s, "overlapping triangles: {}", seen.len());
+    emit(&s);
+    ExitCode::SUCCESS
+}
+
+fn nav_cmd(args: &[String]) -> ExitCode {
+    let a = match parse_args(args, &["game-dir"]) {
+        Ok(a) => a,
+        Err(e) => return usage_error(&e),
+    };
+    let (Some(map), Some(root)) = (a.positional.first(), a.options.get("game-dir")) else {
+        return usage_error("nav needs a map name and --game-dir");
+    };
+    let root = Path::new(root);
+    let nav = xiii_world::PackageCache::open(root).and_then(|mut cache| {
+        let mut defaults = xiii_world::ClassDefaults::open(root)?;
+        xiii_world::navigation::decode_navigation(&mut cache, &mut defaults, map)
+    });
+    let nav = match nav {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut s = String::new();
+    for (i, p) in nav.points.iter().enumerate() {
+        let l = p.location;
+        let _ = writeln!(
+            s,
+            "point {i} {} {} ({:.0},{:.0},{:.0}) r {} h {}",
+            p.class, p.path, l[0], l[1], l[2], p.collision_radius, p.collision_height
+        );
+    }
+    // Union-find over every edge with both ends resolved.
+    let mut parent: Vec<usize> = (0..nav.points.len()).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for e in &nav.edges {
+        let _ = writeln!(
+            s,
+            "edge {:?} -> {:?} r {} h {} flags 0x{:x} {:?} dist {}",
+            e.start_point,
+            e.end_point,
+            e.collision_radius,
+            e.collision_height,
+            e.reach_flags,
+            xiii_world::navigation::reach_flags::names(e.reach_flags),
+            e.distance
+        );
+        if let (Some(x), Some(y)) = (e.start_point, e.end_point) {
+            let (rx, ry) = (find(&mut parent, x), find(&mut parent, y));
+            parent[rx] = ry;
+        }
+    }
+    let mut comps: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for i in 0..nav.points.len() {
+        let r = find(&mut parent, i);
+        comps.entry(r).or_default().push(i);
+    }
+    let _ = writeln!(s, "components {}", comps.len());
+    for members in comps.values() {
+        let list: Vec<String> = members.iter().map(|m| m.to_string()).collect();
+        let _ = writeln!(s, "component size {}: {}", members.len(), list.join(" "));
+    }
+    emit(&s);
+    ExitCode::SUCCESS
 }
 
 fn zones_cmd(args: &[String]) -> ExitCode {

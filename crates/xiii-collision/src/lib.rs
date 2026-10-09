@@ -66,6 +66,8 @@ pub struct MovingObject {
     /// Rows of the rotation matrix: `world = origin + rows * local`.
     rotation: [Vec3; 3],
     bounds: Aabb,
+    /// Whether queries consider this object (a destroyed or non-colliding mover is disabled).
+    enabled: bool,
 }
 
 impl MovingObject {
@@ -89,6 +91,7 @@ impl MovingObject {
             origin,
             rotation,
             bounds: Aabb::empty(),
+            enabled: true,
         };
         object.rebuild_bounds();
         object
@@ -99,6 +102,11 @@ impl MovingObject {
         self.origin = origin;
         self.rotation = rotation;
         self.rebuild_bounds();
+    }
+
+    /// Whether queries consider this object ([`CollisionWorld::set_moving_enabled`]).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     /// Collision source id shared by every triangle.
@@ -248,6 +256,19 @@ impl CollisionWorld {
         }
     }
 
+    /// Enables or disables a moving object for every query (sweeps, rays, overlaps) without
+    /// dropping its triangles, so it can be re-enabled later. `false` when the index is out of
+    /// range. Used for a mover whose actor was destroyed or stopped colliding.
+    pub fn set_moving_enabled(&mut self, index: usize, enabled: bool) -> bool {
+        match self.dynamic.get_mut(index) {
+            Some(object) => {
+                object.enabled = enabled;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Calls `f(world_triangle, source, local_index)` for every moving-object triangle whose
     /// per-object AABB overlaps `query` (simple cull). The returned index is the triangle's
     /// index within its object; `sweep`/`ray` report `u32::MAX` as the triangle field for
@@ -258,7 +279,7 @@ impl CollisionWorld {
         mut f: impl FnMut(Triangle, u32, u32),
     ) {
         for object in &self.dynamic {
-            if !object.bounds.overlaps(&query) {
+            if !object.enabled || !object.bounds.overlaps(&query) {
                 continue;
             }
             for i in 0..object.local.len() {

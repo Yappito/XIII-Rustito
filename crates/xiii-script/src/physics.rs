@@ -47,6 +47,21 @@ pub trait WorldPhysics {
     /// (a zero extent is a line in upstream terms). Returns the first blocking hit.
     fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit>;
 
+    /// [`WorldPhysics::trace`] that also names the actor whose collision geometry produced the
+    /// hit, if the provider knows it (a registered mover, see [`WorldPhysics::register_mover`],
+    /// or a placed mesh actor). The VM keeps the name only for movers: UE2 movers are
+    /// collision-hash actors whose primitive is their own brush/static mesh, so `Actor.Trace`
+    /// returns the mover itself rather than the level. Providers without per-actor sources keep
+    /// the default (no actor).
+    fn trace_with_mover(
+        &mut self,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+    ) -> (Option<WorldHit>, Option<String>) {
+        (self.trace(start, end, extent), None)
+    }
+
     /// UE2 `MoveActor`-like swept box move: from `start`, try to move by `delta` with
     /// half-extents `extent`, stopping at the **first blocking** world hit. No sliding —
     /// sliding is physics/script logic layered above this. Returns the end position and the
@@ -79,6 +94,10 @@ pub trait WorldPhysics {
 
     /// Updates a registered mover's pose (Unreal units/rotators). Default no-op.
     fn set_mover(&mut self, _actor: &str, _location: [f32; 3], _rotation: [i32; 3]) {}
+
+    /// Enables or disables a registered mover's collision (the actor was destroyed or its
+    /// `bCollideActors` changed). Default no-op.
+    fn set_mover_collision(&mut self, _actor: &str, _enabled: bool) {}
 
     /// Diagnostic (item27k): every world primitive overlapping the box `(location, extent)`,
     /// with its kind, source label and triangle. Empty by default; providers backed by a

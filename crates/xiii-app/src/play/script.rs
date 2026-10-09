@@ -21,6 +21,8 @@
 //!   doors and dynamic pawns the camera ray cannot pick).
 //! - `search <ActorName>`: search a named dead pawn's inventory through the game's own
 //!   `PlayerController.SearchPawn` (the corpse-search half of `Grab`).
+//! - `wake <ActorName>`: activate a parked pawn through its controller's authored `Trigger`
+//!   event (the map's scripted-trigger wake; see [`Command::Wake`]).
 //! - `take_control` (alias `assume_control`): explicit diagnostic command that runs the
 //!   controller's own `EnterStartState` with `bOkForMoving = true`. No normal interactive or
 //!   campaign route issues this command; it is available only in a supplied `--play-script`.
@@ -105,6 +107,12 @@ pub enum Command {
     /// controller frozen in `NoControl` when a diagnostic script does not play the authored
     /// cutscene sequence. Normal campaign play does not depend on this command.
     TakeControl,
+    /// Activate a named parked pawn through its controller's authored `Trigger` event (the map's
+    /// scripted-trigger wake): `IAController.faction.BeginState` parks soldiers invisible and
+    /// non-colliding (`SetCollision(false,false,false)`, `SetDrawType(0)`); leaving the state via
+    /// `faction.EndState` restores them. Needed because the headless route does not deliver the
+    /// map's own wake triggers for a pawn the acceptance must shoot.
+    Wake(String),
 }
 
 /// A parsed input script, time-ordered.
@@ -214,6 +222,12 @@ impl Script {
                 }
                 "equip" | "select" => Command::Equip,
                 "take_control" | "take-control" | "assume_control" => Command::TakeControl,
+                "wake" => {
+                    let target = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: wake needs an actor name"))?;
+                    Command::Wake(target.to_owned())
+                }
                 other => return Err(format!("line {n}: unknown command {other:?}")),
             };
             events.push(Event { t, command });
@@ -270,6 +284,8 @@ pub struct Drive {
     goals: Vec<i32>,
     /// `take_control` requested (edge-triggered) and not yet applied by the host.
     control_pending: bool,
+    /// Named `wake <ActorName>` targets not yet applied by the host.
+    wake: Vec<String>,
     tracking: Option<String>,
     track_location: Option<[f32; 3]>,
 }
@@ -295,6 +311,7 @@ impl Drive {
             waiting_travel: false,
             goals: Vec::new(),
             control_pending: false,
+            wake: Vec::new(),
             tracking: None,
             track_location: None,
         }
@@ -354,6 +371,11 @@ impl Drive {
         std::mem::take(&mut self.equip_pending)
     }
 
+    /// Takes the pending `wake <ActorName>` targets.
+    pub fn take_wake(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.wake)
+    }
+
     /// Applies every event due at or before `elapsed` and returns this tick's input.
     ///
     /// Yaw/pitch commands are applied directly to `sim` (they are orientation, not an axis).
@@ -396,6 +418,7 @@ impl Drive {
                 }
                 Command::Equip => self.equip_pending = true,
                 Command::TakeControl => self.control_pending = true,
+                Command::Wake(target) => self.wake.push(target.clone()),
             }
             self.cursor += 1;
         }
@@ -517,10 +540,10 @@ mod tests {
     #[test]
     fn parses_named_use_search_and_take_control() {
         let s = Script::parse(
-            "t=0.0 take_control\nt=0.5 use Porte1\nt=1.0 search BaseSoldier6\nt=1.5 use\n",
+            "t=0.0 take_control\nt=0.5 use Porte1\nt=1.0 search BaseSoldier6\nt=1.5 use\nt=2.0 wake BaseSoldier6\n",
         )
         .unwrap();
-        assert_eq!(s.events.len(), 4);
+        assert_eq!(s.events.len(), 5);
         let mut sim = PlayerSim::new([0.0; 3], 0.0);
         let mut d = Drive::new(&s);
         let _ = d.advance(0.0, &mut sim);
@@ -534,6 +557,10 @@ mod tests {
         let i = d.advance(1.5, &mut sim);
         assert!(i.use_action);
         assert!(d.take_use_named().is_empty());
+        let _ = d.advance(2.0, &mut sim);
+        assert_eq!(d.take_wake(), vec!["BaseSoldier6".to_owned()]);
+        assert!(d.take_wake().is_empty());
+        assert!(Script::parse("t=0.0 wake\n").is_err());
     }
 
     #[test]

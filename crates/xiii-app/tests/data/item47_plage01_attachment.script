@@ -1,0 +1,4 @@
+# Extra item47 camera diagnostic after the authored opening camera hands off control.
+# The default-spawn capture is kept separately. No weapon/native/animation overrides.
+t=45 teleport 1802.0 -12700.0 1100.0
+t=45 track BaseSoldier6

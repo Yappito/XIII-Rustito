@@ -1,6 +1,40 @@
-# item40: Amos01 route attempt. Player input only; deliberately no teleport, set_goal,
-# take_control, weapon grant, or other host bridge. `forward` is sampled while the authored
-# opening cinematic is active; wait_travel marks the requested completion point.
-t=0.00 forward 1
-t=119.90 forward 0
-t=119.90 wait_travel
+# item40/item40e: Amos01 route. Player input plus named use/grab of map actors; no teleport,
+# set_goal, take_control or weapon grant. Input is ignored by the run while the authored
+# cinematics own the controller (intro Cine0, Jones Cine3).
+#
+# item40e findings (local/reports/item40e-amos01-doorway.md):
+#   - Porte14/15 on the office north wall are the sliding panels of a wall cupboard
+#     (AMplacar01 + AMplacarport01) on a 384-UU-thick solid BSP wall: there is no doorway.
+#   - The office's only player exit is the south door Porte17 (8,-528), a PlayerTriggerToggle
+#     XIIIPorte opened by use; opening it fires its OpeningEvent dialamos3tempo.
+#   - The ground-floor ducts are entered through breakable floor-level grilles
+#     (XIDCine.BreakableMover, AMaeraplaq); the player starts without fists, so a deco pickup
+#     (ChaiseDeco -> DecoChair, one swing) breaks a grille.
+t=0.50 forward 1
+t=1.50 forward 0
+# Control returns after the intro (~t=84). Jones (Cine3) waits "wait player 192" behind the
+# office vent grille: walk to him so his scene (jones03, exit through the vent duct) finishes.
+t=86.00 goto 800 330
+# Down the office stairs to the south door and open it.
+t=100.00 goto 420 -470
+t=104.00 goto 60 -300
+t=108.00 goto 72 -470
+t=110.00 yaw 270
+t=110.50 use
+# Corridor (zone 22) -> zone 25; grab the chair ChaiseDeco2 (Grab: bCanPickup branch).
+t=114.00 goto 72 -700
+t=118.00 goto 288 -1000
+t=121.00 goto 156 -1053
+t=123.00 use ChaiseDeco2
+t=123.50 equip
+# Break the duct grille BreakAbleMover16 with the chair swing.
+t=125.00 goto 175 -1198
+t=127.00 track BreakAbleMover16
+t=128.00 shoot
+t=129.50 track off
+# Crouch and crawl the 128-UU duct (zone 26) west to its far grille BreakAbleMover17.
+t=130.00 crouch on
+t=130.50 goto 60 -1198
+t=133.00 goto -300 -1198
+t=137.00 goto -505 -1198
+t=150.00 wait_travel

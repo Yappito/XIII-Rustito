@@ -14,6 +14,7 @@ mod save;
 mod smoke;
 mod video;
 mod viewer;
+mod vmstack;
 
 use bevy::prelude::*;
 use bevy::window::PresentMode;
@@ -56,6 +57,12 @@ fn main() -> AppExit {
         return play::run_headless(&opts);
     }
 
+    // `--survey` (item45) is headless only: it opens one real session per campaign map and
+    // never builds a window.
+    if opts.mode == cli::Mode::Survey {
+        return play::survey::run(&opts);
+    }
+
     // `--menu` runs the front-end. When the game's own New game path reaches
     // `PlayerController.ClientTravel`, the host performs the travel step: it starts `--play`
     // on the requested map.
@@ -66,7 +73,12 @@ fn main() -> AppExit {
                 opts.exit_after_secs, opts.screenshot, opts.width, opts.height
             );
         }
-        let menu_exit = menu::build_menu_app(opts.clone()).run();
+        // The menu's own New game script drives the VM; run the whole app on the explicit
+        // VM host stack (see vmstack) so the engine-limit recursion guard fires before the
+        // thread runs out of stack. WinitPlugin::run_on_any_thread makes the event loop
+        // legal off the main thread (supported on Windows).
+        let menu_opts = opts.clone();
+        let menu_exit = vmstack::run_on_vm_stack(move || menu::build_menu_app(menu_opts).run());
         if let Some(slot) = menu::take_save_load_request() {
             println!("[app] menu requested save slot {slot}; handing off to --play --load {slot}");
             return run_play_travel_step(&opts, "Plage00", Some(slot));
@@ -97,7 +109,9 @@ fn main() -> AppExit {
         );
     }
 
-    build_app(opts).run()
+    // Windowed modes (`--play`, `--smoke`, ...) drive the VM from `fixed_step`; run the whole
+    // app on the explicit VM host stack (see vmstack).
+    vmstack::run_on_vm_stack(move || build_app(opts).run())
 }
 
 /// Host travel step: launches this binary in `--play` mode on the map the menu's own
@@ -169,26 +183,39 @@ fn build_app(opts: cli::Options) -> App {
     if opts.benchmark.is_some() {
         app.insert_resource(bevy::winit::WinitSettings::continuous());
     }
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: match opts.mode {
-                cli::Mode::Smoke => "XIII Classic runtime - smoke test".into(),
-                cli::Mode::Viewer => "XIII Classic runtime - map viewer (diagnostic)".into(),
-                cli::Mode::Skinned => {
-                    "XIII Classic runtime - skinned character viewer (diagnostic)".into()
-                }
-                cli::Mode::Play => {
-                    "XIII Classic runtime - movement prototype (NOT gameplay)".into()
-                }
-                cli::Mode::Menu => "XIII Classic runtime - front-end menu (item16)".into(),
-                cli::Mode::Video => "XIII Classic runtime - Bink cutscene".into(),
-            },
-            resolution: (opts.width, opts.height).into(),
-            present_mode,
-            ..default()
-        }),
-        ..default()
-    }));
+    // The app runs on the explicit VM host stack (see vmstack); allow the winit event loop to
+    // be created off the main thread (supported on Windows).
+    app.add_plugins(
+        DefaultPlugins
+            .set(bevy::winit::WinitPlugin {
+                run_on_any_thread: true,
+            })
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: match opts.mode {
+                        cli::Mode::Smoke => "XIII Classic runtime - smoke test".into(),
+                        cli::Mode::Viewer => {
+                            "XIII Classic runtime - map viewer (diagnostic)".into()
+                        }
+                        cli::Mode::Skinned => {
+                            "XIII Classic runtime - skinned character viewer (diagnostic)".into()
+                        }
+                        cli::Mode::Play => {
+                            "XIII Classic runtime - movement prototype (NOT gameplay)".into()
+                        }
+                        cli::Mode::Menu => "XIII Classic runtime - front-end menu (item16)".into(),
+                        cli::Mode::Video => "XIII Classic runtime - Bink cutscene".into(),
+                        cli::Mode::Survey => {
+                            "XIII Classic runtime - campaign start survey (item45)".into()
+                        }
+                    },
+                    resolution: (opts.width, opts.height).into(),
+                    present_mode,
+                    ..default()
+                }),
+                ..default()
+            }),
+    );
 
     match opts.mode {
         cli::Mode::Smoke => {
@@ -212,6 +239,9 @@ fn build_app(opts: cli::Options) -> App {
         }
         cli::Mode::Video => {
             app.add_plugins(video::VideoPlugin { options: opts });
+        }
+        cli::Mode::Survey => {
+            // Handled before `build_app` (headless only; never builds a window).
         }
     }
 

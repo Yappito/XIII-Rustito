@@ -161,6 +161,13 @@ pub enum UseOutcome {
     /// A dead pawn in reach was searched (the game's own `PlayerController.SearchPawn`), which
     /// transfers its inventory to the player.
     CorpseSearched,
+    /// A deco pickup (`XIIIDecoPickup`: chair, bottle, ashtray...) was taken through its own
+    /// `Touch`/`ValidTouch`/`SpawnCopy` chain (the `bCanPickup` branch of `Grab`).
+    PickedUp,
+    /// The pawn already holds (or is switching to) a `DecoWeapon`; `Grab` refuses a second one.
+    DecoAlreadyHeld,
+    /// The deco pickup's own `ValidTouch` refused the pickup (nothing was taken).
+    PickupRefused,
     /// The script raised on the transition.
     Error(String),
 }
@@ -366,6 +373,28 @@ impl Session {
             // bytecode 0x037A). `Plage00.FirstFrame`'s guard at 0x0013 then skips re-applying
             // the wounded intro Health when it reads "LOAD". Set it here, once, after spawn.
             vm.set_start_spot_event(event);
+        } else if let Some(gi) = game_info {
+            // Native map-entry inventory setup. The decoded script has no other default-weapon
+            // granter on a fresh campaign load: `XIIIGameInfo.RestartPlayer` (xiii.u bytecode
+            // 0x0000-0x03B5) omits stock UE2's `AddDefaultInventory` call, and these maps carry
+            // no MapInfo whose `InitialInv`/`SetUpInitialInventory` could grant one. The engine
+            // binary itself references the `AcceptInventory` event name (three occurrences in
+            // Engine.dll .rdata), and authored code depends on its products: the cutscene
+            // handoff `CineController2.PlayingSequence.Tick` 0x0065 restores the player weapon
+            // through `XIIIPlayerController.SwitchWeapon`, whose `WeaponChange` walk terminates
+            // only on the group-0 `Fists` item (XIIISoloMutator.DefaultWeaponName). With no
+            // travel data the authored event grants exactly the defaults: `Fists` (Spawn+GiveTo,
+            // its `FistsAmmo` linked at amount 0 by the authored `Weapon.GiveAmmo`) and
+            // `XIIILeftHand` (0x0844-0x08A0). Checkpoint resumes skip this here and run the
+            // same event through `restore_checkpoint` with the saved travel inventory instead,
+            // mirroring the engine's travel-data load.
+            if let Err(e) = vm.send_event(
+                gi,
+                "AcceptInventory",
+                vec![Value::Object(Some(ObjRef::Instance(player)))],
+            ) {
+                blocked.push(format!("GameInfo.AcceptInventory: {e}"));
+            }
         }
 
         let dispatcher = vm.find_object("XIIIDispatcher0");
@@ -1323,12 +1352,100 @@ impl Session {
         UseOutcome::CorpseSearched
     }
 
-    /// Host use action on a named actor: a mover (lock/unlock/open) or, failing that, a dead pawn
-    /// (search). See [`Session::use_mover`] and [`Session::search_corpse`].
+    /// Host use action on a named actor: a mover (lock/unlock/open), a dead pawn (search) or a
+    /// deco pickup (grab). See [`Session::use_mover`], [`Session::search_corpse`] and
+    /// [`Session::grab_deco_pickup`].
     pub fn use_target(&mut self, name: &str) -> UseOutcome {
         match self.use_mover(name) {
-            UseOutcome::NotAMover => self.search_corpse(name),
+            UseOutcome::NotAMover => match self.search_corpse(name) {
+                UseOutcome::NotAMover => self.grab_deco_pickup(name),
+                other => other,
+            },
             other => other,
+        }
+    }
+
+    /// item40e: host grab of a deco pickup. Mirrors the `MyInteraction.bCanPickup` branch of the
+    /// game's `XIIIPlayerController.Grab` (XIII.u, bytecode 0x03F1..0x0495): when the target is
+    /// an `XIIIDecoPickup` and the pawn's `Weapon` or `PendingWeapon` is already a `DecoWeapon`,
+    /// `Grab` returns; otherwise it sets `bPickingUp`, calls the target's `Touch(Pawn)` and then
+    /// clears `bPickingUp` and `MyInteraction.TargetActor`. The pickup's own
+    /// `Pickup.ValidTouch` requires both `bPickingUp` and `MyInteraction.TargetActor == self`,
+    /// which is why walking into a chair never takes it. The host has no crosshair interaction
+    /// targeting, so it assigns `MyInteraction.TargetActor` to the named actor (labelled bridge:
+    /// the HUD interaction would set it from the view trace); everything else is the game's
+    /// code. A non-deco target returns [`UseOutcome::NotAMover`].
+    pub fn grab_deco_pickup(&mut self, target_name: &str) -> UseOutcome {
+        let Some(target) = self.vm.find_object(target_name) else {
+            return UseOutcome::NotAMover;
+        };
+        if !self.vm.is_a(target, "XIIIDecoPickup") {
+            return UseOutcome::NotAMover;
+        }
+        let pawn = self.player;
+        let Some(controller) = self.controller else {
+            return UseOutcome::Error("no player controller".to_owned());
+        };
+        let holds_deco = ["Weapon", "PendingWeapon"].iter().any(|slot| {
+            instance_prop(&self.vm, pawn, slot).is_some_and(|w| self.vm.is_a(w, "DecoWeapon"))
+        });
+        if holds_deco {
+            return UseOutcome::DecoAlreadyHeld;
+        }
+        let Some(interaction) = instance_prop(&self.vm, controller, "MyInteraction") else {
+            return UseOutcome::Error("controller has no MyInteraction".to_owned());
+        };
+        self.vm.set_active(pawn, true);
+        self.vm.set_active(controller, true);
+        self.vm.set_active(target, true);
+        // The pickup's `SpawnCopy -> GiveTo` reads and updates the pawn's own inventory (e.g.
+        // `Weapon.GiveTo` -> `FindInventoryType(AmmoName).AddAmmo`), so the carried items are
+        // live participants of this action like the pawn itself (same scope rule as
+        // `search_corpse`): a deferred call on a suspended item would abort the pickup.
+        let mut cur = self.inventory_head(pawn);
+        let mut guard = 0;
+        while let Some(item) = cur {
+            guard += 1;
+            if guard > 256 {
+                break;
+            }
+            self.vm.set_active(item, true);
+            cur = self.inventory_head(item);
+        }
+        let target_ref = Value::Object(Some(ObjRef::Instance(target)));
+        if !self
+            .vm
+            .set_property(interaction, "TargetActor", 0, target_ref)
+            || !self
+                .vm
+                .set_property(controller, "bPickingUp", 0, Value::Bool(true))
+        {
+            return UseOutcome::Error(
+                "MyInteraction.TargetActor / bPickingUp not writable".to_owned(),
+            );
+        }
+        let before = self.inventory_items();
+        let touched = self.vm.send_event(
+            target,
+            "Touch",
+            vec![Value::Object(Some(ObjRef::Instance(pawn)))],
+        );
+        // `Grab` clears both after the touch whatever its result.
+        let _ = self
+            .vm
+            .set_property(controller, "bPickingUp", 0, Value::Bool(false));
+        let _ = self
+            .vm
+            .set_property(interaction, "TargetActor", 0, Value::Object(None));
+        if let Err(e) = touched {
+            return UseOutcome::Error(e.to_string());
+        }
+        self.drain_events();
+        // Taken when the game's chain added an inventory item (`SpawnCopy` -> `GiveTo`).
+        if self.inventory_items().len() > before.len() {
+            UseOutcome::PickedUp
+        } else {
+            UseOutcome::PickupRefused
         }
     }
 
@@ -1978,6 +2095,39 @@ impl Session {
         instance_prop(&self.vm, self.player, "Weapon")
     }
 
+    /// Activates a named parked pawn through its controller's authored `Trigger` event — the same
+    /// event a map's scripted trigger sends. `IAController.faction.BeginState` parks soldiers
+    /// invisible and non-colliding (`SetCollision(false,false,false)`, `SetDrawType(0)`,
+    /// `bStasis`); leaving the state via `faction.EndState` restores
+    /// `SetCollision(true,true,true)` and `SetDrawType(2)`. The method verifies the pawn actually
+    /// became colliding and errors loudly otherwise (never a silent success).
+    pub fn wake_actor(&mut self, target_name: &str) -> Result<String, String> {
+        let soldier = self
+            .vm
+            .find_object(target_name)
+            .ok_or_else(|| format!("wake: no live actor named {target_name:?}"))?;
+        let controller = instance_prop(&self.vm, soldier, "Controller")
+            .ok_or_else(|| format!("wake: {target_name:?} has no live Controller"))?;
+        let arg = || Value::Object(Some(ObjRef::Instance(soldier)));
+        self.vm
+            .send_event(controller, "Trigger", vec![arg(), arg()])
+            .map_err(|e| format!("wake: {target_name:?} controller Trigger failed: {e}"))?;
+        self.drain_events();
+        let flags = (
+            self.vm.get_property(soldier, "bCollideActors").cloned(),
+            self.vm.get_property(soldier, "DrawType").cloned(),
+        );
+        match flags {
+            (Some(Value::Bool(true)), Some(Value::Byte(2))) => Ok(format!(
+                "{target_name} woken (collision restored, mesh drawn)"
+            )),
+            other => Err(format!(
+                "wake: {target_name:?} Trigger left the pawn parked \
+                 (bCollideActors/DrawType = {other:?})"
+            )),
+        }
+    }
+
     /// `Fire` on the player's weapon through the game's own entry point: the controller's exec
     /// `Fire(1.0)` (`XIIIPlayerController.Fire` -> `Pawn.Weapon.Fire`), or the weapon directly
     /// when the pawn has no controller. The weapon runs its own `ServerFire` ->
@@ -2020,7 +2170,15 @@ impl Session {
             let _ = self.vm.set_property(ctrl, "OldAdjustAim", 0, dir.clone());
             let _ = self.vm.set_property(ctrl, "AdjustedAimForFiring", 0, dir);
             self.vm.set_property(ctrl, "bFire", 0, Value::Byte(1));
-            self.vm.set_property(ctrl, "bWeaponMode", 0, Value::Byte(1));
+            // item40e: `XIIIPlayerController.bWeaponMode` is a `bool` (the class's own
+            // `DisplayDebug` converts it with the bool-to-string cast 0x54); writing a byte made
+            // the next script read of it (`DecoWeapon.GiveTo` 0x0000, `&&`) raise a TypeMismatch.
+            // Keep the declared type the layout initialised.
+            let mode = match self.vm.get_property(ctrl, "bWeaponMode") {
+                Some(Value::Bool(_)) => Value::Bool(true),
+                _ => Value::Byte(1),
+            };
+            self.vm.set_property(ctrl, "bWeaponMode", 0, mode);
         }
         let target = self
             .controller
@@ -2105,10 +2263,10 @@ impl Session {
     }
 
     /// Equips the best weapon the player already carries in the game's own `Inventory` chain,
-    /// through the game's own `Weapon.BringUp` -> `Instigator.ChangedWeapon()` path (item14b).
-    /// This is the normal weapon-switch action; it never spawns or grants a weapon. Used after
-    /// walking onto a map weapon pickup. Returns the equipped weapon name, or an error naming the
-    /// reason (no weapon carried, or the script raised).
+    /// through the game's own switch sequence (item14b). This is the normal weapon-switch
+    /// action; it never spawns or grants a weapon. Used after walking onto a map weapon pickup.
+    /// Returns the equipped weapon name, or an error naming the reason (no weapon carried, or
+    /// the script raised).
     pub fn equip_inventory_weapon(&mut self) -> Result<String, String> {
         let mut cur = self.inventory_head(self.player);
         let mut best: Option<ObjectId> = None;
@@ -2130,11 +2288,33 @@ impl Session {
             return Err("no weapon in the inventory chain".to_owned());
         };
         let name = self.vm.objects[weapon as usize].name.clone();
-        // `Weapon.BringUp` sets `Instigator.PendingWeapon` and calls `ChangedWeapon`.
-        match self.vm.send_event(weapon, "BringUp", Vec::new()) {
-            Ok(_) => Ok(name),
-            Err(e) => Err(format!("{name} BringUp: {e}")),
+        // The authored manual switch (`XIIIPlayerController.SwitchWeapon` 0x0140) sets
+        // `Pawn.PendingWeapon` and defers to `Weapon.PutDown()`'s state machine; the immediate
+        // completion is the pawn's own `XIIIPawn.ChangedWeapon` (0x024D: `Weapon =
+        // PendingWeapon`, `AttachToPawn`, `Controller.ChangedWeapon`). `Weapon.BringUp`
+        // (engine.u 0x0087) only runs `PlaySelect`/`GotoState('Active')` and never touches
+        // `PendingWeapon`, so the bridge composes `PendingWeapon` + `BringUp` +
+        // `ChangedWeapon` — the same immediate switch `ClientWeaponSet` (0x0073) runs when the
+        // pawn has no weapon. The PutDown-deferred state machine is not simulated here.
+        self.vm.set_property(
+            self.player,
+            "PendingWeapon",
+            0,
+            Value::Object(Some(ObjRef::Instance(weapon))),
+        );
+        if let Err(e) = self.vm.send_event(weapon, "BringUp", Vec::new()) {
+            return Err(format!("{name} BringUp: {e}"));
         }
+        if let Err(e) = self.vm.send_event(self.player, "ChangedWeapon", Vec::new()) {
+            return Err(format!("{name} ChangedWeapon: {e}"));
+        }
+        if self.player_weapon() != Some(weapon) {
+            return Err(format!(
+                "{name} ChangedWeapon left Pawn.Weapon at {:?}",
+                self.player_weapon()
+            ));
+        }
+        Ok(name)
     }
 
     /// The player weapon's first-person mesh path: the decoded `MeshName` string

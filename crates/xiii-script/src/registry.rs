@@ -2249,6 +2249,7 @@ fn tween_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nativ
     let time = if c.omitted(1) { 0.0 } else { float(vm, a, 1)? };
     let ch = channel(vm, a, 2, c.omitted(2))?;
     vm.start_animation(c.this, &seq, 0.0, time, ch, false)?;
+    vm.mark_tween_only(c.this, ch);
     val(Value::Void)
 }
 
@@ -2776,6 +2777,41 @@ fn calc_first_person_view(
     val(Value::Void)
 }
 
+/// `PlayerController.AdjustAimForDisplay(object<Ammunition> FiredAmmunition, struct<Vector> projStart) -> Rotator`
+/// (native 498).
+///
+/// Decoded from Engine.dll (all measured, ImageBase 0x10300000): the export
+/// `?execAdjustAimForDisplay@APlayerController@@QAEXAAUFFrame@@QAX@Z` registers native 0x1f2 with
+/// thunk slot VA 0x1051aac8 whose .data slot holds the implementation VA 0x1036e2e0
+/// (`execCalcFirstPersonView`, native 497, resolves the same way to 0x10368340 and is already
+/// implemented). Structure at 0x1036e2e0:
+/// - null `FiredAmmunition` fast path -> convert `Rotation` (controller+0xd8) and call
+///   `APlayerController::SmoothedAim(FRotator)` (0x1036c720) -> Result;
+/// - target-scan path gated on `[controller+0x3b0] > [controller+0x3ac]` (scan cooldown) and
+///   `byte [ammunition+0x270] & 0x10 == 0`; the scan (camera axes from the WeaponBob helper,
+///   FCheckResult init Item=None/1.0f/-1, target loop, vector->rotator) ends in
+///   `SmoothedAim(<snapped rotator>)` -> Result;
+/// - every epilogue writes `SmoothedAim(...)` into the Result buffer.
+///
+/// `SmoothedAim` blends the engine's internal smoothed-aim cache (controller+0x5c0..+0x5fc,
+/// display state the VM does not model); with no snap applied it converges to the input rotation.
+/// The snap exists only for the crosshair display: the script consumer
+/// (`xiii.XIIIPlayerInteraction.MyPCPostRender` 0x032D) feeds the returned rotator into the
+/// crosshair ray (`FiringTargHitLoc`) and `AmmoType.WarnTarget` — the un-snapped view rotation is
+/// the faithful unsnapped value there. Partial: no aim-assist snap decode (the ~0x800-byte target
+/// loop is presentation-only in the headless VM).
+fn adjust_aim_for_display(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let rot = match vm.get_property(c.this, "Rotation") {
+        Some(Value::Rotator(r)) => *r,
+        _ => [0; 3],
+    };
+    val(Value::Rotator(rot))
+}
+
 fn replace_texture_by_another(
     vm: &mut Vm<'_>,
     c: &NativeCtx,
@@ -2853,9 +2889,29 @@ fn set_owner(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Native
 }
 
 fn is_player_pawn(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
-    // UE2 `APawn::IsPlayerPawn`: true for a player pawn. XIII has no `bIsPlayerPawn` field
-    // (measured), so this is the class-chain test (the same approximation as `is_player_or_projectile`).
-    val(Value::Bool(vm.is_a(c.this, "PlayerPawn")))
+    // UE2 `APawn::IsPlayerPawn` (upstream): the pawn's `Controller` is a `PlayerController`.
+    // The old class-chain test `IsA('PlayerPawn')` was always false in XIII: Engine.u has no
+    // `PlayerPawn` class (measured; the player pawn chain is
+    // `xiiiplayerpawn <- xiiipawn <- pawn <- actor <- object`), so every authored
+    // `IsPlayerPawn()` branch took the AI path. Measured consequence: `Weapon.GiveTo`'s
+    // ammo-fill guard read `!IsPlayerPawn()` as true and ran `AmmoType.AddAmmo(ReloadCount)`
+    // for the player, and `Weapon.GiveAmmo`'s zero-fill lost its player branch. The engine's
+    // own marker is `Controller.bIsPlayer` (default false on `Controller`, true on
+    // `PlayerController`, measured), which also covers controller classes that predate the
+    // class-chain check.
+    let player = match vm.obj_prop(c.this, "Controller") {
+        Some(ctrl) => {
+            vm.bool_prop(ctrl, "bIsPlayer")
+                || vm.objects.get(ctrl as usize).is_some_and(|o| {
+                    o.layout
+                        .chain_names
+                        .iter()
+                        .any(|n| n.eq_ignore_ascii_case("playercontroller"))
+                })
+        }
+        None => false,
+    };
+    val(Value::Bool(player))
 }
 
 fn find_inventory_type(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -3016,7 +3072,7 @@ fn attach_to_bone(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<N
     if !c.omitted(1)
         && let Some(Value::Name(n)) = a.get(1)
     {
-        vm.set_property(id, "AttachBone", 0, Value::Name(n.clone()));
+        vm.set_property(id, "AttachmentBone", 0, Value::Name(n.clone()));
     }
     val(Value::Bool(true))
 }
@@ -3025,7 +3081,7 @@ fn anim_blend_to_alpha(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmRes
     let stage = int(vm, a, 0)?;
     let target = float(vm, a, 1)?;
     let time = float(vm, a, 2)?;
-    vm.anim_blend_params(c.this, stage, target, time, 0.0, None);
+    vm.anim_blend_to_alpha(c.this, stage, target, time);
     val(Value::Void)
 }
 
@@ -3069,14 +3125,13 @@ fn weapon_has_ammo(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<
 }
 
 fn get_anim_params(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
-    // `Actor.GetAnimParams(int Channel, out name OutSeqName, out float OutAnimFrame,
-    // out float OutAnimRate)`: the VM's channel state holds the frame/rate; the sequence name
-    // is the actor's `AnimSequence` property (the channel itself does not store the name).
+    // Read the requested channel, independent of the actor's last started sequence.
     let ch = channel(vm, a, 0, c.omitted(0))?;
-    let name = vm
-        .get_property(c.this, "AnimSequence")
-        .cloned()
-        .unwrap_or_else(|| Value::Name("None".to_owned()));
+    let name = Value::Name(
+        vm.anim_channel_sequence(c.this, ch)
+            .unwrap_or("None")
+            .to_owned(),
+    );
     let (frame, rate) = vm.anim_channel_params(c.this, ch).unwrap_or((0.0, 0.0));
     if a.len() > 1 {
         a[1] = name;
@@ -4300,7 +4355,7 @@ fn builtin_defs() -> Vec<NativeDef> {
         def(
             "Engine.Pawn.IsPlayerPawn",
             "native(0) final function bool IsPlayerPawn()",
-            "engine.u Pawn.IsPlayerPawn decoded (bool); class-chain test (XIII has no bIsPlayerPawn field; measured)",
+            "engine.u Pawn.IsPlayerPawn decoded (bool); UE2 upstream: the Controller is a PlayerController (Controller.bIsPlayer, measured default true only on PlayerController)",
             is_player_pawn,
         ),
         def(
@@ -4335,12 +4390,12 @@ fn builtin_defs() -> Vec<NativeDef> {
         ),
         NativeDef {
             status: NativeStatus::Partial(
-                "the channel state stores frame/rate but not the sequence name; OutSeqName is the actor's AnimSequence property",
+                "requested channel sequence and normalized frame/rate supported; velocity-derived negative rates and exact interrupted tween/global cache semantics remain unimplemented",
             ),
             ..def(
                 "Engine.Actor.GetAnimParams",
                 "native(396) final static function GetAnimParams(int Channel, out name OutSeqName, out float OutAnimFrame, out float OutAnimRate)",
-                "engine.u Actor.GetAnimParams decoded; fills the channel's sequence name (the AnimSequence property) and the VM's frame/rate",
+                "engine.u Actor.GetAnimParams decoded; fills the requested channel sequence, normalized frame (negative during tween) and normalized rate; channel-zero Actor mirrors stay independent of higher stages",
                 get_anim_params,
             )
         },
@@ -4459,15 +4514,20 @@ fn builtin_defs() -> Vec<NativeDef> {
             "engine.u Actor.SetDrawScale3D decoded (vector, void); stores the DrawScale3D property",
             set_draw_scale3d,
         ),
-        def(
-            "Engine.Actor.AttachToBone",
-            "native(404) final static function bool AttachToBone(object<Actor> Attachment, name BoneName)",
-            "engine.u Actor.AttachToBone decoded (Attachment, BoneName, bool); bases the attachment on self and records the bone; no skeletal transform (headless)",
-            attach_to_bone,
-        ),
         NativeDef {
             status: NativeStatus::Partial(
-                "stores the target blend alpha/time like the other animation channel parameters; no skeletal blending is evaluated",
+                "renderer follows evaluated bones and relative transforms; mesh attachment aliases and VM collision/location propagation remain unimplemented",
+            ),
+            ..def(
+                "Engine.Actor.AttachToBone",
+                "native(404) final static function bool AttachToBone(object<Actor> Attachment, name BoneName)",
+                "engine.u Actor.AttachToBone decoded (Attachment, BoneName, bool); bases attachment on self; play renderer evaluates bone coordinates with RelativeLocation/RelativeRotation; attach aliases and VM collision following remain unimplemented",
+                attach_to_bone,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial(
+                "advances alpha in seconds and preserves subtree; zero/negative intervals and invalid stages still need original-engine validation",
             ),
             ..def(
                 "Engine.Actor.AnimBlendToAlpha",
@@ -4605,7 +4665,7 @@ fn builtin_defs() -> Vec<NativeDef> {
     ));
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "stores the per-channel blend parameters (BlendAlpha/InTime/OutTime and the optional BoneName); no skeletal blending is evaluated and the BoneName bone filter is not applied",
+            "shared CPU evaluator blends stages in ascending order over named subtrees with normalized InTime; OutTime use not found in PC GetFrame; special cached/global pose paths unimplemented",
         ),
         ..def(
             "Engine.Actor.AnimBlendParams",
@@ -4616,7 +4676,7 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "sequence length/notify times come from the AnimationData provider; no skeletal evaluation; playback is frames/second and tween holds frame 0",
+            "authored rate multiplier, last-frame completion, frozen-source tween and CPU channel sampling; velocity-dependent negative rates, automatic TweenTime and callback reentrancy remain unimplemented",
         ),
         ..def(
             "Engine.Actor.PlayAnim",
@@ -4627,18 +4687,18 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "sequence length/notify times come from the AnimationData provider; no skeletal evaluation; playback is frames/second and tween holds frame 0",
+            "authored rate multiplier, last-frame completion, frozen-source tween and CPU channel sampling; velocity-dependent negative rates, automatic TweenTime and callback reentrancy remain unimplemented",
         ),
         ..def(
             "Engine.Actor.LoopAnim",
             "native(260) final function LoopAnim(name Sequence, float Rate, float TweenTime, int Channel)",
-            "engine.u Actor.LoopAnim decoded (Sequence, Rate, TweenTime, Channel); UE1 AActor::LoopAnim (loops, never fires AnimEnd)",
+            "engine.u Actor.LoopAnim decoded (Sequence, Rate, TweenTime, Channel); Engine.dll UpdateAnimation (loop AnimEnd at final frame; wrap at N)",
             loop_anim,
         )
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "is PlayAnim with the sequence held at frame 0 until Time elapses; exact XIII tween blending is not modelled and needs the decoded mesh",
+            "frozen-source pose tween to frame zero then hold, with AnimEnd at tween completion; original cached-pose/global-pose optimizations and automatic negative TweenTime unimplemented",
         ),
         ..def(
             "Engine.Actor.TweenAnim",
@@ -5091,7 +5151,7 @@ fn builtin_defs() -> Vec<NativeDef> {
     ));
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "parameters are stored per actor for the renderer; no skeletal bone control is evaluated",
+            "parameters retained; spine-bone selection, speed/max clamp and world-space yaw conversion remain undecoded; renderer reports active requests",
         ),
         ..def(
             "Engine.Pawn.SpineYawControl",
@@ -5102,7 +5162,7 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "the request is recorded per actor for the renderer; no skeletal transform is evaluated",
+            "CPU evaluator applies per-axis local scale by slot; slot disabling/invalid bones and shear after rotated nonuniform scale need parity validation",
         ),
         ..def(
             "Engine.Actor.SetBoneScalePerAxis",
@@ -5113,7 +5173,7 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "the request is recorded per actor for the renderer; no skeletal transform is evaluated",
+            "request retained per bone; post-hierarchy inverse mesh/world-space rotation and translation alignment at GetFrame 0x103f324d remain undecoded; renderer reports active requests",
         ),
         ..def(
             "Engine.Actor.SetBoneDirection",
@@ -5454,6 +5514,18 @@ fn builtin_defs() -> Vec<NativeDef> {
             "native(497) final native static function CalcFirstPersonView(out struct<Vector> CameraLocation, out struct<Rotator> CameraRotation)",
             "engine.u PlayerController.CalcFirstPersonView decoded (native 497); reachable from XIIIGameInfo.EndGame -> GameEnded.BeginState -> global.PlayerCalcView on the level-complete path",
             calc_first_person_view,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no renderer: returns the un-snapped SmoothedAim(Rotation) (the aim-assist target-scan \
+             is crosshair display only); the returned rotator is the controller view rotation",
+        ),
+        ..def(
+            "PlayerController.AdjustAimForDisplay",
+            "native(498) final native static function Rotator AdjustAimForDisplay(object<Ammunition> FiredAmmunition, struct<Vector> projStart)",
+            "Engine.dll execAdjustAimForDisplay 0x1036e2e0 decoded (native 498, registration thunk 0x1051aac8); every epilogue returns SmoothedAim(0x1036c720) of the rotation, snap path gated on a scan cooldown + ammunition+0x270 bit 0x10; consumer XIIIPlayerInteraction.MyPCPostRender 0x032D (crosshair ray + WarnTarget)",
+            adjust_aim_for_display,
         )
     });
     // item3p: the missing rotator operators, reached by the campaign survey. `Multiply_RotatorFloat`
