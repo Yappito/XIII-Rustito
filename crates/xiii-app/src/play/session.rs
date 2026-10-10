@@ -1320,6 +1320,16 @@ impl Session {
         }
     }
 
+    /// Sets the player pawn's `Base` to the mover it stands on (`None` clears it), the pawn side of
+    /// a lift ride: the host carries the pawn with the mover ([`super::movers::Rider`]).
+    pub fn set_player_base(&mut self, mover: Option<&str>) {
+        let base = mover
+            .and_then(|name| self.vm.find_object(name))
+            .map(ObjRef::Instance);
+        self.vm
+            .set_property(self.player, "Base", 0, Value::Object(base));
+    }
+
     /// Named mover use or aimed Grab. Corpses/pickups use the game's TargetActor and Grab;
     /// naming an actor cannot supply a target or transfer its inventory.
     pub fn use_target(&mut self, name: &str) -> UseOutcome {
@@ -1329,6 +1339,27 @@ impl Session {
         }
     }
 
+    /// Plain `use` with nothing mover-like under the host ray: if the game's own interaction render
+    /// (`XIIIPlayerInteraction.MyPCPostRender`) chose a `TargetActor` for a trigger (a card reader),
+    /// the controller's `Grab` runs. Returns the target's name; `None` when nothing is targeted.
+    pub fn grab_interaction_target(&mut self) -> Option<(String, UseOutcome)> {
+        let controller = self.controller?;
+        let interaction = instance_prop(&self.vm, controller, "MyInteraction")?;
+        let target = instance_prop(&self.vm, interaction, "TargetActor");
+        let target = target?;
+        if !self.vm.is_a(target, "XIIITriggers")
+            || !matches!(
+                self.vm.get_property(interaction, "bCanTrigger"),
+                Some(Value::Bool(true))
+            )
+        {
+            return None;
+        }
+        let name = self.vm.objects[target as usize].name.clone();
+        let outcome = self.grab_aimed_target(&name);
+        Some((name, outcome))
+    }
+
     /// Named corpse/pickup use validates the target chosen by the game's view trace, then executes
     /// the controller's Grab. Naming an actor never supplies TargetActor or bypasses aiming.
     pub fn grab_aimed_target(&mut self, target_name: &str) -> UseOutcome {
@@ -1336,7 +1367,11 @@ impl Session {
             return UseOutcome::NotAMover;
         };
         let corpse = self.vm.is_a(target, "XIIIPawn") && self.actor_is_dead(target);
-        if !corpse && !self.vm.is_a(target, "XIIIDecoPickup") {
+        // An interactive trigger (a card reader: `MagneticPassTrigger`, `XIIITriggers`) is the
+        // `bCanTrigger` branch of `Grab`: the controller's own `TryInteractWithTrigger` picks the
+        // matching inventory item, which a second `Grab` activates.
+        let trigger = self.vm.is_a(target, "XIIITriggers");
+        if !corpse && !trigger && !self.vm.is_a(target, "XIIIDecoPickup") {
             return UseOutcome::NotAMover;
         }
         let Some(controller) = self.controller else {
@@ -1346,6 +1381,7 @@ impl Session {
             return UseOutcome::Error("controller has no MyInteraction".to_owned());
         };
         if !corpse
+            && !trigger
             && ["Weapon", "PendingWeapon"].iter().any(|slot| {
                 instance_prop(&self.vm, self.player, slot)
                     .is_some_and(|w| self.vm.is_a(w, "DecoWeapon"))
@@ -1359,6 +1395,8 @@ impl Session {
                     interaction,
                     if corpse {
                         "bCanSearchCorpse"
+                    } else if trigger {
+                        "bCanTrigger"
                     } else {
                         "bCanPickup"
                     }
@@ -1373,7 +1411,9 @@ impl Session {
             return UseOutcome::Error(e.to_string());
         }
         self.drain_events();
-        if corpse && instance_prop(&self.vm, target, "Inventory").is_none() {
+        if trigger {
+            UseOutcome::Triggered
+        } else if corpse && instance_prop(&self.vm, target, "Inventory").is_none() {
             UseOutcome::CorpseSearched
         } else if self.inventory_items().len() > before.len() {
             UseOutcome::PickedUp

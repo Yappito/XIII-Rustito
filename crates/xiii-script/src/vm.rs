@@ -1381,6 +1381,9 @@ pub struct Vm<'s> {
     pub combat_natives: BTreeMap<String, (u64, Vec<StackEntry>)>,
     /// Opt-in collection of firing-path call stacks (off during ordinary play).
     pub collect_combat_natives: bool,
+    /// Actors that were attached to a base through `Actor.SetBase` (the engine's `Attached` list
+    /// is the inverse of `Base`): a moving brush carries those whose `Base` still names it.
+    based_candidates: Vec<ObjectId>,
     /// Survey mode: unimplemented natives are counted and skipped instead of failing.
     pub survey: bool,
     /// Distinct unimplemented natives seen in survey mode (path -> record, first-hit order).
@@ -1613,6 +1616,7 @@ impl<'s> Vm<'s> {
             natives_first_caller: Default::default(),
             combat_natives: Default::default(),
             collect_combat_natives: false,
+            based_candidates: Vec::new(),
             survey: false,
             missing_natives: Default::default(),
             pending_latent: None,
@@ -8403,6 +8407,15 @@ impl<'s> Vm<'s> {
                 native: "Actor.TraceActors".into(),
             }));
         };
+        // The iterator's per-hit line check composes its trace flags as `flags | 0x9f`
+        // (Engine.dll `execTraceActors` 0x103e8c70, the `orl $0x9f, %esi` at 0x103e8e68; the
+        // iterator's AdditionalTraceType stack slot is zero-initialized at 0x103e8dff). 0x9f
+        // clears the 0x20/0x40 bits of `execTrace`'s 0xbf, so `AActor::ShouldTrace`
+        // (0x10354640) admits every other colliding actor without the
+        // `bProjTarget || (bBlockActors && bBlockPlayers)` gate. Measured item67 consequence:
+        // Hual02's card reader `MagneticPassTrigger1` (bInteractive, bBlockActors=false) is a
+        // `XIIIPlayerController.ReturnTrace` candidate; with 0xbf it was filtered and the aim
+        // fell through to a farther mover's class-cylinder hit.
         // UE2's iterator returns actors intersected by the swept trace; world geometry occludes
         // candidates at or beyond the first world hit. item54: a hit sourced from the candidate's
         // own primitive (a mover's mesh triangles, item53's placed-mesh actors) must not occlude
@@ -8435,7 +8448,7 @@ impl<'s> Vm<'s> {
             if base.is_some_and(|class| !self.objects[id as usize].layout.chain.contains(&class)) {
                 continue;
             }
-            if !self.trace_admits_actor(id, caller, nonzero) {
+            if !self.trace_admits_actor_flags(id, caller, nonzero, 0x9f) {
                 continue;
             }
             let (loc, radius, height) = self.actor_cylinder(id);
@@ -10710,6 +10723,10 @@ impl<'s> Vm<'s> {
             return Ok(());
         }
         let alpha = self.f32_prop(id, "PhysAlpha") + rate * dt;
+        let carried_from = (
+            self.vector_prop(id, "Location").unwrap_or([0.0; 3]),
+            self.rotator_prop(id, "Rotation").unwrap_or([0; 3]),
+        );
         let key_num = usize::from(self.byte_prop(id, "KeyNum"));
         let old_pos = self
             .vector_prop(id, "OldPos")
@@ -10755,8 +10772,87 @@ impl<'s> Vm<'s> {
                 Value::Rotator(lerp_rotator(old_rot, target_rot, alpha)),
             );
         }
+        self.carry_attached_actors(id, carried_from.0, carried_from.1);
         self.update_physics_mover(id);
         Ok(())
+    }
+
+    /// Records that `actor` was attached to a base by `Actor.SetBase` (upstream UE2 appends it to
+    /// the base's `Attached` array in `AActor::SetBase` 0x103555c0; hypothesis, body not decoded).
+    pub(crate) fn note_attached(&mut self, actor: ObjectId) {
+        if !self.based_candidates.contains(&actor) {
+            self.based_candidates.push(actor);
+        }
+    }
+
+    /// Carries the actors attached to the moving brush `mover` after it moved from
+    /// `(old_location, old_rotation)`.
+    ///
+    /// Decoded (`Engine.dll ULevel::MoveActor` 0x1038a770, loop 0x1038ae0d..0x1038b084): once the
+    /// mover's `Location`/`Rotation` are stored, every actor in its `Attached` array (the
+    /// `AActor` array at +0x100) is moved through `MoveActor` by the mover's displacement, its
+    /// offset re-derived through the mover's new rotation when the rotation changed. The VM has no
+    /// `Attached` array: it keeps the actors given a base through `SetBase` and carries those whose
+    /// `Base` is still this mover. Not modelled (hypothesis, unmeasured for this game): the
+    /// attached actor's own rotation delta and the per-actor blocking test of the nested MoveActor.
+    fn carry_attached_actors(&mut self, mover: ObjectId, old_location: [f32; 3], old_rotation: [i32; 3]) {
+        if self.based_candidates.is_empty() {
+            return;
+        }
+        let new_location = self.vector_prop(mover, "Location").unwrap_or(old_location);
+        let new_rotation = self.rotator_prop(mover, "Rotation").unwrap_or(old_rotation);
+        if new_location == old_location && new_rotation == old_rotation {
+            return;
+        }
+        let delta = [
+            new_location[0] - old_location[0],
+            new_location[1] - old_location[1],
+            new_location[2] - old_location[2],
+        ];
+        let candidates = std::mem::take(&mut self.based_candidates);
+        let mut kept = Vec::with_capacity(candidates.len());
+        for actor in candidates {
+            if self.objects.get(actor as usize).is_none_or(|o| o.deleted) {
+                continue;
+            }
+            kept.push(actor);
+            if actor == mover || self.obj_prop(actor, "Base") != Some(mover) {
+                continue;
+            }
+            let Some(location) = self.vector_prop(actor, "Location") else {
+                continue;
+            };
+            let moved = if new_rotation == old_rotation {
+                [location[0] + delta[0], location[1] + delta[1], location[2] + delta[2]]
+            } else {
+                let offset = [
+                    location[0] - old_location[0],
+                    location[1] - old_location[1],
+                    location[2] - old_location[2],
+                ];
+                let (ox, oy, oz) = crate::registry::rotator_basis(old_rotation);
+                let local = [
+                    offset[0] * ox[0] + offset[1] * ox[1] + offset[2] * ox[2],
+                    offset[0] * oy[0] + offset[1] * oy[1] + offset[2] * oy[2],
+                    offset[0] * oz[0] + offset[1] * oz[1] + offset[2] * oz[2],
+                ];
+                let (nx, ny, nz) = crate::registry::rotator_basis(new_rotation);
+                [
+                    new_location[0] + local[0] * nx[0] + local[1] * ny[0] + local[2] * nz[0],
+                    new_location[1] + local[0] * nx[1] + local[1] * ny[1] + local[2] * nz[1],
+                    new_location[2] + local[0] * nx[2] + local[1] * ny[2] + local[2] * nz[2],
+                ]
+            };
+            self.set_property(actor, "Location", 0, Value::Vector(moved));
+            if self.is_mover(actor) {
+                self.update_physics_mover(actor);
+            }
+        }
+        // A carried actor may itself have been re-based while we iterated; keep the new list.
+        let added = std::mem::replace(&mut self.based_candidates, kept);
+        for actor in added {
+            self.note_attached(actor);
+        }
     }
 
     /// Mirrors a mover's current pose into the world-physics provider (if one is installed) so

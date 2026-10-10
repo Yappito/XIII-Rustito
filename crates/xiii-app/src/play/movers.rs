@@ -154,6 +154,103 @@ impl MoverCollision {
     }
 }
 
+/// The mover the host-owned player pawn stands on, and the part of its motion the player
+/// inherits (UE2 `Pawn.Base`: a mover carries the actors attached to it).
+///
+/// The player's motion is host-owned ([`PlayerSim`]); the VM moves the movers. Per tick:
+/// [`Rider::observe`] after the player's own step (which mover is the floor, recorded at the
+/// mover's pre-VM-step pose), then [`Rider::carry`] after the VM step (the mover's displacement
+/// is added to the player). Decoded for the engine's own attached actors in `Engine.dll`
+/// `ULevel::MoveActor` 0x1038a770 (loop 0x1038ae0d..0x1038b084): an attached actor is moved by
+/// the base's displacement. Applying that to the host-owned player pawn is this module's
+/// adaptation (the pawn's own `MoveActor`/blocking test is not run).
+#[derive(Debug, Default)]
+pub struct Rider {
+    base: Option<RideBase>,
+}
+
+#[derive(Debug)]
+struct RideBase {
+    name: String,
+    /// The mover's `Location` the last time the player's pose was reconciled with it.
+    location: [f32; 3],
+}
+
+/// Result of [`Rider::observe`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum BaseChange {
+    /// The base mover (or lack of one) is the same as before.
+    Unchanged,
+    /// The player now stands on this mover, or on none (`None`).
+    Changed(Option<String>),
+}
+
+impl Rider {
+    /// Name of the mover the player currently stands on.
+    #[cfg(test)]
+    pub fn base(&self) -> Option<&str> {
+        self.base.as_ref().map(|b| b.name.as_str())
+    }
+
+    /// Updates the base from the player's last walking/landing step. `floor_source` is the
+    /// collision source of the walkable floor under the box; the actor part of its path
+    /// (`"LiftCage0 -> pkg.mesh"`) names the mover. `state_of` returns a live mover's pose.
+    pub fn observe(
+        &mut self,
+        grounded: bool,
+        floor_source: Option<u32>,
+        sources: &[String],
+        state_of: impl Fn(&str) -> Option<MoverState>,
+    ) -> BaseChange {
+        let now = floor_source
+            .filter(|_| grounded)
+            .and_then(|id| sources.get(id as usize))
+            .and_then(|path| path.split_once(" -> ").map(|(actor, _)| actor))
+            .and_then(|actor| state_of(actor));
+        match (now, self.base.as_ref()) {
+            (Some(s), Some(b)) if b.name.eq_ignore_ascii_case(&s.name) => BaseChange::Unchanged,
+            (Some(s), _) => {
+                self.base = Some(RideBase {
+                    name: s.name,
+                    location: s.location,
+                });
+                BaseChange::Changed(self.base.as_ref().map(|b| b.name.clone()))
+            }
+            (None, Some(_)) => {
+                self.base = None;
+                BaseChange::Changed(None)
+            }
+            (None, None) => BaseChange::Unchanged,
+        }
+    }
+
+    /// Adds the base mover's displacement since the last reconcile to `location` (Unreal units)
+    /// and returns it. A base that vanished (destroyed mover) is dropped.
+    pub fn carry(
+        &mut self,
+        location: &mut [f32; 3],
+        state_of: impl Fn(&str) -> Option<MoverState>,
+    ) -> [f32; 3] {
+        let Some(base) = self.base.as_mut() else {
+            return [0.0; 3];
+        };
+        let Some(state) = state_of(&base.name) else {
+            self.base = None;
+            return [0.0; 3];
+        };
+        let delta = [
+            state.location[0] - base.location[0],
+            state.location[1] - base.location[1],
+            state.location[2] - base.location[2],
+        ];
+        base.location = state.location;
+        for k in 0..3 {
+            location[k] += delta[k];
+        }
+        delta
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +310,99 @@ mod tests {
             world.sweep(a, b, half).is_some(),
             "re-enabled mover must block again"
         );
+    }
+
+    fn cage_at(z: f32) -> MoverState {
+        MoverState {
+            location: [0.0, 0.0, z],
+            name: "LiftCage0".to_owned(),
+            ..grille_state(true)
+        }
+    }
+
+    fn lift_sources() -> Vec<String> {
+        vec![
+            "Model1 (BSP)".to_owned(),
+            "LiftCage0 -> fredprivate.ascenseur".to_owned(),
+            "LiftDoor1 -> pkg.door".to_owned(),
+        ]
+    }
+
+    #[test]
+    fn rider_follows_the_cage_displacement_over_many_small_steps() {
+        let sources = lift_sources();
+        let mut rider = Rider::default();
+        let mut cage_z = 0.0f32;
+        let mut player = [5.0f32, 6.0, 100.0];
+        let state_of = |z: f32| move |name: &str| name.eq_ignore_ascii_case("LiftCage0").then(|| cage_at(z));
+        // Standing on the cage floor (source 1): the base is recorded at the pre-move pose.
+        assert_eq!(
+            rider.observe(true, Some(1), &sources, state_of(cage_z)),
+            BaseChange::Changed(Some("LiftCage0".to_owned()))
+        );
+        for _ in 0..600 {
+            cage_z += 9.6; // 576 UU/s at 60 Hz
+            assert_eq!(
+                rider.observe(true, Some(1), &sources, state_of(cage_z - 9.6)),
+                BaseChange::Unchanged
+            );
+            rider.carry(&mut player, state_of(cage_z));
+        }
+        assert!((player[2] - (100.0 + cage_z)).abs() < 0.05, "z {}", player[2]);
+        assert_eq!((player[0], player[1]), (5.0, 6.0));
+        assert_eq!(rider.base(), Some("LiftCage0"));
+    }
+
+    #[test]
+    fn rider_ignores_static_floors_and_airborne_frames() {
+        let sources = lift_sources();
+        let mut rider = Rider::default();
+        let live = |_: &str| Some(cage_at(0.0));
+        // A BSP floor ("Model1 (BSP)") has no actor part: never a base.
+        assert_eq!(rider.observe(true, Some(0), &sources, live), BaseChange::Unchanged);
+        // An unknown or out-of-range source id must not panic or ride.
+        assert_eq!(rider.observe(true, Some(99), &sources, live), BaseChange::Unchanged);
+        assert_eq!(rider.observe(true, None, &sources, live), BaseChange::Unchanged);
+        // A path naming a non-mover actor is not a base.
+        let no_mover = |_: &str| None;
+        assert_eq!(rider.observe(true, Some(1), &sources, no_mover), BaseChange::Unchanged);
+        // Jumping off ends the ride and a moving cage then no longer moves the player.
+        assert!(matches!(rider.observe(true, Some(1), &sources, live), BaseChange::Changed(Some(_))));
+        assert_eq!(rider.observe(false, Some(1), &sources, live), BaseChange::Changed(None));
+        let mut p = [0.0, 0.0, 10.0];
+        assert_eq!(rider.carry(&mut p, |_| Some(cage_at(500.0))), [0.0; 3]);
+        assert_eq!(p, [0.0, 0.0, 10.0]);
+    }
+
+    #[test]
+    fn rider_switching_cage_for_door_does_not_jump_and_a_destroyed_base_is_dropped() {
+        let sources = lift_sources();
+        let mut rider = Rider::default();
+        let door = |z: f32| MoverState {
+            name: "LiftDoor1".to_owned(),
+            location: [0.0, 0.0, z],
+            ..grille_state(true)
+        };
+        let world = |cage: f32, door_z: f32| {
+            move |name: &str| match name.to_ascii_lowercase().as_str() {
+                "liftcage0" => Some(cage_at(cage)),
+                "liftdoor1" => Some(door(door_z)),
+                _ => None,
+            }
+        };
+        rider.observe(true, Some(1), &sources, world(0.0, 300.0));
+        // Step onto the (resting) door sill while the cage is far away: the new base starts at
+        // the door's own pose, so no displacement is inherited from the cage.
+        assert_eq!(
+            rider.observe(true, Some(2), &sources, world(0.0, 300.0)),
+            BaseChange::Changed(Some("LiftDoor1".to_owned()))
+        );
+        let mut p = [0.0, 0.0, 300.0];
+        assert_eq!(rider.carry(&mut p, world(500.0, 300.0)), [0.0; 3]);
+        assert_eq!(p[2], 300.0);
+        // The base mover is destroyed: the ride ends silently, the player is left where it is.
+        assert_eq!(rider.carry(&mut p, |_| None), [0.0; 3]);
+        assert_eq!(rider.base(), None);
     }
 
     #[test]

@@ -203,6 +203,10 @@ pub struct PlayerSim {
     pub floor_normal: [f32; 3],
     /// Human-readable source of the last blocking contact, if any.
     pub last_source: Option<String>,
+    /// Collision source id of the walkable floor under the box on the last grounded step (a
+    /// mover's id while the player stands on a moving brush, the base of [`Self::floor_source`]
+    /// riding); `None` while airborne.
+    pub floor_source: Option<u32>,
     /// `bIsCrouched`: the box is currently the smaller crouch box.
     pub crouched: bool,
     /// On a ladder volume (`PHYS_Ladder`).
@@ -229,6 +233,7 @@ impl PlayerSim {
             grounded: true,
             floor_normal: [0.0, 0.0, 1.0],
             last_source: None,
+            floor_source: None,
             crouched: false,
             on_ladder: false,
             in_water: false,
@@ -553,6 +558,7 @@ impl PlayerSim {
         {
             self.grounded = true;
             self.floor_normal = bevy_to_unreal_direction(hit.normal);
+            self.floor_source = Some(hit.source);
         }
     }
 
@@ -668,8 +674,12 @@ impl PlayerSim {
             if result.falling || !result.on_floor {
                 self.grounded = false;
                 self.physics = PHYS_FALLING;
+                self.floor_source = None;
             } else if let Some(hit) = floor_probe(world, result.position, half) {
                 self.floor_normal = bevy_to_unreal_direction(hit.normal);
+                self.floor_source = Some(hit.source);
+            } else {
+                self.floor_source = None;
             }
         } else {
             self.physics = PHYS_FALLING;
@@ -698,6 +708,7 @@ impl PlayerSim {
                 self.land_velocity_z = impact_z;
                 self.velocity[2] = 0.0;
                 self.floor_normal = bevy_to_unreal_direction(hit.normal);
+                self.floor_source = Some(hit.source);
             }
         }
         if self.grounded {

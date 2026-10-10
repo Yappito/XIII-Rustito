@@ -3184,10 +3184,18 @@ fn play_rolloff_sound(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResu
 }
 
 fn set_base(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
-    // UE2 `AActor::SetBase`: sets `Base` (and `Floor` when supplied). No attachment transform
-    // is evaluated (the VM has no rendering/movement solver).
+    // UE2 `AActor::SetBase` (Engine.dll 0x103555c0, body not decoded here): sets `Base` (and `Floor` when supplied) and
+    // registers the actor as attached, so a moving brush carries it. The `RelativeLocation`
+    // bookkeeping is not modelled; the carry re-derives the offset from the live locations.
     let base = object(vm, a, 0)?;
     vm.set_property(c.this, "Base", 0, Value::Object(base));
+    if let Some(ObjRef::Instance(b)) = base
+        && vm.is_mover(b)
+    {
+        // Hypothesis (upstream UE2): `AActor::SetBase` appends the actor to the base's `Attached`
+        // array; `ULevel::MoveActor` (decoded) then carries it (see `Vm::carry_attached_actors`).
+        vm.note_attached(c.this);
+    }
     if !c.omitted(1)
         && let Some(Value::Vector(v)) = a.get(1)
     {
@@ -4681,7 +4689,7 @@ fn builtin_defs() -> Vec<NativeDef> {
         def(
             "Engine.Actor.SetBase",
             "native(298) final static function SetBase(object<Actor> NewBase, optional vector NewFloor)",
-            "engine.u Actor.SetBase decoded (NewBase, optional NewFloor, void); sets Base and Floor; no attachment transform (headless)",
+            "engine.u Actor.SetBase decoded (NewBase, optional NewFloor, void); sets Base and Floor; a moving brush carries the actor (Vm::carry_attached_actors)",
             set_base,
         ),
         def(
