@@ -1325,6 +1325,20 @@ fn find_best_path_toward(
     };
     let goal = vm.vector_prop(target, "Location").unwrap_or([0.0; 3]);
     let first = vm.nav_find_path_to(c.this, goal)?;
+    // XIDPawn.dll 0x11901bd9..0x11901bf7: the successful search publishes its
+    // first node and location, exactly as FindBestPathTo does. RouteCache alone
+    // is insufficient: AttaqueH2H uses MoveTarget to reach its movement latent.
+    if let Some(first) = first {
+        vm.set_property(
+            c.this,
+            "MoveTarget",
+            0,
+            Value::Object(Some(ObjRef::Instance(first))),
+        );
+        if let Some(location) = vm.vector_prop(first, "Location") {
+            vm.set_property(c.this, "Destination", 0, Value::Vector(location));
+        }
+    }
     val(Value::Bool(first.is_some()))
 }
 

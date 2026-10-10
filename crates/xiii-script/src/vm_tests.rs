@@ -1006,6 +1006,36 @@ fn step_budget_stops_runaway_loops() {
 }
 
 #[test]
+fn state_label_restart_budget_retains_actor_and_code_stack() {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let spin = b.reserve(IMP_STATE, actor, "Spin");
+    let begin = b.name("Begin") as u8;
+    // Synthetic goto Begin with no latent: unlike a statement jump this repeatedly
+    // exits/restarts the state frame and exercises process_state's rounds guard.
+    let mut code = vec![0x0D, 0x21, begin, 0x08];
+    code.extend([0x0C, begin, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b.state(spin, 0, &code, 0x18, 0x07);
+    b.class(object, 0, 0);
+    b.class(actor, object, spin);
+    let set = set_of(b.build());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let id = vm.spawn(g(&set, "Actor"), "Looper").unwrap();
+    vm.set_active(id, true);
+    vm.goto_state(id, "Spin", None).unwrap();
+    let error = vm.tick(1.0 / 60.0).unwrap_err();
+    assert_eq!(error.kind, VmErrorKind::BudgetExceeded { limit: 1_000_000 });
+    let entry = error
+        .stack
+        .last()
+        .expect("state restart must retain context");
+    assert_eq!(entry.function, "Test.Actor.Spin");
+    assert_eq!(entry.object, "Looper");
+    assert_eq!(entry.offset, 0);
+}
+
+#[test]
 fn tick_memo_re_resolves_after_state_change() {
     let set = set_of(tick_state_fixture());
     let mut vm = Vm::new(&set, VmLimits::default());
@@ -10503,7 +10533,7 @@ fn auto_position_snaps_to_the_floor_and_adds_altitude() {
 }
 
 #[test]
-fn find_best_path_toward_returns_true_and_fills_route_cache() {
+fn find_best_path_toward_publishes_move_target_and_preserves_it_on_failure() {
     let set = nav_set();
     let mut vm = Vm::new(&set, VmLimits::default());
     let _ = spawn_at(&mut vm, &set, "Actor", "Nav0", [0.0, 0.0, 0.0]);
@@ -10529,6 +10559,19 @@ fn find_best_path_toward_returns_true_and_fills_route_cache() {
         route_cache_elem(&vm, ctrl, 0),
         Value::Object(Some(ObjRef::Instance(n1)))
     );
+    assert_eq!(vm.obj_prop(ctrl, "MoveTarget"), Some(n1));
+    assert_eq!(vm.vector_prop(ctrl, "Destination"), Some([500.0, 0.0, 0.0]));
+    // An unreachable path must neither report success nor erase the last target.
+    vm.set_navigation(Box::new(crate::navigation::EmptyNavigation));
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "IAController.FindBestPathToward",
+        ctrl,
+        &[false, false, false],
+        &mut args
+    )));
+    assert_eq!(vm.obj_prop(ctrl, "MoveTarget"), Some(n1));
+    assert_eq!(vm.vector_prop(ctrl, "Destination"), Some([500.0, 0.0, 0.0]));
     // Desired None -> false, no path.
     let mut args = [Value::Object(None), Value::Float(70.0), Value::Float(160.0)];
     assert!(!bool_result(call_native(
@@ -10538,6 +10581,8 @@ fn find_best_path_toward_returns_true_and_fills_route_cache() {
         &[false, false, false],
         &mut args
     )));
+    assert_eq!(vm.obj_prop(ctrl, "MoveTarget"), Some(n1));
+    assert_eq!(vm.vector_prop(ctrl, "Destination"), Some([500.0, 0.0, 0.0]));
 }
 
 /// A minimal `PlayerController`/`Pawn` tree for the `PlayerCanSeeMe` line-of-sight test.
