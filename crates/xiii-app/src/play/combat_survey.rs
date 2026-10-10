@@ -85,11 +85,41 @@ fn opt_in_item51_combat_survey() {
         }
         drop(probe);
         let input = script::Script::parse(&text).expect("combat script");
-        let outcome = run_script_with_cinematic_input(&root, map, &input, &params, &scene, 66.5)
-            .expect("combat run");
+        let outcome = run_script_inner(
+            &root,
+            map,
+            &input,
+            &params,
+            &scene,
+            66.5,
+            true,
+            RunnerOptions {
+                wait_for_control: soldier.is_some(),
+                ..Default::default()
+            },
+        )
+        .expect("combat run");
         let session = &outcome.session;
         survey::print_details(&survey::extract(map, &outcome));
         let vm = session.vm();
+        if map.eq_ignore_ascii_case("SSH101a") {
+            assert!(
+                session
+                    .failures
+                    .iter()
+                    .all(|(_, error)| !error.contains("BudgetExceeded")),
+                "SSH101a must reach its authored movement latent, not exhaust the VM budget: {:?}",
+                session.failures
+            );
+            assert!(
+                vm.trace.iter().any(|event| matches!(
+                    &event.kind,
+                    TraceKind::LatentStart { actor, native, .. }
+                        if actor == "IAController9" && native == "Controller.MoveToward"
+                )),
+                "SSH101a IAController9 must yield to MoveToward after a successful path search"
+            );
+        }
         for (i, object) in vm.objects.iter().enumerate() {
             let id = i as u32;
             if !object.is_actor
@@ -313,6 +343,81 @@ fn opt_in_item51_combat_survey() {
     assert!(
         firing_failures.is_empty(),
         "combat firing acceptance failures: {firing_failures:?}"
+    );
+}
+
+#[test]
+fn opt_in_combat_control_gate_rejects_walking_cinematic_subclasses() {
+    let Ok(root) = std::env::var("XIII_GOG_DIR") else {
+        println!("SKIPPED: set XIII_GOG_DIR for combat control gate regression");
+        return;
+    };
+    let mut session = session::Session::open(Path::new(&root), "Plage01").expect("gate session");
+    let pc = session.controller.expect("player controller");
+    session
+        .vm_mut()
+        .goto_state(pc, "NoControl", None)
+        .expect("intro state");
+    assert!(
+        session.vm().is_in_state(pc, "PlayerWalking"),
+        "NoControl inherits PlayerWalking in XIII"
+    );
+    assert!(
+        !player_has_control(&session),
+        "a family match must not release the survey during an intro"
+    );
+    session
+        .vm_mut()
+        .goto_state(pc, "PlayerWalking", None)
+        .expect("released control");
+    assert!(player_has_control(&session));
+    session
+        .vm_mut()
+        .goto_state(pc, "CameraView", None)
+        .expect("camera cine");
+    assert!(!player_has_control(&session));
+    let root = Path::new(&root);
+    let scene = viewer::load_scene(&Options {
+        game_dir: Some(root.into()),
+        map: Some("Plage01".into()),
+        ..Default::default()
+    })
+    .expect("control wait scene");
+    let params = resolve_params(root)
+        .expect("control wait parameters")
+        .params;
+    let input = script::Script::parse("t=0 weapon XIII.Beretta\nt=1 fire\n").unwrap();
+    let outcome = run_script_inner(
+        root,
+        "Plage01",
+        &input,
+        &params,
+        &scene,
+        2.0,
+        true,
+        RunnerOptions {
+            wait_for_control: true,
+            ..Default::default()
+        },
+    )
+    .expect("wait then fire");
+    let shot = outcome
+        .session
+        .vm()
+        .trace
+        .iter()
+        .find(|event| {
+            matches!(&event.kind,
+        TraceKind::Native { path, .. } if path == "Weapon.PlayFiringSound")
+        })
+        .expect("one controlled shot");
+    assert!(
+        shot.time > 46.5,
+        "must wait for Plage01's actual intro release"
+    );
+    assert!(
+        (outcome.session.vm_time() - shot.time - 1.0).abs() < f64::from(2.0 * DT),
+        "the two-second scenario must end one second after its t=1 shot; waiting must not double-extend it"
     );
 }
 

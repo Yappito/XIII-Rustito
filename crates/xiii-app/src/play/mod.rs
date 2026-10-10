@@ -9,6 +9,8 @@
 //! `--play-script <file>`. Both drive the same [`sim::PlayerSim`] in `FixedUpdate` at 60 Hz.
 //! Fixed 60 Hz is a **hypothesis** (UE2 used variable ticks); see [`FIXED_HZ`].
 
+#[cfg(test)]
+mod campaign_chain;
 pub mod cartoon;
 pub mod cinematics;
 #[cfg(test)]
@@ -1113,6 +1115,7 @@ fn fixed_step(
             physics: sim.0.physics,
             landed_velocity_z: sim.0.landed.then_some(sim.0.land_velocity_z),
             floor_normal: sim.0.floor_normal,
+            eye_height: sim.0.vm_eye_height(&params.0),
         };
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
         sess.sync_view_rotation(sim.0.yaw, sim.0.pitch);
@@ -1844,7 +1847,7 @@ fn travel(
         commands.entity(e).try_despawn();
         removed += 1;
     }
-    let new_session = match session::Session::open(&game_dir, &plan.map) {
+    let new_session = match travel::open_next_session(sess, &game_dir, &plan) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[play] travel load failed for {}: {e}", plan.map);
@@ -1983,6 +1986,7 @@ struct MapRuntime {
     mover_collision: movers::MoverCollision,
     volumes: movement_modes::VolumeMotion,
     sim: PlayerSim,
+    player_params: PlayerParams,
     sources: Vec<String>,
     /// Shared counter of voice names this map's `VoiceDuration` provider could not resolve (the
     /// provider is re-installed on every map open, including travel reloads).
@@ -2001,7 +2005,22 @@ fn open_map_runtime(
     scene: &xiii_world::WorldScene,
     params: &PlayerParams,
 ) -> Result<MapRuntime, String> {
-    let mut session = session::Session::open(game_dir, map)?;
+    build_map_runtime(
+        game_dir,
+        map,
+        scene,
+        params,
+        session::Session::open(game_dir, map)?,
+    )
+}
+
+fn build_map_runtime(
+    game_dir: &Path,
+    map: &str,
+    scene: &xiii_world::WorldScene,
+    params: &PlayerParams,
+    mut session: session::Session,
+) -> Result<MapRuntime, String> {
     // item21: install the host `VideoPlayer` provider. Headless runs have no output device, so
     // audio is off and playback is caller-paced (`advance_virtual_all`): `GetStatus` still
     // reports completion from the decoded frame count, which is what the level-end
@@ -2084,6 +2103,7 @@ fn open_map_runtime(
         mover_collision,
         volumes,
         sim,
+        player_params: *params,
         sources,
         voice_unresolved,
         video_host,
@@ -2095,8 +2115,8 @@ fn open_map_runtime(
 ///
 /// The collision world (static soup + the VM's mover actors as dynamic objects) is built here so
 /// the script can never diverge from the interactive path. When the game's own code requests
-/// level travel, the next map is imported and a fresh session is opened (the host owns the
-/// transition); the run continues on the new map until the duration is spent.
+/// level travel, the next map is imported through the shared native travel bridge, reusing
+/// Login's pawn for imported travel properties; the run continues until the duration is spent.
 #[cfg(test)]
 pub(crate) fn run_script(
     game_dir: &Path,
@@ -2106,7 +2126,16 @@ pub(crate) fn run_script(
     scene: &xiii_world::WorldScene,
     duration: f32,
 ) -> Result<ScriptOutcome, String> {
-    run_script_inner(game_dir, map, script, params, scene, duration, false)
+    run_script_inner(
+        game_dir,
+        map,
+        script,
+        params,
+        scene,
+        duration,
+        false,
+        RunnerOptions::default(),
+    )
 }
 
 /// Player-route variant of [`run_script`]: honor the controller's authored cinematic states in
@@ -2120,9 +2149,33 @@ pub(crate) fn run_script_with_cinematic_input(
     scene: &xiii_world::WorldScene,
     duration: f32,
 ) -> Result<ScriptOutcome, String> {
-    run_script_inner(game_dir, map, script, params, scene, duration, true)
+    run_script_inner(
+        game_dir,
+        map,
+        script,
+        params,
+        scene,
+        duration,
+        true,
+        RunnerOptions::default(),
+    )
 }
 
+#[derive(Default)]
+struct RunnerOptions {
+    initial: Option<MapRuntime>,
+    stop_on_travel: bool,
+    wait_for_control: bool,
+}
+
+fn player_has_control(session: &session::Session) -> bool {
+    !cinematics::input_suppressed(session)
+        && session
+            .controller
+            .is_some_and(|pc| session.vm().is_in_state(pc, "PlayerWalking"))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_script_inner(
     game_dir: &Path,
     map: &str,
@@ -2131,14 +2184,19 @@ fn run_script_inner(
     scene: &xiii_world::WorldScene,
     duration: f32,
     respect_cinematic_input: bool,
+    options: RunnerOptions,
 ) -> Result<ScriptOutcome, String> {
     let started = Instant::now();
-    let ticks = (duration / DT).ceil() as u64;
+    let mut ticks = (duration / DT).ceil() as u64;
     let mut drive = script::Drive::new(script);
     let mut trace = Vec::new();
     let mut travel = Vec::new();
     let mut map_objectives = Vec::new();
-    let mut runtime = open_map_runtime(game_dir, map, scene, params)?;
+    let mut runtime = match options.initial {
+        Some(runtime) => runtime,
+        None => open_map_runtime(game_dir, map, scene, params)?,
+    };
+    let mut control_tick = (!options.wait_for_control).then_some(0);
     #[cfg(test)]
     if std::env::var("XIII_SURVEY").as_deref() == Ok("1") {
         runtime.session.vm_mut().collect_combat_natives = true;
@@ -2152,7 +2210,21 @@ fn run_script_inner(
     let mut footstep_log: Vec<(f32, String, Option<String>)> = Vec::new();
     let mut tick = 0u64;
     while tick < ticks {
-        let elapsed = tick as f32 * DT;
+        if control_tick.is_none() && player_has_control(&runtime.session) {
+            control_tick = Some(tick);
+            println!(
+                "[combat-control] map={map} t={:.3} state={}",
+                tick as f32 * DT,
+                runtime.session.player_controller_state()
+            );
+        }
+        if control_tick.is_none() && tick as f32 * DT >= 120.0 {
+            return Err(format!(
+                "{map}: player control not returned within 120 seconds; state={}",
+                runtime.session.player_controller_state()
+            ));
+        }
+        let elapsed = tick.saturating_sub(control_tick.unwrap_or(tick)) as f32 * DT;
         if let Some(name) = drive.tracking_actor().map(str::to_owned) {
             // Head-zone aim, as in the other drive site: for pawns, a fraction of
             // CollisionHeight above the tracked actor's Location keeps the ray inside the aimed
@@ -2175,7 +2247,11 @@ fn run_script_inner(
         } else {
             drive.set_track_location(None, None);
         }
-        let mut input = drive.advance(elapsed, &mut runtime.sim);
+        let mut input = if control_tick.is_some() {
+            drive.advance(elapsed, &mut runtime.sim)
+        } else {
+            Input::default()
+        };
         let weapons = drive.take_weapons();
         let goals = drive.take_goals();
         let mut weapon_inputs = drive.take_weapon_inputs();
@@ -2228,6 +2304,7 @@ fn run_script_inner(
             physics: runtime.sim.physics,
             landed_velocity_z: runtime.sim.landed.then_some(runtime.sim.land_velocity_z),
             floor_normal: runtime.sim.floor_normal,
+            eye_height: runtime.sim.vm_eye_height(&runtime.player_params),
         };
         runtime.session.step(
             DT,
@@ -2321,7 +2398,7 @@ fn run_script_inner(
         }
 
         // Level transition: the game's own goal/travel code requested it. The VM reported the
-        // URL; the host imports the next map and opens a fresh session.
+        // URL; the host imports the next map and carries the native travel actor properties.
         if let Some(req) = runtime.session.take_travel_request() {
             let plan = travel::TravelPlan::from_request(&req)?;
             println!(
@@ -2346,6 +2423,10 @@ fn run_script_inner(
                 tick,
             });
             map_objectives.push((runtime.name.clone(), runtime.session.objective_states()));
+            if options.stop_on_travel {
+                tick += 1;
+                break;
+            }
             // The script block (if any) is released; the next map starts a fresh run.
             drive.notify_travel();
             let opts = crate::cli::Options {
@@ -2358,7 +2439,8 @@ fn run_script_inner(
             voice_unresolved_total += runtime
                 .voice_unresolved
                 .load(std::sync::atomic::Ordering::Relaxed);
-            runtime = open_map_runtime(game_dir, &plan.map, &next_scene, params)?;
+            let next_session = travel::open_next_session(&mut runtime.session, game_dir, &plan)?;
+            runtime = build_map_runtime(game_dir, &plan.map, &next_scene, params, next_session)?;
             // Rebuild the footstep surface map and driver for the next map.
             surfaces = footsteps::SurfaceSounds::from_scene(&next_scene);
             step_driver = footsteps::FootstepDriver::new();
@@ -2371,6 +2453,9 @@ fn run_script_inner(
             );
         }
         tick += 1;
+        if control_tick.is_none() {
+            ticks += 1;
+        }
     }
     if drive.waiting_travel() && travel.is_empty() {
         println!(
@@ -2398,7 +2483,7 @@ fn run_script_inner(
     }
     Ok(ScriptOutcome {
         session: runtime.session,
-        ticks,
+        ticks: tick,
         wall_secs: started.elapsed().as_secs_f32(),
         trace,
         final_map: runtime.name,
@@ -4418,6 +4503,152 @@ mod tests {
         );
     }
 
+    /// item54 route: Hual01b completed end-to-end by player input: the four generator
+    /// sabotages and the `BreakableMover13` tunnel grille punch through the game's own
+    /// break-by-hand chain (`XIIIWeapon.RealTraceFire` melee -> the interaction's
+    /// `TargetActor`/`bCanBreak` -> `XIIIH2HAmmo.ProcessTraceHit` `TakeDamage(DTFisted)` ->
+    /// `BreakableMover.Breaked` -> `TriggerEvent(self.Event)` -> the level's Dispatcher/
+    /// XIIIGoalTrigger GoalNumber-99 chains -> `xidmaps.Hual01b.SetGoalComplete`; the same
+    /// events dismiss the level's own comic-focus windows), the ladder-base `TouchTrigger0`
+    /// (goal 1), the terrain hole onto the GR_sortie deck, the crawl room and the shaft fall
+    /// into `Trigger0` -> `XIIIGoalTrigger0` (goal 6). With all four generator counter
+    /// objectives complete the map's `xidmaps.Hual01b.SetGoalComplete` override promotes goal
+    /// 6, so the shaft trigger completes it and `TestGoalComplete` -> `DoTravel` ->
+    /// `ServerTravel` requests `Hual02.unr`. The fixture's labelled teleports cover measured
+    /// impassables only (the buried entry corridor, the riverbed wall, the stalled east chain,
+    /// the sealed baraque pocket, the mountain spur, the deck-to-room gap; evidence under
+    /// local/re/item54b/ and local/re/item54/); no `take_control`, no `set_goal`, no weapon
+    /// grant.
+    #[test]
+    fn opt_in_hual01b_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual01b".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual01b");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        // Tracked fixture (our own route commands; no game data).
+        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/hual01b_route.script");
+        let script = script::Script::load(&route_path).expect("load item54 Hual01b route");
+        assert!(
+            script.events.iter().all(|event| {
+                !matches!(
+                    &event.command,
+                    script::Command::TakeControl
+                        | script::Command::SetGoal(_)
+                        | script::Command::Weapon(_)
+                )
+            }),
+            "the Hual01b route must not bridge control, goals or weapons"
+        );
+        // 300 s: the route's shaft fall lands at t~270, the game's own travel request lands
+        // at t~272.9 (measured probe_z5), the host reloads Hual02 and the run ends there.
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Hual01b",
+            &script,
+            &resolved.params,
+            &scene,
+            300.0,
+        )
+        .expect("run Hual01b route");
+        for (map, states) in &outcome.map_objectives {
+            println!(
+                "[hual01b route] objectives as the run left {map}: {}",
+                states
+                    .iter()
+                    .map(|o| format!(
+                        "[{}{}{}{}] {}",
+                        o.index,
+                        if o.primary { " P" } else { " -" },
+                        if o.completed { " C" } else { " ." },
+                        if o.anti_goal { " A" } else { "" },
+                        o.text
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+        }
+        println!(
+            "[hual01b route] travel: {:?}, final map {}",
+            outcome.travel, outcome.final_map
+        );
+        let hual01b = outcome
+            .map_objectives
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Hual01b"))
+            .expect("Hual01b objective states");
+        assert!(
+            hual01b.1.len() >= 7,
+            "Hual01b MapInfo must expose its seven objectives: {:?}",
+            hual01b.1
+        );
+        for (index, why) in [
+            (0usize, "the anti-goal must be authored completed at spawn"),
+            (
+                1,
+                "goal 1 (infiltrate the base) must complete through the ladder-base chain",
+            ),
+            (
+                2,
+                "the generator counter must complete through the sabotage chains",
+            ),
+            (
+                3,
+                "the generator counter must complete through the sabotage chains",
+            ),
+            (
+                4,
+                "the generator counter must complete through the sabotage chains",
+            ),
+            (
+                5,
+                "the generator counter must complete through the sabotage chains",
+            ),
+            (
+                6,
+                "goal 6 (reach the extraction shaft) must complete through Trigger0",
+            ),
+        ] {
+            assert!(
+                hual01b.1[index].completed,
+                "objective {index} must complete: {why}: {:?}",
+                hual01b.1[index]
+            );
+        }
+        assert!(
+            hual01b.1[1].primary && hual01b.1[6].primary,
+            "goals 1 and 6 must be primary when completed: {:?} {:?}",
+            hual01b.1[1],
+            hual01b.1[6]
+        );
+        assert!(
+            !outcome.travel.is_empty(),
+            "the level must travel; blocked actors: {:?}",
+            outcome.session.suspended
+        );
+        assert_eq!(outcome.final_map, "Hual02");
+        assert_eq!(outcome.travel[0].from, "Hual01b");
+        assert_eq!(outcome.travel[0].to, "Hual02");
+        assert_eq!(outcome.travel[0].url, "Hual02.unr");
+        let hual02 = outcome
+            .map_objectives
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Hual02"))
+            .expect("the run must load Hual02 and capture its objective states");
+        assert!(
+            hual02.1.len() >= 5,
+            "Hual02 must load with its own MapInfo objectives: {:?}",
+            hual02.1
+        );
+    }
+
     fn probe_objectifs(game_dir: &std::path::Path, map: &str) {
         let session = session::Session::open(game_dir, map).expect("open map");
         let gi = session.game_info.expect("GameInfo");
@@ -5576,7 +5807,11 @@ mod tests {
     /// measured state so the blockers cannot silently regress. item48 update: with
     /// `VisibleDamageableActors` implemented the route's player is killed by the tarmac's
     /// scripted bazooka fire (see the health assertion below); the fixture was authored while
-    /// that native was missing and the blasts were no-ops.
+    /// that native was missing and the blasts were no-ops. item62 update: the post-grapple
+    /// dialogue chain is no longer a blocker - the demo's `wait event SpeechJones11T` completes
+    /// through the map's own touch chain (TouchTrigger24 -> CineTrigger20 -> 'SpeechJones11T')
+    /// once the route's player enters the armed trigger's zone after the demo's arm gate, and
+    /// the follow-up dialogue 'dialtoits1bis' starts.
     #[test]
     fn opt_in_toits01_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -5599,7 +5834,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            330.0,
+            380.0,
         )
         .expect("run Toits01 route");
         let session = &outcome.session;
@@ -5614,18 +5849,28 @@ mod tests {
             "route unexpectedly travelled: {:?}",
             outcome.travel
         );
-        // item48: `Actor.VisibleDamageableActors` (HurtRadius) now delivers blast damage, so
-        // the tarmac's scripted BazookRocket soldiers (Damage 600, DamageRadius 1000) kill the
-        // route's no-input player near (16000,1300): measured 150 -> 75 @299.0 s, 65 @301.5 s,
-        // dead @302.0 s (identical in two runs; the ratios match the retail HurtRadius script's
-        // `1 - (dist - CollisionRadius)/DamageRadius` falloff for wall impacts ~900-1000 UU out).
-        // The fixture was authored while the native was missing, so the blasts were no-ops.
+        // item48 -> item61b: `Actor.VisibleDamageableActors` (HurtRadius) delivers blast damage,
+        // but since item61's native InitExecution writes (GameInfo.DummyStuff1/2,
+        // GenAlerte.dummy) the tarmac's scripted BazookRocket soldiers are back to their
+        // authored skill/health: their aimed rockets land with falloff spread and the route's
+        // moving player SURVIVES the kill zone. Measured (identical twice,
+        // `local/re/item61b/test-as-is.txt` / `test-as-is-2.txt`): health 150 until t=319.0,
+        // 85 from t=319.5 (blast -65), 74 from t=323.5 (blast -11); the game's TouchTrigger10
+        // Touch fired at 325.017 with the player alive. The route's fight phase (below) then
+        // costs one soldier hit on the way to the door-line stand (74 -> 49) and the stand
+        // itself is safe (the Tmetaldoorhelico door line blocks the soldier's sweep, the same
+        // cover the item53b comment used for the helipad wait). Pinned: alive through the
+        // whole route, final health inside the measured window.
         let health = session
             .player_health()
             .expect("the player must still have a Health property across the route");
         assert!(
-            health <= 0.0,
-            "expected the scripted tarmac rockets to kill the no-input route player once HurtRadius works, got health {health}"
+            health > 0.0,
+            "the route player must survive the tarmac rockets and the fight phase with normal-health soldiers, got health {health}"
+        );
+        assert!(
+            (40.0..=60.0).contains(&health),
+            "the route player's final health must stay in the measured 40..=60 window (measured 150 -> 85 @319.5 s -> 74 @323.5 s -> 49 at the fight stand), got {health}"
         );
         // Goal 3 (Jones must not die) completes; goals 0/1/2 do not.
         for o in &objectives {
@@ -5701,26 +5946,134 @@ mod tests {
             demonstrator_retract,
             "the grapple demonstrator must reach STA_Retract (the demo machine completes)"
         );
-        // item48: the tarmac rockets kill the route's player at ~301.55 s (health pin above).
-        // The engine-wide kill broadcast (`Controller.ClientGameEnded`) then moves every
-        // controller out of the scene: measured CineController2 PlayingSequence -> GameEnded at
-        // 301.550 s, with ScriptedActionIndex cleared (None) after the broadcast. The pre-item48
-        // fixture pinned `ScriptedActionIndex >= 117` and a PlayerWalking handover here; both
-        // were measured on a living player and are unreachable once the kill ends the scene.
-        // Pinned instead: the scene was still running (PlayingSequence) until the kill moved
-        // CineController2 to GameEnded, and the player controller ends in GameEndedDeath.
-        let kill_broadcast = vm.trace.iter().any(|event| {
+        // item53d: the STA_Retract Timer's posed teleport works. GetBoneCoords('X') now
+        // resolves the posed root-bone position through the decoded MeshAnimation (the old
+        // item19 actor-origin fallback made the SetLocation a no-op and Jones stayed on the
+        // demo ledge, wedging action[117]'s move against the corniche forever). Measured:
+        // Jones's yaw turns to ~0 (east, the rWantedRotation facing) during the climb; the
+        // teleport moves him by the posed offset (+226.4, +26.6, +159..187) to the building
+        // roof (feet z 2160), east of the corniche band (x -4570..-4509), where action[117]'s
+        // movseqb walk proceeds.
+        let cine0 = vm
+            .find_object("Cine0")
+            .expect("the cine Jones pawn must exist");
+        let cine0_loc = vm
+            .vector_prop(cine0, "Location")
+            .expect("Cine0 must keep a Location");
+        assert!(
+            cine0_loc[0] > -4509.0,
+            "Cine0 must stand east of the corniche band after the retract teleport, got {cine0_loc:?}"
+        );
+        assert!(
+            (cine0_loc[2] - 2234.3).abs() < 8.0,
+            "Cine0 must rest on the building roof (center z 2234.3 = roof 2160 + half height 74.3), got {cine0_loc:?}"
+        );
+        // The fixed [117] movseqb completed: the demo's post-move dialogue ran — the forced
+        // `dial dialtoits1 11` line speaks (DialogueManager0 enters STA_HeadAnimation, the
+        // voiced-line state, after the demonstrator's retract).
+        let spoke_after_retract = {
+            let retract_at = vm
+                .trace
+                .iter()
+                .position(|event| {
+                    matches!(
+                        &event.kind,
+                        xiii_script::TraceKind::StateChange { actor, to, .. }
+                            if actor.eq_ignore_ascii_case("RoofGrapnleDemonstrator0")
+                                && to.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("STA_Retract"))
+                    )
+                })
+                .expect("demonstrator retract state change recorded");
+            vm.trace[retract_at..].iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    xiii_script::TraceKind::StateChange { actor, to, .. }
+                        if actor.eq_ignore_ascii_case("DialogueManager0")
+                            && to.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("STA_HeadAnimation"))
+                )
+            })
+        };
+        assert!(
+            spoke_after_retract,
+            "the demo must reach action[111]/[118]: the forced dialogue line speaks after the retract"
+        );
+        // item62: the demo's post-grapple `wait event SpeechJones11T` completes through the
+        // map's own touch chain. The '<speech>T' event is not raised by the DialogueManager,
+        // the HUD or HXAudio (all decoded, local/re/item62/): it is the map's trigger chain -
+        // TouchTrigger24 (r220 at -3609,1316,2263, on the grapple-landing roof) fires
+        // 'SpeechJones11Ttempo' only on a Touch while its scene-gate has armed it (bActif,
+        // set by the demo's [118] `event SpeechJones11` at ~81.2), and CineTrigger20
+        // (InitialState BufferTrigger, Period 0.1, MaxDelay 60) forwards it as
+        // 'SpeechJones11T'. The route's player enters the zone at t=85 (the labelled
+        // viewpoint teleport; the player's start roof is ~1200 below the trigger's z band, so
+        // the entry is a measured impassable on foot). Measured (probe72/74/75,
+        // local/re/item62/): TouchTrigger24.Touch -> CineTrigger20.BufferTrigger.Trigger ->
+        // CineController2.PlayingSequence.Trigger ('SpeechJones11T') at 85.0 s, [119]
+        // satisfied; [128] `event jones11` at 86.63 releases DialogueManager0's 'jones11'
+        // EndOfLine park (the manager parks on the NEXT beat's ExpectedEventBeforeNext, not
+        // on '...T' - the item53b report's pinned mechanism claim was wrong and is corrected
+        // in local/reports/item62-dialogue-finish.md); DialogueManager4 starts
+        // 'dialtoits1bis' at 93.85.
+        let tt24_touched = vm.trace.iter().any(|event| {
             matches!(
                 &event.kind,
-                xiii_script::TraceKind::StateChange { actor, from, to, .. }
-                    if actor.eq_ignore_ascii_case("CineController2")
-                        && from.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("PlayingSequence"))
-                        && to.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("GameEnded"))
+                xiii_script::TraceKind::Event { target, function, args }
+                    if target.eq_ignore_ascii_case("TouchTrigger24")
+                        && function.ends_with("TouchTrigger.Touch")
+                        && args.iter().any(|a| a.contains("XIIIPlayerPawn"))
             )
         });
         assert!(
-            kill_broadcast,
-            "the scene must run until the player kill's GameEnded broadcast moves CineController2 out of PlayingSequence"
+            tt24_touched,
+            "the route's player must touch TouchTrigger24 (the '...T' chain's entry gate)"
+        );
+        let buffer_triggered = vm.trace.iter().any(|event| {
+            matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target.eq_ignore_ascii_case("CineTrigger20")
+                        && function.ends_with("BufferTrigger.Trigger")
+            )
+        });
+        assert!(
+            buffer_triggered,
+            "CineTrigger20 (BufferTrigger) must forward the touch as 'SpeechJones11T'"
+        );
+        let tt24_at = vm
+            .trace
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.kind,
+                    xiii_script::TraceKind::Event { target, function, .. }
+                        if target.eq_ignore_ascii_case("TouchTrigger24")
+                            && function.ends_with("TouchTrigger.Touch")
+                )
+            })
+            .expect("TouchTrigger24.Touch recorded");
+        let dm4_started_after_touch = vm.trace[tt24_at..].iter().any(|event| {
+            matches!(
+                &event.kind,
+                xiii_script::TraceKind::StateChange { actor, to, .. }
+                    if actor.eq_ignore_ascii_case("DialogueManager4")
+                        && to.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("STA_PlayingDialogue"))
+            )
+        });
+        assert!(
+            dm4_started_after_touch,
+            "the follow-up dialogue 'dialtoits1bis' (DialogueManager4) must start after the 'SpeechJones11T' chain fires"
+        );
+        // item61b: with normal-health soldiers the player survives, so the item48 kill pins are
+        // gone: no GameEnded broadcast ever fires (measured: no CineController2 state change
+        // after its entry into PlayingSequence; the scene is still running at the cutoff)
+        // and the player controller stays in PlayerWalking. The next blocker is pinned after the
+        // TouchTrigger10/generator assertions below.
+        let cc2 = vm
+            .find_object("CineController2")
+            .expect("CineController2 must exist");
+        assert!(
+            vm.is_in_state(cc2, "PlayingSequence"),
+            "the scene must still be running (CineController2 in PlayingSequence) when the surviving player ends the route"
         );
         let pc = vm
             .objects
@@ -5729,8 +6082,51 @@ mod tests {
             .position(|(_, o)| vm.set().path(o.class).ends_with("XIIIPlayerController"))
             .expect("the player controller must exist");
         assert!(
-            vm.is_in_state(pc as u32, "GameEndedDeath"),
-            "the player controller must end in GameEndedDeath (killed by the scripted tarmac rockets)"
+            vm.is_in_state(pc as u32, "PlayerWalking"),
+            "the surviving player controller must end in PlayerWalking (no kill broadcast), got {:?}",
+            vm.trace
+                .iter()
+                .rev()
+                .find(|event| matches!(
+                    &event.kind,
+                    xiii_script::TraceKind::StateChange { actor, .. }
+                        if actor.eq_ignore_ascii_case("XIIIPlayerController")
+                ))
+                .map(|e| match &e.kind {
+                    xiii_script::TraceKind::StateChange { from, to, .. } => {
+                        format!("{from:?} -> {to:?}")
+                    }
+                    _ => String::new(),
+                })
         );
+        // item61b continuation pins (the route's fight + generator-retry phases):
+        // 1. The route's M60 fire (the labelled XIII.m60 grant; the import carries only Fists)
+        //    damages the road soldier BaseSoldier18 (authored 150 hp, Tag bataillefinale):
+        //    measured one landed burst (32 damage, `X Spine` bone hit, 150 -> 118) before he
+        //    reaches hard cover on the lower road; the remaining bursts trace onto the cover
+        //    (bone None). Normal-health soldiers are damageable by route fire; the full kill
+        //    was measured in the open-road probe (`local/re/item61b/shot-probe.txt`, the
+        //    (17500,1450) stand: 150 -> 20 -> -112 DEAD) but costs the player the remaining
+        //    health, so the route pins the cover fight, not the kill.
+        let soldier18 = vm
+            .find_object("BaseSoldier18")
+            .expect("BaseSoldier18 must exist");
+        assert_eq!(
+            vm.get_property(soldier18, "Health"),
+            Some(&xiii_script::Value::Int(118)),
+            "the route's tracked M60 fire must damage BaseSoldier18 (150 -> 118, the fight demonstration); the value moves only if the fight phase changes"
+        );
+        // 2. The generator-shot retry (t=360-368.5, from the closest road stand at
+        //    (17400,1400), tracking BreakableMover12) lands nothing: the yard stays sealed
+        //    (the generator Health 50 pin above). The next blocker, precisely: the yard's
+        //    south wall line is sealed by BSP + the two ForeverLocked Tportet3 doors (measured
+        //    soup scan: zero clear rays across the whole door band at 5 UU resolution,
+        //    `local/re/item61b/los-probe*.txt`); the doors never open (PorteDecors.ForeverLocked
+        //    absorbs TakeDamage and only plays a sound on PlayerTrigger); the level's own
+        //    shotgun pickup (FusilPompePick1) is inside the sealed yard. So BreakableMover12
+        //    can never be destroyed by route input -> 'PorteDebloquee_cine' never fires ->
+        //    CineTrigger17 never forwards 'PorteDebloquee' -> TT10 stays disarmed -> goal 0's
+        //    chain, the RenfortHelico02 finale, goals 1/2 and the 'finmap' travel are all
+        //    unreachable, and the route ends waiting for a travel that cannot be requested.
     }
 }

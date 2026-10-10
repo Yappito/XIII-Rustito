@@ -37,27 +37,51 @@
 #     CauseGoal -> SetGoalComplete(0) -> TestGoalComplete (both objectives completed) ->
 #     DoTravel -> EndGame("GoalComplete") -> GameEndedSuccess -> ServerTravel.
 #
-# The three labelled teleports cover measured movement gaps of the route driver (all verified
+# The two labelled teleports cover measured movement gaps of the route driver (all verified
 # with xiii-tool box-probe):
-#   - t=160: walking west out of the lever cabanon wedges the box on the room's interior
+#   - t=165: walking west out of the lever cabanon wedges the box on the room's interior
 #     partition and the swung-open door leaf (route-v6/v8/v9 logs); the entry walk is unaided.
-#   - t=168: item53b combat adaptation (measured). With the corrected mover line-check rule
-#     (a registered mover without `bUseCylinderCollision` answers from its mesh, not the
-#     Engine.Mover class-default r=160 cylinder) the camp guards' fire connects along the
-#     dam-bridge crossing where the phantom cylinders used to absorb it: the 35-health
-#     player took hits from t=162 and died at t=178.5 pre-adaptation (hual-skiptrace log).
-#     The teleport jumps from the bridge west abutment (4560,-5030) to TouchTrigger6
-#     ('dernierephrase', r=350 at (6133.7,-4948.9,-105)) so the bridge-crossing touch still
-#     fires on landing, and the east-platform walk resumes from there.
-#   - t=187: the dam-base shaft is sealed at every horizontal approach at trigger height
+#   - t=196.5: the dam-base shaft is sealed at every horizontal approach at trigger height
 #     (cliff faces y=-6512/-6520 and y=-6920/-6928, the GR_passage tube walls); retail descends
 #     it from the cache gallery above. The teleport places the player inside the shaft top so
 #     the fall delivers the game's own `Trigger2` touch; the player lands on the tube floor
 #     at z=-925 (measured, health intact).
 #
+# item57 combat adaptation (measured, replacing the item53b mid-bridge skip teleport): with
+# the corrected mover line-check rule (a registered mover without `bUseCylinderCollision`
+# answers from its mesh, not the Engine.Mover class-default r=160 cylinder) the dam guards'
+# fire connects along the crossing, and item53b skipped it with a teleport. This route fights
+# through instead, with player inputs only:
+#   - The lever cabanon exit (t=157..166): the exit door is held by the cinematic guard
+#     Cine14 (XIDCine.Cine2 'TalkieWalkieSpeech', 150 hp) with the bridge-west guard
+#     BaseSoldier9 (m16, DTShotGunned 22) behind him. The player switches to the carried
+#     FusilPompe (inventorygroup 9; login PompeAmmo 11, measured) and fires six blasts:
+#     measured in the final fixture, every pellet lands on BaseSoldier9 (20x30 = -600 over
+#     the first four blasts, 750 -> 150), and probe runs measured both follow-ups: a fifth
+#     blast killing BaseSoldier9 and a Cine14 kill firing the game's own
+#     `XIIIPlayerController.SearchPawn ["Cine14"]` loot chain (+13 c9mm from his
+#     BerettaPlus3). Which guard eats a given blast is timing-sensitive (Cine14 walks the
+#     fire line within ~0.5 s of the lever swing); the cabanon walls cover the exchange:
+#     zero incoming hits measured during the fight in every run.
+#   - The crossing itself is walked, not teleported (t=173..195): measured in the probe runs,
+#     BaseSoldier0 (crossbow, 750 hp, on the dam crest at (6907,-6182,770)) has fire lines
+#     onto the west abutment and the platform edges only - over the mid-bridge stretch his
+#     line is structurally blocked (no hits measured mid-deck in any run), so the deck is
+#     crossed at a run (the route's own "time the crossing" cover). TouchTrigger6
+#     ('dernierephrase', r=350 at (6133.7,-4948.9,-105)) fires naturally mid-crossing
+#     (measured t=172.6 walking) - no teleport is needed for it. Measured crossing damage:
+#     2-4 DTPierced/DTShotGunned hits of -7 each (player damage scaling ~0.135); crouching
+#     was measured NOT to help against the elevated crest shooter and standing exposed at the
+#     abutment to trade -7 hp per shot cycle for -30 per bolt on a 750-hp target (net loss,
+#     one probe run died standing there), so the route does not duel him: no position with a
+#     clear return line was found (shots from the platform north side stop on the baraque_fin
+#     corner, from the south-east slope on the terrain crest), and the east-camp pickup shack
+#     holding FullMedPick0 is measured sealed (BSP wall + crates + terrain ridge, box-probe).
+#
 # No take_control, no set_goal, no weapon grant (the fresh-login inventory from Hual01a's
 # InitialInv/AcceptInventory - Fists, Beretta, FusilPompe, arbalete, LockPick, Hook,
-# StunningSkill - is untouched; no objective needs a weapon).
+# StunningSkill - is untouched; the fight uses the carried FusilPompe via switch_weapon and
+# the camp-corner M16/armor pickups are still grabbed by touch en route).
 t=0.50 forward 1
 t=1.50 forward 0
 # Ski slope from the spawn (-4523,3674) down to the base yard (nav-graph line, measured).
@@ -126,23 +150,43 @@ t=147.50 goto 4406 -5430
 # TGSDummy 546, and 'PontA' closes the panels (MoveTime 4 s) and ends the focus window
 # through the trigger's own WaitEndFocus.
 t=155.00 use XIIIMover6
+# The cabanon exit fight (see header): switch to the carried FusilPompe and fire six blasts
+# at the exit guards; measured outcomes are BaseSoldier9 killed (-750 over five 5x30 blasts)
+# and/or Cine14 killed (+13 c9mm through the game's own SearchPawn loot chain). The cabanon
+# walls cover the exchange (zero incoming hits measured in every probe run).
+t=157.00 switch_weapon 9
+t=157.50 track Cine14
+t=158.50 fire
+t=160.00 fire
+t=161.50 fire
+t=163.00 fire
+t=164.20 fire
+t=165.40 fire
+t=166.40 track off
 # Labelled teleport (measured cabanon-exit wedge, see header), then north around the poste
-# and east across the CLOSED bridge (x 4765..6232 panels + static GR_pont ramps).
-t=160.00 teleport 4150 -5380 -97
-t=163.00 goto 4150 -5180
-t=166.50 goto 4560 -5030
-# Labelled teleport (item53b combat adaptation, see header): past the lethal mid-bridge
-# stretch, landing inside TouchTrigger6 so its touch still fires.
-t=168.00 teleport 6133 -4949 -105
+# and east across the CLOSED bridge (x 4765..6232 panels + static GR_pont ramps), fought
+# through on foot (see header): BaseSoldier0's fire lines only reach the abutment and the
+# platform edges - the mid-bridge stretch is structurally covered, so the deck is crossed
+# at a run and TouchTrigger6 ('dernierephrase') fires naturally on the way.
+t=167.00 teleport 4150 -5380 -97
+# Waypoints chained at the measured walk speed (400-470 UU/s) so the player never stands in
+# BaseSoldier0's abutment/platform fire lines (measured in the first authored run: 4 hits,
+# death at t=186.5, with the player parked at waypoints for 2-3 s each).
+t=167.50 goto 4150 -5180
+t=168.10 goto 4560 -5030
+t=169.30 goto 4900 -5010
+t=170.20 goto 5300 -4990
+t=171.10 goto 5700 -4970
+t=172.00 goto 6100 -4960
+t=173.30 goto 6650 -4960
 # East platform (GR_bidons04) around the stilt baraque_fin building.
-t=170.00 goto 6650 -4960
-t=173.50 goto 7100 -5250
-t=177.00 goto 7500 -5350
-t=180.50 goto 7900 -5400
-t=184.00 goto 8150 -5800
+t=174.60 goto 7100 -5250
+t=175.70 goto 7500 -5350
+t=176.70 goto 7900 -5400
+t=177.90 goto 8150 -5800
 # Labelled teleport into the sealed dam-base shaft top (measured seal, see header): the fall
 # delivers Trigger2's touch -> 'End_of_level' -> objective 0 -> TestGoalComplete -> DoTravel
-# -> the game's own Hual01b travel request (measured at t=196.5 in the item52 runs).
-t=187.00 teleport 8416 -6720 -380
+# -> the game's own Hual01b travel request.
+t=180.00 teleport 8416 -6720 -380
 # Wait for the game's own travel (Hual01b via the end-of-level chain).
-t=195.00 wait_travel
+t=188.00 wait_travel

@@ -42,6 +42,30 @@ pub trait AnimationData {
     /// `Ok(None)` = the source or the sequence is unknown; `Err(message)` = a decode or
     /// resolution failure that must be reported, never treated as an unknown sequence.
     fn sequence(&mut self, source: &str, seq: &str) -> Result<Option<SeqInfo>, String>;
+
+    /// Mesh-space pose position of one bone, for `Actor.GetBoneCoords`.
+    ///
+    /// `mesh_source` is the actor's `SkeletalMesh` path (skeleton and mesh transform);
+    /// `anim_source` is the animation source the playing sequence was resolved from (a linked
+    /// `MeshAnimation` or the mesh itself); `seq`/`frame`/`looping` describe the channel state.
+    /// The returned offset is the posed bone position relative to the actor origin in
+    /// actor-rotation space: the mesh transform (`RotOrigin`, `MeshOrigin`, scale) is applied
+    /// here, the caller adds the actor's own yaw and `Location` on top (the same split as the
+    /// pawn renderer's `root_transform`). `Ok(None)` = the mesh, sequence or bone is unknown;
+    /// `Err` = a decode failure. The default is `Ok(None)`: providers without pose data keep
+    /// `GetBoneCoords` on its documented actor-origin fallback.
+    fn bone_offset(
+        &mut self,
+        mesh_source: &str,
+        anim_source: &str,
+        seq: &str,
+        frame: f32,
+        looping: bool,
+        bone: &str,
+    ) -> Result<Option<[f32; 3]>, String> {
+        let _ = (mesh_source, anim_source, seq, frame, looping, bone);
+        Ok(None)
+    }
 }
 
 /// Diagnostic provider: **every** sequence exists with a fixed frame count and rate, and no

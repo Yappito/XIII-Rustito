@@ -1325,6 +1325,20 @@ fn find_best_path_toward(
     };
     let goal = vm.vector_prop(target, "Location").unwrap_or([0.0; 3]);
     let first = vm.nav_find_path_to(c.this, goal)?;
+    // XIDPawn.dll 0x11901bd9..0x11901bf7: the successful search publishes its
+    // first node and location, exactly as FindBestPathTo does. RouteCache alone
+    // is insufficient: AttaqueH2H uses MoveTarget to reach its movement latent.
+    if let Some(first) = first {
+        vm.set_property(
+            c.this,
+            "MoveTarget",
+            0,
+            Value::Object(Some(ObjRef::Instance(first))),
+        );
+        if let Some(location) = vm.vector_prop(first, "Location") {
+            vm.set_property(c.this, "Destination", 0, Value::Vector(location));
+        }
+    }
     val(Value::Bool(first.is_some()))
 }
 
@@ -2109,9 +2123,12 @@ fn actor_trace(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nati
     } else {
         int(vm, a, 7)? as u32
     };
-    let flags = (if b_trace_actors { 0xbf } else { 0x86 }) | additional;
+    // execTrace always has a material destination (a local temporary even if omitted),
+    // and therefore requests material data with 0x1000 at 0x103e8b28.
+    let flags = (if b_trace_actors { 0xbf } else { 0x86 }) | 0x1000 | additional;
     let (hit_actor, hit_location, hit_normal) =
-        vm.vm_trace_flags(c.this, start, end, flags, extent)?;
+        vm.vm_script_trace(c.this, start, end, flags, extent)?;
+    // FCheckResult is initialized with zero Location/Normal. A miss does not return TraceEnd.
     a[0] = Value::Vector(hit_location);
     a[1] = Value::Vector(hit_normal);
     if a.len() > 6 && !c.omitted(6) {
@@ -2228,12 +2245,13 @@ fn actor_touching_actors(
             )));
         }
     };
-    let items: Vec<Value> = vm
-        .touching_list(c.this)
-        .into_iter()
-        .filter(|id| base.is_none_or(|b| vm.objects[*id as usize].layout.chain.contains(&b)))
-        .map(|i| Value::Object(Some(ObjRef::Instance(i))))
-        .collect();
+    let mut cursor = 0;
+    let mut items = Vec::new();
+    while let Some(actor) = vm.next_touching_actor(c.this, base, &mut cursor) {
+        items.push(Value::Object(Some(ObjRef::Instance(actor))));
+    }
+    // The native-facing snapshot supplies diagnostics/direct callers. Script foreach
+    // installs a live Touching cursor in native_from_tokens and re-reads on every Next.
     Ok(NativeOutcome::Iterate(
         items.into_iter().map(|v| vec![v]).collect(),
     ))
@@ -2280,6 +2298,14 @@ fn play_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Native
     let seq = name(vm, a, 0)?;
     let rate = if c.omitted(1) { 1.0 } else { float(vm, a, 1)? };
     let tween = if c.omitted(2) { 0.0 } else { float(vm, a, 2)? };
+    let requested_channel = if c.omitted(3) { 0 } else { int(vm, a, 3)? };
+    // ValidateAnimChannel accepts 0..=256 (0x103ecbc5); invalid stages log/no-op.
+    if !(0..=256).contains(&requested_channel) {
+        vm.note(TraceKind::Note(format!(
+            "Actor.PlayAnim: invalid channel {requested_channel}; playback unchanged"
+        )));
+        return val(Value::Void);
+    }
     let ch = channel(vm, a, 3, c.omitted(3))?;
     vm.start_animation(c.this, &seq, rate, tween, ch, false)?;
     val(Value::Void)
@@ -2497,15 +2523,10 @@ fn play_firing_sound(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResul
     val(Value::Void)
 }
 
-/// item14 `Pawn.EyePosition`: the eye offset from the pawn `Location` (UE2 applies crouch/view
-/// height; the VM returns `EyeHeight` along +Z, falling back to `BaseEyeHeight`). Needed by
-/// `XIIIWeapon.RealTraceFire`'s trace start.
+/// Engine.dll execEyePosition 0x103b0410 reads only EyeHeight (+0x290).
+/// View-height interpolation belongs to the pawn update, not this getter.
 fn pawn_eye_position(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let h = match vm.get_property(c.this, "EyeHeight") {
-        Some(Value::Float(f)) => *f,
-        _ => vm.f32_prop(c.this, "BaseEyeHeight"),
-    };
-    val(Value::Vector([0.0, 0.0, h]))
+    val(Value::Vector([0.0, 0.0, vm.f32_prop(c.this, "EyeHeight")]))
 }
 
 /// XIDPawn.dll 0x119012b0 returns +0x28c (BaseEyeHeight), not +0x290 (EyeHeight).
@@ -4751,23 +4772,23 @@ fn builtin_defs() -> Vec<NativeDef> {
         },
         NativeDef {
             status: NativeStatus::Partial(
-                "world placement via provider point_free (only when bCollideWorld||bCollideWhenPlacing) and a blocking-actor cylinder encroachment refusal; no FindSpot search; touch updates unconditional (upstream gates them on Level.bBegunPlay)",
+                "decoded static/movable refusal, bJustTeleported and base detach; world placement still uses point_free instead of FindSpot/CheckSlice; CheckEncroachment uses cylinder refusal without retail mesh push/EncroachingOn callbacks; based actors and zone/leaf updates remain incomplete",
             ),
             ..def(
                 "Engine.Actor.SetLocation",
                 "native(267) final function bool SetLocation(vector NewLocation)",
-                "engine.u Actor.SetLocation decoded (NewLocation, bool); UE1/UE2 AActor::SetLocation via CheckLocation plus touch updates (SurrealEngine UActor::SetLocation); Engine.dll ?execSetLocation@AActor",
+                "Engine.dll execSetLocation 0x103e4ad0 calls FarMoveActor 0x1038a440 with test/no-check/attached all false; flags, detach and location stores decoded in item63",
                 actor_set_location,
             )
         },
         NativeDef {
             status: NativeStatus::Partial(
-                "AdditionalTraceType is ORed into actor category flags; actor hits use ray-vs-grown-cylinder; Material out-param is None and DiscardedHitMask 0 (no material/hit-mask model); special world filtering bits remain unmodelled; mover geometry comes from the physics provider",
+                "decoded defaults, 0x1000 material request, zero miss outputs and AdditionalTraceType composition; Material remains None and DiscardedHitMask 0 (provider lacks material/discard data); grown-cylinder extents, special world filtering and skeletal hit-item selection remain incomplete",
             ),
             ..def(
                 "Engine.Actor.Trace",
                 "native(277) final function Actor Trace(out vector HitLocation, out vector HitNormal, vector TraceEnd, optional vector TraceStart, optional bool bTraceActors, optional vector Extent, optional out object<Material> Material, optional int AdditionalTraceType, optional out int DiscardedHitMask)",
-                "engine.u Actor.Trace decoded params; UE1 227 // = Location / = bCollideActors / extent defaults and LevelInfo-for-world-hit (SurrealEngine UActor::Trace / CollisionSystem::TraceFirstHit); Engine.dll ?execTrace@AActor",
+                "Engine.dll execTrace 0x103e88a0..0x103e8c68: initialized FCheckResult, (actors?0xbf:0x86)|0x1000|extra, SingleLineCheck and out stores; skeletal item side effect at 0x103e8bf3",
                 actor_trace,
             )
         },
@@ -4794,17 +4815,12 @@ fn builtin_defs() -> Vec<NativeDef> {
                 actor_set_collision_size,
             )
         },
-        NativeDef {
-            status: NativeStatus::Partial(
-                "iterates the VM-maintained Touching array; XIII's Touching is a dynamic array (decoded ArrayProperty with a template element), unlike UE1/UT's fixed 4-slot engine array",
-            ),
-            ..def(
-                "Engine.Actor.TouchingActors",
-                "native(307) final iterator function TouchingActors(class<Actor> BaseClass, out Actor Actor)",
-                "engine.u Actor.TouchingActors decoded; UE1 227 'returns all actors touching the current actor'; Engine.dll ?execTouchingActors@AActor",
-                actor_touching_actors,
-            )
-        },
+        def(
+            "Engine.Actor.TouchingActors",
+            "native(307) final iterator function TouchingActors(class<Actor> BaseClass, out Actor Actor)",
+            "Engine.dll execTouchingActors 0x103e65d0..0x103e674d: live +0xb4 array cursor, null BaseClass=Actor, null/IsA filtering (no deletion filter), out cleared before each yield/exhaustion; VM foreach preserves mutation semantics",
+            actor_touching_actors,
+        ),
         def(
             "Engine.Pawn.AddPawnToList",
             "native(0) final native function AddPawnToList()",
@@ -4878,7 +4894,7 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "authored rate multiplier, last-frame completion, frozen-source tween and CPU channel sampling; velocity-dependent negative rates, automatic TweenTime and callback reentrancy remain unimplemented",
+                "decoded nonloop negative-rate no-op, explicit zero hold, empty-sequence no-op, zero-frame refusal and invalid-channel no-op; positive authored rate and last-frame completion supported; valid channel 256 exceeds VM u8 channel storage; automatic TweenTime=-1 cache/velocity branches, one-frame tween state, vertex-mesh playback and callback reentrancy remain incomplete",
         ),
         ..def(
             "Engine.Actor.PlayAnim",
@@ -5570,20 +5586,14 @@ fn builtin_defs() -> Vec<NativeDef> {
             ia_controller_set_enemy,
         )
     });
-    v.push(NativeDef {
-        status: NativeStatus::Partial(
-            "returns EyeHeight/BaseEyeHeight along +Z; crouch and view-height interpolation are \
-             not modelled",
-        ),
-        ..def(
-            "Engine.Pawn.EyePosition",
-            "native(0) native function Vector EyePosition()",
-            "engine.u Pawn.EyePosition decoded (return Vector, native); XIIIPawn overrides it; \
+    v.push(def(
+        "Engine.Pawn.EyePosition",
+        "native(0) native function Vector EyePosition()",
+        "engine.u Pawn.EyePosition decoded (return Vector, native); XIIIPawn overrides it; \
              XIIIWeapon.RealTraceFire adds it to Instigator.Location for the trace start; \
-             Engine.dll ?execEyePosition@APawn",
-            pawn_eye_position,
-        )
-    });
+              Engine.dll execEyePosition 0x103b0410..0x103b0492 reads EyeHeight +0x290 only",
+        pawn_eye_position,
+    ));
     v.push(def(
         "Engine.Pawn.GetViewRotation",
         "native(0) simulated native function Rotator GetViewRotation()",
