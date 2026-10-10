@@ -1,15 +1,23 @@
 # item30: Plage01 route, walked end to end. No teleport commands. Segments A-D are the measured
 # walks from local/reports/item30-plage01-walk.md (hut, beach nav walk incl. the running jump
-# over the crate wall, TouchTrigger8/7 + killer, truck return legs + Porte1).
+# over the crate wall, TouchTrigger7 + killer, truck return legs + Porte1).
 #
-# No weapon is granted by default in the current walked route: the player fights with the
-# level's own picked-up Beretta. NOTE (item30c spec task 1): the spec asks this fixture to keep
-# the `weapon XIII.m60` grant (the Beretta ammo mis-wiring was the original reason). The grant is
-# restored below (t=51.30): the game's own `Weapon.GiveTo`/`ChangedWeapon` path, measured working
-# (rapid fire, 45/hit contact). It is kept because the merged origin/main tree made the beach
-# soldiers lethal (IAController.Init `Pawn.Health *= 5` -> 750 hp, XIDPawn Landed flip) and the
-# route-survival arithmetic is still being re-measured (report round 7): the m60 is the only
-# weapon with the belt depth to matter.
+# The `weapon XIII.m60` grant stays (t=51.30, the game's own `Weapon.GiveTo`/`ChangedWeapon`
+# path). NOTE (item30c round 8, measured): with the item61 anti-tamper gate the beach soldiers
+# are at their authored strength (150 hp) and ACTIVE from their landing, so the walk fights the
+# soldiers it meets instead of tanking them. Measured damage sources (r8 probe runs, report
+# round 8): `BaseSoldier` stands 9 UU off the hut exit (fires from ~72 s); `BaseSoldier7`
+# charges into the crate-wall crossing (~3.6 hp/s there; both first round-8 walk runs died at
+# ~200 s exactly there); `BaseSoldier4` hunts along the shore to the crates and fires on the
+# crossing; `BaseSoldier8` (the heli magnum sniper) walks to the (-5902,-10424) legs and dealt
+# ~45 hp there. Each is killed with the granted m60 (contact 45/hit) at its measured arrival,
+# fitted inside the schedule's existing wait windows. Truck-shore soldiers BaseSoldier9/10
+# are killed before the killer fight below.
+#
+# Round 8 uses the truck-shore stand after T7 rather than the old T8 scene and distant chase.
+# The killer hunts the player's shore position and settles at the water's edge. The route
+# fights him there, walks onto his corpse for the game's own auto-search, then follows the
+# return legs to Porte1. switch_weapon 2 requests the picked-up Beretta before the killer fight.
 #
 # The killer (BaseSoldier6) walks while attacking, so the view is tracked onto it around the
 # firing (`track BaseSoldier6` / `track off`).
@@ -47,6 +55,17 @@ t=71.80 forward 1
 t=73.30 forward 0
 # TouchTrigger9 (-307,-1396) on the way down; objective 0 completes in the game's own chain.
 t=73.50 goto -307.0 -1400.0
+# Hut-exit soldier kill (round 8, measured): BaseSoldier stands at (-299,-1408) - the player
+# touches TouchTrigger9 9 UU from him at ~74.5 s. The m60 kills him here inside the schedule's
+# existing wait window (the next leg fires at 77.7), so no later leg shifts.
+t=74.60 track BaseSoldier
+t=74.70 fire
+t=75.10 fire
+t=75.50 fire
+t=75.90 fire
+t=76.30 fire
+t=76.70 fire
+t=76.90 track off
 
 # ---- beach: nav polyline southwest to the truck shore ------------------------------------
 # Waypoints are the map's decoded ReachSpec polyline. The distance/150 + 2 s per goto is a
@@ -84,9 +103,46 @@ t=184.50 jump
 t=185.30 jump
 t=186.10 jump
 t=189.70 goto -4319.9 -9475.7
-t=194.20 goto -4630.0 -9531.7
+# Crate-wall ambush kill (round 8, measured): BaseSoldier7 charges into the crossing (his fire
+# measured ~3.6 hp/s; both first round-8 walk runs died at ~200 s exactly here) - the player
+# stands at (-4319,-9475) in the schedule's wait window and bursts him with the m60 (contact
+# 45/hit; he dies on the 4th hit, ~191.6).
+t=190.20 track BaseSoldier7
+t=190.40 fire
+t=190.80 fire
+t=191.20 fire
+t=191.60 fire
+t=192.00 track off
+# BaseSoldier4 hunted along the shore from the east and parks 300-600 UU north-east of the
+# crossing; burst him from the same stand - before walking past BaseSoldier7's corpse, which
+# sits directly on the firing line afterwards (measured: the post-leg burst hit the corpse).
+t=192.10 track BaseSoldier4
+t=192.20 fire
+t=192.60 fire
+t=193.00 fire
+t=193.40 fire
+t=193.80 fire
+t=194.20 fire
+t=194.60 fire
+t=195.00 fire
+t=195.10 track off
+t=195.30 goto -4630.0 -9531.7
 t=202.70 goto -5568.0 -9793.0
 t=209.50 goto -5902.0 -10424.5
+# BS8 kill (round 8, measured): the heli magnum sniper drops at (-6139,-13860) at ~193 s,
+# walks the shore and hovers around (-5902,-10424) - 150-250 UU off this leg. Walking past him
+# unharmed measured ~45 hp of magnum fire (the first round-8 route run), so the player bursts
+# him here at contact range.
+t=210.60 track BaseSoldier8
+t=210.80 fire
+t=211.20 fire
+t=211.60 fire
+t=212.00 fire
+t=212.40 fire
+t=212.80 fire
+t=213.20 fire
+t=213.60 fire
+t=213.70 track off
 t=213.20 goto -5839.7 -10664.2
 t=217.80 goto -5738.4 -11048.0
 t=223.20 goto -5445.3 -11461.0
@@ -101,125 +157,86 @@ t=271.20 goto -1191.2 -13523.4
 t=278.90 goto -366.7 -13757.3
 t=288.20 goto 643.2 -14174.5
 
+
 # fight-probe cut: the opt-in fight tests (plage01_killer_awake_prefix) take the route only up
 # to this line. The T7 shore touch above (~289.6 s) has woken BaseSoldier6 out of his
-# IAController `faction` stasis and sent him to the parking wall; everything after this line is
-# the walked back route, chase and stake-out fight.
+# IAController `faction` stasis; he then hunts the player's position and stops at the water's
+# edge ~730 UU short of the truck shore (measured round 8, scratch r8_e1/r8_e2). Everything
+# after this line is the truck-shore stand-and-fight, the corpse search and the truck ending.
 
-# ---- back route: TouchTrigger8 (passe_par_arriere) walked up the back-route nav points ----
-t=296.10 goto 1282.8 -13568.0
-t=303.20 goto 770.5 -12990.7
-t=309.50 goto 1282.4 -12591.3
-# T8 is touched at ~310.5 s; its killer-scene chain holds the player controller ~13 s, so the
-# killer approach starts after the handback. TouchTrigger7 (tueur_conducteur, r850 at
-# 1093,-13854) fires earlier on the shore walk (~289.6 s) - that is the game's own chain.
-
-# ---- the killer: the walked T7 shore touch (~289.6 s) sends the killer to the parking wall;
-# he parks at ~(1771,-13026) (measured with track, scratch item30c_e3/e5/e6). The north firing
-# pose and a 372 UU southern spot deal zero damage (the wall blocks; measured), so the player
-# walks down the proven nav legs after the T8 handback (~13 s scene hold) and fights from
-# (1771,-13200), 174 UU south of him. The killer walks while attacking, so the view is tracked
-# onto it. `switch_weapon 2` re-selects the picked-up Beretta (decoded InventoryGroup 2) through
-# the game's own `PlayerController.SwitchWeapon` exec: the scripted T8 scene had left `Fists`
-# selected (measured: without it the fires were fist swings - weapon Fists3, bone None).
-t=326.00 switch_weapon 2
-# ---- the chase (measured on the merged tree, scratch item30c_e18/e19): the killer leaves his
-# post at ~333 and walks the map's own nav path (FindBestPathTo chain, MoveTarget samples)
-# AttackPoint47 -> PathNode48 -> PathNode47 -> PathNode51 -> PathNode10 -> PathNode44 ->
-# PathNode12 -> TeleportCheat1 -> PathNode41 -> PathNode43 -> PathNode39 -> PathNode17 ->
-# PathNode37 -> AttackPoint14 -> PathNode36 -> AttackPoint26, parking at (-5582,-9821) from
-# ~370 s. The player follows the same walkable legs (the parking wall blocks a direct
-# southbound line - the shots hit it 40 UU out, scratch item30c_e21b) and fights him at his
-# stake-out: the Beretta's damage (c9mmAmmo.ProcessTraceHit 0x0039, decoded) decays with
-# VSize(HitLocation - W.Location) and is zero beyond ~73 UU, so the kill happens at contact
-# distance where the pawn cylinders overlap. `switch_weapon 2` re-selects the picked-up Beretta
-# (decoded InventoryGroup 2): the scripted T8 scene had left `Fists` selected. The game's own
-# switch is the `SwitchWeapon` exec whose state machine walks PutDown -> DownWeapon -> AnimEnd ->
-# Pawn.ChangedWeapon (measured by item44's test on the same pickup); `BringUp` alone is the
-# engine's own no-op shadow (Weapon.Active.BringUp decodes to `bRendered = true; return`).
-t=333.00 goto 770.5 -12990.7
-t=342.00 goto 1282.8 -13568.0
-t=351.00 goto 643.2 -14174.5
-t=361.00 goto -366.7 -13757.3
-t=369.00 goto -1191.2 -13523.4
-t=378.00 goto -2029.2 -13286.1
-t=388.00 goto -2941.9 -12662.5
-t=396.00 goto -3602.7 -12453.4
-t=402.00 goto -4011.9 -12352.8
-t=409.00 goto -4557.0 -12080.8
-t=416.00 goto -5103.0 -11821.9
-t=424.00 goto -5445.3 -11461.0
-t=431.00 goto -5738.4 -11048.0
-t=437.00 goto -5839.7 -10664.2
-t=442.00 goto -5902.0 -10424.5
-# Stand-off ~59 UU from the parked killer (-5582.3,-9821.0, measured e11/e12): inside his
-# r=34 collision cylinder a downward ray exits through the floor before leaving the cylinder
-# and some shots hit the ground instead of him (scratch item30c_e35).
-t=446.00 goto -5568.0 -9793.0
-t=450.00 goto -5540.0 -9780.0
-t=450.50 track BaseSoldier6
-# The full 26-round Beretta burst at contact distance (the killer sits at his stake-out,
-# Enemy=None; the hearing range does not reach - measured: he stayed put through a 60-shot
-# barrage from 5 km, e17). The armour absorbs the first ~8 rounds (item30c_e22).
-t=456.00 fire
-t=456.55 fire
-t=457.10 fire
-t=457.65 fire
-t=458.20 fire
-t=458.75 fire
-t=459.30 fire
-t=459.85 fire
-t=460.40 fire
-t=460.95 fire
-t=461.50 fire
-t=462.05 fire
-t=462.60 fire
-t=463.15 fire
-t=463.70 fire
-t=464.25 fire
-t=464.80 fire
-t=465.35 fire
-t=465.90 fire
-t=466.45 fire
-t=467.00 fire
-t=467.55 fire
-t=468.10 fire
-t=468.65 fire
-t=469.20 fire
-# The last round empties the weapon (the clip and the reserve). The kill itself lands on fire
-# 25 (measured item30c_e39); the shore soldiers woken by the gunfire (item41c hearing) close in
-# - they chase along the nav path and their crossfire killed the player in scratch e24.
-t=469.75 fire
-# The corpse search is the game's own auto-search: the corpse's `XIIIPawn.Dying.Timer` sets
-# `bSearchable` on its first tick, and the player pawn's own `XIIIPlayerPawn.Tick` auto-search
-# (0x017B..0x024F: `bAutoPickup` -> `SearchPawn(XP)` -> `Inventory.Transfer` -> `AddInventory`)
-# drains it as soon as the player's cylinder overlaps the dead pawn's (`Touching`). The corpse
-# sits at the killer's stake-out (-5582,-9821), 59 UU from the firing spot, so the player walks
-# onto it (the truck key is then carried into the return legs below).
-t=470.60 goto -5570.0 -9805.0
-
-# ---- Segment D: the walked return along the same nav legs (stake-out -> PathNode36 ->
-# AttackPoint14 -> ... -> PathNode48 -> PathNode47 -> PathNode18 -> AttackPoint43), then the
-# truck staging point ----------------------------------------------------------------------------
-t=479.00 goto -5902.0 -10424.5
-t=472.00 goto -5839.7 -10664.2
-t=476.00 goto -5738.4 -11048.0
-t=482.00 goto -5445.3 -11461.0
-t=489.00 goto -5103.0 -11821.9
-t=495.00 goto -4557.0 -12080.8
-t=501.00 goto -4011.9 -12352.8
-t=505.00 goto -3602.7 -12453.4
-t=511.00 goto -2941.9 -12662.5
-t=520.00 goto -2029.2 -13286.1
-t=528.00 goto -1191.2 -13523.4
-t=536.00 goto -366.7 -13757.3
-t=545.00 goto 643.2 -14174.5
-t=553.00 goto 1235.0 -14319.0
-t=559.00 goto 1391.8 -14279.6
-t=562.00 goto 1215.0 -14000.0
-# Porte1 is interaction-hidden, so the named use is required; two uses (Unlocked + Triggered).
-t=567.00 yaw 270.0
-t=567.10 use Porte1
-t=568.10 use Porte1
-t=568.60 wait_travel
-t=570.60 forward 0
+# ---- truck-shore stand: BaseSoldier9 (-163,-13066, 110 hp) holds LOS on the whole parking and
+# shore area; BaseSoldier10 (patrolling (470,-16267)..(-154,-15758), 150 hp) reaches the shore
+# too. Both must die before anything else or they pin the player wherever he stands (measured
+# round 8: -12/10 s each). The hut-granted m60 (switch_weapon 16, its decoded InventoryGroup)
+# reaches them with `track` aim at 1540/2750 UU, 45 hp/hit, every fired round landing (measured
+# r8_e2). The fires start as the player arrives at PathNode47 (the goto above lands ~291).
+t=291.10 track BaseSoldier9
+t=291.30 switch_weapon 16
+t=291.60 fire
+t=292.15 fire
+t=292.70 fire
+t=293.25 fire
+t=293.80 fire
+t=294.35 fire
+t=294.90 fire
+t=295.45 fire
+t=296.00 fire
+t=296.10 track off
+t=296.40 track BaseSoldier10
+t=296.70 fire
+t=297.25 fire
+t=297.80 fire
+t=298.35 fire
+t=298.90 fire
+t=299.45 fire
+t=300.00 fire
+t=300.55 fire
+t=301.10 fire
+t=301.65 fire
+t=302.20 fire
+t=302.30 track off
+# ---- the killer: he settles at the water's edge ~(1100,-13750) from ~300 s (r8_e2) and stays
+# there while the player holds the shore. switch_weapon 2 requests the picked-up Beretta
+# (InventoryGroup 2) before the burst; the checkpoint acceptance also checks its selection
+# after the corpse search. The firing window below is measured to kill his authored 125 hp.
+t=302.60 track BaseSoldier6
+t=302.90 switch_weapon 2
+t=303.30 fire
+t=303.85 fire
+t=304.40 fire
+t=304.95 fire
+t=305.50 fire
+t=306.05 fire
+t=306.60 fire
+t=307.15 fire
+t=307.70 fire
+t=308.25 fire
+t=308.80 fire
+t=309.35 fire
+t=309.90 fire
+t=310.45 fire
+t=311.00 fire
+t=311.10 track off
+# ---- corpse walk: the game's own XIIIPlayerPawn.Tick auto-search drains the killer's chain
+# (the truck key) as the player walks over him (measured r8_e2: Touch BaseSoldier6 at ~309,
+# then `use Porte1: Unlocked`). The corpse sits ~(1100..1175,-13680..-13750) depending on his
+# exact hover; the goto aims the middle of that area.
+t=311.50 goto 1170.0 -13700.0
+# Measured: the pre-save run left the M60 selected. Re-select the Beretta through the game's
+# normal switch after the auto-search, preserving the checkpoint's expected selection.
+t=315.00 switch_weapon 2
+# ---- return along the measured back-route legs (r8_e2 walked these exact lines): Porte2
+# opens on approach, the T8 detour is unnecessary with the killer dead (measured: the travel
+# chain is the key + Porte1 only). The shore squad was killed before the killer fight.
+t=318.00 goto 1227.0 -12624.0
+t=325.00 goto 1294.0 -12566.0
+t=327.00 goto 1282.0 -13568.0
+t=334.00 goto 643.0 -14174.0
+t=341.00 goto 1215.0 -14000.0
+# ---- truck ending: Porte1 (the pick-up truck's door) unlocks through the corpse-searched key
+# and triggers the level-end cinematic; PlayerTick then turns it into the ServerTravel to
+# banque01 (the final fixture uses Porte1 at t=345-346; measure travel in the route test).
+t=345.00 yaw 270.0
+t=345.10 use Porte1
+t=346.10 use Porte1
+t=347.00 wait_travel

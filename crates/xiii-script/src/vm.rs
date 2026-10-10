@@ -1091,13 +1091,6 @@ const PHYS_PROJECTILE: u8 = 6;
 /// ends a `PHYS_Falling` fall (`Landed` -> `PHYS_Walking`) and zeroes the contact velocity.
 const FLOOR_NORMAL_Z: f32 = 0.7;
 
-fn cine_trace_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("XIII_CINE_TRACE").is_some_and(|v| v != "0" && !v.is_empty())
-    })
-}
-
 /// An interpreter object.
 #[derive(Debug)]
 pub struct Instance {
@@ -3475,39 +3468,6 @@ impl<'s> Vm<'s> {
 
     /// Writes a property by name and element.
     pub fn set_property(&mut self, id: ObjectId, name: &str, elem: usize, v: Value) -> bool {
-        if std::env::var_os("XIII_PROBE_PAWNS").is_some()
-            && self
-                .objects
-                .get(id as usize)
-                .is_some_and(|o| o.is_actor && o.layout.chain_names.iter().any(|c| c == "xiiipawn"))
-            && name.eq_ignore_ascii_case("health")
-        {
-            let writer = self.stack.last().map_or("<host>", |s| s.function.as_str());
-            eprintln!(
-                "[vm-npchealth] t={:.3} pawn={} writer={} value={}",
-                self.time,
-                self.objects[id as usize].name,
-                writer,
-                self.value_text(&v)
-            );
-        }
-        if std::env::var_os("XIII_WATCH_PLAYER_HEALTH").is_some()
-            && self.objects.get(id as usize).is_some_and(|o| {
-                o.is_actor && o.layout.chain_names.iter().any(|c| c == "xiiiplayerpawn")
-            })
-            && name.eq_ignore_ascii_case("health")
-        {
-            let writer = self.stack.last().map_or("<host>", |s| s.function.as_str());
-            let offset = self.stack.last().map_or(0, |s| s.offset);
-            eprintln!(
-                "[vm-health-write] t={:.6} pawn={} writer={} offset=0x{:04X} value={}",
-                self.time,
-                self.objects[id as usize].name,
-                writer,
-                offset,
-                self.value_text(&v)
-            );
-        }
         let Some(o) = self.objects.get_mut(id as usize) else {
             return false;
         };
@@ -3842,27 +3802,6 @@ impl<'s> Vm<'s> {
             return Ok(None);
         };
         let texts: Vec<String> = args.iter().map(|a| self.value_text(a)).collect();
-        // TEMPORARY scratch probe (XIII_PROBE_PAWNS): attribute player TakeDamage.
-        if std::env::var_os("XIII_PROBE_PAWNS").is_some()
-            && event.eq_ignore_ascii_case("TakeDamage")
-            && self.is_a(id, "XIIIPlayerPawn")
-        {
-            let instigator = match args.get(3) {
-                Some(Value::Object(Some(crate::value::ObjRef::Instance(i)))) => self
-                    .objects
-                    .get(*i as usize)
-                    .map(|x| x.name.clone())
-                    .unwrap_or("?".into()),
-                _ => "none".into(),
-            };
-            eprintln!(
-                "[vm-dmg] t={:.3} target={} instigator={} args={}",
-                self.time,
-                self.objects[id as usize].name,
-                instigator,
-                texts.join(", ")
-            );
-        }
         self.note(TraceKind::Event {
             target: actor,
             function: self.short_path(f),
@@ -4025,128 +3964,7 @@ impl<'s> Vm<'s> {
         }
         self.dispatch_player_ticks(dt)?;
         self.detect_server_travel();
-        self.probe_pawns();
         Ok(())
-    }
-
-    /// TEMPORARY scratch probe (XIII_PROBE_PAWNS): pawn states once a second. Removed before
-    /// finishing.
-    fn probe_pawns(&self) {
-        if std::env::var_os("XIII_PROBE_PAWNS").is_none() || !self.tick_count.is_multiple_of(60) {
-            return;
-        }
-        for id in 0..self.objects.len() as ObjectId {
-            let o = &self.objects[id as usize];
-            if !o.is_actor || o.name.starts_with("Default__") {
-                continue;
-            }
-            let class = self.set.path(o.class).to_ascii_lowercase();
-            if class.contains("pick") || class.contains("clip") || class.contains("ammobox") {
-                let loc = self
-                    .vector_prop(id, "Location")
-                    .map(|l| format!("({:.0},{:.0},{:.0})", l[0], l[1], l[2]))
-                    .unwrap_or("?".into());
-                let flags: Vec<String> = ["bCollideActors", "bBlockActors"]
-                    .into_iter()
-                    .map(|n| format!("{n}={}", self.bool_prop(id, n)))
-                    .collect();
-                let cr = self
-                    .get_property(id, "CollisionRadius")
-                    .map(|v| format!("{v:?}"))
-                    .unwrap_or_default();
-                let ch = self
-                    .get_property(id, "CollisionHeight")
-                    .map(|v| format!("{v:?}"))
-                    .unwrap_or_default();
-                let st = self
-                    .get_property(id, "bPickable")
-                    .map(|v| format!("bPickable={v:?}"))
-                    .unwrap_or_default();
-                eprintln!(
-                    "[vm-pickup] {} class={} loc={} cr={cr} ch={ch} {st} {}",
-                    o.name,
-                    class,
-                    loc,
-                    flags.join(" ")
-                );
-                if o.name == "MedPick0" || o.name == "FullMedPick0" {
-                    let player = (0..self.objects.len() as ObjectId).find(|i| {
-                        self.objects[*i as usize].is_actor
-                            && !self.objects[*i as usize].deleted
-                            && self.is_a(*i, "XIIIPlayerPawn")
-                    });
-                    if let Some(player) = player {
-                        let overlap = self.actors_overlap(player, id);
-                        let pcollides = self.collides(player);
-                        let (pl, pr, ph) = self.actor_cylinder(player);
-                        let (ml, mr, mh) = self.actor_cylinder(id);
-                        let touching = self.touching_list(player);
-                        let touch_names: Vec<String> = touching
-                            .iter()
-                            .map(|t| self.objects[*t as usize].name.clone())
-                            .collect();
-                        eprintln!(
-                            "[vm-pickup-dbg] player_overlap={overlap} pcollides={pcollides} player=({:.0},{:.0},{:.0}) r={pr} h={ph} med=({:.0},{:.0},{:.0}) r={mr} h={mh} player_touching={touch_names:?}",
-                            pl[0], pl[1], pl[2], ml[0], ml[1], ml[2]
-                        );
-                    }
-                }
-            }
-        }
-        for id in 0..self.objects.len() as ObjectId {
-            let o = &self.objects[id as usize];
-            if !o.active || !o.is_actor || !self.is_a(id, "Pawn") {
-                continue;
-            }
-            let mut items = Vec::new();
-            let mut cur = self.obj_prop(id, "Inventory");
-            let mut guard = 0;
-            while let Some(iid) = cur {
-                guard += 1;
-                if guard > 20 {
-                    break;
-                }
-                let ic = self.set.path(self.objects[iid as usize].class);
-                let amt = match self.get_property(iid, "AmmoAmount") {
-                    Some(Value::Int(a)) => format!(" {a}"),
-                    _ => String::new(),
-                };
-                items.push(format!("{}({})", ic, amt));
-                cur = self.obj_prop(iid, "Inventory");
-            }
-            if !items.is_empty() {
-                eprintln!(
-                    "[vm-inv] t={:.0} {} inventory={}",
-                    self.time,
-                    o.name,
-                    items.join(" -> ")
-                );
-            }
-        }
-        for id in 0..self.objects.len() as ObjectId {
-            let o = &self.objects[id as usize];
-            if !o.active || !o.is_actor || !self.is_a(id, "Pawn") {
-                continue;
-            }
-            let loc = self
-                .vector_prop(id, "Location")
-                .map(|l| format!("({:.0},{:.0},{:.0})", l[0], l[1], l[2]))
-                .unwrap_or("?".into());
-            let phys = self.byte_prop(id, "Physics").to_string();
-            let hp = match self.get_property(id, "Health") {
-                Some(Value::Int(h)) => format!("{h}"),
-                Some(Value::Float(h)) => format!("{h:.0}"),
-                _ => "?".into(),
-            };
-            let enemy = match self.obj_prop(id, "Enemy") {
-                Some(e) => self.objects[e as usize].name.clone(),
-                None => "None".into(),
-            };
-            eprintln!(
-                "[vm-probe] t={:.3} pawn={} loc={} phys={} hp={} enemy={}",
-                self.time, o.name, loc, phys, hp, enemy
-            );
-        }
     }
 
     /// Reports a level-travel request when the script called `LevelInfo.ServerTravel` and the
@@ -4312,7 +4130,6 @@ impl<'s> Vm<'s> {
             self.profile.player_tick_dispatch_micros += t0.elapsed().as_micros() as u64;
         }
         self.detect_server_travel();
-        self.probe_pawns();
         errors
     }
 
@@ -4359,12 +4176,6 @@ impl<'s> Vm<'s> {
     /// `XIIIBaseHud.Tick`, pawn controllers) never runs. `Tick` is looked up in the actor's
     /// current state first, then the class chain.
     fn dispatch_tick(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
-        let trace_cine = cine_trace_enabled() && self.is_a(id, "CineController2");
-        let action_before =
-            trace_cine.then(|| match self.get_property(id, "ScriptedActionIndex") {
-                Some(Value::Int(index)) => Some(*index),
-                _ => None,
-            });
         let f = self.tick_function(id);
         if let Some(f) = f {
             let t0 = self.profile.enabled.then(Instant::now);
@@ -4373,18 +4184,6 @@ impl<'s> Vm<'s> {
                 let key = self.tick_fn_key(id);
                 *self.profile.tick_fns.entry(key).or_default() += t0.elapsed().as_micros() as u64;
             }
-        }
-        if trace_cine {
-            let action_after = match self.get_property(id, "ScriptedActionIndex") {
-                Some(Value::Int(index)) => Some(*index),
-                _ => None,
-            };
-            let phase = if action_before.flatten() != action_after {
-                "advance"
-            } else {
-                "blocked/current"
-            };
-            self.trace_cinematic_controller(id, phase);
         }
         Ok(())
     }
@@ -4489,153 +4288,6 @@ impl<'s> Vm<'s> {
         }
     }
 
-    /// Temporary, opt-in diagnostic for the authored XIDCine action interpreter. Kept in the VM
-    /// so it observes the same actor state and decoded action table that `Interpret` consumes.
-    fn trace_cinematic_controller(&self, id: ObjectId, phase: &str) {
-        let obj = &self.objects[id as usize];
-        let action_index = match self.get_property(id, "ScriptedActionIndex") {
-            Some(Value::Int(i)) => *i,
-            _ => -1,
-        };
-        // CineController2 increments ScriptedActionIndex after Interpret. The preceding entry is
-        // the action just executed and, while paused, the action whose wait bit is still set.
-        let pawn = self.obj_prop(id, "MyPawn");
-        let controlled_pawn = self.obj_prop(id, "Pawn");
-        let tab = pawn.and_then(|p| match self.get_property(p, "CurrentTabActionIndex") {
-            Some(Value::Int(i)) => Some(*i),
-            _ => None,
-        });
-        let list = pawn.and_then(|p| {
-            let name = match tab.unwrap_or(0) {
-                2 => "tabActions2",
-                3 => "tabActions3",
-                _ => "tabActions",
-            };
-            match self.get_property(p, name) {
-                Some(Value::Array(items)) => Some(items),
-                _ => None,
-            }
-        });
-        let selected = action_index.saturating_sub(1);
-        let action = list
-            .and_then(|items| usize::try_from(selected).ok().and_then(|i| items.get(i)))
-            .map_or_else(
-                || "<action unavailable>".to_owned(),
-                |v| match v {
-                    Value::Str(s) | Value::Name(s) => s.clone(),
-                    _ => format!("{v}"),
-                },
-            );
-        let state = self.state_name(id).unwrap_or_else(|| "<no state>".into());
-        let flags = match self.get_property(id, "flagsPaused") {
-            Some(Value::Int(v)) => *v,
-            _ => 0,
-        };
-        let mut waits = Vec::new();
-        for (mask, label) in [
-            (1, "player"),
-            (2, "event"),
-            (4, "warning"),
-            (8, "speech/dial"),
-            (16, "move/sequence"),
-            (32, "see-player"),
-            (64, "seen-by-player"),
-            (128, "time"),
-            (256, "animation"),
-            (512, "not-seen-by-player"),
-            (1024, "player-away"),
-            (2048, "cadaver"),
-        ] {
-            if flags & mask != 0 {
-                waits.push(label.to_owned());
-            }
-        }
-        if flags & 2 != 0 {
-            waits.push(format!(
-                "event-name={}",
-                self.get_property(id, "Tag")
-                    .map_or_else(|| "<none>".into(), |v| format!("{v}"))
-            ));
-        }
-        if flags & 4 != 0 {
-            waits.push(format!(
-                "WarnMemory={:?} warning-jump={:?}",
-                self.get_property(id, "WarnMemory"),
-                self.get_property_elem(id, "nOnJump", 2)
-            ));
-        }
-        if flags & 16 != 0 {
-            waits.push(format!("bMoving={:?}", self.get_property(id, "bMoving")));
-        }
-        if flags & 256 != 0 {
-            waits.push(format!(
-                "bAnimOnce={:?} bSubAnim={:?}",
-                self.get_property(id, "bAnimOnce"),
-                self.get_property(id, "bSubAnim")
-            ));
-        }
-        if let Some(pawn) = pawn {
-            let location = self.vector_prop(pawn, "Location");
-            waits.push(format!("pawn-location={location:?}"));
-            for property in ["Target", "NextTarget"] {
-                if let Some(target) = self.obj_prop(id, property) {
-                    let target_name = self.objects[target as usize].name.clone();
-                    let target_location = self.vector_prop(target, "Location");
-                    let distance = location.zip(target_location).map(|(from, to)| {
-                        let delta = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
-                        (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt()
-                    });
-                    waits.push(format!(
-                        "{property}={target_name}@{target_location:?} distance={distance:?}"
-                    ));
-                }
-            }
-            for (&channel, animation) in &self.objects[pawn as usize].anim.channels {
-                if animation.active {
-                    waits.push(format!(
-                        "channel{channel}={} frame={:.3}/{},rate={:.3}fps,loop={}",
-                        animation.sequence,
-                        animation.frame,
-                        animation.frames,
-                        animation.rate,
-                        animation.looping
-                    ));
-                }
-            }
-        }
-        if let Some(code) = obj.state_code.as_ref()
-            && let Some(latent) = &code.latent
-        {
-            waits.push(format!("latent={latent:?}"));
-        }
-        println!(
-            "[cine-trace] t={:.3}s tick={} phase={} actor={} pawn={} mypawn={} state={} label/tag={} action[{}]={:?} flagsPaused=0x{:X} wait={}",
-            self.time,
-            self.tick_count,
-            phase,
-            obj.name,
-            controlled_pawn.map_or_else(
-                || "<none>".into(),
-                |p| self.objects[p as usize].name.clone()
-            ),
-            pawn.map_or_else(
-                || "<none>".into(),
-                |p| self.objects[p as usize].name.clone()
-            ),
-            state,
-            self.get_property(id, "Tag")
-                .map_or_else(|| "<none>".into(), |v| format!("{v}")),
-            selected,
-            action,
-            flags,
-            if waits.is_empty() {
-                "<none>".into()
-            } else {
-                waits.join(",")
-            }
-        );
-    }
-
     /// item18: per-frame `PlayerTick` dispatch to the local player controllers, after the actor
     /// `Tick` pass (UE2 `ULevel::Tick` order; [`Self::tick`] calls this at the same point).
     ///
@@ -4700,8 +4352,6 @@ impl<'s> Vm<'s> {
     /// Suspends the actor that should stop after a failing tick: the innermost object on the
     /// error stack when it can be resolved, otherwise the actor being ticked. Returns the id.
     fn suspend_for_error(&mut self, ticked: ObjectId, e: &VmError) -> ObjectId {
-        #[cfg(test)]
-        eprintln!("[item47 temporary suspension diagnostic] {e}");
         let id = e
             .stack
             .last()
@@ -5093,27 +4743,6 @@ impl<'s> Vm<'s> {
         this: ObjectId,
         args: Vec<Value>,
     ) -> VmResult<Value> {
-        // TEMPORARY scratch probe (XIII_PROBE_PAWNS): attribute player TakeDamage.
-        if std::env::var_os("XIII_PROBE_PAWNS").is_some() && self.is_a(this, "XIIIPlayerPawn") {
-            let path = self.set.path(func);
-            if path.ends_with("TakeDamage") {
-                let texts: Vec<String> = args.iter().map(|a| self.value_text(a)).collect();
-                let instigator = match args.get(1) {
-                    Some(Value::Object(Some(crate::value::ObjRef::Instance(i)))) => self
-                        .objects
-                        .get(*i as usize)
-                        .map(|x| x.name.clone())
-                        .unwrap_or("?".into()),
-                    _ => "none".into(),
-                };
-                eprintln!(
-                    "[vm-dmg] t={:.3} instigator={} args={}",
-                    self.time,
-                    instigator,
-                    texts.join(", ")
-                );
-            }
-        }
         let set = self.set;
         let Some(ScriptObject::Function(f)) = set.object(func) else {
             return Err(self.err(VmErrorKind::Unresolved {
@@ -5156,40 +4785,6 @@ impl<'s> Vm<'s> {
         layout: Rc<FuncLayout>,
     ) -> VmResult<(Value, Vec<Value>)> {
         let set = self.set;
-        // TEMPORARY scratch probe (XIII_PROBE_PAWNS): attribute player TakeDamage.
-        if std::env::var_os("XIII_PROBE_PAWNS").is_some()
-            && set.path(func).ends_with("TakeDamage")
-            && !self.is_a(this, "XIIIPlayerPawn")
-            && self.is_a(this, "Pawn")
-        {
-            let texts: Vec<String> = locals.iter().map(|a| self.value_text(a)).collect();
-            eprintln!(
-                "[vm-npcdmg] t={:.3} target={} locals={}",
-                self.time,
-                self.objects[this as usize].name,
-                texts.join(", ")
-            );
-        }
-        if std::env::var_os("XIII_PROBE_PAWNS").is_some()
-            && set.path(func).ends_with("TakeDamage")
-            && self.is_a(this, "XIIIPlayerPawn")
-        {
-            let texts: Vec<String> = locals.iter().map(|a| self.value_text(a)).collect();
-            let instigator = match locals.get(1) {
-                Some(Value::Object(Some(crate::value::ObjRef::Instance(i)))) => self
-                    .objects
-                    .get(*i as usize)
-                    .map(|x| x.name.clone())
-                    .unwrap_or("?".into()),
-                _ => "none".into(),
-            };
-            eprintln!(
-                "[vm-dmg] t={:.3} instigator={} locals={}",
-                self.time,
-                instigator,
-                texts.join(", ")
-            );
-        }
         if self.stack.len() >= self.limits.max_call_depth {
             return Err(self.err(VmErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
@@ -6940,47 +6535,6 @@ impl<'s> Vm<'s> {
                 let len = self.objects[*o as usize].props.len();
                 if *i >= len {
                     return Err(self.err(VmErrorKind::Other("bad slot".into())));
-                }
-                if std::env::var_os("XIII_WATCH_PLAYER_HEALTH").is_some()
-                    && self.objects[*o as usize].is_actor
-                    && self.is_a(*o, "XIIIPlayerPawn")
-                    && self.objects[*o as usize]
-                        .layout
-                        .slots
-                        .iter()
-                        .find(|s| s.base == *i)
-                        .is_some_and(|s| s.name.eq_ignore_ascii_case("health"))
-                {
-                    let writer = self.stack.last().map_or("<host>", |s| s.function.as_str());
-                    let offset = self.stack.last().map_or(0, |s| s.offset);
-                    eprintln!(
-                        "[vm-health-write] t={:.6} pawn={} writer={} offset=0x{:04X} value={}",
-                        self.time,
-                        self.objects[*o as usize].name,
-                        writer,
-                        offset,
-                        self.value_text(&v)
-                    );
-                }
-                if std::env::var_os("XIII_WATCH_PLAYER_HEALTH").is_some()
-                    && self.objects[*o as usize].is_actor
-                    && self.objects[*o as usize]
-                        .layout
-                        .slots
-                        .iter()
-                        .find(|s| s.base == *i)
-                        .is_some_and(|s| s.name.eq_ignore_ascii_case("startspotevent"))
-                {
-                    let writer = self.stack.last().map_or("<host>", |s| s.function.as_str());
-                    let offset = self.stack.last().map_or(0, |s| s.offset);
-                    eprintln!(
-                        "[vm-sse-write] t={:.6} obj={} writer={} offset=0x{:04X} value={}",
-                        self.time,
-                        self.objects[*o as usize].name,
-                        writer,
-                        offset,
-                        self.value_text(&v)
-                    );
                 }
                 self.objects[*o as usize].props[*i] = v;
             }
@@ -10193,60 +9747,6 @@ impl<'s> Vm<'s> {
             .as_mut()
             .map(|provider| provider.walk_box(location, delta, extent));
         let end = walked.map_or_else(|| add3(location, delta), |o| o.end);
-        // TEMPORARY item53d diagnostic (removed before finishing): with XIII_VM_MOVE_TRACE set,
-        // print each steered move's start/end/velocity and the blocking hit + overlapping
-        // primitives at the blocked position.
-        if std::env::var_os("XIII_VM_MOVE_TRACE").is_some() {
-            let name = self
-                .objects
-                .get(pawn as usize)
-                .map(|o| o.name.clone())
-                .unwrap_or_default();
-            let hit_info = walked
-                .as_ref()
-                .and_then(|o| o.hit.as_ref())
-                .map(|h| {
-                    format!(
-                        "HIT t={:.3} at ({:.1},{:.1},{:.1}) n=({:.2},{:.2},{:.2})",
-                        h.time,
-                        h.location[0],
-                        h.location[1],
-                        h.location[2],
-                        h.normal[0],
-                        h.normal[1],
-                        h.normal[2]
-                    )
-                })
-                .unwrap_or_else(|| "free".to_owned());
-            let overlaps = if walked.as_ref().is_some_and(|o| o.hit.is_some()) {
-                self.physics
-                    .as_mut()
-                    .map(|p| {
-                        p.dump_overlap(end, extent)
-                            .iter()
-                            .take(4)
-                            .map(|r| format!("{}:{}", r.kind, r.source))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            println!(
-                "[move-trace] {name} t={:.3} start=({:.1},{:.1},{:.1}) end=({:.1},{:.1},{:.1}) vel=({:.1},{:.1},{:.1}) {hit_info} overlaps[{overlaps}]",
-                self.time,
-                location[0],
-                location[1],
-                location[2],
-                end[0],
-                end[1],
-                end[2],
-                velocity[0],
-                velocity[1],
-                velocity[2],
-            );
-        }
         self.set_property(pawn, "Location", 0, Value::Vector(end));
         Ok(())
     }
