@@ -735,13 +735,14 @@ fn registry_entries_are_documented() {
     // Partials and the visible Partial for `LevelInfo.DecAttaque` (588); item14c added four
     // trail/particle Partials (SpawnParticle is shared with item18); item20 adds ten decoded GUI
     // save-slot declarations; item40c adds the headless Interaction.Initialize and ForceFeedback
-    // viewport/device Partials; item43 adds Actor.TraceActors; item30b adds the latent
-    // Engine.Controller.WaitForLanding (527) and item30c the BaseSoldier.EyePosition override
-    // (both from the item30 Plage01 walk) plus the item30 walk's Actor.AnimIsInGroup (395);
-    // the item47b banque01 regression fix adds `PlayerController.AdjustAimForDisplay` (498);
-    // item49b adds `Actor.DetachFromBone` (403). Must equal
-    // `Registry::builtin().defs().count()`.
-    assert_eq!(defs.len(), 336);
+    // viewport/device Partials; item43 adds Actor.TraceActors; the item47b banque01 regression
+    // fix adds `PlayerController.AdjustAimForDisplay` (498); item49b adds
+    // `Actor.DetachFromBone` (403); item51b adds the decoded `BaseSoldier.EyePosition`
+    // (XIDPawn.dll 0x119012b0) and `BloodFlow.GrowBloodFlow` (Xiii.dll 0x11b01000); item48 adds
+    // `Actor.VisibleDamageableActors` and `Actor.WaveHasPosition`; the item30 Plage01 walk adds
+    // the latent `Engine.Controller.WaitForLanding` (527) and `Actor.AnimIsInGroup` (395).
+    // Must equal `Registry::builtin().defs().count()`.
+    assert_eq!(defs.len(), 339);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -3009,7 +3010,7 @@ fn survey_counts_missing_natives_without_aborting() {
 // ---------------------------------------------------------------------------------------
 // World physics bridge: Move/SetLocation/Trace/FastTrace/SetCollision(Size) + touching
 
-use crate::physics::{MoveOutcome, WorldHit, WorldPhysics};
+use crate::physics::{ActorMeshHit, MoveOutcome, WorldHit, WorldPhysics};
 
 const IMP_ARRAYPROP: i32 = -12;
 
@@ -3023,7 +3024,12 @@ fn phys_fixture() -> Vec<u8> {
     let actor = b.reserve(0, 0, "Actor");
     let child = b.reserve(0, 0, "Child");
     let decoration = b.reserve(0, 0, "Decoration");
+    let mover = b.reserve(0, 0, "Mover");
     let levelinfo = b.reserve(0, 0, "LevelInfo");
+    // item53: a Pawn/Controller pair whose controller can enter `NoControl` (the scripted-
+    // ownership gate for Walking physics integration).
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "Controller");
 
     let add = b.reserve(IMP_FUNCTION, object, "Add_IntInt");
     let add_a = b.reserve(IMP_INTPROP, add, "A");
@@ -3065,17 +3071,26 @@ fn phys_fixture() -> Vec<u8> {
     let collide_placing = b.reserve(IMP_BOOLPROP, actor, "bCollideWhenPlacing");
     let block_actors = b.reserve(IMP_BOOLPROP, actor, "bBlockActors");
     let block_players = b.reserve(IMP_BOOLPROP, actor, "bBlockPlayers");
-    let proj_target = b.reserve(IMP_BOOLPROP, actor, "bProjTarget");
     let block_zero = b.reserve(IMP_BOOLPROP, actor, "bBlockZeroExtentTraces");
     let block_nonzero = b.reserve(IMP_BOOLPROP, actor, "bBlockNonZeroExtentTraces");
     let movable = b.reserve(IMP_BOOLPROP, actor, "bMovable");
     let bstatic = b.reserve(IMP_BOOLPROP, actor, "bStatic");
+    let use_cylinder = b.reserve(IMP_BOOLPROP, actor, "bUseCylinderCollision");
+    // item53 physics fields (EPhysics, script-written velocity, zone gravity inputs).
+    let physics = b.reserve(IMP_BYTEPROP, actor, "Physics");
+    let velocity = b.reserve(IMP_STRUCTPROP, actor, "Velocity");
+    let acceleration = b.reserve(IMP_STRUCTPROP, actor, "Acceleration");
+    let mass = b.reserve(IMP_FLOATPROP, actor, "Mass");
+    let buoyancy = b.reserve(IMP_FLOATPROP, actor, "Buoyancy");
+    let bbounce = b.reserve(IMP_BOOLPROP, actor, "bBounce");
+    let proj_target = b.reserve(IMP_BOOLPROP, actor, "bProjTarget");
     let hidden = b.reserve(IMP_BOOLPROP, actor, "bHidden");
     let world_geometry = b.reserve(IMP_BOOLPROP, actor, "bWorldGeometry");
     let touches = b.reserve(IMP_INTPROP, actor, "Touches");
     let untouches = b.reserve(IMP_INTPROP, actor, "UnTouches");
     let touching = b.reserve(IMP_ARRAYPROP, actor, "Touching");
     let touching_template = b.reserve(IMP_OBJECTPROP, touching, "Touching");
+    let static_mesh = b.reserve(IMP_OBJECTPROP, actor, "StaticMesh");
 
     b.prop_with(owner, level, 0, &object_extra);
     b.prop_with(level, base, 0, &object_extra);
@@ -3089,14 +3104,22 @@ fn phys_fixture() -> Vec<u8> {
     b.prop(collide_world, collide_placing, 0);
     b.prop(collide_placing, block_actors, 0);
     b.prop(block_actors, block_players, 0);
-    b.prop(block_players, proj_target, 0);
-    b.prop(proj_target, block_zero, 0);
+    b.prop(block_players, block_zero, 0);
     b.prop(block_zero, block_nonzero, 0);
-    b.prop(block_nonzero, hidden, 0);
+    b.prop(block_nonzero, proj_target, 0);
+    b.prop(proj_target, hidden, 0);
     b.prop(hidden, world_geometry, 0);
     b.prop(world_geometry, movable, 0);
     b.prop(movable, bstatic, 0);
-    b.prop(bstatic, touches, 0);
+    b.prop(bstatic, use_cylinder, 0);
+    b.prop(use_cylinder, physics, 0);
+    b.prop_with(physics, velocity, 0, &vector_extra);
+    b.prop_with(velocity, acceleration, 0, &vector_extra);
+    b.prop_with(acceleration, mass, 0, &vector_extra);
+    b.prop(mass, buoyancy, 0);
+    b.prop(buoyancy, bbounce, 0);
+    b.prop(bbounce, static_mesh, 0);
+    b.prop_with(static_mesh, touches, 0, &object_extra);
     b.prop(touches, untouches, 0);
     b.prop(untouches, touching, 0);
     b.prop_with(touching_template, 0, 0, &object_extra);
@@ -3131,7 +3154,16 @@ fn phys_fixture() -> Vec<u8> {
     b.class(actor, object, owner, 0);
     b.class(child, actor, 0, 0);
     b.class(decoration, actor, 0, 0);
+    b.class(mover, actor, 0, 0);
     b.class(levelinfo, actor, 0, 0);
+    let pawn_controller = b.reserve(IMP_OBJECTPROP, pawn, "Controller");
+    b.prop_with(pawn_controller, 0, 0, &object_extra);
+    let ctrl_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
+    let no_control = b.reserve(IMP_STATE, controller, "NoControl");
+    b.state_masks(no_control, 0, 0, u64::MAX);
+    b.prop_with(ctrl_pawn, no_control, 0, &object_extra);
+    b.class(pawn, actor, pawn_controller, 0);
+    b.class(controller, actor, ctrl_pawn, 0);
     b.build()
 }
 
@@ -3364,6 +3396,11 @@ fn item46_set() -> ScriptSet {
         "WeaponStartTrace",
         "LastSeenPos",
         "WeaponEndTrace",
+        "DirectionTir",
+        "EnemyTargetPos",
+        "EnemyTargetVelocity",
+        "FireOffset",
+        "Rotation",
         "Velocity",
         "Acceleration",
     ] {
@@ -3382,6 +3419,11 @@ fn item46_set() -> ScriptSet {
         "GroundFriction",
         "MoveTimer",
         "TacticalOffset",
+        "EyeHeight",
+        "CrouchHeight",
+        "Angle_Visee",
+        "Temps_RefreshEnemyPos",
+        "DrawScale",
     ] {
         fields.push((b.reserve(IMP_FLOATPROP, actor, name), vec![]));
     }
@@ -3400,6 +3442,8 @@ fn item46_set() -> ScriptSet {
         "bAdjusting",
         "bAdvancedTactics",
         "bPreparingMove",
+        "bZoomed",
+        "bTirSurConeMax",
     ] {
         fields.push((b.reserve(IMP_BOOLPROP, actor, name), vec![]));
     }
@@ -3419,10 +3463,14 @@ fn item46_set() -> ScriptSet {
         "NavigationPointList",
         "NextNavigationPoint",
         "NextMoveTarget",
+        "Owner",
+        "Instigator",
     ] {
         fields.push((b.reserve(IMP_OBJECTPROP, actor, name), compact(actor)));
     }
     fields.push((b.reserve(IMP_BYTEPROP, actor, "Physics"), compact(0)));
+    fields.push((b.reserve(IMP_BYTEPROP, actor, "WHand"), compact(0)));
+    fields.push((b.reserve(IMP_INTPROP, actor, "Skill"), vec![]));
     fields.push((b.reserve(IMP_NAMEPROP, actor, "Alliance"), vec![]));
     fields.push((
         b.reserve(IMP_ARRAYPROP, actor, "MusicVars"),
@@ -3709,7 +3757,7 @@ fn item46_stake_out_excludes_boundaries_preserves_failure_and_detects_cycles() {
 }
 
 #[test]
-fn item46_line_of_fire_classifies_ally_hostile_dead_and_shoot_through() {
+fn item51b_line_of_fire_uses_direction_point_and_classifies_obstacles() {
     let set = item46_set();
     let mut vm = Vm::new(&set, VmLimits::default());
     vm.set_physics(Box::new(MockWorld::new()));
@@ -3738,7 +3786,9 @@ fn item46_line_of_fire_classifies_ally_hostile_dead_and_shoot_through() {
         0,
         Value::Object(Some(ObjRef::Instance(ammo))),
     );
-    vm.set_property(ctrl, "WeaponEndTrace", 0, Value::Vector([200.0, 0.0, 0.0]));
+    vm.set_property(ctrl, "DirectionTir", 0, Value::Vector([200.0, 0.0, 0.0]));
+    // Deliberately different: the retail class has no WeaponEndTrace property.
+    vm.set_property(ctrl, "WeaponEndTrace", 0, Value::Vector([0.0, 200.0, 0.0]));
     let other = vm.spawn(pg(&set, "Pawn"), "Other").unwrap();
     vm.set_property(other, "Location", 0, Value::Vector([100.0, 0.0, 0.0]));
     vm.set_property(other, "CollisionRadius", 0, Value::Float(10.0));
@@ -3855,6 +3905,216 @@ fn item46_line_of_fire_classifies_ally_hostile_dead_and_shoot_through() {
             &mut []
         ),
         NativeOutcome::Value(Value::Int(0))
+    );
+}
+
+#[test]
+fn item51b_aim_is_a_sampled_world_point_and_refreshes_native_start() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let (ctrl, pawn) = item46_pair(&mut vm, &set);
+    let enemy = vm.spawn(pg(&set, "Pawn"), "Enemy").unwrap();
+    let weapon = vm.spawn(pg(&set, "Actor"), "Weapon").unwrap();
+    let ammo = vm.spawn(pg(&set, "Actor"), "Ammo").unwrap();
+    for (id, name, value) in [
+        (ctrl, "Enemy", enemy),
+        (pawn, "Weapon", weapon),
+        (weapon, "AmmoType", ammo),
+    ] {
+        vm.set_property(id, name, 0, Value::Object(Some(ObjRef::Instance(value))));
+    }
+    vm.set_property(pawn, "Location", 0, Value::Vector([4000.0, -2000.0, 300.0]));
+    vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(60.0));
+    vm.set_property(pawn, "Skill", 0, Value::Int(1));
+    vm.set_property(
+        enemy,
+        "Location",
+        0,
+        Value::Vector([4100.0, -2000.0, 300.0]),
+    );
+    vm.set_property(
+        ctrl,
+        "EnemyTargetPos",
+        0,
+        Value::Vector([4090.0, -2000.0, 300.0]),
+    );
+    vm.set_property(ctrl, "Rotation", 0, Value::Rotator([0, 0, 0]));
+    vm.set_property(weapon, "FireOffset", 0, Value::Vector([10.0, 20.0, 30.0]));
+    vm.set_property(weapon, "WHand", 0, Value::Byte(1));
+    vm.set_property(ammo, "bInstantHit", 0, Value::Bool(true));
+    let point = call_native(&mut vm, "IAController.DirectionDuTir", ctrl, &[], &mut []);
+    assert_eq!(
+        point,
+        NativeOutcome::Value(Value::Vector([4090.0, -2000.0, 265.0]))
+    );
+    assert_eq!(
+        vm.vector_prop(ctrl, "WeaponStartTrace"),
+        Some([4026.0, -1980.0, 390.0])
+    );
+    assert_eq!(
+        vm.vector_prop(ctrl, "DirectionTir"),
+        Some([4090.0, -2000.0, 265.0])
+    );
+    // Repeated calls after translation must translate both products, not normalize a point.
+    vm.set_property(pawn, "Location", 0, Value::Vector([5000.0, -2000.0, 300.0]));
+    vm.set_property(
+        enemy,
+        "Location",
+        0,
+        Value::Vector([5100.0, -2000.0, 300.0]),
+    );
+    vm.set_property(
+        ctrl,
+        "EnemyTargetPos",
+        0,
+        Value::Vector([5090.0, -2000.0, 300.0]),
+    );
+    assert_eq!(
+        call_native(&mut vm, "IAController.DirectionDuTir", ctrl, &[], &mut []),
+        NativeOutcome::Value(Value::Vector([5090.0, -2000.0, 265.0]))
+    );
+    assert_eq!(
+        vm.vector_prop(ctrl, "WeaponStartTrace"),
+        Some([5026.0, -1980.0, 390.0])
+    );
+    vm.set_property(ctrl, "Angle_Visee", 0, Value::Float(14.0));
+    vm.set_property(ctrl, "bTirSurConeMax", 0, Value::Bool(true));
+    for _ in 0..50 {
+        let NativeOutcome::Value(Value::Vector(point)) =
+            call_native(&mut vm, "IAController.DirectionDuTir", ctrl, &[], &mut [])
+        else {
+            panic!("aim vector");
+        };
+        let lateral = ((point[1] + 2000.0).powi(2) + (point[2] - 265.0).powi(2)).sqrt();
+        assert!((lateral - 100.0 * 14.0_f32.to_radians().tan()).abs() < 0.002);
+        assert_eq!(
+            point[0], 5090.0,
+            "cone offset is perpendicular, not normalized world position"
+        );
+    }
+    vm.set_property(ctrl, "EnemyTargetPos", 0, Value::Vector([0.0; 3]));
+    assert_eq!(
+        call_native(&mut vm, "IAController.DirectionDuTir", ctrl, &[], &mut []),
+        NativeOutcome::Value(Value::Vector([0.0; 3]))
+    );
+    vm.set_property(ctrl, "BaseS", 0, Value::Object(None));
+    assert_eq!(
+        call_native(&mut vm, "IAController.DirectionDuTir", ctrl, &[], &mut []),
+        NativeOutcome::Value(Value::Vector([0.0; 3]))
+    );
+}
+
+#[test]
+fn item51b_fire_start_rotates_offsets_zoom_and_owner_fallback() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pawn = vm.spawn(pg(&set, "Pawn"), "Pawn").unwrap();
+    let weapon = vm.spawn(pg(&set, "Actor"), "Weapon").unwrap();
+    vm.set_property(pawn, "Location", 0, Value::Vector([100.0, 200.0, 300.0]));
+    vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(60.0));
+    vm.set_property(pawn, "EyeHeight", 0, Value::Float(50.0));
+    vm.set_property(
+        weapon,
+        "Owner",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    vm.set_property(weapon, "FireOffset", 0, Value::Vector([10.0, 20.0, 30.0]));
+    let mut axes = [
+        Value::Vector([0.0, 1.0, 0.0]),
+        Value::Vector([-1.0, 0.0, 0.0]),
+        Value::Vector([0.0, 0.0, 1.0]),
+    ];
+    assert_eq!(
+        call_native(&mut vm, "Weapon.GetFireStart", weapon, &[], &mut axes),
+        NativeOutcome::Value(Value::Vector([80.0, 210.0, 380.0]))
+    );
+    assert_eq!(vm.obj_prop(weapon, "Instigator"), Some(pawn));
+    vm.set_property(weapon, "bZoomed", 0, Value::Bool(true));
+    assert_eq!(
+        call_native(&mut vm, "Weapon.GetFireStart", weapon, &[], &mut axes),
+        NativeOutcome::Value(Value::Vector([100.0, 210.0, 350.0]))
+    );
+    assert_eq!(
+        call_native(&mut vm, "BaseSoldier.EyePosition", pawn, &[], &mut []),
+        NativeOutcome::Value(Value::Vector([0.0, 0.0, 60.0]))
+    );
+    vm.set_property(weapon, "Instigator", 0, Value::Object(None));
+    vm.set_property(
+        weapon,
+        "Owner",
+        0,
+        Value::Object(Some(ObjRef::Instance(weapon))),
+    );
+    assert_eq!(
+        call_native(&mut vm, "Weapon.GetFireStart", weapon, &[], &mut axes),
+        NativeOutcome::Value(Value::Vector([0.0; 3]))
+    );
+}
+
+#[test]
+fn item51b_blood_flow_grows_reprojects_and_uses_strict_unclamped_threshold() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let blood = vm.spawn(pg(&set, "Actor"), "Blood").unwrap();
+    vm.set_property(blood, "DrawScale", 0, Value::Float(0.05));
+    for _ in 0..60 {
+        assert_eq!(
+            call_native(
+                &mut vm,
+                "BloodFlow.GrowBloodFlow",
+                blood,
+                &[],
+                &mut [Value::Float(1.0 / 60.0)]
+            ),
+            NativeOutcome::Value(Value::Bool(false))
+        );
+    }
+    assert!((vm.f32_prop(blood, "DrawScale") - 0.1).abs() < 1e-6);
+    let events = vm.drain_events();
+    assert_eq!(events.len(), 120);
+    assert!(matches!(
+        &events[0],
+        crate::PresentationEvent::ProjectorDetach { force: true, .. }
+    ));
+    assert!(matches!(
+        &events[1],
+        crate::PresentationEvent::ProjectorAttach { .. }
+    ));
+    vm.set_property(blood, "DrawScale", 0, Value::Float(0.35));
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "BloodFlow.GrowBloodFlow",
+            blood,
+            &[],
+            &mut [Value::Float(0.0)]
+        ),
+        NativeOutcome::Value(Value::Bool(false))
+    );
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "BloodFlow.GrowBloodFlow",
+            blood,
+            &[],
+            &mut [Value::Float(10.0)]
+        ),
+        NativeOutcome::Value(Value::Bool(true))
+    );
+    assert!(
+        vm.f32_prop(blood, "DrawScale") > 0.8,
+        "overshoot is not clamped"
+    );
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "BloodFlow.GrowBloodFlow",
+            blood,
+            &[],
+            &mut [Value::Float(-20.0)]
+        ),
+        NativeOutcome::Value(Value::Bool(false))
     );
 }
 
@@ -4407,6 +4667,352 @@ fn set_collision_fields(vm: &mut Vm<'_>, id: ObjectId, colliding: bool, blocking
     vm.set_property(id, "CollisionHeight", 0, Value::Float(10.0));
 }
 
+/// item53 test provider: a named actor's own static-mesh triangles (a wall in the YZ plane at
+/// `wall_x` with a window opening between `window_z0` and `window_z1`), plus optional world
+/// walls via [`MockWorld`] semantics. `with_data = false` models a provider without per-actor
+/// mesh data (the cylinder fallback must stay in charge).
+struct MeshWorld {
+    wall_x: f32,
+    window_z0: f32,
+    window_z1: f32,
+    with_data: bool,
+    walls: Vec<([f32; 3], [f32; 3])>,
+}
+
+impl MeshWorld {
+    fn window_wall(wall_x: f32) -> Self {
+        Self {
+            wall_x,
+            window_z0: 60.0,
+            window_z1: 120.0,
+            with_data: true,
+            walls: Vec::new(),
+        }
+    }
+
+    fn without_data(mut self) -> Self {
+        self.with_data = false;
+        self
+    }
+}
+
+impl WorldPhysics for MeshWorld {
+    fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
+        let d = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+        let mut best: Option<(f32, [f32; 3])> = None;
+        for &(mn, mx) in &self.walls {
+            if let Some((t, n)) = swept_aabb(start, d, extent, mn, mx)
+                && best.is_none_or(|(bt, _)| t < bt)
+            {
+                best = Some((t, n));
+            }
+        }
+        best.map(|(t, n)| WorldHit {
+            location: [
+                start[0] + d[0] * t,
+                start[1] + d[1] * t,
+                start[2] + d[2] * t,
+            ],
+            normal: n,
+            time: t,
+        })
+    }
+
+    fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        let end = [
+            start[0] + delta[0],
+            start[1] + delta[1],
+            start[2] + delta[2],
+        ];
+        match self.trace(start, end, extent) {
+            Some(hit) => MoveOutcome {
+                end: [
+                    start[0] + delta[0] * hit.time,
+                    start[1] + delta[1] * hit.time,
+                    start[2] + delta[2] * hit.time,
+                ],
+                hit: Some(hit),
+            },
+            None => MoveOutcome { end, hit: None },
+        }
+    }
+
+    fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool {
+        !self
+            .walls
+            .iter()
+            .any(|&(mn, mx)| aabb_overlaps(location, extent, mn, mx))
+    }
+
+    fn actor_mesh_hit(&mut self, actor: &str, start: [f32; 3], end: [f32; 3]) -> ActorMeshHit {
+        if !self.with_data || !actor.eq_ignore_ascii_case("WindowDoor") {
+            return ActorMeshHit::NoData;
+        }
+        // Two triangles of the wall plane x = wall_x, minus the window band in Z.
+        let d = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+        if d[0].abs() < 1e-9 {
+            return ActorMeshHit::Miss;
+        }
+        let t = (self.wall_x - start[0]) / d[0];
+        if !(0.0..=1.0).contains(&t) {
+            return ActorMeshHit::Miss;
+        }
+        let z = start[2] + d[2] * t;
+        if z > self.window_z0 && z < self.window_z1 {
+            return ActorMeshHit::Miss;
+        }
+        ActorMeshHit::Hit(WorldHit {
+            location: [self.wall_x, start[1] + d[1] * t, z],
+            normal: [-1.0, 0.0, 0.0],
+            time: t,
+        })
+    }
+}
+
+/// item53: a zero-extent ray through a static-mesh actor's window opening does not hit the
+/// actor even though its collision cylinder covers the opening (the Toits01 generator-shot
+/// defect); a ray through the mesh panel does, at the mesh plane.
+#[test]
+fn trace_through_static_mesh_window_misses_but_panel_hits() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let door = vm.spawn(pg(&set, "Decoration"), "WindowDoor").unwrap();
+    vm.set_property(door, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, door, true, true);
+    // PorteDecors-sized cylinder: 160 UU radius covers the whole window.
+    vm.set_property(door, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(door, "CollisionHeight", 0, Value::Float(160.0));
+    vm.set_property(
+        door,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+
+    // Through the window (z = 90): no hit at all.
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 90.0], [400.0, 0.0, 90.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(None, hit, "the ray through the window opening must pass");
+    assert!((location[0] - 400.0).abs() < 0.01, "{location:?}");
+
+    // Through the panel (z = 0): the mesh hit, at the mesh plane (not the grown cylinder).
+    let (hit, location, normal) = vm
+        .vm_trace(tracer, [0.0, 0.0, 0.0], [400.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(Some(door), hit);
+    assert!((location[0] - 40.0).abs() < 0.01, "{location:?}");
+    assert!(normal[0] < -0.9, "mesh plane normal, got {normal:?}");
+}
+
+/// item53: a provider without per-actor mesh data keeps the cylinder approximation, and a
+/// non-zero-extent trace is not refined (the swept-box kDOP is not modelled).
+#[test]
+fn trace_static_mesh_falls_back_to_cylinder_without_mesh_data_or_with_extent() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0).without_data()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let door = vm.spawn(pg(&set, "Decoration"), "WindowDoor").unwrap();
+    vm.set_property(door, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, door, true, true);
+    vm.set_property(door, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(door, "CollisionHeight", 0, Value::Float(160.0));
+    vm.set_property(
+        door,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    // No mesh data: the cylinder blocks even through the window opening (documented fallback).
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 90.0], [400.0, 0.0, 90.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(Some(door), hit);
+
+    // Non-zero extent: not refined, the grown cylinder blocks.
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let (hit, _, _) = vm
+        .vm_trace(
+            tracer,
+            [0.0, 0.0, 90.0],
+            [400.0, 0.0, 90.0],
+            true,
+            [4.0, 4.0, 4.0],
+        )
+        .expect("trace provider installed");
+    assert_eq!(Some(door), hit);
+}
+
+/// item53: `Actor.TraceActors` over a static-mesh actor honours the mesh opening too.
+#[test]
+fn trace_actors_skips_static_mesh_actor_when_the_ray_passes_through_the_mesh() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let caller = phys_actor(&mut vm, &set, "Caller", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, caller, true, true);
+    let door = vm.spawn(pg(&set, "Decoration"), "WindowDoor").unwrap();
+    vm.set_property(door, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, door, true, true);
+    vm.set_property(door, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(door, "CollisionHeight", 0, Value::Float(160.0));
+    vm.set_property(
+        door,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    let rows = vm
+        .vm_trace_actors(caller, None, [0.0, 0.0, 90.0], [400.0, 0.0, 90.0], [0.0; 3])
+        .unwrap();
+    assert!(
+        rows.is_empty(),
+        "the window opening must not list the door: {rows:?}"
+    );
+    let rows = vm
+        .vm_trace_actors(caller, None, [0.0, 0.0, 0.0], [400.0, 0.0, 0.0], [0.0; 3])
+        .unwrap();
+    assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), [door]);
+}
+
+// ---------------------------------------------------------------------------------------
+// item53: scripted-physics integration (PHYS_Walking under NoControl, Falling, Flying,
+// Projectile -> Falling)
+
+/// A projectile flying into a world wall runs `HitWall`, stops at the sweep contact and, with
+/// `bBounce` clear, continues as `PHYS_Falling` with gravity decaying `Velocity.Z` (the engine's
+/// `physProjectile` -> `physFalling` fall-through; the demo's `Crochet.Velocity.Z < 1` cast
+/// transition depends on it).
+#[test]
+fn scripted_physics_projectile_hits_the_world_and_falls() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([50.0, -100.0, -100.0], [51.0, 100.0, 100.0]),
+    ));
+    let hook = vm.spawn(pg(&set, "Actor"), "CineHook").unwrap();
+    vm.set_active(hook, true);
+    vm.set_property(hook, "Location", 0, Value::Vector([0.0, 0.0, 0.0]));
+    vm.set_property(hook, "Physics", 0, Value::Byte(6));
+    vm.set_property(hook, "Velocity", 0, Value::Vector([1200.0, 0.0, 1100.0]));
+    set_collision_fields(&mut vm, hook, true, true);
+    // 50 UU at 1200 UU/s per 16 ms tick: the third tick reaches the wall plane at x = 50.
+    for _ in 0..3 {
+        vm.tick_suspending(0.016);
+    }
+    let location = vm.vector_prop(hook, "Location").unwrap();
+    let physics = vm.byte_prop(hook, "Physics");
+    let velocity = vm.vector_prop(hook, "Velocity").unwrap();
+    assert_eq!(physics, 2, "the wall hit must fall through to PHYS_Falling");
+    // The swept box stops one extent short of the wall plane at x = 50.
+    assert!((location[0] - 40.0).abs() < 0.5, "{location:?}");
+    // Gravity (the measured Engine.PhysicsVolume default -950) applied for the hit frame only:
+    // a projectile keeps constant velocity until it hits (no zone gravity while flying).
+    assert!(
+        (velocity[2] - (1100.0 - 950.0 * 0.016)).abs() < 0.5,
+        "gravity decayed vz: {velocity:?}"
+    );
+    // A later tick keeps decelerating vz toward the `< 1` transition threshold.
+    for _ in 0..80 {
+        vm.tick_suspending(0.016);
+    }
+    let velocity = vm.vector_prop(hook, "Velocity").unwrap();
+    assert!(velocity[2] < 1.0, "vz decayed below 1: {velocity:?}");
+}
+
+/// `PHYS_Falling` integrates the zone gravity (+ `Acceleration`, buoyancy-reduced) into the
+/// velocity and moves the actor; without world collision the actor simply accelerates downward.
+#[test]
+fn scripted_physics_falling_integrates_zone_gravity() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let body = vm.spawn(pg(&set, "Actor"), "Body").unwrap();
+    vm.set_active(body, true);
+    vm.set_property(body, "Location", 0, Value::Vector([0.0, 0.0, 1000.0]));
+    vm.set_property(body, "Physics", 0, Value::Byte(2));
+    vm.set_property(body, "Velocity", 0, Value::Vector([0.0; 3]));
+    vm.set_property(body, "bCollideWorld", 0, Value::Bool(false));
+    vm.tick_suspending(0.016);
+    let velocity = vm.vector_prop(body, "Velocity").unwrap();
+    assert!((velocity[2] + 950.0 * 0.016).abs() < 0.5, "{velocity:?}");
+    vm.tick_suspending(0.016);
+    let velocity = vm.vector_prop(body, "Velocity").unwrap();
+    assert!(
+        (velocity[2] + 2.0 * 950.0 * 0.016).abs() < 0.5,
+        "{velocity:?}"
+    );
+}
+
+/// `PHYS_Flying` moves the actor by the script-written velocity (the demo rewrites
+/// `Jones.Velocity` every tick toward the hook).
+#[test]
+fn scripted_physics_flying_moves_by_script_velocity() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let jones = vm.spawn(pg(&set, "Pawn"), "Jones").unwrap();
+    vm.set_active(jones, true);
+    vm.set_property(jones, "Location", 0, Value::Vector([0.0, 0.0, 100.0]));
+    vm.set_property(jones, "Physics", 0, Value::Byte(4));
+    vm.set_property(jones, "Velocity", 0, Value::Vector([900.0, 0.0, 450.0]));
+    vm.set_property(jones, "bCollideWorld", 0, Value::Bool(false));
+    vm.tick_suspending(0.016);
+    let location = vm.vector_prop(jones, "Location").unwrap();
+    assert!(
+        (location[0] - 14.4).abs() < 0.2 && (location[2] - 107.2).abs() < 0.2,
+        "{location:?}"
+    );
+}
+
+/// `PHYS_Walking` is integrated only while the pawn's controller is in `NoControl`: the
+/// cinematic-owned pawn steps by its script-written horizontal velocity; a pawn whose
+/// controller is elsewhere is left to the host/controller latents (no double movement).
+#[test]
+fn scripted_physics_walking_moves_only_the_script_owned_pawn() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let controller = vm.spawn(pg(&set, "Controller"), "PC").unwrap();
+    let pawn = vm.spawn(pg(&set, "Pawn"), "Jones").unwrap();
+    vm.set_active(controller, true);
+    vm.set_active(pawn, true);
+    vm.set_property(
+        controller,
+        "Pawn",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    vm.set_property(
+        pawn,
+        "Controller",
+        0,
+        Value::Object(Some(ObjRef::Instance(controller))),
+    );
+    vm.goto_state(controller, "NoControl", None).unwrap();
+    vm.set_property(pawn, "Location", 0, Value::Vector([0.0, 0.0, 944.0]));
+    vm.set_property(pawn, "Physics", 0, Value::Byte(1));
+    vm.set_property(pawn, "Velocity", 0, Value::Vector([600.0, 0.0, 0.0]));
+    vm.set_property(pawn, "bCollideWorld", 0, Value::Bool(false));
+    let bystander = vm.spawn(pg(&set, "Pawn"), "Bystander").unwrap();
+    vm.set_active(bystander, true);
+    vm.set_property(bystander, "Location", 0, Value::Vector([0.0, 0.0, 944.0]));
+    vm.set_property(bystander, "Physics", 0, Value::Byte(1));
+    vm.set_property(bystander, "Velocity", 0, Value::Vector([600.0, 0.0, 0.0]));
+    vm.set_property(bystander, "bCollideWorld", 0, Value::Bool(false));
+    vm.tick_suspending(0.016);
+    let location = vm.vector_prop(pawn, "Location").unwrap();
+    assert!((location[0] - 9.6).abs() < 0.2, "{location:?}");
+    assert!(
+        (location[2] - 944.0).abs() < 0.01,
+        "z untouched: {location:?}"
+    );
+    let bystander_location = vm.vector_prop(bystander, "Location").unwrap();
+    assert_eq!(bystander_location[0], 0.0, "host-owned pawn not moved");
+}
+
 #[test]
 fn move_into_wall_stops_at_hit_and_bcollideworld_false_ignores_it() {
     let set = phys_set();
@@ -4733,6 +5339,146 @@ impl WorldPhysics for NamedHitWorld {
     fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool {
         self.inner.point_free(location, extent)
     }
+}
+
+#[test]
+fn mover_with_cylinder_collision_blocks_as_its_cylinder_not_its_mesh() {
+    // item52: `bUseCylinderCollision` makes the mover's cylinder its line-check shape; the
+    // baked mesh alone does not block. Measured need: Hual01a's lever `XIIIMover6` leans its
+    // handle mesh across every sight line to `CWndTarget1` while the target is outside the
+    // lever's cylinder (see `vm_trace_flags`); retail admits the line.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let _li = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0; 3]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    let mv = vm.spawn(pg(&set, "Mover"), "Mv").unwrap();
+    vm.set_property(mv, "Location", 0, Value::Vector([200.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, mv, true, true);
+    vm.set_property(mv, "bUseCylinderCollision", 0, Value::Bool(true));
+    // The provider's world hit is the mover's baked mesh at x=100; the mover's cylinder
+    // (r=10 around x=200) starts at x=190.
+    vm.set_physics(Box::new(NamedHitWorld {
+        inner: MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
+        actor: "Mv".to_owned(),
+    }));
+    // Line ending short of the cylinder: the mesh hit is skipped and, with nothing behind it,
+    // the trace reports no hit at all (the sight-line case).
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [150.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, None, "the mesh-only hit must not block: {location:?}");
+    // Line reaching into the cylinder: the mover blocks at the cylinder surface (x=190).
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [250.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(mv));
+    assert!((location[0] - 190.0).abs() < 1e-3, "{location:?}");
+    // Without the flag the mesh hit reports the mover at the mesh time (previous behaviour).
+    vm.set_property(mv, "bUseCylinderCollision", 0, Value::Bool(false));
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [150.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(mv));
+    assert!((location[0] - 100.0).abs() < 1e-3, "{location:?}");
+}
+
+#[test]
+fn trace_from_inside_a_cylinder_reports_the_exit_with_inverted_normal() {
+    // item52: Engine.dll's per-actor cylinder routine answers a line starting inside the
+    // candidate cylinder with the EXIT hit at `Min3(T-0.001, 1.0, T_exit)` and normal -Dir
+    // (VA 0x103c4cd0..0x103c5573; see `trace_actors_flags`). Measured need: point-blank
+    // shots — the muzzle sits inside the target's cylinder and retail reports the hit there.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let _li = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0; 3]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    // Start inside the candidate's cylinder (r=10 at [5,0,0], spans x -5..15).
+    let inside = phys_actor(&mut vm, &set, "Inside", [5.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, inside, true, true);
+    let (hit, location, normal) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(
+        hit,
+        Some(inside),
+        "the containing cylinder is reported at its exit"
+    );
+    assert!((location[0] - 15.0).abs() < 1e-2, "{location:?}");
+    assert!(
+        (normal[0] + 1.0).abs() < 1e-4,
+        "normal must be -Dir: {normal:?}"
+    );
+    // The exit hit competes by time: a wall beyond it does not win.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
+    ));
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(inside));
+    assert!((location[0] - 15.0).abs() < 1e-2, "{location:?}");
+    // Surface contact (start within 1 UU of the surface, z inside the column) takes the
+    // same exit path: cylinder r=10 at [10,0,0] -> exit at x=20.
+    vm.set_physics(Box::new(MockWorld::new()));
+    // Park the previous candidate so only the touching cylinder contains the start.
+    vm.set_property(inside, "Location", 0, Value::Vector([-1000.0, 0.0, 0.0]));
+    let touching = phys_actor(&mut vm, &set, "Touching", [10.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, touching, true, true);
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(touching));
+    assert!((location[0] - 20.0).abs() < 1e-2, "{location:?}");
+    // Start just outside the surface (within the engine's 1.0 band) and moving away: the
+    // horizontal exit root is negative, so nothing is reported.
+    vm.set_property(touching, "Location", 0, Value::Vector([1000.0, 0.0, 0.0]));
+    let grazing = phys_actor(&mut vm, &set, "Grazing", [-10.02, 0.0, 0.0]);
+    set_collision_fields(&mut vm, grazing, true, true);
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, None, "a grazing start moving away must not hit");
+    // A start above the column is not "inside" (conservative z guard): the ray over the
+    // cylinder is unaffected.
+    let above = phys_actor(&mut vm, &set, "Above", [5.0, 0.0, 500.0]);
+    set_collision_fields(&mut vm, above, true, true);
+    vm.set_property(above, "CollisionHeight", 0, Value::Float(10.0));
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, None, "a ray passing over the cylinder must not hit it");
+}
+
+#[test]
+fn additional_trace_type_8192_excludes_pawn_candidates() {
+    // item52: retail `CWndFocusTrigger.WaitForBeingSeen.Timer` (XIII.u 0x01BA) traces with
+    // `AdditionalTraceType 8192` from `XPP.Location` — inside the pawn's own cylinder — and
+    // accepts only `None` or the focus; the composed flags 0x20bf (execTrace
+    // 0x103e8abf..0x103e8b2e) must therefore not report the pawn, while the default 0xbf
+    // weapon traces must. Labelled hypothesis for the exact Engine.dll gate (see
+    // `trace_admits_actor_flags`); pinned by the retail behaviour on both sides.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let _li = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let trigger = phys_actor(&mut vm, &set, "Trigger", [200.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, trigger, true, false);
+    let pawn = vm.spawn(pg(&set, "Pawn"), "PPawn").unwrap();
+    vm.set_property(pawn, "Location", 0, Value::Vector([0.0; 3]));
+    set_collision_fields(&mut vm, pawn, true, true);
+    // Default weapon flags (0xbf): the pawn is admitted and its cylinder blocks.
+    let (hit, _, _) = vm
+        .vm_trace_flags(trigger, [0.0; 3], [100.0, 0.0, 0.0], 0xbf, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(pawn), "0xbf must still hit the pawn cylinder");
+    // Sight flags (0xbf | 0x2000): the pawn is excluded even with the start inside it.
+    let (hit, _, _) = vm
+        .vm_trace_flags(trigger, [0.0; 3], [100.0, 0.0, 0.0], 0x20bf, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, None, "0x20bf must not report the pawn");
 }
 
 #[test]
@@ -5089,6 +5835,258 @@ fn touching_actors_iterator_filters_by_base_class() {
     };
     assert_eq!(items.len(), 1);
     assert_eq!(items[0][0], Value::Object(Some(ObjRef::Instance(b))));
+}
+
+// ---------------------------------------------------------------------------------------
+// VisibleDamageableActors (item48) — the `Actor.HurtRadius` iterator
+
+/// The retail filter chain: level-hash radius query (inclusive at the boundary), `BaseClass`
+/// filter, `bIgnoreHidden` against `bHidden`, and a world-geometry line check from the blast
+/// point to the candidate's `Location`.
+#[test]
+fn visible_damageable_actors_filters_radius_class_hidden_and_world_los() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    // Wall spanning x=30..40: occludes victims behind it from the blast at the origin.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([30.0, -5.0, -5.0], [40.0, 5.0, 5.0]),
+    ));
+    let barrel = phys_actor(&mut vm, &set, "Barrel", [0.0; 3]);
+    let near = vm.spawn(pg(&set, "Child"), "Near").unwrap();
+    vm.set_property(near, "Location", 0, Value::Vector([25.0, 0.0, 0.0]));
+    // Exactly on the radius boundary (50): the retail distance test is inclusive. On the Z axis
+    // so the x-wall below cannot occlude it.
+    let edge = vm.spawn(pg(&set, "Child"), "Edge").unwrap();
+    vm.set_property(edge, "Location", 0, Value::Vector([0.0, 0.0, 50.0]));
+    // Ten units outside the radius.
+    let far = vm.spawn(pg(&set, "Child"), "Far").unwrap();
+    vm.set_property(far, "Location", 0, Value::Vector([0.0, 0.0, 60.0]));
+    // In radius (45) but behind the wall.
+    let occluded = vm.spawn(pg(&set, "Child"), "Occluded").unwrap();
+    vm.set_property(occluded, "Location", 0, Value::Vector([45.0, 0.0, 0.0]));
+    // In radius, clear LOS, but outside the `Child` base class.
+    let _plain = phys_actor(&mut vm, &set, "Plain", [0.0, 20.0, 0.0]);
+    // In radius, clear LOS, hidden.
+    let hidden = vm.spawn(pg(&set, "Child"), "Hidden").unwrap();
+    vm.set_property(hidden, "Location", 0, Value::Vector([0.0, -20.0, 0.0]));
+    vm.set_property(hidden, "bHidden", 0, Value::Bool(true));
+
+    let base_args = || {
+        [
+            Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+            Value::Object(None),
+            Value::Float(50.0),
+            Value::Vector([0.0; 3]),
+            Value::Bool(false),
+        ]
+    };
+    // bIgnoreHidden=false: hidden actors still qualify.
+    let mut args = base_args();
+    args[4] = Value::Bool(false);
+    let rows = match try_native(
+        &mut vm,
+        "Engine.Actor.VisibleDamageableActors",
+        barrel,
+        &[false; 5],
+        &mut args,
+    )
+    .unwrap()
+    {
+        NativeOutcome::Iterate(rows) => rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+        [
+            Value::Object(Some(ObjRef::Instance(near))),
+            Value::Object(Some(ObjRef::Instance(edge))),
+            Value::Object(Some(ObjRef::Instance(hidden))),
+        ],
+        "radius (inclusive) + class + world-LOS filter"
+    );
+
+    // bIgnoreHidden=true drops the hidden candidate.
+    let mut args = base_args();
+    args[4] = Value::Bool(true);
+    let rows = match try_native(
+        &mut vm,
+        "Engine.Actor.VisibleDamageableActors",
+        barrel,
+        &[false; 5],
+        &mut args,
+    )
+    .unwrap()
+    {
+        NativeOutcome::Iterate(rows) => rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+        [
+            Value::Object(Some(ObjRef::Instance(near))),
+            Value::Object(Some(ObjRef::Instance(edge))),
+        ],
+    );
+
+    // Zero radius: only a victim co-located with the blast point qualifies (inclusive test).
+    let mut args = [
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+        Value::Object(None),
+        Value::Float(0.0),
+        Value::Vector([0.0; 3]),
+        Value::Bool(false),
+    ];
+    let rows = match try_native(
+        &mut vm,
+        "Engine.Actor.VisibleDamageableActors",
+        barrel,
+        &[false; 5],
+        &mut args,
+    )
+    .unwrap()
+    {
+        NativeOutcome::Iterate(rows) => rows,
+        other => panic!("{other:?}"),
+    };
+    assert!(rows.is_empty(), "no Child at the blast point: {rows:?}");
+
+    // An omitted Loc uses the caller's Location (HurtRadius passes HitLocation explicitly, but
+    // the parameter is positional in the same way RadiusActors' Loc is).
+    let at_barrel = vm.spawn(pg(&set, "Child"), "AtBarrel").unwrap();
+    vm.set_property(at_barrel, "Location", 0, Value::Vector([0.0; 3]));
+    let mut args = [
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+        Value::Object(None),
+        Value::Float(1.0),
+        Value::Vector([0.0; 3]),
+        Value::Bool(false),
+    ];
+    let rows = match try_native(
+        &mut vm,
+        "Engine.Actor.VisibleDamageableActors",
+        barrel,
+        &[false; 5],
+        &mut args,
+    )
+    .unwrap()
+    {
+        NativeOutcome::Iterate(rows) => rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Object(Some(ObjRef::Instance(at_barrel))));
+}
+
+/// Without a world-physics provider the iterator fails explicitly (never a silent
+/// radius-only answer): `Actor.HurtRadius` runs on barrels whose blast must respect walls.
+#[test]
+fn visible_damageable_actors_without_physics_provider_fails() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let barrel = phys_actor(&mut vm, &set, "Barrel", [0.0; 3]);
+    let mut args = [
+        Value::Object(Some(ObjRef::Static(pg(&set, "Actor")))),
+        Value::Object(None),
+        Value::Float(100.0),
+        Value::Vector([0.0; 3]),
+        Value::Bool(false),
+    ];
+    let err = try_native(
+        &mut vm,
+        "Engine.Actor.VisibleDamageableActors",
+        barrel,
+        &[false; 5],
+        &mut args,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err.kind,
+        VmErrorKind::NoPhysicsProvider { ref native }
+            if native == "Actor.VisibleDamageableActors"
+    ));
+}
+
+// ---------------------------------------------------------------------------------------
+// WaveHasPosition (item48) — the DialogueManager positional-voice query
+
+/// Provider answers flow through; with no provider the native fails explicitly; an
+/// unclassifiable name notes and reports false (the engine's no-subsystem answer).
+#[test]
+fn wave_has_position_provider_answers_and_missing_provider_fails() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    let mut args = [Value::Str("SMarin01_Jones_00".to_owned())];
+    let err = try_native(
+        &mut vm,
+        "Engine.Actor.WaveHasPosition",
+        a,
+        &[false],
+        &mut args,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err.kind,
+        VmErrorKind::NoAudioProvider { ref native } if native == "Engine.Actor.WaveHasPosition"
+    ));
+
+    vm.set_wave_position(Box::new(crate::voice::FixedWavePosition::new(true)));
+    let mut args = [Value::Str("SMarin01_Jones_00".to_owned())];
+    assert_eq!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.WaveHasPosition",
+            a,
+            &[false],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(true))
+    );
+
+    vm.set_wave_position(Box::new(crate::voice::FixedWavePosition::new(false)));
+    let mut args = [Value::Str(String::new())];
+    assert_eq!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.WaveHasPosition",
+            a,
+            &[false],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(false))
+    );
+
+    // A provider that cannot classify (the current data gap) notes and reports false rather
+    // than failing the speaking actor or inventing a positional answer.
+    struct Unknown;
+    impl crate::voice::WavePosition for Unknown {
+        fn has_position(&self, _sound_name: &str) -> Option<bool> {
+            None
+        }
+    }
+    vm.set_wave_position(Box::new(Unknown));
+    let mut args = [Value::Str("SMarin01_Jones_00".to_owned())];
+    assert_eq!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.WaveHasPosition",
+            a,
+            &[false],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(false))
+    );
+    assert!(
+        vm.trace.iter().any(|e| matches!(
+            &e.kind,
+            TraceKind::Note(s) if s.contains("WaveHasPosition") && s.contains("SMarin01_Jones_00")
+        )),
+        "the unclassified name must be visible: {:?}",
+        vm.trace
+    );
 }
 
 // ---------------------------------------------------------------------------------------

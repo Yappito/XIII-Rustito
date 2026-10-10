@@ -16,7 +16,7 @@ use xiii_collision::{
 use xiii_decode::common::{
     UNREAL_UNITS_PER_METER, to_bevy_direction, to_bevy_position, to_bevy_scale,
 };
-use xiii_script::physics::{MoveOutcome, OverlapRecord, WorldHit, WorldPhysics};
+use xiii_script::physics::{ActorMeshHit, MoveOutcome, OverlapRecord, WorldHit, WorldPhysics};
 
 /// Rotation-matrix rows in Bevy space of an Unreal rotator (roll X / pitch Y / yaw Z), the
 /// axis-permutation conjugate `P R P^-1` of `FRotationMatrix`. Shared by the moving-brush
@@ -82,6 +82,12 @@ pub struct WorldPhysicsAdapter {
     source_names: Vec<String>,
     /// Registered mover actor names by their collision source id (reverse of `mover_by_name`).
     mover_names_by_source: HashMap<u32, String>,
+    /// item53: per placed-mesh actor (lowercased name prefix of a `"<actor> -> <mesh>"` source),
+    /// the lazily built zero-extent sub-world of that actor's own collision triangles plus its
+    /// per-source one-sidedness flags, for `WorldPhysics::actor_mesh_hit`. `None` caches "no
+    /// mesh data" so the VM's cylinder fallback stays in charge; registered movers always cache
+    /// `None` (their triangles live in the moving objects).
+    actor_meshes: HashMap<String, Option<(CollisionWorld, Vec<bool>)>>,
 }
 
 impl WorldPhysicsAdapter {
@@ -99,6 +105,7 @@ impl WorldPhysicsAdapter {
             mover_by_name: HashMap::new(),
             source_names: Vec::new(),
             mover_names_by_source: HashMap::new(),
+            actor_meshes: HashMap::new(),
         }
     }
 
@@ -121,6 +128,14 @@ impl WorldPhysicsAdapter {
     /// Builds the adapter from an imported world's query-specific collision soups.
     pub fn from_scene(scene: &crate::WorldScene) -> Self {
         Self::from_scene_with_line_sidedness(scene)
+    }
+
+    /// Test/diagnostic helper: overrides the collision-source labels (the map path sets them
+    /// from the importer's `"<actor> -> <mesh>"` labels).
+    #[cfg(test)]
+    fn with_source_names(mut self, names: &[&str]) -> Self {
+        self.source_names = names.iter().map(|s| (*s).to_owned()).collect();
+        self
     }
 
     /// The extent-query (box) collision world (for diagnostics and tests).
@@ -205,6 +220,59 @@ impl WorldPhysics for WorldPhysicsAdapter {
             }
             None => (None, None),
         }
+    }
+
+    fn actor_mesh_hit(&mut self, actor: &str, start: [f32; 3], end: [f32; 3]) -> ActorMeshHit {
+        let key = actor.to_ascii_lowercase();
+        if !self.actor_meshes.contains_key(&key) {
+            // A registered mover's triangles live in the moving objects (its static base-pose
+            // copies were dropped at registration), so the per-actor static cache must stay
+            // empty for it.
+            let is_registered_mover = self.mover_by_name.contains_key(&key);
+            let sub = if is_registered_mover {
+                None
+            } else {
+                let mut tris = Vec::new();
+                for (sid, name) in self.source_names.iter().enumerate() {
+                    let Some((owner, _)) = name.split_once(" -> ") else {
+                        continue;
+                    };
+                    if !owner.eq_ignore_ascii_case(actor) {
+                        continue;
+                    }
+                    let source = sid as u32;
+                    for i in 0..self.line_world.triangle_count() {
+                        let i = i as u32;
+                        if self.line_world.source(i) == source {
+                            tris.push((*self.line_world.triangle(i), source));
+                        }
+                    }
+                }
+                (!tris.is_empty()).then(|| {
+                    let one_sided = self.line_one_sided_sources.clone();
+                    (CollisionWorld::new(tris), one_sided)
+                })
+            };
+            self.actor_meshes.insert(key.clone(), sub);
+        }
+        let Some(Some((world, one_sided))) = self.actor_meshes.get(&key) else {
+            return ActorMeshHit::NoData;
+        };
+        let s = to_bevy_position(start);
+        let e = to_bevy_position(end);
+        let Some(hit) = world.ray_with_one_sided_sources(s, e, one_sided) else {
+            return ActorMeshHit::Miss;
+        };
+        let point = [
+            s[0] + (e[0] - s[0]) * hit.t,
+            s[1] + (e[1] - s[1]) * hit.t,
+            s[2] + (e[2] - s[2]) * hit.t,
+        ];
+        ActorMeshHit::Hit(WorldHit {
+            location: bevy_to_unreal_position(point),
+            normal: bevy_to_unreal_direction(hit.normal),
+            time: hit.t,
+        })
     }
 
     fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
@@ -721,6 +789,45 @@ mod tests {
         p.set_mover("Door", [100_000.0, 0.0, 0.0], [0, 0, 0]);
         assert!(p.trace(start, end, [0.0; 3]).is_none());
         assert!(p.point_free([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]));
+    }
+
+    #[test]
+    fn actor_mesh_hit_answers_from_the_placed_mesh_source_and_misses_the_opening() {
+        // item53: a wall panel in the Unreal YZ plane at x=40 with a window band
+        // (z in [60,120]) removed, placed as source "PorteDecors18 -> statitoit.Tportet3".
+        // The provider must answer the actor's own mesh: a ray through the opening misses,
+        // a ray through the panel hits, an unknown actor has no data.
+        let panel = |z0: f32, z1: f32| -> Vec<(Triangle, u32)> {
+            let c = [
+                [40.0, -50.0, z0],
+                [40.0, 50.0, z0],
+                [40.0, 50.0, z1],
+                [40.0, -50.0, z1],
+            ];
+            vec![
+                ([c[0], c[1], c[2]].map(to_bevy_position), 0),
+                ([c[0], c[2], c[3]].map(to_bevy_position), 0),
+            ]
+        };
+        let soup = [panel(-100.0, 60.0), panel(120.0, 400.0)].concat();
+        let mut p = WorldPhysicsAdapter::from_entries(soup.clone(), soup)
+            .with_source_names(&["PorteDecors18 -> statitoit.Tportet3"]);
+        let start = [0.0, 0.0, 90.0];
+        let end = [400.0, 0.0, 90.0];
+        assert_eq!(
+            p.actor_mesh_hit("PorteDecors18", start, end),
+            ActorMeshHit::Miss,
+            "the ray through the window opening must miss the door's mesh"
+        );
+        let start = [0.0, 0.0, 0.0];
+        let ActorMeshHit::Hit(world) = p.actor_mesh_hit("PorteDecors18", start, end) else {
+            panic!("the ray through the panel must hit");
+        };
+        assert!((world.location[0] - 40.0).abs() < 0.5, "{world:?}");
+        assert_eq!(
+            p.actor_mesh_hit("NoSuchActor", start, end),
+            ActorMeshHit::NoData
+        );
     }
 
     #[test]

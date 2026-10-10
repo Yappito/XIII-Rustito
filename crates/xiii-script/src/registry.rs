@@ -1099,6 +1099,41 @@ fn radius_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Na
     ))
 }
 
+/// `Actor.VisibleDamageableActors` (item48): the iterator `Actor.HurtRadius` (engine.u) drives
+/// when a scripted explosive blows up. See [`Vm::visible_damageable_actors`] for the decoded
+/// retail shape and the documented gaps.
+fn visible_damageable_actors(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let base = match object(vm, a, 0)? {
+        Some(ObjRef::Static(g)) => Some(g),
+        None => None,
+        Some(ObjRef::Instance(_)) | Some(ObjRef::External(_)) => {
+            return Err(vm.err(VmErrorKind::Other(
+                "VisibleDamageableActors base class is an instance".into(),
+            )));
+        }
+    };
+    let radius = float(vm, a, 2)?;
+    let loc = if c.omitted(3) {
+        vm.vector_prop(c.this, "Location").unwrap_or([0.0; 3])
+    } else {
+        vector2(vm, a, 3)?
+    };
+    // `Actor.HurtRadius` calls it with four arguments, so `bIgnoreHidden` is optional.
+    let ignore_hidden = !c.omitted(4) && boolean(vm, a, 4)?;
+    let items: Vec<Value> = vm
+        .visible_damageable_actors(base, radius, loc, ignore_hidden)?
+        .into_iter()
+        .map(|i| Value::Object(Some(ObjRef::Instance(i))))
+        .collect();
+    Ok(NativeOutcome::Iterate(
+        items.into_iter().map(|v| vec![v]).collect(),
+    ))
+}
+
 fn eq_ss(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     // UE2 string == is case-insensitive.
     val(Value::Bool(
@@ -1520,7 +1555,7 @@ fn finish_rotation(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult
 
 /// `Controller.WaitForLanding`: suspend the current state until the controller's pawn is no
 /// longer in `PHYS_Falling`. Upstream returns immediately (no latent) when there is no pawn or
-/// the pawn is not falling; the per-tick landing advance is [`Vm::advance_falling`].
+/// the pawn is not falling; the poll reads the pawn's `Physics` property whatever moved it.
 fn wait_for_landing(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
     if !c.in_state_code {
         return Err(vm.err(VmErrorKind::LatentOutsideState {
@@ -1781,29 +1816,10 @@ fn level_info_dec_attaque(
 
 /// `IAController.DirectionDuTir() -> vector`.
 ///
-/// Disassembly evidence (XIDPawn.dll `?execDirectionDuTir@AIAController` RVA 0x2070): with no pawn
-/// it returns `vect(0,0,0)`; otherwise it builds the shooting direction from the pawn's rotation
-/// and `Enemy`. The model here is the unit vector from the pawn to `Enemy.Location`, falling back
-/// to the pawn's forward axis when there is no enemy (documented `Partial`: dispersion and the
-/// aim offset are not reproduced).
+/// XIDPawn.dll 0x11902070: returns a world-space aim POINT, also refreshing WeaponStartTrace.
+/// AdjustAim subtracts its projStart; a normalized direction here aims toward the world origin.
 fn direction_du_tir(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let Some(pawn) = vm.obj_prop(c.this, "Pawn") else {
-        return val(Value::Vector([0.0; 3]));
-    };
-    if let Some(enemy) = vm.obj_prop(c.this, "Enemy") {
-        let l = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
-        let e = vm.vector_prop(enemy, "Location").unwrap_or(l);
-        let d = [e[0] - l[0], e[1] - l[1], e[2] - l[2]];
-        let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        if n > 1e-6 {
-            return val(Value::Vector([d[0] / n, d[1] / n, d[2] / n]));
-        }
-    }
-    let rot = match vm.get_property(pawn, "Rotation") {
-        Some(Value::Rotator(r)) => *r,
-        _ => [0; 3],
-    };
-    val(Value::Vector(rotator_basis(rot).0))
+    val(Value::Vector(vm.ai_aim_point(c.this)?))
 }
 
 /// `IAController.LigneVisee(vector TraceEnd, vector TraceStart) -> bool`.
@@ -2481,18 +2497,17 @@ fn pawn_eye_position(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResu
     val(Value::Vector([0.0, 0.0, h]))
 }
 
-/// `BaseSoldier.EyePosition`: the soldier eye offset. The caller
-/// (`xidpawn.IAController.Chasse.PickDestination` 0x013C, `ViewSpot = Pawn.Location +
-/// Pawn.EyePosition()`) adds `Location`, so the override is Location-relative like the base
-/// `Engine.Pawn.EyePosition`. **Partial**: the VM returns the `EyeHeight` offset along +Z
-/// (falling back to `BaseEyeHeight`); the DLL body's per-soldier stance/lean offsets are not
-/// reproduced.
-fn base_soldier_eye_position(
+/// XIDPawn.dll 0x119012b0 returns +0x28c (BaseEyeHeight), not +0x290 (EyeHeight).
+fn soldier_eye_position(
     vm: &mut Vm<'_>,
     c: &NativeCtx,
     _a: &mut [Value],
 ) -> VmResult<NativeOutcome> {
-    pawn_eye_position(vm, c, _a)
+    val(Value::Vector([
+        0.0,
+        0.0,
+        vm.f32_prop(c.this, "BaseEyeHeight"),
+    ]))
 }
 
 /// item14 `Pawn.GetViewRotation`: the rotation the pawn looks along. UE2 returns the controller's
@@ -2517,22 +2532,59 @@ fn pawn_get_view_rotation(
     val(Value::Rotator(rot))
 }
 
-/// item14 `Weapon.GetFireStart`: the muzzle position for the hitscan. The VM returns the
-/// instigator's eye (Location + `EyePosition`); the decoded muzzle offsets are not applied.
+/// Engine.dll 0x10386ea0: resolve a Pawn Owner when Instigator is null; add EyeHeight and
+/// FireOffset in the supplied view axes. Zoom uses only FireOffset.X.
 fn weapon_get_fire_start(
     vm: &mut Vm<'_>,
     c: &NativeCtx,
-    _a: &mut [Value],
+    a: &mut [Value],
 ) -> VmResult<NativeOutcome> {
-    let Some(pawn) = vm.obj_prop(c.this, "Instigator") else {
+    let pawn = vm
+        .obj_prop(c.this, "Instigator")
+        .or_else(|| vm.obj_prop(c.this, "Owner").filter(|p| vm.is_a(*p, "Pawn")));
+    let Some(pawn) = pawn else {
         return val(Value::Vector([0.0; 3]));
     };
+    vm.set_property(
+        c.this,
+        "Instigator",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
     let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
-    let eye = match vm.get_property(pawn, "EyeHeight") {
-        Some(Value::Float(f)) => *f,
-        _ => vm.f32_prop(pawn, "BaseEyeHeight"),
-    };
-    val(Value::Vector([loc[0], loc[1], loc[2] + eye]))
+    let eye = vm.f32_prop(pawn, "EyeHeight");
+    let axes = [vector2(vm, a, 0)?, vector2(vm, a, 1)?, vector2(vm, a, 2)?];
+    let mut offset = vm.vector_prop(c.this, "FireOffset").unwrap_or([0.0; 3]);
+    if vm.bool_prop(c.this, "bZoomed") {
+        offset[1] = 0.0;
+        offset[2] = 0.0;
+    }
+    let mut start = [loc[0], loc[1], loc[2] + eye];
+    for axis in 0..3 {
+        for (component, value) in start.iter_mut().enumerate() {
+            *value += axes[axis][component] * offset[axis];
+        }
+    }
+    val(Value::Vector(start))
+}
+
+/// Xiii.dll 0x11b01000: detach(true), grow without clamping, reattach, strict double threshold.
+fn grow_blood_flow(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let dt = float(vm, a, 0)?;
+    let actor = vm.objects[c.this as usize].name.clone();
+    vm.emit_event(PresentationEvent::ProjectorDetach {
+        actor: actor.clone(),
+        force: true,
+        time: vm.time,
+    });
+    let scale =
+        (f64::from(vm.f32_prop(c.this, "DrawScale")) + f64::from(dt) * f64::from(0.05_f32)) as f32;
+    vm.set_property(c.this, "DrawScale", 0, Value::Float(scale));
+    vm.emit_event(PresentationEvent::ProjectorAttach {
+        actor,
+        time: vm.time,
+    });
+    val(Value::Bool(f64::from(scale) > 0.35))
 }
 
 /// item14 `Pawn.CalcDrawOffset`: the first-person draw offset of an inventory item. The VM
@@ -2847,8 +2899,13 @@ fn calc_first_person_view(
 /// The snap exists only for the crosshair display: the script consumer
 /// (`xiii.XIIIPlayerInteraction.MyPCPostRender` 0x032D) feeds the returned rotator into the
 /// crosshair ray (`FiringTargHitLoc`) and `AmmoType.WarnTarget` — the un-snapped view rotation is
-/// the faithful unsnapped value there. Partial: no aim-assist snap decode (the ~0x800-byte target
-/// loop is presentation-only in the headless VM).
+/// the faithful unsnapped value there. Partial (item48 measurement): no aim-assist snap decode —
+/// the ~0x800-byte target loop is gated on engine-internal cooldown timers (+0x3ac/+0x3b0) and an
+/// anonymous ammunition bit (+0x270 bit 0x10), scans an anonymous LevelInfo list (0x454/0x4cc,
+/// 5-slot candidate arrays, cone-dot thresholds cos 0.96/0.98/0.99003/0.99456 measured at
+/// 0x1036e6f8-0x1036e729, trace flags 0x97 over max(anonymous float, 3000.0)) and is
+/// presentation-only in the headless VM; all offsets are native C++ fields the script reflection
+/// cannot name.
 fn adjust_aim_for_display(
     vm: &mut Vm<'_>,
     c: &NativeCtx,
@@ -4296,6 +4353,27 @@ fn builtin_defs() -> Vec<NativeDef> {
                 radius_actors,
             )
         },
+        NativeDef {
+            status: NativeStatus::Partial(
+                "visibility point is the victim's Location (retail: a mesh/bounds mid-point, 0.5 \
+                 at 0x1046f584); the two unidentified retail class constants (0x105ac8a8, \
+                 0x105a12c8), the anonymous hidden flag at +0x2c bit 0x10 and the second \
+                 higher-trace point (+0x290) are not reproduced; the line check is world-only \
+                 (retail flags 0x86 can also be blocked by actors); hidden test uses bHidden",
+            ),
+            ..def(
+                "Engine.Actor.VisibleDamageableActors",
+                "native(0) final iterator function VisibleDamageableActors(class<Actor> \
+                 BaseClass, out Actor Actor, float Radius, struct<Vector> Loc, optional bool \
+                 bIgnoreHidden)",
+                "engine.u Actor.VisibleDamageableActors decoded (BaseClass, Actor, Radius, Loc, \
+                 bIgnoreHidden); Actor.HurtRadius calls it as foreach \
+                 VisibleDamageableActors(class'Actor', Victims, DamageRadius, HitLocation); \
+                 Engine.dll ?execVisibleDamageableActors@AActor 0x103e90a0 (level-hash radius \
+                 query, BaseClass/hidden filters, SingleLineCheck flags 0x86)",
+                visible_damageable_actors,
+            )
+        },
         def(
             "Object.At_StrStr",
             "native(168) string @(string, string)",
@@ -4997,9 +5075,11 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "latent ends when the pawn's Physics leaves PHYS_Falling; the per-tick fall advance \
-             applies LevelInfo gravity and lands on the world floor (no fall damage physics, \
-             no velocity-driven horizontal drift)",
+            "latent ends when the pawn's Physics leaves PHYS_Falling (by any path that moves \
+             the property, e.g. a script SetPhysics or the host); the decoded scripted physics \
+             pass (item53 physFalling) does not flip Physics on a floor contact, so a pawn that \
+             only lands through it never resumes this latent (documented approximation; upstream \
+             UE2 APawn::processLanded would fire Landed and set PHYS_Walking)",
         ),
         ..def(
             "Engine.Controller.WaitForLanding",
@@ -5155,14 +5235,13 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "unit vector from the pawn to Enemy.Location (pawn forward fallback); dispersion/aim \
-             offset not reproduced",
+            "world-space sampled target, firing origin, skill offsets and decoded rejection-sampled angular cone; projectile-speed/base-velocity lead branches remain approximate",
         ),
         ..def(
             "IAController.DirectionDuTir",
             "native(0) function vector DirectionDuTir()",
             "XIDPawn.dll ?execDirectionDuTir@AIAController RVA 0x2070; IAController.NotifyFiring \
-             stores it in DirectionTir",
+             stores the world-space target in DirectionTir; 0x1190223a refreshes WeaponStartTrace",
             direction_du_tir,
         )
     });
@@ -5447,48 +5526,34 @@ fn builtin_defs() -> Vec<NativeDef> {
             pawn_eye_position,
         )
     });
-    v.push(NativeDef {
-        status: NativeStatus::Partial(
-            "returns EyeHeight/BaseEyeHeight along +Z; the DLL body's per-soldier stance/lean \
-             offsets are not reproduced",
-        ),
-        ..def(
-            "BaseSoldier.EyePosition",
-            "native(0) simulated native function Vector EyePosition()",
-            "xidpawn.u BaseSoldier.EyePosition decoded (return Vector, native); the caller \
-             IAController.Chasse.PickDestination 0x013C adds Pawn.Location, so the override is \
-             Location-relative; XIDPawn.dll ?execEyePosition@ABaseSoldier",
-            base_soldier_eye_position,
-        )
-    });
-    v.push(NativeDef {
-        status: NativeStatus::Partial(
-            "returns the controller's Rotation when set, else the pawn's Rotation; the native's \
-             cloud/rotation blending is not modelled",
-        ),
-        ..def(
-            "Engine.Pawn.GetViewRotation",
-            "native(0) simulated native function Rotator GetViewRotation()",
-            "engine.u Pawn.GetViewRotation decoded (return Rotator, native); \
+    v.push(def(
+        "Engine.Pawn.GetViewRotation",
+        "native(0) simulated native function Rotator GetViewRotation()",
+        "engine.u Pawn.GetViewRotation decoded (return Rotator, native); \
              XIIIWeapon.RealTraceFire passes it to Object.GetAxes; Engine.dll \
-             ?execGetViewRotation@APawn",
-            pawn_get_view_rotation,
-        )
-    });
-    v.push(NativeDef {
-        status: NativeStatus::Partial(
-            "returns the instigator's eye (Location + EyePosition); the decoded muzzle offset is \
-             not applied",
-        ),
-        ..def(
+              ?execGetViewRotation@APawn 0x103afb90: Controller.Rotation else Pawn.Rotation",
+        pawn_get_view_rotation,
+    ));
+    v.push(def(
             "Engine.Weapon.GetFireStart",
             "native(0) native function Vector GetFireStart(Vector X, Vector Y, Vector Z)",
             "engine.u Weapon.GetFireStart decoded (X,Y,Z, return Vector, native); \
              XIIIWeapon.RealTraceFire uses it as StartTrace for WHand != 0/4; Engine.dll \
-             ?execGetFireStart@AWeapon",
+              ?execGetFireStart@AWeapon 0x10386ea0: Owner Pawn fallback, EyeHeight, rotated FireOffset; zoom X only",
             weapon_get_fire_start,
-        )
-    });
+    ));
+    v.push(def(
+        "BaseSoldier.EyePosition",
+        "native(0) function Vector EyePosition()",
+        "XIDPawn.dll execEyePosition 0x119012b0 returns (0,0,BaseEyeHeight) at +0x28c",
+        soldier_eye_position,
+    ));
+    v.push(def(
+        "BloodFlow.GrowBloodFlow",
+        "native(604) final native static function bool GrowBloodFlow(float dt)",
+        "Xiii.dll execGrowBloodFlow 0x11b01000: Detach(1), DrawScale += dt*0.05f, Attach, return DrawScale > 0.35 (double)",
+        grow_blood_flow,
+    ));
     v.push(NativeDef {
         status: NativeStatus::Partial(
             "returns Inv.PlayerViewOffset; the engine combines it with the mesh eye offset and \
@@ -5623,13 +5688,18 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "no renderer: returns the un-snapped SmoothedAim(Rotation) (the aim-assist target-scan \
-             is crosshair display only); the returned rotator is the controller view rotation",
+            "no snap decode: the aim-assist target scan is gated on engine-internal smoothed-aim \
+             cooldown timers (+0x3ac/+0x3b0, written only by the engine's input/display path) and \
+             an anonymous ammunition property bit (byte +0x270 bit 0x10); the target loop keeps \
+             up to 5 candidates by aim-cone dot thresholds (measured cos 0.96/0.98/0.99003/0.99456) \
+             over an anonymous LevelInfo list with anonymous field offsets the script reflection \
+             cannot name. A VM snap would be invented behaviour; the no-snap path is measured to \
+             return SmoothedAim(un-snapped view rotation), which is what this returns",
         ),
         ..def(
             "PlayerController.AdjustAimForDisplay",
             "native(498) final native static function Rotator AdjustAimForDisplay(object<Ammunition> FiredAmmunition, struct<Vector> projStart)",
-            "Engine.dll execAdjustAimForDisplay 0x1036e2e0 decoded (native 498, registration thunk 0x1051aac8); every epilogue returns SmoothedAim(0x1036c720) of the rotation, snap path gated on a scan cooldown + ammunition+0x270 bit 0x10; consumer XIIIPlayerInteraction.MyPCPostRender 0x032D (crosshair ray + WarnTarget)",
+            "Engine.dll execAdjustAimForDisplay 0x1036e2e0 decoded (native 498, registration thunk 0x1051aac8); every epilogue returns SmoothedAim(0x1036c720) of the rotation; the snap path (item48 measurement) traces flags 0x97 over max(anonymous float, 3000.0) along the view axes, scans the LevelInfo+0x454 actor list (5-slot candidate arrays, SingleLineCheck filters) and picks by cone dot thresholds; consumer XIIIPlayerInteraction.MyPCPostRender 0x032D (crosshair ray + WarnTarget)",
             adjust_aim_for_display,
         )
     });

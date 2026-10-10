@@ -2008,7 +2008,12 @@ fn open_map_runtime(
     let (voice_provider, voice_unresolved) = voice::LibraryVoiceDuration::new(voice_library);
     session
         .vm_mut()
-        .set_voice_duration(Box::new(voice_provider));
+        .set_voice_duration(Box::new(voice_provider.clone()));
+    // item48: `Actor.WaveHasPosition` needs the audio-subsystem seam; without a provider the
+    // native fails explicitly and a speaking `DialogueManager` would be suspended. The provider
+    // cannot classify the positional bit yet (see `play::voice`), which keeps the native's
+    // visible note path.
+    session.vm_mut().set_wave_position(Box::new(voice_provider));
     session.register_movers(scene);
     let mover_states = session.mover_states();
     let (mut world, mover_collision) = movers::MoverCollision::build(scene, &mover_states);
@@ -2740,6 +2745,101 @@ mod tests {
             sim.location[2]
         );
         assert!(dist > 1.0, "player did not move: {dist} UU");
+    }
+
+    /// Opt-in corpus test (item48): the four maps where the item45 survey reported
+    /// `AdjustAimForDisplay` (Hual01a + the HUD-render suspension set), `VisibleDamageableActors`
+    /// (Amos01, SPADS02b explosive canisters) and `WaveHasPosition` (SMarin01, SPADS02b intro
+    /// dialogue), opened through the same headless helper the route tests use (empty input
+    /// script, 90 s, no player input). Asserts the natives are no longer reported (no suspended
+    /// actors, no failures) and prints what happens instead: the `PlayStrVoice` dialogue lines,
+    /// the `TakeDamage` events the `HurtRadius` iterator delivered, the player's final health
+    /// and the natives' call counts.
+    #[test]
+    fn opt_in_item48_natives_no_longer_reported_on_survey_maps() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        for map in ["Hual01a", "Amos01", "SMarin01", "SPADS02b"] {
+            let opts = Options {
+                map: Some(map.to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).unwrap_or_else(|e| panic!("import {map}: {e}"));
+            let script = script::Script::parse("").expect("empty input script");
+            let outcome = run_script_with_cinematic_input(
+                &game_dir,
+                map,
+                &script,
+                &resolved.params,
+                &scene,
+                90.0,
+            )
+            .unwrap_or_else(|e| panic!("{map}: {e}"));
+            let sess = &outcome.session;
+            assert!(
+                sess.suspended.is_empty(),
+                "{map}: suspended actors {:#?}",
+                sess.suspended
+            );
+            assert!(
+                sess.failures.is_empty(),
+                "{map}: script failures {:#?}",
+                sess.failures
+            );
+            let used = &sess.vm().natives_used;
+            for path in [
+                "PlayerController.AdjustAimForDisplay",
+                "Actor.VisibleDamageableActors",
+                "Actor.WaveHasPosition",
+            ] {
+                let hit = used
+                    .iter()
+                    .find(|(p, _)| p.eq_ignore_ascii_case(path))
+                    .map(|(_, v)| *v);
+                println!(
+                    "[item48] {map}: {path} calls {:?}",
+                    hit.unwrap_or((None, 0))
+                );
+            }
+            for (t, d) in &sess.dialogues {
+                println!(
+                    "[item48] {map}: t={t:.3}s dialogue sound={:?} speaker={:?} text={:?}",
+                    d.sound, d.speaker, d.text
+                );
+            }
+            let damages: Vec<String> = sess
+                .vm()
+                .trace
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    xiii_script::TraceKind::Event {
+                        target,
+                        function,
+                        args,
+                    } if function.ends_with("TakeDamage") => Some(format!(
+                        "t={:.3}s {} <- {}({})",
+                        e.time,
+                        target,
+                        function,
+                        args.join(", ")
+                    )),
+                    _ => None,
+                })
+                .collect();
+            println!("[item48] {map}: {} TakeDamage events", damages.len());
+            for line in damages.iter().take(20) {
+                println!("[item48] {map}:   {line}");
+            }
+            let health = sess.vm().get_property(sess.player, "Health").cloned();
+            println!(
+                "[item48] {map}: final player health {:?}, {} dialogue event(s)",
+                health, sess.dialogue_total
+            );
+        }
     }
 
     /// Synthetic ownership/sync test: the render translation follows a VM-moved actor's
@@ -4180,6 +4280,123 @@ mod tests {
         );
     }
 
+    /// item52 route: Hual01a with both MapInfo objectives completed by the game's own chains,
+    /// then the game's own campaign travel to Hual01b (`MapInfo.NextMapLevelWithUnr`). The
+    /// fixture walks the whole map by player input (no teleports except two labelled measured
+    /// movement gaps, no `take_control`, no `set_goal`, no weapon grant). Measured chains:
+    /// the EDF handle `Porte6` fires 'Goal_Manette_EDF' -> `XIIIGoalTrigger3` (goal 666) ->
+    /// the map's own `xidmaps.Hual01a.SetGoalComplete` override (promotes objective 1 and
+    /// completes it); the dam-crest focus window (`CWndFocusTrigger3`, armed by `TouchTrigger8`)
+    /// hands its 'PontA' Tag off on dismissal and the `XIIIMover0/5` panels close the bridge
+    /// through their own `TriggerToggle`; `Trigger2` ('End_of_level') fires `XIIIGoalTrigger1`
+    /// (goal 0) and `TestGoalComplete` -> `DoTravel` -> `ServerTravel` requests the travel.
+    /// The host `fire` at the lever supplies only the press moment the decoded scripts never
+    /// show (the native consumer is a labelled evidence gap, see `session.fire`); everything
+    /// downstream - the trigger's own `WaitEndFocus.Trigger` dismissal and the `PontA` Tag
+    /// delivery - is game code.
+    #[test]
+    fn opt_in_hual01a_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual01a".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual01a");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        // Tracked fixture (our own route commands; no game data).
+        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/hual01a_route.script");
+        let script = script::Script::load(&route_path).expect("load item52 Hual01a route");
+        assert!(
+            script.events.iter().all(|event| {
+                !matches!(
+                    &event.command,
+                    script::Command::TakeControl
+                        | script::Command::SetGoal(_)
+                        | script::Command::Weapon(_)
+                )
+            }),
+            "the Hual01a route must not bridge control, goals or weapons"
+        );
+        // 210 s: the route reaches the shaft teleport at t=194, the game's own travel request
+        // lands at t~196.5 (measured), the host reloads Hual01b and the run ends there.
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Hual01a",
+            &script,
+            &resolved.params,
+            &scene,
+            210.0,
+        )
+        .expect("run Hual01a route");
+        for (map, states) in &outcome.map_objectives {
+            println!(
+                "[hual01a route] objectives as the run left {map}: {}",
+                states
+                    .iter()
+                    .map(|o| format!(
+                        "[{}{}{}{}] {}",
+                        o.index,
+                        if o.primary { " P" } else { " -" },
+                        if o.completed { " C" } else { " ." },
+                        if o.anti_goal { " A" } else { "" },
+                        o.text
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+        }
+        println!(
+            "[hual01a route] travel: {:?}, final map {}",
+            outcome.travel, outcome.final_map
+        );
+        let hual01a = outcome
+            .map_objectives
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Hual01a"))
+            .expect("Hual01a objective states");
+        assert!(
+            hual01a.1.len() >= 2,
+            "Hual01a MapInfo must expose its two objectives: {:?}",
+            hual01a.1
+        );
+        assert!(
+            hual01a.1[0].primary && hual01a.1[0].completed,
+            "objective 0 (penetrate the base enclosure) must complete through the game's own \
+             End_of_level chain: {:?}",
+            hual01a.1[0]
+        );
+        assert!(
+            hual01a.1[1].primary && hual01a.1[1].completed,
+            "objective 1 (re-connect the power supply) must be promoted and completed by the \
+             map's own SetGoalComplete override through the EDF handle chain: {:?}",
+            hual01a.1[1]
+        );
+        assert!(
+            !outcome.travel.is_empty(),
+            "the level must travel; blocked actors: {:?}",
+            outcome.session.suspended
+        );
+        assert_eq!(outcome.final_map, "Hual01b");
+        assert_eq!(outcome.travel[0].from, "Hual01a");
+        assert_eq!(outcome.travel[0].to, "Hual01b");
+        assert_eq!(outcome.travel[0].url, "Hual01b.unr");
+        let hual01b = outcome
+            .map_objectives
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Hual01b"))
+            .expect("the run must load Hual01b and capture its objective states");
+        assert!(
+            hual01b.1.len() >= 7,
+            "Hual01b must load with its own MapInfo objectives: {:?}",
+            hual01b.1
+        );
+    }
+
     fn probe_objectifs(game_dir: &std::path::Path, map: &str) {
         let session = session::Session::open(game_dir, map).expect("open map");
         let gi = session.game_info.expect("GameInfo");
@@ -4670,6 +4887,16 @@ mod tests {
         let health = s.actor_health(soldier);
         let dead = s.actor_is_dead(soldier);
         let weapon = s.player_weapon();
+        if std::env::var("XIII_SURVEY").as_deref() == Ok("1") {
+            for event in &s.vm().trace {
+                if event.time >= 60.0
+                    && matches!(&event.kind,
+                    xiii_script::TraceKind::Note(n) if n.starts_with("combat-ray"))
+                {
+                    println!("[item51b-kill-ray] {event:?}");
+                }
+            }
+        }
         println!(
             "[fight test] player weapon {:?}, BaseSoldier6 health {health:?} dead={dead}",
             weapon.map(|w| s.vm().objects[w as usize].name.clone())
@@ -5314,6 +5541,175 @@ mod tests {
         }
         panic!(
             "no low-clearance spot (100..148 UU) where standing is blocked and crouch fits was found"
+        );
+    }
+
+    /// Opt-in corpus test (item50): a player-input route across Toits01 from the start roof to
+    /// TouchTrigger10 at the pad. The route fires the game's own Touch on TT10, but goal 0 does
+    /// not complete: XIII's TouchTrigger.Touch requires `self.bActif`, and TT10 is authored
+    /// `bActif=false` (`bActivableParTrigger=true`, Tag `PorteDebloquee`) - it arms only when
+    /// BreakableMover12 (the generator, Health 50) is destroyed, and the generator's yard is
+    /// sealed against the route's input in the current sim. Goals 1 and 2 are unreachable for
+    /// the independent demo-wedge reason (the CineController2 grapple demonstration can never
+    /// complete, so the scene blocks forever at `wait event JonesHookEnd`). This test pins the
+    /// measured state so the blockers cannot silently regress. item48 update: with
+    /// `VisibleDamageableActors` implemented the route's player is killed by the tarmac's
+    /// scripted bazooka fire (see the health assertion below); the fixture was authored while
+    /// that native was missing and the blasts were no-ops.
+    #[test]
+    fn opt_in_toits01_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Toits01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Toits01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/toits01_route.script");
+        let script = script::Script::load(&route_path).expect("load item50 Toits01 route");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Toits01",
+            &script,
+            &resolved.params,
+            &scene,
+            330.0,
+        )
+        .expect("run Toits01 route");
+        let session = &outcome.session;
+        let objectives = session.objective_states();
+        println!(
+            "[toits01 route] objectives={objectives:?} travel={:?} final_map={}",
+            outcome.travel, outcome.final_map
+        );
+        assert_eq!(outcome.final_map, "Toits01");
+        assert!(
+            outcome.travel.is_empty(),
+            "route unexpectedly travelled: {:?}",
+            outcome.travel
+        );
+        // item48: `Actor.VisibleDamageableActors` (HurtRadius) now delivers blast damage, so
+        // the tarmac's scripted BazookRocket soldiers (Damage 600, DamageRadius 1000) kill the
+        // route's no-input player near (16000,1300): measured 150 -> 75 @299.0 s, 65 @301.5 s,
+        // dead @302.0 s (identical in two runs; the ratios match the retail HurtRadius script's
+        // `1 - (dist - CollisionRadius)/DamageRadius` falloff for wall impacts ~900-1000 UU out).
+        // The fixture was authored while the native was missing, so the blasts were no-ops.
+        let health = session
+            .player_health()
+            .expect("the player must still have a Health property across the route");
+        assert!(
+            health <= 0.0,
+            "expected the scripted tarmac rockets to kill the no-input route player once HurtRadius works, got health {health}"
+        );
+        // Goal 3 (Jones must not die) completes; goals 0/1/2 do not.
+        for o in &objectives {
+            match o.index {
+                3 => assert!(o.completed, "the survival objective must complete: {o:?}"),
+                0..=2 => assert!(
+                    !o.completed,
+                    "objective {} must stay incomplete in this fixture (measured blockers): {o:?}",
+                    o.index
+                ),
+                _ => {}
+            }
+        }
+        // The route fires the game's own Touch on TouchTrigger10 with the player pawn.
+        let vm = session.vm();
+        let tt10_touched = vm.trace.iter().any(|event| {
+            matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, args }
+                    if target.eq_ignore_ascii_case("TouchTrigger10")
+                        && function.ends_with("TouchTrigger.Touch")
+                        && args.iter().any(|a| a.contains("XIIIPlayerPawn"))
+            )
+        });
+        assert!(
+            tt10_touched,
+            "the route must reach and touch TouchTrigger10 (the game's own trigger)"
+        );
+        // The measured blockers, pinned: TT10 stays disarmed (bActif=false) because the
+        // generator BreakableMover12 that drives the PorteDebloquee chain is never destroyed;
+        // goal 0's Touch fired but its XIII TouchTrigger.Touch guard requires bActif.
+        let tt10 = vm
+            .objects
+            .iter()
+            .enumerate()
+            .position(|(i, o)| {
+                vm.set().path(o.class).ends_with("TouchTrigger")
+                    && vm
+                        .get_property(i as u32, "Event")
+                        .map(|v| v.to_string().contains("RenfortHelico02"))
+                        .unwrap_or(false)
+            })
+            .expect("TouchTrigger10 (Event RenfortHelico02) must exist on Toits01");
+        assert_eq!(
+            vm.get_property(tt10 as u32, "bActif"),
+            Some(&xiii_script::Value::Bool(false)),
+            "TouchTrigger10 must stay disarmed: the generator chain never ran"
+        );
+        let generator = vm
+            .find_object("BreakableMover12")
+            .expect("the generator BreakableMover12 must exist");
+        assert_eq!(
+            vm.get_property(generator, "Health"),
+            Some(&xiii_script::Value::Int(50)),
+            "the generator must be undamaged: the route's input cannot reach it (the yard's              ForeverLocked door line blocks every walk line and the through-window shot never              lands; see local/reports/item50-toits01-route.md)"
+        );
+        println!(
+            "[toits01 route] blockers pinned: TT10.bActif=false (generator Health 50 intact),              goal 0's Touch fired but its XIII TouchTrigger.Touch guard requires bActif"
+        );
+        // item53: the grapple demonstration completes. The demonstrator runs its seven-state
+        // machine (Walking to the marker, the CineHook Projectile cast with the decoded
+        // physProjectile -> physFalling fall-through, the Flying ascent, the retract) and its
+        // final state is STA_Retract, whose Timer fired `TriggerEvent('JonesHookEnd')`.
+        let demonstrator_retract = vm.trace.iter().any(|event| {
+            matches!(
+                &event.kind,
+                xiii_script::TraceKind::StateChange { actor, to, .. }
+                    if actor.eq_ignore_ascii_case("RoofGrapnleDemonstrator0")
+                        && to.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("STA_Retract"))
+            )
+        });
+        assert!(
+            demonstrator_retract,
+            "the grapple demonstrator must reach STA_Retract (the demo machine completes)"
+        );
+        // item48: the tarmac rockets kill the route's player at ~301.55 s (health pin above).
+        // The engine-wide kill broadcast (`Controller.ClientGameEnded`) then moves every
+        // controller out of the scene: measured CineController2 PlayingSequence -> GameEnded at
+        // 301.550 s, with ScriptedActionIndex cleared (None) after the broadcast. The pre-item48
+        // fixture pinned `ScriptedActionIndex >= 117` and a PlayerWalking handover here; both
+        // were measured on a living player and are unreachable once the kill ends the scene.
+        // Pinned instead: the scene was still running (PlayingSequence) until the kill moved
+        // CineController2 to GameEnded, and the player controller ends in GameEndedDeath.
+        let kill_broadcast = vm.trace.iter().any(|event| {
+            matches!(
+                &event.kind,
+                xiii_script::TraceKind::StateChange { actor, from, to, .. }
+                    if actor.eq_ignore_ascii_case("CineController2")
+                        && from.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("PlayingSequence"))
+                        && to.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("GameEnded"))
+            )
+        });
+        assert!(
+            kill_broadcast,
+            "the scene must run until the player kill's GameEnded broadcast moves CineController2 out of PlayingSequence"
+        );
+        let pc = vm
+            .objects
+            .iter()
+            .enumerate()
+            .position(|(_, o)| vm.set().path(o.class).ends_with("XIIIPlayerController"))
+            .expect("the player controller must exist");
+        assert!(
+            vm.is_in_state(pc as u32, "GameEndedDeath"),
+            "the player controller must end in GameEndedDeath (killed by the scripted tarmac rockets)"
         );
     }
 }

@@ -837,17 +837,16 @@ impl Session {
         Ok(())
     }
 
-    /// Host movement ownership is temporarily ceded by the Plage01 wake-up script. While this is
-    /// true, `BeachInBedWithXIII` owns `Location`/`Rotation` and restores collision before it
-    /// returns the controller to PlayerWalking.
+    /// A cinematic owns the player pawn while the controller is in `NoControl`: the bed
+    /// wake-up script (`BeachInBedWithXIII`) and the Toits01 grapple demonstrator
+    /// (`RoofGrapnleDemonstrator.MoveToRightThePlace` writes `PC.Pawn.Velocity`,
+    /// `LookAtJones` writes `PC.Rotation`) drive `Location`/`Rotation`/`Velocity` themselves and
+    /// restore `PlayerWalking` when done (item53). While this holds, the host stops writing the
+    /// pawn fields and follows the VM's pose; the VM's scripted-physics pass integrates the
+    /// script-written `Velocity` (Walking, horizontal).
     fn script_owns_player_pawn(&self) -> bool {
-        self.controller.is_some_and(|pc| {
-            self.vm.is_in_state(pc, "NoControl")
-                && matches!(
-                    self.vm.get_property(self.player, "bCollideWorld"),
-                    Some(Value::Bool(false))
-                )
-        })
+        self.controller
+            .is_some_and(|pc| self.vm.is_in_state(pc, "NoControl"))
     }
 
     /// Script-driven player pose for the host movement sim to follow during the bed wake-up cine.
@@ -2018,6 +2017,33 @@ impl Session {
     /// when the pawn has no controller. The weapon runs its own `ServerFire` ->
     /// `TraceFire`/`ProjectileFire` -> `ProcessTraceHit` -> `TakeDamage` chain (item14).
     pub fn fire(&mut self, yaw: f32, pitch: f32) -> FireOutcome {
+        // item52: while a comic-strip cartoon-focus window is up, a player press ends the
+        // window and fires the focus trigger's Tag. Decoded (`disasm-xiii-all.txt`):
+        // `WaitForBeingSeen.Timer` 0x025C-0x0337 re-assigns `self.Tag = self.EventFinFocus`,
+        // sets `FocusDuration = -1` (-> `SetUpCartoonFocus` 0x0055 `bModeInfini = true`,
+        // `EndOfLife = StartOfLife`), registers itself in `XIIIBaseHud.tFocusTrigger[]` and
+        // parks in `WaitEndFocus`. Every `HudCartoonFocus` auto-close is gated
+        // `!bModeInfini` (`ZoomToStandardCWnd.DrawWnd` 0x0096/0x0153/0x0180/0x0251), and the
+        // only scripted remover for this window is the trigger's own `WaitEndFocus.Trigger`
+        // (finds its `tFocusTrigger` slot, `tCartoonFocus[i].RemoveMe()`, compacts both
+        // arrays, decrements `eNbHudCartoonFocus`, `Destroy()`). An exhaustive script-side
+        // search finds NO input consumer: `XIIIPlayerController` execs (`Fire` 0x0000-0x01F9,
+        // `AltFire`, `UnFire`, weapon/item switch, `Jump`, `Duck`, `ActivateItem`),
+        // `XIIIPlayerInteraction.KeyEvent` (ESC + one debug key only) / `MyPCPostRender`
+        // (render/targeting only) and `XIIIBaseHud` contain no focus-input handling; nothing
+        // outside `CWndFocusTrigger` reads `tFocusTrigger`. So the press consumer is native
+        // (Engine.dll/Xiii.dll, accessing the HUD state by compiled offsets - none of the
+        // binaries contains a `tFocusTrigger`/`CartoonFocus` string, which is weak evidence
+        // only). EVIDENCE GAP (labelled, not proven): which native consumes the press. This
+        // host bridge supplies only that press moment when the game's own window state shows
+        // a live trigger-backed focus; everything downstream is game code: the bridge calls
+        // the registered trigger's own `TriggerEvent(Tag)`, Engine.u's dispatch delivers the
+        // Tag to the receivers (Hual01a: the `PontA` bridge panels) AND back to the trigger
+        // itself, whose `WaitEndFocus.Trigger` runs the decoded dismissal. Logged on every
+        // firing; never invents an event when no focus window is live.
+        if self.dismiss_cartoon_focus() {
+            return FireOutcome::Fired;
+        }
         let Some(weapon) = self.player_weapon() else {
             return FireOutcome::NoWeapon;
         };
@@ -2317,6 +2343,67 @@ impl Session {
         while self.touches.len() > 64 {
             self.touches.pop_front();
         }
+    }
+
+    /// The cartoon-focus dismissal (see `fire`): supplies the press moment the decoded scripts
+    /// never show (native consumer, labelled evidence gap in `fire`) by firing the registered
+    /// focus trigger's own `TriggerEvent(Tag)` once, when a live trigger-backed focus window is
+    /// up. The trigger's own `WaitEndFocus.Trigger` runs the decoded dismissal and the Tag
+    /// receivers run their own code. Returns whether a dismissal ran.
+    fn dismiss_cartoon_focus(&mut self) -> bool {
+        let Some(ctrl) = self.controller else {
+            return false;
+        };
+        let hud = match self.vm.get_property(ctrl, "myHUD") {
+            Some(&Value::Object(Some(ObjRef::Instance(h)))) => h,
+            _ => return false,
+        };
+        let focus_alive = matches!(
+            self.vm.get_property(hud, "HudFoc"),
+            Some(Value::Object(Some(ObjRef::Instance(_))))
+        );
+        if !focus_alive {
+            return false;
+        }
+        let registered = match self.vm.get_property(hud, "eNbHudCartoonFocus") {
+            Some(&Value::Int(n)) if n > 0 => n,
+            _ => return false,
+        };
+        let mut fired = false;
+        for i in 0..registered {
+            let trigger = match self.vm.get_property_elem(hud, "tFocusTrigger", i as usize) {
+                Some(&Value::Object(Some(ObjRef::Instance(t))))
+                    if !self.vm.objects[t as usize].deleted =>
+                {
+                    t
+                }
+                _ => continue,
+            };
+            let tag = match self.vm.get_property(trigger, "Tag") {
+                Some(Value::Name(n)) if !n.eq_ignore_ascii_case("None") => n.clone(),
+                _ => continue,
+            };
+            let name = self.vm.objects[trigger as usize].name.clone();
+            let args = vec![
+                Value::Name(tag.clone()),
+                Value::Object(Some(ObjRef::Instance(trigger))),
+                Value::Object(Some(ObjRef::Instance(self.player))),
+            ];
+            match self.vm.send_event(trigger, "TriggerEvent", args) {
+                Ok(_) => {
+                    println!(
+                        "[play] host bridge: cartoon-focus dismissed; firing {name} Tag {tag:?} \
+                         through its own TriggerEvent"
+                    );
+                    fired = true;
+                }
+                Err(e) => self.record_failure(&name, &e),
+            }
+        }
+        if fired {
+            self.drain_events();
+        }
+        fired
     }
 
     /// Reproduces the engine's `Trigger.Touch` for the one decoded actor that starts a level end
