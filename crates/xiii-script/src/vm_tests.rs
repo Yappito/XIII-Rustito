@@ -762,6 +762,116 @@ fn mapinfo_licence_write_runs_without_a_script_handler() {
     assert_eq!(vm.get_property(mi, "TGSDummy"), Some(&Value::Int(3589)));
 }
 
+/// item61: authored miniature of the engine's `InitExecution` anti-piracy writes (no retail
+/// bytecode): a `GameInfo` subclass carrying `DummyStuff1`/`DummyStuff2`, a `GenAlerte`
+/// subclass carrying `dummy`, and a non-GameInfo/non-GenAlerte `FakeInfo` subclass with the
+/// same property names (so only the chain-name gate may exclude it).
+fn init_execution_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let gameinfo = b.reserve(0, 0, "GameInfo");
+    let mygame = b.reserve(0, 0, "MyGame");
+    let genalerte = b.reserve(0, 0, "GenAlerte");
+    let fakeinfo = b.reserve(0, 0, "FakeInfo");
+    let dummy1 = b.reserve(IMP_FLOATPROP, mygame, "DummyStuff1");
+    let dummy2 = b.reserve(IMP_INTPROP, dummy1, "DummyStuff2");
+    let gen_dummy = b.reserve(IMP_INTPROP, genalerte, "dummy");
+    let fake1 = b.reserve(IMP_FLOATPROP, fakeinfo, "DummyStuff1");
+    let fake2 = b.reserve(IMP_INTPROP, fake1, "DummyStuff2");
+    b.prop(dummy1, dummy2, 0);
+    b.prop(dummy2, 0, 0);
+    b.prop(gen_dummy, 0, 0);
+    b.prop(fake1, fake2, 0);
+    b.prop(fake2, 0, 0);
+    b.class(object, 0, 0);
+    b.class(actor, object, 0);
+    b.class(gameinfo, actor, 0);
+    b.class(mygame, gameinfo, dummy1);
+    b.class(genalerte, actor, gen_dummy);
+    b.class(fakeinfo, actor, fake1);
+    // "Map-placed" actors: exports whose class is the class export itself (the way a map
+    // package's export table instantiates level actors), with an empty tagged property block.
+    let placed_alert = b.reserve(genalerte, 0, "GenAlerte0");
+    let placed_game = b.reserve(mygame, 0, "MyGame0");
+    let placed_fake = b.reserve(fakeinfo, 0, "FakeInfo0");
+    b.set(placed_alert, vec![0]);
+    b.set(placed_game, vec![0]);
+    b.set(placed_fake, vec![0]);
+    b.build()
+}
+
+#[test]
+fn init_execution_writes_gameinfo_dummystuff_on_spawn() {
+    let set = set_of(init_execution_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let spawner = vm.spawn(g(&set, "Actor"), "Spawner").unwrap();
+    let game = vm
+        .spawn_actor(spawner, Some(g(&set, "MyGame")), None, None, None, None)
+        .unwrap()
+        .expect("spawned");
+    // Engine.dll `AGameInfo::InitExecution` 0x103e0cb6/0x103e0cc0: 0xC3A3228F at +0x2c0,
+    // 0x337 at +0x2c4.
+    assert_eq!((-326.27f32).to_bits(), 0xC3A3228F);
+    assert_eq!(
+        vm.get_property(game, "DummyStuff1"),
+        Some(&Value::Float(-326.27))
+    );
+    assert_eq!(vm.get_property(game, "DummyStuff2"), Some(&Value::Int(823)));
+    // A non-GameInfo class with the same property names never receives the write.
+    let fake = vm
+        .spawn_actor(spawner, Some(g(&set, "FakeInfo")), None, None, None, None)
+        .unwrap()
+        .expect("spawned");
+    assert_eq!(
+        vm.get_property(fake, "DummyStuff1"),
+        Some(&Value::Float(0.0)),
+        "a non-GameInfo class never receives the DummyStuff write"
+    );
+    assert_eq!(vm.get_property(fake, "DummyStuff2"), Some(&Value::Int(0)));
+    // The GameInfo write lands before any lifecycle event: `active` is set after the write, so
+    // a PreBeginPlay handler would already observe the magic value.
+    assert!(vm.objects[game as usize].active);
+}
+
+#[test]
+fn init_execution_writes_genalerte_dummy_on_level_load() {
+    let set = set_of(init_execution_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.load_level(0, &Limits::default()).unwrap();
+    let alert = vm.find_object("GenAlerte0").expect("GenAlerte instance");
+    // XIDPawn.dll `AGenAlerte::InitExecution` 0x119015c9: 0x7d2 at this+0x21c.
+    assert_eq!(vm.get_property(alert, "dummy"), Some(&Value::Int(2002)));
+    let fake = vm.find_object("FakeInfo0").expect("FakeInfo instance");
+    assert_eq!(
+        vm.get_property(fake, "dummy"),
+        None,
+        "a non-GenAlerte class has no dummy slot to write"
+    );
+}
+
+#[test]
+fn init_execution_write_survives_map_property_reload_order() {
+    // The engine serialises map properties first, then runs `InitExecution`; a map-authored
+    // value must not survive the write. `MyGame0` (a GameInfo subclass) instantiated from the
+    // "map" package therefore carries the magic float even though no map default set it.
+    let set = set_of(init_execution_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.load_level(0, &Limits::default()).unwrap();
+    let game = vm.find_object("MyGame0").expect("MyGame instance");
+    assert_eq!(
+        vm.get_property(game, "DummyStuff1"),
+        Some(&Value::Float(-326.27))
+    );
+    assert_eq!(vm.get_property(game, "DummyStuff2"), Some(&Value::Int(823)));
+    let fake = vm.find_object("FakeInfo0").expect("FakeInfo instance");
+    assert_eq!(
+        vm.get_property(fake, "DummyStuff1"),
+        Some(&Value::Float(0.0)),
+        "a non-GameInfo class never receives the DummyStuff write"
+    );
+}
+
 fn pressing_fire_package() -> Vec<u8> {
     let mut b = B::new();
     let object = b.reserve(0, 0, "Object");

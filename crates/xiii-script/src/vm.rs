@@ -3182,6 +3182,11 @@ impl<'s> Vm<'s> {
             let mut values = std::mem::take(&mut self.objects[id as usize].props);
             self.apply_block(map, &props.block, &layout, &mut values);
             self.objects[id as usize].props = values;
+            // item61: level-placed actors get the engine's `InitExecution` writes too (the
+            // retail `AGenAlerte::InitExecution` initialises map-placed alert generators).
+            if self.objects[id as usize].is_actor {
+                self.apply_native_init_execution(id);
+            }
         }
         // Cache the map's `LevelInfo` for the per-tick `NextURL` travel check.
         self.level_info = self.find_level_info();
@@ -6981,12 +6986,51 @@ impl<'s> Vm<'s> {
         if let Some(level) = self.obj_prop(spawner, "Level") {
             self.set_property(id, "Level", 0, Value::Object(Some(ObjRef::Instance(level))));
         }
+        // item61: the engine's per-actor `InitExecution` runs before any lifecycle event.
+        self.apply_native_init_execution(id);
         self.objects[id as usize].active = true;
         self.note(TraceKind::Spawned {
             actor: name,
             class: self.set.path(class),
         });
         Ok(Some(id))
+    }
+
+    /// item61: the anti-piracy values the retail engine's `InitExecution` overrides store on
+    /// fresh actors before any script lifecycle runs, applied at the same points the VM
+    /// instantiates actors (runtime [`Vm::spawn_actor`]/[`Vm::spawn_level_actor`] and
+    /// [`Vm::load_level`]):
+    ///
+    /// - Engine.dll `?InitExecution@AGameInfo@@UAEXXZ` (0x103e0c80): after the
+    ///   `AActor::InitExecution` call at 0x103e0cad it stores `0xC3A3228F` (= -326.27f) at
+    ///   `this+0x2c0` (0x103e0cb6) = `GameInfo.DummyStuff1` (float) and `0x337` (= 823) at
+    ///   `this+0x2c4` (0x103e0cc0) = `GameInfo.DummyStuff2` (int). `xidpawn.IAController.Init`
+    ///   state `TurnIntoSoldierInit` (code 0x0010) gives every soldier
+    ///   `BaseS.Skill = 5; Pawn.Health *= 5` unless `Level.Game.DummyStuff1` carries -326.27, so
+    ///   without this write all campaign soldiers are 5x-health skill-5 soldiers.
+    /// - XIDPawn.dll `?InitExecution@AGenAlerte@@UAEXXZ` (VA 0x119015c0, RVA 0x15c0): after its
+    ///   `AActor::InitExecution` IAT call it stores `0x7d2` (= 2002) at `this+0x21c` (0x119015c9)
+    ///   = `GenAlerte.dummy` (int). `GenAlerte.PoteBeugle` (4 sites) applies
+    ///   `BaseS.Skill = 5; Pawn.Health *= 10` to every alerted soldier unless `dummy` is inside
+    ///   (1940, 2003) — the retail value 2002 suppresses it.
+    ///
+    /// Deliberately untraced: the retail write produces no script-visible effect by itself and
+    /// the Plage00 trace baseline must stay byte-identical.
+    fn apply_native_init_execution(&mut self, id: ObjectId) {
+        let Some(chain) = self
+            .objects
+            .get(id as usize)
+            .map(|o| o.layout.chain_names.clone())
+        else {
+            return;
+        };
+        if chain.iter().any(|n| n == "gameinfo") {
+            self.set_property(id, "DummyStuff1", 0, Value::Float(-326.27));
+            self.set_property(id, "DummyStuff2", 0, Value::Int(823));
+        }
+        if chain.iter().any(|n| n == "genalerte") {
+            self.set_property(id, "dummy", 0, Value::Int(2002));
+        }
     }
 
     /// Vector property value, or `None` when the property is absent/another type.
