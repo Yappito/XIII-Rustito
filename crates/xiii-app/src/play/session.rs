@@ -2012,38 +2012,10 @@ impl Session {
         instance_prop(&self.vm, self.player, "Weapon")
     }
 
-    /// `Fire` on the player's weapon through the game's own entry point: the controller's exec
-    /// `Fire(1.0)` (`XIIIPlayerController.Fire` -> `Pawn.Weapon.Fire`), or the weapon directly
-    /// when the pawn has no controller. The weapon runs its own `ServerFire` ->
-    /// `TraceFire`/`ProjectileFire` -> `ProcessTraceHit` -> `TakeDamage` chain (item14).
+    /// Existing host weapon action: explicitly calls the weapon's class `Fire(1.0)` and runs
+    /// its scripted trace/projectile/damage chain (item14). This still bypasses controller/state
+    /// input dispatch; it must not invent a focus-end event from the HUD's registered windows.
     pub fn fire(&mut self, yaw: f32, pitch: f32) -> FireOutcome {
-        // item52: while a comic-strip cartoon-focus window is up, a player press ends the
-        // window and fires the focus trigger's Tag. Decoded (`disasm-xiii-all.txt`):
-        // `WaitForBeingSeen.Timer` 0x025C-0x0337 re-assigns `self.Tag = self.EventFinFocus`,
-        // sets `FocusDuration = -1` (-> `SetUpCartoonFocus` 0x0055 `bModeInfini = true`,
-        // `EndOfLife = StartOfLife`), registers itself in `XIIIBaseHud.tFocusTrigger[]` and
-        // parks in `WaitEndFocus`. Every `HudCartoonFocus` auto-close is gated
-        // `!bModeInfini` (`ZoomToStandardCWnd.DrawWnd` 0x0096/0x0153/0x0180/0x0251), and the
-        // only scripted remover for this window is the trigger's own `WaitEndFocus.Trigger`
-        // (finds its `tFocusTrigger` slot, `tCartoonFocus[i].RemoveMe()`, compacts both
-        // arrays, decrements `eNbHudCartoonFocus`, `Destroy()`). An exhaustive script-side
-        // search finds NO input consumer: `XIIIPlayerController` execs (`Fire` 0x0000-0x01F9,
-        // `AltFire`, `UnFire`, weapon/item switch, `Jump`, `Duck`, `ActivateItem`),
-        // `XIIIPlayerInteraction.KeyEvent` (ESC + one debug key only) / `MyPCPostRender`
-        // (render/targeting only) and `XIIIBaseHud` contain no focus-input handling; nothing
-        // outside `CWndFocusTrigger` reads `tFocusTrigger`. So the press consumer is native
-        // (Engine.dll/Xiii.dll, accessing the HUD state by compiled offsets - none of the
-        // binaries contains a `tFocusTrigger`/`CartoonFocus` string, which is weak evidence
-        // only). EVIDENCE GAP (labelled, not proven): which native consumes the press. This
-        // host bridge supplies only that press moment when the game's own window state shows
-        // a live trigger-backed focus; everything downstream is game code: the bridge calls
-        // the registered trigger's own `TriggerEvent(Tag)`, Engine.u's dispatch delivers the
-        // Tag to the receivers (Hual01a: the `PontA` bridge panels) AND back to the trigger
-        // itself, whose `WaitEndFocus.Trigger` runs the decoded dismissal. Logged on every
-        // firing; never invents an event when no focus window is live.
-        if self.dismiss_cartoon_focus() {
-            return FireOutcome::Fired;
-        }
         let Some(weapon) = self.player_weapon() else {
             return FireOutcome::NoWeapon;
         };
@@ -2343,67 +2315,6 @@ impl Session {
         while self.touches.len() > 64 {
             self.touches.pop_front();
         }
-    }
-
-    /// The cartoon-focus dismissal (see `fire`): supplies the press moment the decoded scripts
-    /// never show (native consumer, labelled evidence gap in `fire`) by firing the registered
-    /// focus trigger's own `TriggerEvent(Tag)` once, when a live trigger-backed focus window is
-    /// up. The trigger's own `WaitEndFocus.Trigger` runs the decoded dismissal and the Tag
-    /// receivers run their own code. Returns whether a dismissal ran.
-    fn dismiss_cartoon_focus(&mut self) -> bool {
-        let Some(ctrl) = self.controller else {
-            return false;
-        };
-        let hud = match self.vm.get_property(ctrl, "myHUD") {
-            Some(&Value::Object(Some(ObjRef::Instance(h)))) => h,
-            _ => return false,
-        };
-        let focus_alive = matches!(
-            self.vm.get_property(hud, "HudFoc"),
-            Some(Value::Object(Some(ObjRef::Instance(_))))
-        );
-        if !focus_alive {
-            return false;
-        }
-        let registered = match self.vm.get_property(hud, "eNbHudCartoonFocus") {
-            Some(&Value::Int(n)) if n > 0 => n,
-            _ => return false,
-        };
-        let mut fired = false;
-        for i in 0..registered {
-            let trigger = match self.vm.get_property_elem(hud, "tFocusTrigger", i as usize) {
-                Some(&Value::Object(Some(ObjRef::Instance(t))))
-                    if !self.vm.objects[t as usize].deleted =>
-                {
-                    t
-                }
-                _ => continue,
-            };
-            let tag = match self.vm.get_property(trigger, "Tag") {
-                Some(Value::Name(n)) if !n.eq_ignore_ascii_case("None") => n.clone(),
-                _ => continue,
-            };
-            let name = self.vm.objects[trigger as usize].name.clone();
-            let args = vec![
-                Value::Name(tag.clone()),
-                Value::Object(Some(ObjRef::Instance(trigger))),
-                Value::Object(Some(ObjRef::Instance(self.player))),
-            ];
-            match self.vm.send_event(trigger, "TriggerEvent", args) {
-                Ok(_) => {
-                    println!(
-                        "[play] host bridge: cartoon-focus dismissed; firing {name} Tag {tag:?} \
-                         through its own TriggerEvent"
-                    );
-                    fired = true;
-                }
-                Err(e) => self.record_failure(&name, &e),
-            }
-        }
-        if fired {
-            self.drain_events();
-        }
-        fired
     }
 
     /// Reproduces the engine's `Trigger.Touch` for the one decoded actor that starts a level end
@@ -2751,6 +2662,202 @@ mod tests {
         } else {
             path
         })
+    }
+
+    /// Generated live-object setup, followed by retail focus registration/removal scripts.
+    /// Arbitrary input must not replace the tag event or skip a slot during compaction.
+    #[test]
+    fn opt_in_item56_focus_input_preserves_windows_until_authored_tag_event() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to run the item56 focus test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Hual01a").expect("open Hual01a");
+        let location = session.player_location().expect("player location");
+        for _ in 0..30 {
+            // Intro-cartoon motion releases the map's normal FirstFrame initialization.
+            session.step(
+                1.0 / 60.0,
+                location,
+                0.0,
+                [1.0, 0.0, 0.0],
+                &PlayerVMModes::default(),
+            );
+            session.drive_render_phase();
+        }
+        let map_info = session.map_info().expect("MapInfo");
+        assert_eq!(
+            instance_prop(&session.vm, map_info, "XIIIPawn"),
+            Some(session.player)
+        );
+        let pc = session.controller.expect("controller");
+        let hud = instance_prop(&session.vm, pc, "myHUD").expect("HUD");
+        let interaction = instance_prop(&session.vm, pc, "MyInteraction").expect("interaction");
+        let target = session
+            .vm
+            .find_live_object("CWndTarget1")
+            .expect("focus target");
+        assert_eq!(
+            session.vm.get_property(hud, "eNbHudCartoonFocus"),
+            Some(&Value::Int(0))
+        );
+        let class = runtime::resolve_class_path(session.vm.set(), "XIII.CWndFocusTrigger")
+            .expect("focus trigger class");
+        let level = instance_prop(&session.vm, session.player, "Level").expect("Level");
+        let mut registered = Vec::new();
+        for (index, tag) in ["Item56EndFirst", "Item56EndSecond"]
+            .into_iter()
+            .enumerate()
+        {
+            let trigger = session.vm.spawn(class, tag).expect("spawn trigger");
+            session.vm.set_active(trigger, true);
+            // Vm::spawn constructs reflected objects; native Actor.Spawn supplies Level.
+            assert!(session.vm.set_property(
+                trigger,
+                "Level",
+                0,
+                Value::Object(Some(ObjRef::Instance(level)))
+            ));
+            assert!(
+                session
+                    .vm
+                    .set_property(trigger, "Tag", 0, Value::Name(tag.into()))
+            );
+            assert!(session.vm.set_property(
+                hud,
+                "tFocusTrigger",
+                index,
+                Value::Object(Some(ObjRef::Instance(trigger)))
+            ));
+            session
+                .vm
+                .send_event(
+                    hud,
+                    "AddHudCartoonFocus",
+                    vec![
+                        Value::Object(Some(ObjRef::Instance(target))),
+                        Value::Int(0),
+                        Value::Bool(false),
+                        Value::Float(-1.0),
+                        Value::Bool(false),
+                        Value::Float(50.0),
+                        Value::Float(200.0),
+                        Value::Bool(false),
+                    ],
+                )
+                .expect("retail focus registration");
+            let window = match session.vm.get_property_elem(hud, "tCartoonFocus", index) {
+                Some(Value::Object(Some(ObjRef::Instance(id)))) => *id,
+                other => panic!("focus slot {index}: {other:?}"),
+            };
+            assert_eq!(
+                session.vm.get_property(window, "bModeInfini"),
+                Some(&Value::Bool(true))
+            );
+            session
+                .vm
+                .goto_state(trigger, "WaitEndFocus", None)
+                .expect("wait for end event");
+            registered.push((trigger, window, tag));
+        }
+        for key in [1, 69] {
+            // LeftMouse and E; retail KeyEvent returns false for both.
+            for action in [1, 2] {
+                // Press and release.
+                assert_eq!(
+                    session
+                        .vm
+                        .send_event(
+                            interaction,
+                            "KeyEvent",
+                            vec![Value::Byte(key), Value::Byte(action), Value::Float(0.0),]
+                        )
+                        .expect("KeyEvent"),
+                    Some(Value::Bool(false))
+                );
+            }
+        }
+        session
+            .vm
+            .send_event(pc, "Fire", vec![Value::Float(1.0)])
+            .expect("controller Fire");
+        session
+            .vm
+            .send_event(pc, "Grab", vec![])
+            .expect("controller Grab");
+        assert_eq!(session.fire(0.0, 0.0), FireOutcome::Fired);
+        let weapon = session.player_weapon().expect("weapon");
+        session
+            .vm
+            .set_property(session.player, "Weapon", 0, Value::Object(None));
+        assert_eq!(session.fire(0.0, 0.0), FireOutcome::NoWeapon);
+        session.vm.set_property(
+            session.player,
+            "Weapon",
+            0,
+            Value::Object(Some(ObjRef::Instance(weapon))),
+        );
+        assert_eq!(
+            session.vm.get_property(hud, "eNbHudCartoonFocus"),
+            Some(&Value::Int(2))
+        );
+        assert_eq!(
+            instance_prop(&session.vm, hud, "HudFoc"),
+            Some(registered[0].1)
+        );
+        for &(trigger, window, _) in &registered {
+            assert!(!session.vm.objects[trigger as usize].deleted);
+            assert!(!session.vm.objects[window as usize].deleted);
+        }
+        for (index, &(trigger, window, tag)) in registered.iter().enumerate() {
+            session
+                .vm
+                .send_event(
+                    trigger,
+                    "TriggerEvent",
+                    vec![
+                        Value::Name(tag.into()),
+                        Value::Object(Some(ObjRef::Instance(trigger))),
+                        Value::Object(Some(ObjRef::Instance(session.player))),
+                    ],
+                )
+                .expect("authored tag event");
+            assert!(session.vm.objects[trigger as usize].deleted);
+            assert!(session.vm.objects[window as usize].deleted);
+            let remaining = (registered.len() - index - 1) as i32;
+            assert_eq!(
+                session.vm.get_property(hud, "eNbHudCartoonFocus"),
+                Some(&Value::Int(remaining))
+            );
+            if remaining > 0 {
+                assert_eq!(
+                    instance_prop(&session.vm, hud, "HudFoc"),
+                    Some(registered[index + 1].1)
+                );
+                assert_eq!(
+                    session.vm.get_property_elem(hud, "tFocusTrigger", 0),
+                    Some(&Value::Object(Some(ObjRef::Instance(
+                        registered[index + 1].0
+                    ))))
+                );
+            } else {
+                assert_eq!(instance_prop(&session.vm, hud, "HudFoc"), None);
+                assert_eq!(
+                    session.vm.get_property_elem(hud, "tFocusTrigger", 0),
+                    Some(&Value::Object(None))
+                );
+            }
+            // Native ProcessEvent drops a second event to the deleted trigger.
+            session
+                .vm
+                .send_event(trigger, "Trigger", vec![])
+                .expect("repeated event");
+            assert_eq!(
+                session.vm.get_property(hud, "eNbHudCartoonFocus"),
+                Some(&Value::Int(remaining))
+            );
+        }
+        println!("[item56] input kept two infinite focuses; tag events removed/compacted both");
     }
 
     /// The map-authored truck key must be linked before its owner dies; Instigator alone

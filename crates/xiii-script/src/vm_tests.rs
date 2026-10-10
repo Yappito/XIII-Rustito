@@ -431,11 +431,335 @@ fn set_of(data: Vec<u8>) -> ScriptSet {
     set
 }
 
+/// Authored miniature of the decoded input/focus call graph, with no retail bytecode.
+/// Fire forwards to the weapon; only the focus trigger's event calls RemoveMe.
+fn cartoon_focus_input_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let weapon = b.reserve(0, 0, "Weapon");
+    let hud = b.reserve(0, 0, "HUD");
+    let focus = b.reserve(0, 0, "Focus");
+    let pc = b.reserve(0, 0, "PlayerController");
+    let trigger = b.reserve(0, 0, "FocusTrigger");
+    let pawn_weapon = b.reserve(IMP_OBJPROP, pawn, "Weapon");
+    let fired = b.reserve(IMP_INTPROP, weapon, "Fired");
+    let weapon_fire = b.reserve(IMP_FUNCTION, weapon, "Fire");
+    let hud_focus = b.reserve(IMP_OBJPROP, hud, "HudFoc");
+    let focus_owner = b.reserve(IMP_OBJPROP, focus, "Owner");
+    let remove = b.reserve(IMP_FUNCTION, focus, "RemoveMe");
+    let pc_pawn = b.reserve(IMP_OBJPROP, pc, "Pawn");
+    let pc_hud = b.reserve(IMP_OBJPROP, pc, "myHUD");
+    let mode = b.reserve(B_BOOLPROP, pc, "bWeaponMode");
+    let fire = b.reserve(IMP_FUNCTION, pc, "Fire");
+    let no_control = b.reserve(IMP_STATE, pc, "NoControl");
+    let shadow_fire = b.reserve(IMP_FUNCTION, no_control, "Fire");
+    let trigger_hud = b.reserve(IMP_OBJPROP, trigger, "HUD");
+    let wait = b.reserve(IMP_STATE, trigger, "WaitEndFocus");
+    let end = b.reserve(IMP_FUNCTION, wait, "Trigger");
+    for (property, next) in [
+        (pawn_weapon, 0),
+        (hud_focus, 0),
+        (focus_owner, remove),
+        (pc_pawn, pc_hud),
+        (pc_hud, mode),
+        (trigger_hud, wait),
+    ] {
+        b.prop_with(property, next, 0, &compact(0));
+    }
+    b.prop(fired, weapon_fire, 0);
+    b.prop(mode, fire, 0);
+    // Weapon.Fire records that it was called. No native or animation dependency.
+    let mut code = vec![0x0F, 0x01];
+    code.extend(compact(fired));
+    code.extend([0x26, 0x04, 0x0B]);
+    b.func(weapon_fire, 0, 0, &code, 9, 0, ff::DEFINED);
+    let context = |property, expression: Vec<u8>, size: u16| {
+        let mut code = vec![0x19, 0x01];
+        code.extend(compact(property));
+        code.extend(size.to_le_bytes());
+        code.push(0);
+        code.extend(expression);
+        code
+    };
+    let mut call_fire = vec![0x1B];
+    call_fire.extend(compact(b.name("Fire")));
+    call_fire.push(0x16);
+    // if (bWeaponMode) Pawn.Weapon.Fire(); return. The return is at memory offset 32.
+    let mut code = vec![0x07, 32, 0, 0x01];
+    code.extend(compact(mode));
+    code.extend(context(pc_pawn, context(pawn_weapon, call_fire, 6), 15));
+    code.extend([0x04, 0x0B]);
+    b.func(fire, no_control, 0, &code, 34, 0, ff::EXEC | ff::DEFINED);
+    b.func(shadow_fire, 0, 0, &[0x04, 0x0B], 2, 0, ff::EXEC);
+    b.state_children(no_control, 0, shadow_fire, &[0x08], 1, 0xFFFF);
+    // RemoveMe owns the head-list update: Owner.HudFoc = None.
+    let mut member = vec![0x01];
+    member.extend(compact(hud_focus));
+    let mut code = vec![0x0F];
+    code.extend(context(focus_owner, member, 5));
+    code.extend([0x2A, 0x04, 0x0B]);
+    b.func(remove, 0, 0, &code, 18, 0, ff::DEFINED);
+    let mut call_remove = vec![0x1B];
+    call_remove.extend(compact(b.name("RemoveMe")));
+    call_remove.push(0x16);
+    let mut code = context(trigger_hud, context(hud_focus, call_remove, 6), 15);
+    code.extend([0x04, 0x0B]);
+    b.func(end, 0, 0, &code, 26, 0, ff::EVENT | ff::DEFINED);
+    b.state_children(wait, 0, end, &[0x08], 1, 0xFFFF);
+    b.class(object, 0, 0);
+    for (class, children) in [
+        (pawn, pawn_weapon),
+        (weapon, fired),
+        (hud, hud_focus),
+        (focus, focus_owner),
+        (pc, pc_pawn),
+        (trigger, trigger_hud),
+    ] {
+        b.class(class, object, children);
+    }
+    b.build()
+}
+
+#[test]
+fn cartoon_focus_survives_fire_and_ends_only_on_its_script_event() {
+    let set = set_of(cartoon_focus_input_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pc = vm.spawn(g(&set, "PlayerController"), "PC").unwrap();
+    let pawn = vm.spawn(g(&set, "Pawn"), "Pawn").unwrap();
+    let weapon = vm.spawn(g(&set, "Weapon"), "Weapon").unwrap();
+    let hud = vm.spawn(g(&set, "HUD"), "HUD").unwrap();
+    let focus = vm.spawn(g(&set, "Focus"), "Focus").unwrap();
+    let trigger = vm.spawn(g(&set, "FocusTrigger"), "Trigger").unwrap();
+    for id in [pc, pawn, weapon, hud, focus, trigger] {
+        vm.set_active(id, true);
+    }
+    for (owner, property, target) in [
+        (pc, "Pawn", pawn),
+        (pc, "myHUD", hud),
+        (pawn, "Weapon", weapon),
+        (hud, "HudFoc", focus),
+        (focus, "Owner", hud),
+        (trigger, "HUD", hud),
+    ] {
+        assert!(vm.set_property(
+            owner,
+            property,
+            0,
+            Value::Object(Some(ObjRef::Instance(target)))
+        ));
+    }
+    vm.set_property(pc, "bWeaponMode", 0, Value::Bool(true));
+    vm.goto_state(trigger, "WaitEndFocus", None).unwrap();
+    for _ in 0..3 {
+        vm.send_event(pc, "Fire", vec![]).unwrap();
+        vm.tick(10.0).unwrap();
+        assert_eq!(vm.get_property(weapon, "Fired"), Some(&Value::Int(1)));
+        assert_eq!(vm.obj_prop(hud, "HudFoc"), Some(focus));
+    }
+    // Mode gates and state shadows still apply while a focus is present.
+    vm.set_property(weapon, "Fired", 0, Value::Int(0));
+    vm.set_property(pc, "bWeaponMode", 0, Value::Bool(false));
+    vm.send_event(pc, "Fire", vec![]).unwrap();
+    assert_eq!(vm.get_property(weapon, "Fired"), Some(&Value::Int(0)));
+    vm.set_property(pc, "bWeaponMode", 0, Value::Bool(true));
+    vm.goto_state(pc, "NoControl", None).unwrap();
+    vm.send_event(pc, "Fire", vec![]).unwrap();
+    assert_eq!(vm.get_property(weapon, "Fired"), Some(&Value::Int(0)));
+    assert_eq!(vm.obj_prop(hud, "HudFoc"), Some(focus));
+    vm.send_event(trigger, "Trigger", vec![]).unwrap();
+    assert_eq!(vm.obj_prop(hud, "HudFoc"), None);
+    // A second event must not call a stale focus head.
+    vm.send_event(trigger, "Trigger", vec![]).unwrap();
+    assert_eq!(vm.obj_prop(hud, "HudFoc"), None);
+}
+
+#[test]
+fn cartoon_focus_fire_with_no_pawn_or_weapon_does_not_invent_an_event() {
+    let set = set_of(cartoon_focus_input_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pc = vm.spawn(g(&set, "PlayerController"), "PC").unwrap();
+    let pawn = vm.spawn(g(&set, "Pawn"), "Pawn").unwrap();
+    vm.set_active(pc, true);
+    vm.set_active(pawn, true);
+    vm.set_property(pc, "bWeaponMode", 0, Value::Bool(true));
+    vm.send_event(pc, "Fire", vec![]).unwrap();
+    vm.set_property(pc, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    vm.send_event(pc, "Fire", vec![]).unwrap();
+    assert!(!vm.trace.iter().any(|event| matches!(
+        &event.kind,
+        TraceKind::Event { function, .. } if function.ends_with(".Trigger") || function.ends_with(".RemoveMe")
+    )));
+}
+
 fn g(set: &ScriptSet, path: &str) -> GlobalRef {
     GlobalRef {
         package: 0,
         export: set.packages[0].export_by_path(path).expect(path),
     }
+}
+
+/// Authored miniature of the MapInfo licence layer (no retail bytecode): an `Actor` base with
+/// unrelated int properties, a `MapInfo` subclass carrying `iLoadSpecificValue`/`TGSDummy` and,
+/// when `with_script`, a `PostBeginPlay` event that snapshots `TGSDummy` into `SawTGS` (so a
+/// test can prove the script body runs before the native write), and a non-MapInfo `Other`
+/// subclass with the same property names.
+fn mapinfo_licence_fixture(with_script: bool) -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let mapinfo = b.reserve(0, 0, "MapInfo");
+    let other = b.reserve(0, 0, "Other");
+    let load = b.reserve(IMP_INTPROP, mapinfo, "iLoadSpecificValue");
+    let tgs = b.reserve(IMP_INTPROP, load, "TGSDummy");
+    let saw = b.reserve(IMP_INTPROP, tgs, "SawTGS");
+    let begin = b.reserve(IMP_FUNCTION, saw, "PostBeginPlay");
+    b.prop(load, tgs, 0);
+    b.prop(tgs, saw, 0);
+    b.prop(saw, if with_script { begin } else { 0 }, 0);
+    let fake_load = b.reserve(IMP_INTPROP, actor, "FakeLoad");
+    let fake_tgs = b.reserve(IMP_INTPROP, fake_load, "FakeTGS");
+    let actor_begin = b.reserve(IMP_FUNCTION, fake_tgs, "PostBeginPlay");
+    b.prop(fake_load, fake_tgs, 0);
+    b.prop(fake_tgs, actor_begin, 0);
+    let other_load = b.reserve(IMP_INTPROP, other, "FakeLoad");
+    let other_tgs = b.reserve(IMP_INTPROP, other_load, "FakeTGS");
+    b.prop(other_load, other_tgs, 0);
+    if with_script {
+        // PostBeginPlay body: `SawTGS = TGSDummy; return`. Two object references cost
+        // OBJECT_MEMORY_SIZE (4) in memory but 1 file byte each, so the declared memory
+        // size is the byte length plus 3 per object reference.
+        let mut code = vec![0x0F, 0x01];
+        code.extend(compact(saw));
+        code.extend([0x01]);
+        code.extend(compact(tgs));
+        code.extend([0x04, 0x0B]);
+        let mem = code.len() as u32 + 6;
+        b.func(begin, 0, 0, &code, mem, 0, ff::EVENT | ff::DEFINED);
+        // The non-MapInfo class also defines the event: only the chain-name gate may exclude it.
+        b.func(
+            actor_begin,
+            0,
+            0,
+            &[0x04, 0x0B],
+            2,
+            0,
+            ff::EVENT | ff::DEFINED,
+        );
+    }
+    b.class(object, 0, 0);
+    b.class(actor, object, fake_load);
+    b.class(mapinfo, actor, load);
+    b.class(other, actor, other_load);
+    b.build()
+}
+
+#[test]
+fn mapinfo_licence_table_writes_after_the_script_body() {
+    let set = set_of(mapinfo_licence_fixture(true));
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let mi = vm.spawn(g(&set, "MapInfo"), "Hual01a0").unwrap();
+    vm.set_active(mi, true);
+    vm.set_property(mi, "iLoadSpecificValue", 0, Value::Int(26));
+    vm.send_event(mi, "PostBeginPlay", vec![]).unwrap();
+    // The script snapshot ran before the native write: it still saw the default 0.
+    assert_eq!(vm.get_property(mi, "SawTGS"), Some(&Value::Int(0)));
+    assert_eq!(vm.get_property(mi, "TGSDummy"), Some(&Value::Int(546)));
+    assert!(vm.trace.iter().any(|event| matches!(
+        &event.kind,
+        TraceKind::Note(text)
+            if text.contains("TGSDummy=546") && text.contains("iLoadSpecificValue 26")
+    )));
+}
+
+#[test]
+fn mapinfo_licence_table_covers_exactly_the_seven_retail_keys() {
+    let set = set_of(mapinfo_licence_fixture(true));
+    let mut vm = Vm::new(&set, VmLimits::default());
+    for (key, value) in [
+        (26, 546),
+        (55, 21627),
+        (81, 856),
+        (106, 4),
+        (130, 69),
+        (142, 3589),
+        (191, 703),
+    ] {
+        let mi = vm.spawn(g(&set, "MapInfo"), "Map0").unwrap();
+        vm.set_active(mi, true);
+        vm.set_property(mi, "iLoadSpecificValue", 0, Value::Int(key));
+        vm.send_event(mi, "PostBeginPlay", vec![]).unwrap();
+        assert_eq!(
+            vm.get_property(mi, "TGSDummy"),
+            Some(&Value::Int(value)),
+            "iLoadSpecificValue {key}"
+        );
+    }
+}
+
+#[test]
+fn mapinfo_licence_table_out_of_range_keys_keep_the_demo_default() {
+    let set = set_of(mapinfo_licence_fixture(true));
+    let mut vm = Vm::new(&set, VmLimits::default());
+    for key in [0, 25, 27, 105, 131, 190, 192, 1000, -26] {
+        let mi = vm.spawn(g(&set, "MapInfo"), "Map0").unwrap();
+        vm.set_active(mi, true);
+        vm.set_property(mi, "iLoadSpecificValue", 0, Value::Int(key));
+        vm.send_event(mi, "PostBeginPlay", vec![]).unwrap();
+        assert_eq!(
+            vm.get_property(mi, "TGSDummy"),
+            Some(&Value::Int(0)),
+            "iLoadSpecificValue {key} is outside the retail selector table"
+        );
+    }
+    assert!(
+        !vm.trace.iter().any(|event| matches!(
+            &event.kind,
+            TraceKind::Note(text) if text.contains("licence table")
+        )),
+        "no licence note may be traced for maps outside the table"
+    );
+}
+
+#[test]
+fn mapinfo_licence_write_needs_the_mapinfo_chain_and_the_postbeginplay_event() {
+    let set = set_of(mapinfo_licence_fixture(true));
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let actor = vm.spawn(g(&set, "Actor"), "Act0").unwrap();
+    vm.set_active(actor, true);
+    vm.set_property(actor, "FakeLoad", 0, Value::Int(26));
+    vm.send_event(actor, "PostBeginPlay", vec![]).unwrap();
+    assert_eq!(
+        vm.get_property(actor, "FakeTGS"),
+        Some(&Value::Int(0)),
+        "a non-MapInfo class never receives the licence write"
+    );
+    let mi = vm.spawn(g(&set, "MapInfo"), "Map0").unwrap();
+    vm.set_active(mi, true);
+    vm.set_property(mi, "iLoadSpecificValue", 0, Value::Int(26));
+    vm.send_event(mi, "Trigger", vec![]).unwrap();
+    assert_eq!(
+        vm.get_property(mi, "TGSDummy"),
+        Some(&Value::Int(0)),
+        "only the PostBeginPlay event carries the native licence write"
+    );
+    vm.send_event(mi, "PostBeginPlay", vec![]).unwrap();
+    assert_eq!(vm.get_property(mi, "TGSDummy"), Some(&Value::Int(546)));
+}
+
+#[test]
+fn mapinfo_licence_write_runs_without_a_script_handler() {
+    let set = set_of(mapinfo_licence_fixture(false));
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let mi = vm.spawn(g(&set, "MapInfo"), "Usa010").unwrap();
+    vm.set_active(mi, true);
+    vm.set_property(mi, "iLoadSpecificValue", 0, Value::Int(142));
+    vm.send_event(mi, "PostBeginPlay", vec![]).unwrap();
+    assert!(vm.trace.iter().any(|event| matches!(
+        &event.kind,
+        TraceKind::NoHandler { event, .. } if event == "PostBeginPlay"
+    )));
+    assert_eq!(vm.get_property(mi, "TGSDummy"), Some(&Value::Int(3589)));
 }
 
 fn pressing_fire_package() -> Vec<u8> {
@@ -4885,11 +5209,14 @@ fn trace_actors_skips_static_mesh_actor_when_the_ray_passes_through_the_mesh() {
 // Projectile -> Falling)
 
 /// A projectile flying into a world wall runs `HitWall`, stops at the sweep contact and, with
-/// `bBounce` clear, continues as `PHYS_Falling` with gravity decaying `Velocity.Z` (the engine's
-/// `physProjectile` -> `physFalling` fall-through; the demo's `Crochet.Velocity.Z < 1` cast
-/// transition depends on it).
+/// `bBounce` clear, keeps `PHYS_Projectile` while the engine's exit tail
+/// (`AActor::physProjectile` 0x103c0ca6-0x103c0d03) rewrites `Velocity = displacement/dt` —
+/// the blocked velocity decays toward zero. The grapple demo's `Crochet.Velocity.Z < 1` cast
+/// transition reads exactly this: the `CineHook` parks at the surface it strikes (probe23:
+/// Jones climbs the full 675 to it); `Physics` only continues with `physFalling` when a
+/// `HitWall` script handler sets it (the `Physics == 2` check at 0x103c0c51).
 #[test]
-fn scripted_physics_projectile_hits_the_world_and_falls() {
+fn scripted_physics_projectile_hits_the_world_and_parks() {
     let set = phys_set();
     let mut vm = Vm::new(&set, VmLimits::default());
     vm.set_physics(Box::new(
@@ -4908,20 +5235,29 @@ fn scripted_physics_projectile_hits_the_world_and_falls() {
     let location = vm.vector_prop(hook, "Location").unwrap();
     let physics = vm.byte_prop(hook, "Physics");
     let velocity = vm.vector_prop(hook, "Velocity").unwrap();
-    assert_eq!(physics, 2, "the wall hit must fall through to PHYS_Falling");
+    assert_eq!(
+        physics, 6,
+        "a scriptless projectile keeps PHYS_Projectile on a hit"
+    );
     // The swept box stops one extent short of the wall plane at x = 50.
     assert!((location[0] - 40.0).abs() < 0.5, "{location:?}");
-    // Gravity (the measured Engine.PhysicsVolume default -950) applied for the hit frame only:
-    // a projectile keeps constant velocity until it hits (no zone gravity while flying).
+    // The exit tail rewrote the velocity from the blocked displacement: every component is
+    // scaled by the sweep fraction that reached the wall (the box stops at first contact).
     assert!(
-        (velocity[2] - (1100.0 - 950.0 * 0.016)).abs() < 0.5,
-        "gravity decayed vz: {velocity:?}"
+        velocity[0] < 1200.0 && velocity[0] >= 0.0,
+        "exit-tail velocity rewrite: {velocity:?}"
     );
-    // A later tick keeps decelerating vz toward the `< 1` transition threshold.
-    for _ in 0..80 {
+    // Later ticks press into the wall: the displacement stays ~0, so the velocity decays to
+    // zero and the demo's `Velocity.Z < 1` transition can fire. No gravity: the projectile
+    // parks instead of falling (probe23 measured the hook hanging at the ceiling).
+    for _ in 0..20 {
         vm.tick_suspending(0.016);
     }
+    let location = vm.vector_prop(hook, "Location").unwrap();
+    let physics = vm.byte_prop(hook, "Physics");
     let velocity = vm.vector_prop(hook, "Velocity").unwrap();
+    assert_eq!(physics, 6);
+    assert!((location[0] - 40.0).abs() < 0.5, "{location:?}");
     assert!(velocity[2] < 1.0, "vz decayed below 1: {velocity:?}");
 }
 
@@ -5314,6 +5650,8 @@ fn trace_ignores_actors_outside_the_collision_hash() {
 struct NamedHitWorld {
     inner: MockWorld,
     actor: String,
+    /// Whether the named actor counts as a registered mover (its mesh lives in the mock's world).
+    registered: bool,
 }
 
 impl WorldPhysics for NamedHitWorld {
@@ -5330,6 +5668,10 @@ impl WorldPhysics for NamedHitWorld {
         let hit = self.inner.trace(start, end, extent);
         let actor = hit.map(|_| self.actor.clone());
         (hit, actor)
+    }
+
+    fn mover_is_registered(&self, actor: &str) -> bool {
+        self.registered && actor.eq_ignore_ascii_case(&self.actor)
     }
 
     fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
@@ -5361,6 +5703,7 @@ fn mover_with_cylinder_collision_blocks_as_its_cylinder_not_its_mesh() {
     vm.set_physics(Box::new(NamedHitWorld {
         inner: MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
         actor: "Mv".to_owned(),
+        registered: true,
     }));
     // Line ending short of the cylinder: the mesh hit is skipped and, with nothing behind it,
     // the trace reports no hit at all (the sight-line case).
@@ -5381,6 +5724,69 @@ fn mover_with_cylinder_collision_blocks_as_its_cylinder_not_its_mesh() {
         .unwrap();
     assert_eq!(hit, Some(mv));
     assert!((location[0] - 100.0).abs() < 1e-3, "{location:?}");
+}
+
+#[test]
+fn registered_mover_without_cylinder_flag_answers_from_its_mesh_not_the_default_cylinder() {
+    // item53b: a REGISTERED mover's line-check primitive is its MESH unless
+    // `bUseCylinderCollision` is set (the vtable+0x70 rule decoded in item52), and that mesh
+    // lives in the provider's moving world. The `Engine.Mover` class-default cylinder
+    // (CollisionRadius/Height 160, measured) must NOT answer the line check: Toits01's
+    // `PorteDecors18` shutter blocked the through-window sight lines ~136 UU in front of its
+    // mesh face (the r=160 cylinder's entry root, measured t=0.0062 vs the mesh face t=0.0120).
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let _li = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0; 3]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    let mv = vm.spawn(pg(&set, "Mover"), "Mv").unwrap();
+    vm.set_property(mv, "Location", 0, Value::Vector([200.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, mv, true, true);
+    vm.set_property(mv, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(mv, "CollisionHeight", 0, Value::Float(160.0));
+    // `bUseCylinderCollision` stays false (the Engine.Mover default): the cylinder (surface at
+    // x=40) must not answer the ray; the provider's world hit — the mover's mesh at x=100 — is
+    // the mover's line-check geometry and must be the reported hit.
+    vm.set_physics(Box::new(NamedHitWorld {
+        inner: MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
+        actor: "Mv".to_owned(),
+        registered: true,
+    }));
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [150.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(mv), "the mover's mesh is its line-check shape");
+    assert!((location[0] - 100.0).abs() < 1e-3, "{location:?}");
+}
+
+#[test]
+fn unregistered_mover_without_cylinder_flag_keeps_the_cylinder_approximation() {
+    // item53b: an UNREGISTERED mover without `bUseCylinderCollision` has no mesh the VM can
+    // reach (its per-actor mesh query returns `NoData` with nothing behind it), so the
+    // Engine.Mover class-default cylinder stays as the only line-check approximation. Dropping
+    // it made such movers fully transparent: Hual01a's guard sight lines stopped blocking at
+    // t=182 (the `EnemyNotVisible` transition vanished and the route run diverged, measured).
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let _li = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0; 3]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    let mv = vm.spawn(pg(&set, "Mover"), "Mv").unwrap();
+    vm.set_property(mv, "Location", 0, Value::Vector([200.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, mv, true, true);
+    vm.set_property(mv, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(mv, "CollisionHeight", 0, Value::Float(160.0));
+    vm.set_physics(Box::new(NamedHitWorld {
+        inner: MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
+        actor: "Mv".to_owned(),
+        registered: false,
+    }));
+    // The cylinder (surface at x=40) blocks in front of the unreachable mesh (x=100).
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [150.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(mv), "the cylinder approximation still stands");
+    assert!((location[0] - 40.0).abs() < 1e-3, "{location:?}");
 }
 
 #[test]
@@ -5491,6 +5897,7 @@ fn world_hit_on_a_non_mover_actor_source_still_returns_the_level() {
     vm.set_physics(Box::new(NamedHitWorld {
         inner: MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
         actor: "Prop".to_owned(),
+        registered: false,
     }));
     let level = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
     let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);

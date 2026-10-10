@@ -222,6 +222,10 @@ impl WorldPhysics for WorldPhysicsAdapter {
         }
     }
 
+    fn mover_is_registered(&self, actor: &str) -> bool {
+        self.mover_by_name.contains_key(&actor.to_ascii_lowercase())
+    }
+
     fn actor_mesh_hit(&mut self, actor: &str, start: [f32; 3], end: [f32; 3]) -> ActorMeshHit {
         let key = actor.to_ascii_lowercase();
         if !self.actor_meshes.contains_key(&key) {

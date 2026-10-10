@@ -2295,7 +2295,7 @@ fn run_script_inner(
                 "[play] {} | {} | {}",
                 format_trace(tick, elapsed, &runtime.sim),
                 format_vm_trace(&runtime.session),
-                format_mover_trace(&runtime.session)
+                format_mover_trace(&runtime.session),
             );
         }
 

@@ -27,8 +27,10 @@ use crate::events::{PresentationEvent, SoundEvent, TravelRequest, TravelSource};
 use crate::external::ExternalObjectData;
 use crate::linker::{GlobalRef, ScriptSet};
 use crate::localize::{LocalizationData, placeholder};
+#[cfg(test)]
+use crate::navigation::move_step;
 use crate::navigation::{
-    NavEdgeInfo, NavPointInfo, NavigationData, find_path, move_step, nearest_point, point_fits,
+    NavEdgeInfo, NavPointInfo, NavigationData, find_path, nearest_point, point_fits,
 };
 use crate::physics::{HitZones, WorldHit, WorldPhysics};
 use crate::reflect::{Property, PropertyKind, ScriptObject, function_flags, property_flags};
@@ -349,6 +351,27 @@ const CLASS_FLAG_ABSTRACT: u16 = 0x0001;
 fn native_class_default(class: &str, prop: &str) -> Option<Value> {
     match (class, prop) {
         ("camera", "bonlyspectator") => Some(Value::Bool(true)),
+        _ => None,
+    }
+}
+
+/// The retail licence-layer value of `MapInfo.TGSDummy`, keyed by the map's
+/// `iLoadSpecificValue` (Xiii.dll native licence table, keyed by id - 26 into a 166-entry
+/// selector; the seven non-default keys are the seven `xidmaps` MapInfo subclasses whose
+/// scripts compare `TGSDummy`, each with the value its own code expects:
+/// Hual01a 546, PRock01a 21627, Hual04a 856, Sanc02a 4, SSH101a 69, USA01 3589, SSH101c 703).
+/// Measured: `?PostBeginPlay@AMapInfo@@UAEXXZ` VA 0x11b01640 in `XIII_Game/system/Xiii.dll`
+/// writes offset 0x1f8 (`TGSDummy`) after the script `PostBeginPlay`; keys outside the
+/// selector table keep the `xiii.MapInfo` default 0 (the demo build behaviour).
+fn native_tgs_dummy(load_specific: i32) -> Option<i32> {
+    match load_specific {
+        26 => Some(546),
+        55 => Some(21627),
+        81 => Some(856),
+        106 => Some(4),
+        130 => Some(69),
+        142 => Some(3589),
+        191 => Some(703),
         _ => None,
     }
 }
@@ -1070,23 +1093,6 @@ const PHYS_PROJECTILE: u8 = 6;
 /// Floor-grade contact normal Z for the physics moves: a hit whose upward normal clears this
 /// ends a `PHYS_Falling` fall (`Landed` -> `PHYS_Walking`) and zeroes the contact velocity.
 const FLOOR_NORMAL_Z: f32 = 0.7;
-
-fn vm_move_trace_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("XIII_VM_MOVE_TRACE")
-            .is_some_and(|value| value != "0" && !value.is_empty())
-    })
-}
-
-/// item27k diagnostic: with `XIII_VM_MOVE_TRACE`, also dump the world primitives overlapping a
-/// blocked pawn's move box (`XIII_VM_MOVE_DUMP`), naming each triangle's source.
-fn vm_move_dump_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("XIII_VM_MOVE_DUMP").is_some_and(|value| value != "0" && !value.is_empty())
-    })
-}
 
 fn cine_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3798,7 +3804,16 @@ impl<'s> Vm<'s> {
             )));
             return Ok(None);
         }
+        // The native `AMapInfo::PostBeginPlay` licence layer runs when the event is delivered
+        // to a live MapInfo instance, with or without a script handler (the retail native is
+        // itself the C++ event; the table write follows the super call in the disassembly).
+        let mapinfo_licence = event.eq_ignore_ascii_case("PostBeginPlay")
+            && self.is_live_actor(id)
+            && self.is_a(id, "mapinfo");
         let Some(f) = self.find_function(id, event, true) else {
+            if mapinfo_licence {
+                self.write_native_tgs_dummy(id)?;
+            }
             self.note(TraceKind::NoHandler {
                 actor,
                 event: event.to_owned(),
@@ -3811,7 +3826,36 @@ impl<'s> Vm<'s> {
             function: self.short_path(f),
             args: texts,
         });
-        self.call_values(f, id, args).map(Some)
+        let result = self.call_values(f, id, args);
+        if mapinfo_licence {
+            self.write_native_tgs_dummy(id)?;
+        }
+        result.map(Some)
+    }
+
+    /// The Xiii.dll `AMapInfo::PostBeginPlay` licence write: sets `TGSDummy` from the
+    /// per-map table ([`native_tgs_dummy`], keyed by the instance's `iLoadSpecificValue`).
+    /// Never traced for maps outside the table (no write, no note), so traces of maps that
+    /// do not use the flag are byte-identical to before.
+    fn write_native_tgs_dummy(&mut self, id: ObjectId) -> VmResult<()> {
+        let load_specific = match self.get_property(id, "iLoadSpecificValue") {
+            Some(Value::Int(n)) => *n,
+            _ => return Ok(()),
+        };
+        let Some(value) = native_tgs_dummy(load_specific) else {
+            return Ok(());
+        };
+        if !self.set_property(id, "TGSDummy", 0, Value::Int(value)) {
+            return Err(self.err(VmErrorKind::Other(format!(
+                "{}: native licence write: no TGSDummy property",
+                self.objects[id as usize].name
+            ))));
+        }
+        self.note(TraceKind::Note(format!(
+            "{}.PostBeginPlay: native licence table sets TGSDummy={} (iLoadSpecificValue {})",
+            self.objects[id as usize].name, value, load_specific
+        )));
+        Ok(())
     }
 
     /// Calls a function by global reference with argument values (no out parameters).
@@ -8081,6 +8125,30 @@ impl<'s> Vm<'s> {
                 }
                 // The actor's mesh is traceable and the ray passes through it: no hit.
                 Some(crate::physics::ActorMeshHit::Miss) => {}
+                // item53b: a REGISTERED mover without `bUseCylinderCollision` answers the line
+                // check with its MESH (the vtable+0x70 primitive; the `byte [+0x30] & 0x40`
+                // early-exit hypothesis of item52), and that mesh is already in the provider's
+                // moving world — the world hit in `vm_trace_flags` carries it. The
+                // Engine.Mover class-default cylinder (CollisionRadius/Height 160, measured) is
+                // NOT its line-check geometry: it blocked Toits01's through-window bullet/focus
+                // sight lines ~136 UU in front of the `PorteDecors18` shutter mesh (entry root
+                // of the r=160 cylinder around the actor origin, measured t=0.0062 vs the mesh
+                // face t=0.0120). Skip the cylinder fallback only for those.
+                // An UNREGISTERED mover without `bUseCylinderCollision` has no mesh the VM can
+                // reach (its per-actor query returns `NoData` with nothing behind it); the
+                // cylinder stays as the only approximation there — Hual01a's guard sight lines
+                // depend on it (the t=182 `EnemyNotVisible` transition regressed when the
+                // fallback was dropped, measured).
+                // With `bUseCylinderCollision` the cylinder IS the primitive (item52 lever).
+                Some(crate::physics::ActorMeshHit::NoData) | None
+                    if self.is_mover(b)
+                        && !self.bool_prop(b, "bUseCylinderCollision")
+                        && self.physics.as_ref().is_some_and(|p| {
+                            self.objects
+                                .get(b as usize)
+                                .map(|o| p.mover_is_registered(&o.name))
+                                .unwrap_or(false)
+                        }) => {}
                 // No per-actor mesh data (or no provider): the cylinder approximation.
                 Some(crate::physics::ActorMeshHit::NoData) | None => {
                     if best.is_none_or(|(bt, _, _)| t <= bt) {
@@ -9433,21 +9501,24 @@ impl<'s> Vm<'s> {
     ///   no volumes), then a swept move.
     /// - `PHYS_Flying` (4): a constant-velocity swept move (the demo rewrites `Velocity` every
     ///   tick; a hit stops the actor rather than sliding along the wall).
-    /// - `PHYS_Walking` (1) is integrated only for a pawn whose controller is in `NoControl` —
+    /// - `PHYS_Walking` (1) is integrated for a pawn whose controller is in `NoControl` —
     ///   a cinematic owns the pawn and steers it by writing `Velocity`
     ///   (`RoofGrapnleDemonstrator.MoveToRightThePlace`; its arrival test is horizontal distance
-    ///   < 1 UU, so the step is horizontal-only). Every other Walking pawn is moved by its
-    ///   controller latents ([`Vm::controller_move_step`]) or the host, which already include the
-    ///   walking step; integrating them here too would move them twice.
+    ///   < 1 UU, so the step is horizontal-only) — and (item53b) for a pawn whose controller is
+    ///   a `CineController2` with `bMoving` (a `movseq`/`movseqb` steering move owns the pawn's
+    ///   walk: `execSteering` writes `Acceleration` and the speed fields, this pass integrates
+    ///   them). Every other Walking pawn is moved by its controller latents
+    ///   ([`Vm::controller_move_step`]) or the host, which already include the walking step;
+    ///   integrating them here too would move them twice.
     ///
     /// Documented approximations (not silent successes): water-zone buoyancy/gravity overrides
     /// are not tracked (`GetNetBuoyancy` decodes to 0.0 outside water; see
     /// [`Vm::integrate_falling`]), actor-vs-actor blocking is not applied to physics moves
-    /// (world + registered movers only), `Landed` is not dispatched from this pass and `Physics`
-    /// is not flipped on a floor contact (the host owns the player's landing; a floor-grade
-    /// contact instead zeroes the velocity, modelling the engine's `Landed` -> `PHYS_Walking` +
-    /// ground friction), and the projectile hit-fall-through applies gravity for the frame
-    /// without the engine's second sub-frame move.
+    /// (world + registered movers only), `Landed` is not dispatched from this pass (the host
+    /// owns the player's landing; a floor-grade contact instead zeroes the velocity and, since
+    /// item53b, switches a pawn to `PHYS_Walking` — the engine's `processLanded` fallback), and
+    /// the projectile hit-fall-through applies gravity for the frame without the engine's second
+    /// sub-frame move.
     fn advance_scripted_physics(&mut self, dt: f32) -> Vec<(ObjectId, VmError)> {
         let mut errors = Vec::new();
         if dt <= 0.0 {
@@ -9464,6 +9535,8 @@ impl<'s> Vm<'s> {
                 PHYS_WALKING => {
                     if self.pawn_script_owned(id) {
                         self.integrate_walking(id, dt)
+                    } else if self.cine_steering_owned(id) {
+                        self.integrate_steered_walking(id, dt)
                     } else {
                         Ok(())
                     }
@@ -9487,6 +9560,18 @@ impl<'s> Vm<'s> {
     fn pawn_script_owned(&self, pawn: ObjectId) -> bool {
         self.obj_prop(pawn, "Controller")
             .is_some_and(|ctrl| self.is_live_actor(ctrl) && self.is_in_state(ctrl, "NoControl"))
+    }
+
+    /// item53b: the pawn's controller is a live `CineController2` with `bMoving` — a cine
+    /// steering move (`movseq`/`movseqb`) is driving the pawn, and `execSteering` (XIDCine.dll
+    /// 0x100021a0) has just written its `Acceleration`/speed fields for the engine's
+    /// `physWalking` to integrate.
+    fn cine_steering_owned(&self, pawn: ObjectId) -> bool {
+        self.obj_prop(pawn, "Controller").is_some_and(|ctrl| {
+            self.is_live_actor(ctrl)
+                && self.is_a(ctrl, "CineController2")
+                && self.bool_prop(ctrl, "bMoving")
+        })
     }
 
     /// `PHYS_Walking` for a script-owned pawn: one horizontal step by the script-written
@@ -9545,7 +9630,144 @@ impl<'s> Vm<'s> {
             velocity[2] = -TERMINAL_VELOCITY;
         }
         self.set_property(id, "Velocity", 0, Value::Vector(velocity));
-        self.integrate_move(id, velocity, dt, true)?;
+        let hit = self.integrate_move_sliding(id, velocity, dt, true)?;
+        // APawn::processLanded (Engine.dll 0x103c1580): after the `Landed` events, a pawn whose
+        // `Physics` is still PHYS_Falling (2, checked at 0x103c188d) is switched to
+        // PHYS_Walking (1) by the engine (the `pushl $1` before the virtual `setPhysics` at
+        // 0x103c18cb). Without this the scripted pawn rests Falling forever and a cine steering
+        // move never reaches its walking phase (measured on Toits01 Cine0, probe24c).
+        if let Some(hit) = hit
+            && hit.normal[2] > 0.7
+            && self.is_a(id, "Pawn")
+            && !self.objects[id as usize].deleted
+            && self.byte_prop(id, "Physics") == PHYS_FALLING
+        {
+            self.set_property(id, "Physics", 0, Value::Byte(PHYS_WALKING));
+        }
+        Ok(())
+    }
+
+    /// item53b: `PHYS_Falling`'s move as per-axis sub-moves (x, then y, then z). The engine's
+    /// pawn move slides along the surfaces it is pressed against; a single combined sweep
+    /// instead stops the whole delta when one axis is blocked (measured: the Toits01 cine pawn
+    /// flush against the Model71 wall with a steering Acceleration into it stopped falling
+    /// entirely, probe27). Each blocked axis cancels its own velocity component into the
+    /// surface; the first blocking hit is returned (and, with `dispatch`, runs `HitWall`).
+    fn integrate_move_sliding(
+        &mut self,
+        id: ObjectId,
+        mut velocity: [f32; 3],
+        dt: f32,
+        dispatch: bool,
+    ) -> VmResult<Option<crate::physics::WorldHit>> {
+        let Some(mut location) = self.vector_prop(id, "Location") else {
+            return Ok(None);
+        };
+        let delta = scale3(velocity, dt);
+        if delta == [0.0; 3] {
+            return Ok(None);
+        }
+        if !self.bool_prop(id, "bCollideWorld") {
+            self.set_property(id, "Location", 0, Value::Vector(add3(location, delta)));
+            return Ok(None);
+        }
+        let extent = self.actor_extent(id);
+        let mut first_hit: Option<crate::physics::WorldHit> = None;
+        for axis in 0..3 {
+            if delta[axis] == 0.0 {
+                continue;
+            }
+            let mut step = [0.0_f32; 3];
+            step[axis] = delta[axis];
+            let end = add3(location, step);
+            let hit = match self.physics.as_mut() {
+                Some(provider) => {
+                    let (hit, _) = provider.trace_with_mover(location, end, extent);
+                    hit
+                }
+                None => None,
+            };
+            match hit {
+                Some(h) => {
+                    location = h.location;
+                    // Cancel this axis's velocity component when it points into the surface.
+                    if velocity[axis] * h.normal[axis] < 0.0 {
+                        velocity[axis] = 0.0;
+                    }
+                    if first_hit.is_none() {
+                        first_hit = Some(h);
+                    }
+                }
+                None => location = end,
+            }
+        }
+        self.set_property(id, "Location", 0, Value::Vector(location));
+        self.set_property(id, "Velocity", 0, Value::Vector(velocity));
+        if dispatch && let Some(hit) = &first_hit {
+            self.send_event(
+                id,
+                "HitWall",
+                vec![
+                    Value::Vector(hit.normal),
+                    Value::Object(Some(ObjRef::Instance(id))),
+                ],
+            )?;
+        }
+        Ok(first_hit)
+    }
+
+    /// item53b: `PHYS_Walking` for a pawn steered by a `CineController2` move sequence
+    /// (`movseq`/`movseqb`). The engine's `APawn::physWalking` integrates the `Acceleration`
+    /// that `execSteering` wrote: the velocity accelerates toward `Normal(Acceleration) *
+    /// GroundSpeed` (`calcVelocity`, Engine.dll 0x103ba250, with the pawn's `AccelRate` — the
+    /// measured `Engine.Pawn` default 2048), then one collision move with floor follow
+    /// ([`WorldPhysics::walk_box`]) moves the pawn. The obstacle slide this produces is what
+    /// lets a steered pawn walk around a wall and cross the arrival plane behind it.
+    ///
+    /// Documented approximation: the engine's per-tick ground friction and the exact
+    /// `calcVelocity` friction iterations are reduced to the accelerate-then-cap form here (a
+    /// steered cine pawn's velocity starts at zero after its landing, so the cap is the
+    /// operative rule), and a steering tick without acceleration parks the velocity (the engine
+    /// decays it).
+    fn integrate_steered_walking(&mut self, pawn: ObjectId, dt: f32) -> VmResult<()> {
+        let Some(location) = self.vector_prop(pawn, "Location") else {
+            return Ok(());
+        };
+        let acceleration = self.vector_prop(pawn, "Acceleration").unwrap_or([0.0; 3]);
+        let speed = self.f32_prop(pawn, "GroundSpeed");
+        let mut velocity = self.vector_prop(pawn, "Velocity").unwrap_or([0.0; 3]);
+        let length = (acceleration[0] * acceleration[0] + acceleration[1] * acceleration[1]).sqrt();
+        if length > 0.0 && speed > 0.0 {
+            let dir = [acceleration[0] / length, acceleration[1] / length, 0.0];
+            let accel_rate = {
+                let rate = self.f32_prop(pawn, "AccelRate");
+                if rate > 0.0 { rate } else { 2048.0 }
+            };
+            for axis in 0..2 {
+                velocity[axis] += dir[axis] * accel_rate * dt;
+            }
+            let vlen = (velocity[0] * velocity[0] + velocity[1] * velocity[1]).sqrt();
+            if vlen > speed {
+                velocity = [dir[0] * speed, dir[1] * speed, 0.0];
+            }
+        } else {
+            velocity = [0.0; 3];
+        }
+        self.set_property(pawn, "Velocity", 0, Value::Vector(velocity));
+        if velocity == [0.0; 3] || !self.bool_prop(pawn, "bCollideWorld") {
+            return Ok(());
+        }
+        let delta = [velocity[0] * dt, velocity[1] * dt, 0.0];
+        if delta == [0.0; 3] {
+            return Ok(());
+        }
+        let extent = self.actor_extent(pawn);
+        let walked = self
+            .physics
+            .as_mut()
+            .map(|provider| provider.walk_box(location, delta, extent));
+        let end = walked.map_or_else(|| add3(location, delta), |o| o.end);
+        self.set_property(pawn, "Location", 0, Value::Vector(end));
         Ok(())
     }
 
@@ -9556,10 +9778,18 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    /// `PHYS_Projectile`: `Velocity += Acceleration*dt` (no zone gravity), one swept move; on a
-    /// world hit with `bBounce` clear the actor becomes `PHYS_Falling` and gravity is applied
-    /// for this frame (the engine's fall-through into `physFalling`).
+    /// `PHYS_Projectile`: `Velocity += Acceleration*dt` (no zone gravity), one swept move; the
+    /// engine's exit tail (`AActor::physProjectile` 0x103c0ca6-0x103c0d03) then rewrites
+    /// `Velocity = (Location - MoveStart)/dt` for a projectile with the bounce bits clear — a
+    /// blocked projectile's velocity decays toward zero with the actual displacement, and its
+    /// `Physics` stays `PHYS_Projectile` (the `Physics == PHYS_Falling` check at 0x103c0c51 only
+    /// continues with `physFalling` when a `HitWall` script handler set it). This is what parks
+    /// the grapple demo's `CineHook` at the ceiling it strikes and lets the demo's
+    /// `Crochet.Velocity.Z < 1` cast transition fire (probe23: Jones climbs the full 675 to it).
     fn integrate_projectile(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
+        let Some(start) = self.vector_prop(id, "Location") else {
+            return Ok(());
+        };
         let acceleration = self.vector_prop(id, "Acceleration").unwrap_or([0.0; 3]);
         let mut velocity = self.vector_prop(id, "Velocity").unwrap_or([0.0; 3]);
         for axis in 0..3 {
@@ -9568,16 +9798,23 @@ impl<'s> Vm<'s> {
         self.set_property(id, "Velocity", 0, Value::Vector(velocity));
         let hit = self.integrate_move(id, velocity, dt, true)?;
         // `HitWall` script may have destroyed the projectile (`Destroy` in a HitWall handler);
-        // the engine checks `bDeleteMe` before continuing the fall-through.
-        if hit.is_some() && !self.objects[id as usize].deleted && !self.bool_prop(id, "bBounce") {
-            self.set_property(id, "Physics", 0, Value::Byte(PHYS_FALLING));
-            // `integrate_move` already wrote the contact-adjusted velocity; the fall-through
-            // applies this frame's gravity on top of it.
-            let gravity = self.zone_gravity(id);
-            let mut velocity = self.vector_prop(id, "Velocity").unwrap_or([0.0; 3]);
-            velocity[2] += gravity[2] * dt;
-            self.set_property(id, "Velocity", 0, Value::Vector(velocity));
+        // the engine checks `bDeleteMe` before the exit tail.
+        if self.objects[id as usize].deleted {
+            return Ok(());
         }
+        // Exit tail: the tracked bounce gate is `bBounce` (+0x34 bit 0x800000); the second
+        // clear-bit (0x8000000) is not tracked as a property and the VM actors that reach this
+        // path (CineHook, XIIIProjectile rounds) have it clear.
+        if !self.bool_prop(id, "bBounce") {
+            let end = self.vector_prop(id, "Location").unwrap_or(start);
+            let moved = [
+                (end[0] - start[0]) / dt,
+                (end[1] - start[1]) / dt,
+                (end[2] - start[2]) / dt,
+            ];
+            self.set_property(id, "Velocity", 0, Value::Vector(moved));
+        }
+        let _ = hit;
         Ok(())
     }
 
@@ -9672,9 +9909,11 @@ impl<'s> Vm<'s> {
         self.move_pawn_step_within(pawn, destination, speed, dt, radius)
     }
 
-    /// Direct cinematic movement with an explicit stop radius: the pawn stops moving (and reports
-    /// arrival) once its horizontal distance to `destination` is within `radius`. Cine steering
-    /// passes 0, since its arrival test is `IsTargetReached`, not the pawn's collision radius.
+    /// Test-only direct-step adapter for the shared cinematic collision walker. Controller
+    /// latents use controller_move_step; the cine steering no longer uses a direct step
+    /// (item53b: the decoded `execSteering` writes `Acceleration`/speed fields for the physics
+    /// pass instead).
+    #[cfg(test)]
     pub(crate) fn move_pawn_step_within(
         &mut self,
         pawn: ObjectId,
@@ -9714,32 +9953,6 @@ impl<'s> Vm<'s> {
                 p.move_box(location, delta, extent)
             }
         });
-        if vm_move_trace_enabled()
-            && let Some(hit) = outcome.and_then(|outcome| outcome.hit)
-        {
-            let object = &self.objects[pawn as usize];
-            let classname = self.set.path(object.class);
-            println!(
-                "[vm-pawn-move] pawn={} class={} Physics={} bCollideWorld={} walking={} from={location:?} delta={delta:?} extent={extent:?} hit_time={:.6} normal={:?}",
-                object.name,
-                classname,
-                self.byte_prop(pawn, "Physics"),
-                self.bool_prop(pawn, "bCollideWorld"),
-                walking,
-                hit.time,
-                hit.normal
-            );
-            if vm_move_dump_enabled()
-                && let Some(p) = self.physics.as_mut()
-            {
-                for (i, record) in p.dump_overlap(location, extent).iter().enumerate().take(8) {
-                    println!(
-                        "[vm-pawn-move-dump] #{i} {} source={} triangle={:?}",
-                        record.kind, record.source, record.triangle
-                    );
-                }
-            }
-        }
         let end = outcome.map_or_else(|| add3(location, delta), |o| o.end);
         self.set_property(pawn, "Location", 0, Value::Vector(end));
         Ok(horizontal_distance(end, destination) <= radius)
