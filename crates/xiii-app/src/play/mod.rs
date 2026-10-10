@@ -135,6 +135,9 @@ pub(crate) struct PlayCam;
 #[derive(Component)]
 struct PlayOverlay;
 
+#[derive(Resource)]
+pub(crate) struct DiagnosticOverlay(pub bool);
+
 /// Bevy light entities driven by live VM light actors: map-placed `TriggerLight`/
 /// `ScriptedLight`/`MovableLight` and runtime-spawned lights such as the Beretta's
 /// `XIII.MuzzleLight`. The VM owns the actors; this host map only mirrors them.
@@ -206,6 +209,7 @@ impl Plugin for PlayPlugin {
         app.insert_non_send(session);
         app.add_plugins((crate::video::CutscenePlugin, cutscene::CutsceneSystems));
         app.insert_non_send(cutscene::CutsceneHost(cutscene_host));
+        app.insert_resource(DiagnosticOverlay(options.diagnostic_overlay));
         app.insert_resource(PlayConfig { options })
             .insert_resource(ClearColor(Color::srgb(0.45, 0.62, 0.82)))
             .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
@@ -248,7 +252,14 @@ impl Plugin for PlayPlugin {
                 )
                     .chain(),
             )
-            .add_systems(Last, (cinematics::report_exit, cartoon::report_exit));
+            .add_systems(
+                Last,
+                (
+                    cinematics::report_exit,
+                    cartoon::report_exit,
+                    hud::report_exit,
+                ),
+            );
     }
 }
 
@@ -733,6 +744,7 @@ fn setup_inner(
     }
     commands.spawn((
         PlayOverlay,
+        Visibility::Hidden,
         Text::new("initialising"),
         TextFont {
             font_size: FontSize::Px(13.0),
@@ -749,7 +761,7 @@ fn setup_inner(
         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
     ));
     println!(
-        "[play] camera start {:?} m, yaw {:.1} deg | controls WASD, mouse look, Space jump, Shift walk, C crouch, E use, Esc quit",
+        "[play] camera start {:?} m, yaw {:.1} deg | controls WASD/arrows, mouse look, Space jump, Shift walk, C crouch, E/Enter use, F3 diagnostics, Ctrl+Q quit",
         Vec3::from_array(eye),
         yaw.to_degrees()
     );
@@ -859,17 +871,17 @@ fn setup_inner(
 
 fn read_keyboard(keys: &ButtonInput<KeyCode>, buttons: &ButtonInput<MouseButton>) -> Input {
     let mut forward = 0.0;
-    if keys.pressed(KeyCode::KeyW) {
+    if keys.any_pressed([KeyCode::KeyW, KeyCode::ArrowUp]) {
         forward += 1.0;
     }
-    if keys.pressed(KeyCode::KeyS) {
+    if keys.any_pressed([KeyCode::KeyS, KeyCode::ArrowDown]) {
         forward -= 1.0;
     }
     let mut right = 0.0;
-    if keys.pressed(KeyCode::KeyD) {
+    if keys.any_pressed([KeyCode::KeyD, KeyCode::ArrowRight]) {
         right += 1.0;
     }
-    if keys.pressed(KeyCode::KeyA) {
+    if keys.any_pressed([KeyCode::KeyA, KeyCode::ArrowLeft]) {
         right -= 1.0;
     }
     Input {
@@ -877,8 +889,8 @@ fn read_keyboard(keys: &ButtonInput<KeyCode>, buttons: &ButtonInput<MouseButton>
         right,
         jump: keys.just_pressed(KeyCode::Space),
         walk: keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]),
-        use_action: keys.just_pressed(KeyCode::KeyE),
-        fire: buttons.just_pressed(MouseButton::Left),
+        use_action: keys.any_just_pressed([KeyCode::KeyE, KeyCode::Enter]),
+        fire: buttons.just_pressed(MouseButton::Left) || keys.just_pressed(KeyCode::ControlRight),
         // XIII binds `C=Duck` (DefUser.ini); ControlLeft is accepted as the conventional
         // alternative the task names.
         crouch: keys.any_pressed([KeyCode::KeyC, KeyCode::ControlLeft]),
@@ -1030,28 +1042,7 @@ fn fixed_step(
     let mut weapon_inputs = if let Some(drive) = script.drive.as_mut() {
         drive.take_weapon_inputs()
     } else {
-        let groups = [0, 1, 2, 3, 4, 6, 9, 11, 14, 15];
-        let digits = [
-            KeyCode::Digit0,
-            KeyCode::Digit1,
-            KeyCode::Digit2,
-            KeyCode::Digit3,
-            KeyCode::Digit4,
-            KeyCode::Digit5,
-            KeyCode::Digit6,
-            KeyCode::Digit7,
-            KeyCode::Digit8,
-            KeyCode::Digit9,
-        ];
-        let mut inputs: Vec<_> = digits
-            .into_iter()
-            .zip(groups)
-            .filter_map(|(key, group)| keys.just_pressed(key).then_some(Some(group)))
-            .collect();
-        if keys.just_pressed(KeyCode::KeyX) || keys.just_pressed(KeyCode::PageUp) {
-            inputs.push(None);
-        }
-        inputs
+        Vec::new() // Live execs are dispatched once per render/input frame in controls.
     };
     if suppressed {
         weapon_inputs.clear();
@@ -1392,9 +1383,182 @@ fn format_vm_trace(sess: &session::Session) -> String {
     )
 }
 
-fn controls(keys: Res<ButtonInput<KeyCode>>, mut exit: MessageWriter<AppExit>) {
+fn live_execs(
+    keys: &ButtonInput<KeyCode>,
+    buttons: &ButtonInput<MouseButton>,
+    wheel: f32,
+) -> Vec<(&'static str, Vec<Value>)> {
+    let mut out = Vec::new();
+    for (pressed, name) in [
+        (
+            buttons.just_pressed(MouseButton::Right) || keys.just_pressed(KeyCode::AltRight),
+            "AltFire",
+        ),
+        (
+            buttons.just_released(MouseButton::Left)
+                || buttons.just_released(MouseButton::Right)
+                || keys.any_just_released([KeyCode::ControlRight, KeyCode::AltRight]),
+            "UnFire",
+        ),
+        (
+            keys.any_just_pressed([KeyCode::KeyZ, KeyCode::PageDown]) || wheel < 0.0,
+            "PrevWeapon",
+        ),
+        (
+            keys.any_just_pressed([KeyCode::KeyX, KeyCode::PageUp]) || wheel > 0.0,
+            "NextWeapon",
+        ),
+        (keys.just_pressed(KeyCode::KeyR), "Reload"),
+        (
+            keys.any_just_pressed([KeyCode::KeyQ, KeyCode::Delete])
+                && !keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]),
+            "QuickHeal",
+        ),
+        (
+            keys.any_just_pressed([KeyCode::KeyF, KeyCode::Numpad0]),
+            "cPrevItem",
+        ),
+        (
+            keys.any_just_pressed([KeyCode::KeyG, KeyCode::Numpad1]),
+            "cNextItem",
+        ),
+        (keys.just_pressed(KeyCode::F1), "ShowScores"),
+        (keys.just_released(KeyCode::F1), "HideScores"),
+    ] {
+        if pressed {
+            out.push((
+                name,
+                if matches!(name, "Fire" | "AltFire") {
+                    vec![Value::Float(1.0)]
+                } else {
+                    Vec::new()
+                },
+            ));
+        }
+    }
+    for (key, group) in [
+        KeyCode::Digit0,
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ]
+    .into_iter()
+    .zip([0, 1, 2, 3, 4, 6, 9, 11, 14, 15])
+    {
+        if keys.just_pressed(key) {
+            out.push(("SelectWeapon", vec![Value::Int(group)]));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod live_input_tests {
+    use super::*;
+
+    #[test]
+    fn live_input_edges_release_and_retail_groups() {
+        let mut keys = ButtonInput::default();
+        let mut buttons = ButtonInput::default();
+        assert!(live_execs(&keys, &buttons, 0.0).is_empty());
+        keys.press(KeyCode::Digit5);
+        keys.press(KeyCode::KeyZ);
+        keys.press(KeyCode::KeyQ);
+        buttons.press(MouseButton::Right);
+        let execs = live_execs(&keys, &buttons, 0.0);
+        assert!(execs.contains(&("SelectWeapon", vec![Value::Int(6)])));
+        assert!(execs.contains(&("PrevWeapon", Vec::new())));
+        assert!(execs.contains(&("QuickHeal", Vec::new())));
+        assert!(execs.contains(&("AltFire", vec![Value::Float(1.0)])));
+        keys.clear();
+        buttons.clear();
+        assert!(
+            live_execs(&keys, &buttons, 0.0).is_empty(),
+            "holding must not replay exec edges"
+        );
+        buttons.release(MouseButton::Right);
+        assert!(live_execs(&keys, &buttons, 0.0).contains(&("UnFire", Vec::new())));
+        keys.press(KeyCode::ControlLeft);
+        keys.release(KeyCode::KeyQ);
+        keys.press(KeyCode::KeyQ);
+        assert!(
+            !live_execs(&keys, &buttons, 0.0)
+                .iter()
+                .any(|(n, _)| *n == "QuickHeal"),
+            "quit chord must not consume a medkit"
+        );
+        assert!(live_execs(&keys, &buttons, -1.0).contains(&("PrevWeapon", Vec::new())));
+        assert!(live_execs(&keys, &buttons, 1.0).contains(&("NextWeapon", Vec::new())));
+        keys.press(KeyCode::ArrowUp);
+        keys.press(KeyCode::ArrowDown);
+        assert_eq!(
+            read_keyboard(&keys, &buttons).forward,
+            0.0,
+            "opposing directions cancel"
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn controls(
+    keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    wheel: Res<bevy::input::mouse::AccumulatedMouseScroll>,
+    cfg: Res<PlayConfig>,
+    mut session: NonSendMut<Result<session::Session, String>>,
+    mut cursor: Single<&mut CursorOptions, With<PrimaryWindow>>,
+    mut diagnostics: ResMut<DiagnosticOverlay>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    if keys.just_pressed(KeyCode::F3) {
+        diagnostics.0 = !diagnostics.0;
+    }
     if keys.just_pressed(KeyCode::Escape) {
+        cursor.grab_mode = CursorGrabMode::None;
+        cursor.visible = true;
+        eprintln!(
+            "[play] In-map menu unavailable: ShowTheMenu GUI bridge is missing. Escape releases the mouse; click to resume, Ctrl+Q to quit."
+        );
+    }
+    // Escape is reserved for retail ShowMenu; Ctrl+Q is an explicit host quit chord.
+    if keys.just_pressed(KeyCode::KeyQ)
+        && keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight])
+    {
         exit.write(AppExit::Success);
+    }
+    if cfg.options.play_script.is_none()
+        && let Ok(sess) = session.as_mut()
+        && let Some(pc) = sess.controller
+    {
+        sess.vm_mut().set_property(
+            pc,
+            "bFire",
+            0,
+            Value::Byte(u8::from(
+                buttons.pressed(MouseButton::Left) || keys.pressed(KeyCode::ControlRight),
+            )),
+        );
+        sess.vm_mut().set_property(
+            pc,
+            "bAltFire",
+            0,
+            Value::Byte(u8::from(
+                buttons.pressed(MouseButton::Right) || keys.pressed(KeyCode::AltRight),
+            )),
+        );
+        // State-aware dispatch preserves retail NoControl/NoMove exec overrides.
+        for (name, args) in live_execs(&keys, &buttons, wheel.delta.y) {
+            if let Err(e) = sess.vm_mut().send_event(pc, name, args) {
+                eprintln!("[play] live input {name} failed: {e}");
+            }
+        }
+        sess.drain_events();
     }
 }
 
@@ -1492,6 +1656,7 @@ fn sync_camera(
 
 #[allow(clippy::too_many_arguments)]
 fn overlay(
+    diagnostics: Res<DiagnosticOverlay>,
     cfg: Res<PlayConfig>,
     sim: Res<SimRes>,
     session: NonSend<Result<session::Session, String>>,
@@ -1502,12 +1667,20 @@ fn overlay(
     weapon_view: Option<Res<weapons::WeaponView>>,
     runtime_lights: Option<Res<RuntimeLights>>,
     mut perf: ResMut<crate::perf::Perf>,
-    mut text: Query<&mut Text, With<PlayOverlay>>,
+    mut text: Query<(&mut Text, &mut Visibility), With<PlayOverlay>>,
 ) {
     let t0 = Instant::now();
-    let Ok(mut text) = text.single_mut() else {
+    let Ok((mut text, mut visibility)) = text.single_mut() else {
         return;
     };
+    *visibility = if diagnostics.0 {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    if !diagnostics.0 {
+        return;
+    }
     let s = &sim.0;
     let vm = match &*session {
         Ok(sess) => format!(
@@ -1619,8 +1792,7 @@ fn overlay(
         None => "dynamic lights unavailable".to_owned(),
     };
     text.0 = format!(
-        "XIII play prototype (NOT a playable mission; no weapons, no full AI)\n\
-         map {} | pos ({:.1}, {:.1}, {:.1}) UU | vel ({:.1}, {:.1}, {:.1}) UU/s | state {}\n\
+        "map {} | pos ({:.1}, {:.1}, {:.1}) UU | vel ({:.1}, {:.1}, {:.1}) UU/s | state {}\n\
          floor normal ({:.2}, {:.2}, {:.2}) | last contact: {}\n\
          {combat_line}\n\
          {}\n\
@@ -1628,7 +1800,7 @@ fn overlay(
          {lights_line}\n\
          {hud_line}\n\
          {projectors_line}\n\
-         WASD move | mouse look | Space jump | Shift walk | C crouch | Left mouse fire | E use | Esc quit",
+          F3 diagnostics | Ctrl+Q quit",
         cfg.options.map.as_deref().unwrap_or("?"),
         s.location[0],
         s.location[1],
@@ -1660,7 +1832,8 @@ fn unattended(
     // item21 hook: an unattended run with a screenshot requested screenshots the in-game
     // cutscene video [`cutscene::VIDEO_SHOT_AFTER_SECS`] into playback (the video may start
     // long after the wall-clock budget began) and exits once the shot is confirmed.
-    if cfg.options.screenshot.is_some()
+    if cfg.options.play_script.is_none()
+        && cfg.options.screenshot.is_some()
         && state.video_exit_at.is_none()
         && cutscene::playing_for(&host, cutscene::VIDEO_SHOT_AFTER_SECS)
     {
@@ -1738,13 +1911,19 @@ fn unattended(
     let Some(secs) = state.exit_secs else {
         return;
     };
-    let elapsed = state.start.elapsed().as_secs_f32();
+    // Script timestamps use fixed simulation time. A slow startup or capped catch-up must not
+    // end a scripted run before its requested inputs have been delivered.
+    let elapsed = unattended_elapsed(
+        cfg.options.play_script.is_some(),
+        state.tick,
+        state.start.elapsed().as_secs_f32(),
+    );
     if flag.0 {
         state.shot_done = true;
     }
     if let Some(path) = &cfg.options.screenshot
         && state.shot == 0
-        && elapsed >= secs * 0.75
+        && elapsed >= screenshot_at(cfg.options.play_script.is_some(), secs)
     {
         let path: std::path::PathBuf = path.clone();
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -1791,6 +1970,22 @@ type MapSceneFilter = (
     )>,
 );
 
+fn unattended_elapsed(scripted: bool, tick: u64, wall_secs: f32) -> f32 {
+    if scripted {
+        tick as f32 * DT
+    } else {
+        wall_secs
+    }
+}
+
+fn screenshot_at(scripted: bool, exit_secs: f32) -> f32 {
+    if scripted {
+        exit_secs
+    } else {
+        exit_secs * 0.75
+    }
+}
+
 /// Level-transition host system (item15). When the game's own code requests travel, this tears
 /// down the current map (every entity except the window), opens a fresh script session for the
 /// requested map and rebuilds the scene through [`setup_inner`]. The input-script cursor and the
@@ -1801,6 +1996,8 @@ fn travel(
     mut cfg: ResMut<PlayConfig>,
     mut session: NonSendMut<Result<session::Session, String>>,
     mut cutscene_host: NonSendMut<cutscene::CutsceneHost>,
+    mut cinematic: ResMut<cinematics::CinematicState>,
+    mut cartoon: ResMut<cartoon::CartoonState>,
     mut sync: ResMut<RenderSync>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -1832,6 +2029,24 @@ fn travel(
         "[play] travel requested at t={:.3}s by {}: url={:?} mode={} items={} source={:?} -> map {} options {:?}",
         req.time, req.actor, req.url, req.mode, req.items, req.source, plan.map, plan.options
     );
+    println!("[play] outgoing objectives: {}", sess.objective_summary());
+    println!(
+        "[play] outgoing suspended={:?} blocked={:?}",
+        sess.suspended, sess.blocked
+    );
+    for (actor, error) in &sess.failures {
+        println!("[play] outgoing failure {actor}: {error}");
+    }
+    println!(
+        "[play] outgoing presentation: dialogue_lines={} view_changes={} cartoon_updates={}",
+        cinematic.lines, cinematic.view_changes, cartoon.render_updates
+    );
+    if let Some(host) = cutscene_host.0.as_ref() {
+        println!("{}", host.report_line());
+        for diagnostic in host.diagnostics() {
+            println!("[video host]   {diagnostic}");
+        }
+    }
     let Some(game_dir) = cfg.options.game_dir.clone() else {
         eprintln!("[play] travel without --game-dir");
         exit.write(AppExit::error());
@@ -1845,6 +2060,15 @@ fn travel(
         commands.entity(e).try_despawn();
         removed += 1;
     }
+    // These caches contain entity IDs from the outgoing scene. They must not issue commands
+    // against despawned entities or mistake a reused VM object ID for an existing light.
+    commands.insert_resource(RuntimeLights::default());
+    commands.insert_resource(viewer::decals::RuntimeProjectorDecals::default());
+    commands.insert_resource(weapons::WeaponView::default());
+    commands.insert_resource(cartoon::CartoonRenderTarget::default());
+    commands.insert_resource(crate::video::VideoOverlay::default());
+    *cinematic = cinematics::CinematicState::default();
+    *cartoon = cartoon::CartoonState::default();
     let new_session = match travel::open_next_session(sess, &game_dir, &plan) {
         Ok(s) => s,
         Err(e) => {
@@ -2762,6 +2986,15 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn scripted_exit_budget_survives_slow_frames_and_startup() {
+        assert_eq!(unattended_elapsed(true, 0, 90.0), 0.0);
+        assert_eq!(unattended_elapsed(true, 120, 90.0), 2.0);
+        assert_eq!(unattended_elapsed(false, 120, 90.0), 90.0);
+        assert_eq!(screenshot_at(true, 164.0), 164.0);
+        assert_eq!(screenshot_at(false, 164.0), 123.0);
+    }
+
     /// item40e: the authored Plage01 opening of `tests/data/plage01_route.script` up to its
     /// `# fight-probe cut` marker line: hut escape, objective promotion, the full beach nav walk
     /// and the TouchTrigger7 shore touch that wakes BaseSoldier6 (the killer) out of his
@@ -3652,7 +3885,10 @@ mod tests {
         resumed
             .restore_checkpoint(&loaded)
             .expect("run AcceptInventory restore path");
-        assert_eq!(resumed.player_health(), Some(saved.health));
+        // Retail AcceptInventory @429895..431665, bytecode 0x0173, restores
+        // Max(int(default.Health * 0.25 + 1), Health). The live-clock route
+        // saves 26 HP; the authored 150-HP class therefore raises it to 38.
+        assert_eq!(resumed.player_health(), Some(saved.health.max(38.0)));
         assert_eq!(
             resumed.player_weapon().map(|id| resumed
                 .vm()
@@ -4664,10 +4900,8 @@ mod tests {
         // is the beach end trigger: `Engine.Trigger.Touch` fires `TriggerEvent('objectif0')`,
         // which calls `XIIIGoalTrigger5.Trigger`. Teleport next to it and walk in, then wait for
         // the game's own travel request.
-        let script = script::Script::parse(
-            "t=0.0 teleport 5420 -1360.3 880\nt=0.0 yaw 0\nt=0.0 forward 1\nt=2.0 forward 0\nt=2.0 wait_travel\n",
-        )
-        .unwrap();
+        let script =
+            script::Script::parse(include_str!("../../tests/data/plage00_goal.script")).unwrap();
         let outcome = run_script(
             &game_dir,
             "Plage00",
@@ -5820,28 +6054,33 @@ mod tests {
             "route unexpectedly travelled: {:?}",
             outcome.travel
         );
-        // item48 -> item61b: `Actor.VisibleDamageableActors` (HurtRadius) delivers blast damage,
-        // but since item61's native InitExecution writes (GameInfo.DummyStuff1/2,
-        // GenAlerte.dummy) the tarmac's scripted BazookRocket soldiers are back to their
-        // authored skill/health: their aimed rockets land with falloff spread and the route's
-        // moving player SURVIVES the kill zone. Measured (identical twice,
-        // `local/re/item61b/test-as-is.txt` / `test-as-is-2.txt`): health 150 until t=319.0,
-        // 85 from t=319.5 (blast -65), 74 from t=323.5 (blast -11); the game's TouchTrigger10
-        // Touch fired at 325.017 with the player alive. The route's fight phase (below) then
-        // costs one soldier hit on the way to the door-line stand (74 -> 49) and the stand
-        // itself is safe (the Tmetaldoorhelico door line blocks the soldier's sweep, the same
-        // cover the item53b comment used for the helipad wait). Pinned: alive through the
-        // whole route, final health inside the measured window.
+        // item68b: with the live Level.TimeSeconds, the old tarmac wait dies at -30 HP.
+        // Input now engages the rocket soldier on landing (head aim, before moving east),
+        // then runs continuously to the same door-line cover. Measured: soldier18
+        // 150 -> 15 at317.4 -> -41 at318.2, player150 throughout. The old40..60
+        // window measured a different input against a frozen script clock.
         let health = session
             .player_health()
             .expect("the player must still have a Health property across the route");
+        for event in &session.vm().trace {
+            if let xiii_script::TraceKind::Event {
+                target,
+                function,
+                args,
+            } = &event.kind
+                && target == &session.player_name
+                && function.ends_with("TakeDamage")
+            {
+                println!("[toits01 damage] {:.3} {function} {args:?}", event.time);
+            }
+        }
         assert!(
             health > 0.0,
             "the route player must survive the tarmac rockets and the fight phase with normal-health soldiers, got health {health}"
         );
-        assert!(
-            (40.0..=60.0).contains(&health),
-            "the route player's final health must stay in the measured 40..=60 window (measured 150 -> 85 @319.5 s -> 74 @323.5 s -> 49 at the fight stand), got {health}"
+        assert_eq!(
+            health, 150.0,
+            "landing engagement and continuous crossing must preserve the measured health150"
         );
         // Goal 3 (Jones must not die) completes; goals 0/1/2 do not.
         for o in &objectives {
@@ -6071,21 +6310,19 @@ mod tests {
                 })
         );
         // item61b continuation pins (the route's fight + generator-retry phases):
-        // 1. The route's M60 fire (the labelled XIII.m60 grant; the import carries only Fists)
-        //    damages the road soldier BaseSoldier18 (authored 150 hp, Tag bataillefinale):
-        //    measured one landed burst (32 damage, `X Spine` bone hit, 150 -> 118) before he
-        //    reaches hard cover on the lower road; the remaining bursts trace onto the cover
-        //    (bone None). Normal-health soldiers are damageable by route fire; the full kill
-        //    was measured in the open-road probe (`local/re/item61b/shot-probe.txt`, the
-        //    (17500,1450) stand: 150 -> 20 -> -112 DEAD) but costs the player the remaining
-        //    health, so the route pins the cover fight, not the kill.
+        // 1. The earlier real-clock landing engagement kills BaseSoldier18 before the
+        // crossing; retain an exact damage result as well as the death assertion.
         let soldier18 = vm
             .find_object("BaseSoldier18")
             .expect("BaseSoldier18 must exist");
         assert_eq!(
             vm.get_property(soldier18, "Health"),
-            Some(&xiii_script::Value::Int(118)),
-            "the route's tracked M60 fire must damage BaseSoldier18 (150 -> 118, the fight demonstration); the value moves only if the fight phase changes"
+            Some(&xiii_script::Value::Int(-41)),
+            "the landing M60 engagement must reproduce the measured 150 -> 15 -> -41 kill"
+        );
+        assert!(
+            session.actor_is_dead(soldier18),
+            "rocket soldier must be killed by route fire"
         );
         // 2. The generator-shot retry (t=360-368.5, from the closest road stand at
         //    (17400,1400), tracking BreakableMover12) lands nothing: the yard stays sealed

@@ -3903,11 +3903,50 @@ impl<'s> Vm<'s> {
         self.do_goto_state(id, state, label.unwrap_or("Begin"))
     }
 
+    /// Retail ULevel::Tick (Engine.dll 0x10390afc..0x10390be0): scale the incoming
+    /// float delta, advance the double level clock unless Pauser is set, publish its
+    /// float mirror before actor callbacks. VM tick accepts a simulation step;
+    /// callers may subdivide it, so retail's outer-frame actor-delta bound is not
+    /// applied to this low-level API (and must never clamp the elapsed clock).
+    fn sync_level_time(&mut self, dt: f32) -> (f32, bool) {
+        if self.level_info.is_none() {
+            self.level_info = self.find_level_info();
+        }
+        let dilation = self.level_info.map_or(1.0, |level| {
+            match self.get_property(level, "TimeDilation") {
+                Some(Value::Float(value)) => *value,
+                _ => 1.0, // Synthetic fixtures without a LevelInfo field.
+            }
+        });
+        let paused = self.level_info.is_some_and(|level| {
+            matches!(
+                self.get_property(level, "Pauser"),
+                Some(Value::Object(Some(_)))
+            )
+        });
+        let scaled = dt * dilation;
+        if !paused {
+            self.time += f64::from(scaled);
+        }
+        if let Some(level) = self.level_info {
+            self.set_property(level, "TimeSeconds", 0, Value::Float(self.time as f32));
+        }
+        (scaled, paused)
+    }
+
     /// One fixed step: timers, then state code of every active object (in id order).
     pub fn tick(&mut self, dt: f32) -> VmResult<()> {
         self.tick_count += 1;
-        self.time += f64::from(dt);
+        let (dt, paused) = self.sync_level_time(dt);
         self.steps = 0;
+        if paused {
+            for id in 0..self.objects.len() as ObjectId {
+                if self.objects[id as usize].active && self.bool_prop(id, "bAlwaysTick") {
+                    self.dispatch_tick(id, dt)?;
+                }
+            }
+            return Ok(());
+        }
         for id in 0..self.objects.len() as ObjectId {
             if !self.objects[id as usize].active {
                 continue;
@@ -4016,9 +4055,21 @@ impl<'s> Vm<'s> {
     /// swallowed.
     pub fn tick_suspending(&mut self, dt: f32) -> Vec<(ObjectId, VmError)> {
         self.tick_count += 1;
-        self.time += f64::from(dt);
+        let (dt, paused) = self.sync_level_time(dt);
         self.steps = 0;
         let mut errors = Vec::new();
+        if paused {
+            for id in 0..self.objects.len() as ObjectId {
+                if self.objects[id as usize].active
+                    && self.bool_prop(id, "bAlwaysTick")
+                    && let Err(e) = self.dispatch_tick(id, dt)
+                {
+                    let suspended = self.suspend_for_error(id, &e);
+                    errors.push((suspended, e));
+                }
+            }
+            return errors;
+        }
         let profiling = self.profile.enabled;
         let t0 = Instant::now();
         for id in 0..self.objects.len() as ObjectId {
