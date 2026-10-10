@@ -95,10 +95,16 @@ t=291.00 goto 15500 1450
 t=297.00 teleport 16000 1300 700
 t=297.10 forward 0
 t=299.00 goto 16500 1200
-t=307.00 goto 17800 1150
+# item53b: the road stand is under enemy fire once the phantom mover cylinders no longer
+# absorb AI rounds (the decoded primitive rule); keep moving through the exposure.
+t=301.00 goto 17800 1150
 # labelled teleport (the warehouse west wall + the Movable2 crate block the doorway;
 # TT10's r700 zone starts west of the wall)
-t=313.00 teleport 18300 1000 800
-t=313.10 forward 0
-t=315.00 goto 18800 1050
+t=305.00 teleport 18300 1000 800
+t=305.10 forward 0
+t=307.00 goto 18800 1050
+# item53b: the helipad wait is under MagnumPlus3 fire once the phantom mover cylinders no
+# longer absorb AI rounds; the wait moves behind the Tmetaldoorhelico line (the sweep from
+# the shooter's muzzle to (18500,1300) is blocked by the door mesh).
+t=311.00 goto 18500 1300
 t=324.00 wait_travel

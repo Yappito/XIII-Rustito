@@ -93,6 +93,16 @@ pub trait WorldPhysics {
         ActorMeshHit::NoData
     }
 
+    /// Whether the named actor is held as a registered mover (see
+    /// [`WorldPhysics::register_mover`]): its collision triangles live in the moving world, so a
+    /// world trace answers from the mover's real mesh. A mover that is NOT registered has no
+    /// mesh the VM can reach — its per-actor mesh query returns
+    /// [`ActorMeshHit::NoData`] with nothing behind it — so the VM keeps the cylinder
+    /// approximation for those.
+    fn mover_is_registered(&self, _actor: &str) -> bool {
+        false
+    }
+
     /// UE2 `MoveActor`-like swept box move: from `start`, try to move by `delta` with
     /// half-extents `extent`, stopping at the **first blocking** world hit. No sliding —
     /// sliding is physics/script logic layered above this. Returns the end position and the
