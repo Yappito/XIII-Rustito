@@ -594,6 +594,7 @@ pub fn is_unimplemented(kind: &xiii_script::VmErrorKind) -> bool {
             | VmErrorKind::NoPhysicsProvider { .. }
             | VmErrorKind::NoAnimationProvider { .. }
             | VmErrorKind::NoNavProvider { .. }
+            | VmErrorKind::NoAudioProvider { .. }
     )
 }
 

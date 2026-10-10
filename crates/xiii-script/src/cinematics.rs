@@ -238,6 +238,40 @@ fn struct_int(fields: &[(String, Value)], name: &str) -> Option<i32> {
     }
 }
 
+/// `Actor.WaveHasPosition(string SoundName) -> bool` (native 356, item48).
+///
+/// Decoded (all measured): Engine.dll `?execWaveHasPosition@AActor` 0x103e3580 returns false when
+/// the level has no audio subsystem, otherwise queries `UHXAUDIOSubsystem::WaveHasPosition`
+/// (HXAudio.dll 0x100226b0), a name-keyed map lookup at `subsystem+0x88` whose hit answers bit 3
+/// of the loaded entry's flag byte (+0x54). That flag byte is assembled from per-entry state
+/// pointers (HXAudio 0x100173f6-0x10017450): bit 3 = pointer +0x34 non-null — i.e. the named
+/// resource's loaded state has a position object. The data-file provenance of that state pointer
+/// is not decoded, so the classification lives in the host [`crate::voice::WavePosition`]
+/// provider: `Some(b)` is the answer, `None` (unclassifiable name) notes and reports `false` —
+/// the engine's own no-subsystem answer, but visible. With **no** provider installed the native
+/// fails explicitly (`VmErrorKind::NoAudioProvider`), never a silent answer.
+///
+/// Consumer: `xidcine.DialogueManager.Speak` 0x0284 uses
+/// `Pawn == None && !WaveHasPosition(SoundName)` (with the `"HP"` name-prefix override) to pick
+/// HUD message type 2 (non-positional) instead of type 0 (positional at the speaker pawn).
+fn wave_has_position(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let name = string(vm, a, 0)?;
+    if !vm.has_wave_position() {
+        return Err(vm.err(VmErrorKind::NoAudioProvider {
+            native: "Engine.Actor.WaveHasPosition".into(),
+        }));
+    }
+    match vm.wave_position(&name) {
+        Some(b) => val(Value::Bool(b)),
+        None => {
+            vm.note(TraceKind::Note(format!(
+                "WaveHasPosition({name:?}): provider cannot classify the wave, reported false"
+            )));
+            val(Value::Bool(false))
+        }
+    }
+}
+
 /// The cinematic natives. `registry::builtin_defs` extends the built-in table with these.
 pub fn cinematic_defs() -> Vec<NativeDef> {
     vec![
@@ -249,6 +283,21 @@ pub fn cinematic_defs() -> Vec<NativeDef> {
             "engine.u Actor.GetWaveDuration decoded; xidcine.DialogueManager.Speak uses it to \
              size the message lifetime; Engine.dll ?execGetWaveDuration@AActor",
             get_wave_duration,
+        ),
+        partial(
+            "the positional bit's data-file provenance is not decoded (HXAudio loaded-entry flag \
+             byte +0x54 bit 3 = state pointer +0x34 non-null); the host WavePosition provider \
+             answers, an unclassifiable name notes and reports false, no provider fails \
+             explicitly (VmErrorKind::NoAudioProvider)",
+            "Engine.Actor.WaveHasPosition",
+            "native(356) final static function bool WaveHasPosition(string SoundName)",
+            "engine.u Actor.WaveHasPosition decoded (SoundName, bool); Engine.dll \
+             ?execWaveHasPosition@AActor 0x103e3580 (no audio subsystem -> false, else the \
+             subsystem's virtual +0x90); HXAudio.dll UHXAUDIOSubsystem::WaveHasPosition \
+             0x100226b0 (name-keyed map at subsystem+0x88, hit -> bit 3 of entry byte +0x54); \
+             xidcine.DialogueManager.Speak 0x0284 uses !WaveHasPosition to pick HUD message \
+             type 2",
+            wave_has_position,
         ),
         def(
             "Engine.Actor.PlayStrVoice",
