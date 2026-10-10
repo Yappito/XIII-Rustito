@@ -482,6 +482,9 @@ pub struct MoverState {
 pub(crate) struct AnimChannel {
     /// Sequence name this channel is playing.
     pub(crate) sequence: String,
+    /// Animation source the sequence was resolved from (a `LinkSkelAnim` path or the actor's
+    /// `Mesh`); posed-bone queries address the same data through it.
+    pub(crate) source: String,
     /// Total frames.
     pub(crate) frames: u32,
     /// Playback rate (frames/second).
@@ -4261,10 +4264,14 @@ impl<'s> Vm<'s> {
             .map(|(i, _)| i as ObjectId)
             .collect();
         for controller in controllers {
-            // Combat focus steering is owned by AAIController/its game subclasses. Player and
-            // scripted controllers also use FinishRotation for view/cinematic work; their view
-            // rotation follows player input and must not be treated as AI focus steering here.
-            if !self.is_a(controller, "aicontroller") {
+            // Combat focus steering is owned by AAIController/its game subclasses. CineController2
+            // extends Controller directly (xidcine.u), but its PlayingSequence.Tick drives
+            // FocalPoint (from rWantedRotation or the move direction) and sets
+            // Pawn.RotationRate.Yaw itself (tick 0x066A), so the same rotateToward facing applies
+            // to its pawn — the XIII demonstrator cutscenes rely on it. Player and scripted
+            // controllers also use FinishRotation for view/cinematic work; their view rotation
+            // follows player input and must not be treated as AI focus steering here.
+            if !self.is_a(controller, "aicontroller") && !self.is_a(controller, "cinecontroller2") {
                 continue;
             }
             let Some(pawn) = self.obj_prop(controller, "Pawn") else {
@@ -9748,6 +9755,60 @@ impl<'s> Vm<'s> {
             .as_mut()
             .map(|provider| provider.walk_box(location, delta, extent));
         let end = walked.map_or_else(|| add3(location, delta), |o| o.end);
+        // TEMPORARY item53d diagnostic (removed before finishing): with XIII_VM_MOVE_TRACE set,
+        // print each steered move's start/end/velocity and the blocking hit + overlapping
+        // primitives at the blocked position.
+        if std::env::var_os("XIII_VM_MOVE_TRACE").is_some() {
+            let name = self
+                .objects
+                .get(pawn as usize)
+                .map(|o| o.name.clone())
+                .unwrap_or_default();
+            let hit_info = walked
+                .as_ref()
+                .and_then(|o| o.hit.as_ref())
+                .map(|h| {
+                    format!(
+                        "HIT t={:.3} at ({:.1},{:.1},{:.1}) n=({:.2},{:.2},{:.2})",
+                        h.time,
+                        h.location[0],
+                        h.location[1],
+                        h.location[2],
+                        h.normal[0],
+                        h.normal[1],
+                        h.normal[2]
+                    )
+                })
+                .unwrap_or_else(|| "free".to_owned());
+            let overlaps = if walked.as_ref().is_some_and(|o| o.hit.is_some()) {
+                self.physics
+                    .as_mut()
+                    .map(|p| {
+                        p.dump_overlap(end, extent)
+                            .iter()
+                            .take(4)
+                            .map(|r| format!("{}:{}", r.kind, r.source))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            println!(
+                "[move-trace] {name} t={:.3} start=({:.1},{:.1},{:.1}) end=({:.1},{:.1},{:.1}) vel=({:.1},{:.1},{:.1}) {hit_info} overlaps[{overlaps}]",
+                self.time,
+                location[0],
+                location[1],
+                location[2],
+                end[0],
+                end[1],
+                end[2],
+                velocity[0],
+                velocity[1],
+                velocity[2],
+            );
+        }
         self.set_property(pawn, "Location", 0, Value::Vector(end));
         Ok(())
     }
@@ -10014,9 +10075,14 @@ impl<'s> Vm<'s> {
     }
 
     /// Queries the animation provider for `sequence` over the actor's candidate sources,
-    /// returning the first hit. `Ok(None)` = not found anywhere (unknown sequence); a provider
-    /// decode failure is returned as [`VmErrorKind::AnimationDataError`].
-    fn sequence_info(&mut self, id: ObjectId, sequence: &str) -> VmResult<Option<SeqInfo>> {
+    /// returning the first hit with the source that answered. `Ok(None)` = not found anywhere
+    /// (unknown sequence); a provider decode failure is returned as
+    /// [`VmErrorKind::AnimationDataError`].
+    fn sequence_info(
+        &mut self,
+        id: ObjectId,
+        sequence: &str,
+    ) -> VmResult<Option<(String, SeqInfo)>> {
         if self.animation.is_none() {
             return Ok(None);
         }
@@ -10031,7 +10097,7 @@ impl<'s> Vm<'s> {
             let provider = self.animation.as_mut().expect("checked above");
             for source in &sources {
                 match provider.sequence(source, sequence) {
-                    Ok(Some(info)) => return Ok(Some(info)),
+                    Ok(Some(info)) => return Ok(Some((source.clone(), info))),
                     Ok(None) => {}
                     Err(message) => {
                         decode_error = Some((source.clone(), message));
@@ -10156,7 +10222,7 @@ impl<'s> Vm<'s> {
         // source therefore no-ops instead of failing. The diagnostic `FixedAnimation` provider
         // still answers the empty source, so harness diagnostics are unaffected.
         let mesh_less = self.animation_sources(id).is_empty();
-        let Some(info) = self.sequence_info(id, sequence)? else {
+        let Some((source, info)) = self.sequence_info(id, sequence)? else {
             if mesh_less {
                 let actor = self.objects[id as usize].name.clone();
                 self.note(TraceKind::Note(format!(
@@ -10221,6 +10287,7 @@ impl<'s> Vm<'s> {
             channel,
             AnimChannel {
                 sequence: sequence.to_owned(),
+                source,
                 frames: info.frames,
                 rate,
                 frame: 0.0,
@@ -10270,6 +10337,63 @@ impl<'s> Vm<'s> {
             .channels
             .get(&channel)
             .map(|c| c.sequence.as_str())
+    }
+
+    /// Current pose parameters of `channel`: `(sequence, source, frame, looping)`.
+    pub(crate) fn anim_channel_pose(
+        &self,
+        id: ObjectId,
+        channel: u8,
+    ) -> Option<(String, String, f32, bool)> {
+        self.objects
+            .get(id as usize)?
+            .anim
+            .channels
+            .get(&channel)
+            .map(|c| (c.sequence.clone(), c.source.clone(), c.frame, c.looping))
+    }
+
+    /// `Engine.Actor.GetBoneCoords` pose query: world-space position of `bone` from the channel
+    /// 0 pose through the animation provider, or `None` when no posed answer is available (no
+    /// provider, no playing channel, unknown mesh/sequence/bone, or a decode failure).
+    ///
+    /// The provider returns the posed bone offset relative to the actor origin in
+    /// actor-rotation space (its `RotOrigin`/`MeshOrigin`/scale applied); the actor's own yaw
+    /// and `Location` are added here. The rotation is the source-space R(yaw) convention —
+    /// `x' = x·cos − y·sin, y' = x·sin + y·cos` — the same policy as the pawn renderer's
+    /// `root_transform` (XIII characters are authored +Y-forward; the mesh `RotOrigin` turns
+    /// that onto the actor's forward axis).
+    pub(crate) fn posed_bone_origin(&mut self, id: ObjectId, bone: &str) -> Option<[f32; 3]> {
+        let (sequence, source, frame, looping) = self.anim_channel_pose(id, 0)?;
+        if sequence.is_empty() || self.animation.is_none() {
+            return None;
+        }
+        let mesh = match self.get_property(id, "Mesh") {
+            Some(Value::Object(Some(r))) => self.ref_path(r),
+            _ => String::new(),
+        };
+        if mesh.is_empty() {
+            return None;
+        }
+        let offset = {
+            let provider = self.animation.as_mut().expect("checked above");
+            match provider.bone_offset(&mesh, &source, &sequence, frame, looping, bone) {
+                Ok(offset) => offset,
+                // A decode failure is surfaced by `sequence` lookups on the same data; here a
+                // posed query quietly falls back to the actor origin like the item19 Partial.
+                Err(_) => return None,
+            }
+        };
+        let offset = offset?;
+        let location = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
+        let yaw = self.rotation_prop(id).unwrap_or([0; 3])[1];
+        let theta = (yaw as f32) * std::f32::consts::TAU / 65536.0;
+        let (sin, cos) = theta.sin_cos();
+        Some([
+            location[0] + offset[0] * cos - offset[1] * sin,
+            location[1] + offset[0] * sin + offset[1] * cos,
+            location[2] + offset[2],
+        ])
     }
 
     /// `Actor.StopAnimating` (native 417): stop every animation channel and clear the animation

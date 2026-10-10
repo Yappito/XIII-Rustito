@@ -489,15 +489,32 @@ fn cine_target_reached(location: [f32; 3], target: [f32; 3], dir: [f32; 3], radi
         || dx * dx + dy * dy < radius * radius
 }
 
-/// item19: return an actor-space Coords placeholder for a skeletal bone query. The camera-only
-/// `BeachInBedWithXIII.LookAtBimbo.Tick` reads `.Origin`; the VM has no posed-bone transform
-/// provider, so the actor origin is returned and the Partial is visible in the native catalog.
-/// This keeps the wake-up state alive to execute the map's GetUpStandUp/control-return chain.
+/// item19: return an actor-space Coords for a skeletal bone query. When the actor's channel 0
+/// plays a sequence the animation provider can pose, the bone's world position is computed from
+/// the decoded pose (`Vm::posed_bone_origin`); otherwise the actor origin is returned with the
+/// visible item19 note, as before. The posed path is what the XIII demonstrator cutscenes need:
+/// `RoofGrapnleDemonstrator.STA_Retract` teleports its pawn with
+/// `SetLocation(GetBoneCoords('X').Origin)`, and `BeachInBedWithXIII.LookAtBimbo.Tick` reads
+/// `GetBoneCoords('X Neck').Origin` to aim the wake-up camera.
 fn get_bone_coords_partial(
     vm: &mut Vm<'_>,
     c: &NativeCtx,
-    _: &mut [Value],
+    args: &mut [Value],
 ) -> VmResult<NativeOutcome> {
+    let bone = match args.first() {
+        Some(Value::Name(n)) => n.clone(),
+        _ => String::new(),
+    };
+    if !bone.is_empty()
+        && let Some(origin) = vm.posed_bone_origin(c.this, &bone)
+    {
+        return val(Value::Struct(vec![
+            ("Origin".into(), Value::Vector(origin)),
+            ("XAxis".into(), Value::Vector([1.0, 0.0, 0.0])),
+            ("YAxis".into(), Value::Vector([0.0, 1.0, 0.0])),
+            ("ZAxis".into(), Value::Vector([0.0, 0.0, 1.0])),
+        ]));
+    }
     let origin = vm.vector_prop(c.this, "Location").unwrap_or([0.0; 3]);
     vm.note(TraceKind::Note(format!(
         "{}: skeletal bone pose unavailable; Coords.Origin uses actor Location (item19 Partial)",
@@ -542,13 +559,15 @@ pub fn item19_defs() -> Vec<NativeDef> {
             cine_steering,
         ),
         partial(
-            "skeletal bone transform unavailable; returns Coords with actor Location as Origin",
+            "posed-bone Coords when the animation provider can pose the channel; otherwise actor \
+             Location as Origin",
             "Engine.Actor.GetBoneCoords",
             "native(410) final native function Coords GetBoneCoords(name BoneName)",
             "engine.u Actor.GetBoneCoords; XIDCine.BeachInBedWithXIII.LookAtBimbo.Tick reads \
-             GetBoneCoords('X Neck').Origin to aim the wake-up camera. Headless VM has no posed-bone \
-             query, so item19 supplies an explicit actor-origin Partial so the state can reach \
-             GetUpStandUp and its game-owned PlayerWalking transition.",
+             GetBoneCoords('X Neck').Origin to aim the wake-up camera, and \
+             RoofGrapnleDemonstrator.STA_Retract teleports with SetLocation(GetBoneCoords('X').\
+             Origin). The pose comes from the decoded MeshAnimation through the world provider; \
+             without a playing channel/provider the item19 actor-origin fallback applies.",
             get_bone_coords_partial,
         ),
         partial(

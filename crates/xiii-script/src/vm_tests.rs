@@ -11537,6 +11537,7 @@ fn stop_animating_clears_every_channel() {
         0,
         crate::vm::AnimChannel {
             sequence: "Run".into(),
+            source: String::new(),
             frames: 10,
             rate: 30.0,
             frame: 4.0,
@@ -12864,4 +12865,234 @@ fn make_noise_nan_and_negative_loudness_follow_the_x87_compares() {
     w.vm.time += 1.0;
     w.noise(player, -1.0);
     assert!(w.heard().is_empty());
+}
+
+// ---------------------------------------------------------------------------------------
+// item53d: posed GetBoneCoords and CineController2 focus facing.
+
+use crate::animation::SeqInfo;
+
+/// Animation provider with posed-bone support: every sequence resolves (100 frames at 30 fps)
+/// and every bone offset is the fixed actor-rotation-space vector (200, 0, 50).
+struct PoseStub;
+
+impl crate::animation::AnimationData for PoseStub {
+    fn sequence(&mut self, _source: &str, _seq: &str) -> Result<Option<SeqInfo>, String> {
+        Ok(Some(SeqInfo {
+            frames: 100,
+            rate: 30.0,
+            notifies: Vec::new(),
+        }))
+    }
+
+    fn bone_offset(
+        &mut self,
+        _mesh_source: &str,
+        _anim_source: &str,
+        _seq: &str,
+        _frame: f32,
+        _looping: bool,
+        _bone: &str,
+    ) -> Result<Option<[f32; 3]>, String> {
+        Ok(Some([200.0, 0.0, 50.0]))
+    }
+}
+
+/// Actor with a `Mesh` object property and Location/Rotation (the posed-bone fixture).
+fn bone_fixture() -> Vec<u8> {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let obj = compact(0);
+    let vec = compact(IMP_STRUCT);
+    let rot = compact(IMP_STRUCT - 1);
+
+    let mesh = b.reserve(IMP_OBJECTPROP, actor, "Mesh");
+    let tag = b.reserve(IMP_NAMEPROP, actor, "Tag");
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let rotation = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
+    b.prop_with(mesh, tag, 0, &obj);
+    b.prop(tag, location, 0);
+    b.prop_with(location, rotation, 0, &vec);
+    b.prop_with(rotation, 0, 0, &rot);
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, mesh, 0);
+    b.build()
+}
+
+#[test]
+fn get_bone_coords_posed_offset_applies_actor_yaw_and_location() {
+    let data = bone_fixture();
+    let p = ScriptPackage::load("Test", data, &ScriptLimits::default(), &Limits::default())
+        .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(PoseStub));
+    let actor = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(actor, true);
+    vm.set_property(
+        actor,
+        "Mesh",
+        0,
+        Value::Object(Some(ObjRef::Static(sg(&set, "Actor")))),
+    );
+    let mut args = [
+        Value::Name("Walk".into()),
+        Value::Float(0.0),
+        Value::Float(0.0),
+        Value::Int(0),
+    ];
+    try_native(
+        &mut vm,
+        "Engine.Actor.PlayAnim",
+        actor,
+        &[false, true, true, true],
+        &mut args,
+    )
+    .unwrap();
+    vm.set_property(actor, "Location", 0, Value::Vector([1000.0, 2000.0, 500.0]));
+    // Yaw 16384 = 90 degrees: the actor-rotation-space offset (200, 0) turns onto +Y.
+    vm.set_property(actor, "Rotation", 0, Value::Rotator([0, 16384, 0]));
+    let mut bone_args = [Value::Name("X".into())];
+    let out = try_native(
+        &mut vm,
+        "Engine.Actor.GetBoneCoords",
+        actor,
+        &[false],
+        &mut bone_args,
+    )
+    .unwrap();
+    let NativeOutcome::Value(Value::Struct(coords)) = out else {
+        panic!("Coords struct expected, got {out:?}");
+    };
+    let origin = coords
+        .iter()
+        .find_map(|(n, v)| (n == "Origin").then_some(v))
+        .expect("Origin");
+    assert_eq!(origin, &Value::Vector([1000.0, 2200.0, 550.0]));
+}
+
+/// Without a playing channel the posed query is unavailable and the item19 actor-origin
+/// fallback applies with its visible note.
+#[test]
+fn get_bone_coords_without_channel_falls_back_to_actor_location() {
+    let data = bone_fixture();
+    let p = ScriptPackage::load("Test", data, &ScriptLimits::default(), &Limits::default())
+        .expect("package");
+    let mut set = ScriptSet::new();
+    set.add(p);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(PoseStub));
+    let actor = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(actor, true);
+    vm.set_property(
+        actor,
+        "Mesh",
+        0,
+        Value::Object(Some(ObjRef::Static(sg(&set, "Actor")))),
+    );
+    vm.set_property(actor, "Location", 0, Value::Vector([10.0, 20.0, 30.0]));
+    let mut bone_args = [Value::Name("X".into())];
+    let out = try_native(
+        &mut vm,
+        "Engine.Actor.GetBoneCoords",
+        actor,
+        &[false],
+        &mut bone_args,
+    )
+    .unwrap();
+    let NativeOutcome::Value(Value::Struct(coords)) = out else {
+        panic!("Coords struct expected, got {out:?}");
+    };
+    let origin = coords
+        .iter()
+        .find_map(|(n, v)| (n == "Origin").then_some(v))
+        .expect("Origin");
+    assert_eq!(origin, &Value::Vector([10.0, 20.0, 30.0]));
+    assert!(
+        vm.trace
+            .iter()
+            .any(|e| matches!(&e.kind, TraceKind::Note(n) if n.contains("item19 Partial")))
+    );
+}
+
+/// A CineController2's pawn faces the controller's FocalPoint at the pawn's RotationRate
+/// (PlayingSequence.Tick drives FocalPoint from rWantedRotation and sets RotationRate.Yaw);
+/// a plain Controller's pawn is left to its owner (player input rule).
+#[test]
+fn cinecontroller2_pawn_turns_toward_focal_point_but_plain_controller_does_not() {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "Controller");
+    let cine = b.reserve(0, 0, "CineController2");
+    let obj = compact(0);
+    let vec = compact(IMP_STRUCT);
+    let rot = compact(IMP_STRUCT - 1);
+
+    let tag = b.reserve(IMP_NAMEPROP, actor, "Tag");
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let rotation = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
+    b.prop(tag, location, 0);
+    b.prop_with(location, rotation, 0, &vec);
+    b.prop_with(rotation, 0, 0, &rot);
+
+    let brot = b.reserve(IMP_BOOLPROP, pawn, "bRotateToDesired");
+    let rate = b.reserve(IMP_STRUCTPROP, pawn, "RotationRate");
+    b.prop(brot, rate, 0);
+    b.prop_with(rate, 0, 0, &rot);
+
+    let pawn_prop = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
+    let focal = b.reserve(IMP_STRUCTPROP, controller, "FocalPoint");
+    b.prop_with(pawn_prop, focal, 0, &obj);
+    b.prop_with(focal, 0, 0, &vec);
+
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, tag, 0);
+    b.class(pawn, actor, brot, 0);
+    b.class(controller, actor, pawn_prop, 0);
+    b.class(cine, controller, 0, 0);
+    let p = ScriptPackage::load(
+        "Test",
+        b.build(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+
+    let build = |vm: &mut Vm<'_>, ctrl_class: &str| {
+        let ctrl = vm.spawn(sg(&set, ctrl_class), "C").unwrap();
+        let pawn = vm.spawn(sg(&set, "Pawn"), "P").unwrap();
+        vm.set_active(ctrl, true);
+        vm.set_active(pawn, true);
+        vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+        vm.set_property(ctrl, "FocalPoint", 0, Value::Vector([1000.0, 0.0, 0.0]));
+        vm.set_property(pawn, "bRotateToDesired", 0, Value::Bool(true));
+        vm.set_property(pawn, "RotationRate", 0, Value::Rotator([0, 54600, 0]));
+        vm.set_property(pawn, "Location", 0, Value::Vector([0.0, 0.0, 0.0]));
+        vm.set_property(pawn, "Rotation", 0, Value::Rotator([0, 10000, 0]));
+        (ctrl, pawn)
+    };
+
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let (_ctrl, pawn) = build(&mut vm, "CineController2");
+    assert!(vm.tick_suspending(1.0).is_empty());
+    assert_eq!(
+        vm.get_property(pawn, "Rotation"),
+        Some(&Value::Rotator([0, 0, 0]))
+    );
+
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let (_ctrl, pawn) = build(&mut vm, "Controller");
+    assert!(vm.tick_suspending(1.0).is_empty());
+    assert_eq!(
+        vm.get_property(pawn, "Rotation"),
+        Some(&Value::Rotator([0, 10000, 0]))
+    );
 }
