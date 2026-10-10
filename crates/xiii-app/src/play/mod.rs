@@ -6277,4 +6277,61 @@ t=10.00 goto -9800 -1700
                 .and_then(|l| vm.get_property(l, "InitialCartoonEffect")),
         );
     }
+
+
+/// item66 scratch probe (deleted before handoff): XIIIMover1 PlayerTrigger visibility.
+#[test]
+fn opt_in_scratch_hual04a_lever_probe() {
+    let Some(game_dir) = opt_in_root() else {
+        println!("SKIPPED");
+        return;
+    };
+    let opts = Options {
+        map: Some("Hual04a".to_owned()),
+        game_dir: Some(game_dir.clone()),
+        ..Default::default()
+    };
+    let scene = viewer::load_scene(&opts).expect("import");
+    let resolved = resolve_params(&game_dir).expect("params");
+    let text = "\
+t=0.50 teleport 900 544 440
+t=1.00 yaw 0
+t=2.00 use XIIIMover1
+";
+    let script = script::Script::parse(text).expect("parse");
+    let outcome = run_script(&game_dir, "Hual04a", &script, &resolved.params, &scene, 6.0)
+        .expect("run");
+    let vm = outcome.session.vm();
+    let lever = vm.find_object("XIIIMover1").expect("lever");
+    println!(
+        "[lever probe] state={:?} bOpened={:?} bClosed={:?} KeyNum={:?} PrevKeyNum={:?} DelayTime={:?} bTriggerOnceOnly={:?} bInteractive={:?}",
+        vm.state_name(lever),
+        vm.get_property(lever, "bOpened"),
+        vm.get_property(lever, "bClosed"),
+        vm.get_property(lever, "KeyNum"),
+        vm.get_property(lever, "PrevKeyNum"),
+        vm.get_property(lever, "DelayTime"),
+        vm.get_property(lever, "bTriggerOnceOnly"),
+        vm.get_property(lever, "bInteractive"),
+    );
+    for event in &vm.trace {
+        let relevant = match &event.kind {
+            xiii_script::TraceKind::Event { target, function, .. } => {
+                target.contains("XIIIMover1") || function.contains("PlayerTrigger")
+                    || target.eq_ignore_ascii_case("XIIIGoalTrigger9")
+            }
+            xiii_script::TraceKind::NoHandler { actor, event } => {
+                actor.contains("XIIIMover1") || event.contains("PlayerTrigger")
+            }
+            xiii_script::TraceKind::StateChange { actor, .. } => actor.contains("XIIIMover1"),
+            xiii_script::TraceKind::ProbeDisabled { actor, probe } => {
+                actor.contains("XIIIMover1") || probe.contains("PlayerTrigger")
+            }
+            _ => false,
+        };
+        if relevant {
+            println!("[lever probe] t={:.3} {:?}", event.time, event.kind);
+        }
+    }
+}
 }
