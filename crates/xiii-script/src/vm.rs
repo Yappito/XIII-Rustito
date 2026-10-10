@@ -1162,6 +1162,9 @@ struct IterState {
     idx: usize,
     places: Vec<Option<Place>>,
     body: usize,
+    /// TouchingActors walks the current native array, not a snapshot. The cursor is
+    /// advanced before the body runs, matching execTouchingActors 0x103e66cf.
+    touching: Option<(ObjectId, Option<GlobalRef>, usize)>,
 }
 
 type ActorTraceHit = (ObjectId, [f32; 3], [f32; 3]);
@@ -5232,6 +5235,7 @@ impl<'s> Vm<'s> {
                     idx: 0,
                     places: Vec::new(),
                     body: 0,
+                    touching: None,
                 });
             }
             return Ok(outcome);
@@ -5314,6 +5318,20 @@ impl<'s> Vm<'s> {
                 idx: 0,
                 places,
                 body: 0,
+                touching: if self
+                    .short_path(func)
+                    .eq_ignore_ascii_case("Actor.TouchingActors")
+                {
+                    let base = match args.first() {
+                        Some(Value::Object(Some(ObjRef::Static(base)))) => Some(*base),
+                        _ => None,
+                    };
+                    let mut cursor = 0;
+                    self.next_touching_actor(target, base, &mut cursor);
+                    Some((target, base, cursor))
+                } else {
+                    None
+                },
             });
             return Ok(NativeOutcome::Iterate(items));
         }
@@ -5584,6 +5602,7 @@ impl<'s> Vm<'s> {
                                 idx: 0,
                                 places: Vec::new(),
                                 body: pc + 1,
+                                touching: None,
                             });
                             return Ok(Flow::Goto(self.goto_offset(frame, u32::from(*end))?));
                         }
@@ -5605,6 +5624,12 @@ impl<'s> Vm<'s> {
                         let st = frame.iters.last_mut().expect("pushed");
                         st.body = pc + 1;
                         if items.is_empty() {
+                            if st.touching.is_some() {
+                                let places = st.places.clone();
+                                for place in places.into_iter().flatten() {
+                                    self.write(frame, &place, Value::Object(None))?;
+                                }
+                            }
                             Flow::Goto(self.goto_offset(frame, u32::from(*end))?)
                         } else {
                             let values = st.items[0].clone();
@@ -5626,6 +5651,22 @@ impl<'s> Vm<'s> {
                 }
             }
             K::IteratorNext => {
+                let live = frame.iters.last().and_then(|st| st.touching);
+                if let Some((this, base, mut cursor)) = live {
+                    let next = self.next_touching_actor(this, base, &mut cursor);
+                    let st = frame.iters.last_mut().expect("live iterator exists");
+                    st.touching = Some((this, base, cursor));
+                    let (places, body) = (st.places.clone(), st.body);
+                    let value = Value::Object(next.map(ObjRef::Instance));
+                    for place in places.into_iter().flatten() {
+                        self.write(frame, &place, value.clone())?;
+                    }
+                    return Ok(if next.is_some() {
+                        Flow::Goto(body)
+                    } else {
+                        Flow::Next
+                    });
+                }
                 let Some(st) = frame.iters.last_mut() else {
                     return Err(
                         self.err(VmErrorKind::Other("IteratorNext without iterator".into()))
@@ -7460,6 +7501,31 @@ impl<'s> Vm<'s> {
         }
     }
 
+    /// Native TouchingActors selection. Deliberately does not call touching_list:
+    /// the retail iterator tests only null and IsA, including retained deleted actors.
+    pub(crate) fn next_touching_actor(
+        &self,
+        id: ObjectId,
+        base: Option<GlobalRef>,
+        cursor: &mut usize,
+    ) -> Option<ObjectId> {
+        let Some(Value::Array(items)) = self.get_property(id, "Touching") else {
+            return None;
+        };
+        while let Some(value) = items.get(*cursor) {
+            *cursor += 1;
+            if let Value::Object(Some(ObjRef::Instance(actor))) = value
+                && let Some(object) = self.objects.get(*actor as usize)
+                && base.map_or(object.is_actor, |class| {
+                    object.layout.chain.contains(&class)
+                })
+            {
+                return Some(*actor);
+            }
+        }
+        None
+    }
+
     fn set_touching_list(&mut self, id: ObjectId, list: Vec<ObjectId>) {
         let items = list
             .into_iter()
@@ -7917,6 +7983,13 @@ impl<'s> Vm<'s> {
     /// `Actor.SetLocation`: teleport when the destination is free of world geometry and not
     /// encroached by a blocking actor; returns whether it moved. Touch relations are updated.
     pub(crate) fn vm_set_location(&mut self, id: ObjectId, location: [f32; 3]) -> VmResult<bool> {
+        // FarMoveActor 0x1038a489 refuses bStatic or !bMovable outside the editor.
+        // Generated fixtures without the native bMovable property use Actor's true default.
+        if self.bool_prop(id, "bStatic")
+            || matches!(self.get_property(id, "bMovable"), Some(Value::Bool(false)))
+        {
+            return Ok(false);
+        }
         let extent = self.actor_extent(id);
         let check_world =
             self.bool_prop(id, "bCollideWorld") || self.bool_prop(id, "bCollideWhenPlacing");
@@ -7950,6 +8023,11 @@ impl<'s> Vm<'s> {
                 }
             }
         }
+        // FarMoveActor 0x1038a5c1 marks a successful non-test teleport, and its
+        // non-attached path calls SetBase(None, (0,0,1), true) before the Location store.
+        self.set_property(id, "bJustTeleported", 0, Value::Bool(true));
+        self.set_property(id, "Base", 0, Value::Object(None));
+        self.set_property(id, "Floor", 0, Value::Vector([0.0, 0.0, 1.0]));
         self.set_property(id, "Location", 0, Value::Vector(location));
         self.refresh_touching(id, false)?;
         Ok(true)
@@ -8398,6 +8476,7 @@ impl<'s> Vm<'s> {
     /// Script Trace's composed flags; pawn/mover category bits remain effective even when
     /// bTraceActors was false. Special BSP/material filtering remains Partial.
     #[allow(clippy::type_complexity)]
+    #[cfg(test)]
     pub(crate) fn vm_trace_flags(
         &mut self,
         id: ObjectId,
@@ -8405,6 +8484,34 @@ impl<'s> Vm<'s> {
         end: [f32; 3],
         flags: u32,
         extent: [f32; 3],
+    ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
+        self.vm_trace_flags_impl(id, start, end, flags, extent, false)
+    }
+
+    /// Script execTrace has zero miss outputs and only updates the last-bone cache
+    /// when TRACE_HitBoxes (0x10000) was requested. Internal query users keep their
+    /// endpoint-on-miss convention and existing hit-zone query behavior.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn vm_script_trace(
+        &mut self,
+        id: ObjectId,
+        start: [f32; 3],
+        end: [f32; 3],
+        flags: u32,
+        extent: [f32; 3],
+    ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
+        self.vm_trace_flags_impl(id, start, end, flags, extent, true)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn vm_trace_flags_impl(
+        &mut self,
+        id: ObjectId,
+        start: [f32; 3],
+        end: [f32; 3],
+        flags: u32,
+        extent: [f32; 3],
+        script: bool,
     ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
         // item52: a mover with `bUseCylinderCollision` collides as its cylinder, not its placed
         // mesh. Measured need (Hual01a): the lever `XIIIMover6` (pivot (4489.4,-5437.4,-85),
@@ -8509,7 +8616,7 @@ impl<'s> Vm<'s> {
         let out = match best {
             Some((t, Some(b), n)) => (Some(b), lerp3(start, end, t), n),
             Some((t, None, n)) => (self.find_level_info(), lerp3(start, end, t), n),
-            None => (None, end, [0.0, 0.0, 0.0]),
+            None => (None, if script { [0.0; 3] } else { end }, [0.0; 3]),
         };
         // item14: record the hit zone for `Actor.GetLastTraceBone` (`XIIIPawn.LastBoneHit`).
         // A world/LevelInfo hit is not a pawn, so the bone stays `None`.
@@ -8519,25 +8626,27 @@ impl<'s> Vm<'s> {
         // bone name wins; otherwise the collision-cylinder classification is the fallback. The
         // ray is the exact trace segment, not the hit point, because a body's boxes can be
         // smaller than the cylinder.
-        self.last_trace_bone = match out.0 {
-            Some(b) if !self.is_a(b, "levelinfo") && !self.is_mover(b) => self
-                .hit_zones
-                .as_ref()
-                .and_then(|z| z.ray_bone(b, start, end))
-                .unwrap_or_else(|| {
-                    let (center, radius, half_height) = self.actor_cylinder(b);
-                    match &self.hit_zones {
-                        Some(z) => z.bone_at(center, radius, half_height, out.1),
-                        None => crate::physics::CylinderZones.bone_at(
-                            center,
-                            radius,
-                            half_height,
-                            out.1,
-                        ),
-                    }
-                }),
-            _ => "None".to_owned(),
-        };
+        if !script || flags & 0x10000 != 0 {
+            self.last_trace_bone = match out.0 {
+                Some(b) if !self.is_a(b, "levelinfo") && !self.is_mover(b) => self
+                    .hit_zones
+                    .as_ref()
+                    .and_then(|z| z.ray_bone(b, start, end))
+                    .unwrap_or_else(|| {
+                        let (center, radius, half_height) = self.actor_cylinder(b);
+                        match &self.hit_zones {
+                            Some(z) => z.bone_at(center, radius, half_height, out.1),
+                            None => crate::physics::CylinderZones.bone_at(
+                                center,
+                                radius,
+                                half_height,
+                                out.1,
+                            ),
+                        }
+                    }),
+                _ => "None".to_owned(),
+            };
+        }
         if self.collect_combat_natives {
             let player = self.objects.iter().enumerate().find_map(|(i, o)| {
                 (o.is_actor && !o.deleted && self.is_a(i as ObjectId, "XIIIPlayerPawn"))
@@ -10168,14 +10277,12 @@ impl<'s> Vm<'s> {
         channel: u8,
         looping: bool,
     ) -> VmResult<()> {
+        // None is an unknown sequence, not StopAnimating: the retail lookup returns
+        // without changing playback (0x103f5723..0x103f5776).
         if sequence.eq_ignore_ascii_case("None") {
-            self.objects[id as usize].anim.channels.remove(&channel);
-            if channel == 0 {
-                self.set_property(id, "AnimSequence", 0, Value::Name("None".into()));
-                self.set_property(id, "AnimRate", 0, Value::Float(0.0));
-                self.set_property(id, "AnimFrame", 0, Value::Float(0.0));
-                self.set_property(id, "bAnimFinished", 0, Value::Bool(true));
-            }
+            self.note(TraceKind::Note(
+                "Actor.PlayAnim('None'): no sequence, playback unchanged".into(),
+            ));
             return Ok(());
         }
         if self.animation.is_none() {
@@ -10217,6 +10324,16 @@ impl<'s> Vm<'s> {
             )));
             return Ok(());
         };
+        // Nonloop PlayAnim takes Rate<=0 through 0x103f5d2f. Negative Rate returns
+        // false immediately at 0x103f5d3d; only exactly zero initializes a hold/tween.
+        // A sequence with no frames is refused in both branches, without replacing the
+        // previous channel. LoopAnim has a separate velocity-dependent negative-rate path.
+        if info.frames == 0 || (!looping && rate < 0.0) {
+            self.note(TraceKind::Note(format!(
+                "Actor.PlayAnim('{sequence}'): retail refuses zero frames or negative nonloop rate; playback unchanged"
+            )));
+            return Ok(());
+        }
         if !info.rate.is_finite() || (rate > 0.0 && !(rate * info.rate).is_finite()) {
             return Err(self.err(VmErrorKind::AnimationDataError {
                 source: self.animation_sources(id).join(", "),
