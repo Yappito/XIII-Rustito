@@ -8231,6 +8231,33 @@ impl<'s> Vm<'s> {
                 }),
             _ => "None".to_owned(),
         };
+        if self.collect_combat_natives {
+            let player = self.objects.iter().enumerate().find_map(|(i, o)| {
+                (o.is_actor && !o.deleted && self.is_a(i as ObjectId, "XIIIPlayerPawn"))
+                    .then_some(i as ObjectId)
+            });
+            let cylinder = player.map(|p| {
+                let (center, radius, height) = self.actor_cylinder(p);
+                (
+                    center,
+                    radius,
+                    height,
+                    segment_cylinder_hit(start, end, center, radius, height).map(|h| h.0),
+                )
+            });
+            let posed_bone = player.and_then(|p| {
+                self.hit_zones
+                    .as_ref()
+                    .and_then(|z| z.ray_bone(p, start, end))
+            });
+            self.note(TraceKind::Note(format!(
+                "combat-ray this={} start={start:?} end={end:?} flags={flags:#x} hit={} location={:?} bone={} player_cylinder={cylinder:?} player_posed_bone={posed_bone:?}",
+                self.objects[id as usize].name,
+                out.0.map_or("None", |b| self.objects[b as usize].name.as_str()),
+                out.1,
+                self.last_trace_bone
+            )));
+        }
         Ok(out)
     }
 
@@ -8778,7 +8805,119 @@ impl<'s> Vm<'s> {
         })
     }
 
-    /// First actor on WeaponStartTrace -> WeaponEndTrace, with XIII shooting-through flags.
+    /// XIDPawn.dll DirectionDuTir's point contract, firing origin and cone sampling.
+    /// Projectile/base-velocity lead branches remain explicitly Partial.
+    pub(crate) fn ai_aim_point(&mut self, controller: ObjectId) -> VmResult<[f32; 3]> {
+        let Some(soldier) = self.obj_prop(controller, "BaseS") else {
+            return Ok([0.0; 3]);
+        };
+        let target = self
+            .vector_prop(controller, "EnemyTargetPos")
+            .unwrap_or([0.0; 3]);
+        if target == [0.0; 3] {
+            return Ok([0.0; 3]);
+        }
+        let Some(pawn) = self.obj_prop(controller, "Pawn") else {
+            return Err(self.err(VmErrorKind::Other("DirectionDuTir requires Pawn".into())));
+        };
+        let Some(weapon) = self.obj_prop(pawn, "Weapon") else {
+            return Err(self.err(VmErrorKind::Other(
+                "DirectionDuTir requires Pawn.Weapon".into(),
+            )));
+        };
+        let Some(enemy) = self.obj_prop(controller, "Enemy") else {
+            return Err(self.err(VmErrorKind::Other("DirectionDuTir requires Enemy".into())));
+        };
+        let loc = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let rot = self.rotation_prop(controller).unwrap_or([0; 3]);
+        let (x, y, z) = crate::registry::rotator_basis(rot);
+        let offset = self.vector_prop(weapon, "FireOffset").unwrap_or([0.0; 3]);
+        let mut start = add3(loc, [0.0, 0.0, self.f32_prop(pawn, "BaseEyeHeight")]);
+        start = add3(
+            start,
+            add3(
+                scale3(x, offset[0]),
+                add3(scale3(y, offset[1]), scale3(z, offset[2])),
+            ),
+        );
+        let ammo = self.obj_prop(weapon, "AmmoType");
+        let instant = ammo.is_some_and(|a| self.bool_prop(a, "bInstantHit"));
+        let hand = match self.get_property(weapon, "WHand") {
+            Some(Value::Byte(v)) => *v,
+            _ => 0,
+        };
+        if instant && hand != 0 && hand != 4 {
+            start = add3(start, scale3(x, 16.0));
+        }
+        self.set_property(controller, "WeaponStartTrace", 0, Value::Vector(start));
+        let skill = match self.get_property(soldier, "Skill") {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        if skill == 5 && self.rand_float() > 0.5 && instant {
+            let point = self.vector_prop(enemy, "Location").unwrap_or(target);
+            self.set_property(controller, "DirectionTir", 0, Value::Vector(point));
+            return Ok(point);
+        }
+        let delta = sub3(self.vector_prop(enemy, "Location").unwrap_or(target), loc);
+        let distance = dot3(delta, delta).sqrt();
+        // 0x11901d60: three FRand draws, reject outside the unit sphere, normalize.
+        let mut random = None;
+        for _ in 0..1024 {
+            let sample = [
+                2.0 * self.rand_float() - 1.0,
+                2.0 * self.rand_float() - 1.0,
+                2.0 * self.rand_float() - 1.0,
+            ];
+            if dot3(sample, sample) <= 1.0 {
+                random = Some(normalize3(sample));
+                break;
+            }
+        }
+        let Some(random) = random else {
+            return Err(self.err(VmErrorKind::Other(
+                "DirectionDuTir random-vector rejection budget exhausted".into(),
+            )));
+        };
+        let forward = normalize3(x);
+        let perpendicular = normalize3([
+            forward[1] * random[2] - forward[2] * random[1],
+            forward[2] * random[0] - forward[0] * random[2],
+            forward[0] * random[1] - forward[1] * random[0],
+        ]);
+        let angle = self.f32_prop(controller, "Angle_Visee")
+            * if self.bool_prop(controller, "bTirSurConeMax") {
+                1.0
+            } else {
+                self.rand_float()
+            };
+        let mut point = add3(
+            target,
+            scale3(perpendicular, distance * angle.to_radians().tan()),
+        );
+        point[2] += match skill {
+            1 => -35.0,
+            2 | 3 => -25.0,
+            _ => 23.62,
+        };
+        // +0x4a0 is Temps_RefreshEnemyPos (elapsed target sampling lead).
+        point = add3(
+            point,
+            scale3(
+                self.vector_prop(controller, "EnemyTargetVelocity")
+                    .unwrap_or([0.0; 3]),
+                self.f32_prop(controller, "Temps_RefreshEnemyPos"),
+            ),
+        );
+        if self.bool_prop(enemy, "bIsCrouched") {
+            point[2] -=
+                self.f32_prop(pawn, "CollisionHeight") - self.f32_prop(pawn, "CrouchHeight");
+        }
+        self.set_property(controller, "DirectionTir", 0, Value::Vector(point));
+        Ok(point)
+    }
+
+    /// First actor on WeaponStartTrace -> DirectionTir, with XIII shooting-through flags.
     /// A world hit terminates the line but classifies as zero; no hit-zone state is modified.
     pub(crate) fn ai_fire_obstacle(&mut self, controller: ObjectId) -> VmResult<Option<ObjectId>> {
         let Some(pawn_id) = self.obj_prop(controller, "Pawn") else {
@@ -8805,7 +8944,7 @@ impl<'s> Vm<'s> {
             .vector_prop(controller, "WeaponStartTrace")
             .unwrap_or([0.0; 3]);
         let end = self
-            .vector_prop(controller, "WeaponEndTrace")
+            .vector_prop(controller, "DirectionTir")
             .unwrap_or(start);
         let Some(provider) = self.physics.as_mut() else {
             return Err(self.err(VmErrorKind::NoPhysicsProvider {
@@ -8833,6 +8972,14 @@ impl<'s> Vm<'s> {
                 best = time;
                 actor = Some(id);
             }
+        }
+        if self.collect_combat_natives {
+            self.note(TraceKind::Note(format!(
+                "combat-ray obstacle={} start={start:?} end={end:?} first={} world_time={:?}",
+                self.objects[controller as usize].name,
+                actor.map_or("None", |id| self.objects[id as usize].name.as_str()),
+                world.map(|h| h.time)
+            )));
         }
         Ok(actor.filter(|id| {
             Some(*id) != pawn
