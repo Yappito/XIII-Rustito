@@ -2,13 +2,15 @@
 # walks from local/reports/item30-plage01-walk.md (hut, beach nav walk incl. the running jump
 # over the crate wall, TouchTrigger8/7 + killer, truck return legs + Porte1).
 #
-# No weapon is granted: the player fights with the level's own picked-up Beretta. The `equip`
-# after the T8 scene handback re-selects it through the game's own `Weapon.BringUp` ->
-# `ChangedWeapon` switch, because the scripted scene had left `Fists` selected. Measured on the
-# merged branch (scratch item30c_e7e): the walked-up Beretta fires c9mmAmmo and kills the parked
-# killer with 35 Spine1 hits (18 hp each) - origin/main's
-# opt_in_plage01_beretta_pickup_uses_nine_mm_and_damages_soldier covers the same pickup damage
-# path from the north pose. The fire/death/corpse-search/inventory work is the game's own code.
+# No weapon is granted: the player fights with the level's own picked-up Beretta. `switch_weapon
+# 2` after the T8 scene handback re-selects it through the game's own `PlayerController.
+# SwitchWeapon` exec (the Beretta's decoded InventoryGroup is 2), whose state-machine walk -
+# PutDown -> DownWeapon -> AnimEnd -> Pawn.ChangedWeapon - brings it up; the scripted scene had
+# left `Fists` selected. Measured on the merged branch (scratch item30c_e7e): the walked-up
+# Beretta fires c9mmAmmo and kills the parked killer with 35 Spine1 hits (18 hp each) -
+# origin/main's opt_in_plage01_beretta_pickup_uses_nine_mm_and_damages_soldier covers the same
+# pickup damage path from the north pose. The fire/death/corpse-search/inventory work is the
+# game's own code.
 #
 # The killer (BaseSoldier6) walks while attacking, so the view is tracked onto it around the
 # firing (`track BaseSoldier6` / `track off`).
@@ -99,6 +101,11 @@ t=271.20 goto -1191.2 -13523.4
 t=278.90 goto -366.7 -13757.3
 t=288.20 goto 643.2 -14174.5
 
+# fight-probe cut: the opt-in fight tests (plage01_killer_awake_prefix) take the route only up
+# to this line. The T7 shore touch above (~289.6 s) has woken BaseSoldier6 out of his
+# IAController `faction` stasis and sent him to the parking wall; everything after this line is
+# the walked back route, chase and stake-out fight.
+
 # ---- back route: TouchTrigger8 (passe_par_arriere) walked up the back-route nav points ----
 t=296.10 goto 1282.8 -13568.0
 t=303.20 goto 770.5 -12990.7
@@ -112,9 +119,10 @@ t=309.50 goto 1282.4 -12591.3
 # pose and a 372 UU southern spot deal zero damage (the wall blocks; measured), so the player
 # walks down the proven nav legs after the T8 handback (~13 s scene hold) and fights from
 # (1771,-13200), 174 UU south of him. The killer walks while attacking, so the view is tracked
-# onto it. `equip` re-selects the picked-up Beretta: the scripted T8 scene had left `Fists`
+# onto it. `switch_weapon 2` re-selects the picked-up Beretta (decoded InventoryGroup 2) through
+# the game's own `PlayerController.SwitchWeapon` exec: the scripted T8 scene had left `Fists`
 # selected (measured: without it the fires were fist swings - weapon Fists3, bone None).
-t=326.00 equip
+t=326.00 switch_weapon 2
 # ---- the chase (measured on the merged tree, scratch item30c_e18/e19): the killer leaves his
 # post at ~333 and walks the map's own nav path (FindBestPathTo chain, MoveTarget samples)
 # AttackPoint47 -> PathNode48 -> PathNode47 -> PathNode51 -> PathNode10 -> PathNode44 ->
@@ -124,11 +132,11 @@ t=326.00 equip
 # southbound line - the shots hit it 40 UU out, scratch item30c_e21b) and fights him at his
 # stake-out: the Beretta's damage (c9mmAmmo.ProcessTraceHit 0x0039, decoded) decays with
 # VSize(HitLocation - W.Location) and is zero beyond ~73 UU, so the kill happens at contact
-# distance where the pawn cylinders overlap. `equip` re-selects the picked-up Beretta: the
-# scripted T8 scene had left `Fists` selected. The game's own switch is
-# `PendingWeapon = new; ChangedWeapon()` (Engine.u Weapon.ClientWeaponSet 0x004F..0x0082);
-# `BringUp` alone is the engine's own no-op shadow (Weapon.Active.BringUp decodes to
-# `bRendered = true; return`).
+# distance where the pawn cylinders overlap. `switch_weapon 2` re-selects the picked-up Beretta
+# (decoded InventoryGroup 2): the scripted T8 scene had left `Fists` selected. The game's own
+# switch is the `SwitchWeapon` exec whose state machine walks PutDown -> DownWeapon -> AnimEnd ->
+# Pawn.ChangedWeapon (measured by item44's test on the same pickup); `BringUp` alone is the
+# engine's own no-op shadow (Weapon.Active.BringUp decodes to `bRendered = true; return`).
 t=333.00 goto 770.5 -12990.7
 t=342.00 goto 1282.8 -13568.0
 t=351.00 goto 643.2 -14174.5
@@ -178,13 +186,17 @@ t=467.55 fire
 t=468.10 fire
 t=468.65 fire
 t=469.20 fire
-# One more round empties the weapon (the clip and the reserve): the game's own empty-weapon
-# behaviour switches back to Fists a few seconds later, which the item33 checkpoint fixture
-# records. The kill itself lands on fire 25 (measured item30c_e39); the shore soldiers woken
-# by the gunfire (item41c hearing) close in - they chase along the nav path and their
-# crossfire killed the player in scratch e24.
+# The last round empties the weapon (the clip and the reserve). The kill itself lands on fire
+# 25 (measured item30c_e39); the shore soldiers woken by the gunfire (item41c hearing) close in
+# - they chase along the nav path and their crossfire killed the player in scratch e24.
 t=469.75 fire
-t=469.00 search BaseSoldier6
+# The corpse search is the game's own auto-search: the corpse's `XIIIPawn.Dying.Timer` sets
+# `bSearchable` on its first tick, and the player pawn's own `XIIIPlayerPawn.Tick` auto-search
+# (0x017B..0x024F: `bAutoPickup` -> `SearchPawn(XP)` -> `Inventory.Transfer` -> `AddInventory`)
+# drains it as soon as the player's cylinder overlaps the dead pawn's (`Touching`). The corpse
+# sits at the killer's stake-out (-5582,-9821), 59 UU from the firing spot, so the player walks
+# onto it (the truck key is then carried into the return legs below).
+t=470.60 goto -5570.0 -9805.0
 
 # ---- Segment D: the walked return along the same nav legs (stake-out -> PathNode36 ->
 # AttackPoint14 -> ... -> PathNode48 -> PathNode47 -> PathNode18 -> AttackPoint43), then the

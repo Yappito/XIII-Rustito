@@ -737,14 +737,11 @@ fn registry_entries_are_documented() {
     // save-slot declarations; item40c adds the headless Interaction.Initialize and ForceFeedback
     // viewport/device Partials; item43 adds Actor.TraceActors; item30b adds the latent
     // Engine.Controller.WaitForLanding (527) and item30c the BaseSoldier.EyePosition override
-    // (both from the item30 Plage01 walk) plus the item30 walk's Actor.AnimIsInGroup (395).
-    // Must equal `Registry::builtin().defs().count()`.
-    assert_eq!(defs.len(), 334);
-    // viewport/device Partials; item43 adds Actor.TraceActors; the item47b banque01 regression
-    // fix adds `PlayerController.AdjustAimForDisplay` (498); item49b adds
-    // `Actor.DetachFromBone` (403). Must equal
+    // (both from the item30 Plage01 walk) plus the item30 walk's Actor.AnimIsInGroup (395);
+    // the item47b banque01 regression fix adds `PlayerController.AdjustAimForDisplay` (498);
+    // item49b adds `Actor.DetachFromBone` (403). Must equal
     // `Registry::builtin().defs().count()`.
-    assert_eq!(defs.len(), 333);
+    assert_eq!(defs.len(), 336);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -3073,7 +3070,6 @@ fn phys_fixture() -> Vec<u8> {
     let block_nonzero = b.reserve(IMP_BOOLPROP, actor, "bBlockNonZeroExtentTraces");
     let movable = b.reserve(IMP_BOOLPROP, actor, "bMovable");
     let bstatic = b.reserve(IMP_BOOLPROP, actor, "bStatic");
-    let proj_target = b.reserve(IMP_BOOLPROP, actor, "bProjTarget");
     let hidden = b.reserve(IMP_BOOLPROP, actor, "bHidden");
     let world_geometry = b.reserve(IMP_BOOLPROP, actor, "bWorldGeometry");
     let touches = b.reserve(IMP_INTPROP, actor, "Touches");
@@ -3096,8 +3092,7 @@ fn phys_fixture() -> Vec<u8> {
     b.prop(block_players, proj_target, 0);
     b.prop(proj_target, block_zero, 0);
     b.prop(block_zero, block_nonzero, 0);
-    b.prop(block_nonzero, proj_target, 0);
-    b.prop(proj_target, hidden, 0);
+    b.prop(block_nonzero, hidden, 0);
     b.prop(hidden, world_geometry, 0);
     b.prop(world_geometry, movable, 0);
     b.prop(movable, bstatic, 0);
@@ -4553,13 +4548,16 @@ fn host_written_location_drives_touch_refresh() {
 
 #[test]
 fn trace_extent_flag_needs_bprojtarget() {
-    // Measured on Plage01 (item30c): `BaseSoldier6` blocks hitscan traces with
-    // `bCollideActors=false` + `bBlockZeroExtentTraces=true` + `bProjTarget=true`, while the
+    // Measured on Plage01 (item30c) and decoded from Engine.dll (the merged origin/main filter):
+    // a trace candidate must first be in the collision hash (`bCollideActors` — every hash
+    // insert/remove site gates on it; the parked `faction`-stasis killer is deliberately outside
+    // it, and `faction.EndState` restores `SetCollision(true,true,true)` before the route's
+    // fight). Within the hash the extent flag is the prefilter and `bProjTarget` - the game's own
+    // shootability marker, set on every shootable actor and clear on triggers and effects -
+    // qualifies it: the awake `BaseSoldier6` blocks hitscan traces with
+    // `bCollideActors=true` + `bBlockZeroExtentTraces=true` + `bProjTarget=true`, while the
     // muzzle-flash `MuzzleLight` (spawned at the muzzle by `MuzzleAttach` once the spawn fix
-    // gives the weapon attachment an Instigator) has the same extent flag but
-    // `bCollideActors=false` + `bProjTarget=false` and must not stop the bullet. The extent
-    // flag is the gate; `bProjTarget` - the game's own shootability marker, set on every
-    // shootable actor and clear on triggers and effects - qualifies it.
+    // gives the weapon attachment an Instigator) must not stop the bullet.
     let set = set_of(trace_package());
     let mut vm = Vm::new(&set, VmLimits::default());
     vm.set_physics(Box::new(MockWorld::new()));
@@ -4572,11 +4570,13 @@ fn trace_extent_flag_needs_bprojtarget() {
         vm.set_property(id, "Location", 0, Value::Vector([x, 0.0, 0.0]));
         vm.set_property(id, "CollisionRadius", 0, Value::Float(24.0));
         vm.set_property(id, "CollisionHeight", 0, Value::Float(24.0));
+        vm.set_property(id, "bCollideActors", 0, Value::Bool(true));
         vm.set_property(id, "bBlockZeroExtentTraces", 0, Value::Bool(true));
         vm.set_property(id, "bProjTarget", 0, Value::Bool(id == pawn));
         vm.set_active(id, true);
     }
-    // The muzzle light: no collision role -> not a trace candidate; the pawn wins.
+    // The muzzle light: in hash and extent-blocking but no proj-target role -> not a candidate;
+    // the pawn wins.
     let mut args = trace_args();
     let hit = call_native(
         &mut vm,
@@ -4588,7 +4588,7 @@ fn trace_extent_flag_needs_bprojtarget() {
     assert_eq!(
         hit,
         NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(pawn)))),
-        "a non-colliding non-proj-target actor must not block the bullet trace"
+        "an in-hash non-proj-target actor must not block the bullet trace"
     );
     // The measured `TouchTrigger7` shape (merged-tree Plage01): `bCollideActors=true` with a
     // map-sized radius but `bProjTarget=false` - it must not stop the bullet either.
@@ -9518,6 +9518,79 @@ fn return_valued_call_on_inactive_placed_actor_runs_synchronously() {
     let value = vm
         .call_function(sg(&set, "Actor.Echo"), target, vec![Value::Int(41)])
         .expect("a return-valued call on a non-active placed actor must run synchronously");
+    assert_eq!(value, Value::Int(41));
+}
+
+/// Fixture: `Caller.Probe()` executes `Return(self.Target.Echo(41))` as bytecode — a
+/// return-valued **virtual** call from executing code, the path the deferral (`Vm::invoke`)
+/// actually gates. `Echo` is the non-static `Actor.Echo` of `list_fixture`.
+fn probe_call_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let caller = b.reserve(0, 0, "Caller");
+
+    let target = b.reserve(IMP_OBJPROP, caller, "Target");
+    let echo = b.reserve(IMP_FUNCTION, actor, "Echo");
+    let echo_a = b.reserve(IMP_INTPROP, echo, "A");
+    let echo_r = b.reserve(IMP_INTPROP, echo, "ReturnValue");
+    b.prop(echo_a, echo_r, PARM | OPTIONAL_PARM);
+    b.prop(echo_r, 0, PARM | RETURN_PARM);
+    // `return A;` = Return(1) + LocalVariable(1 opcode + 4 object) = 6 bytes.
+    b.func(echo, 0, echo_a, &[0x04, 0x00, echo_a as u8], 6, 0, DEFINED);
+
+    let probe = b.reserve(IMP_FUNCTION, caller, "Probe");
+    let probe_r = b.reserve(IMP_INTPROP, probe, "ReturnValue");
+    b.prop(probe_r, 0, RETURN_PARM);
+    let echo_name = b.name("Echo");
+    let probe_code = vec![0x04] // Return
+        .into_iter()
+        .chain([0x19]) // Context: the call context `self.Target`
+        .chain([0x01]) // InstanceVariable
+        .chain(compact(target))
+        .chain([0x00, 0x00, 0x00]) // Context skip u16 + size u8
+        .chain([0x1B]) // VirtualFunction
+        .chain(compact(echo_name))
+        .chain([0x1D]) // IntConst 41
+        .chain(41i32.to_le_bytes())
+        .chain([0x16]) // EndFunctionParms
+        .collect::<Vec<u8>>();
+    // Return (1) + Context (1) + InstanceVariable (1 + object 4) + skip/size (3) +
+    // VirtualFunction (1 + name 4) + IntConst (1 + 4) + EndFunctionParms (1) = 21.
+    b.func(probe, 0, probe_r, &probe_code, 21, 0, DEFINED);
+
+    b.prop_with(target, probe, 0, &compact(0));
+    b.class(object, 0, 0);
+    b.class(actor, object, echo);
+    b.class(caller, actor, target);
+    b.build()
+}
+
+#[test]
+fn return_valued_bytecode_call_on_inactive_actor_runs_synchronously_under_diagnostic_scope() {
+    let set = set_of(probe_call_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    // item49b moved the call deferral behind the opt-in diagnostic scope (the xiii-tool baseline
+    // harness); this test runs under that scope, the only mode that still defers anything.
+    vm.set_diagnostic_call_scope(true);
+    let caller = vm.spawn(g(&set, "Caller"), "Caller").unwrap();
+    vm.set_active(caller, true);
+    let target = vm.spawn(g(&set, "Actor"), "Target").unwrap();
+    vm.set_property(
+        caller,
+        "Target",
+        0,
+        Value::Object(Some(ObjRef::Instance(target))),
+    );
+    // `Target` is a placed actor outside the executed scope. Executing `Probe`'s bytecode must
+    // still run the return-valued `Echo` synchronously (the engine's
+    // `execVirtualFunction -> UObject::CallFunction` runs the callee frame on any context);
+    // the old deferral error (`DeferredWithReturnValue`) aborted the whole calling chain.
+    let value = vm
+        .call_function(g(&set, "Caller.Probe"), caller, vec![])
+        .expect("a return-valued bytecode call on an inactive actor must run synchronously");
     assert_eq!(value, Value::Int(41));
 }
 

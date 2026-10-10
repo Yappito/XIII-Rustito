@@ -981,11 +981,14 @@ fn fixed_step(
         let tracked = drive.tracking_actor().and_then(|name| {
             (*session).as_ref().ok().and_then(|sess| {
                 let id = sess.vm().find_live_object(name)?;
-                // Head-zone aim as in the other drive site: 0.6 of CollisionHeight above the
-                // tracked actor's Location keeps the ray inside the head band.
+                // Head-zone aim as in the other drive site: for pawns, 0.6 of CollisionHeight
+                // above the tracked actor's Location keeps the ray inside the head band. Non
+                // pawns (map movers have oversized collision cylinders; BreakAbleMover16's is
+                // 160 UU against a ~64 UU brush) are aimed at the raw Location.
                 let loc = sess.vm().vector_prop(id, "Location").map(|mut l| {
-                    if let Some(xiii_script::Value::Float(h)) =
-                        sess.vm().get_property(id, "CollisionHeight")
+                    if sess.vm().is_a(id, "XIIIPawn")
+                        && let Some(xiii_script::Value::Float(h)) =
+                            sess.vm().get_property(id, "CollisionHeight")
                     {
                         l[2] += h * 0.6;
                     }
@@ -2134,13 +2137,15 @@ fn run_script_inner(
     while tick < ticks {
         let elapsed = tick as f32 * DT;
         if let Some(name) = drive.tracking_actor().map(str::to_owned) {
-            // Head-zone aim, as in the other drive site: 0.6 of CollisionHeight above the
-            // tracked actor's Location keeps the ray inside the head band (see above).
+            // Head-zone aim, as in the other drive site: for pawns, 0.6 of CollisionHeight
+            // above the tracked actor's Location keeps the ray inside the head band (see
+            // above); non pawns are aimed at the raw Location.
             let location = runtime.session.vm().find_live_object(&name).and_then(|id| {
                 let vm = runtime.session.vm();
                 vm.vector_prop(id, "Location").map(|mut l| {
-                    if let Some(xiii_script::Value::Float(h)) =
-                        vm.get_property(id, "CollisionHeight")
+                    if vm.is_a(id, "XIIIPawn")
+                        && let Some(xiii_script::Value::Float(h)) =
+                            vm.get_property(id, "CollisionHeight")
                     {
                         l[2] += h * 0.6;
                     }
@@ -2654,17 +2659,18 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// item40e: the authored Plage01 opening of `tests/data/plage01_route.script` up to (not
-    /// including) its `t=59.00` weapon line: hut escape, objective promotion and the
-    /// TouchTrigger8 -> XIIIDispatcher3 -> `tueur_conducteur` chain that wakes BaseSoldier6 (the
-    /// killer) out of his IAController `faction` stasis (`SetCollision(false)`, DrawType none).
-    /// UE2 traces only reach collision-hash actors (`bCollideActors`), so the combat probes
-    /// shoot the awake killer, as the route does.
+    /// item40e: the authored Plage01 opening of `tests/data/plage01_route.script` up to its
+    /// `# fight-probe cut` marker line: hut escape, objective promotion, the full beach nav walk
+    /// and the TouchTrigger7 shore touch that wakes BaseSoldier6 (the killer) out of his
+    /// IAController `faction` stasis (`SetCollision(false)`, DrawType none). UE2 traces only
+    /// reach collision-hash actors (`bCollideActors`), so the combat probes can shoot the awake
+    /// killer as soon as the wake chain has run; the probes teleport to the measured southern
+    /// fight spot (the north pose is behind the parking wall - zero damage, scratch item30c_e3).
     fn plage01_killer_awake_prefix() -> String {
         let route = include_str!("../../tests/data/plage01_route.script");
         let mut out = route
             .lines()
-            .take_while(|l| !l.starts_with("t=59.00"))
+            .take_while(|l| !l.starts_with("# fight-probe cut"))
             .collect::<Vec<_>>()
             .join("\n");
         out.push('\n');
@@ -3402,16 +3408,27 @@ mod tests {
         );
         // The chain now begins with the authored entry defaults (`Fists` -> `FistsAmmo` -> ...),
         // so "the first ammo item" is no longer the route weapon's ammunition. Compare the
-        // selected weapon's own ammo class end to end.
+        // selected weapon's own ammo class end to end (the route fights with the picked-up
+        // Beretta, so its AmmoType is `c9mmAmmo` - the old m60-era assert hardcoded `XIII.M60Ammo`).
+        let ammo_class = match outcome.session.vm().get_property(weapon, "AmmoType") {
+            Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => outcome
+                .session
+                .vm()
+                .set()
+                .path(outcome.session.vm().objects[*id as usize].class),
+            other => panic!("selected weapon has no instance AmmoType: {other:?}"),
+        };
         let ammo = saved
             .inventory
             .iter()
-            .find(|item| item.class_path.eq_ignore_ascii_case("XIII.M60Ammo"))
+            .find(|item| item.class_path.eq_ignore_ascii_case(&ammo_class))
             .and_then(|item| {
                 item.ammo_amount
                     .map(|amount| (item.class_path.clone(), amount))
             })
-            .expect("saved travel inventory includes the selected weapon's ammunition");
+            .unwrap_or_else(|| {
+                panic!("saved travel inventory includes the selected weapon's ammunition ({ammo_class})")
+            });
         assert!(ammo.1 >= 0, "invalid saved ammo count: {ammo:?}");
         println!(
             "[item33 route] checkpoint={} weapon={} ammo={ammo:?} health={} objectives={:?} sound={:?}",
@@ -4611,19 +4628,24 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        // item40e: BaseSoldier6 sits in IAController `faction` stasis (no collision, not drawn)
-        // until the authored chain wakes him; shoot him after the route's own wake-up. `track`
-        // turns the player to him; then the aim is raised to his head (pitch +5 deg, as before:
-        // a body-centre aim is a chest hit and the clip runs out before he dies). The battle is
-        // entirely script-driven (no host damage).
+        // item40e: fire at the awake killer (see `plage01_killer_awake_prefix`). The walked
+        // route's T7 shore touch wakes him at ~289.6 s and he parks at (1771,-13026) until he
+        // leaves for his stake-out; the probes teleport to the proven southern spot
+        // (1771,-13200, scratch item30c_e7e: every shot lands from there) and fire a 41-shot
+        // Beretta burst at the 0.55 s cadence the route's fight uses (35 Spine1 hits kill).
         let script = script::Script::parse(&format!(
-            "{}t=59.00 weapon XIII.Beretta\n\
-             t=60.00 teleport 1802.0 -12700.0 1100.0\n\
-             t=60.00 track BaseSoldier6\n\
-             t=60.05 track off\n\
-             t=60.05 pitch 5\n\
-             t=60.10 fire\nt=60.70 fire\nt=61.30 fire\nt=61.90 fire\nt=62.50 fire\nt=63.10 fire\n\
-             t=63.70 fire\nt=64.30 fire\nt=64.90 fire\nt=65.50 fire\nt=66.10 fire\n",
+            "{}t=291.00 teleport 1771.0 -13200.0 1100.0\n\
+             t=291.00 track BaseSoldier6\n\
+             t=291.10 track off\n\
+             t=291.10 weapon XIII.Beretta\n\
+             t=292.50 fire\nt=293.05 fire\nt=293.60 fire\nt=294.15 fire\nt=294.70 fire\n\
+             t=295.25 fire\nt=295.80 fire\nt=296.35 fire\nt=296.90 fire\nt=297.45 fire\n\
+             t=298.00 fire\nt=298.55 fire\nt=299.10 fire\nt=299.65 fire\nt=300.20 fire\n\
+             t=300.75 fire\nt=301.30 fire\nt=301.85 fire\nt=302.40 fire\nt=302.95 fire\n\
+             t=303.50 fire\nt=304.05 fire\nt=304.60 fire\nt=305.15 fire\nt=305.70 fire\n\
+             t=306.25 fire\nt=306.80 fire\nt=307.35 fire\nt=307.90 fire\nt=308.45 fire\n\
+             t=309.00 fire\nt=309.55 fire\nt=310.10 fire\nt=310.65 fire\nt=311.20 fire\n\
+             t=311.75 fire\nt=312.30 fire\nt=312.85 fire\nt=313.40 fire\nt=313.95 fire\n",
             plage01_killer_awake_prefix()
         ))
         .unwrap();
@@ -4633,7 +4655,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            68.0,
+            322.0,
         )
         .expect("run Plage01 fight");
         let s = &outcome.session;
@@ -4931,9 +4953,18 @@ mod tests {
         let route = script::Script::parse(include_str!("../../tests/data/plage01_route.script"))
             .expect("parse the checked-in Plage01 route fixture");
         // Stop before the truck-door ending so the VM trace still covers Plage01 (a server
-        // travel resets it for the next map).
-        let outcome = run_script(&game_dir, "Plage01", &route, &resolved.params, &scene, 65.0)
-            .expect("run the requested Plage01 route through the killer");
+        // travel resets it for the next map). The walked item30 route kills BaseSoldier6 at
+        // ~469 s and the game's own auto-search drains the corpse as the player walks onto it,
+        // so the window must cover the fight (the old 65 s window was main's teleport route).
+        let outcome = run_script(
+            &game_dir,
+            "Plage01",
+            &route,
+            &resolved.params,
+            &scene,
+            480.0,
+        )
+        .expect("run the requested Plage01 route through the killer");
         let vm = outcome.session.vm();
         let corpse = vm
             .find_object("BaseSoldier6")
@@ -5004,12 +5035,17 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        // item40e: fire at the awake killer (see `plage01_killer_awake_prefix`).
+        // item40e: fire at the awake killer (see `plage01_killer_awake_prefix`). The walked
+        // route's T7 shore touch wakes him at ~289.6 s; the probes teleport to the proven
+        // southern spot (1771,-13200, scratch item30c_e7e) and burst the granted M60.
         let script = script::Script::parse(&format!(
-            "{}t=59.00 weapon XIII.M60\n\
-             t=60.00 teleport 1802.0 -12700.0 1100.0\n\
-             t=60.00 track BaseSoldier6\n\
-             t=60.10 fire\nt=60.70 fire\nt=61.30 fire\nt=61.90 fire\nt=62.50 fire\n",
+            "{}t=291.00 teleport 1771.0 -13200.0 1100.0\n\
+             t=291.00 track BaseSoldier6\n\
+             t=291.10 track off\n\
+             t=291.10 weapon XIII.M60\n\
+             t=292.50 fire\nt=293.10 fire\nt=293.70 fire\nt=294.30 fire\nt=294.90 fire\n\
+             t=295.50 fire\nt=296.10 fire\nt=296.70 fire\nt=297.30 fire\nt=297.90 fire\n\
+             t=298.50 fire\nt=299.10 fire\n",
             plage01_killer_awake_prefix()
         ))
         .expect("parse M60 fight script");
@@ -5019,7 +5055,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            63.0,
+            308.0,
         )
         .expect("run Plage01 M60 fight");
         let soldier = outcome
