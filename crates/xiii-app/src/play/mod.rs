@@ -5823,6 +5823,71 @@ mod tests {
             demonstrator_retract,
             "the grapple demonstrator must reach STA_Retract (the demo machine completes)"
         );
+        // item53d: the STA_Retract Timer's posed teleport works. GetBoneCoords('X') now
+        // resolves the posed root-bone position through the decoded MeshAnimation (the old
+        // item19 actor-origin fallback made the SetLocation a no-op and Jones stayed on the
+        // demo ledge, wedging action[117]'s move against the corniche forever). Measured:
+        // Jones's yaw turns to ~0 (east, the rWantedRotation facing) during the climb; the
+        // teleport moves him by the posed offset (+226.4, +26.6, +159..187) to the building
+        // roof (feet z 2160), east of the corniche band (x -4570..-4509), where action[117]'s
+        // movseqb walk proceeds.
+        let cine0 = vm
+            .find_object("Cine0")
+            .expect("the cine Jones pawn must exist");
+        let cine0_loc = vm
+            .vector_prop(cine0, "Location")
+            .expect("Cine0 must keep a Location");
+        assert!(
+            cine0_loc[0] > -4509.0,
+            "Cine0 must stand east of the corniche band after the retract teleport, got {cine0_loc:?}"
+        );
+        assert!(
+            (cine0_loc[2] - 2234.3).abs() < 8.0,
+            "Cine0 must rest on the building roof (center z 2234.3 = roof 2160 + half height 74.3), got {cine0_loc:?}"
+        );
+        // The fixed [117] movseqb completed: the demo's post-move dialogue ran — the forced
+        // `dial dialtoits1 11` line speaks (DialogueManager0 enters STA_HeadAnimation, the
+        // voiced-line state, after the demonstrator's retract).
+        let spoke_after_retract = {
+            let retract_at = vm
+                .trace
+                .iter()
+                .position(|event| {
+                    matches!(
+                        &event.kind,
+                        xiii_script::TraceKind::StateChange { actor, to, .. }
+                            if actor.eq_ignore_ascii_case("RoofGrapnleDemonstrator0")
+                                && to.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("STA_Retract"))
+                    )
+                })
+                .expect("demonstrator retract state change recorded");
+            vm.trace[retract_at..].iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    xiii_script::TraceKind::StateChange { actor, to, .. }
+                        if actor.eq_ignore_ascii_case("DialogueManager0")
+                            && to.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("STA_HeadAnimation"))
+                )
+            })
+        };
+        assert!(
+            spoke_after_retract,
+            "the demo must reach action[111]/[118]: the forced dialogue line speaks after the retract"
+        );
+        // item53d measured blocker, pinned: action[119] `wait event SpeechJones11T` never
+        // completes. The retail engine fires the '<speech>T' event when the dialogue line's
+        // voiced display finishes; the headless VM's dialogue path (DialogueManager0
+        // 'dialtoits1' runs and its EndOfLine waits on ExpectedEventBeforeNext) never fires
+        // it, so the demo's post-grapple dialogue chain stalls there (probe69: 7129 ticks
+        // waiting) and the scene's later actions (the demo wrap-up, goal 1's SystemSec
+        // promotion) stay unreachable on this map.
+        let dialogue_manager = vm
+            .find_object("DialogueManager0")
+            .expect("the demo's DialogueManager0 ('dialtoits1') must exist");
+        assert!(
+            vm.is_in_state(dialogue_manager, "STA_PlayingDialogue"),
+            "the dialogue manager must be stuck waiting for the unfired SpeechJones11T event"
+        );
         // item48: the tarmac rockets kill the route's player at ~301.55 s (health pin above).
         // The engine-wide kill broadcast (`Controller.ClientGameEnded`) then moves every
         // controller out of the scene: measured CineController2 PlayingSequence -> GameEnded at
