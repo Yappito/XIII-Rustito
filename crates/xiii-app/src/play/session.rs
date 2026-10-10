@@ -133,6 +133,10 @@ pub struct PlayerVMModes {
     pub landed_velocity_z: Option<f32>,
     /// Floor normal (Unreal axes) for the `Landed(HitNormal)` argument.
     pub floor_normal: [f32; 3],
+    /// The pawn `EyeHeight` the engine maintains for the current collision box (item54:
+    /// hypothesis 0.8 x half-height — the measured standing 60 matches 0.8 x 75; crouch lowers
+    /// it to 0.8 x 48). The crosshair traces (`MyPCPostRender` StartTrace) read it.
+    pub eye_height: f32,
 }
 
 impl Default for PlayerVMModes {
@@ -143,6 +147,7 @@ impl Default for PlayerVMModes {
             physics: crate::play::sim::PHYS_WALKING,
             landed_velocity_z: None,
             floor_normal: [0.0, 0.0, 1.0],
+            eye_height: 60.0,
         }
     }
 }
@@ -595,6 +600,11 @@ impl Session {
             let _ =
                 self.vm
                     .set_property(self.player, "bIsCrouched", 0, Value::Bool(modes.crouched));
+            // item54: the engine's pawn physics maintains `EyeHeight` for the current collision
+            // box; the host sim owns the crouch state, so publish it for the crosshair traces.
+            let _ =
+                self.vm
+                    .set_property(self.player, "EyeHeight", 0, Value::Float(modes.eye_height));
             let _ = self.vm.set_property(
                 self.player,
                 "bWantsToCrouch",

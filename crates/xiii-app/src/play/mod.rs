@@ -1095,6 +1095,7 @@ fn fixed_step(
             physics: sim.0.physics,
             landed_velocity_z: sim.0.landed.then_some(sim.0.land_velocity_z),
             floor_normal: sim.0.floor_normal,
+            eye_height: sim.0.vm_eye_height(&params.0),
         };
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
         sess.sync_view_rotation(sim.0.yaw, sim.0.pitch);
@@ -1960,6 +1961,7 @@ struct MapRuntime {
     mover_collision: movers::MoverCollision,
     volumes: movement_modes::VolumeMotion,
     sim: PlayerSim,
+    player_params: PlayerParams,
     sources: Vec<String>,
     /// Shared counter of voice names this map's `VoiceDuration` provider could not resolve (the
     /// provider is re-installed on every map open, including travel reloads).
@@ -2076,6 +2078,7 @@ fn build_map_runtime(
         mover_collision,
         volumes,
         sim,
+        player_params: *params,
         sources,
         voice_unresolved,
         video_host,
@@ -2262,6 +2265,7 @@ fn run_script_inner(
             physics: runtime.sim.physics,
             landed_velocity_z: runtime.sim.landed.then_some(runtime.sim.land_velocity_z),
             floor_normal: runtime.sim.floor_normal,
+            eye_height: runtime.sim.vm_eye_height(&runtime.player_params),
         };
         runtime.session.step(
             DT,
@@ -4398,6 +4402,152 @@ mod tests {
             hual01b.1.len() >= 7,
             "Hual01b must load with its own MapInfo objectives: {:?}",
             hual01b.1
+        );
+    }
+
+    /// item54 route: Hual01b completed end-to-end by player input: the four generator
+    /// sabotages and the `BreakableMover13` tunnel grille punch through the game's own
+    /// break-by-hand chain (`XIIIWeapon.RealTraceFire` melee -> the interaction's
+    /// `TargetActor`/`bCanBreak` -> `XIIIH2HAmmo.ProcessTraceHit` `TakeDamage(DTFisted)` ->
+    /// `BreakableMover.Breaked` -> `TriggerEvent(self.Event)` -> the level's Dispatcher/
+    /// XIIIGoalTrigger GoalNumber-99 chains -> `xidmaps.Hual01b.SetGoalComplete`; the same
+    /// events dismiss the level's own comic-focus windows), the ladder-base `TouchTrigger0`
+    /// (goal 1), the terrain hole onto the GR_sortie deck, the crawl room and the shaft fall
+    /// into `Trigger0` -> `XIIIGoalTrigger0` (goal 6). With all four generator counter
+    /// objectives complete the map's `xidmaps.Hual01b.SetGoalComplete` override promotes goal
+    /// 6, so the shaft trigger completes it and `TestGoalComplete` -> `DoTravel` ->
+    /// `ServerTravel` requests `Hual02.unr`. The fixture's labelled teleports cover measured
+    /// impassables only (the buried entry corridor, the riverbed wall, the stalled east chain,
+    /// the sealed baraque pocket, the mountain spur, the deck-to-room gap; evidence under
+    /// local/re/item54b/ and local/re/item54/); no `take_control`, no `set_goal`, no weapon
+    /// grant.
+    #[test]
+    fn opt_in_hual01b_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual01b".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual01b");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        // Tracked fixture (our own route commands; no game data).
+        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/hual01b_route.script");
+        let script = script::Script::load(&route_path).expect("load item54 Hual01b route");
+        assert!(
+            script.events.iter().all(|event| {
+                !matches!(
+                    &event.command,
+                    script::Command::TakeControl
+                        | script::Command::SetGoal(_)
+                        | script::Command::Weapon(_)
+                )
+            }),
+            "the Hual01b route must not bridge control, goals or weapons"
+        );
+        // 300 s: the route's shaft fall lands at t~270, the game's own travel request lands
+        // at t~272.9 (measured probe_z5), the host reloads Hual02 and the run ends there.
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Hual01b",
+            &script,
+            &resolved.params,
+            &scene,
+            300.0,
+        )
+        .expect("run Hual01b route");
+        for (map, states) in &outcome.map_objectives {
+            println!(
+                "[hual01b route] objectives as the run left {map}: {}",
+                states
+                    .iter()
+                    .map(|o| format!(
+                        "[{}{}{}{}] {}",
+                        o.index,
+                        if o.primary { " P" } else { " -" },
+                        if o.completed { " C" } else { " ." },
+                        if o.anti_goal { " A" } else { "" },
+                        o.text
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+        }
+        println!(
+            "[hual01b route] travel: {:?}, final map {}",
+            outcome.travel, outcome.final_map
+        );
+        let hual01b = outcome
+            .map_objectives
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Hual01b"))
+            .expect("Hual01b objective states");
+        assert!(
+            hual01b.1.len() >= 7,
+            "Hual01b MapInfo must expose its seven objectives: {:?}",
+            hual01b.1
+        );
+        for (index, why) in [
+            (0usize, "the anti-goal must be authored completed at spawn"),
+            (
+                1,
+                "goal 1 (infiltrate the base) must complete through the ladder-base chain",
+            ),
+            (
+                2,
+                "the generator counter must complete through the sabotage chains",
+            ),
+            (
+                3,
+                "the generator counter must complete through the sabotage chains",
+            ),
+            (
+                4,
+                "the generator counter must complete through the sabotage chains",
+            ),
+            (
+                5,
+                "the generator counter must complete through the sabotage chains",
+            ),
+            (
+                6,
+                "goal 6 (reach the extraction shaft) must complete through Trigger0",
+            ),
+        ] {
+            assert!(
+                hual01b.1[index].completed,
+                "objective {index} must complete: {why}: {:?}",
+                hual01b.1[index]
+            );
+        }
+        assert!(
+            hual01b.1[1].primary && hual01b.1[6].primary,
+            "goals 1 and 6 must be primary when completed: {:?} {:?}",
+            hual01b.1[1],
+            hual01b.1[6]
+        );
+        assert!(
+            !outcome.travel.is_empty(),
+            "the level must travel; blocked actors: {:?}",
+            outcome.session.suspended
+        );
+        assert_eq!(outcome.final_map, "Hual02");
+        assert_eq!(outcome.travel[0].from, "Hual01b");
+        assert_eq!(outcome.travel[0].to, "Hual02");
+        assert_eq!(outcome.travel[0].url, "Hual02.unr");
+        let hual02 = outcome
+            .map_objectives
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Hual02"))
+            .expect("the run must load Hual02 and capture its objective states");
+        assert!(
+            hual02.1.len() >= 5,
+            "Hual02 must load with its own MapInfo objectives: {:?}",
+            hual02.1
         );
     }
 
