@@ -1,0 +1,113 @@
+# Hual02 route (item59): player input from the vent spawn to Carrington's cell and the exit
+# plateau, objectives driven only by the game's own chains.
+#
+# Player input (no set_goal/take_control): crouch-crawl through the ceiling vent
+# (spawn 104,1840,-4536 -> gallery), two aimed shots break the two grates
+# (BreakableMover5 at 104,1192 yaw 270; BreakAbleMover2 at -496,-688 yaw 259.5,
+# measured legs 9-12), crawl the duct and drop into the office floor -4856,
+# walk the underfloor to the service lift, then the surface corridor to the depot.
+#
+# Labelled teleports, each for a measured movement gap (see the report):
+# - "service lift"   t=190 (-2200,2450): LiftManager/LiftButton is not implemented,
+#                    the lift cage cannot be called or ridden.
+# - "depot"          t=235 (-8880,722): Porte19 is Locked and its magnetic-card
+#                    aim-focus chain (TouchTrigger5 -> 'finfocus1') is unimplemented;
+#                    landing inside CineTrigger6 also starts the game's own
+#                    Carrington scene ('Carring_ShaftEnter' -> tabActions2).
+# - "prison entry"   t=241 (-10368,2800): the prison compound perimeter is sealed
+#                    in this sim (Porte151 Locked opens only from Carrington's
+#                    escort moveseq); the landing touches DetectionVolume14 whose
+#                    'didact6' event completes goal 2 through XIIIGoalTrigger1.
+# - "prison grille escape" t=247 (-10176,2900): the DV14 landing sits inside the
+#                    simplified collision of StaticMeshActor1024 'grille_prison';
+#                    measured leg31: the player is pinned until moved.
+# - "stair head"     t=295 (-14896,656,438): the exit stairwell pins the walker at
+#                    (-14078,1314,35) (measured legs 20-23); the corridor beyond is
+#                    sealed by the Locked Porte151, so the exit plateau is entered here.
+#
+# Weapon grant (labelled diagnostic): the player would carry the Beretta from
+# Hual01b (the campaign loadout; Hual01a's route test documents no grant because
+# the fresh-login inventory already has it). Starting on Hual02 directly hands the
+# Fists only, so the route re-grants xiii.Beretta to make the two grate shots real.
+#
+# Objectives completed by the game's chains on this route (measured leg37):
+# Objectives completed by the game's chains on this route (measured legs 31-37 and the
+# fixture runs): goals 4/5/6 complete (the Carrington scene via CineTrigger6 and the
+# anti-goal completions), goal 3 promoted by the same scene. The promotion chain for
+# goals 1 and 2 is blocked in this sim: DetectionVolume21 ('demarre_bureau', which
+# promotes goal 1 through XIIIGoalTrigger3) floats 78 UU above the real duct floor
+# (z=-4320, cylinder half-height 40, measured), and the eavesdrop scene's
+# 'Blam' -> 'objectif92' promotion of goal 2 stalls at the unimplemented CWndSFXTrigger
+# scene action. The DV14 -> 'didact6' -> XIIIGoalTrigger1 completion of goal 2 only
+# validates a promoted goal (measured: leg37 with the diagnostic cue vs the fixture).
+# (TouchTrigger8 z=63 gallery -> Cine7 'soldat_plan' raid -> 'soldat_assome' ->
+# CineTrigger8 CineGoto -> Carrington moveseqs open Porte151 -> 'fin') is blocked:
+# TouchTrigger8's gallery and Porte151 are both unreachable on foot in this sim, so
+# goal 0 and the travel request stay unmet; the test asserts that measured blocker.
+t=0.20 crouch 1
+t=0.50 goto 104 1840 -4536
+t=3.00 goto 104 1730 -4536
+t=8.00 goto 104 1400 -4536
+t=12.00 yaw 270
+t=12.50 grant xiii.Beretta
+t=14.00 fire
+t=20.00 goto 104 1128 -4536
+t=26.00 goto -200 1128 -4536
+t=34.00 goto -424 1128 -4536
+t=38.00 goto -424 -300 -4536
+t=52.00 yaw 259.5
+t=53.00 fire
+t=55.00 fire
+t=58.00 goto -424 -680 -4536
+t=64.00 goto -560 -688 -4536
+t=72.00 crouch 0
+t=78.00 goto -713 -517 -4781
+t=86.00 goto -711 -18 -4781
+t=94.00 goto -1004 321 -4781
+t=100.00 goto -1394 305 -4781
+t=106.00 goto -1396 16 -4781
+t=112.00 goto -1582 -2 -4781
+t=118.00 goto -1787 239 -4781
+t=124.00 goto -1832 742 -4781
+t=130.00 goto -1817 876 -4781
+t=136.00 goto -1680 1120 -4781
+t=142.00 goto -1695 1454 -4781
+t=148.00 goto -1674 1603 -4781
+t=154.00 goto -1704 2065 -4781
+t=160.00 goto -1775 2424 -4781
+t=166.00 goto -1836 2576 -4781
+t=172.00 goto -2031 2604 -4781
+t=178.00 goto -2209 2447 -4781
+t=184.00 goto -2206 2374 -4781
+t=190.00 teleport -2200 2450 -149
+t=194.00 goto -2681 2436 -149
+t=199.00 goto -2690 1770 -149
+t=202.00 goto -2974 1629 -149
+t=205.00 goto -3258 1845 -149
+t=208.00 goto -3597 1793 -149
+t=211.00 goto -3900 1700 -149
+t=214.00 goto -4474 1797 -149
+t=218.00 goto -4768 1837 -149
+t=220.00 goto -4983 1802 -149
+t=222.00 goto -4989 1489 -149
+t=227.00 goto -4957 894 -149
+t=229.00 goto -5121 963 -149
+t=231.00 goto -5262 860 -149
+t=233.00 use Porte19
+t=235.00 teleport -8880 722 -100
+t=241.00 teleport -10368 2800 -149
+t=243.00 use Porte153
+t=245.00 use Porte152
+t=247.00 teleport -10176 2900 -149
+t=249.00 goto -10176 2700 -149
+t=255.00 goto -9957 2500 -149
+t=263.00 use Porte154
+t=287.00 goto -10176 2700 -149
+t=293.00 goto -10176 2900 -149
+t=295.00 teleport -14896 656 438
+t=300.00 goto -15488 656 438
+t=306.00 goto -15808 688 438
+t=312.00 goto -16272 928 438
+t=317.00 goto -16496 976 438
+t=322.00 goto -16680 950 438
+t=332.00 wait_travel

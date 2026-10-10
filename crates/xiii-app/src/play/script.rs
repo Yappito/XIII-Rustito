@@ -64,8 +64,10 @@ pub enum Command {
     Turn(f32),
     /// Pitch in degrees.
     Pitch(f32),
-    /// Continuously aim at an actor; `None` disables tracking.
-    Track(Option<String>),
+    /// Continuously aim at an actor; `None` disables tracking. The f32 is the aim height as a
+    /// fraction of the tracked pawn's CollisionHeight (0.6 default: spine band; a level ray at
+    /// 0.85 crosses the head band for 3x bullet damage, see mod.rs track sites).
+    Track(Option<(String, f32)>),
     /// Move the box centre to an absolute Unreal-unit position (harness bootstrap).
     Teleport([f32; 3]),
     /// Autopilot toward an Unreal-unit waypoint (the driver re-aims and walks; not a teleport).
@@ -102,6 +104,10 @@ pub enum Command {
     /// controller frozen in `NoControl` when a diagnostic script does not play the authored
     /// cutscene sequence. Normal campaign play does not depend on this command.
     TakeControl,
+    /// Retail H-key: run the game's own `XIIIPlayerController.QuickHeal` exec (decoded: picks the
+    /// MedKit/FullMedKit from the pawn's inventory by `HealthPercent` and calls
+    /// `Med.UseMeQuick`). Edge-triggered like `use`.
+    QuickHeal,
 }
 
 /// A parsed input script, time-ordered.
@@ -164,7 +170,10 @@ impl Script {
                 "pitch" => Command::Pitch(num(&mut it)?),
                 "track" => match it.next() {
                     Some("off") => Command::Track(None),
-                    Some(actor) => Command::Track(Some(actor.to_owned())),
+                    Some(actor) => {
+                        let height = it.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.6);
+                        Command::Track(Some((actor.to_owned(), height)))
+                    }
                     None => return Err(format!("line {n}: track needs an actor name or off")),
                 },
                 "teleport" | "place" => {
@@ -221,6 +230,12 @@ impl Script {
                     Command::NextWeapon
                 }
                 "take_control" | "take-control" | "assume_control" => Command::TakeControl,
+                "heal" | "quick_heal" | "medkit" => {
+                    if it.next().is_some() {
+                        return Err(format!("line {n}: {cmd} takes no arguments"));
+                    }
+                    Command::QuickHeal
+                }
                 other => return Err(format!("line {n}: unknown command {other:?}")),
             };
             events.push(Event { t, command });
@@ -274,7 +289,11 @@ pub struct Drive {
     goals: Vec<i32>,
     /// `take_control` requested (edge-triggered) and not yet applied by the host.
     control_pending: bool,
+    /// `heal` (QuickHeal exec) requested (edge-triggered) and not yet applied by the host.
+    heal_pending: bool,
     tracking: Option<String>,
+    /// Aim height fraction for the active tracking (0.6 default, `track <actor> <f>` sets it).
+    track_height: f32,
     track_location: Option<[f32; 3]>,
 }
 
@@ -298,7 +317,9 @@ impl Drive {
             waiting_travel: false,
             goals: Vec::new(),
             control_pending: false,
+            heal_pending: false,
             tracking: None,
+            track_height: 0.6,
             track_location: None,
         }
     }
@@ -325,6 +346,11 @@ impl Drive {
         std::mem::take(&mut self.control_pending)
     }
 
+    /// Takes the pending `heal` (QuickHeal) request (edge-triggered).
+    pub fn take_quick_heal(&mut self) -> bool {
+        std::mem::take(&mut self.heal_pending)
+    }
+
     /// Supplies the current actor location to the active tracking command.
     pub fn set_track_location(&mut self, actor: Option<&str>, location: Option<[f32; 3]>) {
         self.track_location = match (self.tracking.as_deref(), actor) {
@@ -335,6 +361,11 @@ impl Drive {
 
     pub fn tracking_actor(&self) -> Option<&str> {
         self.tracking.as_deref()
+    }
+
+    /// Aim height fraction for the active tracking (fraction of the pawn's CollisionHeight).
+    pub fn track_height(&self) -> f32 {
+        self.track_height
     }
 
     /// Whether the driver is blocked on a `wait_travel` command.
@@ -369,8 +400,14 @@ impl Drive {
                 &Command::Yaw(deg) => sim.yaw = deg.to_radians(),
                 &Command::Turn(deg) => sim.yaw += deg.to_radians(),
                 &Command::Pitch(deg) => sim.pitch = deg.to_radians(),
-                Command::Track(actor) => {
-                    self.tracking = actor.clone();
+                Command::Track(actor_height) => {
+                    match actor_height {
+                        Some((actor, height)) => {
+                            self.tracking = Some(actor.clone());
+                            self.track_height = *height;
+                        }
+                        None => self.tracking = None,
+                    }
                     self.track_location = None;
                 }
                 &Command::Teleport(p) => {
@@ -394,6 +431,7 @@ impl Drive {
                 &Command::SwitchWeapon(group) => self.weapon_inputs.push(Some(group)),
                 Command::NextWeapon => self.weapon_inputs.push(None),
                 Command::TakeControl => self.control_pending = true,
+                Command::QuickHeal => self.heal_pending = true,
             }
             self.cursor += 1;
         }
@@ -565,7 +603,10 @@ mod tests {
     #[test]
     fn tracking_parses_aims_in_three_dimensions_and_off_releases_it() {
         let s = Script::parse("t=0 track Target\nt=1 track off\n").unwrap();
-        assert_eq!(s.events[0].command, Command::Track(Some("Target".into())));
+        assert_eq!(
+            s.events[0].command,
+            Command::Track(Some(("Target".into(), 0.6)))
+        );
         assert_eq!(s.events[1].command, Command::Track(None));
         let mut sim = PlayerSim::new([0.0; 3], 0.0);
         let mut d = Drive::new(&s);
@@ -583,6 +624,28 @@ mod tests {
         d.advance(1.1, &mut sim);
         assert_eq!(sim.yaw, yaw);
         assert!(Script::parse("t=0 track\n").is_err());
+    }
+
+    #[test]
+    fn track_height_defaults_to_spine_band_and_override_applies() {
+        let s = Script::parse("t=0 track Target\nt=1 track off\nt=2 track Target 0.85\n").unwrap();
+        let mut d = Drive::new(&s);
+        let mut sim = PlayerSim::new([0.0; 3], 0.0);
+        d.advance(0.0, &mut sim);
+        assert!((d.track_height() - 0.6).abs() < 1e-6);
+        d.advance(1.0, &mut sim);
+        assert!((d.track_height() - 0.6).abs() < 1e-6);
+        // `track off` clears the actor (the height value is kept but unused while not tracking).
+        d.advance(1.5, &mut sim);
+        assert_eq!(d.tracking_actor(), None);
+        d.advance(2.0, &mut sim);
+        assert!((d.track_height() - 0.85).abs() < 1e-6);
+        assert_eq!(d.tracking_actor(), Some("Target"));
+        // A non-numeric extra token falls back to the default height.
+        let s2 = Script::parse("t=0 track X 2a\n").unwrap();
+        let mut d2 = Drive::new(&s2);
+        d2.advance(0.0, &mut sim);
+        assert!((d2.track_height() - 0.6).abs() < 1e-6);
     }
 
     #[test]

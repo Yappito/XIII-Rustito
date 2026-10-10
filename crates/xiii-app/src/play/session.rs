@@ -63,6 +63,8 @@ pub struct Session {
     last_synced: Vec<Option<[f32; 3]>>,
     /// Presentation events, most recent last (bounded).
     pub events: VecDeque<(f64, PresentationEvent)>,
+    /// Cumulative presentation-event count, including events evicted from the retained window.
+    pub event_total: u64,
     /// `PlayStrVoice` dialogue events, most recent last (bounded). `dialogue_total` is the
     /// cumulative count so a consumer can detect new entries after the bounded window wraps.
     pub dialogues: VecDeque<(f64, DialogueEvent)>,
@@ -445,6 +447,7 @@ impl Session {
             first_error: None,
             last_synced,
             events: VecDeque::new(),
+            event_total: 0,
             dialogues: VecDeque::new(),
             dialogue_total: 0,
             saves: VecDeque::new(),
@@ -2123,6 +2126,29 @@ impl Session {
         }
     }
 
+    /// Retail H-key: run the game's own `XIIIPlayerController.QuickHeal` exec on the live
+    /// controller (decoded in xiii.u: it picks the `MedKit`/`FullMedKit` inventory item by
+    /// `XIIIPawn.HealthPercent`/`IsWounded` and calls `Med.UseMeQuick`). The heal amount and the
+    /// inventory bookkeeping are the game's own code. Reports the outcome, never silent.
+    pub fn quick_heal(&mut self) -> Result<i32, String> {
+        let controller = self
+            .controller
+            .filter(|c| self.vm.objects.get(*c as usize).is_some_and(|o| !o.deleted))
+            .ok_or_else(|| "quick_heal: no live player controller".to_owned())?;
+        // Match the diagnostic fire scope: a cinematic may have parked the pawn.
+        self.vm.set_active(controller, true);
+        let f = self
+            .vm
+            .class_function(controller, "QuickHeal")
+            .ok_or_else(|| "QuickHeal not found on the player controller class".to_owned())?;
+        self.vm
+            .call_function(f, controller, vec![])
+            .map_err(|e| format!("QuickHeal: {e}"))?;
+        let hp = self.player_health().unwrap_or(0.0).round() as i32;
+        println!("[play] quick_heal: player health now {hp}");
+        Ok(hp)
+    }
+
     /// Diagnostic weapon bootstrap for `--play-script` (item14/item14c): spawn `class_path` and
     /// run the **game's own** give/equip path — `Weapon.GiveTo(Pawn)` (inventory + ammo +
     /// `ClientWeaponSet`) and, when the pawn already carries a weapon, `Pawn.ChangedWeapon` (the
@@ -2322,7 +2348,8 @@ impl Session {
         matches!(self.vm.get_property(id, "bIsDead"), Some(Value::Bool(true)))
     }
 
-    fn drain_events(&mut self) {
+    /// Collects presentation produced by simulation or a host render callback.
+    pub(super) fn drain_events(&mut self) {
         for ev in self.vm.drain_events() {
             let t = self.vm.time;
             if let PresentationEvent::Dialogue(d) = &ev {
@@ -2340,6 +2367,7 @@ impl Session {
                 }
             }
             self.events.push_back((t, ev));
+            self.event_total += 1;
         }
         while self.events.len() > 64 {
             self.events.pop_front();
@@ -3988,7 +4016,7 @@ mod tests {
         });
         println!(
             "[Plage01 combat] cue=TouchTrigger7 event={trigger_event:?}, player={player_location:?}, soldier={soldier_location:?}, distance={player_distance:.1}, SightRadius={sight_radius}, cue Enemy={cue_enemy_name:?}, final Enemy={final_enemy:?}, scripted={scripted_attack_seen}, combat={controller_attack_seen}, held-fire-seen={held_fire_seen}, fire-request-seen={fire_request_seen}, bTire={wants_fire}, soldier state={state:?}, controller state={controller_state:?}, controller states={scripted_states:?}, CanSee={can_see:?}, rotation {initial_rotation:?}->{final_rotation:?}, Health {health_before}->{health_after}; suspended={:?}",
-            session.suspended
+            session.failures
         );
         assert!(
             scripted_attack_seen,
@@ -3999,19 +4027,33 @@ mod tests {
                 && can_see.iter().any(|(_, _, result)| result == "false"),
             "the actual player position should be outside SightRadius with a measured failed CanSee: distance={player_distance}, SightRadius={sight_radius}, CanSee={can_see:?}"
         );
-        // Whether this authored map cue yields combat is determined by the map's own dispatch,
-        // AI state chain, and LOS result at the player's actual spawn location.
+        // With the live level clock ContinueStakeOut expires and temporise enters Chasse
+        // (IAController.temporise 0x01FC..0x0287). The former Patrouille/no Enemy pin
+        // described a frozen-clock artefact, not the authored distant-player outcome.
         assert!(
             cue_enemy == Some(player)
-                && final_enemy.is_none()
+                && final_enemy.as_deref() == Some(session.player_name.as_str())
                 && left_scripted_attack
-                && controller_state.as_deref() == Some("Patrouille")
+                && controller_state.as_deref() == Some("Chasse")
                 && !controller_attack_seen
                 && !held_fire_seen
                 && !fire_request_seen
                 && !wants_fire
                 && health_after == health_before,
             "unexpected combat result: Health {health_before}->{health_after}, bTire={wants_fire}"
+        );
+        assert_eq!(
+            session.failures.len(),
+            1,
+            "only the measured pursuit blocker may fail"
+        );
+        assert!(
+            session.failures[0].0 == session.vm().objects[controller as usize].name
+                && session.failures[0].1.contains("Controller.PickWallAdjust")
+                && session.failures[0].1.contains("Some(526)")
+                && session.failures[0].1.contains("Chasse.PickDestination"),
+            "unexpected distant-player pursuit failure: {:?}",
+            session.failures
         );
     }
 

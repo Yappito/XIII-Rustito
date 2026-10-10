@@ -762,6 +762,116 @@ fn mapinfo_licence_write_runs_without_a_script_handler() {
     assert_eq!(vm.get_property(mi, "TGSDummy"), Some(&Value::Int(3589)));
 }
 
+/// item61: authored miniature of the engine's `InitExecution` anti-piracy writes (no retail
+/// bytecode): a `GameInfo` subclass carrying `DummyStuff1`/`DummyStuff2`, a `GenAlerte`
+/// subclass carrying `dummy`, and a non-GameInfo/non-GenAlerte `FakeInfo` subclass with the
+/// same property names (so only the chain-name gate may exclude it).
+fn init_execution_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let gameinfo = b.reserve(0, 0, "GameInfo");
+    let mygame = b.reserve(0, 0, "MyGame");
+    let genalerte = b.reserve(0, 0, "GenAlerte");
+    let fakeinfo = b.reserve(0, 0, "FakeInfo");
+    let dummy1 = b.reserve(IMP_FLOATPROP, mygame, "DummyStuff1");
+    let dummy2 = b.reserve(IMP_INTPROP, dummy1, "DummyStuff2");
+    let gen_dummy = b.reserve(IMP_INTPROP, genalerte, "dummy");
+    let fake1 = b.reserve(IMP_FLOATPROP, fakeinfo, "DummyStuff1");
+    let fake2 = b.reserve(IMP_INTPROP, fake1, "DummyStuff2");
+    b.prop(dummy1, dummy2, 0);
+    b.prop(dummy2, 0, 0);
+    b.prop(gen_dummy, 0, 0);
+    b.prop(fake1, fake2, 0);
+    b.prop(fake2, 0, 0);
+    b.class(object, 0, 0);
+    b.class(actor, object, 0);
+    b.class(gameinfo, actor, 0);
+    b.class(mygame, gameinfo, dummy1);
+    b.class(genalerte, actor, gen_dummy);
+    b.class(fakeinfo, actor, fake1);
+    // "Map-placed" actors: exports whose class is the class export itself (the way a map
+    // package's export table instantiates level actors), with an empty tagged property block.
+    let placed_alert = b.reserve(genalerte, 0, "GenAlerte0");
+    let placed_game = b.reserve(mygame, 0, "MyGame0");
+    let placed_fake = b.reserve(fakeinfo, 0, "FakeInfo0");
+    b.set(placed_alert, vec![0]);
+    b.set(placed_game, vec![0]);
+    b.set(placed_fake, vec![0]);
+    b.build()
+}
+
+#[test]
+fn init_execution_writes_gameinfo_dummystuff_on_spawn() {
+    let set = set_of(init_execution_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let spawner = vm.spawn(g(&set, "Actor"), "Spawner").unwrap();
+    let game = vm
+        .spawn_actor(spawner, Some(g(&set, "MyGame")), None, None, None, None)
+        .unwrap()
+        .expect("spawned");
+    // Engine.dll `AGameInfo::InitExecution` 0x103e0cb6/0x103e0cc0: 0xC3A3228F at +0x2c0,
+    // 0x337 at +0x2c4.
+    assert_eq!((-326.27f32).to_bits(), 0xC3A3228F);
+    assert_eq!(
+        vm.get_property(game, "DummyStuff1"),
+        Some(&Value::Float(-326.27))
+    );
+    assert_eq!(vm.get_property(game, "DummyStuff2"), Some(&Value::Int(823)));
+    // A non-GameInfo class with the same property names never receives the write.
+    let fake = vm
+        .spawn_actor(spawner, Some(g(&set, "FakeInfo")), None, None, None, None)
+        .unwrap()
+        .expect("spawned");
+    assert_eq!(
+        vm.get_property(fake, "DummyStuff1"),
+        Some(&Value::Float(0.0)),
+        "a non-GameInfo class never receives the DummyStuff write"
+    );
+    assert_eq!(vm.get_property(fake, "DummyStuff2"), Some(&Value::Int(0)));
+    // The GameInfo write lands before any lifecycle event: `active` is set after the write, so
+    // a PreBeginPlay handler would already observe the magic value.
+    assert!(vm.objects[game as usize].active);
+}
+
+#[test]
+fn init_execution_writes_genalerte_dummy_on_level_load() {
+    let set = set_of(init_execution_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.load_level(0, &Limits::default()).unwrap();
+    let alert = vm.find_object("GenAlerte0").expect("GenAlerte instance");
+    // XIDPawn.dll `AGenAlerte::InitExecution` 0x119015c9: 0x7d2 at this+0x21c.
+    assert_eq!(vm.get_property(alert, "dummy"), Some(&Value::Int(2002)));
+    let fake = vm.find_object("FakeInfo0").expect("FakeInfo instance");
+    assert_eq!(
+        vm.get_property(fake, "dummy"),
+        None,
+        "a non-GenAlerte class has no dummy slot to write"
+    );
+}
+
+#[test]
+fn init_execution_write_survives_map_property_reload_order() {
+    // The engine serialises map properties first, then runs `InitExecution`; a map-authored
+    // value must not survive the write. `MyGame0` (a GameInfo subclass) instantiated from the
+    // "map" package therefore carries the magic float even though no map default set it.
+    let set = set_of(init_execution_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.load_level(0, &Limits::default()).unwrap();
+    let game = vm.find_object("MyGame0").expect("MyGame instance");
+    assert_eq!(
+        vm.get_property(game, "DummyStuff1"),
+        Some(&Value::Float(-326.27))
+    );
+    assert_eq!(vm.get_property(game, "DummyStuff2"), Some(&Value::Int(823)));
+    let fake = vm.find_object("FakeInfo0").expect("FakeInfo instance");
+    assert_eq!(
+        vm.get_property(fake, "DummyStuff1"),
+        Some(&Value::Float(0.0)),
+        "a non-GameInfo class never receives the DummyStuff write"
+    );
+}
+
 fn pressing_fire_package() -> Vec<u8> {
     let mut b = B::new();
     let object = b.reserve(0, 0, "Object");
@@ -1346,8 +1456,12 @@ fn registry_entries_are_documented() {
     // (XIDPawn.dll 0x119012b0) and `BloodFlow.GrowBloodFlow` (Xiii.dll 0x11b01000); item48 adds
     // `Actor.VisibleDamageableActors` and `Actor.WaveHasPosition`. Must equal
     // `Registry::builtin().defs().count()`.
-    // item55 adds RotRand, WaitForLanding and the decoded SetPoisonEffect request.
-    assert_eq!(defs.len(), 340);
+    // item55 adds RotRand, WaitForLanding and the decoded SetPoisonEffect request. The
+    // item30c merge keeps this branch's `Actor.AnimIsInGroup` (395, round-4 ChangedWeapon
+    // caller) on top of main's set (main's own decoded `Controller.WaitForLanding` is the
+    // single 527 entry; the branch's duplicate registry def was removed in the merge).
+    // item65 adds Interaction.WorldToScreen backed by the host's active projection.
+    assert_eq!(defs.len(), 342);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -1710,6 +1824,7 @@ fn spawn_fixture() -> Vec<u8> {
     let deleted = b.reserve(IMP_BOOLPROP, actor, "bDeleteMe");
     let spawned = b.reserve(IMP_FUNCTION, actor, "Spawned");
     b.prop_with(owner, instigator, 0, &object_extra);
+    b.prop_with(instigator, level, 0, &object_extra);
     b.prop_with(instigator, seen_instigator, 0, &object_extra);
     b.prop_with(seen_instigator, level, 0, &object_extra);
     b.prop_with(level, tag, 0, &object_extra);
@@ -1997,6 +2112,64 @@ fn spawn_sets_defaults_owner_tag_and_location() {
     assert_eq!(
         vm.get_property(id2, "Tag"),
         Some(&Value::Name("Child".into()))
+    );
+}
+
+#[test]
+fn spawned_actor_inherits_the_spawners_instigator() {
+    // Engine.dll: `AActor::execSpawn` (0x103e56b0) passes the calling actor's `Instigator`
+    // (this+0x88) as `ULevel::SpawnActor`'s last argument, and `SpawnActor` (0x10388a20) stores
+    // that argument directly into the new actor's `Instigator` field (0x10388d91 stores
+    // [ebp+0x38] to [newactor+0x88]) - `SetOwner` (0x10352e30) never touches `Instigator`. So
+    // the spawned actor's `Instigator` is the *spawning actor's* `Instigator` even when an
+    // explicit `SpawnOwner` is supplied (the Weapon.GiveAmmo ammo case: the ammo inherits the
+    // weapon's Instigator - the pawn after GiveTo - while its Owner is the weapon).
+    let set = spawn_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pawn = vm.spawn(sg(&set, "Actor"), "Pawn").unwrap();
+    let spawner = vm.spawn(sg(&set, "Actor"), "Spawner").unwrap();
+    vm.set_property(
+        spawner,
+        "Instigator",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    let explicit_owner = vm.spawn(sg(&set, "Actor"), "ExplicitOwner").unwrap();
+    // An explicit SpawnOwner does not change the inherited Instigator.
+    let id = vm
+        .spawn_actor(
+            spawner,
+            Some(sg(&set, "Child")),
+            Some(explicit_owner),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("spawned with owner");
+    assert_eq!(
+        vm.get_property(id, "Owner"),
+        Some(&Value::Object(Some(ObjRef::Instance(explicit_owner))))
+    );
+    assert_eq!(
+        vm.get_property(id, "Instigator"),
+        Some(&Value::Object(Some(ObjRef::Instance(pawn))))
+    );
+    // A spawner without an Instigator leaves the field None (LevelInfo-level spawns).
+    let id2 = vm
+        .spawn_actor(
+            explicit_owner,
+            Some(sg(&set, "Child")),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("spawned without owner");
+    assert_eq!(
+        vm.get_property(id2, "Instigator"),
+        Some(&Value::Object(None))
     );
 }
 
@@ -3992,6 +4165,115 @@ fn phys_set() -> ScriptSet {
     set
 }
 
+#[test]
+fn level_clock_scales_freezes_and_is_published_before_tick() {
+    use ff::*;
+    use pf::*;
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let level_class = b.reserve(0, 0, "LevelInfo");
+    let dilation = b.reserve(IMP_FLOATPROP, level_class, "TimeDilation");
+    let time = b.reserve(IMP_FLOATPROP, level_class, "TimeSeconds");
+    let pauser = b.reserve(IMP_OBJECTPROP, level_class, "Pauser");
+    let always = b.reserve(IMP_BOOLPROP, level_class, "bAlwaysTick");
+    let observed = b.reserve(IMP_FLOATPROP, level_class, "ObservedTime");
+    let delta = b.reserve(IMP_FLOATPROP, level_class, "ObservedDelta");
+    let tick = b.reserve(IMP_FUNCTION, level_class, "Tick");
+    let dt = b.reserve(IMP_FLOATPROP, tick, "DeltaTime");
+    b.prop(dilation, time, 0);
+    b.prop(time, pauser, 0);
+    b.prop_with(pauser, always, 0, &compact(0));
+    b.prop(always, observed, 0);
+    b.prop(observed, delta, 0);
+    b.prop(delta, tick, 0);
+    b.prop(dt, 0, PARM);
+    // ObservedTime=TimeSeconds; ObservedDelta=DeltaTime; return.
+    let code = [
+        0x0f,
+        0x01,
+        observed as u8,
+        0x01,
+        time as u8,
+        0x0f,
+        0x01,
+        delta as u8,
+        0x00,
+        dt as u8,
+        0x04,
+        0x0b,
+    ];
+    b.func(tick, 0, dt, &code, 24, 0, DEFINED);
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, 0, 0);
+    b.class(level_class, actor, dilation, 0);
+    let set = set_of(b.build());
+    for suspending in [false, true] {
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let level = vm.spawn(pg(&set, "LevelInfo"), "Level").unwrap();
+        vm.set_active(level, true);
+        vm.set_property(level, "TimeDilation", 0, Value::Float(0.5));
+        let step = |vm: &mut Vm<'_>, dt| {
+            if suspending {
+                assert!(vm.tick_suspending(dt).is_empty());
+            } else {
+                vm.tick(dt).unwrap();
+            }
+        };
+        step(&mut vm, 2.0);
+        assert_eq!(
+            vm.time, 1.0,
+            "elapsed clock must not use the actor delta bound"
+        );
+        assert_eq!(
+            vm.get_property(level, "ObservedTime"),
+            Some(&Value::Float(1.0))
+        );
+        assert_eq!(
+            vm.get_property(level, "ObservedDelta"),
+            Some(&Value::Float(1.0))
+        );
+        vm.set_property(
+            level,
+            "Pauser",
+            0,
+            Value::Object(Some(ObjRef::Instance(level))),
+        );
+        vm.set_property(level, "ObservedTime", 0, Value::Float(-1.0));
+        step(&mut vm, 0.25);
+        assert_eq!(vm.time, 1.0);
+        assert_eq!(
+            vm.get_property(level, "ObservedTime"),
+            Some(&Value::Float(-1.0))
+        );
+        vm.set_property(level, "bAlwaysTick", 0, Value::Bool(true));
+        step(&mut vm, 0.25);
+        assert_eq!(
+            vm.get_property(level, "ObservedTime"),
+            Some(&Value::Float(1.0))
+        );
+        vm.set_property(level, "Pauser", 0, Value::Object(None));
+        step(&mut vm, 0.0);
+        assert_eq!(vm.time, 1.0);
+        assert_eq!(
+            vm.get_property(level, "ObservedDelta"),
+            Some(&Value::Float(0.0))
+        );
+        for _ in 0..600 {
+            step(&mut vm, 1.0 / 60.0);
+        }
+        assert!((vm.time - 6.0).abs() < 0.000001);
+        assert_eq!(
+            vm.get_property(level, "TimeSeconds"),
+            Some(&Value::Float(vm.time as f32))
+        );
+        assert_eq!(
+            vm.get_property(level, "ObservedTime"),
+            vm.get_property(level, "TimeSeconds")
+        );
+    }
+}
+
 fn pg(set: &ScriptSet, path: &str) -> GlobalRef {
     GlobalRef {
         package: 0,
@@ -5281,6 +5563,10 @@ fn trace_actors_orders_hits_filters_class_and_returns_all_outs() {
     vm.set_property(near, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
     set_collision_fields(&mut vm, far, true, true);
     set_collision_fields(&mut vm, near, true, true);
+    // Measured game shape (Plage01): a trace-blocking actor is a projectile target.
+    for id in [far, near] {
+        vm.set_property(id, "bProjTarget", 0, Value::Bool(true));
+    }
     let rows = vm
         .vm_trace_actors(
             caller,
@@ -5972,6 +6258,87 @@ fn host_written_location_drives_touch_refresh() {
 }
 
 #[test]
+fn trace_extent_flag_needs_bprojtarget() {
+    // Measured on Plage01 (item30c) and decoded from Engine.dll (the merged origin/main filter):
+    // a trace candidate must first be in the collision hash (`bCollideActors` — every hash
+    // insert/remove site gates on it; the parked `faction`-stasis killer is deliberately outside
+    // it, and `faction.EndState` restores `SetCollision(true,true,true)` before the route's
+    // fight). Within the hash the extent flag is the prefilter and `bProjTarget` - the game's own
+    // shootability marker, set on every shootable actor and clear on triggers and effects -
+    // qualifies it: the awake `BaseSoldier6` blocks hitscan traces with
+    // `bCollideActors=true` + `bBlockZeroExtentTraces=true` + `bProjTarget=true`, while the
+    // muzzle-flash `MuzzleLight` (spawned at the muzzle by `MuzzleAttach` once the spawn fix
+    // gives the weapon attachment an Instigator) must not stop the bullet.
+    let set = set_of(trace_package());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let light = vm.spawn(g(&set, "Actor"), "MuzzleLight").unwrap();
+    let pawn = vm.spawn(g(&set, "Actor"), "Pawn").unwrap();
+    // The tracer is a third actor off the ray, spawned last like the sibling tests.
+    let shooter = vm.spawn(g(&set, "Actor"), "Shooter").unwrap();
+    vm.set_active(shooter, true);
+    for (id, x) in [(light, 50.0), (pawn, 100.0)] {
+        vm.set_property(id, "Location", 0, Value::Vector([x, 0.0, 0.0]));
+        vm.set_property(id, "CollisionRadius", 0, Value::Float(24.0));
+        vm.set_property(id, "CollisionHeight", 0, Value::Float(24.0));
+        vm.set_property(id, "bCollideActors", 0, Value::Bool(true));
+        vm.set_property(id, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+        vm.set_property(id, "bProjTarget", 0, Value::Bool(id == pawn));
+        vm.set_active(id, true);
+    }
+    // The muzzle light: in hash and extent-blocking but no proj-target role -> not a candidate;
+    // the pawn wins.
+    let mut args = trace_args();
+    let hit = call_native(
+        &mut vm,
+        "Actor.Trace",
+        shooter,
+        &[false, false, false, false, false, false],
+        &mut args,
+    );
+    assert_eq!(
+        hit,
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(pawn)))),
+        "an in-hash non-proj-target actor must not block the bullet trace"
+    );
+    // The measured `TouchTrigger7` shape (merged-tree Plage01): `bCollideActors=true` with a
+    // map-sized radius but `bProjTarget=false` - it must not stop the bullet either.
+    vm.set_property(light, "bCollideActors", 0, Value::Bool(true));
+    vm.set_property(light, "CollisionRadius", 0, Value::Float(2000.0));
+    vm.set_property(light, "CollisionHeight", 0, Value::Float(2000.0));
+    let mut args = trace_args();
+    let hit = call_native(
+        &mut vm,
+        "Actor.Trace",
+        shooter,
+        &[false, false, false, false, false, false],
+        &mut args,
+    );
+    assert_eq!(
+        hit,
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(pawn)))),
+        "a colliding non-proj-target trigger must not block the bullet trace"
+    );
+    // Give the light the pawn's role and it becomes the nearer hit.
+    vm.set_property(light, "bProjTarget", 0, Value::Bool(true));
+    vm.set_property(light, "CollisionRadius", 0, Value::Float(24.0));
+    vm.set_property(light, "CollisionHeight", 0, Value::Float(24.0));
+    let mut args = trace_args();
+    let hit = call_native(
+        &mut vm,
+        "Actor.Trace",
+        shooter,
+        &[false, false, false, false, false, false],
+        &mut args,
+    );
+    assert_eq!(
+        hit,
+        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(light)))),
+        "the same actor with a collision role blocks the trace again"
+    );
+}
+
+#[test]
 fn trace_skips_weapon_owned_first_person_muzzle_flash() {
     // item18 B11: `M60.TraceFire` could hit its own `StarFPMF` attachment before the pawn. The
     // attachment has `bCollideActors=false` but `bBlockZeroExtentTraces=true`; UE2's owner-chain
@@ -5985,6 +6352,9 @@ fn trace_skips_weapon_owned_first_person_muzzle_flash() {
     set_collision_fields(&mut vm, weapon, true, false);
     set_collision_fields(&mut vm, flash, false, true);
     set_collision_fields(&mut vm, soldier, true, true);
+    // Measured game shape (Plage01): the shootable soldier is a projectile target; the
+    // muzzle-flash attachment is not (`bProjTarget=false`).
+    vm.set_property(soldier, "bProjTarget", 0, Value::Bool(true));
     vm.set_property(
         flash,
         "Owner",
@@ -6430,6 +6800,10 @@ fn trace_hits_nearer_of_world_and_actor_and_fasttrace_ignores_actors() {
     let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
     set_collision_fields(&mut vm, tracer, true, false);
     let b = phys_actor(&mut vm, &set, "B", [40.0, 0.0, 0.0]);
+    // Blocking shape as measured on the game's shootable actors: the extent flag opts the actor
+    // into traces and `bProjTarget=true` is the trace filter's collision role.
+    set_collision_fields(&mut vm, b, true, true);
+    vm.set_property(b, "bProjTarget", 0, Value::Bool(true));
     // item40e: a zero-extent actor check needs `bCollideActors` (collision hash) and
     // `bBlockZeroExtentTraces` (Engine.dll `FCollisionHash::ActorLineCheck` tests bit 0x400 of
     // the actor flags at 0x10349E90); a non-blocking `B` would not be hit.
@@ -7376,6 +7750,32 @@ fn loop_anim_reports_end_at_last_frame_and_keeps_animating() {
     let mut args = [Value::Int(0)];
     let r = try_native(&mut vm, "Engine.Actor.IsAnimating", a, &[false], &mut args).unwrap();
     assert_eq!(r, NativeOutcome::Value(Value::Bool(true)));
+}
+
+#[test]
+fn anim_is_in_group_answers_false_and_leaves_a_visible_note() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(4, 1.0)));
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    let mut args = [Value::Int(0), Value::Name("Standing".into())];
+    let r = try_native(
+        &mut vm,
+        "Engine.Actor.AnimIsInGroup",
+        a,
+        &[false, false],
+        &mut args,
+    )
+    .unwrap();
+    // The decoded SeqInfo carries no sequence group, so the VM answers the engine's "not in
+    // that group" and never silently claims membership.
+    assert_eq!(r, NativeOutcome::Value(Value::Bool(false)));
+    assert!(
+        vm.trace.iter().any(|e| matches!(&e.kind, TraceKind::Note(text) if text.contains("AnimIsInGroup(0, 'Standing')") && text.contains("no group data"))),
+        "AnimIsInGroup must leave a visible note: {:?}",
+        vm.trace.iter().map(|e| format!("{:?}", e.kind)).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -9873,7 +10273,7 @@ impl crate::canvas::CanvasFonts for TinyFonts {
 }
 
 /// Synthetic Canvas natives: cursor movement, text measurement with a tiny font, clip capture,
-/// and the null-material tile -> rect path.
+/// and rejection of null-material tiles without a fabricated rectangle.
 #[test]
 fn canvas_natives_record_commands_with_cursor_measurement_and_clip() {
     let set = set_of(canvas_fixture());
@@ -9956,7 +10356,7 @@ fn canvas_natives_record_commands_with_cursor_measurement_and_clip() {
     assert_eq!(vm.get_property(canvas, "CurX"), Some(&Value::Float(26.0)));
     assert_eq!(vm.get_property(canvas, "CurY"), Some(&Value::Float(20.0)));
 
-    // A null-material tile becomes a Rect and advances CurX by XL.
+    // Retail rejects a null-material tile without drawing or advancing CurX.
     call_native(
         &mut vm,
         "Engine.Canvas.SetPos",
@@ -9980,18 +10380,13 @@ fn canvas_natives_record_commands_with_cursor_measurement_and_clip() {
         ],
     );
     let cmds = vm.drain_canvas();
+    assert!(cmds.is_empty(), "{cmds:?}");
+    assert_eq!(vm.get_property(canvas, "CurX"), Some(&Value::Float(0.0)));
     assert!(
-        matches!(
-            cmds.as_slice(),
-            [crate::canvas::DrawCommand::Rect {
-                xl: 8.0,
-                yl: 4.0,
-                ..
-            }]
-        ),
-        "{cmds:?}"
+        vm.trace
+            .iter()
+            .any(|t| matches!(&t.kind, TraceKind::Note(n) if n.contains("null material")))
     );
-    assert_eq!(vm.get_property(canvas, "CurX"), Some(&Value::Float(8.0)));
     // A missing font records a visible note instead of silently measuring zero.
     vm.set_property(canvas, "Font", 0, Value::Object(None));
     let mut args = [Value::Str("x".into()), Value::Float(9.0), Value::Float(9.0)];
@@ -11011,6 +11406,7 @@ fn trace_package() -> Vec<u8> {
     let radius = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
     let height = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
     let collide = b.reserve(B_BOOLPROP, actor, "bCollideActors");
+    let proj_target = b.reserve(B_BOOLPROP, actor, "bProjTarget");
     let bzero = b.reserve(B_BOOLPROP, actor, "bBlockZeroExtentTraces");
     let bnz = b.reserve(B_BOOLPROP, actor, "bBlockNonZeroExtentTraces");
     let bblocka = b.reserve(B_BOOLPROP, actor, "bBlockActors");
@@ -11019,7 +11415,8 @@ fn trace_package() -> Vec<u8> {
     b.prop_with(rot, radius, 0, &compact(rotator));
     b.prop(radius, height, 0);
     b.prop(height, collide, 0);
-    b.prop(collide, bzero, 0);
+    b.prop(collide, proj_target, 0);
+    b.prop(proj_target, bzero, 0);
     b.prop(bzero, bnz, 0);
     b.prop(bnz, bblocka, 0);
     b.prop(bblocka, bblockp, 0);
@@ -11063,6 +11460,8 @@ fn synthetic_trace_hits_the_nearest_pawn_before_world_geometry() {
         vm.set_property(id, "bBlockActors", 0, Value::Bool(true));
         vm.set_property(id, "bBlockPlayers", 0, Value::Bool(true));
         vm.set_property(id, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+        // Measured Plage01 pawn shape: `bCollideActors=false` with `bProjTarget=true`.
+        vm.set_property(id, "bProjTarget", 0, Value::Bool(true));
         // item40e: only collision-hash actors (`bCollideActors`) can be hit.
         vm.set_property(id, "bCollideActors", 0, Value::Bool(true));
         vm.set_active(id, true);
@@ -11289,6 +11688,97 @@ fn static_on_default_fixture() -> Vec<u8> {
     b.class(thing, object, get);
     b.class(object, 0, call);
     b.build()
+}
+
+#[test]
+fn return_valued_call_on_inactive_placed_actor_runs_synchronously() {
+    let set = set_of(list_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let caller = vm.spawn(sg(&set, "Actor"), "Caller").unwrap();
+    vm.set_active(caller, true);
+    let target = vm.spawn(sg(&set, "Actor"), "Target").unwrap();
+    // The target is a placed actor outside the executed scope: a call that must return a value
+    // can never be deferred (the engine's `execVirtualFunction -> CallFunction` runs the callee
+    // frame synchronously). Measured caller: `XIIIBulletsAmmo.ProcessTraceHit` (xiii.u 0x029D)
+    // reads `XIIIPawn(Other).GetDamageLocation(...)` on a parked, non-active soldier; the old
+    // deferral error aborted the bullet chain before `Other.TakeDamage`.
+    let value = vm
+        .call_function(sg(&set, "Actor.Echo"), target, vec![Value::Int(41)])
+        .expect("a return-valued call on a non-active placed actor must run synchronously");
+    assert_eq!(value, Value::Int(41));
+}
+
+/// Fixture: `Caller.Probe()` executes `Return(self.Target.Echo(41))` as bytecode — a
+/// return-valued **virtual** call from executing code, the path the deferral (`Vm::invoke`)
+/// actually gates. `Echo` is the non-static `Actor.Echo` of `list_fixture`.
+fn probe_call_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let caller = b.reserve(0, 0, "Caller");
+
+    let target = b.reserve(IMP_OBJPROP, caller, "Target");
+    let echo = b.reserve(IMP_FUNCTION, actor, "Echo");
+    let echo_a = b.reserve(IMP_INTPROP, echo, "A");
+    let echo_r = b.reserve(IMP_INTPROP, echo, "ReturnValue");
+    b.prop(echo_a, echo_r, PARM | OPTIONAL_PARM);
+    b.prop(echo_r, 0, PARM | RETURN_PARM);
+    // `return A;` = Return(1) + LocalVariable(1 opcode + 4 object) = 6 bytes.
+    b.func(echo, 0, echo_a, &[0x04, 0x00, echo_a as u8], 6, 0, DEFINED);
+
+    let probe = b.reserve(IMP_FUNCTION, caller, "Probe");
+    let probe_r = b.reserve(IMP_INTPROP, probe, "ReturnValue");
+    b.prop(probe_r, 0, RETURN_PARM);
+    let echo_name = b.name("Echo");
+    let probe_code = vec![0x04] // Return
+        .into_iter()
+        .chain([0x19]) // Context: the call context `self.Target`
+        .chain([0x01]) // InstanceVariable
+        .chain(compact(target))
+        .chain([0x00, 0x00, 0x00]) // Context skip u16 + size u8
+        .chain([0x1B]) // VirtualFunction
+        .chain(compact(echo_name))
+        .chain([0x1D]) // IntConst 41
+        .chain(41i32.to_le_bytes())
+        .chain([0x16]) // EndFunctionParms
+        .collect::<Vec<u8>>();
+    // Return (1) + Context (1) + InstanceVariable (1 + object 4) + skip/size (3) +
+    // VirtualFunction (1 + name 4) + IntConst (1 + 4) + EndFunctionParms (1) = 21.
+    b.func(probe, 0, probe_r, &probe_code, 21, 0, DEFINED);
+
+    b.prop_with(target, probe, 0, &compact(0));
+    b.class(object, 0, 0);
+    b.class(actor, object, echo);
+    b.class(caller, actor, target);
+    b.build()
+}
+
+#[test]
+fn return_valued_bytecode_call_on_inactive_actor_runs_synchronously_under_diagnostic_scope() {
+    let set = set_of(probe_call_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    // item49b moved the call deferral behind the opt-in diagnostic scope (the xiii-tool baseline
+    // harness); this test runs under that scope, the only mode that still defers anything.
+    vm.set_diagnostic_call_scope(true);
+    let caller = vm.spawn(g(&set, "Caller"), "Caller").unwrap();
+    vm.set_active(caller, true);
+    let target = vm.spawn(g(&set, "Actor"), "Target").unwrap();
+    vm.set_property(
+        caller,
+        "Target",
+        0,
+        Value::Object(Some(ObjRef::Instance(target))),
+    );
+    // `Target` is a placed actor outside the executed scope. Executing `Probe`'s bytecode must
+    // still run the return-valued `Echo` synchronously (the engine's
+    // `execVirtualFunction -> UObject::CallFunction` runs the callee frame on any context);
+    // the old deferral error (`DeferredWithReturnValue`) aborted the whole calling chain.
+    let value = vm
+        .call_function(g(&set, "Caller.Probe"), caller, vec![])
+        .expect("a return-valued bytecode call on an inactive actor must run synchronously");
+    assert_eq!(value, Value::Int(41));
 }
 
 #[test]

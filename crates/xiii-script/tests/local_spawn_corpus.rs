@@ -206,6 +206,105 @@ fn gog_plage00_begin_play_gets_past_actor_spawn() {
     );
 }
 
+/// Opt-in corpus test (item61): the engine's `InitExecution` anti-piracy writes must land on
+/// real data — every level-placed `GenAlerte` carries `dummy = 2002` after `load_level`
+/// (XIDPawn.dll `?InitExecution@AGenAlerte@@UAEXXZ` 0x119015c9 writes 0x7d2 at this+0x21c), and
+/// the spawned GameInfo carries `DummyStuff1 = -326.27` / `DummyStuff2 = 823` (Engine.dll
+/// `?InitExecution@AGameInfo@@UAEXXZ` 0x103e0cb6/0x103e0cc0 writes 0xC3A3228F at +0x2c0 and
+/// 0x337 at +0x2c4). Without them, `IAController.Init`'s `TurnIntoSoldierInit` and
+/// `GenAlerte.PoteBeugle` buff every soldier (`Skill = 5`, `Health *= 5` / `*= 10`).
+#[test]
+fn gog_plage00_init_execution_writes_genalerte_dummy_and_gameinfo_dummystuff() {
+    let Some(root) = std::env::var_os("XIII_GOG_DIR") else {
+        println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let root = if root.is_relative() {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(&root)
+    } else {
+        root
+    };
+    let mut set = ScriptSet::new();
+    for path in find_by_ext(&root, "u") {
+        let data = std::fs::read(&path).expect("read package");
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let pkg = ScriptPackage::load(&name, data, &ScriptLimits::default(), &Limits::default())
+            .expect("parse package");
+        set.add(pkg);
+    }
+    let map_path = find_by_ext(&root, "unr")
+        .into_iter()
+        .find(|p| {
+            p.file_stem()
+                .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("Plage00"))
+        })
+        .expect("Plage00 map");
+    let map_data = std::fs::read(&map_path).expect("read map");
+    let map_pkg = ScriptPackage::load(
+        "Plage00",
+        map_data,
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("parse map");
+    let map = set.add(map_pkg);
+
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.survey = true;
+    let actors = vm.load_level(map, &Limits::default()).expect("load level");
+    let genalertes: Vec<ObjectId> = actors
+        .iter()
+        .copied()
+        .filter(|&id| vm.is_a(id, "GenAlerte"))
+        .collect();
+    assert!(
+        !genalertes.is_empty(),
+        "Plage00 is expected to place at least one GenAlerte actor"
+    );
+    for id in &genalertes {
+        assert_eq!(
+            vm.get_property(*id, "dummy"),
+            Some(&Value::Int(2002)),
+            "{} must carry the InitExecution dummy write",
+            vm.objects[*id as usize].name
+        );
+    }
+
+    let default_game = std::fs::read_to_string(root.join("system/Default.ini"))
+        .ok()
+        .and_then(|t| {
+            t.lines().find_map(|l| {
+                let l = l.trim();
+                l.strip_prefix("DefaultGame=").map(str::to_owned)
+            })
+        })
+        .expect("DefaultGame in Default.ini");
+    let game_class = default_game
+        .split_once('.')
+        .and_then(|(pkg, class)| find_class(&set, pkg, class))
+        .expect("GameInfo class");
+    let info = vm
+        .begin_play_with_game_info(&[], game_class)
+        .expect("begin play");
+    assert_eq!(
+        vm.get_property(info, "DummyStuff1"),
+        Some(&Value::Float(-326.27)),
+        "the spawned GameInfo must carry the InitExecution DummyStuff1 write"
+    );
+    assert_eq!((-326.27f32).to_bits(), 0xC3A3228F);
+    assert_eq!(vm.get_property(info, "DummyStuff2"), Some(&Value::Int(823)));
+    println!(
+        "Plage00 InitExecution writes: {} GenAlerte actors with dummy=2002, GameInfo DummyStuff1=-326.27/DummyStuff2=823",
+        genalertes.len()
+    );
+}
+
 /// Opt-in corpus test: the same opening chain with the diagnostic flat-floor physics provider
 /// must not leave `Actor.Move`/`Trace`/`SetLocation`/`FastTrace` in the survey's missing list,
 /// and reports what is still missing.

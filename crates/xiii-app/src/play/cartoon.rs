@@ -104,8 +104,8 @@ pub struct CartoonState {
     pub log: Vec<String>,
     /// One-shot chain diagnostic printed once.
     diagnosed: bool,
-    /// Last event time scanned for render-target/play-menu events.
-    last_event_time: f64,
+    /// Cumulative event cursor: render callbacks can emit multiple events at one VM time.
+    last_event_total: u64,
 }
 
 /// Render target size in texels (`Engine.RenderTargetMaterial` default `USize`/`VSize` = 256).
@@ -256,12 +256,14 @@ pub fn collect(
         }
     }
 
-    // Scan the retained presentation events for cartoon-path sounds and camera updates. The
-    // retained deque is time-ordered; the cursor skips everything already seen.
-    for (t, ev) in session.events.iter() {
-        if *t <= state.last_event_time + 0.0001 {
-            continue;
-        }
+    // HUD callbacks emit events after the fixed-step drain, often at the same VM timestamp as
+    // the preceding rendered frame. A time cursor discarded these, including updates at t=0.
+    let start = unseen_event_start(
+        session.event_total,
+        session.events.len(),
+        state.last_event_total,
+    );
+    for (t, ev) in session.events.iter().skip(start) {
         match ev {
             PresentationEvent::PlaySound(e) if e.actor.starts_with("XIIIBaseHud") => {
                 state.play_menus += 1;
@@ -297,7 +299,7 @@ pub fn collect(
             _ => {}
         }
     }
-    state.last_event_time = now;
+    state.last_event_total = session.event_total;
 
     if !state.diagnosed {
         state.diagnosed = true;
@@ -310,6 +312,27 @@ pub fn collect(
         ));
     }
     perf.span("cartoon_collect", t0);
+}
+
+fn unseen_event_start(total: u64, retained: usize, seen: u64) -> usize {
+    let unseen = if seen > total { total } else { total - seen };
+    retained.saturating_sub(unseen.min(retained as u64) as usize)
+}
+
+#[cfg(test)]
+mod event_cursor_tests {
+    use super::unseen_event_start;
+
+    #[test]
+    fn event_cursor_keeps_same_timestamp_updates_and_handles_retained_window_wrap() {
+        let timestamps = [0.0, 0.0, 0.0];
+        assert_eq!(&timestamps[unseen_event_start(3, 3, 1)..], &[0.0, 0.0]);
+        assert_eq!(unseen_event_start(3, 3, 3), 3);
+        assert_eq!(unseen_event_start(100, 64, 0), 0);
+        assert_eq!(unseen_event_start(100, 64, 98), 62);
+        assert_eq!(unseen_event_start(0, 0, 100), 0);
+        assert_eq!(unseen_event_start(3, 3, 100), 0);
+    }
 }
 
 /// Keeps the render-to-texture camera in sync with the script's requested panel view. Runs after
@@ -366,6 +389,9 @@ pub fn sync_render_target(
         let entity = commands
             .spawn((
                 Camera3d::default(),
+                // This camera sees the same forward decals as the player camera. Bevy's
+                // decal shader samples prepass_depth and cannot compile without this pass.
+                bevy::core_pipeline::prepass::DepthPrepass,
                 cam,
                 RenderTarget::Image(handle.clone().into()),
                 RenderLayers::layer(crate::viewer::MAIN_LAYER),
