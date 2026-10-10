@@ -232,6 +232,21 @@ pub enum PresentationEvent {
     SaveCheckpoint(SaveCheckpointEvent),
     /// A level-travel request (see [`TravelRequest`]).
     TravelRequest(TravelRequest),
+    /// `LevelInfo.SetPoisonEffect`: decoded render-interface request. Pixel rendering is Partial.
+    SetPoisonEffect {
+        /// Calling level actor.
+        actor: String,
+        /// Enable/disable request.
+        new_state: bool,
+        /// Transition delay passed unmodified to the renderer.
+        delay: f32,
+        /// Requested intensity, without clamping.
+        max_intensity: f32,
+        /// Requested RGBA color.
+        hue: [u8; 4],
+        /// VM time.
+        time: f64,
+    },
 }
 
 /// A checkpoint-save request decoded from `Actor.SaveAtCheckpoint`
@@ -262,6 +277,7 @@ impl PresentationEvent {
             Self::ReplaceTexture { actor, .. }
             | Self::RefreshDisplaying { actor, .. }
             | Self::SetInjuredEffect { actor, .. }
+            | Self::SetPoisonEffect { actor, .. }
             | Self::ProjectorAttach { actor, .. }
             | Self::ProjectorDetach { actor, .. }
             | Self::ProjectorAbandon { actor, .. }
@@ -282,6 +298,7 @@ impl PresentationEvent {
             Self::ReplaceTexture { time, .. }
             | Self::RefreshDisplaying { time, .. }
             | Self::SetInjuredEffect { time, .. }
+            | Self::SetPoisonEffect { time, .. }
             | Self::ProjectorAttach { time, .. }
             | Self::ProjectorDetach { time, .. }
             | Self::ProjectorAbandon { time, .. }
@@ -357,6 +374,17 @@ impl std::fmt::Display for PresentationEvent {
                 "SetInjuredEffect {actor} new_state={new_state} delay={delay:?}"
             ),
             Self::ProjectorAttach { actor, .. } => write!(f, "AttachProjector {actor}"),
+            Self::SetPoisonEffect {
+                actor,
+                new_state,
+                delay,
+                max_intensity,
+                hue,
+                ..
+            } => write!(
+                f,
+                "SetPoisonEffect {actor} new_state={new_state} delay={delay:?} max_intensity={max_intensity:?} hue={hue:?} [Partial: pixel effect unimplemented]"
+            ),
             Self::ProjectorDetach { actor, force, .. } => {
                 write!(f, "DetachProjector {actor} force={force}")
             }
