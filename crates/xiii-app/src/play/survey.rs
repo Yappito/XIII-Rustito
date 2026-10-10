@@ -781,13 +781,25 @@ fn run_one_map(
     let script = script::Script::parse("")?;
     let outcome =
         run_script_with_cinematic_input(game_dir, map, &script, params, &scene, duration)?;
+    let registry = xiii_script::registry::Registry::builtin();
+    for (path, (_, count)) in &outcome.session.vm().natives_used {
+        if let Some(def) = registry.defs().find(|d| {
+            d.path.eq_ignore_ascii_case(path)
+                || d.path
+                    .split_once('.')
+                    .is_some_and(|(_, p)| p.eq_ignore_ascii_case(path))
+        }) && let xiii_script::registry::NativeStatus::Partial(reason) = def.status
+        {
+            println!("[survey-partial] {map} {path} count={count} reason={reason}");
+        }
+    }
     Ok(extract(map, &outcome))
 }
 
 /// Extracts the survey record from a finished run. `map` is the surveyed map; the objective
 /// states are taken from that map's entry in `map_objectives` (the end-state session belongs to
 /// `final_map`, which differs only after a travel).
-fn extract(map: &str, outcome: &super::ScriptOutcome) -> MapSurvey {
+pub(super) fn extract(map: &str, outcome: &super::ScriptOutcome) -> MapSurvey {
     let session = &outcome.session;
     let vm = session.vm();
     let controller_name = session
@@ -1209,7 +1221,7 @@ fn classification_detail(survey: &MapSurvey) -> String {
 }
 
 /// Prints one map's detail block (called right after the map's run).
-fn print_details(survey: &MapSurvey) {
+pub(super) fn print_details(survey: &MapSurvey) {
     let m = &survey.map;
     println!(
         "[survey] {}: classification {} — {}",
@@ -1260,14 +1272,8 @@ fn print_details(survey: &MapSurvey) {
             "[survey] {m}: {} distinct failing actor(s):",
             survey.failures.len()
         );
-        for (actor, summary) in survey.failures.iter().take(12) {
+        for (actor, summary) in &survey.failures {
             println!("[survey] {m}:   {actor}: {summary}");
-        }
-        if survey.failures.len() > 12 {
-            println!(
-                "[survey] {m}:   ... and {} more (see the full log)",
-                survey.failures.len() - 12
-            );
         }
     }
     if !survey.missing_natives.is_empty() {

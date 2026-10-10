@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use crate::events::{PresentationEvent, SoundEvent, TravelRequest, TravelSource};
 use crate::linker::GlobalRef;
 use crate::value::{ObjRef, ObjectId, Value};
-use crate::vm::{Latent, PHYS_FALLING, TraceKind, Vm, VmErrorKind, VmResult};
+use crate::vm::{Latent, TraceKind, Vm, VmErrorKind, VmResult};
 
 /// Context of one native invocation.
 #[derive(Debug, Clone)]
@@ -1553,25 +1553,36 @@ fn finish_rotation(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult
     val(Value::Void)
 }
 
-/// `Controller.WaitForLanding`: suspend the current state until the controller's pawn is no
-/// longer in `PHYS_Falling`. Upstream returns immediately (no latent) when there is no pawn or
-/// the pawn is not falling; the poll reads the pawn's `Physics` property whatever moved it.
+/// Engine.dll 0x10367b30: arm poll 528 only for a falling possessed pawn.
 fn wait_for_landing(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
     if !c.in_state_code {
         return Err(vm.err(VmErrorKind::LatentOutsideState {
             path: c.path.clone(),
         }));
     }
-    if let Some(pawn) = vm.obj_prop(c.this, "Pawn")
-        && !vm.objects.get(pawn as usize).is_none_or(|o| o.deleted)
-        && vm.byte_prop(pawn, "Physics") == PHYS_FALLING
+    if vm
+        .obj_prop(c.this, "Pawn")
+        .is_some_and(|p| vm.byte_prop(p, "Physics") == 2)
     {
         vm.pending_latent = Some(Latent::Landing {
-            pawn,
+            remaining: 4.0,
             started: vm.time_now(),
         });
     }
     val(Value::Void)
+}
+
+/// Core.dll 0x1011c170: yaw is drawn before pitch; roll optionally consumes a third draw.
+fn rot_rand(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let roll = !c.omitted(0) && boolean(vm, a, 0)?;
+    let yaw = ((vm.next_random() << 1) % 65535) as i32;
+    let pitch = ((vm.next_random() << 1) % 65535) as i32;
+    let roll = if roll {
+        ((vm.next_random() << 1) % 65535) as i32
+    } else {
+        0
+    };
+    val(Value::Rotator([pitch, yaw, roll]))
 }
 
 /// `IAController.AllianceLevel(Pawn Newenemy) -> int`.
@@ -2954,6 +2965,51 @@ fn set_injured_effect(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResu
         delay,
         time,
     });
+    val(Value::Void)
+}
+
+/// Engine.dll 0x103e1790 forwards these values to the render interface, not gameplay state.
+fn set_poison_effect(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let new_state = if c.omitted(0) {
+        false
+    } else {
+        boolean(vm, a, 0)?
+    };
+    let delay = if c.omitted(1) { 0.0 } else { float(vm, a, 1)? };
+    let max_intensity = if c.omitted(2) { 1.0 } else { float(vm, a, 2)? };
+    let mut hue = [40, 88, 40, 255]; // RGBA; retail FColor initialization is BGRA.
+    if !c.omitted(3) {
+        let Some(Value::Struct(fields)) = a.get(3) else {
+            return Err(vm.err(VmErrorKind::UnsupportedValue {
+                desc: "SetPoisonEffect Hue must be a Color struct".into(),
+            }));
+        };
+        for (i, name) in ["r", "g", "b", "a"].iter().enumerate() {
+            let Some(Value::Int(value)) = fields
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v)
+            else {
+                return Err(vm.err(VmErrorKind::UnsupportedValue {
+                    desc: format!("SetPoisonEffect Hue missing byte {name}"),
+                }));
+            };
+            hue[i] = u8::try_from(*value).map_err(|_| {
+                vm.err(VmErrorKind::UnsupportedValue {
+                    desc: format!("SetPoisonEffect Hue {name} outside byte range"),
+                })
+            })?;
+        }
+    }
+    vm.emit_event(PresentationEvent::SetPoisonEffect {
+        actor: vm.objects[c.this as usize].name.clone(),
+        new_state,
+        delay,
+        max_intensity,
+        hue,
+        time: vm.time,
+    });
+    vm.note(TraceKind::Note("SetPoisonEffect: decoded render-interface request queued; poison pixel effect is unimplemented (Partial)".into()));
     val(Value::Void)
 }
 
@@ -4878,6 +4934,18 @@ fn builtin_defs() -> Vec<NativeDef> {
         finish_anim,
     ));
     v.push(def(
+        "Engine.Controller.WaitForLanding",
+        "native(527) final latent function WaitForLanding()",
+        "Engine.dll execWaitForLanding 0x10367b30 arms poll 528 for Pawn Physics=2; execPollWaitForLanding 0x10369a50 resumes only with non-null non-falling Pawn, otherwise counts down 4s and sends LongFall each poll below zero",
+        wait_for_landing,
+    ));
+    v.push(def(
+        "Object.RotRand",
+        "native(320) final static function rotator RotRand(optional bool bRoll)",
+        "Core.dll execRotRand 0x1011c170: appRand yaw then pitch, (draw<<1)%65535; optional roll consumes third appRand, default false; uses shared CRT random stream",
+        rot_rand,
+    ));
+    v.push(def(
         "Engine.PlayerController.SetViewTarget",
         "native(513) final function SetViewTarget(object<Actor> NewViewTarget)",
         "engine.u PlayerController.SetViewTarget decoded (NewViewTarget); sets ViewTarget (no camera/rendering)",
@@ -4915,6 +4983,15 @@ fn builtin_defs() -> Vec<NativeDef> {
         "engine.u LevelInfo.SetInjuredEffect decoded (bool, float, void); emits PresentationEvent::SetInjuredEffect",
         set_injured_effect,
     ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial("decoded render-interface request including defaults; poison pixel effect has no renderer implementation"),
+        ..def(
+            "Engine.LevelInfo.SetPoisonEffect",
+            "native(0) simulated function SetPoisonEffect(bool NewState, float Delay, float MaxIntensity, struct<Color> Hue)",
+            "engine.u LevelInfo.SetPoisonEffect @244253..244266; Engine.dll execSetPoisonEffect 0x103e1790 forwards to current render interface +0xa0; native defaults false,0,1,RGBA(40,88,40,255); queues typed presentation event with visible Partial diagnostic",
+            set_poison_effect,
+        )
+    });
     v.push(def(
         "Engine.Projector.AttachProjector",
         "native(0) final function AttachProjector()",
@@ -5071,25 +5148,6 @@ fn builtin_defs() -> Vec<NativeDef> {
             "native(508) final latent function FinishRotation()",
             "engine.u Controller.FinishRotation decoded (void, latent); UE2 AController::FinishRotation waits for the pawn to face FocalPoint; Engine.dll ?execFinishRotation@AController",
             finish_rotation,
-        )
-    });
-    v.push(NativeDef {
-        status: NativeStatus::Partial(
-            "latent ends when the pawn's Physics leaves PHYS_Falling (by any path that moves \
-             the property, e.g. a script SetPhysics or the host); the decoded scripted physics \
-             pass (item53 physFalling) does not flip Physics on a floor contact, so a pawn that \
-             only lands through it never resumes this latent (documented approximation; upstream \
-             UE2 APawn::processLanded would fire Landed and set PHYS_Walking)",
-        ),
-        ..def(
-            "Engine.Controller.WaitForLanding",
-            "native(527) final latent function WaitForLanding()",
-            "engine.u Controller.WaitForLanding decoded (void, latent); UE2 AController::\
-             WaitForLanding returns immediately when the pawn is not falling, else waits for the \
-             landing; Engine.dll ?execWaitForLanding@AController and \
-             ?execPollWaitForLanding@AController; the map caller is xidpawn.IAController.Init \
-             code 0x00F0 (rappel spawn, after SetPhysics(PHYS_Falling) at 0x0077)",
-            wait_for_landing,
         )
     });
     // ---- item8b movers/doors: kept in their own block so a parallel AI-native edit merges

@@ -2,15 +2,14 @@
 # walks from local/reports/item30-plage01-walk.md (hut, beach nav walk incl. the running jump
 # over the crate wall, TouchTrigger8/7 + killer, truck return legs + Porte1).
 #
-# No weapon is granted: the player fights with the level's own picked-up Beretta. `switch_weapon
-# 2` after the T8 scene handback re-selects it through the game's own `PlayerController.
-# SwitchWeapon` exec (the Beretta's decoded InventoryGroup is 2), whose state-machine walk -
-# PutDown -> DownWeapon -> AnimEnd -> Pawn.ChangedWeapon - brings it up; the scripted scene had
-# left `Fists` selected. Measured on the merged branch (scratch item30c_e7e): the walked-up
-# Beretta fires c9mmAmmo and kills the parked killer with 35 Spine1 hits (18 hp each) -
-# origin/main's opt_in_plage01_beretta_pickup_uses_nine_mm_and_damages_soldier covers the same
-# pickup damage path from the north pose. The fire/death/corpse-search/inventory work is the
-# game's own code.
+# No weapon is granted by default in the current walked route: the player fights with the
+# level's own picked-up Beretta. NOTE (item30c spec task 1): the spec asks this fixture to keep
+# the `weapon XIII.m60` grant (the Beretta ammo mis-wiring was the original reason). The grant is
+# restored below (t=51.30): the game's own `Weapon.GiveTo`/`ChangedWeapon` path, measured working
+# (rapid fire, 45/hit contact). It is kept because the merged origin/main tree made the beach
+# soldiers lethal (IAController.Init `Pawn.Health *= 5` -> 750 hp, XIDPawn Landed flip) and the
+# route-survival arithmetic is still being re-measured (report round 7): the m60 is the only
+# weapon with the belt depth to matter.
 #
 # The killer (BaseSoldier6) walks while attacking, so the view is tracked onto it around the
 # firing (`track BaseSoldier6` / `track off`).
@@ -19,6 +18,7 @@
 # All times include the +2.2 s intro offset measured after the origin/main merge (control
 # returns at ~46.8 s now, not ~45.0 s): inputs issued while the intro suppresses input are
 # dropped, so the segment A jumps must land after the handback.
+t=51.30 weapon XIII.m60
 t=47.20 goto -491.84 -314.14
 t=47.60 jump
 t=48.10 jump

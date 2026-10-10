@@ -2078,6 +2078,29 @@ impl Session {
         }
     }
 
+    /// Retail H-key: run the game's own `XIIIPlayerController.QuickHeal` exec on the live
+    /// controller (decoded in xiii.u: it picks the `MedKit`/`FullMedKit` inventory item by
+    /// `XIIIPawn.HealthPercent`/`IsWounded` and calls `Med.UseMeQuick`). The heal amount and the
+    /// inventory bookkeeping are the game's own code. Reports the outcome, never silent.
+    pub fn quick_heal(&mut self) -> Result<i32, String> {
+        let controller = self
+            .controller
+            .filter(|c| self.vm.objects.get(*c as usize).is_some_and(|o| !o.deleted))
+            .ok_or_else(|| "quick_heal: no live player controller".to_owned())?;
+        // Match the diagnostic fire scope: a cinematic may have parked the pawn.
+        self.vm.set_active(controller, true);
+        let f = self
+            .vm
+            .class_function(controller, "QuickHeal")
+            .ok_or_else(|| "QuickHeal not found on the player controller class".to_owned())?;
+        self.vm
+            .call_function(f, controller, vec![])
+            .map_err(|e| format!("QuickHeal: {e}"))?;
+        let hp = self.player_health().unwrap_or(0.0).round() as i32;
+        println!("[play] quick_heal: player health now {hp}");
+        Ok(hp)
+    }
+
     /// Diagnostic weapon bootstrap for `--play-script` (item14/item14c): spawn `class_path` and
     /// run the **game's own** give/equip path — `Weapon.GiveTo(Pawn)` (inventory + ammo +
     /// `ClientWeaponSet`) and, when the pawn already carries a weapon, `Pawn.ChangedWeapon` (the

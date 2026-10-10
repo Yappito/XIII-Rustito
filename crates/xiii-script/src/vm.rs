@@ -423,16 +423,10 @@ pub enum Latent {
         /// VM time when it started.
         started: f64,
     },
-    /// `Controller.WaitForLanding`: wait until its pawn is no longer in `PHYS_Falling`
-    /// (Engine.dll `?execWaitForLanding@AController` / `?execPollWaitForLanding@AController`).
-    /// The poll runs against the pawn's `Physics` property whatever moved it (a script
-    /// `SetPhysics`, the host's writes); the decoded scripted-physics pass
-    /// ([`Vm::advance_scripted_physics`]) does not flip `Physics` on a floor contact (see
-    /// [`Vm::integrate_falling`]), so a pawn that only lands through that pass never resumes
-    /// this latent (documented approximation).
+    /// `Controller.WaitForLanding`: wait for a non-null pawn to stop falling.
     Landing {
-        /// Pawn the landing is waited on.
-        pawn: ObjectId,
+        /// Countdown to repeated `LongFall` callbacks (not a release timeout).
+        remaining: f32,
         /// VM time when it started.
         started: f64,
     },
@@ -3470,6 +3464,22 @@ impl<'s> Vm<'s> {
 
     /// Writes a property by name and element.
     pub fn set_property(&mut self, id: ObjectId, name: &str, elem: usize, v: Value) -> bool {
+        if std::env::var_os("XIII_PROBE_PAWNS").is_some()
+            && self
+                .objects
+                .get(id as usize)
+                .is_some_and(|o| o.is_actor && o.layout.chain_names.iter().any(|c| c == "xiiipawn"))
+            && name.eq_ignore_ascii_case("health")
+        {
+            let writer = self.stack.last().map_or("<host>", |s| s.function.as_str());
+            eprintln!(
+                "[vm-npchealth] t={:.3} pawn={} writer={} value={}",
+                self.time,
+                self.objects[id as usize].name,
+                writer,
+                self.value_text(&v)
+            );
+        }
         if std::env::var_os("XIII_WATCH_PLAYER_HEALTH").is_some()
             && self.objects.get(id as usize).is_some_and(|o| {
                 o.is_actor && o.layout.chain_names.iter().any(|c| c == "xiiiplayerpawn")
@@ -3821,6 +3831,27 @@ impl<'s> Vm<'s> {
             return Ok(None);
         };
         let texts: Vec<String> = args.iter().map(|a| self.value_text(a)).collect();
+        // TEMPORARY scratch probe (XIII_PROBE_PAWNS): attribute player TakeDamage.
+        if std::env::var_os("XIII_PROBE_PAWNS").is_some()
+            && event.eq_ignore_ascii_case("TakeDamage")
+            && self.is_a(id, "XIIIPlayerPawn")
+        {
+            let instigator = match args.get(3) {
+                Some(Value::Object(Some(crate::value::ObjRef::Instance(i)))) => self
+                    .objects
+                    .get(*i as usize)
+                    .map(|x| x.name.clone())
+                    .unwrap_or("?".into()),
+                _ => "none".into(),
+            };
+            eprintln!(
+                "[vm-dmg] t={:.3} target={} instigator={} args={}",
+                self.time,
+                self.objects[id as usize].name,
+                instigator,
+                texts.join(", ")
+            );
+        }
         self.note(TraceKind::Event {
             target: actor,
             function: self.short_path(f),
@@ -3983,7 +4014,128 @@ impl<'s> Vm<'s> {
         }
         self.dispatch_player_ticks(dt)?;
         self.detect_server_travel();
+        self.probe_pawns();
         Ok(())
+    }
+
+    /// TEMPORARY scratch probe (XIII_PROBE_PAWNS): pawn states once a second. Removed before
+    /// finishing.
+    fn probe_pawns(&self) {
+        if std::env::var_os("XIII_PROBE_PAWNS").is_none() || !self.tick_count.is_multiple_of(60) {
+            return;
+        }
+        for id in 0..self.objects.len() as ObjectId {
+            let o = &self.objects[id as usize];
+            if !o.is_actor || o.name.starts_with("Default__") {
+                continue;
+            }
+            let class = self.set.path(o.class).to_ascii_lowercase();
+            if class.contains("pick") || class.contains("clip") || class.contains("ammobox") {
+                let loc = self
+                    .vector_prop(id, "Location")
+                    .map(|l| format!("({:.0},{:.0},{:.0})", l[0], l[1], l[2]))
+                    .unwrap_or("?".into());
+                let flags: Vec<String> = ["bCollideActors", "bBlockActors"]
+                    .into_iter()
+                    .map(|n| format!("{n}={}", self.bool_prop(id, n)))
+                    .collect();
+                let cr = self
+                    .get_property(id, "CollisionRadius")
+                    .map(|v| format!("{v:?}"))
+                    .unwrap_or_default();
+                let ch = self
+                    .get_property(id, "CollisionHeight")
+                    .map(|v| format!("{v:?}"))
+                    .unwrap_or_default();
+                let st = self
+                    .get_property(id, "bPickable")
+                    .map(|v| format!("bPickable={v:?}"))
+                    .unwrap_or_default();
+                eprintln!(
+                    "[vm-pickup] {} class={} loc={} cr={cr} ch={ch} {st} {}",
+                    o.name,
+                    class,
+                    loc,
+                    flags.join(" ")
+                );
+                if o.name == "MedPick0" || o.name == "FullMedPick0" {
+                    let player = (0..self.objects.len() as ObjectId).find(|i| {
+                        self.objects[*i as usize].is_actor
+                            && !self.objects[*i as usize].deleted
+                            && self.is_a(*i, "XIIIPlayerPawn")
+                    });
+                    if let Some(player) = player {
+                        let overlap = self.actors_overlap(player, id);
+                        let pcollides = self.collides(player);
+                        let (pl, pr, ph) = self.actor_cylinder(player);
+                        let (ml, mr, mh) = self.actor_cylinder(id);
+                        let touching = self.touching_list(player);
+                        let touch_names: Vec<String> = touching
+                            .iter()
+                            .map(|t| self.objects[*t as usize].name.clone())
+                            .collect();
+                        eprintln!(
+                            "[vm-pickup-dbg] player_overlap={overlap} pcollides={pcollides} player=({:.0},{:.0},{:.0}) r={pr} h={ph} med=({:.0},{:.0},{:.0}) r={mr} h={mh} player_touching={touch_names:?}",
+                            pl[0], pl[1], pl[2], ml[0], ml[1], ml[2]
+                        );
+                    }
+                }
+            }
+        }
+        for id in 0..self.objects.len() as ObjectId {
+            let o = &self.objects[id as usize];
+            if !o.active || !o.is_actor || !self.is_a(id, "Pawn") {
+                continue;
+            }
+            let mut items = Vec::new();
+            let mut cur = self.obj_prop(id, "Inventory");
+            let mut guard = 0;
+            while let Some(iid) = cur {
+                guard += 1;
+                if guard > 20 {
+                    break;
+                }
+                let ic = self.set.path(self.objects[iid as usize].class);
+                let amt = match self.get_property(iid, "AmmoAmount") {
+                    Some(Value::Int(a)) => format!(" {a}"),
+                    _ => String::new(),
+                };
+                items.push(format!("{}({})", ic, amt));
+                cur = self.obj_prop(iid, "Inventory");
+            }
+            if !items.is_empty() {
+                eprintln!(
+                    "[vm-inv] t={:.0} {} inventory={}",
+                    self.time,
+                    o.name,
+                    items.join(" -> ")
+                );
+            }
+        }
+        for id in 0..self.objects.len() as ObjectId {
+            let o = &self.objects[id as usize];
+            if !o.active || !o.is_actor || !self.is_a(id, "Pawn") {
+                continue;
+            }
+            let loc = self
+                .vector_prop(id, "Location")
+                .map(|l| format!("({:.0},{:.0},{:.0})", l[0], l[1], l[2]))
+                .unwrap_or("?".into());
+            let phys = self.byte_prop(id, "Physics").to_string();
+            let hp = match self.get_property(id, "Health") {
+                Some(Value::Int(h)) => format!("{h}"),
+                Some(Value::Float(h)) => format!("{h:.0}"),
+                _ => "?".into(),
+            };
+            let enemy = match self.obj_prop(id, "Enemy") {
+                Some(e) => self.objects[e as usize].name.clone(),
+                None => "None".into(),
+            };
+            eprintln!(
+                "[vm-probe] t={:.3} pawn={} loc={} phys={} hp={} enemy={}",
+                self.time, o.name, loc, phys, hp, enemy
+            );
+        }
     }
 
     /// Reports a level-travel request when the script called `LevelInfo.ServerTravel` and the
@@ -4149,6 +4301,7 @@ impl<'s> Vm<'s> {
             self.profile.player_tick_dispatch_micros += t0.elapsed().as_micros() as u64;
         }
         self.detect_server_travel();
+        self.probe_pawns();
         errors
     }
 
@@ -4679,6 +4832,30 @@ impl<'s> Vm<'s> {
                         started,
                     });
                 }
+                Some(Latent::Landing { remaining, started }) => {
+                    // Retail poll 528: losing possession does NOT release this latent.
+                    let landed = self
+                        .obj_prop(id, "Pawn")
+                        .is_some_and(|p| self.byte_prop(p, "Physics") != PHYS_FALLING);
+                    if !landed {
+                        let remaining = remaining - dt;
+                        if let Some(c) = self.objects[id as usize].state_code.as_mut() {
+                            c.latent = Some(Latent::Landing { remaining, started });
+                        }
+                        if remaining < 0.0 {
+                            self.send_event(id, "LongFall", Vec::new())?;
+                        }
+                        return Ok(());
+                    }
+                    if let Some(c) = self.objects[id as usize].state_code.as_mut() {
+                        c.latent = None;
+                    }
+                    self.note(TraceKind::LatentResume {
+                        actor: self.objects[id as usize].name.clone(),
+                        native: "Controller.WaitForLanding".into(),
+                        started,
+                    });
+                }
                 Some(Latent::Rotation { started }) => {
                     if !self.focus_rotation_complete(id) {
                         return Ok(());
@@ -4690,26 +4867,6 @@ impl<'s> Vm<'s> {
                     self.note(TraceKind::LatentResume {
                         actor,
                         native: "Controller.FinishRotation".into(),
-                        started,
-                    });
-                }
-                Some(Latent::Landing { pawn, started }) => {
-                    // `Controller.WaitForLanding`: resume once the pawn left PHYS_Falling — by
-                    // any path that moved its `Physics` (script SetPhysics, the host's writes;
-                    // the decoded physics pass does not flip it, see `integrate_falling`). A
-                    // gone pawn resumes like upstream's `!Pawn` check.
-                    let landed = !self.is_live_actor(pawn)
-                        || self.byte_prop(pawn, "Physics") != PHYS_FALLING;
-                    if !landed {
-                        return Ok(());
-                    }
-                    if let Some(c) = self.objects[id as usize].state_code.as_mut() {
-                        c.latent = None;
-                    }
-                    let actor = self.objects[id as usize].name.clone();
-                    self.note(TraceKind::LatentResume {
-                        actor,
-                        native: "Controller.WaitForLanding".into(),
                         started,
                     });
                 }
@@ -4858,7 +5015,7 @@ impl<'s> Vm<'s> {
                         Latent::Landing { .. } => self.note(TraceKind::LatentStart {
                             actor,
                             native,
-                            seconds: 0.0,
+                            seconds: 4.0,
                         }),
                         Latent::Move {
                             pawn,
@@ -4909,6 +5066,27 @@ impl<'s> Vm<'s> {
         this: ObjectId,
         args: Vec<Value>,
     ) -> VmResult<Value> {
+        // TEMPORARY scratch probe (XIII_PROBE_PAWNS): attribute player TakeDamage.
+        if std::env::var_os("XIII_PROBE_PAWNS").is_some() && self.is_a(this, "XIIIPlayerPawn") {
+            let path = self.set.path(func);
+            if path.ends_with("TakeDamage") {
+                let texts: Vec<String> = args.iter().map(|a| self.value_text(a)).collect();
+                let instigator = match args.get(1) {
+                    Some(Value::Object(Some(crate::value::ObjRef::Instance(i)))) => self
+                        .objects
+                        .get(*i as usize)
+                        .map(|x| x.name.clone())
+                        .unwrap_or("?".into()),
+                    _ => "none".into(),
+                };
+                eprintln!(
+                    "[vm-dmg] t={:.3} instigator={} args={}",
+                    self.time,
+                    instigator,
+                    texts.join(", ")
+                );
+            }
+        }
         let set = self.set;
         let Some(ScriptObject::Function(f)) = set.object(func) else {
             return Err(self.err(VmErrorKind::Unresolved {
@@ -4951,6 +5129,40 @@ impl<'s> Vm<'s> {
         layout: Rc<FuncLayout>,
     ) -> VmResult<(Value, Vec<Value>)> {
         let set = self.set;
+        // TEMPORARY scratch probe (XIII_PROBE_PAWNS): attribute player TakeDamage.
+        if std::env::var_os("XIII_PROBE_PAWNS").is_some()
+            && set.path(func).ends_with("TakeDamage")
+            && !self.is_a(this, "XIIIPlayerPawn")
+            && self.is_a(this, "Pawn")
+        {
+            let texts: Vec<String> = locals.iter().map(|a| self.value_text(a)).collect();
+            eprintln!(
+                "[vm-npcdmg] t={:.3} target={} locals={}",
+                self.time,
+                self.objects[this as usize].name,
+                texts.join(", ")
+            );
+        }
+        if std::env::var_os("XIII_PROBE_PAWNS").is_some()
+            && set.path(func).ends_with("TakeDamage")
+            && self.is_a(this, "XIIIPlayerPawn")
+        {
+            let texts: Vec<String> = locals.iter().map(|a| self.value_text(a)).collect();
+            let instigator = match locals.get(1) {
+                Some(Value::Object(Some(crate::value::ObjRef::Instance(i)))) => self
+                    .objects
+                    .get(*i as usize)
+                    .map(|x| x.name.clone())
+                    .unwrap_or("?".into()),
+                _ => "none".into(),
+            };
+            eprintln!(
+                "[vm-dmg] t={:.3} instigator={} locals={}",
+                self.time,
+                instigator,
+                texts.join(", ")
+            );
+        }
         if self.stack.len() >= self.limits.max_call_depth {
             return Err(self.err(VmErrorKind::CallDepthExceeded {
                 limit: self.limits.max_call_depth,
@@ -9600,13 +9812,15 @@ impl<'s> Vm<'s> {
     }
 
     /// `PHYS_Falling`: gravity (+ `Acceleration`) integrated into `Velocity`, then one swept
-    /// move ([`Vm::integrate_move`]). A floor-grade contact zeroes the contact velocity (the
-    /// engine's `Landed` -> `PHYS_Walking` + ground friction, decoded) but does not flip
-    /// `Physics` or dispatch `Landed` — the host owns the player pawn's landing
-    /// (`Session::step` writes `Physics` every tick and sends the player's `Landed` itself), and
-    /// the placed pawns' `Physics` stays as the map script set it. A
-    /// `Controller.WaitForLanding` latent therefore only resumes when something else moves the
-    /// pawn's `Physics` out of `PHYS_Falling` (documented approximation; see the registry note).
+    /// move ([`Vm::integrate_move_sliding`]). A floor-grade contact (`normal.Z > 0.7`) zeroes
+    /// the contact velocity (the engine's `Landed` -> ground friction, decoded) and switches a
+    /// still-`PHYS_Falling` pawn to `PHYS_Walking` — the engine's own `APawn::processLanded`
+    /// fallback (Engine.dll 0x103c188d/0x103c18cb, upstream evidence cited at the switch
+    /// below; measured on Toits01 Cine0, probe24c). `Landed` itself is not dispatched: the
+    /// host owns the player pawn's landing (`Session::step` writes `Physics` every tick and
+    /// sends the player's `Landed` itself), and the placed pawns' `Landed` events are not run
+    /// by the physics pass (documented approximation; a pawn that only lands through this pass
+    /// resumes a `Controller.WaitForLanding` latent through the `PHYS_Walking` flip).
     ///
     /// The engine scales the gravity by `1 - GetNetBuoyancy/Mass`
     /// (`AActor::physFalling` 0x103bfe99-0x103bfeb8), but `GetNetBuoyancy` (0x103bbf50) does

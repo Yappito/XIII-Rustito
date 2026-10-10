@@ -1063,10 +1063,13 @@ fn registry_entries_are_documented() {
     // fix adds `PlayerController.AdjustAimForDisplay` (498); item49b adds
     // `Actor.DetachFromBone` (403); item51b adds the decoded `BaseSoldier.EyePosition`
     // (XIDPawn.dll 0x119012b0) and `BloodFlow.GrowBloodFlow` (Xiii.dll 0x11b01000); item48 adds
-    // `Actor.VisibleDamageableActors` and `Actor.WaveHasPosition`; the item30 Plage01 walk adds
-    // the latent `Engine.Controller.WaitForLanding` (527) and `Actor.AnimIsInGroup` (395).
-    // Must equal `Registry::builtin().defs().count()`.
-    assert_eq!(defs.len(), 339);
+    // `Actor.VisibleDamageableActors` and `Actor.WaveHasPosition`. Must equal
+    // `Registry::builtin().defs().count()`.
+    // item55 adds RotRand, WaitForLanding and the decoded SetPoisonEffect request. The
+    // item30c merge keeps this branch's `Actor.AnimIsInGroup` (395, round-4 ChangedWeapon
+    // caller) on top of main's set (main's own decoded `Controller.WaitForLanding` is the
+    // single 527 entry; the branch's duplicate registry def was removed in the merge).
+    assert_eq!(defs.len(), 341);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -2330,6 +2333,267 @@ fn item51_retail_frand_stream_includes_endpoint_and_rand_shares_state() {
         },
     );
     assert_eq!(zero.rand_float(), 0.0);
+}
+
+#[test]
+fn item55_rotrand_draw_order_optional_roll_and_crt_endpoint() {
+    let set = spawn_set();
+    let mut vm = Vm::new(
+        &set,
+        VmLimits {
+            rng_seed: 1,
+            ..VmLimits::default()
+        },
+    );
+    let object = vm.spawn(sg(&set, "Actor"), "Random").unwrap();
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Object.RotRand",
+            object,
+            &[true],
+            &mut [Value::Void]
+        ),
+        NativeOutcome::Value(Value::Rotator([36934, 82, 0]))
+    );
+    // Omitted roll consumes precisely two draws; Rand shares the same CRT stream.
+    assert_eq!(vm.next_random(), 6334);
+    let mut with_roll = Vm::new(
+        &set,
+        VmLimits {
+            rng_seed: 1,
+            ..VmLimits::default()
+        },
+    );
+    let object = with_roll.spawn(sg(&set, "Actor"), "Random").unwrap();
+    assert_eq!(
+        call_native(
+            &mut with_roll,
+            "Object.RotRand",
+            object,
+            &[false],
+            &mut [Value::Bool(true)]
+        ),
+        NativeOutcome::Value(Value::Rotator([36934, 82, 12668]))
+    );
+    assert_eq!(with_roll.next_random(), 26500);
+    let mut endpoint = Vm::new(
+        &set,
+        VmLimits {
+            rng_seed: 0x1_f01b_f641,
+            ..VmLimits::default()
+        },
+    );
+    let object = endpoint.spawn(sg(&set, "Actor"), "Endpoint").unwrap();
+    let NativeOutcome::Value(Value::Rotator(rotation)) = call_native(
+        &mut endpoint,
+        "Object.RotRand",
+        object,
+        &[false],
+        &mut [Value::Bool(false)],
+    ) else {
+        panic!("rotator")
+    };
+    assert_eq!(
+        rotation[1], 65534,
+        "CRT maximum is not masked to 65535 or scaled by FRand"
+    );
+    assert_eq!(rotation[2], 0);
+    assert!(
+        try_native(
+            &mut endpoint,
+            "Object.RotRand",
+            object,
+            &[false],
+            &mut [Value::Vector([0.0; 3])]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn item55_wait_for_landing_lost_pawn_and_longfall_do_not_release_wait() {
+    let set = item55_landing_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let controller = vm.spawn(pg(&set, "Controller"), "Controller").unwrap();
+    let pawn = vm.spawn(pg(&set, "Pawn"), "Pawn").unwrap();
+    vm.set_property(
+        controller,
+        "Pawn",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    let def = native("Engine.Controller.WaitForLanding");
+    let mut c = ctx(controller, &[], "Controller.WaitForLanding");
+    assert!(matches!(
+        (def.f)(&mut vm, &c, &mut []).unwrap_err().kind,
+        VmErrorKind::LatentOutsideState { .. }
+    ));
+    c.in_state_code = true;
+    // Non-falling and unpossessed calls complete immediately.
+    vm.set_property(pawn, "Physics", 0, Value::Int(1));
+    (def.f)(&mut vm, &c, &mut []).unwrap();
+    assert!(vm.pending_latent.is_none());
+    vm.set_property(controller, "Pawn", 0, Value::Object(None));
+    (def.f)(&mut vm, &c, &mut []).unwrap();
+    assert!(vm.pending_latent.is_none());
+    vm.set_property(
+        controller,
+        "Pawn",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    vm.set_property(pawn, "Physics", 0, Value::Int(2));
+    vm.set_active(controller, true);
+    vm.goto_state(controller, "Landing", None).unwrap();
+    vm.tick(0.0).unwrap();
+    // Exact 4s boundary: callback starts strictly below zero, not at zero.
+    for _ in 0..16 {
+        vm.tick(0.25).unwrap();
+    }
+    assert!(
+        !vm.trace
+            .iter()
+            .any(|e| matches!(&e.kind, TraceKind::NoHandler { event, .. } if event == "LongFall"))
+    );
+    vm.set_property(controller, "Pawn", 0, Value::Object(None));
+    for _ in 0..3 {
+        vm.tick(0.25).unwrap();
+    }
+    assert_eq!(
+        vm.trace
+            .iter()
+            .filter(
+                |e| matches!(&e.kind, TraceKind::NoHandler { event, .. } if event == "LongFall")
+            )
+            .count(),
+        3
+    );
+    assert!(
+        !vm.trace
+            .iter()
+            .any(|e| matches!(&e.kind, TraceKind::StateStop { actor } if actor == "Controller"))
+    );
+    vm.set_property(
+        controller,
+        "Pawn",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    vm.set_property(pawn, "Physics", 0, Value::Int(1));
+    vm.tick(0.01).unwrap();
+    assert!(vm.trace.iter().any(|e| matches!(&e.kind, TraceKind::LatentResume { native, .. } if native == "Controller.WaitForLanding")));
+    assert!(
+        vm.trace
+            .iter()
+            .any(|e| matches!(&e.kind, TraceKind::StateStop { actor } if actor == "Controller")),
+        "state reaches Stop after landing"
+    );
+}
+
+#[test]
+fn item55_poison_effect_preserves_arguments_defaults_and_rejects_bad_color() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let level = vm.spawn(pg(&set, "LevelInfo"), "Level").unwrap();
+    let hue = Value::Struct(vec![
+        ("b".into(), Value::Int(13)),
+        ("g".into(), Value::Int(29)),
+        ("r".into(), Value::Int(71)),
+        ("a".into(), Value::Int(103)),
+    ]);
+    let mut args = [
+        Value::Bool(true),
+        Value::Float(-2.0),
+        Value::Float(1.75),
+        hue,
+    ];
+    assert_eq!(
+        call_native(
+            &mut vm,
+            "Engine.LevelInfo.SetPoisonEffect",
+            level,
+            &[false; 4],
+            &mut args
+        ),
+        NativeOutcome::Value(Value::Void)
+    );
+    assert!(
+        matches!(&vm.drain_events()[0], crate::events::PresentationEvent::SetPoisonEffect {
+        new_state: true, delay, max_intensity, hue: [71,29,13,103], ..
+    } if *delay == -2.0 && *max_intensity == 1.75)
+    );
+    call_native(
+        &mut vm,
+        "Engine.LevelInfo.SetPoisonEffect",
+        level,
+        &[true; 4],
+        &mut [const { Value::Void }; 4],
+    );
+    assert!(
+        matches!(&vm.drain_events()[0], crate::events::PresentationEvent::SetPoisonEffect {
+        new_state: false, delay, max_intensity, hue: [40,88,40,255], ..
+    } if *delay == 0.0 && *max_intensity == 1.0)
+    );
+    // Malformed Hue must neither silently whiten/clamp nor enqueue success.
+    args[3] = Value::Struct(vec![("r".into(), Value::Int(256))]);
+    assert!(
+        try_native(
+            &mut vm,
+            "Engine.LevelInfo.SetPoisonEffect",
+            level,
+            &[false; 4],
+            &mut args
+        )
+        .is_err()
+    );
+    assert!(vm.drain_events().is_empty());
+    assert!(vm.trace.iter().any(|e| matches!(&e.kind, TraceKind::Note(n) if n.contains("poison pixel effect is unimplemented"))));
+}
+
+/// Authored package tests the actual latent opcode/state dispatch, without corpus bytes.
+fn item55_landing_set() -> ScriptSet {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "Controller");
+    let physics = b.reserve(IMP_BYTEPROP, actor, "Physics");
+    let pawn_prop = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
+    let wait = b.reserve(IMP_FUNCTION, controller, "WaitForLanding");
+    let landing = b.reserve(IMP_STATE, controller, "Landing");
+    b.prop_with(physics, 0, 0, &compact(0));
+    b.prop_with(pawn_prop, wait, 0, &compact(pawn));
+    b.func(
+        wait,
+        landing,
+        0,
+        &[],
+        0,
+        527,
+        ff::FINAL | ff::NATIVE | ff::LATENT,
+    );
+    let mut code = vec![0x62, 0x0f, 0x16, 0x08, 0x0c];
+    code.extend(compact(b.name("Begin")));
+    code.extend(0u32.to_le_bytes());
+    code.extend(compact(0));
+    code.extend(0u32.to_le_bytes());
+    b.state(landing, 0, &code, 21, 4);
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, physics, 0);
+    b.class(pawn, actor, 0, 0);
+    b.class(controller, actor, pawn_prop, 0);
+    let package = ScriptPackage::load(
+        "Test",
+        b.build(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .unwrap();
+    assert!(package.errors.is_empty(), "{:?}", package.errors);
+    let mut set = ScriptSet::new();
+    set.add(package);
+    set
 }
 
 #[test]

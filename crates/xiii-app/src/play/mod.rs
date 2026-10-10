@@ -978,19 +978,22 @@ fn fixed_step(
         Err(_) => false,
     };
     if let Some(drive) = script.drive.as_mut() {
+        let track_height = drive.track_height();
         let tracked = drive.tracking_actor().and_then(|name| {
             (*session).as_ref().ok().and_then(|sess| {
                 let id = sess.vm().find_live_object(name)?;
-                // Head-zone aim as in the other drive site: for pawns, 0.6 of CollisionHeight
-                // above the tracked actor's Location keeps the ray inside the head band. Non
-                // pawns (map movers have oversized collision cylinders; BreakAbleMover16's is
-                // 160 UU against a ~64 UU brush) are aimed at the raw Location.
+                // Head-zone aim as in the other drive site: for pawns, a fraction of
+                // CollisionHeight above the tracked actor's Location keeps the ray inside the
+                // aimed band (0.6 default: spine; 0.85 raises a level ray to the head band for
+                // 3x bullet damage). Non pawns (map movers have oversized collision cylinders;
+                // BreakAbleMover16's is 160 UU against a ~64 UU brush) are aimed at the raw
+                // Location.
                 let loc = sess.vm().vector_prop(id, "Location").map(|mut l| {
                     if sess.vm().is_a(id, "XIIIPawn")
                         && let Some(xiii_script::Value::Float(h)) =
                             sess.vm().get_property(id, "CollisionHeight")
                     {
-                        l[2] += h * 0.6;
+                        l[2] += h * track_height;
                     }
                     l
                 });
@@ -1055,6 +1058,10 @@ fn fixed_step(
         .drive
         .as_mut()
         .is_some_and(script::Drive::take_control);
+    let heal = script
+        .drive
+        .as_mut()
+        .is_some_and(script::Drive::take_quick_heal);
     if suppressed {
         input = Input::default();
     }
@@ -1178,6 +1185,11 @@ fn fixed_step(
                 Ok(state) => println!("[play] take_control diagnostic: controller -> {state}"),
                 Err(e) => println!("[play] take_control failed: {e}"),
             }
+        }
+        if heal
+            && let Err(e) = sess.quick_heal()
+        {
+            println!("[play] quick_heal failed: {e}");
         }
         if use_action {
             perform_use(sess, &wr.world, &wr.sources, &sim.0, &params.0);
@@ -2142,9 +2154,11 @@ fn run_script_inner(
     while tick < ticks {
         let elapsed = tick as f32 * DT;
         if let Some(name) = drive.tracking_actor().map(str::to_owned) {
-            // Head-zone aim, as in the other drive site: for pawns, 0.6 of CollisionHeight
-            // above the tracked actor's Location keeps the ray inside the head band (see
-            // above); non pawns are aimed at the raw Location.
+            // Head-zone aim, as in the other drive site: for pawns, a fraction of
+            // CollisionHeight above the tracked actor's Location keeps the ray inside the aimed
+            // band (0.6 default: spine; 0.85 raises a level ray to the head band for 3x bullet
+            // damage); non pawns are aimed at the raw Location.
+            let track_height = drive.track_height();
             let location = runtime.session.vm().find_live_object(&name).and_then(|id| {
                 let vm = runtime.session.vm();
                 vm.vector_prop(id, "Location").map(|mut l| {
@@ -2152,7 +2166,7 @@ fn run_script_inner(
                         && let Some(xiii_script::Value::Float(h)) =
                             vm.get_property(id, "CollisionHeight")
                     {
-                        l[2] += h * 0.6;
+                        l[2] += h * track_height;
                     }
                     l
                 })
@@ -2167,6 +2181,7 @@ fn run_script_inner(
         let mut weapon_inputs = drive.take_weapon_inputs();
         let mut use_named = drive.take_use_named();
         let control = drive.take_control();
+        let mut heal = drive.take_quick_heal();
         // Match the interactive fixed_step: FPC/FPL/CameraView/PlayingVideo own the pawn while
         // the authored cinematic runs. The headless route must still advance its script cursor,
         // but player-axis/action commands are ignored. Explicit test-only set_goal commands are
@@ -2178,6 +2193,7 @@ fn run_script_inner(
             // a player action. Keep it available while an authored cinematic owns input.
             weapon_inputs.clear();
             use_named.clear();
+            heal = false;
         }
         let fired = input.fire;
         if runtime.volumes.is_empty() {
@@ -2258,6 +2274,11 @@ fn run_script_inner(
                 Ok(state) => println!("[play] take_control diagnostic: controller -> {state}"),
                 Err(e) => println!("[play] take_control failed: {e}"),
             }
+        }
+        if heal
+            && let Err(e) = runtime.session.quick_heal()
+        {
+            println!("[play] quick_heal failed: {e}");
         }
         if input.use_action {
             perform_use(
