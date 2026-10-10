@@ -272,18 +272,32 @@ pub fn cinematic_defs() -> Vec<NativeDef> {
     ]
 }
 
-/// item19: `CineController2.Steering(Vector vTargetLocation, float dt, float fDetectionDistance,
-/// bool bDisableAvoidance, bool bFinalLocation)` (native, XIDCine.dll RVA 0x21a0).
+/// item19/item53b: `CineController2.Steering(Vector vTargetLocation, float dt, float
+/// fDetectionDistance, bool bDisableAvoidance, bool bFinalLocation)` (native, XIDCine.dll RVA
+/// 0x21a0).
 ///
 /// `CineController2.PlayingSequence.Tick` calls `Steering` every tick while a `movseq`/`movseqb`
-/// action is moving the possessed cine pawn. The engine native steers that pawn toward the target
-/// through the physics tick and the engine dispatches the controller's `EndOfMove` when the move
-/// finishes; the sequence's own `EndOfMove` -> `NextMove` -> `EndOfSeq` chain then clears the
-/// `endofseq` pause bit that gates the next action. The VM runs no NPC physics tick, so this
-/// native performs the swept-horizontal move itself through the world provider
-/// ([`Vm::move_pawn_step`], the same step the latent `MoveTo` uses) and dispatches the
-/// controller's own `EndOfMove` on arrival. Without it the Plage01 intro suspended at the first
-/// `movseqb` (`UnimplementedNative`), so the level-start cutscene never reached its end.
+/// action is moving the possessed cine pawn. The decoded engine native (`execSteering` VA
+/// 0x100021a0) does not move the pawn itself: it tests arrival (`IsTargetReached` 0x10001d40 —
+/// XY-only, the controller's `Plane` as the pass direction) and, when the move continues, writes
+/// the steering outputs for the pawn's own physics:
+///
+/// * `Pawn.GroundSpeed = Pawn.AirSpeed = speed`, where `speed` is `MyPawnGroundSpeed *
+///   wantedspeed` (the fields `SetWantedSpeed` also writes), lowered near the target to
+///   `max(100, 300*sqrt(dist))` when `bFinalLocation` (the braking curve; constants 300/100/
+///   `speed²/300` at 0x1000583c/0x10005838/0x10005840);
+/// * `Pawn.Acceleration = Normal(delta) * AccelerationFactor * 200` (constant 200 at
+///   0x10005834; `AccelerationFactor` is the movesequence's `af` word, `NextMove` case "AF").
+///   The delta's Z is zeroed when the controller is `bConstrainedToGround` (`Initialize` 0x00A9:
+///   `vMoveConstraint.Z == 0`; the `Cine2` default `(1,1,0)` constrains every cine pawn to the
+///   ground), so ground-constrained steering is horizontal.
+///
+/// The engine's pawn physics (`physWalking`/`physFalling`) then integrates that acceleration —
+/// [`Vm::advance_scripted_physics`] does the same for this VM (falling pawns get the air-control
+/// drift, walking pawns the accelerated step), which is what lets a steered pawn slide around an
+/// obstacle and cross the arrival plane behind it. The one direct-step path kept is a pawn with
+/// `bCollideWorld == false` (the level-start cutscene's `collisionoff` pawns walk the authored
+/// path through geometry; their physics mode is not integrated here).
 fn cine_steering(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let target = match a.first() {
         Some(Value::Vector(v)) => *v,
@@ -307,7 +321,7 @@ fn cine_steering(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Na
         Some(Value::Bool(v)) => *v,
         _ => return val(Value::Void),
     };
-    let _final_location = match a.get(4) {
+    let final_location = match a.get(4) {
         Some(Value::Bool(v)) => *v,
         _ => return val(Value::Void),
     };
@@ -316,14 +330,13 @@ fn cine_steering(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Na
     let Some(pawn) = vm.obj_prop(c.this, "Pawn") else {
         return val(Value::Void);
     };
-    let speed = vm.f32_prop(pawn, "GroundSpeed");
     let loc = vm.vector_prop(pawn, "Location").unwrap_or(target);
     // execSteering tests arrival first (IsTargetReached at 0x100022dd) and, when reached, sends
     // EndOfMove and returns without moving. Its direction argument is the controller's `Plane`
-    // (field 0x404), which the sequence script sets: `Normal(Target - Pawn)` when a move starts,
-    // and in `PlayingSequence.Tick` `NextTarget.Location - Target.Location` (or the target's
-    // rotation vector without a next target), so "passed" means crossing the plane through the
-    // target that faces the next waypoint.
+    // (field 0x404), which only `CineMoveTo`/`GoJump` write (`Normal(Target - Pawn)`);
+    // `PlayingSequence.Tick` computes the same expression into a *local* named `Plane`
+    // (PlayingSequence.Tick token @148096 writes `LocalVariable ...PlayingSequence.Tick.Plane`),
+    // so the instance property the native reads stays the move-setup value.
     let plane = match vm.get_property(c.this, "Plane") {
         Some(Value::Vector(v)) => *v,
         _ => [0.0; 3],
@@ -332,16 +345,51 @@ fn cine_steering(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Na
         vm.send_event(c.this, "EndOfMove", Vec::new())?;
         return val(Value::Void);
     }
-    // During a `movseq` the sequence turns the cine pawn's world collision off (`collisionoff`)
-    // so it follows the authored path through geometry; `Move` would instead stop at the walls.
-    // Steering sets the pawn's velocity toward the target and physics moves a full
-    // `speed * dt` step, so the pawn can overshoot the target point and cross `Plane`; it does
-    // not stop at its collision radius or snap onto the target (Cine pawns commonly have
-    // DetectionDistance 0, so arrival is the plane crossing).
-    let step_target = full_step_target(loc, target, speed * dt);
-    if vm.bool_prop(pawn, "bCollideWorld") {
-        vm.move_pawn_step_within(pawn, step_target, speed, dt, 0.0)?;
+    // The steering delta, with Z dropped for a ground-constrained controller.
+    let constrained = vm.bool_prop(c.this, "bConstrainedToGround");
+    let mut delta = [target[0] - loc[0], target[1] - loc[1], target[2] - loc[2]];
+    if constrained {
+        delta[2] = 0.0;
+    }
+    // speed = MyPawnGroundSpeed * wantedspeed (execSteering 0x10002354: field 0x430 * field
+    // 0x41c, unconditionally), lowered by the braking curve for the chain's final move.
+    let base = vm.f32_prop(c.this, "MyPawnGroundSpeed");
+    let wanted = vm.f32_prop(c.this, "wantedspeed");
+    let mut speed = if base > 0.0 {
+        base * wanted
     } else {
+        vm.f32_prop(pawn, "GroundSpeed")
+    };
+    if final_location {
+        // dist <= speed²/300 lowers the speed to 300*sqrt(dist), floored at 100 (0x1000583c
+        // = 300, 0x10005838 = 100, 0x10005840 = 1/300).
+        let dist = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+        if dist > 0.0 && dist <= speed * speed / 300.0 {
+            speed = (300.0 * dist.sqrt()).max(100.0);
+        }
+    }
+    vm.set_property(pawn, "GroundSpeed", 0, Value::Float(speed));
+    vm.set_property(pawn, "AirSpeed", 0, Value::Float(speed));
+    // Acceleration = Normal(delta) * AccelerationFactor * 200 (0x10005834 = 200); the pawn's
+    // physics integrates it (physWalking/physFalling in the engine, the scripted-physics pass
+    // here). With zero delta the vector is zero.
+    let factor = vm.f32_prop(c.this, "AccelerationFactor");
+    let length = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+    let acceleration = if length > 0.0 {
+        [
+            delta[0] / length * factor * 200.0,
+            delta[1] / length * factor * 200.0,
+            delta[2] / length * factor * 200.0,
+        ]
+    } else {
+        [0.0; 3]
+    };
+    vm.set_property(pawn, "Acceleration", 0, Value::Vector(acceleration));
+    // During a `movseq` the sequence turns the cine pawn's world collision off (`collisionoff`)
+    // so it follows the authored path through geometry; those pawns have no integrated physics
+    // mode here, so the authored path step stays a direct move.
+    if !vm.bool_prop(pawn, "bCollideWorld") {
+        let step_target = full_step_target(loc, target, speed * dt);
         let (next, _) = crate::navigation::move_step(loc, step_target, speed, dt, 0.0);
         if next != loc {
             vm.set_property(pawn, "Location", 0, Value::Vector(next));
