@@ -651,6 +651,7 @@ fn event_kind(e: &PresentationEvent) -> &'static str {
         PresentationEvent::ReplaceTexture { .. } => "ReplaceATextureByAnOther",
         PresentationEvent::RefreshDisplaying { .. } => "RefreshDisplaying",
         PresentationEvent::SetInjuredEffect { .. } => "SetInjuredEffect",
+        PresentationEvent::SetPoisonEffect { .. } => "SetPoisonEffect",
         PresentationEvent::ProjectorAttach { .. } => "ProjectorAttach",
         PresentationEvent::ProjectorDetach { .. } => "ProjectorDetach",
         PresentationEvent::ProjectorAbandon { .. } => "ProjectorAbandon",

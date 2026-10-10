@@ -423,6 +423,13 @@ pub enum Latent {
         /// VM time when it started.
         started: f64,
     },
+    /// `Controller.WaitForLanding`: wait for a non-null pawn to stop falling.
+    Landing {
+        /// Countdown to repeated `LongFall` callbacks (not a release timeout).
+        remaining: f32,
+        /// VM time when it started.
+        started: f64,
+    },
 }
 
 /// An object reference into a package outside the loaded script set (e.g. a `Sound` in a
@@ -4663,6 +4670,30 @@ impl<'s> Vm<'s> {
                         started,
                     });
                 }
+                Some(Latent::Landing { remaining, started }) => {
+                    // Retail poll 528: losing possession does NOT release this latent.
+                    let landed = self
+                        .obj_prop(id, "Pawn")
+                        .is_some_and(|p| self.byte_prop(p, "Physics") != PHYS_FALLING);
+                    if !landed {
+                        let remaining = remaining - dt;
+                        if let Some(c) = self.objects[id as usize].state_code.as_mut() {
+                            c.latent = Some(Latent::Landing { remaining, started });
+                        }
+                        if remaining < 0.0 {
+                            self.send_event(id, "LongFall", Vec::new())?;
+                        }
+                        return Ok(());
+                    }
+                    if let Some(c) = self.objects[id as usize].state_code.as_mut() {
+                        c.latent = None;
+                    }
+                    self.note(TraceKind::LatentResume {
+                        actor: self.objects[id as usize].name.clone(),
+                        native: "Controller.WaitForLanding".into(),
+                        started,
+                    });
+                }
                 Some(Latent::Rotation { started }) => {
                     if !self.focus_rotation_complete(id) {
                         return Ok(());
@@ -4818,6 +4849,11 @@ impl<'s> Vm<'s> {
                             actor,
                             native,
                             seconds: 0.0,
+                        }),
+                        Latent::Landing { .. } => self.note(TraceKind::LatentStart {
+                            actor,
+                            native,
+                            seconds: 4.0,
                         }),
                         Latent::Move {
                             pawn,
