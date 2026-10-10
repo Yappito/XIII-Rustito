@@ -1,4 +1,4 @@
-# Toits01 "Follow Major Jones" player-input route (item50).
+# Toits01 "Follow Major Jones" player-input route (item50, extended by item53).
 # Player input only (goto/forward/track/fire/wait_travel); no set_goal, no take_control.
 # The labelled teleports cover measured impassables: the ladder-top landing traps the walk
 # inside LadderVolume0, the start roof has no walkable exit to the courtyard, the deck's east
@@ -6,13 +6,20 @@
 # 50-UU hole, the east roof's trapped edge over a 486 pit, and the warehouse doorway blocked
 # by the Movable2 crate (probe12-probe20 logs under local/re/item50/).
 #
-# Measured outcome (probe20): the route reaches TouchTrigger10 (r700 at 18812,1118,791) and the
-# game's own Touch fires, but goal 0 does not complete: XIII's TouchTrigger.Touch requires
+# Measured outcome: the route reaches TouchTrigger10 (r700 at 18812,1118,791) and the game's
+# own Touch fires, but goal 0 does not complete: XIII's TouchTrigger.Touch requires
 # self.bActif, and TT10 is authored bActif=false (bActivableParTrigger=true, Tag
 # PorteDebloquee) - it arms only when BreakableMover12 (the generator, Health 50, inside the
 # walled yard) is destroyed. The yard is sealed by the ForeverLocked door line and the
 # through-window shot does not land in the current sim (see the item50 report).
-# probe20 = full route candidate v4.
+# item53: the route now enters the TT17 zone (r90 at -5010,1337,1009) after the scene's
+# 56.7 DonneGrappinStart gate. The grapple demonstration completes (the VM's scripted-physics
+# integration runs the demo's Walking/Projectile/Flying moves; measured probe23 under
+# local/re/item53/): the demonstrator reaches STA_Retract, fires JonesHookEnd at ~71.5 and
+# the handover returns the controller to PlayerWalking (the item50 permanent freeze is gone).
+# The Cine0 scene advances past the demo wait to action[117] (movseqb toward PositionInfo118),
+# where it stays: the NPC's own traverse across the grapple descent is blocked in the sim (a
+# separate measured blocker, distinct from the fixed demo wedge).
 # - ladder-top replaced by a labelled teleport onto the roof: the landing traps the
 #   walk inside LadderVolume0 (the slide-in distance is nondeterministic; jumps get
 #   swallowed in climb state; measured probe13/14/15)
@@ -20,9 +27,6 @@
 #   into the (-1227,1182) stall (measured probe15)
 # - roof->terrace descent replaced by a teleport: the 1167 roof's east edge drops
 #   onto a trapped ledge and a pit at 486 (measured probe15, -43 hp)
-# - the TT17 zone (r90 at -5010,1337,1009) is never entered: a touch caught by the
-#   scene's 56.73 gate starts the handover cutscene which permanently freezes the
-#   player (measured probe14); the scene then blocks at wait DonneGrappinEnd forever
 t=0.50 goto -6300 1383
 t=6.00 goto -5720 1385
 t=11.00 goto -5608 1387
@@ -30,66 +34,71 @@ t=11.00 goto -5608 1387
 t=17.00 teleport -5440 1400 1010
 t=17.10 forward 0
 t=19.00 goto -5300 1400
-# dodge the demonstrator (-5117,1506, r5+capsule ~45): its demo wedge leaves the pawn in a
-# state that later fails the TouchTrigger10.Touch guard (probe19); the y~1400 line keeps 80+ UU
 t=24.00 goto -4900 1450
 t=28.00 forward 0
+# item53: the scene arms TT17 (Tag DonneGrappinStart) at its ~56.7 gate; enter the zone after
+# the gate and stand through the grapple demonstration (the player is NoControl while the
+# demo runs; the handover releases the controller at ~71.5, measured probe23)
+t=56.80 goto -5010 1337
+t=58.00 forward 0
+# released by STA_Retract; leave the demo area
+t=74.00 goto -4940 1420
 # labelled teleport (the level's grapple descent; the start roof has no walkable exit)
-t=30.00 teleport -1162 1009 80
-t=30.10 forward 0
+t=76.00 teleport -1162 1009 80
+t=76.10 forward 0
 # courtyard: AI west corridor
-t=32.00 goto -1450 1100
-t=64.00 goto -1450 1500
-t=70.00 goto -1450 2100
-t=78.00 goto -900 2100
-t=86.00 goto -768 2838
-t=94.00 goto -734 3424
-t=102.00 goto -200 3900
+t=78.00 goto -1450 1100
+t=110.00 goto -1450 1500
+t=116.00 goto -1450 2100
+t=124.00 goto -900 2100
+t=132.00 goto -768 2838
+t=140.00 goto -734 3424
+t=148.00 goto -200 3900
 # alley attempt; labelled teleport fallback (the alley's east end is the windowed wall)
-t=110.00 goto 200 3900
-t=116.00 goto 500 4100
-t=122.00 goto 800 4400
-t=128.00 teleport 800 4500 900
-t=128.10 forward 0
-t=130.00 goto 1400 4500
-t=138.00 goto 1900 4500
-t=146.00 goto 2300 4500
+t=156.00 goto 200 3900
+t=162.00 goto 500 4100
+t=168.00 goto 800 4400
+t=174.00 teleport 800 4500 900
+t=174.10 forward 0
+t=176.00 goto 1400 4500
+t=184.00 goto 1900 4500
+t=192.00 goto 2300 4500
 # labelled teleport (the north-roof gap x~2500-2900 is void)
-t=152.00 teleport 3100 4500 1520
-t=152.10 forward 0
-t=154.00 goto 3150 4490
+t=198.00 teleport 3100 4500 1520
+t=198.10 forward 0
+t=200.00 goto 3150 4490
 # labelled teleport (the level's SauterTempo crossing; measured void)
-t=160.00 teleport 4200 2700 1456
-t=160.10 forward 0
-t=162.00 goto 5000 2700
-t=170.00 goto 5800 2700
-t=178.00 goto 6600 2700
-t=186.00 goto 7400 2700
+t=206.00 teleport 4200 2700 1456
+t=206.10 forward 0
+t=208.00 goto 5000 2700
+t=216.00 goto 5800 2700
+t=224.00 goto 6600 2700
+t=232.00 goto 7400 2700
 # labelled teleport (the deck's east parapet blocks walk and jump)
-t=194.00 teleport 8500 1700 1060
-t=194.10 forward 0
-t=196.00 goto 9000 1400
-t=204.00 goto 10000 1300
-t=212.00 goto 11000 1300
-t=220.00 goto 11700 1261
+t=240.00 teleport 8500 1700 1060
+t=240.10 forward 0
+t=242.00 goto 9000 1400
+t=250.00 goto 10000 1300
+t=258.00 goto 11000 1300
+t=266.00 goto 11700 1261
 # labelled teleport (the palettetremplin ramp lip and the window gap)
-t=228.00 teleport 12700 1261 1170
-t=228.10 forward 0
-t=230.00 goto 13265 1300
-t=237.00 goto 13900 1400
+t=274.00 teleport 12700 1261 1170
+t=274.10 forward 0
+t=276.00 goto 13265 1300
+t=283.00 goto 13900 1400
 # labelled teleport (the roof dip strip x 14000-14150 with a 50-UU hole at x~14150-14200;
 # the east roof surface is 1167)
-t=243.00 teleport 14250 1400 1220
-t=243.10 forward 0
-t=245.00 goto 15500 1450
+t=289.00 teleport 14250 1400 1220
+t=289.10 forward 0
+t=291.00 goto 15500 1450
 # labelled teleport (the roof's east edge drops onto a trapped ledge and a 486 pit)
-t=251.00 teleport 16000 1300 700
-t=251.10 forward 0
-t=253.00 goto 16500 1200
-t=261.00 goto 17800 1150
+t=297.00 teleport 16000 1300 700
+t=297.10 forward 0
+t=299.00 goto 16500 1200
+t=307.00 goto 17800 1150
 # labelled teleport (the warehouse west wall + the Movable2 crate block the doorway;
 # TT10's r700 zone starts west of the wall)
-t=267.00 teleport 18300 1000 800
-t=267.10 forward 0
-t=269.00 goto 18800 1050
-t=278.00 wait_travel
+t=313.00 teleport 18300 1000 800
+t=313.10 forward 0
+t=315.00 goto 18800 1050
+t=324.00 wait_travel

@@ -837,17 +837,16 @@ impl Session {
         Ok(())
     }
 
-    /// Host movement ownership is temporarily ceded by the Plage01 wake-up script. While this is
-    /// true, `BeachInBedWithXIII` owns `Location`/`Rotation` and restores collision before it
-    /// returns the controller to PlayerWalking.
+    /// A cinematic owns the player pawn while the controller is in `NoControl`: the bed
+    /// wake-up script (`BeachInBedWithXIII`) and the Toits01 grapple demonstrator
+    /// (`RoofGrapnleDemonstrator.MoveToRightThePlace` writes `PC.Pawn.Velocity`,
+    /// `LookAtJones` writes `PC.Rotation`) drive `Location`/`Rotation`/`Velocity` themselves and
+    /// restore `PlayerWalking` when done (item53). While this holds, the host stops writing the
+    /// pawn fields and follows the VM's pose; the VM's scripted-physics pass integrates the
+    /// script-written `Velocity` (Walking, horizontal).
     fn script_owns_player_pawn(&self) -> bool {
-        self.controller.is_some_and(|pc| {
-            self.vm.is_in_state(pc, "NoControl")
-                && matches!(
-                    self.vm.get_property(self.player, "bCollideWorld"),
-                    Some(Value::Bool(false))
-                )
-        })
+        self.controller
+            .is_some_and(|pc| self.vm.is_in_state(pc, "NoControl"))
     }
 
     /// Script-driven player pose for the host movement sim to follow during the bed wake-up cine.

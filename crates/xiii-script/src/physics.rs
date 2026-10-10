@@ -40,6 +40,20 @@ pub struct OverlapRecord {
     pub triangle: [[f32; 3]; 3],
 }
 
+/// Result of a provider [`WorldPhysics::actor_mesh_hit`] query (item53): a placed-mesh actor's
+/// own collision triangles either hold the provider's data (`NoData` — the VM falls back to the
+/// cylinder approximation), miss the ray (`Miss` — the actor does not block this line, the UE2
+/// kDOP behaviour), or hit (`Hit`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ActorMeshHit {
+    /// The provider holds no collision triangles for this actor's placed mesh.
+    NoData,
+    /// The actor's mesh is traceable and the zero-extent ray misses it.
+    Miss,
+    /// The actor's mesh blocks the ray.
+    Hit(WorldHit),
+}
+
 /// World collision the VM calls into. Implemented by the host (Bevy app, tests, diagnostics);
 /// the VM only holds `Box<dyn WorldPhysics>`.
 pub trait WorldPhysics {
@@ -60,6 +74,23 @@ pub trait WorldPhysics {
         extent: [f32; 3],
     ) -> (Option<WorldHit>, Option<String>) {
         (self.trace(start, end, extent), None)
+    }
+
+    /// Zone gravity at `location` for the scripted-physics integration (item53). The engine
+    /// reads the enclosing `PhysicsVolume`'s `Gravity`; the VM tracks no volumes, so providers
+    /// without zone data keep the measured `Engine.PhysicsVolume` class default `(0, 0, -950)`.
+    fn zone_gravity(&mut self, _location: [f32; 3]) -> [f32; 3] {
+        [0.0, 0.0, -950.0]
+    }
+
+    /// Zero-extent (line) trace against one named placed-mesh actor's own collision triangles
+    /// (item53). UE2 traces a static-mesh actor against its kDOP triangles — not a collision
+    /// cylinder — so a ray through a mesh's opening (Toits01's window in `PorteDecors18`)
+    /// must not hit the actor. The provider answers from its placed-mesh soup (sources labelled
+    /// `"<actor> -> <mesh>"`); [`ActorMeshHit::NoData`] (the default) means no per-actor mesh
+    /// data, and the VM falls back to the cylinder approximation.
+    fn actor_mesh_hit(&mut self, _actor: &str, _start: [f32; 3], _end: [f32; 3]) -> ActorMeshHit {
+        ActorMeshHit::NoData
     }
 
     /// UE2 `MoveActor`-like swept box move: from `start`, try to move by `delta` with

@@ -5387,7 +5387,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            300.0,
+            330.0,
         )
         .expect("run Toits01 route");
         let session = &outcome.session;
@@ -5434,9 +5434,9 @@ mod tests {
             tt10_touched,
             "the route must reach and touch TouchTrigger10 (the game's own trigger)"
         );
-        // The measured blocker, pinned: TT10 stays disarmed (bActif=false) because the
+        // The measured blockers, pinned: TT10 stays disarmed (bActif=false) because the
         // generator BreakableMover12 that drives the PorteDebloquee chain is never destroyed;
-        // and goals 1/2's scene stays blocked at the grapple-demo wait.
+        // goal 0's Touch fired but its XIII TouchTrigger.Touch guard requires bActif.
         let tt10 = vm
             .objects
             .iter()
@@ -5463,7 +5463,48 @@ mod tests {
             "the generator must be undamaged: the route's input cannot reach it (the yard's              ForeverLocked door line blocks every walk line and the through-window shot never              lands; see local/reports/item50-toits01-route.md)"
         );
         println!(
-            "[toits01 route] blockers pinned: TT10.bActif=false (generator Health 50 intact),              goals 1/2 blocked by the scene's grapple-demo wedge; goal 0's Touch fired but its              XIII TouchTrigger.Touch guard requires bActif"
+            "[toits01 route] blockers pinned: TT10.bActif=false (generator Health 50 intact),              goal 0's Touch fired but its XIII TouchTrigger.Touch guard requires bActif"
+        );
+        // item53: the grapple demonstration completes. The demonstrator runs its seven-state
+        // machine (Walking to the marker, the CineHook Projectile cast with the decoded
+        // physProjectile -> physFalling fall-through, the Flying ascent, the retract) and its
+        // final state is STA_Retract, whose Timer fired `TriggerEvent('JonesHookEnd')`.
+        let demonstrator_retract = vm.trace.iter().any(|event| {
+            matches!(
+                &event.kind,
+                xiii_script::TraceKind::StateChange { actor, to, .. }
+                    if actor.eq_ignore_ascii_case("RoofGrapnleDemonstrator0")
+                        && to.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("STA_Retract"))
+            )
+        });
+        assert!(
+            demonstrator_retract,
+            "the grapple demonstrator must reach STA_Retract (the demo machine completes)"
+        );
+        // The Cine0 scene advanced past the demo wait ([89] `wait event JonesHookEnd`): the
+        // measured end state is action[117] (movseqb toward PositionInfo118), where the NPC's
+        // own traverse stays blocked (a separate measured blocker).
+        let action_index = vm
+            .find_object("CineController2")
+            .and_then(|id| vm.get_property(id, "ScriptedActionIndex").cloned());
+        match action_index {
+            Some(xiii_script::Value::Int(index)) => assert!(
+                index >= 117,
+                "the scene must advance past the grapple demo wait (measured action[117]), got {index}"
+            ),
+            other => panic!("CineController2.ScriptedActionIndex must be an int, got {other:?}"),
+        }
+        // The handover released the player: the controller is back in PlayerWalking at the end
+        // of the route (the item50 permanent NoControl freeze is fixed).
+        let pc = vm
+            .objects
+            .iter()
+            .enumerate()
+            .position(|(_, o)| vm.set().path(o.class).ends_with("XIIIPlayerController"))
+            .expect("the player controller must exist");
+        assert!(
+            vm.is_in_state(pc as u32, "PlayerWalking"),
+            "the handover must return the controller to PlayerWalking"
         );
     }
 }
