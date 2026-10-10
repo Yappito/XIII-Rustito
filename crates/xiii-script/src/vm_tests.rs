@@ -11169,6 +11169,98 @@ fn play_str_voice_emits_dialogue_event_with_speaker_and_duration() {
     assert!(vm.drain_events().is_empty());
 }
 
+/// item62: a voiced dialogue line ends at the wave's real duration. The retail chain is
+/// `Speak` -> `PlayStrVoice` -> `GotoState('STA_HeadAnimation')` -> the audio device's end
+/// callback (`EndOfVoice`, native 180112 - `STA_HeadAnimation.Timer` just calls
+/// `EndOfVoice()`), then `STA_HeadAnimation.Tick` -> `GotoState('STA_PlayingDialogue','EOL')`
+/// -> `EndOfLine`, which parks on the next beat's `ExpectedEventBeforeNext`. The VM emulates
+/// the audio seam by scheduling the speaking actor's `Timer` at the provider duration (the
+/// same duration the script itself reads back through native 357 `GetWaveDuration` to set
+/// `WaveLength = duration + 1.0` for the subtitle lifetime). This pins that the line-end
+/// timer fires at the wave duration, not before and not at the script's fallback 3.0.
+#[test]
+fn play_str_voice_schedules_the_line_end_timer_at_the_wave_duration() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let dm = vm.spawn(sg(&set, "Actor"), "DialogueManager0").unwrap();
+    let pam = vm.spawn(sg(&set, "Actor"), "Cine0").unwrap();
+    vm.set_active(dm, true);
+    vm.set_voice_duration(Box::new(crate::voice::FixedVoiceDuration::new(2.5)));
+    let mut args = [
+        Value::Str("Toits01_JonesMaj_10".to_owned()),
+        Value::Object(Some(ObjRef::Instance(pam))),
+    ];
+    let r = try_native(
+        &mut vm,
+        "Engine.Actor.PlayStrVoice",
+        dm,
+        &[false, false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Bool(true)));
+    let started = vm.drain_events();
+    assert!(
+        started
+            .iter()
+            .any(|e| matches!(e, crate::events::PresentationEvent::Dialogue(_))),
+        "the voice start must be presented: {started:?}"
+    );
+
+    // 2.0 s in (four 0.5 s ticks): the wave is still playing, no Timer.
+    for _ in 0..4 {
+        vm.tick(0.5).unwrap();
+    }
+    assert!(
+        !vm.trace
+            .iter()
+            .any(|event| matches!(event.kind, TraceKind::Timer { .. })),
+        "the line-end timer fired before the wave duration"
+    );
+    // The fifth tick crosses 2.5 s: exactly one Timer, on the speaking actor, at 2.5 s.
+    vm.tick(0.5).unwrap();
+    let timer_events: Vec<_> = vm
+        .trace
+        .iter()
+        .filter(|event| {
+            matches!(&event.kind, TraceKind::Timer { actor } if actor == "DialogueManager0")
+        })
+        .collect();
+    assert_eq!(timer_events.len(), 1);
+    assert_eq!(timer_events[0].tick, 5);
+    assert!((timer_events[0].time - 2.5).abs() < 1e-6);
+
+    // Without a duration provider the engine did not start a voice: PlayStrVoice reports
+    // false and schedules no line-end timer (the script falls back to WaveLength 3.0, but no
+    // audio is playing, so there is no end callback to emulate).
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let dm = vm.spawn(sg(&set, "Actor"), "DialogueManager0").unwrap();
+    let pam = vm.spawn(sg(&set, "Actor"), "Cine0").unwrap();
+    vm.set_active(dm, true);
+    let mut args = [
+        Value::Str("Toits01_JonesMaj_10".to_owned()),
+        Value::Object(Some(ObjRef::Instance(pam))),
+    ];
+    let r = try_native(
+        &mut vm,
+        "Engine.Actor.PlayStrVoice",
+        dm,
+        &[false, false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Bool(false)));
+    for _ in 0..6 {
+        vm.tick(0.5).unwrap();
+    }
+    assert!(
+        !vm.trace
+            .iter()
+            .any(|event| matches!(event.kind, TraceKind::Timer { .. })),
+        "a voice that never started must not schedule a line-end timer"
+    );
+}
+
 /// The subtitle text comes from the `DialogueManager`'s current line: `LineIndex` selects a
 /// `Lines` element, whose `SpeakerIndex`/`SentenceIndex` select the nested speaker sentence.
 #[test]
