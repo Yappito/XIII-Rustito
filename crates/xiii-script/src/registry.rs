@@ -1099,6 +1099,41 @@ fn radius_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Na
     ))
 }
 
+/// `Actor.VisibleDamageableActors` (item48): the iterator `Actor.HurtRadius` (engine.u) drives
+/// when a scripted explosive blows up. See [`Vm::visible_damageable_actors`] for the decoded
+/// retail shape and the documented gaps.
+fn visible_damageable_actors(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let base = match object(vm, a, 0)? {
+        Some(ObjRef::Static(g)) => Some(g),
+        None => None,
+        Some(ObjRef::Instance(_)) | Some(ObjRef::External(_)) => {
+            return Err(vm.err(VmErrorKind::Other(
+                "VisibleDamageableActors base class is an instance".into(),
+            )));
+        }
+    };
+    let radius = float(vm, a, 2)?;
+    let loc = if c.omitted(3) {
+        vm.vector_prop(c.this, "Location").unwrap_or([0.0; 3])
+    } else {
+        vector2(vm, a, 3)?
+    };
+    // `Actor.HurtRadius` calls it with four arguments, so `bIgnoreHidden` is optional.
+    let ignore_hidden = !c.omitted(4) && boolean(vm, a, 4)?;
+    let items: Vec<Value> = vm
+        .visible_damageable_actors(base, radius, loc, ignore_hidden)?
+        .into_iter()
+        .map(|i| Value::Object(Some(ObjRef::Instance(i))))
+        .collect();
+    Ok(NativeOutcome::Iterate(
+        items.into_iter().map(|v| vec![v]).collect(),
+    ))
+}
+
 fn eq_ss(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     // UE2 string == is case-insensitive.
     val(Value::Bool(
@@ -2837,8 +2872,13 @@ fn calc_first_person_view(
 /// The snap exists only for the crosshair display: the script consumer
 /// (`xiii.XIIIPlayerInteraction.MyPCPostRender` 0x032D) feeds the returned rotator into the
 /// crosshair ray (`FiringTargHitLoc`) and `AmmoType.WarnTarget` — the un-snapped view rotation is
-/// the faithful unsnapped value there. Partial: no aim-assist snap decode (the ~0x800-byte target
-/// loop is presentation-only in the headless VM).
+/// the faithful unsnapped value there. Partial (item48 measurement): no aim-assist snap decode —
+/// the ~0x800-byte target loop is gated on engine-internal cooldown timers (+0x3ac/+0x3b0) and an
+/// anonymous ammunition bit (+0x270 bit 0x10), scans an anonymous LevelInfo list (0x454/0x4cc,
+/// 5-slot candidate arrays, cone-dot thresholds cos 0.96/0.98/0.99003/0.99456 measured at
+/// 0x1036e6f8-0x1036e729, trace flags 0x97 over max(anonymous float, 3000.0)) and is
+/// presentation-only in the headless VM; all offsets are native C++ fields the script reflection
+/// cannot name.
 fn adjust_aim_for_display(
     vm: &mut Vm<'_>,
     c: &NativeCtx,
@@ -4286,6 +4326,27 @@ fn builtin_defs() -> Vec<NativeDef> {
                 radius_actors,
             )
         },
+        NativeDef {
+            status: NativeStatus::Partial(
+                "visibility point is the victim's Location (retail: a mesh/bounds mid-point, 0.5 \
+                 at 0x1046f584); the two unidentified retail class constants (0x105ac8a8, \
+                 0x105a12c8), the anonymous hidden flag at +0x2c bit 0x10 and the second \
+                 higher-trace point (+0x290) are not reproduced; the line check is world-only \
+                 (retail flags 0x86 can also be blocked by actors); hidden test uses bHidden",
+            ),
+            ..def(
+                "Engine.Actor.VisibleDamageableActors",
+                "native(0) final iterator function VisibleDamageableActors(class<Actor> \
+                 BaseClass, out Actor Actor, float Radius, struct<Vector> Loc, optional bool \
+                 bIgnoreHidden)",
+                "engine.u Actor.VisibleDamageableActors decoded (BaseClass, Actor, Radius, Loc, \
+                 bIgnoreHidden); Actor.HurtRadius calls it as foreach \
+                 VisibleDamageableActors(class'Actor', Victims, DamageRadius, HitLocation); \
+                 Engine.dll ?execVisibleDamageableActors@AActor 0x103e90a0 (level-hash radius \
+                 query, BaseClass/hidden filters, SingleLineCheck flags 0x86)",
+                visible_damageable_actors,
+            )
+        },
         def(
             "Object.At_StrStr",
             "native(168) string @(string, string)",
@@ -5575,13 +5636,18 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "no renderer: returns the un-snapped SmoothedAim(Rotation) (the aim-assist target-scan \
-             is crosshair display only); the returned rotator is the controller view rotation",
+            "no snap decode: the aim-assist target scan is gated on engine-internal smoothed-aim \
+             cooldown timers (+0x3ac/+0x3b0, written only by the engine's input/display path) and \
+             an anonymous ammunition property bit (byte +0x270 bit 0x10); the target loop keeps \
+             up to 5 candidates by aim-cone dot thresholds (measured cos 0.96/0.98/0.99003/0.99456) \
+             over an anonymous LevelInfo list with anonymous field offsets the script reflection \
+             cannot name. A VM snap would be invented behaviour; the no-snap path is measured to \
+             return SmoothedAim(un-snapped view rotation), which is what this returns",
         ),
         ..def(
             "PlayerController.AdjustAimForDisplay",
             "native(498) final native static function Rotator AdjustAimForDisplay(object<Ammunition> FiredAmmunition, struct<Vector> projStart)",
-            "Engine.dll execAdjustAimForDisplay 0x1036e2e0 decoded (native 498, registration thunk 0x1051aac8); every epilogue returns SmoothedAim(0x1036c720) of the rotation, snap path gated on a scan cooldown + ammunition+0x270 bit 0x10; consumer XIIIPlayerInteraction.MyPCPostRender 0x032D (crosshair ray + WarnTarget)",
+            "Engine.dll execAdjustAimForDisplay 0x1036e2e0 decoded (native 498, registration thunk 0x1051aac8); every epilogue returns SmoothedAim(0x1036c720) of the rotation; the snap path (item48 measurement) traces flags 0x97 over max(anonymous float, 3000.0) along the view axes, scans the LevelInfo+0x454 actor list (5-slot candidate arrays, SingleLineCheck filters) and picks by cone dot thresholds; consumer XIIIPlayerInteraction.MyPCPostRender 0x032D (crosshair ray + WarnTarget)",
             adjust_aim_for_display,
         )
     });

@@ -187,6 +187,12 @@ pub enum VmErrorKind {
         /// `Class.Function` of the native that needed it.
         native: String,
     },
+    /// `Actor.WaveHasPosition` ran without a wave-position provider set (with
+    /// [`Vm::set_wave_position`]); never silently succeeds (item48).
+    NoAudioProvider {
+        /// `Class.Function` of the native that needed it.
+        native: String,
+    },
     /// A sequence the animation provider does not know (and is not the `None` name).
     UnknownAnimation {
         /// Sequence name.
@@ -345,6 +351,27 @@ const CLASS_FLAG_ABSTRACT: u16 = 0x0001;
 fn native_class_default(class: &str, prop: &str) -> Option<Value> {
     match (class, prop) {
         ("camera", "bonlyspectator") => Some(Value::Bool(true)),
+        _ => None,
+    }
+}
+
+/// The retail licence-layer value of `MapInfo.TGSDummy`, keyed by the map's
+/// `iLoadSpecificValue` (Xiii.dll native licence table, keyed by id - 26 into a 166-entry
+/// selector; the seven non-default keys are the seven `xidmaps` MapInfo subclasses whose
+/// scripts compare `TGSDummy`, each with the value its own code expects:
+/// Hual01a 546, PRock01a 21627, Hual04a 856, Sanc02a 4, SSH101a 69, USA01 3589, SSH101c 703).
+/// Measured: `?PostBeginPlay@AMapInfo@@UAEXXZ` VA 0x11b01640 in `XIII_Game/system/Xiii.dll`
+/// writes offset 0x1f8 (`TGSDummy`) after the script `PostBeginPlay`; keys outside the
+/// selector table keep the `xiii.MapInfo` default 0 (the demo build behaviour).
+fn native_tgs_dummy(load_specific: i32) -> Option<i32> {
+    match load_specific {
+        26 => Some(546),
+        55 => Some(21627),
+        81 => Some(856),
+        106 => Some(4),
+        130 => Some(69),
+        142 => Some(3589),
+        191 => Some(703),
         _ => None,
     }
 }
@@ -1369,6 +1396,9 @@ pub struct Vm<'s> {
     /// Voice-wave duration provider (dialogue natives). `None` = `Actor.GetWaveDuration` reports
     /// `0` with a visible note (the script then falls back to its own default wave length).
     pub(crate) voice_duration: Option<Box<dyn crate::voice::VoiceDuration>>,
+    /// Wave-position provider for `Actor.WaveHasPosition` (item48). `None` = the native fails
+    /// with [`VmErrorKind::NoAudioProvider`] (never a silent answer).
+    pub(crate) wave_position: Option<Box<dyn crate::voice::WavePosition>>,
     /// Optional host save-slot adapter for GUIController natives.
     pub(crate) save_slots: Option<Box<dyn crate::item20::SaveSlotProvider>>,
     /// Outbound presentation events emitted by presentation natives (sound, texture, display,
@@ -1581,6 +1611,7 @@ impl<'s> Vm<'s> {
             hearing_partials: HashSet::new(),
             last_trace_bone: "None".to_owned(),
             voice_duration: None,
+            wave_position: None,
             save_slots: None,
             events: Vec::new(),
             particle_spawns: Vec::new(),
@@ -1807,6 +1838,26 @@ impl<'s> Vm<'s> {
         self.voice_duration
             .as_ref()
             .and_then(|p| p.duration(sound_name))
+    }
+
+    /// Sets the wave-position provider (`Actor.WaveHasPosition`, item48). Call before runs that
+    /// speak dialogue; without one the native fails explicitly.
+    pub fn set_wave_position(&mut self, provider: Box<dyn crate::voice::WavePosition>) {
+        self.wave_position = Some(provider);
+    }
+
+    /// Positional classification of a script `SoundName` from the host provider. `None` when no
+    /// provider is installed (the native then fails) or the provider cannot classify the name
+    /// (the native then notes and reports `false`).
+    pub fn wave_position(&self, sound_name: &str) -> Option<bool> {
+        self.wave_position
+            .as_ref()
+            .and_then(|p| p.has_position(sound_name))
+    }
+
+    /// True when a wave-position provider is installed (`Actor.WaveHasPosition`).
+    pub fn has_wave_position(&self) -> bool {
+        self.wave_position.is_some()
     }
 
     /// Configures the map's local URL (`<Map>?<options>`, the `url_options` being the
@@ -3737,7 +3788,16 @@ impl<'s> Vm<'s> {
             )));
             return Ok(None);
         }
+        // The native `AMapInfo::PostBeginPlay` licence layer runs when the event is delivered
+        // to a live MapInfo instance, with or without a script handler (the retail native is
+        // itself the C++ event; the table write follows the super call in the disassembly).
+        let mapinfo_licence = event.eq_ignore_ascii_case("PostBeginPlay")
+            && self.is_live_actor(id)
+            && self.is_a(id, "mapinfo");
         let Some(f) = self.find_function(id, event, true) else {
+            if mapinfo_licence {
+                self.write_native_tgs_dummy(id)?;
+            }
             self.note(TraceKind::NoHandler {
                 actor,
                 event: event.to_owned(),
@@ -3750,7 +3810,36 @@ impl<'s> Vm<'s> {
             function: self.short_path(f),
             args: texts,
         });
-        self.call_values(f, id, args).map(Some)
+        let result = self.call_values(f, id, args);
+        if mapinfo_licence {
+            self.write_native_tgs_dummy(id)?;
+        }
+        result.map(Some)
+    }
+
+    /// The Xiii.dll `AMapInfo::PostBeginPlay` licence write: sets `TGSDummy` from the
+    /// per-map table ([`native_tgs_dummy`], keyed by the instance's `iLoadSpecificValue`).
+    /// Never traced for maps outside the table (no write, no note), so traces of maps that
+    /// do not use the flag are byte-identical to before.
+    fn write_native_tgs_dummy(&mut self, id: ObjectId) -> VmResult<()> {
+        let load_specific = match self.get_property(id, "iLoadSpecificValue") {
+            Some(Value::Int(n)) => *n,
+            _ => return Ok(()),
+        };
+        let Some(value) = native_tgs_dummy(load_specific) else {
+            return Ok(());
+        };
+        if !self.set_property(id, "TGSDummy", 0, Value::Int(value)) {
+            return Err(self.err(VmErrorKind::Other(format!(
+                "{}: native licence write: no TGSDummy property",
+                self.objects[id as usize].name
+            ))));
+        }
+        self.note(TraceKind::Note(format!(
+            "{}.PostBeginPlay: native licence table sets TGSDummy={} (iLoadSpecificValue {})",
+            self.objects[id as usize].name, value, load_specific
+        )));
+        Ok(())
     }
 
     /// Calls a function by global reference with argument values (no out parameters).
@@ -10562,6 +10651,47 @@ impl<'s> Vm<'s> {
 
     pub(crate) fn time_now(&self) -> f64 {
         self.time
+    }
+
+    /// Actors iterated by `VisibleDamageableActors` (item48): live actors of `base` within
+    /// `radius` of `loc` (the same distance filter as [`Vm::radius_actors`], the measured shape
+    /// of the retail level-hash query at Engine.dll 0x103e90a0), minus hidden actors when
+    /// `ignore_hidden`, minus actors whose world-geometry line from `loc` to their `Location` is
+    /// blocked (the retail SingleLineCheck with flags 0x86). Documented gaps (Partial at the
+    /// native): the retail visibility point is a bounds mid-point (0.5 constant at 0x1046f584)
+    /// rather than `Location`, the retail check also honours two unidentified class constants
+    /// and a second higher trace point, and actor occlusion (the retail check can be blocked by
+    /// actors, not only world geometry) is not modelled — the provider trace is world-only.
+    pub(crate) fn visible_damageable_actors(
+        &mut self,
+        base: Option<GlobalRef>,
+        radius: f32,
+        loc: [f32; 3],
+        ignore_hidden: bool,
+    ) -> VmResult<Vec<ObjectId>> {
+        let candidates: Vec<(ObjectId, [f32; 3])> = self
+            .radius_actors(base, radius, loc)
+            .into_iter()
+            .filter(|&id| !(ignore_hidden && self.bool_prop(id, "bHidden")))
+            .map(|id| {
+                let end = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
+                (id, end)
+            })
+            .collect();
+        match self.physics.as_mut() {
+            Some(p) => {
+                let mut out = Vec::new();
+                for (id, end) in candidates {
+                    if p.trace(loc, end, [0.0; 3]).is_none() {
+                        out.push(id);
+                    }
+                }
+                Ok(out)
+            }
+            None => Err(self.err(VmErrorKind::NoPhysicsProvider {
+                native: "Actor.VisibleDamageableActors".into(),
+            })),
+        }
     }
 
     /// Retail PC CRT rand (MSVCR70.dll 0x7c02836d), shared by appRand/appFrand.
