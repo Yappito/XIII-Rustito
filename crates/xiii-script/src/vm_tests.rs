@@ -2948,7 +2948,7 @@ fn survey_counts_missing_natives_without_aborting() {
 // ---------------------------------------------------------------------------------------
 // World physics bridge: Move/SetLocation/Trace/FastTrace/SetCollision(Size) + touching
 
-use crate::physics::{MoveOutcome, WorldHit, WorldPhysics};
+use crate::physics::{ActorMeshHit, MoveOutcome, WorldHit, WorldPhysics};
 
 const IMP_ARRAYPROP: i32 = -12;
 
@@ -2963,6 +2963,10 @@ fn phys_fixture() -> Vec<u8> {
     let child = b.reserve(0, 0, "Child");
     let decoration = b.reserve(0, 0, "Decoration");
     let levelinfo = b.reserve(0, 0, "LevelInfo");
+    // item53: a Pawn/Controller pair whose controller can enter `NoControl` (the scripted-
+    // ownership gate for Walking physics integration).
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "Controller");
 
     let add = b.reserve(IMP_FUNCTION, object, "Add_IntInt");
     let add_a = b.reserve(IMP_INTPROP, add, "A");
@@ -3008,6 +3012,13 @@ fn phys_fixture() -> Vec<u8> {
     let block_nonzero = b.reserve(IMP_BOOLPROP, actor, "bBlockNonZeroExtentTraces");
     let movable = b.reserve(IMP_BOOLPROP, actor, "bMovable");
     let bstatic = b.reserve(IMP_BOOLPROP, actor, "bStatic");
+    // item53 physics fields (EPhysics, script-written velocity, zone gravity inputs).
+    let physics = b.reserve(IMP_BYTEPROP, actor, "Physics");
+    let velocity = b.reserve(IMP_STRUCTPROP, actor, "Velocity");
+    let acceleration = b.reserve(IMP_STRUCTPROP, actor, "Acceleration");
+    let mass = b.reserve(IMP_FLOATPROP, actor, "Mass");
+    let buoyancy = b.reserve(IMP_FLOATPROP, actor, "Buoyancy");
+    let bbounce = b.reserve(IMP_BOOLPROP, actor, "bBounce");
     let proj_target = b.reserve(IMP_BOOLPROP, actor, "bProjTarget");
     let hidden = b.reserve(IMP_BOOLPROP, actor, "bHidden");
     let world_geometry = b.reserve(IMP_BOOLPROP, actor, "bWorldGeometry");
@@ -3015,6 +3026,7 @@ fn phys_fixture() -> Vec<u8> {
     let untouches = b.reserve(IMP_INTPROP, actor, "UnTouches");
     let touching = b.reserve(IMP_ARRAYPROP, actor, "Touching");
     let touching_template = b.reserve(IMP_OBJECTPROP, touching, "Touching");
+    let static_mesh = b.reserve(IMP_OBJECTPROP, actor, "StaticMesh");
 
     b.prop_with(owner, level, 0, &object_extra);
     b.prop_with(level, base, 0, &object_extra);
@@ -3035,7 +3047,14 @@ fn phys_fixture() -> Vec<u8> {
     b.prop(hidden, world_geometry, 0);
     b.prop(world_geometry, movable, 0);
     b.prop(movable, bstatic, 0);
-    b.prop(bstatic, touches, 0);
+    b.prop(bstatic, physics, 0);
+    b.prop_with(physics, velocity, 0, &vector_extra);
+    b.prop_with(velocity, acceleration, 0, &vector_extra);
+    b.prop_with(acceleration, mass, 0, &vector_extra);
+    b.prop(mass, buoyancy, 0);
+    b.prop(buoyancy, bbounce, 0);
+    b.prop(bbounce, static_mesh, 0);
+    b.prop_with(static_mesh, touches, 0, &object_extra);
     b.prop(touches, untouches, 0);
     b.prop(untouches, touching, 0);
     b.prop_with(touching_template, 0, 0, &object_extra);
@@ -3071,6 +3090,14 @@ fn phys_fixture() -> Vec<u8> {
     b.class(child, actor, 0, 0);
     b.class(decoration, actor, 0, 0);
     b.class(levelinfo, actor, 0, 0);
+    let pawn_controller = b.reserve(IMP_OBJECTPROP, pawn, "Controller");
+    b.prop_with(pawn_controller, 0, 0, &object_extra);
+    let ctrl_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
+    let no_control = b.reserve(IMP_STATE, controller, "NoControl");
+    b.state_masks(no_control, 0, 0, u64::MAX);
+    b.prop_with(ctrl_pawn, no_control, 0, &object_extra);
+    b.class(pawn, actor, pawn_controller, 0);
+    b.class(controller, actor, ctrl_pawn, 0);
     b.build()
 }
 
@@ -4340,6 +4367,352 @@ fn set_collision_fields(vm: &mut Vm<'_>, id: ObjectId, colliding: bool, blocking
     vm.set_property(id, "bMovable", 0, Value::Bool(true));
     vm.set_property(id, "CollisionRadius", 0, Value::Float(10.0));
     vm.set_property(id, "CollisionHeight", 0, Value::Float(10.0));
+}
+
+/// item53 test provider: a named actor's own static-mesh triangles (a wall in the YZ plane at
+/// `wall_x` with a window opening between `window_z0` and `window_z1`), plus optional world
+/// walls via [`MockWorld`] semantics. `with_data = false` models a provider without per-actor
+/// mesh data (the cylinder fallback must stay in charge).
+struct MeshWorld {
+    wall_x: f32,
+    window_z0: f32,
+    window_z1: f32,
+    with_data: bool,
+    walls: Vec<([f32; 3], [f32; 3])>,
+}
+
+impl MeshWorld {
+    fn window_wall(wall_x: f32) -> Self {
+        Self {
+            wall_x,
+            window_z0: 60.0,
+            window_z1: 120.0,
+            with_data: true,
+            walls: Vec::new(),
+        }
+    }
+
+    fn without_data(mut self) -> Self {
+        self.with_data = false;
+        self
+    }
+}
+
+impl WorldPhysics for MeshWorld {
+    fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
+        let d = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+        let mut best: Option<(f32, [f32; 3])> = None;
+        for &(mn, mx) in &self.walls {
+            if let Some((t, n)) = swept_aabb(start, d, extent, mn, mx)
+                && best.is_none_or(|(bt, _)| t < bt)
+            {
+                best = Some((t, n));
+            }
+        }
+        best.map(|(t, n)| WorldHit {
+            location: [
+                start[0] + d[0] * t,
+                start[1] + d[1] * t,
+                start[2] + d[2] * t,
+            ],
+            normal: n,
+            time: t,
+        })
+    }
+
+    fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        let end = [
+            start[0] + delta[0],
+            start[1] + delta[1],
+            start[2] + delta[2],
+        ];
+        match self.trace(start, end, extent) {
+            Some(hit) => MoveOutcome {
+                end: [
+                    start[0] + delta[0] * hit.time,
+                    start[1] + delta[1] * hit.time,
+                    start[2] + delta[2] * hit.time,
+                ],
+                hit: Some(hit),
+            },
+            None => MoveOutcome { end, hit: None },
+        }
+    }
+
+    fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool {
+        !self
+            .walls
+            .iter()
+            .any(|&(mn, mx)| aabb_overlaps(location, extent, mn, mx))
+    }
+
+    fn actor_mesh_hit(&mut self, actor: &str, start: [f32; 3], end: [f32; 3]) -> ActorMeshHit {
+        if !self.with_data || !actor.eq_ignore_ascii_case("WindowDoor") {
+            return ActorMeshHit::NoData;
+        }
+        // Two triangles of the wall plane x = wall_x, minus the window band in Z.
+        let d = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+        if d[0].abs() < 1e-9 {
+            return ActorMeshHit::Miss;
+        }
+        let t = (self.wall_x - start[0]) / d[0];
+        if !(0.0..=1.0).contains(&t) {
+            return ActorMeshHit::Miss;
+        }
+        let z = start[2] + d[2] * t;
+        if z > self.window_z0 && z < self.window_z1 {
+            return ActorMeshHit::Miss;
+        }
+        ActorMeshHit::Hit(WorldHit {
+            location: [self.wall_x, start[1] + d[1] * t, z],
+            normal: [-1.0, 0.0, 0.0],
+            time: t,
+        })
+    }
+}
+
+/// item53: a zero-extent ray through a static-mesh actor's window opening does not hit the
+/// actor even though its collision cylinder covers the opening (the Toits01 generator-shot
+/// defect); a ray through the mesh panel does, at the mesh plane.
+#[test]
+fn trace_through_static_mesh_window_misses_but_panel_hits() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let door = vm.spawn(pg(&set, "Decoration"), "WindowDoor").unwrap();
+    vm.set_property(door, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, door, true, true);
+    // PorteDecors-sized cylinder: 160 UU radius covers the whole window.
+    vm.set_property(door, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(door, "CollisionHeight", 0, Value::Float(160.0));
+    vm.set_property(
+        door,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+
+    // Through the window (z = 90): no hit at all.
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 90.0], [400.0, 0.0, 90.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(None, hit, "the ray through the window opening must pass");
+    assert!((location[0] - 400.0).abs() < 0.01, "{location:?}");
+
+    // Through the panel (z = 0): the mesh hit, at the mesh plane (not the grown cylinder).
+    let (hit, location, normal) = vm
+        .vm_trace(tracer, [0.0, 0.0, 0.0], [400.0, 0.0, 0.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(Some(door), hit);
+    assert!((location[0] - 40.0).abs() < 0.01, "{location:?}");
+    assert!(normal[0] < -0.9, "mesh plane normal, got {normal:?}");
+}
+
+/// item53: a provider without per-actor mesh data keeps the cylinder approximation, and a
+/// non-zero-extent trace is not refined (the swept-box kDOP is not modelled).
+#[test]
+fn trace_static_mesh_falls_back_to_cylinder_without_mesh_data_or_with_extent() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0).without_data()));
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, tracer, true, true);
+    let door = vm.spawn(pg(&set, "Decoration"), "WindowDoor").unwrap();
+    vm.set_property(door, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, door, true, true);
+    vm.set_property(door, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(door, "CollisionHeight", 0, Value::Float(160.0));
+    vm.set_property(
+        door,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    // No mesh data: the cylinder blocks even through the window opening (documented fallback).
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0, 0.0, 90.0], [400.0, 0.0, 90.0], true, [0.0; 3])
+        .expect("trace provider installed");
+    assert_eq!(Some(door), hit);
+
+    // Non-zero extent: not refined, the grown cylinder blocks.
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let (hit, _, _) = vm
+        .vm_trace(
+            tracer,
+            [0.0, 0.0, 90.0],
+            [400.0, 0.0, 90.0],
+            true,
+            [4.0, 4.0, 4.0],
+        )
+        .expect("trace provider installed");
+    assert_eq!(Some(door), hit);
+}
+
+/// item53: `Actor.TraceActors` over a static-mesh actor honours the mesh opening too.
+#[test]
+fn trace_actors_skips_static_mesh_actor_when_the_ray_passes_through_the_mesh() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let caller = phys_actor(&mut vm, &set, "Caller", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, caller, true, true);
+    let door = vm.spawn(pg(&set, "Decoration"), "WindowDoor").unwrap();
+    vm.set_property(door, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, door, true, true);
+    vm.set_property(door, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(door, "CollisionHeight", 0, Value::Float(160.0));
+    vm.set_property(
+        door,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    let rows = vm
+        .vm_trace_actors(caller, None, [0.0, 0.0, 90.0], [400.0, 0.0, 90.0], [0.0; 3])
+        .unwrap();
+    assert!(
+        rows.is_empty(),
+        "the window opening must not list the door: {rows:?}"
+    );
+    let rows = vm
+        .vm_trace_actors(caller, None, [0.0, 0.0, 0.0], [400.0, 0.0, 0.0], [0.0; 3])
+        .unwrap();
+    assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), [door]);
+}
+
+// ---------------------------------------------------------------------------------------
+// item53: scripted-physics integration (PHYS_Walking under NoControl, Falling, Flying,
+// Projectile -> Falling)
+
+/// A projectile flying into a world wall runs `HitWall`, stops at the sweep contact and, with
+/// `bBounce` clear, continues as `PHYS_Falling` with gravity decaying `Velocity.Z` (the engine's
+/// `physProjectile` -> `physFalling` fall-through; the demo's `Crochet.Velocity.Z < 1` cast
+/// transition depends on it).
+#[test]
+fn scripted_physics_projectile_hits_the_world_and_falls() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([50.0, -100.0, -100.0], [51.0, 100.0, 100.0]),
+    ));
+    let hook = vm.spawn(pg(&set, "Actor"), "CineHook").unwrap();
+    vm.set_active(hook, true);
+    vm.set_property(hook, "Location", 0, Value::Vector([0.0, 0.0, 0.0]));
+    vm.set_property(hook, "Physics", 0, Value::Byte(6));
+    vm.set_property(hook, "Velocity", 0, Value::Vector([1200.0, 0.0, 1100.0]));
+    set_collision_fields(&mut vm, hook, true, true);
+    // 50 UU at 1200 UU/s per 16 ms tick: the third tick reaches the wall plane at x = 50.
+    for _ in 0..3 {
+        vm.tick_suspending(0.016);
+    }
+    let location = vm.vector_prop(hook, "Location").unwrap();
+    let physics = vm.byte_prop(hook, "Physics");
+    let velocity = vm.vector_prop(hook, "Velocity").unwrap();
+    assert_eq!(physics, 2, "the wall hit must fall through to PHYS_Falling");
+    // The swept box stops one extent short of the wall plane at x = 50.
+    assert!((location[0] - 40.0).abs() < 0.5, "{location:?}");
+    // Gravity (the measured Engine.PhysicsVolume default -950) applied for the hit frame only:
+    // a projectile keeps constant velocity until it hits (no zone gravity while flying).
+    assert!(
+        (velocity[2] - (1100.0 - 950.0 * 0.016)).abs() < 0.5,
+        "gravity decayed vz: {velocity:?}"
+    );
+    // A later tick keeps decelerating vz toward the `< 1` transition threshold.
+    for _ in 0..80 {
+        vm.tick_suspending(0.016);
+    }
+    let velocity = vm.vector_prop(hook, "Velocity").unwrap();
+    assert!(velocity[2] < 1.0, "vz decayed below 1: {velocity:?}");
+}
+
+/// `PHYS_Falling` integrates the zone gravity (+ `Acceleration`, buoyancy-reduced) into the
+/// velocity and moves the actor; without world collision the actor simply accelerates downward.
+#[test]
+fn scripted_physics_falling_integrates_zone_gravity() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let body = vm.spawn(pg(&set, "Actor"), "Body").unwrap();
+    vm.set_active(body, true);
+    vm.set_property(body, "Location", 0, Value::Vector([0.0, 0.0, 1000.0]));
+    vm.set_property(body, "Physics", 0, Value::Byte(2));
+    vm.set_property(body, "Velocity", 0, Value::Vector([0.0; 3]));
+    vm.set_property(body, "bCollideWorld", 0, Value::Bool(false));
+    vm.tick_suspending(0.016);
+    let velocity = vm.vector_prop(body, "Velocity").unwrap();
+    assert!((velocity[2] + 950.0 * 0.016).abs() < 0.5, "{velocity:?}");
+    vm.tick_suspending(0.016);
+    let velocity = vm.vector_prop(body, "Velocity").unwrap();
+    assert!(
+        (velocity[2] + 2.0 * 950.0 * 0.016).abs() < 0.5,
+        "{velocity:?}"
+    );
+}
+
+/// `PHYS_Flying` moves the actor by the script-written velocity (the demo rewrites
+/// `Jones.Velocity` every tick toward the hook).
+#[test]
+fn scripted_physics_flying_moves_by_script_velocity() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let jones = vm.spawn(pg(&set, "Pawn"), "Jones").unwrap();
+    vm.set_active(jones, true);
+    vm.set_property(jones, "Location", 0, Value::Vector([0.0, 0.0, 100.0]));
+    vm.set_property(jones, "Physics", 0, Value::Byte(4));
+    vm.set_property(jones, "Velocity", 0, Value::Vector([900.0, 0.0, 450.0]));
+    vm.set_property(jones, "bCollideWorld", 0, Value::Bool(false));
+    vm.tick_suspending(0.016);
+    let location = vm.vector_prop(jones, "Location").unwrap();
+    assert!(
+        (location[0] - 14.4).abs() < 0.2 && (location[2] - 107.2).abs() < 0.2,
+        "{location:?}"
+    );
+}
+
+/// `PHYS_Walking` is integrated only while the pawn's controller is in `NoControl`: the
+/// cinematic-owned pawn steps by its script-written horizontal velocity; a pawn whose
+/// controller is elsewhere is left to the host/controller latents (no double movement).
+#[test]
+fn scripted_physics_walking_moves_only_the_script_owned_pawn() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let controller = vm.spawn(pg(&set, "Controller"), "PC").unwrap();
+    let pawn = vm.spawn(pg(&set, "Pawn"), "Jones").unwrap();
+    vm.set_active(controller, true);
+    vm.set_active(pawn, true);
+    vm.set_property(
+        controller,
+        "Pawn",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    vm.set_property(
+        pawn,
+        "Controller",
+        0,
+        Value::Object(Some(ObjRef::Instance(controller))),
+    );
+    vm.goto_state(controller, "NoControl", None).unwrap();
+    vm.set_property(pawn, "Location", 0, Value::Vector([0.0, 0.0, 944.0]));
+    vm.set_property(pawn, "Physics", 0, Value::Byte(1));
+    vm.set_property(pawn, "Velocity", 0, Value::Vector([600.0, 0.0, 0.0]));
+    vm.set_property(pawn, "bCollideWorld", 0, Value::Bool(false));
+    let bystander = vm.spawn(pg(&set, "Pawn"), "Bystander").unwrap();
+    vm.set_active(bystander, true);
+    vm.set_property(bystander, "Location", 0, Value::Vector([0.0, 0.0, 944.0]));
+    vm.set_property(bystander, "Physics", 0, Value::Byte(1));
+    vm.set_property(bystander, "Velocity", 0, Value::Vector([600.0, 0.0, 0.0]));
+    vm.set_property(bystander, "bCollideWorld", 0, Value::Bool(false));
+    vm.tick_suspending(0.016);
+    let location = vm.vector_prop(pawn, "Location").unwrap();
+    assert!((location[0] - 9.6).abs() < 0.2, "{location:?}");
+    assert!(
+        (location[2] - 944.0).abs() < 0.01,
+        "z untouched: {location:?}"
+    );
+    let bystander_location = vm.vector_prop(bystander, "Location").unwrap();
+    assert_eq!(bystander_location[0], 0.0, "host-owned pawn not moved");
 }
 
 #[test]
