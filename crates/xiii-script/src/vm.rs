@@ -1082,18 +1082,14 @@ const TIMER_EVENTS: [&str; 3] = ["Timer", "Timer2", "Timer3"];
 /// UE2 `EPhysics::PHYS_Walking` (engine.u enum order; see `item7b-movement-modes.md`).
 const PHYS_WALKING: u8 = 1;
 /// UE2 `EPhysics::PHYS_Falling` (item53: `AActor::performPhysics` jump table 0x103c14dc).
-const PHYS_FALLING: u8 = 2;
+pub(crate) const PHYS_FALLING: u8 = 2;
 /// UE2 `EPhysics::PHYS_Flying` (the grapple demo's `Jones.SetPhysics(4)`).
 const PHYS_FLYING: u8 = 4;
 /// UE2 `EPhysics::PHYS_Projectile` (the grapple demo's `CineHook` class default).
 const PHYS_PROJECTILE: u8 = 6;
-
-fn cine_trace_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("XIII_CINE_TRACE").is_some_and(|v| v != "0" && !v.is_empty())
-    })
-}
+/// Floor-grade contact normal Z for the physics moves: a hit whose upward normal clears this
+/// ends a `PHYS_Falling` fall (`Landed` -> `PHYS_Walking`) and zeroes the contact velocity.
+const FLOOR_NORMAL_Z: f32 = 0.7;
 
 /// An interpreter object.
 #[derive(Debug)]
@@ -1165,6 +1161,9 @@ struct IterState {
     idx: usize,
     places: Vec<Option<Place>>,
     body: usize,
+    /// TouchingActors walks the current native array, not a snapshot. The cursor is
+    /// advanced before the body runs, matching execTouchingActors 0x103e66cf.
+    touching: Option<(ObjectId, Option<GlobalRef>, usize)>,
 }
 
 type ActorTraceHit = (ObjectId, [f32; 3], [f32; 3]);
@@ -3185,6 +3184,11 @@ impl<'s> Vm<'s> {
             let mut values = std::mem::take(&mut self.objects[id as usize].props);
             self.apply_block(map, &props.block, &layout, &mut values);
             self.objects[id as usize].props = values;
+            // item61: level-placed actors get the engine's `InitExecution` writes too (the
+            // retail `AGenAlerte::InitExecution` initialises map-placed alert generators).
+            if self.objects[id as usize].is_actor {
+                self.apply_native_init_execution(id);
+            }
         }
         // Cache the map's `LevelInfo` for the per-tick `NextURL` travel check.
         self.level_info = self.find_level_info();
@@ -3464,23 +3468,6 @@ impl<'s> Vm<'s> {
 
     /// Writes a property by name and element.
     pub fn set_property(&mut self, id: ObjectId, name: &str, elem: usize, v: Value) -> bool {
-        if std::env::var_os("XIII_WATCH_PLAYER_HEALTH").is_some()
-            && self.objects.get(id as usize).is_some_and(|o| {
-                o.is_actor && o.layout.chain_names.iter().any(|c| c == "xiiiplayerpawn")
-            })
-            && name.eq_ignore_ascii_case("health")
-        {
-            let writer = self.stack.last().map_or("<host>", |s| s.function.as_str());
-            let offset = self.stack.last().map_or(0, |s| s.offset);
-            eprintln!(
-                "[vm-health-write] t={:.6} pawn={} writer={} offset=0x{:04X} value={}",
-                self.time,
-                self.objects[id as usize].name,
-                writer,
-                offset,
-                self.value_text(&v)
-            );
-        }
         let Some(o) = self.objects.get_mut(id as usize) else {
             return false;
         };
@@ -3814,7 +3801,7 @@ impl<'s> Vm<'s> {
             });
             return Ok(None);
         };
-        let texts = args.iter().map(|a| self.value_text(a)).collect();
+        let texts: Vec<String> = args.iter().map(|a| self.value_text(a)).collect();
         self.note(TraceKind::Event {
             target: actor,
             function: self.short_path(f),
@@ -4189,12 +4176,6 @@ impl<'s> Vm<'s> {
     /// `XIIIBaseHud.Tick`, pawn controllers) never runs. `Tick` is looked up in the actor's
     /// current state first, then the class chain.
     fn dispatch_tick(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
-        let trace_cine = cine_trace_enabled() && self.is_a(id, "CineController2");
-        let action_before =
-            trace_cine.then(|| match self.get_property(id, "ScriptedActionIndex") {
-                Some(Value::Int(index)) => Some(*index),
-                _ => None,
-            });
         let f = self.tick_function(id);
         if let Some(f) = f {
             let t0 = self.profile.enabled.then(Instant::now);
@@ -4203,18 +4184,6 @@ impl<'s> Vm<'s> {
                 let key = self.tick_fn_key(id);
                 *self.profile.tick_fns.entry(key).or_default() += t0.elapsed().as_micros() as u64;
             }
-        }
-        if trace_cine {
-            let action_after = match self.get_property(id, "ScriptedActionIndex") {
-                Some(Value::Int(index)) => Some(*index),
-                _ => None,
-            };
-            let phase = if action_before.flatten() != action_after {
-                "advance"
-            } else {
-                "blocked/current"
-            };
-            self.trace_cinematic_controller(id, phase);
         }
         Ok(())
     }
@@ -4319,153 +4288,6 @@ impl<'s> Vm<'s> {
         }
     }
 
-    /// Temporary, opt-in diagnostic for the authored XIDCine action interpreter. Kept in the VM
-    /// so it observes the same actor state and decoded action table that `Interpret` consumes.
-    fn trace_cinematic_controller(&self, id: ObjectId, phase: &str) {
-        let obj = &self.objects[id as usize];
-        let action_index = match self.get_property(id, "ScriptedActionIndex") {
-            Some(Value::Int(i)) => *i,
-            _ => -1,
-        };
-        // CineController2 increments ScriptedActionIndex after Interpret. The preceding entry is
-        // the action just executed and, while paused, the action whose wait bit is still set.
-        let pawn = self.obj_prop(id, "MyPawn");
-        let controlled_pawn = self.obj_prop(id, "Pawn");
-        let tab = pawn.and_then(|p| match self.get_property(p, "CurrentTabActionIndex") {
-            Some(Value::Int(i)) => Some(*i),
-            _ => None,
-        });
-        let list = pawn.and_then(|p| {
-            let name = match tab.unwrap_or(0) {
-                2 => "tabActions2",
-                3 => "tabActions3",
-                _ => "tabActions",
-            };
-            match self.get_property(p, name) {
-                Some(Value::Array(items)) => Some(items),
-                _ => None,
-            }
-        });
-        let selected = action_index.saturating_sub(1);
-        let action = list
-            .and_then(|items| usize::try_from(selected).ok().and_then(|i| items.get(i)))
-            .map_or_else(
-                || "<action unavailable>".to_owned(),
-                |v| match v {
-                    Value::Str(s) | Value::Name(s) => s.clone(),
-                    _ => format!("{v}"),
-                },
-            );
-        let state = self.state_name(id).unwrap_or_else(|| "<no state>".into());
-        let flags = match self.get_property(id, "flagsPaused") {
-            Some(Value::Int(v)) => *v,
-            _ => 0,
-        };
-        let mut waits = Vec::new();
-        for (mask, label) in [
-            (1, "player"),
-            (2, "event"),
-            (4, "warning"),
-            (8, "speech/dial"),
-            (16, "move/sequence"),
-            (32, "see-player"),
-            (64, "seen-by-player"),
-            (128, "time"),
-            (256, "animation"),
-            (512, "not-seen-by-player"),
-            (1024, "player-away"),
-            (2048, "cadaver"),
-        ] {
-            if flags & mask != 0 {
-                waits.push(label.to_owned());
-            }
-        }
-        if flags & 2 != 0 {
-            waits.push(format!(
-                "event-name={}",
-                self.get_property(id, "Tag")
-                    .map_or_else(|| "<none>".into(), |v| format!("{v}"))
-            ));
-        }
-        if flags & 4 != 0 {
-            waits.push(format!(
-                "WarnMemory={:?} warning-jump={:?}",
-                self.get_property(id, "WarnMemory"),
-                self.get_property_elem(id, "nOnJump", 2)
-            ));
-        }
-        if flags & 16 != 0 {
-            waits.push(format!("bMoving={:?}", self.get_property(id, "bMoving")));
-        }
-        if flags & 256 != 0 {
-            waits.push(format!(
-                "bAnimOnce={:?} bSubAnim={:?}",
-                self.get_property(id, "bAnimOnce"),
-                self.get_property(id, "bSubAnim")
-            ));
-        }
-        if let Some(pawn) = pawn {
-            let location = self.vector_prop(pawn, "Location");
-            waits.push(format!("pawn-location={location:?}"));
-            for property in ["Target", "NextTarget"] {
-                if let Some(target) = self.obj_prop(id, property) {
-                    let target_name = self.objects[target as usize].name.clone();
-                    let target_location = self.vector_prop(target, "Location");
-                    let distance = location.zip(target_location).map(|(from, to)| {
-                        let delta = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
-                        (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt()
-                    });
-                    waits.push(format!(
-                        "{property}={target_name}@{target_location:?} distance={distance:?}"
-                    ));
-                }
-            }
-            for (&channel, animation) in &self.objects[pawn as usize].anim.channels {
-                if animation.active {
-                    waits.push(format!(
-                        "channel{channel}={} frame={:.3}/{},rate={:.3}fps,loop={}",
-                        animation.sequence,
-                        animation.frame,
-                        animation.frames,
-                        animation.rate,
-                        animation.looping
-                    ));
-                }
-            }
-        }
-        if let Some(code) = obj.state_code.as_ref()
-            && let Some(latent) = &code.latent
-        {
-            waits.push(format!("latent={latent:?}"));
-        }
-        println!(
-            "[cine-trace] t={:.3}s tick={} phase={} actor={} pawn={} mypawn={} state={} label/tag={} action[{}]={:?} flagsPaused=0x{:X} wait={}",
-            self.time,
-            self.tick_count,
-            phase,
-            obj.name,
-            controlled_pawn.map_or_else(
-                || "<none>".into(),
-                |p| self.objects[p as usize].name.clone()
-            ),
-            pawn.map_or_else(
-                || "<none>".into(),
-                |p| self.objects[p as usize].name.clone()
-            ),
-            state,
-            self.get_property(id, "Tag")
-                .map_or_else(|| "<none>".into(), |v| format!("{v}")),
-            selected,
-            action,
-            flags,
-            if waits.is_empty() {
-                "<none>".into()
-            } else {
-                waits.join(",")
-            }
-        );
-    }
-
     /// item18: per-frame `PlayerTick` dispatch to the local player controllers, after the actor
     /// `Tick` pass (UE2 `ULevel::Tick` order; [`Self::tick`] calls this at the same point).
     ///
@@ -4530,8 +4352,6 @@ impl<'s> Vm<'s> {
     /// Suspends the actor that should stop after a failing tick: the innermost object on the
     /// error stack when it can be resolved, otherwise the actor being ticked. Returns the id.
     fn suspend_for_error(&mut self, ticked: ObjectId, e: &VmError) -> ObjectId {
-        #[cfg(test)]
-        eprintln!("[item47 temporary suspension diagnostic] {e}");
         let id = e
             .stack
             .last()
@@ -5047,6 +4867,7 @@ impl<'s> Vm<'s> {
             && !self.objects[target as usize].name.starts_with("Default__")
             && !f.is_static()
             && !destroyed_target
+            && layout.ret.is_none()
         {
             // item14c: a **suspended** actor (cleared by `suspend_for_error`) is not the same as
             // a placed actor outside the executed scope. Dropping its call silently would hide a
@@ -5062,23 +4883,25 @@ impl<'s> Vm<'s> {
                     self.short_path(func)
                 )));
             }
-            if layout.ret.is_some() {
-                return Err(self.err(VmErrorKind::DeferredWithReturnValue {
-                    target: tname,
-                    function: set.path(func),
-                }));
-            }
             // Arguments are still evaluated (side effects, Accessed None) as in a real call.
             for a in &call.args {
                 self.eval(frame, a)?;
             }
             self.note(TraceKind::Deferred {
-                target: tname,
-                class,
+                target: tname.clone(),
+                class: class.clone(),
                 function: self.short_path(func),
             });
+            drop(class);
             return Ok(Value::Void);
         }
+        // A call whose return value the executing code needs can never be deferred: the engine's
+        // `execVirtualFunction -> UObject::CallFunction` runs the callee's frame synchronously on
+        // any context, active or not (measured: `XIIIBulletsAmmo.ProcessTraceHit` xiii.u 0x029D
+        // calls `XIIIPawn(Other).GetDamageLocation(...)` on a parked, non-active soldier, and the
+        // old deferral error aborted the whole bullet chain before `Other.TakeDamage` - scratch
+        // item30c_e34). Non-active targets therefore fall through and run right here.
+
         let mut locals = Vec::with_capacity(layout.size);
         for s in &layout.slots {
             for _ in 0..s.dim {
@@ -5251,6 +5074,7 @@ impl<'s> Vm<'s> {
                     idx: 0,
                     places: Vec::new(),
                     body: 0,
+                    touching: None,
                 });
             }
             return Ok(outcome);
@@ -5333,6 +5157,20 @@ impl<'s> Vm<'s> {
                 idx: 0,
                 places,
                 body: 0,
+                touching: if self
+                    .short_path(func)
+                    .eq_ignore_ascii_case("Actor.TouchingActors")
+                {
+                    let base = match args.first() {
+                        Some(Value::Object(Some(ObjRef::Static(base)))) => Some(*base),
+                        _ => None,
+                    };
+                    let mut cursor = 0;
+                    self.next_touching_actor(target, base, &mut cursor);
+                    Some((target, base, cursor))
+                } else {
+                    None
+                },
             });
             return Ok(NativeOutcome::Iterate(items));
         }
@@ -5603,6 +5441,7 @@ impl<'s> Vm<'s> {
                                 idx: 0,
                                 places: Vec::new(),
                                 body: pc + 1,
+                                touching: None,
                             });
                             return Ok(Flow::Goto(self.goto_offset(frame, u32::from(*end))?));
                         }
@@ -5624,6 +5463,12 @@ impl<'s> Vm<'s> {
                         let st = frame.iters.last_mut().expect("pushed");
                         st.body = pc + 1;
                         if items.is_empty() {
+                            if st.touching.is_some() {
+                                let places = st.places.clone();
+                                for place in places.into_iter().flatten() {
+                                    self.write(frame, &place, Value::Object(None))?;
+                                }
+                            }
                             Flow::Goto(self.goto_offset(frame, u32::from(*end))?)
                         } else {
                             let values = st.items[0].clone();
@@ -5645,6 +5490,22 @@ impl<'s> Vm<'s> {
                 }
             }
             K::IteratorNext => {
+                let live = frame.iters.last().and_then(|st| st.touching);
+                if let Some((this, base, mut cursor)) = live {
+                    let next = self.next_touching_actor(this, base, &mut cursor);
+                    let st = frame.iters.last_mut().expect("live iterator exists");
+                    st.touching = Some((this, base, cursor));
+                    let (places, body) = (st.places.clone(), st.body);
+                    let value = Value::Object(next.map(ObjRef::Instance));
+                    for place in places.into_iter().flatten() {
+                        self.write(frame, &place, value.clone())?;
+                    }
+                    return Ok(if next.is_some() {
+                        Flow::Goto(body)
+                    } else {
+                        Flow::Next
+                    });
+                }
                 let Some(st) = frame.iters.last_mut() else {
                     return Err(
                         self.err(VmErrorKind::Other("IteratorNext without iterator".into()))
@@ -6675,47 +6536,6 @@ impl<'s> Vm<'s> {
                 if *i >= len {
                     return Err(self.err(VmErrorKind::Other("bad slot".into())));
                 }
-                if std::env::var_os("XIII_WATCH_PLAYER_HEALTH").is_some()
-                    && self.objects[*o as usize].is_actor
-                    && self.is_a(*o, "XIIIPlayerPawn")
-                    && self.objects[*o as usize]
-                        .layout
-                        .slots
-                        .iter()
-                        .find(|s| s.base == *i)
-                        .is_some_and(|s| s.name.eq_ignore_ascii_case("health"))
-                {
-                    let writer = self.stack.last().map_or("<host>", |s| s.function.as_str());
-                    let offset = self.stack.last().map_or(0, |s| s.offset);
-                    eprintln!(
-                        "[vm-health-write] t={:.6} pawn={} writer={} offset=0x{:04X} value={}",
-                        self.time,
-                        self.objects[*o as usize].name,
-                        writer,
-                        offset,
-                        self.value_text(&v)
-                    );
-                }
-                if std::env::var_os("XIII_WATCH_PLAYER_HEALTH").is_some()
-                    && self.objects[*o as usize].is_actor
-                    && self.objects[*o as usize]
-                        .layout
-                        .slots
-                        .iter()
-                        .find(|s| s.base == *i)
-                        .is_some_and(|s| s.name.eq_ignore_ascii_case("startspotevent"))
-                {
-                    let writer = self.stack.last().map_or("<host>", |s| s.function.as_str());
-                    let offset = self.stack.last().map_or(0, |s| s.offset);
-                    eprintln!(
-                        "[vm-sse-write] t={:.6} obj={} writer={} offset=0x{:04X} value={}",
-                        self.time,
-                        self.objects[*o as usize].name,
-                        writer,
-                        offset,
-                        self.value_text(&v)
-                    );
-                }
                 self.objects[*o as usize].props[*i] = v;
             }
             Place::Elem(base, i, elem_ty) => {
@@ -7000,12 +6820,51 @@ impl<'s> Vm<'s> {
         if let Some(level) = self.obj_prop(spawner, "Level") {
             self.set_property(id, "Level", 0, Value::Object(Some(ObjRef::Instance(level))));
         }
+        // item61: the engine's per-actor `InitExecution` runs before any lifecycle event.
+        self.apply_native_init_execution(id);
         self.objects[id as usize].active = true;
         self.note(TraceKind::Spawned {
             actor: name,
             class: self.set.path(class),
         });
         Ok(Some(id))
+    }
+
+    /// item61: the anti-piracy values the retail engine's `InitExecution` overrides store on
+    /// fresh actors before any script lifecycle runs, applied at the same points the VM
+    /// instantiates actors (runtime [`Vm::spawn_actor`]/[`Vm::spawn_level_actor`] and
+    /// [`Vm::load_level`]):
+    ///
+    /// - Engine.dll `?InitExecution@AGameInfo@@UAEXXZ` (0x103e0c80): after the
+    ///   `AActor::InitExecution` call at 0x103e0cad it stores `0xC3A3228F` (= -326.27f) at
+    ///   `this+0x2c0` (0x103e0cb6) = `GameInfo.DummyStuff1` (float) and `0x337` (= 823) at
+    ///   `this+0x2c4` (0x103e0cc0) = `GameInfo.DummyStuff2` (int). `xidpawn.IAController.Init`
+    ///   state `TurnIntoSoldierInit` (code 0x0010) gives every soldier
+    ///   `BaseS.Skill = 5; Pawn.Health *= 5` unless `Level.Game.DummyStuff1` carries -326.27, so
+    ///   without this write all campaign soldiers are 5x-health skill-5 soldiers.
+    /// - XIDPawn.dll `?InitExecution@AGenAlerte@@UAEXXZ` (VA 0x119015c0, RVA 0x15c0): after its
+    ///   `AActor::InitExecution` IAT call it stores `0x7d2` (= 2002) at `this+0x21c` (0x119015c9)
+    ///   = `GenAlerte.dummy` (int). `GenAlerte.PoteBeugle` (4 sites) applies
+    ///   `BaseS.Skill = 5; Pawn.Health *= 10` to every alerted soldier unless `dummy` is inside
+    ///   (1940, 2003) — the retail value 2002 suppresses it.
+    ///
+    /// Deliberately untraced: the retail write produces no script-visible effect by itself and
+    /// the Plage00 trace baseline must stay byte-identical.
+    fn apply_native_init_execution(&mut self, id: ObjectId) {
+        let Some(chain) = self
+            .objects
+            .get(id as usize)
+            .map(|o| o.layout.chain_names.clone())
+        else {
+            return;
+        };
+        if chain.iter().any(|n| n == "gameinfo") {
+            self.set_property(id, "DummyStuff1", 0, Value::Float(-326.27));
+            self.set_property(id, "DummyStuff2", 0, Value::Int(823));
+        }
+        if chain.iter().any(|n| n == "genalerte") {
+            self.set_property(id, "dummy", 0, Value::Int(2002));
+        }
     }
 
     /// Vector property value, or `None` when the property is absent/another type.
@@ -7479,6 +7338,36 @@ impl<'s> Vm<'s> {
         }
     }
 
+    /// Live actors in `id`'s `Touching` list (the host-side view of the same list).
+    pub fn touching(&self, id: ObjectId) -> Vec<ObjectId> {
+        self.touching_list(id)
+    }
+
+    /// Native TouchingActors selection. Deliberately does not call touching_list:
+    /// the retail iterator tests only null and IsA, including retained deleted actors.
+    pub(crate) fn next_touching_actor(
+        &self,
+        id: ObjectId,
+        base: Option<GlobalRef>,
+        cursor: &mut usize,
+    ) -> Option<ObjectId> {
+        let Some(Value::Array(items)) = self.get_property(id, "Touching") else {
+            return None;
+        };
+        while let Some(value) = items.get(*cursor) {
+            *cursor += 1;
+            if let Value::Object(Some(ObjRef::Instance(actor))) = value
+                && let Some(object) = self.objects.get(*actor as usize)
+                && base.map_or(object.is_actor, |class| {
+                    object.layout.chain.contains(&class)
+                })
+            {
+                return Some(*actor);
+            }
+        }
+        None
+    }
+
     fn set_touching_list(&mut self, id: ObjectId, list: Vec<ObjectId>) {
         let items = list
             .into_iter()
@@ -7936,6 +7825,13 @@ impl<'s> Vm<'s> {
     /// `Actor.SetLocation`: teleport when the destination is free of world geometry and not
     /// encroached by a blocking actor; returns whether it moved. Touch relations are updated.
     pub(crate) fn vm_set_location(&mut self, id: ObjectId, location: [f32; 3]) -> VmResult<bool> {
+        // FarMoveActor 0x1038a489 refuses bStatic or !bMovable outside the editor.
+        // Generated fixtures without the native bMovable property use Actor's true default.
+        if self.bool_prop(id, "bStatic")
+            || matches!(self.get_property(id, "bMovable"), Some(Value::Bool(false)))
+        {
+            return Ok(false);
+        }
         let extent = self.actor_extent(id);
         let check_world =
             self.bool_prop(id, "bCollideWorld") || self.bool_prop(id, "bCollideWhenPlacing");
@@ -7969,6 +7865,11 @@ impl<'s> Vm<'s> {
                 }
             }
         }
+        // FarMoveActor 0x1038a5c1 marks a successful non-test teleport, and its
+        // non-attached path calls SetBase(None, (0,0,1), true) before the Location store.
+        self.set_property(id, "bJustTeleported", 0, Value::Bool(true));
+        self.set_property(id, "Base", 0, Value::Object(None));
+        self.set_property(id, "Floor", 0, Value::Vector([0.0, 0.0, 1.0]));
         self.set_property(id, "Location", 0, Value::Vector(location));
         self.refresh_touching(id, false)?;
         Ok(true)
@@ -8417,6 +8318,7 @@ impl<'s> Vm<'s> {
     /// Script Trace's composed flags; pawn/mover category bits remain effective even when
     /// bTraceActors was false. Special BSP/material filtering remains Partial.
     #[allow(clippy::type_complexity)]
+    #[cfg(test)]
     pub(crate) fn vm_trace_flags(
         &mut self,
         id: ObjectId,
@@ -8424,6 +8326,34 @@ impl<'s> Vm<'s> {
         end: [f32; 3],
         flags: u32,
         extent: [f32; 3],
+    ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
+        self.vm_trace_flags_impl(id, start, end, flags, extent, false)
+    }
+
+    /// Script execTrace has zero miss outputs and only updates the last-bone cache
+    /// when TRACE_HitBoxes (0x10000) was requested. Internal query users keep their
+    /// endpoint-on-miss convention and existing hit-zone query behavior.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn vm_script_trace(
+        &mut self,
+        id: ObjectId,
+        start: [f32; 3],
+        end: [f32; 3],
+        flags: u32,
+        extent: [f32; 3],
+    ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
+        self.vm_trace_flags_impl(id, start, end, flags, extent, true)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn vm_trace_flags_impl(
+        &mut self,
+        id: ObjectId,
+        start: [f32; 3],
+        end: [f32; 3],
+        flags: u32,
+        extent: [f32; 3],
+        script: bool,
     ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
         // item52: a mover with `bUseCylinderCollision` collides as its cylinder, not its placed
         // mesh. Measured need (Hual01a): the lever `XIIIMover6` (pivot (4489.4,-5437.4,-85),
@@ -8528,7 +8458,7 @@ impl<'s> Vm<'s> {
         let out = match best {
             Some((t, Some(b), n)) => (Some(b), lerp3(start, end, t), n),
             Some((t, None, n)) => (self.find_level_info(), lerp3(start, end, t), n),
-            None => (None, end, [0.0, 0.0, 0.0]),
+            None => (None, if script { [0.0; 3] } else { end }, [0.0; 3]),
         };
         // item14: record the hit zone for `Actor.GetLastTraceBone` (`XIIIPawn.LastBoneHit`).
         // A world/LevelInfo hit is not a pawn, so the bone stays `None`.
@@ -8538,25 +8468,27 @@ impl<'s> Vm<'s> {
         // bone name wins; otherwise the collision-cylinder classification is the fallback. The
         // ray is the exact trace segment, not the hit point, because a body's boxes can be
         // smaller than the cylinder.
-        self.last_trace_bone = match out.0 {
-            Some(b) if !self.is_a(b, "levelinfo") && !self.is_mover(b) => self
-                .hit_zones
-                .as_ref()
-                .and_then(|z| z.ray_bone(b, start, end))
-                .unwrap_or_else(|| {
-                    let (center, radius, half_height) = self.actor_cylinder(b);
-                    match &self.hit_zones {
-                        Some(z) => z.bone_at(center, radius, half_height, out.1),
-                        None => crate::physics::CylinderZones.bone_at(
-                            center,
-                            radius,
-                            half_height,
-                            out.1,
-                        ),
-                    }
-                }),
-            _ => "None".to_owned(),
-        };
+        if !script || flags & 0x10000 != 0 {
+            self.last_trace_bone = match out.0 {
+                Some(b) if !self.is_a(b, "levelinfo") && !self.is_mover(b) => self
+                    .hit_zones
+                    .as_ref()
+                    .and_then(|z| z.ray_bone(b, start, end))
+                    .unwrap_or_else(|| {
+                        let (center, radius, half_height) = self.actor_cylinder(b);
+                        match &self.hit_zones {
+                            Some(z) => z.bone_at(center, radius, half_height, out.1),
+                            None => crate::physics::CylinderZones.bone_at(
+                                center,
+                                radius,
+                                half_height,
+                                out.1,
+                            ),
+                        }
+                    }),
+                _ => "None".to_owned(),
+            };
+        }
         if self.collect_combat_natives {
             let player = self.objects.iter().enumerate().find_map(|(i, o)| {
                 (o.is_actor && !o.deleted && self.is_a(i as ObjectId, "XIIIPlayerPawn"))
@@ -9646,7 +9578,15 @@ impl<'s> Vm<'s> {
     }
 
     /// `PHYS_Falling`: gravity (+ `Acceleration`) integrated into `Velocity`, then one swept
-    /// move ([`Vm::integrate_move`]).
+    /// move ([`Vm::integrate_move_sliding`]). A floor-grade contact (`normal.Z > 0.7`) zeroes
+    /// the contact velocity (the engine's `Landed` -> ground friction, decoded) and switches a
+    /// still-`PHYS_Falling` pawn to `PHYS_Walking` — the engine's own `APawn::processLanded`
+    /// fallback (Engine.dll 0x103c188d/0x103c18cb, upstream evidence cited at the switch
+    /// below; measured on Toits01 Cine0, probe24c). `Landed` itself is not dispatched: the
+    /// host owns the player pawn's landing (`Session::step` writes `Physics` every tick and
+    /// sends the player's `Landed` itself), and the placed pawns' `Landed` events are not run
+    /// by the physics pass (documented approximation; a pawn that only lands through this pass
+    /// resumes a `Controller.WaitForLanding` latent through the `PHYS_Walking` flip).
     ///
     /// The engine scales the gravity by `1 - GetNetBuoyancy/Mass`
     /// (`AActor::physFalling` 0x103bfe99-0x103bfeb8), but `GetNetBuoyancy` (0x103bbf50) does
@@ -9807,60 +9747,6 @@ impl<'s> Vm<'s> {
             .as_mut()
             .map(|provider| provider.walk_box(location, delta, extent));
         let end = walked.map_or_else(|| add3(location, delta), |o| o.end);
-        // TEMPORARY item53d diagnostic (removed before finishing): with XIII_VM_MOVE_TRACE set,
-        // print each steered move's start/end/velocity and the blocking hit + overlapping
-        // primitives at the blocked position.
-        if std::env::var_os("XIII_VM_MOVE_TRACE").is_some() {
-            let name = self
-                .objects
-                .get(pawn as usize)
-                .map(|o| o.name.clone())
-                .unwrap_or_default();
-            let hit_info = walked
-                .as_ref()
-                .and_then(|o| o.hit.as_ref())
-                .map(|h| {
-                    format!(
-                        "HIT t={:.3} at ({:.1},{:.1},{:.1}) n=({:.2},{:.2},{:.2})",
-                        h.time,
-                        h.location[0],
-                        h.location[1],
-                        h.location[2],
-                        h.normal[0],
-                        h.normal[1],
-                        h.normal[2]
-                    )
-                })
-                .unwrap_or_else(|| "free".to_owned());
-            let overlaps = if walked.as_ref().is_some_and(|o| o.hit.is_some()) {
-                self.physics
-                    .as_mut()
-                    .map(|p| {
-                        p.dump_overlap(end, extent)
-                            .iter()
-                            .take(4)
-                            .map(|r| format!("{}:{}", r.kind, r.source))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            println!(
-                "[move-trace] {name} t={:.3} start=({:.1},{:.1},{:.1}) end=({:.1},{:.1},{:.1}) vel=({:.1},{:.1},{:.1}) {hit_info} overlaps[{overlaps}]",
-                self.time,
-                location[0],
-                location[1],
-                location[2],
-                end[0],
-                end[1],
-                end[2],
-                velocity[0],
-                velocity[1],
-                velocity[2],
-            );
-        }
         self.set_property(pawn, "Location", 0, Value::Vector(end));
         Ok(())
     }
@@ -9956,7 +9842,7 @@ impl<'s> Vm<'s> {
                 if into < 0.0 {
                     velocity = sub3(velocity, scale3(hit.normal, into));
                 }
-                if hit.normal[2] > 0.7 {
+                if hit.normal[2] > FLOOR_NORMAL_Z {
                     velocity = [0.0; 3];
                 }
                 self.set_property(id, "Velocity", 0, Value::Vector(velocity));
@@ -10246,14 +10132,12 @@ impl<'s> Vm<'s> {
         channel: u8,
         looping: bool,
     ) -> VmResult<()> {
+        // None is an unknown sequence, not StopAnimating: the retail lookup returns
+        // without changing playback (0x103f5723..0x103f5776).
         if sequence.eq_ignore_ascii_case("None") {
-            self.objects[id as usize].anim.channels.remove(&channel);
-            if channel == 0 {
-                self.set_property(id, "AnimSequence", 0, Value::Name("None".into()));
-                self.set_property(id, "AnimRate", 0, Value::Float(0.0));
-                self.set_property(id, "AnimFrame", 0, Value::Float(0.0));
-                self.set_property(id, "bAnimFinished", 0, Value::Bool(true));
-            }
+            self.note(TraceKind::Note(
+                "Actor.PlayAnim('None'): no sequence, playback unchanged".into(),
+            ));
             return Ok(());
         }
         if self.animation.is_none() {
@@ -10295,6 +10179,16 @@ impl<'s> Vm<'s> {
             )));
             return Ok(());
         };
+        // Nonloop PlayAnim takes Rate<=0 through 0x103f5d2f. Negative Rate returns
+        // false immediately at 0x103f5d3d; only exactly zero initializes a hold/tween.
+        // A sequence with no frames is refused in both branches, without replacing the
+        // previous channel. LoopAnim has a separate velocity-dependent negative-rate path.
+        if info.frames == 0 || (!looping && rate < 0.0) {
+            self.note(TraceKind::Note(format!(
+                "Actor.PlayAnim('{sequence}'): retail refuses zero frames or negative nonloop rate; playback unchanged"
+            )));
+            return Ok(());
+        }
         if !info.rate.is_finite() || (rate > 0.0 && !(rate * info.rate).is_finite()) {
             return Err(self.err(VmErrorKind::AnimationDataError {
                 source: self.animation_sources(id).join(", "),
@@ -10471,6 +10365,30 @@ impl<'s> Vm<'s> {
             }));
         }
         Ok(self.sequence_info(id, sequence)?.is_some())
+    }
+
+    /// `Actor.AnimIsInGroup`: whether `channel`'s active sequence belongs to `group`. The
+    /// decoded `SeqInfo` carries frames/rate/notifies but no sequence group, so the VM cannot
+    /// compare groups and reports `false` - the engine's own "not in that group" answer - once
+    /// per VM as a visible note. Measured caller: `XIIIPawn.ChangedWeapon` (xiii.u) branches on
+    /// it while switching weapons; either answer continues the switch, `false` takes its else
+    /// path.
+    pub(crate) fn anim_is_in_group(&mut self, id: ObjectId, channel: u8, group: &str) -> bool {
+        let active = self
+            .objects
+            .get(id as usize)
+            .and_then(|o| o.anim.channels.get(&channel))
+            .filter(|c| c.active)
+            .map(|c| c.sequence.clone());
+        self.hearing_partial(
+            "AnimIsInGroup",
+            &format!(
+                "Actor.AnimIsInGroup({channel}, '{group}') on {}: decoded SeqInfo has no group data; answering false{}",
+                self.objects.get(id as usize).map(|o| o.name.clone()).unwrap_or_default(),
+                active.as_deref().map(|s| format!(" (channel '{s}' active)")).unwrap_or_default(),
+            ),
+        );
+        false
     }
 
     /// True when `channel` currently has an active animation.
