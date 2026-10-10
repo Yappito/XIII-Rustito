@@ -7922,24 +7922,76 @@ impl<'s> Vm<'s> {
                 continue;
             }
             let (lb, rb, hb) = self.actor_cylinder(b);
-            if let Some((t, n)) = segment_cylinder_hit(
-                start,
-                end,
-                lb,
-                rb + extent[0].max(0.0),
-                hb + extent[2].max(0.0),
-            ) {
-                candidates.push((t, b, n));
-            }
+            let r = rb + extent[0].max(0.0);
+            let hh = hb + extent[2].max(0.0);
+            // item52: the engine's per-actor cylinder routine (VA 0x103c4cd0..0x103c5573, the
+            // vtable+0x70 primitive dispatched by `FCollisionHash::ActorLineCheck`
+            // 0x10349c60/0x1034a4d6) answers a line that starts inside (or within 1 UU of the
+            // surface of: `dist^2 - R^2 < 1.0` at 0x103c5272, coefficients decoded at
+            // 0x103c5204..0x103c526f) the candidate cylinder with the EXIT hit, not the entry:
+            // the quadratic in the horizontal direction (0x103c5401..0x103c544a), no hit when the
+            // discriminant is negative (0x103c53c4..0x103c53d6, moving away), the on-axis
+            // degenerate (`|a| < 1e-8`, 0x103c53d8..0x103c53e6) folded into the same tail, and
+            // the hit time `Min3(T-0.001, 1.0, T_exit)` (constants 0x10480600 = 0.001 and
+            // 0x10311e00 = Min3 at 0x103c54e9..0x103c54fc) with the location on the ray and the
+            // normal = -Dir (0x103c5529..0x103c5566). Measured need: Hual01a/Plage01 point-blank
+            // shots — the muzzle (`GetFireStart`, eye + 16 UU forward) sits inside the target's
+            // cylinder after the fight-test walk, and retail reports the hit there.
+            let u = [start[0] - lb[0], start[1] - lb[1]];
+            let dist2 = u[0] * u[0] + u[1] * u[1];
+            // Conservative deviation (labelled): the decode routes z-outside starts into the
+            // same exit-root tail (the z-range checks at 0x103c5286/0x103c5297 jump to
+            // 0x103c53c4), but applying the exit rule to rays that merely pass above/below a
+            // cylinder would report hits the retail game demonstrably does not produce; the
+            // exit rule is therefore applied only to starts inside the full 3D cylinder.
+            let start_inside = dist2 - r * r < 1.0 && (start[2] - lb[2]).abs() <= hh;
+            let hit = if start_inside {
+                let d = sub3(end, start);
+                let a = d[0] * d[0] + d[1] * d[1];
+                if a <= 1e-8 {
+                    // On-axis: the engine takes the degenerate tail with no exit root
+                    // (0x103c53e8..0x103c53f6 jumps to 0x103c54e9 when `|a| < 1e-8`).
+                    Some((0.999, [-d[0], -d[1], -d[2]]))
+                } else {
+                    let bcoef = 2.0 * (u[0] * d[0] + u[1] * d[1]);
+                    let ccoef = dist2 - r * r;
+                    let disc = bcoef * bcoef - 4.0 * a * ccoef;
+                    if disc < 0.0 {
+                        // Moving away with no exit (0x103c53c4..0x103c53d6): no hit.
+                        None
+                    } else {
+                        let t_exit = (-bcoef + disc.sqrt()) / (2.0 * a);
+                        // A negative exit root means the cylinder is entirely behind the ray
+                        // (grazing start within 1 UU of the surface); the engine's caller
+                        // discards such a Time, so no hit is reported.
+                        if t_exit < 0.0 {
+                            None
+                        } else {
+                            Some((t_exit.min(0.999), [-d[0], -d[1], -d[2]]))
+                        }
+                    }
+                }
+            } else {
+                segment_cylinder_hit(start, end, lb, r, hh)
+            };
+            let Some((t, n)) = hit else {
+                continue;
+            };
+            candidates.push((t, b, normalize3(n)));
         }
         // Second pass: a static-mesh actor's zero-extent trace uses its own mesh triangles
         // (UE2 traces the kDOP, item53). A mesh that misses the ray does not block; when the
         // provider has no per-actor mesh data, or the extent is non-zero (a swept-box kDOP is
-        // not modelled), the cylinder approximation stands.
+        // not modelled), the cylinder approximation stands. item52: a mover with
+        // `bUseCylinderCollision` collides as its cylinder, not its placed mesh, so it keeps the
+        // first-pass cylinder hit (which already applies the start-inside exit rule).
         let mut best: Option<(f32, ObjectId, [f32; 3])> = None;
         let zero_extent = !nonzero;
         for (t, b, n) in candidates {
-            let outcome = if zero_extent && self.actor_has_static_mesh(b) {
+            let outcome = if zero_extent
+                && self.actor_has_static_mesh(b)
+                && !(self.is_mover(b) && self.bool_prop(b, "bUseCylinderCollision"))
+            {
                 self.objects
                     .get(b as usize)
                     .map(|o| o.name.clone())
@@ -8032,6 +8084,21 @@ impl<'s> Vm<'s> {
             return false;
         }
         if self.class_chain_contains(candidate, "pawn") {
+            // item52: trace-flag bit 0x2000 (`AdditionalTraceType`) excludes pawn candidates.
+            // Measured: `execTrace` composes `(bTraceActors ? 0x39 : 0) + 0x86 | 0x1000? | extra`
+            // (VA 0x103e8abf..0x103e8b2e) and `AActor::ShouldTrace` (VA 0x10354640..0x10354753)
+            // tests no pawn-specific bit — yet the retail `CWndFocusTrigger.WaitForBeingSeen`
+            // sight trace (`Trace(..., XPP.Location, true, vect(0,0,0), HitMat, 8192)`, composed
+            // flags 0x20bf) must return `None` although it starts inside the player pawn's
+            // cylinder and the pawn's serialized class defaults block zero-extent traces
+            // (bBlockZeroExtentTraces=true, imported from XIII.u). The 0x2000 bit is the only
+            // structural difference from the default 0xbf weapon traces that must hit pawns.
+            // Labelled hypothesis: the exact Engine.dll gate for bit 0x2000 was not located
+            // (the property-flag tests at 0x1031ec3a/0x10348205 are object/actor bits, not
+            // trace flags); the rule is pinned by the retail behaviour on both sides.
+            if flags & 0x2000 != 0 {
+                return false;
+            }
             return flags & 1 != 0;
         }
         if self.class_chain_contains(candidate, "mover")
@@ -8179,28 +8246,99 @@ impl<'s> Vm<'s> {
         flags: u32,
         extent: [f32; 3],
     ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
-        let (world, mover) = match self.physics.as_mut() {
-            Some(p) => p.trace_with_mover(start, end, extent),
-            None => {
-                return Err(self.err(VmErrorKind::NoPhysicsProvider {
-                    native: "Actor.Trace".into(),
-                }));
+        // item52: a mover with `bUseCylinderCollision` collides as its cylinder, not its placed
+        // mesh. Measured need (Hual01a): the lever `XIIIMover6` (pivot (4489.4,-5437.4,-85),
+        // cylinder r=10/h=50, `bUseCylinderCollision=true`, Rotation pitch -22.5°/yaw 180°,
+        // DrawScale 0.5) leans its handle mesh (`statichual01.manette`, local bounds
+        // [-10.7,-4.3,-19.5]..[4.3,4.3,141.2]) west across EVERY sight line to the bridge-focus
+        // target `CWndTarget1` (4474,-5437,-50) — xiii-tool box-probe measures the mesh hit at
+        // t=0.976 of the line, triangle (4460.9,-5435.5,-20.4)..(4491.6,-5439.4,-94.6), while
+        // the target sits 15.4 UU short of the lever's cylinder, so retail (cylinder collision)
+        // admits the line and the port's mesh hit suspended the map's only `PontA`
+        // bridge-close. Engine.dll: the per-actor line-check geometry is the actor's own
+        // primitive virtual (`FCollisionHash::ActorLineCheck` VA 0x10349c60 dispatches through
+        // vtable+0x70 at 0x1034a4d6/0x10349f2e), and the actor flag bit `byte [+0x30] & 0x40`
+        // is tested in the engine's collision helpers (0x1038e800/0x1038f150/0x1038f3c0) with
+        // early exits that skip the mesh-shaped path — hypothesis (labelled): that bit is
+        // `bUseCylinderCollision` and the primitive virtual answers with the cylinder. The
+        // authored flag on XIIIMover6 is only meaningful under exactly that rule.
+        let nonzero = extent.iter().any(|v| *v != 0.0);
+        const MAX_MOVER_MESH_SKIPS: usize = 8;
+        let d = sub3(end, start);
+        let total = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let mut cursor = start;
+        let mut advance = 0.0f32;
+        let mut world: Option<super::physics::WorldHit> = None;
+        let mut mover: Option<ObjectId> = None;
+        for _ in 0..=MAX_MOVER_MESH_SKIPS {
+            let remaining = total - advance;
+            if remaining <= 1e-3 {
+                break;
             }
-        };
+            let (w, mv) = match self.physics.as_mut() {
+                Some(p) => p.trace_with_mover(cursor, end, extent),
+                None => {
+                    return Err(self.err(VmErrorKind::NoPhysicsProvider {
+                        native: "Actor.Trace".into(),
+                    }));
+                }
+            };
+            let Some(hit) = w else {
+                break;
+            };
+            let named = mv
+                .and_then(|name| self.find_live_object(&name))
+                .filter(|&m| m != id && (self.is_mover(m) || self.actor_has_static_mesh(m)));
+            let cylinder_mover = named
+                .filter(|&m| self.actor_blocks_trace(m, nonzero))
+                .filter(|&m| self.bool_prop(m, "bUseCylinderCollision"));
+            let hit_global = advance + hit.time * remaining;
+            match cylinder_mover {
+                Some(m) => {
+                    let (c, r, hh) = self.actor_cylinder(m);
+                    match segment_cylinder_hit(start, end, c, r, hh) {
+                        // The cylinder also blocks at or before the mesh hit: it is the
+                        // collision shape, report the mover at the cylinder time.
+                        Some((t, n)) if t * total <= hit_global + 1.0 => {
+                            world = Some(super::physics::WorldHit {
+                                location: lerp3(start, end, t),
+                                normal: n,
+                                time: t,
+                            });
+                            mover = named;
+                            break;
+                        }
+                        // The mesh alone blocks: skip past the mesh hit and re-query.
+                        _ => {
+                            let skip = hit_global + 1.0;
+                            if skip >= total {
+                                break;
+                            }
+                            cursor = lerp3(start, end, skip / total);
+                            advance = skip;
+                        }
+                    }
+                }
+                None => {
+                    world = Some(hit);
+                    mover = named;
+                    break;
+                }
+            }
+        }
         // item40e: a hit on a registered mover's geometry returns that mover (a collision-hash
         // actor in UE2) when it blocks this kind of trace; other world hits return the level.
         // item53: a placed static-mesh actor's own triangles are its trace collision in UE2, so
         // a world hit sourced from `"<actor> -> <mesh>"` returns that actor as well (Still under
-        // the same ShouldTrace/collision-flags gates).
-        let nonzero = extent.iter().any(|v| *v != 0.0);
-        let hit_actor = mover
-            .and_then(|name| self.find_live_object(&name))
-            .filter(|&m| {
-                m != id
-                    && self.actor_blocks_trace(m, nonzero)
-                    && self.trace_admits_actor_flags(m, id, nonzero, flags)
-                    && (self.is_mover(m) || self.actor_has_static_mesh(m))
-            });
+        // the same ShouldTrace/collision-flags gates). The item52 cylinder-mover loop above
+        // already restricts the carried name to movers and static-mesh actors; the same gates
+        // chain here.
+        let hit_actor = mover.filter(|&m| {
+            m != id
+                && self.actor_blocks_trace(m, nonzero)
+                && self.trace_admits_actor_flags(m, id, nonzero, flags)
+                && (self.is_mover(m) || self.actor_has_static_mesh(m))
+        });
         let mut best: Option<(f32, Option<ObjectId>, [f32; 3])> =
             world.map(|h| (h.time, hit_actor, h.normal));
         if let Some((t, b, n)) = self.trace_actors_flags(id, start, end, extent, flags)
