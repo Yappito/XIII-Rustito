@@ -350,6 +350,7 @@ fn voice_duration(audio: &crate::audio::AudioRes, sound: &str) -> Option<f32> {
 /// the script HUD and is not reused here), labelled [`SubtitleText`].
 pub fn draw(
     state: Res<CinematicState>,
+    diagnostics: Option<Res<super::DiagnosticOverlay>>,
     mut commands: Commands,
     mut text: Query<&mut Text, With<SubtitleText>>,
 ) {
@@ -390,13 +391,15 @@ pub fn draw(
         }
         out.push_str(&line.text);
     }
-    if let Some(v) = &state.view {
+    if diagnostics.as_deref().is_some_and(|d| d.0)
+        && let Some(v) = &state.view
+    {
         if !out.is_empty() {
             out.push('\n');
         }
         out.push_str(&format!("[camera {} ({})]", v.actor, v.source.as_str()));
     }
-    if state.input_suppressed {
+    if diagnostics.as_deref().is_some_and(|d| d.0) && state.input_suppressed {
         if !out.is_empty() {
             out.push('\n');
         }

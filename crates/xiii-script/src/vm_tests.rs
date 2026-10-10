@@ -3914,6 +3914,115 @@ fn phys_set() -> ScriptSet {
     set
 }
 
+#[test]
+fn level_clock_scales_freezes_and_is_published_before_tick() {
+    use ff::*;
+    use pf::*;
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let level_class = b.reserve(0, 0, "LevelInfo");
+    let dilation = b.reserve(IMP_FLOATPROP, level_class, "TimeDilation");
+    let time = b.reserve(IMP_FLOATPROP, level_class, "TimeSeconds");
+    let pauser = b.reserve(IMP_OBJECTPROP, level_class, "Pauser");
+    let always = b.reserve(IMP_BOOLPROP, level_class, "bAlwaysTick");
+    let observed = b.reserve(IMP_FLOATPROP, level_class, "ObservedTime");
+    let delta = b.reserve(IMP_FLOATPROP, level_class, "ObservedDelta");
+    let tick = b.reserve(IMP_FUNCTION, level_class, "Tick");
+    let dt = b.reserve(IMP_FLOATPROP, tick, "DeltaTime");
+    b.prop(dilation, time, 0);
+    b.prop(time, pauser, 0);
+    b.prop_with(pauser, always, 0, &compact(0));
+    b.prop(always, observed, 0);
+    b.prop(observed, delta, 0);
+    b.prop(delta, tick, 0);
+    b.prop(dt, 0, PARM);
+    // ObservedTime=TimeSeconds; ObservedDelta=DeltaTime; return.
+    let code = [
+        0x0f,
+        0x01,
+        observed as u8,
+        0x01,
+        time as u8,
+        0x0f,
+        0x01,
+        delta as u8,
+        0x00,
+        dt as u8,
+        0x04,
+        0x0b,
+    ];
+    b.func(tick, 0, dt, &code, 24, 0, DEFINED);
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, 0, 0);
+    b.class(level_class, actor, dilation, 0);
+    let set = set_of(b.build());
+    for suspending in [false, true] {
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let level = vm.spawn(pg(&set, "LevelInfo"), "Level").unwrap();
+        vm.set_active(level, true);
+        vm.set_property(level, "TimeDilation", 0, Value::Float(0.5));
+        let step = |vm: &mut Vm<'_>, dt| {
+            if suspending {
+                assert!(vm.tick_suspending(dt).is_empty());
+            } else {
+                vm.tick(dt).unwrap();
+            }
+        };
+        step(&mut vm, 2.0);
+        assert_eq!(
+            vm.time, 1.0,
+            "elapsed clock must not use the actor delta bound"
+        );
+        assert_eq!(
+            vm.get_property(level, "ObservedTime"),
+            Some(&Value::Float(1.0))
+        );
+        assert_eq!(
+            vm.get_property(level, "ObservedDelta"),
+            Some(&Value::Float(1.0))
+        );
+        vm.set_property(
+            level,
+            "Pauser",
+            0,
+            Value::Object(Some(ObjRef::Instance(level))),
+        );
+        vm.set_property(level, "ObservedTime", 0, Value::Float(-1.0));
+        step(&mut vm, 0.25);
+        assert_eq!(vm.time, 1.0);
+        assert_eq!(
+            vm.get_property(level, "ObservedTime"),
+            Some(&Value::Float(-1.0))
+        );
+        vm.set_property(level, "bAlwaysTick", 0, Value::Bool(true));
+        step(&mut vm, 0.25);
+        assert_eq!(
+            vm.get_property(level, "ObservedTime"),
+            Some(&Value::Float(1.0))
+        );
+        vm.set_property(level, "Pauser", 0, Value::Object(None));
+        step(&mut vm, 0.0);
+        assert_eq!(vm.time, 1.0);
+        assert_eq!(
+            vm.get_property(level, "ObservedDelta"),
+            Some(&Value::Float(0.0))
+        );
+        for _ in 0..600 {
+            step(&mut vm, 1.0 / 60.0);
+        }
+        assert!((vm.time - 6.0).abs() < 0.000001);
+        assert_eq!(
+            vm.get_property(level, "TimeSeconds"),
+            Some(&Value::Float(vm.time as f32))
+        );
+        assert_eq!(
+            vm.get_property(level, "ObservedTime"),
+            vm.get_property(level, "TimeSeconds")
+        );
+    }
+}
+
 fn pg(set: &ScriptSet, path: &str) -> GlobalRef {
     GlobalRef {
         package: 0,
@@ -9913,7 +10022,7 @@ impl crate::canvas::CanvasFonts for TinyFonts {
 }
 
 /// Synthetic Canvas natives: cursor movement, text measurement with a tiny font, clip capture,
-/// and the null-material tile -> rect path.
+/// and rejection of null-material tiles without a fabricated rectangle.
 #[test]
 fn canvas_natives_record_commands_with_cursor_measurement_and_clip() {
     let set = set_of(canvas_fixture());
@@ -9996,7 +10105,7 @@ fn canvas_natives_record_commands_with_cursor_measurement_and_clip() {
     assert_eq!(vm.get_property(canvas, "CurX"), Some(&Value::Float(26.0)));
     assert_eq!(vm.get_property(canvas, "CurY"), Some(&Value::Float(20.0)));
 
-    // A null-material tile becomes a Rect and advances CurX by XL.
+    // Retail rejects a null-material tile without drawing or advancing CurX.
     call_native(
         &mut vm,
         "Engine.Canvas.SetPos",
@@ -10020,18 +10129,13 @@ fn canvas_natives_record_commands_with_cursor_measurement_and_clip() {
         ],
     );
     let cmds = vm.drain_canvas();
+    assert!(cmds.is_empty(), "{cmds:?}");
+    assert_eq!(vm.get_property(canvas, "CurX"), Some(&Value::Float(0.0)));
     assert!(
-        matches!(
-            cmds.as_slice(),
-            [crate::canvas::DrawCommand::Rect {
-                xl: 8.0,
-                yl: 4.0,
-                ..
-            }]
-        ),
-        "{cmds:?}"
+        vm.trace
+            .iter()
+            .any(|t| matches!(&t.kind, TraceKind::Note(n) if n.contains("null material")))
     );
-    assert_eq!(vm.get_property(canvas, "CurX"), Some(&Value::Float(8.0)));
     // A missing font records a visible note instead of silently measuring zero.
     vm.set_property(canvas, "Font", 0, Value::Object(None));
     let mut args = [Value::Str("x".into()), Value::Float(9.0), Value::Float(9.0)];

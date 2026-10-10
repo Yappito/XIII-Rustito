@@ -37,6 +37,8 @@ pub enum Lighting {
 /// Parsed command-line options.
 #[derive(Debug, Clone)]
 pub struct Options {
+    /// Show host diagnostic panels (F3 toggles them during play).
+    pub diagnostic_overlay: bool,
     pub mode: Mode,
     /// Exit after this many rendered frames (unattended run).
     pub frames: Option<u32>,
@@ -139,6 +141,7 @@ impl Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            diagnostic_overlay: false,
             mode: Mode::Smoke,
             frames: None,
             exit_after_secs: None,
@@ -249,6 +252,7 @@ xiii-app --model PKG.MESH[,PKG.MESH...] --game-dir DIR [--anim SEQ] [--frame N]
   --exit-after-secs S  Exit cleanly after S seconds and print a report.
   --screenshot PATH    Save a PNG of the window during an unattended run.
   --no-vsync           Use AutoNoVsync present mode.
+  --diagnostic-overlay Show host status/audio panels; F3 toggles them during play.
   --perf               Print a per-system frame-time/CPU table every 5 s and at exit.
   --perf-interval S    Seconds between --perf tables (default 5).
   --perf-natives       --perf: also time individual VM natives (adds overhead).
@@ -289,6 +293,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Options, String>
             }
             "--screenshot" => opts.screenshot = Some(PathBuf::from(value("--screenshot")?)),
             "--no-vsync" => opts.no_vsync = true,
+            "--diagnostic-overlay" => opts.diagnostic_overlay = true,
             "--perf" => {
                 opts.perf = true;
                 if opts.mode == Mode::Smoke {
@@ -467,6 +472,8 @@ mod tests {
         let o = p(&[]).unwrap();
         assert_eq!(o.mode, Mode::Smoke);
         assert!(!o.unattended());
+        assert!(!o.diagnostic_overlay);
+        assert!(p(&["--diagnostic-overlay"]).unwrap().diagnostic_overlay);
     }
 
     #[test]

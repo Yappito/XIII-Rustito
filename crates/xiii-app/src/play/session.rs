@@ -4016,7 +4016,7 @@ mod tests {
         });
         println!(
             "[Plage01 combat] cue=TouchTrigger7 event={trigger_event:?}, player={player_location:?}, soldier={soldier_location:?}, distance={player_distance:.1}, SightRadius={sight_radius}, cue Enemy={cue_enemy_name:?}, final Enemy={final_enemy:?}, scripted={scripted_attack_seen}, combat={controller_attack_seen}, held-fire-seen={held_fire_seen}, fire-request-seen={fire_request_seen}, bTire={wants_fire}, soldier state={state:?}, controller state={controller_state:?}, controller states={scripted_states:?}, CanSee={can_see:?}, rotation {initial_rotation:?}->{final_rotation:?}, Health {health_before}->{health_after}; suspended={:?}",
-            session.suspended
+            session.failures
         );
         assert!(
             scripted_attack_seen,
@@ -4027,19 +4027,33 @@ mod tests {
                 && can_see.iter().any(|(_, _, result)| result == "false"),
             "the actual player position should be outside SightRadius with a measured failed CanSee: distance={player_distance}, SightRadius={sight_radius}, CanSee={can_see:?}"
         );
-        // Whether this authored map cue yields combat is determined by the map's own dispatch,
-        // AI state chain, and LOS result at the player's actual spawn location.
+        // With the live level clock ContinueStakeOut expires and temporise enters Chasse
+        // (IAController.temporise 0x01FC..0x0287). The former Patrouille/no Enemy pin
+        // described a frozen-clock artefact, not the authored distant-player outcome.
         assert!(
             cue_enemy == Some(player)
-                && final_enemy.is_none()
+                && final_enemy.as_deref() == Some(session.player_name.as_str())
                 && left_scripted_attack
-                && controller_state.as_deref() == Some("Patrouille")
+                && controller_state.as_deref() == Some("Chasse")
                 && !controller_attack_seen
                 && !held_fire_seen
                 && !fire_request_seen
                 && !wants_fire
                 && health_after == health_before,
             "unexpected combat result: Health {health_before}->{health_after}, bTire={wants_fire}"
+        );
+        assert_eq!(
+            session.failures.len(),
+            1,
+            "only the measured pursuit blocker may fail"
+        );
+        assert!(
+            session.failures[0].0 == session.vm().objects[controller as usize].name
+                && session.failures[0].1.contains("Controller.PickWallAdjust")
+                && session.failures[0].1.contains("Some(526)")
+                && session.failures[0].1.contains("Chasse.PickDestination"),
+            "unexpected distant-player pursuit failure: {:?}",
+            session.failures
         );
     }
 

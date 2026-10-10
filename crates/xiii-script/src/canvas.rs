@@ -604,6 +604,15 @@ fn push_tile(
     clipped: bool,
     justify: u8,
 ) {
+    // Retail execDrawTile (Engine.dll 0x1036237c..0x103623a0) warns and returns
+    // for a null material, before drawing or advancing the pen. A missing texture
+    // is not an instruction to synthesize a solid white rectangle.
+    if material.is_none() {
+        vm.note(TraceKind::Note(
+            "Canvas.DrawTile: null material; retail draw rejected".into(),
+        ));
+        return;
+    }
     let (mut x, y) = pen(vm, c.this);
     if justify == 1 {
         x -= xl * 0.5;
@@ -613,33 +622,22 @@ fn push_tile(
     let color = draw_color(vm, c.this);
     let style = prop_u8(vm, c.this, "Style", 1);
     let clip = clip(vm, c.this);
-    if material.is_none() {
-        vm.canvas.push(DrawCommand::Rect {
-            x,
-            y,
-            xl,
-            yl,
-            color,
-            clip,
-        });
-    } else {
-        vm.canvas.push(DrawCommand::Tile {
-            material,
-            x,
-            y,
-            xl,
-            yl,
-            u,
-            v,
-            ul,
-            vl,
-            color,
-            style,
-            clip,
-            justify,
-            clipped,
-        });
-    }
+    vm.canvas.push(DrawCommand::Tile {
+        material,
+        x,
+        y,
+        xl,
+        yl,
+        u,
+        v,
+        ul,
+        vl,
+        color,
+        style,
+        clip,
+        justify,
+        clipped,
+    });
     vm.set_property(c.this, "CurX", 0, Value::Float(x + xl));
 }
 
@@ -1016,7 +1014,7 @@ pub fn canvas_defs() -> Vec<NativeDef> {
     v.push(def(
         "Engine.Canvas.DrawTile",
         "native(466) final static function DrawTile(object<Material> Tex, float XL, float YL, float U, float V, float UL, float VL)",
-        "engine.u Canvas.DrawTile decoded; records a Tile (or Rect when Tex is None)",
+        "engine.u Canvas.DrawTile decoded; Engine.dll execDrawTile 0x1036237c rejects null material before draw/pen advance; records decoded material tiles",
         draw_tile,
     ));
     v.push(def(
