@@ -9,6 +9,8 @@
 //! `--play-script <file>`. Both drive the same [`sim::PlayerSim`] in `FixedUpdate` at 60 Hz.
 //! Fixed 60 Hz is a **hypothesis** (UE2 used variable ticks); see [`FIXED_HZ`].
 
+#[cfg(test)]
+mod campaign_chain;
 pub mod cartoon;
 pub mod cinematics;
 #[cfg(test)]
@@ -1819,7 +1821,7 @@ fn travel(
         commands.entity(e).try_despawn();
         removed += 1;
     }
-    let new_session = match session::Session::open(&game_dir, &plan.map) {
+    let new_session = match travel::open_next_session(sess, &game_dir, &plan) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[play] travel load failed for {}: {e}", plan.map);
@@ -1976,7 +1978,22 @@ fn open_map_runtime(
     scene: &xiii_world::WorldScene,
     params: &PlayerParams,
 ) -> Result<MapRuntime, String> {
-    let mut session = session::Session::open(game_dir, map)?;
+    build_map_runtime(
+        game_dir,
+        map,
+        scene,
+        params,
+        session::Session::open(game_dir, map)?,
+    )
+}
+
+fn build_map_runtime(
+    game_dir: &Path,
+    map: &str,
+    scene: &xiii_world::WorldScene,
+    params: &PlayerParams,
+    mut session: session::Session,
+) -> Result<MapRuntime, String> {
     // item21: install the host `VideoPlayer` provider. Headless runs have no output device, so
     // audio is off and playback is caller-paced (`advance_virtual_all`): `GetStatus` still
     // reports completion from the decoded frame count, which is what the level-end
@@ -2070,8 +2087,8 @@ fn open_map_runtime(
 ///
 /// The collision world (static soup + the VM's mover actors as dynamic objects) is built here so
 /// the script can never diverge from the interactive path. When the game's own code requests
-/// level travel, the next map is imported and a fresh session is opened (the host owns the
-/// transition); the run continues on the new map until the duration is spent.
+/// level travel, the next map is imported through the shared native travel bridge, reusing
+/// Login's pawn for imported travel properties; the run continues until the duration is spent.
 #[cfg(test)]
 pub(crate) fn run_script(
     game_dir: &Path,
@@ -2081,7 +2098,16 @@ pub(crate) fn run_script(
     scene: &xiii_world::WorldScene,
     duration: f32,
 ) -> Result<ScriptOutcome, String> {
-    run_script_inner(game_dir, map, script, params, scene, duration, false)
+    run_script_inner(
+        game_dir,
+        map,
+        script,
+        params,
+        scene,
+        duration,
+        false,
+        RunnerOptions::default(),
+    )
 }
 
 /// Player-route variant of [`run_script`]: honor the controller's authored cinematic states in
@@ -2095,9 +2121,33 @@ pub(crate) fn run_script_with_cinematic_input(
     scene: &xiii_world::WorldScene,
     duration: f32,
 ) -> Result<ScriptOutcome, String> {
-    run_script_inner(game_dir, map, script, params, scene, duration, true)
+    run_script_inner(
+        game_dir,
+        map,
+        script,
+        params,
+        scene,
+        duration,
+        true,
+        RunnerOptions::default(),
+    )
 }
 
+#[derive(Default)]
+struct RunnerOptions {
+    initial: Option<MapRuntime>,
+    stop_on_travel: bool,
+    wait_for_control: bool,
+}
+
+fn player_has_control(session: &session::Session) -> bool {
+    !cinematics::input_suppressed(session)
+        && session
+            .controller
+            .is_some_and(|pc| session.vm().is_in_state(pc, "PlayerWalking"))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_script_inner(
     game_dir: &Path,
     map: &str,
@@ -2106,14 +2156,19 @@ fn run_script_inner(
     scene: &xiii_world::WorldScene,
     duration: f32,
     respect_cinematic_input: bool,
+    options: RunnerOptions,
 ) -> Result<ScriptOutcome, String> {
     let started = Instant::now();
-    let ticks = (duration / DT).ceil() as u64;
+    let mut ticks = (duration / DT).ceil() as u64;
     let mut drive = script::Drive::new(script);
     let mut trace = Vec::new();
     let mut travel = Vec::new();
     let mut map_objectives = Vec::new();
-    let mut runtime = open_map_runtime(game_dir, map, scene, params)?;
+    let mut runtime = match options.initial {
+        Some(runtime) => runtime,
+        None => open_map_runtime(game_dir, map, scene, params)?,
+    };
+    let mut control_tick = (!options.wait_for_control).then_some(0);
     #[cfg(test)]
     if std::env::var("XIII_SURVEY").as_deref() == Ok("1") {
         runtime.session.vm_mut().collect_combat_natives = true;
@@ -2127,7 +2182,21 @@ fn run_script_inner(
     let mut footstep_log: Vec<(f32, String, Option<String>)> = Vec::new();
     let mut tick = 0u64;
     while tick < ticks {
-        let elapsed = tick as f32 * DT;
+        if control_tick.is_none() && player_has_control(&runtime.session) {
+            control_tick = Some(tick);
+            println!(
+                "[combat-control] map={map} t={:.3} state={}",
+                tick as f32 * DT,
+                runtime.session.player_controller_state()
+            );
+        }
+        if control_tick.is_none() && tick as f32 * DT >= 120.0 {
+            return Err(format!(
+                "{map}: player control not returned within 120 seconds; state={}",
+                runtime.session.player_controller_state()
+            ));
+        }
+        let elapsed = tick.saturating_sub(control_tick.unwrap_or(tick)) as f32 * DT;
         if let Some(name) = drive.tracking_actor().map(str::to_owned) {
             let location = runtime
                 .session
@@ -2138,7 +2207,11 @@ fn run_script_inner(
         } else {
             drive.set_track_location(None, None);
         }
-        let mut input = drive.advance(elapsed, &mut runtime.sim);
+        let mut input = if control_tick.is_some() {
+            drive.advance(elapsed, &mut runtime.sim)
+        } else {
+            Input::default()
+        };
         let weapons = drive.take_weapons();
         let goals = drive.take_goals();
         let mut weapon_inputs = drive.take_weapon_inputs();
@@ -2277,7 +2350,7 @@ fn run_script_inner(
         }
 
         // Level transition: the game's own goal/travel code requested it. The VM reported the
-        // URL; the host imports the next map and opens a fresh session.
+        // URL; the host imports the next map and carries the native travel actor properties.
         if let Some(req) = runtime.session.take_travel_request() {
             let plan = travel::TravelPlan::from_request(&req)?;
             println!(
@@ -2302,6 +2375,10 @@ fn run_script_inner(
                 tick,
             });
             map_objectives.push((runtime.name.clone(), runtime.session.objective_states()));
+            if options.stop_on_travel {
+                tick += 1;
+                break;
+            }
             // The script block (if any) is released; the next map starts a fresh run.
             drive.notify_travel();
             let opts = crate::cli::Options {
@@ -2314,7 +2391,8 @@ fn run_script_inner(
             voice_unresolved_total += runtime
                 .voice_unresolved
                 .load(std::sync::atomic::Ordering::Relaxed);
-            runtime = open_map_runtime(game_dir, &plan.map, &next_scene, params)?;
+            let next_session = travel::open_next_session(&mut runtime.session, game_dir, &plan)?;
+            runtime = build_map_runtime(game_dir, &plan.map, &next_scene, params, next_session)?;
             // Rebuild the footstep surface map and driver for the next map.
             surfaces = footsteps::SurfaceSounds::from_scene(&next_scene);
             step_driver = footsteps::FootstepDriver::new();
@@ -2327,6 +2405,9 @@ fn run_script_inner(
             );
         }
         tick += 1;
+        if control_tick.is_none() {
+            ticks += 1;
+        }
     }
     if drive.waiting_travel() && travel.is_empty() {
         println!(
@@ -2354,7 +2435,7 @@ fn run_script_inner(
     }
     Ok(ScriptOutcome {
         session: runtime.session,
-        ticks,
+        ticks: tick,
         wall_secs: started.elapsed().as_secs_f32(),
         trace,
         final_map: runtime.name,

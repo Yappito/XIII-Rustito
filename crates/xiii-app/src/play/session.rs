@@ -203,19 +203,25 @@ impl Session {
     /// map actor, runs the level start tolerantly and requires the game's Login/RestartPlayer
     /// chain to create the player pawn and controller.
     pub fn open(game_dir: &Path, map: &str) -> Result<Session, String> {
-        Self::open_inner(game_dir, map, None)
+        Self::open_inner(game_dir, map, None, false)
     }
 
     /// Opens a map as a checkpoint resume, asking its level-start scripts to see the game's
     /// `StartSpotEvent=LOAD` condition before any placed actor's startup callbacks execute.
     pub fn open_checkpoint(game_dir: &Path, map: &str) -> Result<Session, String> {
-        Self::open_inner(game_dir, map, Some("LOAD"))
+        Self::open_inner(game_dir, map, Some("LOAD"), true)
+    }
+
+    /// Login creates the destination pawn; native travel import precedes AcceptInventory.
+    pub(super) fn open_travel(game_dir: &Path, map: &str) -> Result<Session, String> {
+        Self::open_inner(game_dir, map, None, true)
     }
 
     fn open_inner(
         game_dir: &Path,
         map: &str,
         start_event: Option<&str>,
+        defer_inventory: bool,
     ) -> Result<Session, String> {
         let (set, map_idx) = runtime::load_with_map(game_dir, map)?;
         let set: &'static ScriptSet = Box::leak(Box::new(set));
@@ -373,7 +379,7 @@ impl Session {
             // bytecode 0x037A). `Plage00.FirstFrame`'s guard at 0x0013 then skips re-applying
             // the wounded intro Health when it reads "LOAD". Set it here, once, after spawn.
             vm.set_start_spot_event(event);
-        } else if let Some(gi) = game_info {
+        } else if !defer_inventory && let Some(gi) = game_info {
             // Native map-entry inventory setup. The decoded script has no other default-weapon
             // granter on a fresh campaign load: `XIIIGameInfo.RestartPlayer` (xiii.u bytecode
             // 0x0000-0x03B5) omits stock UE2's `AddDefaultInventory` call, and these maps carry
@@ -1413,6 +1419,7 @@ impl Session {
     /// The event owns checkpoint cleanup, objective restore, inventory defaults, ammo refresh,
     /// and bringing up the current weapon. Returns the saved checkpoint's Unreal location.
     pub fn restore_checkpoint(&mut self, save: &crate::save::SaveFile) -> Result<[f32; 3], String> {
+        self.begin_travel_accept()?;
         let tag_match = |v: &Value| match v {
             Value::Name(n) | Value::Str(n) => n.eq_ignore_ascii_case(&save.teleporter),
             _ => false,
@@ -1681,8 +1688,9 @@ impl Session {
         let game_info = self
             .game_info
             .ok_or("GameInfo is not available for AcceptInventory")?;
-        // AcceptInventory computes Max(P.Health, ThingsToSave.Health). Its P input must be
-        // the imported travel pawn, not the fresh login pawn's default 150 health.
+        // SpawnPlayActor reuses Login's Pawn for a Pawn travel record (0x1038d27a), imports
+        // CPF_Travel properties (0x1038d51b), then passes PC.Pawn to AcceptInventory
+        // (0x1038d6b1). Pawn.Health has XIII CPF_Travel=0x10000, so import it here.
         let health = match self.vm.get_property(self.player, "Health") {
             Some(Value::Int(_)) => Value::Int(save.health.round() as i32),
             Some(Value::Float(_)) => Value::Float(save.health),
@@ -1691,13 +1699,30 @@ impl Session {
         if !self.vm.set_property(self.player, "Health", 0, health) {
             return Err("checkpoint pawn Health is not writable".into());
         }
-        self.vm
-            .send_event(
-                game_info,
-                "AcceptInventory",
-                vec![Value::Object(Some(ObjRef::Instance(self.player)))],
-            )
-            .map_err(|e| format!("XIIIGameInfo.AcceptInventory failed: {e}"))?;
+        let mut accepted = vec![self.player];
+        let mut cursor = self.inventory_head(self.player);
+        while let Some(id) = cursor {
+            if accepted.contains(&id) || accepted.len() >= 4096 {
+                return Err(
+                    "checkpoint travel inventory contains a cycle or exceeds 4096 actors".into(),
+                );
+            }
+            accepted.push(id);
+            cursor = self.inventory_head(id);
+        }
+        // Actor.Inventory is not CPF_Travel. Native import starts with an unlinked pawn;
+        // Inventory.TravelPreAccept builds its chain through GiveTo. The v2 adapter above
+        // used GiveTo to reconstruct ammo links, so detach that staging chain before the
+        // native callbacks: Ammunition.GiveTo otherwise finds itself and doubles AmmoAmount.
+        for property in ["Inventory", "Weapon", "PendingWeapon"] {
+            if !self
+                .vm
+                .set_property(self.player, property, 0, Value::Object(None))
+            {
+                return Err(format!("checkpoint pawn {property} is not writable"));
+            }
+        }
+        self.finish_travel_accept(game_info, &accepted)?;
         if let Some(path) = &save.selected_weapon {
             let mut weapon = None;
             let mut cursor = self.inventory_head(self.player);
@@ -2220,6 +2245,52 @@ impl Session {
             Some(Value::Int(v)) => Some(*v as f32),
             _ => None,
         }
+    }
+
+    /// Native SpawnPlayActor calls controller/pawn PreAccept before importing any records.
+    pub(super) fn begin_travel_accept(&mut self) -> Result<(), String> {
+        let pc = self
+            .controller
+            .ok_or("travel destination has no controller")?;
+        for id in [pc, self.player] {
+            self.vm
+                .send_event(id, "TravelPreAccept", vec![])
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Imported records receive callbacks in reverse export order, with GameInfo accepting
+    /// the reused Login pawn between PreAccept and PostAccept (Engine.dll 0x1038d630).
+    pub(super) fn finish_travel_accept(
+        &mut self,
+        game_info: ObjectId,
+        actors: &[ObjectId],
+    ) -> Result<(), String> {
+        for &id in actors.iter().rev() {
+            self.vm
+                .send_event(id, "TravelPreAccept", vec![])
+                .map_err(|e| e.to_string())?;
+        }
+        self.vm
+            .send_event(
+                game_info,
+                "AcceptInventory",
+                vec![Value::Object(Some(ObjRef::Instance(self.player)))],
+            )
+            .map_err(|e| format!("XIIIGameInfo.AcceptInventory failed: {e}"))?;
+        for &id in actors.iter().rev() {
+            self.vm
+                .send_event(id, "TravelPostAccept", vec![])
+                .map_err(|e| e.to_string())?;
+        }
+        let pc = self
+            .controller
+            .ok_or("travel destination has no controller")?;
+        self.vm
+            .send_event(pc, "TravelPostAccept", vec![])
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// Current `Health` of `id` (int or float), if present.
