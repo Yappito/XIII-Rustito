@@ -5725,7 +5725,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            330.0,
+            380.0,
         )
         .expect("run Toits01 route");
         let session = &outcome.session;
@@ -5740,18 +5740,28 @@ mod tests {
             "route unexpectedly travelled: {:?}",
             outcome.travel
         );
-        // item48: `Actor.VisibleDamageableActors` (HurtRadius) now delivers blast damage, so
-        // the tarmac's scripted BazookRocket soldiers (Damage 600, DamageRadius 1000) kill the
-        // route's no-input player near (16000,1300): measured 150 -> 75 @299.0 s, 65 @301.5 s,
-        // dead @302.0 s (identical in two runs; the ratios match the retail HurtRadius script's
-        // `1 - (dist - CollisionRadius)/DamageRadius` falloff for wall impacts ~900-1000 UU out).
-        // The fixture was authored while the native was missing, so the blasts were no-ops.
+        // item48 -> item61b: `Actor.VisibleDamageableActors` (HurtRadius) delivers blast damage,
+        // but since item61's native InitExecution writes (GameInfo.DummyStuff1/2,
+        // GenAlerte.dummy) the tarmac's scripted BazookRocket soldiers are back to their
+        // authored skill/health: their aimed rockets land with falloff spread and the route's
+        // moving player SURVIVES the kill zone. Measured (identical twice,
+        // `local/re/item61b/test-as-is.txt` / `test-as-is-2.txt`): health 150 until t=319.0,
+        // 85 from t=319.5 (blast -65), 74 from t=323.5 (blast -11); the game's TouchTrigger10
+        // Touch fired at 325.017 with the player alive. The route's fight phase (below) then
+        // costs one soldier hit on the way to the door-line stand (74 -> 49) and the stand
+        // itself is safe (the Tmetaldoorhelico door line blocks the soldier's sweep, the same
+        // cover the item53b comment used for the helipad wait). Pinned: alive through the
+        // whole route, final health inside the measured window.
         let health = session
             .player_health()
             .expect("the player must still have a Health property across the route");
         assert!(
-            health <= 0.0,
-            "expected the scripted tarmac rockets to kill the no-input route player once HurtRadius works, got health {health}"
+            health > 0.0,
+            "the route player must survive the tarmac rockets and the fight phase with normal-health soldiers, got health {health}"
+        );
+        assert!(
+            (40.0..=60.0).contains(&health),
+            "the route player's final health must stay in the measured 40..=60 window (measured 150 -> 85 @319.5 s -> 74 @323.5 s -> 49 at the fight stand), got {health}"
         );
         // Goal 3 (Jones must not die) completes; goals 0/1/2 do not.
         for o in &objectives {
@@ -5944,26 +5954,17 @@ mod tests {
             dm4_started_after_touch,
             "the follow-up dialogue 'dialtoits1bis' (DialogueManager4) must start after the 'SpeechJones11T' chain fires"
         );
-        // item48: the tarmac rockets kill the route's player at ~301.55 s (health pin above).
-        // The engine-wide kill broadcast (`Controller.ClientGameEnded`) then moves every
-        // controller out of the scene: measured CineController2 PlayingSequence -> GameEnded at
-        // 301.550 s, with ScriptedActionIndex cleared (None) after the broadcast. The pre-item48
-        // fixture pinned `ScriptedActionIndex >= 117` and a PlayerWalking handover here; both
-        // were measured on a living player and are unreachable once the kill ends the scene.
-        // Pinned instead: the scene was still running (PlayingSequence) until the kill moved
-        // CineController2 to GameEnded, and the player controller ends in GameEndedDeath.
-        let kill_broadcast = vm.trace.iter().any(|event| {
-            matches!(
-                &event.kind,
-                xiii_script::TraceKind::StateChange { actor, from, to, .. }
-                    if actor.eq_ignore_ascii_case("CineController2")
-                        && from.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("PlayingSequence"))
-                        && to.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("GameEnded"))
-            )
-        });
+        // item61b: with normal-health soldiers the player survives, so the item48 kill pins are
+        // gone: no GameEnded broadcast ever fires (measured: no CineController2 state change
+        // after its entry into PlayingSequence; the scene is still running at the cutoff)
+        // and the player controller stays in PlayerWalking. The next blocker is pinned after the
+        // TouchTrigger10/generator assertions below.
+        let cc2 = vm
+            .find_object("CineController2")
+            .expect("CineController2 must exist");
         assert!(
-            kill_broadcast,
-            "the scene must run until the player kill's GameEnded broadcast moves CineController2 out of PlayingSequence"
+            vm.is_in_state(cc2, "PlayingSequence"),
+            "the scene must still be running (CineController2 in PlayingSequence) when the surviving player ends the route"
         );
         let pc = vm
             .objects
@@ -5972,8 +5973,51 @@ mod tests {
             .position(|(_, o)| vm.set().path(o.class).ends_with("XIIIPlayerController"))
             .expect("the player controller must exist");
         assert!(
-            vm.is_in_state(pc as u32, "GameEndedDeath"),
-            "the player controller must end in GameEndedDeath (killed by the scripted tarmac rockets)"
+            vm.is_in_state(pc as u32, "PlayerWalking"),
+            "the surviving player controller must end in PlayerWalking (no kill broadcast), got {:?}",
+            vm.trace
+                .iter()
+                .rev()
+                .find(|event| matches!(
+                    &event.kind,
+                    xiii_script::TraceKind::StateChange { actor, .. }
+                        if actor.eq_ignore_ascii_case("XIIIPlayerController")
+                ))
+                .map(|e| match &e.kind {
+                    xiii_script::TraceKind::StateChange { from, to, .. } => {
+                        format!("{from:?} -> {to:?}")
+                    }
+                    _ => String::new(),
+                })
         );
+        // item61b continuation pins (the route's fight + generator-retry phases):
+        // 1. The route's M60 fire (the labelled XIII.m60 grant; the import carries only Fists)
+        //    damages the road soldier BaseSoldier18 (authored 150 hp, Tag bataillefinale):
+        //    measured one landed burst (32 damage, `X Spine` bone hit, 150 -> 118) before he
+        //    reaches hard cover on the lower road; the remaining bursts trace onto the cover
+        //    (bone None). Normal-health soldiers are damageable by route fire; the full kill
+        //    was measured in the open-road probe (`local/re/item61b/shot-probe.txt`, the
+        //    (17500,1450) stand: 150 -> 20 -> -112 DEAD) but costs the player the remaining
+        //    health, so the route pins the cover fight, not the kill.
+        let soldier18 = vm
+            .find_object("BaseSoldier18")
+            .expect("BaseSoldier18 must exist");
+        assert_eq!(
+            vm.get_property(soldier18, "Health"),
+            Some(&xiii_script::Value::Int(118)),
+            "the route's tracked M60 fire must damage BaseSoldier18 (150 -> 118, the fight demonstration); the value moves only if the fight phase changes"
+        );
+        // 2. The generator-shot retry (t=360-368.5, from the closest road stand at
+        //    (17400,1400), tracking BreakableMover12) lands nothing: the yard stays sealed
+        //    (the generator Health 50 pin above). The next blocker, precisely: the yard's
+        //    south wall line is sealed by BSP + the two ForeverLocked Tportet3 doors (measured
+        //    soup scan: zero clear rays across the whole door band at 5 UU resolution,
+        //    `local/re/item61b/los-probe*.txt`); the doors never open (PorteDecors.ForeverLocked
+        //    absorbs TakeDamage and only plays a sound on PlayerTrigger); the level's own
+        //    shotgun pickup (FusilPompePick1) is inside the sealed yard. So BreakableMover12
+        //    can never be destroyed by route input -> 'PorteDebloquee_cine' never fires ->
+        //    CineTrigger17 never forwards 'PorteDebloquee' -> TT10 stays disarmed -> goal 0's
+        //    chain, the RenfortHelico02 finale, goals 1/2 and the 'finmap' travel are all
+        //    unreachable, and the route ends waiting for a travel that cannot be requested.
     }
 }
