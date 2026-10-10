@@ -5976,4 +5976,57 @@ mod tests {
             "the player controller must end in GameEndedDeath (killed by the scripted tarmac rockets)"
         );
     }
+
+    /// item66 diagnostic: Hual04a's Carrington scene (`Cine1`, a `Cine2`) blocks in `CineInit`
+    /// on `XIIIGameInfo(Level.Game).MapInfo.EndCartoonEffect` until the HUD's own cartoon effect
+    /// ends. This probe runs 15 s of walking input and reports the gate state.
+    #[test]
+    fn opt_in_hual04a_cartoon_probe() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual04a".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual04a");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let text = "\
+t=0.50 forward 1
+t=2.00 forward 0
+t=2.50 goto -10200 -1500
+t=6.00 goto -10000 -1600
+t=10.00 goto -9800 -1700
+";
+        let script = script::Script::parse(text).expect("parse probe script");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Hual04a",
+            &script,
+            &resolved.params,
+            &scene,
+            15.0,
+        )
+        .expect("run Hual04a cartoon probe");
+        let vm = outcome.session.vm();
+        let mi = outcome.session.map_info().expect("MapInfo");
+        let cine1 = vm
+            .objects
+            .iter()
+            .position(|o| o.name.eq_ignore_ascii_case("Cine1"))
+            .expect("Cine1 must exist");
+        println!(
+            "[hual04a cartoon probe] EndCartoonEffect={:?} Cine1.bInitialized={:?} Cine1.state={:?} CheckpointNumber={:?} HudCartoonSFX={:?} InitialCartoonEffect={:?}",
+            vm.get_property(mi, "EndCartoonEffect"),
+            vm.get_property(cine1 as u32, "bInitialized"),
+            outcome.session.vm().state_name(cine1 as u32),
+            vm.get_property(outcome.session.game_info.unwrap(), "CheckpointNumber"),
+            vm.find_live_object("XIIIBaseHud0")
+                .and_then(|h| vm.get_property(h, "HudCartoonSFX")),
+            vm.find_level_info()
+                .and_then(|l| vm.get_property(l, "InitialCartoonEffect")),
+        );
+    }
 }
