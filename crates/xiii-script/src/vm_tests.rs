@@ -431,6 +431,167 @@ fn set_of(data: Vec<u8>) -> ScriptSet {
     set
 }
 
+/// Authored miniature of the decoded input/focus call graph, with no retail bytecode.
+/// Fire forwards to the weapon; only the focus trigger's event calls RemoveMe.
+fn cartoon_focus_input_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let weapon = b.reserve(0, 0, "Weapon");
+    let hud = b.reserve(0, 0, "HUD");
+    let focus = b.reserve(0, 0, "Focus");
+    let pc = b.reserve(0, 0, "PlayerController");
+    let trigger = b.reserve(0, 0, "FocusTrigger");
+    let pawn_weapon = b.reserve(IMP_OBJPROP, pawn, "Weapon");
+    let fired = b.reserve(IMP_INTPROP, weapon, "Fired");
+    let weapon_fire = b.reserve(IMP_FUNCTION, weapon, "Fire");
+    let hud_focus = b.reserve(IMP_OBJPROP, hud, "HudFoc");
+    let focus_owner = b.reserve(IMP_OBJPROP, focus, "Owner");
+    let remove = b.reserve(IMP_FUNCTION, focus, "RemoveMe");
+    let pc_pawn = b.reserve(IMP_OBJPROP, pc, "Pawn");
+    let pc_hud = b.reserve(IMP_OBJPROP, pc, "myHUD");
+    let mode = b.reserve(B_BOOLPROP, pc, "bWeaponMode");
+    let fire = b.reserve(IMP_FUNCTION, pc, "Fire");
+    let no_control = b.reserve(IMP_STATE, pc, "NoControl");
+    let shadow_fire = b.reserve(IMP_FUNCTION, no_control, "Fire");
+    let trigger_hud = b.reserve(IMP_OBJPROP, trigger, "HUD");
+    let wait = b.reserve(IMP_STATE, trigger, "WaitEndFocus");
+    let end = b.reserve(IMP_FUNCTION, wait, "Trigger");
+    for (property, next) in [
+        (pawn_weapon, 0),
+        (hud_focus, 0),
+        (focus_owner, remove),
+        (pc_pawn, pc_hud),
+        (pc_hud, mode),
+        (trigger_hud, wait),
+    ] {
+        b.prop_with(property, next, 0, &compact(0));
+    }
+    b.prop(fired, weapon_fire, 0);
+    b.prop(mode, fire, 0);
+    // Weapon.Fire records that it was called. No native or animation dependency.
+    let mut code = vec![0x0F, 0x01];
+    code.extend(compact(fired));
+    code.extend([0x26, 0x04, 0x0B]);
+    b.func(weapon_fire, 0, 0, &code, 9, 0, ff::DEFINED);
+    let context = |property, expression: Vec<u8>, size: u16| {
+        let mut code = vec![0x19, 0x01];
+        code.extend(compact(property));
+        code.extend(size.to_le_bytes());
+        code.push(0);
+        code.extend(expression);
+        code
+    };
+    let mut call_fire = vec![0x1B];
+    call_fire.extend(compact(b.name("Fire")));
+    call_fire.push(0x16);
+    // if (bWeaponMode) Pawn.Weapon.Fire(); return. The return is at memory offset 32.
+    let mut code = vec![0x07, 32, 0, 0x01];
+    code.extend(compact(mode));
+    code.extend(context(pc_pawn, context(pawn_weapon, call_fire, 6), 15));
+    code.extend([0x04, 0x0B]);
+    b.func(fire, no_control, 0, &code, 34, 0, ff::EXEC | ff::DEFINED);
+    b.func(shadow_fire, 0, 0, &[0x04, 0x0B], 2, 0, ff::EXEC);
+    b.state_children(no_control, 0, shadow_fire, &[0x08], 1, 0xFFFF);
+    // RemoveMe owns the head-list update: Owner.HudFoc = None.
+    let mut member = vec![0x01];
+    member.extend(compact(hud_focus));
+    let mut code = vec![0x0F];
+    code.extend(context(focus_owner, member, 5));
+    code.extend([0x2A, 0x04, 0x0B]);
+    b.func(remove, 0, 0, &code, 18, 0, ff::DEFINED);
+    let mut call_remove = vec![0x1B];
+    call_remove.extend(compact(b.name("RemoveMe")));
+    call_remove.push(0x16);
+    let mut code = context(trigger_hud, context(hud_focus, call_remove, 6), 15);
+    code.extend([0x04, 0x0B]);
+    b.func(end, 0, 0, &code, 26, 0, ff::EVENT | ff::DEFINED);
+    b.state_children(wait, 0, end, &[0x08], 1, 0xFFFF);
+    b.class(object, 0, 0);
+    for (class, children) in [
+        (pawn, pawn_weapon),
+        (weapon, fired),
+        (hud, hud_focus),
+        (focus, focus_owner),
+        (pc, pc_pawn),
+        (trigger, trigger_hud),
+    ] {
+        b.class(class, object, children);
+    }
+    b.build()
+}
+
+#[test]
+fn cartoon_focus_survives_fire_and_ends_only_on_its_script_event() {
+    let set = set_of(cartoon_focus_input_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pc = vm.spawn(g(&set, "PlayerController"), "PC").unwrap();
+    let pawn = vm.spawn(g(&set, "Pawn"), "Pawn").unwrap();
+    let weapon = vm.spawn(g(&set, "Weapon"), "Weapon").unwrap();
+    let hud = vm.spawn(g(&set, "HUD"), "HUD").unwrap();
+    let focus = vm.spawn(g(&set, "Focus"), "Focus").unwrap();
+    let trigger = vm.spawn(g(&set, "FocusTrigger"), "Trigger").unwrap();
+    for id in [pc, pawn, weapon, hud, focus, trigger] {
+        vm.set_active(id, true);
+    }
+    for (owner, property, target) in [
+        (pc, "Pawn", pawn),
+        (pc, "myHUD", hud),
+        (pawn, "Weapon", weapon),
+        (hud, "HudFoc", focus),
+        (focus, "Owner", hud),
+        (trigger, "HUD", hud),
+    ] {
+        assert!(vm.set_property(
+            owner,
+            property,
+            0,
+            Value::Object(Some(ObjRef::Instance(target)))
+        ));
+    }
+    vm.set_property(pc, "bWeaponMode", 0, Value::Bool(true));
+    vm.goto_state(trigger, "WaitEndFocus", None).unwrap();
+    for _ in 0..3 {
+        vm.send_event(pc, "Fire", vec![]).unwrap();
+        vm.tick(10.0).unwrap();
+        assert_eq!(vm.get_property(weapon, "Fired"), Some(&Value::Int(1)));
+        assert_eq!(vm.obj_prop(hud, "HudFoc"), Some(focus));
+    }
+    // Mode gates and state shadows still apply while a focus is present.
+    vm.set_property(weapon, "Fired", 0, Value::Int(0));
+    vm.set_property(pc, "bWeaponMode", 0, Value::Bool(false));
+    vm.send_event(pc, "Fire", vec![]).unwrap();
+    assert_eq!(vm.get_property(weapon, "Fired"), Some(&Value::Int(0)));
+    vm.set_property(pc, "bWeaponMode", 0, Value::Bool(true));
+    vm.goto_state(pc, "NoControl", None).unwrap();
+    vm.send_event(pc, "Fire", vec![]).unwrap();
+    assert_eq!(vm.get_property(weapon, "Fired"), Some(&Value::Int(0)));
+    assert_eq!(vm.obj_prop(hud, "HudFoc"), Some(focus));
+    vm.send_event(trigger, "Trigger", vec![]).unwrap();
+    assert_eq!(vm.obj_prop(hud, "HudFoc"), None);
+    // A second event must not call a stale focus head.
+    vm.send_event(trigger, "Trigger", vec![]).unwrap();
+    assert_eq!(vm.obj_prop(hud, "HudFoc"), None);
+}
+
+#[test]
+fn cartoon_focus_fire_with_no_pawn_or_weapon_does_not_invent_an_event() {
+    let set = set_of(cartoon_focus_input_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pc = vm.spawn(g(&set, "PlayerController"), "PC").unwrap();
+    let pawn = vm.spawn(g(&set, "Pawn"), "Pawn").unwrap();
+    vm.set_active(pc, true);
+    vm.set_active(pawn, true);
+    vm.set_property(pc, "bWeaponMode", 0, Value::Bool(true));
+    vm.send_event(pc, "Fire", vec![]).unwrap();
+    vm.set_property(pc, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    vm.send_event(pc, "Fire", vec![]).unwrap();
+    assert!(!vm.trace.iter().any(|event| matches!(
+        &event.kind,
+        TraceKind::Event { function, .. } if function.ends_with(".Trigger") || function.ends_with(".RemoveMe")
+    )));
+}
+
 fn g(set: &ScriptSet, path: &str) -> GlobalRef {
     GlobalRef {
         package: 0,
