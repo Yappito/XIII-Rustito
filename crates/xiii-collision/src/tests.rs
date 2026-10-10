@@ -1617,3 +1617,105 @@ fn dbg_corner_deadlock() {
         pos = r.position;
     }
 }
+
+/// A vertical panel in the y-z plane at x=0 with a -X winding (like the Amos01 duct
+/// grille meshes: the winding normal points into the duct).
+fn panel_x_wound_minus(x: f32) -> Vec<Triangle> {
+    quad(
+        [x, -5.0, -5.0],
+        [x, -5.0, 5.0],
+        [x, 5.0, 5.0],
+        [x, 5.0, -5.0],
+    )
+}
+
+#[test]
+fn sweeps_are_two_sided_for_every_source() {
+    // Swept movement queries stay two-sided even for a one-sided-flagged source: movers are
+    // engine brushes, and the measured level behaviour (the Amos01 rooftop brick wall blocks
+    // the approach from its winding-normal side) matches a plain solid. One-sidedness is a
+    // ray-path rule only.
+    let mut w = world(panel_x_wound_minus(0.0).into_iter().map(|t| (t, 4)));
+    w.set_one_sided_sources(vec![false, false, false, false, true]);
+    assert!(
+        w.sweep([-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.2, 0.4, 0.2])
+            .is_some(),
+        "a flagged source still keeps the two-sided sweep"
+    );
+    assert!(
+        w.sweep([1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.2, 0.4, 0.2])
+            .is_some(),
+        "the reverse sweep hits as well"
+    );
+}
+
+#[test]
+fn walkable_surface_stays_solid_for_sweeps() {
+    // A standing surface blocks pawn movement from both sides, because the engine's pawn
+    // movement is cylinder-based for actors and our model has no cylinder path.
+    let mut w = world(floor_y(0.0).into_iter().map(|t| (t, 3)));
+    w.set_one_sided_sources(vec![true]);
+    let down = w.sweep([0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.2, 0.4, 0.2]);
+    let hit = down.expect("a downward sweep must still hit a one-sided floor");
+    assert_eq!(hit.source, 3);
+    let up = w.sweep([0.0, -1.0, 0.0], [0.0, 1.0, 0.0], [0.2, 0.4, 0.2]);
+    assert!(
+        up.is_some(),
+        "an upward sweep must also hit the walkable-exempt surface"
+    );
+}
+
+#[test]
+fn dynamic_mover_ray_hits_base_pose_panel() {
+    // BM9's grille panel, in bevy space (unreal x 1/90): the panel plane is unreal
+    // x = -2175, i.e. bevy z = 24.167. The VM's fist ray at unreal z=100 must hit the
+    // registered (dynamic) copy the same way it hits the static copy.
+    let tri: Triangle = [
+        [16.0 / 90.0, 8.0 / 90.0, 2175.0 / 90.0],
+        [16.0 / 90.0, 126.0 / 90.0, 2175.0 / 90.0],
+        [140.0 / 90.0, 126.0 / 90.0, 2175.0 / 90.0],
+    ];
+    let mut w = CollisionWorld::new([(tri, 7u32)]);
+    w.set_one_sided_sources(vec![true]);
+    // The registration path: drop the static copy, add the moving one.
+    w.remove_static_source(7);
+    let center = [0.0, 0.0, 2175.0 / 90.0];
+    let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    w.add_moving(MovingObject::from_world_triangles(
+        [tri],
+        7,
+        center,
+        identity,
+    ));
+    // The dynamic copy answers ray queries like the static one; the panel's bevy winding
+    // points unreal +X, so the westward ray (against the winding) is the accepted side and
+    // the eastward ray is rejected while the source carries the one-sided flag.
+    let start = [78.0 / 90.0, 100.0 / 90.0, 2260.0 / 90.0];
+    let end = [78.0 / 90.0, 100.0 / 90.0, 2160.0 / 90.0];
+    let mut one_sided = vec![false; 8];
+    one_sided[7] = true;
+    let hit = w.ray_with_one_sided_sources(end, start, &one_sided);
+    assert!(
+        hit.is_some(),
+        "the registered mover's base pose must block the ray from its accepted side"
+    );
+    let hit = hit.unwrap();
+    assert_eq!(hit.source, 7);
+    assert!((hit.t - 0.15).abs() < 0.01, "t={}", hit.t);
+    let back = w.ray_with_one_sided_sources(start, end, &one_sided);
+    assert!(
+        back.is_none(),
+        "a one-sided panel must not block a ray from its rejected side"
+    );
+    // And an unflagged world stays two-sided in both directions.
+    let mut plain = CollisionWorld::new([(tri, 7u32)]);
+    plain.remove_static_source(7);
+    plain.add_moving(MovingObject::from_world_triangles(
+        [tri],
+        7,
+        center,
+        identity,
+    ));
+    assert!(plain.ray_with_one_sided_sources(start, end, &[]).is_some());
+    assert!(plain.ray_with_one_sided_sources(end, start, &[]).is_some());
+}

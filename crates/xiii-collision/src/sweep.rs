@@ -107,6 +107,10 @@ pub fn sweep_aabb(
         end[2] + half_extents[2],
     ]);
 
+    // Swept (movement) queries are two-sided for every source: movers are brushes in the
+    // engine, and the measured level behaviour (the Amos01 rooftop brick wall blocks the
+    // approach from its winding-normal side) matches a plain solid. The one-sided static
+    // mesh rule stays on the ray path only (`ray_with_one_sided_sources`).
     let mut best: Option<SweepHit> = None;
     world.for_each_candidate(query, |i| {
         let t = world.triangle(i);

@@ -160,6 +160,14 @@ pub struct CollisionWorld {
     bvh: Bvh,
     degenerate: usize,
     dynamic: Vec<MovingObject>,
+    /// Per-source one-sided flag for the zero-extent ray path
+    /// (`ray_with_one_sided_sources`): a one-sided static mesh accepts a ray that strikes
+    /// its winding's front face and rejects the reverse direction (measured against the
+    /// converted Plage01 desk top; the `dot(D, N_wind) > 0` compare in the
+    /// `UStaticMesh::LineCheck` tail only orients the reported normal). Swept movement
+    /// queries are two-sided for every source. Sources beyond the list length are
+    /// two-sided. Registered movers clear their flag (brush collision is two-sided).
+    one_sided: Vec<bool>,
 }
 
 impl CollisionWorld {
@@ -187,7 +195,30 @@ impl CollisionWorld {
             bvh,
             degenerate,
             dynamic: Vec::new(),
+            one_sided: Vec::new(),
         }
+    }
+
+    /// Sets the per-source one-sided flags used by ray queries
+    /// (see the `one_sided` field documentation).
+    pub fn set_one_sided_sources(&mut self, flags: Vec<bool>) {
+        self.one_sided = flags;
+    }
+
+    /// Whether `source` is one-sided for swept queries.
+    pub fn is_one_sided(&self, source: u32) -> bool {
+        self.one_sided
+            .get(source as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Sets the one-sided flag of one source (registration-time exemption for movers).
+    pub fn set_one_sided_source(&mut self, source: u32, flag: bool) {
+        if source as usize >= self.one_sided.len() {
+            self.one_sided.resize(source as usize + 1, false);
+        }
+        self.one_sided[source as usize] = flag;
     }
 
     /// Position of triangle `index` in the input iterator of [`CollisionWorld::new`].
@@ -762,6 +793,13 @@ fn ray_triangle(o: Vec3, d: Vec3, t: &Triangle, one_sided: bool) -> Option<f32> 
     let e2 = sub(t[2], t[0]);
     let p = cross(d, e2);
     let det = dot(e1, p);
+    // One-sided sources accept the hit when the ray strikes the winding's front face (the
+    // ray travels against the winding normal, `dot(D, N_wind) < 0`, measured against the
+    // converted Plage01 desk top). In Moller-Trumbore `det = dot(e1, cross(D, e2)) =
+    // -dot(D, cross(e1, e2))`, so "accept" means det > 0. The `dot(D, N_wind) > 0` compare
+    // in the `UStaticMesh::LineCheck` tail (Engine.dll 0x104031eb) only orients the
+    // reported normal (it negates the winding normal when the ray travels along it); both
+    // branches reach the same return, so it is not a culling rule.
     if (one_sided && det <= 1e-12) || (!one_sided && det.abs() < 1e-12) {
         return None;
     }

@@ -1937,6 +1937,11 @@ pub(crate) struct ScriptOutcome {
     pub final_map: String,
     /// One entry per level transition, in order (empty when the run did not travel).
     pub travel: Vec<TravelHop>,
+    /// Each map the run passed through and its VM event trace as the run left it (the final
+    /// map's trace is the last entry). The session's VM is rebuilt per map, so this is the only
+    /// place a travelled-from map's scripted events remain observable.
+    #[allow(dead_code)] // test-evidence field (opt-in route tests)
+    pub map_traces: Vec<(String, Vec<xiii_script::TraceEvent>)>,
     /// item18: each map the run passed through and its `MapInfo.Objectif[]` states as the run left
     /// it (the final map's states are the last entry). Requirement 4's "objective states over
     /// time" across a multi-map run.
@@ -2123,6 +2128,7 @@ fn run_script_inner(
     let mut trace = Vec::new();
     let mut travel = Vec::new();
     let mut map_objectives = Vec::new();
+    let mut map_traces = Vec::new();
     let mut runtime = open_map_runtime(game_dir, map, scene, params)?;
     // Accumulated unresolved voice names across maps (the provider is re-installed per map).
     let mut voice_unresolved_total = 0u64;
@@ -2322,6 +2328,7 @@ fn run_script_inner(
                 tick,
             });
             map_objectives.push((runtime.name.clone(), runtime.session.objective_states()));
+            map_traces.push((runtime.name.clone(), runtime.session.vm().trace.clone()));
             // The script block (if any) is released; the next map starts a fresh run.
             drive.notify_travel();
             let opts = crate::cli::Options {
@@ -2355,6 +2362,7 @@ fn run_script_inner(
         );
     }
     map_objectives.push((runtime.name.clone(), runtime.session.objective_states()));
+    map_traces.push((runtime.name.clone(), runtime.session.vm().trace.clone()));
     if let Some(h) = runtime.video_host.as_ref() {
         println!("[play] {}", h.report_line());
         for d in h.diagnostics() {
@@ -2380,6 +2388,7 @@ fn run_script_inner(
         final_map: runtime.name,
         travel,
         map_objectives,
+        map_traces,
         footsteps: footstep_log,
     })
 }
@@ -3918,7 +3927,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            150.0,
+            1400.0,
         )
         .expect("run Amos01 route");
         let pc = outcome
@@ -3935,84 +3944,22 @@ mod tests {
             outcome.session.vm().get_property(pc, "OldWeap"),
             outcome.travel
         );
-        for event in &outcome.session.vm().trace {
-            if let xiii_script::TraceKind::StateChange {
-                actor, from, to, ..
-            } = &event.kind
-                && actor.eq_ignore_ascii_case("XIIIPlayerController")
-            {
-                println!("[amos01 control] t={:.3} {from:?} -> {to:?}", event.time);
-            }
-            if let xiii_script::TraceKind::Event {
-                target,
-                function,
-                args,
-            } = &event.kind
-                && (target.eq_ignore_ascii_case("Amos0") || function.ends_with(".Trigger"))
-            {
-                println!(
-                    "[amos01 event] t={:.3} {target}.{function}{args:?}",
-                    event.time
-                );
-            }
-        }
-        for (i, object) in outcome.session.vm().objects.iter().enumerate() {
-            let id = i as xiii_script::ObjectId;
-            if object.deleted || !object.suspended {
-                continue;
-            }
-            println!(
-                "[amos01 suspended] {} state={:?} class={:?}",
-                object.name,
-                outcome.session.vm().state_name(id),
-                object.class
-            );
-        }
-        for (i, object) in outcome.session.vm().objects.iter().enumerate() {
-            let id = i as xiii_script::ObjectId;
-            if object.deleted || !outcome.session.vm().is_a(id, "XIIIGoalTrigger") {
-                continue;
-            }
-            let number = outcome.session.vm().get_property(id, "GoalNumber");
-            if !matches!(number, Some(xiii_script::Value::Int(1))) {
-                continue;
-            }
-            let vm = outcome.session.vm();
-            println!(
-                "[amos01 goal] {} GoalNumber={number:?} Event={:?} Tag={:?} Location={:?}",
-                object.name,
-                vm.get_property(id, "Event"),
-                vm.get_property(id, "Tag"),
-                vm.vector_prop(id, "Location")
-            );
-        }
-        for (i, object) in outcome.session.vm().objects.iter().enumerate() {
-            let id = i as xiii_script::ObjectId;
-            if object.deleted || !outcome.session.vm().is_a(id, "TouchTrigger") {
-                continue;
-            }
-            if !matches!(outcome.session.vm().get_property(id, "Event"),
-                Some(xiii_script::Value::Name(name)) if name.eq_ignore_ascii_case("findemap"))
-            {
-                continue;
-            }
-            let vm = outcome.session.vm();
-            println!(
-                "[amos01 goal-source] {} Event=findemap Location={:?}",
-                object.name,
-                vm.vector_prop(id, "Location")
-            );
-        }
-        assert_eq!(outcome.final_map, "Amos01");
+        assert_eq!(
+            outcome.final_map, "Toits01",
+            "the route must reach TouchTrigger39 and travel to Toits01"
+        );
         assert!(
-            outcome.travel.is_empty(),
-            "route unexpectedly travelled: {:?}",
+            outcome
+                .travel
+                .iter()
+                .any(|hop| hop.from == "Amos01" && hop.to == "Toits01"),
+            "expected an Amos01 -> Toits01 travel hop: {:?}",
             outcome.travel
         );
         assert_eq!(
             player_state.as_deref(),
             Some("PlayerWalking"),
-            "the authored cutscene must return control through the initialized interaction path"
+            "the authored cutscenes must return control through the initialized interaction path"
         );
         assert!(
             matches!(
@@ -4023,21 +3970,41 @@ mod tests {
             ),
             "InitInputSystem must provide MyInteraction"
         );
-        let rooftop = objectives
+        // item40f acceptance (task item 3): Amos01's rooftop objective completes through the
+        // game's own chain (TouchTrigger39 Event 'findemap' -> XIIIGoalTrigger0, GoalNumber 1,
+        // -> CauseGoal -> SetGoalComplete -> ServerTravel) before the map travels.
+        let (amos_map, amos_objectives) = outcome
+            .map_objectives
+            .iter()
+            .find(|(m, _)| m == "Amos01")
+            .expect("the run must record Amos01's objective snapshot");
+        let rooftop = amos_objectives
             .iter()
             .find(|o| o.index == 1)
             .expect("rooftop objective");
         assert!(
-            rooftop.primary && !rooftop.completed,
-            "this fixture does not yet reach the rooftop goal: {rooftop:?}"
+            rooftop.primary && rooftop.completed,
+            "the rooftop objective must complete before the travel: {amos_map} {rooftop:?}"
         );
-        // item40e milestones. The office door was opened by the route's use action (it swings
-        // open and back; its own OpeningEvent fired), the chair swing destroyed the grille, and
-        // the player ends crouched inside the duct, west of the broken grille.
-        let vm = outcome.session.vm();
+        let anti_goal = amos_objectives
+            .iter()
+            .find(|o| o.index == 0)
+            .expect("FBI anti-goal");
         assert!(
-            vm.trace.iter().any(|event| {
-                (123.0..123.1).contains(&event.time)
+            anti_goal.anti_goal && anti_goal.completed,
+            "the do-not-kill anti-goal must be completed (not violated): {anti_goal:?}"
+        );
+        // item40e milestones, from the travelled-from map's retained VM trace: the chair grab
+        // runs through the controller script (no host bridge) and the swing destroys the grille.
+        let amos_trace = &outcome
+            .map_traces
+            .iter()
+            .find(|(m, _)| m == "Amos01")
+            .expect("the run must retain Amos01's VM trace")
+            .1;
+        assert!(
+            amos_trace.iter().any(|event| {
+                (123.0..123.1).contains(&(event.time as f32))
                     && matches!(&event.kind,
                 xiii_script::TraceKind::Event { function, .. }
                     if function.ends_with("XIIIPlayerController.Grab"))
@@ -4045,21 +4012,36 @@ mod tests {
             "the chair must be grabbed by the controller script, not a host Touch bridge"
         );
         assert!(
-            vm.find_live_object("BreakAbleMover16").is_none(),
-            "the chair swing must break (destroy) the duct grille BreakAbleMover16"
+            !amos_trace.iter().any(|event| matches!(&event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                if target.eq_ignore_ascii_case("ChaiseDeco2")
+                    && function.ends_with(".TakeDamage"))),
+            "the chair swing breaks grilles through the mover damage path, not by damaging the chair"
         );
-        let opened_door = vm.trace.iter().any(|event| {
-            matches!(&event.kind, xiii_script::TraceKind::Event { target, function, .. }
-                if target.eq_ignore_ascii_case("XIIIDispatcher6") && function.ends_with("Trigger"))
-        });
+        let broken = [
+            "BreakAbleMover16",
+            "BreakAbleMover44",
+            "BreakAbleMover56",
+            "BreakableMover9",
+            "BreakAbleMover8",
+            "BreakableMover6",
+        ];
+        let damaged: Vec<String> = amos_trace
+            .iter()
+            .filter_map(|event| match &event.kind {
+                xiii_script::TraceKind::Event {
+                    target, function, ..
+                } if function.contains("TakeDamage") => Some(target.to_ascii_lowercase()),
+                _ => None,
+            })
+            .collect();
+        for name in broken {
+            assert!(
+                damaged.iter().any(|t| t.eq_ignore_ascii_case(name)),
+                "{name} must take scripted damage along the route"
+            );
+        }
         let finish = outcome.trace.last().expect("player trace").2;
-        println!(
-            "[amos01 route] final position {finish:?}; dialamos3tempo dispatcher triggered: {opened_door}"
-        );
-        assert!(
-            finish[0] < -400.0 && (finish[1] + 1198.0).abs() < 40.0 && finish[2] < 60.0,
-            "the player must end crouched inside the zone-26 duct west of the broken grille              (a destroyed mover must leave the player collision; coplanar duct-floor edges must              not stall the crouched box): {finish:?}"
-        );
         let first_after_intro_state = outcome
             .trace
             .iter()
@@ -4071,7 +4053,12 @@ mod tests {
             "the returned PlayerWalking controller must accept the route's forward input"
         );
         println!(
-            "[amos01 route] PARTIAL: office door, chair grab, grille break and duct crawl pass; the rooftop objective and Toits01 travel are not reached (next: the far grille BreakAbleMover17 faces out of the duct; the north route via duct 14 is blocked by breakable cartons)."
+            "[amos01 route] PASS: route to TouchTrigger39, objective 1 completed via XIIIGoalTrigger0, travel to Toits01 at t={:.3}",
+            outcome
+                .travel
+                .first()
+                .map(|h| h.vm_time)
+                .unwrap_or_default()
         );
     }
 

@@ -5945,13 +5945,32 @@ impl<'s> Vm<'s> {
             }
             K::VirtualFunction { name, call } => {
                 let n = self.set.packages[frame.pkg].name_text(*name).to_owned();
-                let f = self.find_function(target, &n, true).ok_or_else(|| {
-                    self.err(VmErrorKind::NoSuchFunction {
-                        object: self.objects[target as usize].name.clone(),
-                        name: n.clone(),
-                    })
-                })?;
-                self.invoke(frame, f, call, target, None)?
+                match self.find_function(target, &n, true) {
+                    Some(f) => self.invoke(frame, f, call, target, None)?,
+                    // `Ammo.SpawnProjectile` has no script body in any package (Engine/Ammo's
+                    // reflected list has only `SpawnCopy`/`BotDesireability`; the natives catalog
+                    // has no entry). The game calls it from `Weapon.NormalFire.Timer` for every
+                    // `bInstantHit` ammo — including the player's Fists (`FistsAmmo`:
+                    // `bInstantHit=true`, `ProjectileClass=None`), whose carton/grille punching
+                    // is required campaign progression (Amos01 duct). The decoded damage chain
+                    // for hand-to-hand is `RealTraceFire`'s melee section
+                    // (XIII.u `XIIIWeapon.RealTraceFire` 0x004D-0x00BC: StartTrace = pawn
+                    // Location + eye, EndTrace = Start + 100*aim, zero-extent `Trace`, then
+                    // 0x049B: when locally controlled and `MyInteraction.bCanBreak`, the target
+                    // is `MyInteraction.TargetActor`) feeding the game's own
+                    // `XIIIH2HAmmo.ProcessTraceHit` (XIII.u, 564 tokens). This bridge runs
+                    // exactly that chain for a hand-to-hand ammo with no projectile class; any
+                    // other shape is reported, never silently dropped.
+                    None if n.eq_ignore_ascii_case("SpawnProjectile") => {
+                        self.spawn_projectile_bridge(frame, target, call)?
+                    }
+                    None => {
+                        return Err(self.err(VmErrorKind::NoSuchFunction {
+                            object: self.objects[target as usize].name.clone(),
+                            name: n.clone(),
+                        }));
+                    }
+                }
             }
             K::GlobalFunction { name, call } => {
                 let n = self.set.packages[frame.pkg].name_text(*name).to_owned();
@@ -7222,6 +7241,136 @@ impl<'s> Vm<'s> {
         )
     }
 
+    /// The hand-to-hand branch of the decoded-native `Ammo.SpawnProjectile` bridge (see the
+    /// `VirtualFunction` dispatch for the evidence). Mirrors `XIIIWeapon.RealTraceFire`'s melee
+    /// section using the fire start and adjusted aim the game's own `Weapon.NormalFire.Timer`
+    /// computed: a 100-UU zero-extent `Trace`, the `MyInteraction.TargetActor` override
+    /// (RealTraceFire 0x049B), then the game's own `XIIIH2HAmmo.ProcessTraceHit` damage chain.
+    fn spawn_projectile_bridge(
+        &mut self,
+        frame: &mut Frame<'s>,
+        ammo: ObjectId,
+        call: &Call,
+    ) -> VmResult<Value> {
+        let mut start = [0.0f32; 3];
+        let mut aim = [0.0f32; 3];
+        for (i, tok) in call.args.iter().enumerate() {
+            match (i, self.eval(frame, tok)?) {
+                (0, Value::Vector(v)) => start = v,
+                (1, Value::Vector(v)) => aim = v,
+                (1, Value::Rotator(r)) => {
+                    let to_rad = |u: i32| (u as f32) * std::f32::consts::TAU / 65536.0;
+                    let (pitch, yaw) = (to_rad(r[0]), to_rad(r[1]));
+                    aim = [
+                        pitch.cos() * yaw.cos(),
+                        pitch.cos() * yaw.sin(),
+                        pitch.sin(),
+                    ];
+                }
+                _ => {}
+            }
+        }
+        if self.obj_prop(ammo, "ProjectileClass").is_some() {
+            self.note(TraceKind::Note(format!(
+                "SpawnProjectile bridge: {} carries a projectile class; projectile spawn is not modelled",
+                self.objects[ammo as usize].name
+            )));
+            return Ok(Value::Void);
+        }
+        if !self.bool_prop(ammo, "bHandToHand") {
+            self.note(TraceKind::Note(format!(
+                "SpawnProjectile bridge: {} is neither a projectile nor hand-to-hand; no effect",
+                self.objects[ammo as usize].name
+            )));
+            return Ok(Value::Void);
+        }
+        // The ammo's Owner chain leads to the firing pawn (the engine's Spawn sets Owner;
+        // `GiveAmmo` may own the ammo to the weapon or straight to the pawn).
+        let owner = self.obj_prop(ammo, "Owner");
+        let (weapon, pawn) = match owner {
+            Some(o) if self.is_a(o, "Pawn") => (o, o),
+            Some(o) => match self.obj_prop(o, "Instigator") {
+                Some(p) => (o, p),
+                None => match self.obj_prop(o, "Owner") {
+                    Some(p) => (o, p),
+                    None => {
+                        return Err(self.err(VmErrorKind::Other(
+                            "SpawnProjectile bridge: hand-to-hand ammo has no pawn owner".into(),
+                        )));
+                    }
+                },
+            },
+            None => {
+                return Err(self.err(VmErrorKind::Other(
+                    "SpawnProjectile bridge: hand-to-hand ammo has no Owner".into(),
+                )));
+            }
+        };
+        // RealTraceFire 0x00A2: EndTrace = StartTrace + 100 * AdjustedAim.
+        let end = [
+            start[0] + 100.0 * aim[0],
+            start[1] + 100.0 * aim[1],
+            start[2] + 100.0 * aim[2],
+        ];
+        let (hit_actor, hit_loc, hit_normal) = self.vm_trace(pawn, start, end, true, [0.0; 3])?;
+        let mut other = hit_actor;
+        // RealTraceFire 0x049B: when locally controlled and the interaction allows breaking,
+        // the crosshair target replaces the trace hit.
+        if let Some(pc) = self.obj_prop(pawn, "Controller")
+            && let Some(interaction) = self.obj_prop(pc, "MyInteraction")
+            && self.bool_prop(interaction, "bCanBreak")
+        {
+            other = self.obj_prop(interaction, "TargetActor").or(other);
+        }
+        // Axes for the damage call (GetAxes of the aim): X = forward, Y = right, Z = up.
+        let len = (aim[0] * aim[0] + aim[1] * aim[1] + aim[2] * aim[2]).sqrt();
+        let x = if len > 1e-9 {
+            [aim[0] / len, aim[1] / len, aim[2] / len]
+        } else {
+            [1.0, 0.0, 0.0]
+        };
+        let up = [0.0f32, 0.0, 1.0];
+        let mut y = [
+            up[1] * x[2] - up[2] * x[1],
+            up[2] * x[0] - up[0] * x[2],
+            up[0] * x[1] - up[1] * x[0],
+        ];
+        let ylen = (y[0] * y[0] + y[1] * y[1] + y[2] * y[2]).sqrt();
+        if ylen > 1e-9 {
+            y = [y[0] / ylen, y[1] / ylen, y[2] / ylen];
+        }
+        let z = [
+            x[1] * y[2] - x[2] * y[1],
+            x[2] * y[0] - x[0] * y[2],
+            x[0] * y[1] - x[1] * y[0],
+        ];
+        let Some(f) = self.find_function(ammo, "ProcessTraceHit", true) else {
+            return Err(self.err(VmErrorKind::Other(
+                "SpawnProjectile bridge: ammo has no ProcessTraceHit".into(),
+            )));
+        };
+        let hit_name = other
+            .map(|id| self.objects[id as usize].name.clone())
+            .unwrap_or_else(|| "None".into());
+        self.note(TraceKind::Note(format!(
+            "SpawnProjectile bridge: hand-to-hand trace {start:?} -> {end:?} hit {hit_name}"
+        )));
+        self.call_function(
+            f,
+            ammo,
+            vec![
+                Value::Object(Some(ObjRef::Instance(weapon))),
+                Value::Object(other.map(ObjRef::Instance)),
+                Value::Vector(hit_loc),
+                Value::Vector(hit_normal),
+                Value::Vector(x),
+                Value::Vector(y),
+                Value::Vector(z),
+            ],
+        )?;
+        Ok(Value::Void)
+    }
+
     /// Half-size extent box of an actor: `(CollisionRadius, CollisionRadius, CollisionHeight)`.
     pub(crate) fn actor_extent(&self, id: ObjectId) -> [f32; 3] {
         let (_, r, h) = self.actor_cylinder(id);
@@ -7974,6 +8123,7 @@ impl<'s> Vm<'s> {
         // UE2's iterator returns actors intersected by the swept trace; world geometry occludes
         // candidates at or beyond the first world hit.
         let world_t = provider.trace(start, end, extent).map(|hit| hit.time);
+
         let nonzero = extent.iter().any(|v| *v != 0.0);
         let mut hits = Vec::new();
         for id in 0..self.objects.len() as ObjectId {
@@ -7987,6 +8137,7 @@ impl<'s> Vm<'s> {
                 continue;
             }
             let (loc, radius, height) = self.actor_cylinder(id);
+
             if let Some((t, normal)) = segment_cylinder_hit(
                 start,
                 end,

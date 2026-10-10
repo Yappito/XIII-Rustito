@@ -94,6 +94,17 @@ impl MoverCollision {
     pub fn build(scene: &WorldScene, movers: &[MoverState]) -> (CollisionWorld, MoverCollision) {
         let (static_entries, parts) = partition(scene, movers);
         let mut world = CollisionWorld::new(static_entries);
+        // The engine's `UStaticMesh::LineCheck` one-sided tail applies to the player's swept
+        // moves against static-mesh-actor sources as well (same rule as the physics adapter's
+        // line world). Movers partitioned into the dynamic set keep their source ids, so the
+        // per-source flags cover them too.
+        world.set_one_sided_sources(
+            scene
+                .collision_sources
+                .iter()
+                .map(|path| path.contains(" -> "))
+                .collect(),
+        );
         let mut actors = Vec::new();
         let mut by_name = HashMap::new();
         for p in parts {
