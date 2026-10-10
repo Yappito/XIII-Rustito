@@ -8270,8 +8270,24 @@ impl<'s> Vm<'s> {
             }));
         };
         // UE2's iterator returns actors intersected by the swept trace; world geometry occludes
-        // candidates at or beyond the first world hit.
-        let world_t = provider.trace(start, end, extent).map(|hit| hit.time);
+        // candidates at or beyond the first world hit. item54: a hit sourced from the candidate's
+        // own primitive (a mover's mesh triangles, item53's placed-mesh actors) must not occlude
+        // that actor itself — Engine.dll's per-actor line check answers through the actor's own
+        // primitive virtual, and the crawl grille BreakableMover13 sits at the end of a tunnel
+        // whose only forward geometry is the grille itself.
+        let world_raw = provider.trace_with_mover(start, end, extent);
+        let (world_t, world_actor) = match world_raw {
+            (Some(hit), name) => {
+                let named = name.and_then(|n| self.find_live_object(&n)).filter(|&m| {
+                    m != caller && (self.is_mover(m) || self.actor_has_static_mesh(m))
+                });
+                (Some(hit.time), named)
+            }
+            (None, _) => (None, None),
+        };
+        let occludes = |t: f32, candidate: ObjectId| {
+            world_t.is_none_or(|limit| t < limit) || world_actor == Some(candidate)
+        };
         let nonzero = extent.iter().any(|v| *v != 0.0);
         let zero_extent = !nonzero;
         // item53: a static-mesh actor's zero-extent candidate is refined against its own mesh
@@ -8296,14 +8312,24 @@ impl<'s> Vm<'s> {
                 radius + extent[0].max(0.0),
                 height + extent[2].max(0.0),
             );
+            // item54: the broad-phase pre-filter must also admit a start point inside the
+            // nominal cylinder (the crawl grille's class-default r/h=160 spans the whole tunnel,
+            // so the punch ray starts inside it and `segment_cylinder_hit` has no entry hit).
+            let start_inside_cylinder = {
+                let dx = start[0] - loc[0];
+                let dy = start[1] - loc[1];
+                let dz = (start[2] - loc[2]).abs();
+                dx * dx + dy * dy <= (radius + extent[0].max(0.0)).powi(2)
+                    && dz <= height + extent[2].max(0.0)
+            };
             if zero_extent && self.actor_has_static_mesh(id) {
-                if cylinder.is_some() {
+                if cylinder.is_some() || start_inside_cylinder {
                     mesh_candidates.push(id);
                 }
                 continue;
             }
             if let Some((t, normal)) = cylinder
-                && world_t.is_none_or(|limit| t < limit)
+                && occludes(t, id)
             {
                 hits.push((t, id, normal));
             }
@@ -8312,30 +8338,39 @@ impl<'s> Vm<'s> {
             let Some(name) = self.objects.get(id as usize).map(|o| o.name.clone()) else {
                 continue;
             };
+            let (cyl_loc, cyl_radius, cyl_height) = self.actor_cylinder(id);
+            let cylinder_fallback = || {
+                segment_cylinder_hit(
+                    start,
+                    end,
+                    cyl_loc,
+                    cyl_radius + extent[0].max(0.0),
+                    cyl_height + extent[2].max(0.0),
+                )
+            };
             let outcome = self
                 .physics
                 .as_mut()
                 .map(|p| p.actor_mesh_hit(&name, start, end))
                 .unwrap_or(crate::physics::ActorMeshHit::NoData);
-            let t = match outcome {
-                crate::physics::ActorMeshHit::Hit(hit) => Some(hit.time),
+            let hit = match outcome {
+                crate::physics::ActorMeshHit::Hit(hit) => Some((hit.time, hit.normal)),
+                // item54: a registered mover whose mesh model misses the ray still answers
+                // through its collision cylinder — the class-authored interactive volume
+                // (BreakableMover r/h=160) that `DrawInteractions`' TargDist gate is sized for;
+                // the registered triangle set is the render mesh's simplified model (a thin
+                // grille quad) and does not fill it. Placed static-mesh actors (item53) keep
+                // strict mesh semantics: a ray through a mesh opening does not hit.
+                crate::physics::ActorMeshHit::Miss if self.is_mover(id) => cylinder_fallback(),
                 crate::physics::ActorMeshHit::Miss => None,
-                crate::physics::ActorMeshHit::NoData => {
-                    let (loc, radius, height) = self.actor_cylinder(id);
-                    segment_cylinder_hit(
-                        start,
-                        end,
-                        loc,
-                        radius + extent[0].max(0.0),
-                        height + extent[2].max(0.0),
-                    )
-                    .map(|(t, _)| t)
-                }
+                crate::physics::ActorMeshHit::NoData => cylinder_fallback(),
             };
-            if let Some(t) = t
-                && world_t.is_none_or(|limit| t < limit)
+            // item54: report the mesh hit's own normal — `ReturnTrace` validates the pick with a
+            // second trace to `HitLoc - HitNorm`, which needs the surface normal, not a placeholder.
+            if let Some((t, normal)) = hit
+                && occludes(t, id)
             {
-                hits.push((t, id, [0.0, 0.0, 1.0]));
+                hits.push((t, id, normal));
             }
         }
         hits.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -8540,10 +8575,15 @@ impl<'s> Vm<'s> {
         Ok(out)
     }
 
-    /// `Actor.FastTrace`: world-only line trace; true when clear.
+    /// `Actor.FastTrace`: world-only line trace; true when clear. item54: a hit at the segment
+    /// endpoint (the traced-to point lies on the surface) does not block — `XIIIPlayerController.
+    /// ReturnTrace` 0x0000 ends its visibility checks on the picked actor's own surface
+    /// (`FastTrace(HitLoc, Start)`), which the retail punch chain passes.
     pub(crate) fn vm_fast_trace(&mut self, start: [f32; 3], end: [f32; 3]) -> VmResult<bool> {
         match self.physics.as_mut() {
-            Some(p) => Ok(p.trace(start, end, [0.0; 3]).is_none()),
+            Some(p) => Ok(p
+                .trace(start, end, [0.0; 3])
+                .is_none_or(|hit| hit.time >= 1.0 - 1e-3)),
             None => Err(self.err(VmErrorKind::NoPhysicsProvider {
                 native: "Actor.FastTrace".into(),
             })),

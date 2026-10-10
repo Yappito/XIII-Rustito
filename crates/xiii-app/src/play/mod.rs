@@ -9,6 +9,8 @@
 //! `--play-script <file>`. Both drive the same [`sim::PlayerSim`] in `FixedUpdate` at 60 Hz.
 //! Fixed 60 Hz is a **hypothesis** (UE2 used variable ticks); see [`FIXED_HZ`].
 
+#[cfg(test)]
+mod campaign_chain;
 pub mod cartoon;
 pub mod cinematics;
 #[cfg(test)]
@@ -1093,6 +1095,7 @@ fn fixed_step(
             physics: sim.0.physics,
             landed_velocity_z: sim.0.landed.then_some(sim.0.land_velocity_z),
             floor_normal: sim.0.floor_normal,
+            eye_height: sim.0.vm_eye_height(&params.0),
         };
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
         sess.sync_view_rotation(sim.0.yaw, sim.0.pitch);
@@ -1819,7 +1822,7 @@ fn travel(
         commands.entity(e).try_despawn();
         removed += 1;
     }
-    let new_session = match session::Session::open(&game_dir, &plan.map) {
+    let new_session = match travel::open_next_session(sess, &game_dir, &plan) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[play] travel load failed for {}: {e}", plan.map);
@@ -1958,6 +1961,7 @@ struct MapRuntime {
     mover_collision: movers::MoverCollision,
     volumes: movement_modes::VolumeMotion,
     sim: PlayerSim,
+    player_params: PlayerParams,
     sources: Vec<String>,
     /// Shared counter of voice names this map's `VoiceDuration` provider could not resolve (the
     /// provider is re-installed on every map open, including travel reloads).
@@ -1976,7 +1980,22 @@ fn open_map_runtime(
     scene: &xiii_world::WorldScene,
     params: &PlayerParams,
 ) -> Result<MapRuntime, String> {
-    let mut session = session::Session::open(game_dir, map)?;
+    build_map_runtime(
+        game_dir,
+        map,
+        scene,
+        params,
+        session::Session::open(game_dir, map)?,
+    )
+}
+
+fn build_map_runtime(
+    game_dir: &Path,
+    map: &str,
+    scene: &xiii_world::WorldScene,
+    params: &PlayerParams,
+    mut session: session::Session,
+) -> Result<MapRuntime, String> {
     // item21: install the host `VideoPlayer` provider. Headless runs have no output device, so
     // audio is off and playback is caller-paced (`advance_virtual_all`): `GetStatus` still
     // reports completion from the decoded frame count, which is what the level-end
@@ -2059,6 +2078,7 @@ fn open_map_runtime(
         mover_collision,
         volumes,
         sim,
+        player_params: *params,
         sources,
         voice_unresolved,
         video_host,
@@ -2070,8 +2090,8 @@ fn open_map_runtime(
 ///
 /// The collision world (static soup + the VM's mover actors as dynamic objects) is built here so
 /// the script can never diverge from the interactive path. When the game's own code requests
-/// level travel, the next map is imported and a fresh session is opened (the host owns the
-/// transition); the run continues on the new map until the duration is spent.
+/// level travel, the next map is imported through the shared native travel bridge, reusing
+/// Login's pawn for imported travel properties; the run continues until the duration is spent.
 #[cfg(test)]
 pub(crate) fn run_script(
     game_dir: &Path,
@@ -2081,7 +2101,16 @@ pub(crate) fn run_script(
     scene: &xiii_world::WorldScene,
     duration: f32,
 ) -> Result<ScriptOutcome, String> {
-    run_script_inner(game_dir, map, script, params, scene, duration, false)
+    run_script_inner(
+        game_dir,
+        map,
+        script,
+        params,
+        scene,
+        duration,
+        false,
+        RunnerOptions::default(),
+    )
 }
 
 /// Player-route variant of [`run_script`]: honor the controller's authored cinematic states in
@@ -2095,9 +2124,33 @@ pub(crate) fn run_script_with_cinematic_input(
     scene: &xiii_world::WorldScene,
     duration: f32,
 ) -> Result<ScriptOutcome, String> {
-    run_script_inner(game_dir, map, script, params, scene, duration, true)
+    run_script_inner(
+        game_dir,
+        map,
+        script,
+        params,
+        scene,
+        duration,
+        true,
+        RunnerOptions::default(),
+    )
 }
 
+#[derive(Default)]
+struct RunnerOptions {
+    initial: Option<MapRuntime>,
+    stop_on_travel: bool,
+    wait_for_control: bool,
+}
+
+fn player_has_control(session: &session::Session) -> bool {
+    !cinematics::input_suppressed(session)
+        && session
+            .controller
+            .is_some_and(|pc| session.vm().is_in_state(pc, "PlayerWalking"))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_script_inner(
     game_dir: &Path,
     map: &str,
@@ -2106,14 +2159,19 @@ fn run_script_inner(
     scene: &xiii_world::WorldScene,
     duration: f32,
     respect_cinematic_input: bool,
+    options: RunnerOptions,
 ) -> Result<ScriptOutcome, String> {
     let started = Instant::now();
-    let ticks = (duration / DT).ceil() as u64;
+    let mut ticks = (duration / DT).ceil() as u64;
     let mut drive = script::Drive::new(script);
     let mut trace = Vec::new();
     let mut travel = Vec::new();
     let mut map_objectives = Vec::new();
-    let mut runtime = open_map_runtime(game_dir, map, scene, params)?;
+    let mut runtime = match options.initial {
+        Some(runtime) => runtime,
+        None => open_map_runtime(game_dir, map, scene, params)?,
+    };
+    let mut control_tick = (!options.wait_for_control).then_some(0);
     #[cfg(test)]
     if std::env::var("XIII_SURVEY").as_deref() == Ok("1") {
         runtime.session.vm_mut().collect_combat_natives = true;
@@ -2127,7 +2185,21 @@ fn run_script_inner(
     let mut footstep_log: Vec<(f32, String, Option<String>)> = Vec::new();
     let mut tick = 0u64;
     while tick < ticks {
-        let elapsed = tick as f32 * DT;
+        if control_tick.is_none() && player_has_control(&runtime.session) {
+            control_tick = Some(tick);
+            println!(
+                "[combat-control] map={map} t={:.3} state={}",
+                tick as f32 * DT,
+                runtime.session.player_controller_state()
+            );
+        }
+        if control_tick.is_none() && tick as f32 * DT >= 120.0 {
+            return Err(format!(
+                "{map}: player control not returned within 120 seconds; state={}",
+                runtime.session.player_controller_state()
+            ));
+        }
+        let elapsed = tick.saturating_sub(control_tick.unwrap_or(tick)) as f32 * DT;
         if let Some(name) = drive.tracking_actor().map(str::to_owned) {
             let location = runtime
                 .session
@@ -2138,7 +2210,11 @@ fn run_script_inner(
         } else {
             drive.set_track_location(None, None);
         }
-        let mut input = drive.advance(elapsed, &mut runtime.sim);
+        let mut input = if control_tick.is_some() {
+            drive.advance(elapsed, &mut runtime.sim)
+        } else {
+            Input::default()
+        };
         let weapons = drive.take_weapons();
         let goals = drive.take_goals();
         let mut weapon_inputs = drive.take_weapon_inputs();
@@ -2189,6 +2265,7 @@ fn run_script_inner(
             physics: runtime.sim.physics,
             landed_velocity_z: runtime.sim.landed.then_some(runtime.sim.land_velocity_z),
             floor_normal: runtime.sim.floor_normal,
+            eye_height: runtime.sim.vm_eye_height(&runtime.player_params),
         };
         runtime.session.step(
             DT,
@@ -2277,7 +2354,7 @@ fn run_script_inner(
         }
 
         // Level transition: the game's own goal/travel code requested it. The VM reported the
-        // URL; the host imports the next map and opens a fresh session.
+        // URL; the host imports the next map and carries the native travel actor properties.
         if let Some(req) = runtime.session.take_travel_request() {
             let plan = travel::TravelPlan::from_request(&req)?;
             println!(
@@ -2302,6 +2379,10 @@ fn run_script_inner(
                 tick,
             });
             map_objectives.push((runtime.name.clone(), runtime.session.objective_states()));
+            if options.stop_on_travel {
+                tick += 1;
+                break;
+            }
             // The script block (if any) is released; the next map starts a fresh run.
             drive.notify_travel();
             let opts = crate::cli::Options {
@@ -2314,7 +2395,8 @@ fn run_script_inner(
             voice_unresolved_total += runtime
                 .voice_unresolved
                 .load(std::sync::atomic::Ordering::Relaxed);
-            runtime = open_map_runtime(game_dir, &plan.map, &next_scene, params)?;
+            let next_session = travel::open_next_session(&mut runtime.session, game_dir, &plan)?;
+            runtime = build_map_runtime(game_dir, &plan.map, &next_scene, params, next_session)?;
             // Rebuild the footstep surface map and driver for the next map.
             surfaces = footsteps::SurfaceSounds::from_scene(&next_scene);
             step_driver = footsteps::FootstepDriver::new();
@@ -2327,6 +2409,9 @@ fn run_script_inner(
             );
         }
         tick += 1;
+        if control_tick.is_none() {
+            ticks += 1;
+        }
     }
     if drive.waiting_travel() && travel.is_empty() {
         println!(
@@ -2354,7 +2439,7 @@ fn run_script_inner(
     }
     Ok(ScriptOutcome {
         session: runtime.session,
-        ticks,
+        ticks: tick,
         wall_secs: started.elapsed().as_secs_f32(),
         trace,
         final_map: runtime.name,
@@ -4317,6 +4402,152 @@ mod tests {
             hual01b.1.len() >= 7,
             "Hual01b must load with its own MapInfo objectives: {:?}",
             hual01b.1
+        );
+    }
+
+    /// item54 route: Hual01b completed end-to-end by player input: the four generator
+    /// sabotages and the `BreakableMover13` tunnel grille punch through the game's own
+    /// break-by-hand chain (`XIIIWeapon.RealTraceFire` melee -> the interaction's
+    /// `TargetActor`/`bCanBreak` -> `XIIIH2HAmmo.ProcessTraceHit` `TakeDamage(DTFisted)` ->
+    /// `BreakableMover.Breaked` -> `TriggerEvent(self.Event)` -> the level's Dispatcher/
+    /// XIIIGoalTrigger GoalNumber-99 chains -> `xidmaps.Hual01b.SetGoalComplete`; the same
+    /// events dismiss the level's own comic-focus windows), the ladder-base `TouchTrigger0`
+    /// (goal 1), the terrain hole onto the GR_sortie deck, the crawl room and the shaft fall
+    /// into `Trigger0` -> `XIIIGoalTrigger0` (goal 6). With all four generator counter
+    /// objectives complete the map's `xidmaps.Hual01b.SetGoalComplete` override promotes goal
+    /// 6, so the shaft trigger completes it and `TestGoalComplete` -> `DoTravel` ->
+    /// `ServerTravel` requests `Hual02.unr`. The fixture's labelled teleports cover measured
+    /// impassables only (the buried entry corridor, the riverbed wall, the stalled east chain,
+    /// the sealed baraque pocket, the mountain spur, the deck-to-room gap; evidence under
+    /// local/re/item54b/ and local/re/item54/); no `take_control`, no `set_goal`, no weapon
+    /// grant.
+    #[test]
+    fn opt_in_hual01b_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual01b".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual01b");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        // Tracked fixture (our own route commands; no game data).
+        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/hual01b_route.script");
+        let script = script::Script::load(&route_path).expect("load item54 Hual01b route");
+        assert!(
+            script.events.iter().all(|event| {
+                !matches!(
+                    &event.command,
+                    script::Command::TakeControl
+                        | script::Command::SetGoal(_)
+                        | script::Command::Weapon(_)
+                )
+            }),
+            "the Hual01b route must not bridge control, goals or weapons"
+        );
+        // 300 s: the route's shaft fall lands at t~270, the game's own travel request lands
+        // at t~272.9 (measured probe_z5), the host reloads Hual02 and the run ends there.
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Hual01b",
+            &script,
+            &resolved.params,
+            &scene,
+            300.0,
+        )
+        .expect("run Hual01b route");
+        for (map, states) in &outcome.map_objectives {
+            println!(
+                "[hual01b route] objectives as the run left {map}: {}",
+                states
+                    .iter()
+                    .map(|o| format!(
+                        "[{}{}{}{}] {}",
+                        o.index,
+                        if o.primary { " P" } else { " -" },
+                        if o.completed { " C" } else { " ." },
+                        if o.anti_goal { " A" } else { "" },
+                        o.text
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+        }
+        println!(
+            "[hual01b route] travel: {:?}, final map {}",
+            outcome.travel, outcome.final_map
+        );
+        let hual01b = outcome
+            .map_objectives
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Hual01b"))
+            .expect("Hual01b objective states");
+        assert!(
+            hual01b.1.len() >= 7,
+            "Hual01b MapInfo must expose its seven objectives: {:?}",
+            hual01b.1
+        );
+        for (index, why) in [
+            (0usize, "the anti-goal must be authored completed at spawn"),
+            (
+                1,
+                "goal 1 (infiltrate the base) must complete through the ladder-base chain",
+            ),
+            (
+                2,
+                "the generator counter must complete through the sabotage chains",
+            ),
+            (
+                3,
+                "the generator counter must complete through the sabotage chains",
+            ),
+            (
+                4,
+                "the generator counter must complete through the sabotage chains",
+            ),
+            (
+                5,
+                "the generator counter must complete through the sabotage chains",
+            ),
+            (
+                6,
+                "goal 6 (reach the extraction shaft) must complete through Trigger0",
+            ),
+        ] {
+            assert!(
+                hual01b.1[index].completed,
+                "objective {index} must complete: {why}: {:?}",
+                hual01b.1[index]
+            );
+        }
+        assert!(
+            hual01b.1[1].primary && hual01b.1[6].primary,
+            "goals 1 and 6 must be primary when completed: {:?} {:?}",
+            hual01b.1[1],
+            hual01b.1[6]
+        );
+        assert!(
+            !outcome.travel.is_empty(),
+            "the level must travel; blocked actors: {:?}",
+            outcome.session.suspended
+        );
+        assert_eq!(outcome.final_map, "Hual02");
+        assert_eq!(outcome.travel[0].from, "Hual01b");
+        assert_eq!(outcome.travel[0].to, "Hual02");
+        assert_eq!(outcome.travel[0].url, "Hual02.unr");
+        let hual02 = outcome
+            .map_objectives
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Hual02"))
+            .expect("the run must load Hual02 and capture its objective states");
+        assert!(
+            hual02.1.len() >= 5,
+            "Hual02 must load with its own MapInfo objectives: {:?}",
+            hual02.1
         );
     }
 

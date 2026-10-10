@@ -773,7 +773,9 @@ fn ray_triangle(o: Vec3, d: Vec3, t: &Triangle, one_sided: bool) -> Option<f32> 
     }
     let q = cross(s, e1);
     let v = dot(d, q) * inv;
-    if v < 0.0 || u + v > 1.0 {
+    // item54: small barycentric tolerance — a ray aimed at a shared triangle edge (the crawl
+    // grille's quad diagonal passes through the actor centre) must hit one of the pair.
+    if v < 0.0 || u + v > 1.0 + 1e-4 {
         return None;
     }
     let time = dot(e2, q) * inv;

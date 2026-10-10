@@ -90,9 +90,12 @@ pub mod function_flags {
     }
 }
 
-/// Stock UE2 property flags used here (verified: the `Net` bit gates the replication offset in
+/// XIII property flags used here (verified: the `Net` bit gates the replication offset in
 /// every property of the corpus).
 pub mod property_flags {
+    /// XIII travel serialization bit, tested by Engine.dll ExportTravel at 0x1037899c
+    /// and SpawnPlayActor's import at 0x1038d51b. Pawn.Health carries 0x10021.
+    pub const TRAVEL: u32 = 0x0001_0000;
     /// Optional parameter.
     pub const OPTIONAL_PARM: u32 = 0x0000_0010;
     /// Replicated (a `u16` replication offset follows the category).
