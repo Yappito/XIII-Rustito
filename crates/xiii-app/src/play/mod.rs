@@ -1340,123 +1340,6 @@ fn sync_vm_lights(
     perf.span("vm_lights", t0);
 }
 
-/// item53b diagnostic: with `XIII_WATCH_ACTORS` set to a comma-separated list of actor names,
-/// the headless `[play]` trace appends each named actor's Location/Velocity/Physics, so
-/// script-driven physics runs (the grapple hook, the cine pawn) can be measured without new
-/// code per run. Missing names print `<absent>`, destroyed ones `<destroyed>`.
-fn format_actor_watch(sess: &session::Session) -> String {
-    let list = std::env::var_os("XIII_WATCH_ACTORS");
-    let Some(list) = list else {
-        return String::new();
-    };
-    let binding = list.to_string_lossy();
-    let names: Vec<&str> = binding
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if names.is_empty() {
-        return String::new();
-    }
-    let vm = sess.vm();
-    let mut parts = Vec::new();
-    for name in names {
-        let Some(id) = vm.find_object(name) else {
-            parts.push(format!("{name}: <absent>"));
-            continue;
-        };
-        if vm.objects.get(id as usize).is_none_or(|o| o.deleted) {
-            parts.push(format!("{name}: <destroyed>"));
-            continue;
-        };
-        let vec = |prop: &str| {
-            vm.vector_prop(id, prop)
-                .map(|v| format!("({:.1},{:.1},{:.1})", v[0], v[1], v[2]))
-                .unwrap_or_else(|| "-".to_owned())
-        };
-        let physics = match vm.get_property(id, "Physics") {
-            Some(xiii_script::Value::Byte(p)) => p.to_string(),
-            _ => "-".to_owned(),
-        };
-        let class = vm.set().path(vm.objects[id as usize].class).to_owned();
-        parts.push(format!(
-            "{name}<{class}>: loc={} vel={} physics={physics}{}{}{}{}",
-            vec("Location"),
-            vec("Velocity"),
-            match vm.get_property(id, "Health") {
-                Some(h) => format!(" health={h}"),
-                None => String::new(),
-            },
-            match vm.get_property(id, "AdjustedAim") {
-                Some(v) => format!(" adjustedaim={v}"),
-                None => String::new(),
-            },
-            match vm.get_property(id, "TraceDist") {
-                Some(v) => format!(" tracedist={v}"),
-                None => String::new(),
-            },
-            match vm.get_property(id, "WHand") {
-                Some(v) => format!(" whand={v}"),
-                None => String::new(),
-            },
-            {
-                // item53b scratch: per-slot dump of the watched actor's property array.
-                let o = &vm.objects[id as usize];
-                let mut dump = String::from(" props[");
-                let mut first = true;
-                for (i, p) in o.props.iter().enumerate().take(90) {
-                    if !first {
-                        dump.push_str(", ");
-                    }
-                    first = false;
-                    let n = o
-                        .layout
-                        .slots
-                        .iter()
-                        .find(|s2| s2.base == i)
-                        .map(|s2| s2.name.clone())
-                        .unwrap_or_default();
-                    dump.push_str(&format!("{n}={p}"));
-                }
-                dump.push(']');
-                dump
-            }
-        ));
-        // A CineController2 additionally shows its scripted action index and the next scene
-        // actions from its pawn's `tabActions` (item53b diagnostic for scene-blocking work).
-        if vm.is_a(id, "CineController2") {
-            let index = match vm.get_property(id, "ScriptedActionIndex") {
-                Some(xiii_script::Value::Int(i)) => *i,
-                _ => -1,
-            };
-            let actions = match vm.get_property(id, "MyPawn") {
-                Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(p)))) => {
-                    match vm.get_property(*p, "tabActions") {
-                        Some(xiii_script::Value::Array(items)) => Some(items.clone()),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            };
-            let mut upcoming = String::new();
-            if let Some(items) = actions {
-                for i in index.saturating_sub(1)..(index + 240).min(items.len() as i32) {
-                    if i < 0 {
-                        continue;
-                    }
-                    if let Some(xiii_script::Value::Str(s) |
-                        xiii_script::Value::Name(s)) = items.get(i as usize)
-                    {
-                        upcoming.push_str(&format!(" [{i}]{s}"));
-                    }
-                }
-            }
-            parts.push(format!("{name}: action{index}{upcoming}"));
-        }
-    }
-    format!("watch {}", parts.join(" | "))
-}
-
 /// One VM status line: time, active/suspended counts, dispatcher state, player VM position,
 /// event count and last player touch.
 fn format_vm_trace(sess: &session::Session) -> String {
@@ -2364,36 +2247,14 @@ fn run_script_inner(
         if fired {
             match runtime.session.fire(runtime.sim.yaw, runtime.sim.pitch) {
                 session::FireOutcome::Fired => {
-                    // item53b diagnostic: the most recent actor-trace result after the weapon's
-                    // own trace chain, so a headless shot's hit actor is measurable.
-                    let last_trace = runtime.session.vm().trace.iter().rev().find_map(|e| {
-                        match &e.kind {
-                            xiii_script::TraceKind::Native {
-                                path,
-                                result,
-                                args,
-                                this,
-                                ..
-                            } if path.ends_with(".Trace")
-                                || path.ends_with(".TraceActors")
-                                || path.ends_with(".AutoTrace") =>
-                            {
-                                Some(format!(
-                                    "{this} {path} args={args:?} -> {result}"
-                                ))
-                            }
-                            _ => None,
-                        }
-                    });
                     println!(
-                        "[play] fire [{elapsed:.3}s] player {} bone {} {} | {}",
+                        "[play] fire [{elapsed:.3}s] player {} bone {} | {}",
                         runtime
                             .session
                             .player_health()
                             .map(|h| format!("{h:.0} hp"))
                             .unwrap_or_else(|| "? hp".to_owned()),
                         runtime.session.vm().last_trace_bone(),
-                        last_trace.unwrap_or_else(|| "trace=-".to_owned()),
                         combat_snapshot(&runtime.session)
                     );
                 }
@@ -2402,18 +2263,11 @@ fn run_script_inner(
         }
         if tick.is_multiple_of(TRACE_EVERY) || tick + 1 == ticks {
             trace.push((tick, elapsed, runtime.sim.location, runtime.sim.velocity));
-            let watch = format_actor_watch(&runtime.session);
-            let watch = if watch.is_empty() {
-                String::new()
-            } else {
-                format!(" | {watch}")
-            };
             println!(
-                "[play] {} | {} | {}{}",
+                "[play] {} | {} | {}",
                 format_trace(tick, elapsed, &runtime.sim),
                 format_vm_trace(&runtime.session),
                 format_mover_trace(&runtime.session),
-                watch
             );
         }
 

@@ -35,11 +35,19 @@
 #     CauseGoal -> SetGoalComplete(0) -> TestGoalComplete (both objectives completed) ->
 #     DoTravel -> EndGame("GoalComplete") -> GameEndedSuccess -> ServerTravel.
 #
-# The two labelled teleports cover measured movement gaps of the route driver (both verified
+# The three labelled teleports cover measured movement gaps of the route driver (all verified
 # with xiii-tool box-probe):
 #   - t=160: walking west out of the lever cabanon wedges the box on the room's interior
 #     partition and the swung-open door leaf (route-v6/v8/v9 logs); the entry walk is unaided.
-#   - t=194: the dam-base shaft is sealed at every horizontal approach at trigger height
+#   - t=168: item53b combat adaptation (measured). With the corrected mover line-check rule
+#     (a registered mover without `bUseCylinderCollision` answers from its mesh, not the
+#     Engine.Mover class-default r=160 cylinder) the camp guards' fire connects along the
+#     dam-bridge crossing where the phantom cylinders used to absorb it: the 35-health
+#     player took hits from t=162 and died at t=178.5 pre-adaptation (hual-skiptrace log).
+#     The teleport jumps from the bridge west abutment (4560,-5030) to TouchTrigger6
+#     ('dernierephrase', r=350 at (6133.7,-4948.9,-105)) so the bridge-crossing touch still
+#     fires on landing, and the east-platform walk resumes from there.
+#   - t=187: the dam-base shaft is sealed at every horizontal approach at trigger height
 #     (cliff faces y=-6512/-6520 and y=-6920/-6928, the GR_passage tube walls); retail descends
 #     it from the cache gallery above. The teleport places the player inside the shaft top so
 #     the fall delivers the game's own `Trigger2` touch; the player lands on the tube floor
@@ -118,17 +126,18 @@ t=155.00 fire
 t=160.00 teleport 4150 -5380 -97
 t=163.00 goto 4150 -5180
 t=166.50 goto 4560 -5030
-t=170.00 goto 5500 -4960
-t=173.50 goto 6300 -4960
-t=177.00 goto 6650 -4960
+# Labelled teleport (item53b combat adaptation, see header): past the lethal mid-bridge
+# stretch, landing inside TouchTrigger6 so its touch still fires.
+t=168.00 teleport 6133 -4949 -105
 # East platform (GR_bidons04) around the stilt baraque_fin building.
-t=180.50 goto 7100 -5250
-t=184.00 goto 7500 -5350
-t=187.50 goto 7900 -5400
-t=191.00 goto 8150 -5800
+t=170.00 goto 6650 -4960
+t=173.50 goto 7100 -5250
+t=177.00 goto 7500 -5350
+t=180.50 goto 7900 -5400
+t=184.00 goto 8150 -5800
 # Labelled teleport into the sealed dam-base shaft top (measured seal, see header): the fall
 # delivers Trigger2's touch -> 'End_of_level' -> objective 0 -> TestGoalComplete -> DoTravel
 # -> the game's own Hual01b travel request (measured at t=196.5 in the item52 runs).
-t=194.00 teleport 8416 -6720 -380
+t=187.00 teleport 8416 -6720 -380
 # Wait for the game's own travel (Hual01b via the end-of-level chain).
-t=202.00 wait_travel
+t=195.00 wait_travel

@@ -4820,11 +4820,14 @@ fn trace_actors_skips_static_mesh_actor_when_the_ray_passes_through_the_mesh() {
 // Projectile -> Falling)
 
 /// A projectile flying into a world wall runs `HitWall`, stops at the sweep contact and, with
-/// `bBounce` clear, continues as `PHYS_Falling` with gravity decaying `Velocity.Z` (the engine's
-/// `physProjectile` -> `physFalling` fall-through; the demo's `Crochet.Velocity.Z < 1` cast
-/// transition depends on it).
+/// `bBounce` clear, keeps `PHYS_Projectile` while the engine's exit tail
+/// (`AActor::physProjectile` 0x103c0ca6-0x103c0d03) rewrites `Velocity = displacement/dt` —
+/// the blocked velocity decays toward zero. The grapple demo's `Crochet.Velocity.Z < 1` cast
+/// transition reads exactly this: the `CineHook` parks at the surface it strikes (probe23:
+/// Jones climbs the full 675 to it); `Physics` only continues with `physFalling` when a
+/// `HitWall` script handler sets it (the `Physics == 2` check at 0x103c0c51).
 #[test]
-fn scripted_physics_projectile_hits_the_world_and_falls() {
+fn scripted_physics_projectile_hits_the_world_and_parks() {
     let set = phys_set();
     let mut vm = Vm::new(&set, VmLimits::default());
     vm.set_physics(Box::new(
@@ -4843,20 +4846,29 @@ fn scripted_physics_projectile_hits_the_world_and_falls() {
     let location = vm.vector_prop(hook, "Location").unwrap();
     let physics = vm.byte_prop(hook, "Physics");
     let velocity = vm.vector_prop(hook, "Velocity").unwrap();
-    assert_eq!(physics, 2, "the wall hit must fall through to PHYS_Falling");
+    assert_eq!(
+        physics, 6,
+        "a scriptless projectile keeps PHYS_Projectile on a hit"
+    );
     // The swept box stops one extent short of the wall plane at x = 50.
     assert!((location[0] - 40.0).abs() < 0.5, "{location:?}");
-    // Gravity (the measured Engine.PhysicsVolume default -950) applied for the hit frame only:
-    // a projectile keeps constant velocity until it hits (no zone gravity while flying).
+    // The exit tail rewrote the velocity from the blocked displacement: every component is
+    // scaled by the sweep fraction that reached the wall (the box stops at first contact).
     assert!(
-        (velocity[2] - (1100.0 - 950.0 * 0.016)).abs() < 0.5,
-        "gravity decayed vz: {velocity:?}"
+        velocity[0] < 1200.0 && velocity[0] >= 0.0,
+        "exit-tail velocity rewrite: {velocity:?}"
     );
-    // A later tick keeps decelerating vz toward the `< 1` transition threshold.
-    for _ in 0..80 {
+    // Later ticks press into the wall: the displacement stays ~0, so the velocity decays to
+    // zero and the demo's `Velocity.Z < 1` transition can fire. No gravity: the projectile
+    // parks instead of falling (probe23 measured the hook hanging at the ceiling).
+    for _ in 0..20 {
         vm.tick_suspending(0.016);
     }
+    let location = vm.vector_prop(hook, "Location").unwrap();
+    let physics = vm.byte_prop(hook, "Physics");
     let velocity = vm.vector_prop(hook, "Velocity").unwrap();
+    assert_eq!(physics, 6);
+    assert!((location[0] - 40.0).abs() < 0.5, "{location:?}");
     assert!(velocity[2] < 1.0, "vz decayed below 1: {velocity:?}");
 }
 
@@ -5165,6 +5177,8 @@ fn trace_ignores_actors_outside_the_collision_hash() {
 struct NamedHitWorld {
     inner: MockWorld,
     actor: String,
+    /// Whether the named actor counts as a registered mover (its mesh lives in the mock's world).
+    registered: bool,
 }
 
 impl WorldPhysics for NamedHitWorld {
@@ -5181,6 +5195,10 @@ impl WorldPhysics for NamedHitWorld {
         let hit = self.inner.trace(start, end, extent);
         let actor = hit.map(|_| self.actor.clone());
         (hit, actor)
+    }
+
+    fn mover_is_registered(&self, actor: &str) -> bool {
+        self.registered && actor.eq_ignore_ascii_case(&self.actor)
     }
 
     fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
@@ -5212,6 +5230,7 @@ fn mover_with_cylinder_collision_blocks_as_its_cylinder_not_its_mesh() {
     vm.set_physics(Box::new(NamedHitWorld {
         inner: MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
         actor: "Mv".to_owned(),
+        registered: true,
     }));
     // Line ending short of the cylinder: the mesh hit is skipped and, with nothing behind it,
     // the trace reports no hit at all (the sight-line case).
@@ -5232,6 +5251,69 @@ fn mover_with_cylinder_collision_blocks_as_its_cylinder_not_its_mesh() {
         .unwrap();
     assert_eq!(hit, Some(mv));
     assert!((location[0] - 100.0).abs() < 1e-3, "{location:?}");
+}
+
+#[test]
+fn registered_mover_without_cylinder_flag_answers_from_its_mesh_not_the_default_cylinder() {
+    // item53b: a REGISTERED mover's line-check primitive is its MESH unless
+    // `bUseCylinderCollision` is set (the vtable+0x70 rule decoded in item52), and that mesh
+    // lives in the provider's moving world. The `Engine.Mover` class-default cylinder
+    // (CollisionRadius/Height 160, measured) must NOT answer the line check: Toits01's
+    // `PorteDecors18` shutter blocked the through-window sight lines ~136 UU in front of its
+    // mesh face (the r=160 cylinder's entry root, measured t=0.0062 vs the mesh face t=0.0120).
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let _li = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0; 3]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    let mv = vm.spawn(pg(&set, "Mover"), "Mv").unwrap();
+    vm.set_property(mv, "Location", 0, Value::Vector([200.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, mv, true, true);
+    vm.set_property(mv, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(mv, "CollisionHeight", 0, Value::Float(160.0));
+    // `bUseCylinderCollision` stays false (the Engine.Mover default): the cylinder (surface at
+    // x=40) must not answer the ray; the provider's world hit — the mover's mesh at x=100 — is
+    // the mover's line-check geometry and must be the reported hit.
+    vm.set_physics(Box::new(NamedHitWorld {
+        inner: MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
+        actor: "Mv".to_owned(),
+        registered: true,
+    }));
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [150.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(mv), "the mover's mesh is its line-check shape");
+    assert!((location[0] - 100.0).abs() < 1e-3, "{location:?}");
+}
+
+#[test]
+fn unregistered_mover_without_cylinder_flag_keeps_the_cylinder_approximation() {
+    // item53b: an UNREGISTERED mover without `bUseCylinderCollision` has no mesh the VM can
+    // reach (its per-actor mesh query returns `NoData` with nothing behind it), so the
+    // Engine.Mover class-default cylinder stays as the only line-check approximation. Dropping
+    // it made such movers fully transparent: Hual01a's guard sight lines stopped blocking at
+    // t=182 (the `EnemyNotVisible` transition vanished and the route run diverged, measured).
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let _li = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0; 3]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    let mv = vm.spawn(pg(&set, "Mover"), "Mv").unwrap();
+    vm.set_property(mv, "Location", 0, Value::Vector([200.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, mv, true, true);
+    vm.set_property(mv, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(mv, "CollisionHeight", 0, Value::Float(160.0));
+    vm.set_physics(Box::new(NamedHitWorld {
+        inner: MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
+        actor: "Mv".to_owned(),
+        registered: false,
+    }));
+    // The cylinder (surface at x=40) blocks in front of the unreachable mesh (x=100).
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [150.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(mv), "the cylinder approximation still stands");
+    assert!((location[0] - 40.0).abs() < 1e-3, "{location:?}");
 }
 
 #[test]
@@ -5342,6 +5424,7 @@ fn world_hit_on_a_non_mover_actor_source_still_returns_the_level() {
     vm.set_physics(Box::new(NamedHitWorld {
         inner: MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
         actor: "Prop".to_owned(),
+        registered: false,
     }));
     let level = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
     let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0, 0.0, 0.0]);

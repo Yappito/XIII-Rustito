@@ -27,6 +27,8 @@ use crate::events::{PresentationEvent, SoundEvent, TravelRequest, TravelSource};
 use crate::external::ExternalObjectData;
 use crate::linker::{GlobalRef, ScriptSet};
 use crate::localize::{LocalizationData, placeholder};
+#[cfg(test)]
+use crate::navigation::move_step;
 use crate::navigation::{
     NavEdgeInfo, NavPointInfo, NavigationData, find_path, nearest_point, point_fits,
 };
@@ -1048,26 +1050,6 @@ const PHYS_FALLING: u8 = 2;
 const PHYS_FLYING: u8 = 4;
 /// UE2 `EPhysics::PHYS_Projectile` (the grapple demo's `CineHook` class default).
 const PHYS_PROJECTILE: u8 = 6;
-
-#[cfg(test)]
-fn vm_move_trace_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("XIII_VM_MOVE_TRACE")
-            .is_some_and(|value| value != "0" && !value.is_empty())
-    })
-}
-
-/// item27k diagnostic: with `XIII_VM_MOVE_TRACE`, also dump the world primitives overlapping a
-/// blocked pawn's move box (`XIII_VM_MOVE_DUMP`), naming each triangle's source. The only
-/// printer left is the test-only direct-step path.
-#[cfg(test)]
-fn vm_move_dump_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("XIII_VM_MOVE_DUMP").is_some_and(|value| value != "0" && !value.is_empty())
-    })
-}
 
 fn cine_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4322,12 +4304,6 @@ impl<'s> Vm<'s> {
         if let Some(pawn) = pawn {
             let location = self.vector_prop(pawn, "Location");
             waits.push(format!("pawn-location={location:?}"));
-            waits.push(format!(
-                "bMoving={:?} bMovePaused={:?} plane={:?}",
-                self.get_property(id, "bMoving"),
-                self.get_property(id, "bMovePaused"),
-                self.get_property(id, "Plane")
-            ));
             for property in ["Target", "NextTarget"] {
                 if let Some(target) = self.obj_prop(id, property) {
                     let target_name = self.objects[target as usize].name.clone();
@@ -8011,6 +7987,30 @@ impl<'s> Vm<'s> {
                 }
                 // The actor's mesh is traceable and the ray passes through it: no hit.
                 Some(crate::physics::ActorMeshHit::Miss) => {}
+                // item53b: a REGISTERED mover without `bUseCylinderCollision` answers the line
+                // check with its MESH (the vtable+0x70 primitive; the `byte [+0x30] & 0x40`
+                // early-exit hypothesis of item52), and that mesh is already in the provider's
+                // moving world — the world hit in `vm_trace_flags` carries it. The
+                // Engine.Mover class-default cylinder (CollisionRadius/Height 160, measured) is
+                // NOT its line-check geometry: it blocked Toits01's through-window bullet/focus
+                // sight lines ~136 UU in front of the `PorteDecors18` shutter mesh (entry root
+                // of the r=160 cylinder around the actor origin, measured t=0.0062 vs the mesh
+                // face t=0.0120). Skip the cylinder fallback only for those.
+                // An UNREGISTERED mover without `bUseCylinderCollision` has no mesh the VM can
+                // reach (its per-actor query returns `NoData` with nothing behind it); the
+                // cylinder stays as the only approximation there — Hual01a's guard sight lines
+                // depend on it (the t=182 `EnemyNotVisible` transition regressed when the
+                // fallback was dropped, measured).
+                // With `bUseCylinderCollision` the cylinder IS the primitive (item52 lever).
+                Some(crate::physics::ActorMeshHit::NoData) | None
+                    if self.is_mover(b)
+                        && !self.bool_prop(b, "bUseCylinderCollision")
+                        && self.physics.as_ref().is_some_and(|p| {
+                            self.objects
+                                .get(b as usize)
+                                .map(|o| p.mover_is_registered(&o.name))
+                                .unwrap_or(false)
+                        }) => {}
                 // No per-actor mesh data (or no provider): the cylinder approximation.
                 Some(crate::physics::ActorMeshHit::NoData) | None => {
                     if best.is_none_or(|(bt, _, _)| t <= bt) {
@@ -9559,9 +9559,7 @@ impl<'s> Vm<'s> {
         }
         self.set_property(id, "Location", 0, Value::Vector(location));
         self.set_property(id, "Velocity", 0, Value::Vector(velocity));
-        if dispatch
-            && let Some(hit) = &first_hit
-        {
+        if dispatch && let Some(hit) = &first_hit {
             self.send_event(
                 id,
                 "HitWall",
@@ -9594,17 +9592,12 @@ impl<'s> Vm<'s> {
         let acceleration = self.vector_prop(pawn, "Acceleration").unwrap_or([0.0; 3]);
         let speed = self.f32_prop(pawn, "GroundSpeed");
         let mut velocity = self.vector_prop(pawn, "Velocity").unwrap_or([0.0; 3]);
-        let length =
-            (acceleration[0] * acceleration[0] + acceleration[1] * acceleration[1]).sqrt();
+        let length = (acceleration[0] * acceleration[0] + acceleration[1] * acceleration[1]).sqrt();
         if length > 0.0 && speed > 0.0 {
             let dir = [acceleration[0] / length, acceleration[1] / length, 0.0];
             let accel_rate = {
                 let rate = self.f32_prop(pawn, "AccelRate");
-                if rate > 0.0 {
-                    rate
-                } else {
-                    2048.0
-                }
+                if rate > 0.0 { rate } else { 2048.0 }
             };
             for axis in 0..2 {
                 velocity[axis] += dir[axis] * accel_rate * dt;
@@ -9625,10 +9618,11 @@ impl<'s> Vm<'s> {
             return Ok(());
         }
         let extent = self.actor_extent(pawn);
-        let end = match self.physics.as_mut() {
-            Some(provider) => provider.walk_box(location, delta, extent).end,
-            None => add3(location, delta),
-        };
+        let walked = self
+            .physics
+            .as_mut()
+            .map(|provider| provider.walk_box(location, delta, extent));
+        let end = walked.map_or_else(|| add3(location, delta), |o| o.end);
         self.set_property(pawn, "Location", 0, Value::Vector(end));
         Ok(())
     }
@@ -9640,10 +9634,18 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    /// `PHYS_Projectile`: `Velocity += Acceleration*dt` (no zone gravity), one swept move; on a
-    /// world hit with `bBounce` clear the actor becomes `PHYS_Falling` and gravity is applied
-    /// for this frame (the engine's fall-through into `physFalling`).
+    /// `PHYS_Projectile`: `Velocity += Acceleration*dt` (no zone gravity), one swept move; the
+    /// engine's exit tail (`AActor::physProjectile` 0x103c0ca6-0x103c0d03) then rewrites
+    /// `Velocity = (Location - MoveStart)/dt` for a projectile with the bounce bits clear — a
+    /// blocked projectile's velocity decays toward zero with the actual displacement, and its
+    /// `Physics` stays `PHYS_Projectile` (the `Physics == PHYS_Falling` check at 0x103c0c51 only
+    /// continues with `physFalling` when a `HitWall` script handler set it). This is what parks
+    /// the grapple demo's `CineHook` at the ceiling it strikes and lets the demo's
+    /// `Crochet.Velocity.Z < 1` cast transition fire (probe23: Jones climbs the full 675 to it).
     fn integrate_projectile(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
+        let Some(start) = self.vector_prop(id, "Location") else {
+            return Ok(());
+        };
         let acceleration = self.vector_prop(id, "Acceleration").unwrap_or([0.0; 3]);
         let mut velocity = self.vector_prop(id, "Velocity").unwrap_or([0.0; 3]);
         for axis in 0..3 {
@@ -9652,16 +9654,23 @@ impl<'s> Vm<'s> {
         self.set_property(id, "Velocity", 0, Value::Vector(velocity));
         let hit = self.integrate_move(id, velocity, dt, true)?;
         // `HitWall` script may have destroyed the projectile (`Destroy` in a HitWall handler);
-        // the engine checks `bDeleteMe` before continuing the fall-through.
-        if hit.is_some() && !self.objects[id as usize].deleted && !self.bool_prop(id, "bBounce") {
-            self.set_property(id, "Physics", 0, Value::Byte(PHYS_FALLING));
-            // `integrate_move` already wrote the contact-adjusted velocity; the fall-through
-            // applies this frame's gravity on top of it.
-            let gravity = self.zone_gravity(id);
-            let mut velocity = self.vector_prop(id, "Velocity").unwrap_or([0.0; 3]);
-            velocity[2] += gravity[2] * dt;
-            self.set_property(id, "Velocity", 0, Value::Vector(velocity));
+        // the engine checks `bDeleteMe` before the exit tail.
+        if self.objects[id as usize].deleted {
+            return Ok(());
         }
+        // Exit tail: the tracked bounce gate is `bBounce` (+0x34 bit 0x800000); the second
+        // clear-bit (0x8000000) is not tracked as a property and the VM actors that reach this
+        // path (CineHook, XIIIProjectile rounds) have it clear.
+        if !self.bool_prop(id, "bBounce") {
+            let end = self.vector_prop(id, "Location").unwrap_or(start);
+            let moved = [
+                (end[0] - start[0]) / dt,
+                (end[1] - start[1]) / dt,
+                (end[2] - start[2]) / dt,
+            ];
+            self.set_property(id, "Velocity", 0, Value::Vector(moved));
+        }
+        let _ = hit;
         Ok(())
     }
 
@@ -9800,32 +9809,6 @@ impl<'s> Vm<'s> {
                 p.move_box(location, delta, extent)
             }
         });
-        if vm_move_trace_enabled()
-            && let Some(hit) = outcome.and_then(|outcome| outcome.hit)
-        {
-            let object = &self.objects[pawn as usize];
-            let classname = self.set.path(object.class);
-            println!(
-                "[vm-pawn-move] pawn={} class={} Physics={} bCollideWorld={} walking={} from={location:?} delta={delta:?} extent={extent:?} hit_time={:.6} normal={:?}",
-                object.name,
-                classname,
-                self.byte_prop(pawn, "Physics"),
-                self.bool_prop(pawn, "bCollideWorld"),
-                walking,
-                hit.time,
-                hit.normal
-            );
-            if vm_move_dump_enabled()
-                && let Some(p) = self.physics.as_mut()
-            {
-                for (i, record) in p.dump_overlap(location, extent).iter().enumerate().take(8) {
-                    println!(
-                        "[vm-pawn-move-dump] #{i} {} source={} triangle={:?}",
-                        record.kind, record.source, record.triangle
-                    );
-                }
-            }
-        }
         let end = outcome.map_or_else(|| add3(location, delta), |o| o.end);
         self.set_property(pawn, "Location", 0, Value::Vector(end));
         Ok(horizontal_distance(end, destination) <= radius)
