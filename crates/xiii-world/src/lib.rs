@@ -1366,7 +1366,10 @@ pub fn ray_triangle(o: [f32; 3], d: [f32; 3], t: &[[f32; 3]; 3]) -> Option<f32> 
     }
     let q = cross(s, e1);
     let v = dot(d, q) * inv;
-    if v < 0.0 || u + v > 1.0 {
+    // item54: a small tolerance on the barycentric bound — the crawl grille's quad is two
+    // triangles whose shared diagonal passes through the actor centre, and the crosshair ray
+    // aimed exactly at the centre must hit one of them, not fall through the seam.
+    if v < 0.0 || u + v > 1.0 + 1e-4 {
         return None;
     }
     let dist = dot(e2, q) * inv;

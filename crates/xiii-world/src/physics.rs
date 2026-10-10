@@ -228,6 +228,65 @@ impl WorldPhysics for WorldPhysicsAdapter {
 
     fn actor_mesh_hit(&mut self, actor: &str, start: [f32; 3], end: [f32; 3]) -> ActorMeshHit {
         let key = actor.to_ascii_lowercase();
+        // item54: a registered mover's collision triangles live in its moving object (the static
+        // base-pose copy is dropped at registration), so the per-actor ray cast must query that
+        // object's current pose. The nominal class-default cylinder (the crawl grille
+        // BreakableMover13's r/h=160 spans the whole tunnel) is not the mover's collision shape;
+        // Engine.dll dispatches the per-actor line check through the actor's own primitive
+        // virtual (see vm.rs item52 note) unless bUseCylinderCollision is set.
+        if let Some(&i) = self.mover_by_name.get(&key)
+            && let Some(&(_, line_index)) = self.movers.get(i)
+            && let Some(object) = self.line_world.moving(line_index)
+        {
+            if object.triangle_count() == 0 {
+                return ActorMeshHit::NoData;
+            }
+            let s = to_bevy_position(start);
+            let e = to_bevy_position(end);
+            let d = [e[0] - s[0], e[1] - s[1], e[2] - s[2]];
+            let mut best: Option<(f32, [f32; 3])> = None;
+            for tri in object.world_triangles() {
+                // Segment-bound: a hit beyond `end` is not a candidate (the nominal 160-cylinder
+                // spans far past the crosshair segment).
+                if let Some(t) = crate::ray_triangle(s, d, &tri).filter(|t| (0.0..=1.0).contains(t))
+                {
+                    let e1 = [
+                        tri[1][0] - tri[0][0],
+                        tri[1][1] - tri[0][1],
+                        tri[1][2] - tri[0][2],
+                    ];
+                    let e2 = [
+                        tri[2][0] - tri[0][0],
+                        tri[2][1] - tri[0][1],
+                        tri[2][2] - tri[0][2],
+                    ];
+                    let mut n = [
+                        e1[1] * e2[2] - e1[2] * e2[1],
+                        e1[2] * e2[0] - e1[0] * e2[2],
+                        e1[0] * e2[1] - e1[1] * e2[0],
+                    ];
+                    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                    if len > 1e-9 {
+                        n = [n[0] / len, n[1] / len, n[2] / len];
+                    }
+                    if best.is_none_or(|(bt, _)| t < bt) {
+                        best = Some((t, n));
+                    }
+                }
+            }
+            return match best {
+                Some((t, n)) => ActorMeshHit::Hit(WorldHit {
+                    location: bevy_to_unreal_position([
+                        s[0] + d[0] * t,
+                        s[1] + d[1] * t,
+                        s[2] + d[2] * t,
+                    ]),
+                    normal: bevy_to_unreal_direction(n),
+                    time: t,
+                }),
+                None => ActorMeshHit::Miss,
+            };
+        }
         if !self.actor_meshes.contains_key(&key) {
             // A registered mover's triangles live in the moving objects (its static base-pose
             // copies were dropped at registration), so the per-actor static cache must stay

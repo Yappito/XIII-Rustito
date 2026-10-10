@@ -1093,6 +1093,7 @@ fn fixed_step(
             physics: sim.0.physics,
             landed_velocity_z: sim.0.landed.then_some(sim.0.land_velocity_z),
             floor_normal: sim.0.floor_normal,
+            eye_height: sim.0.vm_eye_height(&params.0),
         };
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
         sess.sync_view_rotation(sim.0.yaw, sim.0.pitch);
@@ -1958,6 +1959,7 @@ struct MapRuntime {
     mover_collision: movers::MoverCollision,
     volumes: movement_modes::VolumeMotion,
     sim: PlayerSim,
+    player_params: PlayerParams,
     sources: Vec<String>,
     /// Shared counter of voice names this map's `VoiceDuration` provider could not resolve (the
     /// provider is re-installed on every map open, including travel reloads).
@@ -2059,6 +2061,7 @@ fn open_map_runtime(
         mover_collision,
         volumes,
         sim,
+        player_params: *params,
         sources,
         voice_unresolved,
         video_host,
@@ -2189,6 +2192,7 @@ fn run_script_inner(
             physics: runtime.sim.physics,
             landed_velocity_z: runtime.sim.landed.then_some(runtime.sim.land_velocity_z),
             floor_normal: runtime.sim.floor_normal,
+            eye_height: runtime.sim.vm_eye_height(&runtime.player_params),
         };
         runtime.session.step(
             DT,
@@ -4321,17 +4325,21 @@ mod tests {
     }
 
     /// item54 route: Hual01b completed end-to-end by player input: the four generator
-    /// sabotage interactions (the game's own cartoon-focus dismissal chains, e.g.
-    /// `CWndFocusTrigger4` Tag "Break2", plus standing-contact breaks at the measured
-    /// positions), the ladder-base `TouchTrigger0` (goal 1), the terrain hole onto the
-    /// GR_sortie deck, the crawl room, the `BreakableMover13` tunnel grille punch and the
-    /// shaft fall into `Trigger0` -> `XIIIGoalTrigger0` (goal 6). With all four generator
-    /// counter objectives complete the map's `xidmaps.Hual01b.SetGoalComplete` override
-    /// promotes goal 6, so the shaft trigger completes it and `TestGoalComplete` ->
-    /// `DoTravel` -> `ServerTravel` requests `Hual02.unr`. The fixture's labelled teleports
-    /// cover measured impassables only (the buried entry corridor, the sealed baraque pocket
-    /// and mountain spur, the deck-to-room gap; evidence under local/re/item54/); no
-    /// `take_control`, no `set_goal`, no weapon grant.
+    /// sabotages and the `BreakableMover13` tunnel grille punch through the game's own
+    /// break-by-hand chain (`XIIIWeapon.RealTraceFire` melee -> the interaction's
+    /// `TargetActor`/`bCanBreak` -> `XIIIH2HAmmo.ProcessTraceHit` `TakeDamage(DTFisted)` ->
+    /// `BreakableMover.Breaked` -> `TriggerEvent(self.Event)` -> the level's Dispatcher/
+    /// XIIIGoalTrigger GoalNumber-99 chains -> `xidmaps.Hual01b.SetGoalComplete`; the same
+    /// events dismiss the level's own comic-focus windows), the ladder-base `TouchTrigger0`
+    /// (goal 1), the terrain hole onto the GR_sortie deck, the crawl room and the shaft fall
+    /// into `Trigger0` -> `XIIIGoalTrigger0` (goal 6). With all four generator counter
+    /// objectives complete the map's `xidmaps.Hual01b.SetGoalComplete` override promotes goal
+    /// 6, so the shaft trigger completes it and `TestGoalComplete` -> `DoTravel` ->
+    /// `ServerTravel` requests `Hual02.unr`. The fixture's labelled teleports cover measured
+    /// impassables only (the buried entry corridor, the riverbed wall, the stalled east chain,
+    /// the sealed baraque pocket, the mountain spur, the deck-to-room gap; evidence under
+    /// local/re/item54b/ and local/re/item54/); no `take_control`, no `set_goal`, no weapon
+    /// grant.
     #[test]
     fn opt_in_hual01b_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
