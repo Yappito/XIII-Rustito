@@ -41,66 +41,81 @@ t=28.00 forward 0
 # demo runs; the handover releases the controller at ~71.5, measured probe23)
 t=56.80 goto -5010 1337
 t=58.00 forward 0
-# released by STA_Retract; leave the demo area
+# released by STA_Retract; the scene's [117] walk ends at PositionInfo0 (-3335,1241) and its
+# [118] 'event SpeechJones11' arms TouchTrigger24 (r220 at -3609,1316,2263, z band 2163-2363,
+# on the grapple-landing roof ~1200 above the player's start roof). Enter its zone after the
+# arm (measured probe72/74, local/re/item62/): the arrival Touch fires 'SpeechJones11Ttempo'
+# -> CineTrigger20 (BufferTrigger) -> 'SpeechJones11T' releases the demo's
+# 'wait event SpeechJones11T' (a teleport before ~85 is refused by the controller's
+# NoControl window, measured probe73).
 t=74.00 goto -4940 1420
+# labelled teleport (the grapple-landing viewpoint is unreachable on foot from the start roof)
+t=85.00 teleport -3609 1316 2263
+t=85.10 forward 0
+# item62: leave the roof only after the touch chain fires (the old t=76 deck teleport left
+# before the scene's ~81.2 arm and stalled the demo at 'wait event SpeechJones11T').
 # labelled teleport (the level's grapple descent; the start roof has no walkable exit)
-t=76.00 teleport -1162 1009 80
-t=76.10 forward 0
+t=96.00 teleport -1162 1009 80
+t=96.10 forward 0
 # courtyard: AI west corridor
-t=78.00 goto -1450 1100
-t=110.00 goto -1450 1500
-t=116.00 goto -1450 2100
-t=124.00 goto -900 2100
-t=132.00 goto -768 2838
-t=140.00 goto -734 3424
-t=148.00 goto -200 3900
+t=98.00 goto -1450 1100
+t=130.00 goto -1450 1500
+t=136.00 goto -1450 2100
+t=144.00 goto -900 2100
+t=152.00 goto -768 2838
+t=160.00 goto -734 3424
+t=168.00 goto -200 3900
 # alley attempt; labelled teleport fallback (the alley's east end is the windowed wall)
-t=156.00 goto 200 3900
-t=162.00 goto 500 4100
-t=168.00 goto 800 4400
-t=174.00 teleport 800 4500 900
-t=174.10 forward 0
-t=176.00 goto 1400 4500
-t=184.00 goto 1900 4500
-t=192.00 goto 2300 4500
+t=176.00 goto 200 3900
+t=182.00 goto 500 4100
+t=188.00 goto 800 4400
+t=194.00 teleport 800 4500 900
+t=194.10 forward 0
+t=196.00 goto 1400 4500
+t=204.00 goto 1900 4500
+t=212.00 goto 2300 4500
 # labelled teleport (the north-roof gap x~2500-2900 is void)
-t=198.00 teleport 3100 4500 1520
-t=198.10 forward 0
-t=200.00 goto 3150 4490
+t=218.00 teleport 3100 4500 1520
+t=218.10 forward 0
+t=220.00 goto 3150 4490
 # labelled teleport (the level's SauterTempo crossing; measured void)
-t=206.00 teleport 4200 2700 1456
-t=206.10 forward 0
-t=208.00 goto 5000 2700
-t=216.00 goto 5800 2700
-t=224.00 goto 6600 2700
-t=232.00 goto 7400 2700
+t=226.00 teleport 4200 2700 1456
+t=226.10 forward 0
+t=228.00 goto 5000 2700
+t=236.00 goto 5800 2700
+t=244.00 goto 6600 2700
+t=252.00 goto 7400 2700
 # labelled teleport (the deck's east parapet blocks walk and jump)
-t=240.00 teleport 8500 1700 1060
-t=240.10 forward 0
-t=242.00 goto 9000 1400
-t=250.00 goto 10000 1300
-t=258.00 goto 11000 1300
-t=266.00 goto 11700 1261
+t=260.00 teleport 8500 1700 1060
+t=260.10 forward 0
+t=262.00 goto 9000 1400
+t=270.00 goto 10000 1300
+t=278.00 goto 11000 1300
+t=286.00 goto 11700 1261
 # labelled teleport (the palettetremplin ramp lip and the window gap)
-t=274.00 teleport 12700 1261 1170
-t=274.10 forward 0
-t=276.00 goto 13265 1300
-t=283.00 goto 13900 1400
+t=294.00 teleport 12700 1261 1170
+t=294.10 forward 0
+t=296.00 goto 13265 1300
+t=303.00 goto 13900 1400
 # labelled teleport (the roof dip strip x 14000-14150 with a 50-UU hole at x~14150-14200;
 # the east roof surface is 1167)
-t=289.00 teleport 14250 1400 1220
-t=289.10 forward 0
-t=291.00 goto 15500 1450
+t=309.00 teleport 14250 1400 1220
+t=309.10 forward 0
+t=311.00 goto 15500 1450
 # labelled teleport (the roof's east edge drops onto a trapped ledge and a 486 pit)
-t=297.00 teleport 16000 1300 700
-t=297.10 forward 0
-# item61: the tarmac rocket soldiers are no longer 5x-health skill-5 soldiers (the GameInfo
-# DummyStuff1 anti-piracy write is now implemented), so their default-skill rockets land with
-# more spread and the standing player no longer dies within ~5 s. Stay in the kill zone until
-# the repeated rockets kill the player, then the route continues over the corpse: the labelled
-# teleport still moves the dead pawn into TT10's zone and the game's Touch fires (measured on
-# the pre-item61 route, where the player died at ~302 and TT10.Touch fired at ~305).
-t=321.00 teleport 18300 1000 800
-t=321.10 forward 0
-t=323.00 goto 18800 1050
-t=329.00 wait_travel
+t=317.00 teleport 16000 1300 700
+t=317.10 forward 0
+t=319.00 goto 16500 1200
+# item53b: the road stand is under enemy fire once the phantom mover cylinders no longer
+# absorb AI rounds (the decoded primitive rule); keep moving through the exposure.
+t=321.00 goto 17800 1150
+# labelled teleport (the warehouse west wall + the Movable2 crate block the doorway;
+# TT10's r700 zone starts west of the wall)
+t=325.00 teleport 18300 1000 800
+t=325.10 forward 0
+t=327.00 goto 18800 1050
+# item53b: the helipad wait is under MagnumPlus3 fire once the phantom mover cylinders no
+# longer absorb AI rounds; the wait moves behind the Tmetaldoorhelico line (the sweep from
+# the shooter's muzzle to (18500,1300) is blocked by the door mesh).
+t=331.00 goto 18500 1300
+t=344.00 wait_travel

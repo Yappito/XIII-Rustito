@@ -102,6 +102,24 @@ fn opt_in_item51_combat_survey() {
         let session = &outcome.session;
         survey::print_details(&survey::extract(map, &outcome));
         let vm = session.vm();
+        if map.eq_ignore_ascii_case("SSH101a") {
+            assert!(
+                session
+                    .failures
+                    .iter()
+                    .all(|(_, error)| !error.contains("BudgetExceeded")),
+                "SSH101a must reach its authored movement latent, not exhaust the VM budget: {:?}",
+                session.failures
+            );
+            assert!(
+                vm.trace.iter().any(|event| matches!(
+                    &event.kind,
+                    TraceKind::LatentStart { actor, native, .. }
+                        if actor == "IAController9" && native == "Controller.MoveToward"
+                )),
+                "SSH101a IAController9 must yield to MoveToward after a successful path search"
+            );
+        }
         for (i, object) in vm.objects.iter().enumerate() {
             let id = i as u32;
             if !object.is_actor

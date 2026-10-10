@@ -482,6 +482,9 @@ pub struct MoverState {
 pub(crate) struct AnimChannel {
     /// Sequence name this channel is playing.
     pub(crate) sequence: String,
+    /// Animation source the sequence was resolved from (a `LinkSkelAnim` path or the actor's
+    /// `Mesh`); posed-bone queries address the same data through it.
+    pub(crate) source: String,
     /// Total frames.
     pub(crate) frames: u32,
     /// Playback rate (frames/second).
@@ -1162,6 +1165,9 @@ struct IterState {
     idx: usize,
     places: Vec<Option<Place>>,
     body: usize,
+    /// TouchingActors walks the current native array, not a snapshot. The cursor is
+    /// advanced before the body runs, matching execTouchingActors 0x103e66cf.
+    touching: Option<(ObjectId, Option<GlobalRef>, usize)>,
 }
 
 type ActorTraceHit = (ObjectId, [f32; 3], [f32; 3]);
@@ -4266,10 +4272,14 @@ impl<'s> Vm<'s> {
             .map(|(i, _)| i as ObjectId)
             .collect();
         for controller in controllers {
-            // Combat focus steering is owned by AAIController/its game subclasses. Player and
-            // scripted controllers also use FinishRotation for view/cinematic work; their view
-            // rotation follows player input and must not be treated as AI focus steering here.
-            if !self.is_a(controller, "aicontroller") {
+            // Combat focus steering is owned by AAIController/its game subclasses. CineController2
+            // extends Controller directly (xidcine.u), but its PlayingSequence.Tick drives
+            // FocalPoint (from rWantedRotation or the move direction) and sets
+            // Pawn.RotationRate.Yaw itself (tick 0x066A), so the same rotateToward facing applies
+            // to its pawn — the XIII demonstrator cutscenes rely on it. Player and scripted
+            // controllers also use FinishRotation for view/cinematic work; their view rotation
+            // follows player input and must not be treated as AI focus steering here.
+            if !self.is_a(controller, "aicontroller") && !self.is_a(controller, "cinecontroller2") {
                 continue;
             }
             let Some(pawn) = self.obj_prop(controller, "Pawn") else {
@@ -4623,9 +4633,21 @@ impl<'s> Vm<'s> {
         loop {
             rounds += 1;
             if rounds > 10_000 {
-                return Err(self.err(VmErrorKind::BudgetExceeded {
+                let mut error = self.err(VmErrorKind::BudgetExceeded {
                     limit: self.limits.max_steps,
-                }));
+                });
+                if let Some(code) = &self.objects[id as usize].state_code {
+                    let offset = self
+                        .struct_header(code.owner)
+                        .and_then(|h| h.script.statements.get(code.pc))
+                        .map_or(0, |t| t.offset);
+                    error.stack.push(StackEntry {
+                        function: self.set.path(code.owner),
+                        object: self.objects[id as usize].name.clone(),
+                        offset,
+                    });
+                }
+                return Err(error);
             }
             let Some(code) = self.objects[id as usize].state_code.clone() else {
                 return Ok(());
@@ -5237,6 +5259,7 @@ impl<'s> Vm<'s> {
                     idx: 0,
                     places: Vec::new(),
                     body: 0,
+                    touching: None,
                 });
             }
             return Ok(outcome);
@@ -5319,6 +5342,20 @@ impl<'s> Vm<'s> {
                 idx: 0,
                 places,
                 body: 0,
+                touching: if self
+                    .short_path(func)
+                    .eq_ignore_ascii_case("Actor.TouchingActors")
+                {
+                    let base = match args.first() {
+                        Some(Value::Object(Some(ObjRef::Static(base)))) => Some(*base),
+                        _ => None,
+                    };
+                    let mut cursor = 0;
+                    self.next_touching_actor(target, base, &mut cursor);
+                    Some((target, base, cursor))
+                } else {
+                    None
+                },
             });
             return Ok(NativeOutcome::Iterate(items));
         }
@@ -5589,6 +5626,7 @@ impl<'s> Vm<'s> {
                                 idx: 0,
                                 places: Vec::new(),
                                 body: pc + 1,
+                                touching: None,
                             });
                             return Ok(Flow::Goto(self.goto_offset(frame, u32::from(*end))?));
                         }
@@ -5610,6 +5648,12 @@ impl<'s> Vm<'s> {
                         let st = frame.iters.last_mut().expect("pushed");
                         st.body = pc + 1;
                         if items.is_empty() {
+                            if st.touching.is_some() {
+                                let places = st.places.clone();
+                                for place in places.into_iter().flatten() {
+                                    self.write(frame, &place, Value::Object(None))?;
+                                }
+                            }
                             Flow::Goto(self.goto_offset(frame, u32::from(*end))?)
                         } else {
                             let values = st.items[0].clone();
@@ -5631,6 +5675,22 @@ impl<'s> Vm<'s> {
                 }
             }
             K::IteratorNext => {
+                let live = frame.iters.last().and_then(|st| st.touching);
+                if let Some((this, base, mut cursor)) = live {
+                    let next = self.next_touching_actor(this, base, &mut cursor);
+                    let st = frame.iters.last_mut().expect("live iterator exists");
+                    st.touching = Some((this, base, cursor));
+                    let (places, body) = (st.places.clone(), st.body);
+                    let value = Value::Object(next.map(ObjRef::Instance));
+                    for place in places.into_iter().flatten() {
+                        self.write(frame, &place, value.clone())?;
+                    }
+                    return Ok(if next.is_some() {
+                        Flow::Goto(body)
+                    } else {
+                        Flow::Next
+                    });
+                }
                 let Some(st) = frame.iters.last_mut() else {
                     return Err(
                         self.err(VmErrorKind::Other("IteratorNext without iterator".into()))
@@ -7504,6 +7564,31 @@ impl<'s> Vm<'s> {
         }
     }
 
+    /// Native TouchingActors selection. Deliberately does not call touching_list:
+    /// the retail iterator tests only null and IsA, including retained deleted actors.
+    pub(crate) fn next_touching_actor(
+        &self,
+        id: ObjectId,
+        base: Option<GlobalRef>,
+        cursor: &mut usize,
+    ) -> Option<ObjectId> {
+        let Some(Value::Array(items)) = self.get_property(id, "Touching") else {
+            return None;
+        };
+        while let Some(value) = items.get(*cursor) {
+            *cursor += 1;
+            if let Value::Object(Some(ObjRef::Instance(actor))) = value
+                && let Some(object) = self.objects.get(*actor as usize)
+                && base.map_or(object.is_actor, |class| {
+                    object.layout.chain.contains(&class)
+                })
+            {
+                return Some(*actor);
+            }
+        }
+        None
+    }
+
     fn set_touching_list(&mut self, id: ObjectId, list: Vec<ObjectId>) {
         let items = list
             .into_iter()
@@ -7961,6 +8046,13 @@ impl<'s> Vm<'s> {
     /// `Actor.SetLocation`: teleport when the destination is free of world geometry and not
     /// encroached by a blocking actor; returns whether it moved. Touch relations are updated.
     pub(crate) fn vm_set_location(&mut self, id: ObjectId, location: [f32; 3]) -> VmResult<bool> {
+        // FarMoveActor 0x1038a489 refuses bStatic or !bMovable outside the editor.
+        // Generated fixtures without the native bMovable property use Actor's true default.
+        if self.bool_prop(id, "bStatic")
+            || matches!(self.get_property(id, "bMovable"), Some(Value::Bool(false)))
+        {
+            return Ok(false);
+        }
         let extent = self.actor_extent(id);
         let check_world =
             self.bool_prop(id, "bCollideWorld") || self.bool_prop(id, "bCollideWhenPlacing");
@@ -7994,6 +8086,11 @@ impl<'s> Vm<'s> {
                 }
             }
         }
+        // FarMoveActor 0x1038a5c1 marks a successful non-test teleport, and its
+        // non-attached path calls SetBase(None, (0,0,1), true) before the Location store.
+        self.set_property(id, "bJustTeleported", 0, Value::Bool(true));
+        self.set_property(id, "Base", 0, Value::Object(None));
+        self.set_property(id, "Floor", 0, Value::Vector([0.0, 0.0, 1.0]));
         self.set_property(id, "Location", 0, Value::Vector(location));
         self.refresh_touching(id, false)?;
         Ok(true)
@@ -8442,6 +8539,7 @@ impl<'s> Vm<'s> {
     /// Script Trace's composed flags; pawn/mover category bits remain effective even when
     /// bTraceActors was false. Special BSP/material filtering remains Partial.
     #[allow(clippy::type_complexity)]
+    #[cfg(test)]
     pub(crate) fn vm_trace_flags(
         &mut self,
         id: ObjectId,
@@ -8449,6 +8547,34 @@ impl<'s> Vm<'s> {
         end: [f32; 3],
         flags: u32,
         extent: [f32; 3],
+    ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
+        self.vm_trace_flags_impl(id, start, end, flags, extent, false)
+    }
+
+    /// Script execTrace has zero miss outputs and only updates the last-bone cache
+    /// when TRACE_HitBoxes (0x10000) was requested. Internal query users keep their
+    /// endpoint-on-miss convention and existing hit-zone query behavior.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn vm_script_trace(
+        &mut self,
+        id: ObjectId,
+        start: [f32; 3],
+        end: [f32; 3],
+        flags: u32,
+        extent: [f32; 3],
+    ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
+        self.vm_trace_flags_impl(id, start, end, flags, extent, true)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn vm_trace_flags_impl(
+        &mut self,
+        id: ObjectId,
+        start: [f32; 3],
+        end: [f32; 3],
+        flags: u32,
+        extent: [f32; 3],
+        script: bool,
     ) -> VmResult<(Option<ObjectId>, [f32; 3], [f32; 3])> {
         // item52: a mover with `bUseCylinderCollision` collides as its cylinder, not its placed
         // mesh. Measured need (Hual01a): the lever `XIIIMover6` (pivot (4489.4,-5437.4,-85),
@@ -8553,7 +8679,7 @@ impl<'s> Vm<'s> {
         let out = match best {
             Some((t, Some(b), n)) => (Some(b), lerp3(start, end, t), n),
             Some((t, None, n)) => (self.find_level_info(), lerp3(start, end, t), n),
-            None => (None, end, [0.0, 0.0, 0.0]),
+            None => (None, if script { [0.0; 3] } else { end }, [0.0; 3]),
         };
         // item14: record the hit zone for `Actor.GetLastTraceBone` (`XIIIPawn.LastBoneHit`).
         // A world/LevelInfo hit is not a pawn, so the bone stays `None`.
@@ -8563,25 +8689,27 @@ impl<'s> Vm<'s> {
         // bone name wins; otherwise the collision-cylinder classification is the fallback. The
         // ray is the exact trace segment, not the hit point, because a body's boxes can be
         // smaller than the cylinder.
-        self.last_trace_bone = match out.0 {
-            Some(b) if !self.is_a(b, "levelinfo") && !self.is_mover(b) => self
-                .hit_zones
-                .as_ref()
-                .and_then(|z| z.ray_bone(b, start, end))
-                .unwrap_or_else(|| {
-                    let (center, radius, half_height) = self.actor_cylinder(b);
-                    match &self.hit_zones {
-                        Some(z) => z.bone_at(center, radius, half_height, out.1),
-                        None => crate::physics::CylinderZones.bone_at(
-                            center,
-                            radius,
-                            half_height,
-                            out.1,
-                        ),
-                    }
-                }),
-            _ => "None".to_owned(),
-        };
+        if !script || flags & 0x10000 != 0 {
+            self.last_trace_bone = match out.0 {
+                Some(b) if !self.is_a(b, "levelinfo") && !self.is_mover(b) => self
+                    .hit_zones
+                    .as_ref()
+                    .and_then(|z| z.ray_bone(b, start, end))
+                    .unwrap_or_else(|| {
+                        let (center, radius, half_height) = self.actor_cylinder(b);
+                        match &self.hit_zones {
+                            Some(z) => z.bone_at(center, radius, half_height, out.1),
+                            None => crate::physics::CylinderZones.bone_at(
+                                center,
+                                radius,
+                                half_height,
+                                out.1,
+                            ),
+                        }
+                    }),
+                _ => "None".to_owned(),
+            };
+        }
         if self.collect_combat_natives {
             let player = self.objects.iter().enumerate().find_map(|(i, o)| {
                 (o.is_actor && !o.deleted && self.is_a(i as ObjectId, "XIIIPlayerPawn"))
@@ -9832,6 +9960,60 @@ impl<'s> Vm<'s> {
             .as_mut()
             .map(|provider| provider.walk_box(location, delta, extent));
         let end = walked.map_or_else(|| add3(location, delta), |o| o.end);
+        // TEMPORARY item53d diagnostic (removed before finishing): with XIII_VM_MOVE_TRACE set,
+        // print each steered move's start/end/velocity and the blocking hit + overlapping
+        // primitives at the blocked position.
+        if std::env::var_os("XIII_VM_MOVE_TRACE").is_some() {
+            let name = self
+                .objects
+                .get(pawn as usize)
+                .map(|o| o.name.clone())
+                .unwrap_or_default();
+            let hit_info = walked
+                .as_ref()
+                .and_then(|o| o.hit.as_ref())
+                .map(|h| {
+                    format!(
+                        "HIT t={:.3} at ({:.1},{:.1},{:.1}) n=({:.2},{:.2},{:.2})",
+                        h.time,
+                        h.location[0],
+                        h.location[1],
+                        h.location[2],
+                        h.normal[0],
+                        h.normal[1],
+                        h.normal[2]
+                    )
+                })
+                .unwrap_or_else(|| "free".to_owned());
+            let overlaps = if walked.as_ref().is_some_and(|o| o.hit.is_some()) {
+                self.physics
+                    .as_mut()
+                    .map(|p| {
+                        p.dump_overlap(end, extent)
+                            .iter()
+                            .take(4)
+                            .map(|r| format!("{}:{}", r.kind, r.source))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            println!(
+                "[move-trace] {name} t={:.3} start=({:.1},{:.1},{:.1}) end=({:.1},{:.1},{:.1}) vel=({:.1},{:.1},{:.1}) {hit_info} overlaps[{overlaps}]",
+                self.time,
+                location[0],
+                location[1],
+                location[2],
+                end[0],
+                end[1],
+                end[2],
+                velocity[0],
+                velocity[1],
+                velocity[2],
+            );
+        }
         self.set_property(pawn, "Location", 0, Value::Vector(end));
         Ok(())
     }
@@ -10098,9 +10280,14 @@ impl<'s> Vm<'s> {
     }
 
     /// Queries the animation provider for `sequence` over the actor's candidate sources,
-    /// returning the first hit. `Ok(None)` = not found anywhere (unknown sequence); a provider
-    /// decode failure is returned as [`VmErrorKind::AnimationDataError`].
-    fn sequence_info(&mut self, id: ObjectId, sequence: &str) -> VmResult<Option<SeqInfo>> {
+    /// returning the first hit with the source that answered. `Ok(None)` = not found anywhere
+    /// (unknown sequence); a provider decode failure is returned as
+    /// [`VmErrorKind::AnimationDataError`].
+    fn sequence_info(
+        &mut self,
+        id: ObjectId,
+        sequence: &str,
+    ) -> VmResult<Option<(String, SeqInfo)>> {
         if self.animation.is_none() {
             return Ok(None);
         }
@@ -10115,7 +10302,7 @@ impl<'s> Vm<'s> {
             let provider = self.animation.as_mut().expect("checked above");
             for source in &sources {
                 match provider.sequence(source, sequence) {
-                    Ok(Some(info)) => return Ok(Some(info)),
+                    Ok(Some(info)) => return Ok(Some((source.clone(), info))),
                     Ok(None) => {}
                     Err(message) => {
                         decode_error = Some((source.clone(), message));
@@ -10212,14 +10399,12 @@ impl<'s> Vm<'s> {
         channel: u8,
         looping: bool,
     ) -> VmResult<()> {
+        // None is an unknown sequence, not StopAnimating: the retail lookup returns
+        // without changing playback (0x103f5723..0x103f5776).
         if sequence.eq_ignore_ascii_case("None") {
-            self.objects[id as usize].anim.channels.remove(&channel);
-            if channel == 0 {
-                self.set_property(id, "AnimSequence", 0, Value::Name("None".into()));
-                self.set_property(id, "AnimRate", 0, Value::Float(0.0));
-                self.set_property(id, "AnimFrame", 0, Value::Float(0.0));
-                self.set_property(id, "bAnimFinished", 0, Value::Bool(true));
-            }
+            self.note(TraceKind::Note(
+                "Actor.PlayAnim('None'): no sequence, playback unchanged".into(),
+            ));
             return Ok(());
         }
         if self.animation.is_none() {
@@ -10240,7 +10425,7 @@ impl<'s> Vm<'s> {
         // source therefore no-ops instead of failing. The diagnostic `FixedAnimation` provider
         // still answers the empty source, so harness diagnostics are unaffected.
         let mesh_less = self.animation_sources(id).is_empty();
-        let Some(info) = self.sequence_info(id, sequence)? else {
+        let Some((source, info)) = self.sequence_info(id, sequence)? else {
             if mesh_less {
                 let actor = self.objects[id as usize].name.clone();
                 self.note(TraceKind::Note(format!(
@@ -10261,6 +10446,16 @@ impl<'s> Vm<'s> {
             )));
             return Ok(());
         };
+        // Nonloop PlayAnim takes Rate<=0 through 0x103f5d2f. Negative Rate returns
+        // false immediately at 0x103f5d3d; only exactly zero initializes a hold/tween.
+        // A sequence with no frames is refused in both branches, without replacing the
+        // previous channel. LoopAnim has a separate velocity-dependent negative-rate path.
+        if info.frames == 0 || (!looping && rate < 0.0) {
+            self.note(TraceKind::Note(format!(
+                "Actor.PlayAnim('{sequence}'): retail refuses zero frames or negative nonloop rate; playback unchanged"
+            )));
+            return Ok(());
+        }
         if !info.rate.is_finite() || (rate > 0.0 && !(rate * info.rate).is_finite()) {
             return Err(self.err(VmErrorKind::AnimationDataError {
                 source: self.animation_sources(id).join(", "),
@@ -10305,6 +10500,7 @@ impl<'s> Vm<'s> {
             channel,
             AnimChannel {
                 sequence: sequence.to_owned(),
+                source,
                 frames: info.frames,
                 rate,
                 frame: 0.0,
@@ -10354,6 +10550,63 @@ impl<'s> Vm<'s> {
             .channels
             .get(&channel)
             .map(|c| c.sequence.as_str())
+    }
+
+    /// Current pose parameters of `channel`: `(sequence, source, frame, looping)`.
+    pub(crate) fn anim_channel_pose(
+        &self,
+        id: ObjectId,
+        channel: u8,
+    ) -> Option<(String, String, f32, bool)> {
+        self.objects
+            .get(id as usize)?
+            .anim
+            .channels
+            .get(&channel)
+            .map(|c| (c.sequence.clone(), c.source.clone(), c.frame, c.looping))
+    }
+
+    /// `Engine.Actor.GetBoneCoords` pose query: world-space position of `bone` from the channel
+    /// 0 pose through the animation provider, or `None` when no posed answer is available (no
+    /// provider, no playing channel, unknown mesh/sequence/bone, or a decode failure).
+    ///
+    /// The provider returns the posed bone offset relative to the actor origin in
+    /// actor-rotation space (its `RotOrigin`/`MeshOrigin`/scale applied); the actor's own yaw
+    /// and `Location` are added here. The rotation is the source-space R(yaw) convention —
+    /// `x' = x·cos − y·sin, y' = x·sin + y·cos` — the same policy as the pawn renderer's
+    /// `root_transform` (XIII characters are authored +Y-forward; the mesh `RotOrigin` turns
+    /// that onto the actor's forward axis).
+    pub(crate) fn posed_bone_origin(&mut self, id: ObjectId, bone: &str) -> Option<[f32; 3]> {
+        let (sequence, source, frame, looping) = self.anim_channel_pose(id, 0)?;
+        if sequence.is_empty() || self.animation.is_none() {
+            return None;
+        }
+        let mesh = match self.get_property(id, "Mesh") {
+            Some(Value::Object(Some(r))) => self.ref_path(r),
+            _ => String::new(),
+        };
+        if mesh.is_empty() {
+            return None;
+        }
+        let offset = {
+            let provider = self.animation.as_mut().expect("checked above");
+            match provider.bone_offset(&mesh, &source, &sequence, frame, looping, bone) {
+                Ok(offset) => offset,
+                // A decode failure is surfaced by `sequence` lookups on the same data; here a
+                // posed query quietly falls back to the actor origin like the item19 Partial.
+                Err(_) => return None,
+            }
+        };
+        let offset = offset?;
+        let location = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
+        let yaw = self.rotation_prop(id).unwrap_or([0; 3])[1];
+        let theta = (yaw as f32) * std::f32::consts::TAU / 65536.0;
+        let (sin, cos) = theta.sin_cos();
+        Some([
+            location[0] + offset[0] * cos - offset[1] * sin,
+            location[1] + offset[0] * sin + offset[1] * cos,
+            location[2] + offset[2],
+        ])
     }
 
     /// `Actor.StopAnimating` (native 417): stop every animation channel and clear the animation

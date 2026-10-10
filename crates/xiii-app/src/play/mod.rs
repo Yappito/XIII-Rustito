@@ -5698,7 +5698,11 @@ mod tests {
     /// measured state so the blockers cannot silently regress. item48 update: with
     /// `VisibleDamageableActors` implemented the route's player is killed by the tarmac's
     /// scripted bazooka fire (see the health assertion below); the fixture was authored while
-    /// that native was missing and the blasts were no-ops.
+    /// that native was missing and the blasts were no-ops. item62 update: the post-grapple
+    /// dialogue chain is no longer a blocker - the demo's `wait event SpeechJones11T` completes
+    /// through the map's own touch chain (TouchTrigger24 -> CineTrigger20 -> 'SpeechJones11T')
+    /// once the route's player enters the armed trigger's zone after the demo's arm gate, and
+    /// the follow-up dialogue 'dialtoits1bis' starts.
     #[test]
     fn opt_in_toits01_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -5822,6 +5826,123 @@ mod tests {
         assert!(
             demonstrator_retract,
             "the grapple demonstrator must reach STA_Retract (the demo machine completes)"
+        );
+        // item53d: the STA_Retract Timer's posed teleport works. GetBoneCoords('X') now
+        // resolves the posed root-bone position through the decoded MeshAnimation (the old
+        // item19 actor-origin fallback made the SetLocation a no-op and Jones stayed on the
+        // demo ledge, wedging action[117]'s move against the corniche forever). Measured:
+        // Jones's yaw turns to ~0 (east, the rWantedRotation facing) during the climb; the
+        // teleport moves him by the posed offset (+226.4, +26.6, +159..187) to the building
+        // roof (feet z 2160), east of the corniche band (x -4570..-4509), where action[117]'s
+        // movseqb walk proceeds.
+        let cine0 = vm
+            .find_object("Cine0")
+            .expect("the cine Jones pawn must exist");
+        let cine0_loc = vm
+            .vector_prop(cine0, "Location")
+            .expect("Cine0 must keep a Location");
+        assert!(
+            cine0_loc[0] > -4509.0,
+            "Cine0 must stand east of the corniche band after the retract teleport, got {cine0_loc:?}"
+        );
+        assert!(
+            (cine0_loc[2] - 2234.3).abs() < 8.0,
+            "Cine0 must rest on the building roof (center z 2234.3 = roof 2160 + half height 74.3), got {cine0_loc:?}"
+        );
+        // The fixed [117] movseqb completed: the demo's post-move dialogue ran — the forced
+        // `dial dialtoits1 11` line speaks (DialogueManager0 enters STA_HeadAnimation, the
+        // voiced-line state, after the demonstrator's retract).
+        let spoke_after_retract = {
+            let retract_at = vm
+                .trace
+                .iter()
+                .position(|event| {
+                    matches!(
+                        &event.kind,
+                        xiii_script::TraceKind::StateChange { actor, to, .. }
+                            if actor.eq_ignore_ascii_case("RoofGrapnleDemonstrator0")
+                                && to.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("STA_Retract"))
+                    )
+                })
+                .expect("demonstrator retract state change recorded");
+            vm.trace[retract_at..].iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    xiii_script::TraceKind::StateChange { actor, to, .. }
+                        if actor.eq_ignore_ascii_case("DialogueManager0")
+                            && to.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("STA_HeadAnimation"))
+                )
+            })
+        };
+        assert!(
+            spoke_after_retract,
+            "the demo must reach action[111]/[118]: the forced dialogue line speaks after the retract"
+        );
+        // item62: the demo's post-grapple `wait event SpeechJones11T` completes through the
+        // map's own touch chain. The '<speech>T' event is not raised by the DialogueManager,
+        // the HUD or HXAudio (all decoded, local/re/item62/): it is the map's trigger chain -
+        // TouchTrigger24 (r220 at -3609,1316,2263, on the grapple-landing roof) fires
+        // 'SpeechJones11Ttempo' only on a Touch while its scene-gate has armed it (bActif,
+        // set by the demo's [118] `event SpeechJones11` at ~81.2), and CineTrigger20
+        // (InitialState BufferTrigger, Period 0.1, MaxDelay 60) forwards it as
+        // 'SpeechJones11T'. The route's player enters the zone at t=85 (the labelled
+        // viewpoint teleport; the player's start roof is ~1200 below the trigger's z band, so
+        // the entry is a measured impassable on foot). Measured (probe72/74/75,
+        // local/re/item62/): TouchTrigger24.Touch -> CineTrigger20.BufferTrigger.Trigger ->
+        // CineController2.PlayingSequence.Trigger ('SpeechJones11T') at 85.0 s, [119]
+        // satisfied; [128] `event jones11` at 86.63 releases DialogueManager0's 'jones11'
+        // EndOfLine park (the manager parks on the NEXT beat's ExpectedEventBeforeNext, not
+        // on '...T' - the item53b report's pinned mechanism claim was wrong and is corrected
+        // in local/reports/item62-dialogue-finish.md); DialogueManager4 starts
+        // 'dialtoits1bis' at 93.85.
+        let tt24_touched = vm.trace.iter().any(|event| {
+            matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, args }
+                    if target.eq_ignore_ascii_case("TouchTrigger24")
+                        && function.ends_with("TouchTrigger.Touch")
+                        && args.iter().any(|a| a.contains("XIIIPlayerPawn"))
+            )
+        });
+        assert!(
+            tt24_touched,
+            "the route's player must touch TouchTrigger24 (the '...T' chain's entry gate)"
+        );
+        let buffer_triggered = vm.trace.iter().any(|event| {
+            matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target.eq_ignore_ascii_case("CineTrigger20")
+                        && function.ends_with("BufferTrigger.Trigger")
+            )
+        });
+        assert!(
+            buffer_triggered,
+            "CineTrigger20 (BufferTrigger) must forward the touch as 'SpeechJones11T'"
+        );
+        let tt24_at = vm
+            .trace
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.kind,
+                    xiii_script::TraceKind::Event { target, function, .. }
+                        if target.eq_ignore_ascii_case("TouchTrigger24")
+                            && function.ends_with("TouchTrigger.Touch")
+                )
+            })
+            .expect("TouchTrigger24.Touch recorded");
+        let dm4_started_after_touch = vm.trace[tt24_at..].iter().any(|event| {
+            matches!(
+                &event.kind,
+                xiii_script::TraceKind::StateChange { actor, to, .. }
+                    if actor.eq_ignore_ascii_case("DialogueManager4")
+                        && to.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("STA_PlayingDialogue"))
+            )
+        });
+        assert!(
+            dm4_started_after_touch,
+            "the follow-up dialogue 'dialtoits1bis' (DialogueManager4) must start after the 'SpeechJones11T' chain fires"
         );
         // item48: the tarmac rockets kill the route's player at ~301.55 s (health pin above).
         // The engine-wide kill broadcast (`Controller.ClientGameEnded`) then moves every
