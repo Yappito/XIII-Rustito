@@ -599,6 +599,169 @@ fn g(set: &ScriptSet, path: &str) -> GlobalRef {
     }
 }
 
+/// Authored miniature of the MapInfo licence layer (no retail bytecode): an `Actor` base with
+/// unrelated int properties, a `MapInfo` subclass carrying `iLoadSpecificValue`/`TGSDummy` and,
+/// when `with_script`, a `PostBeginPlay` event that snapshots `TGSDummy` into `SawTGS` (so a
+/// test can prove the script body runs before the native write), and a non-MapInfo `Other`
+/// subclass with the same property names.
+fn mapinfo_licence_fixture(with_script: bool) -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let mapinfo = b.reserve(0, 0, "MapInfo");
+    let other = b.reserve(0, 0, "Other");
+    let load = b.reserve(IMP_INTPROP, mapinfo, "iLoadSpecificValue");
+    let tgs = b.reserve(IMP_INTPROP, load, "TGSDummy");
+    let saw = b.reserve(IMP_INTPROP, tgs, "SawTGS");
+    let begin = b.reserve(IMP_FUNCTION, saw, "PostBeginPlay");
+    b.prop(load, tgs, 0);
+    b.prop(tgs, saw, 0);
+    b.prop(saw, if with_script { begin } else { 0 }, 0);
+    let fake_load = b.reserve(IMP_INTPROP, actor, "FakeLoad");
+    let fake_tgs = b.reserve(IMP_INTPROP, fake_load, "FakeTGS");
+    let actor_begin = b.reserve(IMP_FUNCTION, fake_tgs, "PostBeginPlay");
+    b.prop(fake_load, fake_tgs, 0);
+    b.prop(fake_tgs, actor_begin, 0);
+    let other_load = b.reserve(IMP_INTPROP, other, "FakeLoad");
+    let other_tgs = b.reserve(IMP_INTPROP, other_load, "FakeTGS");
+    b.prop(other_load, other_tgs, 0);
+    if with_script {
+        // PostBeginPlay body: `SawTGS = TGSDummy; return`. Two object references cost
+        // OBJECT_MEMORY_SIZE (4) in memory but 1 file byte each, so the declared memory
+        // size is the byte length plus 3 per object reference.
+        let mut code = vec![0x0F, 0x01];
+        code.extend(compact(saw));
+        code.extend([0x01]);
+        code.extend(compact(tgs));
+        code.extend([0x04, 0x0B]);
+        let mem = code.len() as u32 + 6;
+        b.func(begin, 0, 0, &code, mem, 0, ff::EVENT | ff::DEFINED);
+        // The non-MapInfo class also defines the event: only the chain-name gate may exclude it.
+        b.func(
+            actor_begin,
+            0,
+            0,
+            &[0x04, 0x0B],
+            2,
+            0,
+            ff::EVENT | ff::DEFINED,
+        );
+    }
+    b.class(object, 0, 0);
+    b.class(actor, object, fake_load);
+    b.class(mapinfo, actor, load);
+    b.class(other, actor, other_load);
+    b.build()
+}
+
+#[test]
+fn mapinfo_licence_table_writes_after_the_script_body() {
+    let set = set_of(mapinfo_licence_fixture(true));
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let mi = vm.spawn(g(&set, "MapInfo"), "Hual01a0").unwrap();
+    vm.set_active(mi, true);
+    vm.set_property(mi, "iLoadSpecificValue", 0, Value::Int(26));
+    vm.send_event(mi, "PostBeginPlay", vec![]).unwrap();
+    // The script snapshot ran before the native write: it still saw the default 0.
+    assert_eq!(vm.get_property(mi, "SawTGS"), Some(&Value::Int(0)));
+    assert_eq!(vm.get_property(mi, "TGSDummy"), Some(&Value::Int(546)));
+    assert!(vm.trace.iter().any(|event| matches!(
+        &event.kind,
+        TraceKind::Note(text)
+            if text.contains("TGSDummy=546") && text.contains("iLoadSpecificValue 26")
+    )));
+}
+
+#[test]
+fn mapinfo_licence_table_covers_exactly_the_seven_retail_keys() {
+    let set = set_of(mapinfo_licence_fixture(true));
+    let mut vm = Vm::new(&set, VmLimits::default());
+    for (key, value) in [
+        (26, 546),
+        (55, 21627),
+        (81, 856),
+        (106, 4),
+        (130, 69),
+        (142, 3589),
+        (191, 703),
+    ] {
+        let mi = vm.spawn(g(&set, "MapInfo"), "Map0").unwrap();
+        vm.set_active(mi, true);
+        vm.set_property(mi, "iLoadSpecificValue", 0, Value::Int(key));
+        vm.send_event(mi, "PostBeginPlay", vec![]).unwrap();
+        assert_eq!(
+            vm.get_property(mi, "TGSDummy"),
+            Some(&Value::Int(value)),
+            "iLoadSpecificValue {key}"
+        );
+    }
+}
+
+#[test]
+fn mapinfo_licence_table_out_of_range_keys_keep_the_demo_default() {
+    let set = set_of(mapinfo_licence_fixture(true));
+    let mut vm = Vm::new(&set, VmLimits::default());
+    for key in [0, 25, 27, 105, 131, 190, 192, 1000, -26] {
+        let mi = vm.spawn(g(&set, "MapInfo"), "Map0").unwrap();
+        vm.set_active(mi, true);
+        vm.set_property(mi, "iLoadSpecificValue", 0, Value::Int(key));
+        vm.send_event(mi, "PostBeginPlay", vec![]).unwrap();
+        assert_eq!(
+            vm.get_property(mi, "TGSDummy"),
+            Some(&Value::Int(0)),
+            "iLoadSpecificValue {key} is outside the retail selector table"
+        );
+    }
+    assert!(
+        !vm.trace.iter().any(|event| matches!(
+            &event.kind,
+            TraceKind::Note(text) if text.contains("licence table")
+        )),
+        "no licence note may be traced for maps outside the table"
+    );
+}
+
+#[test]
+fn mapinfo_licence_write_needs_the_mapinfo_chain_and_the_postbeginplay_event() {
+    let set = set_of(mapinfo_licence_fixture(true));
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let actor = vm.spawn(g(&set, "Actor"), "Act0").unwrap();
+    vm.set_active(actor, true);
+    vm.set_property(actor, "FakeLoad", 0, Value::Int(26));
+    vm.send_event(actor, "PostBeginPlay", vec![]).unwrap();
+    assert_eq!(
+        vm.get_property(actor, "FakeTGS"),
+        Some(&Value::Int(0)),
+        "a non-MapInfo class never receives the licence write"
+    );
+    let mi = vm.spawn(g(&set, "MapInfo"), "Map0").unwrap();
+    vm.set_active(mi, true);
+    vm.set_property(mi, "iLoadSpecificValue", 0, Value::Int(26));
+    vm.send_event(mi, "Trigger", vec![]).unwrap();
+    assert_eq!(
+        vm.get_property(mi, "TGSDummy"),
+        Some(&Value::Int(0)),
+        "only the PostBeginPlay event carries the native licence write"
+    );
+    vm.send_event(mi, "PostBeginPlay", vec![]).unwrap();
+    assert_eq!(vm.get_property(mi, "TGSDummy"), Some(&Value::Int(546)));
+}
+
+#[test]
+fn mapinfo_licence_write_runs_without_a_script_handler() {
+    let set = set_of(mapinfo_licence_fixture(false));
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let mi = vm.spawn(g(&set, "MapInfo"), "Usa010").unwrap();
+    vm.set_active(mi, true);
+    vm.set_property(mi, "iLoadSpecificValue", 0, Value::Int(142));
+    vm.send_event(mi, "PostBeginPlay", vec![]).unwrap();
+    assert!(vm.trace.iter().any(|event| matches!(
+        &event.kind,
+        TraceKind::NoHandler { event, .. } if event == "PostBeginPlay"
+    )));
+    assert_eq!(vm.get_property(mi, "TGSDummy"), Some(&Value::Int(3589)));
+}
+
 fn pressing_fire_package() -> Vec<u8> {
     let mut b = B::new();
     let object = b.reserve(0, 0, "Object");

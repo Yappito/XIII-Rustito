@@ -1,4 +1,5 @@
-# item52: Hual01a story route, walked. Replaces no prior fixture (first route on this map).
+# item52 route, item56b form: Hual01a story route, walked. Replaces no prior fixture (first
+# route on this map).
 #
 # Both MapInfo objectives complete through the game's own chains and the level requests the
 # campaign travel to Hual01b (NextMapLevelWithUnr), exactly as decoded:
@@ -7,28 +8,29 @@
 #     south-east corner; `TriggerEvent('Goal_Manette_EDF')` reaches XIIIGoalTrigger3
 #     (GoalNumber 666) and `XIIIGoalTrigger.CauseGoal` calls MapInfo.SetGoalComplete(666);
 #     the map's own override `xidmaps.Hual01a.SetGoalComplete` decodes to: case 666 sets
-#     `bYaDuJus = true`, promotes `Objectif[1].bPrimary = true` and calls
-#     `SetGoalComplete(1)` - so objective 1 is promoted and completed by game code.
-#   - the dam bridge: `TouchTrigger8` ('touchmanette') arms `CWndFocusTrigger3`, whose
-#     `WaitForBeingSeen.Timer` starts the comic-strip focus on `CWndTarget1` (the lever
-#     sight-line trace must be clear) and hands off via `self.Tag = self.EventFinFocus`
-#     ('PontA'), `FocusDuration = -1` -> `bModeInfini` (no auto-close: every
-#     `HudCartoonFocus` timeout in `ZoomToStandardCWnd.DrawWnd` is gated `!bModeInfini`).
-#     The press that ends the window is consumed natively in retail - an exhaustive
-#     script-side search (exec `Fire`/`AltFire`/`UnFire`, `XIIIPlayerInteraction.KeyEvent`/
-#     `MyPCPostRender`, `XIIIBaseHud`: no focus-input handling; only `CWndFocusTrigger`
-#     reads `tFocusTrigger`) finds no scripted consumer; that native is a labelled evidence
-#     gap. The host `fire` at t=155 supplies only that press moment: it fires the registered
-#     trigger's own `TriggerEvent('PontA')`, Engine.u's dispatch reaches the `PontA`
-#     receivers (XIIIMover0/5, TriggerToggle - the panels slide closed through the game's
-#     own mover code) AND back to the trigger itself, whose `WaitEndFocus.Trigger` runs the
-#     decoded dismissal (RemoveMe + array compaction + Destroy; measured in the item52
-#     runs as the two actors dropped at t=155). (The decoded alternative closer - pulling
-#     the bridge lever a second time so `xidmaps.Hual01a.SetGoalComplete` case 555 fires
-#     `CloseBridgeEvent` - is gated on the licence-layer flag `TGSDummy == 546`, which the
-#     binary's licence layer sets and the port does not emulate; with the port's default 0
-#     the lever plays the demo message "IF YOU WANT TO CLOSE THE BRIDGE, BUY THE GAME" and
-#     locks.)
+#     `bYaDuJus = true` (the power is connected), promotes `Objectif[1].bPrimary = true` and
+#     calls `SetGoalComplete(1)` - so objective 1 is promoted and completed by game code.
+#   - the dam bridge lever `XIIIMover6` (XIDMaps.Hual01a's `BridgeLever`, static mesh
+#     statichual01.manette in the crest cabanon, InitialState 'PlayerTriggerToggle', Event
+#     'Goal_Manette_Pont', bEaseInteract): the player aims at it and presses use;
+#     `XIIIMover.PlayerTriggerToggle.PlayerTrigger` swings the handle (`Open` label,
+#     Mover defaults DelayTime 0 / MoveTime 1) and `XIIIMover.FinishedOpening` fires
+#     `TriggerEvent('Goal_Manette_Pont')` -> XIIIGoalTrigger2 (GoalNumber 555) ->
+#     `CauseGoal` -> `SetGoalComplete(555)`. Case 555 with `bYaDuJus` set checks
+#     `TGSDummy == 546` and calls `TriggerEvent('PontA')` (CloseBridgeEvent default):
+#     XIIIMover0/5 (Tag 'PontA', MoveTime 4 s) slide the crest panels closed through the
+#     game's own mover code, and `CWndFocusTrigger3` (whose `WaitForBeingSeen.Timer` set
+#     `self.Tag = self.EventFinFocus` = 'PontA' when the comic-strip window started) runs
+#     its own `WaitEndFocus.Trigger` dismissal (RemoveMe + array compaction + Destroy) -
+#     the focus window ends through the authored chain, with no input bridge at all. The
+#     lever then locks itself (`GotoState('Locked')`, `bNoInteractionIcon = true`).
+#     `TGSDummy` is the retail licence-layer flag: nothing in any package writes it; the
+#     full game's `AMapInfo::PostBeginPlay` native (Xiii.dll 0x11b01640, measured) writes
+#     it from a hard-coded per-map table keyed by `iLoadSpecificValue` (Hual01a: 26 ->
+#     546; the demo build leaves 0, which produces the "BUY THE GAME" branch). The port
+#     reproduces that native write after the script `PostBeginPlay` (xiii-script VM,
+#     licence table, synthetic + corpus tests); the lever use is a real player input and
+#     everything downstream is game code.
 #   - objective 0 "Penetrate the base enclosure": the end trigger `Trigger2`
 #     (Engine.Trigger, Event 'End_of_level') sits inside the sealed dam-base shaft
 #     (8426,-6708,-491); touching it fires XIIIGoalTrigger1 (GoalNumber 0, primary) ->
@@ -109,10 +111,13 @@ t=141.00 goto 4195 -5371
 t=144.00 use Porte3
 t=145.50 goto 4230 -5375
 t=147.50 goto 4406 -5430
-# 'touchmanette' (TT8, crossed at t~136) has armed CWndFocusTrigger3; from this spot the
-# sight-line trace to CWndTarget1 is clear, the focus window starts, and the dismiss press
-# fires its 'PontA' Tag: XIIIMover0/5 slide the crest panels closed (MoveTime 4 s).
-t=155.00 fire
+# The lever sight spot: 'touchmanette' (TT8, crossed at t~136) has armed CWndFocusTrigger3,
+# whose comic-strip window on CWndTarget1 is open (FocusDuration -1, infinite). The player
+# aims at the lever (yaw 90 above, 4195,-5371 -> 4489,-5437) and uses it: the handle swings
+# ('Open', MoveTime 1 s), 'Goal_Manette_Pont' fires goal 555, case 555 sees bYaDuJus and
+# TGSDummy 546, and 'PontA' closes the panels (MoveTime 4 s) and ends the focus window
+# through the trigger's own WaitEndFocus.
+t=155.00 use XIIIMover6
 # Labelled teleport (measured cabanon-exit wedge, see header), then north around the poste
 # and east across the CLOSED bridge (x 4765..6232 panels + static GR_pont ramps).
 t=160.00 teleport 4150 -5380 -97

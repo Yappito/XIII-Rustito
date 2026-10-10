@@ -347,6 +347,27 @@ fn native_class_default(class: &str, prop: &str) -> Option<Value> {
     }
 }
 
+/// The retail licence-layer value of `MapInfo.TGSDummy`, keyed by the map's
+/// `iLoadSpecificValue` (Xiii.dll native licence table, keyed by id - 26 into a 166-entry
+/// selector; the seven non-default keys are the seven `xidmaps` MapInfo subclasses whose
+/// scripts compare `TGSDummy`, each with the value its own code expects:
+/// Hual01a 546, PRock01a 21627, Hual04a 856, Sanc02a 4, SSH101a 69, USA01 3589, SSH101c 703).
+/// Measured: `?PostBeginPlay@AMapInfo@@UAEXXZ` VA 0x11b01640 in `XIII_Game/system/Xiii.dll`
+/// writes offset 0x1f8 (`TGSDummy`) after the script `PostBeginPlay`; keys outside the
+/// selector table keep the `xiii.MapInfo` default 0 (the demo build behaviour).
+fn native_tgs_dummy(load_specific: i32) -> Option<i32> {
+    match load_specific {
+        26 => Some(546),
+        55 => Some(21627),
+        81 => Some(856),
+        106 => Some(4),
+        130 => Some(69),
+        142 => Some(3589),
+        191 => Some(703),
+        _ => None,
+    }
+}
+
 /// Latent action of a state frame.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Latent {
@@ -3752,7 +3773,16 @@ impl<'s> Vm<'s> {
             )));
             return Ok(None);
         }
+        // The native `AMapInfo::PostBeginPlay` licence layer runs when the event is delivered
+        // to a live MapInfo instance, with or without a script handler (the retail native is
+        // itself the C++ event; the table write follows the super call in the disassembly).
+        let mapinfo_licence = event.eq_ignore_ascii_case("PostBeginPlay")
+            && self.is_live_actor(id)
+            && self.is_a(id, "mapinfo");
         let Some(f) = self.find_function(id, event, true) else {
+            if mapinfo_licence {
+                self.write_native_tgs_dummy(id)?;
+            }
             self.note(TraceKind::NoHandler {
                 actor,
                 event: event.to_owned(),
@@ -3765,7 +3795,36 @@ impl<'s> Vm<'s> {
             function: self.short_path(f),
             args: texts,
         });
-        self.call_values(f, id, args).map(Some)
+        let result = self.call_values(f, id, args);
+        if mapinfo_licence {
+            self.write_native_tgs_dummy(id)?;
+        }
+        result.map(Some)
+    }
+
+    /// The Xiii.dll `AMapInfo::PostBeginPlay` licence write: sets `TGSDummy` from the
+    /// per-map table ([`native_tgs_dummy`], keyed by the instance's `iLoadSpecificValue`).
+    /// Never traced for maps outside the table (no write, no note), so traces of maps that
+    /// do not use the flag are byte-identical to before.
+    fn write_native_tgs_dummy(&mut self, id: ObjectId) -> VmResult<()> {
+        let load_specific = match self.get_property(id, "iLoadSpecificValue") {
+            Some(Value::Int(n)) => *n,
+            _ => return Ok(()),
+        };
+        let Some(value) = native_tgs_dummy(load_specific) else {
+            return Ok(());
+        };
+        if !self.set_property(id, "TGSDummy", 0, Value::Int(value)) {
+            return Err(self.err(VmErrorKind::Other(format!(
+                "{}: native licence write: no TGSDummy property",
+                self.objects[id as usize].name
+            ))));
+        }
+        self.note(TraceKind::Note(format!(
+            "{}.PostBeginPlay: native licence table sets TGSDummy={} (iLoadSpecificValue {})",
+            self.objects[id as usize].name, value, load_specific
+        )));
+        Ok(())
     }
 
     /// Calls a function by global reference with argument values (no out parameters).
