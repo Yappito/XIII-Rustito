@@ -5624,4 +5624,128 @@ mod tests {
             "the player controller must end in GameEndedDeath (killed by the scripted tarmac rockets)"
         );
     }
+
+    /// item59: Hual02 route by player input (the vent crawl, the underfloor, the surface
+    /// corridor, Carrington's cell) with labelled teleports only for the measured movement
+    /// gaps (the service lift, the Locked Porte19 magnetic chain, the sealed prison
+    /// perimeter, the grille pin, the pinned exit stairwell). The objectives must come from
+    /// the game's own chains: goals 4/5/6 complete, goal 3 is promoted by the Carrington
+    /// scene, goals 0/1/2 stay incomplete on measured blockers, and no travel is requested.
+    #[test]
+    fn opt_in_hual02_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual02".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual02");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let route_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/hual02_route.script");
+        let script = script::Script::load(&route_path).expect("load item59 Hual02 route");
+        // The spec forbids goal/control bridges; the labelled Beretta grant stands in for the
+        // Hual01b campaign loadout (a direct Hual02 start hands the Fists only).
+        assert!(
+            script.events.iter().all(|event| {
+                !matches!(
+                    &event.command,
+                    script::Command::TakeControl | script::Command::SetGoal(_)
+                )
+            }),
+            "the Hual02 route must not bridge control or goals"
+        );
+        // 340 s: the crawl, the underfloor, the surface corridor, the cell unlock (~22 s
+        // hold), and the exit plateau walk; the script's wait_travel never completes.
+        let outcome = run_script(
+            &game_dir,
+            "Hual02",
+            &script,
+            &resolved.params,
+            &scene,
+            340.0,
+        )
+        .expect("run Hual02 route");
+        let session = &outcome.session;
+        let objectives = session.objective_states();
+        println!(
+            "[hual02 route] objectives={objectives:?} travel={:?} final_map={}",
+            outcome.travel, outcome.final_map
+        );
+        assert_eq!(outcome.final_map, "Hual02");
+        assert!(
+            outcome.travel.is_empty(),
+            "route unexpectedly travelled: {:?}",
+            outcome.travel
+        );
+        for o in &objectives {
+            match o.index {
+                // The anti-goal completions and Carrington's survival run through the game's
+                // own Carrington scene (CineTrigger6 'Carring_ShaftEnter' at the depot).
+                4..=6 => assert!(
+                    o.completed,
+                    "objective {} must complete through the game's chains: {o:?}",
+                    o.index
+                ),
+                // Promoted by the same scene, but the escort end chain is unreachable:
+                // TouchTrigger8 sits on a z=63 gallery with no navigable access and the
+                // corridor's Porte151 only opens from Carrington's escort moveseq, which
+                // waits forever on the 'soldat_assome' raid event (measured legs 31-37).
+                3 => assert!(
+                    o.primary && !o.completed,
+                    "objective 3 must be promoted but not completed: {o:?}"
+                ),
+                // Promotion chain blocked: DetectionVolume21 floats 78 UU above the real duct
+                // floor and the eavesdrop scene stalls on the unimplemented CWndSFXTrigger
+                // action, so 'objectif92' never promotes goal 2; DV14's completion only
+                // validates a promoted goal (measured leg37 vs the fixture).
+                1 | 2 => assert!(
+                    !o.primary && !o.completed,
+                    "objective {} must stay unpromoted and incomplete: {o:?}",
+                    o.index
+                ),
+                // The level-end trigger touches fire on the exit plateau, but the goal 0
+                // completion needs every primary goal first (SetGoalComplete's
+                // TestGoalComplete gate), so 'fin2' never completes goal 0.
+                0 => assert!(
+                    o.primary && !o.completed,
+                    "objective 0 must stay promoted and incomplete: {o:?}"
+                ),
+                _ => {}
+            }
+        }
+        // The game's own chains the route does fire, pinned by the session's touch log.
+        let touched: Vec<String> = session
+            .touches()
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        for expected in [
+            "DetectionVolume14",
+            "Porte154",
+            "XIIIGoalTrigger0",
+            "XIIIGoalTrigger8",
+        ] {
+            assert!(
+                touched.iter().any(|t| t.eq_ignore_ascii_case(expected)),
+                "the route must touch {expected} (the game's own chain): touches={touched:?}"
+            );
+        }
+        // The cell unlock must have gone through the door's own Unlocked path.
+        let vm = session.vm();
+        let porte154 = vm.find_object("Porte154").expect("Porte154 must exist");
+        assert!(
+            vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target.eq_ignore_ascii_case("Porte154")
+                        && function.ends_with("Trigger")
+            )),
+            "the unlock must call Porte154.Trigger (the game's own unlock path)"
+        );
+        let _ = porte154;
+    }
 }
