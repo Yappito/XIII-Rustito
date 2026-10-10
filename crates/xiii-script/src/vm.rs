@@ -4625,9 +4625,21 @@ impl<'s> Vm<'s> {
         loop {
             rounds += 1;
             if rounds > 10_000 {
-                return Err(self.err(VmErrorKind::BudgetExceeded {
+                let mut error = self.err(VmErrorKind::BudgetExceeded {
                     limit: self.limits.max_steps,
-                }));
+                });
+                if let Some(code) = &self.objects[id as usize].state_code {
+                    let offset = self
+                        .struct_header(code.owner)
+                        .and_then(|h| h.script.statements.get(code.pc))
+                        .map_or(0, |t| t.offset);
+                    error.stack.push(StackEntry {
+                        function: self.set.path(code.owner),
+                        object: self.objects[id as usize].name.clone(),
+                        offset,
+                    });
+                }
+                return Err(error);
             }
             let Some(code) = self.objects[id as usize].state_code.clone() else {
                 return Ok(());
