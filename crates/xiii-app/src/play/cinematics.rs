@@ -239,7 +239,12 @@ pub fn collect(
     {
         let (provider, unresolved) =
             crate::play::voice::LibraryVoiceDuration::new(audio.library.clone());
-        session.vm_mut().set_voice_duration(Box::new(provider));
+        session
+            .vm_mut()
+            .set_voice_duration(Box::new(provider.clone()));
+        // The headless runtime supplies both HX seams. Windowed dialogue must not suspend
+        // merely because only its duration provider was installed here.
+        session.vm_mut().set_wave_position(Box::new(provider));
         state.voice_unresolved = Some(unresolved);
         println!("[cine] voice-duration provider installed from the decoded HX library");
     }
@@ -347,10 +352,10 @@ pub fn draw(
     state: Res<CinematicState>,
     mut commands: Commands,
     mut text: Query<&mut Text, With<SubtitleText>>,
-    mut init: Local<bool>,
 ) {
-    if !*init {
-        *init = true;
+    // Travel despawns map UI. A Local<bool> survived that teardown and prevented subtitles
+    // from ever being created again in the destination map.
+    if text.is_empty() {
         commands.spawn((
             SubtitleText,
             Text::new(String::new()),
@@ -424,6 +429,30 @@ pub fn report_exit(state: Res<CinematicState>, mut exiting: MessageReader<AppExi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtitle_node_is_recreated_after_map_teardown() {
+        let mut app = App::new();
+        app.insert_resource(CinematicState::default())
+            .add_systems(Update, draw);
+        app.update();
+        let mut nodes = app
+            .world_mut()
+            .query_filtered::<Entity, With<SubtitleText>>();
+        let old = nodes.single(app.world()).expect("initial subtitle node");
+        app.world_mut().despawn(old);
+        app.update();
+        let new = nodes
+            .single(app.world())
+            .expect("destination subtitle node");
+        assert_ne!(new, old);
+        app.update();
+        assert_eq!(
+            nodes.iter(app.world()).count(),
+            1,
+            "no duplicate subtitle nodes"
+        );
+    }
 
     fn pose(name: &str, x: f32) -> (String, [f32; 3], [i32; 3]) {
         (name.to_owned(), [x, 0.0, 0.0], [0; 3])

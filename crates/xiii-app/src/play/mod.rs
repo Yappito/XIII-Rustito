@@ -248,7 +248,14 @@ impl Plugin for PlayPlugin {
                 )
                     .chain(),
             )
-            .add_systems(Last, (cinematics::report_exit, cartoon::report_exit));
+            .add_systems(
+                Last,
+                (
+                    cinematics::report_exit,
+                    cartoon::report_exit,
+                    hud::report_exit,
+                ),
+            );
     }
 }
 
@@ -1637,7 +1644,8 @@ fn unattended(
     // item21 hook: an unattended run with a screenshot requested screenshots the in-game
     // cutscene video [`cutscene::VIDEO_SHOT_AFTER_SECS`] into playback (the video may start
     // long after the wall-clock budget began) and exits once the shot is confirmed.
-    if cfg.options.screenshot.is_some()
+    if cfg.options.play_script.is_none()
+        && cfg.options.screenshot.is_some()
         && state.video_exit_at.is_none()
         && cutscene::playing_for(&host, cutscene::VIDEO_SHOT_AFTER_SECS)
     {
@@ -1715,13 +1723,19 @@ fn unattended(
     let Some(secs) = state.exit_secs else {
         return;
     };
-    let elapsed = state.start.elapsed().as_secs_f32();
+    // Script timestamps use fixed simulation time. A slow startup or capped catch-up must not
+    // end a scripted run before its requested inputs have been delivered.
+    let elapsed = unattended_elapsed(
+        cfg.options.play_script.is_some(),
+        state.tick,
+        state.start.elapsed().as_secs_f32(),
+    );
     if flag.0 {
         state.shot_done = true;
     }
     if let Some(path) = &cfg.options.screenshot
         && state.shot == 0
-        && elapsed >= secs * 0.75
+        && elapsed >= screenshot_at(cfg.options.play_script.is_some(), secs)
     {
         let path: std::path::PathBuf = path.clone();
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -1768,6 +1782,22 @@ type MapSceneFilter = (
     )>,
 );
 
+fn unattended_elapsed(scripted: bool, tick: u64, wall_secs: f32) -> f32 {
+    if scripted {
+        tick as f32 * DT
+    } else {
+        wall_secs
+    }
+}
+
+fn screenshot_at(scripted: bool, exit_secs: f32) -> f32 {
+    if scripted {
+        exit_secs
+    } else {
+        exit_secs * 0.75
+    }
+}
+
 /// Level-transition host system (item15). When the game's own code requests travel, this tears
 /// down the current map (every entity except the window), opens a fresh script session for the
 /// requested map and rebuilds the scene through [`setup_inner`]. The input-script cursor and the
@@ -1778,6 +1808,8 @@ fn travel(
     mut cfg: ResMut<PlayConfig>,
     mut session: NonSendMut<Result<session::Session, String>>,
     mut cutscene_host: NonSendMut<cutscene::CutsceneHost>,
+    mut cinematic: ResMut<cinematics::CinematicState>,
+    mut cartoon: ResMut<cartoon::CartoonState>,
     mut sync: ResMut<RenderSync>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -1809,6 +1841,24 @@ fn travel(
         "[play] travel requested at t={:.3}s by {}: url={:?} mode={} items={} source={:?} -> map {} options {:?}",
         req.time, req.actor, req.url, req.mode, req.items, req.source, plan.map, plan.options
     );
+    println!("[play] outgoing objectives: {}", sess.objective_summary());
+    println!(
+        "[play] outgoing suspended={:?} blocked={:?}",
+        sess.suspended, sess.blocked
+    );
+    for (actor, error) in &sess.failures {
+        println!("[play] outgoing failure {actor}: {error}");
+    }
+    println!(
+        "[play] outgoing presentation: dialogue_lines={} view_changes={} cartoon_updates={}",
+        cinematic.lines, cinematic.view_changes, cartoon.render_updates
+    );
+    if let Some(host) = cutscene_host.0.as_ref() {
+        println!("{}", host.report_line());
+        for diagnostic in host.diagnostics() {
+            println!("[video host]   {diagnostic}");
+        }
+    }
     let Some(game_dir) = cfg.options.game_dir.clone() else {
         eprintln!("[play] travel without --game-dir");
         exit.write(AppExit::error());
@@ -1822,6 +1872,15 @@ fn travel(
         commands.entity(e).try_despawn();
         removed += 1;
     }
+    // These caches contain entity IDs from the outgoing scene. They must not issue commands
+    // against despawned entities or mistake a reused VM object ID for an existing light.
+    commands.insert_resource(RuntimeLights::default());
+    commands.insert_resource(viewer::decals::RuntimeProjectorDecals::default());
+    commands.insert_resource(weapons::WeaponView::default());
+    commands.insert_resource(cartoon::CartoonRenderTarget::default());
+    commands.insert_resource(crate::video::VideoOverlay::default());
+    *cinematic = cinematics::CinematicState::default();
+    *cartoon = cartoon::CartoonState::default();
     let new_session = match travel::open_next_session(sess, &game_dir, &plan) {
         Ok(s) => s,
         Err(e) => {
@@ -2725,6 +2784,15 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scripted_exit_budget_survives_slow_frames_and_startup() {
+        assert_eq!(unattended_elapsed(true, 0, 90.0), 0.0);
+        assert_eq!(unattended_elapsed(true, 120, 90.0), 2.0);
+        assert_eq!(unattended_elapsed(false, 120, 90.0), 90.0);
+        assert_eq!(screenshot_at(true, 164.0), 164.0);
+        assert_eq!(screenshot_at(false, 164.0), 123.0);
+    }
 
     /// item40e: the authored Plage01 opening of `tests/data/plage01_route.script` up to (not
     /// including) its `t=59.00` weapon line: hut escape, objective promotion and the
@@ -4593,10 +4661,8 @@ mod tests {
         // is the beach end trigger: `Engine.Trigger.Touch` fires `TriggerEvent('objectif0')`,
         // which calls `XIIIGoalTrigger5.Trigger`. Teleport next to it and walk in, then wait for
         // the game's own travel request.
-        let script = script::Script::parse(
-            "t=0.0 teleport 5420 -1360.3 880\nt=0.0 yaw 0\nt=0.0 forward 1\nt=2.0 forward 0\nt=2.0 wait_travel\n",
-        )
-        .unwrap();
+        let script =
+            script::Script::parse(include_str!("../../tests/data/plage00_goal.script")).unwrap();
         let outcome = run_script(
             &game_dir,
             "Plage00",

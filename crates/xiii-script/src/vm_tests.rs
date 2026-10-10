@@ -1096,7 +1096,8 @@ fn registry_entries_are_documented() {
     // `Actor.VisibleDamageableActors` and `Actor.WaveHasPosition`. Must equal
     // `Registry::builtin().defs().count()`.
     // item55 adds RotRand, WaitForLanding and the decoded SetPoisonEffect request.
-    assert_eq!(defs.len(), 340);
+    // item65 adds Interaction.WorldToScreen backed by the host's active projection.
+    assert_eq!(defs.len(), 341);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),

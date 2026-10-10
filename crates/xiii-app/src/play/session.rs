@@ -63,6 +63,8 @@ pub struct Session {
     last_synced: Vec<Option<[f32; 3]>>,
     /// Presentation events, most recent last (bounded).
     pub events: VecDeque<(f64, PresentationEvent)>,
+    /// Cumulative presentation-event count, including events evicted from the retained window.
+    pub event_total: u64,
     /// `PlayStrVoice` dialogue events, most recent last (bounded). `dialogue_total` is the
     /// cumulative count so a consumer can detect new entries after the bounded window wraps.
     pub dialogues: VecDeque<(f64, DialogueEvent)>,
@@ -445,6 +447,7 @@ impl Session {
             first_error: None,
             last_synced,
             events: VecDeque::new(),
+            event_total: 0,
             dialogues: VecDeque::new(),
             dialogue_total: 0,
             saves: VecDeque::new(),
@@ -2322,7 +2325,8 @@ impl Session {
         matches!(self.vm.get_property(id, "bIsDead"), Some(Value::Bool(true)))
     }
 
-    fn drain_events(&mut self) {
+    /// Collects presentation produced by simulation or a host render callback.
+    pub(super) fn drain_events(&mut self) {
         for ev in self.vm.drain_events() {
             let t = self.vm.time;
             if let PresentationEvent::Dialogue(d) = &ev {
@@ -2340,6 +2344,7 @@ impl Session {
                 }
             }
             self.events.push_back((t, ev));
+            self.event_total += 1;
         }
         while self.events.len() > 64 {
             self.events.pop_front();

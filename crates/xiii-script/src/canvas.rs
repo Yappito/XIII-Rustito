@@ -122,6 +122,135 @@ pub struct CanvasState {
     fonts: Option<Box<dyn CanvasFonts>>,
     /// item16c host-owned menu configuration.
     pub menu: Option<MenuSettings>,
+    /// Active presentation camera, supplied before PostRender; absent in headless simulation.
+    pub screen_projection: Option<ScreenProjection>,
+}
+
+/// Renderer-independent world-to-clip snapshot. Columns consume Unreal world coordinates;
+/// viewport dimensions are pixels. The host owns camera selection and projection conventions.
+#[derive(Clone, Copy, Debug)]
+pub struct ScreenProjection {
+    /// Column-major homogeneous transform.
+    pub clip_from_world: [[f32; 4]; 4],
+    /// Width and height of the active viewport.
+    pub viewport: [f32; 2],
+}
+
+impl ScreenProjection {
+    /// Homogeneous divide followed by the canvas viewport mapping. No behind-camera clipping
+    /// or denominator clamping: retail FSceneNode::Project divides by signed W as well.
+    pub fn project(&self, point: [f32; 3]) -> Option<[f32; 3]> {
+        if !point.iter().all(|v| v.is_finite())
+            || !self.clip_from_world.iter().flatten().all(|v| v.is_finite())
+            || !self.viewport.iter().all(|v| v.is_finite() && *v > 0.0)
+        {
+            return None;
+        }
+        let v = [point[0], point[1], point[2], 1.0];
+        let clip: [f32; 4] = std::array::from_fn(|row| {
+            (0..4)
+                .map(|col| self.clip_from_world[col][row] * v[col])
+                .sum()
+        });
+        Some([
+            (clip[0] / clip[3] + 1.0) * self.viewport[0] * 0.5,
+            (1.0 - clip[1] / clip[3]) * self.viewport[1] * 0.5,
+            clip[2] / clip[3],
+        ])
+    }
+}
+
+fn world_to_screen(
+    vm: &mut Vm<'_>,
+    ctx: &NativeCtx,
+    args: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let Some(Value::Vector(point)) = args.first() else {
+        return Err(vm.err(VmErrorKind::Other(
+            "WorldToScreen requires a vector Location".into(),
+        )));
+    };
+    // Retail evaluates these optional arguments before PlayerCalcView selects the final view.
+    // This host snapshot is that active view; overrides are not claimed as supported.
+    if !ctx.omitted(1) || !ctx.omitted(2) {
+        return Err(vm.err(VmErrorKind::Other(
+            "WorldToScreen explicit camera arguments require PlayerCalcView support".into(),
+        )));
+    }
+    let projection = vm.canvas.screen_projection.as_ref().ok_or_else(|| {
+        vm.err(VmErrorKind::Other(
+            "WorldToScreen requires an active presentation camera".into(),
+        ))
+    })?;
+    let projected = projection.project(*point).ok_or_else(|| {
+        vm.err(VmErrorKind::Other(
+            "WorldToScreen invalid viewport, matrix or Location".into(),
+        ))
+    })?;
+    Ok(NativeOutcome::Value(Value::Vector(projected)))
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    fn projection() -> ScreenProjection {
+        // Forward depth = source X, right = source Y, up = source Z.
+        ScreenProjection {
+            clip_from_world: [
+                [0.0, 0.0, 1.0, 1.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ],
+            viewport: [1280.0, 720.0],
+        }
+    }
+
+    #[test]
+    fn projection_preserves_signed_depth_and_outside_viewport_positions() {
+        let p = projection();
+        assert_eq!(p.project([10.0, 0.0, 0.0]), Some([640.0, 360.0, 1.0]));
+        assert_eq!(p.project([10.0, 20.0, 10.0]), Some([1920.0, 0.0, 1.0]));
+        assert_eq!(p.project([-10.0, 20.0, 10.0]), Some([-640.0, 720.0, 1.0]));
+        let eye_plane = p.project([0.0, 1.0, 1.0]).unwrap();
+        assert!(eye_plane[0].is_infinite() && eye_plane[1].is_infinite());
+    }
+
+    #[test]
+    fn projection_rejects_invalid_host_data_and_nonfinite_locations() {
+        let mut p = projection();
+        assert!(p.project([f32::NAN, 0.0, 0.0]).is_none());
+        p.viewport[0] = 0.0;
+        assert!(p.project([10.0, 0.0, 0.0]).is_none());
+        p.viewport[0] = 1280.0;
+        p.clip_from_world[0][0] = f32::INFINITY;
+        assert!(p.project([10.0, 0.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn world_to_screen_requires_a_camera_and_rejects_unsupported_overrides() {
+        let set = crate::linker::ScriptSet::new();
+        let mut vm = Vm::new(&set, crate::vm::VmLimits::default());
+        let mut ctx = NativeCtx {
+            this: 0,
+            in_state_code: false,
+            path: "Interaction.WorldToScreen".into(),
+            omitted: vec![false, true, true],
+        };
+        let mut args = [Value::Vector([10.0, 0.0, 0.0]), Value::Void, Value::Void];
+        assert!(world_to_screen(&mut vm, &ctx, &mut args).is_err());
+        vm.canvas.screen_projection = Some(projection());
+        assert_eq!(
+            world_to_screen(&mut vm, &ctx, &mut args).unwrap(),
+            NativeOutcome::Value(Value::Vector([640.0, 360.0, 1.0]))
+        );
+        ctx.omitted[1] = false;
+        assert!(world_to_screen(&mut vm, &ctx, &mut args).is_err());
+        ctx.omitted[1] = true;
+        args[0] = Value::Void;
+        assert!(world_to_screen(&mut vm, &ctx, &mut args).is_err());
+    }
 }
 
 impl CanvasState {
@@ -951,6 +1080,13 @@ pub fn canvas_defs() -> Vec<NativeDef> {
         "native(467) final static function DrawActor(object<Actor> A, bool Wireframe, bool ClearZ, float DisplayFOV)",
         "engine.u Canvas.DrawActor decoded; needs a canvas camera/mesh pass",
         draw_actor,
+    ));
+    v.push(partial(
+        "uses the active host camera's projection (including its near-plane/depth convention); explicit camera arguments fail visibly rather than bypassing retail PlayerCalcView",
+        "Engine.Interaction.WorldToScreen",
+        "native(0) function vector WorldToScreen(vector Location, optional vector CameraLocation, optional rotator CameraRotation)",
+        "Engine.dll execWorldToScreen 0x103858d0 calls PlayerCalcView, FCameraSceneNode, FSceneNode::Project 0x103c99d0 (signed homogeneous divide), then canvas transform 0x10385670; XIIIPlayerInteraction.DrawInteractions 0x0B71 uses returned X/Y for focus marker",
+        world_to_screen,
     ));
     v.push(partial(
         "the portal camera pass is not rendered; a rectangle is recorded and a note added",
