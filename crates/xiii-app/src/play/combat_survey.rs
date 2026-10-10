@@ -12,14 +12,16 @@ fn opt_in_item51_combat_survey() {
         return;
     };
     if std::env::var("XIII_SURVEY").as_deref() != Ok("1") {
-        println!("SKIPPED: set XIII_SURVEY=1 (five 66-second combat scenarios)");
+        println!("SKIPPED: set XIII_SURVEY=1 (campaign combat survey)");
         return;
     }
     let root = PathBuf::from(root);
     let params = resolve_params(&root).expect("player parameters").params;
     let registry = Registry::builtin();
     let mut rank = BTreeMap::<String, u64>::new();
-    for map in ["Base01", "Hual01a", "SPADS01", "Kello01a", "USA01"] {
+    let mut firing_failures = Vec::new();
+    let (maps, _) = survey::discover_campaign_order(&root).expect("campaign order");
+    for map in maps.iter().map(String::as_str) {
         if std::env::var("XIII_COMBAT_MAP")
             .is_ok_and(|selected| !selected.eq_ignore_ascii_case(map))
         {
@@ -47,39 +49,46 @@ fn opt_in_item51_combat_survey() {
                         && vm.is_a(*i as u32, "BaseSoldier")
                 })
                 .map(|(i, _)| i as u32)
+        };
+        let mut text = String::new();
+        if let Some(soldier) = soldier {
+            let name = vm.objects[soldier as usize].name.clone();
+            let loc = vm
+                .vector_prop(soldier, "Location")
+                .expect("soldier location");
+            let rot = vm.rotation_prop(soldier).expect("soldier rotation");
+            let yaw = rot[1] as f32 * std::f32::consts::TAU / 65536.0;
+            let place = [
+                loc[0] + yaw.cos() * 100.0,
+                loc[1] + yaw.sin() * 100.0,
+                loc[2] + 20.0,
+            ];
+            println!(
+                "[combat] map={map} target={name} authored_location={loc:?} rotation={rot:?} diagnostic_place={place:?}"
+            );
+            text = format!(
+                "t=6 take_control\nt=6 teleport {} {} {}\nt=6 yaw {}\nt=6.1 weapon XIII.Beretta\n",
+                place[0],
+                place[1],
+                place[2],
+                yaw.to_degrees() + 180.0
+            );
+            // Fire beside, rather than kill, the observed soldier: no health/invulnerability edits.
+            text.push_str("t=6.2 turn 45\n");
+            for i in 0..60 {
+                text.push_str(&format!("t={} fire\n", 6.5 + i as f32));
+            }
+        } else {
+            println!(
+                "[combat-no-target] {map}: no authored BaseSoldier; running empty-input session (no fight available)"
+            );
         }
-        .expect("map soldier");
-        let name = vm.objects[soldier as usize].name.clone();
-        let loc = vm
-            .vector_prop(soldier, "Location")
-            .expect("soldier location");
-        let rot = vm.rotation_prop(soldier).expect("soldier rotation");
-        let yaw = rot[1] as f32 * std::f32::consts::TAU / 65536.0;
-        let place = [
-            loc[0] + yaw.cos() * 100.0,
-            loc[1] + yaw.sin() * 100.0,
-            loc[2] + 20.0,
-        ];
-        println!(
-            "[combat] map={map} target={name} authored_location={loc:?} rotation={rot:?} diagnostic_place={place:?}"
-        );
         drop(probe);
-        let mut text = format!(
-            "t=6 take_control\nt=6 teleport {} {} {}\nt=6 yaw {}\nt=6.1 weapon XIII.Beretta\n",
-            place[0],
-            place[1],
-            place[2],
-            yaw.to_degrees() + 180.0
-        );
-        // Fire beside, rather than kill, the observed soldier: no health/invulnerability edits.
-        text.push_str("t=6.2 turn 45\n");
-        for i in 0..60 {
-            text.push_str(&format!("t={} fire\n", 6.5 + i as f32));
-        }
         let input = script::Script::parse(&text).expect("combat script");
         let outcome = run_script_with_cinematic_input(&root, map, &input, &params, &scene, 66.5)
             .expect("combat run");
         let session = &outcome.session;
+        survey::print_details(&survey::extract(map, &outcome));
         let vm = session.vm();
         for (i, object) in vm.objects.iter().enumerate() {
             let id = i as u32;
@@ -222,10 +231,12 @@ fn opt_in_item51_combat_survey() {
         println!(
             "[combat-shooters] {map} shots={shots_by_soldier:?} hits_on_player={hits_by_soldier:?}"
         );
-        assert_eq!(
-            player_shots, 60,
-            "{map}: diagnostic grant must fire all 60 requested shots"
-        );
+        if soldier.is_some() && player_shots != 60 {
+            println!(
+                "[combat-acceptance-fail] {map}: expected 60 player shots, measured {player_shots}"
+            );
+            firing_failures.push(format!("{map}: {player_shots}/60 player shots"));
+        }
         // Preserve orphaned/destroyed controllers and weapon reload states too: looking only
         // at each pawn's final Controller pointer loses earlier lifecycle transitions.
         for event in &vm.trace {
@@ -299,6 +310,10 @@ fn opt_in_item51_combat_survey() {
     for (path, count) in rank {
         println!("[combat-rank] {count} {path}");
     }
+    assert!(
+        firing_failures.is_empty(),
+        "combat firing acceptance failures: {firing_failures:?}"
+    );
 }
 
 #[test]
