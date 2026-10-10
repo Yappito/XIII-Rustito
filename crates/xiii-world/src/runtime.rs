@@ -408,6 +408,19 @@ impl AnimationData for LoggingAnim {
         });
         result
     }
+
+    fn bone_offset(
+        &mut self,
+        mesh_source: &str,
+        anim_source: &str,
+        seq: &str,
+        frame: f32,
+        looping: bool,
+        bone: &str,
+    ) -> Result<Option<[f32; 3]>, String> {
+        self.inner
+            .bone_offset(mesh_source, anim_source, seq, frame, looping, bone)
+    }
 }
 
 /// Which real-map providers to build.

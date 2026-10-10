@@ -1006,6 +1006,36 @@ fn step_budget_stops_runaway_loops() {
 }
 
 #[test]
+fn state_label_restart_budget_retains_actor_and_code_stack() {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let spin = b.reserve(IMP_STATE, actor, "Spin");
+    let begin = b.name("Begin") as u8;
+    // Synthetic goto Begin with no latent: unlike a statement jump this repeatedly
+    // exits/restarts the state frame and exercises process_state's rounds guard.
+    let mut code = vec![0x0D, 0x21, begin, 0x08];
+    code.extend([0x0C, begin, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b.state(spin, 0, &code, 0x18, 0x07);
+    b.class(object, 0, 0);
+    b.class(actor, object, spin);
+    let set = set_of(b.build());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let id = vm.spawn(g(&set, "Actor"), "Looper").unwrap();
+    vm.set_active(id, true);
+    vm.goto_state(id, "Spin", None).unwrap();
+    let error = vm.tick(1.0 / 60.0).unwrap_err();
+    assert_eq!(error.kind, VmErrorKind::BudgetExceeded { limit: 1_000_000 });
+    let entry = error
+        .stack
+        .last()
+        .expect("state restart must retain context");
+    assert_eq!(entry.function, "Test.Actor.Spin");
+    assert_eq!(entry.object, "Looper");
+    assert_eq!(entry.offset, 0);
+}
+
+#[test]
 fn tick_memo_re_resolves_after_state_change() {
     let set = set_of(tick_state_fixture());
     let mut vm = Vm::new(&set, VmLimits::default());
@@ -10507,7 +10537,7 @@ fn auto_position_snaps_to_the_floor_and_adds_altitude() {
 }
 
 #[test]
-fn find_best_path_toward_returns_true_and_fills_route_cache() {
+fn find_best_path_toward_publishes_move_target_and_preserves_it_on_failure() {
     let set = nav_set();
     let mut vm = Vm::new(&set, VmLimits::default());
     let _ = spawn_at(&mut vm, &set, "Actor", "Nav0", [0.0, 0.0, 0.0]);
@@ -10533,6 +10563,19 @@ fn find_best_path_toward_returns_true_and_fills_route_cache() {
         route_cache_elem(&vm, ctrl, 0),
         Value::Object(Some(ObjRef::Instance(n1)))
     );
+    assert_eq!(vm.obj_prop(ctrl, "MoveTarget"), Some(n1));
+    assert_eq!(vm.vector_prop(ctrl, "Destination"), Some([500.0, 0.0, 0.0]));
+    // An unreachable path must neither report success nor erase the last target.
+    vm.set_navigation(Box::new(crate::navigation::EmptyNavigation));
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "IAController.FindBestPathToward",
+        ctrl,
+        &[false, false, false],
+        &mut args
+    )));
+    assert_eq!(vm.obj_prop(ctrl, "MoveTarget"), Some(n1));
+    assert_eq!(vm.vector_prop(ctrl, "Destination"), Some([500.0, 0.0, 0.0]));
     // Desired None -> false, no path.
     let mut args = [Value::Object(None), Value::Float(70.0), Value::Float(160.0)];
     assert!(!bool_result(call_native(
@@ -10542,6 +10585,8 @@ fn find_best_path_toward_returns_true_and_fills_route_cache() {
         &[false, false, false],
         &mut args
     )));
+    assert_eq!(vm.obj_prop(ctrl, "MoveTarget"), Some(n1));
+    assert_eq!(vm.vector_prop(ctrl, "Destination"), Some([500.0, 0.0, 0.0]));
 }
 
 /// A minimal `PlayerController`/`Pawn` tree for the `PlayerCanSeeMe` line-of-sight test.
@@ -11176,6 +11221,98 @@ fn play_str_voice_emits_dialogue_event_with_speaker_and_duration() {
     assert!(vm.drain_events().is_empty());
 }
 
+/// item62: a voiced dialogue line ends at the wave's real duration. The retail chain is
+/// `Speak` -> `PlayStrVoice` -> `GotoState('STA_HeadAnimation')` -> the audio device's end
+/// callback (`EndOfVoice`, native 180112 - `STA_HeadAnimation.Timer` just calls
+/// `EndOfVoice()`), then `STA_HeadAnimation.Tick` -> `GotoState('STA_PlayingDialogue','EOL')`
+/// -> `EndOfLine`, which parks on the next beat's `ExpectedEventBeforeNext`. The VM emulates
+/// the audio seam by scheduling the speaking actor's `Timer` at the provider duration (the
+/// same duration the script itself reads back through native 357 `GetWaveDuration` to set
+/// `WaveLength = duration + 1.0` for the subtitle lifetime). This pins that the line-end
+/// timer fires at the wave duration, not before and not at the script's fallback 3.0.
+#[test]
+fn play_str_voice_schedules_the_line_end_timer_at_the_wave_duration() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let dm = vm.spawn(sg(&set, "Actor"), "DialogueManager0").unwrap();
+    let pam = vm.spawn(sg(&set, "Actor"), "Cine0").unwrap();
+    vm.set_active(dm, true);
+    vm.set_voice_duration(Box::new(crate::voice::FixedVoiceDuration::new(2.5)));
+    let mut args = [
+        Value::Str("Toits01_JonesMaj_10".to_owned()),
+        Value::Object(Some(ObjRef::Instance(pam))),
+    ];
+    let r = try_native(
+        &mut vm,
+        "Engine.Actor.PlayStrVoice",
+        dm,
+        &[false, false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Bool(true)));
+    let started = vm.drain_events();
+    assert!(
+        started
+            .iter()
+            .any(|e| matches!(e, crate::events::PresentationEvent::Dialogue(_))),
+        "the voice start must be presented: {started:?}"
+    );
+
+    // 2.0 s in (four 0.5 s ticks): the wave is still playing, no Timer.
+    for _ in 0..4 {
+        vm.tick(0.5).unwrap();
+    }
+    assert!(
+        !vm.trace
+            .iter()
+            .any(|event| matches!(event.kind, TraceKind::Timer { .. })),
+        "the line-end timer fired before the wave duration"
+    );
+    // The fifth tick crosses 2.5 s: exactly one Timer, on the speaking actor, at 2.5 s.
+    vm.tick(0.5).unwrap();
+    let timer_events: Vec<_> = vm
+        .trace
+        .iter()
+        .filter(|event| {
+            matches!(&event.kind, TraceKind::Timer { actor } if actor == "DialogueManager0")
+        })
+        .collect();
+    assert_eq!(timer_events.len(), 1);
+    assert_eq!(timer_events[0].tick, 5);
+    assert!((timer_events[0].time - 2.5).abs() < 1e-6);
+
+    // Without a duration provider the engine did not start a voice: PlayStrVoice reports
+    // false and schedules no line-end timer (the script falls back to WaveLength 3.0, but no
+    // audio is playing, so there is no end callback to emulate).
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let dm = vm.spawn(sg(&set, "Actor"), "DialogueManager0").unwrap();
+    let pam = vm.spawn(sg(&set, "Actor"), "Cine0").unwrap();
+    vm.set_active(dm, true);
+    let mut args = [
+        Value::Str("Toits01_JonesMaj_10".to_owned()),
+        Value::Object(Some(ObjRef::Instance(pam))),
+    ];
+    let r = try_native(
+        &mut vm,
+        "Engine.Actor.PlayStrVoice",
+        dm,
+        &[false, false],
+        &mut args,
+    )
+    .unwrap();
+    assert_eq!(r, NativeOutcome::Value(Value::Bool(false)));
+    for _ in 0..6 {
+        vm.tick(0.5).unwrap();
+    }
+    assert!(
+        !vm.trace
+            .iter()
+            .any(|event| matches!(event.kind, TraceKind::Timer { .. })),
+        "a voice that never started must not schedule a line-end timer"
+    );
+}
+
 /// The subtitle text comes from the `DialogueManager`'s current line: `LineIndex` selects a
 /// `Lines` element, whose `SpeakerIndex`/`SentenceIndex` select the nested speaker sentence.
 #[test]
@@ -11544,6 +11681,7 @@ fn stop_animating_clears_every_channel() {
         0,
         crate::vm::AnimChannel {
             sequence: "Run".into(),
+            source: String::new(),
             frames: 10,
             rate: 30.0,
             frame: 4.0,
@@ -13191,4 +13329,234 @@ fn item63_touching_foreach_rechecks_array_and_clears_out_only_on_exhaustion() {
         );
         assert_eq!(vm.get_property(actor, "Count"), Some(&Value::Int(1)));
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// item53d: posed GetBoneCoords and CineController2 focus facing.
+
+use crate::animation::SeqInfo;
+
+/// Animation provider with posed-bone support: every sequence resolves (100 frames at 30 fps)
+/// and every bone offset is the fixed actor-rotation-space vector (200, 0, 50).
+struct PoseStub;
+
+impl crate::animation::AnimationData for PoseStub {
+    fn sequence(&mut self, _source: &str, _seq: &str) -> Result<Option<SeqInfo>, String> {
+        Ok(Some(SeqInfo {
+            frames: 100,
+            rate: 30.0,
+            notifies: Vec::new(),
+        }))
+    }
+
+    fn bone_offset(
+        &mut self,
+        _mesh_source: &str,
+        _anim_source: &str,
+        _seq: &str,
+        _frame: f32,
+        _looping: bool,
+        _bone: &str,
+    ) -> Result<Option<[f32; 3]>, String> {
+        Ok(Some([200.0, 0.0, 50.0]))
+    }
+}
+
+/// Actor with a `Mesh` object property and Location/Rotation (the posed-bone fixture).
+fn bone_fixture() -> Vec<u8> {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let obj = compact(0);
+    let vec = compact(IMP_STRUCT);
+    let rot = compact(IMP_STRUCT - 1);
+
+    let mesh = b.reserve(IMP_OBJECTPROP, actor, "Mesh");
+    let tag = b.reserve(IMP_NAMEPROP, actor, "Tag");
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let rotation = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
+    b.prop_with(mesh, tag, 0, &obj);
+    b.prop(tag, location, 0);
+    b.prop_with(location, rotation, 0, &vec);
+    b.prop_with(rotation, 0, 0, &rot);
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, mesh, 0);
+    b.build()
+}
+
+#[test]
+fn get_bone_coords_posed_offset_applies_actor_yaw_and_location() {
+    let data = bone_fixture();
+    let p = ScriptPackage::load("Test", data, &ScriptLimits::default(), &Limits::default())
+        .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(PoseStub));
+    let actor = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(actor, true);
+    vm.set_property(
+        actor,
+        "Mesh",
+        0,
+        Value::Object(Some(ObjRef::Static(sg(&set, "Actor")))),
+    );
+    let mut args = [
+        Value::Name("Walk".into()),
+        Value::Float(0.0),
+        Value::Float(0.0),
+        Value::Int(0),
+    ];
+    try_native(
+        &mut vm,
+        "Engine.Actor.PlayAnim",
+        actor,
+        &[false, true, true, true],
+        &mut args,
+    )
+    .unwrap();
+    vm.set_property(actor, "Location", 0, Value::Vector([1000.0, 2000.0, 500.0]));
+    // Yaw 16384 = 90 degrees: the actor-rotation-space offset (200, 0) turns onto +Y.
+    vm.set_property(actor, "Rotation", 0, Value::Rotator([0, 16384, 0]));
+    let mut bone_args = [Value::Name("X".into())];
+    let out = try_native(
+        &mut vm,
+        "Engine.Actor.GetBoneCoords",
+        actor,
+        &[false],
+        &mut bone_args,
+    )
+    .unwrap();
+    let NativeOutcome::Value(Value::Struct(coords)) = out else {
+        panic!("Coords struct expected, got {out:?}");
+    };
+    let origin = coords
+        .iter()
+        .find_map(|(n, v)| (n == "Origin").then_some(v))
+        .expect("Origin");
+    assert_eq!(origin, &Value::Vector([1000.0, 2200.0, 550.0]));
+}
+
+/// Without a playing channel the posed query is unavailable and the item19 actor-origin
+/// fallback applies with its visible note.
+#[test]
+fn get_bone_coords_without_channel_falls_back_to_actor_location() {
+    let data = bone_fixture();
+    let p = ScriptPackage::load("Test", data, &ScriptLimits::default(), &Limits::default())
+        .expect("package");
+    let mut set = ScriptSet::new();
+    set.add(p);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(PoseStub));
+    let actor = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    vm.set_active(actor, true);
+    vm.set_property(
+        actor,
+        "Mesh",
+        0,
+        Value::Object(Some(ObjRef::Static(sg(&set, "Actor")))),
+    );
+    vm.set_property(actor, "Location", 0, Value::Vector([10.0, 20.0, 30.0]));
+    let mut bone_args = [Value::Name("X".into())];
+    let out = try_native(
+        &mut vm,
+        "Engine.Actor.GetBoneCoords",
+        actor,
+        &[false],
+        &mut bone_args,
+    )
+    .unwrap();
+    let NativeOutcome::Value(Value::Struct(coords)) = out else {
+        panic!("Coords struct expected, got {out:?}");
+    };
+    let origin = coords
+        .iter()
+        .find_map(|(n, v)| (n == "Origin").then_some(v))
+        .expect("Origin");
+    assert_eq!(origin, &Value::Vector([10.0, 20.0, 30.0]));
+    assert!(
+        vm.trace
+            .iter()
+            .any(|e| matches!(&e.kind, TraceKind::Note(n) if n.contains("item19 Partial")))
+    );
+}
+
+/// A CineController2's pawn faces the controller's FocalPoint at the pawn's RotationRate
+/// (PlayingSequence.Tick drives FocalPoint from rWantedRotation and sets RotationRate.Yaw);
+/// a plain Controller's pawn is left to its owner (player input rule).
+#[test]
+fn cinecontroller2_pawn_turns_toward_focal_point_but_plain_controller_does_not() {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "Controller");
+    let cine = b.reserve(0, 0, "CineController2");
+    let obj = compact(0);
+    let vec = compact(IMP_STRUCT);
+    let rot = compact(IMP_STRUCT - 1);
+
+    let tag = b.reserve(IMP_NAMEPROP, actor, "Tag");
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let rotation = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
+    b.prop(tag, location, 0);
+    b.prop_with(location, rotation, 0, &vec);
+    b.prop_with(rotation, 0, 0, &rot);
+
+    let brot = b.reserve(IMP_BOOLPROP, pawn, "bRotateToDesired");
+    let rate = b.reserve(IMP_STRUCTPROP, pawn, "RotationRate");
+    b.prop(brot, rate, 0);
+    b.prop_with(rate, 0, 0, &rot);
+
+    let pawn_prop = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
+    let focal = b.reserve(IMP_STRUCTPROP, controller, "FocalPoint");
+    b.prop_with(pawn_prop, focal, 0, &obj);
+    b.prop_with(focal, 0, 0, &vec);
+
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, tag, 0);
+    b.class(pawn, actor, brot, 0);
+    b.class(controller, actor, pawn_prop, 0);
+    b.class(cine, controller, 0, 0);
+    let p = ScriptPackage::load(
+        "Test",
+        b.build(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+
+    let build = |vm: &mut Vm<'_>, ctrl_class: &str| {
+        let ctrl = vm.spawn(sg(&set, ctrl_class), "C").unwrap();
+        let pawn = vm.spawn(sg(&set, "Pawn"), "P").unwrap();
+        vm.set_active(ctrl, true);
+        vm.set_active(pawn, true);
+        vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+        vm.set_property(ctrl, "FocalPoint", 0, Value::Vector([1000.0, 0.0, 0.0]));
+        vm.set_property(pawn, "bRotateToDesired", 0, Value::Bool(true));
+        vm.set_property(pawn, "RotationRate", 0, Value::Rotator([0, 54600, 0]));
+        vm.set_property(pawn, "Location", 0, Value::Vector([0.0, 0.0, 0.0]));
+        vm.set_property(pawn, "Rotation", 0, Value::Rotator([0, 10000, 0]));
+        (ctrl, pawn)
+    };
+
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let (_ctrl, pawn) = build(&mut vm, "CineController2");
+    assert!(vm.tick_suspending(1.0).is_empty());
+    assert_eq!(
+        vm.get_property(pawn, "Rotation"),
+        Some(&Value::Rotator([0, 0, 0]))
+    );
+
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let (_ctrl, pawn) = build(&mut vm, "Controller");
+    assert!(vm.tick_suspending(1.0).is_empty());
+    assert_eq!(
+        vm.get_property(pawn, "Rotation"),
+        Some(&Value::Rotator([0, 10000, 0]))
+    );
 }
