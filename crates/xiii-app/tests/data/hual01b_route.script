@@ -1,0 +1,169 @@
+# Hual01b "Find a passage and infiltrate the base" player-input route (item54b form).
+#
+# Route: entry corridor -> south ledge -> valley SW -> riverbed (generator 1) -> east guerite
+# (generator 4) -> baraque yard (generator 3) -> west cliff (generator 2) -> ladder base
+# (TouchTrigger0, goal 1 chain armed) -> terrain hole onto the GR_sortie deck -> crawl room ->
+# tunnel -> BreakableMover13 grille punch -> shaft fall (Trigger0 -> XIIIGoalTrigger0 goal 6)
+# -> EndGame -> travel to Hual02.unr.
+#
+# Driver notes (script.rs semantics, measured): a `goto` autopilot holds forward and re-aims
+# every tick until the waypoint is within 24 UU, overriding `forward 0` and `track` aiming
+# while active; `teleport` clears the pending goto but leaves the last axis value, so every
+# teleport is followed by a same-tick `forward 0` (and a short settle goto where the break
+# needs a precise spot). Track/fire sequences only run once the preceding goto has arrived.
+#
+# Every sabotage is the game's own break-by-hand chain, decoded from xiii.u/xidcine.u and
+# measured with the XIII_ITEM54_DEBUG probe (local/re/item54b/): the player carries Fists on a
+# direct Hual01b start (Fists, FistsAmmo, XIIILeftHand, StunningSkill, SixSenseSkill, Hook,
+# LockPick). `XIIIWeapon.RealTraceFire` (0x049B..0x0522) replaces a melee (WHand 0) hit with
+# `XIIIPlayerController.MyInteraction.TargetActor` when the interaction set `bCanBreak`
+# (`XIIIPlayerInteraction.DrawInteractions` 0x039A: TargetActor IsA BreakableMover, not
+# bNoInteractionIcon, TargDist < 160, `IsBreakableByPlayer()`); `XIIIH2HAmmo.ProcessTraceHit`
+# (0x00B1) then delivers `TakeDamage(15, DTFisted)`. The compteur BreakableMovers (Health 10)
+# break through `BreakableMover.TakeDamage` -> `EffectiveTakeDamage` -> `Breaking` ->
+# `Breaked` (0x0015: `TriggerEvent(self.Event)`):
+#   gen1 BreakAbleMover1   Event 'Dispatcher1' -> Dispatcher5 (Tag 'Dispatcher1')
+#   gen2 BreakAbleMover20  Event 'Dispatcher2' -> Dispatcher4 (Tag 'Dispatcher2')
+#   gen3 BreakableMover9   Event 'Dispatcher3' -> Dispatcher3 (Tag 'Dispatcher3')
+#   gen4 BreakableMover7   Event 'Dispatcher4' -> Dispatcher2 (Tag 'Dispatcher4')
+# each Dispatcher fires OutEvents 'BreakN' -> XIIIGoalTrigger1/2/6/7 (GoalNumber 99) ->
+# `xidmaps.Hual01b.SetGoalComplete(99)`: the counter walks objectives 3/4/5 and the 4th break
+# promotes goal 6 and kills the ladder's pain volume. The same 'DispatcherN' event dismisses
+# the level's own comic-focus window (`CWndFocusTrigger1..4`, whose `WaitForBeingSeen.Timer`
+# set `self.Tag = self.EventFinFocus` = 'DispatcherN'/'Break2' when the window opened) through
+# the trigger's own `WaitEndFocus.Trigger` - no input bridge anywhere.
+#
+# The labelled teleports cover measured impassables only (probes under local/re/item54b/ and
+# local/re/item54/):
+#  - t=3.50  the entry corridor is buried by entree_new mesh + terrain south of y~-250
+#            (item54 probes J/L: walk stalls at y~-35; box-probes: StaticMeshActor43 +
+#            TerrainInfo0 pinch); the BreakableMover6 grille is unreachable from inside.
+#  - t=50.0  the riverbed nav chain stalls against a wall at x=-2819: the walk freezes at
+#            (-2819.1,-3159.8) for 20+ s pushing east (route v2 run t=50-70 and probe Q
+#            t=60-72, both measured); the teleport lands on the measured gen1 sabotage spot
+#            (-1183,-3450,-1015) of probe gen1_track (fire 1 targets the protective grille
+#            BreakableMover11 at TargDist 53.3, fire 2 the compteur at 57.7, bCanBreak=true).
+#  - t=55.0  the east chain from the riverbed stalls: the v1 run froze at (-1034.6,-3202.5)
+#            for 42 s (route_debug t=72-114) and probe Q stalled at (-2435,-2537) and
+#            (-419,-2810); the teleport lands on the gen4 approach (3600,-1310) that probe
+#            new_spots walked down to (3600,-1121) where track+fire reaches the compteur at
+#            TargDist 50.1.
+#  - t=147.0 the baraque pocket's east side is sealed: the yard walk slides on the
+#            StaticMeshActor1 slope and presses StaticMeshActor46 at (441,2756) (route v6
+#            t=147-156 and the v1 run t=188-196, both measured); the teleport lands on probe
+#            gen3_gen2b's pocket start (-150,2700), from which the measured walk reaches the
+#            gen3 sabotage spot (fire 1 the protective grille BreakableMover63 at TargDist
+#            41.8, fire 2 the compteur at 42.5).
+#  - t=158.5 the x~-2800 mountain spur (item54 probe X: TerrainInfo2 blocks the
+#            (-2741,3194)->(-3139,2815) traverse) seals the west path; the teleport lands
+#            on the measured gen2 sabotage spot (-4852,2300,-880): every walked approach
+#            stalls 32 UU short of a working spot against the niche wall (probes gen2c/gen2d:
+#            the walk stops at (-4819.7,2300) and no aim reaches the compteur from there),
+#            while the yaw-0 ray from the teleported spot clips the compteur (measured
+#            TargetActor=BreakAbleMover20 TargDist=121.1 bCanBreak=true, route v2 run t=211.5).
+#  - t=156.0 the east return past the same spur is terrain-blocked in the reverse direction
+#            (item54 probe X); lands at the ladder approach (TouchTrigger0 r300 zone).
+#  - t=185.0 the GR_sortie deck -> crawl-room transition is sealed: BreakableMover57 sits
+#            under the solid deck, the south ledge wall blocks, the niche is a dead-end
+#            pocket (item54 probes F/G/H/I); the teleport lands inside the crawl room on the
+#            measured floor (-1360).
+# The gens 1/4/3 break positions are the ends of walked legs (no teleports there): gen3 is
+# reached on the yard walk to (-110,2790) (probe gen3_gen2b: fire 1 targets the protective
+# grille BreakAbleMover63 at TargDist 41.8, fire 2 the compteur at 42.5). Break order
+# 1,4,3,2 exercises the SetGoalComplete(99) counter to 4; goal 6 becomes primary after the
+# 4th break, so the shaft Trigger0 completes it and EndGame requests the Hual02.unr travel.
+# The crawl grille punch is measured (probe crawl8): crouched at (4480,-3120), level aim,
+# one fist fire breaks BreakableMover13 (Health 10 -> -5, PlaySound Grille_break_dry).
+t=0.50 goto -5428 -500
+t=3.50 teleport -5428 -720 -990
+t=3.50 forward 0
+t=4.50 goto -5428 -1400
+t=10.00 goto -5428 -2200
+t=16.00 goto -5333 -2435
+t=22.00 goto -4400 -2950
+t=28.00 goto -3596 -3095
+t=33.50 goto -3000 -3060
+t=38.50 goto -2758 -2920
+t=44.00 goto -2652 -2974
+# generator 1 (riverbed, east bank chain): the riverbed wall is the measured stall; break by
+# hand from the measured sabotage spot
+t=50.00 teleport -1183 -3450 -1015
+t=50.00 forward 0
+t=50.50 goto -1183 -3450
+t=52.00 track BreakAbleMover1
+t=52.50 fire
+t=53.10 fire
+t=53.70 fire
+t=54.50 track off
+# generator 4 (east guerite): the east chain stall is measured; walk down to the compteur
+# (the probe's own waypoint -1150, whose arrival overshoot lands at the measured
+# (3600,-1121.2,-1075.3) firing spot)
+t=55.50 teleport 3600 -1310 -1050
+t=55.50 forward 0
+t=56.00 goto 3600 -1150
+t=59.00 track BreakableMover7
+t=59.50 fire
+t=60.10 fire
+t=60.70 fire
+t=61.50 track off
+# generator 3 (baraque yard, north-middle chain): walked the whole way, break by hand
+t=62.50 goto 3606 -2110
+t=67.50 goto 2664 -2306
+t=73.00 goto 2472 -2315
+t=77.50 goto 1546 -2320
+t=82.50 goto 1135 -3122
+t=94.50 goto 898 -3105
+t=98.50 goto 612 -2714
+t=102.50 goto 602 -2602
+t=106.50 goto 651 -218
+t=114.00 goto 70 511
+t=118.50 goto 595 694
+t=122.50 goto 501 1048
+t=126.50 goto 790 1453
+t=130.50 goto 619 2070
+t=135.00 goto 620 2552
+t=139.00 goto 889 2566
+# the baraque pocket's east side is sealed: the yard walk slides on the StaticMeshActor1
+# slope and presses StaticMeshActor46 at (441,2756) (route v6 t=147-156 and the v1 run
+# t=188-196, both measured); the teleport lands on probe gen3_gen2b's pocket start
+t=147.00 teleport -150 2700 -1070
+t=147.00 forward 0
+t=147.50 goto -110 2790
+t=152.00 track BreakableMover9
+t=152.50 fire
+t=153.10 fire
+t=153.70 fire
+t=154.50 track off
+# generator 2 (west cliff): the pocket/spur seal is measured; the yaw-0 fire clips the
+# compteur and the game's own break chain runs
+t=158.50 teleport -4852 2300 -880
+t=158.50 forward 0
+t=159.00 yaw 0
+t=159.00 pitch 0
+t=159.50 fire
+t=160.10 fire
+t=160.70 fire
+# ladder base (TouchTrigger0 r300 zone): the east return past the spur is measured sealed
+t=162.00 teleport 3300 3000 -1020
+t=162.00 forward 0
+t=162.50 goto 3266 3250
+# terrain hole onto the GR_sortie deck
+t=167.00 goto 4024 -3100
+t=177.00 goto 4024 -3760
+t=187.00 goto 4024 -3829
+t=190.00 forward 0
+# crawl room -> tunnel -> grille punch -> shaft -> travel: the deck-to-room seal is measured
+t=190.50 teleport 4023 -3700 -1360
+t=190.50 forward 0
+t=191.50 crouch on
+t=192.00 goto 4023 -3140
+t=202.00 goto 4480 -3120
+t=210.00 yaw 0
+t=210.50 fire
+t=211.10 fire
+t=211.70 fire
+t=213.00 goto 4650 -3120
+t=219.00 crouch off
+t=220.00 forward 1
+t=225.00 forward 0
+t=226.00 wait_travel

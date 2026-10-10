@@ -14,9 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use xiii_audio::SoundLibrary;
-use xiii_script::VoiceDuration;
+use xiii_script::{VoiceDuration, WavePosition};
 
 /// Resolves a script voice name to its decoded wave length via the shared [`SoundLibrary`].
+#[derive(Clone)]
 pub struct LibraryVoiceDuration {
     library: Arc<Mutex<SoundLibrary>>,
     unresolved: Arc<AtomicU64>,
@@ -58,6 +59,22 @@ impl VoiceDuration for LibraryVoiceDuration {
         };
         let frames = pcm.samples.len() as f32 / f32::from(pcm.channels.max(1));
         (pcm.sample_rate > 0).then(|| frames / pcm.sample_rate as f32)
+    }
+}
+
+/// item48: `Actor.WaveHasPosition` classification over the same library.
+///
+/// The engine's answer is a runtime flag of the loaded wave resource (HXAudio flag byte +0x54
+/// bit 3, assembled from per-entry state pointers at 0x100173f6-0x10017450: bit 3 = position
+/// pointer +0x34 non-null). The state pointers' data-file provenance is not decoded, so no
+/// `.hxc`/`.uax` byte this library parses classifies a wave: the honest answer for every name is
+/// `None` ("cannot classify"), which the native turns into a visible note and `false` — the
+/// engine's own no-subsystem answer — instead of an invented positional claim. Installing the
+/// provider still matters: without one the native fails explicitly and suspends the speaking
+/// actor, so the intro line would never play.
+impl WavePosition for LibraryVoiceDuration {
+    fn has_position(&self, _sound_name: &str) -> Option<bool> {
+        None
     }
 }
 

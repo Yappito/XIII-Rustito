@@ -257,6 +257,18 @@ impl PlayerSim {
         ]
     }
 
+    /// The pawn `EyeHeight` the engine maintains for the current collision box (item54
+    /// hypothesis: 0.8 x half-height — the standing default measures 60 = 0.8 x 75; crouched
+    /// 0.8 x 48 = 38.4). The host sim owns the crouch state, so it publishes this each tick.
+    pub fn vm_eye_height(&self, params: &PlayerParams) -> f32 {
+        let half = if self.crouched {
+            params.crouch_height_uu
+        } else {
+            params.height_uu
+        };
+        half * 0.8
+    }
+
     /// Movement-mode state name (`"walking"`, `"crouched"`, `"falling"`, `"swimming"`,
     /// `"ladder"`), for the overlay and trace.
     pub fn state(&self) -> &'static str {

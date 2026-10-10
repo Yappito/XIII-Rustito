@@ -59,7 +59,7 @@ pub use vm::{
     NativeProfile, SpineControl, TraceEvent, TraceKind, VideoPlayerHost, VideoTiming, Vm, VmError,
     VmErrorKind, VmLimits,
 };
-pub use voice::{FixedVoiceDuration, VoiceDuration};
+pub use voice::{FixedVoiceDuration, FixedWavePosition, VoiceDuration, WavePosition};
 
 #[cfg(test)]
 mod tests;

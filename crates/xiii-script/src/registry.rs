@@ -1099,6 +1099,41 @@ fn radius_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Na
     ))
 }
 
+/// `Actor.VisibleDamageableActors` (item48): the iterator `Actor.HurtRadius` (engine.u) drives
+/// when a scripted explosive blows up. See [`Vm::visible_damageable_actors`] for the decoded
+/// retail shape and the documented gaps.
+fn visible_damageable_actors(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let base = match object(vm, a, 0)? {
+        Some(ObjRef::Static(g)) => Some(g),
+        None => None,
+        Some(ObjRef::Instance(_)) | Some(ObjRef::External(_)) => {
+            return Err(vm.err(VmErrorKind::Other(
+                "VisibleDamageableActors base class is an instance".into(),
+            )));
+        }
+    };
+    let radius = float(vm, a, 2)?;
+    let loc = if c.omitted(3) {
+        vm.vector_prop(c.this, "Location").unwrap_or([0.0; 3])
+    } else {
+        vector2(vm, a, 3)?
+    };
+    // `Actor.HurtRadius` calls it with four arguments, so `bIgnoreHidden` is optional.
+    let ignore_hidden = !c.omitted(4) && boolean(vm, a, 4)?;
+    let items: Vec<Value> = vm
+        .visible_damageable_actors(base, radius, loc, ignore_hidden)?
+        .into_iter()
+        .map(|i| Value::Object(Some(ObjRef::Instance(i))))
+        .collect();
+    Ok(NativeOutcome::Iterate(
+        items.into_iter().map(|v| vec![v]).collect(),
+    ))
+}
+
 fn eq_ss(vm: &mut Vm<'_>, _: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     // UE2 string == is case-insensitive.
     val(Value::Bool(
@@ -1290,6 +1325,20 @@ fn find_best_path_toward(
     };
     let goal = vm.vector_prop(target, "Location").unwrap_or([0.0; 3]);
     let first = vm.nav_find_path_to(c.this, goal)?;
+    // XIDPawn.dll 0x11901bd9..0x11901bf7: the successful search publishes its
+    // first node and location, exactly as FindBestPathTo does. RouteCache alone
+    // is insufficient: AttaqueH2H uses MoveTarget to reach its movement latent.
+    if let Some(first) = first {
+        vm.set_property(
+            c.this,
+            "MoveTarget",
+            0,
+            Value::Object(Some(ObjRef::Instance(first))),
+        );
+        if let Some(location) = vm.vector_prop(first, "Location") {
+            vm.set_property(c.this, "Destination", 0, Value::Vector(location));
+        }
+    }
     val(Value::Bool(first.is_some()))
 }
 
@@ -1516,6 +1565,38 @@ fn finish_rotation(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult
         started: vm.time_now(),
     });
     val(Value::Void)
+}
+
+/// Engine.dll 0x10367b30: arm poll 528 only for a falling possessed pawn.
+fn wait_for_landing(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    if !c.in_state_code {
+        return Err(vm.err(VmErrorKind::LatentOutsideState {
+            path: c.path.clone(),
+        }));
+    }
+    if vm
+        .obj_prop(c.this, "Pawn")
+        .is_some_and(|p| vm.byte_prop(p, "Physics") == 2)
+    {
+        vm.pending_latent = Some(Latent::Landing {
+            remaining: 4.0,
+            started: vm.time_now(),
+        });
+    }
+    val(Value::Void)
+}
+
+/// Core.dll 0x1011c170: yaw is drawn before pitch; roll optionally consumes a third draw.
+fn rot_rand(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let roll = !c.omitted(0) && boolean(vm, a, 0)?;
+    let yaw = ((vm.next_random() << 1) % 65535) as i32;
+    let pitch = ((vm.next_random() << 1) % 65535) as i32;
+    let roll = if roll {
+        ((vm.next_random() << 1) % 65535) as i32
+    } else {
+        0
+    };
+    val(Value::Rotator([pitch, yaw, roll]))
 }
 
 /// `IAController.AllianceLevel(Pawn Newenemy) -> int`.
@@ -1760,29 +1841,10 @@ fn level_info_dec_attaque(
 
 /// `IAController.DirectionDuTir() -> vector`.
 ///
-/// Disassembly evidence (XIDPawn.dll `?execDirectionDuTir@AIAController` RVA 0x2070): with no pawn
-/// it returns `vect(0,0,0)`; otherwise it builds the shooting direction from the pawn's rotation
-/// and `Enemy`. The model here is the unit vector from the pawn to `Enemy.Location`, falling back
-/// to the pawn's forward axis when there is no enemy (documented `Partial`: dispersion and the
-/// aim offset are not reproduced).
+/// XIDPawn.dll 0x11902070: returns a world-space aim POINT, also refreshing WeaponStartTrace.
+/// AdjustAim subtracts its projStart; a normalized direction here aims toward the world origin.
 fn direction_du_tir(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let Some(pawn) = vm.obj_prop(c.this, "Pawn") else {
-        return val(Value::Vector([0.0; 3]));
-    };
-    if let Some(enemy) = vm.obj_prop(c.this, "Enemy") {
-        let l = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
-        let e = vm.vector_prop(enemy, "Location").unwrap_or(l);
-        let d = [e[0] - l[0], e[1] - l[1], e[2] - l[2]];
-        let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        if n > 1e-6 {
-            return val(Value::Vector([d[0] / n, d[1] / n, d[2] / n]));
-        }
-    }
-    let rot = match vm.get_property(pawn, "Rotation") {
-        Some(Value::Rotator(r)) => *r,
-        _ => [0; 3],
-    };
-    val(Value::Vector(rotator_basis(rot).0))
+    val(Value::Vector(vm.ai_aim_point(c.this)?))
 }
 
 /// `IAController.LigneVisee(vector TraceEnd, vector TraceStart) -> bool`.
@@ -2054,8 +2116,19 @@ fn actor_trace(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nati
     if !vm.physics_ready("Actor.Trace", Some(277), c.this, Value::Object(None))? {
         return val(Value::Object(None));
     }
+    // Engine.dll execTrace 0x103e8ac7: (bTraceActors ? 0xBF : 0x86) | extra.
+    // AdditionalTraceType is additive, so it can admit pawns even with bTraceActors=false.
+    let additional = if a.len() <= 7 || c.omitted(7) {
+        0
+    } else {
+        int(vm, a, 7)? as u32
+    };
+    // execTrace always has a material destination (a local temporary even if omitted),
+    // and therefore requests material data with 0x1000 at 0x103e8b28.
+    let flags = (if b_trace_actors { 0xbf } else { 0x86 }) | 0x1000 | additional;
     let (hit_actor, hit_location, hit_normal) =
-        vm.vm_trace(c.this, start, end, b_trace_actors, extent)?;
+        vm.vm_script_trace(c.this, start, end, flags, extent)?;
+    // FCheckResult is initialized with zero Location/Normal. A miss does not return TraceEnd.
     a[0] = Value::Vector(hit_location);
     a[1] = Value::Vector(hit_normal);
     if a.len() > 6 && !c.omitted(6) {
@@ -2172,12 +2245,13 @@ fn actor_touching_actors(
             )));
         }
     };
-    let items: Vec<Value> = vm
-        .touching_list(c.this)
-        .into_iter()
-        .filter(|id| base.is_none_or(|b| vm.objects[*id as usize].layout.chain.contains(&b)))
-        .map(|i| Value::Object(Some(ObjRef::Instance(i))))
-        .collect();
+    let mut cursor = 0;
+    let mut items = Vec::new();
+    while let Some(actor) = vm.next_touching_actor(c.this, base, &mut cursor) {
+        items.push(Value::Object(Some(ObjRef::Instance(actor))));
+    }
+    // The native-facing snapshot supplies diagnostics/direct callers. Script foreach
+    // installs a live Touching cursor in native_from_tokens and re-reads on every Next.
     Ok(NativeOutcome::Iterate(
         items.into_iter().map(|v| vec![v]).collect(),
     ))
@@ -2222,8 +2296,16 @@ fn play_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Native
         return val(Value::Void);
     }
     let seq = name(vm, a, 0)?;
-    let rate = if c.omitted(1) { 0.0 } else { float(vm, a, 1)? };
+    let rate = if c.omitted(1) { 1.0 } else { float(vm, a, 1)? };
     let tween = if c.omitted(2) { 0.0 } else { float(vm, a, 2)? };
+    let requested_channel = if c.omitted(3) { 0 } else { int(vm, a, 3)? };
+    // ValidateAnimChannel accepts 0..=256 (0x103ecbc5); invalid stages log/no-op.
+    if !(0..=256).contains(&requested_channel) {
+        vm.note(TraceKind::Note(format!(
+            "Actor.PlayAnim: invalid channel {requested_channel}; playback unchanged"
+        )));
+        return val(Value::Void);
+    }
     let ch = channel(vm, a, 3, c.omitted(3))?;
     vm.start_animation(c.this, &seq, rate, tween, ch, false)?;
     val(Value::Void)
@@ -2234,7 +2316,7 @@ fn loop_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Native
         return val(Value::Void);
     }
     let seq = name(vm, a, 0)?;
-    let rate = if c.omitted(1) { 0.0 } else { float(vm, a, 1)? };
+    let rate = if c.omitted(1) { 1.0 } else { float(vm, a, 1)? };
     let tween = if c.omitted(2) { 0.0 } else { float(vm, a, 2)? };
     let ch = channel(vm, a, 3, c.omitted(3))?;
     vm.start_animation(c.this, &seq, rate, tween, ch, true)?;
@@ -2435,15 +2517,23 @@ fn play_firing_sound(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResul
     val(Value::Void)
 }
 
-/// item14 `Pawn.EyePosition`: the eye offset from the pawn `Location` (UE2 applies crouch/view
-/// height; the VM returns `EyeHeight` along +Z, falling back to `BaseEyeHeight`). Needed by
-/// `XIIIWeapon.RealTraceFire`'s trace start.
+/// Engine.dll execEyePosition 0x103b0410 reads only EyeHeight (+0x290).
+/// View-height interpolation belongs to the pawn update, not this getter.
 fn pawn_eye_position(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let h = match vm.get_property(c.this, "EyeHeight") {
-        Some(Value::Float(f)) => *f,
-        _ => vm.f32_prop(c.this, "BaseEyeHeight"),
-    };
-    val(Value::Vector([0.0, 0.0, h]))
+    val(Value::Vector([0.0, 0.0, vm.f32_prop(c.this, "EyeHeight")]))
+}
+
+/// XIDPawn.dll 0x119012b0 returns +0x28c (BaseEyeHeight), not +0x290 (EyeHeight).
+fn soldier_eye_position(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    _a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    val(Value::Vector([
+        0.0,
+        0.0,
+        vm.f32_prop(c.this, "BaseEyeHeight"),
+    ]))
 }
 
 /// item14 `Pawn.GetViewRotation`: the rotation the pawn looks along. UE2 returns the controller's
@@ -2468,22 +2558,59 @@ fn pawn_get_view_rotation(
     val(Value::Rotator(rot))
 }
 
-/// item14 `Weapon.GetFireStart`: the muzzle position for the hitscan. The VM returns the
-/// instigator's eye (Location + `EyePosition`); the decoded muzzle offsets are not applied.
+/// Engine.dll 0x10386ea0: resolve a Pawn Owner when Instigator is null; add EyeHeight and
+/// FireOffset in the supplied view axes. Zoom uses only FireOffset.X.
 fn weapon_get_fire_start(
     vm: &mut Vm<'_>,
     c: &NativeCtx,
-    _a: &mut [Value],
+    a: &mut [Value],
 ) -> VmResult<NativeOutcome> {
-    let Some(pawn) = vm.obj_prop(c.this, "Instigator") else {
+    let pawn = vm
+        .obj_prop(c.this, "Instigator")
+        .or_else(|| vm.obj_prop(c.this, "Owner").filter(|p| vm.is_a(*p, "Pawn")));
+    let Some(pawn) = pawn else {
         return val(Value::Vector([0.0; 3]));
     };
+    vm.set_property(
+        c.this,
+        "Instigator",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
     let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
-    let eye = match vm.get_property(pawn, "EyeHeight") {
-        Some(Value::Float(f)) => *f,
-        _ => vm.f32_prop(pawn, "BaseEyeHeight"),
-    };
-    val(Value::Vector([loc[0], loc[1], loc[2] + eye]))
+    let eye = vm.f32_prop(pawn, "EyeHeight");
+    let axes = [vector2(vm, a, 0)?, vector2(vm, a, 1)?, vector2(vm, a, 2)?];
+    let mut offset = vm.vector_prop(c.this, "FireOffset").unwrap_or([0.0; 3]);
+    if vm.bool_prop(c.this, "bZoomed") {
+        offset[1] = 0.0;
+        offset[2] = 0.0;
+    }
+    let mut start = [loc[0], loc[1], loc[2] + eye];
+    for axis in 0..3 {
+        for (component, value) in start.iter_mut().enumerate() {
+            *value += axes[axis][component] * offset[axis];
+        }
+    }
+    val(Value::Vector(start))
+}
+
+/// Xiii.dll 0x11b01000: detach(true), grow without clamping, reattach, strict double threshold.
+fn grow_blood_flow(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let dt = float(vm, a, 0)?;
+    let actor = vm.objects[c.this as usize].name.clone();
+    vm.emit_event(PresentationEvent::ProjectorDetach {
+        actor: actor.clone(),
+        force: true,
+        time: vm.time,
+    });
+    let scale =
+        (f64::from(vm.f32_prop(c.this, "DrawScale")) + f64::from(dt) * f64::from(0.05_f32)) as f32;
+    vm.set_property(c.this, "DrawScale", 0, Value::Float(scale));
+    vm.emit_event(PresentationEvent::ProjectorAttach {
+        actor,
+        time: vm.time,
+    });
+    val(Value::Bool(f64::from(scale) > 0.35))
 }
 
 /// item14 `Pawn.CalcDrawOffset`: the first-person draw offset of an inventory item. The VM
@@ -2798,8 +2925,13 @@ fn calc_first_person_view(
 /// The snap exists only for the crosshair display: the script consumer
 /// (`xiii.XIIIPlayerInteraction.MyPCPostRender` 0x032D) feeds the returned rotator into the
 /// crosshair ray (`FiringTargHitLoc`) and `AmmoType.WarnTarget` — the un-snapped view rotation is
-/// the faithful unsnapped value there. Partial: no aim-assist snap decode (the ~0x800-byte target
-/// loop is presentation-only in the headless VM).
+/// the faithful unsnapped value there. Partial (item48 measurement): no aim-assist snap decode —
+/// the ~0x800-byte target loop is gated on engine-internal cooldown timers (+0x3ac/+0x3b0) and an
+/// anonymous ammunition bit (+0x270 bit 0x10), scans an anonymous LevelInfo list (0x454/0x4cc,
+/// 5-slot candidate arrays, cone-dot thresholds cos 0.96/0.98/0.99003/0.99456 measured at
+/// 0x1036e6f8-0x1036e729, trace flags 0x97 over max(anonymous float, 3000.0)) and is
+/// presentation-only in the headless VM; all offsets are native C++ fields the script reflection
+/// cannot name.
 fn adjust_aim_for_display(
     vm: &mut Vm<'_>,
     c: &NativeCtx,
@@ -2848,6 +2980,51 @@ fn set_injured_effect(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResu
         delay,
         time,
     });
+    val(Value::Void)
+}
+
+/// Engine.dll 0x103e1790 forwards these values to the render interface, not gameplay state.
+fn set_poison_effect(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let new_state = if c.omitted(0) {
+        false
+    } else {
+        boolean(vm, a, 0)?
+    };
+    let delay = if c.omitted(1) { 0.0 } else { float(vm, a, 1)? };
+    let max_intensity = if c.omitted(2) { 1.0 } else { float(vm, a, 2)? };
+    let mut hue = [40, 88, 40, 255]; // RGBA; retail FColor initialization is BGRA.
+    if !c.omitted(3) {
+        let Some(Value::Struct(fields)) = a.get(3) else {
+            return Err(vm.err(VmErrorKind::UnsupportedValue {
+                desc: "SetPoisonEffect Hue must be a Color struct".into(),
+            }));
+        };
+        for (i, name) in ["r", "g", "b", "a"].iter().enumerate() {
+            let Some(Value::Int(value)) = fields
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v)
+            else {
+                return Err(vm.err(VmErrorKind::UnsupportedValue {
+                    desc: format!("SetPoisonEffect Hue missing byte {name}"),
+                }));
+            };
+            hue[i] = u8::try_from(*value).map_err(|_| {
+                vm.err(VmErrorKind::UnsupportedValue {
+                    desc: format!("SetPoisonEffect Hue {name} outside byte range"),
+                })
+            })?;
+        }
+    }
+    vm.emit_event(PresentationEvent::SetPoisonEffect {
+        actor: vm.objects[c.this as usize].name.clone(),
+        new_state,
+        delay,
+        max_intensity,
+        hue,
+        time: vm.time,
+    });
+    vm.note(TraceKind::Note("SetPoisonEffect: decoded render-interface request queued; poison pixel effect is unimplemented (Partial)".into()));
     val(Value::Void)
 }
 
@@ -3074,6 +3251,24 @@ fn attach_to_bone(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<N
     {
         vm.set_property(id, "AttachmentBone", 0, Value::Name(n.clone()));
     }
+    val(Value::Bool(true))
+}
+
+fn detach_from_bone(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    // UE2 `AActor::DetachFromBone(AActor* Attachment)`: the counterpart of AttachToBone — the
+    // attachment stops being based on this actor and returns to world space. The VM clears the
+    // recorded Base/AttachmentBone link; the world transform the engine recomputes from the bone
+    // is not evaluated (no skeletal transforms headless), which is safe for the campaign flows
+    // that call it: `xidmaps.CineMalletteSM.Trigger` 0x00E3..0x0148 sets Location/Rotation
+    // explicitly right after every detach.
+    let Some(ObjRef::Instance(id)) = object(vm, a, 0)? else {
+        return val(Value::Bool(false));
+    };
+    if vm.obj_prop(id, "Base") != Some(c.this) {
+        return val(Value::Bool(false));
+    }
+    vm.set_property(id, "Base", 0, Value::Object(None));
+    vm.set_property(id, "AttachmentBone", 0, Value::Name("None".to_owned()));
     val(Value::Bool(true))
 }
 
@@ -4105,28 +4300,18 @@ fn builtin_defs() -> Vec<NativeDef> {
             "UE2: component-wise scale; Core.dll operator thunk",
             multiply_fv,
         ),
-        NativeDef {
-            status: NativeStatus::Partial(
-                "deterministic seeded PRNG (splitmix64); the engine RNG sequence is not reproduced",
-            ),
-            ..def(
-                "Object.FRand",
-                "native(195) final static function float FRand()",
-                "UE2: pseudo-random float in [0,1); Core.dll ?execFRand@UObject",
-                f_rand,
-            )
-        },
-        NativeDef {
-            status: NativeStatus::Partial(
-                "deterministic seeded PRNG (splitmix64); the engine RNG sequence is not reproduced",
-            ),
-            ..def(
-                "Object.Rand",
-                "native(167) final static function int Rand(int Max)",
-                "UE2: pseudo-random int in [0,Max); Core.dll ?execRand@UObject",
-                rand_i,
-            )
-        },
+        def(
+            "Object.FRand",
+            "native(195) final static function float FRand()",
+            "Core.dll execFRand 0x1011a950 -> appFrand 0x1010ffd0: MSVCR70 rand * float 0x38000100 (inclusive 0..1); CRT rand 0x7c02836d uses 32-bit LCG 214013*s+2531011, bits 16..30",
+            f_rand,
+        ),
+        def(
+            "Object.Rand",
+            "native(167) final static function int Rand(int Max)",
+            "Core.dll execRand 0x101197f0: Max<=0 returns 0 without consuming RNG; otherwise same CRT rand stream modulo Max",
+            rand_i,
+        ),
         def(
             "Engine.Actor.SetRotation",
             "native(299) final function bool SetRotation(rotator NewRotation)",
@@ -4237,6 +4422,27 @@ fn builtin_defs() -> Vec<NativeDef> {
                 "native(310) final iterator function RadiusActors(class<Actor> BaseClass, out Actor Actor, float Radius, optional vector Loc)",
                 "engine.u Actor.RadiusActors decoded (BaseClass, Actor, Radius, Loc); UE1 AActor::execRadiusActors distance test; Engine.dll ?execRadiusActors@AActor",
                 radius_actors,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial(
+                "visibility point is the victim's Location (retail: a mesh/bounds mid-point, 0.5 \
+                 at 0x1046f584); the two unidentified retail class constants (0x105ac8a8, \
+                 0x105a12c8), the anonymous hidden flag at +0x2c bit 0x10 and the second \
+                 higher-trace point (+0x290) are not reproduced; the line check is world-only \
+                 (retail flags 0x86 can also be blocked by actors); hidden test uses bHidden",
+            ),
+            ..def(
+                "Engine.Actor.VisibleDamageableActors",
+                "native(0) final iterator function VisibleDamageableActors(class<Actor> \
+                 BaseClass, out Actor Actor, float Radius, struct<Vector> Loc, optional bool \
+                 bIgnoreHidden)",
+                "engine.u Actor.VisibleDamageableActors decoded (BaseClass, Actor, Radius, Loc, \
+                 bIgnoreHidden); Actor.HurtRadius calls it as foreach \
+                 VisibleDamageableActors(class'Actor', Victims, DamageRadius, HitLocation); \
+                 Engine.dll ?execVisibleDamageableActors@AActor 0x103e90a0 (level-hash radius \
+                 query, BaseClass/hidden filters, SingleLineCheck flags 0x86)",
+                visible_damageable_actors,
             )
         },
         def(
@@ -4527,6 +4733,17 @@ fn builtin_defs() -> Vec<NativeDef> {
         },
         NativeDef {
             status: NativeStatus::Partial(
+                "the bone-space world transform the engine restores on detach is not evaluated headless; callers set Location/Rotation explicitly (xidmaps.CineMalletteSM.Trigger 0x00E3..0x0148)",
+            ),
+            ..def(
+                "Engine.Actor.DetachFromBone",
+                "native(403) final static function bool DetachFromBone(object<Actor> Attachment)",
+                "engine.u Actor.DetachFromBone decoded (Attachment, bool); clears the attachment's Base/AttachmentBone when it is based on self, false otherwise",
+                detach_from_bone,
+            )
+        },
+        NativeDef {
+            status: NativeStatus::Partial(
                 "advances alpha in seconds and preserves subtree; zero/negative intervals and invalid stages still need original-engine validation",
             ),
             ..def(
@@ -4549,23 +4766,23 @@ fn builtin_defs() -> Vec<NativeDef> {
         },
         NativeDef {
             status: NativeStatus::Partial(
-                "world placement via provider point_free (only when bCollideWorld||bCollideWhenPlacing) and a blocking-actor cylinder encroachment refusal; no FindSpot search; touch updates unconditional (upstream gates them on Level.bBegunPlay)",
+                "decoded static/movable refusal, bJustTeleported and base detach; world placement still uses point_free instead of FindSpot/CheckSlice; CheckEncroachment uses cylinder refusal without retail mesh push/EncroachingOn callbacks; based actors and zone/leaf updates remain incomplete",
             ),
             ..def(
                 "Engine.Actor.SetLocation",
                 "native(267) final function bool SetLocation(vector NewLocation)",
-                "engine.u Actor.SetLocation decoded (NewLocation, bool); UE1/UE2 AActor::SetLocation via CheckLocation plus touch updates (SurrealEngine UActor::SetLocation); Engine.dll ?execSetLocation@AActor",
+                "Engine.dll execSetLocation 0x103e4ad0 calls FarMoveActor 0x1038a440 with test/no-check/attached all false; flags, detach and location stores decoded in item63",
                 actor_set_location,
             )
         },
         NativeDef {
             status: NativeStatus::Partial(
-                "actor hits use ray-vs-grown-cylinder, owned actors are skipped; Material out-param is None and DiscardedHitMask 0 (no material/hit-mask model); AdditionalTraceType and mover brush geometry are not modelled; world hits return the map LevelInfo (upstream)",
+                "decoded defaults, 0x1000 material request, zero miss outputs and AdditionalTraceType composition; Material remains None and DiscardedHitMask 0 (provider lacks material/discard data); grown-cylinder extents, special world filtering and skeletal hit-item selection remain incomplete",
             ),
             ..def(
                 "Engine.Actor.Trace",
                 "native(277) final function Actor Trace(out vector HitLocation, out vector HitNormal, vector TraceEnd, optional vector TraceStart, optional bool bTraceActors, optional vector Extent, optional out object<Material> Material, optional int AdditionalTraceType, optional out int DiscardedHitMask)",
-                "engine.u Actor.Trace decoded params; UE1 227 // = Location / = bCollideActors / extent defaults and LevelInfo-for-world-hit (SurrealEngine UActor::Trace / CollisionSystem::TraceFirstHit); Engine.dll ?execTrace@AActor",
+                "Engine.dll execTrace 0x103e88a0..0x103e8c68: initialized FCheckResult, (actors?0xbf:0x86)|0x1000|extra, SingleLineCheck and out stores; skeletal item side effect at 0x103e8bf3",
                 actor_trace,
             )
         },
@@ -4592,17 +4809,12 @@ fn builtin_defs() -> Vec<NativeDef> {
                 actor_set_collision_size,
             )
         },
-        NativeDef {
-            status: NativeStatus::Partial(
-                "iterates the VM-maintained Touching array; XIII's Touching is a dynamic array (decoded ArrayProperty with a template element), unlike UE1/UT's fixed 4-slot engine array",
-            ),
-            ..def(
-                "Engine.Actor.TouchingActors",
-                "native(307) final iterator function TouchingActors(class<Actor> BaseClass, out Actor Actor)",
-                "engine.u Actor.TouchingActors decoded; UE1 227 'returns all actors touching the current actor'; Engine.dll ?execTouchingActors@AActor",
-                actor_touching_actors,
-            )
-        },
+        def(
+            "Engine.Actor.TouchingActors",
+            "native(307) final iterator function TouchingActors(class<Actor> BaseClass, out Actor Actor)",
+            "Engine.dll execTouchingActors 0x103e65d0..0x103e674d: live +0xb4 array cursor, null BaseClass=Actor, null/IsA filtering (no deletion filter), out cleared before each yield/exhaustion; VM foreach preserves mutation semantics",
+            actor_touching_actors,
+        ),
         def(
             "Engine.Pawn.AddPawnToList",
             "native(0) final native function AddPawnToList()",
@@ -4676,7 +4888,7 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "authored rate multiplier, last-frame completion, frozen-source tween and CPU channel sampling; velocity-dependent negative rates, automatic TweenTime and callback reentrancy remain unimplemented",
+                "decoded nonloop negative-rate no-op, explicit zero hold, empty-sequence no-op, zero-frame refusal and invalid-channel no-op; positive authored rate and last-frame completion supported; valid channel 256 exceeds VM u8 channel storage; automatic TweenTime=-1 cache/velocity branches, one-frame tween state, vertex-mesh playback and callback reentrancy remain incomplete",
         ),
         ..def(
             "Engine.Actor.PlayAnim",
@@ -4726,6 +4938,18 @@ fn builtin_defs() -> Vec<NativeDef> {
         finish_anim,
     ));
     v.push(def(
+        "Engine.Controller.WaitForLanding",
+        "native(527) final latent function WaitForLanding()",
+        "Engine.dll execWaitForLanding 0x10367b30 arms poll 528 for Pawn Physics=2; execPollWaitForLanding 0x10369a50 resumes only with non-null non-falling Pawn, otherwise counts down 4s and sends LongFall each poll below zero",
+        wait_for_landing,
+    ));
+    v.push(def(
+        "Object.RotRand",
+        "native(320) final static function rotator RotRand(optional bool bRoll)",
+        "Core.dll execRotRand 0x1011c170: appRand yaw then pitch, (draw<<1)%65535; optional roll consumes third appRand, default false; uses shared CRT random stream",
+        rot_rand,
+    ));
+    v.push(def(
         "Engine.PlayerController.SetViewTarget",
         "native(513) final function SetViewTarget(object<Actor> NewViewTarget)",
         "engine.u PlayerController.SetViewTarget decoded (NewViewTarget); sets ViewTarget (no camera/rendering)",
@@ -4763,6 +4987,15 @@ fn builtin_defs() -> Vec<NativeDef> {
         "engine.u LevelInfo.SetInjuredEffect decoded (bool, float, void); emits PresentationEvent::SetInjuredEffect",
         set_injured_effect,
     ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial("decoded render-interface request including defaults; poison pixel effect has no renderer implementation"),
+        ..def(
+            "Engine.LevelInfo.SetPoisonEffect",
+            "native(0) simulated function SetPoisonEffect(bool NewState, float Delay, float MaxIntensity, struct<Color> Hue)",
+            "engine.u LevelInfo.SetPoisonEffect @244253..244266; Engine.dll execSetPoisonEffect 0x103e1790 forwards to current render interface +0xa0; native defaults false,0,1,RGBA(40,88,40,255); queues typed presentation event with visible Partial diagnostic",
+            set_poison_effect,
+        )
+    });
     v.push(def(
         "Engine.Projector.AttachProjector",
         "native(0) final function AttachProjector()",
@@ -5064,14 +5297,13 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "unit vector from the pawn to Enemy.Location (pawn forward fallback); dispersion/aim \
-             offset not reproduced",
+            "world-space sampled target, firing origin, skill offsets and decoded rejection-sampled angular cone; projectile-speed/base-velocity lead branches remain approximate",
         ),
         ..def(
             "IAController.DirectionDuTir",
             "native(0) function vector DirectionDuTir()",
             "XIDPawn.dll ?execDirectionDuTir@AIAController RVA 0x2070; IAController.NotifyFiring \
-             stores it in DirectionTir",
+             stores the world-space target in DirectionTir; 0x1190223a refreshes WeaponStartTrace",
             direction_du_tir,
         )
     });
@@ -5342,48 +5574,42 @@ fn builtin_defs() -> Vec<NativeDef> {
             ia_controller_set_enemy,
         )
     });
-    v.push(NativeDef {
-        status: NativeStatus::Partial(
-            "returns EyeHeight/BaseEyeHeight along +Z; crouch and view-height interpolation are \
-             not modelled",
-        ),
-        ..def(
-            "Engine.Pawn.EyePosition",
-            "native(0) native function Vector EyePosition()",
-            "engine.u Pawn.EyePosition decoded (return Vector, native); XIIIPawn overrides it; \
+    v.push(def(
+        "Engine.Pawn.EyePosition",
+        "native(0) native function Vector EyePosition()",
+        "engine.u Pawn.EyePosition decoded (return Vector, native); XIIIPawn overrides it; \
              XIIIWeapon.RealTraceFire adds it to Instigator.Location for the trace start; \
-             Engine.dll ?execEyePosition@APawn",
-            pawn_eye_position,
-        )
-    });
-    v.push(NativeDef {
-        status: NativeStatus::Partial(
-            "returns the controller's Rotation when set, else the pawn's Rotation; the native's \
-             cloud/rotation blending is not modelled",
-        ),
-        ..def(
-            "Engine.Pawn.GetViewRotation",
-            "native(0) simulated native function Rotator GetViewRotation()",
-            "engine.u Pawn.GetViewRotation decoded (return Rotator, native); \
+              Engine.dll execEyePosition 0x103b0410..0x103b0492 reads EyeHeight +0x290 only",
+        pawn_eye_position,
+    ));
+    v.push(def(
+        "Engine.Pawn.GetViewRotation",
+        "native(0) simulated native function Rotator GetViewRotation()",
+        "engine.u Pawn.GetViewRotation decoded (return Rotator, native); \
              XIIIWeapon.RealTraceFire passes it to Object.GetAxes; Engine.dll \
-             ?execGetViewRotation@APawn",
-            pawn_get_view_rotation,
-        )
-    });
-    v.push(NativeDef {
-        status: NativeStatus::Partial(
-            "returns the instigator's eye (Location + EyePosition); the decoded muzzle offset is \
-             not applied",
-        ),
-        ..def(
+              ?execGetViewRotation@APawn 0x103afb90: Controller.Rotation else Pawn.Rotation",
+        pawn_get_view_rotation,
+    ));
+    v.push(def(
             "Engine.Weapon.GetFireStart",
             "native(0) native function Vector GetFireStart(Vector X, Vector Y, Vector Z)",
             "engine.u Weapon.GetFireStart decoded (X,Y,Z, return Vector, native); \
              XIIIWeapon.RealTraceFire uses it as StartTrace for WHand != 0/4; Engine.dll \
-             ?execGetFireStart@AWeapon",
+              ?execGetFireStart@AWeapon 0x10386ea0: Owner Pawn fallback, EyeHeight, rotated FireOffset; zoom X only",
             weapon_get_fire_start,
-        )
-    });
+    ));
+    v.push(def(
+        "BaseSoldier.EyePosition",
+        "native(0) function Vector EyePosition()",
+        "XIDPawn.dll execEyePosition 0x119012b0 returns (0,0,BaseEyeHeight) at +0x28c",
+        soldier_eye_position,
+    ));
+    v.push(def(
+        "BloodFlow.GrowBloodFlow",
+        "native(604) final native static function bool GrowBloodFlow(float dt)",
+        "Xiii.dll execGrowBloodFlow 0x11b01000: Detach(1), DrawScale += dt*0.05f, Attach, return DrawScale > 0.35 (double)",
+        grow_blood_flow,
+    ));
     v.push(NativeDef {
         status: NativeStatus::Partial(
             "returns Inv.PlayerViewOffset; the engine combines it with the mesh eye offset and \
@@ -5518,13 +5744,18 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
-            "no renderer: returns the un-snapped SmoothedAim(Rotation) (the aim-assist target-scan \
-             is crosshair display only); the returned rotator is the controller view rotation",
+            "no snap decode: the aim-assist target scan is gated on engine-internal smoothed-aim \
+             cooldown timers (+0x3ac/+0x3b0, written only by the engine's input/display path) and \
+             an anonymous ammunition property bit (byte +0x270 bit 0x10); the target loop keeps \
+             up to 5 candidates by aim-cone dot thresholds (measured cos 0.96/0.98/0.99003/0.99456) \
+             over an anonymous LevelInfo list with anonymous field offsets the script reflection \
+             cannot name. A VM snap would be invented behaviour; the no-snap path is measured to \
+             return SmoothedAim(un-snapped view rotation), which is what this returns",
         ),
         ..def(
             "PlayerController.AdjustAimForDisplay",
             "native(498) final native static function Rotator AdjustAimForDisplay(object<Ammunition> FiredAmmunition, struct<Vector> projStart)",
-            "Engine.dll execAdjustAimForDisplay 0x1036e2e0 decoded (native 498, registration thunk 0x1051aac8); every epilogue returns SmoothedAim(0x1036c720) of the rotation, snap path gated on a scan cooldown + ammunition+0x270 bit 0x10; consumer XIIIPlayerInteraction.MyPCPostRender 0x032D (crosshair ray + WarnTarget)",
+            "Engine.dll execAdjustAimForDisplay 0x1036e2e0 decoded (native 498, registration thunk 0x1051aac8); every epilogue returns SmoothedAim(0x1036c720) of the rotation; the snap path (item48 measurement) traces flags 0x97 over max(anonymous float, 3000.0) along the view axes, scans the LevelInfo+0x454 actor list (5-slot candidate arrays, SingleLineCheck filters) and picks by cone dot thresholds; consumer XIIIPlayerInteraction.MyPCPostRender 0x032D (crosshair ray + WarnTarget)",
             adjust_aim_for_display,
         )
     });

@@ -191,6 +191,9 @@ pub fn run_touch_chain_with_providers(
             "diagnostic animation (every sequence has {frames} frames at {rate} fps), not the mesh"
         )));
     }
+    // This tool deliberately executes a selected subset of the map. Keep that diagnostic
+    // policy separate from the VM's normal engine-compatible direct-call dispatch.
+    vm.set_diagnostic_call_scope(true);
     let actors = vm
         .load_level(map, &Limits::default())
         .map_err(|e| e.to_string())?;

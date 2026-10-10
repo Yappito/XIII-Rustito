@@ -973,7 +973,7 @@ fn bsp_point_text(m: &model::Model, p: [f32; 3]) -> String {
 
 fn box_probe_cmd(args: &[String]) -> ExitCode {
     use xiii_decode::common::{UNREAL_UNITS_PER_METER, to_bevy_position};
-    let a = match parse_args(args, &["game-dir", "from", "to", "half", "samples"]) {
+    let a = match parse_args(args, &["game-dir", "from", "to", "half", "samples", "soup"]) {
         Ok(a) => a,
         Err(e) => return usage_error(&e),
     };
@@ -1003,7 +1003,13 @@ fn box_probe_cmd(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let world = xiii_collision::CollisionWorld::new(scene.box_collision());
+    let soup = a.options.get("soup").map(String::as_str) == Some("line");
+    let entries: Vec<([[f32; 3]; 3], u32)> = if soup {
+        scene.line_collision().collect()
+    } else {
+        scene.box_collision().collect()
+    };
+    let world = xiii_collision::CollisionWorld::new(entries);
     let s_m = 1.0 / UNREAL_UNITS_PER_METER;
     // Unreal (r, r, h) -> Bevy (y, z, x) axes.
     let half_b = [half[0] * s_m, half[1] * s_m, half[0] * s_m];

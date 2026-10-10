@@ -133,6 +133,10 @@ pub struct PlayerVMModes {
     pub landed_velocity_z: Option<f32>,
     /// Floor normal (Unreal axes) for the `Landed(HitNormal)` argument.
     pub floor_normal: [f32; 3],
+    /// The pawn `EyeHeight` the engine maintains for the current collision box (item54:
+    /// hypothesis 0.8 x half-height — the measured standing 60 matches 0.8 x 75; crouch lowers
+    /// it to 0.8 x 48). The crosshair traces (`MyPCPostRender` StartTrace) read it.
+    pub eye_height: f32,
 }
 
 impl Default for PlayerVMModes {
@@ -143,6 +147,7 @@ impl Default for PlayerVMModes {
             physics: crate::play::sim::PHYS_WALKING,
             landed_velocity_z: None,
             floor_normal: [0.0, 0.0, 1.0],
+            eye_height: 60.0,
         }
     }
 }
@@ -203,19 +208,25 @@ impl Session {
     /// map actor, runs the level start tolerantly and requires the game's Login/RestartPlayer
     /// chain to create the player pawn and controller.
     pub fn open(game_dir: &Path, map: &str) -> Result<Session, String> {
-        Self::open_inner(game_dir, map, None)
+        Self::open_inner(game_dir, map, None, false)
     }
 
     /// Opens a map as a checkpoint resume, asking its level-start scripts to see the game's
     /// `StartSpotEvent=LOAD` condition before any placed actor's startup callbacks execute.
     pub fn open_checkpoint(game_dir: &Path, map: &str) -> Result<Session, String> {
-        Self::open_inner(game_dir, map, Some("LOAD"))
+        Self::open_inner(game_dir, map, Some("LOAD"), true)
+    }
+
+    /// Login creates the destination pawn; native travel import precedes AcceptInventory.
+    pub(super) fn open_travel(game_dir: &Path, map: &str) -> Result<Session, String> {
+        Self::open_inner(game_dir, map, None, true)
     }
 
     fn open_inner(
         game_dir: &Path,
         map: &str,
         start_event: Option<&str>,
+        defer_inventory: bool,
     ) -> Result<Session, String> {
         let (set, map_idx) = runtime::load_with_map(game_dir, map)?;
         let set: &'static ScriptSet = Box::leak(Box::new(set));
@@ -373,7 +384,7 @@ impl Session {
             // bytecode 0x037A). `Plage00.FirstFrame`'s guard at 0x0013 then skips re-applying
             // the wounded intro Health when it reads "LOAD". Set it here, once, after spawn.
             vm.set_start_spot_event(event);
-        } else if let Some(gi) = game_info {
+        } else if !defer_inventory && let Some(gi) = game_info {
             // Native map-entry inventory setup. The decoded script has no other default-weapon
             // granter on a fresh campaign load: `XIIIGameInfo.RestartPlayer` (xiii.u bytecode
             // 0x0000-0x03B5) omits stock UE2's `AddDefaultInventory` call, and these maps carry
@@ -531,21 +542,6 @@ impl Session {
         self.moved.clear();
         self.script_pawn_sync = None;
         let script_owned_before = self.script_owns_player_pawn();
-        // A cutscene can defer a return-valued inventory callback while it temporarily removes
-        // the player pawn from the VM tick set. Once the game's controller state returns to
-        // PlayerWalking, the pawn is again a live participant: pickup Touch -> GiveTo ->
-        // AddInventory must execute on it rather than being deferred as an out-of-scope event.
-        if self
-            .controller
-            .is_some_and(|pc| self.vm.is_in_state(pc, "PlayerWalking"))
-            && !self.vm.objects[self.player as usize].active
-        {
-            self.vm.set_active(self.player, true);
-            println!(
-                "[play] t={:.3}s restored local player pawn to VM tick scope after cutscene handoff",
-                self.vm.time
-            );
-        }
         // Refresh the posed hit boxes before the VM traces (host `fire` and any script trace in
         // this tick see the current body pose).
         self.update_hit_boxes();
@@ -604,6 +600,11 @@ impl Session {
             let _ =
                 self.vm
                     .set_property(self.player, "bIsCrouched", 0, Value::Bool(modes.crouched));
+            // item54: the engine's pawn physics maintains `EyeHeight` for the current collision
+            // box; the host sim owns the crouch state, so publish it for the crosshair traces.
+            let _ =
+                self.vm
+                    .set_property(self.player, "EyeHeight", 0, Value::Float(modes.eye_height));
             let _ = self.vm.set_property(
                 self.player,
                 "bWantsToCrouch",
@@ -852,17 +853,16 @@ impl Session {
         Ok(())
     }
 
-    /// Host movement ownership is temporarily ceded by the Plage01 wake-up script. While this is
-    /// true, `BeachInBedWithXIII` owns `Location`/`Rotation` and restores collision before it
-    /// returns the controller to PlayerWalking.
+    /// A cinematic owns the player pawn while the controller is in `NoControl`: the bed
+    /// wake-up script (`BeachInBedWithXIII`) and the Toits01 grapple demonstrator
+    /// (`RoofGrapnleDemonstrator.MoveToRightThePlace` writes `PC.Pawn.Velocity`,
+    /// `LookAtJones` writes `PC.Rotation`) drive `Location`/`Rotation`/`Velocity` themselves and
+    /// restore `PlayerWalking` when done (item53). While this holds, the host stops writing the
+    /// pawn fields and follows the VM's pose; the VM's scripted-physics pass integrates the
+    /// script-written `Velocity` (Walking, horizontal).
     fn script_owns_player_pawn(&self) -> bool {
-        self.controller.is_some_and(|pc| {
-            self.vm.is_in_state(pc, "NoControl")
-                && matches!(
-                    self.vm.get_property(self.player, "bCollideWorld"),
-                    Some(Value::Bool(false))
-                )
-        })
+        self.controller
+            .is_some_and(|pc| self.vm.is_in_state(pc, "NoControl"))
     }
 
     /// Script-driven player pose for the host movement sim to follow during the bed wake-up cine.
@@ -1287,11 +1287,6 @@ impl Session {
         }
         let pawn = self.player;
         let controller = self.controller.unwrap_or(pawn);
-        // A user-issued use action is delivered to the local controller and pawn even when an
-        // unrelated deferred call previously suspended either from the VM's tick set. In
-        // particular, the final truck-door trigger broadcasts GameEndedSuccess to the controller.
-        self.vm.set_active(pawn, true);
-        self.vm.set_active(controller, true);
         if self.vm.is_in_state(target, "Locked") {
             let Some(key) = self.carried_key_for(target) else {
                 // No matching key carried: run the door's own `Locked.PlayerTrigger` (plays the
@@ -1325,102 +1320,23 @@ impl Session {
         }
     }
 
-    /// item18: host corpse-search bridge. The engine's `XIIIPlayerController.Grab` reaches
-    /// `SearchPawn(Pawn)` when `MyInteraction.bCanSearchCorpse` (the HUD interaction target); the
-    /// host has no dynamic-pawn targeting, so a named dead pawn is searched through the
-    /// controller's **own** `SearchPawn`, which transfers the corpse's inventory to the player.
-    /// Not a no-op: a non-pawn or live target returns [`UseOutcome::NotAMover`].
-    pub fn search_corpse(&mut self, target_name: &str) -> UseOutcome {
-        let Some(target) = self.vm.find_object(target_name) else {
-            return UseOutcome::NotAMover;
-        };
-        if !self.vm.is_a(target, "pawn") || !self.actor_is_dead(target) {
-            return UseOutcome::NotAMover;
-        }
-        // A player-controlled pawn remains a live participant in the host search action even if
-        // an earlier deferred controller/UI call removed it from the VM's tick set. The real
-        // SearchPawn -> Transfer -> AddInventory chain needs that scope to link the picked-up key.
-        self.vm.set_active(self.player, true);
-        // Collect every item the corpse owns: the `Inventory` chain plus any live `Inventory`
-        // object whose `Instigator` is the corpse. The second set matters because the VM defers a
-        // script call on an out-of-scope actor, so `FirstFrame.GiveSomething -> GiveTo ->
-        // AddInventory` can leave the truck key with `Instigator` set but never linked into the
-        // chain (measured: `XIII.Keys` owns `Instigator=BaseSoldier6` yet the chain is
-        // `Fists -> FistsAmmo`). UE2's `SearchPawn` walks the chain only; the host also picks up
-        // the orphaned owner items, transfers each through its own `Transfer` (which fires
-        // `cleftueur`), and enforces the unlink so the walk always advances.
-        let mut items: Vec<ObjectId> = Vec::new();
-        {
-            let mut cur = target;
-            let mut guard = 0;
-            loop {
-                guard += 1;
-                if guard > 256 {
-                    break;
-                }
-                match self.vm.get_property(cur, "Inventory") {
-                    Some(Value::Object(Some(ObjRef::Instance(n)))) => {
-                        if !items.contains(n) {
-                            items.push(*n);
-                        }
-                        cur = *n;
-                    }
-                    _ => break,
-                }
-            }
-        }
-        for (i, o) in self.vm.objects.iter().enumerate() {
-            let id = i as ObjectId;
-            if o.deleted || id == target || items.contains(&id) {
-                continue;
-            }
-            if !self.vm.is_a(id, "inventory") {
-                continue;
-            }
-            if matches!(
-                self.vm.get_property(id, "Instigator"),
-                Some(Value::Object(Some(ObjRef::Instance(n)))) if *n == target
-            ) {
-                items.push(id);
-            }
-        }
-        for item in items {
-            // Corpse-owned inventory objects can be outside the actor execution scope even though
-            // the dead pawn is searchable. `Transfer` is the game's real pickup chain and must run
-            // on the key so its `GiveTo`/`AddInventory` code can link it to the live player.
-            self.vm.set_active(item, true);
-            if let Some(f) = self.vm.class_function(item, "Transfer") {
-                let arg = Value::Object(Some(ObjRef::Instance(self.player)));
-                if let Err(e) = self.vm.call_function(f, item, vec![arg]) {
-                    return UseOutcome::Error(e.to_string());
-                }
-            }
-            self.vm.unlink_inventory(target, item);
-        }
-        self.drain_events();
-        UseOutcome::CorpseSearched
-    }
-
-    /// Host use action on a named actor: a mover (lock/unlock/open), a dead pawn (search) or a
-    /// deco pickup (grab). See [`Session::use_mover`], [`Session::search_corpse`] and
-    /// [`Session::grab_deco_pickup`].
+    /// Named mover use or aimed Grab. Corpses/pickups use the game's TargetActor and Grab;
+    /// naming an actor cannot supply a target or transfer its inventory.
     pub fn use_target(&mut self, name: &str) -> UseOutcome {
         match self.use_mover(name) {
-            UseOutcome::NotAMover => match self.search_corpse(name) {
-                UseOutcome::NotAMover => self.grab_deco_pickup(name),
-                other => other,
-            },
+            UseOutcome::NotAMover => self.grab_aimed_target(name),
             other => other,
         }
     }
 
-    /// Named deco use validates the target chosen by the game's view trace and then executes
+    /// Named corpse/pickup use validates the target chosen by the game's view trace, then executes
     /// the controller's Grab. Naming an actor never supplies TargetActor or bypasses aiming.
-    pub fn grab_deco_pickup(&mut self, target_name: &str) -> UseOutcome {
+    pub fn grab_aimed_target(&mut self, target_name: &str) -> UseOutcome {
         let Some(target) = self.vm.find_live_object(target_name) else {
             return UseOutcome::NotAMover;
         };
-        if !self.vm.is_a(target, "XIIIDecoPickup") {
+        let corpse = self.vm.is_a(target, "XIIIPawn") && self.actor_is_dead(target);
+        if !corpse && !self.vm.is_a(target, "XIIIDecoPickup") {
             return UseOutcome::NotAMover;
         }
         let Some(controller) = self.controller else {
@@ -1429,15 +1345,24 @@ impl Session {
         let Some(interaction) = instance_prop(&self.vm, controller, "MyInteraction") else {
             return UseOutcome::Error("controller has no MyInteraction".to_owned());
         };
-        if ["Weapon", "PendingWeapon"].iter().any(|slot| {
-            instance_prop(&self.vm, self.player, slot)
-                .is_some_and(|w| self.vm.is_a(w, "DecoWeapon"))
-        }) {
+        if !corpse
+            && ["Weapon", "PendingWeapon"].iter().any(|slot| {
+                instance_prop(&self.vm, self.player, slot)
+                    .is_some_and(|w| self.vm.is_a(w, "DecoWeapon"))
+            })
+        {
             return UseOutcome::DecoAlreadyHeld;
         }
         if instance_prop(&self.vm, interaction, "TargetActor") != Some(target)
             || !matches!(
-                self.vm.get_property(interaction, "bCanPickup"),
+                self.vm.get_property(
+                    interaction,
+                    if corpse {
+                        "bCanSearchCorpse"
+                    } else {
+                        "bCanPickup"
+                    }
+                ),
                 Some(Value::Bool(true))
             )
         {
@@ -1448,7 +1373,9 @@ impl Session {
             return UseOutcome::Error(e.to_string());
         }
         self.drain_events();
-        if self.inventory_items().len() > before.len() {
+        if corpse && instance_prop(&self.vm, target, "Inventory").is_none() {
+            UseOutcome::CorpseSearched
+        } else if self.inventory_items().len() > before.len() {
             UseOutcome::PickedUp
         } else {
             UseOutcome::PickupRefused
@@ -1502,6 +1429,7 @@ impl Session {
     /// The event owns checkpoint cleanup, objective restore, inventory defaults, ammo refresh,
     /// and bringing up the current weapon. Returns the saved checkpoint's Unreal location.
     pub fn restore_checkpoint(&mut self, save: &crate::save::SaveFile) -> Result<[f32; 3], String> {
+        self.begin_travel_accept()?;
         let tag_match = |v: &Value| match v {
             Value::Name(n) | Value::Str(n) => n.eq_ignore_ascii_case(&save.teleporter),
             _ => false,
@@ -1770,13 +1698,41 @@ impl Session {
         let game_info = self
             .game_info
             .ok_or("GameInfo is not available for AcceptInventory")?;
-        self.vm
-            .send_event(
-                game_info,
-                "AcceptInventory",
-                vec![Value::Object(Some(ObjRef::Instance(self.player)))],
-            )
-            .map_err(|e| format!("XIIIGameInfo.AcceptInventory failed: {e}"))?;
+        // SpawnPlayActor reuses Login's Pawn for a Pawn travel record (0x1038d27a), imports
+        // CPF_Travel properties (0x1038d51b), then passes PC.Pawn to AcceptInventory
+        // (0x1038d6b1). Pawn.Health has XIII CPF_Travel=0x10000, so import it here.
+        let health = match self.vm.get_property(self.player, "Health") {
+            Some(Value::Int(_)) => Value::Int(save.health.round() as i32),
+            Some(Value::Float(_)) => Value::Float(save.health),
+            _ => return Err("checkpoint pawn has no numeric Health property".into()),
+        };
+        if !self.vm.set_property(self.player, "Health", 0, health) {
+            return Err("checkpoint pawn Health is not writable".into());
+        }
+        let mut accepted = vec![self.player];
+        let mut cursor = self.inventory_head(self.player);
+        while let Some(id) = cursor {
+            if accepted.contains(&id) || accepted.len() >= 4096 {
+                return Err(
+                    "checkpoint travel inventory contains a cycle or exceeds 4096 actors".into(),
+                );
+            }
+            accepted.push(id);
+            cursor = self.inventory_head(id);
+        }
+        // Actor.Inventory is not CPF_Travel. Native import starts with an unlinked pawn;
+        // Inventory.TravelPreAccept builds its chain through GiveTo. The v2 adapter above
+        // used GiveTo to reconstruct ammo links, so detach that staging chain before the
+        // native callbacks: Ammunition.GiveTo otherwise finds itself and doubles AmmoAmount.
+        for property in ["Inventory", "Weapon", "PendingWeapon"] {
+            if !self
+                .vm
+                .set_property(self.player, property, 0, Value::Object(None))
+            {
+                return Err(format!("checkpoint pawn {property} is not writable"));
+            }
+        }
+        self.finish_travel_accept(game_info, &accepted)?;
         if let Some(path) = &save.selected_weapon {
             let mut weapon = None;
             let mut cursor = self.inventory_head(self.player);
@@ -2101,53 +2057,13 @@ impl Session {
         instance_prop(&self.vm, self.player, "Weapon")
     }
 
-    /// Activates a named parked pawn through its controller's authored `Trigger` event — the same
-    /// event a map's scripted trigger sends. `IAController.faction.BeginState` parks soldiers
-    /// invisible and non-colliding (`SetCollision(false,false,false)`, `SetDrawType(0)`,
-    /// `bStasis`); leaving the state via `faction.EndState` restores
-    /// `SetCollision(true,true,true)` and `SetDrawType(2)`. The method verifies the pawn actually
-    /// became colliding and errors loudly otherwise (never a silent success).
-    pub fn wake_actor(&mut self, target_name: &str) -> Result<String, String> {
-        let soldier = self
-            .vm
-            .find_object(target_name)
-            .ok_or_else(|| format!("wake: no live actor named {target_name:?}"))?;
-        let controller = instance_prop(&self.vm, soldier, "Controller")
-            .ok_or_else(|| format!("wake: {target_name:?} has no live Controller"))?;
-        let arg = || Value::Object(Some(ObjRef::Instance(soldier)));
-        self.vm
-            .send_event(controller, "Trigger", vec![arg(), arg()])
-            .map_err(|e| format!("wake: {target_name:?} controller Trigger failed: {e}"))?;
-        self.drain_events();
-        let flags = (
-            self.vm.get_property(soldier, "bCollideActors").cloned(),
-            self.vm.get_property(soldier, "DrawType").cloned(),
-        );
-        match flags {
-            (Some(Value::Bool(true)), Some(Value::Byte(2))) => Ok(format!(
-                "{target_name} woken (collision restored, mesh drawn)"
-            )),
-            other => Err(format!(
-                "wake: {target_name:?} Trigger left the pawn parked \
-                 (bCollideActors/DrawType = {other:?})"
-            )),
-        }
-    }
-
-    /// `Fire` on the player's weapon through the game's own entry point: the controller's exec
-    /// `Fire(1.0)` (`XIIIPlayerController.Fire` -> `Pawn.Weapon.Fire`), or the weapon directly
-    /// when the pawn has no controller. The weapon runs its own `ServerFire` ->
-    /// `TraceFire`/`ProjectileFire` -> `ProcessTraceHit` -> `TakeDamage` chain (item14).
+    /// Existing host weapon action: explicitly calls the weapon's class `Fire(1.0)` and runs
+    /// its scripted trace/projectile/damage chain (item14). This still bypasses controller/state
+    /// input dispatch; it must not invent a focus-end event from the HUD's registered windows.
     pub fn fire(&mut self, yaw: f32, pitch: f32) -> FireOutcome {
         let Some(weapon) = self.player_weapon() else {
             return FireOutcome::NoWeapon;
         };
-        // A host fire input can arrive while the VM has suspended the locally controlled pawn
-        // and its diagnostic weapon after unrelated deferred inventory/UI calls. Both are live
-        // participants in this action; restore their execution scope before running the game's
-        // normal aim, reload and trace-fire chain.
-        self.vm.set_active(self.player, true);
-        self.vm.set_active(weapon, true);
         // The host owns the player view (yaw and pitch); the VM's controller state code does not
         // sync it, so re-assert it here where the script reads `GetViewRotation` (item14). The
         // pitch matters for item14b: a level shot at eye height only ever hits the head box, so
@@ -2221,6 +2137,19 @@ impl Session {
         let class = runtime::resolve_class_path(self.vm.set(), class_path)
             .ok_or_else(|| format!("weapon class {class_path} is not loaded"))?;
         let pawn = self.player;
+        // Match diagnostic fire's execution scope: a cinematic may have parked the pawn.
+        // GiveTo/ChangedWeapon must run, rather than defer and report an unequipped grant.
+        self.vm.set_active(pawn, true);
+        if let Some(controller) = self.controller {
+            // Diagnostic grant explicitly selects weapon mode. XIIIPawn.ChangedWeapon
+            // copies bWaitForWeaponMode and clears Weapon when bWeaponBlock is true
+            // (retail xiii.u code 0x0010..0x0151). A skipped intro may retain that lock.
+            // Do not assign Pawn.Weapon: the normal GiveTo/ChangedWeapon chain still equips it.
+            self.vm
+                .set_property(controller, "bWaitForWeaponMode", 0, Value::Bool(true));
+            self.vm
+                .set_property(controller, "bWeaponBlock", 0, Value::Bool(false));
+        }
         // `spawn_actor` runs the weapon's own PreBeginPlay/BeginPlay/PostBeginPlay lifecycle.
         let loc = self.vm.vector_prop(pawn, "Location");
         let id = self
@@ -2229,13 +2158,42 @@ impl Session {
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("spawning {class_path} returned None"))?;
         let p = Value::Object(Some(ObjRef::Instance(pawn)));
+        self.vm.set_active(id, true);
         // `GiveTo`/`ClientWeaponSet` read `Owner` (the engine's `Spawn` sets it) and `Instigator`.
         self.vm.set_property(id, "Instigator", 0, p.clone());
         self.vm.set_property(id, "Owner", 0, p.clone());
         // The game's own pickup entry point: adds to the inventory chain, creates the ammo and
         // (only when the pawn has no active weapon) runs `ClientWeaponSet` -> `ChangedWeapon`.
         let give = self.vm.send_event(id, "GiveTo", vec![p.clone()]);
-        let active_after_give = self.player_weapon() == Some(id);
+        // Weapon.GiveTo merges duplicate-class ammo into the carried weapon and destroys
+        // the newly spawned instance (engine.u 0x0305..0x042B). Select that carried instance,
+        // never the destroyed donor. This is a diagnostic inventory grant, not a new weapon
+        // pointer bypassing the script chain.
+        let equipped_id = if self.vm.objects[id as usize].deleted {
+            match self
+                .vm
+                .send_event(
+                    pawn,
+                    "FindInventoryType",
+                    vec![Value::Object(Some(ObjRef::Static(class)))],
+                )
+                .map_err(|e| e.to_string())?
+            {
+                Some(Value::Object(Some(ObjRef::Instance(existing))))
+                    if !self.vm.objects[existing as usize].deleted =>
+                {
+                    existing
+                }
+                other => {
+                    return Err(format!(
+                        "GiveTo destroyed {class_path} donor but no carried replacement was found: {other:?}"
+                    ));
+                }
+            }
+        } else {
+            id
+        };
+        let active_after_give = self.player_weapon() == Some(equipped_id);
         // When the pawn already had a weapon, run the game's own switch: set the field the engine
         // sets and call the pawn's `ChangedWeapon` (the same call `ClientWeaponSet` makes).
         let changed = if active_after_give {
@@ -2245,7 +2203,7 @@ impl Session {
                 pawn,
                 "PendingWeapon",
                 0,
-                Value::Object(Some(ObjRef::Instance(id))),
+                Value::Object(Some(ObjRef::Instance(equipped_id))),
             );
             Some(self.vm.send_event(pawn, "ChangedWeapon", Vec::new()))
         };
@@ -2260,6 +2218,11 @@ impl Session {
                 .push(format!("grant_weapon {name} ChangedWeapon: {e}"));
         }
         let weapon = self.player_weapon();
+        if weapon != Some(equipped_id) {
+            return Err(format!(
+                "diagnostic grant {name} did not equip {equipped_id}: GiveTo {give:?}, ChangedWeapon {changed:?}, Pawn.Weapon={weapon:?}"
+            ));
+        }
         let attach = weapon.and_then(|w| instance_prop(&self.vm, w, "ThirdPersonActor"));
         Ok(format!(
             "granted {name} ({class_path}) via GiveTo; GiveTo {give:?}, \
@@ -2292,6 +2255,52 @@ impl Session {
             Some(Value::Int(v)) => Some(*v as f32),
             _ => None,
         }
+    }
+
+    /// Native SpawnPlayActor calls controller/pawn PreAccept before importing any records.
+    pub(super) fn begin_travel_accept(&mut self) -> Result<(), String> {
+        let pc = self
+            .controller
+            .ok_or("travel destination has no controller")?;
+        for id in [pc, self.player] {
+            self.vm
+                .send_event(id, "TravelPreAccept", vec![])
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Imported records receive callbacks in reverse export order, with GameInfo accepting
+    /// the reused Login pawn between PreAccept and PostAccept (Engine.dll 0x1038d630).
+    pub(super) fn finish_travel_accept(
+        &mut self,
+        game_info: ObjectId,
+        actors: &[ObjectId],
+    ) -> Result<(), String> {
+        for &id in actors.iter().rev() {
+            self.vm
+                .send_event(id, "TravelPreAccept", vec![])
+                .map_err(|e| e.to_string())?;
+        }
+        self.vm
+            .send_event(
+                game_info,
+                "AcceptInventory",
+                vec![Value::Object(Some(ObjRef::Instance(self.player)))],
+            )
+            .map_err(|e| format!("XIIIGameInfo.AcceptInventory failed: {e}"))?;
+        for &id in actors.iter().rev() {
+            self.vm
+                .send_event(id, "TravelPostAccept", vec![])
+                .map_err(|e| e.to_string())?;
+        }
+        let pc = self
+            .controller
+            .ok_or("travel destination has no controller")?;
+        self.vm
+            .send_event(pc, "TravelPostAccept", vec![])
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// Current `Health` of `id` (int or float), if present.
@@ -2744,6 +2753,259 @@ mod tests {
         } else {
             path
         })
+    }
+
+    /// Generated live-object setup, followed by retail focus registration/removal scripts.
+    /// Arbitrary input must not replace the tag event or skip a slot during compaction.
+    #[test]
+    fn opt_in_item56_focus_input_preserves_windows_until_authored_tag_event() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to run the item56 focus test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Hual01a").expect("open Hual01a");
+        let location = session.player_location().expect("player location");
+        for _ in 0..30 {
+            // Intro-cartoon motion releases the map's normal FirstFrame initialization.
+            session.step(
+                1.0 / 60.0,
+                location,
+                0.0,
+                [1.0, 0.0, 0.0],
+                &PlayerVMModes::default(),
+            );
+            session.drive_render_phase();
+        }
+        let map_info = session.map_info().expect("MapInfo");
+        assert_eq!(
+            instance_prop(&session.vm, map_info, "XIIIPawn"),
+            Some(session.player)
+        );
+        let pc = session.controller.expect("controller");
+        let hud = instance_prop(&session.vm, pc, "myHUD").expect("HUD");
+        let interaction = instance_prop(&session.vm, pc, "MyInteraction").expect("interaction");
+        let target = session
+            .vm
+            .find_live_object("CWndTarget1")
+            .expect("focus target");
+        assert_eq!(
+            session.vm.get_property(hud, "eNbHudCartoonFocus"),
+            Some(&Value::Int(0))
+        );
+        let class = runtime::resolve_class_path(session.vm.set(), "XIII.CWndFocusTrigger")
+            .expect("focus trigger class");
+        let level = instance_prop(&session.vm, session.player, "Level").expect("Level");
+        let mut registered = Vec::new();
+        for (index, tag) in ["Item56EndFirst", "Item56EndSecond"]
+            .into_iter()
+            .enumerate()
+        {
+            let trigger = session.vm.spawn(class, tag).expect("spawn trigger");
+            session.vm.set_active(trigger, true);
+            // Vm::spawn constructs reflected objects; native Actor.Spawn supplies Level.
+            assert!(session.vm.set_property(
+                trigger,
+                "Level",
+                0,
+                Value::Object(Some(ObjRef::Instance(level)))
+            ));
+            assert!(
+                session
+                    .vm
+                    .set_property(trigger, "Tag", 0, Value::Name(tag.into()))
+            );
+            assert!(session.vm.set_property(
+                hud,
+                "tFocusTrigger",
+                index,
+                Value::Object(Some(ObjRef::Instance(trigger)))
+            ));
+            session
+                .vm
+                .send_event(
+                    hud,
+                    "AddHudCartoonFocus",
+                    vec![
+                        Value::Object(Some(ObjRef::Instance(target))),
+                        Value::Int(0),
+                        Value::Bool(false),
+                        Value::Float(-1.0),
+                        Value::Bool(false),
+                        Value::Float(50.0),
+                        Value::Float(200.0),
+                        Value::Bool(false),
+                    ],
+                )
+                .expect("retail focus registration");
+            let window = match session.vm.get_property_elem(hud, "tCartoonFocus", index) {
+                Some(Value::Object(Some(ObjRef::Instance(id)))) => *id,
+                other => panic!("focus slot {index}: {other:?}"),
+            };
+            assert_eq!(
+                session.vm.get_property(window, "bModeInfini"),
+                Some(&Value::Bool(true))
+            );
+            session
+                .vm
+                .goto_state(trigger, "WaitEndFocus", None)
+                .expect("wait for end event");
+            registered.push((trigger, window, tag));
+        }
+        for key in [1, 69] {
+            // LeftMouse and E; retail KeyEvent returns false for both.
+            for action in [1, 2] {
+                // Press and release.
+                assert_eq!(
+                    session
+                        .vm
+                        .send_event(
+                            interaction,
+                            "KeyEvent",
+                            vec![Value::Byte(key), Value::Byte(action), Value::Float(0.0),]
+                        )
+                        .expect("KeyEvent"),
+                    Some(Value::Bool(false))
+                );
+            }
+        }
+        session
+            .vm
+            .send_event(pc, "Fire", vec![Value::Float(1.0)])
+            .expect("controller Fire");
+        session
+            .vm
+            .send_event(pc, "Grab", vec![])
+            .expect("controller Grab");
+        assert_eq!(session.fire(0.0, 0.0), FireOutcome::Fired);
+        let weapon = session.player_weapon().expect("weapon");
+        session
+            .vm
+            .set_property(session.player, "Weapon", 0, Value::Object(None));
+        assert_eq!(session.fire(0.0, 0.0), FireOutcome::NoWeapon);
+        session.vm.set_property(
+            session.player,
+            "Weapon",
+            0,
+            Value::Object(Some(ObjRef::Instance(weapon))),
+        );
+        assert_eq!(
+            session.vm.get_property(hud, "eNbHudCartoonFocus"),
+            Some(&Value::Int(2))
+        );
+        assert_eq!(
+            instance_prop(&session.vm, hud, "HudFoc"),
+            Some(registered[0].1)
+        );
+        for &(trigger, window, _) in &registered {
+            assert!(!session.vm.objects[trigger as usize].deleted);
+            assert!(!session.vm.objects[window as usize].deleted);
+        }
+        for (index, &(trigger, window, tag)) in registered.iter().enumerate() {
+            session
+                .vm
+                .send_event(
+                    trigger,
+                    "TriggerEvent",
+                    vec![
+                        Value::Name(tag.into()),
+                        Value::Object(Some(ObjRef::Instance(trigger))),
+                        Value::Object(Some(ObjRef::Instance(session.player))),
+                    ],
+                )
+                .expect("authored tag event");
+            assert!(session.vm.objects[trigger as usize].deleted);
+            assert!(session.vm.objects[window as usize].deleted);
+            let remaining = (registered.len() - index - 1) as i32;
+            assert_eq!(
+                session.vm.get_property(hud, "eNbHudCartoonFocus"),
+                Some(&Value::Int(remaining))
+            );
+            if remaining > 0 {
+                assert_eq!(
+                    instance_prop(&session.vm, hud, "HudFoc"),
+                    Some(registered[index + 1].1)
+                );
+                assert_eq!(
+                    session.vm.get_property_elem(hud, "tFocusTrigger", 0),
+                    Some(&Value::Object(Some(ObjRef::Instance(
+                        registered[index + 1].0
+                    ))))
+                );
+            } else {
+                assert_eq!(instance_prop(&session.vm, hud, "HudFoc"), None);
+                assert_eq!(
+                    session.vm.get_property_elem(hud, "tFocusTrigger", 0),
+                    Some(&Value::Object(None))
+                );
+            }
+            // Native ProcessEvent drops a second event to the deleted trigger.
+            session
+                .vm
+                .send_event(trigger, "Trigger", vec![])
+                .expect("repeated event");
+            assert_eq!(
+                session.vm.get_property(hud, "eNbHudCartoonFocus"),
+                Some(&Value::Int(remaining))
+            );
+        }
+        println!("[item56] input kept two infinite focuses; tag events removed/compacted both");
+    }
+
+    /// The map-authored truck key must be linked before its owner dies; Instigator alone
+    /// cannot make the game's SearchPawn loop find it.
+    #[test]
+    fn opt_in_item49b_plage01_authored_key_is_linked_before_search() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Plage01").expect("open Plage01");
+        let soldier = session.vm.find_live_object("BaseSoldier6").expect("killer");
+        let location = session.player_location().expect("player location");
+        for _ in 0..120 {
+            session.step(
+                1.0 / 60.0,
+                location,
+                0.0,
+                [0.0; 3],
+                &PlayerVMModes::default(),
+            );
+        }
+        let key = session
+            .vm
+            .objects
+            .iter()
+            .enumerate()
+            .find_map(|(i, o)| {
+                let id = i as ObjectId;
+                (!o.deleted
+                    && session.vm.is_a(id, "Keys")
+                    && instance_prop(&session.vm, id, "Instigator") == Some(soldier))
+                .then_some(id)
+            })
+            .expect("FirstFrame creates the killer's key");
+        let mut current = instance_prop(&session.vm, soldier, "Inventory");
+        let mut chain = Vec::new();
+        while let Some(id) = current {
+            assert!(!chain.contains(&id), "inventory cycle: {chain:?}");
+            chain.push(id);
+            current = instance_prop(&session.vm, id, "Inventory");
+        }
+        println!(
+            "[item49b] killer active={} suspended={} key={} chain={:?} failures={:?}",
+            session.vm.objects[soldier as usize].active,
+            session.vm.objects[soldier as usize].suspended,
+            session.vm.objects[key as usize].name,
+            chain
+                .iter()
+                .map(|id| &session.vm.objects[*id as usize].name)
+                .collect::<Vec<_>>(),
+            session.failures
+        );
+        assert!(
+            chain.contains(&key),
+            "authored key must be in killer's inventory"
+        );
     }
 
     /// Corpus regression for the authored `SPADS02b` `Explo02` particle event. `Cine9.Event` and
