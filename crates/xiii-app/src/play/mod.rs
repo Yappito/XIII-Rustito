@@ -1995,7 +1995,12 @@ fn open_map_runtime(
     let (voice_provider, voice_unresolved) = voice::LibraryVoiceDuration::new(voice_library);
     session
         .vm_mut()
-        .set_voice_duration(Box::new(voice_provider));
+        .set_voice_duration(Box::new(voice_provider.clone()));
+    // item48: `Actor.WaveHasPosition` needs the audio-subsystem seam; without a provider the
+    // native fails explicitly and a speaking `DialogueManager` would be suspended. The provider
+    // cannot classify the positional bit yet (see `play::voice`), which keeps the native's
+    // visible note path.
+    session.vm_mut().set_wave_position(Box::new(voice_provider));
     session.register_movers(scene);
     let mover_states = session.mover_states();
     let (mut world, mover_collision) = movers::MoverCollision::build(scene, &mover_states);
@@ -2716,6 +2721,101 @@ mod tests {
             sim.location[2]
         );
         assert!(dist > 1.0, "player did not move: {dist} UU");
+    }
+
+    /// Opt-in corpus test (item48): the four maps where the item45 survey reported
+    /// `AdjustAimForDisplay` (Hual01a + the HUD-render suspension set), `VisibleDamageableActors`
+    /// (Amos01, SPADS02b explosive canisters) and `WaveHasPosition` (SMarin01, SPADS02b intro
+    /// dialogue), opened through the same headless helper the route tests use (empty input
+    /// script, 90 s, no player input). Asserts the natives are no longer reported (no suspended
+    /// actors, no failures) and prints what happens instead: the `PlayStrVoice` dialogue lines,
+    /// the `TakeDamage` events the `HurtRadius` iterator delivered, the player's final health
+    /// and the natives' call counts.
+    #[test]
+    fn opt_in_item48_natives_no_longer_reported_on_survey_maps() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        for map in ["Hual01a", "Amos01", "SMarin01", "SPADS02b"] {
+            let opts = Options {
+                map: Some(map.to_owned()),
+                game_dir: Some(game_dir.clone()),
+                ..Default::default()
+            };
+            let scene = viewer::load_scene(&opts).unwrap_or_else(|e| panic!("import {map}: {e}"));
+            let script = script::Script::parse("").expect("empty input script");
+            let outcome = run_script_with_cinematic_input(
+                &game_dir,
+                map,
+                &script,
+                &resolved.params,
+                &scene,
+                90.0,
+            )
+            .unwrap_or_else(|e| panic!("{map}: {e}"));
+            let sess = &outcome.session;
+            assert!(
+                sess.suspended.is_empty(),
+                "{map}: suspended actors {:#?}",
+                sess.suspended
+            );
+            assert!(
+                sess.failures.is_empty(),
+                "{map}: script failures {:#?}",
+                sess.failures
+            );
+            let used = &sess.vm().natives_used;
+            for path in [
+                "PlayerController.AdjustAimForDisplay",
+                "Actor.VisibleDamageableActors",
+                "Actor.WaveHasPosition",
+            ] {
+                let hit = used
+                    .iter()
+                    .find(|(p, _)| p.eq_ignore_ascii_case(path))
+                    .map(|(_, v)| *v);
+                println!(
+                    "[item48] {map}: {path} calls {:?}",
+                    hit.unwrap_or((None, 0))
+                );
+            }
+            for (t, d) in &sess.dialogues {
+                println!(
+                    "[item48] {map}: t={t:.3}s dialogue sound={:?} speaker={:?} text={:?}",
+                    d.sound, d.speaker, d.text
+                );
+            }
+            let damages: Vec<String> = sess
+                .vm()
+                .trace
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    xiii_script::TraceKind::Event {
+                        target,
+                        function,
+                        args,
+                    } if function.ends_with("TakeDamage") => Some(format!(
+                        "t={:.3}s {} <- {}({})",
+                        e.time,
+                        target,
+                        function,
+                        args.join(", ")
+                    )),
+                    _ => None,
+                })
+                .collect();
+            println!("[item48] {map}: {} TakeDamage events", damages.len());
+            for line in damages.iter().take(20) {
+                println!("[item48] {map}:   {line}");
+            }
+            let health = sess.vm().get_property(sess.player, "Health").cloned();
+            println!(
+                "[item48] {map}: final player health {:?}, {} dialogue event(s)",
+                health, sess.dialogue_total
+            );
+        }
     }
 
     /// Synthetic ownership/sync test: the render translation follows a VM-moved actor's
@@ -5364,7 +5464,10 @@ mod tests {
     /// sealed against the route's input in the current sim. Goals 1 and 2 are unreachable for
     /// the independent demo-wedge reason (the CineController2 grapple demonstration can never
     /// complete, so the scene blocks forever at `wait event JonesHookEnd`). This test pins the
-    /// measured state so the blockers cannot silently regress.
+    /// measured state so the blockers cannot silently regress. item48 update: with
+    /// `VisibleDamageableActors` implemented the route's player is killed by the tarmac's
+    /// scripted bazooka fire (see the health assertion below); the fixture was authored while
+    /// that native was missing and the blasts were no-ops.
     #[test]
     fn opt_in_toits01_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -5402,11 +5505,19 @@ mod tests {
             "route unexpectedly travelled: {:?}",
             outcome.travel
         );
-        // The route completes the level's walk with the player alive.
+        // item48: `Actor.VisibleDamageableActors` (HurtRadius) now delivers blast damage, so
+        // the tarmac's scripted BazookRocket soldiers (Damage 600, DamageRadius 1000) kill the
+        // route's no-input player near (16000,1300): measured 150 -> 75 @299.0 s, 65 @301.5 s,
+        // dead @302.0 s (identical in two runs; the ratios match the retail HurtRadius script's
+        // `1 - (dist - CollisionRadius)/DamageRadius` falloff for wall impacts ~900-1000 UU out).
+        // The fixture was authored while the native was missing, so the blasts were no-ops.
         let health = session
             .player_health()
-            .expect("the player must stay alive across the route");
-        assert!(health > 0.0, "the player must not die on the route");
+            .expect("the player must still have a Health property across the route");
+        assert!(
+            health <= 0.0,
+            "expected the scripted tarmac rockets to kill the no-input route player once HurtRadius works, got health {health}"
+        );
         // Goal 3 (Jones must not die) completes; goals 0/1/2 do not.
         for o in &objectives {
             match o.index {
@@ -5481,21 +5592,27 @@ mod tests {
             demonstrator_retract,
             "the grapple demonstrator must reach STA_Retract (the demo machine completes)"
         );
-        // The Cine0 scene advanced past the demo wait ([89] `wait event JonesHookEnd`): the
-        // measured end state is action[117] (movseqb toward PositionInfo118), where the NPC's
-        // own traverse stays blocked (a separate measured blocker).
-        let action_index = vm
-            .find_object("CineController2")
-            .and_then(|id| vm.get_property(id, "ScriptedActionIndex").cloned());
-        match action_index {
-            Some(xiii_script::Value::Int(index)) => assert!(
-                index >= 117,
-                "the scene must advance past the grapple demo wait (measured action[117]), got {index}"
-            ),
-            other => panic!("CineController2.ScriptedActionIndex must be an int, got {other:?}"),
-        }
-        // The handover released the player: the controller is back in PlayerWalking at the end
-        // of the route (the item50 permanent NoControl freeze is fixed).
+        // item48: the tarmac rockets kill the route's player at ~301.55 s (health pin above).
+        // The engine-wide kill broadcast (`Controller.ClientGameEnded`) then moves every
+        // controller out of the scene: measured CineController2 PlayingSequence -> GameEnded at
+        // 301.550 s, with ScriptedActionIndex cleared (None) after the broadcast. The pre-item48
+        // fixture pinned `ScriptedActionIndex >= 117` and a PlayerWalking handover here; both
+        // were measured on a living player and are unreachable once the kill ends the scene.
+        // Pinned instead: the scene was still running (PlayingSequence) until the kill moved
+        // CineController2 to GameEnded, and the player controller ends in GameEndedDeath.
+        let kill_broadcast = vm.trace.iter().any(|event| {
+            matches!(
+                &event.kind,
+                xiii_script::TraceKind::StateChange { actor, from, to, .. }
+                    if actor.eq_ignore_ascii_case("CineController2")
+                        && from.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("PlayingSequence"))
+                        && to.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("GameEnded"))
+            )
+        });
+        assert!(
+            kill_broadcast,
+            "the scene must run until the player kill's GameEnded broadcast moves CineController2 out of PlayingSequence"
+        );
         let pc = vm
             .objects
             .iter()
@@ -5503,8 +5620,8 @@ mod tests {
             .position(|(_, o)| vm.set().path(o.class).ends_with("XIIIPlayerController"))
             .expect("the player controller must exist");
         assert!(
-            vm.is_in_state(pc as u32, "PlayerWalking"),
-            "the handover must return the controller to PlayerWalking"
+            vm.is_in_state(pc as u32, "GameEndedDeath"),
+            "the player controller must end in GameEndedDeath (killed by the scripted tarmac rockets)"
         );
     }
 }

@@ -1062,9 +1062,10 @@ fn registry_entries_are_documented() {
     // viewport/device Partials; item43 adds Actor.TraceActors; the item47b banque01 regression
     // fix adds `PlayerController.AdjustAimForDisplay` (498); item49b adds
     // `Actor.DetachFromBone` (403); item51b adds the decoded `BaseSoldier.EyePosition`
-    // (XIDPawn.dll 0x119012b0) and `BloodFlow.GrowBloodFlow` (Xiii.dll 0x11b01000). Must equal
+    // (XIDPawn.dll 0x119012b0) and `BloodFlow.GrowBloodFlow` (Xiii.dll 0x11b01000); item48 adds
+    // `Actor.VisibleDamageableActors` and `Actor.WaveHasPosition`. Must equal
     // `Registry::builtin().defs().count()`.
-    assert_eq!(defs.len(), 335);
+    assert_eq!(defs.len(), 337);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -6006,6 +6007,258 @@ fn touching_actors_iterator_filters_by_base_class() {
     };
     assert_eq!(items.len(), 1);
     assert_eq!(items[0][0], Value::Object(Some(ObjRef::Instance(b))));
+}
+
+// ---------------------------------------------------------------------------------------
+// VisibleDamageableActors (item48) — the `Actor.HurtRadius` iterator
+
+/// The retail filter chain: level-hash radius query (inclusive at the boundary), `BaseClass`
+/// filter, `bIgnoreHidden` against `bHidden`, and a world-geometry line check from the blast
+/// point to the candidate's `Location`.
+#[test]
+fn visible_damageable_actors_filters_radius_class_hidden_and_world_los() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    // Wall spanning x=30..40: occludes victims behind it from the blast at the origin.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([30.0, -5.0, -5.0], [40.0, 5.0, 5.0]),
+    ));
+    let barrel = phys_actor(&mut vm, &set, "Barrel", [0.0; 3]);
+    let near = vm.spawn(pg(&set, "Child"), "Near").unwrap();
+    vm.set_property(near, "Location", 0, Value::Vector([25.0, 0.0, 0.0]));
+    // Exactly on the radius boundary (50): the retail distance test is inclusive. On the Z axis
+    // so the x-wall below cannot occlude it.
+    let edge = vm.spawn(pg(&set, "Child"), "Edge").unwrap();
+    vm.set_property(edge, "Location", 0, Value::Vector([0.0, 0.0, 50.0]));
+    // Ten units outside the radius.
+    let far = vm.spawn(pg(&set, "Child"), "Far").unwrap();
+    vm.set_property(far, "Location", 0, Value::Vector([0.0, 0.0, 60.0]));
+    // In radius (45) but behind the wall.
+    let occluded = vm.spawn(pg(&set, "Child"), "Occluded").unwrap();
+    vm.set_property(occluded, "Location", 0, Value::Vector([45.0, 0.0, 0.0]));
+    // In radius, clear LOS, but outside the `Child` base class.
+    let _plain = phys_actor(&mut vm, &set, "Plain", [0.0, 20.0, 0.0]);
+    // In radius, clear LOS, hidden.
+    let hidden = vm.spawn(pg(&set, "Child"), "Hidden").unwrap();
+    vm.set_property(hidden, "Location", 0, Value::Vector([0.0, -20.0, 0.0]));
+    vm.set_property(hidden, "bHidden", 0, Value::Bool(true));
+
+    let base_args = || {
+        [
+            Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+            Value::Object(None),
+            Value::Float(50.0),
+            Value::Vector([0.0; 3]),
+            Value::Bool(false),
+        ]
+    };
+    // bIgnoreHidden=false: hidden actors still qualify.
+    let mut args = base_args();
+    args[4] = Value::Bool(false);
+    let rows = match try_native(
+        &mut vm,
+        "Engine.Actor.VisibleDamageableActors",
+        barrel,
+        &[false; 5],
+        &mut args,
+    )
+    .unwrap()
+    {
+        NativeOutcome::Iterate(rows) => rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+        [
+            Value::Object(Some(ObjRef::Instance(near))),
+            Value::Object(Some(ObjRef::Instance(edge))),
+            Value::Object(Some(ObjRef::Instance(hidden))),
+        ],
+        "radius (inclusive) + class + world-LOS filter"
+    );
+
+    // bIgnoreHidden=true drops the hidden candidate.
+    let mut args = base_args();
+    args[4] = Value::Bool(true);
+    let rows = match try_native(
+        &mut vm,
+        "Engine.Actor.VisibleDamageableActors",
+        barrel,
+        &[false; 5],
+        &mut args,
+    )
+    .unwrap()
+    {
+        NativeOutcome::Iterate(rows) => rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+        [
+            Value::Object(Some(ObjRef::Instance(near))),
+            Value::Object(Some(ObjRef::Instance(edge))),
+        ],
+    );
+
+    // Zero radius: only a victim co-located with the blast point qualifies (inclusive test).
+    let mut args = [
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+        Value::Object(None),
+        Value::Float(0.0),
+        Value::Vector([0.0; 3]),
+        Value::Bool(false),
+    ];
+    let rows = match try_native(
+        &mut vm,
+        "Engine.Actor.VisibleDamageableActors",
+        barrel,
+        &[false; 5],
+        &mut args,
+    )
+    .unwrap()
+    {
+        NativeOutcome::Iterate(rows) => rows,
+        other => panic!("{other:?}"),
+    };
+    assert!(rows.is_empty(), "no Child at the blast point: {rows:?}");
+
+    // An omitted Loc uses the caller's Location (HurtRadius passes HitLocation explicitly, but
+    // the parameter is positional in the same way RadiusActors' Loc is).
+    let at_barrel = vm.spawn(pg(&set, "Child"), "AtBarrel").unwrap();
+    vm.set_property(at_barrel, "Location", 0, Value::Vector([0.0; 3]));
+    let mut args = [
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+        Value::Object(None),
+        Value::Float(1.0),
+        Value::Vector([0.0; 3]),
+        Value::Bool(false),
+    ];
+    let rows = match try_native(
+        &mut vm,
+        "Engine.Actor.VisibleDamageableActors",
+        barrel,
+        &[false; 5],
+        &mut args,
+    )
+    .unwrap()
+    {
+        NativeOutcome::Iterate(rows) => rows,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::Object(Some(ObjRef::Instance(at_barrel))));
+}
+
+/// Without a world-physics provider the iterator fails explicitly (never a silent
+/// radius-only answer): `Actor.HurtRadius` runs on barrels whose blast must respect walls.
+#[test]
+fn visible_damageable_actors_without_physics_provider_fails() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let barrel = phys_actor(&mut vm, &set, "Barrel", [0.0; 3]);
+    let mut args = [
+        Value::Object(Some(ObjRef::Static(pg(&set, "Actor")))),
+        Value::Object(None),
+        Value::Float(100.0),
+        Value::Vector([0.0; 3]),
+        Value::Bool(false),
+    ];
+    let err = try_native(
+        &mut vm,
+        "Engine.Actor.VisibleDamageableActors",
+        barrel,
+        &[false; 5],
+        &mut args,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err.kind,
+        VmErrorKind::NoPhysicsProvider { ref native }
+            if native == "Actor.VisibleDamageableActors"
+    ));
+}
+
+// ---------------------------------------------------------------------------------------
+// WaveHasPosition (item48) — the DialogueManager positional-voice query
+
+/// Provider answers flow through; with no provider the native fails explicitly; an
+/// unclassifiable name notes and reports false (the engine's no-subsystem answer).
+#[test]
+fn wave_has_position_provider_answers_and_missing_provider_fails() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(sg(&set, "Actor"), "A").unwrap();
+    let mut args = [Value::Str("SMarin01_Jones_00".to_owned())];
+    let err = try_native(
+        &mut vm,
+        "Engine.Actor.WaveHasPosition",
+        a,
+        &[false],
+        &mut args,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err.kind,
+        VmErrorKind::NoAudioProvider { ref native } if native == "Engine.Actor.WaveHasPosition"
+    ));
+
+    vm.set_wave_position(Box::new(crate::voice::FixedWavePosition::new(true)));
+    let mut args = [Value::Str("SMarin01_Jones_00".to_owned())];
+    assert_eq!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.WaveHasPosition",
+            a,
+            &[false],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(true))
+    );
+
+    vm.set_wave_position(Box::new(crate::voice::FixedWavePosition::new(false)));
+    let mut args = [Value::Str(String::new())];
+    assert_eq!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.WaveHasPosition",
+            a,
+            &[false],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(false))
+    );
+
+    // A provider that cannot classify (the current data gap) notes and reports false rather
+    // than failing the speaking actor or inventing a positional answer.
+    struct Unknown;
+    impl crate::voice::WavePosition for Unknown {
+        fn has_position(&self, _sound_name: &str) -> Option<bool> {
+            None
+        }
+    }
+    vm.set_wave_position(Box::new(Unknown));
+    let mut args = [Value::Str("SMarin01_Jones_00".to_owned())];
+    assert_eq!(
+        try_native(
+            &mut vm,
+            "Engine.Actor.WaveHasPosition",
+            a,
+            &[false],
+            &mut args
+        )
+        .unwrap(),
+        NativeOutcome::Value(Value::Bool(false))
+    );
+    assert!(
+        vm.trace.iter().any(|e| matches!(
+            &e.kind,
+            TraceKind::Note(s) if s.contains("WaveHasPosition") && s.contains("SMarin01_Jones_00")
+        )),
+        "the unclassified name must be visible: {:?}",
+        vm.trace
+    );
 }
 
 // ---------------------------------------------------------------------------------------
