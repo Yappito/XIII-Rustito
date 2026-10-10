@@ -4113,8 +4113,10 @@ mod tests {
     /// hands its 'PontA' Tag off on dismissal and the `XIIIMover0/5` panels close the bridge
     /// through their own `TriggerToggle`; `Trigger2` ('End_of_level') fires `XIIIGoalTrigger1`
     /// (goal 0) and `TestGoalComplete` -> `DoTravel` -> `ServerTravel` requests the travel.
-    /// The host `fire` input at the lever is consumed by the cartoon-focus dismissal bridge
-    /// (logged); everything downstream is game code.
+    /// The host `fire` at the lever supplies only the press moment the decoded scripts never
+    /// show (the native consumer is a labelled evidence gap, see `session.fire`); everything
+    /// downstream - the trigger's own `WaitEndFocus.Trigger` dismissal and the `PontA` Tag
+    /// delivery - is game code.
     #[test]
     fn opt_in_hual01a_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {

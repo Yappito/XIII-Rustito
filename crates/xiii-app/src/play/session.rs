@@ -2028,14 +2028,30 @@ impl Session {
     /// when the pawn has no controller. The weapon runs its own `ServerFire` ->
     /// `TraceFire`/`ProjectileFire` -> `ProcessTraceHit` -> `TakeDamage` chain (item14).
     pub fn fire(&mut self, yaw: f32, pitch: f32) -> FireOutcome {
-        // item52: while a comic-strip cartoon-focus window is up, the binary's own HUD/input
-        // layer consumes the press and fires the focus trigger's Tag (the decoded scripts only
-        // record the hand-off: `CWndFocusTrigger.WaitForBeingSeen.Timer` 0x026B re-assigns
-        // `self.Tag = self.EventFinFocus` and parks the trigger in `WaitEndFocus`). The host
-        // bridge fires that Tag through the game's own `TriggerEvent`; the registered trigger's
-        // own `WaitEndFocus.Trigger` then runs its HUD bookkeeping and destroys itself, and the
-        // Tag receivers (Hual01a: the `PontA` bridge panels) run their own code. Logged on
-        // every firing; never invents an event when no focus window is live.
+        // item52: while a comic-strip cartoon-focus window is up, a player press ends the
+        // window and fires the focus trigger's Tag. Decoded (`disasm-xiii-all.txt`):
+        // `WaitForBeingSeen.Timer` 0x025C-0x0337 re-assigns `self.Tag = self.EventFinFocus`,
+        // sets `FocusDuration = -1` (-> `SetUpCartoonFocus` 0x0055 `bModeInfini = true`,
+        // `EndOfLife = StartOfLife`), registers itself in `XIIIBaseHud.tFocusTrigger[]` and
+        // parks in `WaitEndFocus`. Every `HudCartoonFocus` auto-close is gated
+        // `!bModeInfini` (`ZoomToStandardCWnd.DrawWnd` 0x0096/0x0153/0x0180/0x0251), and the
+        // only scripted remover for this window is the trigger's own `WaitEndFocus.Trigger`
+        // (finds its `tFocusTrigger` slot, `tCartoonFocus[i].RemoveMe()`, compacts both
+        // arrays, decrements `eNbHudCartoonFocus`, `Destroy()`). An exhaustive script-side
+        // search finds NO input consumer: `XIIIPlayerController` execs (`Fire` 0x0000-0x01F9,
+        // `AltFire`, `UnFire`, weapon/item switch, `Jump`, `Duck`, `ActivateItem`),
+        // `XIIIPlayerInteraction.KeyEvent` (ESC + one debug key only) / `MyPCPostRender`
+        // (render/targeting only) and `XIIIBaseHud` contain no focus-input handling; nothing
+        // outside `CWndFocusTrigger` reads `tFocusTrigger`. So the press consumer is native
+        // (Engine.dll/Xiii.dll, accessing the HUD state by compiled offsets - none of the
+        // binaries contains a `tFocusTrigger`/`CartoonFocus` string, which is weak evidence
+        // only). EVIDENCE GAP (labelled, not proven): which native consumes the press. This
+        // host bridge supplies only that press moment when the game's own window state shows
+        // a live trigger-backed focus; everything downstream is game code: the bridge calls
+        // the registered trigger's own `TriggerEvent(Tag)`, Engine.u's dispatch delivers the
+        // Tag to the receivers (Hual01a: the `PontA` bridge panels) AND back to the trigger
+        // itself, whose `WaitEndFocus.Trigger` runs the decoded dismissal. Logged on every
+        // firing; never invents an event when no focus window is live.
         if self.dismiss_cartoon_focus() {
             return FireOutcome::Fired;
         }
@@ -2340,8 +2356,11 @@ impl Session {
         }
     }
 
-    /// The cartoon-focus dismissal (see `fire`): fires the registered focus trigger's Tag once,
-    /// when a live focus window is up. Returns whether a dismissal ran.
+    /// The cartoon-focus dismissal (see `fire`): supplies the press moment the decoded scripts
+    /// never show (native consumer, labelled evidence gap in `fire`) by firing the registered
+    /// focus trigger's own `TriggerEvent(Tag)` once, when a live trigger-backed focus window is
+    /// up. The trigger's own `WaitEndFocus.Trigger` runs the decoded dismissal and the Tag
+    /// receivers run their own code. Returns whether a dismissal ran.
     fn dismiss_cartoon_focus(&mut self) -> bool {
         let Some(ctrl) = self.controller else {
             return false;

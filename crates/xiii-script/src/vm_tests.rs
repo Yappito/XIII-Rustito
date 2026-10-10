@@ -2963,6 +2963,8 @@ fn phys_fixture() -> Vec<u8> {
     let actor = b.reserve(0, 0, "Actor");
     let child = b.reserve(0, 0, "Child");
     let decoration = b.reserve(0, 0, "Decoration");
+    let mover = b.reserve(0, 0, "Mover");
+    let pawn = b.reserve(0, 0, "Pawn");
     let levelinfo = b.reserve(0, 0, "LevelInfo");
 
     let add = b.reserve(IMP_FUNCTION, object, "Add_IntInt");
@@ -3009,6 +3011,7 @@ fn phys_fixture() -> Vec<u8> {
     let block_nonzero = b.reserve(IMP_BOOLPROP, actor, "bBlockNonZeroExtentTraces");
     let movable = b.reserve(IMP_BOOLPROP, actor, "bMovable");
     let bstatic = b.reserve(IMP_BOOLPROP, actor, "bStatic");
+    let use_cylinder = b.reserve(IMP_BOOLPROP, actor, "bUseCylinderCollision");
     let proj_target = b.reserve(IMP_BOOLPROP, actor, "bProjTarget");
     let hidden = b.reserve(IMP_BOOLPROP, actor, "bHidden");
     let world_geometry = b.reserve(IMP_BOOLPROP, actor, "bWorldGeometry");
@@ -3036,7 +3039,8 @@ fn phys_fixture() -> Vec<u8> {
     b.prop(hidden, world_geometry, 0);
     b.prop(world_geometry, movable, 0);
     b.prop(movable, bstatic, 0);
-    b.prop(bstatic, touches, 0);
+    b.prop(bstatic, use_cylinder, 0);
+    b.prop(use_cylinder, touches, 0);
     b.prop(touches, untouches, 0);
     b.prop(untouches, touching, 0);
     b.prop_with(touching_template, 0, 0, &object_extra);
@@ -3071,6 +3075,8 @@ fn phys_fixture() -> Vec<u8> {
     b.class(actor, object, owner, 0);
     b.class(child, actor, 0, 0);
     b.class(decoration, actor, 0, 0);
+    b.class(mover, actor, 0, 0);
+    b.class(pawn, actor, 0, 0);
     b.class(levelinfo, actor, 0, 0);
     b.build()
 }
@@ -4813,6 +4819,146 @@ impl WorldPhysics for NamedHitWorld {
     fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool {
         self.inner.point_free(location, extent)
     }
+}
+
+#[test]
+fn mover_with_cylinder_collision_blocks_as_its_cylinder_not_its_mesh() {
+    // item52: `bUseCylinderCollision` makes the mover's cylinder its line-check shape; the
+    // baked mesh alone does not block. Measured need: Hual01a's lever `XIIIMover6` leans its
+    // handle mesh across every sight line to `CWndTarget1` while the target is outside the
+    // lever's cylinder (see `vm_trace_flags`); retail admits the line.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let _li = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0; 3]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    let mv = vm.spawn(pg(&set, "Mover"), "Mv").unwrap();
+    vm.set_property(mv, "Location", 0, Value::Vector([200.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, mv, true, true);
+    vm.set_property(mv, "bUseCylinderCollision", 0, Value::Bool(true));
+    // The provider's world hit is the mover's baked mesh at x=100; the mover's cylinder
+    // (r=10 around x=200) starts at x=190.
+    vm.set_physics(Box::new(NamedHitWorld {
+        inner: MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
+        actor: "Mv".to_owned(),
+    }));
+    // Line ending short of the cylinder: the mesh hit is skipped and, with nothing behind it,
+    // the trace reports no hit at all (the sight-line case).
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [150.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, None, "the mesh-only hit must not block: {location:?}");
+    // Line reaching into the cylinder: the mover blocks at the cylinder surface (x=190).
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [250.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(mv));
+    assert!((location[0] - 190.0).abs() < 1e-3, "{location:?}");
+    // Without the flag the mesh hit reports the mover at the mesh time (previous behaviour).
+    vm.set_property(mv, "bUseCylinderCollision", 0, Value::Bool(false));
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [150.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(mv));
+    assert!((location[0] - 100.0).abs() < 1e-3, "{location:?}");
+}
+
+#[test]
+fn trace_from_inside_a_cylinder_reports_the_exit_with_inverted_normal() {
+    // item52: Engine.dll's per-actor cylinder routine answers a line starting inside the
+    // candidate cylinder with the EXIT hit at `Min3(T-0.001, 1.0, T_exit)` and normal -Dir
+    // (VA 0x103c4cd0..0x103c5573; see `trace_actors_flags`). Measured need: point-blank
+    // shots — the muzzle sits inside the target's cylinder and retail reports the hit there.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let _li = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0; 3]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    // Start inside the candidate's cylinder (r=10 at [5,0,0], spans x -5..15).
+    let inside = phys_actor(&mut vm, &set, "Inside", [5.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, inside, true, true);
+    let (hit, location, normal) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(
+        hit,
+        Some(inside),
+        "the containing cylinder is reported at its exit"
+    );
+    assert!((location[0] - 15.0).abs() < 1e-2, "{location:?}");
+    assert!(
+        (normal[0] + 1.0).abs() < 1e-4,
+        "normal must be -Dir: {normal:?}"
+    );
+    // The exit hit competes by time: a wall beyond it does not win.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
+    ));
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(inside));
+    assert!((location[0] - 15.0).abs() < 1e-2, "{location:?}");
+    // Surface contact (start within 1 UU of the surface, z inside the column) takes the
+    // same exit path: cylinder r=10 at [10,0,0] -> exit at x=20.
+    vm.set_physics(Box::new(MockWorld::new()));
+    // Park the previous candidate so only the touching cylinder contains the start.
+    vm.set_property(inside, "Location", 0, Value::Vector([-1000.0, 0.0, 0.0]));
+    let touching = phys_actor(&mut vm, &set, "Touching", [10.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, touching, true, true);
+    let (hit, location, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(touching));
+    assert!((location[0] - 20.0).abs() < 1e-2, "{location:?}");
+    // Start just outside the surface (within the engine's 1.0 band) and moving away: the
+    // horizontal exit root is negative, so nothing is reported.
+    vm.set_property(touching, "Location", 0, Value::Vector([1000.0, 0.0, 0.0]));
+    let grazing = phys_actor(&mut vm, &set, "Grazing", [-10.02, 0.0, 0.0]);
+    set_collision_fields(&mut vm, grazing, true, true);
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, None, "a grazing start moving away must not hit");
+    // A start above the column is not "inside" (conservative z guard): the ray over the
+    // cylinder is unaffected.
+    let above = phys_actor(&mut vm, &set, "Above", [5.0, 0.0, 500.0]);
+    set_collision_fields(&mut vm, above, true, true);
+    vm.set_property(above, "CollisionHeight", 0, Value::Float(10.0));
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, None, "a ray passing over the cylinder must not hit it");
+}
+
+#[test]
+fn additional_trace_type_8192_excludes_pawn_candidates() {
+    // item52: retail `CWndFocusTrigger.WaitForBeingSeen.Timer` (XIII.u 0x01BA) traces with
+    // `AdditionalTraceType 8192` from `XPP.Location` — inside the pawn's own cylinder — and
+    // accepts only `None` or the focus; the composed flags 0x20bf (execTrace
+    // 0x103e8abf..0x103e8b2e) must therefore not report the pawn, while the default 0xbf
+    // weapon traces must. Labelled hypothesis for the exact Engine.dll gate (see
+    // `trace_admits_actor_flags`); pinned by the retail behaviour on both sides.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let _li = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let trigger = phys_actor(&mut vm, &set, "Trigger", [200.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, trigger, true, false);
+    let pawn = vm.spawn(pg(&set, "Pawn"), "PPawn").unwrap();
+    vm.set_property(pawn, "Location", 0, Value::Vector([0.0; 3]));
+    set_collision_fields(&mut vm, pawn, true, true);
+    // Default weapon flags (0xbf): the pawn is admitted and its cylinder blocks.
+    let (hit, _, _) = vm
+        .vm_trace_flags(trigger, [0.0; 3], [100.0, 0.0, 0.0], 0xbf, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(pawn), "0xbf must still hit the pawn cylinder");
+    // Sight flags (0xbf | 0x2000): the pawn is excluded even with the start inside it.
+    let (hit, _, _) = vm
+        .vm_trace_flags(trigger, [0.0; 3], [100.0, 0.0, 0.0], 0x20bf, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, None, "0x20bf must not report the pawn");
 }
 
 #[test]

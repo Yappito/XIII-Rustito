@@ -12,15 +12,23 @@
 #   - the dam bridge: `TouchTrigger8` ('touchmanette') arms `CWndFocusTrigger3`, whose
 #     `WaitForBeingSeen.Timer` starts the comic-strip focus on `CWndTarget1` (the lever
 #     sight-line trace must be clear) and hands off via `self.Tag = self.EventFinFocus`
-#     ('PontA'). The binary's own HUD/input layer consumes the dismiss press and fires that
-#     Tag; the host bridge in `session.dismiss_cartoon_focus` reproduces only that input
-#     consumption (logged on every firing) - the route's `fire` at t=155 delivers it and the
-#     `PontA` receivers (XIIIMover0/5, TriggerToggle) slide the crest panels closed through
-#     the game's own mover code. (The decoded alternative closer - pulling the bridge lever
-#     a second time so `xidmaps.Hual01a.SetGoalComplete` case 555 fires `CloseBridgeEvent` -
-#     is gated on the licence-layer flag `TGSDummy == 546`, which the binary's licence layer
-#     sets and the port does not emulate; with the port's default 0 the lever plays the demo
-#     message "IF YOU WANT TO CLOSE THE BRIDGE, BUY THE GAME" and locks.)
+#     ('PontA'), `FocusDuration = -1` -> `bModeInfini` (no auto-close: every
+#     `HudCartoonFocus` timeout in `ZoomToStandardCWnd.DrawWnd` is gated `!bModeInfini`).
+#     The press that ends the window is consumed natively in retail - an exhaustive
+#     script-side search (exec `Fire`/`AltFire`/`UnFire`, `XIIIPlayerInteraction.KeyEvent`/
+#     `MyPCPostRender`, `XIIIBaseHud`: no focus-input handling; only `CWndFocusTrigger`
+#     reads `tFocusTrigger`) finds no scripted consumer; that native is a labelled evidence
+#     gap. The host `fire` at t=155 supplies only that press moment: it fires the registered
+#     trigger's own `TriggerEvent('PontA')`, Engine.u's dispatch reaches the `PontA`
+#     receivers (XIIIMover0/5, TriggerToggle - the panels slide closed through the game's
+#     own mover code) AND back to the trigger itself, whose `WaitEndFocus.Trigger` runs the
+#     decoded dismissal (RemoveMe + array compaction + Destroy; measured in the item52
+#     runs as the two actors dropped at t=155). (The decoded alternative closer - pulling
+#     the bridge lever a second time so `xidmaps.Hual01a.SetGoalComplete` case 555 fires
+#     `CloseBridgeEvent` - is gated on the licence-layer flag `TGSDummy == 546`, which the
+#     binary's licence layer sets and the port does not emulate; with the port's default 0
+#     the lever plays the demo message "IF YOU WANT TO CLOSE THE BRIDGE, BUY THE GAME" and
+#     locks.)
 #   - objective 0 "Penetrate the base enclosure": the end trigger `Trigger2`
 #     (Engine.Trigger, Event 'End_of_level') sits inside the sealed dam-base shaft
 #     (8426,-6708,-491); touching it fires XIIIGoalTrigger1 (GoalNumber 0, primary) ->
