@@ -4203,6 +4203,123 @@ mod tests {
         );
     }
 
+    /// item52 route: Hual01a with both MapInfo objectives completed by the game's own chains,
+    /// then the game's own campaign travel to Hual01b (`MapInfo.NextMapLevelWithUnr`). The
+    /// fixture walks the whole map by player input (no teleports except two labelled measured
+    /// movement gaps, no `take_control`, no `set_goal`, no weapon grant). Measured chains:
+    /// the EDF handle `Porte6` fires 'Goal_Manette_EDF' -> `XIIIGoalTrigger3` (goal 666) ->
+    /// the map's own `xidmaps.Hual01a.SetGoalComplete` override (promotes objective 1 and
+    /// completes it); the dam-crest focus window (`CWndFocusTrigger3`, armed by `TouchTrigger8`)
+    /// hands its 'PontA' Tag off on dismissal and the `XIIIMover0/5` panels close the bridge
+    /// through their own `TriggerToggle`; `Trigger2` ('End_of_level') fires `XIIIGoalTrigger1`
+    /// (goal 0) and `TestGoalComplete` -> `DoTravel` -> `ServerTravel` requests the travel.
+    /// The host `fire` at the lever supplies only the press moment the decoded scripts never
+    /// show (the native consumer is a labelled evidence gap, see `session.fire`); everything
+    /// downstream - the trigger's own `WaitEndFocus.Trigger` dismissal and the `PontA` Tag
+    /// delivery - is game code.
+    #[test]
+    fn opt_in_hual01a_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual01a".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual01a");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        // Tracked fixture (our own route commands; no game data).
+        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/hual01a_route.script");
+        let script = script::Script::load(&route_path).expect("load item52 Hual01a route");
+        assert!(
+            script.events.iter().all(|event| {
+                !matches!(
+                    &event.command,
+                    script::Command::TakeControl
+                        | script::Command::SetGoal(_)
+                        | script::Command::Weapon(_)
+                )
+            }),
+            "the Hual01a route must not bridge control, goals or weapons"
+        );
+        // 210 s: the route reaches the shaft teleport at t=194, the game's own travel request
+        // lands at t~196.5 (measured), the host reloads Hual01b and the run ends there.
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Hual01a",
+            &script,
+            &resolved.params,
+            &scene,
+            210.0,
+        )
+        .expect("run Hual01a route");
+        for (map, states) in &outcome.map_objectives {
+            println!(
+                "[hual01a route] objectives as the run left {map}: {}",
+                states
+                    .iter()
+                    .map(|o| format!(
+                        "[{}{}{}{}] {}",
+                        o.index,
+                        if o.primary { " P" } else { " -" },
+                        if o.completed { " C" } else { " ." },
+                        if o.anti_goal { " A" } else { "" },
+                        o.text
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+        }
+        println!(
+            "[hual01a route] travel: {:?}, final map {}",
+            outcome.travel, outcome.final_map
+        );
+        let hual01a = outcome
+            .map_objectives
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Hual01a"))
+            .expect("Hual01a objective states");
+        assert!(
+            hual01a.1.len() >= 2,
+            "Hual01a MapInfo must expose its two objectives: {:?}",
+            hual01a.1
+        );
+        assert!(
+            hual01a.1[0].primary && hual01a.1[0].completed,
+            "objective 0 (penetrate the base enclosure) must complete through the game's own \
+             End_of_level chain: {:?}",
+            hual01a.1[0]
+        );
+        assert!(
+            hual01a.1[1].primary && hual01a.1[1].completed,
+            "objective 1 (re-connect the power supply) must be promoted and completed by the \
+             map's own SetGoalComplete override through the EDF handle chain: {:?}",
+            hual01a.1[1]
+        );
+        assert!(
+            !outcome.travel.is_empty(),
+            "the level must travel; blocked actors: {:?}",
+            outcome.session.suspended
+        );
+        assert_eq!(outcome.final_map, "Hual01b");
+        assert_eq!(outcome.travel[0].from, "Hual01a");
+        assert_eq!(outcome.travel[0].to, "Hual01b");
+        assert_eq!(outcome.travel[0].url, "Hual01b.unr");
+        let hual01b = outcome
+            .map_objectives
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("Hual01b"))
+            .expect("the run must load Hual01b and capture its objective states");
+        assert!(
+            hual01b.1.len() >= 7,
+            "Hual01b must load with its own MapInfo objectives: {:?}",
+            hual01b.1
+        );
+    }
+
     fn probe_objectifs(game_dir: &std::path::Path, map: &str) {
         let session = session::Session::open(game_dir, map).expect("open map");
         let gi = session.game_info.expect("GameInfo");
