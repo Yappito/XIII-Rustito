@@ -163,4 +163,96 @@ t=335.50 goto 18800 1050
 # longer absorb AI rounds; the wait moves behind the Tmetaldoorhelico line (the sweep from
 # the shooter's muzzle to (18500,1300) is blocked by the door mesh).
 t=339.50 goto 18500 1300
-t=352.50 wait_travel
+# item61b (times shifted +8.5 s for the item64 grapple route): the route player SURVIVES the tarmac (normal-health soldiers; item61) and the
+# game's TouchTrigger10.Touch fired at 325.017 while TT10 is still disarmed (the generator
+# chain is blocked; pinned in the test). The route continues by player input:
+#
+# 1. Fight (labelled M60 grant): the fresh import carries only Fists (GameInfo.AcceptInventory
+#    grants no weapon on a campaign map without travel data), so the route grants the M60
+#    through the game's own Weapon.GiveTo/BringUp - the item14 diagnostic bootstrap, the same
+#    grant the item53b spec sanctioned ("the M60 or a weapon the level gives"; the level has
+#    only ammo clips: 2x bmg50AmmoClip, PumpAmmoClip, BazookAmmoClip - no weapon pickup).
+#    BaseSoldier18 (Tag bataillefinale, authored 150 hp, Skill 2, bAlerte) stands on the
+#    lower road at (17807,1438); track him and fire from behind the Tmetaldoorhelico door
+#    line, crouching between bursts (cover).
+t=341.50 weapon XIII.m60
+# (a closer fight stand at (18150,1250) was measured and rejected: the player, at 74 hp after
+# the tarmac, is killed by the returning fire during the tracked burst - measured
+# local/re/item61b/test-ext5.txt, dead at -6 hp; the door-line standoff below is the cover
+# the item53b comment already used for the helipad wait)
+t=341.70 track BaseSoldier18
+t=342.50 fire
+t=343.00 fire
+t=343.50 fire
+t=344.00 fire
+t=344.50 fire
+t=345.00 fire
+t=345.50 fire
+t=346.00 fire
+t=346.50 fire
+t=347.00 fire
+t=347.50 fire
+t=348.00 fire
+t=348.50 fire
+t=349.00 fire
+t=349.50 fire
+t=350.00 fire
+t=350.50 fire
+t=351.00 fire
+t=351.50 fire
+t=352.00 fire
+t=352.50 fire
+t=353.00 fire
+t=353.50 fire
+t=354.00 fire
+t=354.50 fire
+t=355.00 fire
+t=355.50 fire
+t=356.00 fire
+t=356.50 fire
+t=357.00 fire
+t=361.50 fire
+t=362.00 fire
+t=362.50 fire
+t=363.00 fire
+t=363.50 fire
+t=364.00 fire
+t=364.50 fire
+t=365.00 fire
+t=365.50 fire
+t=366.00 fire
+t=366.50 fire
+t=343.60 crouch 1
+t=344.50 crouch 0
+# 2. Generator-shot retry (the item50 blocker, re-measured post-item53/post-item61): the
+#    walk north toward the yard is blocked at y~1447 by the ForeverLocked door line
+#    (PorteDecors18/Porte6 absorb nothing and never open; measured stalls), so the stand is
+#    a labelled teleport to the closest road position. Track BreakableMover12 and fire: the
+#    soup seals the wall band (measured local/re/item61b/los-probe*.txt: every ray from the
+#    road side into the door band hits the Tportet3 door meshes or Model71 BSP; no clear ray
+#    at 5 UU resolution), and the in-game M60 burst from six road positions never lowered
+#    BreakableMover12.Health (local/re/item61b/shot-probe.txt).
+t=368.50 track off
+t=368.60 teleport 17400 1400 800
+t=368.70 forward 0
+t=368.80 track BreakableMover12
+t=369.50 fire
+t=370.00 fire
+t=370.50 fire
+t=371.00 fire
+t=371.50 fire
+t=372.00 fire
+t=372.50 fire
+t=373.00 fire
+t=373.50 fire
+t=374.00 fire
+t=374.50 fire
+t=375.00 fire
+t=375.50 fire
+t=376.00 fire
+t=376.50 fire
+t=377.00 fire
+# The route ends waiting for the travel that only the generator -> PorteDebloquee ->
+# TouchTrigger10 -> RenfortHelico02 -> ... -> 'finmap' chain can request; every link ahead of
+# TouchTrigger10 is measured unreachable by route input (the pins in the route test).
+t=380.50 wait_travel

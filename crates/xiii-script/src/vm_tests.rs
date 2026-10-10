@@ -762,6 +762,116 @@ fn mapinfo_licence_write_runs_without_a_script_handler() {
     assert_eq!(vm.get_property(mi, "TGSDummy"), Some(&Value::Int(3589)));
 }
 
+/// item61: authored miniature of the engine's `InitExecution` anti-piracy writes (no retail
+/// bytecode): a `GameInfo` subclass carrying `DummyStuff1`/`DummyStuff2`, a `GenAlerte`
+/// subclass carrying `dummy`, and a non-GameInfo/non-GenAlerte `FakeInfo` subclass with the
+/// same property names (so only the chain-name gate may exclude it).
+fn init_execution_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let gameinfo = b.reserve(0, 0, "GameInfo");
+    let mygame = b.reserve(0, 0, "MyGame");
+    let genalerte = b.reserve(0, 0, "GenAlerte");
+    let fakeinfo = b.reserve(0, 0, "FakeInfo");
+    let dummy1 = b.reserve(IMP_FLOATPROP, mygame, "DummyStuff1");
+    let dummy2 = b.reserve(IMP_INTPROP, dummy1, "DummyStuff2");
+    let gen_dummy = b.reserve(IMP_INTPROP, genalerte, "dummy");
+    let fake1 = b.reserve(IMP_FLOATPROP, fakeinfo, "DummyStuff1");
+    let fake2 = b.reserve(IMP_INTPROP, fake1, "DummyStuff2");
+    b.prop(dummy1, dummy2, 0);
+    b.prop(dummy2, 0, 0);
+    b.prop(gen_dummy, 0, 0);
+    b.prop(fake1, fake2, 0);
+    b.prop(fake2, 0, 0);
+    b.class(object, 0, 0);
+    b.class(actor, object, 0);
+    b.class(gameinfo, actor, 0);
+    b.class(mygame, gameinfo, dummy1);
+    b.class(genalerte, actor, gen_dummy);
+    b.class(fakeinfo, actor, fake1);
+    // "Map-placed" actors: exports whose class is the class export itself (the way a map
+    // package's export table instantiates level actors), with an empty tagged property block.
+    let placed_alert = b.reserve(genalerte, 0, "GenAlerte0");
+    let placed_game = b.reserve(mygame, 0, "MyGame0");
+    let placed_fake = b.reserve(fakeinfo, 0, "FakeInfo0");
+    b.set(placed_alert, vec![0]);
+    b.set(placed_game, vec![0]);
+    b.set(placed_fake, vec![0]);
+    b.build()
+}
+
+#[test]
+fn init_execution_writes_gameinfo_dummystuff_on_spawn() {
+    let set = set_of(init_execution_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let spawner = vm.spawn(g(&set, "Actor"), "Spawner").unwrap();
+    let game = vm
+        .spawn_actor(spawner, Some(g(&set, "MyGame")), None, None, None, None)
+        .unwrap()
+        .expect("spawned");
+    // Engine.dll `AGameInfo::InitExecution` 0x103e0cb6/0x103e0cc0: 0xC3A3228F at +0x2c0,
+    // 0x337 at +0x2c4.
+    assert_eq!((-326.27f32).to_bits(), 0xC3A3228F);
+    assert_eq!(
+        vm.get_property(game, "DummyStuff1"),
+        Some(&Value::Float(-326.27))
+    );
+    assert_eq!(vm.get_property(game, "DummyStuff2"), Some(&Value::Int(823)));
+    // A non-GameInfo class with the same property names never receives the write.
+    let fake = vm
+        .spawn_actor(spawner, Some(g(&set, "FakeInfo")), None, None, None, None)
+        .unwrap()
+        .expect("spawned");
+    assert_eq!(
+        vm.get_property(fake, "DummyStuff1"),
+        Some(&Value::Float(0.0)),
+        "a non-GameInfo class never receives the DummyStuff write"
+    );
+    assert_eq!(vm.get_property(fake, "DummyStuff2"), Some(&Value::Int(0)));
+    // The GameInfo write lands before any lifecycle event: `active` is set after the write, so
+    // a PreBeginPlay handler would already observe the magic value.
+    assert!(vm.objects[game as usize].active);
+}
+
+#[test]
+fn init_execution_writes_genalerte_dummy_on_level_load() {
+    let set = set_of(init_execution_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.load_level(0, &Limits::default()).unwrap();
+    let alert = vm.find_object("GenAlerte0").expect("GenAlerte instance");
+    // XIDPawn.dll `AGenAlerte::InitExecution` 0x119015c9: 0x7d2 at this+0x21c.
+    assert_eq!(vm.get_property(alert, "dummy"), Some(&Value::Int(2002)));
+    let fake = vm.find_object("FakeInfo0").expect("FakeInfo instance");
+    assert_eq!(
+        vm.get_property(fake, "dummy"),
+        None,
+        "a non-GenAlerte class has no dummy slot to write"
+    );
+}
+
+#[test]
+fn init_execution_write_survives_map_property_reload_order() {
+    // The engine serialises map properties first, then runs `InitExecution`; a map-authored
+    // value must not survive the write. `MyGame0` (a GameInfo subclass) instantiated from the
+    // "map" package therefore carries the magic float even though no map default set it.
+    let set = set_of(init_execution_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.load_level(0, &Limits::default()).unwrap();
+    let game = vm.find_object("MyGame0").expect("MyGame instance");
+    assert_eq!(
+        vm.get_property(game, "DummyStuff1"),
+        Some(&Value::Float(-326.27))
+    );
+    assert_eq!(vm.get_property(game, "DummyStuff2"), Some(&Value::Int(823)));
+    let fake = vm.find_object("FakeInfo0").expect("FakeInfo instance");
+    assert_eq!(
+        vm.get_property(fake, "DummyStuff1"),
+        Some(&Value::Float(0.0)),
+        "a non-GameInfo class never receives the DummyStuff write"
+    );
+}
+
 fn pressing_fire_package() -> Vec<u8> {
     let mut b = B::new();
     let object = b.reserve(0, 0, "Object");
@@ -3651,6 +3761,8 @@ fn phys_fixture() -> Vec<u8> {
     let touching = b.reserve(IMP_ARRAYPROP, actor, "Touching");
     let touching_template = b.reserve(IMP_OBJECTPROP, touching, "Touching");
     let static_mesh = b.reserve(IMP_OBJECTPROP, actor, "StaticMesh");
+    let just_teleported = b.reserve(IMP_BOOLPROP, actor, "bJustTeleported");
+    let floor = b.reserve(IMP_STRUCTPROP, actor, "Floor");
 
     b.prop_with(owner, level, 0, &object_extra);
     b.prop_with(level, base, 0, &object_extra);
@@ -3683,7 +3795,9 @@ fn phys_fixture() -> Vec<u8> {
     b.prop(touches, untouches, 0);
     b.prop(untouches, touching, 0);
     b.prop_with(touching_template, 0, 0, &object_extra);
-    b.prop_array(touching, touch_fn, 0, touching_template);
+    b.prop_array(touching, just_teleported, 0, touching_template);
+    b.prop(just_teleported, floor, 0);
+    b.prop_with(floor, touch_fn, 0, &vector_extra);
 
     let tc = touches as u8;
     let touch_code = vec![0x0F, 0x01, tc, 0x92, 0x00, tc, 0x26, 0x16, 0x04, 0x0B];
@@ -10817,11 +10931,14 @@ fn synthetic_trace_hits_the_nearest_pawn_before_world_geometry() {
         vm.set_active(id, true);
     }
     let mut args = trace_args();
+    // Retail execTrace updates the last-bone cache only with 0x10000 requested.
+    // This test exercises the VM's Partial cylinder-zone model behind that gate.
+    args.extend([Value::Object(None), Value::Int(0x10000)]);
     let hit = call_native(
         &mut vm,
         "Actor.Trace",
         shooter,
-        &[false, false, false, false, false, false],
+        &[false, false, false, false, false, false, true, false],
         &mut args,
     );
     assert_eq!(
@@ -13006,6 +13123,326 @@ fn make_noise_nan_and_negative_loudness_follow_the_x87_compares() {
     w.vm.time += 1.0;
     w.noise(player, -1.0);
     assert!(w.heard().is_empty());
+}
+
+#[test]
+fn item63_eye_position_reads_current_height_without_base_or_crouch_fallback() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pawn = vm.spawn(pg(&set, "Pawn"), "Eye").unwrap();
+    vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(60.0));
+    vm.set_property(pawn, "bIsCrouched", 0, Value::Bool(true));
+    for height in [0.0, -7.0, 35.5] {
+        vm.set_property(pawn, "EyeHeight", 0, Value::Float(height));
+        assert_eq!(
+            call_native(&mut vm, "Pawn.EyePosition", pawn, &[], &mut []),
+            NativeOutcome::Value(Value::Vector([0.0, 0.0, height]))
+        );
+    }
+    let set = nav_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let pawn = vm.spawn(pg(&set, "Pawn"), "MissingEye").unwrap();
+    vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(60.0));
+    assert_eq!(
+        call_native(&mut vm, "Pawn.EyePosition", pawn, &[], &mut []),
+        NativeOutcome::Value(Value::Vector([0.0; 3]))
+    );
+}
+
+#[test]
+fn item63_playanim_refused_requests_preserve_the_running_clip() {
+    let set = anim_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(10, 10.0)));
+    let actor = vm.spawn(sg(&set, "Actor"), "Animation").unwrap();
+    vm.set_active(actor, true);
+    play_anim(&mut vm, actor, "Walk", 1.0, 0);
+    vm.tick(0.2).unwrap();
+    for (sequence, rate, channel) in [
+        ("None", 1.0, 0),
+        ("Run", -1.0, 0),
+        ("Run", 1.0, -1),
+        ("Run", 1.0, 257),
+    ] {
+        play_anim(&mut vm, actor, sequence, rate, channel);
+        assert_eq!(vm.anim_channel_sequence(actor, 0), Some("Walk"));
+        assert_eq!(
+            vm.get_property(actor, "AnimFrame"),
+            Some(&Value::Float(0.2))
+        );
+    }
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(0, 10.0)));
+    play_anim(&mut vm, actor, "Empty", 1.0, 0);
+    assert_eq!(vm.anim_channel_sequence(actor, 0), Some("Walk"));
+    vm.set_animation_data(Box::new(crate::animation::FixedAnimation::new(10, 10.0)));
+    play_anim(&mut vm, actor, "Hold", 0.0, 0);
+    for _ in 0..50 {
+        vm.tick(0.01).unwrap();
+    }
+    assert_eq!(
+        vm.get_property(actor, "AnimFrame"),
+        Some(&Value::Float(0.0))
+    );
+    assert_eq!(anim_end_count(&vm), 0);
+}
+
+#[test]
+fn item63_setlocation_refusal_preserves_base_and_success_detaches() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let actor = phys_actor(&mut vm, &set, "Teleport", [0.0; 3]);
+    let base = phys_actor(&mut vm, &set, "Base", [100.0; 3]);
+    set_collision_fields(&mut vm, actor, false, false);
+    vm.set_property(
+        actor,
+        "Base",
+        0,
+        Value::Object(Some(ObjRef::Instance(base))),
+    );
+    let mut args = [Value::Vector([30.0, 20.0, 10.0])];
+    for (static_flag, movable) in [(true, true), (false, false)] {
+        vm.set_property(actor, "bStatic", 0, Value::Bool(static_flag));
+        vm.set_property(actor, "bMovable", 0, Value::Bool(movable));
+        assert!(!bool_result(call_native(
+            &mut vm,
+            "Actor.SetLocation",
+            actor,
+            &[false],
+            &mut args
+        )));
+        assert_eq!(
+            vm.get_property(actor, "Location"),
+            Some(&Value::Vector([0.0; 3]))
+        );
+        assert_eq!(vm.obj_prop(actor, "Base"), Some(base));
+        assert_eq!(
+            vm.get_property(actor, "bJustTeleported"),
+            Some(&Value::Bool(false))
+        );
+    }
+    vm.set_property(actor, "bMovable", 0, Value::Bool(true));
+    assert!(bool_result(call_native(
+        &mut vm,
+        "Actor.SetLocation",
+        actor,
+        &[false],
+        &mut args
+    )));
+    assert_eq!(vm.get_property(actor, "Location"), Some(&args[0]));
+    assert_eq!(vm.get_property(actor, "Base"), Some(&Value::Object(None)));
+    assert_eq!(
+        vm.get_property(actor, "Floor"),
+        Some(&Value::Vector([0.0, 0.0, 1.0]))
+    );
+    assert_eq!(
+        vm.get_property(actor, "bJustTeleported"),
+        Some(&Value::Bool(true))
+    );
+}
+
+#[test]
+fn item63_trace_miss_zeros_outs_and_unflagged_trace_preserves_last_bone() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let actor = phys_actor(&mut vm, &set, "Trace", [10.0, 20.0, 30.0]);
+    let target = phys_actor(&mut vm, &set, "PreviousHit", [100.0, 20.0, 30.0]);
+    set_collision_fields(&mut vm, target, true, true);
+    vm.vm_trace(
+        actor,
+        [10.0, 20.0, 30.0],
+        [200.0, 20.0, 30.0],
+        true,
+        [0.0; 3],
+    )
+    .unwrap();
+    let previous_bone = vm.last_trace_bone().to_owned();
+    assert_ne!(previous_bone, "None");
+    for extra in [0, 0x10000] {
+        let mut args = [
+            Value::Vector([99.0; 3]),
+            Value::Vector([99.0; 3]),
+            Value::Vector([50.0, 20.0, 30.0]),
+            Value::Vector([0.0; 3]),
+            Value::Bool(false),
+            Value::Vector([0.0; 3]),
+            Value::Object(None),
+            Value::Int(extra),
+            Value::Int(123),
+        ];
+        assert_eq!(
+            call_native(
+                &mut vm,
+                "Actor.Trace",
+                actor,
+                &[false, false, false, true, false, true, false, false, false],
+                &mut args
+            ),
+            NativeOutcome::Value(Value::Object(None))
+        );
+        assert_eq!(args[0], Value::Vector([0.0; 3]));
+        assert_eq!(args[1], Value::Vector([0.0; 3]));
+        assert_eq!(args[8], Value::Int(0));
+        assert_eq!(
+            vm.last_trace_bone(),
+            if extra == 0 { &previous_bone } else { "None" }
+        );
+    }
+}
+
+#[test]
+fn item63_touching_cursor_observes_mutation_nulls_classes_and_retained_deletion() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let actor = phys_actor(&mut vm, &set, "Touching", [0.0; 3]);
+    let first = vm.spawn(pg(&set, "Child"), "First").unwrap();
+    let shifted = vm.spawn(pg(&set, "Child"), "Shifted").unwrap();
+    let appended = vm.spawn(pg(&set, "Child"), "Appended").unwrap();
+    let reference = |id| Value::Object(Some(ObjRef::Instance(id)));
+    vm.set_property(
+        actor,
+        "Touching",
+        0,
+        Value::Array(vec![
+            Value::Object(None),
+            reference(first),
+            reference(shifted),
+        ]),
+    );
+    let mut cursor = 0;
+    assert_eq!(
+        vm.next_touching_actor(actor, Some(pg(&set, "Child")), &mut cursor),
+        Some(first)
+    );
+    // Removing the yielded element shifts Shifted below the already advanced cursor;
+    // appending a new element is visible on the next native yield.
+    vm.set_property(
+        actor,
+        "Touching",
+        0,
+        Value::Array(vec![
+            Value::Object(None),
+            reference(shifted),
+            reference(appended),
+        ]),
+    );
+    vm.objects[appended as usize].deleted = true;
+    assert_eq!(
+        vm.next_touching_actor(actor, Some(pg(&set, "Child")), &mut cursor),
+        Some(appended)
+    );
+    assert_eq!(vm.next_touching_actor(actor, None, &mut cursor), None);
+    cursor = 0;
+    assert_eq!(
+        vm.next_touching_actor(actor, Some(pg(&set, "Mover")), &mut cursor),
+        None
+    );
+}
+
+/// Authored synthetic bytecode, with no dependency on a game install or local reports.
+fn item63_touching_foreach_set(break_after_first: bool) -> ScriptSet {
+    use ff::*;
+    use pf::*;
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let count = b.reserve(IMP_INTPROP, actor, "Count");
+    let selected = b.reserve(IMP_OBJECTPROP, actor, "Selected");
+    let touching = b.reserve(IMP_ARRAYPROP, actor, "Touching");
+    let inner = b.reserve(IMP_OBJECTPROP, touching, "Touching");
+    let iterator = b.reserve(IMP_FUNCTION, actor, "TouchingActors");
+    let base = b.reserve(IMP_OBJECTPROP, iterator, "BaseClass");
+    let out = b.reserve(IMP_OBJECTPROP, iterator, "Actor");
+    let run = b.reserve(IMP_FUNCTION, actor, "Run");
+    let add = b.reserve(IMP_FUNCTION, object, "Add_IntInt");
+    let left = b.reserve(IMP_INTPROP, add, "A");
+    let right = b.reserve(IMP_INTPROP, add, "B");
+    let result = b.reserve(IMP_INTPROP, add, "ReturnValue");
+    b.prop(count, selected, 0);
+    b.prop_with(selected, touching, 0, &compact(0));
+    b.prop_with(inner, 0, 0, &compact(0));
+    b.prop_array(touching, iterator, 0, inner);
+    b.prop_with(base, out, PARM, &compact(0));
+    b.prop_with(out, 0, PARM | OUT_PARM, &compact(0));
+    b.func(iterator, run, base, &[], 0, 307, FINAL | NATIVE | ITERATOR);
+    b.prop(left, right, PARM);
+    b.prop(right, result, PARM);
+    b.prop(result, 0, PARM | RETURN_PARM);
+    b.func(
+        add,
+        0,
+        left,
+        &[],
+        0,
+        146,
+        FINAL | NATIVE | OPERATOR | STATIC,
+    );
+    // foreach TouchingActors(None, Selected) { Count = Count+1; Touching.Length=0; }
+    // Compact property refs occupy four bytes in the VM's logical script offsets.
+    let pop_offset: u16 = if break_after_first { 34 } else { 35 };
+    let mut code = vec![0x2f, 0x61, 0x33, 0x2a, 0x01, selected as u8, 0x16];
+    code.extend(pop_offset.to_le_bytes());
+    code.extend([0x0f, 0x01, count as u8, 0x92, 0x01, count as u8, 0x26, 0x16]);
+    code.extend([0x0f, 0x37, 0x01, touching as u8, 0x25]);
+    if !break_after_first {
+        code.push(0x31);
+    }
+    code.extend([0x30, 0x04, 0x0b]);
+    b.func(run, 0, 0, &code, u32::from(pop_offset) + 3, 0, DEFINED);
+    b.class(object, 0, add, 0);
+    b.class(actor, object, count, 0);
+    let package = ScriptPackage::load(
+        "Test",
+        b.build(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .unwrap();
+    assert!(package.errors.is_empty(), "{:?}", package.errors);
+    let mut set = ScriptSet::new();
+    set.add(package);
+    set
+}
+
+#[test]
+fn item63_touching_foreach_rechecks_array_and_clears_out_only_on_exhaustion() {
+    for early_break in [false, true] {
+        let set = item63_touching_foreach_set(early_break);
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let actor = vm.spawn(pg(&set, "Actor"), "Caller").unwrap();
+        let first = vm.spawn(pg(&set, "Actor"), "First").unwrap();
+        let second = vm.spawn(pg(&set, "Actor"), "Second").unwrap();
+        let reference = |id| Value::Object(Some(ObjRef::Instance(id)));
+        vm.set_property(
+            actor,
+            "Touching",
+            0,
+            Value::Array(vec![reference(first), reference(second)]),
+        );
+        vm.send_event(actor, "Run", Vec::new()).unwrap();
+        assert_eq!(
+            vm.get_property(actor, "Count"),
+            Some(&Value::Int(1)),
+            "snapshot would run the removed second entry"
+        );
+        assert_eq!(
+            vm.get_property(actor, "Selected"),
+            Some(&if early_break {
+                reference(first)
+            } else {
+                Value::Object(None)
+            })
+        );
+        // Empty iteration must overwrite a previous non-null out value too.
+        vm.set_property(actor, "Selected", 0, reference(second));
+        vm.send_event(actor, "Run", Vec::new()).unwrap();
+        assert_eq!(
+            vm.get_property(actor, "Selected"),
+            Some(&Value::Object(None))
+        );
+        assert_eq!(vm.get_property(actor, "Count"), Some(&Value::Int(1)));
+    }
 }
 
 // ---------------------------------------------------------------------------------------

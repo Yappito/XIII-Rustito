@@ -2380,6 +2380,61 @@ fn run_script_inner(
             let outcome = runtime.session.altfire_pressed();
             println!("[play] altfire_hold press [{elapsed:.3}s]: {outcome:?}");
         }
+        // TEMP item64b probe (remove before finishing)
+        if let Ok(win) = std::env::var("XIII_PROBE_HOOK") {
+            let mut w = win.split(',').filter_map(|v| v.parse::<f32>().ok());
+            let (a, b) = (w.next().unwrap_or(0.0), w.next().unwrap_or(0.0));
+            let t = tick as f32 * DT;
+            if t >= a && t <= b {
+                let vm = runtime.session.vm();
+                let pc = runtime.session.controller;
+                let hooked = pc.and_then(|pc| vm.get_property(pc, "bHooked")).map(|v| v.to_string());
+                let hook = pc.and_then(|pc| match vm.get_property(pc, "HookUsed") {
+                    Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(h)))) => Some(*h),
+                    _ => None,
+                });
+                let hp = |n: &str| hook.and_then(|h| vm.get_property(h, n)).map(|v| v.to_string()).unwrap_or_default();
+                let pawn = pc.and_then(|pc| match vm.get_property(pc, "Pawn") {
+                    Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(h)))) => Some(*h),
+                    _ => None,
+                });
+                let sel = pawn.and_then(|p| match vm.get_property(p, "SelectedItem") {
+                    Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(h)))) => Some(*h),
+                    _ => None,
+                });
+                let sel_desc = sel.map(|h| format!("{} st={:?} pot={:?} len={:?}", vm.objects[h as usize].name, vm.state_name(h), vm.get_property(h, "PotHookPoint").map(|v| v.to_string()), vm.get_property(h, "HookLength").map(|v| v.to_string())));
+                let wm = pc.and_then(|pc| vm.get_property(pc, "bWeaponMode")).map(|v| v.to_string());
+                let inter = pc.and_then(|pc| match vm.get_property(pc, "MyInteraction") {
+                    Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(h)))) => Some(*h),
+                    _ => None,
+                });
+                let ta = inter.and_then(|i| match vm.get_property(i, "TargetActor") {
+                    Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(h)))) => Some(vm.objects[*h as usize].name.clone()),
+                    _ => None,
+                });
+                let thl = inter.and_then(|i| vm.vector_prop(i, "TargHitLoc"));
+                println!("[probe-hook2] t={t:.3} sel={sel_desc:?} wm={wm:?} weapon={:?} target={ta:?} hit={thl:?} yaw={:.1} pitch={:.1}", pawn.and_then(|p| match vm.get_property(p, "Weapon") { Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(w)))) => Some(vm.objects[*w as usize].name.clone()), _ => None }), runtime.sim.yaw.to_degrees(), runtime.sim.pitch.to_degrees());
+                if tick.is_multiple_of(15) {
+                    let mut parts = Vec::new();
+                    for n in ["BaseSoldier", "BaseSoldier4", "Cine0"] {
+                        if let Some(id) = vm.find_live_object(n) {
+                            parts.push(format!("{n}@{:?} hp={:?}", vm.vector_prop(id, "Location").map(|l| [l[0] as i32, l[1] as i32, l[2] as i32]), vm.get_property(id, "Health").map(|v| v.to_string())));
+                        }
+                    }
+                    let ammo = pawn.and_then(|p| match vm.get_property(p, "Weapon") { Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(w)))) => Some(*w), _ => None }).and_then(|w| match vm.get_property(w, "AmmoType") { Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(a)))) => vm.get_property(*a, "AmmoAmount").map(|v| v.to_string()), _ => None });
+                    println!("[probe-snip] t={t:.3} ammo={ammo:?} {}", parts.join(" "));
+                }
+                println!(
+                    "[probe-hook] t={t:.3} sim=({:.0},{:.0},{:.0}) v=({:.0},{:.0},{:.0}) phys={:?} hooked={hooked:?} len={} up={} down={} state={} hp={:?}",
+                    runtime.sim.location[0], runtime.sim.location[1], runtime.sim.location[2],
+                    runtime.sim.velocity[0], runtime.sim.velocity[1], runtime.sim.velocity[2],
+                    runtime.session.player_physics(),
+                    hp("HookLength"), hp("bGoUp"), hp("bGoDown"),
+                    runtime.session.player_controller_state(),
+                    runtime.session.player_health(),
+                );
+            }
+        }
         if tick.is_multiple_of(TRACE_EVERY) || tick + 1 == ticks {
             trace.push((tick, elapsed, runtime.sim.location, runtime.sim.velocity));
             println!(
@@ -5878,7 +5933,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            345.0,
+            389.0,
         )
         .expect("run Toits01 route");
         let session = &outcome.session;
@@ -5893,18 +5948,28 @@ mod tests {
             "route unexpectedly travelled: {:?}",
             outcome.travel
         );
-        // item48: `Actor.VisibleDamageableActors` (HurtRadius) now delivers blast damage, so
-        // the tarmac's scripted BazookRocket soldiers (Damage 600, DamageRadius 1000) kill the
-        // route's no-input player near (16000,1300): measured 150 -> 75 @299.0 s, 65 @301.5 s,
-        // dead @302.0 s (identical in two runs; the ratios match the retail HurtRadius script's
-        // `1 - (dist - CollisionRadius)/DamageRadius` falloff for wall impacts ~900-1000 UU out).
-        // The fixture was authored while the native was missing, so the blasts were no-ops.
+        // item48 -> item61b: `Actor.VisibleDamageableActors` (HurtRadius) delivers blast damage,
+        // but since item61's native InitExecution writes (GameInfo.DummyStuff1/2,
+        // GenAlerte.dummy) the tarmac's scripted BazookRocket soldiers are back to their
+        // authored skill/health: their aimed rockets land with falloff spread and the route's
+        // moving player SURVIVES the kill zone. Measured (identical twice,
+        // `local/re/item61b/test-as-is.txt` / `test-as-is-2.txt`): health 150 until t=319.0,
+        // 85 from t=319.5 (blast -65), 74 from t=323.5 (blast -11); the game's TouchTrigger10
+        // Touch fired at 325.017 with the player alive. The route's fight phase (below) then
+        // costs one soldier hit on the way to the door-line stand (74 -> 49) and the stand
+        // itself is safe (the Tmetaldoorhelico door line blocks the soldier's sweep, the same
+        // cover the item53b comment used for the helipad wait). Pinned: alive through the
+        // whole route, final health inside the measured window.
         let health = session
             .player_health()
             .expect("the player must still have a Health property across the route");
         assert!(
-            health <= 0.0,
-            "expected the scripted tarmac rockets to kill the no-input route player once HurtRadius works, got health {health}"
+            health > 0.0,
+            "the route player must survive the tarmac rockets and the fight phase with normal-health soldiers, got health {health}"
+        );
+        assert!(
+            (40.0..=60.0).contains(&health),
+            "the route player's final health must stay in the measured 40..=60 window (measured 150 -> 85 @319.5 s -> 74 @323.5 s -> 49 at the fight stand), got {health}"
         );
         // Goal 3 (Jones must not die) completes; goals 0/1/2 do not.
         for o in &objectives {
@@ -6098,26 +6163,17 @@ mod tests {
             dm4_started_after_touch,
             "the follow-up dialogue 'dialtoits1bis' (DialogueManager4) must start after the 'SpeechJones11T' chain fires"
         );
-        // item48: the tarmac rockets kill the route's player at ~301.55 s (health pin above).
-        // The engine-wide kill broadcast (`Controller.ClientGameEnded`) then moves every
-        // controller out of the scene: measured CineController2 PlayingSequence -> GameEnded at
-        // 301.550 s, with ScriptedActionIndex cleared (None) after the broadcast. The pre-item48
-        // fixture pinned `ScriptedActionIndex >= 117` and a PlayerWalking handover here; both
-        // were measured on a living player and are unreachable once the kill ends the scene.
-        // Pinned instead: the scene was still running (PlayingSequence) until the kill moved
-        // CineController2 to GameEnded, and the player controller ends in GameEndedDeath.
-        let kill_broadcast = vm.trace.iter().any(|event| {
-            matches!(
-                &event.kind,
-                xiii_script::TraceKind::StateChange { actor, from, to, .. }
-                    if actor.eq_ignore_ascii_case("CineController2")
-                        && from.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("PlayingSequence"))
-                        && to.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("GameEnded"))
-            )
-        });
+        // item61b: with normal-health soldiers the player survives, so the item48 kill pins are
+        // gone: no GameEnded broadcast ever fires (measured: no CineController2 state change
+        // after its entry into PlayingSequence; the scene is still running at the cutoff)
+        // and the player controller stays in PlayerWalking. The next blocker is pinned after the
+        // TouchTrigger10/generator assertions below.
+        let cc2 = vm
+            .find_object("CineController2")
+            .expect("CineController2 must exist");
         assert!(
-            kill_broadcast,
-            "the scene must run until the player kill's GameEnded broadcast moves CineController2 out of PlayingSequence"
+            vm.is_in_state(cc2, "PlayingSequence"),
+            "the scene must still be running (CineController2 in PlayingSequence) when the surviving player ends the route"
         );
         let pc = vm
             .objects
@@ -6126,8 +6182,150 @@ mod tests {
             .position(|(_, o)| vm.set().path(o.class).ends_with("XIIIPlayerController"))
             .expect("the player controller must exist");
         assert!(
-            vm.is_in_state(pc as u32, "GameEndedDeath"),
-            "the player controller must end in GameEndedDeath (killed by the scripted tarmac rockets)"
+            vm.is_in_state(pc as u32, "PlayerWalking"),
+            "the surviving player controller must end in PlayerWalking (no kill broadcast), got {:?}",
+            vm.trace
+                .iter()
+                .rev()
+                .find(|event| matches!(
+                    &event.kind,
+                    xiii_script::TraceKind::StateChange { actor, .. }
+                        if actor.eq_ignore_ascii_case("XIIIPlayerController")
+                ))
+                .map(|e| match &e.kind {
+                    xiii_script::TraceKind::StateChange { from, to, .. } => {
+                        format!("{from:?} -> {to:?}")
+                    }
+                    _ => String::new(),
+                })
         );
+        // item61b continuation pins (the route's fight + generator-retry phases):
+        // 1. The route's M60 fire (the labelled XIII.m60 grant; the import carries only Fists)
+        //    damages the road soldier BaseSoldier18 (authored 150 hp, Tag bataillefinale):
+        //    measured one landed burst (32 damage, `X Spine` bone hit, 150 -> 118) before he
+        //    reaches hard cover on the lower road; the remaining bursts trace onto the cover
+        //    (bone None). Normal-health soldiers are damageable by route fire; the full kill
+        //    was measured in the open-road probe (`local/re/item61b/shot-probe.txt`, the
+        //    (17500,1450) stand: 150 -> 20 -> -112 DEAD) but costs the player the remaining
+        //    health, so the route pins the cover fight, not the kill.
+        let soldier18 = vm
+            .find_object("BaseSoldier18")
+            .expect("BaseSoldier18 must exist");
+        assert_eq!(
+            vm.get_property(soldier18, "Health"),
+            Some(&xiii_script::Value::Int(118)),
+            "the route's tracked M60 fire must damage BaseSoldier18 (150 -> 118, the fight demonstration); the value moves only if the fight phase changes"
+        );
+        // 2. The generator-shot retry (t=360-368.5, from the closest road stand at
+        //    (17400,1400), tracking BreakableMover12) lands nothing: the yard stays sealed
+        //    (the generator Health 50 pin above). The next blocker, precisely: the yard's
+        //    south wall line is sealed by BSP + the two ForeverLocked Tportet3 doors (measured
+        //    soup scan: zero clear rays across the whole door band at 5 UU resolution,
+        //    `local/re/item61b/los-probe*.txt`); the doors never open (PorteDecors.ForeverLocked
+        //    absorbs TakeDamage and only plays a sound on PlayerTrigger); the level's own
+        //    shotgun pickup (FusilPompePick1) is inside the sealed yard. So BreakableMover12
+        //    can never be destroyed by route input -> 'PorteDebloquee_cine' never fires ->
+        //    CineTrigger17 never forwards 'PorteDebloquee' -> TT10 stays disarmed -> goal 0's
+        //    chain, the RenfortHelico02 finale, goals 1/2 and the 'finmap' travel are all
+        //    unreachable, and the route ends waiting for a travel that cannot be requested.
+    }
+
+    // TEMP item64b probe (remove before finishing)
+    #[test]
+    fn opt_in_item64b_probe_tmp() {
+        let Some(game_dir) = opt_in_root() else {
+            return;
+        };
+        let Ok(path) = std::env::var("XIII_PROBE_SCRIPT") else {
+            return;
+        };
+        let dur: f32 = std::env::var("XIII_PROBE_DUR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(389.0);
+        let opts = Options {
+            map: Some("Toits01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Toits01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let script = script::Script::load(std::path::Path::new(&path)).expect("load");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir, "Toits01", &script, &resolved.params, &scene, dur,
+        )
+        .expect("run");
+        let vm = outcome.session.vm();
+        println!("[probe] final health={:?}", outcome.session.player_health());
+        for name in ["BaseSoldier18", "BreakableMover12"] {
+            if let Some(id) = vm.find_object(name) {
+                println!("[probe] {name} Health={:?}", vm.get_property(id, "Health"));
+            }
+        }
+        for name in ["HookPoint0", "HookPoint2", "XIIIGoalTrigger6"] {
+            if let Some(id) = vm.find_object(name) {
+                println!("[probe] {name} bInteractive={:?} bHookPointActivated-map={:?}", vm.get_property(id, "bInteractive"), vm.get_property(id, "bHookPointActivated"));
+            }
+        }
+        if let Some(mi) = vm.find_object("Toits01") {
+            println!("[probe] mapinfo Toits01 class={:?} bHookPointActivated={:?} HookPointToActive={:?}", vm.objects[mi as usize].class, vm.get_property(mi, "bHookPointActivated"), vm.get_property(mi, "HookPointToActive"));
+        }
+        for event in &vm.trace {
+            if let xiii_script::TraceKind::StateChange { actor, .. } = &event.kind
+                && (actor.eq_ignore_ascii_case("HookPoint2") || actor.eq_ignore_ascii_case("XIIIGoalTrigger6") || actor.eq_ignore_ascii_case("Toits01"))
+            {
+                println!("[probe-sc] {event}");
+            }
+        }
+        let keys: Vec<String> = std::env::var("XIII_PROBE_KEYS").unwrap_or_default().split(',').filter(|k| !k.is_empty()).map(|k| k.to_ascii_lowercase()).collect();
+        for event in &vm.trace {
+            let line = format!("{event}");
+            let low = line.to_ascii_lowercase();
+            if keys.iter().any(|k| low.contains(k.as_str())) {
+                println!("[probe-key] {line}");
+            }
+        }
+        for event in &vm.trace {
+            if let xiii_script::TraceKind::Event { target, function, args } = &event.kind
+                && (function.contains("TakeDamage") || function.contains("Died") || target.eq_ignore_ascii_case("TouchTrigger10"))
+                && (args.iter().any(|a| a.contains("XIIIPlayerPawn")) || target.contains("XIIIPlayerPawn"))
+            {
+                println!("[probe] trace {:?} {target} {function} {args:?}", event.time);
+            }
+        }
+    }
+
+    // TEMP item64b probe (remove before finishing)
+    #[test]
+    fn opt_in_item64b_floor_probe_tmp() {
+        let Some(game_dir) = opt_in_root() else {
+            return;
+        };
+        if std::env::var("XIII_PROBE_FLOOR").is_err() {
+            return;
+        }
+        let opts = Options {
+            map: Some("Toits01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Toits01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let rt = open_map_runtime(&game_dir, "Toits01", &scene, &resolved.params).expect("open");
+        let spec: Vec<f32> = std::env::var("XIII_PROBE_FLOOR").unwrap().split(',').filter_map(|v| v.parse().ok()).collect();
+        let (x0, x1, y0, y1, step, ztop) = (spec[0], spec[1], spec[2], spec[3], spec[4], spec[5]);
+        let mut y = y1;
+        while y >= y0 {
+            let mut row = format!("[floor] y={y:6.0}:");
+            let mut x = x0;
+            while x <= x1 {
+                let hit = rt.world.ray([x, y, ztop], [x, y, -400.0]);
+                let z = hit.map(|h| ztop + (-400.0 - ztop) * h.t);
+                row.push_str(&match z { Some(z) => format!(" {z:5.0}"), None => "     -".to_owned() });
+                x += step;
+            }
+            println!("{row}");
+            y -= step;
+        }
     }
 }
