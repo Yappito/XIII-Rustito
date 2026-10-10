@@ -936,7 +936,13 @@ fn perform_use(
             let outcome = sess.use_target(&target);
             println!("[play] use {target}: {outcome:?}");
         }
-        None => println!("[play] use: nothing in reach"),
+        // item64: with nothing in reach the use input still runs the game's own `Grab` exec —
+        // its early branches are gameplay, not interaction: while hooked it is the rope detach
+        // (`bHooked && !bWeaponMode && SelectedItem is Hook -> Hook.Release()`).
+        None => {
+            println!("[play] use: nothing in reach (sending the bare Grab exec)");
+            sess.use_grab_exec();
+        }
     }
 }
 
@@ -2216,6 +2222,8 @@ fn run_script_inner(
             Input::default()
         };
         let weapons = drive.take_weapons();
+        let items = drive.take_items();
+        let ((fire_hold, fire_edge), (altfire_hold, altfire_edge)) = drive.take_hook_buttons();
         let goals = drive.take_goals();
         let mut weapon_inputs = drive.take_weapon_inputs();
         let mut use_named = drive.take_use_named();
@@ -2267,6 +2275,14 @@ fn run_script_inner(
             floor_normal: runtime.sim.floor_normal,
             eye_height: runtime.sim.vm_eye_height(&runtime.player_params),
         };
+        // item64: publish the held rope buttons before the VM tick so `PressingFire`/
+        // `PressingAltFire` polls inside this tick's hook `Timer`/`Tick` see them. The drive's
+        // walk axes and yaw ride along: while the grapple owns the pawn, `ProcessMove`'s
+        // `newAccel` steers the hanging player from them (the retail input stack's role).
+        runtime.session.set_hook_buttons(fire_hold, altfire_hold);
+        runtime
+            .session
+            .set_hook_move(input.forward, input.right, runtime.sim.yaw);
         runtime.session.step(
             DT,
             runtime.sim.location,
@@ -2296,6 +2312,17 @@ fn run_script_inner(
                 Ok(msg) => println!("[play] weapon {msg}"),
                 Err(e) => println!("[play] weapon grant failed {path}: {e}"),
             }
+        }
+        for path in &items {
+            match runtime.session.grant_item(path) {
+                Ok(msg) => println!("[play] item {msg}"),
+                Err(e) => println!("[play] item grant failed {path}: {e}"),
+            }
+        }
+        if drive.take_next_item()
+            && let Err(e) = runtime.session.next_item()
+        {
+            println!("[play] next_item failed: {e}");
         }
         for n in &goals {
             if let Err(e) = runtime.session.set_goal(*n) {
@@ -2342,6 +2369,16 @@ fn run_script_inner(
                 }
                 other => println!("[play] fire [{elapsed:.3}s]: {other:?}"),
             }
+        }
+        if fire_edge {
+            let outcome = runtime
+                .session
+                .fire_pressed(runtime.sim.yaw, runtime.sim.pitch);
+            println!("[play] fire_hold press [{elapsed:.3}s]: {outcome:?}");
+        }
+        if altfire_edge {
+            let outcome = runtime.session.altfire_pressed();
+            println!("[play] altfire_hold press [{elapsed:.3}s]: {outcome:?}");
         }
         if tick.is_multiple_of(TRACE_EVERY) || tick + 1 == ticks {
             trace.push((tick, elapsed, runtime.sim.location, runtime.sim.velocity));
@@ -2753,6 +2790,122 @@ mod tests {
         } else {
             path
         })
+    }
+
+    /// item64 opt-in regression: the hook use chain on Toits01. Grant + select `XIII.Hook`, aim
+    /// at `HookPoint0` from the start roof, fire (the exec `Fire` -> `ActivatedByFire` ->
+    /// `Idle.Activate` -> `UseMe` attach), hold fire (the `HookInUse.Timer` -> `bGoUp` climb and
+    /// the `PlayerWalking.ProcessMove` taut-rope pull lift the pawn), then use (the `Grab` exec's
+    /// `bHooked` branch -> `Hook.Release()` detach). The retail input model: a continuous fire
+    /// hold never climbs (the first `HookInUse.Tick` consumes the Walking `bGoDown` and clears
+    /// the `ActivatedBy*` flags) — the climb needs a fresh fire press.
+    #[test]
+    fn opt_in_hook_use_chain_smoke() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Toits01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Toits01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let prefix = "t=0.50 item XIII.Hook\nt=1.50 teleport -4926 1446 979\n\
+             t=2.00 track HookPoint0\nt=2.50 fire_hold 1\nt=3.00 fire_hold 0\n\
+             t=3.50 fire_hold 1\nt=6.00 fire_hold 0\n";
+        // Run A stops before the use key: the attach and the climb must be observable.
+        let attach = run_script_with_cinematic_input(
+            &game_dir,
+            "Toits01",
+            &script::Script::parse(prefix).expect("parse attach script"),
+            &resolved.params,
+            &scene,
+            6.0,
+        )
+        .expect("run attach smoke");
+        let vm = attach.session.vm();
+        // The map carries its own XIII.Hook pickup, so resolve the GRANTED item through the
+        // session's SelectedItem (the grant selects it).
+        let hook = attach
+            .session
+            .selected_item()
+            .expect("the grant must leave the hook selected");
+        assert!(
+            vm.is_a(hook, "Hook"),
+            "SelectedItem must be the hook, got class {}",
+            vm.set().path(vm.objects[hook as usize].class)
+        );
+        // The attach: the exec's ActivatedByFire -> ActivateItem -> Idle.Activate -> UseMe path
+        // completed - MyHook spawned, the rope length is locked, and the pawn started hooking.
+        // (ActivatedByFire is consumed by the HookInUse Timer afterwards, so it is not asserted.)
+        assert!(
+            vm.get_property(hook, "MyHook")
+                .is_some_and(|v| !matches!(v, Value::Object(None))),
+            "UseMe must spawn the HookProjectile (Hook.MyHook)"
+        );
+        // MaxHookLength is UseMe's copy of the aimed anchor's RopeLength; only HookPoint0
+        // carries 1900, so this proves the render-phase item trace aimed at it. (PotHookPoint
+        // itself is transient: ResetPotentialTargets clears it once the aim moves off.)
+        assert_eq!(
+            vm.get_property(hook, "MaxHookLength"),
+            Some(&Value::Float(1900.0)),
+            "UseMe must read the anchor's RopeLength (the range check ran)"
+        );
+        assert_eq!(
+            vm.get_property(hook, "bHooked"),
+            Some(&Value::Bool(true)),
+            "UseMe must set the hook's bHooked (the attach completed)"
+        );
+        // The climb: 2.25 s of held fire from the fresh press re-arms the Timer -> bGoUp ->
+        // ReduceRopeLength (150 UU/s), and each ProcessMove pulls the pawn up the excess. The
+        // pawn must have LEFT the start roof (979) toward the anchor.
+        let pawn = match vm.get_property(hook, "Owner") {
+            Some(Value::Object(Some(xiii_script::ObjRef::Instance(i)))) => *i,
+            other => panic!("the hook must own the pawn, got {other:?}"),
+        };
+        let z = match vm.get_property(pawn, "Location") {
+            Some(Value::Vector(v)) => v[2],
+            other => panic!("pawn Location, got {other:?}"),
+        };
+        assert!(
+            z > 1050.0,
+            "the held fire must lift the pawn off the start roof (z={z})"
+        );
+        // Run B adds the use key: the Grab exec's bHooked branch detaches the rope.
+        let detach = run_script_with_cinematic_input(
+            &game_dir,
+            "Toits01",
+            &script::Script::parse(&format!("{prefix}t=6.50 use\n")).expect("parse detach script"),
+            &resolved.params,
+            &scene,
+            10.0,
+        )
+        .expect("run detach smoke");
+        let vm = detach.session.vm();
+        let hook = detach
+            .session
+            .selected_item()
+            .expect("the grant must leave the hook selected");
+        // The detach: the use key's Grab exec -> bHooked && !bWeaponMode && SelectedItem is
+        // Hook -> Hook.HookInUse.Release destroys MyHook and clears bHooked on both sides.
+        assert_eq!(
+            vm.get_property(hook, "bHooked"),
+            Some(&Value::Bool(false)),
+            "the use key must detach the rope (Hook.Release ran)"
+        );
+        assert!(
+            vm.get_property(hook, "MyHook").is_none_or(|v| match v {
+                Value::Object(None) => true,
+                Value::Object(Some(xiii_script::ObjRef::Instance(i))) => {
+                    // Actor.Destroy marks the object deleted; the property keeps the last ref.
+                    vm.objects[*i as usize].deleted
+                }
+                other => panic!("Hook.MyHook, got {other:?}"),
+            }),
+            "Hook.Release must destroy the HookProjectile (Hook.MyHook)"
+        );
     }
 
     /// Opt-in corpus test: Plage00, 2 s of forward input from the PlayerStart must stay on the
@@ -5725,7 +5878,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            330.0,
+            345.0,
         )
         .expect("run Toits01 route");
         let session = &outcome.session;
@@ -5885,9 +6038,10 @@ mod tests {
         // 'SpeechJones11Ttempo' only on a Touch while its scene-gate has armed it (bActif,
         // set by the demo's [118] `event SpeechJones11` at ~81.2), and CineTrigger20
         // (InitialState BufferTrigger, Period 0.1, MaxDelay 60) forwards it as
-        // 'SpeechJones11T'. The route's player enters the zone at t=85 (the labelled
-        // viewpoint teleport; the player's start roof is ~1200 below the trigger's z band, so
-        // the entry is a measured impassable on foot). Measured (probe72/74/75,
+        // 'SpeechJones11T'. item64: the route's player reaches the zone on the grapple - the
+        // hook swing from HookPoint0 lands ~(-3910,858) at ~t=114.5 and the run into the zone
+        // touches TT24 at ~t=121 (the start roof is ~1200 below the trigger's z band, so the
+        // entry is a measured impassable on foot). Measured (probe72/74/75,
         // local/re/item62/): TouchTrigger24.Touch -> CineTrigger20.BufferTrigger.Trigger ->
         // CineController2.PlayingSequence.Trigger ('SpeechJones11T') at 85.0 s, [119]
         // satisfied; [128] `event jones11` at 86.63 releases DialogueManager0's 'jones11'

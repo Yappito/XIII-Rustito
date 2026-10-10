@@ -1096,7 +1096,11 @@ fn registry_entries_are_documented() {
     // `Actor.VisibleDamageableActors` and `Actor.WaveHasPosition`. Must equal
     // `Registry::builtin().defs().count()`.
     // item55 adds RotRand, WaitForLanding and the decoded SetPoisonEffect request.
-    assert_eq!(defs.len(), 340);
+    // item64 adds the screen-effect no-op Partials `ViewShake` (496), `ViewFlash` (505) and
+    // `CheckBob` (504), reached by the hook's controller-state `PlayerMove` dispatch, plus
+    // `Pawn.FaceRotation` (the PlayerMove -> UpdateRotation chain) and
+    // `Interaction.WorldToScreen` (514, the HUD easy-interact box).
+    assert_eq!(defs.len(), 345);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),

@@ -1384,13 +1384,42 @@ fn controller_can_see(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResu
     val(Value::Bool(vm.nav_can_see(c.this, other)?))
 }
 
+/// `Pawn.FaceRotation(rotator NewRotation, float DeltaTime)` (native 0): Engine.dll
+/// `?execFaceRotation@APawn` 0x103b0640 applies the controller's rotation to the pawn by
+/// physics — Walking (1) and Falling (2) zero the Pitch component (0x103b074d..0x103b0756),
+/// the special-cased 11 uses the pawn's own cached rotation and others pass it through — then
+/// SetRotation (the class-virtual call at 0x103b070a..0x103b0732). The player-walking
+/// `PlayerMove` -> `UpdateRotation` chain calls it every tick.
+fn pawn_face_rotation(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let mut rotation = match a.first() {
+        Some(Value::Rotator(r)) => *r,
+        Some(other) => return Err(type_err(vm, "rotator", other)),
+        None => return Err(vm.err(VmErrorKind::Other("missing argument".into()))),
+    };
+    let physics = match vm.get_property(c.this, "Physics") {
+        Some(Value::Byte(b)) => *b,
+        _ => 0,
+    };
+    if physics == 1 || physics == 2 {
+        rotation[0] = 0;
+    }
+    vm.set_property(c.this, "Rotation", 0, Value::Rotator(rotation));
+    val(Value::Void)
+}
+
 /// `Pawn.PressingFire() -> bool` (native 0): Engine.dll `APawn::execPressingFire` returns false
 /// without a controller and otherwise reads the controller's `bFire` field. It does not inspect
-/// the pawn, instigator, or XIII's script-only `IAController.bTire` field.
+/// the pawn, instigator, or XIII's script-only `IAController.bTire` field. `bFire` is a byte
+/// (analog fire weight), so a nonzero byte counts as pressing — a bool-only read made the
+/// grapple's `HookInUse.Timer` climb gate (`ActivatedByFire && PressingFire()`) never fire.
 fn pawn_pressing_fire(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let fire = vm
-        .obj_prop(c.this, "Controller")
-        .is_some_and(|ctrl| vm.bool_prop(ctrl, "bFire"));
+    let fire = vm.obj_prop(c.this, "Controller").is_some_and(|ctrl| {
+        match vm.get_property(ctrl, "bFire") {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::Byte(n)) => *n != 0,
+            _ => false,
+        }
+    });
     val(Value::Bool(fire))
 }
 
@@ -2897,6 +2926,97 @@ fn calc_first_person_view(
     val(Value::Void)
 }
 
+/// `Interaction.WorldToScreen(vector Location, optional vector CameraLocation, optional rotator
+/// CameraRotation) -> vector` (name-based native, index 0). Engine.dll
+/// `?execWorldToScreen@UInteraction` 0x103858d0 steps the optional camera args, then overwrites those slots with the
+/// PlayerController's view (`eventPlayerCalcView` 0x10313950 always runs), builds an
+/// FCameraSceneNode over the viewport (0x103cc190) with the viewport FOV and calls
+/// `FSceneNode::Project` (0x103c99d0) -> FPlane -> the return vector. The UE2
+/// FSceneNode::Project convention: v in camera space (X=forward, Y=right, Z=up), screen
+/// X = center + (Y/X) * halfClipX / tan(FOV/2), screen Y = center - (Z/X) * halfClipX /
+/// tan(FOV/2) (the X-based scale carries the aspect), Z = the forward depth, no behind-camera
+/// clamp in the projection itself. Camera pose: the pawn's eye + the controller rotation (the
+/// same first-person description as `CalcFirstPersonView`, native 497). FOV: DefUser.ini
+/// `DefaultFOV=85`. The clip size is the driver's render canvas (1280x720 headless); the
+/// consumer (`XIIIPlayerInteraction.DrawInteractions` 0x0B71) reads only X/Y for the
+/// easy-interact box, so the headless depth convention is presentation-only.
+fn interaction_world_to_screen(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let location = match a.first() {
+        Some(Value::Vector(v)) => *v,
+        Some(other) => return Err(type_err(vm, "vector", other)),
+        None => return Err(vm.err(VmErrorKind::Other("missing argument".into()))),
+    };
+    // The camera: the interaction's `MyPC` (the DrawInteractions consumer's own field), falling
+    // back to the live player controller.
+    let pc = vm
+        .obj_prop(c.this, "MyPC")
+        .or_else(|| {
+            (0..vm.objects.len() as ObjectId)
+                .find(|&id| !vm.objects[id as usize].deleted && vm.is_a(id, "playercontroller"))
+        })
+        .ok_or_else(|| {
+            vm.err(VmErrorKind::Other(
+                "WorldToScreen: no player controller".into(),
+            ))
+        })?;
+    let pawn = vm.obj_prop(pc, "Pawn").unwrap_or(pc);
+    let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+    let eye = match vm.get_property(pawn, "EyeHeight") {
+        Some(Value::Float(h)) => *h,
+        _ => match vm.get_property(pawn, "BaseEyeHeight") {
+            Some(Value::Float(h)) => *h,
+            _ => 0.0,
+        },
+    };
+    let rot = match vm.get_property(pc, "Rotation") {
+        Some(Value::Rotator(r)) => *r,
+        _ => match vm.get_property(pawn, "Rotation") {
+            Some(Value::Rotator(r)) => *r,
+            _ => [0; 3],
+        },
+    };
+    let camera = [loc[0], loc[1], loc[2] + eye];
+    let (forward, right, up) = rotator_basis(rot);
+    let v = [
+        location[0] - camera[0],
+        location[1] - camera[1],
+        location[2] - camera[2],
+    ];
+    let depth = dot3(v, forward);
+    let canvas = (0..vm.objects.len() as ObjectId)
+        .find(|&id| !vm.objects[id as usize].deleted && vm.is_a(id, "Canvas"));
+    let (clip_x, clip_y) = match canvas {
+        Some(canvas) => (
+            match vm.get_property(canvas, "ClipX") {
+                Some(Value::Float(x)) => *x,
+                _ => 1280.0,
+            },
+            match vm.get_property(canvas, "ClipY") {
+                Some(Value::Float(y)) => *y,
+                _ => 720.0,
+            },
+        ),
+        None => (1280.0, 720.0),
+    };
+    const FOV_DEGREES: f32 = 85.0;
+    let half_fov = FOV_DEGREES.to_radians() * 0.5;
+    let scale = (clip_x * 0.5) / half_fov.tan();
+    let screen = if depth == 0.0 {
+        [0.0, 0.0, 0.0]
+    } else {
+        [
+            clip_x * 0.5 + dot3(v, right) / depth * scale,
+            clip_y * 0.5 - dot3(v, up) / depth * scale,
+            depth,
+        ]
+    };
+    val(Value::Vector(screen))
+}
+
 /// `PlayerController.AdjustAimForDisplay(object<Ammunition> FiredAmmunition, struct<Vector> projStart) -> Rotator`
 /// (native 498).
 ///
@@ -3826,6 +3946,14 @@ fn builtin_defs() -> Vec<NativeDef> {
                 interaction_initialize,
             )
         },
+        def(
+            "Interaction.WorldToScreen",
+            "native(0) final function vector WorldToScreen(vector Location, optional vector CameraLocation, optional rotator CameraRotation)",
+            "Engine.dll ?execWorldToScreen@UInteraction 0x103858d0: the camera comes from the \
+             PlayerController's CalcView (the optional args are overwritten), projected through \
+             FSceneNode::Project 0x103c99d0; the easy-interact box consumer reads X/Y only",
+            interaction_world_to_screen,
+        ),
         def(
             "Object.Not_PreBool",
             "native(129) preoperator bool !(bool A)",
@@ -4953,6 +5081,45 @@ fn builtin_defs() -> Vec<NativeDef> {
         "engine.u PlayerController.SetViewTarget decoded (NewViewTarget); sets ViewTarget (no camera/rendering)",
         set_view_target,
     ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no-op: view shake is a screen effect; the headless VM has no camera to shake",
+        ),
+        ..def(
+            "Engine.PlayerController.ViewShake",
+            "native(496) final function ViewShake(float DeltaTime)",
+            "engine.u PlayerController.ViewShake declared (native 496, no script body, nativeparm \
+             DeltaTime only); called by PlayerController.UpdateRotation and PlayerWalking.PlayerMove \
+             (item64: the hook's PlayerMove dispatch reaches it); screen-shake only",
+            noop,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no-op: colour-modulation fade is a screen effect; the headless VM renders nothing",
+        ),
+        ..def(
+            "Engine.PlayerController.ViewFlash",
+            "native(505) final function ViewFlash(float DeltaTime)",
+            "engine.u PlayerController.ViewFlash declared (native 505, no script body); called by \
+             PlayerController.UpdateRotation (item64: the hook's PlayerMove dispatch reaches it); \
+             screen-flash only",
+            noop,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no-op: weapon bob is a first-person view animation; the headless VM has no view model",
+        ),
+        ..def(
+            "Engine.PlayerController.CheckBob",
+            "native(504) final static function CheckBob(float DeltaTime, float Speed2D, struct<Vector> Y)",
+            "engine.u PlayerController.CheckBob declared (native 504, no script body, nativeparm \
+             tokens only); called by XIIIPlayerController.PlayerWalking.PlayerMove (item64: the \
+             hook's PlayerMove dispatch runs that script every tick)",
+            noop,
+        )
+    });
     // Presentation natives: the VM is headless, so these enqueue a typed PresentationEvent and
     // return the decoded declaration's value (void). Consumed with Vm::drain_events.
     v.push(def(
@@ -5378,6 +5545,15 @@ fn builtin_defs() -> Vec<NativeDef> {
          ?execPressingFire@APawn reads Controller.bFire (not IAController.bTire); the \
          XIIIWeapon state fire chain calls it",
         pawn_pressing_fire,
+    ));
+    v.push(def(
+        "Engine.Pawn.FaceRotation",
+        "native(0) final simulated native function FaceRotation(rotator NewRotation, float DeltaTime)",
+        "Engine.dll ?execFaceRotation@APawn 0x103b0640: applies the controller's rotation to \
+         the pawn by physics - Walking(1)/Falling(2) zero the Pitch component, others pass it \
+         through - then SetRotation; the player-walking PlayerMove -> UpdateRotation chain \
+         needs it every tick",
+        pawn_face_rotation,
     ));
     v.push(NativeDef {
         status: NativeStatus::Partial(

@@ -79,6 +79,21 @@ pub enum Command {
     UseNamed(String),
     /// Request one fire action (edge-triggered; routed to the player's weapon, item14).
     Fire,
+    /// item64: hold/release the fire button (DefUser.ini `Fire` = `Button bFire | Fire`). The
+    /// rising edge dispatches the game's own `XIIIPlayerController.Fire` exec; while held the
+    /// controller's `bFire` is published each tick (`Pawn.PressingFire` polls — the rope climbs
+    /// while held). `fire_hold 0` releases (`onrelease UnFire`).
+    FireHold(bool),
+    /// item64: hold/release the alt-fire button (DefUser.ini `AltFire` = `Button bAltFire |
+    /// AltFire`); the rising edge dispatches the `AltFire` exec (the rope descends while held).
+    AltFireHold(bool),
+    /// item64: grant the player the named `Package.Class` inventory item and select it through
+    /// `GiveTo` + `ServerChangedItem` (the hook's route bootstrap; the campaign grants it from a
+    /// save the route does not load).
+    Item(String),
+    /// item64: the item-cycle press (DefUser.ini `InventoryNext`, the F/G keys); the hook's
+    /// put-away/unhook input.
+    NextItem,
     /// Grant the player the named `Package.Class` weapon (item14 diagnostic bootstrap; the
     /// gameplay maps start the player with `XIII.Fists`, so a demonstration weapon is granted
     /// through the game's own `Weapon.GiveTo`/`BringUp`).
@@ -185,6 +200,28 @@ impl Script {
                     None => Command::Use,
                 },
                 "fire" | "shoot" => Command::Fire,
+                "fire_hold" | "rope_up" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: fire_hold needs 0 or 1"))?;
+                    Command::FireHold(matches!(v, "1" | "on" | "true" | "yes"))
+                }
+                "altfire_hold" | "alt_fire_hold" | "rope_down" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: altfire_hold needs 0 or 1"))?;
+                    Command::AltFireHold(matches!(v, "1" | "on" | "true" | "yes"))
+                }
+                "item" => {
+                    let path = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: item needs a Package.Class"))?;
+                    if !path.contains('.') {
+                        return Err(format!("line {n}: item {path:?} must be Package.Class"));
+                    }
+                    Command::Item(path.to_owned())
+                }
+                "next_item" => Command::NextItem,
                 "weapon" | "grant" => {
                     let path = it
                         .next()
@@ -264,6 +301,16 @@ pub struct Drive {
     weapon_inputs: Vec<Option<u8>>,
     /// Weapons requested (`weapon <Package.Class>`) and not yet applied by the host.
     weapons: Vec<String>,
+    /// item64: held fire/alt-fire buttons (`fire_hold`/`altfire_hold`) and whether this tick's
+    /// apply is a rising edge.
+    fire_hold: bool,
+    altfire_hold: bool,
+    fire_hold_edge: bool,
+    altfire_hold_edge: bool,
+    /// item64: items requested (`item <Package.Class>`) and not yet applied by the host.
+    items: Vec<String>,
+    /// item64: `next_item` requested (edge-triggered) and not yet applied by the host.
+    next_item_pending: bool,
     /// Named `use <ActorName>` targets not yet applied by the host.
     use_named: Vec<String>,
     /// Active `goto` waypoint (Unreal units), if any.
@@ -293,6 +340,12 @@ impl Drive {
             fire_pending: false,
             weapon_inputs: Vec::new(),
             weapons: Vec::new(),
+            fire_hold: false,
+            altfire_hold: false,
+            fire_hold_edge: false,
+            altfire_hold_edge: false,
+            items: Vec::new(),
+            next_item_pending: false,
             use_named: Vec::new(),
             goto: None,
             waiting_travel: false,
@@ -307,6 +360,27 @@ impl Drive {
     /// [`Input`] because it is not a per-tick axis and carries a class path.
     pub fn take_weapons(&mut self) -> Vec<String> {
         std::mem::take(&mut self.weapons)
+    }
+
+    /// item64: the held rope buttons after applying this tick's events, plus whether the fire
+    /// (alt-fire) button rose this tick (the exec dispatch edge).
+    pub fn take_hook_buttons(&mut self) -> ((bool, bool), (bool, bool)) {
+        let fire = (self.fire_hold, std::mem::take(&mut self.fire_hold_edge));
+        let altfire = (
+            self.altfire_hold,
+            std::mem::take(&mut self.altfire_hold_edge),
+        );
+        (fire, altfire)
+    }
+
+    /// Drains the `item` commands due so far (the host grants + selects them through the VM).
+    pub fn take_items(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.items)
+    }
+
+    /// Takes the pending `next_item` request (edge-triggered).
+    pub fn take_next_item(&mut self) -> bool {
+        std::mem::take(&mut self.next_item_pending)
     }
 
     /// Drains the `set_goal` objective numbers due so far (the host calls the map's own
@@ -383,6 +457,16 @@ impl Drive {
                 Command::Use => self.use_pending = true,
                 Command::UseNamed(target) => self.use_named.push(target.clone()),
                 Command::Fire => self.fire_pending = true,
+                Command::FireHold(v) => {
+                    self.fire_hold_edge = *v && !self.fire_hold;
+                    self.fire_hold = *v;
+                }
+                Command::AltFireHold(v) => {
+                    self.altfire_hold_edge = *v && !self.altfire_hold;
+                    self.altfire_hold = *v;
+                }
+                Command::Item(path) => self.items.push(path.clone()),
+                Command::NextItem => self.next_item_pending = true,
                 Command::Weapon(path) => self.weapons.push(path.clone()),
                 &Command::SetGoal(n) => self.goals.push(n),
                 Command::WaitTravel => {

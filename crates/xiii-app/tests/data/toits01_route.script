@@ -49,73 +49,118 @@ t=58.00 forward 0
 # 'wait event SpeechJones11T' (a teleport before ~85 is refused by the controller's
 # NoControl window, measured probe73).
 t=74.00 goto -4940 1420
-# labelled teleport (the grapple-landing viewpoint is unreachable on foot from the start roof)
-t=85.00 teleport -3609 1316 2263
-t=85.10 forward 0
-# item62: leave the roof only after the touch chain fires (the old t=76 deck teleport left
-# before the scene's ~81.2 arm and stalled the demo at 'wait event SpeechJones11T').
-# labelled teleport (the level's grapple descent; the start roof has no walkable exit)
-t=96.00 teleport -1162 1009 80
-t=96.10 forward 0
-# courtyard: AI west corridor
-t=98.00 goto -1450 1100
-t=130.00 goto -1450 1500
-t=136.00 goto -1450 2100
-t=144.00 goto -900 2100
-t=152.00 goto -768 2838
-t=160.00 goto -734 3424
-t=168.00 goto -200 3900
+# item64 grapple #1: the player's own hook replaces the grapple-landing teleport. Grant+select
+# XIII.Hook (GiveTo + ServerChangedItem), aim at HookPoint0 (-4883,1508,2734; RopeLength 1900,
+# ~1756 UU from the roof), fire: the exec Fire -> UseMe spawns HookProjectile +
+# HookLink, GoHooking sets bHooked, the +0.25s Timer starts the climb (HookUpSpeed 150/s) and
+# the PlayerWalking.ProcessMove taut-rope constraint reels the pawn in (VM-owned while it
+# hangs). ~11 s from ~1800 to the 150 minimum. No ClimbableHookNavPoint is authored on
+# Toits01 (measured, local/re/item64/toits01-props.txt), so the rope-top handoff never fires;
+# the only player-initiated detach is the use key (Grab's bHooked branch -> Hook.Release).
+t=85.00 item XIII.Hook
+t=85.80 track HookPoint0
+# attach (the fire edge: exec -> ActivatedByFire -> ActivateItem -> Idle.Activate -> UseMe;
+# HookLength locks at max(VSize(HookPoint-Pawn),50) = ~1806 < RopeLength 1900). While Walking
+# the first HookInUse.Tick consumes the UseMe bGoDown payout request (stops it and clears the
+# ActivatedBy* flags), so a continuous hold never climbs: the retail input is a fresh fire
+# press, whose ActivateItem re-arms the 0.25 s Timer -> bGoUp + Enable('Tick').
+t=86.50 fire_hold 1
+t=86.70 fire_hold 0
+# climb: HookInUse.Tick ReduceRopeLength (150 UU/s) shortens the rope; each PlayerWalking.
+# ProcessMove (0x0237) then pulls the pawn up the excess (SetPhysics Falling + Pawn.Move +
+# the radial velocity projection) - (1806-150)/150 = ~11 s to the 150 rope floor.
+t=87.00 fire_hold 1
+t=98.50 fire_hold 0
+# swing east across the roof gap: the anchor (-4883,1508,2733) hangs west of the Model71 roof
+# (z=2160, x=-4512..-3490), so the descent must carry horizontal speed. The payout (300 UU/s,
+# 1.55 s -> rope ~615) plus the ProcessMove air accel (aForward 32768 -> Acceleration 327 after
+# the 0.01 scale) drives the pendulum; the arc crosses the edge ~10.5 s in rising through
+# z~2400. Detach on the upswing (the use key: Grab's bHooked branch -> Hook.Release; deselection
+# does NOT release the rope - measured, the HookInUse.Tick keeps running after cNextItem) and
+# drop onto the roof ~(-3910,858).
+t=99.00 yaw -9
+t=99.30 altfire_hold 1
+t=99.30 forward 1
+t=100.85 altfire_hold 0
+t=113.00 use
+# walk the landing roof into the TT24 zone (r220 at -3609,1316,2263; armed by the scene's
+# SpeechJones11 chain at ~81.2 - the arrival Touch fires it, same as the pre-item64 teleport run)
+t=112.00 goto -3609 1316
+t=119.00 forward 0
+# item64 grapple #2: the grapple descent replaces the street teleport. HookPoint2
+# (-2817,1068,2337; RopeLength 2400) hangs over the street; a short fire press attaches
+# (UseMe's bGoDown pays the rope while Walking; the +0.25s Timer stops it once fire is
+# released), ALTFIRE resumes the payout, walking off the roof edge drops the pawn (Falling ->
+# taut -> swing/arrest), the payout runs to the 2400 max and the pawn reaches the street
+# directly below the anchor (ground at VSize ~2182 < 2400, so the rope never re-tautens).
+# The use key detaches on the street (Grab's bHooked branch -> Hook.Release).
+t=119.50 track HookPoint2
+t=120.00 fire_hold 1
+t=120.20 fire_hold 0
+t=121.00 altfire_hold 1
+t=121.50 goto -2700 1080
+t=132.50 altfire_hold 0
+t=133.00 use
+t=133.50 forward 0
+# courtyard: AI west corridor (the descent lands below HookPoint2; walk east then north)
+t=134.50 goto -1450 1100
+t=138.50 goto -1450 1500
+t=144.50 goto -1450 2100
+t=152.50 goto -900 2100
+t=160.50 goto -768 2838
+t=168.50 goto -734 3424
+t=176.50 goto -200 3900
 # alley attempt; labelled teleport fallback (the alley's east end is the windowed wall)
-t=176.00 goto 200 3900
-t=182.00 goto 500 4100
-t=188.00 goto 800 4400
-t=194.00 teleport 800 4500 900
-t=194.10 forward 0
-t=196.00 goto 1400 4500
-t=204.00 goto 1900 4500
-t=212.00 goto 2300 4500
+t=184.50 goto 200 3900
+t=190.50 goto 500 4100
+t=196.50 goto 800 4400
+t=202.50 teleport 800 4500 900
+t=202.60 forward 0
+t=204.50 goto 1400 4500
+t=212.50 goto 1900 4500
+t=220.50 goto 2300 4500
 # labelled teleport (the north-roof gap x~2500-2900 is void)
-t=218.00 teleport 3100 4500 1520
-t=218.10 forward 0
-t=220.00 goto 3150 4490
+t=226.50 teleport 3100 4500 1520
+t=226.60 forward 0
+t=228.50 goto 3150 4490
 # labelled teleport (the level's SauterTempo crossing; measured void)
-t=226.00 teleport 4200 2700 1456
-t=226.10 forward 0
-t=228.00 goto 5000 2700
-t=236.00 goto 5800 2700
-t=244.00 goto 6600 2700
-t=252.00 goto 7400 2700
+t=234.50 teleport 4200 2700 1456
+t=234.60 forward 0
+t=236.50 goto 5000 2700
+t=244.50 goto 5800 2700
+t=252.50 goto 6600 2700
+t=260.50 goto 7400 2700
 # labelled teleport (the deck's east parapet blocks walk and jump)
-t=260.00 teleport 8500 1700 1060
-t=260.10 forward 0
-t=262.00 goto 9000 1400
-t=270.00 goto 10000 1300
-t=278.00 goto 11000 1300
-t=286.00 goto 11700 1261
+t=268.50 teleport 8500 1700 1060
+t=268.60 forward 0
+t=270.50 goto 9000 1400
+t=278.50 goto 10000 1300
+t=286.50 goto 11000 1300
+t=294.50 goto 11700 1261
 # labelled teleport (the palettetremplin ramp lip and the window gap)
-t=294.00 teleport 12700 1261 1170
-t=294.10 forward 0
-t=296.00 goto 13265 1300
-t=303.00 goto 13900 1400
+t=302.50 teleport 12700 1261 1170
+t=302.60 forward 0
+t=304.50 goto 13265 1300
+t=311.50 goto 13900 1400
 # labelled teleport (the roof dip strip x 14000-14150 with a 50-UU hole at x~14150-14200;
 # the east roof surface is 1167)
-t=309.00 teleport 14250 1400 1220
-t=309.10 forward 0
-t=311.00 goto 15500 1450
+t=317.50 teleport 14250 1400 1220
+t=317.60 forward 0
+t=319.50 goto 15500 1450
 # labelled teleport (the roof's east edge drops onto a trapped ledge and a 486 pit)
-t=317.00 teleport 16000 1300 700
-t=317.10 forward 0
-t=319.00 goto 16500 1200
+t=325.50 teleport 16000 1300 700
+t=325.60 forward 0
+t=327.50 goto 16500 1200
 # item53b: the road stand is under enemy fire once the phantom mover cylinders no longer
 # absorb AI rounds (the decoded primitive rule); keep moving through the exposure.
-t=321.00 goto 17800 1150
+t=329.50 goto 17800 1150
 # labelled teleport (the warehouse west wall + the Movable2 crate block the doorway;
 # TT10's r700 zone starts west of the wall)
-t=325.00 teleport 18300 1000 800
-t=325.10 forward 0
-t=327.00 goto 18800 1050
+t=333.50 teleport 18300 1000 800
+t=333.60 forward 0
+t=335.50 goto 18800 1050
 # item53b: the helipad wait is under MagnumPlus3 fire once the phantom mover cylinders no
 # longer absorb AI rounds; the wait moves behind the Tmetaldoorhelico line (the sweep from
 # the shooter's muzzle to (18500,1300) is blocked by the door mesh).
-t=331.00 goto 18500 1300
-t=344.00 wait_travel
+t=339.50 goto 18500 1300
+t=352.50 wait_travel
