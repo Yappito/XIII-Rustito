@@ -953,6 +953,11 @@ pub(crate) fn frame(
         while drive.take_menu_close() {
             menu.request_close(sess);
         }
+        for key in drive.take_menu_keys() {
+            if let Err(error) = menu.key(sess, key) {
+                menu.record_error(format!("scripted menu key {key}: {error}"));
+            }
+        }
     }
     menu.frame(sess);
     state.menu_open = menu.is_open();
