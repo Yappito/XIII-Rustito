@@ -816,6 +816,237 @@ mod tests {
         sim
     }
 
+    /// A flat Bevy Y=0 floor plus a vertical slab standing on it in the plane
+    /// `Bevy z = wall_z` (the player faces Bevy -Z), from the floor up to `top_m` metres, with a
+    /// 20 m deep top (a walker at 472 UU/s covers ~10.5 m in the longest loop, so it stays on
+    /// the top instead of walking off its far edge). Used for the sill/step worlds: a 112 UU top
+    /// is the Hual02 window sill, 35 UU is `Engine.Actor.MAXSTEPHEIGHT`.
+    fn wall_world(wall_z: f32, top_m: f32) -> CollisionWorld {
+        let t: Vec<(Triangle, u32)> = vec![
+            (
+                [[-50.0, 0.0, -50.0], [50.0, 0.0, -50.0], [50.0, 0.0, 50.0]],
+                0,
+            ),
+            (
+                [[-50.0, 0.0, -50.0], [50.0, 0.0, 50.0], [-50.0, 0.0, 50.0]],
+                0,
+            ),
+            (
+                [
+                    [-50.0, 0.0, wall_z],
+                    [50.0, 0.0, wall_z],
+                    [50.0, top_m, wall_z],
+                ],
+                1,
+            ),
+            (
+                [
+                    [-50.0, 0.0, wall_z],
+                    [50.0, top_m, wall_z],
+                    [-50.0, top_m, wall_z],
+                ],
+                1,
+            ),
+            (
+                [
+                    [-50.0, top_m, wall_z - 20.0],
+                    [50.0, top_m, wall_z - 20.0],
+                    [50.0, top_m, wall_z],
+                ],
+                1,
+            ),
+            (
+                [
+                    [-50.0, top_m, wall_z - 20.0],
+                    [50.0, top_m, wall_z],
+                    [-50.0, top_m, wall_z],
+                ],
+                1,
+            ),
+        ];
+        CollisionWorld::new(t)
+    }
+
+    #[test]
+    fn falling_into_a_wall_slides_but_never_steps_up_or_mantles() {
+        // item84, decoded from Engine.dll: `APawn::physFalling` (0x103c37b0) answers a wall hit
+        // (sweep hit with normal.Z < 0.7, constant 0x10483428) with `processHitWall`
+        // (vtable+0x104 -> 0x103bed60) and a `TwoWallAdjust` slide, never `stepUp` (called only
+        // from `moveSmooth` 0x103b7990, vtable+0x11c) and never a mantle;
+        // `APawn::processHitWall` runs its only climb probe (a downward 35-unit `MoveActor`,
+        // delta constant 0xC20C0000 = -35.0, at 0x103bef37) for AI pawns in PHYS_Walking only.
+        // So a pawn jumping at the Hual02 window sill (aperture z -112..16, jump apex
+        // 420^2/(2*950) = 92.84 UU < 112) must bounce/slide in front of it and land back,
+        // whatever jump spam it does.
+        let params = instant_params();
+        // Sill top 112 UU above the floor, 90 UU (1 m) ahead.
+        let world = wall_world(-1.0, 112.0 / UNREAL_UNITS_PER_METER);
+        let mut sim = start_on_floor(&params, 0.0, 0.0);
+        let dt = 1.0 / 60.0;
+        let mut max_x = f32::MIN;
+        let mut max_center_z = f32::MIN;
+        let mut saw_falling = false;
+        // 3 s of jump spam into the sill, then 1 s of plain running into it.
+        for tick in 0..240 {
+            sim.step(
+                dt,
+                &world,
+                &params,
+                Input {
+                    forward: 1.0,
+                    jump: tick < 180,
+                    ..Default::default()
+                },
+                &[],
+            );
+            saw_falling |= !sim.grounded;
+            // Unreal x = -Bevy z * 90; the wall plane sits at Unreal x = 90.
+            max_x = max_x.max(sim.location[0]);
+            max_center_z = max_center_z.max(sim.location[2]);
+        }
+        assert!(saw_falling, "jump spam must actually leave the ground");
+        assert!(
+            sim.grounded,
+            "must land back on the floor in front of the sill"
+        );
+        assert!(
+            max_x < 80.0,
+            "must never pass the sill plane (Unreal x=90): max x {max_x}"
+        );
+        // Standing on the sill would put the centre at 75 + 112 = 187 UU; even reaching the
+        // analytic jump apex must stay below the sill top + half height.
+        assert!(
+            max_center_z < params.height_uu + 112.0 - 1.0,
+            "no step-up/mantle onto the sill: max centre z {max_center_z}"
+        );
+        assert!(
+            (sim.location[2] - params.height_uu).abs() < 0.5,
+            "ends on the start floor: z={}",
+            sim.location[2]
+        );
+    }
+
+    #[test]
+    fn ai_falling_into_a_wall_matches_the_player_fall() {
+        // The decode is class-generic: `APawn::physFalling` runs for AI pawns too (Xiii.dll and
+        // XIDPawn.dll re-export Engine.dll's physFalling/processHitWall/stepUp ordinals - no
+        // XIII override). An AI pawn (no crouch, no ladders) spamming jump at the same sill
+        // stays in front of it exactly like the player.
+        let params = PlayerParams {
+            b_can_crouch: false,
+            b_can_climb_ladders: false,
+            ..instant_params()
+        };
+        let world = wall_world(-1.0, 112.0 / UNREAL_UNITS_PER_METER);
+        let mut sim = start_on_floor(&params, 0.0, 0.0);
+        let dt = 1.0 / 60.0;
+        let mut max_x = f32::MIN;
+        let mut max_center_z = f32::MIN;
+        let mut saw_falling = false;
+        for tick in 0..240 {
+            sim.step(
+                dt,
+                &world,
+                &params,
+                Input {
+                    forward: 1.0,
+                    jump: tick < 180,
+                    ..Default::default()
+                },
+                &[],
+            );
+            saw_falling |= !sim.grounded;
+            max_x = max_x.max(sim.location[0]);
+            max_center_z = max_center_z.max(sim.location[2]);
+        }
+        assert!(saw_falling, "jump spam must actually leave the ground");
+        assert!(sim.grounded, "must land back on the floor");
+        assert!(
+            max_x < 80.0,
+            "must never pass the sill plane: max x {max_x}"
+        );
+        assert!(
+            max_center_z < params.height_uu + 112.0 - 1.0,
+            "no step-up/mantle onto the sill: max centre z {max_center_z}"
+        );
+    }
+
+    #[test]
+    fn walking_steps_maxstepheight_but_falling_does_not_step_anything() {
+        // The contrast the decode pins: `MAXSTEPHEIGHT = 35.0` (`Engine.Actor` ScriptText) is a
+        // WALKING primitive (`moveSmooth` 0x103b7990 -> vtable+0x11c `stepUp`); physFalling has
+        // no step path at all. Walking crosses a 30 UU step (within 35) and refuses a 112 UU
+        // sill; the 30 UU step under jump spam is crossed only through the air (apex 92.84 UU),
+        // which is a plain ballistic jump, not a step.
+        let params = instant_params();
+        let dt = 1.0 / 60.0;
+
+        // Walking up the 30 UU step (within `MAXSTEPHEIGHT` 35; exactly-35 leaves the box
+        // bottom touching the step top and the raise is refused as a starting contact).
+        let step = wall_world(-1.0, 30.0 / UNREAL_UNITS_PER_METER);
+        let mut sim = start_on_floor(&params, 0.0, 0.0);
+        for _ in 0..120 {
+            sim.step(
+                dt,
+                &step,
+                &params,
+                Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                &[],
+            );
+        }
+        assert!(
+            sim.grounded && (sim.location[2] - params.height_uu - 30.0).abs() < 1.0,
+            "walking must stand on the 30 UU step: grounded={} z={}",
+            sim.grounded,
+            sim.location[2]
+        );
+
+        // Walking into the 112 UU sill: blocked at floor height (above MAXSTEPHEIGHT).
+        let sill = wall_world(-1.0, 112.0 / UNREAL_UNITS_PER_METER);
+        let mut sim = start_on_floor(&params, 0.0, 0.0);
+        for _ in 0..120 {
+            sim.step(
+                dt,
+                &sill,
+                &params,
+                Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                &[],
+            );
+        }
+        assert!(
+            sim.grounded && (sim.location[2] - params.height_uu).abs() < 1.0,
+            "walking must not step the 112 UU sill: z={}",
+            sim.location[2]
+        );
+
+        // Jumping at the 30 UU step: crossed while airborne (ballistic, not a step-up).
+        let mut sim = start_on_floor(&params, 0.0, 0.0);
+        for _ in 0..240 {
+            sim.step(
+                dt,
+                &step,
+                &params,
+                Input {
+                    forward: 1.0,
+                    jump: true,
+                    ..Default::default()
+                },
+                &[],
+            );
+        }
+        assert!(
+            sim.location[0] > 90.0 + params.radius_uu,
+            "a plain jump must clear the 30 UU step: x={}",
+            sim.location[0]
+        );
+    }
+
     #[test]
     fn flat_floor_forward_distance_matches_ground_speed() {
         // Instant acceleration (AccelRate absent): after one second of full forward input the

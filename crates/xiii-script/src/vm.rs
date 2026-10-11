@@ -1407,11 +1407,6 @@ pub struct Vm<'s> {
     /// `Actor.GetLastTraceBone` (`XIIIPawn.LastBoneHit`). `"None"` when the last trace hit world
     /// geometry (or nothing).
     last_trace_bone: String,
-    /// Source actor of the most recent `Actor.Trace` hit whose triangles belong to a live
-    /// placed static-mesh actor (the `"<actor> -> <mesh>"` collision source). `None` after a
-    /// pure-BSP, pawn or mover hit, or once consumed. The engine's bullet-impact rule
-    /// (`Session`-independent, item67h) reads it when an impact-effect actor spawns.
-    last_trace_hit_source: Option<ObjectId>,
     /// Voice-wave duration provider (dialogue natives). `None` = `Actor.GetWaveDuration` reports
     /// `0` with a visible note (the script then falls back to its own default wave length).
     pub(crate) voice_duration: Option<Box<dyn crate::voice::VoiceDuration>>,
@@ -1630,7 +1625,6 @@ impl<'s> Vm<'s> {
             hit_zones: None,
             hearing_partials: HashSet::new(),
             last_trace_bone: "None".to_owned(),
-            last_trace_hit_source: None,
             voice_duration: None,
             wave_position: None,
             save_slots: None,
@@ -7127,49 +7121,6 @@ impl<'s> Vm<'s> {
         }
     }
 
-    /// item67h: the engine's bullet-impact glass rule. Retail XIII shatters glass on bullet
-    /// impact. The map's own collision-category data marks the glass actors (`ColCategory`
-    /// byte 3; in Hual02 exactly the two `grande_vitre` window walls, the `passerelle_carre2`
-    /// glass walkway and one `caisse_64` crate carry it, while 384 `ColCategory`-5 structural
-    /// meshes do not). `XIIIBulletsAmmo.ProcessTraceHit`'s impact branch spawns its impact
-    /// emitter / decal projector through `Actor.Spawn`; when such a spawn immediately follows
-    /// a weapon trace whose resolved world hit belongs to a live glass-category static-mesh
-    /// actor, the engine shatters it: the actor is destroyed (its collision leaves the world,
-    /// like `BreakableMover.Breaked` -> `Destroy`) and the effect is recorded as a visible
-    /// trace note, never silently. Labelled hypothesis: the matching Engine.dll impact native
-    /// was not located this session (no disassembler available); the rule is pinned by the
-    /// map data above and by retail-visible behaviour (shot glass shatters).
-    pub(crate) fn glass_impact_shatter(&mut self) {
-        let Some(source) = self.last_trace_hit_source.take() else {
-            return;
-        };
-        if !self.is_live_actor(source)
-            || self.class_chain_contains(source, "pawn")
-            || self.is_mover(source)
-        {
-            return;
-        }
-        if self.byte_prop(source, "ColCategory") != 3 {
-            return;
-        }
-        let actor = self.objects[source as usize].name.clone();
-        match self.destroy(source) {
-            Ok(_) => {
-                if let Some(p) = self.physics.as_mut() {
-                    p.set_static_actor_collision(&actor, false);
-                }
-                self.note(TraceKind::Note(format!(
-                    "[glass] impact shattered {actor} (ColCategory 3)"
-                )));
-            }
-            Err(e) => {
-                self.note(TraceKind::Note(format!(
-                    "[glass] impact shatter of {actor} failed: {e}"
-                )));
-            }
-        }
-    }
-
     /// First live `LevelInfo` instance, if the map has one (it is normally not in the executed
     /// scope, so the harness does not supply it).
     pub fn find_level_info(&self) -> Option<ObjectId> {
@@ -8640,22 +8591,6 @@ impl<'s> Vm<'s> {
             Some((t, Some(b), n)) => (Some(b), lerp3(start, end, t), n),
             Some((t, None, n)) => (self.find_level_info(), lerp3(start, end, t), n),
             None => (None, if script { [0.0; 3] } else { end }, [0.0; 3]),
-        };
-        // item67h: record the source actor of a static-mesh world hit (the `"<actor> -> <mesh>"`
-        // collision source, the same item53 resolution this function already carries in
-        // `hit_actor`). The bullet-impact rule (`glass_impact_shatter`, called from the impact
-        // spawn) consumes it; a fresh trace always replaces it, so only the impact immediately
-        // following the shot can act on it.
-        self.last_trace_hit_source = match out.0 {
-            Some(b)
-                if !self.is_a(b, "levelinfo")
-                    && !self.is_mover(b)
-                    && !self.class_chain_contains(b, "pawn")
-                    && self.actor_has_static_mesh(b) =>
-            {
-                Some(b)
-            }
-            _ => None,
         };
         // item14: record the hit zone for `Actor.GetLastTraceBone` (`XIIIPawn.LastBoneHit`).
         // A world/LevelInfo hit is not a pawn, so the bone stays `None`.

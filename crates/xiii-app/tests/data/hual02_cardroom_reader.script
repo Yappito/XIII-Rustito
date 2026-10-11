@@ -2,10 +2,14 @@
 #
 # Two labelled teleport diagnostics stand in for the two measured movement gaps that are pinned,
 # not fixed: (1) the card room is a nav island whose only corridor-side openings are the two
-# shootable grande_vitre windows (ColCategory 3), whose 112 UU sill (aperture z -112..16) no
-# measured retail primitive crosses from the flat corridor floor (step 35 measured at
-# Engine.dll stepUp 0x104829c4; jump 92.8 = JumpZ 420, PhysicsVolume.Gravity (0,0,-950)
-# class-default; no sill-mantle script found) - the player is placed inside the card room;
+# grande_vitre windows (ColCategory 3 = ColType_StaticGlass, engine.u Actor.ScriptText; item84
+# decoded that no retail consumer shatters them - the panes are script-less StaticMeshActors and
+# Engine.dll's only ColCategory reader is execActorInIterationCategory 0x103e6f00), whose 112 UU
+# sill (aperture z -112..16) no measured retail primitive crosses from the flat corridor floor
+# (APawn::physFalling 0x103c37b0 slides, never steps: processHitWall 0x103bed60 + TwoWallAdjust;
+# stepUp only from moveSmooth 0x103b7990, MAXSTEPHEIGHT 35; jump 92.8 = JumpZ 420,
+# PhysicsVolume.Gravity (0,0,-950) class-default; no sill-mantle script found) - the player is
+# placed inside the card room;
 # (2) the west corridor beyond the opened Porte19 ends at the ForeverLocked decor doors
 # PorteDecors18/19 (PorteDecors.SetInitialState -> GotoState('ForeverLocked'); PlayerTrigger
 # only plays the sound), so the player is placed at the depot-leg nav node (-5211,921) that the

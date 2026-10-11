@@ -41,14 +41,27 @@
 #                    the petitesalle card room: its entrance Porte21 (Event 'reveil_3') opens by
 #                    real `use` from the neighbouring zone, but that zone (the office + card
 #                    room nav island, 71 PathNodes) is walled off from the surface corridor
-#                    except the two shootable `grande_vitre` window panes (StaticMeshActor8 at
-#                    -4328,1638 and StaticMeshActor7 at -3354,1632, the map's only ColCategory-3
-#                    blocking meshes; item67j). The glass now shatters on bullet impact
-#                    (item67j engine rule, unit-tested), but the aperture is z -112..16 (sill
-#                    112 UU above the walked floors) and no measured retail primitive crosses it
-#                    from the flat corridor floor (step 35 = Engine.dll stepUp 0x104829c4;
-#                    jump 92.8 = JumpZ 420 with PhysicsVolume.Gravity (0,0,-950); no sill-mantle
-#                    script in any package), so the card stays unreachable on foot - pinned.
+#                    except the two `grande_vitre` window panes (StaticMeshActor8 at -4328,1638
+#                    and StaticMeshActor7 at -3354,1632, the map's only ColCategory-3 blocking
+#                    meshes; item67j). item84 decoded that entry closed: ColCategory 3 is
+#                    `ColType_StaticGlass` (engine.u Actor.ScriptText enum), but no consumer
+#                    shatters such an actor - the panes are script-less Engine.StaticMeshActor
+#                    exports (0 functions/states), XIIIBulletsAmmo.ProcessTraceHit's non-pawn
+#                    branch only runs Other.TakeDamage (a no-op on them) plus impact FX
+#                    (GlassImpactEmitter / BulletScorchGlass / HitMat.HitSound are dressing), and
+#                    Engine.dll reads AActor+0x1a0 (ColCategory) nowhere except
+#                    execActorInIterationCategory 0x103e6f00 and actor copy/serialize (Xiii.dll
+#                    and XIDPawn.dll read it never), so shooting cannot open the island. The
+#                    aperture is z -112..16 (sill 112 UU above the walked floors) and no measured
+#                    retail primitive crosses it from the flat corridor floor: APawn::physFalling
+#                    0x103c37b0 answers a wall hit (normal.Z < 0.7 at 0x10483428) with
+#                    processHitWall 0x103bed60 + a TwoWallAdjust slide, never stepUp (walking
+#                    only, moveSmooth 0x103b7990 vtbl+0x11c; MAXSTEPHEIGHT 35.0,
+#                    Actor.ScriptText) and never a mantle (processHitWall's downward-35 probe at
+#                    0x103bef37 runs for AI PHYS_Walking only); jump 92.8 = JumpZ 420 with
+#                    PhysicsVolume.Gravity (0,0,-950) < 112 - both pinned by unit tests
+#                    (play::sim::tests::*falling*). So the card stays unreachable on foot - the
+#                    depot teleport remains.
 #                    item67j measured the rest of the chain with the card in hand (the committed
 #                    probe opt_in_hual02_card_room_reader_chain): the reader use with the card
 #                    fires OutEvent 'Porteentrevs' and Porte19 opens, but the corridor west of

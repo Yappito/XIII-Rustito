@@ -6558,9 +6558,13 @@ mod tests {
     /// the ForeverLocked decor-door seal at x~-6198 west of Porte19, the sealed prison
     /// perimeter, the grille pin, the pinned exit stairwell). item67g removed the surface
     /// teleport: the item67f (-2854,2338) dead-end was a wrong turn off the map's nav chain,
-    /// not a blocker. item67j decoded the island entry (the shootable grande_vitre windows),
-    /// implemented the bullet-impact glass shatter, and measured the card -> reader -> Porte19
-    /// chain in `opt_in_hual02_card_room_reader_chain`.
+    /// not a blocker. item67j measured the card -> reader -> Porte19 chain in
+    /// `opt_in_hual02_card_room_reader_chain`; item84 decoded the entry closed (the panes are
+    /// `ColType_StaticGlass` `StaticMeshActor`s no consumer shatters - `Actor.ScriptText` enum,
+    /// Engine.dll's only ColCategory reader is `execActorInIterationCategory` 0x103e6f00 - and
+    /// `APawn::physFalling` 0x103c37b0 never steps or mantles: slide only, `stepUp` is
+    /// walking-only at `MAXSTEPHEIGHT` 35), so the sill pin stands and the depot teleport
+    /// remains.
     /// The objectives must come from the game's own chains: goals 4/5/6 complete, goal 3 is
     /// promoted by the depot reader chain, goals 0/1/2 stay incomplete on measured blockers, and
     /// no travel is requested.
@@ -6819,11 +6823,16 @@ mod tests {
 
     /// item67j: the Hual02 magnetic-card chain by player input, with two labelled teleport
     /// diagnostics for the measured, pinned movement gaps. The card room is a nav island whose
-    /// only corridor-side openings are the two shootable `grande_vitre` windows (`ColCategory`
-    /// 3), whose 112 UU sill (aperture z -112..16) no measured retail primitive crosses from the
-    /// flat corridor floor (step 35, `Engine.dll` stepUp 0x104829c4; jump 92.8 = JumpZ 420 with
-    /// `PhysicsVolume.Gravity` (0,0,-950); no sill-mantle script exists in any package), so the
-    /// player is placed on the pickup. The west corridor beyond the opened Porte19 ends at the
+    /// only corridor-side openings are the two `grande_vitre` windows (`ColCategory` 3 =
+    /// `ColType_StaticGlass`, engine.u `Actor.ScriptText`; item84 decoded that no retail
+    /// consumer shatters them - the panes are script-less `Engine.StaticMeshActor` exports and
+    /// Engine.dll reads `ColCategory` (AActor+0x1a0) only in `execActorInIterationCategory`
+    /// 0x103e6f00), whose 112 UU sill (aperture z -112..16) no measured retail primitive crosses
+    /// from the flat corridor floor (`APawn::physFalling` 0x103c37b0 answers a wall hit with
+    /// `processHitWall` 0x103bed60 and a `TwoWallAdjust` slide, never `stepUp` - that is
+    /// walking-only via `moveSmooth` 0x103b7990 at `MAXSTEPHEIGHT` 35; jump 92.8 = JumpZ 420
+    /// with `PhysicsVolume.Gravity` (0,0,-950); no sill-mantle script exists in any package), so
+    /// the player is placed on the pickup. The west corridor beyond the opened Porte19 ends at the
     /// `ForeverLocked` decor doors `PorteDecors18/19` (`PorteDecors.SetInitialState` ->
     /// `GotoState('ForeverLocked')`; its `PlayerTrigger` only plays the sound), so the player is
     /// placed at the depot-leg nav node the main route already walks to. Everything between the

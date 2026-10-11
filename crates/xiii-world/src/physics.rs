@@ -496,25 +496,6 @@ impl WorldPhysics for WorldPhysicsAdapter {
         self.line_world.set_moving_enabled(line_index, enabled);
     }
 
-    /// item67h: enables/disables the static collision triangles of one named placed actor
-    /// (the `"<actor> -> <mesh>"` source prefix, case-insensitive) in both query worlds.
-    /// Used when the engine shatters a glass-category static-mesh actor: its geometry leaves
-    /// the world without being dropped, so a later restoration stays possible.
-    fn set_static_actor_collision(&mut self, actor: &str, enabled: bool) {
-        let prefix = format!("{} -> ", actor.to_ascii_lowercase());
-        let matching: Vec<u32> = (0..self.source_names.len() as u32)
-            .filter(|&s| {
-                self.source_names
-                    .get(s as usize)
-                    .is_some_and(|label| label.to_ascii_lowercase().starts_with(&prefix))
-            })
-            .collect();
-        for source in matching {
-            self.box_world.set_source_enabled(source, enabled);
-            self.line_world.set_source_enabled(source, enabled);
-        }
-    }
-
     fn set_mover(&mut self, actor: &str, location: [f32; 3], rotation: [i32; 3]) {
         let Some(&i) = self.mover_by_name.get(&actor.to_ascii_lowercase()) else {
             return;
@@ -693,60 +674,6 @@ mod tests {
         // Unknown names are ignored, not a panic.
         p.set_mover_collision("NoSuchMover", false);
         assert!(p.trace(start, end, [0.0; 3]).is_some());
-    }
-
-    #[test]
-    fn set_static_actor_collision_disables_and_restores_one_actors_sources() {
-        // item67h: the shattered glass rule must free the actor's own static triangles from
-        // both query worlds without dropping them, and leave every other source in place.
-        let wall_u: Vec<[[f32; 3]; 3]> = vec![
-            [
-                [-5.0, -100.0, -100.0],
-                [-5.0, 100.0, -100.0],
-                [-5.0, 100.0, 100.0],
-            ],
-            [
-                [-5.0, -100.0, -100.0],
-                [-5.0, 100.0, 100.0],
-                [-5.0, -100.0, 100.0],
-            ],
-        ];
-        // `from_entries` takes Bevy-space triangles (as the importer produces); the trace
-        // below is in Unreal space across the same wall at Unreal x = -5.
-        let soup_u: Vec<([[f32; 3]; 3], u32)> = wall_u.into_iter().map(|t| (t, 0)).collect();
-        let mut soup: Vec<([[f32; 3]; 3], u32)> = soup_u
-            .iter()
-            .map(|(t, s)| (t.map(to_bevy_position), *s))
-            .collect();
-        soup.push((
-            [
-                [5.0, -100.0, -100.0],
-                [5.0, 100.0, -100.0],
-                [5.0, 100.0, 100.0],
-            ]
-            .map(to_bevy_position),
-            1,
-        ));
-        let mut p = WorldPhysicsAdapter::from_entries(soup.clone(), soup)
-            .with_source_names(&["Vitre -> fred.grande_vitre", "Wall -> fred.beton"]);
-        let (start, end) = ([-4.0, 0.0, 0.0], [-6.0, 0.0, 0.0]);
-        assert!(
-            p.trace(start, end, [0.5, 0.5, 0.5]).is_some(),
-            "the wall blocks the sweep"
-        );
-        p.set_static_actor_collision("Vitre", false);
-        assert!(
-            p.trace(start, end, [0.5, 0.5, 0.5]).is_none(),
-            "the shattered actor's triangles must leave both query worlds"
-        );
-        // Unknown names are ignored, not a panic.
-        p.set_static_actor_collision("NoSuchActor", false);
-        assert!(p.trace(start, end, [0.5, 0.5, 0.5]).is_none());
-        // The other source still blocks from the other side.
-        let hit = p.trace([6.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.5, 0.5, 0.5]);
-        assert!(hit.is_some(), "the unrelated source must keep colliding");
-        p.set_static_actor_collision("vitre", true);
-        assert!(p.trace(start, end, [0.5, 0.5, 0.5]).is_some());
     }
 
     #[test]

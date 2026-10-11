@@ -160,9 +160,6 @@ pub struct CollisionWorld {
     bvh: Bvh,
     degenerate: usize,
     dynamic: Vec<MovingObject>,
-    /// item67h: static source ids excluded from every query (sweeps, rays, overlaps) without
-    /// dropping their triangles, so a shattered actor's geometry can be re-enabled later.
-    disabled_sources: std::collections::HashSet<u32>,
 }
 
 impl CollisionWorld {
@@ -190,7 +187,6 @@ impl CollisionWorld {
             bvh,
             degenerate,
             dynamic: Vec::new(),
-            disabled_sources: std::collections::HashSet::new(),
         }
     }
 
@@ -224,31 +220,8 @@ impl CollisionWorld {
         self.sources[index as usize]
     }
 
-    /// item67h: excludes (or restores) every static triangle of `source` from all queries
-    /// (sweeps, rays, overlaps), without dropping its triangles. Returns the number of retained
-    /// triangles now carrying the state change. Used for a static-mesh actor that was shattered
-    /// (destroyed) or that stopped colliding; the counterpart for moving objects is
-    /// [`CollisionWorld::set_moving_enabled`].
-    pub fn set_source_enabled(&mut self, source: u32, enabled: bool) -> usize {
-        let changed = if enabled {
-            self.disabled_sources.remove(&source)
-        } else {
-            self.disabled_sources.insert(source)
-        };
-        if changed {
-            self.sources.iter().filter(|&&s| s == source).count()
-        } else {
-            0
-        }
-    }
-
-    pub(crate) fn for_each_candidate(&self, query: Aabb, mut f: impl FnMut(u32)) {
-        let disabled = &self.disabled_sources;
-        self.bvh.traverse(query, |i| {
-            if !disabled.contains(&self.sources[i as usize]) {
-                f(i);
-            }
-        });
+    pub(crate) fn for_each_candidate(&self, query: Aabb, f: impl FnMut(u32)) {
+        self.bvh.traverse(query, f);
     }
 
     /// Adds a moving collision object, returning its index.
