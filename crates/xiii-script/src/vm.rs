@@ -3966,6 +3966,17 @@ impl<'s> Vm<'s> {
             )
         });
         let scaled = dt * dilation;
+        // A retail pause is entered through GameInfo.SetPause after the world has already
+        // published LevelInfo.TimeSeconds. Reconcile the VM's double accumulator with that
+        // published value before freezing it; otherwise a level whose startup scripts advanced
+        // the float clock before the VM's first managed tick would rewind to zero on the first
+        // paused tick.
+        if paused
+            && let Some(level) = self.level_info
+            && let Some(Value::Float(published)) = self.get_property(level, "TimeSeconds")
+        {
+            self.time = f64::from(*published);
+        }
         if !paused {
             self.time += f64::from(scaled);
         }
@@ -6487,6 +6498,11 @@ impl<'s> Vm<'s> {
             (0x47, Value::Object(o)) => Value::Bool(o.is_some()),
             (0x47, Value::NativeClass(_)) => Value::Bool(true),
             (0x48, Value::Name(n)) => Value::Bool(!n.eq_ignore_ascii_case("None")),
+            // UE2 `EC_StringToByte` (0x49): parse the leading integer (`appAtoi`: optional sign
+            // then leading decimal digits, stopping at the first non-digit; 0 when there is
+            // none) and truncate it to a byte. Decoded at `xidpawn.gennmi` 0x07E7, which switches
+            // on `byte(Mid(TimbresPossibles, Rand(j)))` with `TimbresPossibles="123;"`.
+            (0x49, Value::Str(s)) => Value::Byte(Self::app_atoi(s) as u8),
             (0x4A, Value::Str(s)) => Value::Int(s.trim().parse().unwrap_or(0)),
             (0x4B, Value::Str(s)) => Value::Bool(
                 s.eq_ignore_ascii_case("true") || s.trim().parse::<i32>().is_ok_and(|i| i != 0),
@@ -6522,6 +6538,21 @@ impl<'s> Vm<'s> {
                 ))));
             }
         })
+    }
+
+    /// UE2 `appAtoi`: parse an optional leading `+`/`-` sign and the decimal digits that
+    /// immediately follow it, stopping at the first non-digit; returns 0 when there is no
+    /// leading integer. Used by the `EC_StringToByte` (0x49) primitive cast.
+    fn app_atoi(s: &str) -> i32 {
+        let t = s.trim_start();
+        let (negative, rest) = match t.strip_prefix('-') {
+            Some(r) => (true, r),
+            None => (false, t.strip_prefix('+').unwrap_or(t)),
+        };
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        let magnitude = digits.parse::<i64>().unwrap_or(0);
+        let value = if negative { -magnitude } else { magnitude };
+        value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
     }
 
     // ------------------------------------------------------------------ places

@@ -112,6 +112,13 @@ pub enum Command {
     /// MedKit/FullMedKit from the pawn's inventory by `HealthPercent` and calls
     /// `Med.UseMeQuick`). Edge-triggered like `use`.
     QuickHeal,
+    /// item72: open the retail in-game menu (the same decoded `ShowTheMenu` path the
+    /// `Escape=Showmenu` binding runs).
+    Menu,
+    /// item72: close the in-game menu through the page's own Esc handler (resume).
+    MenuClose,
+    /// item72: save a screenshot of the current frame to this path (repeatable).
+    Shot(String),
 }
 
 /// A parsed input script, time-ordered.
@@ -242,6 +249,27 @@ impl Script {
                     }
                     Command::QuickHeal
                 }
+                "menu" => {
+                    if it.next().is_some() {
+                        return Err(format!("line {n}: menu takes no arguments"));
+                    }
+                    Command::Menu
+                }
+                "menu_close" | "close_menu" => {
+                    if it.next().is_some() {
+                        return Err(format!("line {n}: {cmd} takes no arguments"));
+                    }
+                    Command::MenuClose
+                }
+                "shot" | "screenshot" => {
+                    let path = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: shot needs a path"))?;
+                    if it.next().is_some() {
+                        return Err(format!("line {n}: unexpected shot argument"));
+                    }
+                    Command::Shot(path.to_owned())
+                }
                 other => return Err(format!("line {n}: unknown command {other:?}")),
             };
             events.push(Event { t, command });
@@ -297,6 +325,12 @@ pub struct Drive {
     control_pending: bool,
     /// `heal` (QuickHeal exec) requested (edge-triggered) and not yet applied by the host.
     heal_pending: bool,
+    /// item72: `menu` requested (edge-triggered) and not yet applied by the host.
+    menu_pending: bool,
+    /// item72: `menu_close` requests, in order.
+    menu_close_pending: usize,
+    /// item72: `shot <path>` requests, in order.
+    shots: Vec<String>,
     exec_inputs: Vec<&'static str>,
     tracking: Option<String>,
     /// Aim height fraction for the active tracking (0.6 default, `track <actor> <f>` sets it).
@@ -325,6 +359,9 @@ impl Drive {
             goals: Vec::new(),
             control_pending: false,
             heal_pending: false,
+            menu_pending: false,
+            menu_close_pending: 0,
+            shots: Vec::new(),
             exec_inputs: Vec::new(),
             tracking: None,
             track_height: 0.6,
@@ -357,6 +394,27 @@ impl Drive {
     /// Takes the pending `heal` (QuickHeal) request (edge-triggered).
     pub fn take_quick_heal(&mut self) -> bool {
         std::mem::take(&mut self.heal_pending)
+    }
+
+    /// Takes the pending `menu` request (edge-triggered).
+    pub fn take_menu_open(&mut self) -> bool {
+        std::mem::take(&mut self.menu_pending)
+    }
+
+    /// Takes the pending `menu_close` requests, in order.
+    pub fn take_menu_close(&mut self) -> bool {
+        let n = &mut self.menu_close_pending;
+        if *n > 0 {
+            *n -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drains the pending `shot <path>` requests, in order.
+    pub fn take_shots(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.shots)
     }
 
     /// Drains ordinary player exec edges (Reload and Grab), preserving input order.
@@ -447,6 +505,9 @@ impl Drive {
                 Command::NextWeapon => self.weapon_inputs.push(None),
                 Command::TakeControl => self.control_pending = true,
                 Command::QuickHeal => self.heal_pending = true,
+                Command::Menu => self.menu_pending = true,
+                Command::MenuClose => self.menu_close_pending += 1,
+                Command::Shot(path) => self.shots.push(path.clone()),
             }
             self.cursor += 1;
         }

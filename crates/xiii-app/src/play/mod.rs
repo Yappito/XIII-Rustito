@@ -18,6 +18,8 @@ mod combat_survey;
 pub mod cutscene;
 pub mod footsteps;
 pub mod hud;
+/// item72: the retail in-game menu hosted in the play session's VM.
+pub mod ingamemenu;
 pub mod movement_modes;
 pub mod movers;
 pub mod pawns;
@@ -100,8 +102,8 @@ struct RenderSync {
 }
 
 #[derive(Resource)]
-struct ScriptRes {
-    drive: Option<script::Drive>,
+pub(crate) struct ScriptRes {
+    pub(crate) drive: Option<script::Drive>,
 }
 
 /// Player footstep cadence for `--play` (surface lookup table + accumulator). See
@@ -111,7 +113,7 @@ struct ScriptRes {
 struct FootstepRes(footsteps::FootstepDriver);
 
 #[derive(Resource)]
-struct TraceState {
+pub(crate) struct TraceState {
     tick: u64,
     saved_total: u64,
     start: Instant,
@@ -126,6 +128,9 @@ struct TraceState {
     /// only): the screenshot fires [`cutscene::VIDEO_SHOT_AFTER_SECS`] into playback and the run
     /// exits once the shot is confirmed, independent of the original budget.
     video_exit_at: Option<Instant>,
+    /// item72: the in-game menu page is open (retail pauses the level; the fixed step
+    /// suppresses the player input while it is).
+    menu_open: bool,
 }
 
 #[derive(Resource, Default)]
@@ -212,7 +217,8 @@ impl Plugin for PlayPlugin {
         app.add_plugins((crate::video::CutscenePlugin, cutscene::CutsceneSystems));
         app.insert_non_send(cutscene::CutsceneHost(cutscene_host));
         app.insert_resource(DiagnosticOverlay(options.diagnostic_overlay));
-        app.insert_resource(PlayConfig { options })
+        app.insert_non_send(ingamemenu::InGameMenu::default())
+            .insert_resource(PlayConfig { options })
             .insert_resource(ClearColor(Color::srgb(0.45, 0.62, 0.82)))
             .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
             .init_resource::<ShotFlag>()
@@ -232,6 +238,7 @@ impl Plugin for PlayPlugin {
                 Update,
                 (
                     controls,
+                    ingamemenu::frame,
                     grab_cursor,
                     mouse_look,
                     cinematics::collect,
@@ -250,9 +257,12 @@ impl Plugin for PlayPlugin {
                     cartoon::sync_render_target,
                     hud::draw,
                     overlay,
-                    unattended,
                 )
                     .chain(),
+            )
+            .add_systems(
+                Update,
+                (unattended, ingamemenu::scripted_shots).after(overlay),
             )
             .add_systems(
                 Last,
@@ -443,6 +453,7 @@ fn setup(
     mut commands: Commands,
     cfg: Res<PlayConfig>,
     mut session: NonSendMut<Result<session::Session, String>>,
+    mut menu: NonSendMut<ingamemenu::InGameMenu>,
     mut sync: ResMut<RenderSync>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -460,6 +471,9 @@ fn setup(
             return;
         }
     };
+    // item72: the in-game menu's save device writes into the configured save dir, and Quit
+    // interception keys on the map.
+    menu.configure(cfg.options.save_dir.clone(), cfg.options.map.clone());
     match setup_inner(
         &mut commands,
         &cfg.options,
@@ -851,6 +865,7 @@ fn setup_inner(
             target_at: None,
             post_travel_at: None,
             video_exit_at: None,
+            menu_open: false,
         });
     } else {
         // The reload owns a fresh per-map runtime, but the input-script cursor (`ScriptRes`) and
@@ -999,11 +1014,13 @@ fn fixed_step(
     // Scripted cutscenes freeze the player (`CineController2.Interpret` FPC/FPL ->
     // `NoControl`/`NoMove`, and `CameraView`/`PlayingVideo`). The host owns the player pawn's
     // movement, so it must zero the movement input itself; the VM's state machine only sets the
-    // state. See `cinematics`.
+    // state. See `cinematics`. The in-game menu page (item72) pauses the level the same way:
+    // retail input goes to the GUI while the page is open (`state.menu_open` is maintained by
+    // the menu's per-frame system).
     let suppressed = match &*session {
         Ok(sess) => cinematics::input_suppressed(sess),
         Err(_) => false,
-    };
+    } || state.menu_open;
     if let Some(drive) = script.drive.as_mut() {
         let track_height = drive.track_height();
         let tracked = drive.tracking_actor().and_then(|name| {
@@ -1554,27 +1571,74 @@ fn controls(
     wheel: Res<bevy::input::mouse::AccumulatedMouseScroll>,
     cfg: Res<PlayConfig>,
     mut session: NonSendMut<Result<session::Session, String>>,
+    mut menu: NonSendMut<ingamemenu::InGameMenu>,
+    mut menu_was_open: Local<bool>,
     mut cursor: Single<&mut CursorOptions, With<PrimaryWindow>>,
+    window: Query<&Window, With<PrimaryWindow>>,
     mut diagnostics: ResMut<DiagnosticOverlay>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if keys.just_pressed(KeyCode::F3) {
         diagnostics.0 = !diagnostics.0;
     }
-    if keys.just_pressed(KeyCode::Escape) {
-        cursor.grab_mode = CursorGrabMode::None;
-        cursor.visible = true;
-        eprintln!(
-            "[play] In-map menu unavailable: ShowTheMenu GUI bridge is missing. Escape releases the mouse; click to resume, Ctrl+Q to quit."
-        );
-    }
-    // Escape is reserved for retail ShowMenu; Ctrl+Q is an explicit host quit chord.
+    // Ctrl+Q stays the explicit hard quit, also while the menu is open.
     if keys.just_pressed(KeyCode::KeyQ)
         && keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight])
     {
         exit.write(AppExit::Success);
     }
+    if let Ok(sess) = session.as_mut() {
+        // Escape is the retail Showmenu binding: it opens the in-game page through the game's
+        // own ShowTheMenu path; while the page is open the page's own Esc handler closes it.
+        if keys.just_pressed(KeyCode::Escape) {
+            if menu.is_open() {
+                menu.request_close(sess);
+            } else {
+                menu.open(sess);
+            }
+        }
+        if menu.is_open() {
+            // Route the menu keys to the page (the retail GUIController dispatch). Movement,
+            // weapons and the held fire flags stay suppressed below.
+            for (key, code) in [
+                (KeyCode::ArrowUp, 38u8),
+                (KeyCode::ArrowDown, 40),
+                (KeyCode::ArrowLeft, 37),
+                (KeyCode::ArrowRight, 39),
+                (KeyCode::Enter, 13),
+                (KeyCode::Backspace, 8),
+            ] {
+                if keys.just_pressed(key)
+                    && let Err(e) = menu.key(sess, code)
+                {
+                    menu.errors.push(format!("menu key {key:?}: {e}"));
+                }
+            }
+            if buttons.just_pressed(MouseButton::Left) {
+                let at = window
+                    .single()
+                    .ok()
+                    .and_then(|w| w.cursor_position())
+                    .map(|p| (p.x, p.y));
+                menu.click(sess, at);
+            }
+        }
+    }
+    // Mouse capture follows the menu state: the page is mouse-driven, so the cursor is
+    // released while it is open and re-grabbed when it closes.
+    let open = menu.is_open();
+    if open != *menu_was_open {
+        if open {
+            cursor.grab_mode = CursorGrabMode::None;
+            cursor.visible = true;
+        } else {
+            cursor.grab_mode = CursorGrabMode::Locked;
+            cursor.visible = false;
+        }
+        *menu_was_open = open;
+    }
     if cfg.options.play_script.is_none()
+        && !menu.is_open()
         && let Ok(sess) = session.as_mut()
         && let Some(pc) = sess.controller
     {
@@ -1617,9 +1681,14 @@ fn mouse_look(
     buttons: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
     mut cursor: Single<&mut CursorOptions, With<PrimaryWindow>>,
+    menu: NonSend<ingamemenu::InGameMenu>,
     mut sim: ResMut<SimRes>,
 ) {
-    if buttons.just_pressed(MouseButton::Left) && cursor.grab_mode != CursorGrabMode::Locked {
+    // A menu click is the page's input, not a re-grab request.
+    if buttons.just_pressed(MouseButton::Left)
+        && cursor.grab_mode != CursorGrabMode::Locked
+        && !menu.is_open()
+    {
         cursor.grab_mode = CursorGrabMode::Locked;
         cursor.visible = false;
     }
@@ -2038,6 +2107,7 @@ fn travel(
     mut cfg: ResMut<PlayConfig>,
     mut session: NonSendMut<Result<session::Session, String>>,
     mut cutscene_host: NonSendMut<cutscene::CutsceneHost>,
+    mut menu: NonSendMut<ingamemenu::InGameMenu>,
     mut cinematic: ResMut<cinematics::CinematicState>,
     mut cartoon: ResMut<cartoon::CartoonState>,
     mut sync: ResMut<RenderSync>,
@@ -2059,6 +2129,20 @@ fn travel(
     let Some(req) = sess.take_travel_request() else {
         return;
     };
+    // item72: the in-game menu's `QuitGame` travels to the front-end map; the host hands off to
+    // the `--menu` mode instead of loading it as a play level (one event loop per process).
+    match travel::TravelPlan::from_request(&req) {
+        Ok(plan) if ingamemenu::InGameMenu::is_front_end_map(&plan.map) => {
+            println!(
+                "[play] travel to the front-end map {} requested by {} at t={:.3}s; the host relaunches --menu",
+                plan.map, req.actor, req.time
+            );
+            ingamemenu::request_relaunch(ingamemenu::MenuRelaunch::FrontEnd);
+            exit.write(AppExit::Success);
+            return;
+        }
+        _ => {}
+    }
     let plan = match travel::TravelPlan::from_request(&req) {
         Ok(p) => p,
         Err(e) => {
@@ -2130,6 +2214,9 @@ fn travel(
             return;
         }
     };
+    // item72: the in-game menu's VM references died with the outgoing session; re-configure for
+    // the new map (the next `open` reinstalls the GUI graph into the new VM).
+    menu.configure(cfg.options.save_dir.clone(), cfg.options.map.clone());
     // item21: reinstall the cutscene host on the new map's VM. Dropping the old session stops
     // its clip; the overlay sync tears the picture/audio down once the new host has none open.
     cutscene_host.0 = Some(cutscene::install(
@@ -6574,13 +6661,15 @@ mod tests {
         );
     }
 
-    /// item59, re-authored by item67/item67f: Hual02 route by player input (the vent crawl, the
-    /// underfloor with the Porte11 use, the service-lift ride by the cage's own button, the
-    /// walk out through the manager-opened Porte20, the surface corridor, the depot reader,
-    /// Carrington's cell) with labelled teleports only for the measured movement gaps (the
-    /// surface corridor's BSP dead-end at (-2854,2338), the Locked Porte19 magnetic chain whose
-    /// only card pickup is sealed in the meeting-room petitesalle, the corridor block at
-    /// (-6198,842), the sealed prison perimeter, the grille pin, the pinned exit stairwell).
+    /// item59, re-authored by item67/item67f/item67g: Hual02 route by player input (the vent
+    /// crawl, the underfloor with the Porte11 use, the service-lift ride by the cage's own
+    /// button, the walk out through the manager-opened live LiftDoor1, the map's own surface
+    /// nav chain to the depot reader, the depot reader use, Carrington's cell) with labelled
+    /// teleports only for the measured movement gaps (the Locked Porte19 magnetic chain whose
+    /// only card pickup is sealed in the card-room petitesalle, the corridor block at (-6198,842),
+    /// the sealed prison perimeter, the grille pin, the pinned exit stairwell). item67g removed
+    /// the surface teleport: the item67f (-2854,2338) dead-end was a wrong turn off the map's
+    /// nav chain, not a blocker.
     /// The objectives must come from the game's own chains: goals 4/5/6 complete, goal 3 is
     /// promoted by the depot reader chain, goals 0/1/2 stay incomplete on measured blockers, and
     /// no travel is requested.
@@ -6624,16 +6713,16 @@ mod tests {
             removed >= 20,
             "the Hual02 hostile garrison is ~22 BaseSoldier pawns, removed {removed}"
         );
-        // 392 s: the crawl, the underfloor, the lift ride (~40 s, item67), the surface
-        // corridor and the reader, the cell unlock (~22 s hold), and the exit plateau walk;
-        // the script's wait_travel never completes.
+        // 500 s: the crawl, the underfloor, the lift ride (~40 s, item67), the surface nav-chain
+        // walk to the depot reader (item67g, ~160 s), the reader use, the cell unlock (~22 s
+        // hold), and the exit plateau walk; the script's wait_travel never completes.
         let outcome = run_script_inner(
             &game_dir,
             "Hual02",
             &script,
             &resolved.params,
             &scene,
-            392.0,
+            500.0,
             false,
             RunnerOptions {
                 initial: Some(runtime),
@@ -6777,27 +6866,37 @@ mod tests {
             )),
             "the LiftManager must trigger LiftDoor1 (the game's own outer-door path)"
         );
-        // item67f measured walk: with the destroyed `Porte20` no longer part of the level, the
-        // player leaves the cage north through the doorway and follows the surface corridor
-        // (max y ~2650) west, dead-ending at the BSP wall (-2854,2338) (measured).
+        // item67g measured walk: with the destroyed `Porte20` no longer part of the level, the
+        // player leaves the cage north through the live `LiftDoor1` doorway and follows the
+        // map's own ReachSpec/PathNode chain (measured with `xiii-tool nav` + `box-probe`)
+        // south from the doorway to y~2436 and west along the y~1790 corridor, around the
+        // x=-5120 BSP wall, to the depot reader. The item67f dead-end at (-2854,2338) was a
+        // wrong turn off this chain (the wall is real BSP), not a blocker; the surface teleport
+        // is removed.
         let walk = outcome
             .trace
             .iter()
-            .filter(|s| (232.0..258.0).contains(&s.1));
+            .filter(|s| (232.0..402.0).contains(&s.1));
         let max_y = walk.clone().map(|s| s.2[1]).fold(f32::MIN, f32::max);
         assert!(
             max_y > 2550.0,
             "the walker must leave the cage through the doorway (max corridor y {max_y})"
         );
-        let pin = outcome
-            .trace
-            .iter()
-            .min_by(|a, b| (a.1 - 256.0).abs().total_cmp(&(b.1 - 256.0).abs()))
-            .expect("trace sample");
+        let min_y = walk.clone().map(|s| s.2[1]).fold(f32::MAX, f32::min);
         assert!(
-            (pin.2[0] - -2854.0).abs() < 60.0 && (pin.2[1] - 2338.0).abs() < 60.0,
-            "the surface corridor must dead-end at the measured BSP wall (-2854,2338): got {:?}",
-            pin.2
+            min_y < 900.0,
+            "the walker must follow the nav chain all the way to the depot corridor (min y {min_y})"
+        );
+        // The depot reader was reached by real input: over the surface walk the player gets
+        // within a few UU of the reader's volume (MagneticPassTrigger1 at -5259,803), where the
+        // aimed use runs.
+        let closest = walk
+            .clone()
+            .map(|s| ((s.2[0] + 5259.0).powi(2) + (s.2[1] - 803.0).powi(2)).sqrt())
+            .fold(f32::MAX, f32::min);
+        assert!(
+            closest < 60.0,
+            "the nav-chain walk must reach the depot reader (-5259,803): closest {closest:.1} UU"
         );
         // The depot reader was aimed and used (the game's TargetActor + bCanTrigger -> Grab),
         // but the player carries no matching card, so Grab only ran
