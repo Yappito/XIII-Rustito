@@ -94,6 +94,17 @@ impl MoverCollision {
     pub fn build(scene: &WorldScene, movers: &[MoverState]) -> (CollisionWorld, MoverCollision) {
         let (static_entries, parts) = partition(scene, movers);
         let mut world = CollisionWorld::new(static_entries);
+        // The engine's `UStaticMesh::LineCheck` one-sided tail applies to the player's swept
+        // moves against static-mesh-actor sources as well (same rule as the physics adapter's
+        // line world). Movers partitioned into the dynamic set keep their source ids, so the
+        // per-source flags cover them too.
+        world.set_one_sided_sources(
+            scene
+                .collision_sources
+                .iter()
+                .map(|path| path.contains(" -> "))
+                .collect(),
+        );
         let mut actors = Vec::new();
         let mut by_name = HashMap::new();
         for p in parts {
@@ -426,6 +437,37 @@ mod tests {
         // The base mover is destroyed: the ride ends silently, the player is left where it is.
         assert_eq!(rider.carry(&mut p, |_| None), [0.0; 3]);
         assert_eq!(rider.base(), None);
+    }
+
+    #[test]
+    fn a_sliding_panel_mover_reposes_and_blocks_the_lane_the_vm_moves_it_across() {
+        // item40l: the world-space collision triangles of a mover are re-posed by the VM
+        // transform (they are not re-registered), so a panel serialized off a lane and slid
+        // across it by the VM blocks the walk exactly at the slid pose. This is the measured
+        // Amos01 `XIIIMover9` door: serialized (base) off the ground corridor, opened by the
+        // game's clabataille chain across it; the route therefore uses the elevated walkway.
+        let y = 10.0_f32;
+        let panel: Vec<Triangle> = vec![
+            [[-1.0, y, -1.0], [1.0, y, -1.0], [1.0, y, 1.0]],
+            [[-1.0, y, -1.0], [1.0, y, 1.0], [-1.0, y, 1.0]],
+        ];
+        let mut world = CollisionWorld::new(std::iter::empty());
+        let index = world.add_moving(MovingObject::from_world_triangles(
+            panel,
+            7,
+            [0.0, y, 0.0],
+            rotation_rows([0, 0, 0]),
+        ));
+        let (a, b, half) = ([-5.0_f32, 0.0, 0.0], [5.0_f32, 0.0, 0.0], [0.1_f32; 3]);
+        assert!(
+            world.sweep(a, b, half).is_none(),
+            "the base panel sits off the lane and must not block it"
+        );
+        world.set_moving_transform(index, [0.0, 0.0, 0.0], rotation_rows([0, 0, 0]));
+        assert!(
+            world.sweep(a, b, half).is_some(),
+            "the slid panel covers the lane and must block the walk"
+        );
     }
 
     #[test]

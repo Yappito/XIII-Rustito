@@ -116,6 +116,12 @@ impl WorldPhysicsAdapter {
             .iter()
             .map(|path| path.contains(" -> "))
             .collect();
+        // The flags drive the zero-extent ray path only; swept movement queries are
+        // two-sided for every source. Registered movers clear their flag (brush collision
+        // is two-sided, see `register_mover`).
+        physics
+            .box_world
+            .set_one_sided_sources(physics.line_one_sided_sources.clone());
         physics.source_names = scene.collision_sources.clone();
         physics
     }
@@ -458,6 +464,17 @@ impl WorldPhysics for WorldPhysicsAdapter {
         if triangles.is_empty() {
             return;
         }
+        // Movers are brushes in the engine: their collision (the mover brush polys) is
+        // two-sided. The one-sided `UStaticMesh::LineCheck` tail applies to static-mesh
+        // actors only, so a registered mover's source must not keep the static-mesh
+        // one-sided flag (measured: the chair swing must break BreakAbleMover16 from the
+        // room side, and the fist must break BreakableMover9 from zone 15 - both hit the
+        // grille from the side its mesh winding points away from).
+        self.box_world.set_one_sided_source(source, false);
+        self.line_world.set_one_sided_source(source, false);
+        if let Some(f) = self.line_one_sided_sources.get_mut(source as usize) {
+            *f = false;
+        }
         // The mover's triangles must exist in exactly one place (the same invariant the host's
         // `movers::partition` applies to the player world): drop the static base-pose copies from
         // both query soups, otherwise every pawn move/trace keeps hitting a frozen copy of the
@@ -565,6 +582,47 @@ mod tests {
     /// Unreal coordinates of a Bevy point (via the adapter's public inverse).
     fn u(p: [f32; 3]) -> [f32; 3] {
         bevy_to_unreal_position(p)
+    }
+
+    #[test]
+    fn registered_mover_rays_hit_from_both_sides() {
+        // A mover is a brush in the engine: two-sided. Even when the one-sided flag was set
+        // from the static-mesh label rule, registering the mover must exempt its source so
+        // traces (the chair swing breaking BreakAbleMover16 from the room side) hit it.
+        let tri: Triangle = [
+            [16.0 / 90.0, 8.0 / 90.0, 2175.0 / 90.0],
+            [16.0 / 90.0, 126.0 / 90.0, 2175.0 / 90.0],
+            [140.0 / 90.0, 126.0 / 90.0, 2175.0 / 90.0],
+        ];
+        let mut p = WorldPhysicsAdapter::from_entries(vec![(tri, 133)], vec![(tri, 133)]);
+        // Simulate the static-mesh label rule flagging this source one-sided (both the
+        // worlds' sweep flags and the adapter's ray flag array).
+        p.line_world.set_one_sided_source(133, true);
+        p.box_world.set_one_sided_source(133, true);
+        p.line_one_sided_sources = vec![false; 134];
+        p.line_one_sided_sources[133] = true;
+        let tri_unreal: Vec<Triangle> = vec![tri.map(bevy_to_unreal_position)];
+        p.register_mover(
+            "BreakableMover9",
+            133,
+            &tri_unreal,
+            [-2175.0, 78.0, 67.0],
+            [0, 0, 0],
+        );
+        // Unreal-space rays eastward (along the winding) and westward (against it) must
+        // both hit the registered brush.
+        let east = p.trace(
+            [-2260.0, 78.0, 100.0],
+            [-2160.0, 78.0, 100.0],
+            [0.0, 0.0, 0.0],
+        );
+        let west = p.trace(
+            [-2100.0, 78.0, 100.0],
+            [-2190.0, 78.0, 100.0],
+            [0.0, 0.0, 0.0],
+        );
+        assert!(east.is_some(), "eastward ray must hit the registered brush");
+        assert!(west.is_some(), "westward ray must hit the registered brush");
     }
 
     #[test]

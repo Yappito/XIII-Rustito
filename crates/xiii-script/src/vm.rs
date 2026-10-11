@@ -1480,6 +1480,15 @@ pub struct Vm<'s> {
     /// installed, `GetStatus` reports completion from the actual host playback instead of the
     /// Bink-header duration timer.
     video_host: Option<Box<dyn VideoPlayerHost>>,
+    /// item40i: the most recently completed script call ended on `EX_Return EX_Nothing` (a
+    /// bodyless declaration, or a body that falls through to the compiler-appended `return;`),
+    /// so it wrote nothing into the caller's result buffer. Decoded (Core.dll):
+    /// `ProcessInternal` (0x10116620) steps the return expression into the caller's `Result`
+    /// (0x10116766..0x10116776) and `execNothing` (0x10115f10) is a bare `ret 8`; `execLet`
+    /// (0x10117190) steps the right-hand side straight into the variable's address
+    /// (0x101172ef..0x101172f1), so such a call leaves the assigned variable unchanged. Read by
+    /// `K::Let` only; every other consumer zero-initialises its temporary (see `K::Let`).
+    call_result_unwritten: bool,
 }
 
 /// item21: host-backed cutscene playback for `Engine.VideoPlayer`. The VM is filesystem-free and
@@ -1539,6 +1548,19 @@ pub struct VideoPlayback {
 
 fn lower(s: &str) -> String {
     s.to_ascii_lowercase()
+}
+
+/// item40i: whether `t` is a function call whose result is the callee's own return step
+/// (directly, or as the member of an object/class context), i.e. a call that may leave the
+/// caller's result buffer unwritten (see `Vm::call_result_unwritten`).
+fn is_script_call(t: &Token) -> bool {
+    match &t.kind {
+        TokenKind::VirtualFunction { .. }
+        | TokenKind::GlobalFunction { .. }
+        | TokenKind::FinalFunction { .. } => true,
+        TokenKind::Context(c) | TokenKind::ClassContext(c) => is_script_call(&c.member),
+        _ => false,
+    }
 }
 
 /// UE2 `FixedTurn`: move the wrapped 16-bit rotator component toward its target by at most
@@ -1650,6 +1672,7 @@ impl<'s> Vm<'s> {
             video_durations: HashMap::new(),
             video: None,
             video_host: None,
+            call_result_unwritten: false,
         }
     }
 
@@ -4878,6 +4901,22 @@ impl<'s> Vm<'s> {
             .object(func)
             .and_then(ScriptObject::struct_header)
             .expect("function");
+        if h.script.statements.is_empty() {
+            // item40i: a non-native function with no bytecode at all. The retail compiler never
+            // emits one (measured: all 333 bodyless declarations in the ten retail .u packages
+            // carry the 2-byte `EX_Return EX_Nothing`, none has 0 bytes). Decoded: UFunction::Bind
+            // (0x101126b0) points every non-native function at ProcessInternal (0x10112701),
+            // CallFunction takes `Code` from `Script.Data` (0x1011e72b) and ProcessInternal
+            // dereferences it before any length check (0x10116715); the only early exit, the
+            // UObject::ProcessRemoteFunction override (vtable +0x20, 0x101168b0), is `xor eax;
+            // ret C` in Core.dll — it always returns 0 and cannot rescue a null `Script.Data`.
+            // An empty script is malformed data the engine would fault on, not a no-op.
+            // Report it.
+            return Err(self.err(VmErrorKind::Other(format!(
+                "script function {} has no bytecode (not even EX_Return)",
+                set.path(func)
+            ))));
+        }
         let map = self.stmt_map(func, &h.script);
         let mut frame = Frame {
             pkg: func.package,
@@ -4896,6 +4935,9 @@ impl<'s> Vm<'s> {
             offset: 0,
         });
         let exit = self.run(&mut frame, 0, None);
+        if !matches!(exit, Ok(Exit::Return(_))) {
+            self.call_result_unwritten = false;
+        }
         let result = match exit {
             Ok(Exit::Return(v)) => Ok(v),
             Ok(Exit::End) => Ok(match &layout.ret {
@@ -4931,7 +4973,10 @@ impl<'s> Vm<'s> {
             }));
         };
         if f.is_native() {
-            return match self.native_from_tokens(frame, func, call, target, index)? {
+            let outcome = self.native_from_tokens(frame, func, call, target, index)?;
+            // A native always writes its result (item40i: see `call_result_unwritten`).
+            self.call_result_unwritten = false;
+            return match outcome {
                 NativeOutcome::Value(v) => Ok(v),
                 NativeOutcome::Iterate(_) => Err(self.err(VmErrorKind::Other(
                     "iterator native outside a foreach".into(),
@@ -4975,6 +5020,7 @@ impl<'s> Vm<'s> {
                 class: class.clone(),
                 function: self.short_path(func),
             });
+            self.call_result_unwritten = false;
             drop(class);
             return Ok(Value::Void);
         }
@@ -5436,13 +5482,30 @@ impl<'s> Vm<'s> {
                 }
             }
             K::Return(e) => {
-                let v = match e.kind {
-                    K::Nothing => match frame.layout.as_ref().and_then(|l| l.ret.clone()) {
-                        Some((slot, _)) => frame.locals[slot].clone(),
-                        None => Value::Void,
-                    },
-                    _ => self.eval(frame, e)?,
+                // item40i, decoded (Core.dll ProcessInternal 0x10116620): the loop stops at
+                // the first top-level EX_Return (0x10116715..0x1011674d), then steps the return
+                // expression into the caller's `Result` buffer (0x10116766..0x10116776). The
+                // callee's zeroed frame (CallFunction 0x1011e70f) is never copied to `Result`,
+                // so `return;` (EX_Nothing, `execNothing` 0x10115f10 = `ret 8`) writes nothing:
+                // the caller sees its own buffer. The VM returns the zeroed ReturnValue slot
+                // (what every zero-initialising consumer reads) and records that nothing was
+                // written, which `K::Let` honours. `return F();` forwards the caller's buffer to
+                // F, so F's unwritten result propagates.
+                let (v, unwritten) = match e.kind {
+                    K::Nothing => (
+                        match frame.layout.as_ref().and_then(|l| l.ret.clone()) {
+                            Some((slot, _)) => frame.locals[slot].clone(),
+                            None => Value::Void,
+                        },
+                        true,
+                    ),
+                    _ => {
+                        self.call_result_unwritten = false;
+                        let v = self.eval(frame, e)?;
+                        (v, self.call_result_unwritten && is_script_call(e))
+                    }
                 };
+                self.call_result_unwritten = unwritten;
                 Flow::Return(v)
             }
             K::Stop => Flow::Stop,
@@ -5991,6 +6054,9 @@ impl<'s> Vm<'s> {
             }
             K::Context(c) => {
                 let v = self.eval_in(frame, &c.object, target)?;
+                // Only the member call may report an unwritten result (item40i); a None context
+                // zeroes the result (decoded: execContext 0x101173a0, `rep stos` at 0x10117474).
+                self.call_result_unwritten = false;
                 if let Value::Object(Some(ObjRef::External(id))) = &v {
                     // A property of an object in a non-script package. The host provider answers
                     // known native properties (for example `Texture.USize`/`VSize`, read by
@@ -6021,6 +6087,7 @@ impl<'s> Vm<'s> {
             }
             K::ClassContext(c) => {
                 let v = self.eval_in(frame, &c.object, target)?;
+                self.call_result_unwritten = false;
                 let class = match v {
                     Value::Object(Some(ObjRef::Static(g))) => Some(g),
                     Value::Object(Some(ObjRef::Instance(i))) => {
@@ -6056,8 +6123,20 @@ impl<'s> Vm<'s> {
             }
             K::Let { lhs, rhs } | K::LetBool { lhs, rhs } => {
                 let place = self.place(frame, lhs, target)?;
+                self.call_result_unwritten = false;
                 let v = self.eval(frame, rhs)?;
+                // item40i, decoded (Core.dll): `execLet` (0x10117190) steps the right-hand side
+                // directly into the variable's address (0x101172ef..0x101172f1), so a script call
+                // that ends on `return;` (nothing written, see `K::Return`) leaves the variable
+                // unchanged. `execLetBool` (0x10117300) steps into a zeroed temporary (0x10117347)
+                // and then stores it, so the bool form assigns false; `execJumpIfNot` and the
+                // native parameter readers zero their temporaries likewise.
+                let unwritten = matches!(t.kind, K::Let { .. })
+                    && self.call_result_unwritten
+                    && is_script_call(rhs);
+                self.call_result_unwritten = false;
                 match place {
+                    Some(_) if unwritten => {}
                     Some(p) => self.write(frame, &p, v)?,
                     None => self.accessed_none(),
                 }
@@ -6065,6 +6144,21 @@ impl<'s> Vm<'s> {
             }
             K::VirtualFunction { name, call } => {
                 let n = self.set.packages[frame.pkg].name_text(*name).to_owned();
+                // item40i (Core.dll, decoded; image base 0x10100000): execVirtualFunction
+                // (0x10117490) reads the FName and calls FindFunctionChecked(Name, Global=0)
+                // (0x1012f080; execGlobalFunction 0x101174f0 passes Global=1), then the virtual
+                // CallFunction (vtable +0x50, 0x1011e650). FindFunctionChecked searches the
+                // state node's function map, then the class's, and accepts only a UFunction; a
+                // miss logs "Failed to find function %s in %s" (0x1017ac0c) on GError
+                // (0x10176614 = ?GError@@3PAVFOutputDeviceError@@A, the fatal device) and returns
+                // NULL. The VM reports that as `NoSuchFunction` (the caller suspends), never a
+                // skip. A *found* function without a body is an ordinary call: every bodyless
+                // declaration in the retail packages is compiled to `EX_Return EX_Nothing`
+                // (measured: 333 of them, all 2 bytes, 22 with a return value) and runs as a
+                // no-op that logs nothing; see `K::Return`/`K::Let` for what its result reads as.
+                // (The removed item40f `Ammo.SpawnProjectile` host bridge rested on a wrong "no
+                // script body" claim: `engine.u Ammunition.SpawnProjectile` has one, and Fists
+                // punch through `RealTraceFire` because `FistsAmmo.bInstantHit` is true.)
                 let f = self.find_function(target, &n, true).ok_or_else(|| {
                     self.err(VmErrorKind::NoSuchFunction {
                         object: self.objects[target as usize].name.clone(),

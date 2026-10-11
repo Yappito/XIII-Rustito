@@ -90,7 +90,7 @@ impl Plugin for ParticlePlugin {
 /// inspecting triggered effects in the viewer.
 pub fn spawn_particles(
     commands: &mut Commands,
-    meshes: &mut Assets<Mesh>,
+    _meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
     image_handles: &[Handle<Image>],
@@ -129,18 +129,13 @@ pub fn spawn_particles(
                 texture_handle,
                 two_sided,
             ));
-            // Start with the full (empty) attribute layout the per-frame rebuild uses: a mesh
-            // with no attributes has no valid vertex layout, which the depth prepass (needed by
-            // the projector decals) rejects as a pipeline validation error.
-            let mut empty = Mesh::new(
-                PrimitiveTopology::TriangleList,
-                RenderAssetUsages::RENDER_WORLD,
-            );
-            empty.insert_attribute(Mesh::ATTRIBUTE_POSITION, Vec::<[f32; 3]>::new());
-            empty.insert_attribute(Mesh::ATTRIBUTE_NORMAL, Vec::<[f32; 3]>::new());
-            empty.insert_attribute(Mesh::ATTRIBUTE_UV_0, Vec::<[f32; 2]>::new());
-            empty.insert_attribute(Mesh::ATTRIBUTE_COLOR, Vec::<[f32; 4]>::new());
-            let mesh = meshes.add(empty);
+            // Do not attach a `Mesh3d` until the emitter actually has live particles. A
+            // zero-vertex mesh (empty or zero-element attributes) is skipped by Bevy's mesh slab
+            // allocator (`allocate_meshes` returns early on a zero-size vertex buffer) but is
+            // still handed to `copy_element_data`, which logs
+            // `slab_allocator` "Use-after-free: attempted to copy element data for an unallocated
+            // key". With no `Mesh3d` at all the entity is simply not extracted, so no empty
+            // placeholder is ever uploaded.
             let mut sim = EmitterSim::new(si.wrapping_mul(97).wrapping_add(ei));
             sim.set_enabled(force_all || initially_enabled(system, desc));
             commands.spawn((
@@ -152,7 +147,6 @@ pub fn spawn_particles(
                     sim,
                     last_count: 0,
                 },
-                Mesh3d(mesh),
                 MeshMaterial3d(material),
                 RenderLayers::layer(crate::viewer::MAIN_LAYER),
                 Transform::IDENTITY,
@@ -470,7 +464,7 @@ fn build_mesh(
     sim: &EmitterSim,
     transform: &BevyTransform,
     camera: Option<&Transform>,
-) -> Mesh {
+) -> Option<Mesh> {
     let (cam_right, cam_up) = camera
         .map(|t| (t.rotation * Vec3::X, t.rotation * Vec3::Y))
         .unwrap_or((Vec3::X, Vec3::Y));
@@ -547,21 +541,23 @@ fn build_mesh(
         RenderAssetUsages::RENDER_WORLD,
     );
     if out.positions.is_empty() {
-        return mesh;
+        return None;
     }
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, out.positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, out.normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, out.uvs);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, out.colors);
     mesh.insert_indices(Indices::U32(out.indices));
-    mesh
+    Some(mesh)
 }
 
 /// Steps every sub-emitter simulator and rebuilds its mesh. Registered by [`ParticlePlugin`].
 ///
 /// A fresh mesh asset is added and the entity's `Mesh3d` handle is swapped instead of mutating
 /// the existing asset in place: replacing the vertex buffers of a live `RENDER_WORLD` mesh
-/// triggers `bevy_render::slab_allocator` use-after-free errors.
+/// triggers `bevy_render::slab_allocator` use-after-free errors. When an emitter has no live
+/// geometry the `Mesh3d` component is removed entirely rather than pointing it at a zero-vertex
+/// mesh, which Bevy's mesh slab allocator would skip allocating and then warn about.
 pub fn update_particles(
     mut commands: Commands,
     time: Res<Time>,
@@ -595,7 +591,16 @@ pub fn update_particles(
         if count == 0 && e.last_count == 0 {
             continue;
         }
-        let mesh = build_mesh(desc, &e.sim, &system.transform, camera.as_ref());
+        // `build_mesh` returns `None` when the emitter has no drawable geometry (zero active
+        // particles, or a mesh emitter whose reference mesh carries no vertices). Drop the
+        // `Mesh3d` instead of inserting a zero-vertex mesh.
+        let Some(mesh) = build_mesh(desc, &e.sim, &system.transform, camera.as_ref()) else {
+            if e.last_count != 0 {
+                commands.entity(entity).remove::<Mesh3d>();
+                e.last_count = 0;
+            }
+            continue;
+        };
         let handle = meshes.add(mesh);
         commands.entity(entity).insert(Mesh3d(handle));
         e.last_count = count;
@@ -755,5 +760,27 @@ mod tests {
         // A single-cell atlas is the full texture.
         let empty = xiii_world::particles::decode_emitter("SpriteEmitter", "t", &BTreeMap::new());
         assert_eq!(subdivision_uv(&empty, 3), [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    // Regression for item78: an emitter with no drawable geometry must yield `None` (and so no
+    // `Mesh3d` at all), never a zero-vertex mesh. Bevy's mesh slab allocator skips allocating a
+    // zero-size vertex buffer but still calls `copy_element_data`, which then logs
+    // `slab_allocator` "Use-after-free: ... unallocated key".
+    #[test]
+    fn build_mesh_is_none_without_live_geometry() {
+        let desc = xiii_world::particles::decode_emitter("SpriteEmitter", "t", &BTreeMap::new());
+        let sim = EmitterSim::new(0);
+        let transform = xiii_decode::common::actor_to_bevy([0.0; 3], [0; 3], [1.0; 3]);
+        assert!(build_mesh(&desc, &sim, &transform, None).is_none());
+    }
+
+    #[test]
+    fn build_mesh_has_geometry_for_a_live_sprite_particle() {
+        let desc = xiii_world::particles::decode_emitter("SpriteEmitter", "t", &BTreeMap::new());
+        let mut sim = EmitterSim::new(0);
+        sim.particles.push(particle([0.0; 3], [0.0; 3]));
+        let transform = xiii_decode::common::actor_to_bevy([0.0; 3], [0; 3], [1.0; 3]);
+        let mesh = build_mesh(&desc, &sim, &transform, None).expect("live sprite geometry");
+        assert_eq!(mesh.count_vertices(), 4);
     }
 }
