@@ -35,6 +35,7 @@ pub mod physics;
 pub mod projectors;
 pub mod reach;
 pub mod runtime;
+pub mod volume_brushes;
 pub mod zones;
 
 use materials::{BlendMode, MaterialNode, NodeKey, ResolvedMaterial, UvOp};

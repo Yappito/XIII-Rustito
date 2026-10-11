@@ -3824,6 +3824,9 @@ fn phys_fixture() -> Vec<u8> {
     let static_mesh = b.reserve(IMP_OBJECTPROP, actor, "StaticMesh");
     let just_teleported = b.reserve(IMP_BOOLPROP, actor, "bJustTeleported");
     let floor = b.reserve(IMP_STRUCTPROP, actor, "Floor");
+    // `ABrush.Brush` (the volume/mover brush model reference), used by the volume-brush overlap
+    // test (`AActor::IsOverlapping`).
+    let brush = b.reserve(IMP_OBJECTPROP, actor, "Brush");
 
     b.prop_with(owner, level, 0, &object_extra);
     b.prop_with(level, base, 0, &object_extra);
@@ -3858,7 +3861,8 @@ fn phys_fixture() -> Vec<u8> {
     b.prop_with(touching_template, 0, 0, &object_extra);
     b.prop_array(touching, just_teleported, 0, touching_template);
     b.prop(just_teleported, floor, 0);
-    b.prop_with(floor, touch_fn, 0, &vector_extra);
+    b.prop_with(floor, brush, 0, &vector_extra);
+    b.prop_with(brush, touch_fn, 0, &object_extra);
 
     let tc = touches as u8;
     let touch_code = vec![0x0F, 0x01, tc, 0x92, 0x00, tc, 0x26, 0x16, 0x04, 0x0B];
@@ -3891,6 +3895,9 @@ fn phys_fixture() -> Vec<u8> {
     b.class(decoration, actor, 0, 0);
     b.class(mover, actor, 0, 0);
     b.class(levelinfo, actor, 0, 0);
+    // `Engine.Volume` (`Brush` + the volume-brush overlap path).
+    let volume = b.reserve(0, 0, "Volume");
+    b.class(volume, actor, 0, 0);
     let pawn_controller = b.reserve(IMP_OBJECTPROP, pawn, "Controller");
     b.prop_with(pawn_controller, 0, 0, &object_extra);
     let ctrl_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
@@ -6236,63 +6243,96 @@ fn host_written_location_drives_touch_refresh() {
     assert!(vm.touching_list(player).is_empty());
 }
 
-#[test]
-fn seed_touching_links_the_spawn_overlap_without_a_touch_event() {
-    // Engine contract for the spawn placement: an actor placed already overlapping a volume gets
-    // a `Touching` link but no `Touch` notification, so a one-shot trigger
-    // (`XIDPawn.DetectionVolume.Detection.Touch`, which latches `bActivated`) is not consumed at
-    // spawn. Only a later genuine re-entry fires it.
-    let set = phys_set();
-    let mut vm = Vm::new(&set, VmLimits::default());
-    vm.set_physics(Box::new(MockWorld::new()));
-    let player = phys_actor(&mut vm, &set, "Player", [0.0, 0.0, 0.0]);
-    let volume = phys_actor(&mut vm, &set, "Volume", [0.0, 0.0, 0.0]);
-    set_collision_fields(&mut vm, player, true, false);
-    set_collision_fields(&mut vm, volume, true, false);
-
-    // Seed links both sides but dispatches no Touch.
-    vm.seed_touching_of(player).unwrap();
-    assert_eq!(vm.touching_list(player), vec![volume]);
-    assert_eq!(vm.touching_list(volume), vec![player]);
-    assert_eq!(vm.get_property(player, "Touches"), Some(&Value::Int(0)));
-    assert_eq!(vm.get_property(volume, "Touches"), Some(&Value::Int(0)));
-    assert_eq!(vm.get_property(volume, "UnTouches"), Some(&Value::Int(0)));
-
-    // A refresh while still overlapping keeps the silent link (no event).
-    vm.refresh_touching_of(player).unwrap();
-    assert_eq!(vm.get_property(volume, "Touches"), Some(&Value::Int(0)));
-
-    // Leaving and re-entering fires Touch exactly once (the one-shot's cue is preserved for the
-    // genuine enter, not the spawn).
-    vm.set_property(player, "Location", 0, Value::Vector([500.0, 0.0, 0.0]));
-    vm.refresh_touching_of(player).unwrap();
-    assert_eq!(vm.get_property(volume, "UnTouches"), Some(&Value::Int(1)));
-    assert!(vm.touching_list(player).is_empty());
-    vm.set_property(player, "Location", 0, Value::Vector([0.0, 0.0, 0.0]));
-    vm.refresh_touching_of(player).unwrap();
-    assert_eq!(vm.get_property(volume, "Touches"), Some(&Value::Int(1)));
-    assert_eq!(vm.touching_list(player), vec![volume]);
+/// A unit cube `[0,1]^3` world-space BSP primitive (six outward planes, back = inside).
+fn unit_cube_primitive() -> crate::brush::BrushPrimitive {
+    use crate::brush::{BrushNode, BrushPrimitive};
+    let planes = [
+        [1.0, 0.0, 0.0, 1.0],
+        [-1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 1.0],
+        [0.0, 0.0, -1.0, 0.0],
+    ];
+    let nodes = planes
+        .iter()
+        .enumerate()
+        .map(|(i, p)| BrushNode {
+            plane: *p,
+            csg: true,
+            front: -1,
+            back: if i + 1 < planes.len() {
+                (i + 1) as i16
+            } else {
+                -1
+            },
+        })
+        .collect();
+    BrushPrimitive {
+        root: 0,
+        root_outside: true,
+        nodes,
+    }
 }
 
 #[test]
-fn seed_touching_handles_a_degenerate_and_deleted_case() {
+fn volume_brush_overlap_uses_the_primitive_not_the_class_cylinder() {
+    // Retail `AActor::IsOverlapping`: a volume brush is tested with its `Brush` primitive, not
+    // the class cylinder. Place the volume's class cylinder far from the other actor; without
+    // the primitive the actor would not overlap it, but its box is inside the registered cube.
     let set = phys_set();
     let mut vm = Vm::new(&set, VmLimits::default());
     vm.set_physics(Box::new(MockWorld::new()));
-    let player = phys_actor(&mut vm, &set, "Player", [0.0, 0.0, 0.0]);
-    let volume = phys_actor(&mut vm, &set, "Volume", [0.0, 0.0, 0.0]);
-    set_collision_fields(&mut vm, player, true, false);
-    set_collision_fields(&mut vm, volume, true, false);
+    let volume = vm.spawn(pg(&set, "Volume"), "Volume").unwrap();
+    vm.set_property(
+        volume,
+        "Location",
+        0,
+        Value::Vector([1000.0, 1000.0, 1000.0]),
+    );
+    vm.set_property(volume, "CollisionRadius", 0, Value::Float(10.0));
+    vm.set_property(volume, "CollisionHeight", 0, Value::Float(10.0));
+    // Non-null `Brush` marks it a brush actor (the engine field 0x144).
+    vm.set_property(
+        volume,
+        "Brush",
+        0,
+        Value::Object(Some(ObjRef::Instance(volume))),
+    );
+    assert!(vm.is_brush_actor(volume));
+    assert!(vm.is_volume_brush(volume));
+    vm.set_brush_primitive(volume, unit_cube_primitive());
 
-    // A player with collision disabled seeds nothing (the spawn link uses the collision gate).
-    set_collision_fields(&mut vm, player, false, false);
-    vm.seed_touching_of(player).unwrap();
-    assert!(vm.touching_list(player).is_empty());
-    // Seeding a dead/absent id is a no-op, never a panic.
-    vm.seed_touching_of(9999).unwrap();
-    set_collision_fields(&mut vm, player, true, false);
-    vm.seed_touching_of(player).unwrap();
-    assert_eq!(vm.touching_list(player), vec![volume]);
+    let player = phys_actor(&mut vm, &set, "Player", [0.5, 0.5, 0.5]);
+    vm.set_property(player, "CollisionRadius", 0, Value::Float(5.0));
+    vm.set_property(player, "CollisionHeight", 0, Value::Float(5.0));
+    // A cylinder inside the brush but far outside the volume's class cylinder: the primitive
+    // reports the overlap, the cylinder would not.
+    assert!(vm.actors_overlap(player, volume));
+    assert!(vm.actors_overlap(volume, player));
+
+    // Moved entirely outside the brush (and still outside the class cylinder): no overlap.
+    vm.set_property(player, "Location", 0, Value::Vector([2.0, 2.0, 2.0]));
+    assert!(!vm.actors_overlap(player, volume));
+}
+
+#[test]
+fn two_brush_actors_never_overlap() {
+    // The top of `AActor::IsOverlapping` (Engine.dll @0x10352bdc) returns 0 when both actors are
+    // brushes. Give the player a `Brush` too; even a perfectly overlapping pair must not touch.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let a = vm.spawn(pg(&set, "Volume"), "A").unwrap();
+    let b = vm.spawn(pg(&set, "Volume"), "B").unwrap();
+    for id in [a, b] {
+        vm.set_property(id, "Location", 0, Value::Vector([0.0, 0.0, 0.0]));
+        vm.set_property(id, "CollisionRadius", 0, Value::Float(50.0));
+        vm.set_property(id, "CollisionHeight", 0, Value::Float(50.0));
+        vm.set_property(id, "Brush", 0, Value::Object(Some(ObjRef::Instance(id))));
+    }
+    assert!(!vm.actors_overlap(a, b));
+    assert!(!vm.actors_overlap(b, a));
 }
 
 #[test]

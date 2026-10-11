@@ -1387,6 +1387,10 @@ pub struct Vm<'s> {
     /// World-collision provider (movement/trace natives). `None` = every collision native
     /// fails with [`VmErrorKind::NoPhysicsProvider`].
     pub(crate) physics: Option<Box<dyn WorldPhysics>>,
+    /// Brush-primitive BSPs of volume brushes, in world (Unreal) space, registered by the host
+    /// (see [`crate::brush`]). `AActor::IsOverlapping` uses these for volume-brush actors
+    /// instead of the vertical cylinder; an unregistered volume keeps the cylinder fallback.
+    brush_primitives: HashMap<ObjectId, crate::brush::BrushPrimitive>,
     /// Last mover collision state sent to `physics` ([`Vm::sync_mover_collision`]).
     mover_collision_sent: HashMap<ObjectId, bool>,
     /// Animation-sequence provider (animation natives). `None` = every native that needs
@@ -1615,6 +1619,7 @@ impl<'s> Vm<'s> {
             missing_natives: Default::default(),
             pending_latent: None,
             physics: None,
+            brush_primitives: HashMap::new(),
             mover_collision_sent: HashMap::new(),
             animation: None,
             navigation: None,
@@ -7306,11 +7311,51 @@ impl<'s> Vm<'s> {
         })
     }
 
-    /// UE2 vertical-cylinder overlap, exactly as decoded from `engine.u Actor.TouchingActor`
-    /// (final simulated): `|dz| <= h1 + h2` and `sqrt(dx^2+dy^2) <= r1 + r2` (both inclusive).
+    /// True when `id` is a brush actor: a non-null `Brush` property (`AActor` field `0x144`).
+    /// Every `ABrush` subclass (volumes, movers, the level brush) stores its `Brush` UModel here.
+    /// The reference may be a cross-package `Static` object (the map's `Brush` -> `Engine.Model`
+    /// export), so any non-null object reference counts, not only a live VM `Instance`.
+    pub(crate) fn is_brush_actor(&self, id: ObjectId) -> bool {
+        matches!(self.get_property(id, "Brush"), Some(Value::Object(Some(_))))
+    }
+
+    /// Retail `AActor::IsVolumeBrush` (Engine.dll @0x1030f0d0): a non-null `Brush` field **and**
+    /// `IsA(AVolume)`. `XIDPawn.DetectionVolume`, `PhysicsVolume`, `Trigger` volumes and the like
+    /// derive from `Engine.Volume`, so their `IsOverlapping` uses the brush primitive.
+    pub(crate) fn is_volume_brush(&self, id: ObjectId) -> bool {
+        self.is_brush_actor(id) && self.is_a(id, "Volume")
+    }
+
+    /// Registers a volume brush's world-space BSP (host-decoded, see [`crate::brush`]). Called
+    /// once per placed volume at map load; [`Vm::actors_overlap`] then uses it instead of the
+    /// vertical cylinder for that actor.
+    pub fn set_brush_primitive(&mut self, id: ObjectId, primitive: crate::brush::BrushPrimitive) {
+        self.brush_primitives.insert(id, primitive);
+    }
+
+    /// `AActor::IsOverlapping` as decoded from Engine.dll @0x10352bd0:
+    ///
+    /// 1. Two brush actors never overlap (top check @0x10352bdc, `IsA(ABrush)` for both).
+    /// 2. If either actor is a volume brush (`IsVolumeBrush` @0x1030f0d0), the brush's
+    ///    `UModel::PointCheck` is asked whether the other actor's collision box is inside it
+    ///    (primitive path @0x10352cf3..0x10352d9c). The host registers that BSP; if it is absent
+    ///    the cylinder fallback is kept (reported by the host).
+    /// 3. Otherwise the vertical-cylinder test @0x10352d9e: `|dz| <= h1 + h2` and
+    ///    `sqrt(dx^2+dy^2) <= r1 + r2` (both inclusive).
     pub(crate) fn actors_overlap(&self, a: ObjectId, b: ObjectId) -> bool {
         if a == b {
             return false;
+        }
+        if self.is_brush_actor(a) && self.is_brush_actor(b) {
+            return false;
+        }
+        for (brush, other) in [(a, b), (b, a)] {
+            if self.is_volume_brush(brush)
+                && let Some(primitive) = self.brush_primitives.get(&brush)
+            {
+                let (center, radius, half_height) = self.actor_cylinder(other);
+                return primitive.overlaps_cylinder(center, radius, half_height);
+            }
         }
         let (la, ra, ha) = self.actor_cylinder(a);
         let (lb, rb, hb) = self.actor_cylinder(b);
@@ -7487,39 +7532,6 @@ impl<'s> Vm<'s> {
     /// otherwise only deliver from a script `Move`/`SetLocation`.
     pub fn refresh_touching_of(&mut self, id: ObjectId) -> VmResult<()> {
         self.refresh_touching(id, false)
-    }
-
-    /// Links the touch relations of `id` for its **initial placement** without delivering
-    /// `Touch`/`UnTouch`. The engine's spawn places an actor already overlapping the volumes at
-    /// its start spot; those relations become `Touching` entries but no `Touch` is notified (the
-    /// one-shot `XIDPawn.DetectionVolume.Detection.Touch` would otherwise be consumed at spawn,
-    /// before its listener is ready). A later genuine enter (after the actor has left the volume)
-    /// fires `Touch` through [`Vm::refresh_touching_of`]. Actors absent here keep the cylinder /
-    /// brush test; only the link is created, no event is dispatched.
-    pub fn seed_touching_of(&mut self, id: ObjectId) -> VmResult<()> {
-        if !self.is_live_actor(id) {
-            return Ok(());
-        }
-        let collide = self.collides(id);
-        let mut valid: Vec<ObjectId> = Vec::new();
-        for b in 0..self.objects.len() as ObjectId {
-            if b == id || !self.is_live_actor(b) {
-                continue;
-            }
-            let touches = collide
-                && self.collides(b)
-                && self.actors_overlap(id, b)
-                && !self.based_on(id, b)
-                && !self.based_on(b, id);
-            if touches {
-                valid.push(b);
-            }
-        }
-        for b in valid {
-            self.touching_add(id, b);
-            self.touching_add(b, id);
-        }
-        Ok(())
     }
 
     /// Recomputes the touching relations of `id` after it moved or its collision changed:
