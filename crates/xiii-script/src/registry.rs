@@ -2369,6 +2369,12 @@ fn is_animating(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nat
     val(Value::Bool(vm.anim_channel_active(c.this, ch)))
 }
 
+fn anim_is_in_group(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let ch = channel(vm, a, 0, c.omitted(0))?;
+    let group = name(vm, a, 1)?;
+    val(Value::Bool(vm.anim_is_in_group(c.this, ch, &group)))
+}
+
 fn has_anim(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     if !vm.animation_ready("Actor.HasAnim", Some(263), c.this, Value::Bool(false))? {
         return val(Value::Bool(false));
@@ -2931,97 +2937,6 @@ fn calc_first_person_view(
         *slot = Value::Rotator(rot);
     }
     val(Value::Void)
-}
-
-/// `Interaction.WorldToScreen(vector Location, optional vector CameraLocation, optional rotator
-/// CameraRotation) -> vector` (name-based native, index 0). Engine.dll
-/// `?execWorldToScreen@UInteraction` 0x103858d0 steps the optional camera args, then overwrites those slots with the
-/// PlayerController's view (`eventPlayerCalcView` 0x10313950 always runs), builds an
-/// FCameraSceneNode over the viewport (0x103cc190) with the viewport FOV and calls
-/// `FSceneNode::Project` (0x103c99d0) -> FPlane -> the return vector. The UE2
-/// FSceneNode::Project convention: v in camera space (X=forward, Y=right, Z=up), screen
-/// X = center + (Y/X) * halfClipX / tan(FOV/2), screen Y = center - (Z/X) * halfClipX /
-/// tan(FOV/2) (the X-based scale carries the aspect), Z = the forward depth, no behind-camera
-/// clamp in the projection itself. Camera pose: the pawn's eye + the controller rotation (the
-/// same first-person description as `CalcFirstPersonView`, native 497). FOV: DefUser.ini
-/// `DefaultFOV=85`. The clip size is the driver's render canvas (1280x720 headless); the
-/// consumer (`XIIIPlayerInteraction.DrawInteractions` 0x0B71) reads only X/Y for the
-/// easy-interact box, so the headless depth convention is presentation-only.
-fn interaction_world_to_screen(
-    vm: &mut Vm<'_>,
-    c: &NativeCtx,
-    a: &mut [Value],
-) -> VmResult<NativeOutcome> {
-    let location = match a.first() {
-        Some(Value::Vector(v)) => *v,
-        Some(other) => return Err(type_err(vm, "vector", other)),
-        None => return Err(vm.err(VmErrorKind::Other("missing argument".into()))),
-    };
-    // The camera: the interaction's `MyPC` (the DrawInteractions consumer's own field), falling
-    // back to the live player controller.
-    let pc = vm
-        .obj_prop(c.this, "MyPC")
-        .or_else(|| {
-            (0..vm.objects.len() as ObjectId)
-                .find(|&id| !vm.objects[id as usize].deleted && vm.is_a(id, "playercontroller"))
-        })
-        .ok_or_else(|| {
-            vm.err(VmErrorKind::Other(
-                "WorldToScreen: no player controller".into(),
-            ))
-        })?;
-    let pawn = vm.obj_prop(pc, "Pawn").unwrap_or(pc);
-    let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
-    let eye = match vm.get_property(pawn, "EyeHeight") {
-        Some(Value::Float(h)) => *h,
-        _ => match vm.get_property(pawn, "BaseEyeHeight") {
-            Some(Value::Float(h)) => *h,
-            _ => 0.0,
-        },
-    };
-    let rot = match vm.get_property(pc, "Rotation") {
-        Some(Value::Rotator(r)) => *r,
-        _ => match vm.get_property(pawn, "Rotation") {
-            Some(Value::Rotator(r)) => *r,
-            _ => [0; 3],
-        },
-    };
-    let camera = [loc[0], loc[1], loc[2] + eye];
-    let (forward, right, up) = rotator_basis(rot);
-    let v = [
-        location[0] - camera[0],
-        location[1] - camera[1],
-        location[2] - camera[2],
-    ];
-    let depth = dot3(v, forward);
-    let canvas = (0..vm.objects.len() as ObjectId)
-        .find(|&id| !vm.objects[id as usize].deleted && vm.is_a(id, "Canvas"));
-    let (clip_x, clip_y) = match canvas {
-        Some(canvas) => (
-            match vm.get_property(canvas, "ClipX") {
-                Some(Value::Float(x)) => *x,
-                _ => 1280.0,
-            },
-            match vm.get_property(canvas, "ClipY") {
-                Some(Value::Float(y)) => *y,
-                _ => 720.0,
-            },
-        ),
-        None => (1280.0, 720.0),
-    };
-    const FOV_DEGREES: f32 = 85.0;
-    let half_fov = FOV_DEGREES.to_radians() * 0.5;
-    let scale = (clip_x * 0.5) / half_fov.tan();
-    let screen = if depth == 0.0 {
-        [0.0, 0.0, 0.0]
-    } else {
-        [
-            clip_x * 0.5 + dot3(v, right) / depth * scale,
-            clip_y * 0.5 - dot3(v, up) / depth * scale,
-            depth,
-        ]
-    };
-    val(Value::Vector(screen))
 }
 
 /// `PlayerController.AdjustAimForDisplay(object<Ammunition> FiredAmmunition, struct<Vector> projStart) -> Rotator`
@@ -3953,14 +3868,6 @@ fn builtin_defs() -> Vec<NativeDef> {
                 interaction_initialize,
             )
         },
-        def(
-            "Interaction.WorldToScreen",
-            "native(0) final function vector WorldToScreen(vector Location, optional vector CameraLocation, optional rotator CameraRotation)",
-            "Engine.dll ?execWorldToScreen@UInteraction 0x103858d0: the camera comes from the \
-             PlayerController's CalcView (the optional args are overwritten), projected through \
-             FSceneNode::Project 0x103c99d0; the easy-interact box consumer reads X/Y only",
-            interaction_world_to_screen,
-        ),
         def(
             "Object.Not_PreBool",
             "native(129) preoperator bool !(bool A)",
@@ -5052,6 +4959,12 @@ fn builtin_defs() -> Vec<NativeDef> {
         "native(282) final function bool IsAnimating(int Channel)",
         "engine.u Actor.IsAnimating decoded (Channel, bool); true while the channel has an active sequence",
         is_animating,
+    ));
+    v.push(def(
+        "Engine.Actor.AnimIsInGroup",
+        "native(395) final function bool AnimIsInGroup(int Channel, name GroupName)",
+        "engine.u Actor.AnimIsInGroup decoded (Channel, GroupName, bool); the channel's active sequence's group check - the decoded SeqInfo carries no group, so the VM compares nothing and reports false with a visible note (the XIIIPawn.ChangedWeapon caller only branches on it)",
+        anim_is_in_group,
     ));
     v.push(def(
         "Engine.Actor.HasAnim",

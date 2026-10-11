@@ -87,23 +87,36 @@ t=113.00 use
 # SpeechJones11 chain at ~81.2 - the arrival Touch fires it, same as the pre-item64 teleport run)
 t=112.00 goto -3609 1316
 t=119.00 forward 0
-# item64 grapple #2: the grapple descent replaces the street teleport. HookPoint2
-# (-2817,1068,2337; RopeLength 2400) hangs over the street; a short fire press attaches
-# (UseMe's bGoDown pays the rope while Walking; the +0.25s Timer stops it once fire is
-# released), ALTFIRE resumes the payout, walking off the roof edge drops the pawn (Falling ->
-# taut -> swing/arrest), the payout runs to the 2400 max and the pawn reaches the street
-# directly below the anchor (ground at VSize ~2182 < 2400, so the rope never re-tautens).
-# The use key detaches on the street (Grab's bHooked branch -> Hook.Release).
-t=119.50 track HookPoint2
-t=120.00 fire_hold 1
-t=120.20 fire_hold 0
-t=121.00 altfire_hold 1
-t=121.50 goto -2700 1080
-t=132.50 altfire_hold 0
-t=133.00 use
-t=133.50 forward 0
+# item64 grapple #2: the grapple descent replaces the street teleport. The level gates the
+# anchor: xidmaps.u Toits01.FirstFrame sets HookPointToActive(HookPoint2).bInteractive =
+# false at level start, and Toits01.SetGoalComplete(99) (goal 99 = XIIIGoalTrigger6, Tag
+# 'transmutation', at (-3280,1200,2208) on this roof) sets bHookPointActivated and
+# HookPoint2.bInteractive = true. Without goal 99 the interaction never targets H2 and the
+# fire press attaches nothing (measured, local/re/item64d/route-probe.txt). The retail
+# descent: short fire press attaches (HookLength locks at the standing distance), walk east
+# off the roof edge - the taut-rope constraint (PlayerWalking.ProcessMove 0x0237) arrests
+# the fall in mid-air (VM-owned while bHooked and PHYS_Falling; no ground contact, no fall
+# damage) - then ALTFIRE pays the rope out and the pendulum lowers toward the street below
+# the anchor. The real-clock fall damage (XIIIPawn.Landed -> TakeFallingDamage: scaled
+# -0.3*(Vz+820) below -820 UU/s, lethal 1000 below -1620) makes any free landing past
+# ~-588 UU/s costly, so the rope owns the whole descent.
+t=119.10 goto -3280 1200
+# continue east past the 'GrappinPoint' crank (XIIIMoverVarTime1 at (-3264,1066,2194): its
+# oversized mover cylinder swallows the crosshair trace from the trigger stand, so TargetActor
+# is the crank, DrawTargets' HookPoint cast fails and the fire attaches nothing - measured,
+# local/re/item64d/route-probe3.txt) to the clear stand east of it.
+t=121.60 goto -3105 1165
+t=122.40 forward 0
+t=122.50 track HookPoint2
+t=123.30 fire_hold 1
+t=123.50 fire_hold 0
+t=123.70 goto -2700 1080
+t=124.90 altfire_hold 1
+t=132.00 altfire_hold 0
+t=135.00 use
+t=135.50 forward 0
 # courtyard: AI west corridor (the descent lands below HookPoint2; walk east then north)
-t=134.50 goto -1450 1100
+t=136.50 goto -1450 1100
 t=138.50 goto -1450 1500
 t=144.50 goto -1450 2100
 t=152.50 goto -900 2100
@@ -147,40 +160,76 @@ t=311.50 goto 13900 1400
 t=317.50 teleport 14250 1400 1220
 t=317.60 forward 0
 t=319.50 goto 15500 1450
+# item68d (the item68b real-clock block re-timed +8.5 s for the item64 grapple route):
+# move the diagnostic M60 bootstrap before the exposed descent. Roof return-fire was
+# blocked; the landing below supplies the real fire line.
+t=319.60 weapon XIII.m60
 # labelled teleport (the roof's east edge drops onto a trapped ledge and a 486 pit)
 t=325.50 teleport 16000 1300 700
 t=325.60 forward 0
-t=327.50 goto 16500 1200
+# item68b: live-clock rockets killed the old stationary landing/crossing. Engage
+# the launcher before crossing, then run continuously between cover positions.
+# The real-clock damage trace identifies BaseSoldier18 as the rocket instigator.
+# Engage him on landing (roof return-fire was blocked). `goto` overrides tracked
+# yaw, so stand for this burst before starting the run. Measured on origin/main's
+# route: 150 -> 15 HP on the317.4 head hit, then -41 on318.2; no incoming damage.
+# Later burst edges cover the crossing until the target is released; no new
+# teleport skips it.
+t=325.70 track BaseSoldier18 0.85
+t=325.90 fire
+t=326.10 fire
+t=326.30 fire
+t=326.50 fire
+t=326.70 fire
+t=326.90 fire
+t=327.10 fire
+t=327.30 fire
+t=327.50 fire
+t=327.70 fire
+t=327.90 fire
+t=328.10 fire
+t=328.30 fire
+t=328.50 fire
+t=328.70 fire
+t=328.90 fire
+t=329.10 fire
+t=329.30 fire
+t=329.50 fire
+t=329.70 fire
+t=329.90 fire
+t=330.10 track off
 # item53b: the road stand is under enemy fire once the phantom mover cylinders no longer
 # absorb AI rounds (the decoded primitive rule); keep moving through the exposure.
-t=329.50 goto 17800 1150
+t=327.00 goto 17800 1150
+t=330.00 goto 18150 1150
 # labelled teleport (the warehouse west wall + the Movable2 crate block the doorway;
 # TT10's r700 zone starts west of the wall)
-t=333.50 teleport 18300 1000 800
-t=333.60 forward 0
-t=335.50 goto 18800 1050
+t=331.50 teleport 18300 1000 800
+t=331.60 forward 0
+t=331.70 goto 18800 1050
 # item53b: the helipad wait is under MagnumPlus3 fire once the phantom mover cylinders no
 # longer absorb AI rounds; the wait moves behind the Tmetaldoorhelico line (the sweep from
 # the shooter's muzzle to (18500,1300) is blocked by the door mesh).
-t=339.50 goto 18500 1300
-# item61b (times shifted +8.5 s for the item64 grapple route): the route player SURVIVES the tarmac (normal-health soldiers; item61) and the
-# game's TouchTrigger10.Touch fired at 325.017 while TT10 is still disarmed (the generator
-# chain is blocked; pinned in the test). The route continues by player input:
+t=333.20 goto 18500 1300
+# item64d (post-landing block re-measured on the merged tree): the route player SURVIVES
+# the tarmac (normal-health soldiers; item61) and the game's TouchTrigger10.Touch fires
+# while TT10 is still disarmed (the generator chain is blocked; pinned in the test). The
+# route continues by player input:
 #
-# 1. Fight (labelled M60 grant): the fresh import carries only Fists (GameInfo.AcceptInventory
-#    grants no weapon on a campaign map without travel data), so the route grants the M60
-#    through the game's own Weapon.GiveTo/BringUp - the item14 diagnostic bootstrap, the same
-#    grant the item53b spec sanctioned ("the M60 or a weapon the level gives"; the level has
-#    only ammo clips: 2x bmg50AmmoClip, PumpAmmoClip, BazookAmmoClip - no weapon pickup).
-#    BaseSoldier18 (Tag bataillefinale, authored 150 hp, Skill 2, bAlerte) stands on the
-#    lower road at (17807,1438); track him and fire from behind the Tmetaldoorhelico door
-#    line, crouching between bursts (cover).
-t=341.50 weapon XIII.m60
-# (a closer fight stand at (18150,1250) was measured and rejected: the player, at 74 hp after
-# the tarmac, is killed by the returning fire during the tracked burst - measured
-# local/re/item61b/test-ext5.txt, dead at -6 hp; the door-line standoff below is the cover
+# 1. Fights (the diagnostic M60 grant now sits at t=319.60, before the exposed descent -
+#    the item14 bootstrap, the same grant the item53b spec sanctioned; the fresh import
+#    carries only Fists: GameInfo.AcceptInventory grants no weapon on a campaign map
+#    without travel data, and the level has only ammo clips - 2x bmg50AmmoClip,
+#    PumpAmmoClip, BazookAmmoClip - no weapon pickup). The landing burst engages
+#    BaseSoldier18 (Tag bataillefinale, authored 150 hp, Skill 2, bAlerte, the rocket
+#    instigator at (17807,1438)); the crossing then runs under burst cover. The door-line
+#    standoff behind Tmetaldoorhelico engages BaseSoldier17, crouching between bursts
+#    (cover).
+# (a closer fight stand at (18150,1250) was measured and rejected in item61b: the player is
+# killed by the returning fire during the tracked burst - measured
+# local/re/item61b/test-ext5.txt, dead at -6 hp; the door-line standoff is the cover
 # the item53b comment already used for the helipad wait)
-t=341.70 track BaseSoldier18
+t=341.70 track BaseSoldier17
 t=342.50 fire
 t=343.00 fire
 t=343.50 fire
