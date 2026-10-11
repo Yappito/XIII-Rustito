@@ -116,6 +116,24 @@ pub struct Session {
     /// Pawn pose owned by a script cutscene this step; the host movement sim copies it back after
     /// `step` so it resumes from the script's final pose rather than snapping to its stale pose.
     script_pawn_sync: Option<([f32; 3], f32, [f32; 3])>,
+    /// item64: the route's held rope buttons (`fire_hold`/`altfire_hold`). While the hook owns
+    /// the buttons (selected in item mode, or attached) `step` publishes the controller's
+    /// `bFire`/`bAltFire` each tick so the game's own `Pawn.PressingFire`/`PressingAltFire`
+    /// polls (`Hook.HookInUse.Tick`/`Timer`) see the held key, the way the engine's input stack
+    /// (`Button bFire | Fire | onrelease UnFire`) does; with no rope command held the published
+    /// bytes are 0, matching a released button.
+    hook_fire_held: bool,
+    hook_altfire_held: bool,
+    /// item64: the driver's walk input (forward, strafe in 0..1) and facing yaw (radians)
+    /// published to the VM while the grapple owns the pawn, so `PlayerWalking.ProcessMove`'s
+    /// `newAccel` steers the hanging player the way the retail input stack would.
+    hook_move_input: (f32, f32),
+    hook_move_yaw: f32,
+    /// item64f: which hook inputs `step` published on the previous tick (buttons, axes), so
+    /// the tick the hook stops owning them writes the released value once and then leaves the
+    /// controller fields to the rest of the host (the weapon `fire` click owns `bFire` then).
+    hook_buttons_published: bool,
+    hook_axes_published: bool,
 }
 
 /// Host-owned player movement fields published to the VM pawn each fixed tick (item7b).
@@ -476,6 +494,12 @@ impl Session {
             tick_count: 0,
             render_canvas: None,
             script_pawn_sync: None,
+            hook_fire_held: false,
+            hook_altfire_held: false,
+            hook_move_input: (0.0, 0.0),
+            hook_move_yaw: 0.0,
+            hook_buttons_published: false,
+            hook_axes_published: false,
         };
         session.localized_overrides = session.vm.localized_overrides;
         session.suspended.dedup();
@@ -551,6 +575,64 @@ impl Session {
         self.moved.clear();
         self.script_pawn_sync = None;
         let script_owned_before = self.script_owns_player_pawn();
+        // item64: publish the held rope buttons before the VM tick so the hook's `Timer`/`Tick`
+        // polls (`Pawn.PressingFire` -> `Controller.bFire`) see this tick's key state. The walk
+        // axes and the pawn's facing are published too while the grapple owns the pawn: the rope
+        // scripts build `newAccel` from `aForward`/`aStrafe` over the pawn's rotation
+        // (`PlayerWalking.PlayerMove` 0x000B), and the retail hanging player steers with them
+        // (the pendulum swing toward the landing roof is player input, not rope physics).
+        // item64f: only while the hook owns them. The buttons belong to the hook while it is
+        // the selected item in item mode or the rope is attached (its `Idle`/`HookInUse`
+        // `Timer`/`Tick` poll them); the axes and the facing only while the rope owns the pawn
+        // (`dispatch_hook_player_moves`' PlayerMove window). Publishing them on every tick
+        // overwrote the weapon `fire` path's `bFire` and wrote the driver's yaw over the
+        // pawn pose a cinematic (`NoControl`) owns, on every map.
+        let hook_buttons = self.hook_owns_buttons();
+        let hook_axes = self.hook_owns_pawn();
+        if let Some(pc) = self.controller {
+            if hook_buttons || self.hook_buttons_published {
+                let (fire, altfire) = if hook_buttons {
+                    (self.hook_fire_held, self.hook_altfire_held)
+                } else {
+                    (false, false)
+                };
+                let _ = self
+                    .vm
+                    .set_property(pc, "bFire", 0, Value::Byte(u8::from(fire)));
+                let _ = self
+                    .vm
+                    .set_property(pc, "bAltFire", 0, Value::Byte(u8::from(altfire)));
+            }
+            if hook_axes || self.hook_axes_published {
+                // The analog input range: `PlayerWalking.ProcessMove` 0x0037 scales `newAccel`
+                // by 0.01 into `Pawn.Acceleration`, so a full press is ±32768 (UE2 `input
+                // aForward`), not 1.0 — publishing 1.0 left the hanging pawn with 0.01 UU/s².
+                let (forward, strafe) = if hook_axes {
+                    (
+                        self.hook_move_input.0 * 32768.0,
+                        self.hook_move_input.1 * 32768.0,
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+                let _ = self
+                    .vm
+                    .set_property(pc, "aForward", 0, Value::Float(forward));
+                let _ = self.vm.set_property(pc, "aStrafe", 0, Value::Float(strafe));
+            }
+        }
+        self.hook_buttons_published = hook_buttons;
+        self.hook_axes_published = hook_axes;
+        if hook_axes {
+            let yaw_units = (self.hook_move_yaw / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN)
+                .rem_euclid(ROTATOR_UNITS_PER_TURN) as i32;
+            let _ = self.vm.set_property(
+                self.player,
+                "Rotation",
+                0,
+                Value::Rotator([0, yaw_units, 0]),
+            );
+        }
         // Refresh the posed hit boxes before the VM traces (host `fire` and any script trace in
         // this tick see the current body pose).
         self.update_hit_boxes();
@@ -757,6 +839,15 @@ impl Session {
     /// Run the script callbacks needed by headless gameplay. HUD.PostRender drives the opening
     /// cartoon gate; MyPCPostRender owns interaction targeting throughout play. Weapon drawing
     /// belongs to the presentation renderer, so the headless driver does not render weapons.
+    ///
+    /// item64f: after the cartoon the one gameplay producer of the item display still runs:
+    /// `XIIIPlayerController.RenderOverlays`' item branch (0x0223: `!bWeaponMode` ->
+    /// `Pawn.SelectedItem.RenderOverlays(C)`) for the Hook, whose `RenderOverlays` ->
+    /// `DrawTargets` copies the interaction's `TargetActor` into `PotHookPoint` (the anchor
+    /// `UseMe` attaches to). It runs after MyPCPostRender, the order `RenderOverlays` uses
+    /// (0x0014 before 0x024F). Item64 had removed the cartoon gate instead, which ran the whole
+    /// HUD chain every frame on every map - including a second MyPCPostRender per frame, since
+    /// `RenderOverlays` 0x0014 calls it as well as [`Session::render_interaction`].
     pub fn drive_render_phase(&mut self) {
         let canvas = if let Some(canvas) = self.render_canvas {
             canvas
@@ -808,8 +899,31 @@ impl Session {
             self.record_failure("headless HUD.PostRender", &e);
         }
         self.render_interaction(canvas);
+        if end_cartoon {
+            self.render_hook_targets(canvas);
+        }
         self.vm.drain_canvas();
         self.drain_events();
+    }
+
+    /// item64f: the Hook's targeting pass of `XIIIPlayerController.RenderOverlays` (see
+    /// [`Session::drive_render_phase`]): with the Hook selected in item mode, run its
+    /// `RenderOverlays(C)` so `DrawTargets` refreshes `PotHookPoint` from this frame's
+    /// interaction target.
+    fn render_hook_targets(&mut self, canvas: ObjectId) {
+        let Some(pc) = self.controller else {
+            return;
+        };
+        if self.controller_flag(pc, "bWeaponMode") {
+            return;
+        }
+        let Some(hook) = self.selected_item().filter(|id| self.vm.is_a(*id, "Hook")) else {
+            return;
+        };
+        let arg = Value::Object(Some(ObjRef::Instance(canvas)));
+        if let Err(e) = self.vm.send_event(hook, "RenderOverlays", vec![arg]) {
+            self.record_failure("Hook.RenderOverlays", &e);
+        }
     }
 
     /// The game's interaction render event is a gameplay producer as well as HUD presentation:
@@ -862,13 +976,15 @@ impl Session {
 
     /// Dispatch a normal controller weapon-selection exec; completion belongs to the weapon
     /// state machine and decoded animation/timer callbacks, so this does not complete a switch.
-    pub fn weapon_input(&mut self, group: Option<u8>) -> Result<(), String> {
+    pub fn weapon_input(&mut self, input: super::script::WeaponInput) -> Result<(), String> {
+        use super::script::WeaponInput;
         let pc = self
             .controller
             .ok_or_else(|| "no player controller".to_owned())?;
-        let (function, args) = match group {
-            Some(group) => ("SwitchWeapon", vec![Value::Byte(group)]),
-            None => ("NextWeapon", Vec::new()),
+        let (function, args) = match input {
+            WeaponInput::Switch(group) => ("SwitchWeapon", vec![Value::Byte(group)]),
+            WeaponInput::Select(group) => ("SelectWeapon", vec![Value::Byte(group)]),
+            WeaponInput::Next => ("NextWeapon", Vec::new()),
         };
         self.vm
             .send_event(pc, function, args)
@@ -884,9 +1000,28 @@ impl Session {
     /// restore `PlayerWalking` when done (item53). While this holds, the host stops writing the
     /// pawn fields and follows the VM's pose; the VM's scripted-physics pass integrates the
     /// script-written `Velocity` (Walking, horizontal).
+    ///
+    /// item64: the player's own grapple adds two VM-owned windows. While the controller is
+    /// hooked and the pawn hangs (`bHooked` and `Physics == PHYS_Falling`, the taut-rope state
+    /// `PlayerWalking.ProcessMove` sets at 0x0297), the rope constraint — `Pawn.Move(HookMove)`
+    /// and the velocity projection — runs in the VM and must not be fought by the host. While
+    /// the controller climbs to a hook nav point (`ClimbToHookNavPoint`), the state's
+    /// `ProcessMove` writes `Velocity` with `PHYS_None` and disabled collision. While hooked but
+    /// still `Walking` (rope attached, pawn on the roof) the host keeps moving the pawn — the
+    /// rope only tracks `HookLength` there (`ProcessMove` 0x01BB..0x0237) and the retail player
+    /// stays in control.
     fn script_owns_player_pawn(&self) -> bool {
-        self.controller
-            .is_some_and(|pc| self.vm.is_in_state(pc, "NoControl"))
+        self.controller.is_some_and(|pc| {
+            self.vm.is_in_state(pc, "NoControl")
+                || self.vm.is_in_state(pc, "ClimbToHookNavPoint")
+                || (self.controller_flag(pc, "bHooked") && self.player_physics() == Some(2))
+        })
+    }
+
+    /// Boolean property of an object through the generic property read (the VM's typed
+    /// `bool_prop` accessor is crate-internal).
+    fn controller_flag(&self, id: ObjectId, name: &str) -> bool {
+        matches!(self.vm.get_property(id, name), Some(Value::Bool(true)))
     }
 
     /// Script-driven player pose for the host movement sim to follow during the bed wake-up cine.
@@ -2315,6 +2450,12 @@ impl Session {
                 .map(Some),
             None => self.vm.send_event(target, "Fire", vec![Value::Float(1.0)]),
         };
+        // item64f: the route's `fire` is one click: release the button after the shot
+        // (`onrelease UnFire`), so `Pawn.PressingFire` (Engine.dll reads the `bFire` byte)
+        // does not see a button held forever after the first shot.
+        if let Some(ctrl) = self.controller {
+            self.vm.set_property(ctrl, "bFire", 0, Value::Byte(0));
+        }
         match r {
             Ok(_) => FireOutcome::Fired,
             Err(e) => FireOutcome::Error(e.to_string()),
@@ -2450,6 +2591,196 @@ impl Session {
              active-after-GiveTo={active_after_give}, ChangedWeapon {changed:?}, \
              Pawn.Weapon={weapon:?}, ThirdPersonActor={attach:?}"
         ))
+    }
+
+    /// item64: the player's currently selected inventory item, if any (live).
+    pub fn selected_item(&self) -> Option<ObjectId> {
+        instance_prop(&self.vm, self.player, "SelectedItem")
+    }
+
+    /// Whether the selected item is the grapple hook (`xiii.Hook`).
+    pub fn selected_item_is_hook(&self) -> bool {
+        self.selected_item()
+            .is_some_and(|id| self.vm.is_a(id, "Hook"))
+    }
+
+    /// item64f: the rope owns the pawn (attached, or the rope-top nav handoff): the window in
+    /// which `dispatch_hook_player_moves` runs the controller's `PlayerMove`.
+    fn hook_owns_pawn(&self) -> bool {
+        self.controller.is_some_and(|pc| {
+            self.controller_flag(pc, "bHooked") || self.vm.is_in_state(pc, "ClimbToHookNavPoint")
+        })
+    }
+
+    /// item64f: the fire buttons drive the hook: it is the selected item in item mode
+    /// (`bWeaponMode` false; `Idle.Activate`/the climb Timer poll `PressingFire`) or attached.
+    fn hook_owns_buttons(&self) -> bool {
+        self.hook_owns_pawn()
+            || self.controller.is_some_and(|pc| {
+                !self.controller_flag(pc, "bWeaponMode") && self.selected_item_is_hook()
+            })
+    }
+
+    /// item64: the bare use-key exec (`XIIIPlayerController.Grab`, xiii.u @161880). While hooked
+    /// in hook mode its early branch is the rope detach (`bHooked && !bWeaponMode &&
+    /// SelectedItem is Hook` -> `Hook.Release()`); the interaction/target branches live further
+    /// down and are driven by `use_target` instead.
+    pub fn use_grab_exec(&mut self) {
+        let Some(pc) = self.controller else {
+            return;
+        };
+        if let Err(e) = self.vm.send_event(pc, "Grab", Vec::new())
+            && !self.failures.iter().any(|(n, _)| n == "Grab exec")
+        {
+            self.failures.push(("Grab exec".to_owned(), e.to_string()));
+        }
+        self.drain_events();
+    }
+
+    /// item64: publish the held rope buttons for this and following ticks (the route's
+    /// `fire_hold`/`altfire_hold` commands; DefUser.ini `Fire`/`AltFire` aliases bind them to
+    /// `Button bFire`/`Button bAltFire`).
+    pub fn set_hook_buttons(&mut self, fire: bool, altfire: bool) {
+        self.hook_fire_held = fire;
+        self.hook_altfire_held = altfire;
+    }
+
+    /// item64: the driver's walk input and facing while the grapple owns the pawn (the route's
+    /// `forward`/`strafe`/`yaw`/`goto` state). `step` publishes them to the VM each tick so
+    /// `PlayerWalking.ProcessMove`'s `newAccel` steers the hanging player.
+    pub fn set_hook_move(&mut self, forward: f32, strafe: f32, yaw: f32) {
+        self.hook_move_input = (forward, strafe);
+        self.hook_move_yaw = yaw;
+    }
+
+    /// item64: the fire button press. With the hook selected (`bWeaponMode` false) this runs the
+    /// game's own input exec `XIIIPlayerController.Fire(1.0)` (xiii.u @177503), which sets
+    /// `Hook.ActivatedByFire` and calls `ActivateItem` — the same path a mouse click takes.
+    /// Anything else keeps the item14 weapon path.
+    pub fn fire_pressed(&mut self, yaw: f32, pitch: f32) -> FireOutcome {
+        if !self.selected_item_is_hook() {
+            return self.fire(yaw, pitch);
+        }
+        let Some(pc) = self.controller else {
+            return FireOutcome::NoWeapon;
+        };
+        match self.vm.send_event(pc, "Fire", vec![Value::Float(1.0)]) {
+            Ok(_) => FireOutcome::Fired,
+            Err(e) => FireOutcome::Error(e.to_string()),
+        }
+    }
+
+    /// item64: the alt-fire button press. The game's own exec `XIIIPlayerController.AltFire`
+    /// (xiii.u @174590) sets `Hook.ActivatedByAltFire` and calls `ActivateItem` — but only while
+    /// already hooked (`self.bHooked && !bGoUp && !bGoDown`); before the hook attaches it is a
+    /// no-op for the hook.
+    pub fn altfire_pressed(&mut self) -> FireOutcome {
+        if !self.selected_item_is_hook() {
+            return FireOutcome::NoWeapon;
+        }
+        let Some(pc) = self.controller else {
+            return FireOutcome::NoWeapon;
+        };
+        match self.vm.send_event(pc, "AltFire", vec![Value::Float(1.0)]) {
+            Ok(_) => FireOutcome::Fired,
+            Err(e) => FireOutcome::Error(e.to_string()),
+        }
+    }
+
+    /// item64: grant the player an inventory item (`Package.Class`) and select it, through the
+    /// game's own chain: `Spawn` + `Inventory.GiveTo(Pawn)` (the inventory-chain insert), then
+    /// the selection half of `XIIIPawn.ServerChangedItem` (xiii.u @334515, 0x0054..0x00F4):
+    /// `SelectedItem = i`, `AttachToPawn`, `BringUp` (GotoState('Activated')). `OldItem` is
+    /// passed as `None` so the old item's detach half (0x0000..0x0053) is skipped — the starting
+    /// `Fists` weapon is a `Weapon`, not an item, and must stay equipped. Reported, never
+    /// silent.
+    pub fn grant_item(&mut self, class_path: &str) -> Result<String, String> {
+        let class = runtime::resolve_class_path(self.vm.set(), class_path)
+            .ok_or_else(|| format!("item class {class_path} is not loaded"))?;
+        let pawn = self.player;
+        self.vm.set_active(pawn, true);
+        let loc = self.vm.vector_prop(pawn, "Location");
+        let id = self
+            .vm
+            .spawn_actor(pawn, Some(class), Some(pawn), None, loc, None)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("spawning {class_path} returned None"))?;
+        let p = Value::Object(Some(ObjRef::Instance(pawn)));
+        self.vm.set_active(id, true);
+        self.vm.set_property(id, "Instigator", 0, p.clone());
+        self.vm.set_property(id, "Owner", 0, p.clone());
+        let give = self.vm.send_event(id, "GiveTo", vec![p.clone()]);
+        if let Err(e) = &give {
+            self.blocked
+                .push(format!("grant_item {class_path} GiveTo: {e}"));
+        }
+        // The game's own item selection (ServerChangedItem with OldItem=None).
+        let selected = self
+            .vm
+            .send_event(
+                pawn,
+                "ServerChangedItem",
+                vec![
+                    Value::Object(None),
+                    Value::Object(Some(ObjRef::Instance(id))),
+                ],
+            )
+            .map_err(|e| e.to_string());
+        if let Err(e) = &selected {
+            self.blocked
+                .push(format!("grant_item {class_path} ServerChangedItem: {e}"));
+        }
+        let carried = self.selected_item();
+        if carried != Some(id) {
+            return Err(format!(
+                "grant_item {class_path}: SelectedItem is {carried:?}, not the granted item {id} (GiveTo {give:?}, ServerChangedItem {selected:?})"
+            ));
+        }
+        // Host bridge (reported, not silent): the retail player reaches item mode through
+        // `SwitchWeaponMode` (the first InventoryNext press selects the first inventory item and
+        // sets `bWaitForWeaponMode`), whose completion then clears `bWeaponMode` through the
+        // weapon put-down anim chain. The route's grant is already the selection, so the field
+        // is set to the value that state machine converges to; every later step (the Fire exec,
+        // the interaction's long-range item trace, the hook chain) stays the game's own code and
+        // requires this field (`XIIIPlayerController.AllowHooking`, `Fire` 0x00D5).
+        let weapon_mode_before = self
+            .vm
+            .get_property(self.controller.unwrap_or(pawn), "bWeaponMode")
+            .cloned();
+        if let Some(pc) = self.controller {
+            let _ = self
+                .vm
+                .set_property(pc, "bWeaponMode", 0, Value::Bool(false));
+        }
+        let state = self
+            .vm
+            .state_name(id)
+            .unwrap_or_else(|| "<none>".to_owned());
+        if !state.eq_ignore_ascii_case("Activated") && !state.eq_ignore_ascii_case("Idle") {
+            self.blocked.push(format!(
+                "grant_item {class_path}: state after ServerChangedItem is {state} (expected the BringUp 'Activated' state)"
+            ));
+        }
+        Ok(format!(
+            "granted item {class_path} via GiveTo; GiveTo {give:?}, ServerChangedItem {selected:?}, \
+             SelectedItem={carried:?}, state={state}, bWeaponMode {weapon_mode_before:?}->false (host bridge)"
+        ))
+    }
+
+    /// item64: the item-cycle press (DefUser.ini `InventoryNext` -> `cNextItem`). While the hook
+    /// is in use this is the game's own put-away input: `cNextItem` runs
+    /// `XIIIItems(SelectedItem).PutDown()` (bChangeItem), and the hook's state machine then
+    /// unwinds `HookInUse` -> `DownHookInUse` -> `Release` (destroys the rope, clears
+    /// `bHooked`) -> `DownItemRopeCut`, bringing up the next inventory item.
+    pub fn next_item(&mut self) -> Result<(), String> {
+        let pc = self
+            .controller
+            .ok_or_else(|| "no player controller".to_owned())?;
+        self.vm
+            .send_event(pc, "cNextItem", Vec::new())
+            .map_err(|e| e.to_string())?;
+        self.drain_events();
+        Ok(())
     }
 
     /// The player weapon's first-person mesh path: the decoded `MeshName` string

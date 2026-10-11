@@ -1390,11 +1390,35 @@ fn controller_can_see(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResu
     val(Value::Bool(vm.nav_can_see(c.this, other)?))
 }
 
+/// `Pawn.FaceRotation(rotator NewRotation, float DeltaTime)` (native 0): Engine.dll
+/// `?execFaceRotation@APawn` 0x103b0640 applies the controller's rotation to the pawn by
+/// physics — Walking (1) and Falling (2) zero the Pitch component (0x103b074d..0x103b0756),
+/// the special-cased 11 uses the pawn's own cached rotation and others pass it through — then
+/// SetRotation (the class-virtual call at 0x103b070a..0x103b0732). The player-walking
+/// `PlayerMove` -> `UpdateRotation` chain calls it every tick.
+fn pawn_face_rotation(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let mut rotation = match a.first() {
+        Some(Value::Rotator(r)) => *r,
+        Some(other) => return Err(type_err(vm, "rotator", other)),
+        None => return Err(vm.err(VmErrorKind::Other("missing argument".into()))),
+    };
+    let physics = match vm.get_property(c.this, "Physics") {
+        Some(Value::Byte(b)) => *b,
+        _ => 0,
+    };
+    if physics == 1 || physics == 2 {
+        rotation[0] = 0;
+    }
+    vm.set_property(c.this, "Rotation", 0, Value::Rotator(rotation));
+    val(Value::Void)
+}
+
 /// `Pawn.PressingFire() -> bool` (native 0): Engine.dll `APawn::execPressingFire` returns false
 /// without a controller and otherwise reads the controller's `bFire` field. It does not inspect
 /// the pawn, instigator, or XIII's script-only `IAController.bTire` field. `bFire` is a byte
 /// (Controller+0x212, tested `!= 0` at 0x103afca1), so a nonzero byte counts as pressing: a
-/// bool-only read made every automatic AI burst (`IAController.Timer` holds `bFire`) one shot.
+/// bool-only read made every automatic AI burst (`IAController.Timer` holds `bFire`) one shot
+/// and the grapple's `HookInUse.Timer` climb gate (`ActivatedByFire && PressingFire()`) never fire.
 fn pawn_pressing_fire(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
     let fire = vm.obj_prop(c.this, "Controller").is_some_and(|ctrl| {
         match vm.get_property(ctrl, "bFire") {
@@ -5030,6 +5054,45 @@ fn builtin_defs() -> Vec<NativeDef> {
         "engine.u PlayerController.SetViewTarget decoded (NewViewTarget); sets ViewTarget (no camera/rendering)",
         set_view_target,
     ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no-op: view shake is a screen effect; the headless VM has no camera to shake",
+        ),
+        ..def(
+            "Engine.PlayerController.ViewShake",
+            "native(496) final function ViewShake(float DeltaTime)",
+            "engine.u PlayerController.ViewShake declared (native 496, no script body, nativeparm \
+             DeltaTime only); called by PlayerController.UpdateRotation and PlayerWalking.PlayerMove \
+             (item64: the hook's PlayerMove dispatch reaches it); screen-shake only",
+            noop,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no-op: colour-modulation fade is a screen effect; the headless VM renders nothing",
+        ),
+        ..def(
+            "Engine.PlayerController.ViewFlash",
+            "native(505) final function ViewFlash(float DeltaTime)",
+            "engine.u PlayerController.ViewFlash declared (native 505, no script body); called by \
+             PlayerController.UpdateRotation (item64: the hook's PlayerMove dispatch reaches it); \
+             screen-flash only",
+            noop,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "no-op: weapon bob is a first-person view animation; the headless VM has no view model",
+        ),
+        ..def(
+            "Engine.PlayerController.CheckBob",
+            "native(504) final static function CheckBob(float DeltaTime, float Speed2D, struct<Vector> Y)",
+            "engine.u PlayerController.CheckBob declared (native 504, no script body, nativeparm \
+             tokens only); called by XIIIPlayerController.PlayerWalking.PlayerMove (item64: the \
+             hook's PlayerMove dispatch runs that script every tick)",
+            noop,
+        )
+    });
     // Presentation natives: the VM is headless, so these enqueue a typed PresentationEvent and
     // return the decoded declaration's value (void). Consumed with Vm::drain_events.
     v.push(def(
@@ -5480,6 +5543,15 @@ fn builtin_defs() -> Vec<NativeDef> {
          ?execPressingFire@APawn reads Controller.bFire (not IAController.bTire); the \
          XIIIWeapon state fire chain calls it",
         pawn_pressing_fire,
+    ));
+    v.push(def(
+        "Engine.Pawn.FaceRotation",
+        "native(0) final simulated native function FaceRotation(rotator NewRotation, float DeltaTime)",
+        "Engine.dll ?execFaceRotation@APawn 0x103b0640: applies the controller's rotation to \
+         the pawn by physics - Walking(1)/Falling(2) zero the Pitch component, others pass it \
+         through - then SetRotation; the player-walking PlayerMove -> UpdateRotation chain \
+         needs it every tick",
+        pawn_face_rotation,
     ));
     v.push(NativeDef {
         status: NativeStatus::Partial(

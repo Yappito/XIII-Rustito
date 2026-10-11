@@ -1083,6 +1083,8 @@ struct Timer {
 const TIMER_EVENTS: [&str; 3] = ["Timer", "Timer2", "Timer3"];
 /// UE2 `EPhysics::PHYS_Walking` (engine.u enum order; see `item7b-movement-modes.md`).
 const PHYS_WALKING: u8 = 1;
+/// UE2 `EPhysics::PHYS_None` (0; the hook nav climb: `ClimbToHookNavPoint.BeginState` sets it).
+const PHYS_NONE: u8 = 0;
 /// UE2 `EPhysics::PHYS_Falling` (item53: `AActor::performPhysics` jump table 0x103c14dc).
 pub(crate) const PHYS_FALLING: u8 = 2;
 /// UE2 `EPhysics::PHYS_Flying` (the grapple demo's `Jones.SetPhysics(4)`).
@@ -4093,6 +4095,7 @@ impl<'s> Vm<'s> {
             }
         }
         self.dispatch_player_ticks(dt)?;
+        self.dispatch_hook_player_moves(dt)?;
         self.detect_server_travel();
         Ok(())
     }
@@ -4271,6 +4274,16 @@ impl<'s> Vm<'s> {
         if profiling {
             self.profile.player_tick_dispatch_micros += t0.elapsed().as_micros() as u64;
         }
+        // item64: the same PlayerMove dispatch as `tick` — `tick_suspending` is the driver path
+        // (`Session::step`), and without it the hooked pawn's rope constraint
+        // (`PlayerWalking.ProcessMove` 0x01B2..0x0345) and the nav climb never ran.
+        let pc = (0..self.objects.len() as ObjectId).find(|&id| self.is_a(id, "playercontroller"));
+        if let Err(e) = self.dispatch_hook_player_moves(dt)
+            && let Some(pc) = pc
+        {
+            let suspended = self.suspend_for_error(pc, &e);
+            errors.push((suspended, e));
+        }
         self.detect_server_travel();
         errors
     }
@@ -4446,6 +4459,49 @@ impl<'s> Vm<'s> {
         for id in 0..self.objects.len() as ObjectId {
             if self.player_tick_overridden(id) {
                 self.dispatch_player_tick(id, dt)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// item64: `PlayerMove` dispatch for the player's grapple. The host owns the player pawn's
+    /// walking movement, so the port deliberately does not run the controller state `PlayerMove`
+    /// while the player walks (the movement would double-run). The rope constraint and the nav
+    /// climb, however, live in those very scripts: `XIIIPlayerController.PlayerWalking.
+    /// ProcessMove` (xiii.u @206191, the taut-rope pull at 0x01B2..0x0345) runs only from
+    /// `PlayerWalking.PlayerMove`, and `ClimbToHookNavPoint.ProcessMove` (xiii.u @532816) only
+    /// from the same dispatch (the state resolves `PlayerMove` through its super-state chain to
+    /// `PlayerWalking.PlayerMove` — the class-level `Engine.PlayerController.PlayerMove` is an
+    /// empty stub). While the controller is hooked (`bHooked`, set by `Hook.UseMe` ->
+    /// `GoHooking`) or in `ClimbToHookNavPoint`, the VM runs the state `PlayerMove(DeltaTime)`
+    /// after the actor Tick pass — the same point UE2's `PlayerTick` reaches it. No double
+    /// dispatch: the host keeps the player controller inactive, so the actor-Tick `PlayerTick`
+    /// path never runs for it.
+    fn dispatch_hook_player_moves(&mut self, dt: f32) -> VmResult<()> {
+        for id in 0..self.objects.len() as ObjectId {
+            let o = &self.objects[id as usize];
+            // The host keeps the player controller INACTIVE (it owns the pawn's walking
+            // movement and drives the controller through explicit exec events), so unlike the
+            // actor Tick dispatch this gate must not require `active` — the hooked windows are
+            // exactly when the controller's own state code must run.
+            if !o.is_actor || o.deleted {
+                continue;
+            }
+            if !self.is_a(id, "playercontroller") {
+                continue;
+            }
+            // `bHooked` is set by `XIIIPawn.GoHooking` and cleared by `Hook.*.Release`; the
+            // climb-nav handoff state runs its own PlayerMove too.
+            let hooked = self.bool_prop(id, "bHooked");
+            let climbing = self.is_in_state(id, "ClimbToHookNavPoint");
+            if !hooked && !climbing {
+                continue;
+            }
+            if !self.state_defines_function(id, "PlayerMove") {
+                continue;
+            }
+            if let Some(f) = self.find_function(id, "PlayerMove", true) {
+                self.call_values(f, id, vec![Value::Float(dt)])?;
             }
         }
         Ok(())
@@ -7771,9 +7827,23 @@ impl<'s> Vm<'s> {
         }
         let collide = self.collides(id);
         let current = self.touching_list(id);
+        // item64: a projectile never receives `Touch` from its own instigator. The hook
+        // projectile spawns at `Instigator.Location + CalcDrawOffset` — inside the shooter's
+        // collision cylinder — and `HookProjectile.ProcessTouch` releases the hook for any
+        // non-`HookPoint` other, so the instigator must be excluded (the retail engine spawns
+        // projectiles inside the shooter without self-hits; XIII's Engine.Projectile.Touch carries
+        // no script-side instigator filter, so the engine's touch list does the skipping).
+        let instigator = if self.is_a(id, "Projectile") {
+            self.obj_prop(id, "Instigator")
+        } else {
+            None
+        };
         let mut valid: Vec<ObjectId> = Vec::new();
         for b in 0..self.objects.len() as ObjectId {
             if b == id || !self.is_live_actor(b) {
+                continue;
+            }
+            if instigator.is_some_and(|i| i == b) {
                 continue;
             }
             let touches = collide
@@ -8470,6 +8540,25 @@ impl<'s> Vm<'s> {
         if self.class_chain_contains(candidate, "mover")
             || self.class_chain_contains(candidate, "decoration")
         {
+            // `AMover`/`ADecoration::ShouldTrace` (shared VA 0x10306c70) is `TraceFlags & 2`;
+            // no 0x4000 test exists in any `ShouldTrace` (AActor 0x10354640, APawn 0x10305d20,
+            // AVolume 0x10354760; item64f). item64f labelled hypothesis, pinned by retail
+            // behaviour on both sides: the grapple rope check `HookLink.Tick` traces from the
+            // pawn's eye to the locked projectile with `Trace(..., bTraceActors=false, ...,
+            // 16384)` (composed 0x86 | 0x4000) and releases the hook on any obstacle, yet the
+            // projectile is locked inside the `HookPoint` decoration's cylinder and the retail
+            // rope stays attached - so that composition must not report the decoration. The
+            // weapon trace `XIIIWeapon.RealTraceFire` composes 0x4000 | 0x10000 WITH the actor
+            // bits (bTraceActors=true) and its own `bShouldGoThroughTraversable` branch reads
+            // `XIIIMover(Other)`, so 0x4000 cannot exclude movers, nor decorations for actor
+            // traces (item64's mover+decoration exclusion let every weapon trace pass through
+            // both; the Engine.dll gate for 0x4000 itself was not located).
+            if flags & 0x4000 != 0
+                && flags & 1 == 0
+                && self.class_chain_contains(candidate, "decoration")
+            {
+                return false;
+            }
             return flags & 2 != 0;
         }
         if self.bool_prop(candidate, "bWorldGeometry") {
@@ -9983,6 +10072,13 @@ impl<'s> Vm<'s> {
                 continue;
             }
             let result = match self.byte_prop(id, "Physics") {
+                PHYS_NONE => {
+                    if self.climb_nav_owned(id) {
+                        self.integrate_climb_nav(id, dt)
+                    } else {
+                        Ok(())
+                    }
+                }
                 PHYS_WALKING => {
                     if self.pawn_script_owned(id) {
                         self.integrate_walking(id, dt)
@@ -10011,6 +10107,44 @@ impl<'s> Vm<'s> {
     fn pawn_script_owned(&self, pawn: ObjectId) -> bool {
         self.obj_prop(pawn, "Controller")
             .is_some_and(|ctrl| self.is_live_actor(ctrl) && self.is_in_state(ctrl, "NoControl"))
+    }
+
+    /// item64: a pawn whose controller is in `ClimbToHookNavPoint` — the hook's nav climb
+    /// (`GoClimbHookNavPoint` at the rope-top handoff). The state authoring moves the pawn by
+    /// per-tick `Velocity` writes with `PHYS_None` and disabled collision
+    /// (`ClimbToHookNavPoint.BeginState`: `SetCollision(false,false,false)`,
+    /// `SetPhysics(0)`; `ProcessMove` writes `Velocity` every tick). The session's
+    /// `script_owns_player_pawn` mirrors this for the player pawn.
+    fn climb_nav_owned(&self, pawn: ObjectId) -> bool {
+        self.obj_prop(pawn, "Controller").is_some_and(|ctrl| {
+            self.is_live_actor(ctrl) && self.is_in_state(ctrl, "ClimbToHookNavPoint")
+        })
+    }
+
+    /// `PHYS_None` for the nav climb: one linear move by the state-written `Velocity`, without
+    /// collision (the state itself disabled the pawn's collision for the climb; the move target
+    /// is the authored `ClimbableHookNavPoint`).
+    ///
+    /// Documented basis: Engine.dll exports no `?physNone@AActor` symbol (the other physics
+    /// routines are exported — item53 measured `physFalling`/`physProjectile`), so the native
+    /// `PHYS_None` mover was not decoded. The climb completing is retail-observable behaviour
+    /// and the script's only motion source is the `Velocity` write, so the VM applies it as a
+    /// collision-free linear move.
+    fn integrate_climb_nav(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
+        let velocity = self.vector_prop(id, "Velocity").unwrap_or([0.0; 3]);
+        if velocity == [0.0; 3] {
+            return Ok(());
+        }
+        let Some(location) = self.vector_prop(id, "Location") else {
+            return Ok(());
+        };
+        self.set_property(
+            id,
+            "Location",
+            0,
+            Value::Vector(add3(location, scale3(velocity, dt))),
+        );
+        Ok(())
     }
 
     /// item53b: the pawn's controller is a live `CineController2` with `bMoving` — a cine
@@ -10267,6 +10401,10 @@ impl<'s> Vm<'s> {
             ];
             self.set_property(id, "Velocity", 0, Value::Vector(moved));
         }
+        // item64: the engine moves projectiles with collision, so overlap maintenance runs on
+        // every move. Without it `HookProjectile` never receives `Touch(HookPoint)` and its
+        // `ProcessTouch` lock (`TriggerEvent`, `GotoState('Locked')`) never fires.
+        self.refresh_touching(id, false)?;
         let _ = hit;
         Ok(())
     }

@@ -977,11 +977,17 @@ fn perform_use(
         }
         // Nothing mover-like was hit: a card reader has no collision, so the game's own
         // interaction targeting (`MyInteraction.TargetActor`) decides what `Grab` acts on.
+        // item64: with nothing targeted either, the use input still runs the game's own `Grab`
+        // exec - its early branches are gameplay, not interaction: while hooked it is the rope
+        // detach (`bHooked && !bWeaponMode && SelectedItem is Hook -> Hook.Release()`).
         (hit, _) => match sess.grab_interaction_target() {
             Some((target, outcome)) => println!("[play] use {target}: {outcome:?}"),
             None => match hit {
                 Some(target) => println!("[play] use {target}: NotAMover"),
-                None => println!("[play] use: nothing in reach"),
+                None => {
+                    println!("[play] use: nothing in reach (sending the bare Grab exec)");
+                    sess.use_grab_exec();
+                }
             },
         },
     }
@@ -2660,6 +2666,8 @@ fn run_script_inner(
             Input::default()
         };
         let weapons = drive.take_weapons();
+        let items = drive.take_items();
+        let ((fire_hold, fire_edge), (altfire_hold, altfire_edge)) = drive.take_hook_buttons();
         let goals = drive.take_goals();
         let mut weapon_inputs = drive.take_weapon_inputs();
         let mut use_named = drive.take_use_named();
@@ -2723,6 +2731,14 @@ fn run_script_inner(
             floor_normal: runtime.sim.floor_normal,
             eye_height: runtime.sim.vm_eye_height(&runtime.player_params),
         };
+        // item64: publish the held rope buttons before the VM tick so `PressingFire`/
+        // `PressingAltFire` polls inside this tick's hook `Timer`/`Tick` see them. The drive's
+        // walk axes and yaw ride along: while the grapple owns the pawn, `ProcessMove`'s
+        // `newAccel` steers the hanging player from them (the retail input stack's role).
+        runtime.session.set_hook_buttons(fire_hold, altfire_hold);
+        runtime
+            .session
+            .set_hook_move(input.forward, input.right, runtime.sim.yaw);
         runtime.session.step(
             DT,
             runtime.sim.location,
@@ -2759,6 +2775,17 @@ fn run_script_inner(
                 Ok(msg) => println!("[play] weapon {msg}"),
                 Err(e) => println!("[play] weapon grant failed {path}: {e}"),
             }
+        }
+        for path in &items {
+            match runtime.session.grant_item(path) {
+                Ok(msg) => println!("[play] item {msg}"),
+                Err(e) => println!("[play] item grant failed {path}: {e}"),
+            }
+        }
+        if drive.take_next_item()
+            && let Err(e) = runtime.session.next_item()
+        {
+            println!("[play] next_item failed: {e}");
         }
         for n in &goals {
             if let Err(e) = runtime.session.set_goal(*n) {
@@ -2813,6 +2840,16 @@ fn run_script_inner(
                 }
                 other => println!("[play] fire [{elapsed:.3}s]: {other:?}"),
             }
+        }
+        if fire_edge {
+            let outcome = runtime
+                .session
+                .fire_pressed(runtime.sim.yaw, runtime.sim.pitch);
+            println!("[play] fire_hold press [{elapsed:.3}s]: {outcome:?}");
+        }
+        if altfire_edge {
+            let outcome = runtime.session.altfire_pressed();
+            println!("[play] altfire_hold press [{elapsed:.3}s]: {outcome:?}");
         }
         if tick.is_multiple_of(TRACE_EVERY) || tick + 1 == ticks {
             trace.push((tick, elapsed, runtime.sim.location, runtime.sim.velocity));
@@ -3241,6 +3278,122 @@ mod tests {
         } else {
             path
         })
+    }
+
+    /// item64 opt-in regression: the hook use chain on Toits01. Grant + select `XIII.Hook`, aim
+    /// at `HookPoint0` from the start roof, fire (the exec `Fire` -> `ActivatedByFire` ->
+    /// `Idle.Activate` -> `UseMe` attach), hold fire (the `HookInUse.Timer` -> `bGoUp` climb and
+    /// the `PlayerWalking.ProcessMove` taut-rope pull lift the pawn), then use (the `Grab` exec's
+    /// `bHooked` branch -> `Hook.Release()` detach). The retail input model: a continuous fire
+    /// hold never climbs (the first `HookInUse.Tick` consumes the Walking `bGoDown` and clears
+    /// the `ActivatedBy*` flags) — the climb needs a fresh fire press.
+    #[test]
+    fn opt_in_hook_use_chain_smoke() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Toits01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Toits01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let prefix = "t=0.50 item XIII.Hook\nt=1.50 teleport -4926 1446 979\n\
+             t=2.00 track HookPoint0\nt=2.50 fire_hold 1\nt=3.00 fire_hold 0\n\
+             t=3.50 fire_hold 1\nt=6.00 fire_hold 0\n";
+        // Run A stops before the use key: the attach and the climb must be observable.
+        let attach = run_script_with_cinematic_input(
+            &game_dir,
+            "Toits01",
+            &script::Script::parse(prefix).expect("parse attach script"),
+            &resolved.params,
+            &scene,
+            6.0,
+        )
+        .expect("run attach smoke");
+        let vm = attach.session.vm();
+        // The map carries its own XIII.Hook pickup, so resolve the GRANTED item through the
+        // session's SelectedItem (the grant selects it).
+        let hook = attach
+            .session
+            .selected_item()
+            .expect("the grant must leave the hook selected");
+        assert!(
+            vm.is_a(hook, "Hook"),
+            "SelectedItem must be the hook, got class {}",
+            vm.set().path(vm.objects[hook as usize].class)
+        );
+        // The attach: the exec's ActivatedByFire -> ActivateItem -> Idle.Activate -> UseMe path
+        // completed - MyHook spawned, the rope length is locked, and the pawn started hooking.
+        // (ActivatedByFire is consumed by the HookInUse Timer afterwards, so it is not asserted.)
+        assert!(
+            vm.get_property(hook, "MyHook")
+                .is_some_and(|v| !matches!(v, Value::Object(None))),
+            "UseMe must spawn the HookProjectile (Hook.MyHook)"
+        );
+        // MaxHookLength is UseMe's copy of the aimed anchor's RopeLength; only HookPoint0
+        // carries 1900, so this proves the render-phase item trace aimed at it. (PotHookPoint
+        // itself is transient: ResetPotentialTargets clears it once the aim moves off.)
+        assert_eq!(
+            vm.get_property(hook, "MaxHookLength"),
+            Some(&Value::Float(1900.0)),
+            "UseMe must read the anchor's RopeLength (the range check ran)"
+        );
+        assert_eq!(
+            vm.get_property(hook, "bHooked"),
+            Some(&Value::Bool(true)),
+            "UseMe must set the hook's bHooked (the attach completed)"
+        );
+        // The climb: 2.25 s of held fire from the fresh press re-arms the Timer -> bGoUp ->
+        // ReduceRopeLength (150 UU/s), and each ProcessMove pulls the pawn up the excess. The
+        // pawn must have LEFT the start roof (979) toward the anchor.
+        let pawn = match vm.get_property(hook, "Owner") {
+            Some(Value::Object(Some(xiii_script::ObjRef::Instance(i)))) => *i,
+            other => panic!("the hook must own the pawn, got {other:?}"),
+        };
+        let z = match vm.get_property(pawn, "Location") {
+            Some(Value::Vector(v)) => v[2],
+            other => panic!("pawn Location, got {other:?}"),
+        };
+        assert!(
+            z > 1050.0,
+            "the held fire must lift the pawn off the start roof (z={z})"
+        );
+        // Run B adds the use key: the Grab exec's bHooked branch detaches the rope.
+        let detach = run_script_with_cinematic_input(
+            &game_dir,
+            "Toits01",
+            &script::Script::parse(&format!("{prefix}t=6.50 use\n")).expect("parse detach script"),
+            &resolved.params,
+            &scene,
+            10.0,
+        )
+        .expect("run detach smoke");
+        let vm = detach.session.vm();
+        let hook = detach
+            .session
+            .selected_item()
+            .expect("the grant must leave the hook selected");
+        // The detach: the use key's Grab exec -> bHooked && !bWeaponMode && SelectedItem is
+        // Hook -> Hook.HookInUse.Release destroys MyHook and clears bHooked on both sides.
+        assert_eq!(
+            vm.get_property(hook, "bHooked"),
+            Some(&Value::Bool(false)),
+            "the use key must detach the rope (Hook.Release ran)"
+        );
+        assert!(
+            vm.get_property(hook, "MyHook").is_none_or(|v| match v {
+                Value::Object(None) => true,
+                Value::Object(Some(xiii_script::ObjRef::Instance(i))) => {
+                    // Actor.Destroy marks the object deleted; the property keeps the last ref.
+                    vm.objects[*i as usize].deleted
+                }
+                other => panic!("Hook.MyHook, got {other:?}"),
+            }),
+            "Hook.Release must destroy the HookProjectile (Hook.MyHook)"
+        );
     }
 
     /// Opt-in corpus test: Plage00, 2 s of forward input from the PlayerStart must stay on the
@@ -6260,7 +6413,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            380.0,
+            415.0,
         )
         .expect("run Toits01 route");
         let session = &outcome.session;
@@ -6290,6 +6443,14 @@ mod tests {
         // 318.817 (the one unavoidable hit: none/one-juke/two-juke dodges all took the
         // 318.8 blast for 50/45/41, v2/v3/v4); soldier17 150 -> 94 -> 38 -> dead by323.3
         // without landing a hit; player 150 -> 100 and stays there.
+        // item64f: the grapple route plays the sniper section Jones's scene gates the
+        // HookPoint2 descent on, so it reaches the tarmac landing teleport at 351.5
+        // (34.5 s after main's 317.0) and main's stationary burst from there met a direct
+        // rocket hit (two DTRocketed, 600 + 575 raw, dead at -25; measured
+        // local/re/item64f/run11.txt). The burst strafes left (south) from 352.0 to 353.4:
+        // soldier18 150 -> 94 -> 38 -> dead by 352.3 (main's -18), no rocket damage;
+        // soldier17 150 -> 94 -> 38 by 356.4, one DTGunned hit at 356.517 (67 raw,
+        // 150 -> 140), dead by 356.8; player ends at 140 (local/re/item64f/run12.txt).
         let health = session
             .player_health()
             .expect("the player must still have a Health property across the route");
@@ -6305,14 +6466,40 @@ mod tests {
                 println!("[toits01 damage] {:.3} {function} {args:?}", event.time);
             }
         }
+        for name in ["BaseSoldier17", "BaseSoldier18"] {
+            let vm = session.vm();
+            if let Some(id) = vm.find_object(name) {
+                let controller = match vm.get_property(id, "Controller") {
+                    Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(c)))) => {
+                        vm.state_name(*c)
+                    }
+                    _ => None,
+                };
+                println!(
+                    "[toits01 tarmac] {name} health={:?} location={:?} controller_state={controller:?} dead={}",
+                    vm.get_property(id, "Health"),
+                    vm.vector_prop(id, "Location"),
+                    session.actor_is_dead(id)
+                );
+            }
+        }
         assert!(
             health > 0.0,
             "the route player must survive the tarmac rockets and the fight phase with normal-health soldiers, got health {health}"
         );
         assert_eq!(
-            health, 100.0,
-            "the re-timed tarmac fight must end at the measured health100 (one in-flight \
-             rocket from the killed rocketeer; both pursuers dead, no further damage)"
+            health, 140.0,
+            "the re-timed tarmac fight must end at the measured health 140 (the strafing \
+             landing burst kills the rocketeer before his rocket lands; one DTGunned hit \
+             from soldier17 before he dies)"
+        );
+        let soldier17 = session
+            .vm()
+            .find_object("BaseSoldier17")
+            .expect("BaseSoldier17 must exist");
+        assert!(
+            session.actor_is_dead(soldier17),
+            "the long-range duel must kill soldier17"
         );
         // Goal 3 (Jones must not die) completes; goals 0/1/2 do not.
         for o in &objectives {
@@ -6446,9 +6633,10 @@ mod tests {
         // 'SpeechJones11Ttempo' only on a Touch while its scene-gate has armed it (bActif,
         // set by the demo's [118] `event SpeechJones11` at ~81.2), and CineTrigger20
         // (InitialState BufferTrigger, Period 0.1, MaxDelay 60) forwards it as
-        // 'SpeechJones11T'. The route's player enters the zone at t=85 (the labelled
-        // viewpoint teleport; the player's start roof is ~1200 below the trigger's z band, so
-        // the entry is a measured impassable on foot). Measured (probe72/74/75,
+        // 'SpeechJones11T'. item64: the route's player reaches the zone on the grapple - the
+        // hook swing from HookPoint0 lands ~(-3910,858) at ~t=114.5 and the run into the zone
+        // touches TT24 at ~t=121 (the start roof is ~1200 below the trigger's z band, so the
+        // entry is a measured impassable on foot). Measured (probe72/74/75,
         // local/re/item62/): TouchTrigger24.Touch -> CineTrigger20.BufferTrigger.Trigger ->
         // CineController2.PlayingSequence.Trigger ('SpeechJones11T') at 85.0 s, [119]
         // satisfied; [128] `event jones11` at 86.63 releases DialogueManager0's 'jones11'
@@ -6505,6 +6693,105 @@ mod tests {
             dm4_started_after_touch,
             "the follow-up dialogue 'dialtoits1bis' (DialogueManager4) must start after the 'SpeechJones11T' chain fires"
         );
+        // item64f: the HookPoint2 descent is gated by the level's own progression. With the
+        // live clock MapInfo.Timer -> Toits01.FirstFrame clears HookPoint2.bInteractive, and
+        // only Toits01.SetGoalComplete(99) restores it: XIIIGoalTrigger6 ('transmutation')
+        // fires from the 'GrappinPoint' crank XIIIMoverVarTime1's FinishedOpening, and the
+        // crank is triggered only by Jones's scene ([189] 'event GrappinPoint') after the
+        // player stood at his side ([149] 'wait player 75') and both snipers died
+        // (CineTrigger1, CounterTrigger InitialCounterValue 2 -> 'counter_finact1').
+        let event_seen = |who: &str, what: &str, arg: &str| {
+            vm.trace.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    xiii_script::TraceKind::Event { target, function, args }
+                        if target.eq_ignore_ascii_case(who)
+                            && function.ends_with(what)
+                            && args.iter().any(|a| a.contains(arg))
+                )
+            })
+        };
+        let sniper_kills = vm
+            .trace
+            .iter()
+            .filter(|event| {
+                matches!(
+                    &event.kind,
+                    xiii_script::TraceKind::Event { target, function, args }
+                        if target.eq_ignore_ascii_case("CineTrigger1")
+                            && function.ends_with("CounterTrigger.Trigger")
+                            && args.iter().any(|a| a.contains("XIIIPlayerPawn"))
+                )
+            })
+            .count();
+        assert_eq!(
+            sniper_kills, 2,
+            "both 'Activation_Sc1_Snipers' snipers must die to the route player's fire"
+        );
+        assert!(
+            event_seen(
+                "XIIIMoverVarTime1",
+                "Mover.TriggerControl.Trigger",
+                "CineController2"
+            ),
+            "Jones's scene must trigger the 'GrappinPoint' crank"
+        );
+        assert!(
+            event_seen(
+                "XIIIGoalTrigger6",
+                "XIIIGoalTrigger.Trigger",
+                "XIIIMoverVarTime1"
+            ),
+            "the opened crank's 'transmutation' must trigger goal 99's XIIIGoalTrigger6"
+        );
+        assert!(
+            event_seen("Toits0", "Toits01.SetGoalComplete", "99"),
+            "goal 99 must complete through the map's own SetGoalComplete"
+        );
+        let hook_point2 = vm.find_object("HookPoint2").expect("HookPoint2 must exist");
+        assert_eq!(
+            vm.get_property(hook_point2, "bInteractive"),
+            Some(&xiii_script::Value::Bool(true)),
+            "goal 99 must re-enable HookPoint2 (Toits01.SetGoalComplete case 99)"
+        );
+        // The route grapples with the hook the game itself gives (the demo scene's GiveTo at
+        // ~58.8); no route-granted second Hook exists.
+        let player_hooks = vm
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(i, o)| {
+                !o.deleted
+                    && vm.set().path(o.class).ends_with(".Hook")
+                    && vm.get_property(*i as u32, "Owner")
+                        == Some(&xiii_script::Value::Object(Some(
+                            xiii_script::ObjRef::Instance(session.player),
+                        )))
+            })
+            .count();
+        assert_eq!(
+            player_hooks, 1,
+            "the player must carry exactly the game-given Hook"
+        );
+        // Both grapples (the HookPoint0 climb/swing and the HookPoint2 street descent) and the
+        // sniper section cost no health: the first player damage is the tarmac rocket.
+        let early_damage: Vec<f64> = vm
+            .trace
+            .iter()
+            .filter(|event| {
+                event.time < 351.0
+                    && matches!(
+                        &event.kind,
+                        xiii_script::TraceKind::Event { target, function, .. }
+                            if target == &session.player_name && function.ends_with("TakeDamage")
+                    )
+            })
+            .map(|event| event.time)
+            .collect();
+        assert!(
+            early_damage.is_empty(),
+            "no player damage before the tarmac landing (grapples and snipers), got {early_damage:?}"
+        );
         // item61b: with normal-health soldiers the player survives, so the item48 kill pins are
         // gone: no GameEnded broadcast ever fires (measured: no CineController2 state change
         // after its entry into PlayingSequence; the scene is still running at the cutoff)
@@ -6547,6 +6834,8 @@ mod tests {
         // item69: the pursuing soldier18 fires while dying and the re-timed burst hits
         // measure 56-per-spine-hit (150 -> 94 at317.2 -> 38 at317.4 -> -18), so the
         // corpse value moves from the item68b -41 to the measured -18.
+        // item64f: the grapple route's later landing (351.5) reproduces the same three
+        // spine hits (150 -> 94 -> 38 -> -18 by 352.3; local/re/item64f/run12.txt).
         let soldier18 = vm
             .find_object("BaseSoldier18")
             .expect("BaseSoldier18 must exist");

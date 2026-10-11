@@ -7,6 +7,8 @@
 //!
 //! Supported commands:
 //! - `switch_weapon <byte>` / `next_weapon`: normal controller weapon selection execs.
+//! - `select_weapon <byte>`: the retail number-key exec (DefUser.ini `8=SelectWeapon 14`), which
+//!   also leaves item mode (`XIIIPlayerController.SelectWeapon` -> `SwitchWeaponMode`).
 //! - `forward <v>` / `back <v>`: set the forward axis (`back` negates `v`).
 //! - `right <v>` / `left <v>`: set the strafe axis (`left` negates `v`).
 //! - `walk <0|1|on|off>`: set the Shift walk modifier.
@@ -85,6 +87,21 @@ pub enum Command {
     UseNamed(String),
     /// Request one fire action (edge-triggered; routed to the player's weapon, item14).
     Fire,
+    /// item64: hold/release the fire button (DefUser.ini `Fire` = `Button bFire | Fire`). The
+    /// rising edge dispatches the game's own `XIIIPlayerController.Fire` exec; while held the
+    /// controller's `bFire` is published each tick (`Pawn.PressingFire` polls — the rope climbs
+    /// while held). `fire_hold 0` releases (`onrelease UnFire`).
+    FireHold(bool),
+    /// item64: hold/release the alt-fire button (DefUser.ini `AltFire` = `Button bAltFire |
+    /// AltFire`); the rising edge dispatches the `AltFire` exec (the rope descends while held).
+    AltFireHold(bool),
+    /// item64: grant the player the named `Package.Class` inventory item and select it through
+    /// `GiveTo` + `ServerChangedItem` (the hook's route bootstrap; the campaign grants it from a
+    /// save the route does not load).
+    Item(String),
+    /// item64: the item-cycle press (DefUser.ini `InventoryNext`, the F/G keys); the hook's
+    /// put-away/unhook input.
+    NextItem,
     /// Grant the player the named `Package.Class` weapon (item14 diagnostic bootstrap; the
     /// gameplay maps start the player with `XIII.Fists`, so a demonstration weapon is granted
     /// through the game's own `Weapon.GiveTo`/`BringUp`).
@@ -100,6 +117,8 @@ pub enum Command {
     SetGoal(i32),
     /// Normal player controller SwitchWeapon exec, selecting a carried inventory group.
     SwitchWeapon(u8),
+    /// Retail number-key `SelectWeapon` exec (selects a group, leaving item mode if needed).
+    SelectWeapon(u8),
     /// Normal player controller NextWeapon exec.
     NextWeapon,
     /// item18 diagnostic command: give the local player control by running the game's own
@@ -121,6 +140,17 @@ pub enum Command {
     MenuKey(u8),
     /// item72: save a screenshot of the current frame to this path (repeatable).
     Shot(String),
+}
+
+/// A normal controller weapon-selection exec, in script order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeaponInput {
+    /// `XIIIPlayerController.SwitchWeapon(group)`.
+    Switch(u8),
+    /// `XIIIPlayerController.SelectWeapon(group)` (the retail number keys).
+    Select(u8),
+    /// `XIIIPlayerController.NextWeapon`.
+    Next,
 }
 
 /// A parsed input script, time-ordered.
@@ -207,6 +237,28 @@ impl Script {
                     None => Command::Use,
                 },
                 "fire" | "shoot" => Command::Fire,
+                "fire_hold" | "rope_up" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: fire_hold needs 0 or 1"))?;
+                    Command::FireHold(matches!(v, "1" | "on" | "true" | "yes"))
+                }
+                "altfire_hold" | "alt_fire_hold" | "rope_down" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: altfire_hold needs 0 or 1"))?;
+                    Command::AltFireHold(matches!(v, "1" | "on" | "true" | "yes"))
+                }
+                "item" => {
+                    let path = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: item needs a Package.Class"))?;
+                    if !path.contains('.') {
+                        return Err(format!("line {n}: item {path:?} must be Package.Class"));
+                    }
+                    Command::Item(path.to_owned())
+                }
+                "next_item" => Command::NextItem,
                 "reload" => Command::Reload,
                 "grab_input" => Command::GrabInput,
                 "weapon" | "grant" => {
@@ -237,6 +289,17 @@ impl Script {
                         return Err(format!("line {n}: unexpected switch_weapon argument"));
                     }
                     Command::SwitchWeapon(group)
+                }
+                "select_weapon" => {
+                    let group = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: select_weapon needs a byte"))?
+                        .parse::<u8>()
+                        .map_err(|_| format!("line {n}: invalid weapon group"))?;
+                    if it.next().is_some() {
+                        return Err(format!("line {n}: unexpected select_weapon argument"));
+                    }
+                    Command::SelectWeapon(group)
                 }
                 "next_weapon" => {
                     if it.next().is_some() {
@@ -323,9 +386,19 @@ pub struct Drive {
     jump_pending: bool,
     use_pending: bool,
     fire_pending: bool,
-    weapon_inputs: Vec<Option<u8>>,
+    weapon_inputs: Vec<WeaponInput>,
     /// Weapons requested (`weapon <Package.Class>`) and not yet applied by the host.
     weapons: Vec<String>,
+    /// item64: held fire/alt-fire buttons (`fire_hold`/`altfire_hold`) and whether this tick's
+    /// apply is a rising edge.
+    fire_hold: bool,
+    altfire_hold: bool,
+    fire_hold_edge: bool,
+    altfire_hold_edge: bool,
+    /// item64: items requested (`item <Package.Class>`) and not yet applied by the host.
+    items: Vec<String>,
+    /// item64: `next_item` requested (edge-triggered) and not yet applied by the host.
+    next_item_pending: bool,
     /// Named `use <ActorName>` targets not yet applied by the host.
     use_named: Vec<String>,
     /// Active `goto` waypoint (Unreal units), if any.
@@ -368,6 +441,12 @@ impl Drive {
             fire_pending: false,
             weapon_inputs: Vec::new(),
             weapons: Vec::new(),
+            fire_hold: false,
+            altfire_hold: false,
+            fire_hold_edge: false,
+            altfire_hold_edge: false,
+            items: Vec::new(),
+            next_item_pending: false,
             use_named: Vec::new(),
             goto: None,
             waiting_travel: false,
@@ -389,6 +468,27 @@ impl Drive {
     /// [`Input`] because it is not a per-tick axis and carries a class path.
     pub fn take_weapons(&mut self) -> Vec<String> {
         std::mem::take(&mut self.weapons)
+    }
+
+    /// item64: the held rope buttons after applying this tick's events, plus whether the fire
+    /// (alt-fire) button rose this tick (the exec dispatch edge).
+    pub fn take_hook_buttons(&mut self) -> ((bool, bool), (bool, bool)) {
+        let fire = (self.fire_hold, std::mem::take(&mut self.fire_hold_edge));
+        let altfire = (
+            self.altfire_hold,
+            std::mem::take(&mut self.altfire_hold_edge),
+        );
+        (fire, altfire)
+    }
+
+    /// Drains the `item` commands due so far (the host grants + selects them through the VM).
+    pub fn take_items(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.items)
+    }
+
+    /// Takes the pending `next_item` request (edge-triggered).
+    pub fn take_next_item(&mut self) -> bool {
+        std::mem::take(&mut self.next_item_pending)
     }
 
     /// Drains the `set_goal` objective numbers due so far (the host calls the map's own
@@ -471,7 +571,7 @@ impl Drive {
     }
 
     /// Drains normal weapon-selection inputs, preserving repeated commands in order.
-    pub fn take_weapon_inputs(&mut self) -> Vec<Option<u8>> {
+    pub fn take_weapon_inputs(&mut self) -> Vec<WeaponInput> {
         std::mem::take(&mut self.weapon_inputs)
     }
 
@@ -512,6 +612,16 @@ impl Drive {
                 Command::Use => self.use_pending = true,
                 Command::UseNamed(target) => self.use_named.push(target.clone()),
                 Command::Fire => self.fire_pending = true,
+                Command::FireHold(v) => {
+                    self.fire_hold_edge = *v && !self.fire_hold;
+                    self.fire_hold = *v;
+                }
+                Command::AltFireHold(v) => {
+                    self.altfire_hold_edge = *v && !self.altfire_hold;
+                    self.altfire_hold = *v;
+                }
+                Command::Item(path) => self.items.push(path.clone()),
+                Command::NextItem => self.next_item_pending = true,
                 Command::Reload => self.exec_inputs.push("Reload"),
                 Command::GrabInput => self.exec_inputs.push("Grab"),
                 Command::Weapon(path) => self.weapons.push(path.clone()),
@@ -522,8 +632,13 @@ impl Drive {
                     self.cursor += 1;
                     break;
                 }
-                &Command::SwitchWeapon(group) => self.weapon_inputs.push(Some(group)),
-                Command::NextWeapon => self.weapon_inputs.push(None),
+                &Command::SwitchWeapon(group) => {
+                    self.weapon_inputs.push(WeaponInput::Switch(group))
+                }
+                &Command::SelectWeapon(group) => {
+                    self.weapon_inputs.push(WeaponInput::Select(group))
+                }
+                Command::NextWeapon => self.weapon_inputs.push(WeaponInput::Next),
                 Command::TakeControl => self.control_pending = true,
                 Command::QuickHeal => self.heal_pending = true,
                 Command::Menu => self.menu_pending = true,
@@ -579,19 +694,30 @@ mod tests {
 
     #[test]
     fn normal_weapon_input_preserves_order_and_does_not_request_diagnostic_equip() {
-        let script =
-            Script::parse("t=1 switch_weapon 2\nt=1 next_weapon\nt=1 switch_weapon 20\n").unwrap();
+        let script = Script::parse(
+            "t=1 switch_weapon 2\nt=1 next_weapon\nt=1 select_weapon 14\nt=1 switch_weapon 20\n",
+        )
+        .unwrap();
         let mut drive = Drive::new(&script);
         let mut sim = PlayerSim::new([0.0; 3], 0.0);
         drive.advance(0.9, &mut sim);
         assert!(drive.take_weapon_inputs().is_empty());
         drive.advance(1.0, &mut sim);
-        assert_eq!(drive.take_weapon_inputs(), [Some(2), None, Some(20)]);
+        assert_eq!(
+            drive.take_weapon_inputs(),
+            [
+                WeaponInput::Switch(2),
+                WeaponInput::Next,
+                WeaponInput::Select(14),
+                WeaponInput::Switch(20)
+            ]
+        );
         assert!(drive.take_weapon_inputs().is_empty());
         assert!(Script::parse("t=0 equip").is_err());
         assert!(Script::parse("t=0 next_weapon extra").is_err());
         for invalid in ["-1", "256", "NaN", "2 extra", ""] {
             assert!(Script::parse(&format!("t=0 switch_weapon {invalid}")).is_err());
+            assert!(Script::parse(&format!("t=0 select_weapon {invalid}")).is_err());
         }
     }
 

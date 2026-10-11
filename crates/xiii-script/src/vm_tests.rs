@@ -1521,13 +1521,18 @@ fn registry_entries_are_documented() {
     // item30c merge keeps this branch's `Actor.AnimIsInGroup` (395, round-4 ChangedWeapon
     // caller) on top of main's set (main's own decoded `Controller.WaitForLanding` is the
     // single 527 entry; the branch's duplicate registry def was removed in the merge).
-    // item65 adds Interaction.WorldToScreen backed by the host's active projection.
+    // item65 adds Interaction.WorldToScreen backed by the host's active projection (canvas.rs);
+    // the item64d merge removed this branch's duplicate registry def and keeps only item64's
+    // screen-effect no-op Partials `ViewShake` (496), `ViewFlash` (505) and `CheckBob` (504),
+    // reached by the hook's controller-state `PlayerMove` dispatch, plus `Pawn.FaceRotation`
+    // (the PlayerMove -> UpdateRotation chain).
     // item69 adds the decoded Controller.PickWallAdjust (526) pursuit detour.
     // item70 adds the decoded Actor.RecomputeBoundingVolume (391) render-box freeze; item72 adds
     // the three decoded in-game menu natives (ResetInputs and GUI save/checkpoint writes).
     // item82 adds shift (148), GUI Sleep (430), config-write request/poll, checkpoint load,
     // menu font lookup/selection, and GUI actual width/height (nine entries).
-    assert_eq!(defs.len(), 356);
+    // item64 adds ViewShake (496), ViewFlash (505), CheckBob (504) and Pawn.FaceRotation.
+    assert_eq!(defs.len(), 360);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -7090,6 +7095,63 @@ fn additional_trace_type_8192_excludes_pawn_candidates() {
         .vm_trace_flags(trigger, [0.0; 3], [100.0, 0.0, 0.0], 0x20bf, [0.0; 3])
         .unwrap();
     assert_eq!(hit, None, "0x20bf must not report the pawn");
+}
+
+#[test]
+fn additional_trace_type_16384_hides_decorations_only_from_world_traces() {
+    // item64f: `XIIIWeapon.RealTraceFire` traces with bTraceActors=true and 16384|65536
+    // (composed 0xbf | 0x14000) and must still hit movers and decorations (its own
+    // `bShouldGoThroughTraversable` branch reads `XIIIMover(Other)`); `HookLink.Tick`'s rope
+    // check traces with bTraceActors=false and 16384 (0x86 | 0x4000) and must not report the
+    // `HookPoint` decoration the locked projectile sits in. Movers stay admitted by `& 2`
+    // (`AMover::ShouldTrace` 0x10306c70) for both. Labelled hypothesis (see
+    // `trace_admits_actor_flags`).
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let _li = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0; 3]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    let prop = vm.spawn(pg(&set, "Decoration"), "Anchor").unwrap();
+    vm.set_property(prop, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, prop, true, false);
+    vm.set_property(prop, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    let trace = |vm: &mut Vm<'_>, flags: u32| {
+        vm.vm_trace_flags(tracer, [0.0; 3], [200.0, 0.0, 0.0], flags, [0.0; 3])
+            .unwrap()
+            .0
+    };
+    assert_eq!(
+        trace(&mut vm, 0xbf | 0x14000),
+        Some(prop),
+        "weapon trace hits it"
+    );
+    assert_eq!(
+        trace(&mut vm, 0x86),
+        Some(prop),
+        "a plain world trace admits it (& 2)"
+    );
+    assert_eq!(
+        trace(&mut vm, 0x86 | 0x4000),
+        None,
+        "the rope check must not"
+    );
+    // Boundary: the rope trace that only ENDS inside the decoration (the locked projectile)
+    // is the measured case; a trace past it is excluded the same way.
+    assert_eq!(
+        vm.vm_trace_flags(tracer, [0.0; 3], [40.0, 0.0, 0.0], 0x86 | 0x4000, [0.0; 3])
+            .unwrap()
+            .0,
+        None
+    );
+    // A mover in the same place is reported by both compositions.
+    vm.set_property(prop, "Location", 0, Value::Vector([5000.0, 0.0, 0.0]));
+    let mv = vm.spawn(pg(&set, "Mover"), "Door").unwrap();
+    vm.set_property(mv, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, mv, true, true);
+    vm.set_property(mv, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    assert_eq!(trace(&mut vm, 0xbf | 0x14000), Some(mv));
+    assert_eq!(trace(&mut vm, 0x86 | 0x4000), Some(mv));
 }
 
 #[test]
