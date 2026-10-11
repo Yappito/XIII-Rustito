@@ -1391,11 +1391,17 @@ fn controller_can_see(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResu
 
 /// `Pawn.PressingFire() -> bool` (native 0): Engine.dll `APawn::execPressingFire` returns false
 /// without a controller and otherwise reads the controller's `bFire` field. It does not inspect
-/// the pawn, instigator, or XIII's script-only `IAController.bTire` field.
+/// the pawn, instigator, or XIII's script-only `IAController.bTire` field. `bFire` is a byte
+/// (Controller+0x212, tested `!= 0` at 0x103afca1), so a nonzero byte counts as pressing: a
+/// bool-only read made every automatic AI burst (`IAController.Timer` holds `bFire`) one shot.
 fn pawn_pressing_fire(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let fire = vm
-        .obj_prop(c.this, "Controller")
-        .is_some_and(|ctrl| vm.bool_prop(ctrl, "bFire"));
+    let fire = vm.obj_prop(c.this, "Controller").is_some_and(|ctrl| {
+        match vm.get_property(ctrl, "bFire") {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::Byte(n)) => *n != 0,
+            _ => false,
+        }
+    });
     val(Value::Bool(fire))
 }
 
