@@ -577,12 +577,9 @@ pub fn draw(
                             height: px(*yl),
                             ..default()
                         },
-                        ImageNode {
-                            image: handle,
-                            rect,
-                            color: to_color(*color),
-                            ..default()
-                        },
+                        // Canvas tiles specify independent destination dimensions (XL/YL); source
+                        // UV size (UL/VL) only chooses the sampled region.
+                        canvas_tile_image(handle, rect, *color),
                         GlobalZIndex(10),
                     ))
                     .id();
@@ -661,6 +658,16 @@ fn to_color(c: [u8; 4]) -> Color {
     Color::srgba_u8(c[0], c[1], c[2], c[3])
 }
 
+fn canvas_tile_image(image: Handle<Image>, rect: Option<Rect>, color: [u8; 4]) -> ImageNode {
+    ImageNode {
+        image,
+        rect,
+        image_mode: bevy::ui::widget::NodeImageMode::Stretch,
+        color: to_color(color),
+        ..default()
+    }
+}
+
 /// Resolves a `Package.Object` path to a decoded texture image handle.
 fn decode_texture_path(
     cache: &mut PackageCache,
@@ -690,6 +697,19 @@ fn decode_texture_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canvas_tile_stretches_non_square_destination_and_keeps_source_uv_rect() {
+        let rect = Rect::new(0.0, 0.0, 8.0, 8.0);
+        let node = canvas_tile_image(Handle::<Image>::default(), Some(rect), [255, 255, 255, 128]);
+
+        assert!(matches!(
+            node.image_mode,
+            bevy::ui::widget::NodeImageMode::Stretch
+        ));
+        assert_eq!(node.rect, Some(rect));
+        assert!((node.color.to_srgba().alpha - 128.0 / 255.0).abs() < f32::EPSILON);
+    }
 
     #[test]
     fn opt_in_checkpoint_message_expires_on_level_clock() {
