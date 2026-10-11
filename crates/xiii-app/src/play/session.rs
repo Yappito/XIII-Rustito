@@ -165,6 +165,12 @@ pub enum UseOutcome {
     Unlocked,
     /// An (unlocked) door was triggered to open/close.
     Triggered,
+    /// A `XIIITriggers` reader was grabbed, but the player carried no matching power-up item, so
+    /// the controller's `Grab` only called `XIIITriggers.PlayerTrigger` (its sound/goal side
+    /// effects); no held item was activated. The retail `Grab` tail
+    /// `XIIIPlayerController.Grab 0x0497..0x0649`: `TryInteractWithTrigger` returned `None`, so
+    /// the reader's `PlayerTrigger` ran instead of an item `Activate`.
+    PlayerTriggerOnly,
     /// A dead pawn in reach was searched (the game's own `PlayerController.SearchPawn`), which
     /// transfers its inventory to the player.
     CorpseSearched,
@@ -1213,6 +1219,12 @@ impl Session {
         self.vm.mover_states()
     }
 
+    /// Live movers plus the pending-kill (`bDeleteMe`) movers, for the collision partition
+    /// (their triangles must become a disabled moving object, never static geometry).
+    pub fn mover_states_including_pending_kill(&self) -> Vec<MoverState> {
+        self.vm.mover_states_including_pending_kill()
+    }
+
     /// Registers every live mover's box-collision triangles (world space at its `BasePos`/
     /// `BaseRot`) with the VM's physics provider, so the VM's own `Move`/`Trace` consider the
     /// moving brush. The map collision soup is read from `scene`; the host's player physics is
@@ -1284,6 +1296,32 @@ impl Session {
         match self.vm.get_property(id, name) {
             Some(Value::Str(s)) | Some(Value::Name(s)) => Some(s.clone()),
             _ => None,
+        }
+    }
+
+    /// The power-up item the player carries that a `XIIITriggers` reader matches by tag, run
+    /// through the pawn's own `XIIIPawn.FindPowerUpItemNameForTrigger(Trigger.Tag)` (the
+    /// controller's `TryInteractWithTrigger`). `None` means the reader's `Grab` tail only calls
+    /// `XIIITriggers.PlayerTrigger`, so no held item is activated. A script failure is recorded in
+    /// `blocked` (visible), never silently treated as "no item".
+    fn carried_trigger_item(&mut self, trigger: ObjectId) -> Option<ObjectId> {
+        let name = self.vm.get_property(trigger, "Tag").cloned()?;
+        let Some(f) = self
+            .vm
+            .class_function(self.player, "FindPowerUpItemNameForTrigger")
+        else {
+            self.blocked
+                .push("FindPowerUpItemNameForTrigger: pawn has no such function".to_owned());
+            return None;
+        };
+        match self.vm.call_function(f, self.player, vec![name]) {
+            Ok(Value::Object(Some(ObjRef::Instance(i)))) => Some(i),
+            Ok(_) => None,
+            Err(e) => {
+                self.blocked
+                    .push(format!("FindPowerUpItemNameForTrigger failed: {e}"));
+                None
+            }
         }
     }
 
@@ -1384,6 +1422,14 @@ impl Session {
         // `bCanTrigger` branch of `Grab`: the controller's own `TryInteractWithTrigger` picks the
         // matching inventory item, which a second `Grab` activates.
         let trigger = self.vm.is_a(target, "XIIITriggers");
+        // Whether the player carries the item the reader's tag matches (`XIIIPawn.
+        // FindPowerUpItemNameForTrigger`, the controller's `TryInteractWithTrigger`): when it is
+        // absent, `Grab` only runs `XIIITriggers.PlayerTrigger`, not an item `Activate`.
+        let trigger_item = if trigger {
+            self.carried_trigger_item(target)
+        } else {
+            None
+        };
         if !corpse && !trigger && !self.vm.is_a(target, "XIIIDecoPickup") {
             return UseOutcome::NotAMover;
         }
@@ -1425,7 +1471,11 @@ impl Session {
         }
         self.drain_events();
         if trigger {
-            UseOutcome::Triggered
+            if trigger_item.is_some() {
+                UseOutcome::Triggered
+            } else {
+                UseOutcome::PlayerTriggerOnly
+            }
         } else if corpse && instance_prop(&self.vm, target, "Inventory").is_none() {
             UseOutcome::CorpseSearched
         } else if self.inventory_items().len() > before.len() {

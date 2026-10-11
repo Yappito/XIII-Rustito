@@ -571,7 +571,8 @@ fn setup_inner(
     }
 
     let mover_states = session.mover_states();
-    let (mut world, mover_collision) = movers::MoverCollision::build(&scene, &mover_states);
+    let mover_parts = session.mover_states_including_pending_kill();
+    let (mut world, mover_collision) = movers::MoverCollision::build(&scene, &mover_parts);
     mover_collision.update(&mut world, &mover_states);
     println!(
         "[play] movers: {} collision objects from {} live mover actors ({} static triangles): {}",
@@ -2312,7 +2313,8 @@ fn build_map_runtime(
     session.vm_mut().set_wave_position(Box::new(voice_provider));
     session.register_movers(scene);
     let mover_states = session.mover_states();
-    let (mut world, mover_collision) = movers::MoverCollision::build(scene, &mover_states);
+    let mover_parts = session.mover_states_including_pending_kill();
+    let (mut world, mover_collision) = movers::MoverCollision::build(scene, &mover_parts);
     mover_collision.update(&mut world, &mover_states);
     println!(
         "[play] movers: {} collision objects from {} live mover actors ({} static triangles): {}",
@@ -6546,14 +6548,16 @@ mod tests {
         );
     }
 
-    /// item59, re-authored by item67: Hual02 route by player input (the vent crawl, the
+    /// item59, re-authored by item67/item67f: Hual02 route by player input (the vent crawl, the
     /// underfloor with the Porte11 use, the service-lift ride by the cage's own button, the
-    /// surface corridor, the depot reader, Carrington's cell) with labelled teleports only for
-    /// the measured movement gaps (the Locked Porte19 magnetic chain whose only card pickup is
-    /// sealed in the meeting-room petitesalle, the corridor block at (-6198,842), the sealed
-    /// prison perimeter, the grille pin, the pinned exit stairwell). The objectives must come
-    /// from the game's own chains: goals 4/5/6 complete, goal 3 is promoted by the Carrington
-    /// scene, goals 0/1/2 stay incomplete on measured blockers, and no travel is requested.
+    /// walk out through the manager-opened Porte20, the surface corridor, the depot reader,
+    /// Carrington's cell) with labelled teleports only for the measured movement gaps (the
+    /// surface corridor's BSP dead-end at (-2854,2338), the Locked Porte19 magnetic chain whose
+    /// only card pickup is sealed in the meeting-room petitesalle, the corridor block at
+    /// (-6198,842), the sealed prison perimeter, the grille pin, the pinned exit stairwell).
+    /// The objectives must come from the game's own chains: goals 4/5/6 complete, goal 3 is
+    /// promoted by the depot reader chain, goals 0/1/2 stay incomplete on measured blockers, and
+    /// no travel is requested.
     ///
     /// Labelled diagnostic: the hostile `BaseSoldier*` pawns are removed (`remove_soldiers`,
     /// the `Cine*` scene pawns kept). Under the real level clock the unmodified level's
@@ -6719,24 +6723,60 @@ mod tests {
             Some(&xiii_script::Value::Int(2)),
             "the route rode the cage to floor 2: {objectives:?}"
         );
-        // item67 pinned next blocker: the floor-2 lobby exit is sealed. The LiftManager opens
-        // its two LiftDoor outer leaves, but the doorway's third leaf Porte20 ('porte_haut') is
-        // not in the manager's Floor2_OuterDoors set, never triggers and stays closed; the
-        // walker is pinned at its panel plane (y~2346) after the ride. That is why the surface
-        // corridor to the depot reader is a labelled teleport, not a walk.
-        let porte20 = vm.find_object("Porte20").expect("Porte20 must exist");
-        assert_eq!(
-            vm.get_property(porte20, "bClosed"),
-            Some(&xiii_script::Value::Bool(true)),
-            "Porte20 (the upper lift door) stays closed: the pinned blocker"
+        // item67f: Hual02's `Porte4`/`Porte20` (`XIDCine.Porte`, Tags 'porte_bas'/'porte_haut')
+        // are serialised with `bDeleteMe=true`, in a trailing block of 54 destroyed exports that
+        // also holds the `LiftManager0`'s stale `XIIIMover0` cage reference. No actor in the map
+        // fires an event named 'porte_haut'/'porte_bas' (the strings occur only as the live
+        // `LiftDoor` Tags), so no `TriggerEvent` can open `Porte20`; and the class's automatic
+        // `PostBeginPlay` radius search only matches `XIDCine.LiftDoor`. The engine's
+        // `AActor::IsPendingKill` (Engine.dll 0x10304b40, `AActor+0x2e & 1`) reports those exports
+        // dead, so the dead `Porte20` is not part of the live level and never blocked the exit.
+        assert!(
+            vm.find_object("Porte20").is_none() && vm.find_object("Porte4").is_none(),
+            "the destroyed Porte4/Porte20 exports must not be live level actors"
         );
+        // The live floor-2 lift door is `LiftDoor1` (Tag 'porte_haut'), which the `LiftManager0`'s
+        // own outer-door states open; the player walks out through the doorway.
+        let lift_door = vm.find_object("LiftDoor1").expect("LiftDoor1 must exist");
         assert_eq!(
-            vm.get_property(porte20, "bOpened"),
-            Some(&xiii_script::Value::Bool(false)),
-            "Porte20 never opened: the walker cannot leave the lift lobby on foot"
+            vm.get_property(lift_door, "bOpened"),
+            Some(&xiii_script::Value::Bool(true)),
+            "the manager must open the live floor-2 LiftDoor1"
+        );
+        assert!(
+            vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target.eq_ignore_ascii_case("LiftDoor1") && function.ends_with("Trigger")
+            )),
+            "the LiftManager must trigger LiftDoor1 (the game's own outer-door path)"
+        );
+        // item67f measured walk: with the destroyed `Porte20` no longer part of the level, the
+        // player leaves the cage north through the doorway and follows the surface corridor
+        // (max y ~2650) west, dead-ending at the BSP wall (-2854,2338) (measured).
+        let walk = outcome
+            .trace
+            .iter()
+            .filter(|s| (232.0..258.0).contains(&s.1));
+        let max_y = walk.clone().map(|s| s.2[1]).fold(f32::MIN, f32::max);
+        assert!(
+            max_y > 2550.0,
+            "the walker must leave the cage through the doorway (max corridor y {max_y})"
+        );
+        let pin = outcome
+            .trace
+            .iter()
+            .min_by(|a, b| (a.1 - 256.0).abs().total_cmp(&(b.1 - 256.0).abs()))
+            .expect("trace sample");
+        assert!(
+            (pin.2[0] - -2854.0).abs() < 60.0 && (pin.2[1] - 2338.0).abs() < 60.0,
+            "the surface corridor must dead-end at the measured BSP wall (-2854,2338): got {:?}",
+            pin.2
         );
         // The depot reader was aimed and used (the game's TargetActor + bCanTrigger -> Grab),
-        // but without the (sealed) magnetic card Porte19 must still be locked: the next
+        // but the player carries no matching card, so Grab only ran
+        // `MagneticPassTrigger1.PlayerTrigger` (its sound/goal side effects) - not an item
+        // activation; without the (sealed) magnetic card Porte19 must still be locked: the next
         // measured blocker, pinned instead of hidden.
         let porte19 = vm.find_object("Porte19").expect("Porte19 must exist");
         assert_eq!(

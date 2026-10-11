@@ -3195,6 +3195,18 @@ impl<'s> Vm<'s> {
             if self.objects[id as usize].is_actor {
                 self.apply_native_init_execution(id);
             }
+            // item67f: a map's tagged-property blocks serialise editor/runtime state, including
+            // `bDeleteMe` on actors the level no longer contains. Hual02's trailing export block
+            // holds 54 such destroyed actors (among them `Porte4`/`Porte20` and the `LiftManager0`'s
+            // stale serialised `XIIIMover0` cage). `AActor::IsPendingKill` (Engine.dll 0x10304b40)
+            // returns `AActor+0x2e & 1` = `bDeleteMe`, and a pending-kill actor receives no
+            // `ProcessEvent` and leaves the collision hash, so the VM must not run them either
+            // (the dead `Porte20` otherwise blocks the floor-2 lift exit). The objects stay so
+            // serialised references still resolve, exactly as the engine keeps them until GC.
+            if self.bool_prop(id, "bDeleteMe") {
+                self.objects[id as usize].deleted = true;
+                self.objects[id as usize].active = false;
+            }
         }
         // Cache the map's `LevelInfo` for the per-tick `NextURL` travel check.
         self.level_info = self.find_level_info();
@@ -3993,17 +4005,20 @@ impl<'s> Vm<'s> {
         // Movers advance in the same pre-state slice (UE2 `physInterpolating` runs in Tick), so
         // a `FinishInterpolation` waiter resumes in the tick its `bInterpolating` clears.
         for id in 0..self.objects.len() as ObjectId {
-            if self.objects[id as usize].active {
+            if self.objects[id as usize].active && !self.objects[id as usize].deleted {
                 self.advance_interpolation(id, dt)?;
             }
         }
         for id in 0..self.objects.len() as ObjectId {
-            if self.objects[id as usize].active {
+            if self.objects[id as usize].active && !self.objects[id as usize].deleted {
                 self.process_state(id, dt)?;
             }
         }
         for id in 0..self.objects.len() as ObjectId {
-            if self.objects[id as usize].active && self.objects[id as usize].is_actor {
+            if self.objects[id as usize].active
+                && !self.objects[id as usize].deleted
+                && self.objects[id as usize].is_actor
+            {
                 self.dispatch_tick(id, dt)?;
             }
         }
@@ -6995,6 +7010,25 @@ impl<'s> Vm<'s> {
         Some(s)
     }
 
+    /// Live movers plus the pending-kill (`bDeleteMe`) movers. The host's collision partition
+    /// must own a pending-kill mover's triangles with a **disabled** moving object rather than
+    /// let them fall through to the static soup: Hual02 holds both the live `LiftCage0` and the
+    /// pending-kill `XIIIMover0` (the `LiftManager0`'s stale serialised cage) at the same spot, and
+    /// making the dead one static shadows the live cage so the rider is never carried.
+    pub fn mover_states_including_pending_kill(&self) -> Vec<MoverState> {
+        let mut out = Vec::new();
+        for (i, object) in self.objects.iter().enumerate() {
+            if let Some(mut s) = self
+                .mover_state_of(i as ObjectId)
+                .or_else(|| self.mover_state_pending_kill(i as ObjectId))
+            {
+                s.name = object.name.clone();
+                out.push(s);
+            }
+        }
+        out
+    }
+
     /// True when `id` is a live instance deriving from `Mover`.
     pub fn is_mover(&self, id: ObjectId) -> bool {
         self.is_live_actor(id) && self.is_a(id, "mover")
@@ -7006,7 +7040,24 @@ impl<'s> Vm<'s> {
         if !o.is_actor || o.deleted || o.name.starts_with("Default__") || !o.layout.is_mover_class {
             return None;
         }
-        Some(MoverState {
+        Some(self.mover_state_fields(id))
+    }
+
+    /// Pose/state of a pending-kill (`bDeleteMe`) mover with collision forced off (the engine
+    /// removed it from the collision hash). See [`Vm::mover_states_including_pending_kill`].
+    fn mover_state_pending_kill(&self, id: ObjectId) -> Option<MoverState> {
+        let o = self.objects.get(id as usize)?;
+        if !o.is_actor || !o.deleted || o.name.starts_with("Default__") || !o.layout.is_mover_class
+        {
+            return None;
+        }
+        let mut s = self.mover_state_fields(id);
+        s.blocks_players = false;
+        Some(s)
+    }
+
+    fn mover_state_fields(&self, id: ObjectId) -> MoverState {
+        MoverState {
             name: String::new(),
             location: self.location_prop(id).unwrap_or([0.0; 3]),
             rotation: self.rotation_prop(id).unwrap_or([0; 3]),
@@ -7018,7 +7069,7 @@ impl<'s> Vm<'s> {
             interpolating: self.bool_prop(id, "bInterpolating"),
             blocks_players: self.bool_prop(id, "bCollideActors")
                 && self.bool_prop(id, "bBlockPlayers"),
-        })
+        }
     }
 
     /// item40e: propagates every mover's collision state to the world-physics provider. A mover

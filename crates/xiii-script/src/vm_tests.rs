@@ -872,6 +872,67 @@ fn init_execution_write_survives_map_property_reload_order() {
     );
 }
 
+/// item67f: a map actor serialised with `bDeleteMe=true` is a pending-kill export. The engine's
+/// `AActor::IsPendingKill` (Engine.dll 0x10304b40) reads `AActor+0x2e & 1`, i.e. the serialised
+/// `bDeleteMe`; such an actor receives no `ProcessEvent` and leaves the collision hash, so it
+/// must not be a live level actor. Hual02's `Porte4`/`Porte20` are exactly this (a trailing block
+/// of 54 destroyed exports), and the dead `Porte20` otherwise blocks the floor-2 lift exit.
+fn pending_kill_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let bdelete = b.reserve(B_BOOLPROP, actor, "bDeleteMe");
+    let live = b.reserve(actor, 0, "Live0");
+    let dead_true = b.reserve(actor, 0, "DeadTrue0");
+    let dead_false = b.reserve(actor, 0, "DeadFalse0");
+    b.prop(bdelete, 0, 0);
+    b.class(object, 0, actor);
+    b.class(actor, object, bdelete);
+    // Empty tag block: no `bDeleteMe` -> live.
+    b.set(live, vec![0]);
+    // Bool tag: name, info 0xd3 (BoolProperty, size code 5, bit 7 = value true), explicit size 0,
+    // then the `None` terminator (corpus form: `bool_value_lives_in_the_info_bit`).
+    let mut dead = compact(b.name("bDeleteMe"));
+    dead.extend([0xd3, 0x00, 0x00]);
+    b.set(dead_true, dead);
+    let mut live_false = compact(b.name("bDeleteMe"));
+    live_false.extend([0x53, 0x00, 0x00]);
+    b.set(dead_false, live_false);
+    b.build()
+}
+
+#[test]
+fn load_level_marks_bdeleteme_exports_pending_kill() {
+    let set = set_of(pending_kill_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let actors = vm.load_level(0, &Limits::default()).unwrap();
+    // Every export is instantiated (the engine creates the objects), but the `bDeleteMe` one is
+    // pending-kill: not a live actor and invisible to name lookup.
+    assert!(vm.find_object("Live0").is_some());
+    assert!(
+        vm.find_object("DeadFalse0").is_some(),
+        "bDeleteMe=false stays a live actor"
+    );
+    assert!(
+        vm.find_object("DeadTrue0").is_none(),
+        "a bDeleteMe export must not be a live level actor"
+    );
+    // The object still exists so serialised references resolve, flagged deleted and inactive.
+    let id = actors
+        .iter()
+        .copied()
+        .find(|&i| vm.objects[i as usize].name == "DeadTrue0")
+        .expect("DeadTrue0 export instantiated");
+    assert!(vm.objects[id as usize].deleted);
+    assert!(!vm.objects[id as usize].active);
+    // Events delivered to it are dropped exactly as `ProcessEvent` drops a pending-kill actor.
+    assert!(
+        vm.send_event(id, "PostBeginPlay", vec![])
+            .unwrap()
+            .is_none()
+    );
+}
+
 fn pressing_fire_package() -> Vec<u8> {
     let mut b = B::new();
     let object = b.reserve(0, 0, "Object");
