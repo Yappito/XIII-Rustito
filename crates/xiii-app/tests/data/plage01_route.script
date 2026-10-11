@@ -21,6 +21,16 @@
 #
 # The killer (BaseSoldier6) walks while attacking, so the view is tracked onto it around the
 # firing (`track BaseSoldier6` / `track off`).
+#
+# item76 (measured, scratch local/re/item76): `Pawn.PressingFire` now reads the controller's
+# `bFire` byte, so automatic AI weapons fire real bursts (the hut-exit `BaseSoldier`'s kalash
+# took 147 -> 93 hp in 4 s under the old schedule; the old route died at 158 s). Re-timed by
+# input only: the hut-exit soldier is shot as he wakes (head aim, he dies at 72.9 s),
+# BaseSoldier4 is killed from the (-877,-8153) wait stand where he otherwise fires for 8 s, the
+# crate-wall stand clears its unreached goto so the tracked aim is not overridden, and the
+# killer is approached to ~250 UU before the Beretta burst. A `goto` that never comes within
+# 24 UU stays active and keeps driving the yaw, so a stand that fires is entered with a `goto`
+# to the spot the player actually stops on.
 
 # ---- hut: key, Beretta, door (all walked) ------------------------------------------------
 # All times include the +2.2 s intro offset measured after the origin/main merge (control
@@ -52,20 +62,20 @@ t=70.50 use
 t=71.00 use
 t=71.50 use
 t=71.80 forward 1
-t=73.30 forward 0
+# Hut-exit soldier kill (item76, measured): BaseSoldier stands at (-299,-1408) and wakes as the
+# player touches TouchTrigger9 at ~72.0 s; his kalash bursts from 72.25 s. The player stops on
+# the hut steps and fires at his head straight away: he dies at 72.9 s (r5: 147 -> 141 hp here,
+# against 147 -> 93 hp when the old schedule fired from 74.7 s, run c_orig).
+t=72.30 forward 0
+t=72.30 track BaseSoldier 0.85
+t=72.50 fire
+t=72.90 fire
+t=73.30 fire
+t=73.70 fire
+t=74.10 fire
+t=74.40 track off
 # TouchTrigger9 (-307,-1396) on the way down; objective 0 completes in the game's own chain.
 t=73.50 goto -307.0 -1400.0
-# Hut-exit soldier kill (round 8, measured): BaseSoldier stands at (-299,-1408) - the player
-# touches TouchTrigger9 9 UU from him at ~74.5 s. The m60 kills him here inside the schedule's
-# existing wait window (the next leg fires at 77.7), so no later leg shifts.
-t=74.60 track BaseSoldier
-t=74.70 fire
-t=75.10 fire
-t=75.50 fire
-t=75.90 fire
-t=76.30 fire
-t=76.70 fire
-t=76.90 track off
 
 # ---- beach: nav polyline southwest to the truck shore ------------------------------------
 # Waypoints are the map's decoded ReachSpec polyline. The distance/150 + 2 s per goto is a
@@ -90,6 +100,24 @@ t=124.10 goto 98.1 -6628.7
 t=133.80 goto -909.8 -7179.3
 t=141.30 goto -805.2 -7997.7
 t=144.20 goto -861.8 -8127.4
+# BaseSoldier4 kill (item76, measured): he follows the shore to 200-600 UU of this wait stand
+# and keeps firing (control run without this block: he hits the player 26 times from 132 to
+# 194 s, 127 -> 106 hp over this wait alone, and the player dies at 299 s). The player stops
+# on the spot he reaches, (-877,-8153) (the goto above ends 30 UU short, so it stays active and
+# would keep the yaw), and bursts him: he dies at 147.1 s (r5).
+t=146.40 goto -877.1 -8153.1
+t=146.50 track BaseSoldier4 0.85
+t=146.70 fire
+t=147.10 fire
+t=147.50 fire
+t=147.90 fire
+t=148.30 fire
+t=148.70 fire
+t=149.10 fire
+t=149.50 fire
+t=149.90 fire
+t=150.30 fire
+t=150.50 track off
 t=152.90 goto -1686.3 -8702.9
 t=160.90 goto -2554.9 -8907.9
 t=169.10 goto -3413.6 -9257.6
@@ -106,7 +134,10 @@ t=189.70 goto -4319.9 -9475.7
 # Crate-wall ambush kill (round 8, measured): BaseSoldier7 charges into the crossing (his fire
 # measured ~3.6 hp/s; both first round-8 walk runs died at ~200 s exactly here) - the player
 # stands at (-4319,-9475) in the schedule's wait window and bursts him with the m60 (contact
-# 45/hit; he dies on the 4th hit, ~191.6).
+# 45/hit). item76: the goto above stops 34 UU short at (-4347.7,-9495.1) and would keep the
+# yaw, so it is replaced by the reached spot before the tracked burst (measured r5:
+# BaseSoldier7 dies at 190.8 s on the first two hits).
+t=190.10 goto -4347.7 -9495.1
 t=190.20 track BaseSoldier7
 t=190.40 fire
 t=190.80 fire
@@ -199,10 +230,12 @@ t=302.30 track off
 # there while the player holds the shore. switch_weapon 2 requests the picked-up Beretta
 # (InventoryGroup 2) before the burst; the checkpoint acceptance also checks its selection
 # after the corpse search. The firing window below is measured to kill his authored 125 hp.
-t=302.60 track BaseSoldier6
+# item76 (measured r5): from the 630 UU stand no round reached him (0 hits in 15), and a fire
+# during the M60's 0.67 s DownWeapon aborted the switch. The player now walks to ~250 UU of him
+# while the Beretta comes up, then fires head-aimed from 304.4 s: he dies at 305.0 s.
+t=302.60 track BaseSoldier6 0.85
 t=302.90 switch_weapon 2
-t=303.30 fire
-t=303.85 fire
+t=303.00 goto 947.0 -13924.0
 t=304.40 fire
 t=304.95 fire
 t=305.50 fire
@@ -219,9 +252,10 @@ t=311.00 fire
 t=311.10 track off
 # ---- corpse walk: the game's own XIIIPlayerPawn.Tick auto-search drains the killer's chain
 # (the truck key) as the player walks over him (measured r8_e2: Touch BaseSoldier6 at ~309,
-# then `use Porte1: Unlocked`). The corpse sits ~(1100..1175,-13680..-13750) depending on his
-# exact hover; the goto aims the middle of that area.
-t=311.50 goto 1170.0 -13700.0
+# then `use Porte1: Unlocked`). item76 (measured): the killer now dies coming at the player and
+# his corpse comes to rest at (1391.6,-13495.1) (diagnostic run to 311 s), so the walk aims
+# there instead of the old (1170,-13700) hover spot.
+t=311.50 goto 1391.6 -13495.1
 # Measured: the pre-save run left the M60 selected. Re-select the Beretta through the game's
 # normal switch after the auto-search, preserving the checkpoint's expected selection.
 t=315.00 switch_weapon 2

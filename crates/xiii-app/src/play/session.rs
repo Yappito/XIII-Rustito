@@ -2236,7 +2236,24 @@ impl Session {
     /// Existing host weapon action: explicitly calls the weapon's class `Fire(1.0)` and runs
     /// its scripted trace/projectile/damage chain (item14). This still bypasses controller/state
     /// input dispatch; it must not invent a focus-end event from the HUD's registered windows.
+    ///
+    /// A scripted `fire` is a tap: the controller's `bFire` byte is held only for this call and
+    /// then restored. `Pawn.PressingFire` reads that byte (Engine.dll `execPressingFire`), and an
+    /// automatic weapon's end-of-shot refire check polls it, so leaving it set turned one tap into
+    /// a held trigger that emptied the M60 (item76, measured on the Plage01 route). The
+    /// windowed live path writes `bFire` from the button state every frame instead.
     pub fn fire(&mut self, yaw: f32, pitch: f32) -> FireOutcome {
+        let held = self
+            .controller
+            .and_then(|ctrl| self.vm.get_property(ctrl, "bFire").cloned());
+        let outcome = self.fire_tap(yaw, pitch);
+        if let (Some(ctrl), Some(previous)) = (self.controller, held) {
+            self.vm.set_property(ctrl, "bFire", 0, previous);
+        }
+        outcome
+    }
+
+    fn fire_tap(&mut self, yaw: f32, pitch: f32) -> FireOutcome {
         let Some(weapon) = self.player_weapon() else {
             return FireOutcome::NoWeapon;
         };
