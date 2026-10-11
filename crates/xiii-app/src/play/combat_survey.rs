@@ -111,13 +111,37 @@ fn opt_in_item51_combat_survey() {
                 "SSH101a must reach its authored movement latent, not exhaust the VM budget: {:?}",
                 session.failures
             );
+            // item80 decoded the old assertion here, which required a
+            // `LatentStart { actor: "IAController9", native: "Controller.MoveToward" }`.
+            // `IAController9` is the runtime name of the controller that `BaseSoldier17` spawns,
+            // and that map export is serialised as a pending-kill actor:
+            // `xiii-tool props XIII_Game/maps/SSH101a.unr --export BaseSoldier17` shows
+            // `bDeleteMe=true` and `bPendingDelete=true` (BaseSoldier13/14 too). The engine's
+            // `AActor::IsPendingKill` (Engine.dll 0x10304b40:
+            // `movb 0x2e(%ecx),%al; andl $1,%eax; ret`) reports `AActor+0x2e & 1` = `bDeleteMe`,
+            // so a pending-kill actor receives no `ProcessEvent` and never spawns a controller.
+            // item67f therefore correctly keeps these exports out of the live level; the old
+            // assertion instead depended on the dead `BaseSoldier17` being live. Decoding gate:
+            // temporarily disabling item67f's load-time `bDeleteMe` gate brings `BaseSoldier17`
+            // back live, respawns `IAController9` and re-runs its `AttaqueH2H` ->
+            // `Controller.MoveToward` latent (assertion passes), confirming item67f is what
+            // removed it (measured, item80 report). The `FindBestPathToward` -> `MoveTarget`
+            // behaviour itself stays covered by the unit test
+            // `find_best_path_toward_publishes_move_target_and_preserves_it_on_failure`.
+            for dead in ["BaseSoldier13", "BaseSoldier14", "BaseSoldier17"] {
+                assert!(
+                    vm.find_object(dead).is_none(),
+                    "{dead} is a pending-kill (bDeleteMe=true/bPendingDelete=true) map export and \
+                     must not be a live level actor"
+                );
+            }
             assert!(
-                vm.trace.iter().any(|event| matches!(
+                !vm.trace.iter().any(|event| matches!(
                     &event.kind,
                     TraceKind::LatentStart { actor, native, .. }
                         if actor == "IAController9" && native == "Controller.MoveToward"
                 )),
-                "SSH101a IAController9 must yield to MoveToward after a successful path search"
+                "the pending-kill BaseSoldier17 must not spawn a live IAController9"
             );
         }
         for (i, object) in vm.objects.iter().enumerate() {
