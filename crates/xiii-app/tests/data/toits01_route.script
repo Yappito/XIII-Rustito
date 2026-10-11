@@ -112,10 +112,14 @@ t=317.10 forward 0
 # the launcher before crossing, then run continuously between cover positions.
 # The real-clock damage trace identifies BaseSoldier18 as the rocket instigator.
 # Engage him on landing (roof return-fire was blocked). `goto` overrides tracked
-# yaw, so stand for this burst before starting the run. Measured: 150 -> 15 HP
-# on the317.4 head hit, then -41 on318.2; no incoming damage. Later burst edges
-# cover the crossing until the target is released; no new teleport skips it.
-t=317.20 track BaseSoldier18 0.85
+# yaw, so stand for this burst before starting the run. item69: PickWallAdjust
+# unblocked his pursuit, so he now closes and fires back during the burst (two
+# DTRocketed hits at 318.7 and 320.8 against the old input, measured
+# local/re/item69/toits01-before-retiming.txt). Re-timed: the whole burst is
+# stationary again (the east run waits until he is dead) and starts at 317.15 so
+# the third M60 spine hit lands before his second rocket leaves the tube.
+t=317.15 track BaseSoldier18 0.85
+t=317.20 fire
 t=317.40 fire
 t=317.60 fire
 t=317.80 fire
@@ -123,94 +127,71 @@ t=318.00 fire
 t=318.20 fire
 t=318.40 fire
 t=318.60 fire
-t=318.80 fire
-t=319.00 fire
-t=319.20 fire
-t=319.40 fire
-t=319.60 fire
-t=319.80 fire
-t=320.00 fire
-t=320.20 fire
-t=320.40 fire
-t=320.60 fire
-t=320.80 fire
-t=321.00 fire
-t=321.20 fire
-t=321.40 fire
-t=321.60 track off
-# item53b: the road stand is under enemy fire once the phantom mover cylinders no longer
-# absorb AI rounds (the decoded primitive rule); keep moving through the exposure.
-t=318.50 goto 17800 1150
-t=321.50 goto 18150 1150
+t=318.80 track off
+t=319.00 forward 0
+# item69: soldier17 (bataillefinale, 150 hp) pursues behind soldier18. From the old
+# door-line stand the Tmetaldoorhelico mesh blocked every M60 ray to him while his
+# pursuit flank put his muzzle on the player side (DTGunned 75 at 342.1 and a
+# 74-dmg series through the generator phase killed the route player; measured
+# local/re/item69/toits01-retiming-v1.txt). Duel him at long range instead, from
+# the landing spot, before closing on the door line. His one unavoidable hit is
+# soldier18's in-flight rocket: three dodge retimings (none, one juke, two jukes
+# under local/re/item69/toits01-retiming-v2/-v3/-v4.txt) all took the 318.8 blast
+# (50/45/41 hp), so the route eats it once and duels from range where v3 measured
+# zero returning DTGunned hits.
+# item69: soldier17 (bataillefinale, 150 hp) pursues behind soldier18. From the old
+# door-line stand the Tmetaldoorhelico mesh blocked every M60 ray to him while his
+# pursuit flank put his muzzle on the player side (DTGunned 75 at 342.1 and a
+# 74-dmg series through the generator phase killed the route player; measured
+# local/re/item69/toits01-retiming-v1.txt). Duel him at long range instead, from
+# the landing area, before closing on the door line.
+t=319.10 track BaseSoldier17
+t=319.30 fire
+t=319.50 fire
+t=319.70 fire
+t=319.90 fire
+t=320.10 fire
+t=320.30 fire
+t=320.50 fire
+t=320.70 fire
+t=320.90 fire
+t=321.10 fire
+t=321.30 fire
+t=321.50 fire
+t=321.70 fire
+t=321.90 fire
+t=322.10 fire
+t=322.30 fire
+t=322.50 fire
+t=322.70 fire
+t=322.90 fire
+t=323.10 fire
+t=323.30 fire
+t=323.50 track off
+t=323.70 goto 17800 1150
+t=325.70 forward 0
 # labelled teleport (the warehouse west wall + the Movable2 crate block the doorway;
 # TT10's r700 zone starts west of the wall)
-t=323.00 teleport 18300 1000 800
-t=323.10 forward 0
-t=323.20 goto 18800 1050
+t=326.00 teleport 18300 1000 800
+t=326.10 forward 0
+t=326.30 goto 18800 1050
 # item53b: the helipad wait is under MagnumPlus3 fire once the phantom mover cylinders no
 # longer absorb AI rounds; the wait moves behind the Tmetaldoorhelico line (the sweep from
 # the shooter's muzzle to (18500,1300) is blocked by the door mesh).
-t=324.70 goto 18500 1300
-# item61b: the route player SURVIVES the tarmac (normal-health soldiers; item61) and the
-# game's TouchTrigger10.Touch fired at 325.017 while TT10 is still disarmed (the generator
-# chain is blocked; pinned in the test). The route continues by player input:
+t=328.00 goto 18500 1300
+# item61b: the route player SURVIVES the tarmac and the game's TouchTrigger10.Touch
+# fires while TT10 is still disarmed (the generator chain is blocked; pinned in the
+# test). The route continues by player input:
 #
-# 1. Fight (labelled M60 grant): the fresh import carries only Fists (GameInfo.AcceptInventory
-#    grants no weapon on a campaign map without travel data), so the route grants the M60
-#    through the game's own Weapon.GiveTo/BringUp - the item14 diagnostic bootstrap, the same
-#    grant the item53b spec sanctioned ("the M60 or a weapon the level gives"; the level has
-#    only ammo clips: 2x bmg50AmmoClip, PumpAmmoClip, BazookAmmoClip - no weapon pickup).
-#    BaseSoldier18 (Tag bataillefinale, authored 150 hp, Skill 2, bAlerte) stands on the
-#    lower road at (17807,1438); track him and fire from behind the Tmetaldoorhelico door
-#    line, crouching between bursts (cover).
-# (a closer fight stand at (18150,1250) was measured and rejected: the player, at 74 hp after
-# the tarmac, is killed by the returning fire during the tracked burst - measured
-# local/re/item61b/test-ext5.txt, dead at -6 hp; the door-line standoff below is the cover
-# the item53b comment already used for the helipad wait)
-t=333.20 track BaseSoldier17
-t=334.00 fire
-t=334.50 fire
-t=335.00 fire
-t=335.50 fire
-t=336.00 fire
-t=336.50 fire
-t=337.00 fire
-t=337.50 fire
-t=338.00 fire
-t=338.50 fire
-t=339.00 fire
-t=339.50 fire
-t=340.00 fire
-t=340.50 fire
-t=341.00 fire
-t=341.50 fire
-t=342.00 fire
-t=342.50 fire
-t=343.00 fire
-t=343.50 fire
-t=344.00 fire
-t=344.50 fire
-t=345.00 fire
-t=345.50 fire
-t=346.00 fire
-t=346.50 fire
-t=347.00 fire
-t=347.50 fire
-t=348.00 fire
-t=348.50 fire
-t=353.00 fire
-t=353.50 fire
-t=354.00 fire
-t=354.50 fire
-t=355.00 fire
-t=355.50 fire
-t=356.00 fire
-t=356.50 fire
-t=357.00 fire
-t=357.50 fire
-t=358.00 fire
-t=335.10 crouch 1
-t=336.00 crouch 0
+# Weapon (labelled M60 grant): the fresh import carries only Fists (GameInfo.AcceptInventory
+# grants no weapon on a campaign map without travel data), so the route grants the M60
+# through the game's own Weapon.GiveTo/BringUp - the item14 diagnostic bootstrap, the same
+# grant the item53b spec sanctioned ("the M60 or a weapon the level gives"; the level has
+# only ammo clips: 2x bmg50AmmoClip, PumpAmmoClip, BazookAmmoClip - no weapon pickup).
+# item69: both bataillefinale soldiers (BaseSoldier18 rockets, BaseSoldier17 gun) are
+# engaged and killed in the open-road phase above (the old 333-358 door-line burst is
+# gone: the Tmetaldoorhelico mesh blocked every M60 ray to soldier17 while his pursuit
+# flank put his muzzle on the player side; measured local/re/item69/).
 # 2. Generator-shot retry (the item50 blocker, re-measured post-item53/post-item61): the
 #    walk north toward the yard is blocked at y~1447 by the ForeverLocked door line
 #    (PorteDecors18/Porte6 absorb nothing and never open; measured stalls), so the stand is

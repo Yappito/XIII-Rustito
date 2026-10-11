@@ -1305,6 +1305,11 @@ fn find_path_to(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nat
     val(object_out(vm.nav_find_path_to(c.this, goal)?))
 }
 
+fn pick_wall_adjust(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let direction = vector2(vm, a, 0)?;
+    val(Value::Bool(vm.pick_wall_adjust(c.this, direction)?))
+}
+
 /// `IAController.FindBestPathToward(Actor Desired, float xyMargin, float heightMargin) -> bool`.
 ///
 /// Disassembly evidence (XIDPawn.dll `?execFindBestPathToward@AIAController` RVA 0x1AB0): it reads
@@ -5086,6 +5091,17 @@ fn builtin_defs() -> Vec<NativeDef> {
             "native(518) final function Actor FindPathTo(vector aPoint, bool bClearPaths)",
             "engine.u Controller.FindPathTo decoded; UE2 AController::FindPathTo; Engine.dll ?execFindPathTo@AController",
             find_path_to,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "decoded walking detour and jump probes; flying/swimming Pick3DWallAdjust is explicitly unsupported; ADoor associated geometry override and automatic wall-hit invocation remain incomplete",
+        ),
+        ..def(
+            "Engine.Controller.PickWallAdjust",
+            "native(526) final function bool PickWallAdjust(vector HitNormal)",
+            "Engine.dll execPickWallAdjust 0x10367b80; APawn::PickWallAdjust 0x103b5120..0x103b5b74; AAIController::SetAdjustLocation 0x10368270",
+            pick_wall_adjust,
         )
     });
     v.push(NativeDef {
