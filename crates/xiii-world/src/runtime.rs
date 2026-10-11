@@ -389,6 +389,14 @@ pub struct LoggingAnim {
 }
 
 impl AnimationData for LoggingAnim {
+    fn posed_vertices(
+        &mut self,
+        mesh: &str,
+        pose: Option<(&str, &str, f32, bool)>,
+    ) -> Result<Option<Vec<[f32; 3]>>, String> {
+        self.inner.posed_vertices(mesh, pose)
+    }
+
     fn sequence(&mut self, source: &str, seq: &str) -> Result<Option<SeqInfo>, String> {
         let result = self.inner.sequence(source, seq);
         let outcome = match &result {

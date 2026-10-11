@@ -165,6 +165,12 @@ pub enum UseOutcome {
     Unlocked,
     /// An (unlocked) door was triggered to open/close.
     Triggered,
+    /// A `XIIITriggers` reader was grabbed, but the player carried no matching power-up item, so
+    /// the controller's `Grab` only called `XIIITriggers.PlayerTrigger` (its sound/goal side
+    /// effects); no held item was activated. The retail `Grab` tail
+    /// `XIIIPlayerController.Grab 0x0497..0x0649`: `TryInteractWithTrigger` returned `None`, so
+    /// the reader's `PlayerTrigger` ran instead of an item `Activate`.
+    PlayerTriggerOnly,
     /// A dead pawn in reach was searched (the game's own `PlayerController.SearchPawn`), which
     /// transfers its inventory to the player.
     CorpseSearched,
@@ -839,6 +845,16 @@ impl Session {
         }
     }
 
+    /// Ordinary player exec; the game's controller and interaction own its behavior.
+    pub fn controller_input(&mut self, name: &str) -> Result<(), String> {
+        let pc = self.controller.ok_or("input: no player controller")?;
+        self.vm
+            .send_event(pc, name, Vec::new())
+            .map_err(|e| e.to_string())?;
+        self.drain_events();
+        Ok(())
+    }
+
     /// Dispatch a normal controller weapon-selection exec; completion belongs to the weapon
     /// state machine and decoded animation/timer callbacks, so this does not complete a switch.
     pub fn weapon_input(&mut self, group: Option<u8>) -> Result<(), String> {
@@ -1203,6 +1219,12 @@ impl Session {
         self.vm.mover_states()
     }
 
+    /// Live movers plus the pending-kill (`bDeleteMe`) movers, for the collision partition
+    /// (their triangles must become a disabled moving object, never static geometry).
+    pub fn mover_states_including_pending_kill(&self) -> Vec<MoverState> {
+        self.vm.mover_states_including_pending_kill()
+    }
+
     /// Registers every live mover's box-collision triangles (world space at its `BasePos`/
     /// `BaseRot`) with the VM's physics provider, so the VM's own `Move`/`Trace` consider the
     /// moving brush. The map collision soup is read from `scene`; the host's player physics is
@@ -1277,6 +1299,32 @@ impl Session {
         }
     }
 
+    /// The power-up item the player carries that a `XIIITriggers` reader matches by tag, run
+    /// through the pawn's own `XIIIPawn.FindPowerUpItemNameForTrigger(Trigger.Tag)` (the
+    /// controller's `TryInteractWithTrigger`). `None` means the reader's `Grab` tail only calls
+    /// `XIIITriggers.PlayerTrigger`, so no held item is activated. A script failure is recorded in
+    /// `blocked` (visible), never silently treated as "no item".
+    fn carried_trigger_item(&mut self, trigger: ObjectId) -> Option<ObjectId> {
+        let name = self.vm.get_property(trigger, "Tag").cloned()?;
+        let Some(f) = self
+            .vm
+            .class_function(self.player, "FindPowerUpItemNameForTrigger")
+        else {
+            self.blocked
+                .push("FindPowerUpItemNameForTrigger: pawn has no such function".to_owned());
+            return None;
+        };
+        match self.vm.call_function(f, self.player, vec![name]) {
+            Ok(Value::Object(Some(ObjRef::Instance(i)))) => Some(i),
+            Ok(_) => None,
+            Err(e) => {
+                self.blocked
+                    .push(format!("FindPowerUpItemNameForTrigger failed: {e}"));
+                None
+            }
+        }
+    }
+
     /// Host use action (`E` in `--play`, `use` in a script). Mirrors the tail of
     /// `XIIIPlayerController.Grab` for a mover target: a locked `XIIIPorte` is unlocked with the
     /// matching key the player **carries in the game's inventory** via its own `Trigger`
@@ -1323,6 +1371,16 @@ impl Session {
         }
     }
 
+    /// Sets the player pawn's `Base` to the mover it stands on (`None` clears it), the pawn side of
+    /// a lift ride: the host carries the pawn with the mover ([`super::movers::Rider`]).
+    pub fn set_player_base(&mut self, mover: Option<&str>) {
+        let base = mover
+            .and_then(|name| self.vm.find_object(name))
+            .map(ObjRef::Instance);
+        self.vm
+            .set_property(self.player, "Base", 0, Value::Object(base));
+    }
+
     /// Named mover use or aimed Grab. Corpses/pickups use the game's TargetActor and Grab;
     /// naming an actor cannot supply a target or transfer its inventory.
     pub fn use_target(&mut self, name: &str) -> UseOutcome {
@@ -1332,6 +1390,27 @@ impl Session {
         }
     }
 
+    /// Plain `use` with nothing mover-like under the host ray: if the game's own interaction render
+    /// (`XIIIPlayerInteraction.MyPCPostRender`) chose a `TargetActor` for a trigger (a card reader),
+    /// the controller's `Grab` runs. Returns the target's name; `None` when nothing is targeted.
+    pub fn grab_interaction_target(&mut self) -> Option<(String, UseOutcome)> {
+        let controller = self.controller?;
+        let interaction = instance_prop(&self.vm, controller, "MyInteraction")?;
+        let target = instance_prop(&self.vm, interaction, "TargetActor");
+        let target = target?;
+        if !self.vm.is_a(target, "XIIITriggers")
+            || !matches!(
+                self.vm.get_property(interaction, "bCanTrigger"),
+                Some(Value::Bool(true))
+            )
+        {
+            return None;
+        }
+        let name = self.vm.objects[target as usize].name.clone();
+        let outcome = self.grab_aimed_target(&name);
+        Some((name, outcome))
+    }
+
     /// Named corpse/pickup use validates the target chosen by the game's view trace, then executes
     /// the controller's Grab. Naming an actor never supplies TargetActor or bypasses aiming.
     pub fn grab_aimed_target(&mut self, target_name: &str) -> UseOutcome {
@@ -1339,7 +1418,19 @@ impl Session {
             return UseOutcome::NotAMover;
         };
         let corpse = self.vm.is_a(target, "XIIIPawn") && self.actor_is_dead(target);
-        if !corpse && !self.vm.is_a(target, "XIIIDecoPickup") {
+        // An interactive trigger (a card reader: `MagneticPassTrigger`, `XIIITriggers`) is the
+        // `bCanTrigger` branch of `Grab`: the controller's own `TryInteractWithTrigger` picks the
+        // matching inventory item, which a second `Grab` activates.
+        let trigger = self.vm.is_a(target, "XIIITriggers");
+        // Whether the player carries the item the reader's tag matches (`XIIIPawn.
+        // FindPowerUpItemNameForTrigger`, the controller's `TryInteractWithTrigger`): when it is
+        // absent, `Grab` only runs `XIIITriggers.PlayerTrigger`, not an item `Activate`.
+        let trigger_item = if trigger {
+            self.carried_trigger_item(target)
+        } else {
+            None
+        };
+        if !corpse && !trigger && !self.vm.is_a(target, "XIIIDecoPickup") {
             return UseOutcome::NotAMover;
         }
         let Some(controller) = self.controller else {
@@ -1349,6 +1440,7 @@ impl Session {
             return UseOutcome::Error("controller has no MyInteraction".to_owned());
         };
         if !corpse
+            && !trigger
             && ["Weapon", "PendingWeapon"].iter().any(|slot| {
                 instance_prop(&self.vm, self.player, slot)
                     .is_some_and(|w| self.vm.is_a(w, "DecoWeapon"))
@@ -1362,6 +1454,8 @@ impl Session {
                     interaction,
                     if corpse {
                         "bCanSearchCorpse"
+                    } else if trigger {
+                        "bCanTrigger"
                     } else {
                         "bCanPickup"
                     }
@@ -1376,7 +1470,13 @@ impl Session {
             return UseOutcome::Error(e.to_string());
         }
         self.drain_events();
-        if corpse && instance_prop(&self.vm, target, "Inventory").is_none() {
+        if trigger {
+            if trigger_item.is_some() {
+                UseOutcome::Triggered
+            } else {
+                UseOutcome::PlayerTriggerOnly
+            }
+        } else if corpse && instance_prop(&self.vm, target, "Inventory").is_none() {
             UseOutcome::CorpseSearched
         } else if self.inventory_items().len() > before.len() {
             UseOutcome::PickedUp
@@ -4014,6 +4114,22 @@ mod tests {
         let left_scripted_attack = scripted_states.iter().any(|(from, to)| {
             from.as_deref() == Some("AttaqueScriptee") && to.as_deref() == Some("temporise")
         });
+        let wall_adjust: Vec<_> = session
+            .vm()
+            .trace
+            .iter()
+            .filter_map(|event| match &event.kind {
+                xiii_script::TraceKind::Native {
+                    path, this, result, ..
+                } if path == "Controller.PickWallAdjust"
+                    && this == &session.vm().objects[controller as usize].name =>
+                {
+                    Some((event.time, result.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        println!("[Plage01 pursuit] wall_adjust={wall_adjust:?}");
         println!(
             "[Plage01 combat] cue=TouchTrigger7 event={trigger_event:?}, player={player_location:?}, soldier={soldier_location:?}, distance={player_distance:.1}, SightRadius={sight_radius}, cue Enemy={cue_enemy_name:?}, final Enemy={final_enemy:?}, scripted={scripted_attack_seen}, combat={controller_attack_seen}, held-fire-seen={held_fire_seen}, fire-request-seen={fire_request_seen}, bTire={wants_fire}, soldier state={state:?}, controller state={controller_state:?}, controller states={scripted_states:?}, CanSee={can_see:?}, rotation {initial_rotation:?}->{final_rotation:?}, Health {health_before}->{health_after}; suspended={:?}",
             session.failures
@@ -4027,14 +4143,13 @@ mod tests {
                 && can_see.iter().any(|(_, _, result)| result == "false"),
             "the actual player position should be outside SightRadius with a measured failed CanSee: distance={player_distance}, SightRadius={sight_radius}, CanSee={can_see:?}"
         );
-        // With the live level clock ContinueStakeOut expires and temporise enters Chasse
-        // (IAController.temporise 0x01FC..0x0287). The former Patrouille/no Enemy pin
-        // described a frozen-clock artefact, not the authored distant-player outcome.
+        // The live clock takes temporise into Chasse. Decoded wall adjustment now
+        // allows the authored search to finish and return to patrol without firing.
         assert!(
             cue_enemy == Some(player)
-                && final_enemy.as_deref() == Some(session.player_name.as_str())
+                && final_enemy.is_none()
                 && left_scripted_attack
-                && controller_state.as_deref() == Some("Chasse")
+                && controller_state.as_deref() == Some("Patrouille")
                 && !controller_attack_seen
                 && !held_fire_seen
                 && !fire_request_seen
@@ -4042,19 +4157,30 @@ mod tests {
                 && health_after == health_before,
             "unexpected combat result: Health {health_before}->{health_after}, bTire={wants_fire}"
         );
-        assert_eq!(
-            session.failures.len(),
-            1,
-            "only the measured pursuit blocker may fail"
-        );
         assert!(
-            session.failures[0].0 == session.vm().objects[controller as usize].name
-                && session.failures[0].1.contains("Controller.PickWallAdjust")
-                && session.failures[0].1.contains("Some(526)")
-                && session.failures[0].1.contains("Chasse.PickDestination"),
+            session.failures.is_empty(),
             "unexpected distant-player pursuit failure: {:?}",
             session.failures
         );
+        assert!(
+            scripted_states
+                .iter()
+                .any(|(from, to)| from.as_deref() == Some("temporise")
+                    && to.as_deref() == Some("Chasse"))
+        );
+        assert!(
+            scripted_states
+                .iter()
+                .any(|(from, to)| from.as_deref() == Some("Chasse")
+                    && to.as_deref() == Some("Patrouille"))
+        );
+        assert_eq!(
+            wall_adjust.len(),
+            1,
+            "the measured pursuit calls native 526 once"
+        );
+        assert_eq!(wall_adjust[0].1, "false");
+        assert!((wall_adjust[0].0 - 9.316667).abs() < 1.0 / 60.0);
     }
 
     /// Opt-in corpus regression (item3o): the Plage00 level-start checkpoint path runs the

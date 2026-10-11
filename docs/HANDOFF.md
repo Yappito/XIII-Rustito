@@ -4,9 +4,53 @@ Updated: **2026-10-09 (coordinator session)**. Research phase (2026-10-04), M0, 
 
 ## Next session: start here
 
-State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `7fe4712` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
+State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `0bbd96e` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
-### Session 2026-10-09 — read this first
+### Session 2026-10-10/11 — read this first
+
+Everything verified is on `origin/main` (`0bbd96e`, 992 tests passed, Plage00 `--trace`
+byte-identical). Landed this session (each by the game's own scripts, headless scripted input):
+
+- **Level clock (item68b, the biggest fix):** `LevelInfo.TimeSeconds` was never written, so every
+  script read a frozen clock (HUD message lifetimes, `temporise.ContinueStakeOut`, save logic,
+  AI timers). Now advanced as retail `ULevel::Tick` (Engine.dll 0x10390a10): delta x
+  `TimeDilation` (LevelInfo+0x310), added to a double clock only when `Pauser` (+0x36c) is empty,
+  published to the float field before actors tick. Every route measured before `0bbd96e` was
+  measured on the frozen clock; Hual01a, Toits01 and a Plage01 AI test were re-measured.
+- **Plage01 walked route (item30):** no teleports; fight vs authored-strength soldiers with the
+  picked-up Beretta, corpse auto-search gives the truck key, travel to Banque01. Plage00 ->
+  Plage01 -> Banque01 now chains without teleports.
+- **Anti-tamper writes (item61):** `GameInfo.DummyStuff1/2`, `GenAlerte.dummy`, `MapInfo.TGSDummy`
+  (without them `IAController.Init` sets Skill 5 and Health x5).
+- **Windowed play (item65, item68):** the five route fixtures reach the headless objectives/travel
+  in the window; menu -> New Game -> cine00 -> Plage00 control. `Interaction.WorldToScreen`
+  (Partial, host projection), grouped HUD texture paths, WavePosition in the windowed cinematics,
+  comic depth prepass, presentation events after PostRender, caches reset on travel. HudState
+  messages expire by script; `execDrawTile` rejects null-material tiles (the white centre square);
+  diagnostic overlay off by default (F3 or `--diagnostic-overlay`); DefUser.ini bindings in the
+  live dispatch; Esc releases the mouse, Ctrl+Q quits (the in-map menu needs a GUI bridge:
+  `XIIIPlayerController.ShowMenu` -> `ConsoleCommand("ShowTheMenu")` is unsupported). Frame time
+  p95 < 16.7 ms except Banque01 (~25 ms whole-route; vm_step/hud_postrender/pawn_pose).
+- **Hual02 route (item59)** on main with labelled teleports for the service lift and Porte19.
+
+Open branches (git-ignored worktrees `P:/AI/XIII/local/wt/*`; each has a WIP checkpoint commit and
+was merged with the level-clock main, some mid-merge for their agent to resolve):
+
+| Worktree / branch | State |
+|---|---|
+| `sweep` / `item40f-amos01-duct` | Amos01 completes objective 1 and travels to Toits01 by the punch chain; SpawnProjectile bridge removed; after merges the route blocks at a BSP wall x=-1280; no-body script-call semantics to decode. Agent item40k. |
+| `bsp` / `item64-player-grapple` | Player grapple (replaces Toits01's two grapple teleports). Mid-merge with main's real-clock Toits01 route; duplicate `Interaction.WorldToScreen` (keep main's canvas.rs one). Agent item64d. |
+| `viewer` / `item67-lifts-keycards` | Hual02 lift by input (one leg blocked), card room sealed behind a blocked meeting event. Mid-merge. Agent item67c. |
+| `audio` / `item69-pickwalladjust` | Native 526 `Controller.PickWallAdjust` (IAController `Chasse` pursuit; reached once the clock runs). Agent item69b. |
+| `steam` / `item66-hual04a-route` | Hual04a objective map measured; the card chain needs all six soldiers dead. Parked. |
+
+**Providers (user's instructions 2026-10-10):** opencode `zai-coding-plan/glm-5.3-flash` (5-hour
+window; the reset time it prints is Beijing time, UTC+8; four sessions use the window in about an
+hour); opencode `openai/gpt-6.1-sol` (one session) and Codex CLI `gpt-6.1-sol` (credits run out after
+~380-480k tokens); Sonnet/Haiku sub-agents only with limited use (they share the user's Claude
+usage). **EUM and Opus sub-agents are no longer used.**
+
+### Session 2026-10-09 (historical)
 
 Everything verified is on `origin/main` (`7fe4712`, 902 tests passed, Plage00 `--trace`
 byte-identical). Open work (git-ignored worktrees under `P:/AI/XIII/local/wt/*`):
@@ -394,22 +438,19 @@ Native Windows reports an RTX 4090. Rust/Cargo were not found on the inspected W
 
 ## Exact next work
 
-1. **Plage01 walked route** (item30c, `audio` branch): finish the fight against the now more
-   engine-accurate AI, merge (resolve the trace filter in favour of item47's decoded rule).
-2. **Amos01** (item40f): duct -> rooftop objective -> travel to Toits01.
-3. **Missing natives** (item48): `VisibleDamageableActors` (HurtRadius), `WaveHasPosition`;
-   `AdjustAimForDisplay` snap-to-target path.
-4. **Banque01 residual teleports:** the five strongroom/escape teleports (measured walker wedges at
-   x=-7010, y=-2046, x=964 may be walker defects; the original nav graph has no path there).
-5. **Survey-driven:** rerun `xiii-app --survey` after each batch; next campaign maps after
-   Toits01 in `NextMapLevelWithUnr` order.
-6. **Host bridges still in use:** route `equip`/`wake`/`set_goal`/`take_control` diagnostic
-   commands, deco-pickup `TargetActor` assignment (item40e), `search_corpse` fix-up (item30c says
-   it covers a deferred-call orphan). Each needs its engine path.
-7. **Performance:** benchmark item39 on a quiet machine; `vm_step` dominates busy maps.
-8. **Menus/rendering:** menu backdrop and comic outline need retail reference captures from the user.
-
-Do not report playable progress from the viewer, the `--play` prototype or headless traces until a mission can be completed by the game's own logic without host shortcuts.
+1. **Finish and land the open branches** above (Amos01, Toits01 grapple, Hual02 lift/keycard,
+   PickWallAdjust), each re-measured on the real clock.
+2. **AI pursuit natives** reached now that the clock runs: `PickWallAdjust` (526) and whatever
+   `Chasse`/`temporise` reach next; rerun the combat survey.
+3. **User playtest** of Plage00 -> Plage01 -> Banque01 in the window (`--menu`), then fix what
+   they find. In-map menu (Esc -> `ShowTheMenu`) needs a GUI bridge in the play host.
+4. **Next maps:** Hual04a (item66), then onward in `NextMapLevelWithUnr` order; Toits01 generator
+   yard access; Banque01's residual strongroom/escape teleports.
+5. **Renderer diagnostics:** Bevy slab_allocator "Use-after-free" messages, missing
+   RenderTargetMaterial tiles on the destination map's first comic, one Banque01 stale entity.
+6. **Performance:** Banque01 vm_step/hud_postrender/pawn_pose.
+7. **Host bridges still in use:** route diagnostic `weapon` grants and labelled teleports; each
+   needs its engine path.
 
 ## Validation completed
 

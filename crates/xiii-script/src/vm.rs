@@ -510,6 +510,8 @@ pub(crate) struct AnimChannel {
 /// Per-actor animation state: the animation sources and one channel per `Channel` argument.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AnimState {
+    /// Frozen world-space skeletal render box (Engine mesh-instance FBox +0x248).
+    pub(crate) frozen_render_bounds: Option<([f32; 3], [f32; 3])>,
     /// `MeshAnimation` object paths linked with `Actor.LinkSkelAnim`, in call order.
     pub(crate) linked_anims: Vec<String>,
     /// Channels by index (ordered for deterministic notifies/traces).
@@ -1377,6 +1379,9 @@ pub struct Vm<'s> {
     pub combat_natives: BTreeMap<String, (u64, Vec<StackEntry>)>,
     /// Opt-in collection of firing-path call stacks (off during ordinary play).
     pub collect_combat_natives: bool,
+    /// Actors that were attached to a base through `Actor.SetBase` (the engine's `Attached` list
+    /// is the inverse of `Base`): a moving brush carries those whose `Base` still names it.
+    based_candidates: Vec<ObjectId>,
     /// Survey mode: unimplemented natives are counted and skipped instead of failing.
     pub survey: bool,
     /// Distinct unimplemented natives seen in survey mode (path -> record, first-hit order).
@@ -1631,6 +1636,7 @@ impl<'s> Vm<'s> {
             natives_first_caller: Default::default(),
             combat_natives: Default::default(),
             collect_combat_natives: false,
+            based_candidates: Vec::new(),
             survey: false,
             missing_natives: Default::default(),
             pending_latent: None,
@@ -3212,6 +3218,18 @@ impl<'s> Vm<'s> {
             if self.objects[id as usize].is_actor {
                 self.apply_native_init_execution(id);
             }
+            // item67f: a map's tagged-property blocks serialise editor/runtime state, including
+            // `bDeleteMe` on actors the level no longer contains. Hual02's trailing export block
+            // holds 54 such destroyed actors (among them `Porte4`/`Porte20` and the `LiftManager0`'s
+            // stale serialised `XIIIMover0` cage). `AActor::IsPendingKill` (Engine.dll 0x10304b40)
+            // returns `AActor+0x2e & 1` = `bDeleteMe`, and a pending-kill actor receives no
+            // `ProcessEvent` and leaves the collision hash, so the VM must not run them either
+            // (the dead `Porte20` otherwise blocks the floor-2 lift exit). The objects stay so
+            // serialised references still resolve, exactly as the engine keeps them until GC.
+            if self.bool_prop(id, "bDeleteMe") {
+                self.objects[id as usize].deleted = true;
+                self.objects[id as usize].active = false;
+            }
         }
         // Cache the map's `LevelInfo` for the per-tick `NextURL` travel check.
         self.level_info = self.find_level_info();
@@ -4010,17 +4028,20 @@ impl<'s> Vm<'s> {
         // Movers advance in the same pre-state slice (UE2 `physInterpolating` runs in Tick), so
         // a `FinishInterpolation` waiter resumes in the tick its `bInterpolating` clears.
         for id in 0..self.objects.len() as ObjectId {
-            if self.objects[id as usize].active {
+            if self.objects[id as usize].active && !self.objects[id as usize].deleted {
                 self.advance_interpolation(id, dt)?;
             }
         }
         for id in 0..self.objects.len() as ObjectId {
-            if self.objects[id as usize].active {
+            if self.objects[id as usize].active && !self.objects[id as usize].deleted {
                 self.process_state(id, dt)?;
             }
         }
         for id in 0..self.objects.len() as ObjectId {
-            if self.objects[id as usize].active && self.objects[id as usize].is_actor {
+            if self.objects[id as usize].active
+                && !self.objects[id as usize].deleted
+                && self.objects[id as usize].is_actor
+            {
                 self.dispatch_tick(id, dt)?;
             }
         }
@@ -7083,6 +7104,25 @@ impl<'s> Vm<'s> {
         Some(s)
     }
 
+    /// Live movers plus the pending-kill (`bDeleteMe`) movers. The host's collision partition
+    /// must own a pending-kill mover's triangles with a **disabled** moving object rather than
+    /// let them fall through to the static soup: Hual02 holds both the live `LiftCage0` and the
+    /// pending-kill `XIIIMover0` (the `LiftManager0`'s stale serialised cage) at the same spot, and
+    /// making the dead one static shadows the live cage so the rider is never carried.
+    pub fn mover_states_including_pending_kill(&self) -> Vec<MoverState> {
+        let mut out = Vec::new();
+        for (i, object) in self.objects.iter().enumerate() {
+            if let Some(mut s) = self
+                .mover_state_of(i as ObjectId)
+                .or_else(|| self.mover_state_pending_kill(i as ObjectId))
+            {
+                s.name = object.name.clone();
+                out.push(s);
+            }
+        }
+        out
+    }
+
     /// True when `id` is a live instance deriving from `Mover`.
     pub fn is_mover(&self, id: ObjectId) -> bool {
         self.is_live_actor(id) && self.is_a(id, "mover")
@@ -7094,7 +7134,24 @@ impl<'s> Vm<'s> {
         if !o.is_actor || o.deleted || o.name.starts_with("Default__") || !o.layout.is_mover_class {
             return None;
         }
-        Some(MoverState {
+        Some(self.mover_state_fields(id))
+    }
+
+    /// Pose/state of a pending-kill (`bDeleteMe`) mover with collision forced off (the engine
+    /// removed it from the collision hash). See [`Vm::mover_states_including_pending_kill`].
+    fn mover_state_pending_kill(&self, id: ObjectId) -> Option<MoverState> {
+        let o = self.objects.get(id as usize)?;
+        if !o.is_actor || !o.deleted || o.name.starts_with("Default__") || !o.layout.is_mover_class
+        {
+            return None;
+        }
+        let mut s = self.mover_state_fields(id);
+        s.blocks_players = false;
+        Some(s)
+    }
+
+    fn mover_state_fields(&self, id: ObjectId) -> MoverState {
+        MoverState {
             name: String::new(),
             location: self.location_prop(id).unwrap_or([0.0; 3]),
             rotation: self.rotation_prop(id).unwrap_or([0; 3]),
@@ -7106,7 +7163,7 @@ impl<'s> Vm<'s> {
             interpolating: self.bool_prop(id, "bInterpolating"),
             blocks_players: self.bool_prop(id, "bCollideActors")
                 && self.bool_prop(id, "bBlockPlayers"),
-        })
+        }
     }
 
     /// item40e: propagates every mover's collision state to the world-physics provider. A mover
@@ -8245,10 +8302,6 @@ impl<'s> Vm<'s> {
     /// `bHidden` is deliberately NOT tested: it appears nowhere in the hash insert/remove paths,
     /// the hash walk, or any `ShouldTrace` override. A carried first-person weapon does not block
     /// because its class defaults clear `bCollideActors` (`xiii.Fists`, measured).
-    fn trace_admits_actor(&self, candidate: ObjectId, tracer: ObjectId, nonzero: bool) -> bool {
-        self.trace_admits_actor_flags(candidate, tracer, nonzero, 0xbf)
-    }
-
     fn trace_admits_actor_flags(
         &self,
         candidate: ObjectId,
@@ -8327,6 +8380,15 @@ impl<'s> Vm<'s> {
                 native: "Actor.TraceActors".into(),
             }));
         };
+        // The iterator's per-hit line check composes its trace flags as `flags | 0x9f`
+        // (Engine.dll `execTraceActors` 0x103e8c70, the `orl $0x9f, %esi` at 0x103e8e68; the
+        // iterator's AdditionalTraceType stack slot is zero-initialized at 0x103e8dff). 0x9f
+        // clears the 0x20/0x40 bits of `execTrace`'s 0xbf, so `AActor::ShouldTrace`
+        // (0x10354640) admits every other colliding actor without the
+        // `bProjTarget || (bBlockActors && bBlockPlayers)` gate. Measured item67 consequence:
+        // Hual02's card reader `MagneticPassTrigger1` (bInteractive, bBlockActors=false) is a
+        // `XIIIPlayerController.ReturnTrace` candidate; with 0xbf it was filtered and the aim
+        // fell through to a farther mover's class-cylinder hit.
         // UE2's iterator returns actors intersected by the swept trace; world geometry occludes
         // candidates at or beyond the first world hit. item54: a hit sourced from the candidate's
         // own primitive (a mover's mesh triangles, item53's placed-mesh actors) must not occlude
@@ -8359,7 +8421,7 @@ impl<'s> Vm<'s> {
             if base.is_some_and(|class| !self.objects[id as usize].layout.chain.contains(&class)) {
                 continue;
             }
-            if !self.trace_admits_actor(id, caller, nonzero) {
+            if !self.trace_admits_actor_flags(id, caller, nonzero, 0x9f) {
                 continue;
             }
             let (loc, radius, height) = self.actor_cylinder(id);
@@ -8460,10 +8522,9 @@ impl<'s> Vm<'s> {
         )
     }
 
-    /// Script Trace's composed flags; pawn/mover category bits remain effective even when
-    /// bTraceActors was false. Special BSP/material filtering remains Partial.
+    /// Internal composed trace flags, with endpoint-on-miss outputs. Special
+    /// BSP/material filtering remains Partial.
     #[allow(clippy::type_complexity)]
-    #[cfg(test)]
     pub(crate) fn vm_trace_flags(
         &mut self,
         id: ObjectId,
@@ -9441,6 +9502,138 @@ impl<'s> Vm<'s> {
         self.nav_point_reachable(controller, point)
     }
 
+    /// Retail walking wall adjustment (Engine.dll 0x103b5120). The supplied vector
+    /// is only used by the jump branch; lateral choices derive from Destination.
+    pub(crate) fn pick_wall_adjust(
+        &mut self,
+        controller: ObjectId,
+        hit_normal: [f32; 3],
+    ) -> VmResult<bool> {
+        let Some(pawn) = self.obj_prop(controller, "Pawn") else {
+            return Ok(false);
+        };
+        let physics = self.byte_prop(pawn, "Physics");
+        if physics == 2 || self.obj_prop(pawn, "Controller").is_none() {
+            return Ok(false);
+        }
+        if matches!(physics, 3 | 4) {
+            return Err(self.err(VmErrorKind::Other(
+                "Controller.PickWallAdjust: swimming/flying Pick3DWallAdjust is not implemented"
+                    .into(),
+            )));
+        }
+        let loc = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let dest = self.vector_prop(controller, "Destination").unwrap_or(loc);
+        let radius = self.f32_prop(pawn, "CollisionRadius");
+        let height = self.f32_prop(pawn, "CollisionHeight");
+        let delta = sub3(dest, loc);
+        if !hit_normal.iter().chain(delta.iter()).all(|v| v.is_finite())
+            || !radius.is_finite()
+            || radius < 0.0
+            || !height.is_finite()
+            || height < 0.0
+        {
+            return Err(self.err(VmErrorKind::Other(
+                "Controller.PickWallAdjust: invalid direction, destination or pawn extent".into(),
+            )));
+        }
+        if delta[2] > height && delta[0] * delta[0] + delta[1] * delta[1] < radius * radius {
+            return Ok(false);
+        }
+        let length = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+        if length == 0.0 {
+            return Ok(false);
+        }
+        let dir = [delta[0] / length, delta[1] / length, 0.0];
+        let eye = add3(loc, [0.0, 0.0, self.f32_prop(pawn, "EyeHeight")]);
+        let associated = self
+            .obj_prop(controller, "MoveTarget")
+            .filter(|&target| self.bool_prop(target, "bWorldGeometry"));
+        let trace = self.vm_trace_flags(pawn, eye, dest, 0x286, [0.0; 3])?;
+        let distance = 16.0 + 1.5 * radius + if trace.0 != associated { radius } else { 0.0 };
+        let mut side = [dir[1], -dir[0], 0.0];
+        let mut eye_offset = scale3(side, 1.4 * radius);
+        let mut reversed = false;
+        if self
+            .vm_trace_flags(pawn, add3(eye, eye_offset), dest, 0x286, [0.0; 3])?
+            .0
+            != associated
+        {
+            side = scale3(side, -1.0);
+            eye_offset = scale3(eye_offset, -1.0);
+            reversed = true;
+            if self
+                .vm_trace_flags(pawn, add3(eye, eye_offset), dest, 0x286, [0.0; 3])?
+                .0
+                != associated
+            {
+                return Ok(false);
+            }
+        }
+        let extent = [radius, radius, height];
+        let forward = scale3(dir, 14.0);
+        // This is a jump-clearance test, not the walker's ordinary 35-UU step-up.
+        if physics == PHYS_WALKING && self.bool_prop(pawn, "bCanJump") {
+            let up = add3(loc, [0.0, 0.0, 80.0]);
+            let (_, point, _) = self.vm_trace_flags(pawn, loc, up, 0x86, extent)?;
+            let fraction = (point[2] - loc[2]) / 80.0;
+            if fraction > 0.5 {
+                let raised = add3(loc, [0.0, 0.0, 80.0 * fraction]);
+                if self
+                    .vm_trace_flags(pawn, raised, add3(raised, forward), 0x286, extent)?
+                    .0
+                    .is_none()
+                {
+                    let jump_dir = [-hit_normal[0], -hit_normal[1], 0.0];
+                    let mut velocity = scale3(jump_dir, self.f32_prop(pawn, "GroundSpeed"));
+                    velocity[2] = self.f32_prop(pawn, "JumpZ");
+                    self.set_property(pawn, "Velocity", 0, Value::Vector(velocity));
+                    self.set_property(
+                        pawn,
+                        "Acceleration",
+                        0,
+                        Value::Vector(scale3(jump_dir, self.f32_prop(pawn, "AccelRate"))),
+                    );
+                    self.set_property(pawn, "Physics", 0, Value::Byte(2));
+                    return Ok(true);
+                }
+            }
+        }
+        for attempt in 0..2 {
+            if attempt == 1 {
+                if reversed {
+                    break;
+                }
+                eye_offset = scale3(eye_offset, -1.0);
+                if self
+                    .vm_trace_flags(pawn, add3(eye, eye_offset), dest, 0x286, [0.0; 3])?
+                    .0
+                    .is_some()
+                {
+                    break;
+                }
+                side = scale3(side, -1.0);
+            }
+            let candidate = add3(loc, scale3(side, distance));
+            if self
+                .vm_trace_flags(pawn, loc, candidate, 0x286, extent)?
+                .0
+                .is_none()
+                && self
+                    .vm_trace_flags(pawn, candidate, add3(candidate, forward), 0x286, extent)?
+                    .0
+                    .is_none()
+            {
+                if self.is_a(controller, "AIController") {
+                    self.set_property(controller, "bAdjusting", 0, Value::Bool(true));
+                    self.set_property(controller, "AdjustLoc", 0, Value::Vector(candidate));
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Starts a latent `MoveTo`/`MoveToward`. Returns `false` when there is no pawn to move (the
     /// native then returns `void` without suspending, like upstream on a controller without a
     /// pawn). `native` is recorded in the latent for the trace.
@@ -10120,6 +10313,64 @@ impl<'s> Vm<'s> {
 
     // ------------------------------------------------------------------ animation
 
+    /// Frozen skeletal render bounds. Collision dimensions and touching are independent.
+    pub fn frozen_render_bounds(&self, id: ObjectId) -> Option<([f32; 3], [f32; 3])> {
+        self.objects.get(id as usize)?.anim.frozen_render_bounds
+    }
+
+    pub(crate) fn recompute_bounding_volume(&mut self, id: ObjectId, freeze: bool) -> VmResult<()> {
+        let mesh = match self.get_property(id, "Mesh") {
+            Some(Value::Object(Some(r))) => self.ref_path(r),
+            _ => return Ok(()), // Retail checks Mesh and skeletal instance before changing anything.
+        };
+        if !freeze {
+            self.objects[id as usize].anim.frozen_render_bounds = None;
+            return Ok(());
+        }
+        let pose = self.anim_channel_pose(id, 0);
+        let channel = pose
+            .as_ref()
+            .map(|(seq, source, frame, looping)| (seq.as_str(), source.as_str(), *frame, *looping));
+        let Some(provider) = self.animation.as_mut() else {
+            return Err(self.err(VmErrorKind::NoAnimationProvider {
+                native: "Actor.RecomputeBoundingVolume".into(),
+            }));
+        };
+        let vertices = provider
+            .posed_vertices(&mesh, channel)
+            .map_err(|e| self.err(VmErrorKind::Other(e)))?;
+        let Some(vertices) = vertices else {
+            return Ok(());
+        };
+        let location = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
+        let scale = match self.get_property(id, "DrawScale") {
+            Some(Value::Float(s)) => *s,
+            _ => 1.0,
+        };
+        let scale3 = self.vector_prop(id, "DrawScale3D").unwrap_or([1.0; 3]);
+        let (x, y, z) = crate::registry::rotator_basis(self.rotation_prop(id).unwrap_or([0; 3]));
+        let mut bounds: Option<([f32; 3], [f32; 3])> = None;
+        for p in vertices {
+            let p: [f32; 3] = std::array::from_fn(|i| p[i] * scale * scale3[i]);
+            let world: [f32; 3] =
+                std::array::from_fn(|i| location[i] + x[i] * p[0] + y[i] * p[1] + z[i] * p[2]);
+            if world.iter().any(|v| !v.is_finite()) {
+                return Err(self.err(VmErrorKind::Other(
+                    "non-finite skeletal bounding vertex".into(),
+                )));
+            }
+            bounds = Some(match bounds {
+                None => (world, world),
+                Some((min, max)) => (
+                    std::array::from_fn(|i| min[i].min(world[i])),
+                    std::array::from_fn(|i| max[i].max(world[i])),
+                ),
+            });
+        }
+        self.objects[id as usize].anim.frozen_render_bounds = bounds;
+        Ok(())
+    }
+
     /// Display path of an object reference (empty when it cannot be named).
     fn ref_path(&self, r: &ObjRef) -> String {
         match r {
@@ -10612,6 +10863,10 @@ impl<'s> Vm<'s> {
             return Ok(());
         }
         let alpha = self.f32_prop(id, "PhysAlpha") + rate * dt;
+        let carried_from = (
+            self.vector_prop(id, "Location").unwrap_or([0.0; 3]),
+            self.rotator_prop(id, "Rotation").unwrap_or([0; 3]),
+        );
         let key_num = usize::from(self.byte_prop(id, "KeyNum"));
         let old_pos = self
             .vector_prop(id, "OldPos")
@@ -10657,8 +10912,96 @@ impl<'s> Vm<'s> {
                 Value::Rotator(lerp_rotator(old_rot, target_rot, alpha)),
             );
         }
+        self.carry_attached_actors(id, carried_from.0, carried_from.1);
         self.update_physics_mover(id);
         Ok(())
+    }
+
+    /// Records that `actor` was attached to a base by `Actor.SetBase` (upstream UE2 appends it to
+    /// the base's `Attached` array in `AActor::SetBase` 0x103555c0; hypothesis, body not decoded).
+    pub(crate) fn note_attached(&mut self, actor: ObjectId) {
+        if !self.based_candidates.contains(&actor) {
+            self.based_candidates.push(actor);
+        }
+    }
+
+    /// Carries the actors attached to the moving brush `mover` after it moved from
+    /// `(old_location, old_rotation)`.
+    ///
+    /// Decoded (`Engine.dll ULevel::MoveActor` 0x1038a770, loop 0x1038ae0d..0x1038b084): once the
+    /// mover's `Location`/`Rotation` are stored, every actor in its `Attached` array (the
+    /// `AActor` array at +0x100) is moved through `MoveActor` by the mover's displacement, its
+    /// offset re-derived through the mover's new rotation when the rotation changed. The VM has no
+    /// `Attached` array: it keeps the actors given a base through `SetBase` and carries those whose
+    /// `Base` is still this mover. Not modelled (hypothesis, unmeasured for this game): the
+    /// attached actor's own rotation delta and the per-actor blocking test of the nested MoveActor.
+    fn carry_attached_actors(
+        &mut self,
+        mover: ObjectId,
+        old_location: [f32; 3],
+        old_rotation: [i32; 3],
+    ) {
+        if self.based_candidates.is_empty() {
+            return;
+        }
+        let new_location = self.vector_prop(mover, "Location").unwrap_or(old_location);
+        let new_rotation = self.rotator_prop(mover, "Rotation").unwrap_or(old_rotation);
+        if new_location == old_location && new_rotation == old_rotation {
+            return;
+        }
+        let delta = [
+            new_location[0] - old_location[0],
+            new_location[1] - old_location[1],
+            new_location[2] - old_location[2],
+        ];
+        let candidates = std::mem::take(&mut self.based_candidates);
+        let mut kept = Vec::with_capacity(candidates.len());
+        for actor in candidates {
+            if self.objects.get(actor as usize).is_none_or(|o| o.deleted) {
+                continue;
+            }
+            kept.push(actor);
+            if actor == mover || self.obj_prop(actor, "Base") != Some(mover) {
+                continue;
+            }
+            let Some(location) = self.vector_prop(actor, "Location") else {
+                continue;
+            };
+            let moved = if new_rotation == old_rotation {
+                [
+                    location[0] + delta[0],
+                    location[1] + delta[1],
+                    location[2] + delta[2],
+                ]
+            } else {
+                let offset = [
+                    location[0] - old_location[0],
+                    location[1] - old_location[1],
+                    location[2] - old_location[2],
+                ];
+                let (ox, oy, oz) = crate::registry::rotator_basis(old_rotation);
+                let local = [
+                    offset[0] * ox[0] + offset[1] * ox[1] + offset[2] * ox[2],
+                    offset[0] * oy[0] + offset[1] * oy[1] + offset[2] * oy[2],
+                    offset[0] * oz[0] + offset[1] * oz[1] + offset[2] * oz[2],
+                ];
+                let (nx, ny, nz) = crate::registry::rotator_basis(new_rotation);
+                [
+                    new_location[0] + local[0] * nx[0] + local[1] * ny[0] + local[2] * nz[0],
+                    new_location[1] + local[0] * nx[1] + local[1] * ny[1] + local[2] * nz[1],
+                    new_location[2] + local[0] * nx[2] + local[1] * ny[2] + local[2] * nz[2],
+                ]
+            };
+            self.set_property(actor, "Location", 0, Value::Vector(moved));
+            if self.is_mover(actor) {
+                self.update_physics_mover(actor);
+            }
+        }
+        // A carried actor may itself have been re-based while we iterated; keep the new list.
+        let added = std::mem::replace(&mut self.based_candidates, kept);
+        for actor in added {
+            self.note_attached(actor);
+        }
     }
 
     /// Mirrors a mover's current pose into the world-physics provider (if one is installed) so

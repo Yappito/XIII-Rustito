@@ -88,6 +88,8 @@ struct WorldRes {
     world: CollisionWorld,
     sources: Vec<String>,
     movers: movers::MoverCollision,
+    /// The mover the player stands on (a lift cage carries the player).
+    rider: movers::Rider,
 }
 
 /// Render entities per map actor (the part of the scene object path before `" -> "`), for the
@@ -569,7 +571,8 @@ fn setup_inner(
     }
 
     let mover_states = session.mover_states();
-    let (mut world, mover_collision) = movers::MoverCollision::build(&scene, &mover_states);
+    let mover_parts = session.mover_states_including_pending_kill();
+    let (mut world, mover_collision) = movers::MoverCollision::build(&scene, &mover_parts);
     mover_collision.update(&mut world, &mover_states);
     println!(
         "[play] movers: {} collision objects from {} live mover actors ({} static triangles): {}",
@@ -834,6 +837,7 @@ fn setup_inner(
         world,
         sources,
         movers: mover_collision,
+        rider: movers::Rider::default(),
     });
     if !resetting {
         commands.insert_resource(ScriptRes { drive });
@@ -941,14 +945,23 @@ fn perform_use(
     params: &PlayerParams,
 ) {
     let (origin, dir) = use_ray(sim, params);
-    match ray_target(world, sources, origin, dir, USE_REACH_M) {
-        Some(target) => {
-            // A mover is used through its own lock/unlock/open chain; a dead pawn in front is
-            // searched (the engine `Grab` interaction). `use_target` tries both, in that order.
-            let outcome = sess.use_target(&target);
+    let hit = ray_target(world, sources, origin, dir, USE_REACH_M);
+    let outcome = hit.as_ref().map(|target| sess.use_target(target));
+    match (hit, outcome) {
+        // A mover is used through its own lock/unlock/open chain; a dead pawn in front is
+        // searched (the engine `Grab` interaction). `use_target` tries both, in that order.
+        (Some(target), Some(outcome)) if outcome != session::UseOutcome::NotAMover => {
             println!("[play] use {target}: {outcome:?}");
         }
-        None => println!("[play] use: nothing in reach"),
+        // Nothing mover-like was hit: a card reader has no collision, so the game's own
+        // interaction targeting (`MyInteraction.TargetActor`) decides what `Grab` acts on.
+        (hit, _) => match sess.grab_interaction_target() {
+            Some((target, outcome)) => println!("[play] use {target}: {outcome:?}"),
+            None => match hit {
+                Some(target) => println!("[play] use {target}: NotAMover"),
+                None => println!("[play] use: nothing in reach"),
+            },
+        },
     }
 }
 
@@ -1055,6 +1068,14 @@ fn fixed_step(
         .drive
         .as_mut()
         .is_some_and(script::Drive::take_quick_heal);
+    let mut exec_inputs = script
+        .drive
+        .as_mut()
+        .map(script::Drive::take_exec_inputs)
+        .unwrap_or_default();
+    if suppressed {
+        exec_inputs.clear();
+    }
     if suppressed {
         input = Input::default();
     }
@@ -1080,6 +1101,19 @@ fn fixed_step(
         );
     }
     perf.span("player_sim", t0);
+    if let Ok(sess) = session.as_mut() {
+        let sim = &sim.0;
+        let world = &mut *world;
+        if let movers::BaseChange::Changed(base) =
+            world
+                .rider
+                .observe(sim.grounded, sim.floor_source, &world.sources, |name| {
+                    sess.vm().mover_state(name)
+                })
+        {
+            sess.set_player_base(base.as_deref());
+        }
+    }
     // Player footsteps: the original fires the `PlayFootStep` notify from the third-person walk
     // animation, which `--play` does not render, so the host synthesises it from the same
     // surface lookup the script would read from `LastCollidedMaterial`. Emit only when audio is
@@ -1110,6 +1144,9 @@ fn fixed_step(
         };
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
         sess.sync_view_rotation(sim.0.yaw, sim.0.pitch);
+        world
+            .rider
+            .carry(&mut sim.0.location, |name| sess.vm().mover_state(name));
         if let Some((location, yaw, velocity)) = sess.script_pawn_pose() {
             sim.0.location = location;
             sim.0.yaw = yaw;
@@ -1178,6 +1215,11 @@ fn fixed_step(
             match sess.take_control() {
                 Ok(state) => println!("[play] take_control diagnostic: controller -> {state}"),
                 Err(e) => println!("[play] take_control failed: {e}"),
+            }
+        }
+        for name in exec_inputs {
+            if let Err(e) = sess.controller_input(name) {
+                sess.blocked.push(format!("{name} input: {e}"));
             }
         }
         if heal && let Err(e) = sess.quick_heal() {
@@ -2211,6 +2253,8 @@ struct MapRuntime {
     session: session::Session,
     world: CollisionWorld,
     mover_collision: movers::MoverCollision,
+    /// The mover the player stands on (a lift cage carries the player).
+    rider: movers::Rider,
     volumes: movement_modes::VolumeMotion,
     sim: PlayerSim,
     player_params: PlayerParams,
@@ -2274,7 +2318,8 @@ fn build_map_runtime(
     session.vm_mut().set_wave_position(Box::new(voice_provider));
     session.register_movers(scene);
     let mover_states = session.mover_states();
-    let (mut world, mover_collision) = movers::MoverCollision::build(scene, &mover_states);
+    let mover_parts = session.mover_states_including_pending_kill();
+    let (mut world, mover_collision) = movers::MoverCollision::build(scene, &mover_parts);
     mover_collision.update(&mut world, &mover_states);
     println!(
         "[play] movers: {} collision objects from {} live mover actors ({} static triangles): {}",
@@ -2328,6 +2373,7 @@ fn build_map_runtime(
         session,
         world,
         mover_collision,
+        rider: movers::Rider::default(),
         volumes,
         sim,
         player_params: *params,
@@ -2482,6 +2528,7 @@ fn run_script_inner(
         let mut use_named = drive.take_use_named();
         let control = drive.take_control();
         let mut heal = drive.take_quick_heal();
+        let mut exec_inputs = drive.take_exec_inputs();
         // Match the interactive fixed_step: FPC/FPL/CameraView/PlayingVideo own the pawn while
         // the authored cinematic runs. The headless route must still advance its script cursor,
         // but player-axis/action commands are ignored. Explicit test-only set_goal commands are
@@ -2494,6 +2541,7 @@ fn run_script_inner(
             weapon_inputs.clear();
             use_named.clear();
             heal = false;
+            exec_inputs.clear();
         }
         let fired = input.fire;
         if runtime.volumes.is_empty() {
@@ -2509,6 +2557,14 @@ fn run_script_inner(
                 &runtime.sources,
                 &runtime.volumes,
             );
+        }
+        if let movers::BaseChange::Changed(base) = runtime.rider.observe(
+            runtime.sim.grounded,
+            runtime.sim.floor_source,
+            &runtime.sources,
+            |name| runtime.session.vm().mover_state(name),
+        ) {
+            runtime.session.set_player_base(base.as_deref());
         }
         // The headless driver only records footsteps; playback belongs to the windowed
         // `fixed_step` path (this function opens no audio device).
@@ -2540,6 +2596,9 @@ fn run_script_inner(
         runtime
             .session
             .sync_view_rotation(runtime.sim.yaw, runtime.sim.pitch);
+        runtime.rider.carry(&mut runtime.sim.location, |name| {
+            runtime.session.vm().mover_state(name)
+        });
         runtime.session.drive_render_phase();
         if let Some((location, yaw, velocity)) = runtime.session.script_pawn_pose() {
             runtime.sim.location = location;
@@ -2574,6 +2633,11 @@ fn run_script_inner(
             match runtime.session.take_control() {
                 Ok(state) => println!("[play] take_control diagnostic: controller -> {state}"),
                 Err(e) => println!("[play] take_control failed: {e}"),
+            }
+        }
+        for name in exec_inputs {
+            if let Err(e) = runtime.session.controller_input(name) {
+                runtime.session.blocked.push(format!("{name} input: {e}"));
             }
         }
         if heal && let Err(e) = runtime.session.quick_heal() {
@@ -4055,10 +4119,12 @@ mod tests {
     /// TestGoalComplete -> DoTravel -> EndGame -> GameEndedSuccess -> PlayingVideo ->
     /// PlayingVideo.PlayerTick -> ServerTravel` chain as Plage01. The route fixture
     /// (`tests/data/banque01_route.script`) walks onto the map's own trigger/volume actors and
-    /// uses two labelled `set_goal` bridges for the objectives that three scripted bank scenes
-    /// would otherwise promote (blockers B1-B3 in the item24 report). This test asserts the
-    /// measured Banque01 objective states and the travel hop; it does not claim the cutscenes
-    /// play.
+    /// keeps four labelled flow teleports whose legs are re-measured unwalkable on main
+    /// (item73: the strongroom is sealed at the safe level and the platform level, the lift
+    /// cannot be boarded or called, the shaft wall y=-2080 and the banksortiescasecour tower
+    /// enclose the TT2 landing). The old t=139 TT10 teleport is gone: the fbi_dial2 cutscene
+    /// owns the player pose from t=133.017, so it never relocated the player nor fired
+    /// TouchTrigger10 (measured); the CarOut beat does not fire in this engine run.
     #[test]
     fn opt_in_banque01_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -4075,15 +4141,14 @@ mod tests {
         let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/banque01_route.script");
         let script = script::Script::load(&route_path).expect("load item24 banque01 route");
-        // 185 s: the item27l walked schedule needs it — the route walks to the vault door
-        // (touches t~88), teleports to DetectionVolume12 at t~90, and Jones then reaches
-        // Cine15's [34] "wait player 300" at t~114.3 (his scene's dialogue/anims run ~24 s
-        // after the DV12 touch; the teleport route reached it at t~69.1 because its DV12 touch
-        // fired at t~47). fin_flash lands at t~118.5, the escape-flow touches run to t~136, and
-        // Cine11's `playerevent fin_map` fires at t~143.7 (measured in
-        // local/re/item27l/route-final4.log). The map-outro video then runs its full 33.92 s
-        // headless before `PlayingVideo.PlayerTick` issues the `ServerTravel` (measured
-        // GameEndedSuccess t~96 -> travel t~131.2 in local/re/item27k/route-final.log).
+        // 185 s: the measured schedule needs it — the route walks to the vault door (touches
+        // t~88), teleports to DetectionVolume12 at t=93.017, and Jones then reaches Cine15's
+        // touch at t=115.7 with his scene running to fin_flash (~t=125.5); the escape-flow
+        // teleports run t=127..133 (TT5 127.017, TT2 130.017, TT11 133.017, TT4 133.333),
+        // objective 0 completes by t=138.5 (fin_flash + the 13 s XIIIDispatcher4 delay) and
+        // objective 1 by t=146.5 (Cine11's fin_map -> XIIIGoalTrigger2). The map-outro video
+        // then runs its full 33.92 s headless before `PlayingVideo.PlayerTick` issues the
+        // `ServerTravel` (measured travel t=181.967 in the item73 baseline run).
         let outcome = run_script_with_cinematic_input(
             &game_dir,
             "banque01",
@@ -6042,10 +6107,20 @@ mod tests {
             outcome.travel
         );
         // item68b: with the live Level.TimeSeconds, the old tarmac wait dies at -30 HP.
-        // Input now engages the rocket soldier on landing (head aim, before moving east),
-        // then runs continuously to the same door-line cover. Measured: soldier18
-        // 150 -> 15 at317.4 -> -41 at318.2, player150 throughout. The old40..60
-        // window measured a different input against a frozen script clock.
+        // Input engages the rocket soldier on landing. item69: PickWallAdjust unblocked
+        // both bataillefinale soldiers' pursuit, which changes the tarmac fight (measured
+        // local/re/item69/toits01-retiming-v1.txt): soldier18 closes and fires a rocket
+        // while dying, and soldier17's pursuit flank around the Tmetaldoorhelico door line
+        // puts his muzzle on the player side of the old door-line cover (DTGunned 75 at
+        // 342.1, then a 74-dmg series through the generator phase killed the item68b
+        // route player at -10). The route input is re-timed: kill soldier18 in the
+        // landing burst, then duel soldier17 at long range from the landing spot (where
+        // the same sight line serves both ways and his DTGunned fire misses; the door
+        // line blocked only the player's rays), then cross. Measured (v5): soldier18
+        // 150 -> 94 at317.2 -> 38 at317.4 -> dead at318.2; his in-flight rocket lands at
+        // 318.817 (the one unavoidable hit: none/one-juke/two-juke dodges all took the
+        // 318.8 blast for 50/45/41, v2/v3/v4); soldier17 150 -> 94 -> 38 -> dead by323.3
+        // without landing a hit; player 150 -> 100 and stays there.
         let health = session
             .player_health()
             .expect("the player must still have a Health property across the route");
@@ -6066,8 +6141,9 @@ mod tests {
             "the route player must survive the tarmac rockets and the fight phase with normal-health soldiers, got health {health}"
         );
         assert_eq!(
-            health, 150.0,
-            "landing engagement and continuous crossing must preserve the measured health150"
+            health, 100.0,
+            "the re-timed tarmac fight must end at the measured health100 (one in-flight \
+             rocket from the killed rocketeer; both pursuers dead, no further damage)"
         );
         // Goal 3 (Jones must not die) completes; goals 0/1/2 do not.
         for o in &objectives {
@@ -6299,13 +6375,16 @@ mod tests {
         // item61b continuation pins (the route's fight + generator-retry phases):
         // 1. The earlier real-clock landing engagement kills BaseSoldier18 before the
         // crossing; retain an exact damage result as well as the death assertion.
+        // item69: the pursuing soldier18 fires while dying and the re-timed burst hits
+        // measure 56-per-spine-hit (150 -> 94 at317.2 -> 38 at317.4 -> -18), so the
+        // corpse value moves from the item68b -41 to the measured -18.
         let soldier18 = vm
             .find_object("BaseSoldier18")
             .expect("BaseSoldier18 must exist");
         assert_eq!(
             vm.get_property(soldier18, "Health"),
-            Some(&xiii_script::Value::Int(-41)),
-            "the landing M60 engagement must reproduce the measured 150 -> 15 -> -41 kill"
+            Some(&xiii_script::Value::Int(-18)),
+            "the landing M60 engagement must reproduce the measured 150 -> 94 -> 38 -> -18 kill"
         );
         assert!(
             session.actor_is_dead(soldier18),
@@ -6325,12 +6404,154 @@ mod tests {
         //    unreachable, and the route ends waiting for a travel that cannot be requested.
     }
 
-    /// item59: Hual02 route by player input (the vent crawl, the underfloor, the surface
-    /// corridor, Carrington's cell) with labelled teleports only for the measured movement
-    /// gaps (the service lift, the Locked Porte19 magnetic chain, the sealed prison
-    /// perimeter, the grille pin, the pinned exit stairwell). The objectives must come from
-    /// the game's own chains: goals 4/5/6 complete, goal 3 is promoted by the Carrington
-    /// scene, goals 0/1/2 stay incomplete on measured blockers, and no travel is requested.
+    /// Destroys every live `BaseSoldier*` of the session (labelled diagnostic): the Hual02
+    /// underfloor and upper floor are held by sighted soldiers who kill the unarmoured player
+    /// within seconds under the real level clock (measured, see the item67 report), so the
+    /// systems under test (Porte11, the lift, the depot reader) are exercised with the hostile
+    /// pawns removed. The `Cine*` scene pawns are KEPT: the depot Carrington scene (goals
+    /// 4/5/6) runs through them. The unmodified level is pinned by the route header and the
+    /// report, not by this diagnostic.
+    fn remove_soldiers(session: &mut session::Session) -> usize {
+        let ids: Vec<xiii_script::ObjectId> = (0..session.vm().objects.len() as u32)
+            .filter(|&id| {
+                let o = &session.vm().objects[id as usize];
+                o.is_actor
+                    && !o.deleted
+                    && !o.name.starts_with("Default__")
+                    && o.name.starts_with("BaseSoldier")
+                    && session.vm().is_a(id, "BaseSoldier")
+            })
+            .collect();
+        for &id in &ids {
+            session.vm_mut().destroy(id).expect("destroy soldier");
+        }
+        ids.len()
+    }
+
+    /// item67: the Hual02 service lift is called and ridden by player input only. The game's own
+    /// `LiftButton.PlayerTrigger` -> `LiftManager` states close the doors, `LiftCage` runs its
+    /// key (+4632 UU in 8 s) and the player, standing on the cage, is carried up (mover base
+    /// carry: `Engine.dll ULevel::MoveActor` 0x1038a770 attached-actor loop) and again down. Without
+    /// the carry the cage passed through the player (measured: z stayed -4782.1).
+    ///
+    /// Labelled diagnostics: the player is placed at the lobby entrance (the underfloor walk to it
+    /// is pinned by the route test) and the ambush soldiers are removed (see `remove_soldiers`).
+    #[test]
+    fn opt_in_hual02_lift_carries_the_player_up_and_down() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual02".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual02");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let mut runtime =
+            open_map_runtime(&game_dir, "Hual02", &scene, &resolved.params).expect("open Hual02");
+        let removed = remove_soldiers(&mut runtime.session);
+        assert!(removed >= 20, "Hual02 has ~25 soldiers, removed {removed}");
+        // yaw 270 = -Y: LiftButton0 is on the cage wall at (-2209, 2092), the player at y=2223.
+        let script = script::Script::parse(
+            "t=0.20 teleport -2206 2374 -4781
+             t=1.00 goto -2209 2330 -4781
+             t=4.00 goto -2209 2223 -4781
+             t=7.00 yaw 270
+             t=7.50 use
+             t=40.00 use
+             t=75.00 goto -2209 2330 -4781
+",
+        )
+        .unwrap();
+        let outcome = run_script_inner(
+            &game_dir,
+            "Hual02",
+            &script,
+            &resolved.params,
+            &scene,
+            80.0,
+            false,
+            RunnerOptions {
+                initial: Some(runtime),
+                ..Default::default()
+            },
+        )
+        .expect("run lift ride");
+        let z_at = |t: f32| {
+            outcome
+                .trace
+                .iter()
+                .min_by(|a, b| (a.1 - t).abs().total_cmp(&(b.1 - t).abs()))
+                .map(|s| s.2[2])
+                .unwrap()
+        };
+        let top_z = z_at(36.0);
+        let mid_up = outcome
+            .trace
+            .iter()
+            .filter(|s| (7.5..40.0).contains(&s.1))
+            .map(|s| s.2[2])
+            .fold(f32::MIN, f32::max);
+        println!(
+            "[lift ride] floor z {:.1} top z {top_z:.1} highest {mid_up:.1} final {:?}",
+            z_at(7.0),
+            outcome.trace.last().map(|s| s.2)
+        );
+        // Floor 1 -> floor 2: the cage KeyPos[1].z = +4632 above its -4725 start; the player
+        // stands on the cage floor (measured -150.1 = -4782.1 + 4632).
+        assert!(
+            (z_at(7.0) - -4782.1).abs() < 2.0,
+            "starts on floor 1: {}",
+            z_at(7.0)
+        );
+        assert!(
+            (top_z - -150.1).abs() < 2.0,
+            "the cage must carry the player to floor 2 (z -150.1), got {top_z}"
+        );
+        assert!(
+            mid_up > -4000.0,
+            "the player must be carried through the shaft"
+        );
+        // Floor 2 -> floor 1 by the same internal button: carried back down, not left hanging.
+        let vm = outcome.session.vm();
+        let manager = vm.find_live_object("LiftManager0").expect("LiftManager0");
+        assert_eq!(
+            vm.get_property(manager, "CurrentFloor"),
+            Some(&xiii_script::Value::Int(1)),
+            "the second press returns the cage to floor 1"
+        );
+        let last = outcome.trace.last().unwrap().2;
+        assert!(
+            (z_at(70.0) - -4782.1).abs() < 2.0,
+            "carried back down to floor 1: z {}",
+            z_at(70.0)
+        );
+        assert!(last[2] < -4700.0, "final z {last:?}");
+        let cage = vm.find_live_object("LiftCage0").unwrap();
+        assert_eq!(
+            vm.get_property(cage, "KeyNum"),
+            Some(&xiii_script::Value::Byte(0))
+        );
+    }
+
+    /// item59, re-authored by item67/item67f: Hual02 route by player input (the vent crawl, the
+    /// underfloor with the Porte11 use, the service-lift ride by the cage's own button, the
+    /// walk out through the manager-opened Porte20, the surface corridor, the depot reader,
+    /// Carrington's cell) with labelled teleports only for the measured movement gaps (the
+    /// surface corridor's BSP dead-end at (-2854,2338), the Locked Porte19 magnetic chain whose
+    /// only card pickup is sealed in the meeting-room petitesalle, the corridor block at
+    /// (-6198,842), the sealed prison perimeter, the grille pin, the pinned exit stairwell).
+    /// The objectives must come from the game's own chains: goals 4/5/6 complete, goal 3 is
+    /// promoted by the depot reader chain, goals 0/1/2 stay incomplete on measured blockers, and
+    /// no travel is requested.
+    ///
+    /// Labelled diagnostic: the hostile `BaseSoldier*` pawns are removed (`remove_soldiers`,
+    /// the `Cine*` scene pawns kept). Under the real level clock the unmodified level's
+    /// underfloor gauntlet (BaseSoldier25/26/27 + lobby 15/28) kills the unarmoured player at
+    /// t~130-138 on this route (measured, the item67 report); that kill is the pinned next
+    /// blocker, not something this diagnostic hides.
     #[test]
     fn opt_in_hual02_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -6358,15 +6579,28 @@ mod tests {
             }),
             "the Hual02 route must not bridge control or goals"
         );
-        // 340 s: the crawl, the underfloor, the surface corridor, the cell unlock (~22 s
-        // hold), and the exit plateau walk; the script's wait_travel never completes.
-        let outcome = run_script(
+        let mut runtime =
+            open_map_runtime(&game_dir, "Hual02", &scene, &resolved.params).expect("open Hual02");
+        let removed = remove_soldiers(&mut runtime.session);
+        assert!(
+            removed >= 20,
+            "the Hual02 hostile garrison is ~22 BaseSoldier pawns, removed {removed}"
+        );
+        // 392 s: the crawl, the underfloor, the lift ride (~40 s, item67), the surface
+        // corridor and the reader, the cell unlock (~22 s hold), and the exit plateau walk;
+        // the script's wait_travel never completes.
+        let outcome = run_script_inner(
             &game_dir,
             "Hual02",
             &script,
             &resolved.params,
             &scene,
-            340.0,
+            392.0,
+            false,
+            RunnerOptions {
+                initial: Some(runtime),
+                ..Default::default()
+            },
         )
         .expect("run Hual02 route");
         let session = &outcome.session;
@@ -6383,20 +6617,22 @@ mod tests {
         );
         for o in &objectives {
             match o.index {
-                // The anti-goal completions and Carrington's survival run through the game's
-                // own Carrington scene (CineTrigger6 'Carring_ShaftEnter' at the depot).
+                // Goals 4/5/6 (the anti-goals) complete through the game's own chains in
+                // every measured real-clock run.
                 4..=6 => assert!(
                     o.completed,
                     "objective {} must complete through the game's chains: {o:?}",
                     o.index
                 ),
-                // Promoted by the same scene, but the escort end chain is unreachable:
-                // TouchTrigger8 sits on a z=63 gallery with no navigable access and the
-                // corridor's Porte151 only opens from Carrington's escort moveseq, which
-                // waits forever on the 'soldat_assome' raid event (measured legs 31-37).
+                // item67 measured: reaching and using the depot reader (MagneticPassTrigger1
+                // -> Grab, the game's own aim-focus chain) promotes goal 3 via the map's own
+                // chain, but the escort never starts: TouchTrigger8 sits on a z=63 gallery
+                // with no navigable access and the corridor's Porte151 opens only from
+                // Carrington's escort moveseq, which waits forever on the 'soldat_assome'
+                // raid event (measured legs 31-37).
                 3 => assert!(
                     o.primary && !o.completed,
-                    "objective 3 must be promoted but not completed: {o:?}"
+                    "objective 3 is promoted by the reader chain but stays incomplete: {o:?}"
                 ),
                 // Promotion chain blocked: DetectionVolume21 floats 78 UU above the real duct
                 // floor and the eavesdrop scene stalls on the unimplemented CWndSFXTrigger
@@ -6423,12 +6659,10 @@ mod tests {
             .into_iter()
             .map(|(_, name)| name)
             .collect();
-        for expected in [
-            "DetectionVolume14",
-            "Porte154",
-            "XIIIGoalTrigger0",
-            "XIIIGoalTrigger8",
-        ] {
+        // item67 measured: Porte154 is aimed/used, not walked into, so it is NOT in the
+        // player touch log (its touch events in the probe belong to the door bumping the
+        // Cine triggers, not the pawn). The game's own chains the pawn physically touches:
+        for expected in ["DetectionVolume14", "XIIIGoalTrigger0", "XIIIGoalTrigger8"] {
             assert!(
                 touched.iter().any(|t| t.eq_ignore_ascii_case(expected)),
                 "the route must touch {expected} (the game's own chain): touches={touched:?}"
@@ -6446,6 +6680,287 @@ mod tests {
             )),
             "the unlock must call Porte154.Trigger (the game's own unlock path)"
         );
+        // The underfloor Porte11 corridor door must have opened through its own
+        // PlayerTrigger (the route's named use, the game's Grab tail).
+        assert!(
+            vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target.eq_ignore_ascii_case("Porte11")
+                        && function.ends_with("PlayerTrigger")
+            )),
+            "the underfloor Porte11 must open through its own PlayerTrigger"
+        );
+        // item67: the service lift was ridden through the game's own chain: the cage button's
+        // PlayerTrigger ran, the LiftManager states drove the cage to floor 2 and the player
+        // walked out on the surface (the teleport-free z=-149 corridor legs after t=232).
+        assert!(
+            vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target.eq_ignore_ascii_case("LiftButton0")
+                        && function.ends_with("PlayerTrigger")
+            )),
+            "the ride must start at the cage's own LiftButton0.PlayerTrigger"
+        );
+        let manager = vm
+            .find_object("LiftManager0")
+            .expect("LiftManager0 must exist");
+        assert_eq!(
+            vm.get_property(manager, "CurrentFloor"),
+            Some(&xiii_script::Value::Int(2)),
+            "the route rode the cage to floor 2: {objectives:?}"
+        );
+        // item67f: Hual02's `Porte4`/`Porte20` (`XIDCine.Porte`, Tags 'porte_bas'/'porte_haut')
+        // are serialised with `bDeleteMe=true`, in a trailing block of 54 destroyed exports that
+        // also holds the `LiftManager0`'s stale `XIIIMover0` cage reference. No actor in the map
+        // fires an event named 'porte_haut'/'porte_bas' (the strings occur only as the live
+        // `LiftDoor` Tags), so no `TriggerEvent` can open `Porte20`; and the class's automatic
+        // `PostBeginPlay` radius search only matches `XIDCine.LiftDoor`. The engine's
+        // `AActor::IsPendingKill` (Engine.dll 0x10304b40, `AActor+0x2e & 1`) reports those exports
+        // dead, so the dead `Porte20` is not part of the live level and never blocked the exit.
+        assert!(
+            vm.find_object("Porte20").is_none() && vm.find_object("Porte4").is_none(),
+            "the destroyed Porte4/Porte20 exports must not be live level actors"
+        );
+        // The live floor-2 lift door is `LiftDoor1` (Tag 'porte_haut'), which the `LiftManager0`'s
+        // own outer-door states open; the player walks out through the doorway.
+        let lift_door = vm.find_object("LiftDoor1").expect("LiftDoor1 must exist");
+        assert_eq!(
+            vm.get_property(lift_door, "bOpened"),
+            Some(&xiii_script::Value::Bool(true)),
+            "the manager must open the live floor-2 LiftDoor1"
+        );
+        assert!(
+            vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target.eq_ignore_ascii_case("LiftDoor1") && function.ends_with("Trigger")
+            )),
+            "the LiftManager must trigger LiftDoor1 (the game's own outer-door path)"
+        );
+        // item67f measured walk: with the destroyed `Porte20` no longer part of the level, the
+        // player leaves the cage north through the doorway and follows the surface corridor
+        // (max y ~2650) west, dead-ending at the BSP wall (-2854,2338) (measured).
+        let walk = outcome
+            .trace
+            .iter()
+            .filter(|s| (232.0..258.0).contains(&s.1));
+        let max_y = walk.clone().map(|s| s.2[1]).fold(f32::MIN, f32::max);
+        assert!(
+            max_y > 2550.0,
+            "the walker must leave the cage through the doorway (max corridor y {max_y})"
+        );
+        let pin = outcome
+            .trace
+            .iter()
+            .min_by(|a, b| (a.1 - 256.0).abs().total_cmp(&(b.1 - 256.0).abs()))
+            .expect("trace sample");
+        assert!(
+            (pin.2[0] - -2854.0).abs() < 60.0 && (pin.2[1] - 2338.0).abs() < 60.0,
+            "the surface corridor must dead-end at the measured BSP wall (-2854,2338): got {:?}",
+            pin.2
+        );
+        // The depot reader was aimed and used (the game's TargetActor + bCanTrigger -> Grab),
+        // but the player carries no matching card, so Grab only ran
+        // `MagneticPassTrigger1.PlayerTrigger` (its sound/goal side effects) - not an item
+        // activation; without the (sealed) magnetic card Porte19 must still be locked: the next
+        // measured blocker, pinned instead of hidden.
+        let porte19 = vm.find_object("Porte19").expect("Porte19 must exist");
+        assert_eq!(
+            vm.get_property(porte19, "KeyNum"),
+            Some(&xiii_script::Value::Byte(0)),
+            "Porte19 stays locked without the card"
+        );
+        assert_eq!(
+            vm.get_property(porte19, "bOpened"),
+            Some(&xiii_script::Value::Bool(false)),
+            "Porte19 never opened"
+        );
+        assert!(
+            vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target.eq_ignore_ascii_case("MagneticPassTrigger1")
+                        && function.ends_with("PlayerTrigger")
+            )),
+            "the reader use must run Grab's trigger branch on MagneticPassTrigger1"
+        );
         let _ = porte154;
+    }
+
+    /// Hual04a's walked route currently stops at the explicit corpse-bounds native failure.
+    /// Pin the failure and the game's objective state rather than granting a card or goals.
+    #[test]
+    fn opt_in_hual04a_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual04a".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual04a");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let text = include_str!("../../tests/data/hual04a_route.script");
+        assert!(!text.lines().any(|line| {
+            let command = line.split('#').next().unwrap_or("");
+            command.contains("set_goal")
+                || command.contains("take_control")
+                || command.contains("teleport")
+        }));
+        let script = script::Script::parse(text).expect("parse Hual04a route");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Hual04a",
+            &script,
+            &resolved.params,
+            &scene,
+            335.0,
+        )
+        .expect("run Hual04a route");
+        let session = &outcome.session;
+        let vm = session.vm();
+        let mi = session.map_info().expect("Hual04a MapInfo");
+        let pc = session.controller.expect("player controller");
+        let Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(interaction)))) =
+            vm.get_property(pc, "MyInteraction")
+        else {
+            panic!("player interaction");
+        };
+        let blocker = vm
+            .find_object("BreakAbleMover69")
+            .expect("reader trace blocker");
+        assert_eq!(
+            vm.get_property(*interaction, "TargetActor"),
+            Some(&xiii_script::Value::Object(Some(
+                xiii_script::ObjRef::Instance(blocker)
+            )))
+        );
+        assert_eq!(
+            vm.get_property(*interaction, "bCanTrigger"),
+            Some(&xiii_script::Value::Bool(false))
+        );
+        let reader = vm
+            .find_object("MagneticPassTrigger4")
+            .expect("bureau reader");
+        let door = vm.find_object("Porte11").expect("bureau door");
+        assert_eq!(
+            vm.get_property(reader, "Icon"),
+            vm.get_property(reader, "NeverUsedIcon")
+        );
+        assert_eq!(
+            vm.get_property(door, "KeyNum"),
+            Some(&xiii_script::Value::Byte(0))
+        );
+        let card = vm.find_live_object("MagneticCard").expect("six-kill card");
+        assert_eq!(
+            vm.get_property(card, "Owner"),
+            Some(&xiii_script::Value::Object(Some(
+                xiii_script::ObjRef::Instance(session.player)
+            )))
+        );
+        assert_eq!(
+            vm.get_property(card, "Event"),
+            Some(&xiii_script::Value::Name("passtrigger_ascenseur".into()))
+        );
+        println!(
+            "[hual04a next blocker] carried card, aimed reader -> BreakAbleMover69, bCanTrigger=false, reader unused, Porte11 key=0; position={:?}",
+            session.player_location()
+        );
+        for (id, object) in vm.objects.iter().enumerate() {
+            if object.name.starts_with("Cine") {
+                for table in ["tabActions", "tabActions2", "tabActions3"] {
+                    if let Some(xiii_script::Value::Array(actions)) =
+                        vm.get_property(id as u32, table)
+                    {
+                        for (index, action) in actions.iter().enumerate() {
+                            if let xiii_script::Value::Str(text) = action
+                                && text.to_ascii_lowercase().contains("wait player")
+                            {
+                                println!(
+                                    "[hual04a wait radius] {} {table}[{index}] {text}",
+                                    object.name
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let error = session.first_error().map(ToString::to_string);
+        println!(
+            "[hual04a route] error={error:?} objectives={:?} eNbVivants={:?} travel={:?}",
+            session.objective_states(),
+            vm.get_property(mi, "eNbVivants"),
+            outcome.travel
+        );
+        for name in [
+            "BaseSoldier1",
+            "BaseSoldier5",
+            "BaseSoldier10",
+            "BaseSoldier12",
+            "BaseSoldier0",
+            "BaseSoldier4",
+        ] {
+            let id = vm.find_object(name).expect("authored soldier");
+            println!(
+                "[hual04a soldier] {name} health={:?} location={:?} event={:?} searchable={:?} bounds={:?}",
+                vm.get_property(id, "Health"),
+                vm.get_property(id, "Location"),
+                vm.get_property(id, "Event"),
+                vm.get_property(id, "bSearchable"),
+                vm.frozen_render_bounds(id)
+            );
+            assert!(
+                matches!(vm.get_property(id, "Health"), Some(xiii_script::Value::Int(h)) if *h <= 0),
+                "{name} must die through player input"
+            );
+            assert_eq!(
+                vm.get_property(id, "bIsDead"),
+                Some(&xiii_script::Value::Bool(true))
+            );
+            assert!(
+                vm.frozen_render_bounds(id).is_some(),
+                "{name} skeletal bounds frozen"
+            );
+            let Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(shadow)))) =
+                vm.get_property(id, "Shadow")
+            else {
+                panic!("{name} shadow");
+            };
+            assert_eq!(
+                vm.get_property(*shadow, "bShadowIsStatic"),
+                Some(&xiii_script::Value::Bool(true)),
+                "{name} must finish Timer after 0x019D"
+            );
+        }
+        assert!(error.is_none(), "unexpected blocker: {error:?}");
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert_eq!(
+            vm.get_property(mi, "eNbVivants"),
+            Some(&xiii_script::Value::Int(1)),
+            "Died triggers before setting bIsDead: six deaths leave the count one behind"
+        );
+        assert_eq!(
+            vm.get_property(mi, "eNbMorts"),
+            Some(&xiii_script::Value::Int(6))
+        );
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "player must survive"
+        );
+        assert!(outcome.travel.is_empty(), "blocked route must not travel");
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 6);
+        for (index, goal) in goals.iter().enumerate() {
+            assert_eq!(goal.completed, index == 1, "objective {index}: {goal:?}");
+        }
+        assert_eq!(
+            vm.get_property(mi, "NextMapLevelWithUnr"),
+            Some(&xiii_script::Value::Str("Hual04c.unr".to_owned()))
+        );
     }
 }

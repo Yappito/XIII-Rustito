@@ -872,6 +872,67 @@ fn init_execution_write_survives_map_property_reload_order() {
     );
 }
 
+/// item67f: a map actor serialised with `bDeleteMe=true` is a pending-kill export. The engine's
+/// `AActor::IsPendingKill` (Engine.dll 0x10304b40) reads `AActor+0x2e & 1`, i.e. the serialised
+/// `bDeleteMe`; such an actor receives no `ProcessEvent` and leaves the collision hash, so it
+/// must not be a live level actor. Hual02's `Porte4`/`Porte20` are exactly this (a trailing block
+/// of 54 destroyed exports), and the dead `Porte20` otherwise blocks the floor-2 lift exit.
+fn pending_kill_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let bdelete = b.reserve(B_BOOLPROP, actor, "bDeleteMe");
+    let live = b.reserve(actor, 0, "Live0");
+    let dead_true = b.reserve(actor, 0, "DeadTrue0");
+    let dead_false = b.reserve(actor, 0, "DeadFalse0");
+    b.prop(bdelete, 0, 0);
+    b.class(object, 0, actor);
+    b.class(actor, object, bdelete);
+    // Empty tag block: no `bDeleteMe` -> live.
+    b.set(live, vec![0]);
+    // Bool tag: name, info 0xd3 (BoolProperty, size code 5, bit 7 = value true), explicit size 0,
+    // then the `None` terminator (corpus form: `bool_value_lives_in_the_info_bit`).
+    let mut dead = compact(b.name("bDeleteMe"));
+    dead.extend([0xd3, 0x00, 0x00]);
+    b.set(dead_true, dead);
+    let mut live_false = compact(b.name("bDeleteMe"));
+    live_false.extend([0x53, 0x00, 0x00]);
+    b.set(dead_false, live_false);
+    b.build()
+}
+
+#[test]
+fn load_level_marks_bdeleteme_exports_pending_kill() {
+    let set = set_of(pending_kill_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let actors = vm.load_level(0, &Limits::default()).unwrap();
+    // Every export is instantiated (the engine creates the objects), but the `bDeleteMe` one is
+    // pending-kill: not a live actor and invisible to name lookup.
+    assert!(vm.find_object("Live0").is_some());
+    assert!(
+        vm.find_object("DeadFalse0").is_some(),
+        "bDeleteMe=false stays a live actor"
+    );
+    assert!(
+        vm.find_object("DeadTrue0").is_none(),
+        "a bDeleteMe export must not be a live level actor"
+    );
+    // The object still exists so serialised references resolve, flagged deleted and inactive.
+    let id = actors
+        .iter()
+        .copied()
+        .find(|&i| vm.objects[i as usize].name == "DeadTrue0")
+        .expect("DeadTrue0 export instantiated");
+    assert!(vm.objects[id as usize].deleted);
+    assert!(!vm.objects[id as usize].active);
+    // Events delivered to it are dropped exactly as `ProcessEvent` drops a pending-kill actor.
+    assert!(
+        vm.send_event(id, "PostBeginPlay", vec![])
+            .unwrap()
+            .is_none()
+    );
+}
+
 fn pressing_fire_package() -> Vec<u8> {
     let mut b = B::new();
     let object = b.reserve(0, 0, "Object");
@@ -1461,7 +1522,9 @@ fn registry_entries_are_documented() {
     // caller) on top of main's set (main's own decoded `Controller.WaitForLanding` is the
     // single 527 entry; the branch's duplicate registry def was removed in the merge).
     // item65 adds Interaction.WorldToScreen backed by the host's active projection.
-    assert_eq!(defs.len(), 342);
+    // item69 adds the decoded Controller.PickWallAdjust (526) pursuit detour.
+    // item70 adds the decoded Actor.RecomputeBoundingVolume (391) render-box freeze.
+    assert_eq!(defs.len(), 344);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -4436,6 +4499,7 @@ fn item46_set() -> ScriptSet {
     let pawn = b.reserve(0, 0, "Pawn");
     let controller = b.reserve(0, 0, "IAController");
     let controller_base = b.reserve(0, 0, "Controller");
+    let ai_base = b.reserve(0, 0, "AIController");
     let move_toward = b.reserve(IMP_FUNCTION, controller_base, "MoveToward");
     let new_target = b.reserve(IMP_OBJECTPROP, move_toward, "NewTarget");
     let view_focus = b.reserve(IMP_OBJECTPROP, move_toward, "ViewFocus");
@@ -4496,6 +4560,7 @@ fn item46_set() -> ScriptSet {
         "Rotation",
         "Velocity",
         "Acceleration",
+        "AdjustLoc",
     ] {
         fields.push((b.reserve(IMP_STRUCTPROP, actor, name), compact(IMP_STRUCT)));
     }
@@ -4517,6 +4582,7 @@ fn item46_set() -> ScriptSet {
         "Angle_Visee",
         "Temps_RefreshEnemyPos",
         "DrawScale",
+        "JumpZ",
     ] {
         fields.push((b.reserve(IMP_FLOATPROP, actor, name), vec![]));
     }
@@ -4537,11 +4603,14 @@ fn item46_set() -> ScriptSet {
         "bPreparingMove",
         "bZoomed",
         "bTirSurConeMax",
+        "bCanJump",
+        "bWorldGeometry",
     ] {
         fields.push((b.reserve(IMP_BOOLPROP, actor, name), vec![]));
     }
     for name in [
         "Pawn",
+        "Controller",
         "Enemy",
         "Level",
         "BaseS",
@@ -4599,7 +4668,8 @@ fn item46_set() -> ScriptSet {
     b.class(object, 0, 0, 0);
     b.class(actor, object, fields[0].0, 0);
     b.class(controller_base, actor, move_toward, 0);
-    b.class(controller, controller_base, moving, 0);
+    b.class(ai_base, controller_base, 0, 0);
+    b.class(controller, ai_base, moving, 0);
     for class in [pawn, level, node] {
         b.class(class, actor, 0, 0);
     }
@@ -5483,6 +5553,150 @@ fn aabb_overlaps(c: [f32; 3], e: [f32; 3], mn: [f32; 3], mx: [f32; 3]) -> bool {
     (0..3).all(|i| c[i] + e[i] > mn[i] && c[i] - e[i] < mx[i])
 }
 
+fn wall_adjust_pair(vm: &mut Vm<'_>, set: &ScriptSet) -> (ObjectId, ObjectId) {
+    vm.spawn(pg(set, "LevelInfo"), "LevelInfo0").unwrap();
+    let pawn = vm.spawn(pg(set, "Pawn"), "AdjustPawn").unwrap();
+    let controller = vm
+        .spawn(pg(set, "IAController"), "AdjustController")
+        .unwrap();
+    vm.set_property(
+        controller,
+        "Pawn",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    vm.set_property(
+        pawn,
+        "Controller",
+        0,
+        Value::Object(Some(ObjRef::Instance(controller))),
+    );
+    vm.set_property(pawn, "Location", 0, Value::Vector([0.0; 3]));
+    vm.set_property(pawn, "Physics", 0, Value::Byte(1));
+    vm.set_property(pawn, "EyeHeight", 0, Value::Float(60.0));
+    vm.set_property(pawn, "CollisionRadius", 0, Value::Float(20.0));
+    vm.set_property(pawn, "CollisionHeight", 0, Value::Float(40.0));
+    vm.set_property(pawn, "GroundSpeed", 0, Value::Float(200.0));
+    vm.set_property(pawn, "AccelRate", 0, Value::Float(400.0));
+    vm.set_property(pawn, "JumpZ", 0, Value::Float(300.0));
+    vm.set_property(
+        controller,
+        "Destination",
+        0,
+        Value::Vector([1000.0, 0.0, 0.0]),
+    );
+    (controller, pawn)
+}
+
+#[test]
+fn pick_wall_adjust_open_side_preserves_destination_and_move_target() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let (controller, _) = wall_adjust_pair(&mut vm, &set);
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([30.0, -10.0, -100.0], [50.0, 10.0, 20.0]),
+    ));
+    let result = call_native(
+        &mut vm,
+        "Engine.Controller.PickWallAdjust",
+        controller,
+        &[false],
+        &mut [Value::Vector([1.0, 0.0, 0.0])],
+    );
+    assert_eq!(result, NativeOutcome::Value(Value::Bool(true)));
+    assert_eq!(
+        vm.vector_prop(controller, "AdjustLoc"),
+        Some([0.0, -46.0, 0.0])
+    );
+    assert!(vm.bool_prop(controller, "bAdjusting"));
+    assert_eq!(
+        vm.vector_prop(controller, "Destination"),
+        Some([1000.0, 0.0, 0.0])
+    );
+    assert_eq!(vm.obj_prop(controller, "MoveTarget"), None);
+}
+
+#[test]
+fn pick_wall_adjust_both_sides_blocked_and_zero_direction_do_not_mutate() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let (controller, _) = wall_adjust_pair(&mut vm, &set);
+    vm.set_physics(Box::new(
+        MockWorld::new()
+            .with_wall([-100.0, -30.0, -100.0], [100.0, -25.0, 100.0])
+            .with_wall([-100.0, 25.0, -100.0], [100.0, 30.0, 100.0]),
+    ));
+    assert!(!vm.pick_wall_adjust(controller, [1.0, 0.0, 0.0]).unwrap());
+    assert!(!vm.bool_prop(controller, "bAdjusting"));
+    vm.set_property(controller, "Destination", 0, Value::Vector([0.0; 3]));
+    assert!(!vm.pick_wall_adjust(controller, [0.0; 3]).unwrap());
+    assert!(
+        vm.pick_wall_adjust(controller, [f32::NAN, 0.0, 0.0])
+            .is_err()
+    );
+}
+
+#[test]
+fn pick_wall_adjust_retries_opposite_side_after_body_sweep_blocks() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let (controller, _) = wall_adjust_pair(&mut vm, &set);
+    // Eye-level sight is clear but the full pawn extent hits the low side wall.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([-100.0, -30.0, -100.0], [100.0, -25.0, 30.0]),
+    ));
+    assert!(vm.pick_wall_adjust(controller, [1.0, 0.0, 0.0]).unwrap());
+    assert_eq!(
+        vm.vector_prop(controller, "AdjustLoc"),
+        Some([0.0, 46.0, 0.0])
+    );
+}
+
+#[test]
+fn pick_wall_adjust_jump_clearance_and_half_height_ceiling_boundary() {
+    let set = item46_set();
+    for ceiling in [false, true] {
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let (controller, pawn) = wall_adjust_pair(&mut vm, &set);
+        vm.set_property(pawn, "bCanJump", 0, Value::Bool(true));
+        let mut world = MockWorld::new().with_wall([30.0, -10.0, -100.0], [50.0, 10.0, 20.0]);
+        if ceiling {
+            world = world.with_wall([-100.0, -100.0, 80.0], [100.0, 100.0, 90.0]);
+        }
+        vm.set_physics(Box::new(world));
+        assert!(vm.pick_wall_adjust(controller, [1.0, 0.0, 0.5]).unwrap());
+        if ceiling {
+            assert_eq!(vm.byte_prop(pawn, "Physics"), 1);
+            assert!(vm.bool_prop(controller, "bAdjusting"));
+        } else {
+            assert_eq!(vm.byte_prop(pawn, "Physics"), 2);
+            assert_eq!(vm.vector_prop(pawn, "Velocity"), Some([-200.0, 0.0, 300.0]));
+            assert_eq!(
+                vm.vector_prop(pawn, "Acceleration"),
+                Some([-400.0, 0.0, 0.0])
+            );
+            assert!(!vm.bool_prop(controller, "bAdjusting"));
+        }
+    }
+}
+
+#[test]
+fn pick_wall_adjust_missing_provider_falling_and_unsupported_3d_are_explicit() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let (controller, pawn) = wall_adjust_pair(&mut vm, &set);
+    assert!(vm.pick_wall_adjust(controller, [1.0, 0.0, 0.0]).is_err());
+    vm.set_property(pawn, "Physics", 0, Value::Byte(2));
+    assert!(!vm.pick_wall_adjust(controller, [1.0, 0.0, 0.0]).unwrap());
+    vm.set_property(pawn, "Physics", 0, Value::Byte(4));
+    assert!(
+        vm.pick_wall_adjust(controller, [1.0, 0.0, 0.0])
+            .unwrap_err()
+            .to_string()
+            .contains("Pick3DWallAdjust")
+    );
+}
+
 /// Swept AABB vs static AABB; returns `(fraction, normal)`.
 fn swept_aabb(
     start: [f32; 3],
@@ -5624,6 +5838,49 @@ fn item49_view_target_requires_aim_range_and_clear_world_segment() {
         trace(&mut vm, [0.0, 0.0, -120.0]).is_empty(),
         "world geometry occludes interaction"
     );
+}
+
+/// item67: `Actor.TraceActors` composes its trace flags as `| 0x9f` (Engine.dll
+/// `execTraceActors` 0x103e8c70, the `orl $0x9f, %esi` at 0x103e8e68), clearing the 0x20/0x40
+/// bits of `execTrace`'s 0xbf: an interactive actor that blocks nothing (`bBlockActors=false`,
+/// like Hual02's card reader `MagneticPassTrigger1`) is still a candidate, and its entry hit
+/// orders ahead of farther blocking candidates.
+#[test]
+fn trace_actors_admits_non_blocking_interactive_actors() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let caller = phys_actor(&mut vm, &set, "Eye", [0.0; 3]);
+    set_collision_fields(&mut vm, caller, true, true);
+    // The reader: an interactive trigger off-axis that blocks nothing (the measured depot
+    // actor: bCollideActors, bBlockZeroExtentTraces, r/h=40, bBlockActors/bBlockPlayers=false).
+    let reader = phys_actor(&mut vm, &set, "Reader", [60.0, -30.0, 7.0]);
+    set_collision_fields(&mut vm, reader, true, true);
+    vm.set_property(reader, "CollisionRadius", 0, Value::Float(40.0));
+    vm.set_property(reader, "CollisionHeight", 0, Value::Float(40.0));
+    vm.set_property(reader, "bBlockActors", 0, Value::Bool(false));
+    vm.set_property(reader, "bBlockPlayers", 0, Value::Bool(false));
+    // A farther blocking actor entered later along the same ray.
+    let deco = phys_actor(&mut vm, &set, "WallThing", [150.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, deco, true, true);
+    let rows = vm
+        .vm_trace_actors(caller, None, [0.0; 3], [160.0, 0.0, 0.0], [0.0; 3])
+        .unwrap();
+    assert_eq!(
+        rows.first().map(|r| r.0),
+        Some(reader),
+        "the non-blocking interactive reader is a TraceActors candidate: {rows:?}"
+    );
+    assert!(
+        rows[0].1[0] > 0.0,
+        "the hit location is the entry point, not the segment start: {rows:?}"
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "the blocking actor is hit behind it: {rows:?}"
+    );
+    assert!(rows[1].1[0] > rows[0].1[0]);
 }
 
 /// Item47b: the decoded engine actor-trace filter (`trace_admits_actor`). Each case maps to a
@@ -9819,6 +10076,7 @@ fn mover_fixture() -> Vec<u8> {
     let key_pos = b.reserve(IMP_ARRAYPROP, actor, "KeyPos");
     let key_rot = b.reserve(IMP_ARRAYPROP, actor, "KeyRot");
     let key_hits = b.reserve(IMP_INTPROP, actor, "KeyHits");
+    let base = b.reserve(IMP_OBJECTPROP, actor, "Base");
     let kf = b.reserve(IMP_FUNCTION, actor, "KeyFrameReached");
     b.prop_with(location, rotation, 0, &vector_extra);
     b.prop_with(rotation, old_pos, 0, &rotator_extra);
@@ -9833,7 +10091,8 @@ fn mover_fixture() -> Vec<u8> {
     b.prop(interp, key_pos, 0);
     b.prop_array_dim(key_pos, key_rot, 0, IMP_STRUCT, 8);
     b.prop_array_dim(key_rot, key_hits, 0, IMP_STRUCT - 1, 8);
-    b.prop(key_hits, kf, 0);
+    b.prop(key_hits, base, 0);
+    b.prop_with(base, kf, 0, &compact(0));
     let kh = key_hits as u8;
     let kf_code = vec![
         0x0F, 0x01, kh, 0x92, 0x00, kh, 0x26, 0x16, // KeyHits = KeyHits + 1
@@ -9906,6 +10165,97 @@ fn synthetic_mover_interpolates_and_fires_keyframe_reached() {
     vm.tick(0.25).unwrap();
     assert_eq!(vm.vector_prop(a, "Location").unwrap()[0], 100.0);
     assert_eq!(vm.get_property(a, "KeyHits"), Some(&Value::Int(1)));
+}
+
+/// A moving brush carries the actors attached to it (`Engine.dll ULevel::MoveActor` 0x1038a770,
+/// attached-actor loop 0x1038ae0d..0x1038b084): a rider whose `Base` is the mover is displaced by
+/// the mover's per-tick displacement; an actor whose `Base` was cleared or never set stays put.
+#[test]
+fn moving_brush_carries_attached_actors_by_its_displacement() {
+    let set = mover_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let mover = vm.spawn(sg(&set, "Actor"), "Cage").unwrap();
+    let rider = vm.spawn(sg(&set, "Actor"), "Rider").unwrap();
+    let bystander = vm.spawn(sg(&set, "Actor"), "Bystander").unwrap();
+    let released = vm.spawn(sg(&set, "Actor"), "Released").unwrap();
+    for id in [mover, rider, bystander, released] {
+        vm.set_active(id, true);
+    }
+    vm.set_property(mover, "PhysRate", 0, Value::Float(0.5)); // 2 s to the key
+    vm.set_property(mover, "KeyNum", 0, Value::Byte(1));
+    for prop in ["BasePos", "OldPos"] {
+        vm.set_property(mover, prop, 0, Value::Vector([0.0, 0.0, 0.0]));
+    }
+    vm.set_property(mover, "KeyPos", 1, Value::Vector([0.0, 0.0, 400.0]));
+    vm.set_property(mover, "bInterpolating", 0, Value::Bool(true));
+    let mover_ref = Value::Object(Some(ObjRef::Instance(mover)));
+    vm.set_property(rider, "Location", 0, Value::Vector([10.0, 20.0, 5.0]));
+    vm.set_property(rider, "Base", 0, mover_ref.clone());
+    vm.note_attached(rider);
+    vm.set_property(bystander, "Location", 0, Value::Vector([10.0, 20.0, 5.0]));
+    vm.set_property(released, "Location", 0, Value::Vector([10.0, 20.0, 5.0]));
+    vm.set_property(released, "Base", 0, mover_ref);
+    vm.note_attached(released);
+    vm.set_property(released, "Base", 0, Value::Object(None)); // stepped off before the move
+
+    // Many small steps: the rider must accumulate the exact displacement (no drift, no skip).
+    for _ in 0..60 {
+        vm.tick(1.0 / 60.0).unwrap();
+    }
+    let z_mover = vm.vector_prop(mover, "Location").unwrap()[2];
+    let z_rider = vm.vector_prop(rider, "Location").unwrap()[2];
+    assert!((z_mover - 200.0).abs() < 0.5, "mover half way: {z_mover}");
+    assert!(
+        (z_rider - 5.0 - z_mover).abs() < 0.01,
+        "rider keeps its offset to the mover: mover {z_mover} rider {z_rider}"
+    );
+    let rider_xy = vm.vector_prop(rider, "Location").unwrap();
+    assert_eq!((rider_xy[0], rider_xy[1]), (10.0, 20.0));
+    assert_eq!(vm.vector_prop(bystander, "Location").unwrap()[2], 5.0);
+    assert_eq!(vm.vector_prop(released, "Location").unwrap()[2], 5.0);
+
+    // Arrival: the final snap to the key carries the rider onto the exact key height.
+    for _ in 0..62 {
+        vm.tick(1.0 / 60.0).unwrap();
+    }
+    assert_eq!(vm.vector_prop(mover, "Location").unwrap()[2], 400.0);
+    assert!((vm.vector_prop(rider, "Location").unwrap()[2] - 405.0).abs() < 0.01);
+    // A finished mover no longer moves its riders.
+    vm.tick(0.5).unwrap();
+    assert!((vm.vector_prop(rider, "Location").unwrap()[2] - 405.0).abs() < 0.01);
+}
+
+/// A rotating brush swings its riders around its origin (the offset is re-derived through the
+/// mover's new rotation, `ULevel::MoveActor` attached loop).
+#[test]
+fn rotating_brush_swings_attached_actors_about_its_origin() {
+    let set = mover_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let mover = vm.spawn(sg(&set, "Actor"), "Turntable").unwrap();
+    let rider = vm.spawn(sg(&set, "Actor"), "Rider").unwrap();
+    for id in [mover, rider] {
+        vm.set_active(id, true);
+    }
+    vm.set_property(mover, "PhysRate", 0, Value::Float(1.0));
+    vm.set_property(mover, "KeyNum", 0, Value::Byte(1));
+    vm.set_property(mover, "KeyRot", 1, Value::Rotator([0, 16384, 0])); // +90 degrees yaw
+    vm.set_property(mover, "bInterpolating", 0, Value::Bool(true));
+    vm.set_property(rider, "Location", 0, Value::Vector([100.0, 0.0, 0.0]));
+    vm.set_property(
+        rider,
+        "Base",
+        0,
+        Value::Object(Some(ObjRef::Instance(mover))),
+    );
+    vm.note_attached(rider);
+    for _ in 0..61 {
+        vm.tick(1.0 / 60.0).unwrap();
+    }
+    let p = vm.vector_prop(rider, "Location").unwrap();
+    assert!(
+        p[0].abs() < 0.5 && (p[1] - 100.0).abs() < 0.5 && p[2].abs() < 0.01,
+        "a +90 degree yaw takes (100,0,0) to (0,100,0), got {p:?}"
+    );
 }
 
 /// `Actor.FinishInterpolation` is latent (sets `Latent::Interp`) and refuses a call outside state
@@ -14080,6 +14430,125 @@ use crate::animation::SeqInfo;
 /// Animation provider with posed-bone support: every sequence resolves (100 frames at 30 fps)
 /// and every bone offset is the fixed actor-rotation-space vector (200, 0, 50).
 struct PoseStub;
+
+struct BoundingPose(Vec<[f32; 3]>);
+
+impl crate::animation::AnimationData for BoundingPose {
+    fn sequence(&mut self, _: &str, _: &str) -> Result<Option<SeqInfo>, String> {
+        Err("unused sequence lookup".into())
+    }
+    fn posed_vertices(
+        &mut self,
+        _: &str,
+        _: Option<(&str, &str, f32, bool)>,
+    ) -> Result<Option<Vec<[f32; 3]>>, String> {
+        Ok(Some(self.0.clone()))
+    }
+}
+
+#[test]
+fn recompute_bounding_volume_freezes_world_vertices_and_false_invalidates() {
+    let p = ScriptPackage::load(
+        "Test",
+        bone_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .unwrap();
+    let mut set = ScriptSet::new();
+    set.add(p);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let actor = vm.spawn(sg(&set, "Actor"), "Corpse").unwrap();
+    // No mesh must be a genuine no-op, including without a provider.
+    call_native(
+        &mut vm,
+        "Engine.Actor.RecomputeBoundingVolume",
+        actor,
+        &[false],
+        &mut [Value::Bool(true)],
+    );
+    assert_eq!(vm.frozen_render_bounds(actor), None);
+    vm.set_property(
+        actor,
+        "Mesh",
+        0,
+        Value::Object(Some(ObjRef::Static(sg(&set, "Actor")))),
+    );
+    vm.set_property(actor, "Location", 0, Value::Vector([100.0, 200.0, 300.0]));
+    vm.set_property(actor, "Rotation", 0, Value::Rotator([0, 16384, 0]));
+    let properties = vm.objects[actor as usize].props.clone();
+    vm.set_animation_data(Box::new(BoundingPose(vec![
+        [1.0, 2.0, -3.0],
+        [-4.0, -5.0, 6.0],
+    ])));
+    call_native(
+        &mut vm,
+        "Engine.Actor.RecomputeBoundingVolume",
+        actor,
+        &[false],
+        &mut [Value::Bool(true)],
+    );
+    let (min, max) = vm.frozen_render_bounds(actor).unwrap();
+    for (actual, expected) in min
+        .into_iter()
+        .zip([98.0, 196.0, 297.0])
+        .chain(max.into_iter().zip([105.0, 201.0, 306.0]))
+    {
+        assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+    }
+    // Collision, location, animation and script fields must not be mutated by a render box.
+    assert_eq!(vm.objects[actor as usize].props, properties);
+    vm.set_property(actor, "Location", 0, Value::Vector([0.0; 3]));
+    assert_eq!(
+        vm.frozen_render_bounds(actor),
+        Some((min, max)),
+        "fixed box must stay in world space"
+    );
+    call_native(
+        &mut vm,
+        "Engine.Actor.RecomputeBoundingVolume",
+        actor,
+        &[false],
+        &mut [Value::Bool(false)],
+    );
+    assert_eq!(vm.frozen_render_bounds(actor), None);
+}
+
+#[test]
+fn recompute_bounding_volume_empty_and_bad_pose_do_not_invent_bounds() {
+    let p = ScriptPackage::load(
+        "Test",
+        bone_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .unwrap();
+    let mut set = ScriptSet::new();
+    set.add(p);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let actor = vm.spawn(sg(&set, "Actor"), "Corpse").unwrap();
+    vm.set_property(
+        actor,
+        "Mesh",
+        0,
+        Value::Object(Some(ObjRef::Static(sg(&set, "Actor")))),
+    );
+    assert!(
+        vm.recompute_bounding_volume(actor, true).is_err(),
+        "missing pose provider must fail"
+    );
+    vm.set_animation_data(Box::new(BoundingPose(Vec::new())));
+    vm.recompute_bounding_volume(actor, true).unwrap();
+    assert_eq!(vm.frozen_render_bounds(actor), None);
+    vm.set_animation_data(Box::new(BoundingPose(vec![[f32::NAN, 0.0, 0.0]])));
+    assert!(vm.recompute_bounding_volume(actor, true).is_err());
+    assert_eq!(vm.frozen_render_bounds(actor), None);
+    vm.set_animation_data(Box::new(PoseStub));
+    assert!(
+        vm.recompute_bounding_volume(actor, true).is_err(),
+        "unsupported provider must fail"
+    );
+}
 
 impl crate::animation::AnimationData for PoseStub {
     fn sequence(&mut self, _source: &str, _seq: &str) -> Result<Option<SeqInfo>, String> {
