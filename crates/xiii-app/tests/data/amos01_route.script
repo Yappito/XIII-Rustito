@@ -1,34 +1,23 @@
-# item40/item40e: Amos01 route. Player input plus named use/grab of map actors; no teleport,
-# set_goal, take_control or weapon grant. Input is ignored by the run while the authored
-# cinematics own the controller (intro Cine0, Jones Cine3).
+# item40m: Amos01 route. Player input plus named use/grab of map actors; no teleport,
+# set_goal, take_control or weapon grant beyond the level's own pickups. Input is ignored
+# while the authored cinematics own the controller (intro Cine0, Jones Cine3).
 #
-# item40e findings (local/reports/item40e-amos01-doorway.md):
-#   - Porte14/15 on the office north wall are the sliding panels of a wall cupboard
-#     (AMplacar01 + AMplacarport01) on a 384-UU-thick solid BSP wall: there is no doorway.
-#   - The office's only player exit is the south door Porte17 (8,-528), a PlayerTriggerToggle
-#     XIIIPorte opened by use; opening it fires its OpeningEvent dialamos3tempo.
-#   - The ground-floor ducts are entered through breakable floor-level grilles
-#     (XIDCine.BreakableMover, AMaeraplaq); the player starts without fists, so a deco pickup
-#     (ChaiseDeco -> DecoChair, one swing) breaks a grille.
+# The body up to the zone-19 crouch doorway is item40e/f/j (see
+# local/reports/item40f-amos01-duct.md): the office's only exit is Porte17 (use), the chair
+# ChaiseDeco2 swing breaks the zone-26 duct grille BreakAbleMover16, the west/north loop uses
+# Porte24 and punches the cartons/vent grilles (BreakAbleMover44/56/9/8) with the Fists.
 #
-# item40f (local/reports/item40f-amos01-duct.md): the duct is a dead end for the objective
-# (BreakAbleMover17's walkable face points out of the duct, item 1) and so is the zone-23
-# conference room (the AMtabloreso table's collision is the full 128x128x200 corridor block).
-# The authored ground route is the WEST/NORTH loop, measured from the portal graph and
-# box-probe sweeps: corridor (zone 22) west -> zone 24 (open boundary y=-544) -> use Porte24
-# (-2432,-240) -> zone 15 -> punch the breakable cartons BreakAbleMover44/56 (Fists,
-# inventorygroup 0; the chair's single swing is spent on the duct grille) -> duct 14 crawl
-# (crouched; BreakableMover9 at the west end faces into the duct, BreakableMover8 at the east
-# end faces into the duct) -> zone 19 south -> crouch doorway zone 21 (x=-1269, y 90..218) ->
-# zone 17 crawl (crouched, ceiling 128) north: (-1098,145) -> (-1098,421) -> (-1032,425) ->
-# (-1033,969) -> (-1018,1891) -> zone 41 -> (-1021,2322) -> (-1021,2704) -> zone 44 ->
-# TouchTrigger41 (-1010,3194) fires clabataille (Cine5, opens Porte6) -> (-1022,3367) ->
-# zone 45 (44-45 portal y 3316..3444) -> zone 45 west -> Porte6 (45-57 portal y=3600) ->
-# zone 57 (Porte7) -> 49 -> 56 -> sliver 59 -> zone 58 ground room -> AMescalier01 switchback
-# stairs (StaticMeshActor677) -> landing -> strip stairs to the 53-58 portal (Porte48) ->
-# zone 53 -> 52 (porte41/Porte38) -> 43 (Porte35) -> 39 ring -> slope down to zone 7 -> 6 ->
-# elevated nav chain 6/8/12/33 -> 32 corridor (y=-1360 band) -> 32-38 portal -> TouchTrigger39
-# (-1999,-553,524): objective 1 completes and the map travels to Toits01.
+# item40m re-timed the post-duct tail to continuous movement, densely resampled along the
+# known-good item40f waypoint polyline (every 80 UU) at a conservative ground speed (300 UU/s
+# walking, 120 UU/s crouch-crawl) so the player is never stationary in the open and never
+# arrives after a door use. Measured on the merged tree (local/re/item40m/amos01_diag1.log):
+# with the item40j dash-and-wait cadence the player stood still ~90% of the run and the live
+# AI bled 150 -> 0 by t=644 (BaseSoldier10 strip, BaseSoldier18/26 hall, BaseSoldier12 ring);
+# the invulnerable run (amos01_inv.log) shows the potential damage is ~880 hp, dominated by
+# BaseSoldier21 firing down the 32 corridor while the player waited at each 8-10 s waypoint.
+# Every authored anchor keeps its position; every punch block and door use is kept.
+# The Beretta+c9mmAmmo is the level's own pickup at (-2674,3679,75) (t=429 measured,
+# BerettaPick1 Touch); no host grant. No teleports.
 t=0.50 forward 1
 t=1.50 forward 0
 # Control returns after the intro (~t=84). Jones (Cine3) waits "wait player 192" behind the
@@ -141,204 +130,349 @@ t=236.50 shoot
 t=238.00 track off
 t=240.00 goto -1620 78
 t=243.00 crouch off
-# Zone 19 south -> crouch doorway zone 21 (x=-1269, y 90..218) -> zone 17 crawl north.
-# item40j: BaseSoldier10 (Tag 'prereinforcement', event 'reinforcement', static zone-45
-# (-1776,3268)) acquires the player at t=242.1 as the duct exit comes into view and hits every
-# ~2 s (measured TakeDamage 49 DTGunned = -7 hp; the old 6 s goto cadence stood at
-# (-1467,129) and (-1320,155), -56 hp over the strip). Run the strip to the crouch doorway
-# without a stand; past the x=-1269 doorway the measured fire line ends (no hits in the crawl).
-t=244.00 goto -1500 120
-t=245.00 goto -1370 150
-t=246.00 goto -1290 155
-# item40k: BreakableMover3 (-1279,154, class-default Health 10) fills the crouch doorway -
-# the standing box rests against it at x=-1313 (measured run 1; the pre-merge runs passed an
-# intact grille by a physics slip). One fist punch breaks Health 10; the second covers timing
-# slack and its ray ends in the empty crawl behind the doorway.
-t=246.80 track BreakableMover3
-t=247.50 shoot
-t=249.50 shoot
-t=251.00 track off
-t=251.50 crouch on
-t=252.00 goto -1235 155
-t=256.00 goto -1100 150
-# Zone 17 crawl: ceiling 128, floor z=0, nav chain (PathNode161/162/163/164/167).
-t=268.00 goto -1098 300
-t=274.00 goto -1098 421
-t=280.00 goto -1032 425
-t=286.00 goto -1033 700
-t=292.00 goto -1033 969
-t=300.00 goto -1020 1300
-t=308.00 goto -1018 1700
-t=315.00 goto -1018 1891
-# Zone 41 crawl (17-41 portal y=1910), then zone 44; TouchTrigger41 (-1010,3194) fires
-# clabataille -> Cine5 (the hall fight scene) opens Porte6 for the zone-45 west exit.
-t=323.00 goto -1021 2100
-t=331.00 goto -1021 2322
-# BreakAbleMover57 (-1012,2305) is the crawl corridor's first vent grille (Health 10);
-# punch it open (extra shots cover the crawl-timing slack; the corridor is empty).
-t=339.00 track BreakAbleMover57
-t=340.00 shoot
-t=341.50 shoot
-t=343.00 shoot
-t=344.50 track off
-t=346.00 goto -1021 2600
-t=354.00 goto -1021 2704
-# item40k: the old BreakableMover5 punch here was out of fist reach - the grille stands at
-# the ring corridor's west mouth (x=-1279, 258 UU west); it is punched from the strip side in
-# the zone-39 ring section below.
-t=371.00 goto -1021 2900
-t=379.00 goto -1010 3100
-t=385.00 goto -1010 3194
-t=393.00 goto -1022 3367
-t=401.00 goto -1200 3390
-t=408.00 crouch off
-# BreakableMover6 (-1279,3380) is the zone-45 west vent grille (Health 10): walk up to it
-# (the fist ray reaches 100 UU from the eye - at t=471 the player was 97 UU out and short),
-# then punch it open.
-t=411.00 goto -1250 3385
-t=417.00 track BreakableMover6
-t=418.00 shoot
-t=419.50 shoot
-t=421.00 track off
-# Zone 45 west; Porte6 is opened by the game's own clabataille chain (TouchTrigger41 ->
-# XIIIMover9 -> Cine5 scene -> Porte6). Measured on this tree (clabataille opens Porte6 at
-# t=388): the door is already open, so the route must NOT `use` it - a use toggles it shut
-# (XIIIPorte.PlayerTriggerToggle) and blocks the zone-45 west exit.
-t=423.00 goto -1800 3300
-t=425.00 goto -2300 3450
-# item40j: BaseSoldier18 (Tag 'clabataille', event 'dialamos5', static (-2744,4130) facing
-# south, holds MagnumPlus1) acquires the player at t=427.7 through the open Porte6 line and
-# hits every ~1.2-2.4 s (measured TakeDamage 80 DTGunned = -12 hp; the old cadence stood in his
-# line at (-2649,3550) and (-2487,3803) and died at t=437 with 5 hits). Run the hall to Porte7
-# without a stand; every later command is shifted 12.5 s earlier to match.
-# Steer through the Porte6 doorway west of the door leaf: the BSP block at y 3584..3616 spans
-# x -2624..-2176, so the passable lane is x < -2624 (measured box-probe at -2624,3550 is
-# start-penetrating; the door leaf itself is at x -2752..-2624).
-t=426.50 goto -2560 3530
-t=427.50 goto -2700 3620
-t=428.80 goto -2500 3800
-t=429.80 goto -2470 3900
-t=431.00 goto -2410 4150
-t=432.20 goto -2380 4400
-t=433.40 goto -2368 4620
-t=434.40 use Porte7
-# Zone 49 west, then zone 56 north.
-t=439.50 goto -2600 4850
-t=445.50 goto -2900 4900
-t=451.50 goto -2950 5060
-t=457.50 goto -2950 5300
-t=465.50 goto -2900 5800
-t=473.50 goto -2800 6100
-t=478.50 goto -2650 6170
-# Sliver 59 into the zone 58 ground room; AMescalier01 switchback stairs.
-t=482.50 goto -2560 6180
-t=486.50 goto -2400 6180
-t=491.50 goto -2250 6180
-t=496.50 goto -2190 6150
-t=501.50 goto -2190 6080
-t=506.50 goto -2180 6020
-t=511.50 goto -2170 5960
-t=516.50 goto -2160 5910
-t=519.50 use Porte48
-t=524.50 goto -2110 5860
-t=529.50 goto -2110 5750
-# Zone 53 elevated west walk (nav chain), through 52 (porte41/Porte38) and 43 (Porte35).
-t=535.50 goto -2245 5736
-t=545.50 goto -3060 5549
-t=557.50 goto -3020 5117
-t=563.50 use porte41
-t=564.50 use Porte38
-t=568.50 goto -3014 4727
-t=574.50 goto -2831 4584
-t=580.50 goto -3152 4395
-t=587.50 goto -2623 4327
-t=593.50 goto -2457 4217
-t=599.50 goto -2405 3942
-t=605.50 goto -2280 3800
-t=609.50 use Porte35
-t=613.50 goto -2110 3540
-# item40k zone-39 ring re-authoring (bsp grid, box-probe and nav measured): the old west loop
-# pressed the M/J boundary wall (south face y~3268, x -2500..-1750) - every pre-merge run
-# stalled there and bled out. The authored crossing is the k strip (x -1650..-1300, clear
-# standing: box-probe -1500,3250 -> -1500,2700 no hit) between the thin wall (x -1750..-1700)
-# and the block (x -1280..-1076): north strip east, strip south to the south crawl corridor
-# (y 2644..2772, ceiling 128; nav PathNode185/173/172/171), punch its west grille
-# BreakableMover5 from the strip side, then crawl east under the block.
-t=619.50 goto -1700 3480
-t=625.50 goto -1500 3250
-t=633.50 goto -1500 2760
-t=640.50 goto -1330 2708
-# BreakableMover5 (x=-1279, y 2646..2770, Health 10): close to contact first (49 UU; the fist
-# ray reaches 100 UU and a 101 UU stand misses - the measured BM6 lesson), then punch.
-t=647.00 track BreakableMover5
-t=648.00 shoot
-t=649.50 shoot
-t=651.00 track off
-# Crouch-crawl east under the block (z 0..128); stand past x=-1076.
-t=651.50 crouch on
-t=652.00 goto -1240 2700
-t=656.00 goto -1100 2700
-t=660.00 crouch off
-t=660.50 goto -1000 2750
-# item40k: the corridor exit runs 12 s ahead of the old schedule (the k strip replaces the
-# ~50 s west loop); the tail keeps the original waypoint cadence, shifted to match.
-t=667.50 goto -800 2900
-t=674.50 goto -700 3200
-t=681.50 goto -700 3500
-t=689.50 goto -300 3520
-t=697.50 goto 300 3520
-t=705.50 goto 480 3300
-t=715.50 goto 478 2930
-# SW slope from the strip top down to zone 7's roof (r8/r9-validated slide line).
-t=721.50 goto 400 1990
-# Zone 7 west, 7-6 portal, zone 6, nav chain 6/8/12/33.
-t=739.50 goto 400 2000
-t=746.50 goto -400 1900
-t=753.50 goto -768 1900
-t=759.50 goto -1000 1890
-t=765.50 goto -1249 1891
-t=771.50 goto -1014 1753
-t=777.50 goto -1285 1586
-t=782.50 goto -1286 1436
-t=789.50 goto -1348 1111
-t=796.50 goto -1469 992
-t=802.50 goto -1356 757
-t=808.50 goto -1369 561
-t=814.50 goto -1340 428
-t=820.50 goto -1300 61
-t=827.50 goto -1275 -179
-t=833.50 goto -1287 -286
-t=840.50 goto -1227 -608
-t=847.50 goto -1141 -677
-t=853.50 goto -1041 -751
-t=859.50 goto -1210 -865
-t=866.50 goto -998 -889
-t=872.50 goto -828 -898
-t=878.50 goto -728 -903
-t=885.50 goto -350 -829
-t=892.50 goto -30 -827
-t=898.50 goto 84 -832
-t=905.50 goto 259 -936
-# Zone 33 -> 32 corridor (walk the y=-1360 band: AMtourporte2/BreakAbleMover48 at x~192).
-t=912.50 goto 288 -1100
-t=918.50 goto 288 -1260
-t=924.50 goto 250 -1360
-t=930.50 goto 0 -1360
-t=940.50 goto -500 -1360
-t=950.50 goto -1000 -1360
-t=960.50 goto -1500 -1350
-t=969.50 goto -1900 -1330
-t=975.50 goto -1980 -1300
-# 32-38 portal, then north through zone 38 to TouchTrigger39. StaticMeshActor592's brick
-# wall (x -2000..-1900, south face y=-1162) blocks the direct line; thread the clear lane at
-# x=-2050 (measured: box-probes at x=-2000/-1980/-1900 hit the wall, x=-2050 is clear).
-t=981.50 goto -1980 -1250
-t=989.50 goto -2045 -1250
-# StaticMeshActor592's brick wall spans the pocket at y=-1162; its opening is a window
-# (z 457..525, x -2100..-1990) only a crouched box fits (measured: box-probe half 34,75
-# hits, half 34,37 at z=485 clears). Crouch and crawl through.
-t=993.50 crouch on
-t=995.50 goto -2045 -650
-t=1007.50 crouch off
-t=1013.50 goto -1999 -553
-t=1032.00 wait_travel
+t=244.44 goto -1370 150
+t=244.71 goto -1290 155
+t=244.71 track BreakableMover3
+t=244.71 shoot
+t=246.51 shoot
+t=246.51 track off
+t=247.01 crouch on
+t=247.47 goto -1235 155
+t=248.60 goto -1100 150
+t=249.85 goto -1098 300
+t=250.85 goto -1098 421
+t=251.41 goto -1032 425
+t=252.17 goto -1032 517
+t=252.93 goto -1033 608
+t=253.70 goto -1033 700
+t=254.44 goto -1033 790
+t=255.19 goto -1033 879
+t=255.94 goto -1033 969
+t=256.63 goto -1030 1052
+t=257.32 goto -1026 1134
+t=258.01 goto -1023 1217
+t=258.70 goto -1020 1300
+t=259.37 goto -1020 1380
+t=260.03 goto -1019 1460
+t=260.70 goto -1019 1540
+t=261.37 goto -1018 1620
+t=262.03 goto -1018 1700
+t=262.83 goto -1018 1796
+t=263.62 goto -1018 1891
+t=264.50 goto -1020 1996
+t=265.37 goto -1021 2100
+t=266.29 goto -1021 2211
+t=267.22 goto -1021 2322
+t=267.22 track BreakAbleMover57
+t=267.22 shoot
+t=268.82 shoot
+t=270.42 shoot
+t=270.42 track off
+t=271.69 goto -1021 2415
+t=272.46 goto -1021 2507
+t=273.23 goto -1021 2600
+t=274.10 goto -1021 2704
+t=274.92 goto -1021 2802
+t=275.73 goto -1021 2900
+t=276.57 goto -1016 3000
+t=277.40 goto -1010 3100
+t=278.19 goto -1010 3194
+t=278.91 goto -1016 3280
+t=279.63 goto -1022 3367
+t=280.38 goto -1111 3378
+t=281.13 goto -1200 3390
+t=281.13 crouch off
+t=281.69 goto -1250 3385
+t=281.69 track BreakableMover6
+t=281.69 shoot
+t=283.29 shoot
+t=283.29 track off
+t=284.20 goto -1342 3371
+t=284.51 goto -1433 3357
+t=284.82 goto -1525 3342
+t=285.13 goto -1617 3328
+t=285.44 goto -1708 3314
+t=285.75 goto -1800 3300
+t=286.04 goto -1883 3325
+t=286.33 goto -1967 3350
+t=286.62 goto -2050 3375
+t=286.91 goto -2133 3400
+t=287.20 goto -2217 3425
+t=287.49 goto -2300 3450
+t=287.79 goto -2387 3477
+t=288.09 goto -2473 3503
+t=288.40 goto -2560 3530
+t=288.67 goto -2630 3575
+t=288.95 goto -2700 3620
+t=289.38 goto -2620 3720
+t=289.86 goto -2500 3800
+t=290.21 goto -2470 3900
+t=290.49 goto -2450 3983
+t=290.78 goto -2430 4067
+t=291.06 goto -2410 4150
+t=291.34 goto -2400 4233
+t=291.62 goto -2390 4317
+t=291.90 goto -2380 4400
+t=292.27 goto -2374 4510
+t=292.64 goto -2368 4620
+t=292.64 use Porte7
+t=294.71 goto -2426 4678
+t=294.98 goto -2484 4735
+t=295.25 goto -2542 4792
+t=295.53 goto -2600 4850
+t=295.86 goto -2700 4867
+t=296.20 goto -2800 4883
+t=296.54 goto -2900 4900
+t=296.82 goto -2925 4980
+t=297.10 goto -2950 5060
+t=297.36 goto -2950 5140
+t=297.63 goto -2950 5220
+t=297.90 goto -2950 5300
+t=298.18 goto -2942 5383
+t=298.46 goto -2933 5467
+t=298.74 goto -2925 5550
+t=299.01 goto -2917 5633
+t=299.29 goto -2908 5717
+t=299.57 goto -2900 5800
+t=299.92 goto -2867 5900
+t=300.28 goto -2833 6000
+t=300.63 goto -2800 6100
+t=300.90 goto -2725 6135
+t=301.18 goto -2650 6170
+t=301.48 goto -2560 6180
+t=301.75 goto -2480 6180
+t=302.01 goto -2400 6180
+t=302.51 goto -2250 6180
+t=302.74 goto -2190 6150
+t=302.97 goto -2190 6080
+t=303.17 goto -2180 6020
+t=303.38 goto -2170 5960
+t=303.55 goto -2160 5910
+t=303.55 use Porte48
+t=305.58 goto -2110 5860
+t=305.95 goto -2110 5750
+t=306.40 goto -2245 5736
+t=306.68 goto -2326 5717
+t=306.96 goto -2408 5699
+t=307.24 goto -2490 5680
+t=307.52 goto -2571 5661
+t=307.80 goto -2652 5642
+t=308.07 goto -2734 5624
+t=308.35 goto -2816 5605
+t=308.63 goto -2897 5586
+t=308.91 goto -2978 5568
+t=309.19 goto -3060 5549
+t=309.48 goto -3052 5463
+t=309.77 goto -3044 5376
+t=310.06 goto -3036 5290
+t=310.35 goto -3028 5203
+t=310.63 goto -3020 5117
+t=310.63 use porte41
+t=311.83 use Porte38
+t=313.36 goto -3018 5020
+t=313.68 goto -3017 4922
+t=314.01 goto -3016 4824
+t=314.34 goto -3014 4727
+t=314.72 goto -2922 4656
+t=315.11 goto -2831 4584
+t=315.42 goto -2911 4537
+t=315.73 goto -2992 4490
+t=316.04 goto -3072 4442
+t=316.35 goto -3152 4395
+t=316.65 goto -3064 4384
+t=316.94 goto -2976 4372
+t=317.24 goto -2888 4361
+t=317.54 goto -2799 4350
+t=317.83 goto -2711 4338
+t=318.13 goto -2623 4327
+t=318.46 goto -2540 4272
+t=318.79 goto -2457 4217
+t=319.10 goto -2440 4125
+t=319.41 goto -2422 4034
+t=319.73 goto -2405 3942
+t=320.04 goto -2342 3871
+t=320.36 goto -2280 3800
+t=320.36 use Porte35
+t=322.50 goto -2223 3713
+t=322.85 goto -2167 3627
+t=323.19 goto -2110 3540
+t=323.47 goto -2028 3528
+t=323.74 goto -1946 3516
+t=324.02 goto -1864 3504
+t=324.30 goto -1782 3492
+t=324.57 goto -1700 3480
+t=324.91 goto -1633 3403
+t=325.25 goto -1567 3327
+t=325.59 goto -1500 3250
+t=325.86 goto -1500 3168
+t=326.13 goto -1500 3087
+t=326.41 goto -1500 3005
+t=326.68 goto -1500 2923
+t=326.95 goto -1500 2842
+t=327.22 goto -1500 2760
+t=327.52 goto -1415 2734
+t=327.81 goto -1330 2708
+t=327.81 track BreakableMover5
+t=327.81 shoot
+t=329.41 shoot
+t=329.41 track off
+t=329.91 crouch on
+t=330.67 goto -1240 2700
+t=331.83 goto -1100 2700
+t=331.83 crouch off
+t=332.61 goto -1000 2750
+t=332.88 goto -933 2800
+t=333.16 goto -867 2850
+t=333.44 goto -800 2900
+t=333.79 goto -767 3000
+t=334.14 goto -733 3100
+t=334.49 goto -700 3200
+t=334.83 goto -700 3300
+t=335.16 goto -700 3400
+t=335.49 goto -700 3500
+t=335.76 goto -620 3504
+t=336.03 goto -540 3508
+t=336.30 goto -460 3512
+t=336.56 goto -380 3516
+t=336.83 goto -300 3520
+t=337.12 goto -214 3520
+t=337.40 goto -129 3520
+t=337.69 goto -43 3520
+t=337.97 goto 43 3520
+t=338.26 goto 129 3520
+t=338.54 goto 214 3520
+t=338.83 goto 300 3520
+t=339.15 goto 360 3447
+t=339.46 goto 420 3373
+t=339.78 goto 480 3300
+t=340.09 goto 480 3208
+t=340.39 goto 479 3115
+t=340.70 goto 478 3022
+t=341.01 goto 478 2930
+t=341.30 goto 471 2845
+t=341.58 goto 464 2759
+t=341.87 goto 457 2674
+t=342.15 goto 450 2588
+t=342.44 goto 443 2503
+t=342.73 goto 435 2417
+t=343.01 goto 428 2332
+t=343.30 goto 421 2246
+t=343.58 goto 414 2161
+t=343.87 goto 407 2075
+t=344.15 goto 400 1990
+t=344.19 goto 400 2000
+t=344.46 goto 320 1990
+t=344.73 goto 240 1980
+t=344.99 goto 160 1970
+t=345.26 goto 80 1960
+t=345.53 goto 0 1950
+t=345.80 goto -80 1940
+t=346.07 goto -160 1930
+t=346.34 goto -240 1920
+t=346.61 goto -320 1910
+t=346.88 goto -400 1900
+t=347.18 goto -492 1900
+t=347.49 goto -584 1900
+t=347.80 goto -676 1900
+t=348.10 goto -768 1900
+t=348.49 goto -884 1895
+t=348.88 goto -1000 1890
+t=349.15 goto -1083 1890
+t=349.43 goto -1166 1891
+t=349.71 goto -1249 1891
+t=350.01 goto -1171 1845
+t=350.31 goto -1092 1799
+t=350.61 goto -1014 1753
+t=350.97 goto -1104 1697
+t=351.32 goto -1195 1642
+t=351.68 goto -1285 1586
+t=352.18 goto -1286 1436
+t=352.45 goto -1302 1355
+t=352.73 goto -1317 1274
+t=353.00 goto -1332 1192
+t=353.28 goto -1348 1111
+t=353.56 goto -1408 1052
+t=353.84 goto -1469 992
+t=354.13 goto -1431 914
+t=354.42 goto -1394 835
+t=354.71 goto -1356 757
+t=355.04 goto -1362 659
+t=355.37 goto -1369 561
+t=355.82 goto -1340 428
+t=356.13 goto -1330 336
+t=356.44 goto -1320 244
+t=356.74 goto -1310 153
+t=357.05 goto -1300 61
+t=357.32 goto -1292 -19
+t=357.59 goto -1283 -99
+t=357.86 goto -1275 -179
+t=358.22 goto -1287 -286
+t=358.49 goto -1272 -366
+t=358.76 goto -1257 -447
+t=359.03 goto -1242 -528
+t=359.31 goto -1227 -608
+t=359.67 goto -1141 -677
+t=360.09 goto -1041 -751
+t=360.43 goto -1126 -808
+t=360.77 goto -1210 -865
+t=361.12 goto -1104 -877
+t=361.48 goto -998 -889
+t=361.76 goto -913 -894
+t=362.05 goto -828 -898
+t=362.38 goto -728 -903
+t=362.70 goto -634 -884
+t=363.02 goto -539 -866
+t=363.34 goto -444 -848
+t=363.67 goto -350 -829
+t=363.93 goto -270 -828
+t=364.20 goto -190 -828
+t=364.47 goto -110 -828
+t=364.73 goto -30 -827
+t=365.11 goto 84 -832
+t=365.45 goto 172 -884
+t=365.79 goto 259 -936
+t=366.07 goto 274 -1018
+t=366.35 goto 288 -1100
+t=366.61 goto 288 -1180
+t=366.88 goto 288 -1260
+t=367.24 goto 250 -1360
+t=367.51 goto 167 -1360
+t=367.79 goto 83 -1360
+t=368.07 goto 0 -1360
+t=368.35 goto -83 -1360
+t=368.62 goto -167 -1360
+t=368.90 goto -250 -1360
+t=369.18 goto -333 -1360
+t=369.46 goto -417 -1360
+t=369.74 goto -500 -1360
+t=370.01 goto -583 -1360
+t=370.29 goto -667 -1360
+t=370.57 goto -750 -1360
+t=370.85 goto -833 -1360
+t=371.12 goto -917 -1360
+t=371.40 goto -1000 -1360
+t=371.68 goto -1083 -1358
+t=371.96 goto -1167 -1357
+t=372.24 goto -1250 -1355
+t=372.51 goto -1333 -1353
+t=372.79 goto -1417 -1352
+t=373.07 goto -1500 -1350
+t=373.34 goto -1580 -1346
+t=373.60 goto -1660 -1342
+t=373.87 goto -1740 -1338
+t=374.14 goto -1820 -1334
+t=374.40 goto -1900 -1330
+t=374.69 goto -1980 -1300
+t=374.86 goto -1980 -1250
+t=375.07 goto -2045 -1250
+t=375.07 crouch on
+t=375.79 goto -2045 -1164
+t=376.50 goto -2045 -1079
+t=377.22 goto -2045 -993
+t=377.93 goto -2045 -907
+t=378.64 goto -2045 -821
+t=379.36 goto -2045 -736
+t=380.07 goto -2045 -650
+t=380.07 crouch off
+t=380.83 goto -1999 -553
+t=398.83 wait_travel

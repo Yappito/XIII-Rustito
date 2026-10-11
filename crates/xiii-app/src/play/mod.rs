@@ -2223,6 +2223,11 @@ pub(crate) struct ScriptOutcome {
     /// it (the final map's states are the last entry). Requirement 4's "objective states over
     /// time" across a multi-map run.
     pub map_objectives: Vec<(String, Vec<session::ObjectiveState>)>,
+    /// item40m: each map the run passed through and the minimum player `Health` observed on it
+    /// (the final map's value is the last entry). The route tests pin the lowest value so a
+    /// change that lets the live AI bleed the player more fails visibly.
+    #[allow(dead_code)] // test-evidence field (opt-in route tests)
+    pub map_min_health: Vec<(String, f32)>,
     /// Host-synthesised footsteps in order:
     /// `(seconds, XIIIFootStepSound wrapper path, floor material path)`.
     pub footsteps: Vec<(f32, String, Option<String>)>,
@@ -2466,6 +2471,9 @@ fn run_script_inner(
     let mut travel = Vec::new();
     let mut map_objectives = Vec::new();
     let mut map_traces = Vec::new();
+    // item40m: minimum player Health seen on the current map (reset after each travel).
+    let mut map_min_health: Vec<(String, f32)> = Vec::new();
+    let mut cur_min_health = f32::INFINITY;
     let mut runtime = match options.initial {
         Some(runtime) => runtime,
         None => open_map_runtime(game_dir, map, scene, params)?,
@@ -2596,6 +2604,10 @@ fn run_script_inner(
         runtime
             .session
             .sync_view_rotation(runtime.sim.yaw, runtime.sim.pitch);
+        // item40m: record the minimum player Health this tick (before any heal/damage later).
+        if let Some(h) = runtime.session.player_health() {
+            cur_min_health = cur_min_health.min(h);
+        }
         runtime.rider.carry(&mut runtime.sim.location, |name| {
             runtime.session.vm().mover_state(name)
         });
@@ -2710,6 +2722,8 @@ fn run_script_inner(
             });
             map_objectives.push((runtime.name.clone(), runtime.session.objective_states()));
             map_traces.push((runtime.name.clone(), runtime.session.vm().trace.clone()));
+            map_min_health.push((runtime.name.clone(), cur_min_health));
+            cur_min_health = f32::INFINITY;
             if options.stop_on_travel {
                 tick += 1;
                 break;
@@ -2752,6 +2766,7 @@ fn run_script_inner(
     }
     map_objectives.push((runtime.name.clone(), runtime.session.objective_states()));
     map_traces.push((runtime.name.clone(), runtime.session.vm().trace.clone()));
+    map_min_health.push((runtime.name.clone(), cur_min_health));
     if let Some(h) = runtime.video_host.as_ref() {
         println!("[play] {}", h.report_line());
         for d in h.diagnostics() {
@@ -2778,6 +2793,7 @@ fn run_script_inner(
         travel,
         map_objectives,
         map_traces,
+        map_min_health,
         footsteps: footstep_log,
     })
 }
@@ -4489,7 +4505,11 @@ mod tests {
     /// breaks the duct grille `BreakAbleMover16`, the crawl and west/north loop punch the
     /// vent grilles (`BreakableMover9/8/57/5/6`) through the game's own fire chain, the
     /// rooftop window crawl reaches `TouchTrigger39` (objective 1) and the level travels to
-    /// Toits01 (see the item40f report).
+    /// Toits01 (see the item40f report). item40m re-timed the post-duct tail to continuous
+    /// movement so the live AI (whose fire killed the player at t=644 with the old
+    /// dash-and-wait cadence) never engages: the route is densely resampled along the same
+    /// polyline at a conservative ground speed, and the test pins the measured minimum player
+    /// Health. The Beretta+c9mmAmmo is the level's own `BerettaPick1` touch pickup.
     #[test]
     fn opt_in_amos01_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -4532,6 +4552,24 @@ mod tests {
         assert_eq!(
             outcome.final_map, "Toits01",
             "the route must reach TouchTrigger39 and travel to Toits01"
+        );
+        // item40m: the route survives the now-live AI by keeping the player moving (the item40j
+        // dash-and-wait cadence bled 150 -> 0 by t=644). Pin the measured floor so a change that
+        // lets the AI engage the player again fails visibly instead of silently passing.
+        let amos_min_health = outcome
+            .map_min_health
+            .iter()
+            .find(|(m, _)| m == "Amos01")
+            .map(|(_, h)| *h)
+            .expect("the run must record Amos01's minimum player Health");
+        println!(
+            "[amos01 route] minimum player Health along Amos01: {amos_min_health} (measured; \
+             survived the live-AI fire)"
+        );
+        assert!(
+            amos_min_health.is_finite() && amos_min_health >= 25.0,
+            "the route player must survive the live-AI fire with margin (measured floor 28); \
+             got {amos_min_health} (a non-finite value means no Health was ever observed)"
         );
         assert!(
             outcome
