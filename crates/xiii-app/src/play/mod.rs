@@ -6055,10 +6055,20 @@ mod tests {
             outcome.travel
         );
         // item68b: with the live Level.TimeSeconds, the old tarmac wait dies at -30 HP.
-        // Input now engages the rocket soldier on landing (head aim, before moving east),
-        // then runs continuously to the same door-line cover. Measured: soldier18
-        // 150 -> 15 at317.4 -> -41 at318.2, player150 throughout. The old40..60
-        // window measured a different input against a frozen script clock.
+        // Input engages the rocket soldier on landing. item69: PickWallAdjust unblocked
+        // both bataillefinale soldiers' pursuit, which changes the tarmac fight (measured
+        // local/re/item69/toits01-retiming-v1.txt): soldier18 closes and fires a rocket
+        // while dying, and soldier17's pursuit flank around the Tmetaldoorhelico door line
+        // puts his muzzle on the player side of the old door-line cover (DTGunned 75 at
+        // 342.1, then a 74-dmg series through the generator phase killed the item68b
+        // route player at -10). The route input is re-timed: kill soldier18 in the
+        // landing burst, then duel soldier17 at long range from the landing spot (where
+        // the same sight line serves both ways and his DTGunned fire misses; the door
+        // line blocked only the player's rays), then cross. Measured (v5): soldier18
+        // 150 -> 94 at317.2 -> 38 at317.4 -> dead at318.2; his in-flight rocket lands at
+        // 318.817 (the one unavoidable hit: none/one-juke/two-juke dodges all took the
+        // 318.8 blast for 50/45/41, v2/v3/v4); soldier17 150 -> 94 -> 38 -> dead by323.3
+        // without landing a hit; player 150 -> 100 and stays there.
         let health = session
             .player_health()
             .expect("the player must still have a Health property across the route");
@@ -6079,8 +6089,9 @@ mod tests {
             "the route player must survive the tarmac rockets and the fight phase with normal-health soldiers, got health {health}"
         );
         assert_eq!(
-            health, 150.0,
-            "landing engagement and continuous crossing must preserve the measured health150"
+            health, 100.0,
+            "the re-timed tarmac fight must end at the measured health100 (one in-flight \
+             rocket from the killed rocketeer; both pursuers dead, no further damage)"
         );
         // Goal 3 (Jones must not die) completes; goals 0/1/2 do not.
         for o in &objectives {
@@ -6312,13 +6323,16 @@ mod tests {
         // item61b continuation pins (the route's fight + generator-retry phases):
         // 1. The earlier real-clock landing engagement kills BaseSoldier18 before the
         // crossing; retain an exact damage result as well as the death assertion.
+        // item69: the pursuing soldier18 fires while dying and the re-timed burst hits
+        // measure 56-per-spine-hit (150 -> 94 at317.2 -> 38 at317.4 -> -18), so the
+        // corpse value moves from the item68b -41 to the measured -18.
         let soldier18 = vm
             .find_object("BaseSoldier18")
             .expect("BaseSoldier18 must exist");
         assert_eq!(
             vm.get_property(soldier18, "Health"),
-            Some(&xiii_script::Value::Int(-41)),
-            "the landing M60 engagement must reproduce the measured 150 -> 15 -> -41 kill"
+            Some(&xiii_script::Value::Int(-18)),
+            "the landing M60 engagement must reproduce the measured 150 -> 94 -> 38 -> -18 kill"
         );
         assert!(
             session.actor_is_dead(soldier18),

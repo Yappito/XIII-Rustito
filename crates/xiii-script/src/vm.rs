@@ -8366,10 +8366,9 @@ impl<'s> Vm<'s> {
         )
     }
 
-    /// Script Trace's composed flags; pawn/mover category bits remain effective even when
-    /// bTraceActors was false. Special BSP/material filtering remains Partial.
+    /// Internal composed trace flags, with endpoint-on-miss outputs. Special
+    /// BSP/material filtering remains Partial.
     #[allow(clippy::type_complexity)]
-    #[cfg(test)]
     pub(crate) fn vm_trace_flags(
         &mut self,
         id: ObjectId,
@@ -9345,6 +9344,138 @@ impl<'s> Vm<'s> {
     ) -> VmResult<bool> {
         let point = self.vector_prop(other, "Location").unwrap_or([0.0; 3]);
         self.nav_point_reachable(controller, point)
+    }
+
+    /// Retail walking wall adjustment (Engine.dll 0x103b5120). The supplied vector
+    /// is only used by the jump branch; lateral choices derive from Destination.
+    pub(crate) fn pick_wall_adjust(
+        &mut self,
+        controller: ObjectId,
+        hit_normal: [f32; 3],
+    ) -> VmResult<bool> {
+        let Some(pawn) = self.obj_prop(controller, "Pawn") else {
+            return Ok(false);
+        };
+        let physics = self.byte_prop(pawn, "Physics");
+        if physics == 2 || self.obj_prop(pawn, "Controller").is_none() {
+            return Ok(false);
+        }
+        if matches!(physics, 3 | 4) {
+            return Err(self.err(VmErrorKind::Other(
+                "Controller.PickWallAdjust: swimming/flying Pick3DWallAdjust is not implemented"
+                    .into(),
+            )));
+        }
+        let loc = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let dest = self.vector_prop(controller, "Destination").unwrap_or(loc);
+        let radius = self.f32_prop(pawn, "CollisionRadius");
+        let height = self.f32_prop(pawn, "CollisionHeight");
+        let delta = sub3(dest, loc);
+        if !hit_normal.iter().chain(delta.iter()).all(|v| v.is_finite())
+            || !radius.is_finite()
+            || radius < 0.0
+            || !height.is_finite()
+            || height < 0.0
+        {
+            return Err(self.err(VmErrorKind::Other(
+                "Controller.PickWallAdjust: invalid direction, destination or pawn extent".into(),
+            )));
+        }
+        if delta[2] > height && delta[0] * delta[0] + delta[1] * delta[1] < radius * radius {
+            return Ok(false);
+        }
+        let length = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+        if length == 0.0 {
+            return Ok(false);
+        }
+        let dir = [delta[0] / length, delta[1] / length, 0.0];
+        let eye = add3(loc, [0.0, 0.0, self.f32_prop(pawn, "EyeHeight")]);
+        let associated = self
+            .obj_prop(controller, "MoveTarget")
+            .filter(|&target| self.bool_prop(target, "bWorldGeometry"));
+        let trace = self.vm_trace_flags(pawn, eye, dest, 0x286, [0.0; 3])?;
+        let distance = 16.0 + 1.5 * radius + if trace.0 != associated { radius } else { 0.0 };
+        let mut side = [dir[1], -dir[0], 0.0];
+        let mut eye_offset = scale3(side, 1.4 * radius);
+        let mut reversed = false;
+        if self
+            .vm_trace_flags(pawn, add3(eye, eye_offset), dest, 0x286, [0.0; 3])?
+            .0
+            != associated
+        {
+            side = scale3(side, -1.0);
+            eye_offset = scale3(eye_offset, -1.0);
+            reversed = true;
+            if self
+                .vm_trace_flags(pawn, add3(eye, eye_offset), dest, 0x286, [0.0; 3])?
+                .0
+                != associated
+            {
+                return Ok(false);
+            }
+        }
+        let extent = [radius, radius, height];
+        let forward = scale3(dir, 14.0);
+        // This is a jump-clearance test, not the walker's ordinary 35-UU step-up.
+        if physics == PHYS_WALKING && self.bool_prop(pawn, "bCanJump") {
+            let up = add3(loc, [0.0, 0.0, 80.0]);
+            let (_, point, _) = self.vm_trace_flags(pawn, loc, up, 0x86, extent)?;
+            let fraction = (point[2] - loc[2]) / 80.0;
+            if fraction > 0.5 {
+                let raised = add3(loc, [0.0, 0.0, 80.0 * fraction]);
+                if self
+                    .vm_trace_flags(pawn, raised, add3(raised, forward), 0x286, extent)?
+                    .0
+                    .is_none()
+                {
+                    let jump_dir = [-hit_normal[0], -hit_normal[1], 0.0];
+                    let mut velocity = scale3(jump_dir, self.f32_prop(pawn, "GroundSpeed"));
+                    velocity[2] = self.f32_prop(pawn, "JumpZ");
+                    self.set_property(pawn, "Velocity", 0, Value::Vector(velocity));
+                    self.set_property(
+                        pawn,
+                        "Acceleration",
+                        0,
+                        Value::Vector(scale3(jump_dir, self.f32_prop(pawn, "AccelRate"))),
+                    );
+                    self.set_property(pawn, "Physics", 0, Value::Byte(2));
+                    return Ok(true);
+                }
+            }
+        }
+        for attempt in 0..2 {
+            if attempt == 1 {
+                if reversed {
+                    break;
+                }
+                eye_offset = scale3(eye_offset, -1.0);
+                if self
+                    .vm_trace_flags(pawn, add3(eye, eye_offset), dest, 0x286, [0.0; 3])?
+                    .0
+                    .is_some()
+                {
+                    break;
+                }
+                side = scale3(side, -1.0);
+            }
+            let candidate = add3(loc, scale3(side, distance));
+            if self
+                .vm_trace_flags(pawn, loc, candidate, 0x286, extent)?
+                .0
+                .is_none()
+                && self
+                    .vm_trace_flags(pawn, candidate, add3(candidate, forward), 0x286, extent)?
+                    .0
+                    .is_none()
+            {
+                if self.is_a(controller, "AIController") {
+                    self.set_property(controller, "bAdjusting", 0, Value::Bool(true));
+                    self.set_property(controller, "AdjustLoc", 0, Value::Vector(candidate));
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Starts a latent `MoveTo`/`MoveToward`. Returns `false` when there is no pawn to move (the
