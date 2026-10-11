@@ -10006,15 +10006,25 @@ impl<'s> Vm<'s> {
         let displacement = scale3(velocity, dt);
         let extent = self.actor_extent(pawn);
         let collides_world = self.bool_prop(pawn, "bCollideWorld");
-        let end = if collides_world {
+        let (end, on_floor) = if collides_world {
             let Some(provider) = self.physics.as_mut() else {
                 return Err(self.err(VmErrorKind::NoPhysicsProvider {
                     native: "Controller movement".into(),
                 }));
             };
-            provider.walk_box(loc, displacement, extent).end
+            let outcome = provider.walk_box(loc, displacement, extent);
+            // `walk_box` follows the floor when one is within the walking step height. A
+            // controller-driven walk must hand off to scripted falling physics when it has
+            // stepped beyond that support; otherwise its next MoveToward poll continues to
+            // move horizontally at the old Z forever. Probe down by the engine's 35 UU step
+            // height (plus a small contact tolerance) at the resulting pawn location.
+            let floor = provider.move_box(outcome.end, [0.0, 0.0, -(35.0 + 1.0e-3)], extent);
+            (
+                outcome.end,
+                floor.hit.is_some_and(|hit| hit.normal[2] >= FLOOR_NORMAL_Z),
+            )
         } else {
-            add3(loc, displacement)
+            (add3(loc, displacement), true)
         };
         self.set_property(pawn, "Location", 0, Value::Vector(end));
         self.set_property(
@@ -10023,6 +10033,9 @@ impl<'s> Vm<'s> {
             0,
             Value::Vector(scale3(sub3(end, loc), dt.recip())),
         );
+        if walking && collides_world && !on_floor {
+            self.set_property(pawn, "Physics", 0, Value::Byte(PHYS_FALLING));
+        }
         Ok(false)
     }
 
