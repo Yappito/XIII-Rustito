@@ -88,6 +88,8 @@ struct WorldRes {
     world: CollisionWorld,
     sources: Vec<String>,
     movers: movers::MoverCollision,
+    /// The mover the player stands on (a lift cage carries the player).
+    rider: movers::Rider,
 }
 
 /// Render entities per map actor (the part of the scene object path before `" -> "`), for the
@@ -834,6 +836,7 @@ fn setup_inner(
         world,
         sources,
         movers: mover_collision,
+        rider: movers::Rider::default(),
     });
     if !resetting {
         commands.insert_resource(ScriptRes { drive });
@@ -941,14 +944,23 @@ fn perform_use(
     params: &PlayerParams,
 ) {
     let (origin, dir) = use_ray(sim, params);
-    match ray_target(world, sources, origin, dir, USE_REACH_M) {
-        Some(target) => {
-            // A mover is used through its own lock/unlock/open chain; a dead pawn in front is
-            // searched (the engine `Grab` interaction). `use_target` tries both, in that order.
-            let outcome = sess.use_target(&target);
+    let hit = ray_target(world, sources, origin, dir, USE_REACH_M);
+    let outcome = hit.as_ref().map(|target| sess.use_target(target));
+    match (hit, outcome) {
+        // A mover is used through its own lock/unlock/open chain; a dead pawn in front is
+        // searched (the engine `Grab` interaction). `use_target` tries both, in that order.
+        (Some(target), Some(outcome)) if outcome != session::UseOutcome::NotAMover => {
             println!("[play] use {target}: {outcome:?}");
         }
-        None => println!("[play] use: nothing in reach"),
+        // Nothing mover-like was hit: a card reader has no collision, so the game's own
+        // interaction targeting (`MyInteraction.TargetActor`) decides what `Grab` acts on.
+        (hit, _) => match sess.grab_interaction_target() {
+            Some((target, outcome)) => println!("[play] use {target}: {outcome:?}"),
+            None => match hit {
+                Some(target) => println!("[play] use {target}: NotAMover"),
+                None => println!("[play] use: nothing in reach"),
+            },
+        },
     }
 }
 
@@ -1088,6 +1100,19 @@ fn fixed_step(
         );
     }
     perf.span("player_sim", t0);
+    if let Ok(sess) = session.as_mut() {
+        let sim = &sim.0;
+        let world = &mut *world;
+        if let movers::BaseChange::Changed(base) =
+            world
+                .rider
+                .observe(sim.grounded, sim.floor_source, &world.sources, |name| {
+                    sess.vm().mover_state(name)
+                })
+        {
+            sess.set_player_base(base.as_deref());
+        }
+    }
     // Player footsteps: the original fires the `PlayFootStep` notify from the third-person walk
     // animation, which `--play` does not render, so the host synthesises it from the same
     // surface lookup the script would read from `LastCollidedMaterial`. Emit only when audio is
@@ -1118,6 +1143,9 @@ fn fixed_step(
         };
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
         sess.sync_view_rotation(sim.0.yaw, sim.0.pitch);
+        world
+            .rider
+            .carry(&mut sim.0.location, |name| sess.vm().mover_state(name));
         if let Some((location, yaw, velocity)) = sess.script_pawn_pose() {
             sim.0.location = location;
             sim.0.yaw = yaw;
@@ -2219,6 +2247,8 @@ struct MapRuntime {
     session: session::Session,
     world: CollisionWorld,
     mover_collision: movers::MoverCollision,
+    /// The mover the player stands on (a lift cage carries the player).
+    rider: movers::Rider,
     volumes: movement_modes::VolumeMotion,
     sim: PlayerSim,
     player_params: PlayerParams,
@@ -2336,6 +2366,7 @@ fn build_map_runtime(
         session,
         world,
         mover_collision,
+        rider: movers::Rider::default(),
         volumes,
         sim,
         player_params: *params,
@@ -2519,6 +2550,14 @@ fn run_script_inner(
                 &runtime.volumes,
             );
         }
+        if let movers::BaseChange::Changed(base) = runtime.rider.observe(
+            runtime.sim.grounded,
+            runtime.sim.floor_source,
+            &runtime.sources,
+            |name| runtime.session.vm().mover_state(name),
+        ) {
+            runtime.session.set_player_base(base.as_deref());
+        }
         // The headless driver only records footsteps; playback belongs to the windowed
         // `fixed_step` path (this function opens no audio device).
         if let Some(step) = step_driver.advance(
@@ -2549,6 +2588,9 @@ fn run_script_inner(
         runtime
             .session
             .sync_view_rotation(runtime.sim.yaw, runtime.sim.pitch);
+        runtime.rider.carry(&mut runtime.sim.location, |name| {
+            runtime.session.vm().mover_state(name)
+        });
         runtime.session.drive_render_phase();
         if let Some((location, yaw, velocity)) = runtime.session.script_pawn_pose() {
             runtime.sim.location = location;
@@ -6373,12 +6415,152 @@ mod tests {
         //    unreachable, and the route ends waiting for a travel that cannot be requested.
     }
 
-    /// item59: Hual02 route by player input (the vent crawl, the underfloor, the surface
-    /// corridor, Carrington's cell) with labelled teleports only for the measured movement
-    /// gaps (the service lift, the Locked Porte19 magnetic chain, the sealed prison
-    /// perimeter, the grille pin, the pinned exit stairwell). The objectives must come from
-    /// the game's own chains: goals 4/5/6 complete, goal 3 is promoted by the Carrington
+    /// Destroys every live `BaseSoldier*` of the session (labelled diagnostic): the Hual02
+    /// underfloor and upper floor are held by sighted soldiers who kill the unarmoured player
+    /// within seconds under the real level clock (measured, see the item67 report), so the
+    /// systems under test (Porte11, the lift, the depot reader) are exercised with the hostile
+    /// pawns removed. The `Cine*` scene pawns are KEPT: the depot Carrington scene (goals
+    /// 4/5/6) runs through them. The unmodified level is pinned by the route header and the
+    /// report, not by this diagnostic.
+    fn remove_soldiers(session: &mut session::Session) -> usize {
+        let ids: Vec<xiii_script::ObjectId> = (0..session.vm().objects.len() as u32)
+            .filter(|&id| {
+                let o = &session.vm().objects[id as usize];
+                o.is_actor
+                    && !o.deleted
+                    && !o.name.starts_with("Default__")
+                    && o.name.starts_with("BaseSoldier")
+                    && session.vm().is_a(id, "BaseSoldier")
+            })
+            .collect();
+        for &id in &ids {
+            session.vm_mut().destroy(id).expect("destroy soldier");
+        }
+        ids.len()
+    }
+
+    /// item67: the Hual02 service lift is called and ridden by player input only. The game's own
+    /// `LiftButton.PlayerTrigger` -> `LiftManager` states close the doors, `LiftCage` runs its
+    /// key (+4632 UU in 8 s) and the player, standing on the cage, is carried up (mover base
+    /// carry: `Engine.dll ULevel::MoveActor` 0x1038a770 attached-actor loop) and again down. Without
+    /// the carry the cage passed through the player (measured: z stayed -4782.1).
+    ///
+    /// Labelled diagnostics: the player is placed at the lobby entrance (the underfloor walk to it
+    /// is pinned by the route test) and the ambush soldiers are removed (see `remove_soldiers`).
+    #[test]
+    fn opt_in_hual02_lift_carries_the_player_up_and_down() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual02".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual02");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let mut runtime =
+            open_map_runtime(&game_dir, "Hual02", &scene, &resolved.params).expect("open Hual02");
+        let removed = remove_soldiers(&mut runtime.session);
+        assert!(removed >= 20, "Hual02 has ~25 soldiers, removed {removed}");
+        // yaw 270 = -Y: LiftButton0 is on the cage wall at (-2209, 2092), the player at y=2223.
+        let script = script::Script::parse(
+            "t=0.20 teleport -2206 2374 -4781
+             t=1.00 goto -2209 2330 -4781
+             t=4.00 goto -2209 2223 -4781
+             t=7.00 yaw 270
+             t=7.50 use
+             t=40.00 use
+             t=75.00 goto -2209 2330 -4781
+",
+        )
+        .unwrap();
+        let outcome = run_script_inner(
+            &game_dir,
+            "Hual02",
+            &script,
+            &resolved.params,
+            &scene,
+            80.0,
+            false,
+            RunnerOptions {
+                initial: Some(runtime),
+                ..Default::default()
+            },
+        )
+        .expect("run lift ride");
+        let z_at = |t: f32| {
+            outcome
+                .trace
+                .iter()
+                .min_by(|a, b| (a.1 - t).abs().total_cmp(&(b.1 - t).abs()))
+                .map(|s| s.2[2])
+                .unwrap()
+        };
+        let top_z = z_at(36.0);
+        let mid_up = outcome
+            .trace
+            .iter()
+            .filter(|s| (7.5..40.0).contains(&s.1))
+            .map(|s| s.2[2])
+            .fold(f32::MIN, f32::max);
+        println!(
+            "[lift ride] floor z {:.1} top z {top_z:.1} highest {mid_up:.1} final {:?}",
+            z_at(7.0),
+            outcome.trace.last().map(|s| s.2)
+        );
+        // Floor 1 -> floor 2: the cage KeyPos[1].z = +4632 above its -4725 start; the player
+        // stands on the cage floor (measured -150.1 = -4782.1 + 4632).
+        assert!(
+            (z_at(7.0) - -4782.1).abs() < 2.0,
+            "starts on floor 1: {}",
+            z_at(7.0)
+        );
+        assert!(
+            (top_z - -150.1).abs() < 2.0,
+            "the cage must carry the player to floor 2 (z -150.1), got {top_z}"
+        );
+        assert!(
+            mid_up > -4000.0,
+            "the player must be carried through the shaft"
+        );
+        // Floor 2 -> floor 1 by the same internal button: carried back down, not left hanging.
+        let vm = outcome.session.vm();
+        let manager = vm.find_live_object("LiftManager0").expect("LiftManager0");
+        assert_eq!(
+            vm.get_property(manager, "CurrentFloor"),
+            Some(&xiii_script::Value::Int(1)),
+            "the second press returns the cage to floor 1"
+        );
+        let last = outcome.trace.last().unwrap().2;
+        assert!(
+            (z_at(70.0) - -4782.1).abs() < 2.0,
+            "carried back down to floor 1: z {}",
+            z_at(70.0)
+        );
+        assert!(last[2] < -4700.0, "final z {last:?}");
+        let cage = vm.find_live_object("LiftCage0").unwrap();
+        assert_eq!(
+            vm.get_property(cage, "KeyNum"),
+            Some(&xiii_script::Value::Byte(0))
+        );
+    }
+
+    /// item59, re-authored by item67: Hual02 route by player input (the vent crawl, the
+    /// underfloor with the Porte11 use, the service-lift ride by the cage's own button, the
+    /// surface corridor, the depot reader, Carrington's cell) with labelled teleports only for
+    /// the measured movement gaps (the Locked Porte19 magnetic chain whose only card pickup is
+    /// sealed in the meeting-room petitesalle, the corridor block at (-6198,842), the sealed
+    /// prison perimeter, the grille pin, the pinned exit stairwell). The objectives must come
+    /// from the game's own chains: goals 4/5/6 complete, goal 3 is promoted by the Carrington
     /// scene, goals 0/1/2 stay incomplete on measured blockers, and no travel is requested.
+    ///
+    /// Labelled diagnostic: the hostile `BaseSoldier*` pawns are removed (`remove_soldiers`,
+    /// the `Cine*` scene pawns kept). Under the real level clock the unmodified level's
+    /// underfloor gauntlet (BaseSoldier25/26/27 + lobby 15/28) kills the unarmoured player at
+    /// t~130-138 on this route (measured, the item67 report); that kill is the pinned next
+    /// blocker, not something this diagnostic hides.
     #[test]
     fn opt_in_hual02_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -6406,15 +6588,28 @@ mod tests {
             }),
             "the Hual02 route must not bridge control or goals"
         );
-        // 340 s: the crawl, the underfloor, the surface corridor, the cell unlock (~22 s
-        // hold), and the exit plateau walk; the script's wait_travel never completes.
-        let outcome = run_script(
+        let mut runtime =
+            open_map_runtime(&game_dir, "Hual02", &scene, &resolved.params).expect("open Hual02");
+        let removed = remove_soldiers(&mut runtime.session);
+        assert!(
+            removed >= 20,
+            "the Hual02 hostile garrison is ~22 BaseSoldier pawns, removed {removed}"
+        );
+        // 392 s: the crawl, the underfloor, the lift ride (~40 s, item67), the surface
+        // corridor and the reader, the cell unlock (~22 s hold), and the exit plateau walk;
+        // the script's wait_travel never completes.
+        let outcome = run_script_inner(
             &game_dir,
             "Hual02",
             &script,
             &resolved.params,
             &scene,
-            340.0,
+            392.0,
+            false,
+            RunnerOptions {
+                initial: Some(runtime),
+                ..Default::default()
+            },
         )
         .expect("run Hual02 route");
         let session = &outcome.session;
@@ -6431,20 +6626,22 @@ mod tests {
         );
         for o in &objectives {
             match o.index {
-                // The anti-goal completions and Carrington's survival run through the game's
-                // own Carrington scene (CineTrigger6 'Carring_ShaftEnter' at the depot).
+                // Goals 4/5/6 (the anti-goals) complete through the game's own chains in
+                // every measured real-clock run.
                 4..=6 => assert!(
                     o.completed,
                     "objective {} must complete through the game's chains: {o:?}",
                     o.index
                 ),
-                // Promoted by the same scene, but the escort end chain is unreachable:
-                // TouchTrigger8 sits on a z=63 gallery with no navigable access and the
-                // corridor's Porte151 only opens from Carrington's escort moveseq, which
-                // waits forever on the 'soldat_assome' raid event (measured legs 31-37).
+                // item67 measured: reaching and using the depot reader (MagneticPassTrigger1
+                // -> Grab, the game's own aim-focus chain) promotes goal 3 via the map's own
+                // chain, but the escort never starts: TouchTrigger8 sits on a z=63 gallery
+                // with no navigable access and the corridor's Porte151 opens only from
+                // Carrington's escort moveseq, which waits forever on the 'soldat_assome'
+                // raid event (measured legs 31-37).
                 3 => assert!(
                     o.primary && !o.completed,
-                    "objective 3 must be promoted but not completed: {o:?}"
+                    "objective 3 is promoted by the reader chain but stays incomplete: {o:?}"
                 ),
                 // Promotion chain blocked: DetectionVolume21 floats 78 UU above the real duct
                 // floor and the eavesdrop scene stalls on the unimplemented CWndSFXTrigger
@@ -6471,12 +6668,10 @@ mod tests {
             .into_iter()
             .map(|(_, name)| name)
             .collect();
-        for expected in [
-            "DetectionVolume14",
-            "Porte154",
-            "XIIIGoalTrigger0",
-            "XIIIGoalTrigger8",
-        ] {
+        // item67 measured: Porte154 is aimed/used, not walked into, so it is NOT in the
+        // player touch log (its touch events in the probe belong to the door bumping the
+        // Cine triggers, not the pawn). The game's own chains the pawn physically touches:
+        for expected in ["DetectionVolume14", "XIIIGoalTrigger0", "XIIIGoalTrigger8"] {
             assert!(
                 touched.iter().any(|t| t.eq_ignore_ascii_case(expected)),
                 "the route must touch {expected} (the game's own chain): touches={touched:?}"
@@ -6493,6 +6688,76 @@ mod tests {
                         && function.ends_with("Trigger")
             )),
             "the unlock must call Porte154.Trigger (the game's own unlock path)"
+        );
+        // The underfloor Porte11 corridor door must have opened through its own
+        // PlayerTrigger (the route's named use, the game's Grab tail).
+        assert!(
+            vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target.eq_ignore_ascii_case("Porte11")
+                        && function.ends_with("PlayerTrigger")
+            )),
+            "the underfloor Porte11 must open through its own PlayerTrigger"
+        );
+        // item67: the service lift was ridden through the game's own chain: the cage button's
+        // PlayerTrigger ran, the LiftManager states drove the cage to floor 2 and the player
+        // walked out on the surface (the teleport-free z=-149 corridor legs after t=232).
+        assert!(
+            vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target.eq_ignore_ascii_case("LiftButton0")
+                        && function.ends_with("PlayerTrigger")
+            )),
+            "the ride must start at the cage's own LiftButton0.PlayerTrigger"
+        );
+        let manager = vm
+            .find_object("LiftManager0")
+            .expect("LiftManager0 must exist");
+        assert_eq!(
+            vm.get_property(manager, "CurrentFloor"),
+            Some(&xiii_script::Value::Int(2)),
+            "the route rode the cage to floor 2: {objectives:?}"
+        );
+        // item67 pinned next blocker: the floor-2 lobby exit is sealed. The LiftManager opens
+        // its two LiftDoor outer leaves, but the doorway's third leaf Porte20 ('porte_haut') is
+        // not in the manager's Floor2_OuterDoors set, never triggers and stays closed; the
+        // walker is pinned at its panel plane (y~2346) after the ride. That is why the surface
+        // corridor to the depot reader is a labelled teleport, not a walk.
+        let porte20 = vm.find_object("Porte20").expect("Porte20 must exist");
+        assert_eq!(
+            vm.get_property(porte20, "bClosed"),
+            Some(&xiii_script::Value::Bool(true)),
+            "Porte20 (the upper lift door) stays closed: the pinned blocker"
+        );
+        assert_eq!(
+            vm.get_property(porte20, "bOpened"),
+            Some(&xiii_script::Value::Bool(false)),
+            "Porte20 never opened: the walker cannot leave the lift lobby on foot"
+        );
+        // The depot reader was aimed and used (the game's TargetActor + bCanTrigger -> Grab),
+        // but without the (sealed) magnetic card Porte19 must still be locked: the next
+        // measured blocker, pinned instead of hidden.
+        let porte19 = vm.find_object("Porte19").expect("Porte19 must exist");
+        assert_eq!(
+            vm.get_property(porte19, "KeyNum"),
+            Some(&xiii_script::Value::Byte(0)),
+            "Porte19 stays locked without the card"
+        );
+        assert_eq!(
+            vm.get_property(porte19, "bOpened"),
+            Some(&xiii_script::Value::Bool(false)),
+            "Porte19 never opened"
+        );
+        assert!(
+            vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target.eq_ignore_ascii_case("MagneticPassTrigger1")
+                        && function.ends_with("PlayerTrigger")
+            )),
+            "the reader use must run Grab's trigger branch on MagneticPassTrigger1"
         );
         let _ = porte154;
     }
