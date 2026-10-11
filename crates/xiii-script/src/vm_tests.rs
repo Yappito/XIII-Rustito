@@ -6237,6 +6237,65 @@ fn host_written_location_drives_touch_refresh() {
 }
 
 #[test]
+fn seed_touching_links_the_spawn_overlap_without_a_touch_event() {
+    // Engine contract for the spawn placement: an actor placed already overlapping a volume gets
+    // a `Touching` link but no `Touch` notification, so a one-shot trigger
+    // (`XIDPawn.DetectionVolume.Detection.Touch`, which latches `bActivated`) is not consumed at
+    // spawn. Only a later genuine re-entry fires it.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let player = phys_actor(&mut vm, &set, "Player", [0.0, 0.0, 0.0]);
+    let volume = phys_actor(&mut vm, &set, "Volume", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, player, true, false);
+    set_collision_fields(&mut vm, volume, true, false);
+
+    // Seed links both sides but dispatches no Touch.
+    vm.seed_touching_of(player).unwrap();
+    assert_eq!(vm.touching_list(player), vec![volume]);
+    assert_eq!(vm.touching_list(volume), vec![player]);
+    assert_eq!(vm.get_property(player, "Touches"), Some(&Value::Int(0)));
+    assert_eq!(vm.get_property(volume, "Touches"), Some(&Value::Int(0)));
+    assert_eq!(vm.get_property(volume, "UnTouches"), Some(&Value::Int(0)));
+
+    // A refresh while still overlapping keeps the silent link (no event).
+    vm.refresh_touching_of(player).unwrap();
+    assert_eq!(vm.get_property(volume, "Touches"), Some(&Value::Int(0)));
+
+    // Leaving and re-entering fires Touch exactly once (the one-shot's cue is preserved for the
+    // genuine enter, not the spawn).
+    vm.set_property(player, "Location", 0, Value::Vector([500.0, 0.0, 0.0]));
+    vm.refresh_touching_of(player).unwrap();
+    assert_eq!(vm.get_property(volume, "UnTouches"), Some(&Value::Int(1)));
+    assert!(vm.touching_list(player).is_empty());
+    vm.set_property(player, "Location", 0, Value::Vector([0.0, 0.0, 0.0]));
+    vm.refresh_touching_of(player).unwrap();
+    assert_eq!(vm.get_property(volume, "Touches"), Some(&Value::Int(1)));
+    assert_eq!(vm.touching_list(player), vec![volume]);
+}
+
+#[test]
+fn seed_touching_handles_a_degenerate_and_deleted_case() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let player = phys_actor(&mut vm, &set, "Player", [0.0, 0.0, 0.0]);
+    let volume = phys_actor(&mut vm, &set, "Volume", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, player, true, false);
+    set_collision_fields(&mut vm, volume, true, false);
+
+    // A player with collision disabled seeds nothing (the spawn link uses the collision gate).
+    set_collision_fields(&mut vm, player, false, false);
+    vm.seed_touching_of(player).unwrap();
+    assert!(vm.touching_list(player).is_empty());
+    // Seeding a dead/absent id is a no-op, never a panic.
+    vm.seed_touching_of(9999).unwrap();
+    set_collision_fields(&mut vm, player, true, false);
+    vm.seed_touching_of(player).unwrap();
+    assert_eq!(vm.touching_list(player), vec![volume]);
+}
+
+#[test]
 fn trace_extent_flag_needs_bprojtarget() {
     // Measured on Plage01 (item30c) and decoded from Engine.dll (the merged origin/main filter):
     // a trace candidate must first be in the collision hash (`bCollideActors` — every hash

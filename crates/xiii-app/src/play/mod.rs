@@ -6586,6 +6586,16 @@ mod tests {
             vm.get_property(mi, "eNbVivants"),
             outcome.travel
         );
+        for name in ["GenNMI1", "gennmi2", "gennmi3", "GenNMI6", "GenNMI7"] {
+            let id = vm
+                .find_object(name)
+                .expect("authored reinforcement generator");
+            println!(
+                "[hual04a reinforcement] {name} spawn={:?} state={:?}",
+                vm.get_property(id, "SpawnActor"),
+                vm.state_name(id)
+            );
+        }
         for name in [
             "BaseSoldier1",
             "BaseSoldier5",
@@ -6659,8 +6669,19 @@ mod tests {
         assert_eq!(
             vm.get_property(carrington, "Controller"),
             Some(&xiii_script::Value::Object(None)),
-            "Carrington has not received the sequence-start cue"
+            "Carrington has no possession Controller; the cine controller is the CineController field"
         );
+        // The engine links the pawn's spawn overlaps silently (`Vm::seed_touching_of`), but here
+        // the pawn spawns only inside the *cylinder* range of no trigger: DetectionVolume4's
+        // class cylinder is at (-9776,-944,272) r=h=126, ~867 UU from the spawn, and
+        // DetectionVolume5's cylinder (top z=158) is below the canyon floor the player walks
+        // (z~391). The engine's `AActor::IsOverlapping` tests a `VolumeBrush` with its brush
+        // primitive, not the class cylinder, so in retail both volumes touch; substituting the
+        // brush's world AABB for the primitive was measured to regress Hual01b/Hual02 (concave
+        // volumes over-fire), so the cylinder test is retained. With both one-shot `Touch`es
+        // undelivered, `Degage` -> `Cine1.Play(2)` never arrives, the LastWave reinforcement spawn
+        // (tabActions[35]) is never reached, and the generators keep `SpawnActor=None`, which
+        // `SetGoalComplete` case 3 treats as `!bIsDead == true` -> `FinDeMission`.
         let departure = vm
             .find_object("DetectionVolume4")
             .expect("Carrington start volume");
@@ -6669,14 +6690,29 @@ mod tests {
             .expect("dernierpoint volume");
         assert_eq!(
             vm.get_property(departure, "bActivated"),
-            Some(&xiii_script::Value::Bool(false))
+            Some(&xiii_script::Value::Bool(false)),
+            "DetectionVolume4's cylinder is out of range of the walked route"
         );
         assert_eq!(
             vm.get_property(last_point, "bActivated"),
-            Some(&xiii_script::Value::Bool(false))
+            Some(&xiii_script::Value::Bool(false)),
+            "DetectionVolume5's cylinder top (z=158) is below the canyon floor"
+        );
+        let cine_controller = match vm.get_property(carrington, "CineController") {
+            Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(c)))) => *c,
+            other => panic!("Carrington's CineController: {other:?}"),
+        };
+        assert_eq!(vm.state_name(carrington).as_deref(), Some("CineInit"));
+        // `EndGame` from `FinDeMission` drives the cine controller into `GameEnded`; it never
+        // reached `PrePlayingSequence`/`PlayingSequence` on this route.
+        assert_eq!(vm.state_name(cine_controller).as_deref(), Some("GameEnded"));
+        assert_eq!(
+            vm.get_property(carrington, "CurrentScript"),
+            Some(&xiii_script::Value::Int(-1)),
+            "the Degage cue was never delivered, so Play(2) never started the sequence"
         );
         println!(
-            "[hual04a next blocker] Carrington has no controller before Degage; DetectionVolume4/5 untouched; generators have no spawned reinforcement"
+            "[hual04a next blocker] DV4/DV5 untouched (class cylinders off the route); the engine needs the brush-primitive volume overlap to fire 'Degage'; Cine1 never starts, reinforcements never spawn"
         );
         let lever = vm.find_object("XIIIMover1").expect("cable-car lever");
         assert_eq!(

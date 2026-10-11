@@ -78,6 +78,8 @@ pub struct Session {
     /// `Touch` events involving the player, most recent last (bounded).
     pub touches: VecDeque<(f64, String)>,
     player_touching: Vec<ObjectId>,
+    /// Touch gate for the host-owned player pawn (see [`TouchSpawnGate`]).
+    touch_gate: TouchSpawnGate,
     /// Actors the VM moved this step (cleared at the start of [`Session::step`]).
     pub moved: Vec<MovedActor>,
     /// Level-travel request observed by the VM (item15), if any. Consumed by
@@ -150,6 +152,32 @@ impl Default for PlayerVMModes {
             landed_velocity_z: None,
             floor_normal: [0.0, 0.0, 1.0],
             eye_height: 60.0,
+        }
+    }
+}
+
+/// Touch gate for the host-owned player pawn.
+///
+/// The engine places the pawn already overlapping the volumes at its start spot. UE2 records
+/// those overlaps as `Touching` relations but does not notify `Touch` for the initial placement,
+/// so a one-shot trigger (`XIDPawn.DetectionVolume.Detection.Touch` latches `bActivated`) must not
+/// be consumed at spawn. The host tracks the first step so it can seed the spawn overlaps silently
+/// ([`Session::step`], [`xiii_script::Vm::seed_touching_of`]) and only fire `Touch` on a later
+/// genuine enter.
+#[derive(Debug, Default)]
+struct TouchSpawnGate {
+    /// Collision-centre `Location` seen on the first step (the spawn placement).
+    spawn: Option<[f32; 3]>,
+}
+
+impl TouchSpawnGate {
+    /// Records the spawn placement on the first call; returns true exactly once (the first step).
+    fn observe_spawn(&mut self, location: [f32; 3]) -> bool {
+        if self.spawn.is_none() {
+            self.spawn = Some(location);
+            true
+        } else {
+            false
         }
     }
 }
@@ -454,6 +482,7 @@ impl Session {
             save_total: 0,
             touches: VecDeque::new(),
             player_touching: Vec::new(),
+            touch_gate: TouchSpawnGate::default(),
             moved: Vec::new(),
             travel: None,
             dispatcher,
@@ -544,6 +573,11 @@ impl Session {
     ) {
         self.moved.clear();
         self.script_pawn_sync = None;
+        // The engine places the pawn already overlapping the volumes at its start spot; those
+        // relations become `Touching` entries with no `Touch` notification (a one-shot
+        // `DetectionVolume` would otherwise be consumed at spawn, before its listener is ready).
+        // Link them silently on the first step, then maintain enter/leave transitions every tick.
+        let first_step = self.touch_gate.observe_spawn(location);
         let script_owned_before = self.script_owns_player_pawn();
         // Refresh the posed hit boxes before the VM traces (host `fire` and any script trace in
         // this tick see the current body pose).
@@ -625,11 +659,17 @@ impl Session {
             self.vm.native_profile_mut().player_write_micros += t0.elapsed().as_micros() as u64;
         }
 
-        // VM touch update for the host-moved player (the walk into a trigger volume). Run every
-        // tick even when the player is stationary: movers, spawned actors and re-enabled
-        // collision can change the player's touch set without the player moving.
+        // VM touch update for the host-moved player (the walk into a trigger volume). The first
+        // step seeds the spawn overlap silently; every later step maintains the enter/leave
+        // transitions, because movers, spawned actors and re-enabled collision can change the
+        // player's touch set without the player moving.
         let t0 = Instant::now();
-        if let Err(e) = self.vm.refresh_touching_of(self.player) {
+        let touch = if first_step {
+            self.vm.seed_touching_of(self.player)
+        } else {
+            self.vm.refresh_touching_of(self.player)
+        };
+        if let Err(e) = touch {
             self.suspend(self.player, &e);
         }
         if profiling {
@@ -2791,6 +2831,22 @@ mod tests {
         } else {
             path
         })
+    }
+
+    #[test]
+    fn touch_spawn_gate_reports_only_the_first_step() {
+        let mut gate = TouchSpawnGate::default();
+        let spawn = [10.0, 20.0, 30.0];
+        // The first step records the spawn placement and reports the seed step exactly once.
+        assert!(gate.observe_spawn(spawn));
+        // Every later step is a normal enter/leave refresh, regardless of location.
+        assert!(!gate.observe_spawn(spawn));
+        assert!(!gate.observe_spawn([10.5, 20.0, 30.0]));
+        assert!(!gate.observe_spawn([0.0, 0.0, 0.0]));
+        // A fresh gate always reports its own first step, even at the origin.
+        let mut gate = TouchSpawnGate::default();
+        assert!(gate.observe_spawn([0.0, 0.0, 0.0]));
+        assert!(!gate.observe_spawn([0.0, 0.0, 0.0]));
     }
 
     /// Generated live-object setup, followed by retail focus registration/removal scripts.

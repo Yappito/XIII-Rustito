@@ -7489,6 +7489,39 @@ impl<'s> Vm<'s> {
         self.refresh_touching(id, false)
     }
 
+    /// Links the touch relations of `id` for its **initial placement** without delivering
+    /// `Touch`/`UnTouch`. The engine's spawn places an actor already overlapping the volumes at
+    /// its start spot; those relations become `Touching` entries but no `Touch` is notified (the
+    /// one-shot `XIDPawn.DetectionVolume.Detection.Touch` would otherwise be consumed at spawn,
+    /// before its listener is ready). A later genuine enter (after the actor has left the volume)
+    /// fires `Touch` through [`Vm::refresh_touching_of`]. Actors absent here keep the cylinder /
+    /// brush test; only the link is created, no event is dispatched.
+    pub fn seed_touching_of(&mut self, id: ObjectId) -> VmResult<()> {
+        if !self.is_live_actor(id) {
+            return Ok(());
+        }
+        let collide = self.collides(id);
+        let mut valid: Vec<ObjectId> = Vec::new();
+        for b in 0..self.objects.len() as ObjectId {
+            if b == id || !self.is_live_actor(b) {
+                continue;
+            }
+            let touches = collide
+                && self.collides(b)
+                && self.actors_overlap(id, b)
+                && !self.based_on(id, b)
+                && !self.based_on(b, id);
+            if touches {
+                valid.push(b);
+            }
+        }
+        for b in valid {
+            self.touching_add(id, b);
+            self.touching_add(b, id);
+        }
+        Ok(())
+    }
+
     /// Recomputes the touching relations of `id` after it moved or its collision changed:
     /// begins overlap with actors it now touches, ends overlap it no longer has. `skip_blocking`
     /// mirrors upstream `TryMove` (an actor cannot touch what blocks it); `SetLocation` does

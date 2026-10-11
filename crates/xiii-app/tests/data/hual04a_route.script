@@ -4,12 +4,15 @@
 # No teleports, set_goal or take_control. Coordinates and times are Unreal units/seconds.
 # Native #391 now permits the corpse timer to freeze its shadow. Continue the
 # six-soldier death-event chain by input; do not infer the card counter from Timer.
-# Carrington's sequence has not received its Degage start cue on this fixture.
-# An additional input probe started it, but then waited for dernierpoint; the current
-# DetectionVolume5 touch cylinder is below terrain along the measured approaches.
-# Reinforcement SpawnActor fields stay None on the retained card/fuse route;
-# installation case3 treats their bIsDead as false and enters FinDeMission. No reinforcement
-# kill, cable-car lever activation or travel is claimed, and no remote named lever use occurs.
+# The engine links the pawn's spawn overlaps silently (Vm::seed_touching_of), but the player
+# spawns only inside DetectionVolume4's *brush* (its class cylinder sits ~867 UU away) and walks
+# the canyon floor above DetectionVolume5's cylinder (top z=158). The engine's
+# `AActor::IsOverlapping` tests a VolumeBrush with its brush primitive; substituting the brush's
+# world AABB for the primitive regressed Hual01b/Hual02 (concave volumes over-fire), so this route
+# keeps the cylinder test. Both one-shot Touch events stay undelivered, Carrington's Cine1 (and
+# its LastWave reinforcement spawn) never starts, and installation case3 treats the empty
+# SpawnActor as not-dead -> FinDeMission. No reinforcement kill, lever activation or travel is
+# claimed.
 t=0.50 weapon xiii.Beretta
 t=1.00 switch_weapon 2
 t=2.50 goto -10200 -1500

@@ -25,13 +25,52 @@
 //! coverage.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use xiii_decode::common::{Props, to_bevy_position};
 use xiii_decode::model::{decode_model, level};
-use xiii_package::Limits;
+use xiii_package::{Limits, ObjectRef};
 
 use crate::physics::bevy_to_unreal_position;
-use crate::{ClassDefaults, PackageCache, apply_transform_pub, placement_transform};
+use crate::{
+    ClassDefaults, Loaded, PackageCache, ResolvedPlacement, apply_transform_pub,
+    placement_transform,
+};
+
+/// World-space AABB `(min, max)` in Unreal units of a placed brush actor's `Brush` ->
+/// `Engine.Model` primitive bounding box, transformed with the actor's effective placement (the
+/// same Location/Rotation/DrawScale/PrePivot the world importer applies). An absent/null `Brush`
+/// or a decode failure is an explicit error string, never a silent empty box.
+fn brush_world_aabb(
+    cache: &mut PackageCache,
+    map_pkg: &Arc<Loaded>,
+    eff: &ResolvedPlacement,
+    brush: Option<ObjectRef>,
+) -> Result<([f32; 3], [f32; 3]), String> {
+    let brush = brush.filter(|r| !r.is_null()).ok_or("no Brush property")?;
+    let (bp, bx) = cache.resolve(map_pkg, brush)?;
+    let model = decode_model(&bp.package, &bp.data, bx).map_err(|e| e.to_string())?;
+    let b = model.primitive.bounding_box;
+    let t = placement_transform(eff);
+    let mut mn = [f32::INFINITY; 3];
+    let mut mx = [f32::NEG_INFINITY; 3];
+    for i in 0..8 {
+        // Brush model bounds are in source (Unreal) local axes; the transform operates in Bevy
+        // space, so convert the corner first (the same order the static-mesh importer uses).
+        let corner = to_bevy_position([
+            if i & 1 == 0 { b.min[0] } else { b.max[0] },
+            if i & 2 == 0 { b.min[1] } else { b.max[1] },
+            if i & 4 == 0 { b.min[2] } else { b.max[2] },
+        ]);
+        let bevy = apply_transform_pub(&t, corner);
+        let uu = bevy_to_unreal_position(bevy);
+        for k in 0..3 {
+            mn[k] = mn[k].min(uu[k]);
+            mx[k] = mx[k].max(uu[k]);
+        }
+    }
+    Ok((mn, mx))
+}
 
 /// Kind of a movement volume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,51 +266,16 @@ impl MovementVolumes {
 
             // Brush geometry: the actor's `Brush` -> `Engine.Model` primitive bounding box,
             // transformed with the same effective placement the world importer uses.
-            let (min_uu, max_uu, point_fallback) = match p
-                .as_ref()
-                .and_then(|p| p.object("Brush"))
-                .filter(|r| !r.is_null())
-            {
-                Some(brush) => match cache.resolve(&map_pkg, brush) {
-                    Ok((bp, bx)) => match decode_model(&bp.package, &bp.data, bx) {
-                        Ok(model) => {
-                            let b = model.primitive.bounding_box;
-                            let t = placement_transform(&eff);
-                            let mut mn = [f32::INFINITY; 3];
-                            let mut mx = [f32::NEG_INFINITY; 3];
-                            for i in 0..8 {
-                                // Brush model bounds are in source (Unreal) local axes; the
-                                // transform operates in Bevy space, so convert the corner first
-                                // (the same order the static-mesh importer uses).
-                                let corner = to_bevy_position([
-                                    if i & 1 == 0 { b.min[0] } else { b.max[0] },
-                                    if i & 2 == 0 { b.min[1] } else { b.max[1] },
-                                    if i & 4 == 0 { b.min[2] } else { b.max[2] },
-                                ]);
-                                let bevy = apply_transform_pub(&t, corner);
-                                let uu = bevy_to_unreal_position(bevy);
-                                for k in 0..3 {
-                                    mn[k] = mn[k].min(uu[k]);
-                                    mx[k] = mx[k].max(uu[k]);
-                                }
-                            }
-                            (mn, mx, false)
-                        }
-                        Err(e) => {
-                            out.diagnostics
-                                .push(format!("{}: brush model decode failed: {e}", a.path));
-                            (eff.location, eff.location, true)
-                        }
-                    },
-                    Err(e) => {
-                        out.diagnostics
-                            .push(format!("{}: brush model unresolved: {e}", a.path));
-                        (eff.location, eff.location, true)
-                    }
-                },
-                None => {
+            let (min_uu, max_uu, point_fallback) = match brush_world_aabb(
+                &mut cache,
+                &map_pkg,
+                &eff,
+                p.as_ref().and_then(|p| p.object("Brush")),
+            ) {
+                Ok((mn, mx)) => (mn, mx, false),
+                Err(e) => {
                     out.diagnostics
-                        .push(format!("{}: no Brush property", a.path));
+                        .push(format!("{}: brush model decode failed: {e}", a.path));
                     (eff.location, eff.location, true)
                 }
             };
