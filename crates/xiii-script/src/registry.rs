@@ -3168,6 +3168,16 @@ fn get_bounding_box(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult
     ]))
 }
 
+fn recompute_bounding_volume(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let freeze = boolean(vm, a, 0)?;
+    vm.recompute_bounding_volume(c.this, freeze)?;
+    val(Value::Void)
+}
+
 fn find_inventory_kind(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     // UE2 `APawn::FindInventoryKind`: walks the `Inventory` -> `Inventory` chain and returns the
     // first item whose class chain contains `DesiredClassName`. Declaration measured from
@@ -5201,6 +5211,20 @@ fn builtin_defs() -> Vec<NativeDef> {
          XIIIPorte.Locked.Trigger's FindInventoryKind('PickLockSkill') gate",
         find_inventory_kind,
     ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "channel-zero skinned render bounds; channel blending, tweening and bone controllers \
+             are not included, and presentation does not yet consume the frozen box",
+        ),
+        ..def(
+            "Engine.Actor.RecomputeBoundingVolume",
+            "native(391) final function RecomputeBoundingVolume(bool bFixed)",
+            "Engine.dll execRecomputeBoundingVolume 0x103eaa20: skeletal-instance guard; true \
+             skins vertices and freezes a world FBox at instance+0x248; false invalidates +0x260. \
+             GetRenderBoundingBox 0x103ec2b0 returns that frozen box. No collision/hash changes",
+            recompute_bounding_volume,
+        )
+    });
     v.push(NativeDef {
         status: NativeStatus::Partial(
             "the VM has no mesh/pre-pivot bounds; the returned Box is the collision cylinder \

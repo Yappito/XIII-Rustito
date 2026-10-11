@@ -1,12 +1,12 @@
-# Hual04a diagnostic route: walked canyon, real Beretta fight, corpse search attempt.
+# Hual04a diagnostic route: six real kills, corpse card search, walked bureau approach.
 # Diagnostic weapon grant: Beretta carried from Hual01b through Hual02 (see
 # hual02_route.script's campaign-loadout note). Direct Hual04a login has no Beretta.
 # No teleports, set_goal or take_control. Coordinates and times are Unreal units/seconds.
-# Current-runtime blocker: after BaseSoldier1 dies, XIIIPawn.Dying.Timer calls
-# unsupported Actor.RecomputeBoundingVolume (#391) at bytecode 0x019D. The corpse
-# suspends during its corpse timer. This fixture pins that explicit failure,
-# not a completed mission; the remaining card/fuse/cable-car route is documented
-# in local/reports/item66-hual04a-route.md and is not bypassed here.
+# Native #391 now permits the corpse timer to freeze its shadow. Continue the
+# six-soldier death-event chain by input; do not infer the card counter from Timer.
+# Measured next blocker: the reader-directed view trace selects BreakAbleMover69,
+# bCanTrigger stays false, and Grab never uses the carried card. Porte11 stays closed;
+# fuse/cable-car/travel are not claimed. The opt-in test pins this aim/interaction state.
 t=0.50 weapon xiii.Beretta
 t=1.00 switch_weapon 2
 t=2.50 goto -10200 -1500
@@ -47,4 +47,118 @@ t=107.00 goto -3458 -3358
 t=111.00 track off
 # Walk across the pursued soldier's corpse (his death position moved from spawn).
 t=112.00 goto -3300 -2800
-t=118.00 wait_travel
+t=115.00 reload
+t=118.00 track BaseSoldier5 1.0
+t=118.00 goto -3500 -2450
+t=121.00 fire
+t=122.20 fire
+t=123.40 fire
+t=124.60 fire
+t=125.80 fire
+t=127.00 fire
+t=128.20 fire
+t=129.40 fire
+t=131.00 track off
+t=131.00 goto -3050 -2896
+t=133.00 goto -3123 -2652
+t=135.00 goto -3000 -1900
+t=139.00 goto -2400 -1600
+t=143.00 goto -1800 -1400
+t=140.00 reload
+t=146.00 track BaseSoldier0 1.0
+t=146.00 goto -1400 -1300
+t=149.00 fire
+t=150.20 fire
+t=151.40 fire
+t=152.60 fire
+t=153.80 fire
+t=155.00 fire
+t=156.20 fire
+t=157.40 fire
+t=160.00 track off
+t=160.00 goto -1899 -1821
+t=164.00 goto -1280 -900
+t=166.50 goto -1280 -272
+t=168.00 reload
+t=168.00 goto -1150 -176
+t=170.00 use Porte22
+t=171.00 goto -860 -176
+# M16 from the map's own login/corpse inventory; group 11 is measured, not a grant.
+t=171.00 switch_weapon 11
+t=171.00 track BaseSoldier10 1.0
+t=172.00 fire
+t=173.20 fire
+t=174.40 fire
+t=175.60 fire
+t=176.80 fire
+t=178.00 fire
+t=179.20 fire
+t=180.40 fire
+t=182.00 track off
+t=182.00 goto -614 -394
+t=184.00 goto -860 -56
+t=186.00 goto -850 493
+t=188.00 goto -650 493
+t=190.00 goto -450 493
+t=192.00 use Porte15
+t=193.00 goto -230 486
+t=195.00 goto 125 470
+t=190.00 track BaseSoldier12 1.0
+t=190.00 reload
+t=193.00 fire
+t=194.20 fire
+t=195.40 fire
+t=196.60 fire
+t=197.80 fire
+t=199.00 fire
+t=200.20 fire
+t=201.40 fire
+t=204.00 track off
+t=204.00 goto 401 -26
+t=207.00 goto 125 470
+t=210.00 goto -230 600
+t=212.00 use Porte17
+t=213.00 goto -255 824
+t=215.00 goto -255 921
+t=218.00 goto 770 876
+t=221.00 goto 770 960
+t=223.00 use Porte8
+t=224.00 goto 770 1158
+t=227.00 track BaseSoldier4 1.0
+t=227.00 reload
+t=230.00 fire
+t=231.20 fire
+t=232.40 fire
+t=233.60 fire
+t=234.80 fire
+t=236.00 fire
+t=237.20 fire
+t=238.40 fire
+t=241.00 track off
+t=241.00 goto 826 1359
+t=246.00 goto 362 1280
+t=255.00 goto 770 1158
+# The station doors are still open; a second use would close them.
+t=259.00 goto 770 876
+t=262.00 goto -255 921
+t=265.00 goto -255 824
+t=266.00 goto -230 486
+t=269.00 goto -565 493
+t=272.00 goto -860 -176
+t=276.00 goto -1280 -176
+t=279.00 goto -1306 771
+t=282.00 goto -1280 1237
+t=286.00 goto -2182 331
+t=290.00 goto -2626 417
+t=294.00 goto -3302 1388
+t=298.00 goto -3751 1383
+t=302.00 goto -4092 1866
+t=306.00 goto -4262 2247
+t=310.00 goto -4000 2800
+t=314.00 goto -3900 2960
+t=317.00 goto -3880 3100
+t=320.00 goto -3804 3170
+t=322.00 crouch 1
+t=323.00 track MagneticPassTrigger4 0
+t=329.00 grab_input
+t=330.00 wait_travel

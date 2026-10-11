@@ -68,6 +68,10 @@ pub enum Command {
     /// fraction of the tracked pawn's CollisionHeight (0.6 default: spine band; a level ray at
     /// 0.85 crosses the head band for 3x bullet damage, see mod.rs track sites).
     Track(Option<(String, f32)>),
+    /// Press the player's Reload exec, as the R binding does.
+    Reload,
+    /// Dispatch the controller's ordinary Grab exec using its script-selected aim target.
+    GrabInput,
     /// Move the box centre to an absolute Unreal-unit position (harness bootstrap).
     Teleport([f32; 3]),
     /// Autopilot toward an Unreal-unit waypoint (the driver re-aims and walks; not a teleport).
@@ -194,6 +198,8 @@ impl Script {
                     None => Command::Use,
                 },
                 "fire" | "shoot" => Command::Fire,
+                "reload" => Command::Reload,
+                "grab_input" => Command::GrabInput,
                 "weapon" | "grant" => {
                     let path = it
                         .next()
@@ -291,6 +297,7 @@ pub struct Drive {
     control_pending: bool,
     /// `heal` (QuickHeal exec) requested (edge-triggered) and not yet applied by the host.
     heal_pending: bool,
+    exec_inputs: Vec<&'static str>,
     tracking: Option<String>,
     /// Aim height fraction for the active tracking (0.6 default, `track <actor> <f>` sets it).
     track_height: f32,
@@ -318,6 +325,7 @@ impl Drive {
             goals: Vec::new(),
             control_pending: false,
             heal_pending: false,
+            exec_inputs: Vec::new(),
             tracking: None,
             track_height: 0.6,
             track_location: None,
@@ -349,6 +357,11 @@ impl Drive {
     /// Takes the pending `heal` (QuickHeal) request (edge-triggered).
     pub fn take_quick_heal(&mut self) -> bool {
         std::mem::take(&mut self.heal_pending)
+    }
+
+    /// Drains ordinary player exec edges (Reload and Grab), preserving input order.
+    pub fn take_exec_inputs(&mut self) -> Vec<&'static str> {
+        std::mem::take(&mut self.exec_inputs)
     }
 
     /// Supplies the current actor location to the active tracking command.
@@ -420,6 +433,8 @@ impl Drive {
                 Command::Use => self.use_pending = true,
                 Command::UseNamed(target) => self.use_named.push(target.clone()),
                 Command::Fire => self.fire_pending = true,
+                Command::Reload => self.exec_inputs.push("Reload"),
+                Command::GrabInput => self.exec_inputs.push("Grab"),
                 Command::Weapon(path) => self.weapons.push(path.clone()),
                 &Command::SetGoal(n) => self.goals.push(n),
                 Command::WaitTravel => {
@@ -598,6 +613,22 @@ mod tests {
         let s = Script::parse("\n# nothing\n").unwrap();
         assert!(s.events.is_empty());
         assert_eq!(s.last_time(), 0.0);
+    }
+
+    #[test]
+    fn controller_exec_edges_preserve_order_and_are_not_repeated() {
+        let script = Script::parse("t=1 reload\nt=1 grab_input\nt=2 reload\n").unwrap();
+        let mut drive = Drive::new(&script);
+        let mut sim = PlayerSim::new([0.0; 3], 0.0);
+        drive.advance(0.5, &mut sim);
+        assert!(drive.take_exec_inputs().is_empty());
+        drive.advance(1.0, &mut sim);
+        assert_eq!(drive.take_exec_inputs(), ["Reload", "Grab"]);
+        drive.advance(1.0, &mut sim);
+        assert!(drive.take_exec_inputs().is_empty());
+        drive.advance(3.0, &mut sim);
+        assert_eq!(drive.take_exec_inputs(), ["Reload"]);
+        assert!(drive.take_exec_inputs().is_empty());
     }
 
     #[test]

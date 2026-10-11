@@ -510,6 +510,8 @@ pub(crate) struct AnimChannel {
 /// Per-actor animation state: the animation sources and one channel per `Channel` argument.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AnimState {
+    /// Frozen world-space skeletal render box (Engine mesh-instance FBox +0x248).
+    pub(crate) frozen_render_bounds: Option<([f32; 3], [f32; 3])>,
     /// `MeshAnimation` object paths linked with `Actor.LinkSkelAnim`, in call order.
     pub(crate) linked_anims: Vec<String>,
     /// Channels by index (ordered for deterministic notifies/traces).
@@ -10156,6 +10158,64 @@ impl<'s> Vm<'s> {
     }
 
     // ------------------------------------------------------------------ animation
+
+    /// Frozen skeletal render bounds. Collision dimensions and touching are independent.
+    pub fn frozen_render_bounds(&self, id: ObjectId) -> Option<([f32; 3], [f32; 3])> {
+        self.objects.get(id as usize)?.anim.frozen_render_bounds
+    }
+
+    pub(crate) fn recompute_bounding_volume(&mut self, id: ObjectId, freeze: bool) -> VmResult<()> {
+        let mesh = match self.get_property(id, "Mesh") {
+            Some(Value::Object(Some(r))) => self.ref_path(r),
+            _ => return Ok(()), // Retail checks Mesh and skeletal instance before changing anything.
+        };
+        if !freeze {
+            self.objects[id as usize].anim.frozen_render_bounds = None;
+            return Ok(());
+        }
+        let pose = self.anim_channel_pose(id, 0);
+        let channel = pose
+            .as_ref()
+            .map(|(seq, source, frame, looping)| (seq.as_str(), source.as_str(), *frame, *looping));
+        let Some(provider) = self.animation.as_mut() else {
+            return Err(self.err(VmErrorKind::NoAnimationProvider {
+                native: "Actor.RecomputeBoundingVolume".into(),
+            }));
+        };
+        let vertices = provider
+            .posed_vertices(&mesh, channel)
+            .map_err(|e| self.err(VmErrorKind::Other(e)))?;
+        let Some(vertices) = vertices else {
+            return Ok(());
+        };
+        let location = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
+        let scale = match self.get_property(id, "DrawScale") {
+            Some(Value::Float(s)) => *s,
+            _ => 1.0,
+        };
+        let scale3 = self.vector_prop(id, "DrawScale3D").unwrap_or([1.0; 3]);
+        let (x, y, z) = crate::registry::rotator_basis(self.rotation_prop(id).unwrap_or([0; 3]));
+        let mut bounds: Option<([f32; 3], [f32; 3])> = None;
+        for p in vertices {
+            let p: [f32; 3] = std::array::from_fn(|i| p[i] * scale * scale3[i]);
+            let world: [f32; 3] =
+                std::array::from_fn(|i| location[i] + x[i] * p[0] + y[i] * p[1] + z[i] * p[2]);
+            if world.iter().any(|v| !v.is_finite()) {
+                return Err(self.err(VmErrorKind::Other(
+                    "non-finite skeletal bounding vertex".into(),
+                )));
+            }
+            bounds = Some(match bounds {
+                None => (world, world),
+                Some((min, max)) => (
+                    std::array::from_fn(|i| min[i].min(world[i])),
+                    std::array::from_fn(|i| max[i].max(world[i])),
+                ),
+            });
+        }
+        self.objects[id as usize].anim.frozen_render_bounds = bounds;
+        Ok(())
+    }
 
     /// Display path of an object reference (empty when it cannot be named).
     fn ref_path(&self, r: &ObjRef) -> String {

@@ -1211,7 +1211,8 @@ fn registry_entries_are_documented() {
     // single 527 entry; the branch's duplicate registry def was removed in the merge).
     // item65 adds Interaction.WorldToScreen backed by the host's active projection.
     // item69 adds the decoded Controller.PickWallAdjust (526) pursuit detour.
-    assert_eq!(defs.len(), 343);
+    // item70 adds the decoded Actor.RecomputeBoundingVolume (391) render-box freeze.
+    assert_eq!(defs.len(), 344);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -13981,6 +13982,125 @@ use crate::animation::SeqInfo;
 /// Animation provider with posed-bone support: every sequence resolves (100 frames at 30 fps)
 /// and every bone offset is the fixed actor-rotation-space vector (200, 0, 50).
 struct PoseStub;
+
+struct BoundingPose(Vec<[f32; 3]>);
+
+impl crate::animation::AnimationData for BoundingPose {
+    fn sequence(&mut self, _: &str, _: &str) -> Result<Option<SeqInfo>, String> {
+        Err("unused sequence lookup".into())
+    }
+    fn posed_vertices(
+        &mut self,
+        _: &str,
+        _: Option<(&str, &str, f32, bool)>,
+    ) -> Result<Option<Vec<[f32; 3]>>, String> {
+        Ok(Some(self.0.clone()))
+    }
+}
+
+#[test]
+fn recompute_bounding_volume_freezes_world_vertices_and_false_invalidates() {
+    let p = ScriptPackage::load(
+        "Test",
+        bone_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .unwrap();
+    let mut set = ScriptSet::new();
+    set.add(p);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let actor = vm.spawn(sg(&set, "Actor"), "Corpse").unwrap();
+    // No mesh must be a genuine no-op, including without a provider.
+    call_native(
+        &mut vm,
+        "Engine.Actor.RecomputeBoundingVolume",
+        actor,
+        &[false],
+        &mut [Value::Bool(true)],
+    );
+    assert_eq!(vm.frozen_render_bounds(actor), None);
+    vm.set_property(
+        actor,
+        "Mesh",
+        0,
+        Value::Object(Some(ObjRef::Static(sg(&set, "Actor")))),
+    );
+    vm.set_property(actor, "Location", 0, Value::Vector([100.0, 200.0, 300.0]));
+    vm.set_property(actor, "Rotation", 0, Value::Rotator([0, 16384, 0]));
+    let properties = vm.objects[actor as usize].props.clone();
+    vm.set_animation_data(Box::new(BoundingPose(vec![
+        [1.0, 2.0, -3.0],
+        [-4.0, -5.0, 6.0],
+    ])));
+    call_native(
+        &mut vm,
+        "Engine.Actor.RecomputeBoundingVolume",
+        actor,
+        &[false],
+        &mut [Value::Bool(true)],
+    );
+    let (min, max) = vm.frozen_render_bounds(actor).unwrap();
+    for (actual, expected) in min
+        .into_iter()
+        .zip([98.0, 196.0, 297.0])
+        .chain(max.into_iter().zip([105.0, 201.0, 306.0]))
+    {
+        assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+    }
+    // Collision, location, animation and script fields must not be mutated by a render box.
+    assert_eq!(vm.objects[actor as usize].props, properties);
+    vm.set_property(actor, "Location", 0, Value::Vector([0.0; 3]));
+    assert_eq!(
+        vm.frozen_render_bounds(actor),
+        Some((min, max)),
+        "fixed box must stay in world space"
+    );
+    call_native(
+        &mut vm,
+        "Engine.Actor.RecomputeBoundingVolume",
+        actor,
+        &[false],
+        &mut [Value::Bool(false)],
+    );
+    assert_eq!(vm.frozen_render_bounds(actor), None);
+}
+
+#[test]
+fn recompute_bounding_volume_empty_and_bad_pose_do_not_invent_bounds() {
+    let p = ScriptPackage::load(
+        "Test",
+        bone_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .unwrap();
+    let mut set = ScriptSet::new();
+    set.add(p);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let actor = vm.spawn(sg(&set, "Actor"), "Corpse").unwrap();
+    vm.set_property(
+        actor,
+        "Mesh",
+        0,
+        Value::Object(Some(ObjRef::Static(sg(&set, "Actor")))),
+    );
+    assert!(
+        vm.recompute_bounding_volume(actor, true).is_err(),
+        "missing pose provider must fail"
+    );
+    vm.set_animation_data(Box::new(BoundingPose(Vec::new())));
+    vm.recompute_bounding_volume(actor, true).unwrap();
+    assert_eq!(vm.frozen_render_bounds(actor), None);
+    vm.set_animation_data(Box::new(BoundingPose(vec![[f32::NAN, 0.0, 0.0]])));
+    assert!(vm.recompute_bounding_volume(actor, true).is_err());
+    assert_eq!(vm.frozen_render_bounds(actor), None);
+    vm.set_animation_data(Box::new(PoseStub));
+    assert!(
+        vm.recompute_bounding_volume(actor, true).is_err(),
+        "unsupported provider must fail"
+    );
+}
 
 impl crate::animation::AnimationData for PoseStub {
     fn sequence(&mut self, _source: &str, _seq: &str) -> Result<Option<SeqInfo>, String> {

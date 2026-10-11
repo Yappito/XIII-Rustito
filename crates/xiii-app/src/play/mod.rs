@@ -1055,6 +1055,14 @@ fn fixed_step(
         .drive
         .as_mut()
         .is_some_and(script::Drive::take_quick_heal);
+    let mut exec_inputs = script
+        .drive
+        .as_mut()
+        .map(script::Drive::take_exec_inputs)
+        .unwrap_or_default();
+    if suppressed {
+        exec_inputs.clear();
+    }
     if suppressed {
         input = Input::default();
     }
@@ -1178,6 +1186,11 @@ fn fixed_step(
             match sess.take_control() {
                 Ok(state) => println!("[play] take_control diagnostic: controller -> {state}"),
                 Err(e) => println!("[play] take_control failed: {e}"),
+            }
+        }
+        for name in exec_inputs {
+            if let Err(e) = sess.controller_input(name) {
+                sess.blocked.push(format!("{name} input: {e}"));
             }
         }
         if heal && let Err(e) = sess.quick_heal() {
@@ -2476,6 +2489,7 @@ fn run_script_inner(
         let mut use_named = drive.take_use_named();
         let control = drive.take_control();
         let mut heal = drive.take_quick_heal();
+        let mut exec_inputs = drive.take_exec_inputs();
         // Match the interactive fixed_step: FPC/FPL/CameraView/PlayingVideo own the pawn while
         // the authored cinematic runs. The headless route must still advance its script cursor,
         // but player-axis/action commands are ignored. Explicit test-only set_goal commands are
@@ -2488,6 +2502,7 @@ fn run_script_inner(
             weapon_inputs.clear();
             use_named.clear();
             heal = false;
+            exec_inputs.clear();
         }
         let fired = input.fire;
         if runtime.volumes.is_empty() {
@@ -2568,6 +2583,11 @@ fn run_script_inner(
             match runtime.session.take_control() {
                 Ok(state) => println!("[play] take_control diagnostic: controller -> {state}"),
                 Err(e) => println!("[play] take_control failed: {e}"),
+            }
+        }
+        for name in exec_inputs {
+            if let Err(e) = runtime.session.controller_input(name) {
+                runtime.session.blocked.push(format!("{name} input: {e}"));
             }
         }
         if heal && let Err(e) = runtime.session.quick_heal() {
@@ -6505,13 +6525,58 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            120.0,
+            335.0,
         )
         .expect("run Hual04a route");
         let session = &outcome.session;
         let vm = session.vm();
-        let soldier = vm.find_object("BaseSoldier1").expect("route soldier");
         let mi = session.map_info().expect("Hual04a MapInfo");
+        let pc = session.controller.expect("player controller");
+        let Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(interaction)))) =
+            vm.get_property(pc, "MyInteraction")
+        else {
+            panic!("player interaction");
+        };
+        let blocker = vm
+            .find_object("BreakAbleMover69")
+            .expect("reader trace blocker");
+        assert_eq!(
+            vm.get_property(*interaction, "TargetActor"),
+            Some(&xiii_script::Value::Object(Some(
+                xiii_script::ObjRef::Instance(blocker)
+            )))
+        );
+        assert_eq!(
+            vm.get_property(*interaction, "bCanTrigger"),
+            Some(&xiii_script::Value::Bool(false))
+        );
+        let reader = vm
+            .find_object("MagneticPassTrigger4")
+            .expect("bureau reader");
+        let door = vm.find_object("Porte11").expect("bureau door");
+        assert_eq!(
+            vm.get_property(reader, "Icon"),
+            vm.get_property(reader, "NeverUsedIcon")
+        );
+        assert_eq!(
+            vm.get_property(door, "KeyNum"),
+            Some(&xiii_script::Value::Byte(0))
+        );
+        let card = vm.find_live_object("MagneticCard").expect("six-kill card");
+        assert_eq!(
+            vm.get_property(card, "Owner"),
+            Some(&xiii_script::Value::Object(Some(
+                xiii_script::ObjRef::Instance(session.player)
+            )))
+        );
+        assert_eq!(
+            vm.get_property(card, "Event"),
+            Some(&xiii_script::Value::Name("passtrigger_ascenseur".into()))
+        );
+        println!(
+            "[hual04a next blocker] carried card, aimed reader -> BreakAbleMover69, bCanTrigger=false, reader unused, Porte11 key=0; position={:?}",
+            session.player_location()
+        );
         for (id, object) in vm.objects.iter().enumerate() {
             if object.name.starts_with("Cine") {
                 for table in ["tabActions", "tabActions2", "tabActions3"] {
@@ -6532,33 +6597,63 @@ mod tests {
                 }
             }
         }
-        let error = session
-            .first_error()
-            .expect("measured corpse native blocker")
-            .to_string();
+        let error = session.first_error().map(ToString::to_string);
         println!(
-            "[hual04a route] error={error} objectives={:?} eNbVivants={:?} travel={:?}",
+            "[hual04a route] error={error:?} objectives={:?} eNbVivants={:?} travel={:?}",
             session.objective_states(),
             vm.get_property(mi, "eNbVivants"),
             outcome.travel
         );
-        assert!(
-            error.contains("Actor.RecomputeBoundingVolume")
-                && error.contains("391")
-                && error.contains("XIIIPawn.Dying.Timer")
-                && error.contains("BaseSoldier1")
-                && error.contains("019D"),
-            "unexpected blocker: {error}"
-        );
-        assert_eq!(session.suspended, vec!["BaseSoldier1".to_owned()]);
+        for name in [
+            "BaseSoldier1",
+            "BaseSoldier5",
+            "BaseSoldier10",
+            "BaseSoldier12",
+            "BaseSoldier0",
+            "BaseSoldier4",
+        ] {
+            let id = vm.find_object(name).expect("authored soldier");
+            println!(
+                "[hual04a soldier] {name} health={:?} location={:?} event={:?} searchable={:?} bounds={:?}",
+                vm.get_property(id, "Health"),
+                vm.get_property(id, "Location"),
+                vm.get_property(id, "Event"),
+                vm.get_property(id, "bSearchable"),
+                vm.frozen_render_bounds(id)
+            );
+            assert!(
+                matches!(vm.get_property(id, "Health"), Some(xiii_script::Value::Int(h)) if *h <= 0),
+                "{name} must die through player input"
+            );
+            assert_eq!(
+                vm.get_property(id, "bIsDead"),
+                Some(&xiii_script::Value::Bool(true))
+            );
+            assert!(
+                vm.frozen_render_bounds(id).is_some(),
+                "{name} skeletal bounds frozen"
+            );
+            let Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(shadow)))) =
+                vm.get_property(id, "Shadow")
+            else {
+                panic!("{name} shadow");
+            };
+            assert_eq!(
+                vm.get_property(*shadow, "bShadowIsStatic"),
+                Some(&xiii_script::Value::Bool(true)),
+                "{name} must finish Timer after 0x019D"
+            );
+        }
+        assert!(error.is_none(), "unexpected blocker: {error:?}");
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
         assert_eq!(
             vm.get_property(mi, "eNbVivants"),
-            Some(&xiii_script::Value::Int(6)),
-            "the death event must remain blocked before the card-chain count advances"
+            Some(&xiii_script::Value::Int(1)),
+            "Died triggers before setting bIsDead: six deaths leave the count one behind"
         );
-        assert!(
-            matches!(vm.get_property(soldier, "Health"), Some(xiii_script::Value::Int(h)) if *h <= 0),
-            "the soldier must die through the player's weapon chain"
+        assert_eq!(
+            vm.get_property(mi, "eNbMorts"),
+            Some(&xiii_script::Value::Int(6))
         );
         assert!(
             session.player_health().is_some_and(|h| h > 0.0),

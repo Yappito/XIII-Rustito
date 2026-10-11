@@ -839,6 +839,16 @@ impl Session {
         }
     }
 
+    /// Ordinary player exec; the game's controller and interaction own its behavior.
+    pub fn controller_input(&mut self, name: &str) -> Result<(), String> {
+        let pc = self.controller.ok_or("input: no player controller")?;
+        self.vm
+            .send_event(pc, name, Vec::new())
+            .map_err(|e| e.to_string())?;
+        self.drain_events();
+        Ok(())
+    }
+
     /// Dispatch a normal controller weapon-selection exec; completion belongs to the weapon
     /// state machine and decoded animation/timer callbacks, so this does not complete a switch.
     pub fn weapon_input(&mut self, group: Option<u8>) -> Result<(), String> {

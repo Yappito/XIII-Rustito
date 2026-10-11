@@ -35,6 +35,18 @@ pub struct SeqInfo {
 /// Decoded animation data the VM queries. A provider may cache and is free to be strict about
 /// unknown sources/sequences (`Ok(None)` = unknown; the VM turns that into an explicit error).
 pub trait AnimationData {
+    /// Current channel-zero skinned vertices in actor-local Unreal space, with the mesh's
+    /// origin, scale and rotation applied. None means the source is not a skeletal mesh.
+    /// Providers lacking pose data must fail explicitly rather than freeze a cylinder.
+    fn posed_vertices(
+        &mut self,
+        mesh: &str,
+        pose: Option<(&str, &str, f32, bool)>,
+    ) -> Result<Option<Vec<[f32; 3]>>, String> {
+        let _ = (mesh, pose);
+        Err("animation provider cannot supply skinned bounding vertices".into())
+    }
+
     /// Sequence data for `seq` on animation source `source`.
     ///
     /// `source` is an object path from the actor's script state: a `Mesh` (`SkeletalMesh`,
