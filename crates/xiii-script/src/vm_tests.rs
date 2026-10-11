@@ -12276,6 +12276,33 @@ fn vector_to_rotator_and_string_casts_match_ue2() {
 }
 
 #[test]
+fn string_to_byte_cast_parses_the_leading_integer() {
+    let set = spawn_set();
+    let vm = Vm::new(&set, VmLimits::default());
+    let cast = |s: &str| vm.primitive_cast(0x49, Value::Str(s.into())).unwrap();
+    assert_eq!(cast("1"), Value::Byte(1));
+    assert_eq!(cast("12"), Value::Byte(12));
+    // `xidpawn.gennmi` 0x07E7 switches on `byte(Mid(TimbresPossibles, Rand(j)))` with
+    // `TimbresPossibles="123;"`; `Mid(S,i)` returns the rest of the string, so the cast must
+    // parse the leading integer of a longer tail.
+    assert_eq!(cast("123;"), Value::Byte(123));
+    assert_eq!(cast("23;"), Value::Byte(23));
+    assert_eq!(cast("3;"), Value::Byte(3));
+    // `appAtoi` skips leading whitespace and accepts a sign; the parse stops at the first
+    // non-digit. Bytes truncate out-of-range values (300 -> 44, -1 -> 255).
+    assert_eq!(cast(" 7 "), Value::Byte(7));
+    assert_eq!(cast("-1"), Value::Byte(255));
+    assert_eq!(cast("300"), Value::Byte(300u32 as u8));
+    // No leading integer yields 0, never an error: the call site's switch default, not a
+    // suspended actor.
+    assert_eq!(cast(""), Value::Byte(0));
+    assert_eq!(cast(";2"), Value::Byte(0));
+    assert_eq!(cast("abc"), Value::Byte(0));
+    // The operand must be a string; another type is still an explicit error.
+    assert!(vm.primitive_cast(0x49, Value::Int(1)).is_err());
+}
+
+#[test]
 fn context_object_class_resolves_a_class_cast_target() {
     use crate::bytecode::{Token, TokenKind};
     use xiii_package::ObjectRef;
