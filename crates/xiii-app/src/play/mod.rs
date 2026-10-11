@@ -4111,11 +4111,13 @@ mod tests {
     /// PlayingVideo.PlayerTick -> ServerTravel` chain as Plage01. The route fixture
     /// (`tests/data/banque01_route.script`) walks onto the map's own trigger/volume actors and
     /// keeps four labelled flow teleports whose legs are re-measured unwalkable on main
-    /// (item73: the strongroom is sealed at the safe level and the platform level, the lift
-    /// cannot be boarded or called, the shaft wall y=-2080 and the banksortiescasecour tower
-    /// enclose the TT2 landing). The old t=139 TT10 teleport is gone: the fbi_dial2 cutscene
-    /// owns the player pose from t=133.017, so it never relocated the player nor fired
-    /// TouchTrigger10 (measured); the CarOut beat does not fire in this engine run.
+    /// (item75: the strongroom is sealed at the safe level and the platform level and nothing
+    /// in the map opens it, the lift cannot be called from the hall and both known rides —
+    /// the direct cage use and the internal-button manager cycle — end against sealed BSP or
+    /// a floor-2 corridor dead end, and the shaft wall y=-2080 and the banksortiescasecour
+    /// tower enclose the TT2 landing). The old t=139 TT10 teleport is gone: the fbi_dial2
+    /// cutscene owns the player pose from t=133.017, so it never relocated the player nor
+    /// fired TouchTrigger10 (measured); the CarOut beat does not fire in this engine run.
     #[test]
     fn opt_in_banque01_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -4134,12 +4136,12 @@ mod tests {
         let script = script::Script::load(&route_path).expect("load item24 banque01 route");
         // 185 s: the measured schedule needs it — the route walks to the vault door (touches
         // t~88), teleports to DetectionVolume12 at t=93.017, and Jones then reaches Cine15's
-        // touch at t=115.7 with his scene running to fin_flash (~t=125.5); the escape-flow
+        // touch at t=116.1 with his scene running to fin_flash (~t=125.5); the escape-flow
         // teleports run t=127..133 (TT5 127.017, TT2 130.017, TT11 133.017, TT4 133.333),
-        // objective 0 completes by t=138.5 (fin_flash + the 13 s XIIIDispatcher4 delay) and
+        // objective 0 completes by t=139.0 (fin_flash + the 13 s XIIIDispatcher4 delay) and
         // objective 1 by t=146.5 (Cine11's fin_map -> XIIIGoalTrigger2). The map-outro video
         // then runs its full 33.92 s headless before `PlayingVideo.PlayerTick` issues the
-        // `ServerTravel` (measured travel t=181.967 in the item73 baseline run).
+        // `ServerTravel` (measured travel t=181.967 in the item75 baseline run).
         let outcome = run_script_with_cinematic_input(
             &game_dir,
             "banque01",

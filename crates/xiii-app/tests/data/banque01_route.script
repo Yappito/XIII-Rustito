@@ -37,39 +37,60 @@
 #     BreakableMover0, Porte8, TriggerSound6/11/14, XIIIMover6/27, and XIIIDispatcher5 (the
 #     briefcase `debut_flash` chain); Porte20/21 (the vault door panels) open by themselves.
 #     The t=44 vault teleport of the old route is gone entirely.
-#   - Teleport to DetectionVolume12 (-7616,-2784,1456) — re-measured on main a45fbd4 (item73):
-#     there is still NO walkable connection between the vault level (z=-149) and the strongroom
-#     (z 800-1504). The basement corridor's west wall is x=-3500 (bsp grid z=-149), the original
-#     nav graph still has no point in the strongroom or south of y=-6000 (6 components over 229
-#     points), and the strongroom is sealed at both levels: the safe-level wall x=-6976
-#     (Model69, z 800..1312) stops the radius-34 box at x=-7010 standing and crouched, its top
-#     meets the landing ceiling z=1312 (no step/crouch/jump clears it), and the DV12 platform's
-#     east/south sides are Model69 walls (diagonal face hit at (-7527,-2784), x=-7360 wall z
-#     1312..1504, y=-1856/-2368/-2752 perimeter). Zone grids at z=875 and z=1500 show solid
-#     between the strongroom and the bank floors. DetectionVolume12's Touch starts Cine15
-#     (Jones) through the game's own code.
+#   - Teleport to DetectionVolume12 (-7616,-2784,1456) — re-measured on main 42d039f (item73
+#     walls re-confirmed by item75 sweeps): there is still NO walkable connection between the
+#     vault level (z=-149) and the strongroom (z 800-1504). The basement corridor's west wall
+#     is x=-3500 (bsp grid z=-149), the original nav graph still has no point in the strongroom
+#     or south of y=-6000 (6 components over 229 points), and the strongroom is sealed at both
+#     levels: the safe-level wall x=-6976 (Model69, z 800..1312) stops the radius-34 box at
+#     x=-7010 standing and crouched, its top meets the landing ceiling z=1312 (no step/crouch/
+#     jump clears it), and the DV12 platform's east/south sides are Model69 walls (diagonal
+#     face hit at (-7527.3,-2784,1531), x=-7360 wall z 1312..1504, y=-1856/-2368/-2752
+#     perimeter). Zone grids at z=875 and z=1500 show solid between the strongroom and the bank
+#     floors, and nothing opens it: the strongroom's own mover XIIIMover26 (Tag
+#     'explocoffre_bis', TriggerOpenTimed) has no sender anywhere in the map data and the
+#     fin_flash chain's only receiver is XIIIDispatcher4 (item75 props re-scan). Banque01's 13
+#     bDeleteMe exports (item75, props) include no door of the strongroom or the lift; the dead
+#     XIIIEcumeEmitter5 (safe level, Event 'tiroir') removes only a foam effect.
+#     DetectionVolume12's Touch starts Cine15 (Jones) through the game's own code.
 #   - walk the strongroom interior: fall from the DV12 platform to the safe level (z=875,
 #     Cine15[3] "wait player 300" vs Jones at the safe passes at (-7161,-2141)), then walk the
 #     walkway to (-7883,-2648) where Cine15[34] "wait player 300" passes (Jones at
 #     (-7885,-2647,875)). Both t=48/t=70 teleports of the old route are gone.
-#   - Escape teleports TT5/TT2/TT3 stay — re-measured on main a45fbd4 (item73). The player is
+#   - Escape teleports TT5/TT2/TT3 stay — re-measured on main 42d039f (item75). The player is
 #     inside the sealed strongroom, so no input walk can reach any escape volume; the teleports
 #     deliver each volume's own engine Touch (the game's own code):
-#     * TT5 (1300.03,-1917.39,1478): the lift cannot board or be called — LiftManager0's
-#       PostBeginPlay (xidcine.u bytecode) makes LiftButton0 the cage's INTERNAL button
-#       (SetBase to the cage) and finds no floor calling-button, and LiftDoor0/1 start closed
-#       (KeyNum 0). The teleport delivers TouchTrigger5's Touch (t=127.017) and lands on
-#       LiftCage0's roof (centre 1317.1 = roof inner 1242.1 + 75; mover mesh collision).
-#     * TT2 (865,-4075,1530): from the TT5 landing the Model69 shaft wall y=-2080 (z
-#       1008..1968) stops the box at y=-2046 at both z=1478 and z=1530, and the hall east wall
-#       x=1120 (z 992..2368) blocks the south-east line (fresh sweeps).
+#     * TT5 (1300.03,-1917.39,1478): the lift cannot be CALLED — LiftManager0's PostBeginPlay
+#       (xidcine.u bytecode, bAutomatic defaults true) radius-finds LiftCage0, makes LiftButton0
+#       the cage-based INTERNAL button (SetBase, in the cage's south wall niche) and finds no
+#       Floor1/Floor2_CallingButton; the closed LiftDoors answer use with the empty class
+#       PlayerTrigger (measured probe: `use LiftDoor2/3` → Triggered, movers 0/89 moving). NEW
+#       on main (measured probes): the cage itself is use-interactable (the map serialises
+#       InitialState 'PlayerTriggerToggle' on LiftCage0) — ray `use LiftCage0` from the roof
+#       toggles key 0→1 and the Rider carries the player 1317.1→1798.1; and a NAMED
+#       `use LiftButton0` from inside the cabin fires the whole manager cycle (outer doors
+#       cycle, cage rises 6 s, internal doors + floor-2 outer doors open, the player walks out
+#       to the floor-2 corridor). None of it reaches an escape volume: the shaft is sealed at
+#       the ride top (south wall y=-2080 spans z 1008..1968 > the 1803 roof-stop centre; west
+#       wall stops the roof walk at x=1170), the ray use cannot hit the occluded button, and
+#       the floor-2 corridor south dead-ends (see TT2). The teleport still delivers
+#       TouchTrigger5's Touch (t=127.017) and lands on LiftCage0's roof (centre 1317.1 =
+#       roof inner 1242.1 + 75; mover mesh collision).
+#     * TT2 (865,-4075,1530): from the TT5 landing the Model69 shaft wall y=-2080 (triangle
+#       x 1136..1472, z 1008..1968) stops the box at y=-2046 at z=1478 and at the ride-top
+#       z=1803 alike (fresh sweeps). From the floor-2 lift exit (reached by input in the item75
+#       probe: cabin button → manager cycle → walk out at z=1563) the corridor south dead-ends
+#       at StaticMeshActor39 (`Staticbanque.GR_buro_lampe_fauteuil`, box x 877.9..1057.8,
+#       y -3633.5..-3438.2, top 1741.6 > the jump-apex box top 1730.8; stops at y=-3404.5 for
+#       x=946 and y=-3426.2 for x=900) with the Model69 wall y=-3680 (z 992..2368, x 48..1120)
+#       behind it; the portelift5/6 doors open by bump on the way (measured).
 #     * TT3 (1134,-4222,480): from the TT2 landing the banksortiescasecour tower encloses the
 #       landing: south stall y=-4271.2, east stall x=964.2275 (side plane x=998.2275 minus the
-#       34 radius; route probes local/re/item73/probe-descent*.script), and the west top strip
-#       (floor 1489.9) dead-ends at the tower faces y=-4585.9/-4619.9. The fall delivers
-#       TouchTrigger11's Touch (t=133.017; same fbi_dial2 event as TT3) and the fbi_dial2
-#       cutscene (Cine11) places the player at (1186.5,-4051.8,347) where TT4 fires
-#       (t=133.333); the yard walk to TT3's own cylinder never fires it (distance 177.7 > 74).
+#       34 radius; probe re-run on main 42d039f), and the west top strip (floor 1489.9)
+#       dead-ends at the tower faces y=-4585.9/-4619.9. The fall delivers TouchTrigger11's
+#       Touch (t=133.017; same fbi_dial2 event as TT3) and the fbi_dial2 cutscene (Cine11)
+#       places the player at (1186.5,-4051.8,347) where TT4 fires (t=133.333); the yard walk
+#       to TT3's own cylinder never fires it (distance 177.7 > 74).
 #   - TT10 (CarOut, 1014.38,-4309,609.458) has NO working delivery in this engine run and its
 #     teleport was REMOVED (item73): the cutscene owns the player pose from t=133.017, so the
 #     old t=139 teleport never relocated the player and TouchTrigger10's Touch never fired
@@ -173,8 +194,8 @@ t=104.00 forward 0
 # delivers each volume's own engine Touch; every touch is the game's own code. They wait for
 # fin_flash (see hold above) but may safely overlap the 13 s XIIIDispatcher4 delay that turns
 # fin_flash into the objective-0 promotion. (+3.0 shift vs the item27l route.)
-t=127.00 teleport 1300.03 -1917.39 1478  # TT5: strongroom sealed; cage not boardable (item73)
-t=130.00 teleport 865 -4075 1530         # TT2: TT5 roof's y=-2080 BSP wall blocks south walk
+t=127.00 teleport 1300.03 -1917.39 1478  # TT5: strongroom sealed; lift not callable, ride ends sealed (item75)
+t=130.00 teleport 865 -4075 1530         # TT2: shaft wall y=-2080; floor-2 corridor dead-ends (item75)
 t=133.00 teleport 1134 -4222 480         # TT3: banksortiescasecour tower encloses the TT2 landing
 t=136.00 forward 0                     # TT4 already touched on the natural fall at t=133.333;
                                        # TT10 (CarOut) has no working delivery — see header note.
