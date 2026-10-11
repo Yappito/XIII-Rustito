@@ -839,6 +839,16 @@ impl Session {
         }
     }
 
+    /// Ordinary player exec; the game's controller and interaction own its behavior.
+    pub fn controller_input(&mut self, name: &str) -> Result<(), String> {
+        let pc = self.controller.ok_or("input: no player controller")?;
+        self.vm
+            .send_event(pc, name, Vec::new())
+            .map_err(|e| e.to_string())?;
+        self.drain_events();
+        Ok(())
+    }
+
     /// Dispatch a normal controller weapon-selection exec; completion belongs to the weapon
     /// state machine and decoded animation/timer callbacks, so this does not complete a switch.
     pub fn weapon_input(&mut self, group: Option<u8>) -> Result<(), String> {
@@ -4054,6 +4064,22 @@ mod tests {
         let left_scripted_attack = scripted_states.iter().any(|(from, to)| {
             from.as_deref() == Some("AttaqueScriptee") && to.as_deref() == Some("temporise")
         });
+        let wall_adjust: Vec<_> = session
+            .vm()
+            .trace
+            .iter()
+            .filter_map(|event| match &event.kind {
+                xiii_script::TraceKind::Native {
+                    path, this, result, ..
+                } if path == "Controller.PickWallAdjust"
+                    && this == &session.vm().objects[controller as usize].name =>
+                {
+                    Some((event.time, result.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        println!("[Plage01 pursuit] wall_adjust={wall_adjust:?}");
         println!(
             "[Plage01 combat] cue=TouchTrigger7 event={trigger_event:?}, player={player_location:?}, soldier={soldier_location:?}, distance={player_distance:.1}, SightRadius={sight_radius}, cue Enemy={cue_enemy_name:?}, final Enemy={final_enemy:?}, scripted={scripted_attack_seen}, combat={controller_attack_seen}, held-fire-seen={held_fire_seen}, fire-request-seen={fire_request_seen}, bTire={wants_fire}, soldier state={state:?}, controller state={controller_state:?}, controller states={scripted_states:?}, CanSee={can_see:?}, rotation {initial_rotation:?}->{final_rotation:?}, Health {health_before}->{health_after}; suspended={:?}",
             session.failures
@@ -4067,14 +4093,13 @@ mod tests {
                 && can_see.iter().any(|(_, _, result)| result == "false"),
             "the actual player position should be outside SightRadius with a measured failed CanSee: distance={player_distance}, SightRadius={sight_radius}, CanSee={can_see:?}"
         );
-        // With the live level clock ContinueStakeOut expires and temporise enters Chasse
-        // (IAController.temporise 0x01FC..0x0287). The former Patrouille/no Enemy pin
-        // described a frozen-clock artefact, not the authored distant-player outcome.
+        // The live clock takes temporise into Chasse. Decoded wall adjustment now
+        // allows the authored search to finish and return to patrol without firing.
         assert!(
             cue_enemy == Some(player)
-                && final_enemy.as_deref() == Some(session.player_name.as_str())
+                && final_enemy.is_none()
                 && left_scripted_attack
-                && controller_state.as_deref() == Some("Chasse")
+                && controller_state.as_deref() == Some("Patrouille")
                 && !controller_attack_seen
                 && !held_fire_seen
                 && !fire_request_seen
@@ -4082,19 +4107,30 @@ mod tests {
                 && health_after == health_before,
             "unexpected combat result: Health {health_before}->{health_after}, bTire={wants_fire}"
         );
-        assert_eq!(
-            session.failures.len(),
-            1,
-            "only the measured pursuit blocker may fail"
-        );
         assert!(
-            session.failures[0].0 == session.vm().objects[controller as usize].name
-                && session.failures[0].1.contains("Controller.PickWallAdjust")
-                && session.failures[0].1.contains("Some(526)")
-                && session.failures[0].1.contains("Chasse.PickDestination"),
+            session.failures.is_empty(),
             "unexpected distant-player pursuit failure: {:?}",
             session.failures
         );
+        assert!(
+            scripted_states
+                .iter()
+                .any(|(from, to)| from.as_deref() == Some("temporise")
+                    && to.as_deref() == Some("Chasse"))
+        );
+        assert!(
+            scripted_states
+                .iter()
+                .any(|(from, to)| from.as_deref() == Some("Chasse")
+                    && to.as_deref() == Some("Patrouille"))
+        );
+        assert_eq!(
+            wall_adjust.len(),
+            1,
+            "the measured pursuit calls native 526 once"
+        );
+        assert_eq!(wall_adjust[0].1, "false");
+        assert!((wall_adjust[0].0 - 9.316667).abs() < 1.0 / 60.0);
     }
 
     /// Opt-in corpus regression (item3o): the Plage00 level-start checkpoint path runs the

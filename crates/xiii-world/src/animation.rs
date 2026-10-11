@@ -19,7 +19,7 @@ use std::sync::Arc;
 use xiii_decode::skeletal::{
     MESH_ANIMATION_CLASS, RawMeshAnimation, SKELETAL_MESH_CLASS, Skeleton, decode_mesh_animation,
     decode_skeletal_mesh,
-    normalize::{AnimSet, evaluate_pose},
+    normalize::{AnimSet, SkinnedMesh, evaluate_pose},
 };
 use xiii_script::animation::{AnimationData, SeqInfo};
 
@@ -72,6 +72,7 @@ pub struct MapAnimationProvider {
 /// mesh onto the actor's forward axis).
 struct MeshSkeleton {
     skeleton: Skeleton,
+    mesh: SkinnedMesh,
     mesh_origin: [f32; 3],
     mesh_scale: [f32; 3],
     rot_origin: [i32; 3],
@@ -134,8 +135,11 @@ impl MapAnimationProvider {
         let raw = decode_skeletal_mesh(&pkg.package, &pkg.data, idx)
             .map_err(|e| format!("{source}: skeletal mesh decode: {e}"))?;
         let skeleton = Skeleton::from_mesh(&raw).map_err(|e| format!("{source}: skeleton: {e}"))?;
+        let mesh = SkinnedMesh::from_raw(&raw, &skeleton, None)
+            .map_err(|e| format!("{source}: skin: {e}"))?;
         Ok(Some(Arc::new(MeshSkeleton {
             skeleton,
+            mesh,
             mesh_origin: raw.mesh_origin,
             mesh_scale: raw.mesh_scale,
             rot_origin: raw.rot_origin,
@@ -190,6 +194,55 @@ impl MapAnimationProvider {
 }
 
 impl AnimationData for MapAnimationProvider {
+    fn posed_vertices(
+        &mut self,
+        source: &str,
+        channel: Option<(&str, &str, f32, bool)>,
+    ) -> Result<Option<Vec<[f32; 3]>>, String> {
+        let Some(mesh) = self.skeleton_of(source)? else {
+            return Ok(None);
+        };
+        let pose = if let Some((sequence, anim_source, frame, looping)) = channel {
+            // Resolve through the same cache and error path as sequence queries.
+            self.sequence(anim_source, sequence)?;
+            let anim = self
+                .anims
+                .get(&anim_source.to_ascii_lowercase())
+                .and_then(|a| a.as_ref().ok())
+                .and_then(|a| a.as_ref())
+                .ok_or_else(|| format!("{anim_source}: no animation for bounding pose"))?;
+            let set = AnimSet::from_raw(anim).map_err(|e| e.to_string())?;
+            let clip = set
+                .clip(sequence)
+                .ok_or_else(|| format!("{anim_source}: missing bounding sequence {sequence}"))?;
+            evaluate_pose(
+                &mesh.skeleton,
+                clip,
+                &set.bone_map(&mesh.skeleton),
+                frame,
+                looping,
+            )
+        } else {
+            mesh.skeleton.bind_globals()
+        };
+        let rotation = xiii_decode::skeletal::blend::rotator_quat(mesh.rot_origin);
+        let vertices = mesh
+            .mesh
+            .skin(&mesh.skeleton, &pose)
+            .into_iter()
+            .map(|v| {
+                let p = [
+                    (v.x - mesh.mesh_origin[0]) * mesh.mesh_scale[0],
+                    (v.y - mesh.mesh_origin[1]) * mesh.mesh_scale[1],
+                    (v.z - mesh.mesh_origin[2]) * mesh.mesh_scale[2],
+                ];
+                let p = rotation.rotate(xiii_decode::skeletal::math::Vec3::new(p[0], p[1], p[2]));
+                [p.x, p.y, p.z]
+            })
+            .collect();
+        Ok(Some(vertices))
+    }
+
     fn sequence(&mut self, source: &str, seq: &str) -> Result<Option<SeqInfo>, String> {
         if source.is_empty() {
             return Ok(None);
@@ -341,6 +394,39 @@ mod tests {
         anim.sequences[1].num_frames = -3;
         let e = sequence_info(&anim, "Run").unwrap_err();
         assert!(e.contains("negative"), "{e}");
+    }
+
+    #[test]
+    fn gog_bounding_vertices_pose_and_unknown_sequence_failure() {
+        let Some(root) = std::env::var_os("XIII_GOG_DIR") else {
+            println!("SKIPPED: set XIII_GOG_DIR for skinned bounding vertices");
+            return;
+        };
+        let mut provider = MapAnimationProvider::open(Path::new(&root)).unwrap();
+        let mesh = "xiiipersos.XIIIM";
+        let bind = provider.posed_vertices(mesh, None).unwrap().unwrap();
+        assert!(!bind.is_empty());
+        assert!(bind.iter().flatten().all(|v| v.is_finite()));
+        let pose = provider
+            .posed_vertices(mesh, Some(("Walk", mesh, 3.0, true)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pose.len(), bind.len());
+        assert!(
+            pose.iter().zip(&bind).any(|(a, b)| a != b),
+            "a pose must skin, not use bind bounds"
+        );
+        assert!(
+            provider
+                .posed_vertices(mesh, Some(("NoSuchSequence", mesh, 0.0, false)))
+                .is_err()
+        );
+        assert!(
+            provider
+                .posed_vertices("xiiipersos.NoSuchMesh", None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Opt-in corpus check: the provider's answer for `XIIIM` (the soldier mesh) is byte-for-byte
