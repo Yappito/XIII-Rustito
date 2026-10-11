@@ -35,6 +35,7 @@ pub mod physics;
 pub mod projectors;
 pub mod reach;
 pub mod runtime;
+pub mod volume_brushes;
 pub mod zones;
 
 use materials::{BlendMode, MaterialNode, NodeKey, ResolvedMaterial, UvOp};
@@ -166,6 +167,9 @@ pub struct WorldScene {
     pub collision_line: Vec<u32>,
     /// Source object path per collision source id (shared by both soups).
     pub collision_sources: Vec<String>,
+    /// Actor-local line-query products in placed Bevy space, including non-blocking actors
+    /// admitted by script traces. Empty sets are known misses, not absent mesh data.
+    pub actor_line_primitives: BTreeMap<String, Vec<[[f32; 3]; 3]>>,
     /// BSP zones of the level: actor metadata, sky flag and per-zone geometry counts.
     pub zones: Vec<zones::SceneZone>,
     /// Indices into [`WorldScene::zones`] of the sky zones (`is_sky`), in increasing order.
@@ -1667,6 +1671,16 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                         });
                     }
                 }
+                // Script actor traces query the primitive independently of world movement
+                // blocking. Retain the selected line collision even for a non-blocking light.
+                im.scene.actor_line_primitives.insert(
+                    a.path.to_ascii_lowercase(),
+                    converted
+                        .collision_line
+                        .iter()
+                        .map(|t| t.map(|v| apply_transform(&transform, v)))
+                        .collect(),
+                );
                 // Collision: explicit bCollideActors/bBlockPlayers = false excludes the actor.
                 let [collide, _, block_players] = a.collision_flags;
                 if collide == Some(false) || block_players == Some(false) {

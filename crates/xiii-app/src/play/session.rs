@@ -631,9 +631,14 @@ impl Session {
             self.vm.native_profile_mut().player_write_micros += t0.elapsed().as_micros() as u64;
         }
 
-        // VM touch update for the host-moved player (the walk into a trigger volume). Run every
-        // tick even when the player is stationary: movers, spawned actors and re-enabled
-        // collision can change the player's touch set without the player moving.
+        // VM touch update for the host-moved player (the walk into a trigger volume). Every step
+        // maintains the enter/leave transitions, because movers, spawned actors and re-enabled
+        // collision can change the player's touch set without the player moving. The **spawn**
+        // placement is no exception: retail `ULevel::SpawnActor` (Engine.dll @0x10388a20) calls
+        // `ULevel::CheckEncroachment` (@0x1038b2e0) at 0x10388e2b, which calls
+        // `AActor::BeginTouch` (@0x103545b0) at 0x1038b61b for every non-blocking actor the new
+        // actor overlaps, so the initial placement delivers `Touch`. The first
+        // `refresh_touching_of` below is that spawn touch setup.
         let t0 = Instant::now();
         if let Err(e) = self.vm.refresh_touching_of(self.player) {
             self.suspend(self.player, &e);

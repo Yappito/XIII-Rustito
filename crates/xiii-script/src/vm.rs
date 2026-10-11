@@ -1390,6 +1390,10 @@ pub struct Vm<'s> {
     /// World-collision provider (movement/trace natives). `None` = every collision native
     /// fails with [`VmErrorKind::NoPhysicsProvider`].
     pub(crate) physics: Option<Box<dyn WorldPhysics>>,
+    /// Brush-primitive BSPs of volume brushes, in world (Unreal) space, registered by the host
+    /// (see [`crate::brush`]). `AActor::IsOverlapping` uses these for volume-brush actors
+    /// instead of the vertical cylinder; an unregistered volume keeps the cylinder fallback.
+    brush_primitives: HashMap<ObjectId, crate::brush::BrushPrimitive>,
     /// Last mover collision state sent to `physics` ([`Vm::sync_mover_collision`]).
     mover_collision_sent: HashMap<ObjectId, bool>,
     /// Animation-sequence provider (animation natives). `None` = every native that needs
@@ -1641,6 +1645,7 @@ impl<'s> Vm<'s> {
             missing_natives: Default::default(),
             pending_latent: None,
             physics: None,
+            brush_primitives: HashMap::new(),
             mover_collision_sent: HashMap::new(),
             animation: None,
             navigation: None,
@@ -7533,11 +7538,51 @@ impl<'s> Vm<'s> {
         })
     }
 
-    /// UE2 vertical-cylinder overlap, exactly as decoded from `engine.u Actor.TouchingActor`
-    /// (final simulated): `|dz| <= h1 + h2` and `sqrt(dx^2+dy^2) <= r1 + r2` (both inclusive).
+    /// True when `id` is a brush actor: a non-null `Brush` property (`AActor` field `0x144`).
+    /// Every `ABrush` subclass (volumes, movers, the level brush) stores its `Brush` UModel here.
+    /// The reference may be a cross-package `Static` object (the map's `Brush` -> `Engine.Model`
+    /// export), so any non-null object reference counts, not only a live VM `Instance`.
+    pub(crate) fn is_brush_actor(&self, id: ObjectId) -> bool {
+        matches!(self.get_property(id, "Brush"), Some(Value::Object(Some(_))))
+    }
+
+    /// Retail `AActor::IsVolumeBrush` (Engine.dll @0x1030f0d0): a non-null `Brush` field **and**
+    /// `IsA(AVolume)`. `XIDPawn.DetectionVolume`, `PhysicsVolume`, `Trigger` volumes and the like
+    /// derive from `Engine.Volume`, so their `IsOverlapping` uses the brush primitive.
+    pub(crate) fn is_volume_brush(&self, id: ObjectId) -> bool {
+        self.is_brush_actor(id) && self.is_a(id, "Volume")
+    }
+
+    /// Registers a volume brush's world-space BSP (host-decoded, see [`crate::brush`]). Called
+    /// once per placed volume at map load; [`Vm::actors_overlap`] then uses it instead of the
+    /// vertical cylinder for that actor.
+    pub fn set_brush_primitive(&mut self, id: ObjectId, primitive: crate::brush::BrushPrimitive) {
+        self.brush_primitives.insert(id, primitive);
+    }
+
+    /// `AActor::IsOverlapping` as decoded from Engine.dll @0x10352bd0:
+    ///
+    /// 1. Two brush actors never overlap (top check @0x10352bdc, `IsA(ABrush)` for both).
+    /// 2. If either actor is a volume brush (`IsVolumeBrush` @0x1030f0d0), the brush's
+    ///    `UModel::PointCheck` is asked whether the other actor's collision box is inside it
+    ///    (primitive path @0x10352cf3..0x10352d9c). The host registers that BSP; if it is absent
+    ///    the cylinder fallback is kept (reported by the host).
+    /// 3. Otherwise the vertical-cylinder test @0x10352d9e: `|dz| <= h1 + h2` and
+    ///    `sqrt(dx^2+dy^2) <= r1 + r2` (both inclusive).
     pub(crate) fn actors_overlap(&self, a: ObjectId, b: ObjectId) -> bool {
         if a == b {
             return false;
+        }
+        if self.is_brush_actor(a) && self.is_brush_actor(b) {
+            return false;
+        }
+        for (brush, other) in [(a, b), (b, a)] {
+            if self.is_volume_brush(brush)
+                && let Some(primitive) = self.brush_primitives.get(&brush)
+            {
+                let (center, radius, half_height) = self.actor_cylinder(other);
+                return primitive.overlaps_cylinder(center, radius, half_height);
+            }
         }
         let (la, ra, ha) = self.actor_cylinder(a);
         let (lb, rb, hb) = self.actor_cylinder(b);
@@ -8445,6 +8490,7 @@ impl<'s> Vm<'s> {
         self.bool_prop(candidate, "bBlockActors") && self.bool_prop(candidate, "bBlockPlayers")
     }
 
+    #[cfg(test)]
     pub(crate) fn vm_trace_actors(
         &mut self,
         caller: ObjectId,
@@ -8452,6 +8498,18 @@ impl<'s> Vm<'s> {
         start: [f32; 3],
         end: [f32; 3],
         extent: [f32; 3],
+    ) -> VmResult<Vec<ActorTraceHit>> {
+        self.vm_trace_actors_flags(caller, base, start, end, extent, 0)
+    }
+
+    pub(crate) fn vm_trace_actors_flags(
+        &mut self,
+        caller: ObjectId,
+        base: Option<GlobalRef>,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+        additional: u32,
     ) -> VmResult<Vec<ActorTraceHit>> {
         let Some(provider) = self.physics.as_mut() else {
             return Err(self.err(VmErrorKind::NoPhysicsProvider {
@@ -8499,7 +8557,8 @@ impl<'s> Vm<'s> {
             if base.is_some_and(|class| !self.objects[id as usize].layout.chain.contains(&class)) {
                 continue;
             }
-            if !self.trace_admits_actor_flags(id, caller, nonzero, 0x9f) {
+            // Engine.dll execTraceActors 0x103e8e68: TraceFlags = 0x9f | extra.
+            if !self.trace_admits_actor_flags(id, caller, nonzero, 0x9f | additional) {
                 continue;
             }
             let (loc, radius, height) = self.actor_cylinder(id);
@@ -8520,7 +8579,10 @@ impl<'s> Vm<'s> {
                 dx * dx + dy * dy <= (radius + extent[0].max(0.0)).powi(2)
                     && dz <= height + extent[2].max(0.0)
             };
-            if zero_extent && self.actor_has_static_mesh(id) {
+            if zero_extent
+                && self.actor_has_static_mesh(id)
+                && !(self.is_mover(id) && self.bool_prop(id, "bUseCylinderCollision"))
+            {
                 if cylinder.is_some() || start_inside_cylinder {
                     mesh_candidates.push(id);
                 }
@@ -8553,13 +8615,8 @@ impl<'s> Vm<'s> {
                 .unwrap_or(crate::physics::ActorMeshHit::NoData);
             let hit = match outcome {
                 crate::physics::ActorMeshHit::Hit(hit) => Some((hit.time, hit.normal)),
-                // item54: a registered mover whose mesh model misses the ray still answers
-                // through its collision cylinder — the class-authored interactive volume
-                // (BreakableMover r/h=160) that `DrawInteractions`' TargDist gate is sized for;
-                // the registered triangle set is the render mesh's simplified model (a thin
-                // grille quad) and does not fill it. Placed static-mesh actors (item53) keep
-                // strict mesh semantics: a ray through a mesh opening does not hit.
-                crate::physics::ActorMeshHit::Miss if self.is_mover(id) => cylinder_fallback(),
+                // item71: the hash dispatches exactly one primitive LineCheck (0x10349f2e).
+                // A mesh miss is final, including movers; there is no cylinder retry.
                 crate::physics::ActorMeshHit::Miss => None,
                 crate::physics::ActorMeshHit::NoData => cylinder_fallback(),
             };

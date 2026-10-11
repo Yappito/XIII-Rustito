@@ -4139,6 +4139,9 @@ fn phys_fixture() -> Vec<u8> {
     let static_mesh = b.reserve(IMP_OBJECTPROP, actor, "StaticMesh");
     let just_teleported = b.reserve(IMP_BOOLPROP, actor, "bJustTeleported");
     let floor = b.reserve(IMP_STRUCTPROP, actor, "Floor");
+    // `ABrush.Brush` (the volume/mover brush model reference), used by the volume-brush overlap
+    // test (`AActor::IsOverlapping`).
+    let brush = b.reserve(IMP_OBJECTPROP, actor, "Brush");
 
     b.prop_with(owner, level, 0, &object_extra);
     b.prop_with(level, base, 0, &object_extra);
@@ -4173,7 +4176,8 @@ fn phys_fixture() -> Vec<u8> {
     b.prop_with(touching_template, 0, 0, &object_extra);
     b.prop_array(touching, just_teleported, 0, touching_template);
     b.prop(just_teleported, floor, 0);
-    b.prop_with(floor, touch_fn, 0, &vector_extra);
+    b.prop_with(floor, brush, 0, &vector_extra);
+    b.prop_with(brush, touch_fn, 0, &object_extra);
 
     let tc = touches as u8;
     let touch_code = vec![0x0F, 0x01, tc, 0x92, 0x00, tc, 0x26, 0x16, 0x04, 0x0B];
@@ -4206,6 +4210,9 @@ fn phys_fixture() -> Vec<u8> {
     b.class(decoration, actor, 0, 0);
     b.class(mover, actor, 0, 0);
     b.class(levelinfo, actor, 0, 0);
+    // `Engine.Volume` (`Brush` + the volume-brush overlap path).
+    let volume = b.reserve(0, 0, "Volume");
+    b.class(volume, actor, 0, 0);
     let pawn_controller = b.reserve(IMP_OBJECTPROP, pawn, "Controller");
     b.prop_with(pawn_controller, 0, 0, &object_extra);
     let ctrl_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
@@ -6203,6 +6210,83 @@ fn trace_static_mesh_falls_back_to_cylinder_without_mesh_data_or_with_extent() {
 
 /// item53: `Actor.TraceActors` over a static-mesh actor honours the mesh opening too.
 #[test]
+fn trace_actors_mover_mesh_miss_is_final_unless_cylinder_is_selected() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let caller = phys_actor(&mut vm, &set, "Caller", [0.0; 3]);
+    let mover = vm.spawn(pg(&set, "Mover"), "WindowDoor").unwrap();
+    vm.set_property(mover, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, mover, true, true);
+    vm.set_property(mover, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(mover, "CollisionHeight", 0, Value::Float(160.0));
+    vm.set_property(
+        mover,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    // Start inside the nominal volume, looking through an opening: no cylinder retry.
+    let rows = vm
+        .vm_trace_actors(caller, None, [0.0, 0.0, 90.0], [100.0, 0.0, 90.0], [0.0; 3])
+        .unwrap();
+    assert!(rows.is_empty(), "mesh miss is final: {rows:?}");
+    let rows = vm
+        .vm_trace_actors(caller, None, [0.0; 3], [100.0, 0.0, 0.0], [0.0; 3])
+        .unwrap();
+    assert_eq!(rows[0].0, mover);
+    assert!((rows[0].1[0] - 40.0).abs() < 0.01);
+    // Explicit cylinder selection ignores the mesh, including its openings.
+    vm.set_property(mover, "bUseCylinderCollision", 0, Value::Bool(true));
+    let rows = vm
+        .vm_trace_actors(
+            caller,
+            None,
+            [-200.0, 0.0, 90.0],
+            [0.0, 0.0, 90.0],
+            [0.0; 3],
+        )
+        .unwrap();
+    assert_eq!(rows[0].0, mover);
+    vm.set_property(mover, "bBlockZeroExtentTraces", 0, Value::Bool(false));
+    assert!(
+        vm.vm_trace_actors(
+            caller,
+            None,
+            [-200.0, 0.0, 90.0],
+            [0.0, 0.0, 90.0],
+            [0.0; 3]
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+#[test]
+fn trace_actors_uses_9f_and_honors_additional_blocking_filter() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let caller = phys_actor(&mut vm, &set, "Caller", [0.0; 3]);
+    let target = phys_actor(&mut vm, &set, "Target", [50.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, target, true, false);
+    vm.set_property(target, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    vm.set_property(target, "bProjTarget", 0, Value::Bool(false));
+    vm.set_property(target, "bHidden", 0, Value::Bool(true));
+    let rows = vm
+        .vm_trace_actors(caller, None, [0.0; 3], [100.0, 0.0, 0.0], [0.0; 3])
+        .unwrap();
+    assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), [target]);
+    let rows = vm
+        .vm_trace_actors_flags(caller, None, [0.0; 3], [100.0, 0.0, 0.0], [0.0; 3], 0x20)
+        .unwrap();
+    assert!(
+        rows.is_empty(),
+        "extra projectile/blocking filter must be honored"
+    );
+}
+
+#[test]
 fn trace_actors_skips_static_mesh_actor_when_the_ray_passes_through_the_mesh() {
     let set = phys_set();
     let mut vm = Vm::new(&set, VmLimits::default());
@@ -6515,6 +6599,98 @@ fn host_written_location_drives_touch_refresh() {
     vm.refresh_touching_of(player).unwrap();
     assert_eq!(vm.get_property(trigger, "UnTouches"), Some(&Value::Int(1)));
     assert!(vm.touching_list(player).is_empty());
+}
+
+/// A unit cube `[0,1]^3` world-space BSP primitive (six outward planes, back = inside).
+fn unit_cube_primitive() -> crate::brush::BrushPrimitive {
+    use crate::brush::{BrushNode, BrushPrimitive};
+    let planes = [
+        [1.0, 0.0, 0.0, 1.0],
+        [-1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 1.0],
+        [0.0, 0.0, -1.0, 0.0],
+    ];
+    let nodes = planes
+        .iter()
+        .enumerate()
+        .map(|(i, p)| BrushNode {
+            plane: *p,
+            csg: true,
+            front: -1,
+            back: if i + 1 < planes.len() {
+                (i + 1) as i16
+            } else {
+                -1
+            },
+        })
+        .collect();
+    BrushPrimitive {
+        root: 0,
+        root_outside: true,
+        nodes,
+    }
+}
+
+#[test]
+fn volume_brush_overlap_uses_the_primitive_not_the_class_cylinder() {
+    // Retail `AActor::IsOverlapping`: a volume brush is tested with its `Brush` primitive, not
+    // the class cylinder. Place the volume's class cylinder far from the other actor; without
+    // the primitive the actor would not overlap it, but its box is inside the registered cube.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let volume = vm.spawn(pg(&set, "Volume"), "Volume").unwrap();
+    vm.set_property(
+        volume,
+        "Location",
+        0,
+        Value::Vector([1000.0, 1000.0, 1000.0]),
+    );
+    vm.set_property(volume, "CollisionRadius", 0, Value::Float(10.0));
+    vm.set_property(volume, "CollisionHeight", 0, Value::Float(10.0));
+    // Non-null `Brush` marks it a brush actor (the engine field 0x144).
+    vm.set_property(
+        volume,
+        "Brush",
+        0,
+        Value::Object(Some(ObjRef::Instance(volume))),
+    );
+    assert!(vm.is_brush_actor(volume));
+    assert!(vm.is_volume_brush(volume));
+    vm.set_brush_primitive(volume, unit_cube_primitive());
+
+    let player = phys_actor(&mut vm, &set, "Player", [0.5, 0.5, 0.5]);
+    vm.set_property(player, "CollisionRadius", 0, Value::Float(5.0));
+    vm.set_property(player, "CollisionHeight", 0, Value::Float(5.0));
+    // A cylinder inside the brush but far outside the volume's class cylinder: the primitive
+    // reports the overlap, the cylinder would not.
+    assert!(vm.actors_overlap(player, volume));
+    assert!(vm.actors_overlap(volume, player));
+
+    // Moved entirely outside the brush (and still outside the class cylinder): no overlap.
+    vm.set_property(player, "Location", 0, Value::Vector([2.0, 2.0, 2.0]));
+    assert!(!vm.actors_overlap(player, volume));
+}
+
+#[test]
+fn two_brush_actors_never_overlap() {
+    // The top of `AActor::IsOverlapping` (Engine.dll @0x10352bdc) returns 0 when both actors are
+    // brushes. Give the player a `Brush` too; even a perfectly overlapping pair must not touch.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let a = vm.spawn(pg(&set, "Volume"), "A").unwrap();
+    let b = vm.spawn(pg(&set, "Volume"), "B").unwrap();
+    for id in [a, b] {
+        vm.set_property(id, "Location", 0, Value::Vector([0.0, 0.0, 0.0]));
+        vm.set_property(id, "CollisionRadius", 0, Value::Float(50.0));
+        vm.set_property(id, "CollisionHeight", 0, Value::Float(50.0));
+        vm.set_property(id, "Brush", 0, Value::Object(Some(ObjRef::Instance(id))));
+    }
+    assert!(!vm.actors_overlap(a, b));
+    assert!(!vm.actors_overlap(b, a));
 }
 
 #[test]

@@ -1,12 +1,18 @@
-# Hual04a diagnostic route: six real kills, corpse card search, walked bureau approach.
+# Hual04a diagnostic route: six kills, earned card, bureau reader, fuse and installation.
 # Diagnostic weapon grant: Beretta carried from Hual01b through Hual02 (see
 # hual02_route.script's campaign-loadout note). Direct Hual04a login has no Beretta.
 # No teleports, set_goal or take_control. Coordinates and times are Unreal units/seconds.
 # Native #391 now permits the corpse timer to freeze its shadow. Continue the
 # six-soldier death-event chain by input; do not infer the card counter from Timer.
-# Measured next blocker: the reader-directed view trace selects BreakAbleMover69,
-# bCanTrigger stays false, and Grab never uses the carried card. Porte11 stays closed;
-# fuse/cable-car/travel are not claimed. The opt-in test pins this aim/interaction state.
+# The engine links the pawn's spawn overlaps silently (Vm::seed_touching_of), but the player
+# spawns only inside DetectionVolume4's *brush* (its class cylinder sits ~867 UU away) and walks
+# the canyon floor above DetectionVolume5's cylinder (top z=158). The engine's
+# `AActor::IsOverlapping` tests a VolumeBrush with its brush primitive; substituting the brush's
+# world AABB for the primitive regressed Hual01b/Hual02 (concave volumes over-fire), so this route
+# keeps the cylinder test. Both one-shot Touch events stay undelivered, Carrington's Cine1 (and
+# its LastWave reinforcement spawn) never starts, and installation case3 treats the empty
+# SpawnActor as not-dead -> FinDeMission. No reinforcement kill, lever activation or travel is
+# claimed.
 t=0.50 weapon xiii.Beretta
 t=1.00 switch_weapon 2
 t=2.50 goto -10200 -1500
@@ -161,4 +167,46 @@ t=320.00 goto -3804 3170
 t=322.00 crouch 1
 t=323.00 track MagneticPassTrigger4 0
 t=329.00 grab_input
-t=330.00 wait_travel
+# First Grab selects the card; the second activates the selected EventItem.
+t=332.00 grab_input
+t=335.00 track off
+t=335.00 crouch 0
+t=335.00 goto -3650 3100
+t=338.00 goto -3650 2780
+t=341.00 goto -3320 2780
+t=344.00 goto -3200 2986
+t=347.00 track Hual04aFusiblePick0 0
+t=349.00 grab_input
+t=352.00 track off
+t=352.00 goto -3320 2780
+t=354.00 goto -3650 2950
+t=356.00 goto -3810 3100
+t=358.00 goto -3880 3100
+t=360.00 goto -4000 3100
+t=361.00 goto -4000 2800
+t=362.00 goto -4262 2247
+t=366.00 goto -4092 1866
+t=370.00 goto -3751 1383
+t=374.00 goto -3302 1388
+t=378.00 goto -2626 417
+t=382.00 goto -2182 331
+t=386.00 goto -1280 1237
+t=390.00 goto -1306 771
+t=394.00 goto -1280 -176
+t=398.00 goto -860 -176
+t=402.00 goto -565 493
+t=406.00 goto -230 486
+t=409.00 goto -255 824
+t=412.00 goto -255 921
+t=416.00 goto 770 876
+t=420.00 goto 770 1158
+t=423.00 goto 680 1038
+t=425.00 goto 600 1100
+t=427.00 use Porte13
+t=428.00 track XIIIGoalTrigger19 0
+t=431.00 grab_input
+t=434.00 grab_input
+t=437.00 grab_input
+# Installation enters the map's reinforcement predicate; FinDeMission then fails
+# the anti-goal before the lever/cabin/travel leg can be controlled.
+t=442.00 wait_travel

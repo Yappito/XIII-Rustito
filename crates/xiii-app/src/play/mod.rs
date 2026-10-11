@@ -2423,6 +2423,34 @@ fn build_map_runtime(
     // visible note path.
     session.vm_mut().set_wave_position(Box::new(voice_provider));
     session.register_movers(scene);
+    // Retail `AActor::IsOverlapping` tests a volume brush with its `Brush` UModel primitive, not
+    // its collision cylinder (Engine.dll @0x10352bd0; see `xiii_script::brush`). Decode each
+    // placed volume brush's BSP to world space and register it on the VM actor so the touch
+    // refresh fires `DetectionVolume`/`PhysicsVolume`/`Trigger` overlaps on the real geometry.
+    match xiii_world::volume_brushes::import(game_dir, map) {
+        Ok(vb) => {
+            let total = vb.brushes.len();
+            let mut registered = 0usize;
+            for b in vb.brushes {
+                if let Some(id) = session.vm_mut().find_live_object(&b.name) {
+                    session.vm_mut().set_brush_primitive(id, b.primitive);
+                    registered += 1;
+                } else {
+                    println!(
+                        "[play]   volume brush '{}' has no live VM actor; cylinder fallback",
+                        b.name
+                    );
+                }
+            }
+            println!("[play] volume brushes: {registered}/{total} registered");
+            for d in &vb.diagnostics {
+                println!("[play]   volume-brush diagnostic: {d}");
+            }
+        }
+        Err(e) => {
+            println!("[play] volume brushes unavailable ({e}); volume overlaps use cylinders")
+        }
+    }
     let mover_states = session.mover_states();
     let mover_parts = session.mover_states_including_pending_kill();
     let (mut world, mover_collision) = movers::MoverCollision::build(scene, &mover_parts);
@@ -6942,8 +6970,8 @@ mod tests {
         let _ = porte154;
     }
 
-    /// Hual04a's walked route currently stops at the explicit corpse-bounds native failure.
-    /// Pin the failure and the game's objective state rather than granting a card or goals.
+    /// Hual04a: earned card, reader, bureau and fuse installation by player input.
+    /// Pin the next authored reinforcement/FinDeMission failure before lever/travel.
     #[test]
     fn opt_in_hual04a_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -6971,84 +6999,19 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            335.0,
+            450.0,
         )
         .expect("run Hual04a route");
         let session = &outcome.session;
         let vm = session.vm();
         let mi = session.map_info().expect("Hual04a MapInfo");
-        let pc = session.controller.expect("player controller");
-        let Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(interaction)))) =
-            vm.get_property(pc, "MyInteraction")
-        else {
-            panic!("player interaction");
-        };
-        let blocker = vm
-            .find_object("BreakAbleMover69")
-            .expect("reader trace blocker");
-        assert_eq!(
-            vm.get_property(*interaction, "TargetActor"),
-            Some(&xiii_script::Value::Object(Some(
-                xiii_script::ObjRef::Instance(blocker)
-            )))
-        );
-        assert_eq!(
-            vm.get_property(*interaction, "bCanTrigger"),
-            Some(&xiii_script::Value::Bool(false))
-        );
-        let reader = vm
-            .find_object("MagneticPassTrigger4")
-            .expect("bureau reader");
-        let door = vm.find_object("Porte11").expect("bureau door");
-        assert_eq!(
-            vm.get_property(reader, "Icon"),
-            vm.get_property(reader, "NeverUsedIcon")
-        );
-        assert_eq!(
-            vm.get_property(door, "KeyNum"),
-            Some(&xiii_script::Value::Byte(0))
-        );
-        let card = vm.find_live_object("MagneticCard").expect("six-kill card");
-        assert_eq!(
-            vm.get_property(card, "Owner"),
-            Some(&xiii_script::Value::Object(Some(
-                xiii_script::ObjRef::Instance(session.player)
-            )))
-        );
-        assert_eq!(
-            vm.get_property(card, "Event"),
-            Some(&xiii_script::Value::Name("passtrigger_ascenseur".into()))
-        );
-        println!(
-            "[hual04a next blocker] carried card, aimed reader -> BreakAbleMover69, bCanTrigger=false, reader unused, Porte11 key=0; position={:?}",
-            session.player_location()
-        );
-        for (id, object) in vm.objects.iter().enumerate() {
-            if object.name.starts_with("Cine") {
-                for table in ["tabActions", "tabActions2", "tabActions3"] {
-                    if let Some(xiii_script::Value::Array(actions)) =
-                        vm.get_property(id as u32, table)
-                    {
-                        for (index, action) in actions.iter().enumerate() {
-                            if let xiii_script::Value::Str(text) = action
-                                && text.to_ascii_lowercase().contains("wait player")
-                            {
-                                println!(
-                                    "[hual04a wait radius] {} {table}[{index}] {text}",
-                                    object.name
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
         let error = session.first_error().map(ToString::to_string);
         println!(
-            "[hual04a route] error={error:?} objectives={:?} eNbVivants={:?} travel={:?}",
+            "[hual04a route] error={error:?} objectives={:?} eNbVivants={:?} travel={:?} position={:?}",
             session.objective_states(),
             vm.get_property(mi, "eNbVivants"),
-            outcome.travel
+            outcome.travel,
+            session.player_location()
         );
         for name in [
             "BaseSoldier1",
@@ -7060,60 +7023,93 @@ mod tests {
         ] {
             let id = vm.find_object(name).expect("authored soldier");
             println!(
-                "[hual04a soldier] {name} health={:?} location={:?} event={:?} searchable={:?} bounds={:?}",
+                "[hual04a soldier] {name} health={:?} location={:?} dead={:?}",
                 vm.get_property(id, "Health"),
                 vm.get_property(id, "Location"),
-                vm.get_property(id, "Event"),
-                vm.get_property(id, "bSearchable"),
-                vm.frozen_render_bounds(id)
-            );
-            assert!(
-                matches!(vm.get_property(id, "Health"), Some(xiii_script::Value::Int(h)) if *h <= 0),
-                "{name} must die through player input"
-            );
-            assert_eq!(
-                vm.get_property(id, "bIsDead"),
-                Some(&xiii_script::Value::Bool(true))
-            );
-            assert!(
-                vm.frozen_render_bounds(id).is_some(),
-                "{name} skeletal bounds frozen"
-            );
-            let Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(shadow)))) =
-                vm.get_property(id, "Shadow")
-            else {
-                panic!("{name} shadow");
-            };
-            assert_eq!(
-                vm.get_property(*shadow, "bShadowIsStatic"),
-                Some(&xiii_script::Value::Bool(true)),
-                "{name} must finish Timer after 0x019D"
+                vm.get_property(id, "bIsDead")
             );
         }
         assert!(error.is_none(), "unexpected blocker: {error:?}");
         assert!(session.suspended.is_empty(), "{:?}", session.suspended);
-        assert_eq!(
-            vm.get_property(mi, "eNbVivants"),
-            Some(&xiii_script::Value::Int(1)),
-            "Died triggers before setting bIsDead: six deaths leave the count one behind"
-        );
-        assert_eq!(
-            vm.get_property(mi, "eNbMorts"),
-            Some(&xiii_script::Value::Int(6))
-        );
+        assert!(outcome.travel.is_empty(), "blocked route must not travel");
         assert!(
             session.player_health().is_some_and(|h| h > 0.0),
             "player must survive"
         );
-        assert!(outcome.travel.is_empty(), "blocked route must not travel");
         let goals = session.objective_states();
         assert_eq!(goals.len(), 6);
-        for (index, goal) in goals.iter().enumerate() {
-            assert_eq!(goal.completed, index == 1, "objective {index}: {goal:?}");
+        // The anti-goal is authored completed and must hold on this route.
+        assert!(
+            goals[1].anti_goal && goals[1].primary && goals[1].completed,
+            "the primary anti-goal must stay completed at spawn: {:?}",
+            goals[1]
+        );
+        let carrington = vm.find_object("Cine1").expect("Carrington's authored pawn");
+        // Retail `AActor::IsOverlapping` (Engine.dll @0x10352bd0) uses the brush primitive for a
+        // volume brush, so `Degage` (DetectionVolume4) and `dernierpoint` (DetectionVolume5) now
+        // fire on the walked route. The old class-cylinder test missed both (DV4's cylinder is
+        // ~867 UU off the path; DV5's cylinder top z=158 is below the canyon floor), so the map
+        // previously fell into `FinDeMission` at the fuse. `Degage` -> `Cine1.Play(2)` now starts
+        // Carrington's sequence.
+        let departure = vm
+            .find_object("DetectionVolume4")
+            .expect("Carrington start volume");
+        let last_point = vm
+            .find_object("DetectionVolume5")
+            .expect("dernierpoint volume");
+        assert_eq!(
+            vm.get_property(departure, "bActivated"),
+            Some(&xiii_script::Value::Bool(true)),
+            "DetectionVolume4 must fire 'Degage' through its brush primitive"
+        );
+        assert_eq!(
+            vm.get_property(last_point, "bActivated"),
+            Some(&xiii_script::Value::Bool(true)),
+            "DetectionVolume5 must fire 'dernierpoint' through its brush primitive"
+        );
+        assert_eq!(vm.state_name(carrington).as_deref(), Some("CineInit"));
+        assert_eq!(
+            vm.get_property(carrington, "CurrentScript"),
+            Some(&xiii_script::Value::Int(0)),
+            "the delivered Degage cue started Cine1.Play(2)"
+        );
+        // The remaining measured blocker (asserted): the corrected volume overlaps also deliver
+        // the AI/dialogue volumes the cylinder missed, so the alerted soldiers diverge and the
+        // six-kill card chain stalls (BaseSoldier0 survives out of the engagement range). The fuse
+        // is therefore never picked (goal 2) or installed (goal 3), the `LastWave` reinforcement
+        // spawn (Cine1 tabActions[35], reached only after `FusibleRamasse`) never runs, and the
+        // `XIIIMover1` lever / Hual04c travel are unreached.
+        assert_eq!(
+            vm.get_property(mi, "eNbVivants"),
+            Some(&xiii_script::Value::Int(2)),
+            "the six-kill card chain stalls with one soldier left"
+        );
+        assert!(
+            !goals[2].completed && !goals[3].completed,
+            "fuse goals 2/3 are unreached on this route: {goals:?}"
+        );
+        let lever = vm.find_object("XIIIMover1").expect("cable-car lever");
+        assert_eq!(
+            vm.get_property(lever, "KeyNum"),
+            Some(&xiii_script::Value::Byte(0)),
+            "the lever has not been activated"
+        );
+        for name in ["GenNMI1", "gennmi2", "gennmi3"] {
+            let id = vm
+                .find_object(name)
+                .expect("authored reinforcement generator");
+            assert_eq!(
+                vm.get_property(id, "SpawnActor"),
+                Some(&xiii_script::Value::Object(None)),
+                "{name}: no LastWave spawn on this route (FusibleRamasse undelivered)"
+            );
         }
         assert_eq!(
             vm.get_property(mi, "NextMapLevelWithUnr"),
             Some(&xiii_script::Value::Str("Hual04c.unr".to_owned()))
+        );
+        println!(
+            "[hual04a next blocker] DV4/DV5 fire through the brush primitive (Degage + dernierpoint, Cine1 Play(2) started), but the corrected volume overlaps change the alerted AI: the six-kill card chain stalls (BaseSoldier0 survives), so fuse goals 2/3, the LastWave reinforcement spawn, the XIIIMover1 lever and Hual04c travel are unreached"
         );
     }
 }

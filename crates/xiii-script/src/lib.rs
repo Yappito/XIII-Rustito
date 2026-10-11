@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 pub mod animation;
+pub mod brush;
 pub mod bytecode;
 pub mod canvas;
 pub mod cartoon;
