@@ -1,0 +1,50 @@
+# Hual04a diagnostic route: walked canyon, real Beretta fight, corpse search attempt.
+# Diagnostic weapon grant: Beretta carried from Hual01b through Hual02 (see
+# hual02_route.script's campaign-loadout note). Direct Hual04a login has no Beretta.
+# No teleports, set_goal or take_control. Coordinates and times are Unreal units/seconds.
+# Current-runtime blocker: after BaseSoldier1 dies, XIIIPawn.Dying.Timer calls
+# unsupported Actor.RecomputeBoundingVolume (#391) at bytecode 0x019D. The corpse
+# suspends during its corpse timer. This fixture pins that explicit failure,
+# not a completed mission; the remaining card/fuse/cable-car route is documented
+# in local/reports/item66-hual04a-route.md and is not bypassed here.
+t=0.50 weapon xiii.Beretta
+t=1.00 switch_weapon 2
+t=2.50 goto -10200 -1500
+t=6.00 goto -9600 -1600
+t=10.00 goto -9042 -2286
+t=14.00 goto -8582 -2333
+t=18.00 goto -8058 -2049
+t=22.00 goto -7433 -1524
+t=26.00 goto -6741 -1012
+t=30.00 goto -6432 320
+t=34.00 goto -6172 -533
+t=38.00 goto -5625 4
+t=42.00 goto -5522 462
+t=46.00 goto -5105 1301
+t=50.00 goto -4474 2524
+t=54.00 goto -3645 1693
+t=58.00 goto -3302 1388
+t=62.00 goto -3203 1209
+t=66.00 goto -3140 300
+t=70.00 goto -3160 -600
+t=74.00 goto -3260 -1600
+t=78.00 goto -3380 -2400
+t=81.00 goto -3440 -3000
+t=84.00 goto -3455 -3230
+t=87.00 track BaseSoldier1 0.85
+t=88.00 goto -3458 -3300
+t=92.00 fire
+t=93.20 fire
+t=94.40 fire
+t=95.60 fire
+t=96.80 fire
+t=98.00 fire
+t=99.20 fire
+t=100.40 fire
+t=102.00 goto -3458 -3338
+t=104.50 goto -3458 -3355
+t=107.00 goto -3458 -3358
+t=111.00 track off
+# Walk across the pursued soldier's corpse (his death position moved from spawn).
+t=112.00 goto -3300 -2800
+t=118.00 wait_travel

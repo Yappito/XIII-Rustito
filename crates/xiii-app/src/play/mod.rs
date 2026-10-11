@@ -6476,11 +6476,10 @@ mod tests {
         let _ = porte154;
     }
 
-    /// item66 diagnostic: Hual04a's Carrington scene (`Cine1`, a `Cine2`) blocks in `CineInit`
-    /// on `XIIIGameInfo(Level.Game).MapInfo.EndCartoonEffect` until the HUD's own cartoon effect
-    /// ends. This probe runs 15 s of walking input and reports the gate state.
+    /// Hual04a's walked route currently stops at the explicit corpse-bounds native failure.
+    /// Pin the failure and the game's objective state rather than granting a card or goals.
     #[test]
-    fn opt_in_hual04a_cartoon_probe() {
+    fn opt_in_hual04a_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
             return;
@@ -6492,97 +6491,88 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Hual04a");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let text = "\
-t=0.50 forward 1
-t=2.00 forward 0
-t=2.50 goto -10200 -1500
-t=6.00 goto -10000 -1600
-t=10.00 goto -9800 -1700
-";
-        let script = script::Script::parse(text).expect("parse probe script");
+        let text = include_str!("../../tests/data/hual04a_route.script");
+        assert!(!text.lines().any(|line| {
+            let command = line.split('#').next().unwrap_or("");
+            command.contains("set_goal")
+                || command.contains("take_control")
+                || command.contains("teleport")
+        }));
+        let script = script::Script::parse(text).expect("parse Hual04a route");
         let outcome = run_script_with_cinematic_input(
             &game_dir,
             "Hual04a",
             &script,
             &resolved.params,
             &scene,
-            15.0,
+            120.0,
         )
-        .expect("run Hual04a cartoon probe");
-        let vm = outcome.session.vm();
-        let mi = outcome.session.map_info().expect("MapInfo");
-        let cine1 = vm
-            .objects
-            .iter()
-            .position(|o| o.name.eq_ignore_ascii_case("Cine1"))
-            .expect("Cine1 must exist");
+        .expect("run Hual04a route");
+        let session = &outcome.session;
+        let vm = session.vm();
+        let soldier = vm.find_object("BaseSoldier1").expect("route soldier");
+        let mi = session.map_info().expect("Hual04a MapInfo");
+        for (id, object) in vm.objects.iter().enumerate() {
+            if object.name.starts_with("Cine") {
+                for table in ["tabActions", "tabActions2", "tabActions3"] {
+                    if let Some(xiii_script::Value::Array(actions)) =
+                        vm.get_property(id as u32, table)
+                    {
+                        for (index, action) in actions.iter().enumerate() {
+                            if let xiii_script::Value::Str(text) = action
+                                && text.to_ascii_lowercase().contains("wait player")
+                            {
+                                println!(
+                                    "[hual04a wait radius] {} {table}[{index}] {text}",
+                                    object.name
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let error = session
+            .first_error()
+            .expect("measured corpse native blocker")
+            .to_string();
         println!(
-            "[hual04a cartoon probe] EndCartoonEffect={:?} Cine1.bInitialized={:?} Cine1.state={:?} CheckpointNumber={:?} HudCartoonSFX={:?} InitialCartoonEffect={:?}",
-            vm.get_property(mi, "EndCartoonEffect"),
-            vm.get_property(cine1 as u32, "bInitialized"),
-            outcome.session.vm().state_name(cine1 as u32),
-            vm.get_property(outcome.session.game_info.unwrap(), "CheckpointNumber"),
-            vm.find_live_object("XIIIBaseHud0")
-                .and_then(|h| vm.get_property(h, "HudCartoonSFX")),
-            vm.find_level_info()
-                .and_then(|l| vm.get_property(l, "InitialCartoonEffect")),
+            "[hual04a route] error={error} objectives={:?} eNbVivants={:?} travel={:?}",
+            session.objective_states(),
+            vm.get_property(mi, "eNbVivants"),
+            outcome.travel
+        );
+        assert!(
+            error.contains("Actor.RecomputeBoundingVolume")
+                && error.contains("391")
+                && error.contains("XIIIPawn.Dying.Timer")
+                && error.contains("BaseSoldier1")
+                && error.contains("019D"),
+            "unexpected blocker: {error}"
+        );
+        assert_eq!(session.suspended, vec!["BaseSoldier1".to_owned()]);
+        assert_eq!(
+            vm.get_property(mi, "eNbVivants"),
+            Some(&xiii_script::Value::Int(6)),
+            "the death event must remain blocked before the card-chain count advances"
+        );
+        assert!(
+            matches!(vm.get_property(soldier, "Health"), Some(xiii_script::Value::Int(h)) if *h <= 0),
+            "the soldier must die through the player's weapon chain"
+        );
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "player must survive"
+        );
+        assert!(outcome.travel.is_empty(), "blocked route must not travel");
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 6);
+        for (index, goal) in goals.iter().enumerate() {
+            assert_eq!(goal.completed, index == 1, "objective {index}: {goal:?}");
+        }
+        assert_eq!(
+            vm.get_property(mi, "NextMapLevelWithUnr"),
+            Some(&xiii_script::Value::Str("Hual04c.unr".to_owned()))
         );
     }
-
-
-/// item66 scratch probe (deleted before handoff): XIIIMover1 PlayerTrigger visibility.
-#[test]
-fn opt_in_scratch_hual04a_lever_probe() {
-    let Some(game_dir) = opt_in_root() else {
-        println!("SKIPPED");
-        return;
-    };
-    let opts = Options {
-        map: Some("Hual04a".to_owned()),
-        game_dir: Some(game_dir.clone()),
-        ..Default::default()
-    };
-    let scene = viewer::load_scene(&opts).expect("import");
-    let resolved = resolve_params(&game_dir).expect("params");
-    let text = "\
-t=0.50 teleport 900 544 440
-t=1.00 yaw 0
-t=2.00 use XIIIMover1
-";
-    let script = script::Script::parse(text).expect("parse");
-    let outcome = run_script(&game_dir, "Hual04a", &script, &resolved.params, &scene, 6.0)
-        .expect("run");
-    let vm = outcome.session.vm();
-    let lever = vm.find_object("XIIIMover1").expect("lever");
-    println!(
-        "[lever probe] state={:?} bOpened={:?} bClosed={:?} KeyNum={:?} PrevKeyNum={:?} DelayTime={:?} bTriggerOnceOnly={:?} bInteractive={:?}",
-        vm.state_name(lever),
-        vm.get_property(lever, "bOpened"),
-        vm.get_property(lever, "bClosed"),
-        vm.get_property(lever, "KeyNum"),
-        vm.get_property(lever, "PrevKeyNum"),
-        vm.get_property(lever, "DelayTime"),
-        vm.get_property(lever, "bTriggerOnceOnly"),
-        vm.get_property(lever, "bInteractive"),
-    );
-    for event in &vm.trace {
-        let relevant = match &event.kind {
-            xiii_script::TraceKind::Event { target, function, .. } => {
-                target.contains("XIIIMover1") || function.contains("PlayerTrigger")
-                    || target.eq_ignore_ascii_case("XIIIGoalTrigger9")
-            }
-            xiii_script::TraceKind::NoHandler { actor, event } => {
-                actor.contains("XIIIMover1") || event.contains("PlayerTrigger")
-            }
-            xiii_script::TraceKind::StateChange { actor, .. } => actor.contains("XIIIMover1"),
-            xiii_script::TraceKind::ProbeDisabled { actor, probe } => {
-                actor.contains("XIIIMover1") || probe.contains("PlayerTrigger")
-            }
-            _ => false,
-        };
-        if relevant {
-            println!("[lever probe] t={:.3} {:?}", event.time, event.kind);
-        }
-    }
-}
 }
