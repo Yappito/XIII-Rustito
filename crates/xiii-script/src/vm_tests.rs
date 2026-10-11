@@ -872,6 +872,67 @@ fn init_execution_write_survives_map_property_reload_order() {
     );
 }
 
+/// item67f: a map actor serialised with `bDeleteMe=true` is a pending-kill export. The engine's
+/// `AActor::IsPendingKill` (Engine.dll 0x10304b40) reads `AActor+0x2e & 1`, i.e. the serialised
+/// `bDeleteMe`; such an actor receives no `ProcessEvent` and leaves the collision hash, so it
+/// must not be a live level actor. Hual02's `Porte4`/`Porte20` are exactly this (a trailing block
+/// of 54 destroyed exports), and the dead `Porte20` otherwise blocks the floor-2 lift exit.
+fn pending_kill_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let bdelete = b.reserve(B_BOOLPROP, actor, "bDeleteMe");
+    let live = b.reserve(actor, 0, "Live0");
+    let dead_true = b.reserve(actor, 0, "DeadTrue0");
+    let dead_false = b.reserve(actor, 0, "DeadFalse0");
+    b.prop(bdelete, 0, 0);
+    b.class(object, 0, actor);
+    b.class(actor, object, bdelete);
+    // Empty tag block: no `bDeleteMe` -> live.
+    b.set(live, vec![0]);
+    // Bool tag: name, info 0xd3 (BoolProperty, size code 5, bit 7 = value true), explicit size 0,
+    // then the `None` terminator (corpus form: `bool_value_lives_in_the_info_bit`).
+    let mut dead = compact(b.name("bDeleteMe"));
+    dead.extend([0xd3, 0x00, 0x00]);
+    b.set(dead_true, dead);
+    let mut live_false = compact(b.name("bDeleteMe"));
+    live_false.extend([0x53, 0x00, 0x00]);
+    b.set(dead_false, live_false);
+    b.build()
+}
+
+#[test]
+fn load_level_marks_bdeleteme_exports_pending_kill() {
+    let set = set_of(pending_kill_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let actors = vm.load_level(0, &Limits::default()).unwrap();
+    // Every export is instantiated (the engine creates the objects), but the `bDeleteMe` one is
+    // pending-kill: not a live actor and invisible to name lookup.
+    assert!(vm.find_object("Live0").is_some());
+    assert!(
+        vm.find_object("DeadFalse0").is_some(),
+        "bDeleteMe=false stays a live actor"
+    );
+    assert!(
+        vm.find_object("DeadTrue0").is_none(),
+        "a bDeleteMe export must not be a live level actor"
+    );
+    // The object still exists so serialised references resolve, flagged deleted and inactive.
+    let id = actors
+        .iter()
+        .copied()
+        .find(|&i| vm.objects[i as usize].name == "DeadTrue0")
+        .expect("DeadTrue0 export instantiated");
+    assert!(vm.objects[id as usize].deleted);
+    assert!(!vm.objects[id as usize].active);
+    // Events delivered to it are dropped exactly as `ProcessEvent` drops a pending-kill actor.
+    assert!(
+        vm.send_event(id, "PostBeginPlay", vec![])
+            .unwrap()
+            .is_none()
+    );
+}
+
 fn pressing_fire_package() -> Vec<u8> {
     let mut b = B::new();
     let object = b.reserve(0, 0, "Object");
@@ -5529,6 +5590,49 @@ fn item49_view_target_requires_aim_range_and_clear_world_segment() {
     );
 }
 
+/// item67: `Actor.TraceActors` composes its trace flags as `| 0x9f` (Engine.dll
+/// `execTraceActors` 0x103e8c70, the `orl $0x9f, %esi` at 0x103e8e68), clearing the 0x20/0x40
+/// bits of `execTrace`'s 0xbf: an interactive actor that blocks nothing (`bBlockActors=false`,
+/// like Hual02's card reader `MagneticPassTrigger1`) is still a candidate, and its entry hit
+/// orders ahead of farther blocking candidates.
+#[test]
+fn trace_actors_admits_non_blocking_interactive_actors() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let caller = phys_actor(&mut vm, &set, "Eye", [0.0; 3]);
+    set_collision_fields(&mut vm, caller, true, true);
+    // The reader: an interactive trigger off-axis that blocks nothing (the measured depot
+    // actor: bCollideActors, bBlockZeroExtentTraces, r/h=40, bBlockActors/bBlockPlayers=false).
+    let reader = phys_actor(&mut vm, &set, "Reader", [60.0, -30.0, 7.0]);
+    set_collision_fields(&mut vm, reader, true, true);
+    vm.set_property(reader, "CollisionRadius", 0, Value::Float(40.0));
+    vm.set_property(reader, "CollisionHeight", 0, Value::Float(40.0));
+    vm.set_property(reader, "bBlockActors", 0, Value::Bool(false));
+    vm.set_property(reader, "bBlockPlayers", 0, Value::Bool(false));
+    // A farther blocking actor entered later along the same ray.
+    let deco = phys_actor(&mut vm, &set, "WallThing", [150.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, deco, true, true);
+    let rows = vm
+        .vm_trace_actors(caller, None, [0.0; 3], [160.0, 0.0, 0.0], [0.0; 3])
+        .unwrap();
+    assert_eq!(
+        rows.first().map(|r| r.0),
+        Some(reader),
+        "the non-blocking interactive reader is a TraceActors candidate: {rows:?}"
+    );
+    assert!(
+        rows[0].1[0] > 0.0,
+        "the hit location is the entry point, not the segment start: {rows:?}"
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "the blocking actor is hit behind it: {rows:?}"
+    );
+    assert!(rows[1].1[0] > rows[0].1[0]);
+}
+
 /// Item47b: the decoded engine actor-trace filter (`trace_admits_actor`). Each case maps to a
 /// measured Engine.dll behavior cited in the function's documentation.
 #[test]
@@ -9722,6 +9826,7 @@ fn mover_fixture() -> Vec<u8> {
     let key_pos = b.reserve(IMP_ARRAYPROP, actor, "KeyPos");
     let key_rot = b.reserve(IMP_ARRAYPROP, actor, "KeyRot");
     let key_hits = b.reserve(IMP_INTPROP, actor, "KeyHits");
+    let base = b.reserve(IMP_OBJECTPROP, actor, "Base");
     let kf = b.reserve(IMP_FUNCTION, actor, "KeyFrameReached");
     b.prop_with(location, rotation, 0, &vector_extra);
     b.prop_with(rotation, old_pos, 0, &rotator_extra);
@@ -9736,7 +9841,8 @@ fn mover_fixture() -> Vec<u8> {
     b.prop(interp, key_pos, 0);
     b.prop_array_dim(key_pos, key_rot, 0, IMP_STRUCT, 8);
     b.prop_array_dim(key_rot, key_hits, 0, IMP_STRUCT - 1, 8);
-    b.prop(key_hits, kf, 0);
+    b.prop(key_hits, base, 0);
+    b.prop_with(base, kf, 0, &compact(0));
     let kh = key_hits as u8;
     let kf_code = vec![
         0x0F, 0x01, kh, 0x92, 0x00, kh, 0x26, 0x16, // KeyHits = KeyHits + 1
@@ -9809,6 +9915,97 @@ fn synthetic_mover_interpolates_and_fires_keyframe_reached() {
     vm.tick(0.25).unwrap();
     assert_eq!(vm.vector_prop(a, "Location").unwrap()[0], 100.0);
     assert_eq!(vm.get_property(a, "KeyHits"), Some(&Value::Int(1)));
+}
+
+/// A moving brush carries the actors attached to it (`Engine.dll ULevel::MoveActor` 0x1038a770,
+/// attached-actor loop 0x1038ae0d..0x1038b084): a rider whose `Base` is the mover is displaced by
+/// the mover's per-tick displacement; an actor whose `Base` was cleared or never set stays put.
+#[test]
+fn moving_brush_carries_attached_actors_by_its_displacement() {
+    let set = mover_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let mover = vm.spawn(sg(&set, "Actor"), "Cage").unwrap();
+    let rider = vm.spawn(sg(&set, "Actor"), "Rider").unwrap();
+    let bystander = vm.spawn(sg(&set, "Actor"), "Bystander").unwrap();
+    let released = vm.spawn(sg(&set, "Actor"), "Released").unwrap();
+    for id in [mover, rider, bystander, released] {
+        vm.set_active(id, true);
+    }
+    vm.set_property(mover, "PhysRate", 0, Value::Float(0.5)); // 2 s to the key
+    vm.set_property(mover, "KeyNum", 0, Value::Byte(1));
+    for prop in ["BasePos", "OldPos"] {
+        vm.set_property(mover, prop, 0, Value::Vector([0.0, 0.0, 0.0]));
+    }
+    vm.set_property(mover, "KeyPos", 1, Value::Vector([0.0, 0.0, 400.0]));
+    vm.set_property(mover, "bInterpolating", 0, Value::Bool(true));
+    let mover_ref = Value::Object(Some(ObjRef::Instance(mover)));
+    vm.set_property(rider, "Location", 0, Value::Vector([10.0, 20.0, 5.0]));
+    vm.set_property(rider, "Base", 0, mover_ref.clone());
+    vm.note_attached(rider);
+    vm.set_property(bystander, "Location", 0, Value::Vector([10.0, 20.0, 5.0]));
+    vm.set_property(released, "Location", 0, Value::Vector([10.0, 20.0, 5.0]));
+    vm.set_property(released, "Base", 0, mover_ref);
+    vm.note_attached(released);
+    vm.set_property(released, "Base", 0, Value::Object(None)); // stepped off before the move
+
+    // Many small steps: the rider must accumulate the exact displacement (no drift, no skip).
+    for _ in 0..60 {
+        vm.tick(1.0 / 60.0).unwrap();
+    }
+    let z_mover = vm.vector_prop(mover, "Location").unwrap()[2];
+    let z_rider = vm.vector_prop(rider, "Location").unwrap()[2];
+    assert!((z_mover - 200.0).abs() < 0.5, "mover half way: {z_mover}");
+    assert!(
+        (z_rider - 5.0 - z_mover).abs() < 0.01,
+        "rider keeps its offset to the mover: mover {z_mover} rider {z_rider}"
+    );
+    let rider_xy = vm.vector_prop(rider, "Location").unwrap();
+    assert_eq!((rider_xy[0], rider_xy[1]), (10.0, 20.0));
+    assert_eq!(vm.vector_prop(bystander, "Location").unwrap()[2], 5.0);
+    assert_eq!(vm.vector_prop(released, "Location").unwrap()[2], 5.0);
+
+    // Arrival: the final snap to the key carries the rider onto the exact key height.
+    for _ in 0..62 {
+        vm.tick(1.0 / 60.0).unwrap();
+    }
+    assert_eq!(vm.vector_prop(mover, "Location").unwrap()[2], 400.0);
+    assert!((vm.vector_prop(rider, "Location").unwrap()[2] - 405.0).abs() < 0.01);
+    // A finished mover no longer moves its riders.
+    vm.tick(0.5).unwrap();
+    assert!((vm.vector_prop(rider, "Location").unwrap()[2] - 405.0).abs() < 0.01);
+}
+
+/// A rotating brush swings its riders around its origin (the offset is re-derived through the
+/// mover's new rotation, `ULevel::MoveActor` attached loop).
+#[test]
+fn rotating_brush_swings_attached_actors_about_its_origin() {
+    let set = mover_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let mover = vm.spawn(sg(&set, "Actor"), "Turntable").unwrap();
+    let rider = vm.spawn(sg(&set, "Actor"), "Rider").unwrap();
+    for id in [mover, rider] {
+        vm.set_active(id, true);
+    }
+    vm.set_property(mover, "PhysRate", 0, Value::Float(1.0));
+    vm.set_property(mover, "KeyNum", 0, Value::Byte(1));
+    vm.set_property(mover, "KeyRot", 1, Value::Rotator([0, 16384, 0])); // +90 degrees yaw
+    vm.set_property(mover, "bInterpolating", 0, Value::Bool(true));
+    vm.set_property(rider, "Location", 0, Value::Vector([100.0, 0.0, 0.0]));
+    vm.set_property(
+        rider,
+        "Base",
+        0,
+        Value::Object(Some(ObjRef::Instance(mover))),
+    );
+    vm.note_attached(rider);
+    for _ in 0..61 {
+        vm.tick(1.0 / 60.0).unwrap();
+    }
+    let p = vm.vector_prop(rider, "Location").unwrap();
+    assert!(
+        p[0].abs() < 0.5 && (p[1] - 100.0).abs() < 0.5 && p[2].abs() < 0.01,
+        "a +90 degree yaw takes (100,0,0) to (0,100,0), got {p:?}"
+    );
 }
 
 /// `Actor.FinishInterpolation` is latent (sets `Latent::Interp`) and refuses a call outside state
