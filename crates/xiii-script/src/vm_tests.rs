@@ -1211,8 +1211,9 @@ fn registry_entries_are_documented() {
     // single 527 entry; the branch's duplicate registry def was removed in the merge).
     // item65 adds Interaction.WorldToScreen backed by the host's active projection.
     // item69 adds the decoded Controller.PickWallAdjust (526) pursuit detour.
-    // item70 adds the decoded Actor.RecomputeBoundingVolume (391) render-box freeze.
-    assert_eq!(defs.len(), 344);
+    // item70 adds the decoded Actor.RecomputeBoundingVolume (391) render-box freeze; item72 adds
+    // the three decoded in-game menu natives (ResetInputs and GUI save/checkpoint writes).
+    assert_eq!(defs.len(), 347);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -14321,4 +14322,161 @@ fn cinecontroller2_pawn_turns_toward_focal_point_but_plain_controller_does_not()
         vm.get_property(pawn, "Rotation"),
         Some(&Value::Rotator([0, 10000, 0]))
     );
+}
+
+/// item72: shared save-slot cell a host holds next to the VM (the in-game save bridge).
+struct Item72Shared {
+    write_requested: Vec<u32>,
+    write_result: Option<bool>,
+}
+
+struct Item72Handle(std::rc::Rc<std::cell::RefCell<Item72Shared>>);
+
+impl crate::item20::SaveSlotProvider for Item72Handle {
+    fn slot(&self, _s: u32) -> Option<crate::item20::SaveSlotInfo> {
+        None
+    }
+    fn request_empty(&mut self, _s: u32) -> bool {
+        false
+    }
+    fn poll_empty(&mut self) -> Option<bool> {
+        None
+    }
+    fn request_description(&mut self, _s: u32) -> bool {
+        false
+    }
+    fn poll_description(&mut self) -> Option<String> {
+        None
+    }
+    fn request_date(&mut self, _s: u32) -> bool {
+        false
+    }
+    fn poll_date(&mut self) -> Option<[i32; 5]> {
+        None
+    }
+    fn request_read(&mut self, _s: u32) -> bool {
+        false
+    }
+    fn poll_read(&mut self) -> bool {
+        false
+    }
+    fn take_read_slot(&mut self) -> Option<u32> {
+        None
+    }
+    fn request_write(&mut self, slot: u32) -> bool {
+        self.0.borrow_mut().write_requested.push(slot);
+        true
+    }
+    fn poll_write(&mut self) -> Option<bool> {
+        self.0.borrow().write_result
+    }
+    fn has_any_checkpoint(&self) -> bool {
+        true
+    }
+}
+
+/// item72: the in-game save natives must report the retail `ReturnCode` contract and the
+/// checkpoint presence, and refuse cleanly without a provider.
+#[test]
+fn item72_write_slot_natives_report_codes_and_checkpoint_presence() {
+    let set = set_of(canvas_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(g(&set, "Object"), "O").unwrap();
+
+    // Without a provider the query is refused (never silently true).
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "GUIController.IsThereACheckpoint",
+        o,
+        &[],
+        &mut []
+    )));
+    let mut args = [Value::Int(-99)];
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "GUIController.IsWriteSlotFinished",
+        o,
+        &[true],
+        &mut args
+    )));
+    assert_eq!(
+        args[0],
+        Value::Int(-99),
+        "no provider: the out param is left untouched and the call is refused"
+    );
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "GUIController.RequestWriteSlot",
+        o,
+        &[],
+        &mut [Value::Int(3)]
+    )));
+
+    let shared = std::rc::Rc::new(std::cell::RefCell::new(Item72Shared {
+        write_requested: Vec::new(),
+        write_result: None,
+    }));
+    vm.set_save_slots(Box::new(Item72Handle(shared.clone())));
+
+    assert!(
+        bool_result(call_native(
+            &mut vm,
+            "GUIController.IsThereACheckpoint",
+            o,
+            &[],
+            &mut []
+        )),
+        "provider advertises a reloadable checkpoint"
+    );
+    assert!(bool_result(call_native(
+        &mut vm,
+        "GUIController.RequestWriteSlot",
+        o,
+        &[],
+        &mut [Value::Int(3)]
+    )));
+    assert_eq!(shared.borrow().write_requested, vec![3]);
+
+    // Still running: ReturnCode -2 and false.
+    let mut args = [Value::Int(-99)];
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "GUIController.IsWriteSlotFinished",
+        o,
+        &[true],
+        &mut args
+    )));
+    assert_eq!(args[0], Value::Int(-2));
+    // Written: ReturnCode 0 and true.
+    shared.borrow_mut().write_result = Some(true);
+    let mut args = [Value::Int(-99)];
+    assert!(bool_result(call_native(
+        &mut vm,
+        "GUIController.IsWriteSlotFinished",
+        o,
+        &[true],
+        &mut args
+    )));
+    assert_eq!(args[0], Value::Int(0));
+    // Device failure: ReturnCode -1 and true (finished, failed).
+    shared.borrow_mut().write_result = Some(false);
+    let mut args = [Value::Int(-99)];
+    assert!(bool_result(call_native(
+        &mut vm,
+        "GUIController.IsWriteSlotFinished",
+        o,
+        &[true],
+        &mut args
+    )));
+    assert_eq!(args[0], Value::Int(-1));
+    // A refused request (negative/absent slot) is not accepted.
+    shared.borrow_mut().write_requested.clear();
+    assert!(!bool_result(call_native(
+        &mut vm,
+        "GUIController.RequestWriteSlot",
+        o,
+        &[],
+        &mut [Value::Int(-1)]
+    )));
+    assert!(shared.borrow().write_requested.is_empty());
 }

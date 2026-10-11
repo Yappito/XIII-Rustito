@@ -3927,6 +3927,17 @@ impl<'s> Vm<'s> {
             )
         });
         let scaled = dt * dilation;
+        // A retail pause is entered through GameInfo.SetPause after the world has already
+        // published LevelInfo.TimeSeconds. Reconcile the VM's double accumulator with that
+        // published value before freezing it; otherwise a level whose startup scripts advanced
+        // the float clock before the VM's first managed tick would rewind to zero on the first
+        // paused tick.
+        if paused
+            && let Some(level) = self.level_info
+            && let Some(Value::Float(published)) = self.get_property(level, "TimeSeconds")
+        {
+            self.time = f64::from(*published);
+        }
         if !paused {
             self.time += f64::from(scaled);
         }

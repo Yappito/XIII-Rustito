@@ -1,0 +1,5 @@
+# item72 scripted capture: open the decoded in-map menu, capture it, resume, capture gameplay.
+t=1.0 menu
+t=1.5 shot local/reports/item72/plage00-menu-open.png
+t=3.0 menu_close
+t=3.5 shot local/reports/item72/plage00-menu-resumed.png

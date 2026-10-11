@@ -18,6 +18,8 @@ mod combat_survey;
 pub mod cutscene;
 pub mod footsteps;
 pub mod hud;
+/// item72: the retail in-game menu hosted in the play session's VM.
+pub mod ingamemenu;
 pub mod movement_modes;
 pub mod movers;
 pub mod pawns;
@@ -98,8 +100,8 @@ struct RenderSync {
 }
 
 #[derive(Resource)]
-struct ScriptRes {
-    drive: Option<script::Drive>,
+pub(crate) struct ScriptRes {
+    pub(crate) drive: Option<script::Drive>,
 }
 
 /// Player footstep cadence for `--play` (surface lookup table + accumulator). See
@@ -109,7 +111,7 @@ struct ScriptRes {
 struct FootstepRes(footsteps::FootstepDriver);
 
 #[derive(Resource)]
-struct TraceState {
+pub(crate) struct TraceState {
     tick: u64,
     saved_total: u64,
     start: Instant,
@@ -124,6 +126,9 @@ struct TraceState {
     /// only): the screenshot fires [`cutscene::VIDEO_SHOT_AFTER_SECS`] into playback and the run
     /// exits once the shot is confirmed, independent of the original budget.
     video_exit_at: Option<Instant>,
+    /// item72: the in-game menu page is open (retail pauses the level; the fixed step
+    /// suppresses the player input while it is).
+    menu_open: bool,
 }
 
 #[derive(Resource, Default)]
@@ -210,7 +215,8 @@ impl Plugin for PlayPlugin {
         app.add_plugins((crate::video::CutscenePlugin, cutscene::CutsceneSystems));
         app.insert_non_send(cutscene::CutsceneHost(cutscene_host));
         app.insert_resource(DiagnosticOverlay(options.diagnostic_overlay));
-        app.insert_resource(PlayConfig { options })
+        app.insert_non_send(ingamemenu::InGameMenu::default())
+            .insert_resource(PlayConfig { options })
             .insert_resource(ClearColor(Color::srgb(0.45, 0.62, 0.82)))
             .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
             .init_resource::<ShotFlag>()
@@ -230,6 +236,7 @@ impl Plugin for PlayPlugin {
                 Update,
                 (
                     controls,
+                    ingamemenu::frame,
                     grab_cursor,
                     mouse_look,
                     cinematics::collect,
@@ -248,9 +255,12 @@ impl Plugin for PlayPlugin {
                     cartoon::sync_render_target,
                     hud::draw,
                     overlay,
-                    unattended,
                 )
                     .chain(),
+            )
+            .add_systems(
+                Update,
+                (unattended, ingamemenu::scripted_shots).after(overlay),
             )
             .add_systems(
                 Last,
@@ -441,6 +451,7 @@ fn setup(
     mut commands: Commands,
     cfg: Res<PlayConfig>,
     mut session: NonSendMut<Result<session::Session, String>>,
+    mut menu: NonSendMut<ingamemenu::InGameMenu>,
     mut sync: ResMut<RenderSync>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -458,6 +469,9 @@ fn setup(
             return;
         }
     };
+    // item72: the in-game menu's save device writes into the configured save dir, and Quit
+    // interception keys on the map.
+    menu.configure(cfg.options.save_dir.clone(), cfg.options.map.clone());
     match setup_inner(
         &mut commands,
         &cfg.options,
@@ -847,6 +861,7 @@ fn setup_inner(
             target_at: None,
             post_travel_at: None,
             video_exit_at: None,
+            menu_open: false,
         });
     } else {
         // The reload owns a fresh per-map runtime, but the input-script cursor (`ScriptRes`) and
@@ -986,11 +1001,13 @@ fn fixed_step(
     // Scripted cutscenes freeze the player (`CineController2.Interpret` FPC/FPL ->
     // `NoControl`/`NoMove`, and `CameraView`/`PlayingVideo`). The host owns the player pawn's
     // movement, so it must zero the movement input itself; the VM's state machine only sets the
-    // state. See `cinematics`.
+    // state. See `cinematics`. The in-game menu page (item72) pauses the level the same way:
+    // retail input goes to the GUI while the page is open (`state.menu_open` is maintained by
+    // the menu's per-frame system).
     let suppressed = match &*session {
         Ok(sess) => cinematics::input_suppressed(sess),
         Err(_) => false,
-    };
+    } || state.menu_open;
     if let Some(drive) = script.drive.as_mut() {
         let track_height = drive.track_height();
         let tracked = drive.tracking_actor().and_then(|name| {
@@ -1525,27 +1542,74 @@ fn controls(
     wheel: Res<bevy::input::mouse::AccumulatedMouseScroll>,
     cfg: Res<PlayConfig>,
     mut session: NonSendMut<Result<session::Session, String>>,
+    mut menu: NonSendMut<ingamemenu::InGameMenu>,
+    mut menu_was_open: Local<bool>,
     mut cursor: Single<&mut CursorOptions, With<PrimaryWindow>>,
+    window: Query<&Window, With<PrimaryWindow>>,
     mut diagnostics: ResMut<DiagnosticOverlay>,
     mut exit: MessageWriter<AppExit>,
 ) {
     if keys.just_pressed(KeyCode::F3) {
         diagnostics.0 = !diagnostics.0;
     }
-    if keys.just_pressed(KeyCode::Escape) {
-        cursor.grab_mode = CursorGrabMode::None;
-        cursor.visible = true;
-        eprintln!(
-            "[play] In-map menu unavailable: ShowTheMenu GUI bridge is missing. Escape releases the mouse; click to resume, Ctrl+Q to quit."
-        );
-    }
-    // Escape is reserved for retail ShowMenu; Ctrl+Q is an explicit host quit chord.
+    // Ctrl+Q stays the explicit hard quit, also while the menu is open.
     if keys.just_pressed(KeyCode::KeyQ)
         && keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight])
     {
         exit.write(AppExit::Success);
     }
+    if let Ok(sess) = session.as_mut() {
+        // Escape is the retail Showmenu binding: it opens the in-game page through the game's
+        // own ShowTheMenu path; while the page is open the page's own Esc handler closes it.
+        if keys.just_pressed(KeyCode::Escape) {
+            if menu.is_open() {
+                menu.request_close(sess);
+            } else {
+                menu.open(sess);
+            }
+        }
+        if menu.is_open() {
+            // Route the menu keys to the page (the retail GUIController dispatch). Movement,
+            // weapons and the held fire flags stay suppressed below.
+            for (key, code) in [
+                (KeyCode::ArrowUp, 38u8),
+                (KeyCode::ArrowDown, 40),
+                (KeyCode::ArrowLeft, 37),
+                (KeyCode::ArrowRight, 39),
+                (KeyCode::Enter, 13),
+                (KeyCode::Backspace, 8),
+            ] {
+                if keys.just_pressed(key)
+                    && let Err(e) = menu.key(sess, code)
+                {
+                    menu.errors.push(format!("menu key {key:?}: {e}"));
+                }
+            }
+            if buttons.just_pressed(MouseButton::Left) {
+                let at = window
+                    .single()
+                    .ok()
+                    .and_then(|w| w.cursor_position())
+                    .map(|p| (p.x, p.y));
+                menu.click(sess, at);
+            }
+        }
+    }
+    // Mouse capture follows the menu state: the page is mouse-driven, so the cursor is
+    // released while it is open and re-grabbed when it closes.
+    let open = menu.is_open();
+    if open != *menu_was_open {
+        if open {
+            cursor.grab_mode = CursorGrabMode::None;
+            cursor.visible = true;
+        } else {
+            cursor.grab_mode = CursorGrabMode::Locked;
+            cursor.visible = false;
+        }
+        *menu_was_open = open;
+    }
     if cfg.options.play_script.is_none()
+        && !menu.is_open()
         && let Ok(sess) = session.as_mut()
         && let Some(pc) = sess.controller
     {
@@ -1588,9 +1652,14 @@ fn mouse_look(
     buttons: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
     mut cursor: Single<&mut CursorOptions, With<PrimaryWindow>>,
+    menu: NonSend<ingamemenu::InGameMenu>,
     mut sim: ResMut<SimRes>,
 ) {
-    if buttons.just_pressed(MouseButton::Left) && cursor.grab_mode != CursorGrabMode::Locked {
+    // A menu click is the page's input, not a re-grab request.
+    if buttons.just_pressed(MouseButton::Left)
+        && cursor.grab_mode != CursorGrabMode::Locked
+        && !menu.is_open()
+    {
         cursor.grab_mode = CursorGrabMode::Locked;
         cursor.visible = false;
     }
@@ -2009,6 +2078,7 @@ fn travel(
     mut cfg: ResMut<PlayConfig>,
     mut session: NonSendMut<Result<session::Session, String>>,
     mut cutscene_host: NonSendMut<cutscene::CutsceneHost>,
+    mut menu: NonSendMut<ingamemenu::InGameMenu>,
     mut cinematic: ResMut<cinematics::CinematicState>,
     mut cartoon: ResMut<cartoon::CartoonState>,
     mut sync: ResMut<RenderSync>,
@@ -2030,6 +2100,20 @@ fn travel(
     let Some(req) = sess.take_travel_request() else {
         return;
     };
+    // item72: the in-game menu's `QuitGame` travels to the front-end map; the host hands off to
+    // the `--menu` mode instead of loading it as a play level (one event loop per process).
+    match travel::TravelPlan::from_request(&req) {
+        Ok(plan) if ingamemenu::InGameMenu::is_front_end_map(&plan.map) => {
+            println!(
+                "[play] travel to the front-end map {} requested by {} at t={:.3}s; the host relaunches --menu",
+                plan.map, req.actor, req.time
+            );
+            ingamemenu::request_relaunch(ingamemenu::MenuRelaunch::FrontEnd);
+            exit.write(AppExit::Success);
+            return;
+        }
+        _ => {}
+    }
     let plan = match travel::TravelPlan::from_request(&req) {
         Ok(p) => p,
         Err(e) => {
@@ -2101,6 +2185,9 @@ fn travel(
             return;
         }
     };
+    // item72: the in-game menu's VM references died with the outgoing session; re-configure for
+    // the new map (the next `open` reinstalls the GUI graph into the new VM).
+    menu.configure(cfg.options.save_dir.clone(), cfg.options.map.clone());
     // item21: reinstall the cutscene host on the new map's VM. Dropping the old session stops
     // its clip; the overlay sync tears the picture/audio down once the new host has none open.
     cutscene_host.0 = Some(cutscene::install(

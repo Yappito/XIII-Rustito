@@ -111,7 +111,71 @@ fn main() -> AppExit {
 
     // Windowed modes (`--play`, `--smoke`, ...) drive the VM from `fixed_step`; run the whole
     // app on the explicit VM host stack (see vmstack).
-    vmstack::run_on_vm_stack(move || build_app(opts).run())
+    let relaunch_opts = opts.clone();
+    let app_exit = vmstack::run_on_vm_stack(move || build_app(opts).run());
+    // item72: an in-game `QuitGame` (`ClientTravel("MapMenu")`) or Retry (`LoadAtCheckpoint`)
+    // hands off to a child process — Bevy/winit allows one event loop per process, the same
+    // arrangement as the menu → play travel step.
+    if let Some(req) = play::ingamemenu::take_relaunch() {
+        return run_menu_relaunch_step(&relaunch_opts, &req);
+    }
+    app_exit
+}
+
+/// Host handoff step for the in-game menu's quit/retry: relaunches this binary in `--menu`
+/// mode (quit to main menu) or `--play --load <slot>` (Retry), forwarding the unattended
+/// flags, and returns the child's exit status.
+fn run_menu_relaunch_step(opts: &cli::Options, req: &play::ingamemenu::MenuRelaunch) -> AppExit {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[app] menu relaunch: cannot locate the executable: {e}");
+            return AppExit::error();
+        }
+    };
+    let mut cmd = std::process::Command::new(exe);
+    match req {
+        play::ingamemenu::MenuRelaunch::FrontEnd => {
+            cmd.arg("--menu");
+        }
+        play::ingamemenu::MenuRelaunch::Load(slot) => {
+            cmd.arg("--play").arg("--load").arg(slot.to_string());
+        }
+    }
+    if let Some(dir) = &opts.game_dir {
+        cmd.arg("--game-dir").arg(dir);
+    }
+    if let Some(dir) = &opts.save_dir {
+        cmd.arg("--save-dir").arg(dir);
+    }
+    if let Some(dir) = &opts.config_dir {
+        cmd.arg("--config-dir").arg(dir);
+    }
+    if opts.diagnostic_overlay {
+        cmd.arg("--diagnostic-overlay");
+    }
+    if let Some(secs) = opts.exit_after_secs {
+        cmd.arg("--exit-after-secs").arg(secs.to_string());
+    }
+    if let Some(p) = &opts.screenshot {
+        cmd.arg("--screenshot").arg(p);
+    }
+    cmd.arg("--size")
+        .arg(format!("{}x{}", opts.width, opts.height));
+    if opts.no_vsync {
+        cmd.arg("--no-vsync");
+    }
+    match cmd.status() {
+        Ok(s) if s.success() => AppExit::Success,
+        Ok(s) => {
+            eprintln!("[app] menu relaunch: child exited with {s}");
+            AppExit::error()
+        }
+        Err(e) => {
+            eprintln!("[app] menu relaunch: failed to start the child: {e}");
+            AppExit::error()
+        }
+    }
 }
 
 /// Host travel step: launches this binary in `--play` mode on the map the menu's own

@@ -1841,6 +1841,75 @@ impl Session {
         position: [f32; 3],
         rotation: [i32; 3],
     ) -> Result<crate::save::SaveFile, String> {
+        let common = self.capture_save_common(map, position, rotation)?;
+        let saved_trigger = self
+            .vm
+            .objects
+            .iter()
+            .enumerate()
+            .find_map(|(i, actor)| {
+                (actor.is_actor && actor.name.eq_ignore_ascii_case(&event.actor))
+                    .then_some(i as ObjectId)
+            })
+            .ok_or_else(|| format!("SaveCheckpoint actor {:?} is not in the VM", event.actor))?;
+        let sound_value = self
+            .vm
+            .get_property(saved_trigger, "SoundToLaunch")
+            .ok_or_else(|| {
+                format!(
+                    "checkpoint trigger {} has no SoundToLaunch property",
+                    event.actor
+                )
+            })?;
+        let sound_to_launch = match sound_value {
+            Value::Object(None) => None,
+            Value::Object(Some(_)) => Some(self.vm.obj_path(sound_value).ok_or_else(|| {
+                format!(
+                    "checkpoint trigger {} SoundToLaunch has no resolvable object path",
+                    event.actor
+                )
+            })?),
+            other => {
+                return Err(format!(
+                    "checkpoint trigger {} SoundToLaunch is {}, expected object",
+                    event.actor,
+                    other.type_name()
+                ));
+            }
+        };
+        let save_trigger_tag = match self.vm.get_property(saved_trigger, "Tag") {
+            Some(Value::Name(tag)) | Some(Value::Str(tag)) => tag.clone(),
+            Some(other) => {
+                return Err(format!(
+                    "checkpoint trigger {} Tag is {}, expected name",
+                    event.actor,
+                    other.type_name()
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "checkpoint trigger {} has no Tag property",
+                    event.actor
+                ));
+            }
+        };
+        Ok(crate::save::SaveFile {
+            teleporter: event.teleporter_name.clone(),
+            save_trigger_tag,
+            description: event.description.clone(),
+            sound_to_launch,
+            ..common
+        })
+    }
+
+    /// The save fields every save flavor shares (health, speed factor, checkpoint number,
+    /// objectives, inventory, selected weapon, music variables) plus `map`.
+    fn capture_save_common(
+        &self,
+        map: &str,
+        position: [f32; 3],
+        rotation: [i32; 3],
+    ) -> Result<crate::save::SaveFile, String> {
         let health = self
             .player_health()
             .ok_or("checkpoint snapshot player has no Health property")?;
@@ -1899,63 +1968,12 @@ impl Session {
             .player_weapon()
             .map(|id| self.vm.set().path(self.vm.objects[id as usize].class));
         let inventory = self.inventory_snapshot()?;
-        let saved_trigger = self
-            .vm
-            .objects
-            .iter()
-            .enumerate()
-            .find_map(|(i, actor)| {
-                (actor.is_actor && actor.name.eq_ignore_ascii_case(&event.actor))
-                    .then_some(i as ObjectId)
-            })
-            .ok_or_else(|| format!("SaveCheckpoint actor {:?} is not in the VM", event.actor))?;
-        let sound_value = self
-            .vm
-            .get_property(saved_trigger, "SoundToLaunch")
-            .ok_or_else(|| {
-                format!(
-                    "checkpoint trigger {} has no SoundToLaunch property",
-                    event.actor
-                )
-            })?;
-        let sound_to_launch = match sound_value {
-            Value::Object(None) => None,
-            Value::Object(Some(_)) => Some(self.vm.obj_path(sound_value).ok_or_else(|| {
-                format!(
-                    "checkpoint trigger {} SoundToLaunch has no resolvable object path",
-                    event.actor
-                )
-            })?),
-            other => {
-                return Err(format!(
-                    "checkpoint trigger {} SoundToLaunch is {}, expected object",
-                    event.actor,
-                    other.type_name()
-                ));
-            }
-        };
-        let save_trigger_tag = match self.vm.get_property(saved_trigger, "Tag") {
-            Some(Value::Name(tag)) | Some(Value::Str(tag)) => tag.clone(),
-            Some(other) => {
-                return Err(format!(
-                    "checkpoint trigger {} Tag is {}, expected name",
-                    event.actor,
-                    other.type_name()
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "checkpoint trigger {} has no Tag property",
-                    event.actor
-                ));
-            }
-        };
         let music_vars = self.music_variable_snapshot()?;
         Ok(crate::save::SaveFile {
             map: map.to_owned(),
-            teleporter: event.teleporter_name.clone(),
-            save_trigger_tag,
-            description: event.description.clone(),
+            teleporter: String::new(),
+            save_trigger_tag: String::new(),
+            description: String::new(),
             health,
             speed_factor_limit,
             checkpoint_number,
@@ -1963,10 +1981,56 @@ impl Session {
             rotation,
             objectives,
             inventory,
-            sound_to_launch,
+            sound_to_launch: None,
             selected_weapon,
             music_vars,
         })
+    }
+
+    /// item72: captures the live game state for an in-menu save (`XIIIMenuSave` slot write).
+    ///
+    /// Resume identity follows the map's own save-trigger chain when the map has one: the
+    /// teleporter/save-trigger tags are a live `XIIISaveGameTrigger`'s `TeleporterName`/`Tag`
+    /// (exactly what a checkpoint save records), so `--load` resumes through the same
+    /// `restore_checkpoint` pipeline and places the player at the named start spot with the saved
+    /// health/inventory/objectives. A map without any live `XIIISaveGameTrigger` has no resumable
+    /// identity and the capture fails (the save bridge reports the error; nothing is written).
+    /// The position/rotation are captured in the file for diagnostics but the resume placement
+    /// follows the trigger's start spot, like every checkpoint resume.
+    pub fn menu_snapshot(
+        &self,
+        map: &str,
+        position: [f32; 3],
+        rotation: [i32; 3],
+    ) -> Result<crate::save::SaveFile, String> {
+        let mut common = self.capture_save_common(map, position, rotation)?;
+        let trigger = self
+            .vm
+            .objects
+            .iter()
+            .enumerate()
+            .find(|(i, actor)| {
+                actor.is_actor
+                    && !actor.deleted
+                    && self.vm.is_a(*i as ObjectId, "xiiisavegametrigger")
+            })
+            .map(|(i, _)| i as ObjectId)
+            .ok_or_else(|| {
+                "map has no live XIIISaveGameTrigger; in-menu save has no resume identity"
+                    .to_owned()
+            })?;
+        let teleporter = match self.vm.get_property(trigger, "TeleporterName") {
+            Some(Value::Str(t)) | Some(Value::Name(t)) => t.clone(),
+            _ => return Err("XIIISaveGameTrigger has no TeleporterName".to_owned()),
+        };
+        let trigger_tag = match self.vm.get_property(trigger, "Tag") {
+            Some(Value::Name(t)) | Some(Value::Str(t)) => t.clone(),
+            _ => return Err("XIIISaveGameTrigger has no Tag".to_owned()),
+        };
+        common.teleporter = teleporter;
+        common.save_trigger_tag = trigger_tag;
+        common.description = "Menu save".to_owned();
+        Ok(common)
     }
 
     /// One compact line of the objective states (goal index, primary/anti/completed flags, text).

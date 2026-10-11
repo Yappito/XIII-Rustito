@@ -359,12 +359,15 @@ pub(crate) fn find_hud(vm: &Vm<'_>) -> Option<ObjectId> {
 }
 
 /// Per-rendered-frame system: set `ClipX`/`ClipY` from the window, call the HUD's `PostRender`,
-/// drain the recorded commands into [`HudRuntime`].
+/// drain the recorded commands into [`HudRuntime`]. When the item72 in-game menu is open its
+/// page draw runs after the HUD's, into the same command list.
+#[allow(clippy::too_many_arguments)]
 pub fn refresh(
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Transform, &Projection), With<super::PlayCam>>,
     mut session: NonSendMut<Result<Session, String>>,
     mut hud: ResMut<HudRuntime>,
+    mut menu: NonSendMut<super::ingamemenu::InGameMenu>,
     mut perf: ResMut<crate::perf::Perf>,
 ) {
     let t0 = std::time::Instant::now();
@@ -414,7 +417,10 @@ pub fn refresh(
             }
         }
     }
-    let commands = vm.drain_canvas();
+    // The HUD's commands are drained before the in-game menu page draws, so the page's canvas
+    // commands land after the HUD's (the page paints over the frozen game view).
+    let mut commands = vm.drain_canvas();
+    commands.extend(menu.page_commands(session, canvas, size));
     hud.total_commands += commands.len() as u64;
     hud.commands = commands;
     // Cartoon collection runs immediately after this callback. Deliver its camera updates

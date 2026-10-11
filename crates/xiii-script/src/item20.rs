@@ -37,6 +37,24 @@ pub trait SaveSlotProvider {
     fn poll_read(&mut self) -> bool;
     /// Takes the selected slot after the menu calls `LoadAtCheckpoint`.
     fn take_read_slot(&mut self) -> Option<u32>;
+    /// Starts writing the current game state into `slot` (item72: the in-game `XIIIMenuSave`
+    /// `SaveInSlot` state). `false` = the device refuses the request (the page logs and leaves).
+    fn request_write(&mut self, slot: u32) -> bool {
+        let _ = slot;
+        false
+    }
+    /// Completes the prior write request: `None` = still running, `Some(true)` = the slot was
+    /// written, `Some(false)` = the device failed (the page treats `ReturnCode != -2` as failure
+    /// and closes). Hosts without a write device keep the default `None`.
+    fn poll_write(&mut self) -> Option<bool> {
+        None
+    }
+    /// `GUIController.IsThereACheckpoint`: whether any reloadable save exists. Hosts without a
+    /// save store keep the default `false` (the retail `XIIIMenuInGame.BeforePaint` then greys
+    /// the Save button, which is the game's own behaviour).
+    fn has_any_checkpoint(&self) -> bool {
+        false
+    }
 }
 
 fn native(vm: &mut Vm<'_>, ctx: &NativeCtx, args: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -53,6 +71,11 @@ fn native(vm: &mut Vm<'_>, ctx: &NativeCtx, args: &mut [Value]) -> VmResult<Nati
         )));
         return Ok(NativeOutcome::Value(Value::Bool(false)));
     };
+    if path == "IsThereACheckpoint" {
+        return Ok(NativeOutcome::Value(Value::Bool(
+            provider.has_any_checkpoint(),
+        )));
+    }
     let slot_arg = || {
         args.first().and_then(|v| match v {
             Value::Int(n) if *n >= 0 => Some(*n as u32),
@@ -120,6 +143,20 @@ fn native(vm: &mut Vm<'_>, ctx: &NativeCtx, args: &mut [Value]) -> VmResult<Nati
                 *a = Value::Int(0);
             }
             provider.poll_read()
+        }
+        "RequestWriteSlot" => slot_arg().is_some_and(|s| provider.request_write(s)),
+        "IsWriteSlotFinished" => {
+            let result = provider.poll_write();
+            if let Some(a) = args.first_mut() {
+                // The page treats `-2` as "cancelled" and anything else non-negative as done;
+                // 0 = written, -1 = the device failed.
+                *a = Value::Int(match result {
+                    Some(true) => 0,
+                    Some(false) => -1,
+                    None => -2,
+                });
+            }
+            result.is_some()
         }
         "LoadAtCheckpoint" => {
             if let Some(slot) = provider.take_read_slot() {
@@ -195,9 +232,19 @@ pub fn save_defs() -> Vec<NativeDef> {
             "gui.u GUIController.IsReadSlotFinished; xidinterf XIIIMenuLoadGameWindow.LoadFromSlot",
         ),
         def(
-            "GUIController.LoadAtCheckpoint",
-            "native(0) final native static function bool LoadAtCheckpoint(bool ForceLoadAtMapStart)",
-            "gui.u GUIController.LoadAtCheckpoint; engine PlayerController.QuickLoad travels with ?load=9",
+            "GUIController.RequestWriteSlot",
+            "native(0) final native static function bool RequestWriteSlot(int SlotNumber)",
+            "gui.u GUIController.RequestWriteSlot; xidinterf XIIIMenuSave.SaveInSlot 0x0000 (item72 in-game save)",
+        ),
+        def(
+            "GUIController.IsWriteSlotFinished",
+            "native(0) final native static function bool IsWriteSlotFinished(out int ReturnCode)",
+            "gui.u GUIController.IsWriteSlotFinished; xidinterf XIIIMenuSave.SaveInSlot 0x0040 polls it (item72)",
+        ),
+        def(
+            "GUIController.IsThereACheckpoint",
+            "native(0) final native static function bool IsThereACheckpoint()",
+            "gui.u GUIController.IsThereACheckpoint; xidinterf XIIIMenuInGame.BeforePaint gates the Save button and XIIIMenuInGame.RestartGame branches on it (item72)",
         ),
     ]
 }
@@ -208,7 +255,7 @@ mod tests {
     #[test]
     fn item20_menu_native_set_is_unique_and_explicitly_partial() {
         let defs = save_defs();
-        assert_eq!(defs.len(), 10);
+        assert_eq!(defs.len(), 12);
         let mut paths = std::collections::BTreeSet::new();
         for d in defs {
             assert!(
