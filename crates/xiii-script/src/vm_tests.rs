@@ -5035,7 +5035,9 @@ fn item51b_blood_flow_grows_reprojects_and_uses_strict_unclamped_threshold() {
 fn item46_move_to_fractional_speed_accelerates_and_none_physics_does_not_teleport() {
     let set = item46_set();
     let mut vm = Vm::new(&set, VmLimits::default());
-    vm.set_physics(Box::new(MockWorld::new()));
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([-10_000.0, -10_000.0, -20.0], [10_000.0, 10_000.0, -1.0]),
+    ));
     let (ctrl, pawn) = item46_pair(&mut vm, &set);
     for (name, value) in [
         ("GroundSpeed", 100.0),
@@ -5116,6 +5118,21 @@ fn item46_move_to_fractional_speed_accelerates_and_none_physics_does_not_telepor
         vm.start_move(ctrl, destination, 0.0, "Controller.MoveTo", true)
             .is_err()
     );
+}
+
+#[test]
+fn controller_walking_step_off_ledge_enters_falling_physics() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let (ctrl, pawn) = item46_pair(&mut vm, &set);
+    vm.set_property(pawn, "Physics", 0, Value::Byte(1));
+    vm.set_property(pawn, "bCollideWorld", 0, Value::Bool(true));
+    vm.set_property(pawn, "GroundSpeed", 0, Value::Float(120.0));
+    vm.set_property(pawn, "AccelRate", 0, Value::Float(120.0));
+    vm.controller_move_step(ctrl, pawn, [500.0, 0.0, 0.0], 0.1)
+        .unwrap();
+    assert_eq!(vm.byte_prop(pawn, "Physics"), 2);
 }
 
 #[test]
