@@ -83,7 +83,7 @@ pub enum DrawCommand {
         /// Drawn with the clipped native.
         clipped: bool,
     },
-    /// Solid colour rectangle (a null-material `DrawTile` or `DrawMsgboxBackground`).
+    /// Solid colour rectangle (an explicit script/native rectangle command).
     Rect {
         /// X.
         x: f32,
@@ -744,28 +744,18 @@ fn wrap_string(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nati
 
 fn draw_msgbox_background(
     vm: &mut Vm<'_>,
-    c: &NativeCtx,
-    a: &mut [Value],
+    _c: &NativeCtx,
+    _a: &mut [Value],
 ) -> VmResult<NativeOutcome> {
-    // Partial: the decoded boxes are not reproduced; a clip-sized rectangle is recorded.
-    let (w, h) = (
-        float(vm, a, 4).unwrap_or(0.0),
-        float(vm, a, 5).unwrap_or(0.0),
-    );
-    let (x, y) = (
-        float(vm, a, 1).unwrap_or(0.0),
-        float(vm, a, 2).unwrap_or(0.0),
-    );
-    let color = draw_color(vm, c.this);
-    let clip = clip(vm, c.this);
-    vm.canvas.push(DrawCommand::Rect {
-        x,
-        y,
-        xl: w.max(1.0),
-        yl: h.max(1.0),
-        color,
-        clip,
-    });
+    // Retail Canvas.DrawMsgboxBackground has two leading booleans/coordinates and its last
+    // two arguments are Width and Height (indices 5 and 6). The VM host does not yet decode the
+    // native GUI frame artwork; emitting a solid rectangle here fabricated a conspicuous white
+    // bar (LineWidth x Width) over the page, so leave the unsupported frame absent rather than
+    // substituting a placeholder.
+    vm.note(TraceKind::Note(
+        "Canvas.DrawMsgboxBackground: GUI frame artwork is not decoded; no placeholder drawn"
+            .into(),
+    ));
     val(Value::Void)
 }
 
@@ -1069,7 +1059,7 @@ pub fn canvas_defs() -> Vec<NativeDef> {
         "records a clip-sized rectangle; the decoded msgbox geometry is not reproduced",
         "Engine.Canvas.DrawMsgboxBackground",
         "native(0) final static function DrawMsgboxBackground(bool bOnlyCenter, float OrgX, float OrgY, float LineWidth, float LineHeight, float Width, float Height)",
-        "engine.u Canvas.DrawMsgboxBackground decoded; no msgbox model in the VM",
+        "item72c: GUI frame art is unsupported; no false solid-white replacement",
         draw_msgbox_background,
     ));
     v.push(partial(
@@ -1499,6 +1489,9 @@ pub fn item16b_defs() -> Vec<NativeDef> {
 #[cfg(test)]
 mod menu_tests {
     use super::*;
+    use crate::linker::ScriptSet;
+    use crate::registry::NativeCtx;
+    use crate::vm::VmLimits;
 
     #[test]
     fn travel_note_round_trips_and_extracts_the_map() {
@@ -1524,6 +1517,36 @@ mod menu_tests {
             (r.map.as_str(), r.travel_type, r.items),
             ("banque01", 3, true)
         );
+    }
+
+    #[test]
+    fn msgbox_background_does_not_fabricate_white_geometry() {
+        let set = ScriptSet::new();
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let ctx = NativeCtx {
+            this: 0,
+            in_state_code: false,
+            path: "Engine.Canvas.DrawMsgboxBackground".into(),
+            omitted: vec![false; 7],
+        };
+        let mut args = [
+            Value::Bool(false),
+            Value::Float(220.0),
+            Value::Float(130.0),
+            Value::Float(10.0),
+            Value::Float(10.0),
+            Value::Float(220.0),
+            Value::Float(230.0),
+        ];
+        draw_msgbox_background(&mut vm, &ctx, &mut args).expect("native accepts retail args");
+        assert!(
+            vm.drain_canvas().is_empty(),
+            "unsupported GUI art must not be replaced with a white rectangle"
+        );
+        assert!(vm.trace.iter().any(|event| matches!(
+            &event.kind,
+            TraceKind::Note(note) if note.contains("no placeholder drawn")
+        )));
     }
 }
 
