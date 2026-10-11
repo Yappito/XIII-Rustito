@@ -136,6 +136,12 @@ fn run_play_travel_step(opts: &cli::Options, map: &str, load: Option<u32>) -> Ap
     if let Some(dir) = &opts.save_dir {
         cmd.arg("--save-dir").arg(dir);
     }
+    if let Some(dir) = &opts.config_dir {
+        cmd.arg("--config-dir").arg(dir);
+    }
+    if opts.diagnostic_overlay {
+        cmd.arg("--diagnostic-overlay");
+    }
     if let Some(secs) = opts.exit_after_secs {
         cmd.arg("--exit-after-secs").arg(secs.to_string());
     }

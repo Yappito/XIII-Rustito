@@ -206,7 +206,7 @@ impl Rider {
             .filter(|_| grounded)
             .and_then(|id| sources.get(id as usize))
             .and_then(|path| path.split_once(" -> ").map(|(actor, _)| actor))
-            .and_then(|actor| state_of(actor));
+            .and_then(state_of);
         match (now, self.base.as_ref()) {
             (Some(s), Some(b)) if b.name.eq_ignore_ascii_case(&s.name) => BaseChange::Unchanged,
             (Some(s), _) => {
@@ -334,7 +334,8 @@ mod tests {
         let mut rider = Rider::default();
         let mut cage_z = 0.0f32;
         let mut player = [5.0f32, 6.0, 100.0];
-        let state_of = |z: f32| move |name: &str| name.eq_ignore_ascii_case("LiftCage0").then(|| cage_at(z));
+        let state_of =
+            |z: f32| move |name: &str| name.eq_ignore_ascii_case("LiftCage0").then(|| cage_at(z));
         // Standing on the cage floor (source 1): the base is recorded at the pre-move pose.
         assert_eq!(
             rider.observe(true, Some(1), &sources, state_of(cage_z)),
@@ -348,7 +349,11 @@ mod tests {
             );
             rider.carry(&mut player, state_of(cage_z));
         }
-        assert!((player[2] - (100.0 + cage_z)).abs() < 0.05, "z {}", player[2]);
+        assert!(
+            (player[2] - (100.0 + cage_z)).abs() < 0.05,
+            "z {}",
+            player[2]
+        );
         assert_eq!((player[0], player[1]), (5.0, 6.0));
         assert_eq!(rider.base(), Some("LiftCage0"));
     }
@@ -359,16 +364,34 @@ mod tests {
         let mut rider = Rider::default();
         let live = |_: &str| Some(cage_at(0.0));
         // A BSP floor ("Model1 (BSP)") has no actor part: never a base.
-        assert_eq!(rider.observe(true, Some(0), &sources, live), BaseChange::Unchanged);
+        assert_eq!(
+            rider.observe(true, Some(0), &sources, live),
+            BaseChange::Unchanged
+        );
         // An unknown or out-of-range source id must not panic or ride.
-        assert_eq!(rider.observe(true, Some(99), &sources, live), BaseChange::Unchanged);
-        assert_eq!(rider.observe(true, None, &sources, live), BaseChange::Unchanged);
+        assert_eq!(
+            rider.observe(true, Some(99), &sources, live),
+            BaseChange::Unchanged
+        );
+        assert_eq!(
+            rider.observe(true, None, &sources, live),
+            BaseChange::Unchanged
+        );
         // A path naming a non-mover actor is not a base.
         let no_mover = |_: &str| None;
-        assert_eq!(rider.observe(true, Some(1), &sources, no_mover), BaseChange::Unchanged);
+        assert_eq!(
+            rider.observe(true, Some(1), &sources, no_mover),
+            BaseChange::Unchanged
+        );
         // Jumping off ends the ride and a moving cage then no longer moves the player.
-        assert!(matches!(rider.observe(true, Some(1), &sources, live), BaseChange::Changed(Some(_))));
-        assert_eq!(rider.observe(false, Some(1), &sources, live), BaseChange::Changed(None));
+        assert!(matches!(
+            rider.observe(true, Some(1), &sources, live),
+            BaseChange::Changed(Some(_))
+        ));
+        assert_eq!(
+            rider.observe(false, Some(1), &sources, live),
+            BaseChange::Changed(None)
+        );
         let mut p = [0.0, 0.0, 10.0];
         assert_eq!(rider.carry(&mut p, |_| Some(cage_at(500.0))), [0.0; 3]);
         assert_eq!(p, [0.0, 0.0, 10.0]);

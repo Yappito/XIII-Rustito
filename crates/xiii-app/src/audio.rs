@@ -1251,10 +1251,10 @@ fn expire_without_device(
 }
 
 fn overlay_audio(
+    diagnostics: Option<Res<crate::play::DiagnosticOverlay>>,
     audio: Option<Res<AudioRes>>,
     cfg: Res<AudioConfig>,
-    mut text: Query<&mut Text, With<AudioOverlay>>,
-    mut done: Local<bool>,
+    mut text: Query<(&mut Text, &mut Visibility), With<AudioOverlay>>,
     mut commands: Commands,
 ) {
     if cfg.options.mode == crate::cli::Mode::Menu {
@@ -1263,9 +1263,10 @@ fn overlay_audio(
     let Some(audio) = audio else {
         return;
     };
-    if !*done {
+    if text.is_empty() {
         commands.spawn((
             AudioOverlay,
+            Visibility::Hidden,
             Text::new("audio init"),
             TextFont {
                 font_size: FontSize::Px(12.0),
@@ -1282,12 +1283,20 @@ fn overlay_audio(
             },
             BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.5)),
         ));
-        *done = true;
         return;
     }
-    let Ok(mut text) = text.single_mut() else {
+    let Ok((mut text, mut visibility)) = text.single_mut() else {
         return;
     };
+    let visible = diagnostics.as_deref().is_some_and(|d| d.0);
+    *visibility = if visible {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    if !visible {
+        return;
+    }
     let s = &audio.stats;
     let mut out = format!(
         "audio {} | requests {} played {} music {} steps {} spatial {} (fallback {}) failed {} | radius applied {} absent {} | no-device {}\n",

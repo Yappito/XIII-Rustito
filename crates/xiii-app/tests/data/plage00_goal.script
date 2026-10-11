@@ -1,0 +1,6 @@
+# Exact input from opt_in_plage00_goal_trigger_requests_travel_to_plage01.
+t=0.0 teleport 5420 -1360.3 880
+t=0.0 yaw 0
+t=0.0 forward 1
+t=2.0 forward 0
+t=2.0 wait_travel

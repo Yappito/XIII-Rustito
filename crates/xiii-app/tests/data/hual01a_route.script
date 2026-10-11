@@ -86,7 +86,12 @@ t=0.50 forward 1
 t=1.50 forward 0
 # Ski slope from the spawn (-4523,3674) down to the base yard (nav-graph line, measured).
 t=2.00 goto -4000 3300
-t=6.00 goto -3100 2950
+# item68b: the old southward slope leg stalls falling against the ridge near
+# (-3124,3125), inflicting 81+19 fall damage and starting live-clock bleeding.
+# Follow the north side of the ridge instead of driving into its steep face.
+t=6.00 goto -3500 3300
+t=7.50 goto -3100 3300
+t=8.70 goto -2700 3300
 t=10.00 goto -2143 3021
 t=13.50 goto -2294 2549
 t=16.00 goto -2478 2540

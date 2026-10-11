@@ -102,22 +102,55 @@ t=303.00 goto 13900 1400
 t=309.00 teleport 14250 1400 1220
 t=309.10 forward 0
 t=311.00 goto 15500 1450
+# item68b: move the existing diagnostic M60 bootstrap before the exposed descent.
+# Roof return-fire was blocked; the landing below supplies the real fire line.
+t=311.10 weapon XIII.m60
 # labelled teleport (the roof's east edge drops onto a trapped ledge and a 486 pit)
 t=317.00 teleport 16000 1300 700
 t=317.10 forward 0
-t=319.00 goto 16500 1200
+# item68b: live-clock rockets killed the old stationary landing/crossing. Engage
+# the launcher before crossing, then run continuously between cover positions.
+# The real-clock damage trace identifies BaseSoldier18 as the rocket instigator.
+# Engage him on landing (roof return-fire was blocked). `goto` overrides tracked
+# yaw, so stand for this burst before starting the run. Measured: 150 -> 15 HP
+# on the317.4 head hit, then -41 on318.2; no incoming damage. Later burst edges
+# cover the crossing until the target is released; no new teleport skips it.
+t=317.20 track BaseSoldier18 0.85
+t=317.40 fire
+t=317.60 fire
+t=317.80 fire
+t=318.00 fire
+t=318.20 fire
+t=318.40 fire
+t=318.60 fire
+t=318.80 fire
+t=319.00 fire
+t=319.20 fire
+t=319.40 fire
+t=319.60 fire
+t=319.80 fire
+t=320.00 fire
+t=320.20 fire
+t=320.40 fire
+t=320.60 fire
+t=320.80 fire
+t=321.00 fire
+t=321.20 fire
+t=321.40 fire
+t=321.60 track off
 # item53b: the road stand is under enemy fire once the phantom mover cylinders no longer
 # absorb AI rounds (the decoded primitive rule); keep moving through the exposure.
-t=321.00 goto 17800 1150
+t=318.50 goto 17800 1150
+t=321.50 goto 18150 1150
 # labelled teleport (the warehouse west wall + the Movable2 crate block the doorway;
 # TT10's r700 zone starts west of the wall)
-t=325.00 teleport 18300 1000 800
-t=325.10 forward 0
-t=327.00 goto 18800 1050
+t=323.00 teleport 18300 1000 800
+t=323.10 forward 0
+t=323.20 goto 18800 1050
 # item53b: the helipad wait is under MagnumPlus3 fire once the phantom mover cylinders no
 # longer absorb AI rounds; the wait moves behind the Tmetaldoorhelico line (the sweep from
 # the shooter's muzzle to (18500,1300) is blocked by the door mesh).
-t=331.00 goto 18500 1300
+t=324.70 goto 18500 1300
 # item61b: the route player SURVIVES the tarmac (normal-health soldiers; item61) and the
 # game's TouchTrigger10.Touch fired at 325.017 while TT10 is still disarmed (the generator
 # chain is blocked; pinned in the test). The route continues by player input:
@@ -130,12 +163,11 @@ t=331.00 goto 18500 1300
 #    BaseSoldier18 (Tag bataillefinale, authored 150 hp, Skill 2, bAlerte) stands on the
 #    lower road at (17807,1438); track him and fire from behind the Tmetaldoorhelico door
 #    line, crouching between bursts (cover).
-t=333.00 weapon XIII.m60
 # (a closer fight stand at (18150,1250) was measured and rejected: the player, at 74 hp after
 # the tarmac, is killed by the returning fire during the tracked burst - measured
 # local/re/item61b/test-ext5.txt, dead at -6 hp; the door-line standoff below is the cover
 # the item53b comment already used for the helipad wait)
-t=333.20 track BaseSoldier18
+t=333.20 track BaseSoldier17
 t=334.00 fire
 t=334.50 fire
 t=335.00 fire

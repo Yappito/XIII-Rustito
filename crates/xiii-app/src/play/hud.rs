@@ -362,6 +362,7 @@ pub(crate) fn find_hud(vm: &Vm<'_>) -> Option<ObjectId> {
 /// drain the recorded commands into [`HudRuntime`].
 pub fn refresh(
     window: Query<&Window, With<PrimaryWindow>>,
+    camera: Query<(&Transform, &Projection), With<super::PlayCam>>,
     mut session: NonSendMut<Result<Session, String>>,
     mut hud: ResMut<HudRuntime>,
     mut perf: ResMut<crate::perf::Perf>,
@@ -382,6 +383,22 @@ pub fn refresh(
         let vm = session.vm_mut();
         vm.set_property(canvas, "ClipX", 0, Value::Float(size[0]));
         vm.set_property(canvas, "ClipY", 0, Value::Float(size[1]));
+        vm.canvas.screen_projection = camera.single().ok().map(|(transform, projection)| {
+            let scale = 1.0 / xiii_decode::common::UNREAL_UNITS_PER_METER;
+            let unreal_to_bevy = Mat4::from_cols(
+                Vec4::new(0.0, 0.0, -scale, 0.0),
+                Vec4::new(scale, 0.0, 0.0, 0.0),
+                Vec4::new(0.0, scale, 0.0, 0.0),
+                Vec4::W,
+            );
+            xiii_script::canvas::ScreenProjection {
+                clip_from_world: (projection.get_clip_from_view()
+                    * transform.to_matrix().inverse()
+                    * unreal_to_bevy)
+                    .to_cols_array_2d(),
+                viewport: size,
+            }
+        });
     }
     session.render_interaction(canvas);
     let vm = session.vm_mut();
@@ -400,7 +417,29 @@ pub fn refresh(
     let commands = vm.drain_canvas();
     hud.total_commands += commands.len() as u64;
     hud.commands = commands;
+    // Cartoon collection runs immediately after this callback. Deliver its camera updates
+    // now rather than waiting for a fixed step (there may be several renders per VM tick).
+    session.drain_events();
     perf.span("hud_postrender", t0);
+}
+
+/// Records actual script draw activity and outstanding presentation diagnostics at exit.
+pub fn report_exit(
+    hud: Res<HudRuntime>,
+    diagnostics: Res<super::DiagnosticOverlay>,
+    mut exiting: MessageReader<AppExit>,
+) {
+    if exiting.read().next().is_some() {
+        println!(
+            "[hud] exit: PostRender frames={} commands={} glyphs={} error={:?} missing_materials={:?}",
+            hud.frames, hud.total_commands, hud.glyphs_drawn, hud.error, hud.missing_materials
+        );
+        if diagnostics.0 {
+            for command in &hud.commands {
+                println!("[hud canvas] {command:?}");
+            }
+        }
+    }
 }
 
 /// Per-rendered-frame system: rebuild the Bevy UI nodes from [`HudRuntime::commands`].
@@ -601,6 +640,7 @@ pub fn draw(
         }
     }
     hud.glyphs_drawn = glyphs;
+    hud.commands = cmds;
     for (path, n) in missing {
         let entry = hud.missing_materials.entry(path).or_default();
         if *entry == 0 {
@@ -621,7 +661,9 @@ fn decode_texture_path(
     path: &str,
     images: &mut Assets<Image>,
 ) -> Option<Handle<Image>> {
-    let (package, object) = path.rsplit_once('.')?;
+    // Only the first segment is the package. HUD materials commonly have a group, e.g.
+    // XIIIMenu.HUD.FondMsg; treating XIIIMenu.HUD as a package dropped every such tile.
+    let (package, object) = path.split_once('.')?;
     let loaded = cache.get(package).ok()?;
     let pkg = &loaded.package;
     let export = (0..pkg.exports().len()).find(|&e| {
@@ -637,4 +679,109 @@ fn decode_texture_path(
     let texture = decode_texture(pkg, &loaded.data, export).ok()?;
     let image = texture.decode_mip(0).ok()?;
     Some(images.add(image_from_rgba(&image)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opt_in_checkpoint_message_expires_on_level_clock() {
+        let Some(root) = std::env::var_os("XIII_GOG_DIR") else {
+            println!("SKIPPED: set XIII_GOG_DIR for checkpoint HUD lifetime");
+            return;
+        };
+        let mut session = Session::open(Path::new(&root), "Plage01").expect("session");
+        let mut images = Assets::<Image>::default();
+        let runtime = setup(&mut session, Path::new(&root), &mut images).expect("HUD");
+        let canvas = runtime.canvas.expect("canvas");
+        let hud = runtime.hud.expect("HUD actor");
+        let vm = session.vm_mut();
+        vm.set_property(canvas, "ClipX", 0, Value::Float(1280.0));
+        vm.set_property(canvas, "ClipY", 0, Value::Float(720.0));
+        vm.tick_suspending(1.0 / 60.0);
+        vm.send_event(
+            hud,
+            "PostRender",
+            vec![Value::Object(Some(ObjRef::Instance(canvas)))],
+        )
+        .expect("PostRender");
+        let initial = vm.drain_canvas();
+        for command in &initial {
+            println!("[checkpoint initial canvas] {command:?}");
+        }
+        assert!(initial.iter().any(|c| matches!(c, DrawCommand::Text { text, .. } if text.contains("Checkpoint reached"))), "authored checkpoint message must be drawn initially");
+        let message = instance_prop(vm, hud, "HudStt").expect("message widget");
+        println!(
+            "[checkpoint] MyMessage={:?}",
+            vm.get_property(message, "MyMessage")
+        );
+        vm.tick_suspending(2.95);
+        vm.send_event(
+            hud,
+            "PostRender",
+            vec![Value::Object(Some(ObjRef::Instance(canvas)))],
+        )
+        .expect("fade PostRender");
+        assert!(vm.drain_canvas().iter().any(|c| matches!(c, DrawCommand::Text { text, color, .. } if text.contains("Checkpoint reached") && color[3] < 102 && color[3] > 0)), "retail fade must reduce alpha before expiry");
+        for _ in 0..600 {
+            vm.tick_suspending(1.0 / 60.0);
+        }
+        let level = vm.find_level_info().expect("level");
+        assert!(
+            matches!(vm.get_property(level, "TimeSeconds"), Some(Value::Float(t)) if *t > 10.0)
+        );
+        vm.send_event(
+            hud,
+            "PostRender",
+            vec![Value::Object(Some(ObjRef::Instance(canvas)))],
+        )
+        .expect("expired PostRender");
+        assert!(!vm.drain_canvas().iter().any(
+            |c| matches!(c, DrawCommand::Text { text, .. } if text.contains("Checkpoint reached"))
+        ));
+        assert!(
+            vm.objects[message as usize].deleted,
+            "script RemoveMe must destroy expired widget"
+        );
+        for id in 0..vm.objects.len() as ObjectId {
+            vm.set_active(id, false);
+        }
+        vm.tick(0.0).expect("zero tick with no actor callbacks");
+        assert_eq!(
+            vm.get_property(level, "TimeSeconds"),
+            Some(&Value::Float(vm.time as f32))
+        );
+        vm.tick(0.25).expect("non-suspending clock");
+        assert_eq!(
+            vm.get_property(level, "TimeSeconds"),
+            Some(&Value::Float(vm.time as f32))
+        );
+    }
+
+    #[test]
+    fn opt_in_hud_grouped_textures_resolve_and_missing_paths_do_not() {
+        let Some(root) = std::env::var_os("XIII_GOG_DIR") else {
+            println!("SKIPPED: set XIII_GOG_DIR for HUD grouped texture resolution");
+            return;
+        };
+        let mut cache = PackageCache::open(Path::new(&root)).expect("installation");
+        let mut images = Assets::<Image>::default();
+        for path in [
+            "XIIIMenu.HUD.FondMsg",
+            "XIIIMenu.HUD.blanc",
+            "XIIIMenu.HUD.Miredot",
+            "XIIIMenu.HUD.fondialog",
+            "xiiimenu.hud.FLECHDIALOGA",
+        ] {
+            assert!(
+                decode_texture_path(&mut cache, path, &mut images).is_some(),
+                "{path}"
+            );
+        }
+        assert!(
+            decode_texture_path(&mut cache, "XIIIMenu.HUD.NoSuchTexture", &mut images).is_none()
+        );
+        assert!(decode_texture_path(&mut cache, "NoPackageSeparator", &mut images).is_none());
+    }
 }
