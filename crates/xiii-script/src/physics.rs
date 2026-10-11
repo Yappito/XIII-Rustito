@@ -140,6 +140,11 @@ pub trait WorldPhysics {
     /// `bCollideActors` changed). Default no-op.
     fn set_mover_collision(&mut self, _actor: &str, _enabled: bool) {}
 
+    /// item67h: enables or disables a named static (non-mover) actor's own collision triangles
+    /// (the engine shattered it). Default no-op: providers without per-actor static sources
+    /// keep the actor colliding and report the limitation through the caller's trace note.
+    fn set_static_actor_collision(&mut self, _actor: &str, _enabled: bool) {}
+
     /// Diagnostic (item27k): every world primitive overlapping the box `(location, extent)`,
     /// with its kind, source label and triangle. Empty by default; providers backed by a
     /// triangle soup implement it so a blocked pawn move can name what it hit.

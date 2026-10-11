@@ -2063,6 +2063,21 @@ fn spawn(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutc
         }
     };
     let id = vm.spawn_actor(c.this, class, owner, tag.as_deref(), location, rotation)?;
+    // item67h: the bullet-impact glass rule. `XIIIBulletsAmmo.ProcessTraceHit`'s impact branch
+    // spawns its impact emitter / decal projector (`SpawnDecal` also spawns here), so an
+    // impact-effect spawn immediately after a weapon trace that resolved to a glass-category
+    // static-mesh actor is the engine's shatter moment (see `Vm::glass_impact_shatter`).
+    if let Some(id) = id {
+        let chain: Vec<String> = vm.objects[id as usize]
+            .layout
+            .chain_names
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        if chain.iter().any(|n| n == "projector" || n == "emitter") {
+            vm.glass_impact_shatter();
+        }
+    }
     val(match id {
         Some(id) => Value::Object(Some(ObjRef::Instance(id))),
         None => Value::Object(None),

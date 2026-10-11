@@ -36,15 +36,25 @@
 #                    surface to the reader (MagneticPassTrigger1 at -5259,803; touched at
 #                    t=396.2, used by real input at t=400.5: aim-focus
 #                    TargetActor=MagneticPassTrigger1, bCanTrigger=true, Grab runs). With no
-#                    magnetic card, Porte19 (Tag 'Porteentrevs') stays KeyNum=0/locked, so the
-#                    teleport crosses it. The card pickup (Hual02MagneticCardPick4 at
-#                    -3474,1550) sits in the petitesalle card room: its entrance Porte21 (Event
-#                    'reveil_3') opens by real `use` from the neighbouring zone, but that zone
-#                    is a nav island walled off from the surface corridor (BSP wall at y=1664,
-#                    z -224..160; nearest nav boundary ~205 UU), so the card is unreachable on
-#                    foot (item67g re-check). The corridor west of Porte19 is itself blocked at
-#                    (-6198,842) in this sim (measured probe, local/re/item67/out/west.txt),
-#                    so the teleport also crosses that gap.
+#                    magnetic card, Porte19 (Tag 'Porteentrevs') stays locked, so the teleport
+#                    crosses it. The card pickup (Hual02MagneticCardPick4 at -3474,1550) sits in
+#                    the petitesalle card room: its entrance Porte21 (Event 'reveil_3') opens by
+#                    real `use` from the neighbouring zone, but that zone (the office + card
+#                    room nav island, 71 PathNodes) is walled off from the surface corridor
+#                    except the two shootable `grande_vitre` window panes (StaticMeshActor8 at
+#                    -4328,1638 and StaticMeshActor7 at -3354,1632, the map's only ColCategory-3
+#                    blocking meshes; item67j). The glass now shatters on bullet impact
+#                    (item67j engine rule, unit-tested), but the aperture is z -112..16 (sill
+#                    112 UU above the walked floors) and no measured retail primitive crosses it
+#                    from the flat corridor floor (step 35 = Engine.dll stepUp 0x104829c4;
+#                    jump 92.8 = JumpZ 420 with PhysicsVolume.Gravity (0,0,-950); no sill-mantle
+#                    script in any package), so the card stays unreachable on foot - pinned.
+#                    item67j measured the rest of the chain with the card in hand (the committed
+#                    probe opt_in_hual02_card_room_reader_chain): the reader use with the card
+#                    fires OutEvent 'Porteentrevs' and Porte19 opens, but the corridor west of
+#                    Porte19 then pins at x~-6198 against PorteDecors18/19 - decor doors whose
+#                    PorteDecors.SetInitialState forces ForeverLocked (its PlayerTrigger only
+#                    plays a sound), so the teleport also crosses that seal.
 # - "prison entry"   t=408 (-10368,2800): the prison compound perimeter is sealed
 #                    in this sim (Porte151 Locked opens only from Carrington's
 #                    escort moveseq); the landing touches DetectionVolume14 whose

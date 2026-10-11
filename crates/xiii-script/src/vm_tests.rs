@@ -3868,6 +3868,8 @@ fn phys_fixture() -> Vec<u8> {
     let movable = b.reserve(IMP_BOOLPROP, actor, "bMovable");
     let bstatic = b.reserve(IMP_BOOLPROP, actor, "bStatic");
     let use_cylinder = b.reserve(IMP_BOOLPROP, actor, "bUseCylinderCollision");
+    // item67h: the engine's per-actor collision category (byte; 3 = glass).
+    let col_category = b.reserve(IMP_BYTEPROP, actor, "ColCategory");
     // item53 physics fields (EPhysics, script-written velocity, zone gravity inputs).
     let physics = b.reserve(IMP_BYTEPROP, actor, "Physics");
     let velocity = b.reserve(IMP_STRUCTPROP, actor, "Velocity");
@@ -3906,7 +3908,8 @@ fn phys_fixture() -> Vec<u8> {
     b.prop(world_geometry, movable, 0);
     b.prop(movable, bstatic, 0);
     b.prop(bstatic, use_cylinder, 0);
-    b.prop(use_cylinder, physics, 0);
+    b.prop(use_cylinder, col_category, 0);
+    b.prop_with(col_category, physics, 0, &compact(0));
     b.prop_with(physics, velocity, 0, &vector_extra);
     b.prop_with(velocity, acceleration, 0, &vector_extra);
     b.prop_with(acceleration, mass, 0, &vector_extra);
@@ -3952,6 +3955,9 @@ fn phys_fixture() -> Vec<u8> {
     b.class(decoration, actor, 0, 0);
     b.class(mover, actor, 0, 0);
     b.class(levelinfo, actor, 0, 0);
+    // item67h: an impact-effect class (the bullet's decal projector / impact emitter chain).
+    let emitter = b.reserve(0, 0, "Emitter");
+    b.class(emitter, actor, 0, 0);
     let pawn_controller = b.reserve(IMP_OBJECTPROP, pawn, "Controller");
     b.prop_with(pawn_controller, 0, 0, &object_extra);
     let ctrl_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
@@ -6562,6 +6568,128 @@ fn unregistered_mover_without_cylinder_flag_keeps_the_cylinder_approximation() {
         .unwrap();
     assert_eq!(hit, Some(mv), "the cylinder approximation still stands");
     assert!((location[0] - 40.0).abs() < 1e-3, "{location:?}");
+}
+
+#[test]
+fn bullet_impact_effect_spawn_shatters_the_glass_category_hit_actor() {
+    // item67h: the engine's bullet-impact glass rule. A weapon trace that resolves to a live
+    // static-mesh actor carrying the map's glass collision category (`ColCategory` byte 3;
+    // Hual02's two `grande_vitre` window walls, the glass walkway and one crate) is shattered
+    // by the next impact-effect spawn (the impact branch's emitter / decal projector), and by
+    // nothing else: another category keeps the actor alive, a non-effect spawn keeps it alive,
+    // and the recorded source is consumed so a later unrelated spawn cannot act on it.
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let _li = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let tracer = phys_actor(&mut vm, &set, "Shooter", [0.0; 3]);
+    set_collision_fields(&mut vm, tracer, true, false);
+
+    let spawn_of = |vm: &mut Vm<'_>, spawner: ObjectId, class: GlobalRef| -> ObjectId {
+        let mut args = vec![Value::Object(Some(ObjRef::Static(class)))];
+        match call_native(
+            vm,
+            "Engine.Actor.Spawn",
+            spawner,
+            &[false, true, true, true, true],
+            &mut args,
+        ) {
+            NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(id)))) => id,
+            other => panic!("{other:?}"),
+        }
+    };
+
+    // Case 1: glass (ColCategory 3). The weapon trace names the actor; the impact-effect spawn
+    // (Emitter chain) shatters it.
+    let glass = vm.spawn(pg(&set, "Child"), "Vitre").unwrap();
+    vm.set_property(glass, "Location", 0, Value::Vector([100.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, glass, true, true);
+    vm.set_property(
+        glass,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    vm.set_property(glass, "ColCategory", 0, Value::Byte(3));
+    vm.set_physics(Box::new(NamedHitWorld {
+        inner: MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
+        actor: "Vitre".to_owned(),
+        registered: false,
+    }));
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(
+        hit,
+        Some(glass),
+        "the weapon trace resolves to the glass actor"
+    );
+    let emitter = spawn_of(&mut vm, tracer, pg(&set, "Emitter"));
+    assert!(
+        vm.objects[glass as usize].deleted,
+        "the impact-effect spawn must shatter the glass actor"
+    );
+    assert!(
+        !vm.objects[emitter as usize].deleted,
+        "the spawned effect stays alive"
+    );
+
+    // Case 2: the same geometry with another collision category survives the same chain.
+    let plain = vm.spawn(pg(&set, "Child"), "Wall").unwrap();
+    vm.set_property(plain, "Location", 0, Value::Vector([100.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, plain, true, true);
+    vm.set_property(
+        plain,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    vm.set_property(plain, "ColCategory", 0, Value::Byte(5));
+    let mut w = NamedHitWorld {
+        inner: MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
+        actor: "Wall".to_owned(),
+        registered: false,
+    };
+    w.inner = MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]);
+    vm.set_physics(Box::new(w));
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(plain));
+    spawn_of(&mut vm, tracer, pg(&set, "Emitter"));
+    assert!(
+        !vm.objects[plain as usize].deleted,
+        "a non-glass category must not shatter"
+    );
+
+    // Case 3: a spawn that is not an impact effect never shatters, even with a fresh
+    // glass hit recorded.
+    let glass2 = vm.spawn(pg(&set, "Child"), "Vitre2").unwrap();
+    vm.set_property(glass2, "Location", 0, Value::Vector([100.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, glass2, true, true);
+    vm.set_property(
+        glass2,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    vm.set_property(glass2, "ColCategory", 0, Value::Byte(3));
+    vm.set_physics(Box::new(NamedHitWorld {
+        inner: MockWorld::new().with_wall([100.0, -50.0, -50.0], [110.0, 50.0, 50.0]),
+        actor: "Vitre2".to_owned(),
+        registered: false,
+    }));
+    let (hit, _, _) = vm
+        .vm_trace(tracer, [0.0; 3], [200.0, 0.0, 0.0], true, [0.0; 3])
+        .unwrap();
+    assert_eq!(hit, Some(glass2));
+    spawn_of(&mut vm, tracer, pg(&set, "Child"));
+    assert!(
+        !vm.objects[glass2 as usize].deleted,
+        "a non-effect spawn must not consume the hit as an impact"
+    );
+    // ...but the next impact-effect spawn does (the state survives until consumed).
+    spawn_of(&mut vm, tracer, pg(&set, "Emitter"));
+    assert!(vm.objects[glass2 as usize].deleted);
 }
 
 #[test]
