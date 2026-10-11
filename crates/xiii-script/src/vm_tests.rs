@@ -1157,6 +1157,257 @@ fn unimplemented_and_unregistered_natives_fail_with_stack() {
     );
 }
 
+/// item40i fixture: bodyless declarations (`EX_Return EX_Nothing`, FUNC_Defined clear, the
+/// form every one of the 333 retail declarations has) and callers that consume their result
+/// through `Let`, `LetBool`, an out parameter, a forwarding `return F()` and a native operand.
+fn bodyless_call_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let add = b.reserve(IMP_FUNCTION, object, "Add_IntInt");
+    let empty = b.reserve(IMP_FUNCTION, object, "Empty");
+    let empty_bool = b.reserve(IMP_FUNCTION, object, "EmptyBool");
+    let empty_out = b.reserve(IMP_FUNCTION, object, "EmptyOut");
+    let forwards = b.reserve(IMP_FUNCTION, object, "ForwardsEmpty");
+    let let_keeps = b.reserve(IMP_FUNCTION, object, "LetKeeps");
+    let let_forwarded = b.reserve(IMP_FUNCTION, object, "LetKeepsForwarded");
+    let let_bool = b.reserve(IMP_FUNCTION, object, "LetBoolZeroes");
+    let out_keeps = b.reserve(IMP_FUNCTION, object, "OutKeeps");
+    let native_operand = b.reserve(IMP_FUNCTION, object, "NativeOperand");
+    let no_code = b.reserve(IMP_FUNCTION, object, "NoCode");
+    let calls_no_code = b.reserve(IMP_FUNCTION, object, "CallsNoCode");
+
+    let add_a = b.reserve(IMP_INTPROP, add, "A");
+    let add_b = b.reserve(IMP_INTPROP, add, "B");
+    let add_r = b.reserve(IMP_INTPROP, add, "ReturnValue");
+    b.prop(add_a, add_b, pf::PARM);
+    b.prop(add_b, add_r, pf::PARM);
+    b.prop(add_r, 0, pf::PARM | pf::RETURN_PARM);
+    let ret_of = |b: &mut B, f: i32, class: i32| {
+        let r = b.reserve(class, f, "ReturnValue");
+        b.prop(r, 0, pf::PARM | pf::RETURN_PARM);
+        r
+    };
+    let empty_r = ret_of(&mut b, empty, IMP_INTPROP);
+    let empty_bool_r = ret_of(&mut b, empty_bool, B_BOOLPROP);
+    let empty_out_a = b.reserve(IMP_INTPROP, empty_out, "A");
+    b.prop(empty_out_a, 0, pf::PARM | pf::OUT_PARM);
+    let forwards_r = ret_of(&mut b, forwards, IMP_INTPROP);
+    // Callers with one local X (int or bool) and a ReturnValue of the same type.
+    let local_then_ret = |b: &mut B, f: i32, class: i32| {
+        let x = b.reserve(class, f, "X");
+        let r = b.reserve(class, f, "ReturnValue");
+        b.prop(x, r, 0);
+        b.prop(r, 0, pf::PARM | pf::RETURN_PARM);
+        x
+    };
+    let keeps_x = local_then_ret(&mut b, let_keeps, IMP_INTPROP);
+    let forwarded_x = local_then_ret(&mut b, let_forwarded, IMP_INTPROP);
+    let bool_x = local_then_ret(&mut b, let_bool, B_BOOLPROP);
+    let out_x = local_then_ret(&mut b, out_keeps, IMP_INTPROP);
+    let operand_x = local_then_ret(&mut b, native_operand, IMP_INTPROP);
+
+    let call = |b: &mut B, name: &str, args: &[u8]| {
+        let mut code = vec![0x1Bu8];
+        code.extend(compact(b.name(name)));
+        code.extend(args);
+        code.push(0x16);
+        code
+    };
+    let local = |r: i32| {
+        let mut code = vec![0x00u8];
+        code.extend(compact(r));
+        code
+    };
+    let bool_local = |r: i32| {
+        let mut code = vec![0x2Du8];
+        code.extend(local(r));
+        code
+    };
+    let flags_native = ff::FINAL | ff::NATIVE | ff::OPERATOR | ff::STATIC;
+    b.func(add, empty, add_a, &[], 0, 146, flags_native);
+    // The declarations `function int Empty();` etc. compile to `return;` (04 0B) with
+    // FUNC_Defined clear.
+    b.func(empty, empty_bool, empty_r, &[0x04, 0x0B], 2, 0, 0);
+    b.func(empty_bool, empty_out, empty_bool_r, &[0x04, 0x0B], 2, 0, 0);
+    b.func(empty_out, forwards, empty_out_a, &[0x04, 0x0B], 2, 0, 0);
+    // `return Empty();`
+    let code = [vec![0x04], call(&mut b, "Empty", &[])].concat();
+    b.func(forwards, let_keeps, forwards_r, &code, 7, 0, ff::DEFINED);
+    // `X = 7; X = Empty(); return X;`
+    let code = [
+        vec![0x0F],
+        local(keeps_x),
+        vec![0x2C, 7],
+        vec![0x0F],
+        local(keeps_x),
+        call(&mut b, "Empty", &[]),
+        vec![0x04],
+        local(keeps_x),
+    ]
+    .concat();
+    b.func(let_keeps, let_forwarded, keeps_x, &code, 26, 0, ff::DEFINED);
+    // `X = 5; X = ForwardsEmpty(); return X;`
+    let code = [
+        vec![0x0F],
+        local(forwarded_x),
+        vec![0x2C, 5],
+        vec![0x0F],
+        local(forwarded_x),
+        call(&mut b, "ForwardsEmpty", &[]),
+        vec![0x04],
+        local(forwarded_x),
+    ]
+    .concat();
+    b.func(
+        let_forwarded,
+        let_bool,
+        forwarded_x,
+        &code,
+        26,
+        0,
+        ff::DEFINED,
+    );
+    // `X = true; X = EmptyBool(); return X;` (LetBool)
+    let code = [
+        vec![0x14],
+        bool_local(bool_x),
+        vec![0x27],
+        vec![0x14],
+        bool_local(bool_x),
+        call(&mut b, "EmptyBool", &[]),
+        vec![0x04],
+        bool_local(bool_x),
+    ]
+    .concat();
+    b.func(let_bool, out_keeps, bool_x, &code, 28, 0, ff::DEFINED);
+    // `X = 9; EmptyOut(X); return X;`
+    let code = [
+        vec![0x0F],
+        local(out_x),
+        vec![0x2C, 9],
+        call(&mut b, "EmptyOut", &local(out_x)),
+        vec![0x04],
+        local(out_x),
+    ]
+    .concat();
+    b.func(out_keeps, native_operand, out_x, &code, 25, 0, ff::DEFINED);
+    // `X = 7; X = Empty() + 1; return X;` (the native `+` writes its own result)
+    let code = [
+        vec![0x0F],
+        local(operand_x),
+        vec![0x2C, 7],
+        vec![0x0F],
+        local(operand_x),
+        vec![0x92],
+        call(&mut b, "Empty", &[]),
+        vec![0x26, 0x16],
+        vec![0x04],
+        local(operand_x),
+    ]
+    .concat();
+    b.func(
+        native_operand,
+        no_code,
+        operand_x,
+        &code,
+        29,
+        0,
+        ff::DEFINED,
+    );
+    // A function with no bytecode at all (never produced by the retail compiler).
+    b.func(no_code, calls_no_code, 0, &[], 0, 0, ff::DEFINED);
+    let code = [call(&mut b, "NoCode", &[]), vec![0x04, 0x0B]].concat();
+    b.func(calls_no_code, 0, 0, &code, 8, 0, ff::DEFINED);
+    b.class(object, 0, add);
+    b.build()
+}
+
+#[test]
+fn bodyless_declaration_runs_as_a_noop_that_writes_no_result() {
+    // Decoded semantics (Core.dll, item40i): CallFunction (0x1011e650) zeroes the callee frame
+    // and runs ProcessInternal (0x10116620), which stops at the first EX_Return and steps the
+    // return expression into the caller's result buffer; `return;` (EX_Nothing, a bare
+    // `ret 8` at 0x10115f10) writes nothing and logs nothing. execLet (0x10117190) steps the
+    // call straight into the variable, so the variable keeps its value; execLetBool
+    // (0x10117300) and the native parameter readers step into zeroed temporaries.
+    let set = set_of(bodyless_call_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let obj = vm.spawn(g(&set, "Object"), "O").unwrap();
+    vm.set_active(obj, true);
+    let mut run = |path: &str| vm.call_function(g(&set, path), obj, vec![]).unwrap();
+    // `X = Empty()` leaves X at 7, also when the empty result is forwarded by `return F()`.
+    assert_eq!(run("Object.LetKeeps"), Value::Int(7));
+    assert_eq!(run("Object.LetKeepsForwarded"), Value::Int(5));
+    // The bool assignment stores the zeroed temporary.
+    assert_eq!(run("Object.LetBoolZeroes"), Value::Bool(false));
+    // An out argument is copied back unchanged from the callee frame.
+    assert_eq!(run("Object.OutKeeps"), Value::Int(9));
+    // As a native operand the empty result reads as zero, and the native writes 0 + 1.
+    assert_eq!(run("Object.NativeOperand"), Value::Int(1));
+    // Called directly (ProcessEvent-style, zeroed parms), the result is the zero value.
+    assert_eq!(run("Object.Empty"), Value::Int(0));
+    assert_eq!(run("Object.ForwardsEmpty"), Value::Int(0));
+    assert_eq!(run("Object.EmptyBool"), Value::Bool(false));
+}
+
+#[test]
+fn function_with_no_bytecode_is_reported_not_skipped() {
+    // No retail function has an empty script (measured: the 333 bodyless declarations all
+    // carry `04 0B`). ProcessInternal reads `*Code` (0x10116715) with `Code` taken from
+    // `Script.Data` (CallFunction 0x1011e72b) before any length check, so an empty script is
+    // malformed data, not a no-op: the VM reports it with the call stack.
+    let set = set_of(bodyless_call_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let obj = vm.spawn(g(&set, "Object"), "O").unwrap();
+    vm.set_active(obj, true);
+    let e = vm
+        .call_function(g(&set, "Object.CallsNoCode"), obj, vec![])
+        .unwrap_err();
+    assert!(
+        matches!(&e.kind, VmErrorKind::Other(m) if m.contains("NoCode") && m.contains("no bytecode")),
+        "{e}"
+    );
+    assert_eq!(e.stack.last().unwrap().function, "Test.Object.CallsNoCode");
+}
+
+#[test]
+fn virtual_call_to_unresolvable_name_is_reported_never_skipped() {
+    // Decoded (Core.dll, item40i): a name that resolves to no function in the state or class
+    // chain makes FindFunctionChecked (0x1012f080) log "Failed to find function %s in %s"
+    // (0x1017ac0c) on GError (0x10176614, the fatal error device) and return NULL. The VM
+    // surfaces it as a NoSuchFunction error naming the object and function, never a skip.
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let calls = b.reserve(IMP_FUNCTION, object, "CallsMissing");
+    let calls_ret = b.reserve(IMP_INTPROP, calls, "ReturnValue");
+    b.prop(calls_ret, 0, pf::PARM | pf::RETURN_PARM);
+    // `NoSuchFunction(); return;`
+    let missing_name = b.name("NoSuchFunction");
+    let code = [0x1Bu8]
+        .into_iter()
+        .chain(compact(missing_name))
+        .chain([0x16, 0x04, 0x0B])
+        .collect::<Vec<u8>>();
+    b.func(calls, 0, calls_ret, &code, 8, 0, ff::DEFINED);
+    b.class(object, 0, calls);
+    let set = set_of(b.build());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let obj = vm.spawn(g(&set, "Object"), "O").unwrap();
+    vm.set_active(obj, true);
+    let e = vm
+        .call_function(g(&set, "Object.CallsMissing"), obj, vec![])
+        .unwrap_err();
+    assert!(
+        matches!(
+            &e.kind,
+            VmErrorKind::NoSuchFunction { object, name, .. }
+                if object == "O" && name == "NoSuchFunction"
+        ),
+        "{e}"
+    );
+    assert_eq!(e.stack.last().unwrap().function, "Test.Object.CallsMissing");
+}
+
 #[test]
 fn step_budget_stops_runaway_loops() {
     let set = set_of(fixture());
