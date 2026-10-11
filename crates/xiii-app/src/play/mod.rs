@@ -6636,13 +6636,15 @@ mod tests {
         );
     }
 
-    /// item59, re-authored by item67/item67f: Hual02 route by player input (the vent crawl, the
-    /// underfloor with the Porte11 use, the service-lift ride by the cage's own button, the
-    /// walk out through the manager-opened Porte20, the surface corridor, the depot reader,
-    /// Carrington's cell) with labelled teleports only for the measured movement gaps (the
-    /// surface corridor's BSP dead-end at (-2854,2338), the Locked Porte19 magnetic chain whose
-    /// only card pickup is sealed in the meeting-room petitesalle, the corridor block at
-    /// (-6198,842), the sealed prison perimeter, the grille pin, the pinned exit stairwell).
+    /// item59, re-authored by item67/item67f/item67g: Hual02 route by player input (the vent
+    /// crawl, the underfloor with the Porte11 use, the service-lift ride by the cage's own
+    /// button, the walk out through the manager-opened live LiftDoor1, the map's own surface
+    /// nav chain to the depot reader, the depot reader use, Carrington's cell) with labelled
+    /// teleports only for the measured movement gaps (the Locked Porte19 magnetic chain whose
+    /// only card pickup is sealed in the card-room petitesalle, the corridor block at (-6198,842),
+    /// the sealed prison perimeter, the grille pin, the pinned exit stairwell). item67g removed
+    /// the surface teleport: the item67f (-2854,2338) dead-end was a wrong turn off the map's
+    /// nav chain, not a blocker.
     /// The objectives must come from the game's own chains: goals 4/5/6 complete, goal 3 is
     /// promoted by the depot reader chain, goals 0/1/2 stay incomplete on measured blockers, and
     /// no travel is requested.
@@ -6686,16 +6688,16 @@ mod tests {
             removed >= 20,
             "the Hual02 hostile garrison is ~22 BaseSoldier pawns, removed {removed}"
         );
-        // 392 s: the crawl, the underfloor, the lift ride (~40 s, item67), the surface
-        // corridor and the reader, the cell unlock (~22 s hold), and the exit plateau walk;
-        // the script's wait_travel never completes.
+        // 500 s: the crawl, the underfloor, the lift ride (~40 s, item67), the surface nav-chain
+        // walk to the depot reader (item67g, ~160 s), the reader use, the cell unlock (~22 s
+        // hold), and the exit plateau walk; the script's wait_travel never completes.
         let outcome = run_script_inner(
             &game_dir,
             "Hual02",
             &script,
             &resolved.params,
             &scene,
-            392.0,
+            500.0,
             false,
             RunnerOptions {
                 initial: Some(runtime),
@@ -6839,27 +6841,37 @@ mod tests {
             )),
             "the LiftManager must trigger LiftDoor1 (the game's own outer-door path)"
         );
-        // item67f measured walk: with the destroyed `Porte20` no longer part of the level, the
-        // player leaves the cage north through the doorway and follows the surface corridor
-        // (max y ~2650) west, dead-ending at the BSP wall (-2854,2338) (measured).
+        // item67g measured walk: with the destroyed `Porte20` no longer part of the level, the
+        // player leaves the cage north through the live `LiftDoor1` doorway and follows the
+        // map's own ReachSpec/PathNode chain (measured with `xiii-tool nav` + `box-probe`)
+        // south from the doorway to y~2436 and west along the y~1790 corridor, around the
+        // x=-5120 BSP wall, to the depot reader. The item67f dead-end at (-2854,2338) was a
+        // wrong turn off this chain (the wall is real BSP), not a blocker; the surface teleport
+        // is removed.
         let walk = outcome
             .trace
             .iter()
-            .filter(|s| (232.0..258.0).contains(&s.1));
+            .filter(|s| (232.0..402.0).contains(&s.1));
         let max_y = walk.clone().map(|s| s.2[1]).fold(f32::MIN, f32::max);
         assert!(
             max_y > 2550.0,
             "the walker must leave the cage through the doorway (max corridor y {max_y})"
         );
-        let pin = outcome
-            .trace
-            .iter()
-            .min_by(|a, b| (a.1 - 256.0).abs().total_cmp(&(b.1 - 256.0).abs()))
-            .expect("trace sample");
+        let min_y = walk.clone().map(|s| s.2[1]).fold(f32::MAX, f32::min);
         assert!(
-            (pin.2[0] - -2854.0).abs() < 60.0 && (pin.2[1] - 2338.0).abs() < 60.0,
-            "the surface corridor must dead-end at the measured BSP wall (-2854,2338): got {:?}",
-            pin.2
+            min_y < 900.0,
+            "the walker must follow the nav chain all the way to the depot corridor (min y {min_y})"
+        );
+        // The depot reader was reached by real input: over the surface walk the player gets
+        // within a few UU of the reader's volume (MagneticPassTrigger1 at -5259,803), where the
+        // aimed use runs.
+        let closest = walk
+            .clone()
+            .map(|s| ((s.2[0] + 5259.0).powi(2) + (s.2[1] - 803.0).powi(2)).sqrt())
+            .fold(f32::MAX, f32::min);
+        assert!(
+            closest < 60.0,
+            "the nav-chain walk must reach the depot reader (-5259,803): closest {closest:.1} UU"
         );
         // The depot reader was aimed and used (the game's TargetActor + bCanTrigger -> Grab),
         // but the player carries no matching card, so Grab only ran
