@@ -227,6 +227,37 @@ mod tests {
     }
 
     #[test]
+    fn a_sliding_panel_mover_reposes_and_blocks_the_lane_the_vm_moves_it_across() {
+        // item40l: the world-space collision triangles of a mover are re-posed by the VM
+        // transform (they are not re-registered), so a panel serialized off a lane and slid
+        // across it by the VM blocks the walk exactly at the slid pose. This is the measured
+        // Amos01 `XIIIMover9` door: serialized (base) off the ground corridor, opened by the
+        // game's clabataille chain across it; the route therefore uses the elevated walkway.
+        let y = 10.0_f32;
+        let panel: Vec<Triangle> = vec![
+            [[-1.0, y, -1.0], [1.0, y, -1.0], [1.0, y, 1.0]],
+            [[-1.0, y, -1.0], [1.0, y, 1.0], [-1.0, y, 1.0]],
+        ];
+        let mut world = CollisionWorld::new(std::iter::empty());
+        let index = world.add_moving(MovingObject::from_world_triangles(
+            panel,
+            7,
+            [0.0, y, 0.0],
+            rotation_rows([0, 0, 0]),
+        ));
+        let (a, b, half) = ([-5.0_f32, 0.0, 0.0], [5.0_f32, 0.0, 0.0], [0.1_f32; 3]);
+        assert!(
+            world.sweep(a, b, half).is_none(),
+            "the base panel sits off the lane and must not block it"
+        );
+        world.set_moving_transform(index, [0.0, 0.0, 0.0], rotation_rows([0, 0, 0]));
+        assert!(
+            world.sweep(a, b, half).is_some(),
+            "the slid panel covers the lane and must block the walk"
+        );
+    }
+
+    #[test]
     fn identity_rotation_rows_are_identity() {
         let r = rotation_rows([0, 0, 0]);
         for (i, row) in r.iter().enumerate() {

@@ -150,9 +150,17 @@ t=243.00 crouch off
 t=244.00 goto -1500 120
 t=245.00 goto -1370 150
 t=246.00 goto -1290 155
-t=246.80 crouch on
-t=247.40 goto -1235 155
-t=251.00 goto -1100 150
+# item40k: BreakableMover3 (-1279,154, class-default Health 10) fills the crouch doorway -
+# the standing box rests against it at x=-1313 (measured run 1; the pre-merge runs passed an
+# intact grille by a physics slip). One fist punch breaks Health 10; the second covers timing
+# slack and its ray ends in the empty crawl behind the doorway.
+t=246.80 track BreakableMover3
+t=247.50 shoot
+t=249.50 shoot
+t=251.00 track off
+t=251.50 crouch on
+t=252.00 goto -1235 155
+t=256.00 goto -1100 150
 # Zone 17 crawl: ceiling 128, floor z=0, nav chain (PathNode161/162/163/164/167).
 t=268.00 goto -1098 300
 t=274.00 goto -1098 421
@@ -175,13 +183,9 @@ t=343.00 shoot
 t=344.50 track off
 t=346.00 goto -1021 2600
 t=354.00 goto -1021 2704
-# BreakableMover5 (-1279,2708) is the crawl corridor's west vent grille (Health 10).
-t=362.00 track BreakableMover5
-t=363.00 shoot
-t=364.50 shoot
-t=366.00 shoot
-t=367.50 shoot
-t=369.00 track off
+# item40k: the old BreakableMover5 punch here was out of fist reach - the grille stands at
+# the ring corridor's west mouth (x=-1279, 258 UU west); it is punched from the strip side in
+# the zone-39 ring section below.
 t=371.00 goto -1021 2900
 t=379.00 goto -1010 3100
 t=385.00 goto -1010 3194
@@ -196,9 +200,10 @@ t=417.00 track BreakableMover6
 t=418.00 shoot
 t=419.50 shoot
 t=421.00 track off
-# Zone 45 west; Porte6 is opened by Cine5 (clabataille) in the authored game - the route keeps
-# the labelled bypass (use) because the scene's CineController sequence does not reach the door
-# action in the VM.
+# Zone 45 west; Porte6 is opened by the game's own clabataille chain (TouchTrigger41 ->
+# XIIIMover9 -> Cine5 scene -> Porte6). Measured on this tree (clabataille opens Porte6 at
+# t=388): the door is already open, so the route must NOT `use` it - a use toggles it shut
+# (XIIIPorte.PlayerTriggerToggle) and blocks the zone-45 west exit.
 t=423.00 goto -1800 3300
 t=425.00 goto -2300 3450
 # item40j: BaseSoldier18 (Tag 'clabataille', event 'dialamos5', static (-2744,4130) facing
@@ -206,10 +211,12 @@ t=425.00 goto -2300 3450
 # hits every ~1.2-2.4 s (measured TakeDamage 80 DTGunned = -12 hp; the old cadence stood in his
 # line at (-2649,3550) and (-2487,3803) and died at t=437 with 5 hits). Run the hall to Porte7
 # without a stand; every later command is shifted 12.5 s earlier to match.
+# Steer through the Porte6 doorway west of the door leaf: the BSP block at y 3584..3616 spans
+# x -2624..-2176, so the passable lane is x < -2624 (measured box-probe at -2624,3550 is
+# start-penetrating; the door leaf itself is at x -2752..-2624).
 t=426.50 goto -2560 3530
-t=427.50 goto -2624 3600
-t=428.00 use Porte6
-t=428.80 goto -2560 3690
+t=427.50 goto -2700 3620
+t=428.80 goto -2500 3800
 t=429.80 goto -2470 3900
 t=431.00 goto -2410 4150
 t=432.20 goto -2380 4400
@@ -250,25 +257,40 @@ t=599.50 goto -2405 3942
 t=605.50 goto -2280 3800
 t=609.50 use Porte35
 t=613.50 goto -2110 3540
-t=619.50 goto -2225 3573
-t=625.50 goto -2411 3218
-t=632.50 goto -2567 3018
-t=639.50 goto -2543 2638
-t=645.50 goto -2349 2569
-t=650.50 goto -2343 2539
-# Zone 39 ring: west block (TouchTrigger24), north strip, east strip top.
-t=657.50 goto -1800 2700
-t=666.50 goto -1250 2750
-t=672.50 goto -1000 2750
-t=679.50 goto -800 2900
-t=686.50 goto -700 3200
-t=693.50 goto -700 3500
-t=701.50 goto -300 3520
-t=709.50 goto 300 3520
-t=717.50 goto 480 3300
-t=727.50 goto 478 2930
+# item40k zone-39 ring re-authoring (bsp grid, box-probe and nav measured): the old west loop
+# pressed the M/J boundary wall (south face y~3268, x -2500..-1750) - every pre-merge run
+# stalled there and bled out. The authored crossing is the k strip (x -1650..-1300, clear
+# standing: box-probe -1500,3250 -> -1500,2700 no hit) between the thin wall (x -1750..-1700)
+# and the block (x -1280..-1076): north strip east, strip south to the south crawl corridor
+# (y 2644..2772, ceiling 128; nav PathNode185/173/172/171), punch its west grille
+# BreakableMover5 from the strip side, then crawl east under the block.
+t=619.50 goto -1700 3480
+t=625.50 goto -1500 3250
+t=633.50 goto -1500 2760
+t=640.50 goto -1330 2708
+# BreakableMover5 (x=-1279, y 2646..2770, Health 10): close to contact first (49 UU; the fist
+# ray reaches 100 UU and a 101 UU stand misses - the measured BM6 lesson), then punch.
+t=647.00 track BreakableMover5
+t=648.00 shoot
+t=649.50 shoot
+t=651.00 track off
+# Crouch-crawl east under the block (z 0..128); stand past x=-1076.
+t=651.50 crouch on
+t=652.00 goto -1240 2700
+t=656.00 goto -1100 2700
+t=660.00 crouch off
+t=660.50 goto -1000 2750
+# item40k: the corridor exit runs 12 s ahead of the old schedule (the k strip replaces the
+# ~50 s west loop); the tail keeps the original waypoint cadence, shifted to match.
+t=667.50 goto -800 2900
+t=674.50 goto -700 3200
+t=681.50 goto -700 3500
+t=689.50 goto -300 3520
+t=697.50 goto 300 3520
+t=705.50 goto 480 3300
+t=715.50 goto 478 2930
 # SW slope from the strip top down to zone 7's roof (r8/r9-validated slide line).
-t=733.50 goto 400 1990
+t=721.50 goto 400 1990
 # Zone 7 west, 7-6 portal, zone 6, nav chain 6/8/12/33.
 t=739.50 goto 400 2000
 t=746.50 goto -400 1900
