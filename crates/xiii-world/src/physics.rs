@@ -83,11 +83,41 @@ pub struct WorldPhysicsAdapter {
     /// Registered mover actor names by their collision source id (reverse of `mover_by_name`).
     mover_names_by_source: HashMap<u32, String>,
     /// item53: per placed-mesh actor (lowercased name prefix of a `"<actor> -> <mesh>"` source),
-    /// the lazily built zero-extent sub-world of that actor's own collision triangles plus its
-    /// per-source one-sidedness flags, for `WorldPhysics::actor_mesh_hit`. `None` caches "no
-    /// mesh data" so the VM's cylinder fallback stays in charge; registered movers always cache
-    /// `None` (their triangles live in the moving objects).
+    /// the decoded zero-extent sub-world plus per-source one-sidedness flags, for
+    /// `WorldPhysics::actor_mesh_hit`. Scene construction includes non-blocking and empty
+    /// products; entry-only adapters build this lazily. `None` means missing mesh data.
+    /// Registered movers query moving objects first, retaining this base-pose line product
+    /// for registration independently of the movement hull.
     actor_meshes: HashMap<String, Option<(CollisionWorld, Vec<bool>)>>,
+}
+
+/// UStaticMesh::LineCheck 0x104030e0..0x1040314d pulls the reported hit back
+/// by min(0.1 / |End-Start|, 0.1) in trace-time units, then clamps to [0,1].
+/// Endpoints are Unreal units: using the presentation scale changes the clearance.
+fn static_mesh_line_hit(start: [f32; 3], end: [f32; 3], time: f32, normal: [f32; 3]) -> WorldHit {
+    let d = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+    let length = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let backoff = if length > 0.0 {
+        (0.1 / length).min(0.1)
+    } else {
+        0.1
+    };
+    let time = (time - backoff).clamp(0.0, 1.0);
+    // 0x104031c0..0x1040321d flips a normal pointing along the trace.
+    let normal = if d[0] * normal[0] + d[1] * normal[1] + d[2] * normal[2] > 0.0 {
+        [-normal[0], -normal[1], -normal[2]]
+    } else {
+        normal
+    };
+    WorldHit {
+        location: [
+            start[0] + d[0] * time,
+            start[1] + d[1] * time,
+            start[2] + d[2] * time,
+        ],
+        normal,
+        time,
+    }
 }
 
 impl WorldPhysicsAdapter {
@@ -117,6 +147,15 @@ impl WorldPhysicsAdapter {
             .map(|path| path.contains(" -> "))
             .collect();
         physics.source_names = scene.collision_sources.clone();
+        for (name, triangles) in &scene.actor_line_primitives {
+            physics.actor_meshes.insert(
+                name.clone(),
+                Some((
+                    CollisionWorld::new(triangles.iter().copied().map(|tri| (tri, 0))),
+                    vec![true],
+                )),
+            );
+        }
         physics
     }
 
@@ -239,7 +278,9 @@ impl WorldPhysics for WorldPhysicsAdapter {
             && let Some(object) = self.line_world.moving(line_index)
         {
             if object.triangle_count() == 0 {
-                return ActorMeshHit::NoData;
+                // A decoded empty collision set is a known miss, not missing mesh data.
+                // Retrying the class-default cylinder invents geometry (e.g. light fixtures).
+                return ActorMeshHit::Miss;
             }
             let s = to_bevy_position(start);
             let e = to_bevy_position(end);
@@ -275,15 +316,12 @@ impl WorldPhysics for WorldPhysicsAdapter {
                 }
             }
             return match best {
-                Some((t, n)) => ActorMeshHit::Hit(WorldHit {
-                    location: bevy_to_unreal_position([
-                        s[0] + d[0] * t,
-                        s[1] + d[1] * t,
-                        s[2] + d[2] * t,
-                    ]),
-                    normal: bevy_to_unreal_direction(n),
-                    time: t,
-                }),
+                Some((t, n)) => ActorMeshHit::Hit(static_mesh_line_hit(
+                    start,
+                    end,
+                    t,
+                    bevy_to_unreal_direction(n),
+                )),
                 None => ActorMeshHit::Miss,
             };
         }
@@ -326,16 +364,12 @@ impl WorldPhysics for WorldPhysicsAdapter {
         let Some(hit) = world.ray_with_one_sided_sources(s, e, one_sided) else {
             return ActorMeshHit::Miss;
         };
-        let point = [
-            s[0] + (e[0] - s[0]) * hit.t,
-            s[1] + (e[1] - s[1]) * hit.t,
-            s[2] + (e[2] - s[2]) * hit.t,
-        ];
-        ActorMeshHit::Hit(WorldHit {
-            location: bevy_to_unreal_position(point),
-            normal: bevy_to_unreal_direction(hit.normal),
-            time: hit.t,
-        })
+        ActorMeshHit::Hit(static_mesh_line_hit(
+            start,
+            end,
+            hit.t,
+            bevy_to_unreal_direction(hit.normal),
+        ))
     }
 
     fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
@@ -465,6 +499,18 @@ impl WorldPhysics for WorldPhysicsAdapter {
         self.box_world.remove_static_source(source);
         self.line_world.remove_static_source(source);
         let bevy: Vec<Triangle> = triangles.iter().map(|t| t.map(to_bevy_position)).collect();
+        // The registration input is the movement (box) set. Keep the separately decoded
+        // line set; using the simplified box hull here screens interaction rays.
+        let line_bevy = self
+            .actor_meshes
+            .get(&actor.to_ascii_lowercase())
+            .and_then(|entry| entry.as_ref())
+            .map(|(world, _)| {
+                (0..world.triangle_count())
+                    .map(|i| *world.triangle(i as u32))
+                    .collect()
+            })
+            .unwrap_or_else(|| bevy.clone());
         let center = to_bevy_position(origin);
         let rows = rotation_rows(rotation);
         let box_index = self
@@ -478,7 +524,7 @@ impl WorldPhysics for WorldPhysicsAdapter {
         let line_index = self
             .line_world
             .add_moving(MovingObject::from_world_triangles(
-                bevy, source, center, rows,
+                line_bevy, source, center, rows,
             ));
         self.mover_names_by_source
             .insert(source, actor.to_ascii_lowercase());
@@ -565,6 +611,72 @@ mod tests {
     /// Unreal coordinates of a Bevy point (via the adapter's public inverse).
     fn u(p: [f32; 3]) -> [f32; 3] {
         bevy_to_unreal_position(p)
+    }
+
+    #[test]
+    fn decoded_empty_mover_mesh_is_a_miss_not_missing_data() {
+        let mut scene = crate::WorldScene::default();
+        scene
+            .actor_line_primitives
+            .insert("empty".into(), Vec::new());
+        let mut p = WorldPhysicsAdapter::from_scene_with_line_sidedness(&scene);
+        assert!(matches!(
+            p.actor_mesh_hit("Empty", [-10.0, 0.0, 0.0], [10.0, 0.0, 0.0]),
+            ActorMeshHit::Miss
+        ));
+        assert!(matches!(
+            p.actor_mesh_hit("Empty", [0.0; 3], [0.0; 3]),
+            ActorMeshHit::Miss
+        ));
+        assert!(matches!(
+            p.actor_mesh_hit("Unknown", [0.0; 3], [0.0; 3]),
+            ActorMeshHit::NoData
+        ));
+    }
+
+    #[test]
+    fn static_mesh_line_hit_backoff_preserves_unreal_clearance_and_boundaries() {
+        let hit = static_mesh_line_hit([0.0; 3], [160.0, 0.0, 0.0], 0.5, [-1.0, 0.0, 0.0]);
+        assert!((hit.location[0] - 79.9).abs() < 1e-5);
+        let short = static_mesh_line_hit([0.0; 3], [0.5, 0.0, 0.0], 0.5, [-1.0, 0.0, 0.0]);
+        assert!((short.location[0] - 0.2).abs() < 1e-6);
+        let touching = static_mesh_line_hit([0.0; 3], [160.0, 0.0, 0.0], 0.0, [-1.0, 0.0, 0.0]);
+        assert_eq!(touching.time, 0.0);
+        assert_eq!(touching.location, [0.0; 3]);
+        let backface = static_mesh_line_hit([0.0; 3], [160.0, 0.0, 0.0], 0.5, [1.0, 0.0, 0.0]);
+        assert_eq!(backface.normal, [-1.0, 0.0, 0.0]);
+        let degenerate = static_mesh_line_hit([1.0; 3], [1.0; 3], 0.0, [0.0; 3]);
+        assert_eq!(degenerate.location, [1.0; 3]);
+    }
+
+    #[test]
+    fn registered_mover_retains_line_set_instead_of_box_hull() {
+        let box_tri = [[0.0, -10.0, -10.0], [0.0, 10.0, -10.0], [0.0, 0.0, 10.0]];
+        let line_tri = [
+            [100.0, -10.0, -10.0],
+            [100.0, 10.0, -10.0],
+            [100.0, 0.0, 10.0],
+        ];
+        let mut scene = crate::WorldScene::default();
+        scene
+            .actor_line_primitives
+            .insert("door".into(), vec![line_tri.map(to_bevy_position)]);
+        let mut p = WorldPhysicsAdapter::from_scene_with_line_sidedness(&scene);
+        p.register_mover("Door", 0, &[box_tri], [0.0; 3], [0; 3]);
+        assert!(matches!(
+            p.actor_mesh_hit("Door", [-50.0, 0.0, 0.0], [50.0, 0.0, 0.0]),
+            ActorMeshHit::Miss
+        ));
+        let ActorMeshHit::Hit(hit) = p.actor_mesh_hit("Door", [-50.0, 0.0, 0.0], [150.0, 0.0, 0.0])
+        else {
+            panic!("line set hit");
+        };
+        assert!((hit.location[0] - 99.9).abs() < 1e-4);
+        p.set_mover("Door", [50.0, 0.0, 0.0], [0; 3]);
+        assert!(matches!(
+            p.actor_mesh_hit("Door", [-50.0, 0.0, 0.0], [120.0, 0.0, 0.0]),
+            ActorMeshHit::Miss
+        ));
     }
 
     #[test]

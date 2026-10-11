@@ -2174,7 +2174,12 @@ fn actor_trace_actors(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResu
     if !vm.physics_ready("Actor.TraceActors", Some(309), c.this, Value::Void)? {
         return Ok(NativeOutcome::Iterate(Vec::new()));
     }
-    let rows = vm.vm_trace_actors(c.this, base, start, end, extent)?;
+    let additional = if c.omitted(7) {
+        0
+    } else {
+        int(vm, a, 7)? as u32
+    };
+    let rows = vm.vm_trace_actors_flags(c.this, base, start, end, extent, additional)?;
     Ok(NativeOutcome::Iterate(
         rows.into_iter()
             .map(|(actor, loc, normal)| {

@@ -8153,10 +8153,6 @@ impl<'s> Vm<'s> {
     /// `bHidden` is deliberately NOT tested: it appears nowhere in the hash insert/remove paths,
     /// the hash walk, or any `ShouldTrace` override. A carried first-person weapon does not block
     /// because its class defaults clear `bCollideActors` (`xiii.Fists`, measured).
-    fn trace_admits_actor(&self, candidate: ObjectId, tracer: ObjectId, nonzero: bool) -> bool {
-        self.trace_admits_actor_flags(candidate, tracer, nonzero, 0xbf)
-    }
-
     fn trace_admits_actor_flags(
         &self,
         candidate: ObjectId,
@@ -8222,6 +8218,7 @@ impl<'s> Vm<'s> {
         self.bool_prop(candidate, "bBlockActors") && self.bool_prop(candidate, "bBlockPlayers")
     }
 
+    #[cfg(test)]
     pub(crate) fn vm_trace_actors(
         &mut self,
         caller: ObjectId,
@@ -8229,6 +8226,18 @@ impl<'s> Vm<'s> {
         start: [f32; 3],
         end: [f32; 3],
         extent: [f32; 3],
+    ) -> VmResult<Vec<ActorTraceHit>> {
+        self.vm_trace_actors_flags(caller, base, start, end, extent, 0)
+    }
+
+    pub(crate) fn vm_trace_actors_flags(
+        &mut self,
+        caller: ObjectId,
+        base: Option<GlobalRef>,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+        additional: u32,
     ) -> VmResult<Vec<ActorTraceHit>> {
         let Some(provider) = self.physics.as_mut() else {
             return Err(self.err(VmErrorKind::NoPhysicsProvider {
@@ -8267,7 +8276,8 @@ impl<'s> Vm<'s> {
             if base.is_some_and(|class| !self.objects[id as usize].layout.chain.contains(&class)) {
                 continue;
             }
-            if !self.trace_admits_actor(id, caller, nonzero) {
+            // Engine.dll execTraceActors 0x103e8e68: TraceFlags = 0x9f | extra.
+            if !self.trace_admits_actor_flags(id, caller, nonzero, 0x9f | additional) {
                 continue;
             }
             let (loc, radius, height) = self.actor_cylinder(id);
@@ -8288,7 +8298,10 @@ impl<'s> Vm<'s> {
                 dx * dx + dy * dy <= (radius + extent[0].max(0.0)).powi(2)
                     && dz <= height + extent[2].max(0.0)
             };
-            if zero_extent && self.actor_has_static_mesh(id) {
+            if zero_extent
+                && self.actor_has_static_mesh(id)
+                && !(self.is_mover(id) && self.bool_prop(id, "bUseCylinderCollision"))
+            {
                 if cylinder.is_some() || start_inside_cylinder {
                     mesh_candidates.push(id);
                 }
@@ -8321,13 +8334,8 @@ impl<'s> Vm<'s> {
                 .unwrap_or(crate::physics::ActorMeshHit::NoData);
             let hit = match outcome {
                 crate::physics::ActorMeshHit::Hit(hit) => Some((hit.time, hit.normal)),
-                // item54: a registered mover whose mesh model misses the ray still answers
-                // through its collision cylinder — the class-authored interactive volume
-                // (BreakableMover r/h=160) that `DrawInteractions`' TargDist gate is sized for;
-                // the registered triangle set is the render mesh's simplified model (a thin
-                // grille quad) and does not fill it. Placed static-mesh actors (item53) keep
-                // strict mesh semantics: a ray through a mesh opening does not hit.
-                crate::physics::ActorMeshHit::Miss if self.is_mover(id) => cylinder_fallback(),
+                // item71: the hash dispatches exactly one primitive LineCheck (0x10349f2e).
+                // A mesh miss is final, including movers; there is no cylinder retry.
                 crate::physics::ActorMeshHit::Miss => None,
                 crate::physics::ActorMeshHit::NoData => cylinder_fallback(),
             };

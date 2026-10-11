@@ -6496,8 +6496,8 @@ mod tests {
         let _ = porte154;
     }
 
-    /// Hual04a's walked route currently stops at the explicit corpse-bounds native failure.
-    /// Pin the failure and the game's objective state rather than granting a card or goals.
+    /// Hual04a: earned card, reader, bureau and fuse installation by player input.
+    /// Pin the next authored reinforcement/FinDeMission failure before lever/travel.
     #[test]
     fn opt_in_hual04a_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -6525,42 +6525,24 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            335.0,
+            450.0,
         )
         .expect("run Hual04a route");
         let session = &outcome.session;
         let vm = session.vm();
         let mi = session.map_info().expect("Hual04a MapInfo");
         let pc = session.controller.expect("player controller");
-        let Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(interaction)))) =
-            vm.get_property(pc, "MyInteraction")
-        else {
-            panic!("player interaction");
-        };
-        let blocker = vm
-            .find_object("BreakAbleMover69")
-            .expect("reader trace blocker");
-        assert_eq!(
-            vm.get_property(*interaction, "TargetActor"),
-            Some(&xiii_script::Value::Object(Some(
-                xiii_script::ObjRef::Instance(blocker)
-            )))
-        );
-        assert_eq!(
-            vm.get_property(*interaction, "bCanTrigger"),
-            Some(&xiii_script::Value::Bool(false))
-        );
         let reader = vm
             .find_object("MagneticPassTrigger4")
             .expect("bureau reader");
         let door = vm.find_object("Porte11").expect("bureau door");
         assert_eq!(
             vm.get_property(reader, "Icon"),
-            vm.get_property(reader, "NeverUsedIcon")
+            vm.get_property(reader, "UsedIcon")
         );
         assert_eq!(
             vm.get_property(door, "KeyNum"),
-            Some(&xiii_script::Value::Byte(0))
+            Some(&xiii_script::Value::Byte(1))
         );
         let card = vm.find_live_object("MagneticCard").expect("six-kill card");
         assert_eq!(
@@ -6574,7 +6556,7 @@ mod tests {
             Some(&xiii_script::Value::Name("passtrigger_ascenseur".into()))
         );
         println!(
-            "[hual04a next blocker] carried card, aimed reader -> BreakAbleMover69, bCanTrigger=false, reader unused, Porte11 key=0; position={:?}",
+            "[hual04a next blocker] reader used, Porte11 key=1, fuse installed; FinDeMission fails anti-goal before lever/travel; position={:?}",
             session.player_location()
         );
         for (id, object) in vm.objects.iter().enumerate() {
@@ -6663,7 +6645,57 @@ mod tests {
         let goals = session.objective_states();
         assert_eq!(goals.len(), 6);
         for (index, goal) in goals.iter().enumerate() {
-            assert_eq!(goal.completed, index == 1, "objective {index}: {goal:?}");
+            assert_eq!(
+                goal.completed,
+                matches!(index, 2 | 3),
+                "objective {index}: {goal:?}"
+            );
+        }
+        assert!(goals[1].anti_goal && goals[1].primary);
+        assert!(goals[4].primary && !goals[5].primary);
+        assert_eq!(vm.state_name(mi).as_deref(), Some("FinDeMission"));
+        assert_eq!(vm.state_name(pc).as_deref(), Some("GameEnded"));
+        let carrington = vm.find_object("Cine1").expect("Carrington's authored pawn");
+        assert_eq!(
+            vm.get_property(carrington, "Controller"),
+            Some(&xiii_script::Value::Object(None)),
+            "Carrington has not received the sequence-start cue"
+        );
+        let departure = vm
+            .find_object("DetectionVolume4")
+            .expect("Carrington start volume");
+        let last_point = vm
+            .find_object("DetectionVolume5")
+            .expect("dernierpoint volume");
+        assert_eq!(
+            vm.get_property(departure, "bActivated"),
+            Some(&xiii_script::Value::Bool(false))
+        );
+        assert_eq!(
+            vm.get_property(last_point, "bActivated"),
+            Some(&xiii_script::Value::Bool(false))
+        );
+        println!(
+            "[hual04a next blocker] Carrington has no controller before Degage; DetectionVolume4/5 untouched; generators have no spawned reinforcement"
+        );
+        let lever = vm.find_object("XIIIMover1").expect("cable-car lever");
+        assert_eq!(
+            vm.get_property(lever, "KeyNum"),
+            Some(&xiii_script::Value::Byte(0))
+        );
+        for name in ["GenNMI1", "gennmi2", "gennmi3"] {
+            let id = vm
+                .find_object(name)
+                .expect("authored reinforcement generator");
+            assert_eq!(
+                vm.get_property(id, "SpawnActor"),
+                Some(&xiii_script::Value::Object(None)),
+                "{name}: empty SpawnActor drives Accessed-None bIsDead=false in case3"
+            );
+            println!(
+                "[hual04a reinforcement] {name} spawn={:?}",
+                vm.get_property(id, "SpawnActor")
+            );
         }
         assert_eq!(
             vm.get_property(mi, "NextMapLevelWithUnr"),

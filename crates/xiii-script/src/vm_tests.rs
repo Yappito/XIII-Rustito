@@ -5845,6 +5845,83 @@ fn trace_static_mesh_falls_back_to_cylinder_without_mesh_data_or_with_extent() {
 
 /// item53: `Actor.TraceActors` over a static-mesh actor honours the mesh opening too.
 #[test]
+fn trace_actors_mover_mesh_miss_is_final_unless_cylinder_is_selected() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let caller = phys_actor(&mut vm, &set, "Caller", [0.0; 3]);
+    let mover = vm.spawn(pg(&set, "Mover"), "WindowDoor").unwrap();
+    vm.set_property(mover, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, mover, true, true);
+    vm.set_property(mover, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(mover, "CollisionHeight", 0, Value::Float(160.0));
+    vm.set_property(
+        mover,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    // Start inside the nominal volume, looking through an opening: no cylinder retry.
+    let rows = vm
+        .vm_trace_actors(caller, None, [0.0, 0.0, 90.0], [100.0, 0.0, 90.0], [0.0; 3])
+        .unwrap();
+    assert!(rows.is_empty(), "mesh miss is final: {rows:?}");
+    let rows = vm
+        .vm_trace_actors(caller, None, [0.0; 3], [100.0, 0.0, 0.0], [0.0; 3])
+        .unwrap();
+    assert_eq!(rows[0].0, mover);
+    assert!((rows[0].1[0] - 40.0).abs() < 0.01);
+    // Explicit cylinder selection ignores the mesh, including its openings.
+    vm.set_property(mover, "bUseCylinderCollision", 0, Value::Bool(true));
+    let rows = vm
+        .vm_trace_actors(
+            caller,
+            None,
+            [-200.0, 0.0, 90.0],
+            [0.0, 0.0, 90.0],
+            [0.0; 3],
+        )
+        .unwrap();
+    assert_eq!(rows[0].0, mover);
+    vm.set_property(mover, "bBlockZeroExtentTraces", 0, Value::Bool(false));
+    assert!(
+        vm.vm_trace_actors(
+            caller,
+            None,
+            [-200.0, 0.0, 90.0],
+            [0.0, 0.0, 90.0],
+            [0.0; 3]
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
+#[test]
+fn trace_actors_uses_9f_and_honors_additional_blocking_filter() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let caller = phys_actor(&mut vm, &set, "Caller", [0.0; 3]);
+    let target = phys_actor(&mut vm, &set, "Target", [50.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, target, true, false);
+    vm.set_property(target, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    vm.set_property(target, "bProjTarget", 0, Value::Bool(false));
+    vm.set_property(target, "bHidden", 0, Value::Bool(true));
+    let rows = vm
+        .vm_trace_actors(caller, None, [0.0; 3], [100.0, 0.0, 0.0], [0.0; 3])
+        .unwrap();
+    assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), [target]);
+    let rows = vm
+        .vm_trace_actors_flags(caller, None, [0.0; 3], [100.0, 0.0, 0.0], [0.0; 3], 0x20)
+        .unwrap();
+    assert!(
+        rows.is_empty(),
+        "extra projectile/blocking filter must be honored"
+    );
+}
+
+#[test]
 fn trace_actors_skips_static_mesh_actor_when_the_ray_passes_through_the_mesh() {
     let set = phys_set();
     let mut vm = Vm::new(&set, VmLimits::default());
