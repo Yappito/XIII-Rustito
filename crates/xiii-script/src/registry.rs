@@ -1305,6 +1305,11 @@ fn find_path_to(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nat
     val(object_out(vm.nav_find_path_to(c.this, goal)?))
 }
 
+fn pick_wall_adjust(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let direction = vector2(vm, a, 0)?;
+    val(Value::Bool(vm.pick_wall_adjust(c.this, direction)?))
+}
+
 /// `IAController.FindBestPathToward(Actor Desired, float xyMargin, float heightMargin) -> bool`.
 ///
 /// Disassembly evidence (XIDPawn.dll `?execFindBestPathToward@AIAController` RVA 0x1AB0): it reads
@@ -3190,6 +3195,16 @@ fn get_bounding_box(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult
         // 0x0077); omitting it made those reads fail with "no struct member isvalid".
         ("isvalid".into(), Value::Byte(1)),
     ]))
+}
+
+fn recompute_bounding_volume(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    a: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let freeze = boolean(vm, a, 0)?;
+    vm.recompute_bounding_volume(c.this, freeze)?;
+    val(Value::Void)
 }
 
 fn find_inventory_kind(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -5158,6 +5173,17 @@ fn builtin_defs() -> Vec<NativeDef> {
     });
     v.push(NativeDef {
         status: NativeStatus::Partial(
+            "decoded walking detour and jump probes; flying/swimming Pick3DWallAdjust is explicitly unsupported; ADoor associated geometry override and automatic wall-hit invocation remain incomplete",
+        ),
+        ..def(
+            "Engine.Controller.PickWallAdjust",
+            "native(526) final function bool PickWallAdjust(vector HitNormal)",
+            "Engine.dll execPickWallAdjust 0x10367b80; APawn::PickWallAdjust 0x103b5120..0x103b5b74; AAIController::SetAdjustLocation 0x10368270",
+            pick_wall_adjust,
+        )
+    });
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
             "picks a point with the VM's deterministic PRNG; the engine uses its own RNG",
         ),
         ..def(
@@ -5253,6 +5279,20 @@ fn builtin_defs() -> Vec<NativeDef> {
          XIIIPorte.Locked.Trigger's FindInventoryKind('PickLockSkill') gate",
         find_inventory_kind,
     ));
+    v.push(NativeDef {
+        status: NativeStatus::Partial(
+            "channel-zero skinned render bounds; channel blending, tweening and bone controllers \
+             are not included, and presentation does not yet consume the frozen box",
+        ),
+        ..def(
+            "Engine.Actor.RecomputeBoundingVolume",
+            "native(391) final function RecomputeBoundingVolume(bool bFixed)",
+            "Engine.dll execRecomputeBoundingVolume 0x103eaa20: skeletal-instance guard; true \
+             skins vertices and freezes a world FBox at instance+0x248; false invalidates +0x260. \
+             GetRenderBoundingBox 0x103ec2b0 returns that frozen box. No collision/hash changes",
+            recompute_bounding_volume,
+        )
+    });
     v.push(NativeDef {
         status: NativeStatus::Partial(
             "the VM has no mesh/pre-pivot bounds; the returned Box is the collision cylinder \

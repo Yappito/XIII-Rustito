@@ -1214,7 +1214,9 @@ fn registry_entries_are_documented() {
     // screen-effect no-op Partials `ViewShake` (496), `ViewFlash` (505) and `CheckBob` (504),
     // reached by the hook's controller-state `PlayerMove` dispatch, plus `Pawn.FaceRotation`
     // (the PlayerMove -> UpdateRotation chain).
-    assert_eq!(defs.len(), 346);
+    // item69 adds the decoded Controller.PickWallAdjust (526) pursuit detour.
+    // item70 adds the decoded Actor.RecomputeBoundingVolume (391) render-box freeze.
+    assert_eq!(defs.len(), 348);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -4189,6 +4191,7 @@ fn item46_set() -> ScriptSet {
     let pawn = b.reserve(0, 0, "Pawn");
     let controller = b.reserve(0, 0, "IAController");
     let controller_base = b.reserve(0, 0, "Controller");
+    let ai_base = b.reserve(0, 0, "AIController");
     let move_toward = b.reserve(IMP_FUNCTION, controller_base, "MoveToward");
     let new_target = b.reserve(IMP_OBJECTPROP, move_toward, "NewTarget");
     let view_focus = b.reserve(IMP_OBJECTPROP, move_toward, "ViewFocus");
@@ -4249,6 +4252,7 @@ fn item46_set() -> ScriptSet {
         "Rotation",
         "Velocity",
         "Acceleration",
+        "AdjustLoc",
     ] {
         fields.push((b.reserve(IMP_STRUCTPROP, actor, name), compact(IMP_STRUCT)));
     }
@@ -4270,6 +4274,7 @@ fn item46_set() -> ScriptSet {
         "Angle_Visee",
         "Temps_RefreshEnemyPos",
         "DrawScale",
+        "JumpZ",
     ] {
         fields.push((b.reserve(IMP_FLOATPROP, actor, name), vec![]));
     }
@@ -4290,11 +4295,14 @@ fn item46_set() -> ScriptSet {
         "bPreparingMove",
         "bZoomed",
         "bTirSurConeMax",
+        "bCanJump",
+        "bWorldGeometry",
     ] {
         fields.push((b.reserve(IMP_BOOLPROP, actor, name), vec![]));
     }
     for name in [
         "Pawn",
+        "Controller",
         "Enemy",
         "Level",
         "BaseS",
@@ -4352,7 +4360,8 @@ fn item46_set() -> ScriptSet {
     b.class(object, 0, 0, 0);
     b.class(actor, object, fields[0].0, 0);
     b.class(controller_base, actor, move_toward, 0);
-    b.class(controller, controller_base, moving, 0);
+    b.class(ai_base, controller_base, 0, 0);
+    b.class(controller, ai_base, moving, 0);
     for class in [pawn, level, node] {
         b.class(class, actor, 0, 0);
     }
@@ -5234,6 +5243,150 @@ impl WorldPhysics for MockWorld {
 
 fn aabb_overlaps(c: [f32; 3], e: [f32; 3], mn: [f32; 3], mx: [f32; 3]) -> bool {
     (0..3).all(|i| c[i] + e[i] > mn[i] && c[i] - e[i] < mx[i])
+}
+
+fn wall_adjust_pair(vm: &mut Vm<'_>, set: &ScriptSet) -> (ObjectId, ObjectId) {
+    vm.spawn(pg(set, "LevelInfo"), "LevelInfo0").unwrap();
+    let pawn = vm.spawn(pg(set, "Pawn"), "AdjustPawn").unwrap();
+    let controller = vm
+        .spawn(pg(set, "IAController"), "AdjustController")
+        .unwrap();
+    vm.set_property(
+        controller,
+        "Pawn",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
+    );
+    vm.set_property(
+        pawn,
+        "Controller",
+        0,
+        Value::Object(Some(ObjRef::Instance(controller))),
+    );
+    vm.set_property(pawn, "Location", 0, Value::Vector([0.0; 3]));
+    vm.set_property(pawn, "Physics", 0, Value::Byte(1));
+    vm.set_property(pawn, "EyeHeight", 0, Value::Float(60.0));
+    vm.set_property(pawn, "CollisionRadius", 0, Value::Float(20.0));
+    vm.set_property(pawn, "CollisionHeight", 0, Value::Float(40.0));
+    vm.set_property(pawn, "GroundSpeed", 0, Value::Float(200.0));
+    vm.set_property(pawn, "AccelRate", 0, Value::Float(400.0));
+    vm.set_property(pawn, "JumpZ", 0, Value::Float(300.0));
+    vm.set_property(
+        controller,
+        "Destination",
+        0,
+        Value::Vector([1000.0, 0.0, 0.0]),
+    );
+    (controller, pawn)
+}
+
+#[test]
+fn pick_wall_adjust_open_side_preserves_destination_and_move_target() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let (controller, _) = wall_adjust_pair(&mut vm, &set);
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([30.0, -10.0, -100.0], [50.0, 10.0, 20.0]),
+    ));
+    let result = call_native(
+        &mut vm,
+        "Engine.Controller.PickWallAdjust",
+        controller,
+        &[false],
+        &mut [Value::Vector([1.0, 0.0, 0.0])],
+    );
+    assert_eq!(result, NativeOutcome::Value(Value::Bool(true)));
+    assert_eq!(
+        vm.vector_prop(controller, "AdjustLoc"),
+        Some([0.0, -46.0, 0.0])
+    );
+    assert!(vm.bool_prop(controller, "bAdjusting"));
+    assert_eq!(
+        vm.vector_prop(controller, "Destination"),
+        Some([1000.0, 0.0, 0.0])
+    );
+    assert_eq!(vm.obj_prop(controller, "MoveTarget"), None);
+}
+
+#[test]
+fn pick_wall_adjust_both_sides_blocked_and_zero_direction_do_not_mutate() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let (controller, _) = wall_adjust_pair(&mut vm, &set);
+    vm.set_physics(Box::new(
+        MockWorld::new()
+            .with_wall([-100.0, -30.0, -100.0], [100.0, -25.0, 100.0])
+            .with_wall([-100.0, 25.0, -100.0], [100.0, 30.0, 100.0]),
+    ));
+    assert!(!vm.pick_wall_adjust(controller, [1.0, 0.0, 0.0]).unwrap());
+    assert!(!vm.bool_prop(controller, "bAdjusting"));
+    vm.set_property(controller, "Destination", 0, Value::Vector([0.0; 3]));
+    assert!(!vm.pick_wall_adjust(controller, [0.0; 3]).unwrap());
+    assert!(
+        vm.pick_wall_adjust(controller, [f32::NAN, 0.0, 0.0])
+            .is_err()
+    );
+}
+
+#[test]
+fn pick_wall_adjust_retries_opposite_side_after_body_sweep_blocks() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let (controller, _) = wall_adjust_pair(&mut vm, &set);
+    // Eye-level sight is clear but the full pawn extent hits the low side wall.
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([-100.0, -30.0, -100.0], [100.0, -25.0, 30.0]),
+    ));
+    assert!(vm.pick_wall_adjust(controller, [1.0, 0.0, 0.0]).unwrap());
+    assert_eq!(
+        vm.vector_prop(controller, "AdjustLoc"),
+        Some([0.0, 46.0, 0.0])
+    );
+}
+
+#[test]
+fn pick_wall_adjust_jump_clearance_and_half_height_ceiling_boundary() {
+    let set = item46_set();
+    for ceiling in [false, true] {
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let (controller, pawn) = wall_adjust_pair(&mut vm, &set);
+        vm.set_property(pawn, "bCanJump", 0, Value::Bool(true));
+        let mut world = MockWorld::new().with_wall([30.0, -10.0, -100.0], [50.0, 10.0, 20.0]);
+        if ceiling {
+            world = world.with_wall([-100.0, -100.0, 80.0], [100.0, 100.0, 90.0]);
+        }
+        vm.set_physics(Box::new(world));
+        assert!(vm.pick_wall_adjust(controller, [1.0, 0.0, 0.5]).unwrap());
+        if ceiling {
+            assert_eq!(vm.byte_prop(pawn, "Physics"), 1);
+            assert!(vm.bool_prop(controller, "bAdjusting"));
+        } else {
+            assert_eq!(vm.byte_prop(pawn, "Physics"), 2);
+            assert_eq!(vm.vector_prop(pawn, "Velocity"), Some([-200.0, 0.0, 300.0]));
+            assert_eq!(
+                vm.vector_prop(pawn, "Acceleration"),
+                Some([-400.0, 0.0, 0.0])
+            );
+            assert!(!vm.bool_prop(controller, "bAdjusting"));
+        }
+    }
+}
+
+#[test]
+fn pick_wall_adjust_missing_provider_falling_and_unsupported_3d_are_explicit() {
+    let set = item46_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let (controller, pawn) = wall_adjust_pair(&mut vm, &set);
+    assert!(vm.pick_wall_adjust(controller, [1.0, 0.0, 0.0]).is_err());
+    vm.set_property(pawn, "Physics", 0, Value::Byte(2));
+    assert!(!vm.pick_wall_adjust(controller, [1.0, 0.0, 0.0]).unwrap());
+    vm.set_property(pawn, "Physics", 0, Value::Byte(4));
+    assert!(
+        vm.pick_wall_adjust(controller, [1.0, 0.0, 0.0])
+            .unwrap_err()
+            .to_string()
+            .contains("Pick3DWallAdjust")
+    );
 }
 
 /// Swept AABB vs static AABB; returns `(fraction, normal)`.
@@ -6407,6 +6560,63 @@ fn additional_trace_type_8192_excludes_pawn_candidates() {
         .vm_trace_flags(trigger, [0.0; 3], [100.0, 0.0, 0.0], 0x20bf, [0.0; 3])
         .unwrap();
     assert_eq!(hit, None, "0x20bf must not report the pawn");
+}
+
+#[test]
+fn additional_trace_type_16384_hides_decorations_only_from_world_traces() {
+    // item64f: `XIIIWeapon.RealTraceFire` traces with bTraceActors=true and 16384|65536
+    // (composed 0xbf | 0x14000) and must still hit movers and decorations (its own
+    // `bShouldGoThroughTraversable` branch reads `XIIIMover(Other)`); `HookLink.Tick`'s rope
+    // check traces with bTraceActors=false and 16384 (0x86 | 0x4000) and must not report the
+    // `HookPoint` decoration the locked projectile sits in. Movers stay admitted by `& 2`
+    // (`AMover::ShouldTrace` 0x10306c70) for both. Labelled hypothesis (see
+    // `trace_admits_actor_flags`).
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let _li = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    let tracer = phys_actor(&mut vm, &set, "Tracer", [0.0; 3]);
+    set_collision_fields(&mut vm, tracer, true, false);
+    let prop = vm.spawn(pg(&set, "Decoration"), "Anchor").unwrap();
+    vm.set_property(prop, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, prop, true, false);
+    vm.set_property(prop, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    let trace = |vm: &mut Vm<'_>, flags: u32| {
+        vm.vm_trace_flags(tracer, [0.0; 3], [200.0, 0.0, 0.0], flags, [0.0; 3])
+            .unwrap()
+            .0
+    };
+    assert_eq!(
+        trace(&mut vm, 0xbf | 0x14000),
+        Some(prop),
+        "weapon trace hits it"
+    );
+    assert_eq!(
+        trace(&mut vm, 0x86),
+        Some(prop),
+        "a plain world trace admits it (& 2)"
+    );
+    assert_eq!(
+        trace(&mut vm, 0x86 | 0x4000),
+        None,
+        "the rope check must not"
+    );
+    // Boundary: the rope trace that only ENDS inside the decoration (the locked projectile)
+    // is the measured case; a trace past it is excluded the same way.
+    assert_eq!(
+        vm.vm_trace_flags(tracer, [0.0; 3], [40.0, 0.0, 0.0], 0x86 | 0x4000, [0.0; 3])
+            .unwrap()
+            .0,
+        None
+    );
+    // A mover in the same place is reported by both compositions.
+    vm.set_property(prop, "Location", 0, Value::Vector([5000.0, 0.0, 0.0]));
+    let mv = vm.spawn(pg(&set, "Mover"), "Door").unwrap();
+    vm.set_property(mv, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, mv, true, true);
+    vm.set_property(mv, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    assert_eq!(trace(&mut vm, 0xbf | 0x14000), Some(mv));
+    assert_eq!(trace(&mut vm, 0x86 | 0x4000), Some(mv));
 }
 
 #[test]
@@ -13833,6 +14043,125 @@ use crate::animation::SeqInfo;
 /// Animation provider with posed-bone support: every sequence resolves (100 frames at 30 fps)
 /// and every bone offset is the fixed actor-rotation-space vector (200, 0, 50).
 struct PoseStub;
+
+struct BoundingPose(Vec<[f32; 3]>);
+
+impl crate::animation::AnimationData for BoundingPose {
+    fn sequence(&mut self, _: &str, _: &str) -> Result<Option<SeqInfo>, String> {
+        Err("unused sequence lookup".into())
+    }
+    fn posed_vertices(
+        &mut self,
+        _: &str,
+        _: Option<(&str, &str, f32, bool)>,
+    ) -> Result<Option<Vec<[f32; 3]>>, String> {
+        Ok(Some(self.0.clone()))
+    }
+}
+
+#[test]
+fn recompute_bounding_volume_freezes_world_vertices_and_false_invalidates() {
+    let p = ScriptPackage::load(
+        "Test",
+        bone_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .unwrap();
+    let mut set = ScriptSet::new();
+    set.add(p);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let actor = vm.spawn(sg(&set, "Actor"), "Corpse").unwrap();
+    // No mesh must be a genuine no-op, including without a provider.
+    call_native(
+        &mut vm,
+        "Engine.Actor.RecomputeBoundingVolume",
+        actor,
+        &[false],
+        &mut [Value::Bool(true)],
+    );
+    assert_eq!(vm.frozen_render_bounds(actor), None);
+    vm.set_property(
+        actor,
+        "Mesh",
+        0,
+        Value::Object(Some(ObjRef::Static(sg(&set, "Actor")))),
+    );
+    vm.set_property(actor, "Location", 0, Value::Vector([100.0, 200.0, 300.0]));
+    vm.set_property(actor, "Rotation", 0, Value::Rotator([0, 16384, 0]));
+    let properties = vm.objects[actor as usize].props.clone();
+    vm.set_animation_data(Box::new(BoundingPose(vec![
+        [1.0, 2.0, -3.0],
+        [-4.0, -5.0, 6.0],
+    ])));
+    call_native(
+        &mut vm,
+        "Engine.Actor.RecomputeBoundingVolume",
+        actor,
+        &[false],
+        &mut [Value::Bool(true)],
+    );
+    let (min, max) = vm.frozen_render_bounds(actor).unwrap();
+    for (actual, expected) in min
+        .into_iter()
+        .zip([98.0, 196.0, 297.0])
+        .chain(max.into_iter().zip([105.0, 201.0, 306.0]))
+    {
+        assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+    }
+    // Collision, location, animation and script fields must not be mutated by a render box.
+    assert_eq!(vm.objects[actor as usize].props, properties);
+    vm.set_property(actor, "Location", 0, Value::Vector([0.0; 3]));
+    assert_eq!(
+        vm.frozen_render_bounds(actor),
+        Some((min, max)),
+        "fixed box must stay in world space"
+    );
+    call_native(
+        &mut vm,
+        "Engine.Actor.RecomputeBoundingVolume",
+        actor,
+        &[false],
+        &mut [Value::Bool(false)],
+    );
+    assert_eq!(vm.frozen_render_bounds(actor), None);
+}
+
+#[test]
+fn recompute_bounding_volume_empty_and_bad_pose_do_not_invent_bounds() {
+    let p = ScriptPackage::load(
+        "Test",
+        bone_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .unwrap();
+    let mut set = ScriptSet::new();
+    set.add(p);
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let actor = vm.spawn(sg(&set, "Actor"), "Corpse").unwrap();
+    vm.set_property(
+        actor,
+        "Mesh",
+        0,
+        Value::Object(Some(ObjRef::Static(sg(&set, "Actor")))),
+    );
+    assert!(
+        vm.recompute_bounding_volume(actor, true).is_err(),
+        "missing pose provider must fail"
+    );
+    vm.set_animation_data(Box::new(BoundingPose(Vec::new())));
+    vm.recompute_bounding_volume(actor, true).unwrap();
+    assert_eq!(vm.frozen_render_bounds(actor), None);
+    vm.set_animation_data(Box::new(BoundingPose(vec![[f32::NAN, 0.0, 0.0]])));
+    assert!(vm.recompute_bounding_volume(actor, true).is_err());
+    assert_eq!(vm.frozen_render_bounds(actor), None);
+    vm.set_animation_data(Box::new(PoseStub));
+    assert!(
+        vm.recompute_bounding_volume(actor, true).is_err(),
+        "unsupported provider must fail"
+    );
+}
 
 impl crate::animation::AnimationData for PoseStub {
     fn sequence(&mut self, _source: &str, _seq: &str) -> Result<Option<SeqInfo>, String> {

@@ -7,6 +7,8 @@
 //!
 //! Supported commands:
 //! - `switch_weapon <byte>` / `next_weapon`: normal controller weapon selection execs.
+//! - `select_weapon <byte>`: the retail number-key exec (DefUser.ini `8=SelectWeapon 14`), which
+//!   also leaves item mode (`XIIIPlayerController.SelectWeapon` -> `SwitchWeaponMode`).
 //! - `forward <v>` / `back <v>`: set the forward axis (`back` negates `v`).
 //! - `right <v>` / `left <v>`: set the strafe axis (`left` negates `v`).
 //! - `walk <0|1|on|off>`: set the Shift walk modifier.
@@ -68,6 +70,10 @@ pub enum Command {
     /// fraction of the tracked pawn's CollisionHeight (0.6 default: spine band; a level ray at
     /// 0.85 crosses the head band for 3x bullet damage, see mod.rs track sites).
     Track(Option<(String, f32)>),
+    /// Press the player's Reload exec, as the R binding does.
+    Reload,
+    /// Dispatch the controller's ordinary Grab exec using its script-selected aim target.
+    GrabInput,
     /// Move the box centre to an absolute Unreal-unit position (harness bootstrap).
     Teleport([f32; 3]),
     /// Autopilot toward an Unreal-unit waypoint (the driver re-aims and walks; not a teleport).
@@ -111,6 +117,8 @@ pub enum Command {
     SetGoal(i32),
     /// Normal player controller SwitchWeapon exec, selecting a carried inventory group.
     SwitchWeapon(u8),
+    /// Retail number-key `SelectWeapon` exec (selects a group, leaving item mode if needed).
+    SelectWeapon(u8),
     /// Normal player controller NextWeapon exec.
     NextWeapon,
     /// item18 diagnostic command: give the local player control by running the game's own
@@ -123,6 +131,17 @@ pub enum Command {
     /// MedKit/FullMedKit from the pawn's inventory by `HealthPercent` and calls
     /// `Med.UseMeQuick`). Edge-triggered like `use`.
     QuickHeal,
+}
+
+/// A normal controller weapon-selection exec, in script order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeaponInput {
+    /// `XIIIPlayerController.SwitchWeapon(group)`.
+    Switch(u8),
+    /// `XIIIPlayerController.SelectWeapon(group)` (the retail number keys).
+    Select(u8),
+    /// `XIIIPlayerController.NextWeapon`.
+    Next,
 }
 
 /// A parsed input script, time-ordered.
@@ -231,6 +250,8 @@ impl Script {
                     Command::Item(path.to_owned())
                 }
                 "next_item" => Command::NextItem,
+                "reload" => Command::Reload,
+                "grab_input" => Command::GrabInput,
                 "weapon" | "grant" => {
                     let path = it
                         .next()
@@ -259,6 +280,17 @@ impl Script {
                         return Err(format!("line {n}: unexpected switch_weapon argument"));
                     }
                     Command::SwitchWeapon(group)
+                }
+                "select_weapon" => {
+                    let group = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: select_weapon needs a byte"))?
+                        .parse::<u8>()
+                        .map_err(|_| format!("line {n}: invalid weapon group"))?;
+                    if it.next().is_some() {
+                        return Err(format!("line {n}: unexpected select_weapon argument"));
+                    }
+                    Command::SelectWeapon(group)
                 }
                 "next_weapon" => {
                     if it.next().is_some() {
@@ -313,7 +345,7 @@ pub struct Drive {
     jump_pending: bool,
     use_pending: bool,
     fire_pending: bool,
-    weapon_inputs: Vec<Option<u8>>,
+    weapon_inputs: Vec<WeaponInput>,
     /// Weapons requested (`weapon <Package.Class>`) and not yet applied by the host.
     weapons: Vec<String>,
     /// item64: held fire/alt-fire buttons (`fire_hold`/`altfire_hold`) and whether this tick's
@@ -338,6 +370,7 @@ pub struct Drive {
     control_pending: bool,
     /// `heal` (QuickHeal exec) requested (edge-triggered) and not yet applied by the host.
     heal_pending: bool,
+    exec_inputs: Vec<&'static str>,
     tracking: Option<String>,
     /// Aim height fraction for the active tracking (0.6 default, `track <actor> <f>` sets it).
     track_height: f32,
@@ -371,6 +404,7 @@ impl Drive {
             goals: Vec::new(),
             control_pending: false,
             heal_pending: false,
+            exec_inputs: Vec::new(),
             tracking: None,
             track_height: 0.6,
             track_location: None,
@@ -425,6 +459,11 @@ impl Drive {
         std::mem::take(&mut self.heal_pending)
     }
 
+    /// Drains ordinary player exec edges (Reload and Grab), preserving input order.
+    pub fn take_exec_inputs(&mut self) -> Vec<&'static str> {
+        std::mem::take(&mut self.exec_inputs)
+    }
+
     /// Supplies the current actor location to the active tracking command.
     pub fn set_track_location(&mut self, actor: Option<&str>, location: Option<[f32; 3]>) {
         self.track_location = match (self.tracking.as_deref(), actor) {
@@ -453,7 +492,7 @@ impl Drive {
     }
 
     /// Drains normal weapon-selection inputs, preserving repeated commands in order.
-    pub fn take_weapon_inputs(&mut self) -> Vec<Option<u8>> {
+    pub fn take_weapon_inputs(&mut self) -> Vec<WeaponInput> {
         std::mem::take(&mut self.weapon_inputs)
     }
 
@@ -504,6 +543,8 @@ impl Drive {
                 }
                 Command::Item(path) => self.items.push(path.clone()),
                 Command::NextItem => self.next_item_pending = true,
+                Command::Reload => self.exec_inputs.push("Reload"),
+                Command::GrabInput => self.exec_inputs.push("Grab"),
                 Command::Weapon(path) => self.weapons.push(path.clone()),
                 &Command::SetGoal(n) => self.goals.push(n),
                 Command::WaitTravel => {
@@ -512,8 +553,13 @@ impl Drive {
                     self.cursor += 1;
                     break;
                 }
-                &Command::SwitchWeapon(group) => self.weapon_inputs.push(Some(group)),
-                Command::NextWeapon => self.weapon_inputs.push(None),
+                &Command::SwitchWeapon(group) => {
+                    self.weapon_inputs.push(WeaponInput::Switch(group))
+                }
+                &Command::SelectWeapon(group) => {
+                    self.weapon_inputs.push(WeaponInput::Select(group))
+                }
+                Command::NextWeapon => self.weapon_inputs.push(WeaponInput::Next),
                 Command::TakeControl => self.control_pending = true,
                 Command::QuickHeal => self.heal_pending = true,
             }
@@ -565,19 +611,30 @@ mod tests {
 
     #[test]
     fn normal_weapon_input_preserves_order_and_does_not_request_diagnostic_equip() {
-        let script =
-            Script::parse("t=1 switch_weapon 2\nt=1 next_weapon\nt=1 switch_weapon 20\n").unwrap();
+        let script = Script::parse(
+            "t=1 switch_weapon 2\nt=1 next_weapon\nt=1 select_weapon 14\nt=1 switch_weapon 20\n",
+        )
+        .unwrap();
         let mut drive = Drive::new(&script);
         let mut sim = PlayerSim::new([0.0; 3], 0.0);
         drive.advance(0.9, &mut sim);
         assert!(drive.take_weapon_inputs().is_empty());
         drive.advance(1.0, &mut sim);
-        assert_eq!(drive.take_weapon_inputs(), [Some(2), None, Some(20)]);
+        assert_eq!(
+            drive.take_weapon_inputs(),
+            [
+                WeaponInput::Switch(2),
+                WeaponInput::Next,
+                WeaponInput::Select(14),
+                WeaponInput::Switch(20)
+            ]
+        );
         assert!(drive.take_weapon_inputs().is_empty());
         assert!(Script::parse("t=0 equip").is_err());
         assert!(Script::parse("t=0 next_weapon extra").is_err());
         for invalid in ["-1", "256", "NaN", "2 extra", ""] {
             assert!(Script::parse(&format!("t=0 switch_weapon {invalid}")).is_err());
+            assert!(Script::parse(&format!("t=0 select_weapon {invalid}")).is_err());
         }
     }
 
@@ -682,6 +739,22 @@ mod tests {
         let s = Script::parse("\n# nothing\n").unwrap();
         assert!(s.events.is_empty());
         assert_eq!(s.last_time(), 0.0);
+    }
+
+    #[test]
+    fn controller_exec_edges_preserve_order_and_are_not_repeated() {
+        let script = Script::parse("t=1 reload\nt=1 grab_input\nt=2 reload\n").unwrap();
+        let mut drive = Drive::new(&script);
+        let mut sim = PlayerSim::new([0.0; 3], 0.0);
+        drive.advance(0.5, &mut sim);
+        assert!(drive.take_exec_inputs().is_empty());
+        drive.advance(1.0, &mut sim);
+        assert_eq!(drive.take_exec_inputs(), ["Reload", "Grab"]);
+        drive.advance(1.0, &mut sim);
+        assert!(drive.take_exec_inputs().is_empty());
+        drive.advance(3.0, &mut sim);
+        assert_eq!(drive.take_exec_inputs(), ["Reload"]);
+        assert!(drive.take_exec_inputs().is_empty());
     }
 
     #[test]

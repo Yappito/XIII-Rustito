@@ -116,11 +116,12 @@ pub struct Session {
     /// Pawn pose owned by a script cutscene this step; the host movement sim copies it back after
     /// `step` so it resumes from the script's final pose rather than snapping to its stale pose.
     script_pawn_sync: Option<([f32; 3], f32, [f32; 3])>,
-    /// item64: the route's held rope buttons (`fire_hold`/`altfire_hold`). `step` publishes the
-    /// controller's `bFire`/`bAltFire` each tick so the game's own `Pawn.PressingFire`/
-    /// `PressingAltFire` polls (`Hook.HookInUse.Tick`/`Timer`) see the held key, the way the
-    /// engine's input stack (`Button bFire | Fire | onrelease UnFire`) does; with no rope
-    /// command held the published bytes are 0, matching a released button.
+    /// item64: the route's held rope buttons (`fire_hold`/`altfire_hold`). While the hook owns
+    /// the buttons (selected in item mode, or attached) `step` publishes the controller's
+    /// `bFire`/`bAltFire` each tick so the game's own `Pawn.PressingFire`/`PressingAltFire`
+    /// polls (`Hook.HookInUse.Tick`/`Timer`) see the held key, the way the engine's input stack
+    /// (`Button bFire | Fire | onrelease UnFire`) does; with no rope command held the published
+    /// bytes are 0, matching a released button.
     hook_fire_held: bool,
     hook_altfire_held: bool,
     /// item64: the driver's walk input (forward, strafe in 0..1) and facing yaw (radians)
@@ -128,6 +129,11 @@ pub struct Session {
     /// `newAccel` steers the hanging player the way the retail input stack would.
     hook_move_input: (f32, f32),
     hook_move_yaw: f32,
+    /// item64f: which hook inputs `step` published on the previous tick (buttons, axes), so
+    /// the tick the hook stops owning them writes the released value once and then leaves the
+    /// controller fields to the rest of the host (the weapon `fire` click owns `bFire` then).
+    hook_buttons_published: bool,
+    hook_axes_published: bool,
 }
 
 /// Host-owned player movement fields published to the VM pawn each fixed tick (item7b).
@@ -486,6 +492,8 @@ impl Session {
             hook_altfire_held: false,
             hook_move_input: (0.0, 0.0),
             hook_move_yaw: 0.0,
+            hook_buttons_published: false,
+            hook_axes_published: false,
         };
         session.localized_overrides = session.vm.localized_overrides;
         session.suspended.dedup();
@@ -567,33 +575,49 @@ impl Session {
         // scripts build `newAccel` from `aForward`/`aStrafe` over the pawn's rotation
         // (`PlayerWalking.PlayerMove` 0x000B), and the retail hanging player steers with them
         // (the pendulum swing toward the landing roof is player input, not rope physics).
+        // item64f: only while the hook owns them. The buttons belong to the hook while it is
+        // the selected item in item mode or the rope is attached (its `Idle`/`HookInUse`
+        // `Timer`/`Tick` poll them); the axes and the facing only while the rope owns the pawn
+        // (`dispatch_hook_player_moves`' PlayerMove window). Publishing them on every tick
+        // overwrote the weapon `fire` path's `bFire` and wrote the driver's yaw over the
+        // pawn pose a cinematic (`NoControl`) owns, on every map.
+        let hook_buttons = self.hook_owns_buttons();
+        let hook_axes = self.hook_owns_pawn();
         if let Some(pc) = self.controller {
-            let _ =
-                self.vm
-                    .set_property(pc, "bFire", 0, Value::Byte(u8::from(self.hook_fire_held)));
-            let _ = self.vm.set_property(
-                pc,
-                "bAltFire",
-                0,
-                Value::Byte(u8::from(self.hook_altfire_held)),
-            );
-            // The analog input range: `PlayerWalking.ProcessMove` 0x0037 scales `newAccel` by
-            // 0.01 into `Pawn.Acceleration`, so a full press is ±32768 (UE2 `input aForward`),
-            // not 1.0 — publishing 1.0 left the hanging pawn with 0.01 UU/s² of thrust.
-            let _ = self.vm.set_property(
-                pc,
-                "aForward",
-                0,
-                Value::Float(self.hook_move_input.0 * 32768.0),
-            );
-            let _ = self.vm.set_property(
-                pc,
-                "aStrafe",
-                0,
-                Value::Float(self.hook_move_input.1 * 32768.0),
-            );
+            if hook_buttons || self.hook_buttons_published {
+                let (fire, altfire) = if hook_buttons {
+                    (self.hook_fire_held, self.hook_altfire_held)
+                } else {
+                    (false, false)
+                };
+                let _ = self
+                    .vm
+                    .set_property(pc, "bFire", 0, Value::Byte(u8::from(fire)));
+                let _ = self
+                    .vm
+                    .set_property(pc, "bAltFire", 0, Value::Byte(u8::from(altfire)));
+            }
+            if hook_axes || self.hook_axes_published {
+                // The analog input range: `PlayerWalking.ProcessMove` 0x0037 scales `newAccel`
+                // by 0.01 into `Pawn.Acceleration`, so a full press is ±32768 (UE2 `input
+                // aForward`), not 1.0 — publishing 1.0 left the hanging pawn with 0.01 UU/s².
+                let (forward, strafe) = if hook_axes {
+                    (
+                        self.hook_move_input.0 * 32768.0,
+                        self.hook_move_input.1 * 32768.0,
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+                let _ = self
+                    .vm
+                    .set_property(pc, "aForward", 0, Value::Float(forward));
+                let _ = self.vm.set_property(pc, "aStrafe", 0, Value::Float(strafe));
+            }
         }
-        if script_owned_before {
+        self.hook_buttons_published = hook_buttons;
+        self.hook_axes_published = hook_axes;
+        if hook_axes {
             let yaw_units = (self.hook_move_yaw / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN)
                 .rem_euclid(ROTATOR_UNITS_PER_TURN) as i32;
             let _ = self.vm.set_property(
@@ -802,13 +826,17 @@ impl Session {
     }
 
     /// Run the script callbacks needed by headless gameplay. HUD.PostRender drives the opening
-    /// cartoon (which ends by script — `DrawCartoonWindowBis` sets `EndCartoonEffect` when the
-    /// player moves or the last panel fills, and `DrawHUD` then skips the cartoon each frame)
-    /// and the first-person item display: `XIIIPlayerController.RenderOverlays` renders the
-    /// selected item, and the hook's aiming (`Hook.RenderOverlays` -> `DrawTargets` ->
-    /// `PotHookPoint`) is gameplay input that must keep running after the cartoon ends.
-    /// MyPCPostRender owns interaction targeting throughout play. Weapon drawing belongs to the
-    /// presentation renderer, so the headless driver does not render weapons.
+    /// cartoon gate; MyPCPostRender owns interaction targeting throughout play. Weapon drawing
+    /// belongs to the presentation renderer, so the headless driver does not render weapons.
+    ///
+    /// item64f: after the cartoon the one gameplay producer of the item display still runs:
+    /// `XIIIPlayerController.RenderOverlays`' item branch (0x0223: `!bWeaponMode` ->
+    /// `Pawn.SelectedItem.RenderOverlays(C)`) for the Hook, whose `RenderOverlays` ->
+    /// `DrawTargets` copies the interaction's `TargetActor` into `PotHookPoint` (the anchor
+    /// `UseMe` attaches to). It runs after MyPCPostRender, the order `RenderOverlays` uses
+    /// (0x0014 before 0x024F). Item64 had removed the cartoon gate instead, which ran the whole
+    /// HUD chain every frame on every map - including a second MyPCPostRender per frame, since
+    /// `RenderOverlays` 0x0014 calls it as well as [`Session::render_interaction`].
     pub fn drive_render_phase(&mut self) {
         let canvas = if let Some(canvas) = self.render_canvas {
             canvas
@@ -844,17 +872,47 @@ impl Session {
             canvas
         };
         let arg = Value::Object(Some(ObjRef::Instance(canvas)));
-        if let Some(hud) = self
-            .controller
-            .and_then(|pc| instance_prop(&self.vm, pc, "myHUD"))
-            .or_else(|| crate::play::hud::find_hud(&self.vm))
+        let end_cartoon = self.map_info().is_some_and(|mi| {
+            matches!(
+                self.vm.get_property(mi, "EndCartoonEffect"),
+                Some(Value::Bool(true))
+            )
+        });
+        if !end_cartoon
+            && let Some(hud) = self
+                .controller
+                .and_then(|pc| instance_prop(&self.vm, pc, "myHUD"))
+                .or_else(|| crate::play::hud::find_hud(&self.vm))
             && let Err(e) = self.vm.send_event(hud, "PostRender", vec![arg.clone()])
         {
             self.record_failure("headless HUD.PostRender", &e);
         }
         self.render_interaction(canvas);
+        if end_cartoon {
+            self.render_hook_targets(canvas);
+        }
         self.vm.drain_canvas();
         self.drain_events();
+    }
+
+    /// item64f: the Hook's targeting pass of `XIIIPlayerController.RenderOverlays` (see
+    /// [`Session::drive_render_phase`]): with the Hook selected in item mode, run its
+    /// `RenderOverlays(C)` so `DrawTargets` refreshes `PotHookPoint` from this frame's
+    /// interaction target.
+    fn render_hook_targets(&mut self, canvas: ObjectId) {
+        let Some(pc) = self.controller else {
+            return;
+        };
+        if self.controller_flag(pc, "bWeaponMode") {
+            return;
+        }
+        let Some(hook) = self.selected_item().filter(|id| self.vm.is_a(*id, "Hook")) else {
+            return;
+        };
+        let arg = Value::Object(Some(ObjRef::Instance(canvas)));
+        if let Err(e) = self.vm.send_event(hook, "RenderOverlays", vec![arg]) {
+            self.record_failure("Hook.RenderOverlays", &e);
+        }
     }
 
     /// The game's interaction render event is a gameplay producer as well as HUD presentation:
@@ -895,15 +953,27 @@ impl Session {
         }
     }
 
+    /// Ordinary player exec; the game's controller and interaction own its behavior.
+    pub fn controller_input(&mut self, name: &str) -> Result<(), String> {
+        let pc = self.controller.ok_or("input: no player controller")?;
+        self.vm
+            .send_event(pc, name, Vec::new())
+            .map_err(|e| e.to_string())?;
+        self.drain_events();
+        Ok(())
+    }
+
     /// Dispatch a normal controller weapon-selection exec; completion belongs to the weapon
     /// state machine and decoded animation/timer callbacks, so this does not complete a switch.
-    pub fn weapon_input(&mut self, group: Option<u8>) -> Result<(), String> {
+    pub fn weapon_input(&mut self, input: super::script::WeaponInput) -> Result<(), String> {
+        use super::script::WeaponInput;
         let pc = self
             .controller
             .ok_or_else(|| "no player controller".to_owned())?;
-        let (function, args) = match group {
-            Some(group) => ("SwitchWeapon", vec![Value::Byte(group)]),
-            None => ("NextWeapon", Vec::new()),
+        let (function, args) = match input {
+            WeaponInput::Switch(group) => ("SwitchWeapon", vec![Value::Byte(group)]),
+            WeaponInput::Select(group) => ("SelectWeapon", vec![Value::Byte(group)]),
+            WeaponInput::Next => ("NextWeapon", Vec::new()),
         };
         self.vm
             .send_event(pc, function, args)
@@ -2195,6 +2265,12 @@ impl Session {
                 .map(Some),
             None => self.vm.send_event(target, "Fire", vec![Value::Float(1.0)]),
         };
+        // item64f: the route's `fire` is one click: release the button after the shot
+        // (`onrelease UnFire`), so `Pawn.PressingFire` (Engine.dll reads the `bFire` byte)
+        // does not see a button held forever after the first shot.
+        if let Some(ctrl) = self.controller {
+            self.vm.set_property(ctrl, "bFire", 0, Value::Byte(0));
+        }
         match r {
             Ok(_) => FireOutcome::Fired,
             Err(e) => FireOutcome::Error(e.to_string()),
@@ -2341,6 +2417,23 @@ impl Session {
     pub fn selected_item_is_hook(&self) -> bool {
         self.selected_item()
             .is_some_and(|id| self.vm.is_a(id, "Hook"))
+    }
+
+    /// item64f: the rope owns the pawn (attached, or the rope-top nav handoff): the window in
+    /// which `dispatch_hook_player_moves` runs the controller's `PlayerMove`.
+    fn hook_owns_pawn(&self) -> bool {
+        self.controller.is_some_and(|pc| {
+            self.controller_flag(pc, "bHooked") || self.vm.is_in_state(pc, "ClimbToHookNavPoint")
+        })
+    }
+
+    /// item64f: the fire buttons drive the hook: it is the selected item in item mode
+    /// (`bWeaponMode` false; `Idle.Activate`/the climb Timer poll `PressingFire`) or attached.
+    fn hook_owns_buttons(&self) -> bool {
+        self.hook_owns_pawn()
+            || self.controller.is_some_and(|pc| {
+                !self.controller_flag(pc, "bWeaponMode") && self.selected_item_is_hook()
+            })
     }
 
     /// item64: the bare use-key exec (`XIIIPlayerController.Grab`, xiii.u @161880). While hooked
@@ -4262,6 +4355,22 @@ mod tests {
         let left_scripted_attack = scripted_states.iter().any(|(from, to)| {
             from.as_deref() == Some("AttaqueScriptee") && to.as_deref() == Some("temporise")
         });
+        let wall_adjust: Vec<_> = session
+            .vm()
+            .trace
+            .iter()
+            .filter_map(|event| match &event.kind {
+                xiii_script::TraceKind::Native {
+                    path, this, result, ..
+                } if path == "Controller.PickWallAdjust"
+                    && this == &session.vm().objects[controller as usize].name =>
+                {
+                    Some((event.time, result.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        println!("[Plage01 pursuit] wall_adjust={wall_adjust:?}");
         println!(
             "[Plage01 combat] cue=TouchTrigger7 event={trigger_event:?}, player={player_location:?}, soldier={soldier_location:?}, distance={player_distance:.1}, SightRadius={sight_radius}, cue Enemy={cue_enemy_name:?}, final Enemy={final_enemy:?}, scripted={scripted_attack_seen}, combat={controller_attack_seen}, held-fire-seen={held_fire_seen}, fire-request-seen={fire_request_seen}, bTire={wants_fire}, soldier state={state:?}, controller state={controller_state:?}, controller states={scripted_states:?}, CanSee={can_see:?}, rotation {initial_rotation:?}->{final_rotation:?}, Health {health_before}->{health_after}; suspended={:?}",
             session.failures
@@ -4275,14 +4384,13 @@ mod tests {
                 && can_see.iter().any(|(_, _, result)| result == "false"),
             "the actual player position should be outside SightRadius with a measured failed CanSee: distance={player_distance}, SightRadius={sight_radius}, CanSee={can_see:?}"
         );
-        // With the live level clock ContinueStakeOut expires and temporise enters Chasse
-        // (IAController.temporise 0x01FC..0x0287). The former Patrouille/no Enemy pin
-        // described a frozen-clock artefact, not the authored distant-player outcome.
+        // The live clock takes temporise into Chasse. Decoded wall adjustment now
+        // allows the authored search to finish and return to patrol without firing.
         assert!(
             cue_enemy == Some(player)
-                && final_enemy.as_deref() == Some(session.player_name.as_str())
+                && final_enemy.is_none()
                 && left_scripted_attack
-                && controller_state.as_deref() == Some("Chasse")
+                && controller_state.as_deref() == Some("Patrouille")
                 && !controller_attack_seen
                 && !held_fire_seen
                 && !fire_request_seen
@@ -4290,19 +4398,30 @@ mod tests {
                 && health_after == health_before,
             "unexpected combat result: Health {health_before}->{health_after}, bTire={wants_fire}"
         );
-        assert_eq!(
-            session.failures.len(),
-            1,
-            "only the measured pursuit blocker may fail"
-        );
         assert!(
-            session.failures[0].0 == session.vm().objects[controller as usize].name
-                && session.failures[0].1.contains("Controller.PickWallAdjust")
-                && session.failures[0].1.contains("Some(526)")
-                && session.failures[0].1.contains("Chasse.PickDestination"),
+            session.failures.is_empty(),
             "unexpected distant-player pursuit failure: {:?}",
             session.failures
         );
+        assert!(
+            scripted_states
+                .iter()
+                .any(|(from, to)| from.as_deref() == Some("temporise")
+                    && to.as_deref() == Some("Chasse"))
+        );
+        assert!(
+            scripted_states
+                .iter()
+                .any(|(from, to)| from.as_deref() == Some("Chasse")
+                    && to.as_deref() == Some("Patrouille"))
+        );
+        assert_eq!(
+            wall_adjust.len(),
+            1,
+            "the measured pursuit calls native 526 once"
+        );
+        assert_eq!(wall_adjust[0].1, "false");
+        assert!((wall_adjust[0].0 - 9.316667).abs() < 1.0 / 60.0);
     }
 
     /// Opt-in corpus regression (item3o): the Plage00 level-start checkpoint path runs the
