@@ -1,0 +1,18 @@
+# Save via the retail slot/overwrite flow, then Retry that save in the same session.
+t=1.0 menu
+t=1.2 menu_key 13
+t=1.5 menu_key 40
+t=1.6 menu_key 40
+t=1.7 menu_key 13
+t=1.9 menu_key 37
+t=2.0 menu_key 13
+t=2.1 menu_close
+t=2.2 menu
+t=2.3 menu_key 40
+t=2.4 menu_key 40
+t=2.5 menu_key 40
+t=2.6 menu_key 40
+t=2.7 menu_key 13
+t=3.0 shot local/reports/item82/retry-page.png
+t=3.3 menu_key 37
+t=3.5 menu_key 13

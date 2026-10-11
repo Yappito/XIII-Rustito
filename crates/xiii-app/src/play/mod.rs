@@ -474,6 +474,13 @@ fn setup(
     // item72: the in-game menu's save device writes into the configured save dir, and Quit
     // interception keys on the map.
     menu.configure(cfg.options.save_dir.clone(), cfg.options.map.clone());
+    if let (Some(game), Some(config)) = (&cfg.options.game_dir, &cfg.options.config_dir)
+        && let Err(error) = menu.install_settings(session, game, config)
+    {
+        eprintln!("[menu] settings installation failed: {error}");
+        exit.write(AppExit::error());
+        return;
+    }
     match setup_inner(
         &mut commands,
         &cfg.options,
@@ -2217,6 +2224,13 @@ fn travel(
     // item72: the in-game menu's VM references died with the outgoing session; re-configure for
     // the new map (the next `open` reinstalls the GUI graph into the new VM).
     menu.configure(cfg.options.save_dir.clone(), cfg.options.map.clone());
+    if let Some(config) = &cfg.options.config_dir
+        && let Err(error) = menu.install_settings(s, Path::new(&game_dir), config)
+    {
+        eprintln!("[menu] travel settings installation failed: {error}");
+        exit.write(AppExit::error());
+        return;
+    }
     // item21: reinstall the cutscene host on the new map's VM. Dropping the old session stops
     // its clip; the overlay sync tears the picture/audio down once the new host has none open.
     cutscene_host.0 = Some(cutscene::install(

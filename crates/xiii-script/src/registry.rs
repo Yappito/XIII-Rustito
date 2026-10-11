@@ -209,6 +209,7 @@ int2!(ge_ii, |x, y| Value::Bool(x >= y));
 int2!(eq_ii, |x, y| Value::Bool(x == y));
 int2!(ne_ii, |x, y| Value::Bool(x != y));
 int2!(and_ii, |x, y| Value::Int(x & y));
+int2!(shl_ii, |x, y| Value::Int(x.wrapping_shl(y as u32)));
 float2!(add_ff, |x, y| Value::Float(x + y));
 float2!(sub_ff, |x, y| Value::Float(x - y));
 float2!(mul_ff, |x, y| Value::Float(x * y));
@@ -2804,7 +2805,23 @@ fn play_snd_pn_jo(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<N
 ///   `Level.Game.GoreLevel` as a decimal string (the parental-lock check).
 fn console_command(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let command = string(vm, a, 0)?;
-    if vm.canvas.menu.is_some() {
+    if vm.canvas.menu.is_some()
+        && command.split_whitespace().next().is_some_and(|verb| {
+            matches!(
+                verb.to_ascii_lowercase().as_str(),
+                "toggleime"
+                    | "get"
+                    | "set"
+                    | "getcurrentres"
+                    | "setres"
+                    | "brightness"
+                    | "gamma"
+                    | "contrast"
+                    | "keyname"
+                    | "keybinding"
+            )
+        })
+    {
         return crate::canvas::menu_console(vm, &command)
             .map_err(|e| vm.err(VmErrorKind::Other(e)));
     }
@@ -3935,6 +3952,12 @@ fn builtin_defs() -> Vec<NativeDef> {
             lt_ii,
         ),
         def(
+            "Object.LessLess_IntInt",
+            "native(148) int <<(int, int)",
+            "Core.dll execLessLess_IntInt 0x10118d54 SHL CL masks count to five bits",
+            shl_ii,
+        ),
+        def(
             "Object.Greater_IntInt",
             "native(151) bool >(int, int)",
             UE2_OP,
@@ -4556,6 +4579,12 @@ fn builtin_defs() -> Vec<NativeDef> {
             "Engine.Actor.Sleep",
             "native(256) final latent function Sleep(float Seconds)",
             "UE2 AActor::execSleep + execPollSleep (finishes when remaining < 0.5*dt); Engine.dll ?execSleep / ?execPollSleep@AActor",
+            sleep,
+        ),
+        def(
+            "GUIPage.Sleep",
+            "native(430) final latent function Sleep(float Seconds)",
+            "GUI.dll execSleep 0x1170b080 / execPollSleep 0x1170b140; page-local latent countdown",
             sleep,
         ),
         def(
@@ -5954,6 +5983,30 @@ fn builtin_defs() -> Vec<NativeDef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integer_shift_masks_counts_and_wraps_sign_bit() {
+        let set = crate::linker::ScriptSet::new();
+        let mut vm = Vm::new(&set, crate::vm::VmLimits::default());
+        let ctx = NativeCtx {
+            this: 0,
+            in_state_code: false,
+            path: "Object.LessLess_IntInt".into(),
+            omitted: vec![false; 2],
+        };
+        for (input, count, expected) in [
+            (1, 31, i32::MIN),
+            (1, 32, 1),
+            (1, -1, i32::MIN),
+            (16, 32, 16),
+            (-1, 1, -2),
+        ] {
+            let result =
+                shl_ii(&mut vm, &ctx, &mut [Value::Int(input), Value::Int(count)]).unwrap();
+            assert_eq!(result, NativeOutcome::Value(Value::Int(expected)));
+        }
+        assert!(shl_ii(&mut vm, &ctx, &mut [Value::Int(1)]).is_err());
+    }
 
     /// Item15/item16 merge guard: `Registry` is a `BTreeMap`, so a second registration of the same
     /// `Class.Function` silently replaces the first. This checks the raw `builtin_defs()` list so a

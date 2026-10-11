@@ -246,6 +246,11 @@ pub fn save_defs() -> Vec<NativeDef> {
             "native(0) final native static function bool IsThereACheckpoint()",
             "gui.u GUIController.IsThereACheckpoint; xidinterf XIIIMenuInGame.BeforePaint gates the Save button and XIIIMenuInGame.RestartGame branches on it (item72)",
         ),
+        def(
+            "GUIController.LoadAtCheckpoint",
+            "native(0) final native static function bool LoadAtCheckpoint(optional bool ForceLoadAtMapStart)",
+            "gui.u @34218..34222; XIIIMenuInGame.RestartGame @487161..487248 requests checkpoint host reload",
+        ),
     ]
 }
 
@@ -255,7 +260,7 @@ mod tests {
     #[test]
     fn item20_menu_native_set_is_unique_and_explicitly_partial() {
         let defs = save_defs();
-        assert_eq!(defs.len(), 12);
+        assert_eq!(defs.len(), 13);
         let mut paths = std::collections::BTreeSet::new();
         for d in defs {
             assert!(

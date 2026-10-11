@@ -16,7 +16,7 @@
 //! duplicate it.
 
 use crate::registry::{NativeCtx, NativeDef, NativeOutcome, NativeStatus};
-use crate::value::{ObjRef, Value};
+use crate::value::{ObjRef, ObjectId, Value};
 use crate::vm::{TraceKind, VideoTiming, Vm, VmErrorKind, VmResult};
 
 /// Host font metrics used by `StrLen`/`TextSize`.
@@ -1420,11 +1420,10 @@ pub fn menu_defs() -> Vec<NativeDef> {
 // not interpret delegate opcodes. This block supplies the two controller services those
 // decoded functions use so the real init path can run (item16b):
 //
-//   * `GUI.GUIComponent.InitComponent` (block `gui-all.txt`, `gui.u` @15432) does
-//     `self.Style = self.Controller.GetStyle(self.StyleName)`. No style table is loaded, so
-//     `GetStyle` returns `None` (Partial, labelled): `XIIIWindow`/`XIIIGUIBaseButton` carry
-//     their own `WhiteColor`/`BlackColor`/`HighlightColor` defaults, which is what the menu
-//     drawing reads.
+//   * `GUI.GUIComponent.InitComponent` (gui.u @15432) does
+//     `self.Style = self.Controller.GetStyle(self.StyleName)`. item82 loads the retail
+//     StyleNames table and calls GUIStyles.Initialize to resolve FontNames. Confirmation
+//     layout reads BorderOffsets, so returning None is insufficient for these pages.
 //   * `GUIController.OpenMenuWithClass` (gui.u @36514) calls the final native
 //     `InitStateFrame(NewMenu)` before `InternalMenuInit`. The host bridge does not use the
 //     page stack, but the call is accepted and recorded so the decoded flow is not blocked.
@@ -1433,22 +1432,174 @@ pub fn menu_defs() -> Vec<NativeDef> {
 
 /// `GUI.GUIController.GetStyle(string StyleName) -> object<GUIStyles>`.
 ///
-/// No style table is loaded; returns `None` and records a Partial note the first time. The
-/// menu classes do not rely on the style object for their colours.
+/// Uses the controller's retail style names/defaults; empty style names are unstyled.
 fn gui_controller_get_style(
     vm: &mut Vm<'_>,
-    _c: &NativeCtx,
+    c: &NativeCtx,
     a: &mut [Value],
 ) -> VmResult<NativeOutcome> {
-    let name = a.first().and_then(|v| match v {
-        Value::Str(s) | Value::Name(s) => Some(s.clone()),
-        _ => None,
-    });
-    vm.note(TraceKind::Note(format!(
-        "GUI.GUIController.GetStyle({}) -> None (no style table loaded; Partial, item16b)",
-        name.as_deref().unwrap_or("None")
-    )));
-    val(Value::Object(None))
+    let name = text(vm, a, 0)?;
+    if name.is_empty() {
+        return val(Value::Object(None));
+    }
+    let mut styles = match vm.get_property(c.this, "StyleStack").cloned() {
+        Some(Value::Array(items)) => items,
+        _ => return Err(menu_error(vm, "GUIController.StyleStack is not an array")),
+    };
+    if styles.is_empty() {
+        let names = match vm.get_property(c.this, "StyleNames").cloned() {
+            Some(Value::Array(items)) => items,
+            _ => return Err(menu_error(vm, "GUIController.StyleNames is not an array")),
+        };
+        for path in names {
+            let Value::Str(path) = path else {
+                return Err(menu_error(vm, "invalid GUI style class name"));
+            };
+            let class = gui_class(vm, &path)?;
+            let style = vm.spawn(class, &path)?;
+            vm.set_property(
+                style,
+                "Controller",
+                0,
+                Value::Object(Some(ObjRef::Instance(c.this))),
+            );
+            vm.send_event(style, "Initialize", vec![])?;
+            styles.push(Value::Object(Some(ObjRef::Instance(style))));
+        }
+        vm.set_property(c.this, "StyleStack", 0, Value::Array(styles.clone()));
+    }
+    for style in styles {
+        if let Value::Object(Some(ObjRef::Instance(id))) = &style
+            && matches!(vm.get_property(*id, "KeyName"), Some(Value::Str(key)) if key.eq_ignore_ascii_case(&name))
+        {
+            return val(style);
+        }
+    }
+    Err(menu_error(
+        vm,
+        format!("GUI style {name:?} is not registered"),
+    ))
+}
+
+fn gui_class(vm: &Vm<'_>, path: &str) -> VmResult<crate::linker::GlobalRef> {
+    let (package_name, local_path) = path
+        .split_once('.')
+        .ok_or_else(|| menu_error(vm, "GUI class needs package path"))?;
+    for (package, data) in vm.set().packages.iter().enumerate() {
+        if data.name.eq_ignore_ascii_case(package_name)
+            && let Some(export) = data.export_by_path(local_path)
+            && matches!(
+                vm.set()
+                    .object(crate::linker::GlobalRef { package, export }),
+                Some(crate::reflect::ScriptObject::Class(_))
+            )
+        {
+            return Ok(crate::linker::GlobalRef { package, export });
+        }
+    }
+    Err(menu_error(vm, format!("GUI class {path} is not loaded")))
+}
+
+fn gui_controller_get_menu_font(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    args: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let name = text(vm, args, 0)?;
+    let mut fonts = match vm.get_property(c.this, "FontStack").cloned() {
+        Some(Value::Array(items)) => items,
+        _ => return Err(menu_error(vm, "GUIController.FontStack is not an array")),
+    };
+    for font in &mut fonts {
+        if let Value::Object(Some(ObjRef::Static(class))) = font {
+            let id = vm.spawn_gui_font_template(*class)?;
+            *font = Value::Object(Some(ObjRef::Instance(id)));
+        }
+    }
+    vm.set_property(c.this, "FontStack", 0, Value::Array(fonts.clone()));
+    for font in fonts {
+        if let Value::Object(Some(ObjRef::Instance(id))) = &font
+            && matches!(vm.get_property(*id, "KeyName"), Some(Value::Str(key)) if key.eq_ignore_ascii_case(&name))
+        {
+            return val(font);
+        }
+    }
+    Err(menu_error(
+        vm,
+        format!("GUI font {name:?} is not registered"),
+    ))
+}
+
+fn gui_font_get_font(
+    vm: &mut Vm<'_>,
+    c: &NativeCtx,
+    args: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    // A single-font table has no resolution choice (the controller initially supplies zero).
+    if !matches!(args.first(), Some(Value::Int(_))) {
+        return Err(menu_error(vm, "GUI font requires an integer resolution"));
+    }
+    let name = match vm.get_property(c.this, "FontArrayNames") {
+        Some(Value::Array(names)) if names.len() == 1 => match names.first() {
+            Some(Value::Str(name)) => name.clone(),
+            _ => return Err(menu_error(vm, "GUI font has no font name")),
+        },
+        Some(Value::Array(names)) => {
+            return Err(menu_error(
+                vm,
+                format!(
+                    "GUI font resolution table {:?} requires native selection",
+                    names
+                ),
+            ));
+        }
+        _ => return Err(menu_error(vm, "GUI font names are not an array")),
+    };
+    let (font, _) = vm
+        .external_asset(&name)
+        .ok_or_else(|| menu_error(vm, format!("GUI font asset {name} missing")))?;
+    val(font)
+}
+
+fn gui_actual_size(vm: &Vm<'_>, id: ObjectId, height: bool, depth: usize) -> VmResult<f32> {
+    if depth > 32 {
+        return Err(menu_error(vm, "GUI owner cycle in actual size"));
+    }
+    let prop = if height { "WinHeight" } else { "WinWidth" };
+    let size = match vm.get_property(id, prop) {
+        Some(Value::Float(size)) if size.is_finite() => *size,
+        _ => return Err(menu_error(vm, format!("GUI {prop} is not finite"))),
+    };
+    if size > 1.0 {
+        return Ok(size);
+    }
+    if vm.get_property(id, "bBoundToParent") == Some(&Value::Bool(true))
+        && let Some(Value::Object(Some(ObjRef::Instance(owner)))) = vm.get_property(id, "MenuOwner")
+    {
+        return Ok(size * gui_actual_size(vm, *owner, height, depth + 1)?);
+    }
+    let clip = if height { "ClipY" } else { "ClipX" };
+    for (index, object) in vm.objects.iter().enumerate().rev() {
+        if !object.deleted
+            && vm.is_a(index as ObjectId, "Canvas")
+            && let Some(Value::Float(clip)) = vm.get_property(index as ObjectId, clip)
+            && clip.is_finite()
+            && *clip > 0.0
+        {
+            return Ok(size * clip);
+        }
+    }
+    Err(menu_error(
+        vm,
+        "GUI relative size requires host viewport canvas",
+    ))
+}
+
+fn gui_actual_width(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Float(gui_actual_size(vm, c.this, false, 0)?))
+}
+fn gui_actual_height(vm: &mut Vm<'_>, c: &NativeCtx, _: &mut [Value]) -> VmResult<NativeOutcome> {
+    val(Value::Float(gui_actual_size(vm, c.this, true, 0)?))
 }
 
 /// `GUI.GUIController.InitStateFrame(object<GUIPage> Page)` (final native).
@@ -1470,11 +1621,33 @@ fn gui_controller_init_state_frame(
 pub fn item16b_defs() -> Vec<NativeDef> {
     let mut v: Vec<NativeDef> = Vec::new();
     v.push(partial(
-        "no GUI style table loaded: returns None and records a Partial note; menu colours come from the class defaults",
+        "retail StyleNames/StyleStack defaults and GUIStyles.Initialize; GUI native style drawing is not implemented",
         "GUIController.GetStyle",
         "native(0) event function object<GUIStyles> GetStyle(string StyleName)",
         "gui.u GUIComponent.InitComponent 0x0016 reads Controller.GetStyle(StyleName); gui.GUIController.GetStyle decoded",
         gui_controller_get_style,
+    ));
+    v.push(partial("retail font templates; no multi-font resolution selection", "GUIController.GetMenuFont", "native(0) event function GUIFont GetMenuFont(string FontName)", "gui.u FontStack defaults contain GUISmallFont/GUIBigFont; GUIStyles.Initialize resolves FontNames", gui_controller_get_menu_font));
+    v.push(partial(
+        "single-font retail tables; multi-font resolution selection fails explicitly",
+        "GUIFont.GetFont",
+        "native(0) event function Font GetFont(int XRes)",
+        "gui.u GUISmallFont/GUIBigFont bFixedSize=True FontArrayNames=XIIIFonts.Policef16",
+        gui_font_get_font,
+    ));
+    v.push(partial(
+        "host canvas supplies viewport dimensions",
+        "GUIComponent.ActualWidth",
+        "native(0) function float ActualWidth()",
+        "GUI.dll 0x1170b570: WinWidth >1 absolute; otherwise multiply parent/viewport width",
+        gui_actual_width,
+    ));
+    v.push(partial(
+        "host canvas supplies viewport dimensions",
+        "GUIComponent.ActualHeight",
+        "native(0) function float ActualHeight()",
+        "GUI.dll 0x1170b690: WinHeight >1 absolute; otherwise multiply parent/viewport height",
+        gui_actual_height,
     ));
     v.push(partial(
         "host bridge does not run the GUIController page stack; the call is accepted and recorded",
@@ -1673,12 +1846,25 @@ pub fn apply_menu_config(vm: &mut Vm<'_>, object: crate::value::ObjectId) -> VmR
     Ok(())
 }
 
+fn scalar_property_text(value: &Value) -> Result<String, String> {
+    match value {
+        Value::Byte(v) => Ok(v.to_string()),
+        Value::Int(v) => Ok(v.to_string()),
+        Value::Float(v) if v.is_finite() => Ok(v.to_string()),
+        Value::Bool(v) => Ok(v.to_string()),
+        Value::Str(v) | Value::Name(v) => Ok(v.clone()),
+        _ => Err("configuration export requires a finite scalar property".into()),
+    }
+}
+
 fn get_property_text(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let name = text(vm, a, 0)?;
     let value = vm
         .get_property(c.this, &name)
         .ok_or_else(|| menu_error(vm, format!("GetPropertyText: unknown property {name}")))?;
-    val(Value::Str(vm.value_text(value)))
+    val(Value::Str(
+        scalar_property_text(value).map_err(|e| menu_error(vm, e))?,
+    ))
 }
 
 fn set_property_text(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
@@ -1711,7 +1897,10 @@ fn save_config(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<Nat
         "ConfigType",
     ] {
         if let Some(value) = vm.get_property(c.this, key) {
-            entries.push((key, vm.value_text(value)));
+            entries.push((
+                key,
+                scalar_property_text(value).map_err(|e| menu_error(vm, e))?,
+            ));
         }
     }
     let Some(settings) = vm.canvas.menu.as_mut() else {
@@ -1951,7 +2140,36 @@ fn available_res(vm: &mut Vm<'_>, _c: &NativeCtx, a: &mut [Value]) -> VmResult<N
     val(Value::Void)
 }
 
-/// item16c registry contribution. Scoped semantics fail explicitly outside the menu host.
+fn request_write_user_config(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    _: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let Some(settings) = vm.canvas.menu.as_mut() else {
+        return Err(menu_error(vm, "user config provider unavailable"));
+    };
+    settings.save_requested = true;
+    val(Value::Bool(true))
+}
+
+fn is_write_user_config_finished(
+    vm: &mut Vm<'_>,
+    _: &NativeCtx,
+    args: &mut [Value],
+) -> VmResult<NativeOutcome> {
+    let settings = vm
+        .canvas
+        .menu
+        .as_ref()
+        .ok_or_else(|| menu_error(vm, "user config provider unavailable"))?;
+    let result = args
+        .first_mut()
+        .ok_or_else(|| menu_error(vm, "user config poll requires ReturnCode"))?;
+    *result = Value::Int(0);
+    val(Value::Bool(!settings.save_requested))
+}
+
+/// Menu configuration and asynchronous host-flush native registry contribution.
 pub fn item16c_defs() -> Vec<NativeDef> {
     [
         ("Object.SaveConfig", "native(536) final function SaveConfig()", save_config as crate::registry::NativeFn),
@@ -1961,6 +2179,8 @@ pub fn item16c_defs() -> Vec<NativeDef> {
         ("Engine.Actor.SetMusicSliderPos", "native(362) final function SetMusicSliderPos(int Pos)", set_music_slider),
         ("Engine.Actor.StopMusic", "native(345) final function StopMusic()", stop_music),
         ("Engine.LevelInfo.GetAvailableRes", "native(0) function GetAvailableRes(out array<VideoMode> Modes)", available_res),
+        ("GUIController.RequestWriteUserConfig", "native(0) final function bool RequestWriteUserConfig()", request_write_user_config),
+        ("GUIController.IsWriteUserConfigFinished", "native(0) final function bool IsWriteUserConfigFinished(out int ReturnCode)", is_write_user_config_finished),
     ].into_iter().map(|(path,signature,f)| partial(
         "item16c menu provider: scalar property text, menu settings and host modes; no filesystem or shell access",
         path, signature, "retail Core/Engine declarations; XIDInterf XIIIMenuAudioClientWindow/InternalOnKeyEvent and XIIIMenuVideoClientWindow.Created", f
@@ -1972,6 +2192,54 @@ mod item16c_tests {
     use super::*;
     use crate::linker::ScriptSet;
     use crate::vm::VmLimits;
+
+    #[test]
+    fn config_scalar_export_round_trips_without_debug_suffixes_or_quotes() {
+        for value in [
+            Value::Byte(1),
+            Value::Byte(255),
+            Value::Int(-7),
+            Value::Float(0.5),
+            Value::Bool(true),
+            Value::Str("Forward | Axis aBaseY".into()),
+            Value::Name("None".into()),
+        ] {
+            let text = scalar_property_text(&value).unwrap();
+            assert_eq!(parse_property_text(&value, &text).unwrap(), value);
+        }
+        assert!(scalar_property_text(&Value::Float(f32::NAN)).is_err());
+        assert!(scalar_property_text(&Value::Array(vec![])).is_err());
+    }
+
+    #[test]
+    fn config_poll_waits_for_host_flush_and_rejects_absent_provider() {
+        let set = ScriptSet::new();
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let ctx = NativeCtx {
+            this: 0,
+            in_state_code: true,
+            path: "GUIController.RequestWriteUserConfig".into(),
+            omitted: vec![],
+        };
+        assert!(request_write_user_config(&mut vm, &ctx, &mut []).is_err());
+        vm.canvas.menu = Some(MenuSettings::default());
+        assert_eq!(
+            request_write_user_config(&mut vm, &ctx, &mut []).unwrap(),
+            NativeOutcome::Value(Value::Bool(true))
+        );
+        let mut result = [Value::Int(-2)];
+        assert_eq!(
+            is_write_user_config_finished(&mut vm, &ctx, &mut result).unwrap(),
+            NativeOutcome::Value(Value::Bool(false))
+        );
+        vm.canvas.menu.as_mut().unwrap().save_requested = false;
+        assert_eq!(
+            is_write_user_config_finished(&mut vm, &ctx, &mut result).unwrap(),
+            NativeOutcome::Value(Value::Bool(true))
+        );
+        assert_eq!(result[0], Value::Int(0));
+        assert!(is_write_user_config_finished(&mut vm, &ctx, &mut []).is_err());
+    }
 
     #[test]
     fn property_text_round_trips_scalars_and_rejects_overflow_or_compounds() {

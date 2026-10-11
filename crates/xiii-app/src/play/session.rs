@@ -2079,11 +2079,12 @@ impl Session {
 
     /// item72: captures the live game state for an in-menu save (`XIIIMenuSave` slot write).
     ///
-    /// Resume identity follows the map's own save-trigger chain when the map has one: the
+    /// Resume identity follows the most recently emitted checkpoint (including one-shot triggers
+    /// which have since destroyed themselves). Before that first event, it uses a live trigger:
     /// teleporter/save-trigger tags are a live `XIIISaveGameTrigger`'s `TeleporterName`/`Tag`
     /// (exactly what a checkpoint save records), so `--load` resumes through the same
     /// `restore_checkpoint` pipeline and places the player at the named start spot with the saved
-    /// health/inventory/objectives. A map without any live `XIIISaveGameTrigger` has no resumable
+    /// health/inventory/objectives. A map without any recorded or live `XIIISaveGameTrigger` has no resumable
     /// identity and the capture fails (the save bridge reports the error; nothing is written).
     /// The position/rotation are captured in the file for diagnostics but the resume placement
     /// follows the trigger's start spot, like every checkpoint resume.
@@ -2093,6 +2094,14 @@ impl Session {
         position: [f32; 3],
         rotation: [i32; 3],
     ) -> Result<crate::save::SaveFile, String> {
+        // One-shot triggers destroy themselves after SaveAtCheckpoint. Their emitted identity
+        // remains the current checkpoint; selecting an arbitrary live trigger can select a
+        // future checkpoint instead.
+        if let Some((_, checkpoint)) = self.saves.back() {
+            let mut save = self.checkpoint_snapshot(map, checkpoint, position, rotation)?;
+            save.description = "Menu save".into();
+            return Ok(save);
+        }
         let mut common = self.capture_save_common(map, position, rotation)?;
         let trigger = self
             .vm
