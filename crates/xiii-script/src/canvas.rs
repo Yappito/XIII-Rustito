@@ -1328,6 +1328,29 @@ fn actor_resume_all_sounds(
     val(Value::Void)
 }
 
+/// `Engine.Actor.ResetInputs()` (final native; retail `AActor::execResetInputs` Engine.dll
+/// 0x103e87a0 iterates the engine's viewports and calls each viewport's input reset — the
+/// decoded `XIIIMenuInGame` Return/Esc paths call it on the player controller). The host owns
+/// the input devices, so the bridge clears the controller-held fire/alt-fire flags the VM can
+/// see and records what it did (Partial, item72).
+fn actor_reset_inputs(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
+    let mut cleared = Vec::new();
+    for (prop, byte) in [("bFire", 0u8), ("bAltFire", 0u8)] {
+        if vm.set_property(c.this, prop, 0, Value::Byte(byte)) {
+            cleared.push(prop);
+        }
+    }
+    vm.note(TraceKind::Note(format!(
+        "Engine.Actor.ResetInputs on {}: cleared [{}] (the host owns the input devices; Partial, item72)",
+        vm.objects
+            .get(c.this as usize)
+            .map(|o| o.name.as_str())
+            .unwrap_or("?"),
+        cleared.join(", ")
+    )));
+    val(Value::Void)
+}
+
 /// The menu-path natives defined by this block. `registry::builtin_defs` extends the
 /// built-in table with these.
 #[allow(clippy::vec_init_then_push)]
@@ -1384,6 +1407,13 @@ pub fn menu_defs() -> Vec<NativeDef> {
         "native(338) final native static function ResumeAllSounds()",
         "engine.u Actor.ResumeAllSounds decoded; XIIIRootWindow.UWindows.EndState calls it",
         actor_resume_all_sounds,
+    ));
+    v.push(partial(
+        "retail resets every viewport's held input; the host owns the input devices, so the bridge clears the controller bFire/bAltFire flags and records a note",
+        "Actor.ResetInputs",
+        "native(0) final native static function ResetInputs()",
+        "Engine.dll AActor::execResetInputs 0x103e87a0 resets each viewport's input; decoded XIIIMenuInGame InternalOnClick (Return) and InternalOnKeyEvent (Esc/Backspace) call GetPlayerOwner().ResetInputs() (item72)",
+        actor_reset_inputs,
     ));
     // `PlayerController.ClientTravel` is registered once, in `registry::builtin_defs` (the item15
     // travel block): that single implementation records both this block's trace note
