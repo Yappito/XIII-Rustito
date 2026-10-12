@@ -431,6 +431,96 @@ fn set_of(data: Vec<u8>) -> ScriptSet {
     set
 }
 
+#[test]
+fn indexed_function_lookup_keeps_first_function_and_bounds_cyclic_children() {
+    let mut b = B::new();
+    let base = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let property = b.reserve(IMP_INTPROP, actor, "FindMe");
+    let first = b.reserve(IMP_FUNCTION, actor, "FindMe");
+    let duplicate = b.reserve(IMP_FUNCTION, actor, "fINDmE");
+    let long = "Z".repeat(65);
+    let inherited = b.reserve(IMP_FUNCTION, base, &long);
+    let unicode = b.reserve(IMP_FUNCTION, base, "CAFé");
+    b.prop(property, first, 0);
+    b.func(first, duplicate, 0, &[0x04, 0x0B], 2, 0, ff::DEFINED);
+    b.func(duplicate, first, 0, &[0x04, 0x0B], 2, 0, ff::DEFINED);
+    b.func(inherited, unicode, 0, &[0x04, 0x0B], 2, 0, ff::DEFINED);
+    b.func(unicode, 0, 0, &[0x04, 0x0B], 2, 0, ff::DEFINED);
+    b.class(base, 0, inherited);
+    b.class(actor, base, property);
+    let mut set = set_of(b.build());
+    // The package parser correctly rejects out-of-range references. Inject a dangling
+    // link after parsing to exercise the lookup's own malformed-metadata boundary.
+    let crate::ScriptObject::Function(f) = set.packages[0]
+        .objects
+        .get_mut(&((unicode - 1) as u32))
+        .unwrap()
+    else {
+        panic!("fixture function");
+    };
+    f.header.field.next = xiii_package::ObjectRef::Export(12345);
+    // This fixture writer stores UTF-8 bytes in the package's ANSI name encoding.
+    // Exercise the actual decoded non-ASCII spelling rather than assuming UTF-8 decoding.
+    let unicode_name = set.packages[0]
+        .ref_name(xiii_package::ObjectRef::Export((unicode - 1) as u32))
+        .to_owned();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let id = vm.spawn(g(&set, "Actor"), "probe").unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            vm.class_function(id, "FINDME").unwrap().export,
+            (first - 1) as u32
+        );
+        assert_eq!(
+            vm.class_function(id, &long.to_ascii_lowercase())
+                .unwrap()
+                .export,
+            (inherited - 1) as u32
+        );
+        assert_eq!(
+            vm.class_function(id, &unicode_name.to_ascii_lowercase())
+                .unwrap()
+                .export,
+            (unicode - 1) as u32
+        );
+        assert!(vm.class_function(id, "CAFÉ").is_none());
+        assert!(vm.class_function(id, "missing").is_none());
+    }
+}
+
+#[test]
+fn query_slot_cache_reads_current_values_and_preserves_missing_properties() {
+    let mut b = B::new();
+    let actor = b.reserve(0, 0, "Actor");
+    let radius = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
+    let gate = b.reserve(B_BOOLPROP, actor, "bBlockZeroExtentTraces");
+    b.prop(radius, gate, 0);
+    b.prop(gate, 0, 0);
+    b.class(actor, 0, radius);
+    let set = set_of(b.build());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let id = vm.spawn(g(&set, "Actor"), "probe").unwrap();
+    for (r, flag) in [(0.0, false), (160.0, true), (0.5, false)] {
+        assert!(vm.set_property(id, "COLLISIONRADIUS", 0, Value::Float(r)));
+        assert!(vm.set_property(id, "bblockzeroextenttraces", 0, Value::Bool(flag)));
+        assert_eq!(
+            vm.get_property(id, "CollisionRadius"),
+            Some(&Value::Float(r))
+        );
+        assert_eq!(
+            vm.get_property(id, "bBlockZeroExtentTraces"),
+            Some(&Value::Bool(flag))
+        );
+        assert_eq!(
+            vm.get_property(id, "CollisionRadius"),
+            vm.get_property(id, "collisionradius")
+        );
+    }
+    assert!(vm.get_property(id, "CollisionHeight").is_none());
+    assert!(vm.get_property(u32::MAX, "CollisionRadius").is_none());
+}
+
 /// Authored miniature of the decoded input/focus call graph, with no retail bytecode.
 /// Fire forwards to the weapon; only the focus trigger's event calls RemoveMe.
 fn cartoon_focus_input_fixture() -> Vec<u8> {

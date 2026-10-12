@@ -4362,6 +4362,49 @@ mod tests {
     }
 
     #[test]
+    fn opt_in_banque01_vm_profile() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to run the Banque01 VM profile");
+            return;
+        };
+        let opts = Options {
+            map: Some("Banque01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Banque01");
+        let resolved = resolve_params(&game_dir).expect("player parameters");
+        let route = script::Script::load(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/banque01_route.script"),
+        )
+        .expect("route");
+        let mut runtime =
+            open_map_runtime(&game_dir, "Banque01", &scene, &resolved.params).expect("runtime");
+        runtime.session.enable_native_timers(true);
+        let outcome = run_script_inner(
+            &game_dir,
+            "Banque01",
+            &route,
+            &resolved.params,
+            &scene,
+            181.0,
+            true,
+            RunnerOptions {
+                initial: Some(runtime),
+                ..Default::default()
+            },
+        )
+        .expect("profile route before travel");
+        println!("[vm-profile] {:#?}", outcome.session.vm().native_profile());
+        assert!(
+            outcome.session.failures.is_empty(),
+            "{:?}",
+            outcome.session.failures
+        );
+        assert!(outcome.session.vm().native_profile().enabled);
+    }
+
+    #[test]
     fn opt_in_banque01_postrender_completes_while_player_moves() {
         let Some(game_dir) = opt_in_root() else {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
