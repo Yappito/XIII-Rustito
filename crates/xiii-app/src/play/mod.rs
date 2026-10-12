@@ -6423,7 +6423,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            415.0,
+            440.0,
         )
         .expect("run Toits01 route");
         let session = &outcome.session;
@@ -6498,10 +6498,9 @@ mod tests {
             "the route player must survive the tarmac rockets and the fight phase with normal-health soldiers, got health {health}"
         );
         assert_eq!(
-            health, 140.0,
-            "the re-timed tarmac fight must end at the measured health 140 (the strafing \
-             landing burst kills the rocketeer before his rocket lands; one DTGunned hit \
-             from soldier17 before he dies)"
+            health, 79.0,
+            "the re-timed route must end at the measured health 79 (item86: the \
+             DetectionVolume1 'act2b' courtyard combat plus the tarmac fight)"
         );
         let soldier17 = session
             .vm()
@@ -6784,12 +6783,15 @@ mod tests {
             "the player must carry exactly the game-given Hook"
         );
         // Both grapples (the HookPoint0 climb/swing and the HookPoint2 street descent) and the
-        // sniper section cost no health: the first player damage is the tarmac rocket.
+        // sniper section cost no health. item86: after the descent the level's own
+        // DetectionVolume1 brush now fires 'act2b' (item81c), which is the authored trigger for
+        // the courtyard soldiers' AttaqueScriptee; that intended combat is excluded from this
+        // pin (its measured result is the Health pin above).
         let early_damage: Vec<f64> = vm
             .trace
             .iter()
             .filter(|event| {
-                event.time < 351.0
+                event.time < 172.0
                     && matches!(
                         &event.kind,
                         xiii_script::TraceKind::Event { target, function, .. }
@@ -6800,7 +6802,8 @@ mod tests {
             .collect();
         assert!(
             early_damage.is_empty(),
-            "no player damage before the tarmac landing (grapples and snipers), got {early_damage:?}"
+            "no player damage during the grapples, snipers and the gated HookPoint2 descent \
+             (before the act2b courtyard combat), got {early_damage:?}"
         );
         // item61b: with normal-health soldiers the player survives, so the item48 kill pins are
         // gone: no GameEnded broadcast ever fires (measured: no CineController2 state change
