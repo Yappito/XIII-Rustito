@@ -4127,6 +4127,8 @@ fn phys_fixture() -> Vec<u8> {
     let movable = b.reserve(IMP_BOOLPROP, actor, "bMovable");
     let bstatic = b.reserve(IMP_BOOLPROP, actor, "bStatic");
     let use_cylinder = b.reserve(IMP_BOOLPROP, actor, "bUseCylinderCollision");
+    // item67h: the engine's per-actor collision category (byte; 3 = glass).
+    let col_category = b.reserve(IMP_BYTEPROP, actor, "ColCategory");
     // item53 physics fields (EPhysics, script-written velocity, zone gravity inputs).
     let physics = b.reserve(IMP_BYTEPROP, actor, "Physics");
     let velocity = b.reserve(IMP_STRUCTPROP, actor, "Velocity");
@@ -4168,7 +4170,8 @@ fn phys_fixture() -> Vec<u8> {
     b.prop(world_geometry, movable, 0);
     b.prop(movable, bstatic, 0);
     b.prop(bstatic, use_cylinder, 0);
-    b.prop(use_cylinder, physics, 0);
+    b.prop(use_cylinder, col_category, 0);
+    b.prop_with(col_category, physics, 0, &compact(0));
     b.prop_with(physics, velocity, 0, &vector_extra);
     b.prop_with(velocity, acceleration, 0, &vector_extra);
     b.prop_with(acceleration, mass, 0, &vector_extra);
@@ -4218,6 +4221,9 @@ fn phys_fixture() -> Vec<u8> {
     // `Engine.Volume` (`Brush` + the volume-brush overlap path).
     let volume = b.reserve(0, 0, "Volume");
     b.class(volume, actor, 0, 0);
+    // item67h: an impact-effect class (the bullet's decal projector / impact emitter chain).
+    let emitter = b.reserve(0, 0, "Emitter");
+    b.class(emitter, actor, 0, 0);
     let pawn_controller = b.reserve(IMP_OBJECTPROP, pawn, "Controller");
     b.prop_with(pawn_controller, 0, 0, &object_extra);
     let ctrl_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");

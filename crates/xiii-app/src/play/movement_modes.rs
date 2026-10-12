@@ -47,6 +47,7 @@ impl MotionQuery for VolumeMotion {
             .ladder_box_at(center_uu, half_uu)
             .map(|v| LadderSample {
                 climb_dir: v.climb_dir,
+                look_dir: v.look_dir,
             })
     }
 }

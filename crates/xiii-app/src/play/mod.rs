@@ -6999,10 +6999,17 @@ mod tests {
     /// button, the walk out through the manager-opened live LiftDoor1, the map's own surface
     /// nav chain to the depot reader, the depot reader use, Carrington's cell) with labelled
     /// teleports only for the measured movement gaps (the Locked Porte19 magnetic chain whose
-    /// only card pickup is sealed in the card-room petitesalle, the corridor block at (-6198,842),
-    /// the sealed prison perimeter, the grille pin, the pinned exit stairwell). item67g removed
-    /// the surface teleport: the item67f (-2854,2338) dead-end was a wrong turn off the map's
-    /// nav chain, not a blocker.
+    /// only card pickup is sealed in the card-room petitesalle behind the 112 UU window sills,
+    /// the ForeverLocked decor-door seal at x~-6198 west of Porte19, the sealed prison
+    /// perimeter, the grille pin, the pinned exit stairwell). item67g removed the surface
+    /// teleport: the item67f (-2854,2338) dead-end was a wrong turn off the map's nav chain,
+    /// not a blocker. item67j measured the card -> reader -> Porte19 chain in
+    /// `opt_in_hual02_card_room_reader_chain`; item84 decoded the entry closed (the panes are
+    /// `ColType_StaticGlass` `StaticMeshActor`s no consumer shatters - `Actor.ScriptText` enum,
+    /// Engine.dll's only ColCategory reader is `execActorInIterationCategory` 0x103e6f00 - and
+    /// `APawn::physFalling` 0x103c37b0 never steps or mantles: slide only, `stepUp` is
+    /// walking-only at `MAXSTEPHEIGHT` 35), so the sill pin stands and the depot teleport
+    /// remains.
     /// The objectives must come from the game's own chains: goals 4/5/6 complete, goal 3 is
     /// promoted by the depot reader chain, goals 0/1/2 stay incomplete on measured blockers, and
     /// no travel is requested.
@@ -7257,6 +7264,207 @@ mod tests {
             "the reader use must run Grab's trigger branch on MagneticPassTrigger1"
         );
         let _ = porte154;
+    }
+
+    /// item67j: the Hual02 magnetic-card chain by player input, with two labelled teleport
+    /// diagnostics for the measured, pinned movement gaps. The card room is a nav island whose
+    /// only corridor-side openings are the two `grande_vitre` windows (`ColCategory` 3 =
+    /// `ColType_StaticGlass`, engine.u `Actor.ScriptText`; item84 decoded that no retail
+    /// consumer shatters them - the panes are script-less `Engine.StaticMeshActor` exports and
+    /// Engine.dll reads `ColCategory` (AActor+0x1a0) only in `execActorInIterationCategory`
+    /// 0x103e6f00), whose 112 UU sill (aperture z -112..16) no measured retail primitive crosses
+    /// from the flat corridor floor (`APawn::physFalling` 0x103c37b0 answers a wall hit with
+    /// `processHitWall` 0x103bed60 and a `TwoWallAdjust` slide, never `stepUp` - that is
+    /// walking-only via `moveSmooth` 0x103b7990 at `MAXSTEPHEIGHT` 35; jump 92.8 = JumpZ 420
+    /// with `PhysicsVolume.Gravity` (0,0,-950); no sill-mantle script exists in any package), so
+    /// the player is placed on the pickup. The west corridor beyond the opened Porte19 ends at the
+    /// `ForeverLocked` decor doors `PorteDecors18/19` (`PorteDecors.SetInitialState` ->
+    /// `GotoState('ForeverLocked')`; its `PlayerTrigger` only plays the sound), so the player is
+    /// placed at the depot-leg nav node the main route already walks to. Everything between the
+    /// teleports is the game's own chain: the walk-over pickup puts `Hual02MagneticCard` in the
+    /// inventory, the aimed use runs the controller's `Grab` (the game's `TargetActor`
+    /// MagneticPassTrigger1 + `bCanTrigger` + `FindPowerUpItemNameForTrigger` matching the card),
+    /// and the reader's OutEvent 'Porteentrevs' Triggers the `TriggerControl` Porte19 open. The
+    /// walk west then pins at the decor seal x~-6198, which stays the route's next blocker after
+    /// the card.
+    // SCRATCH item85 probe (remove before finishing): drives the reader-area shaft mouth,
+    // the ladder climb to the walkway, and the u-room approach, printing a position log.
+    #[test]
+    fn scratch_item85_shaft_probe() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual02".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual02");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let probe_path =
+            std::path::Path::new("P:/AI/XIII/local/wt/viewer/local/re/item85/probe-shaft.script");
+        let script = script::Script::load(probe_path).expect("load shaft probe");
+        let mut runtime =
+            open_map_runtime(&game_dir, "Hual02", &scene, &resolved.params).expect("open Hual02");
+        let removed = remove_soldiers(&mut runtime.session);
+        println!("[probe] removed {removed} soldiers");
+        {
+            let vols = xiii_world::movement_volumes::MovementVolumes::import(&game_dir, "Hual02")
+                .expect("volumes");
+            for v in &vols.volumes {
+                if v.kind == xiii_world::movement_volumes::VolumeKind::Ladder {
+                    println!(
+                        "[probe] ladder {} min {:?} max {:?} climb {:?} look {:?}",
+                        v.name, v.min_uu, v.max_uu, v.climb_dir, v.look_dir
+                    );
+                }
+            }
+        }
+        let outcome = run_script_inner(
+            &game_dir,
+            "Hual02",
+            &script,
+            &resolved.params,
+            &scene,
+            70.0,
+            false,
+            RunnerOptions {
+                initial: Some(runtime),
+                ..Default::default()
+            },
+        )
+        .expect("run shaft probe");
+        for (tick, t, pos, rot) in outcome.trace.iter().step_by(6) {
+            println!("[probe] t={t:.1} at ({:.0},{:.0},{:.0}) rot {:.0}/{:.0}", pos[0], pos[1], pos[2], rot[0], rot[1]);
+        }
+        if let Some((tick, t, pos, rot)) = outcome.trace.last() {
+            println!(
+                "[probe] final t={t:.1} at ({:.0},{:.0},{:.0}) rot {:.0}/{:.0}",
+                pos[0], pos[1], pos[2], rot[0], rot[1]
+            );
+        }
+        let vm = outcome.session.vm();
+        for name in [
+            "TouchTrigger60",
+            "CWndFocusTrigger1",
+            "XIIIDispatcher3",
+            "BreakAbleMover8",
+        ] {
+            match vm.find_object(name) {
+                Some(obj) => {
+                    let state = vm.state_name(obj);
+                    println!("[probe] {name}: state {state:?}");
+                }
+                None => println!("[probe] {name}: NOT FOUND"),
+            }
+        }
+        let events: Vec<String> = vm
+            .trace
+            .iter()
+            .filter_map(|e| match &e.kind {
+                xiii_script::TraceKind::Event { target, function, .. } => {
+                    Some(format!("{}.{}", target, function))
+                }
+                _ => None,
+            })
+            .collect();
+        println!("[probe] events: {events:?}");
+        println!("[probe] health {:?}", outcome.session.player_health());
+    }
+
+    #[test]
+    fn opt_in_hual02_card_room_reader_chain() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual02".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual02");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let probe_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/hual02_cardroom_reader.script");
+        let script = script::Script::load(&probe_path).expect("load card-room reader probe");
+        assert!(
+            script.events.iter().all(|event| {
+                !matches!(
+                    &event.command,
+                    script::Command::TakeControl | script::Command::SetGoal(_)
+                )
+            }),
+            "the probe must not bridge control or goals"
+        );
+        let mut runtime =
+            open_map_runtime(&game_dir, "Hual02", &scene, &resolved.params).expect("open Hual02");
+        let removed = remove_soldiers(&mut runtime.session);
+        assert!(
+            removed >= 20,
+            "the Hual02 hostile garrison is ~22 BaseSoldier pawns, removed {removed}"
+        );
+        let outcome = run_script_inner(
+            &game_dir,
+            "Hual02",
+            &script,
+            &resolved.params,
+            &scene,
+            70.0,
+            false,
+            RunnerOptions {
+                initial: Some(runtime),
+                ..Default::default()
+            },
+        )
+        .expect("run Hual02 card-room reader probe");
+        let session = &outcome.session;
+        let vm = session.vm();
+        // The walk-over pickup put the card in the game's inventory (labelled diagnostic
+        // teleport onto Hual02MagneticCardPick4 at (-3474.6,1549.5): the pickup's own Touch ->
+        // HandlePickupQuery chain).
+        let inventory = session.inventory_items();
+        assert!(
+            inventory
+                .iter()
+                .any(|(item, _)| item.eq_ignore_ascii_case("Hual02MagneticCard")),
+            "the player must carry Hual02MagneticCard after the pickup walk: {inventory:?}"
+        );
+        // The aimed use at the reader ran the game's own Grab with the matching item: the
+        // reader's OutEvent 'Porteentrevs' Triggered the TriggerControl Porte19 open.
+        let porte19 = vm.find_object("Porte19").expect("Porte19 must exist");
+        assert_eq!(
+            vm.get_property(porte19, "bOpened"),
+            Some(&xiii_script::Value::Bool(true)),
+            "the reader's OutEvent must open Porte19"
+        );
+        assert!(
+            vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target.eq_ignore_ascii_case("Porte19") && function.ends_with("Trigger")
+            )),
+            "Porte19 must open through its own Trigger event (the OutEvent chain)"
+        );
+        // The walked west pass: through the open Porte19 doorway (x=-5328) down the 'B' corridor
+        // to the ForeverLocked decor seal, which pins the walk at x~-6198 (measured, repeated
+        // samples; PorteDecors18's PlayerTrigger only plays a sound, so nothing opens it).
+        let west = outcome
+            .trace
+            .iter()
+            .filter(|s| (15.0..33.0).contains(&s.1))
+            .map(|s| s.2[0])
+            .collect::<Vec<_>>();
+        let min_x = west.iter().fold(f32::MAX, |acc, &x| f32::min(acc, x));
+        assert!(
+            west.iter().any(|&x| x < -5350.0),
+            "the walk must pass west through the opened Porte19 (x=-5328): min x {min_x}"
+        );
+        assert!(
+            (-6210.0..=-6180.0).contains(&min_x),
+            "the walk must pin at the PorteDecors18 seal (~-6198), not before or past it: min x {min_x}"
+        );
     }
 
     /// Hual04a: earned card, reader, bureau and fuse installation by player input.

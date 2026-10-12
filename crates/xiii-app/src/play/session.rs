@@ -1468,7 +1468,12 @@ impl Session {
     /// Host use action (`E` in `--play`, `use` in a script). Mirrors the tail of
     /// `XIIIPlayerController.Grab` for a mover target: a locked `XIIIPorte` is unlocked with the
     /// matching key the player **carries in the game's inventory** via its own `Trigger`
-    /// (`TryPickLock`), any other state is opened via `PlayerTrigger`. No host key grant.
+    /// (`TryPickLock`); every other state is opened via `PlayerTrigger`, exactly as retail Grab
+    /// does at `XIIIPlayerController.Grab 0x065B`. For most mover states that call is a
+    /// measured no-op (`XIIIMover.PlayerTrigger` is a bare `return`; a `TriggerControl` door
+    /// moves only through its `Trigger` event, which only the map's trigger chains deliver), so
+    /// the outcome reports [`UseOutcome::PlayerTriggerOnly`] instead of a success-looking
+    /// "triggered". No host key grant.
     pub fn use_mover(&mut self, target_name: &str) -> UseOutcome {
         let Some(target) = self.vm.find_object(target_name) else {
             return UseOutcome::NotAMover;
@@ -1505,7 +1510,7 @@ impl Session {
                 Value::Object(Some(ObjRef::Instance(pawn))),
             ];
             match self.vm.send_event(target, "PlayerTrigger", args) {
-                Ok(_) => UseOutcome::Triggered,
+                Ok(_) => UseOutcome::PlayerTriggerOnly,
                 Err(e) => UseOutcome::Error(e.to_string()),
             }
         }
