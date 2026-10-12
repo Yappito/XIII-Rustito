@@ -2581,6 +2581,32 @@ struct RunnerOptions {
     wait_for_control: bool,
 }
 
+fn headless_projection(
+    location: [f32; 3],
+    eye_height: f32,
+    yaw: f32,
+    pitch: f32,
+) -> xiii_script::canvas::ScreenProjection {
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    let forward = [cp * cy, cp * sy, sp];
+    let right = [-sy, cy, 0.0];
+    let up = [-sp * cy, -sp * sy, cp];
+    let eye = [location[0], location[1], location[2] + eye_height];
+    let dot = |a: [f32; 3]| a.into_iter().zip(eye).map(|(a, b)| a * b).sum::<f32>();
+    // Horizontal FOV 90 degrees, matching the default headless 1280x720 Canvas.
+    let aspect = 1280.0 / 720.0;
+    xiii_script::canvas::ScreenProjection {
+        clip_from_world: [
+            [right[0], up[0] * aspect, forward[0], forward[0]],
+            [right[1], up[1] * aspect, forward[1], forward[1]],
+            [right[2], up[2] * aspect, forward[2], forward[2]],
+            [-dot(right), -dot(up) * aspect, -dot(forward), -dot(forward)],
+        ],
+        viewport: [1280.0, 720.0],
+    }
+}
+
 fn player_has_control(session: &session::Session) -> bool {
     !cinematics::input_suppressed(session)
         && session
@@ -2756,6 +2782,14 @@ fn run_script_inner(
         runtime.rider.carry(&mut runtime.sim.location, |name| {
             runtime.session.vm().mover_state(name)
         });
+        // Headless rendering still needs the camera context required by WorldToScreen,
+        // including the Hook's authored target-outline pass. Use the simulated view.
+        runtime.session.vm_mut().canvas.screen_projection = Some(headless_projection(
+            runtime.sim.location,
+            runtime.sim.vm_eye_height(&runtime.player_params),
+            runtime.sim.yaw,
+            runtime.sim.pitch,
+        ));
         runtime.session.drive_render_phase();
         if let Some((location, yaw, velocity)) = runtime.session.script_pawn_pose() {
             runtime.sim.location = location;
@@ -6247,11 +6281,12 @@ mod tests {
     }
 
     /// Opt-in corpus test (requirement 5): on Banque01 the host walks the player onto the
-    /// `LadderVolume5` brush, enters `PHYS_Ladder` and climbs up `ClimbDir` at `LadderSpeed`.
+    /// `LadderVolume5` brush, enters `PHYS_Ladder` and climbs at `LadderSpeed` by looking up.
     /// The script teleports to the volume floor (the same harness bootstrap the other map demos
     /// use), faces the volume's decoded `LookDir` - `LadderVolume.PawnEnteredVolume` /
     /// `PotentialClimbWatcher.Tick` attach the pawn only while `Dot(facing, LookDir) > 0.9`
-    /// (item85b) - and then *only* holds forward; the climb is the simulation's, not a teleport.
+    /// (item85b) - and then holds forward while looking up (PlayerClimbing's decoded view-space
+    /// acceleration). The climb is the simulation's, not a teleport.
     #[test]
     fn opt_in_banque01_ladder_climb() {
         let Some(game_dir) = opt_in_root() else {
@@ -6282,7 +6317,7 @@ mod tests {
         // is forward = (cos yaw, sin yaw).
         let yaw_deg = lv.look_dir[1].atan2(lv.look_dir[0]).to_degrees();
         let script = script::Script::parse(&format!(
-            "t=0.0 teleport {cx} {cy} {start_z}\nt=0.0 yaw {yaw_deg}\nt=0.0 forward 1\nt=6.0 forward 0\n"
+            "t=0.0 teleport {cx} {cy} {start_z}\nt=0.0 yaw {yaw_deg}\nt=0.0 pitch 90\nt=0.0 forward 1\nt=6.0 forward 0\n"
         ))
         .unwrap();
         let outcome = run_script(
@@ -7526,6 +7561,27 @@ mod tests {
     /// Hual04c's first route pins the cabin-rope ladder obstruction after the real ride.
     /// Completed authored anti-goals are preserved; escort/helicopter travel is not claimed.
     #[test]
+    fn headless_camera_projection_uses_eye_and_rotated_view() {
+        let p = headless_projection(
+            [100.0, 200.0, 300.0],
+            60.0,
+            std::f32::consts::FRAC_PI_2,
+            0.0,
+        );
+        let center = p.project([100.0, 300.0, 360.0]).unwrap();
+        assert!((center[0] - 640.0).abs() < 0.001);
+        assert!((center[1] - 360.0).abs() < 0.001);
+        let right = p.project([0.0, 300.0, 360.0]).unwrap();
+        assert!((right[0] - 1280.0).abs() < 0.001);
+        let above = p.project([100.0, 300.0, 410.0]).unwrap();
+        assert!(
+            above[1] < center[1],
+            "world Z up must project above the crosshair"
+        );
+        assert!(p.project([f32::NAN, 0.0, 0.0]).is_none());
+    }
+
+    #[test]
     fn opt_in_hual04c_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
@@ -7615,10 +7671,10 @@ mod tests {
             "the ground escort sequence has not started"
         );
         let position = session.player_location().expect("player position");
-        for (actual, expected) in position.into_iter().zip([-1062.276, 53.756, 46.380]) {
+        for (actual, expected) in position.into_iter().zip([-1170.363, 56.460, 295.766]) {
             assert!(
                 (actual - expected).abs() < 0.5,
-                "ladder obstruction pin moved: {position:?}"
+                "roof/grapple blocker pin moved: {position:?}"
             );
         }
         let pawns = session.player_pawn_actors();
@@ -7626,16 +7682,44 @@ mod tests {
         let pawn = pawns[0].0;
         assert_eq!(
             vm.get_property(pawn, "Physics"),
-            Some(&xiii_script::Value::Byte(10)),
-            "player must be caught on the cabin rope ladder"
+            Some(&xiii_script::Value::Byte(11)),
+            "player holds the ladder top while attempting the grapple"
         );
         let mi = session.map_info().expect("Hual04c MapInfo");
         assert_eq!(
             vm.get_property(mi, "NextMapLevelWithUnr"),
             Some(&xiii_script::Value::Str("kello01a.unr".to_owned()))
         );
+        let hook = vm.find_object("Hook").expect("game-supplied grapple");
+        assert_eq!(
+            vm.get_property(hook, "bHooked"),
+            Some(&xiii_script::Value::Bool(false))
+        );
+        let releases: Vec<_> = vm
+            .trace
+            .iter()
+            .filter_map(|event| match &event.kind {
+                xiii_script::TraceKind::Event { function, args, .. }
+                    if function == "HookProjectile.ProcessTouch"
+                        || function == "Hook.HookInUse.Release" =>
+                {
+                    Some(format!("{function} {args:?}"))
+                }
+                xiii_script::TraceKind::Log(text)
+                    if text.starts_with("Releasing hook because Projectile hit wall") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        println!("[hual04c grapple blocker] {releases:?}");
+        assert!(
+            releases.iter().any(|text| text == "Releasing hook because Projectile hit wall BreakAbleMover44 (should not happen...)."),
+            "the roof attachment must reach the measured snow-plaque collision failure"
+        );
         println!(
-            "[hual04c next blocker] LadderVolume1 entered by jump; upward input first hits XIIIMover6 -> Telephstatic.TL_boitecorde at z=19.680, then after the car falls stalls at (-1062.276,53.756,46.380) against TelepheriquePoint0 -> Telephstatic.TLcabine; goals 0/2/3 and kello01a travel unreached"
+            "[hual04c next blocker] cabin opening climbed to z=302.4, HookPoint1 attempted from the roof, returns to ladder top (-1170.363,56.460,295.766); grapple projectile releases on a mover Touch; goals 0/2/3 and kello01a travel unreached"
         );
     }
 
