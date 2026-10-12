@@ -7590,13 +7590,17 @@ mod tests {
         }
         assert!(error.is_none(), "unexpected blocker: {error:?}");
         assert!(session.suspended.is_empty(), "{:?}", session.suspended);
-        assert!(outcome.travel.is_empty(), "blocked route must not travel");
         assert!(
             session.player_health().is_some_and(|h| h > 0.0),
             "player must survive"
         );
         let goals = session.objective_states();
-        assert_eq!(goals.len(), 6);
+        // The map authors six `Objectif` entries. Completing goal 4 (the lever) runs
+        // `Hual04a.SetGoalComplete(94)`, which calls `SetPrimaryGoal(6)`; `Objectif` is a dynamic
+        // array and the UE2 dynamic-array write past the end grows it (item90
+        // `execDynArrayElement`), so a seventh zeroed (empty, primary) entry appears. Measured on
+        // this route: 7 entries, index 6 empty.
+        assert_eq!(goals.len(), 7);
         // The anti-goal is authored completed and must hold on this route.
         assert!(
             goals[1].anti_goal && goals[1].primary && goals[1].completed,
@@ -7632,17 +7636,12 @@ mod tests {
             Some(&xiii_script::Value::Int(0)),
             "the delivered Degage cue started Cine1.Play(2)"
         );
-        // item90: with Core.dll's out-of-range fixed-array clamp implemented, the install leg no
-        // longer raises `ArrayIndex`. The re-timed route completes the six-soldier death-event
-        // chain (`eNbVivants` 1), reads the earned card at `MagneticPassTrigger4`, walks to the
-        // bureau fuse (`Hual04aFusiblePick0`, event `FusibleRamasse`) and kills the `Cine1`
-        // `LastWave` reinforcement by input (goal 2). It then walks back through the base to the
-        // bureau circuit-breaker, works the door (`use Porte21`) and attempts the fuse install
-        // (`use XIIIGoalTrigger19`), works the cable-car lever (`use XIIIMover1`) and returns to
-        // the cable-car cabin. The install interaction is refused on this reconstructed input:
-        // the game's aimed target resolves to the closed `Porte21` door (`bCanTrigger=false`), so
-        // `XIIIGoalTrigger19` never fires and goals 3/4 stay unclaimed. Goals 3/4/5 and the
-        // Hual04c travel are not claimed (see the task report for the measured evidence).
+        // item92: with the electrical-box door `Porte21` opened and the view aimed at the exposed
+        // fuse socket `XIIIGoalTrigger19` (`track`), the game's own `ReturnTrace` targets the
+        // trigger, `bCanTrigger` is true and the carried fuse's `EventItem.UseMe` triggers goal 3.
+        // The `XIIIMover1` lever then completes goal 4 (its `PlayerTriggerToggle` open fires the
+        // map's `SetGoalComplete(94)`). Goals 3/4 are claimed; goal 5 / the Hual04c travel are the
+        // route's next leg (recorded below, see the report).
         assert_eq!(
             vm.get_property(mi, "eNbVivants"),
             Some(&xiii_script::Value::Int(1)),
@@ -7653,8 +7652,27 @@ mod tests {
             "goal 2 (find the fuse) must complete on this route: {goals:?}"
         );
         assert!(
-            !goals[3].completed && !goals[4].completed && !goals[5].completed,
-            "goals 3/4/5 stay unreached on this route (install interaction refused): {goals:?}"
+            goals[3].completed,
+            "goal 3 (install the fuse) must complete on this route: {goals:?}"
+        );
+        assert!(
+            goals[4].completed,
+            "goal 4 (activate the cable-car) must complete on this route: {goals:?}"
+        );
+        // item92 pin: goal 5 and the Hual04c travel stay unreached. The lever completed goal 4 and
+        // fired the map's `TeleOn`, starting the `Telepherique0` scripted ride, but the
+        // reconstructed route reaches the lever by the named use from ground level (z~99) while
+        // the station is elevated (z~355..476); the player never boards, the `moving` state's
+        // `PC.Pawn.SetBase(self)` carry is not applied to the host pawn, and the destination
+        // `finmap` goal triggers (z~-76) are not reached, so `travel` stays empty (see report).
+        assert!(
+            !goals[5].completed,
+            "goal 5 (rejoin Carrington) stays unreached on this route (cable-car ride not boarded): {goals:?}"
+        );
+        assert!(
+            outcome.travel.is_empty(),
+            "the Hual04c travel stays unreached on this route: {:?}",
+            outcome.travel
         );
         // The LastWave generators each spawned one reinforcement; all three are dead (killed by
         // input) on this route. The generators may be cleaned up after their wave dies, so count
@@ -7686,8 +7704,10 @@ mod tests {
             renforts, 3,
             "the three Cine1 LastWave reinforcements must have spawned and died"
         );
-        // The second wave (`Wave01`/`Wave02`) is not triggered on this route: the player never
-        // reaches Carrington's post-lever cine, so those generators stay empty.
+        // The second wave (`Wave01`/`Wave02`) belongs to Carrington's post-lever cine. This route
+        // activates the cable car by the named lever use without approaching Carrington, so the
+        // generators stay empty (item86's chase measured the second wave only when the player
+        // walked up to Carrington).
         for name in ["GenNMI6", "GenNMI7"] {
             let id = vm
                 .find_object(name)
@@ -7698,8 +7718,8 @@ mod tests {
                 "{name}: the second wave must not spawn on this route"
             );
         }
-        // The cable-car lever use fired, but goal 4 is gated on the fuse install (goal 3), so it
-        // does not complete. Record the lever state for the report.
+        // The cable-car lever use completed goal 4 (its `PlayerTriggerToggle` open fired the
+        // map's `SetGoalComplete(94)`). Record the lever state for the report.
         let lever = vm.find_object("XIIIMover1").expect("cable-car lever");
         println!(
             "[hual04a lever] XIIIMover1 KeyNum={:?} state={:?}",
@@ -7711,7 +7731,7 @@ mod tests {
             Some(&xiii_script::Value::Str("Hual04c.unr".to_owned()))
         );
         println!(
-            "[hual04a next blocker] the route completes the six-kill chain (eNbVivants 1), the card read and the fuse pickup (goal 2), then walks back through the base to the bureau circuit-breaker, works the door (use Porte21) and attempts the fuse install (use XIIIGoalTrigger19, twice) and the cable-car lever (use XIIIMover1), ending at the cable-car cabin (960,570) with no engine error. The install interaction is refused: the game's aimed target resolves to the closed Porte21 door (TargetActor=Porte21, bCanTrigger=false), so XIIIGoalTrigger19 never fires and goals 3/4 stay unclaimed; goal 5 and the Hual04c travel follow goal 4. The ArrayIndex error of item86 is gone (Core.dll fixed-array clamp); the remaining blocker is interaction targeting on this reconstructed input"
+            "[hual04a next blocker] item92: the route completes goals 2, 3 and 4. Goal 3: `use Porte21` opens the XIIIPorte electrical-box door, `track XIIIGoalTrigger19` aims the view at the exposed fuse socket so the game's ReturnTrace targets the trigger with bCanTrigger=true, and the carried fuse's EventItem.UseMe triggers the goal (measured: door closed -> TargetActor Porte21; door open + aim -> XIIIGoalTrigger19). Goal 4: `use XIIIMover1` opens the lever and its FinishedOpening fires ManetteTele -> SetGoalComplete(94). Pinned next blocker: goal 5 and the Hual04c travel. The lever fired `TeleOn` and Telepherique0 runs its scripted ride, but the route reaches the lever by the named use from ground level (z~99) while the station is elevated (z~355..476); the player never boards, the `moving` state's PC.Pawn.SetBase carry is not applied to the host pawn, and the destination finmap triggers (z~-76) are not reached (travel=[])."
         );
     }
 }
