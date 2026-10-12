@@ -198,7 +198,6 @@ pub enum BaseChange {
 
 impl Rider {
     /// Name of the mover the player currently stands on.
-    #[cfg(test)]
     pub fn base(&self) -> Option<&str> {
         self.base.as_ref().map(|b| b.name.as_str())
     }
@@ -255,6 +254,54 @@ impl Rider {
             state.location[2] - base.location[2],
         ];
         base.location = state.location;
+        for k in 0..3 {
+            location[k] += delta[k];
+        }
+        delta
+    }
+}
+
+/// Host carry for a script-set `Pawn.Base`.
+///
+/// Retail `Actor.SetBase` records the actor in the base's `Attached` list and `ULevel::MoveActor`
+/// carries attached actors by the base's displacement; the VM implements that for scripted actors
+/// in [`xiii_script::Vm::carry_attached_actors`]. The host owns the player pawn's `Location`, so
+/// when a script bases the pawn on a moving brush the engine carry would otherwise be lost. Like
+/// [`Rider`], this is the host adaptation: it records the script-set base before the VM step and
+/// applies the base's displacement afterwards. The floor mover [`Rider`] already carries is
+/// excluded so a displacement is never applied twice.
+#[derive(Debug, Default)]
+pub struct BasedCarry {
+    base: Option<(String, [f32; 3])>,
+}
+
+impl BasedCarry {
+    /// Records the player pawn's script-set base mover and its pose, taken before the VM step.
+    /// `floor_base` is the mover [`Rider`] carries for the player's standing floor; a base with
+    /// that name is dropped.
+    pub fn observe(&mut self, base: Option<(String, [f32; 3])>, floor_base: Option<&str>) {
+        self.base = base
+            .filter(|(name, _)| !floor_base.is_some_and(|floor| floor.eq_ignore_ascii_case(name)));
+    }
+
+    /// Adds the recorded base mover's displacement since [`BasedCarry::observe`] to `location`
+    /// (Unreal units) and returns the delta. A base that vanished is dropped.
+    pub fn carry(
+        &mut self,
+        location: &mut [f32; 3],
+        state_of: impl Fn(&str) -> Option<MoverState>,
+    ) -> [f32; 3] {
+        let Some((name, old)) = self.base.take() else {
+            return [0.0; 3];
+        };
+        let Some(state) = state_of(&name) else {
+            return [0.0; 3];
+        };
+        let delta = [
+            state.location[0] - old[0],
+            state.location[1] - old[1],
+            state.location[2] - old[2],
+        ];
         for k in 0..3 {
             location[k] += delta[k];
         }
@@ -498,5 +545,31 @@ mod tests {
         for k in 0..3 {
             assert!((got[k] - want[k]).abs() < 1e-4, "got {got:?} want {want:?}");
         }
+    }
+
+    #[test]
+    fn based_carry_follows_a_script_set_base_and_excludes_the_floor_base() {
+        let mut carry = BasedCarry::default();
+        let state =
+            |z: f32| move |name: &str| name.eq_ignore_ascii_case("Cage").then(|| cage_at(z));
+        // Script set the pawn's Base to `Cage`; the floor is not a mover: record and carry.
+        carry.observe(Some(("Cage".to_owned(), [0.0, 0.0, 0.0])), None);
+        let mut loc = [5.0f32, 6.0, 10.0];
+        assert_eq!(carry.carry(&mut loc, state(20.0)), [0.0, 0.0, 20.0]);
+        assert_eq!(loc, [5.0, 6.0, 30.0]);
+        // The recorded base is consumed: a second carry without a new observe does nothing.
+        assert_eq!(carry.carry(&mut loc, state(40.0)), [0.0; 3]);
+        assert_eq!(loc, [5.0, 6.0, 30.0]);
+        // A base with the floor mover's name is the Rider's job: excluded.
+        carry.observe(Some(("Cage".to_owned(), [0.0; 3])), Some("cage"));
+        assert_eq!(carry.carry(&mut loc, state(60.0)), [0.0; 3]);
+        assert_eq!(loc, [5.0, 6.0, 30.0]);
+        // A vanished base is dropped silently.
+        carry.observe(Some(("Cage".to_owned(), [0.0; 3])), None);
+        assert_eq!(carry.carry(&mut loc, |_| None), [0.0; 3]);
+        assert_eq!(loc, [5.0, 6.0, 30.0]);
+        // A script-set `Base == None` never rides.
+        carry.observe(None, None);
+        assert_eq!(carry.carry(&mut loc, state(80.0)), [0.0; 3]);
     }
 }

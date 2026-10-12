@@ -92,6 +92,8 @@ struct WorldRes {
     movers: movers::MoverCollision,
     /// The mover the player stands on (a lift cage carries the player).
     rider: movers::Rider,
+    /// A mover a script based the player pawn on (`Actor.SetBase`), carried like the rider.
+    based_carry: movers::BasedCarry,
 }
 
 /// Render entities per map actor (the part of the scene object path before `" -> "`), for the
@@ -859,6 +861,7 @@ fn setup_inner(
         sources,
         movers: mover_collision,
         rider: movers::Rider::default(),
+        based_carry: movers::BasedCarry::default(),
     });
     if !resetting {
         commands.insert_resource(ScriptRes { drive });
@@ -1164,6 +1167,14 @@ fn fixed_step(
     perf.span("footsteps", t0);
     if let Ok(sess) = session.as_mut() {
         let t0 = Instant::now();
+        // item94: mirror a script-set `Pawn.Base` mover carry for the host-owned pawn (see
+        // `BasedCarry`); recorded before the VM step, applied after.
+        let based_before = sess.player_base_mover();
+        let floor_base = world.rider.base().map(str::to_owned);
+        world.based_carry.observe(
+            based_before.map(|(n, s)| (n, s.location)),
+            floor_base.as_deref(),
+        );
         let modes = session::PlayerVMModes {
             crouched: sim.0.crouched,
             in_water: sim.0.in_water,
@@ -1176,6 +1187,9 @@ fn fixed_step(
         sess.sync_view_rotation(sim.0.yaw, sim.0.pitch);
         world
             .rider
+            .carry(&mut sim.0.location, |name| sess.vm().mover_state(name));
+        world
+            .based_carry
             .carry(&mut sim.0.location, |name| sess.vm().mover_state(name));
         if let Some((location, yaw, velocity)) = sess.script_pawn_pose() {
             sim.0.location = location;
@@ -2367,6 +2381,8 @@ struct MapRuntime {
     mover_collision: movers::MoverCollision,
     /// The mover the player stands on (a lift cage carries the player).
     rider: movers::Rider,
+    /// A mover a script based the player pawn on (`Actor.SetBase`), carried like the rider.
+    based_carry: movers::BasedCarry,
     volumes: movement_modes::VolumeMotion,
     sim: PlayerSim,
     player_params: PlayerParams,
@@ -2514,6 +2530,7 @@ fn build_map_runtime(
         world,
         mover_collision,
         rider: movers::Rider::default(),
+        based_carry: movers::BasedCarry::default(),
         volumes,
         sim,
         player_params: *params,
@@ -2739,6 +2756,15 @@ fn run_script_inner(
         runtime
             .session
             .set_hook_move(input.forward, input.right, runtime.sim.yaw);
+        // item94: the host owns the player pawn's `Location`; a script-set `Base` (an
+        // `Actor.SetBase` on a moving brush) is carried by the VM for scripted actors, so record
+        // it before the VM step and mirror the base's displacement after (see `BasedCarry`).
+        let based_before = runtime.session.player_base_mover();
+        let floor_base = runtime.rider.base().map(str::to_owned);
+        runtime.based_carry.observe(
+            based_before.map(|(n, s)| (n, s.location)),
+            floor_base.as_deref(),
+        );
         runtime.session.step(
             DT,
             runtime.sim.location,
@@ -2756,6 +2782,11 @@ fn run_script_inner(
         runtime.rider.carry(&mut runtime.sim.location, |name| {
             runtime.session.vm().mover_state(name)
         });
+        runtime
+            .based_carry
+            .carry(&mut runtime.sim.location, |name| {
+                runtime.session.vm().mover_state(name)
+            });
         runtime.session.drive_render_phase();
         if let Some((location, yaw, velocity)) = runtime.session.script_pawn_pose() {
             runtime.sim.location = location;
@@ -7553,7 +7584,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            500.0,
+            620.0,
         )
         .expect("run Hual04a route");
         let session = &outcome.session;
@@ -7608,6 +7639,66 @@ mod tests {
             goals[1]
         );
         let carrington = vm.find_object("Cine1").expect("Carrington's authored pawn");
+        // item94: after the lever the player walks back through `Porte12` (960,720,128) and around
+        // the station's north side down to the boarding platform below the station floor (the same
+        // path a collision-world BFS of the real walker finds; the direct line south is walled).
+        let player_loc = session.player_location();
+        println!(
+            "[hual04a item94] player={player_loc:?} carrington={:?} telepherique={:?}",
+            vm.get_property(carrington, "Location"),
+            vm.find_object("Telepherique0").map(|t| vm.state_name(t)),
+        );
+        // The post-lever cine: `on event TeleOn label00` (tabActions[39]) jumps Carrington's
+        // sequence to tabActions[52]; action 54 `tp 23` calls
+        // `CineController2.TeleportTo(PositionInfo23)` -> `Actor.SetLocation`. The cine then waits
+        // at action 61 `wait player 128` (action_index 62, flagsPaused bit 1).
+        let (cine_action_index, cine_action) = match vm.get_property(carrington, "CineController") {
+            Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(c)))) => {
+                let c = *c;
+                let idx = match vm.get_property(c, "ScriptedActionIndex") {
+                    Some(xiii_script::Value::Int(i)) => *i,
+                    _ => -1,
+                };
+                let list = match vm.get_property(carrington, "tabActions") {
+                    Some(xiii_script::Value::Array(a)) => a.clone(),
+                    _ => Vec::new(),
+                };
+                let cur = list.get(idx.saturating_sub(1) as usize).map(|v| match v {
+                    xiii_script::Value::Str(s) | xiii_script::Value::Name(s) => s.clone(),
+                    o => format!("{o:?}"),
+                });
+                (idx, cur)
+            }
+            _ => (-1, None),
+        };
+        println!("[hual04a item94] cine action_index={cine_action_index} current={cine_action:?}");
+        let p = player_loc.expect("player location");
+        assert!(
+            (p[0] - 945.8).abs() < 60.0 && (p[1] - 393.75).abs() < 60.0 && p[2] < -50.0,
+            "item94: the walked route must reach the boarding platform at PositionInfo23 \
+             (945.8,393.8,-105): {p:?}"
+        );
+        assert_eq!(
+            (cine_action_index, cine_action.as_deref()),
+            (62, Some("wait player 128")),
+            "item94: the post-lever cine must be parked at `wait player 128`"
+        );
+        // The scripted cine teleport `tp 23` calls `Actor.SetLocation(PositionInfo23.Location)`
+        // but the VM's world-placement check (`point_free`, an approximation of `ULevel::FindSpot`)
+        // refuses it (measured: the cine pawn's extent overlaps one BSP triangle of `Model639` at
+        // the destination), so Carrington stays near `PositionInfo18` and never reaches the
+        // platform; the `wait player 128` can never pass from the reached stand and goal 5 / the
+        // travel stay unreached. `xiii-tool` disasm: `CineController2.TeleportTo` @120418,
+        // `ULevel::FarMoveActor` 0x1038a440 calls `ULevel::FindSpot` 0x1038a080.
+        let cl = match vm.get_property(carrington, "Location") {
+            Some(xiii_script::Value::Vector(v)) => *v,
+            other => panic!("Cine1 location {other:?}"),
+        };
+        assert!(
+            (cl[0] - 945.8).abs() > 100.0 || (cl[1] - 393.75).abs() > 100.0,
+            "item94 pin: Carrington's `tp 23` must not have reached PositionInfo23 while the \
+             scripted SetLocation is refused: {cl:?}"
+        );
         // Retail `AActor::IsOverlapping` (Engine.dll @0x10352bd0) uses the brush primitive for a
         // volume brush, so `Degage` (DetectionVolume4) and `dernierpoint` (DetectionVolume5) now
         // fire on the walked route. The old class-cylinder test missed both (DV4's cylinder is
@@ -7659,15 +7750,15 @@ mod tests {
             goals[4].completed,
             "goal 4 (activate the cable-car) must complete on this route: {goals:?}"
         );
-        // item92 pin: goal 5 and the Hual04c travel stay unreached. The lever completed goal 4 and
-        // fired the map's `TeleOn`, starting the `Telepherique0` scripted ride, but the
-        // reconstructed route reaches the lever by the named use from ground level (z~99) while
-        // the station is elevated (z~355..476); the player never boards, the `moving` state's
-        // `PC.Pawn.SetBase(self)` carry is not applied to the host pawn, and the destination
-        // `finmap` goal triggers (z~-76) are not reached, so `travel` stays empty (see report).
+        // item94 pin: goal 5 and the Hual04c travel stay unreached. The route now walks the player
+        // down to Carrington's boarding platform (`PositionInfo23`), but the post-lever cine's
+        // `tp 23` scripted `SetLocation` is refused by the VM world-placement check, so Carrington
+        // never leaves `PositionInfo18`; the cine is parked at `wait player 128` (asserted above)
+        // and never reaches `event LaFinDeLaMap` (tabActions[95]), so `travel` stays empty. See the
+        // report; the `item92`/item81 `SetBase`-carry hypothesis was refuted (see item94 decode).
         assert!(
             !goals[5].completed,
-            "goal 5 (rejoin Carrington) stays unreached on this route (cable-car ride not boarded): {goals:?}"
+            "goal 5 (rejoin Carrington) stays unreached on this route (cine teleport refused): {goals:?}"
         );
         assert!(
             outcome.travel.is_empty(),
@@ -7704,10 +7795,10 @@ mod tests {
             renforts, 3,
             "the three Cine1 LastWave reinforcements must have spawned and died"
         );
-        // The second wave (`Wave01`/`Wave02`) belongs to Carrington's post-lever cine. This route
-        // activates the cable car by the named lever use without approaching Carrington, so the
-        // generators stay empty (item86's chase measured the second wave only when the player
-        // walked up to Carrington).
+        // The second wave (`Wave01`/`Wave02`) belongs to Carrington's post-lever cine (action 63
+        // `Event Wave01 Wave02`), which the route reaches only after the cine passes action 61
+        // `wait player 128`. The refused `tp 23` keeps the cine parked there, so the generators
+        // stay empty.
         for name in ["GenNMI6", "GenNMI7"] {
             let id = vm
                 .find_object(name)
@@ -7731,7 +7822,7 @@ mod tests {
             Some(&xiii_script::Value::Str("Hual04c.unr".to_owned()))
         );
         println!(
-            "[hual04a next blocker] item92: the route completes goals 2, 3 and 4. Goal 3: `use Porte21` opens the XIIIPorte electrical-box door, `track XIIIGoalTrigger19` aims the view at the exposed fuse socket so the game's ReturnTrace targets the trigger with bCanTrigger=true, and the carried fuse's EventItem.UseMe triggers the goal (measured: door closed -> TargetActor Porte21; door open + aim -> XIIIGoalTrigger19). Goal 4: `use XIIIMover1` opens the lever and its FinishedOpening fires ManetteTele -> SetGoalComplete(94). Pinned next blocker: goal 5 and the Hual04c travel. The lever fired `TeleOn` and Telepherique0 runs its scripted ride, but the route reaches the lever by the named use from ground level (z~99) while the station is elevated (z~355..476); the player never boards, the `moving` state's PC.Pawn.SetBase carry is not applied to the host pawn, and the destination finmap triggers (z~-76) are not reached (travel=[])."
+            "[hual04a next blocker] item94: goal 5 is `Rejoin Carrington in front of the cable-car cabin`. The player now walks the full station route down to the boarding platform at `PositionInfo23` (945.8,393.8,-105) below the station floor. The blocker is the post-lever cine: `on event TeleOn label00` jumps Carrington's `CineController2` sequence to `tabActions[52]`; action[54] `tp 23` calls `CineController2.TeleportTo(PositionInfo23)` -> `Actor.SetLocation`, but the VM's world-placement check (`point_free`, an approximation of `ULevel::FindSpot` 0x1038a080, called from `ULevel::FarMoveActor` 0x1038a440) refuses it because the cine pawn's extent overlaps one BSP triangle of `Model639` at the destination. Carrington therefore stays near `PositionInfo18`, the cine is parked at `wait player 128` (tabActions[61]), and `event LaFinDeLaMap` (tabActions[95]) is never fired, so goal 5 and the Hual04c travel stay unreached (travel=[]). The item92/item81 `PC.Pawn.SetBase` carry hypothesis is refuted: `Telepherique.STA_init.Trigger` sets `PC` only when `Level.Title == \"Hual04c\"`."
         );
     }
 }

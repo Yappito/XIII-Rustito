@@ -1516,6 +1516,23 @@ impl Session {
         }
     }
 
+    /// The player pawn's script-set `Base`, when it is a live mover: `(name, state)`. Used by the
+    /// host to carry the host-owned pawn with a moving brush the script based it on
+    /// ([`super::movers::BasedCarry`]); `None` when the pawn has no base or the base is not a
+    /// mover.
+    pub fn player_base_mover(&self) -> Option<(String, xiii_script::vm::MoverState)> {
+        let base = match self.vm.get_property(self.player, "Base") {
+            Some(Value::Object(Some(ObjRef::Instance(i)))) => *i,
+            _ => return None,
+        };
+        let object = self.vm.objects.get(base as usize)?;
+        if object.deleted {
+            return None;
+        }
+        let name = object.name.clone();
+        self.vm.mover_state(&name).map(|state| (name, state))
+    }
+
     /// Sets the player pawn's `Base` to the mover it stands on (`None` clears it), the pawn side of
     /// a lift ride: the host carries the pawn with the mover ([`super::movers::Rider`]).
     pub fn set_player_base(&mut self, mover: Option<&str>) {
