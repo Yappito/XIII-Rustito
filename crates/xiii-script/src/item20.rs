@@ -163,6 +163,9 @@ fn native(vm: &mut Vm<'_>, ctx: &NativeCtx, args: &mut [Value]) -> VmResult<Nati
                 vm.note(crate::vm::TraceKind::Note(format!(
                     "GUI_SAVE_LOAD_SLOT:{slot}"
                 )));
+                // item89b: the runtime consumer reads the slot from the always-on request
+                // queue (the note alone is lost when the diagnostic trace is off).
+                vm.host_request(crate::vm::HostRequest::LoadSlot(slot));
                 true
             } else {
                 false

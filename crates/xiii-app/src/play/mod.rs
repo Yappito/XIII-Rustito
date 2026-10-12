@@ -212,6 +212,13 @@ impl Plugin for PlayPlugin {
         });
         if let Ok(s) = session.as_mut() {
             s.enable_native_timers(options.perf_natives);
+            // item89: the interactive session is not a trace consumer (`format_vm_trace` reads
+            // session counters, not `vm.trace`), so recording every per-tick native/event into
+            // the unbounded `Vec` is pure leak: it grew commit by ~10-37 MiB/s windowed. The
+            // headless deterministic run keeps tracing (route tests assert on `map_traces`).
+            let vm = s.vm_mut();
+            vm.trace_enabled = false;
+            vm.trace_natives = false;
         }
         app.insert_non_send(session);
         app.add_plugins((crate::video::CutscenePlugin, cutscene::CutsceneSystems));
@@ -2227,6 +2234,10 @@ fn travel(
             return;
         }
     };
+    // item89: keep the interactive (windowed) session's trace off across in-process travel,
+    // for the same reason as in `PlayPlugin::build`.
+    s.vm_mut().trace_enabled = false;
+    s.vm_mut().trace_natives = false;
     // item72: the in-game menu's VM references died with the outgoing session; re-configure for
     // the new map (the next `open` reinstalls the GUI graph into the new VM).
     menu.configure(cfg.options.save_dir.clone(), cfg.options.map.clone());
