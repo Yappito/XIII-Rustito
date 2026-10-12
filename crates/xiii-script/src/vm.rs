@@ -788,6 +788,19 @@ pub enum TraceKind {
         /// Code offset.
         offset: u32,
     },
+    /// Array element access outside the array. Core.dll's `execArrayElement` logs
+    /// "Accessed array out of bounds (index/dim)" and clamps a fixed array; `execDynArrayElement`
+    /// logs "Accessed array '<name>' out of bounds (index/len)" and returns the element type's
+    /// zero on a read. Recorded so the substitution is never silent.
+    ArrayOutOfBounds {
+        /// Array property name, or `"?"` when the base is not a named slot.
+        array: String,
+        /// Requested index (may be negative).
+        index: i64,
+        /// Array size the engine compared against: the declared dimension for a fixed array, the
+        /// current length for a dynamic one.
+        len: usize,
+    },
     /// State code reached `stop`.
     StateStop {
         /// Object.
@@ -937,6 +950,10 @@ impl fmt::Display for TraceEvent {
             TraceKind::AccessedNone { function, offset } => {
                 write!(f, "WARN     accessed None in {function} at 0x{offset:04X}")
             }
+            TraceKind::ArrayOutOfBounds { array, index, len } => write!(
+                f,
+                "WARN     accessed array {array}[{index}] out of bounds (len {len})"
+            ),
             TraceKind::StateStop { actor } => write!(f, "STOP     {actor}: state code stopped"),
             TraceKind::Log(s) => write!(f, "LOG      {s}"),
             TraceKind::Timer { actor } => write!(f, "TIMER    {actor}.Timer"),
@@ -1153,10 +1170,12 @@ pub struct Instance {
 enum Place {
     Local(usize),
     Slot(ObjectId, usize),
-    /// Dynamic-array element. The third field is the declared element type, used to
-    /// initialise elements grown by an out-of-range assignment (UE2 zeroes new elements to the
-    /// element type's default, e.g. a zero struct with all its members, not an `int 0`).
-    Elem(Box<Place>, usize, Option<Ty>),
+    /// Dynamic-array element. The index is signed because the engine accepts a negative index (it
+    /// logs and returns zero on a read, and skips the store on a write). The third field is the
+    /// declared element type, used to initialise elements grown by an out-of-range assignment
+    /// (UE2 zeroes new elements to the element type's default, e.g. a zero struct with all its
+    /// members, not an `int 0`).
+    Elem(Box<Place>, i64, Option<Ty>),
     Member(Box<Place>, String),
     /// A dynamic array's `Length` (UE2 `Array.Length = n` resizes the array). The second field is
     /// the declared element type, used to zero the grown elements.
@@ -6779,6 +6798,24 @@ impl<'s> Vm<'s> {
         }
     }
 
+    /// Lowercase property name behind an array base place, for the out-of-bounds diagnostic. Only
+    /// called when an access is already known to be out of range, so it is off the hot path.
+    fn place_array_name(&self, frame: &Frame<'s>, place: &Place) -> Option<String> {
+        let slot = match place {
+            Place::Local(base) => frame
+                .layout
+                .as_ref()
+                .and_then(|l| l.slots.iter().find(|s| s.base == *base)),
+            Place::Slot(obj, base) => self.objects[*obj as usize]
+                .layout
+                .slots
+                .iter()
+                .find(|s| s.base == *base),
+            _ => None,
+        }?;
+        Some(slot.name.clone())
+    }
+
     fn place(
         &mut self,
         frame: &mut Frame<'s>,
@@ -6809,16 +6846,30 @@ impl<'s> Vm<'s> {
                 let Some(base) = self.place(frame, array, target)? else {
                     return Ok(None);
                 };
-                let dim = self.slot_dim(frame, &base);
+                // Core.dll `execArrayElement` (0x10116c30): a fixed array's index is clamped into
+                // `[0, ArrayDim-1]` after logging "Accessed array out of bounds", and the clamped
+                // element is then read or written. It never returns zero and never aborts.
+                let dim = self.slot_dim(frame, &base).max(1);
+                let clamped = if i < 0 {
+                    0
+                } else if i as usize >= dim {
+                    dim - 1
+                } else {
+                    i as usize
+                };
                 if i < 0 || i as usize >= dim {
-                    return Err(self.err(VmErrorKind::ArrayIndex {
+                    let name = self
+                        .place_array_name(frame, &base)
+                        .unwrap_or_else(|| "?".to_owned());
+                    self.note(TraceKind::ArrayOutOfBounds {
+                        array: name,
                         index: i64::from(i),
                         len: dim,
-                    }));
+                    });
                 }
                 match base {
-                    Place::Local(b) => Place::Local(b + i as usize),
-                    Place::Slot(o, b) => Place::Slot(o, b + i as usize),
+                    Place::Local(b) => Place::Local(b + clamped),
+                    Place::Slot(o, b) => Place::Slot(o, b + clamped),
                     _ => {
                         return Err(self.err(VmErrorKind::NotAPlace { opcode: t.opcode }));
                     }
@@ -6830,13 +6881,9 @@ impl<'s> Vm<'s> {
                 let Some(base) = self.place(frame, array, target)? else {
                     return Ok(None);
                 };
-                if i < 0 {
-                    return Err(self.err(VmErrorKind::ArrayIndex {
-                        index: i64::from(i),
-                        len: 0,
-                    }));
-                }
-                Place::Elem(Box::new(base), i as usize, elem_ty)
+                // Core.dll `execDynArrayElement` (0x1011eeb0) distinguishes read from write with
+                // the result pointer; the signed index is carried through to `read`/`write`.
+                Place::Elem(Box::new(base), i64::from(i), elem_ty)
             }
             K::StructMember { property, expr } => {
                 let g = self.resolve_ref(frame, *property)?;
@@ -6859,22 +6906,33 @@ impl<'s> Vm<'s> {
         }))
     }
 
-    fn read(&self, frame: &Frame<'s>, p: &Place) -> VmResult<Value> {
+    fn read(&mut self, frame: &Frame<'s>, p: &Place) -> VmResult<Value> {
         let v = match p {
             Place::Local(i) => frame.locals.get(*i).cloned(),
             Place::Slot(o, i) => self.objects[*o as usize].props.get(*i).cloned(),
-            Place::Elem(base, i, _) => match self.read(frame, base)? {
-                Value::Array(a) => match a.get(*i) {
-                    Some(v) => Some(v.clone()),
-                    None => {
-                        return Err(self.err(VmErrorKind::ArrayIndex {
-                            index: *i as i64,
-                            len: a.len(),
-                        }));
-                    }
-                },
-                other => return Err(self.type_err("array", &other)),
-            },
+            Place::Elem(base, i, elem_ty) => {
+                let arr = match self.read(frame, base)? {
+                    Value::Array(a) => a,
+                    other => return Err(self.type_err("array", &other)),
+                };
+                // Core.dll `execDynArrayElement` read path (0x1011ef3c -> 0x1011ef8f): an index
+                // outside `[0, len)` logs "Accessed array '<name>' out of bounds" and returns the
+                // element type's zero (the result buffer is memset). It neither clamps (that is
+                // the fixed-array path) nor aborts.
+                if *i < 0 || *i as usize >= arr.len() {
+                    let name = self
+                        .place_array_name(frame, base)
+                        .unwrap_or_else(|| "?".to_owned());
+                    self.note(TraceKind::ArrayOutOfBounds {
+                        array: name,
+                        index: *i,
+                        len: arr.len(),
+                    });
+                    Some(zero_like(elem_ty.as_ref(), arr.last()))
+                } else {
+                    Some(arr[*i as usize].clone())
+                }
+            }
             Place::Member(base, m) => Some(
                 member_get(&self.read(frame, base)?, m)
                     .ok_or_else(|| self.err(VmErrorKind::Other(format!("no struct member {m}"))))?,
@@ -6912,7 +6970,23 @@ impl<'s> Vm<'s> {
                     Value::Array(a) => a,
                     other => return Err(self.type_err("array", &other)),
                 };
-                if *i >= arr.len() {
+                // Core.dll `execDynArrayElement` write path (Result == NULL): a positive index past
+                // the end grows the array with `FArray::AddZeroed` and then stores; a negative
+                // index logs and clears the destination pointer, so `execLet` writes into a
+                // scratch buffer and the array is unchanged.
+                if *i < 0 {
+                    let name = self
+                        .place_array_name(frame, base)
+                        .unwrap_or_else(|| "?".to_owned());
+                    self.note(TraceKind::ArrayOutOfBounds {
+                        array: name,
+                        index: *i,
+                        len: arr.len(),
+                    });
+                    return Ok(());
+                }
+                let i = *i as usize;
+                if i >= arr.len() {
                     // UE2 grows a dynamic array on assignment past its end and initialises the new
                     // elements to the element type's default (a zero struct, not the assigned
                     // scalar). The declared element type is known when the array expression is a
@@ -6927,9 +7001,9 @@ impl<'s> Vm<'s> {
                         },
                         Ty::zero,
                     );
-                    arr.resize(*i + 1, zero);
+                    arr.resize(i + 1, zero);
                 }
-                arr[*i] = v;
+                arr[i] = v;
                 self.write(frame, base, Value::Array(arr))?;
             }
             Place::Member(base, m) => {
@@ -11996,6 +12070,24 @@ fn member_set(v: &mut Value, m: &str, x: Value) -> bool {
         _ => return false,
     }
     true
+}
+
+/// The zero the engine writes when a dynamic array is resized or an element is read out of range.
+/// Uses the declared element type when known; otherwise infers it from a sample element (the same
+/// rule the `Array.Length = n` resize uses). Core.dll zeroes `ElementSize` raw bytes, which is the
+/// element type's zero (a zeroed struct/vector, a null object, an empty string).
+fn zero_like(elem_ty: Option<&Ty>, sample: Option<&Value>) -> Value {
+    elem_ty.map_or_else(
+        || match sample {
+            Some(Value::Float(_)) => Value::Float(0.0),
+            Some(Value::Object(_)) => Value::Object(None),
+            Some(Value::Name(_)) => Value::Name("None".into()),
+            Some(Value::Bool(_)) => Value::Bool(false),
+            Some(Value::Byte(_)) => Value::Byte(0),
+            _ => Value::Int(0),
+        },
+        Ty::zero,
+    )
 }
 
 /// UnrealScript equality used by `switch` and struct comparisons: `Name` and `string` compare
