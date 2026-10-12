@@ -4425,6 +4425,15 @@ mod tests {
     /// tower enclose the TT2 landing). The old t=139 TT10 teleport is gone: the fbi_dial2
     /// cutscene owns the player pose from t=133.017, so it never relocated the player nor
     /// fired TouchTrigger10 (measured); the CarOut beat does not fire in this engine run.
+    ///
+    /// item86 re-time on the integrated volume-brush tree: `DetectionVolume12` now uses its
+    /// `Brush` BSP (x in (-7824,-7616), y in (-2784,-2336), z in (784,1248), measured), so its
+    /// Location (-7616,-2784,1456) is above the brush and the old teleport-to-Location touch at
+    /// t=93.017 no longer fires. The route walks into the volume on the safe level: DV12 Touch
+    /// at t=96.6, then the walkway waypoint back to Jones, then the walkway; Cine15 reaches
+    /// `fin_flash` at t=127.1 and XIIIDispatcher4 promotes objective 0 at t=140.1. The escape
+    /// teleports are re-timed to t=128/131/134 so they follow `fin_flash`; objective 1 completes
+    /// by t=147 and the measured `ServerTravel` runs at t=183.0.
     #[test]
     fn opt_in_banque01_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -4442,13 +4451,14 @@ mod tests {
             .join("tests/data/banque01_route.script");
         let script = script::Script::load(&route_path).expect("load item24 banque01 route");
         // 185 s: the measured schedule needs it — the route walks to the vault door (touches
-        // t~88), teleports to DetectionVolume12 at t=93.017, and Jones then reaches Cine15's
-        // touch at t=116.1 with his scene running to fin_flash (~t=125.5); the escape-flow
-        // teleports run t=127..133 (TT5 127.017, TT2 130.017, TT11 133.017, TT4 133.333),
-        // objective 0 completes by t=139.0 (fin_flash + the 13 s XIIIDispatcher4 delay) and
-        // objective 1 by t=146.5 (Cine11's fin_map -> XIIIGoalTrigger2). The map-outro video
+        // t~88), teleports to DetectionVolume12's platform at t=93.0 and walks into the volume's
+        // brush, delivering DV12's Touch at t=96.6; Cine15's scene then runs to `fin_flash` at
+        // t=127.1 (its `wait player 300` actions pass at t=104.5/111.0). The escape-flow
+        // teleports run t=128..134 (TT5 128.0, TT2 131.0, TT3 134.0, TT4 133.333 on the natural
+        // fall), objective 0 completes at t=140.1 (fin_flash + the 13 s XIIIDispatcher4 delay)
+        // and objective 1 by t=147 (Cine11's fin_map -> XIIIGoalTrigger2). The map-outro video
         // then runs its full 33.92 s headless before `PlayingVideo.PlayerTick` issues the
-        // `ServerTravel` (measured travel t=181.967 in the item75 baseline run).
+        // `ServerTravel` (measured travel t=182.967 in the item86 run).
         let outcome = run_script_with_cinematic_input(
             &game_dir,
             "banque01",
