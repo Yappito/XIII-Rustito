@@ -4566,7 +4566,7 @@ fn builtin_defs() -> Vec<NativeDef> {
         ),
         NativeDef {
             status: NativeStatus::Partial(
-                "no collision/encroachment check at the spawn location; abstract-class refusal uses an unverified class-flag bit",
+                "FindSpot/CheckSlice placement and post-BeginPlay encroachment callbacks remain incomplete; abstract-class flag remains unverified; static/no-delete template refusal and pending-kill return decoded",
             ),
             ..def(
                 "Engine.Actor.Spawn",
@@ -4784,18 +4784,18 @@ fn builtin_defs() -> Vec<NativeDef> {
         },
         NativeDef {
             status: NativeStatus::Partial(
-                "world move via physics provider; cylinder blocking dispatches Bump to the blocking actor, then refreshes Touch/UnTouch; encroachment events and exact native ordering remain unverified; player/projectile bBlockPlayers pairing inferred from class names",
+                "static/movable refusal, zero move, positive-fraction return and bilateral blocker-first Bump decoded; sweep look-ahead/backoff, based-actor transport, world Bump, encroachment callbacks and full touch ordering remain incomplete; player/projectile bBlockPlayers pairing inferred from class names",
             ),
             ..def(
                 "Engine.Actor.Move",
                 "native(266) final function bool Move(vector Delta)",
-                "engine.u Actor.Move decoded (Delta, bool); UE2 ULevel::MoveActor / SurrealEngine UActor::Move=TryMove(delta).Fraction==1.0 (true when the full delta was applied); Engine.dll ?execMove@AActor",
+                "Engine.dll execMove 0x103e49e0 returns MoveActor 0x1038a770 bool directly; MoveActor 0x1038b274..0x1038b288 returns Hit.Time > 0, not full-delta completion; Bump dispatch 0x1038b15c..0x1038b17a",
                 actor_move,
             )
         },
         NativeDef {
             status: NativeStatus::Partial(
-                "decoded static/movable refusal, bJustTeleported and base detach; world placement still uses point_free instead of FindSpot/CheckSlice; CheckEncroachment uses cylinder refusal without retail mesh push/EncroachingOn callbacks; based actors and zone/leaf updates remain incomplete",
+                "static/movable refusal, teleport/base detach and recursive based-actor translation decoded; world placement still uses point_free instead of FindSpot/CheckSlice; encroachment geometry/callbacks, client placement exemption and zone/leaf updates remain incomplete",
             ),
             ..def(
                 "Engine.Actor.SetLocation",
@@ -4806,7 +4806,7 @@ fn builtin_defs() -> Vec<NativeDef> {
         },
         NativeDef {
             status: NativeStatus::Partial(
-                "decoded defaults, 0x1000 material request, zero miss outputs and AdditionalTraceType composition; Material remains None and DiscardedHitMask 0 (provider lacks material/discard data); grown-cylinder extents, special world filtering and skeletal hit-item selection remain incomplete",
+                "defaults, flags, zero miss outputs and independent XYZ grown-cylinder bounds decoded; Material remains None and DiscardedHitMask 0 (provider lacks material/discard data); cylinder quadratic/cap precision, special world filtering and skeletal hit-item selection remain incomplete",
             ),
             ..def(
                 "Engine.Actor.Trace",
