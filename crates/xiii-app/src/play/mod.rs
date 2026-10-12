@@ -4793,7 +4793,10 @@ mod tests {
     /// movement so the live AI (whose fire killed the player at t=644 with the old
     /// dash-and-wait cadence) never engages: the route is densely resampled along the same
     /// polyline at a conservative ground speed, and the test pins the measured minimum player
-    /// Health. The Beretta+c9mmAmmo is the level's own `BerettaPick1` touch pickup.
+    /// Health. The Beretta+c9mmAmmo is the level's own `BerettaPick1` touch pickup. item86 re-timed
+    /// the descent on the integrated engine-fidelity tree (automatic AI bursts + retail
+    /// volume-brush overlap): the route now passes east of the west-facing Roulade patroller and
+    /// keeps moving through the Porte7 wait (see the item86 report).
     #[test]
     fn opt_in_amos01_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -4837,9 +4840,13 @@ mod tests {
             outcome.final_map, "Toits01",
             "the route must reach TouchTrigger39 and travel to Toits01"
         );
-        // item40m: the route survives the now-live AI by keeping the player moving (the item40j
-        // dash-and-wait cadence bled 150 -> 0 by t=644). Pin the measured floor so a change that
-        // lets the AI engage the player again fails visibly instead of silently passing.
+        // item86: the integrated engine-fidelity tree makes the AI fire automatic bursts (item76
+        // `Pawn.PressingFire`) and the retail volume-brush overlap fires the level's detection
+        // volumes; the same route then bled 150 -> 0 at the descent and the final-area
+        // reinforcements. The route now passes east of the dormant Roulade patroller (BaseSoldier9,
+        // facing west at -1035,595) so the player is behind its 180-degree sight cone, and keeps
+        // moving through the Porte7 wait. Measured floor 44 (was 28 pre-integration, dead on
+        // integration); pin it so a change that lets the AI engage again fails visibly.
         let amos_min_health = outcome
             .map_min_health
             .iter()
@@ -4851,8 +4858,8 @@ mod tests {
              survived the live-AI fire)"
         );
         assert!(
-            amos_min_health.is_finite() && amos_min_health >= 25.0,
-            "the route player must survive the live-AI fire with margin (measured floor 28); \
+            amos_min_health.is_finite() && amos_min_health >= 35.0,
+            "the route player must survive the live-AI fire with margin (measured floor 44); \
              got {amos_min_health} (a non-finite value means no Health was ever observed)"
         );
         assert!(
