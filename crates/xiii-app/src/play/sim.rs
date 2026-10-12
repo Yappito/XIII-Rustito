@@ -430,8 +430,9 @@ impl PlayerSim {
         }
     }
 
-    /// Climbs along `ladder.climb_dir` at `LadderSpeed` (forward = up, back = down), then exits
-    /// the ladder state when the box leaves every ladder volume.
+    /// PlayerClimbing.PlayerMove supplies view-space forward/strafe acceleration (including
+    /// pitch), not a forced ClimbDir velocity. physLadder feeds it to calcVelocity and moves
+    /// that velocity; Pawn.EndClimbLadder switches to falling when the volume is left.
     #[allow(clippy::too_many_arguments)]
     fn climb_ladder(
         &mut self,
@@ -441,15 +442,21 @@ impl PlayerSim {
         input: Input,
         sources: &[String],
         modes: &dyn MotionQuery,
-        ladder: LadderSample,
+        _ladder: LadderSample,
     ) {
         self.physics = PHYS_LADDER;
         self.grounded = false;
         self.crouched = false;
-        let mut dir = ladder.climb_dir;
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        let mut dir = [
+            input.forward * cp * cy - input.right * sy,
+            input.forward * cp * sy + input.right * cy,
+            input.forward * sp,
+        ];
         let dl = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
         if dl < 1e-6 {
-            dir = [0.0, 0.0, 1.0];
+            dir = [0.0; 3];
         } else {
             dir = [dir[0] / dl, dir[1] / dl, dir[2] / dl];
         }
@@ -460,14 +467,13 @@ impl PlayerSim {
             self.physics = PHYS_FALLING;
             return;
         }
-        let v = input.forward * params.ladder_speed;
+        let v = params.ladder_speed;
         self.velocity = [dir[0] * v, dir[1] * v, dir[2] * v];
         let delta = [dir[0] * v * dt, dir[1] * v * dt, dir[2] * v * dt];
         self.move_no_gravity(world, params, delta, sources);
         let half_uu = self.half_extents_uu(params);
         if modes.ladder_at(self.location, half_uu).is_none() {
             self.on_ladder = false;
-            self.velocity = [0.0; 3];
             self.physics = PHYS_FALLING;
         }
     }
@@ -1480,6 +1486,7 @@ mod tests {
             ..Default::default()
         };
         let mut sim = start_on_floor(&params, 0.0, 0.0);
+        sim.pitch = std::f32::consts::FRAC_PI_2;
         let start_z = sim.location[2];
         let dt = 1.0 / 60.0;
         let mut entered = false;
@@ -1519,6 +1526,51 @@ mod tests {
         );
         // Once past the top, the box leaves the volume and the ladder state clears.
         assert!(reached_top, "player never left the ladder volume");
+    }
+
+    #[test]
+    fn ladder_view_input_can_exit_sideways_without_losing_velocity() {
+        let params = instant_params();
+        let world = flat_floor();
+        let env = TestEnv {
+            ladder: Some(([-50.0, -50.0, 0.0], [50.0, 50.0, 500.0])),
+            ..Default::default()
+        };
+        let mut sim = PlayerSim::new([0.0, 0.0, 250.0], 0.0);
+        // Neutral input must not drift upwards (the former forced climb direction).
+        for _ in 0..30 {
+            sim.step_with_modes(1.0 / 60.0, &world, &params, Input::default(), &[], &env);
+        }
+        assert!(
+            sim.location
+                .into_iter()
+                .zip([0.0, 0.0, 250.0])
+                .all(|(a, b)| (a - b).abs() < 0.001)
+        );
+        assert!(sim.on_ladder);
+        for _ in 0..120 {
+            sim.step_with_modes(
+                1.0 / 60.0,
+                &world,
+                &params,
+                Input {
+                    right: 1.0,
+                    ..Default::default()
+                },
+                &[],
+                &env,
+            );
+            if !sim.on_ladder {
+                break;
+            }
+        }
+        assert!(
+            !sim.on_ladder,
+            "strafe must leave the volume instead of climbing vertically"
+        );
+        assert_eq!(sim.physics, PHYS_FALLING);
+        assert!((sim.location[2] - 250.0).abs() < 0.01);
+        assert!((sim.velocity[1] - params.ladder_speed).abs() < 0.01);
     }
 
     /// The published `Pawn.Physics` bytes must be XIII's `EPhysics` values, not stock UE2's:

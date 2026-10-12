@@ -810,6 +810,7 @@ fn actor_placement(package: &Package, export: usize, p: &Props<'_>) -> ActorPlac
         draw_type: None,
         hidden: p.bool("bHidden").unwrap_or(false),
         collision_flags: [None; 3],
+        trace_flags: [None; 2],
         collision_height: None,
         collision_radius: None,
     }
