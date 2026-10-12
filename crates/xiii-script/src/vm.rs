@@ -1017,6 +1017,9 @@ pub struct ClassLayout {
     pub interp_slot: Option<usize>,
     /// True when the class chain derives from `Mover` (avoids a chain scan per object per tick).
     pub is_mover_class: bool,
+    /// Hot collision/query property addresses, never cached values. Script writes remain
+    /// visible immediately, including Owner, trace gates and changing cylinder sizes.
+    query_slots: [Option<usize>; 7],
 }
 
 impl ClassLayout {
@@ -1229,6 +1232,8 @@ pub struct NativeProfile {
     /// `Class.Function` (the dispatch loop's [`Vm::call_values`] time; natives inside are
     /// additionally counted in `micros`).
     pub tick_fns: BTreeMap<String, u64>,
+    /// Execution counts for the same concrete-class Tick keys.
+    pub tick_calls: BTreeMap<String, u64>,
     /// `Tick` resolution attempts and the subset served from the per-instance memo.
     pub tick_lookups: u64,
     /// `Tick` resolutions served from the per-instance memo (no state/class scan).
@@ -1267,6 +1272,7 @@ impl NativeProfile {
         self.player_tick_dispatch_micros = 0;
         self.scripted_physics_micros = 0;
         self.tick_fns.clear();
+        self.tick_calls.clear();
         self.tick_lookups = 0;
         self.tick_cache_hits = 0;
         self.spawn_count = 0;
@@ -1466,6 +1472,9 @@ pub struct Vm<'s> {
     pub(crate) external_data: Option<Box<dyn ExternalObjectData>>,
     /// Optional per-native/section timing (`--perf-natives`).
     profile: NativeProfile,
+    /// Immutable script metadata indexed lazily by scope. Keep the original child-list
+    /// precedence (including duplicate names and malformed-list termination).
+    scope_functions: std::cell::RefCell<HashMap<GlobalRef, HashMap<String, GlobalRef>>>,
     /// Edge state of the host-driven AI perception (`item14b`): `controller -> player visible`.
     /// Set by [`Vm::update_ai_perception`] so `SeePlayer`/`EnemyNotVisible` fire only on change,
     /// as the engine's sight counter does, instead of restarting an AI state every tick.
@@ -1673,6 +1682,7 @@ impl<'s> Vm<'s> {
             localization_misses: 0,
             external_data: None,
             profile: NativeProfile::default(),
+            scope_functions: Default::default(),
             ai_visible: HashMap::new(),
             suspended_deferred_calls: 0,
             diagnostic_call_scope: false,
@@ -2481,6 +2491,16 @@ impl<'s> Vm<'s> {
         let rotation_slot = slot_base("rotation");
         let collide_slot = slot_base("bcollideactors");
         let interp_slot = slot_base("binterpolating");
+        let query_slots = [
+            "collisionradius",
+            "collisionheight",
+            "owner",
+            "staticmesh",
+            "bblockzeroextenttraces",
+            "bblocknonzeroextenttraces",
+            "bworldgeometry",
+        ]
+        .map(slot_base);
         let is_mover_class = chain_names.iter().any(|n| n == "mover");
         let mut layout = ClassLayout {
             class,
@@ -2496,6 +2516,7 @@ impl<'s> Vm<'s> {
             collide_slot,
             interp_slot,
             is_mover_class,
+            query_slots,
         };
         for c in chain.iter().rev() {
             if let Some(ScriptObject::Class(cl)) = self.set.object(*c) {
@@ -3344,6 +3365,24 @@ impl<'s> Vm<'s> {
     /// Reads a property by name (first element).
     pub fn get_property(&self, id: ObjectId, name: &str) -> Option<&Value> {
         let o = self.objects.get(id as usize)?;
+        // Literal names used by the native query loops avoid lowercase/hash work. Other
+        // spellings still go through the same case-insensitive property lookup.
+        let cached = match name {
+            "Location" => Some(o.layout.location_slot),
+            "Rotation" => Some(o.layout.rotation_slot),
+            "bCollideActors" => Some(o.layout.collide_slot),
+            "CollisionRadius" => Some(o.layout.query_slots[0]),
+            "CollisionHeight" => Some(o.layout.query_slots[1]),
+            "Owner" => Some(o.layout.query_slots[2]),
+            "StaticMesh" => Some(o.layout.query_slots[3]),
+            "bBlockZeroExtentTraces" => Some(o.layout.query_slots[4]),
+            "bBlockNonZeroExtentTraces" => Some(o.layout.query_slots[5]),
+            "bWorldGeometry" => Some(o.layout.query_slots[6]),
+            _ => None,
+        };
+        if let Some(slot) = cached {
+            return slot.and_then(|i| o.props.get(i));
+        }
         let s = o.layout.slot_by_name(name)?;
         o.props.get(s.base)
     }
@@ -3726,27 +3765,51 @@ impl<'s> Vm<'s> {
     }
 
     fn find_function_in(&self, scope: GlobalRef, name: &str) -> Option<GlobalRef> {
+        let mut scopes = self.scope_functions.borrow_mut();
+        let functions = scopes
+            .entry(scope)
+            .or_insert_with(|| self.index_scope_functions(scope));
+        let bytes = name.as_bytes();
+        if bytes.is_ascii() && bytes.len() <= STACK_NAME_BYTES {
+            let mut buf = [0u8; STACK_NAME_BYTES];
+            for (i, b) in bytes.iter().enumerate() {
+                buf[i] = b.to_ascii_lowercase();
+            }
+            functions
+                .get(std::str::from_utf8(&buf[..bytes.len()]).unwrap_or(name))
+                .copied()
+        } else {
+            functions.get(&name.to_ascii_lowercase()).copied()
+        }
+    }
+
+    fn index_scope_functions(&self, scope: GlobalRef) -> HashMap<String, GlobalRef> {
+        let mut functions = HashMap::new();
         let p = &self.set.packages[scope.package];
-        let h = self.struct_header(scope)?;
+        let Some(h) = self.struct_header(scope) else {
+            return functions;
+        };
         let mut child = h.children;
         let mut guard = 0;
         while let ObjectRef::Export(e) = child {
             guard += 1;
             if guard > 65_536 {
-                return None;
+                break;
             }
-            let obj = p.objects.get(&e)?;
-            if matches!(obj, ScriptObject::Function(_))
-                && p.ref_name(child).eq_ignore_ascii_case(name)
-            {
-                return Some(GlobalRef {
-                    package: scope.package,
-                    export: e,
-                });
+            let Some(obj) = p.objects.get(&e) else {
+                break;
+            };
+            if matches!(obj, ScriptObject::Function(_)) {
+                functions
+                    .entry(p.ref_name(child).to_ascii_lowercase())
+                    .or_insert(GlobalRef {
+                        package: scope.package,
+                        export: e,
+                    });
             }
             child = obj.field().next;
         }
-        None
+        functions
     }
 
     /// Virtual lookup: current state (and its super states), then the class chain.
@@ -4249,7 +4312,7 @@ impl<'s> Vm<'s> {
             }
         }
         if profiling {
-            self.profile.player_tick_dispatch_micros += t0.elapsed().as_micros() as u64;
+            self.profile.tick_dispatch_micros += t0.elapsed().as_micros() as u64;
         }
         // item53: engine physics integration for script-driven actors, after the script Tick
         // phase (the engine integrates inside the actor's native Tick, after the script
@@ -4337,6 +4400,7 @@ impl<'s> Vm<'s> {
             self.call_values(f, id, vec![Value::Float(dt)])?;
             if let Some(t0) = t0 {
                 let key = self.tick_fn_key(id);
+                *self.profile.tick_calls.entry(key.clone()).or_default() += 1;
                 *self.profile.tick_fns.entry(key).or_default() += t0.elapsed().as_micros() as u64;
             }
         }
@@ -11992,6 +12056,7 @@ mod stack_name_tests {
             collide_slot: None,
             interp_slot: None,
             is_mover_class: false,
+            query_slots: [None; 7],
         }
     }
 
