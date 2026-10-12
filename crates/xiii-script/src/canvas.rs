@@ -1178,6 +1178,21 @@ pub struct TravelRequest {
     pub items: bool,
 }
 
+impl TravelRequest {
+    /// Builds the request from a raw `ClientTravel` URL: the map is the part before `?`,
+    /// lowercased (the same rule [`parse_travel_note`] applies to the note payload, so the
+    /// trace note and the host-request queue can never drift).
+    pub fn from_url(url: &str, travel_type: u8, items: bool) -> Self {
+        let map = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+        TravelRequest {
+            url: url.to_owned(),
+            map,
+            travel_type,
+            items,
+        }
+    }
+}
+
 /// Builds the structured trace note recorded by `ClientTravel`.
 pub fn format_travel_note(url: &str, travel_type: u8, items: bool) -> String {
     format!(
@@ -1203,13 +1218,7 @@ pub fn parse_travel_note(note: &str) -> Option<TravelRequest> {
         }
     }
     let url = url?;
-    let map = url.split('?').next().unwrap_or(&url).to_ascii_lowercase();
-    Some(TravelRequest {
-        url,
-        map,
-        travel_type,
-        items,
-    })
+    Some(TravelRequest::from_url(&url, travel_type, items))
 }
 
 /// `Engine.VideoPlayer.Open(string Filename) -> bool` (native 484).
@@ -1690,6 +1699,21 @@ mod menu_tests {
             (r.map.as_str(), r.travel_type, r.items),
             ("banque01", 3, true)
         );
+    }
+
+    /// item89b: the host-request queue builds its `TravelRequest` directly with
+    /// `from_url`; it must stay identical to the note-parsed one.
+    #[test]
+    fn from_url_matches_the_parsed_note_payload() {
+        for (url, tt, items) in [
+            ("MapMenu", 0u8, false),
+            ("Plage00?Difficulty=1?Foo", 2, true),
+            ("", 3, false),
+        ] {
+            let built = TravelRequest::from_url(url, tt, items);
+            let parsed = parse_travel_note(&format_travel_note(url, tt, items)).expect("parses");
+            assert_eq!(built, parsed, "url={url:?}");
+        }
     }
 
     #[test]

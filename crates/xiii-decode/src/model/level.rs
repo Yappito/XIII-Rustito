@@ -41,6 +41,8 @@ pub struct ActorPlacement {
     pub hidden: bool,
     /// `bCollideActors`, `bBlockActors`, `bBlockPlayers` when present.
     pub collision_flags: [Option<bool>; 3],
+    /// `bBlockNonZeroExtentTraces`, `bBlockZeroExtentTraces` (box, line).
+    pub trace_flags: [Option<bool>; 2],
     /// `CollisionHeight` from the map, if present (a HALF height for Pawn-like actors).
     pub collision_height: Option<f32>,
     /// `CollisionRadius` from the map, if present.
@@ -120,6 +122,10 @@ fn placement(package: &Package, export: usize, p: &Props<'_>) -> ActorPlacement 
             p.bool("bCollideActors"),
             p.bool("bBlockActors"),
             p.bool("bBlockPlayers"),
+        ],
+        trace_flags: [
+            p.bool("bBlockNonZeroExtentTraces"),
+            p.bool("bBlockZeroExtentTraces"),
         ],
         collision_height: p.float("CollisionHeight"),
         collision_radius: p.float("CollisionRadius"),

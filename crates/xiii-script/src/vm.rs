@@ -873,6 +873,24 @@ pub enum TraceKind {
     Note(String),
 }
 
+/// Capacity of the bounded host-request queue ([`Vm::host_request`]). The host drains every
+/// frame, so the steady-state depth is a couple of entries; the bound only exists so a
+/// request storm cannot grow memory. When it is full the **oldest** request is evicted (and
+/// counted in [`Vm::host_requests_dropped`]) so the newest request always survives.
+pub const MAX_HOST_REQUESTS: usize = 64;
+
+/// A host-request note a runtime consumer parses, carried on a bounded queue that is always
+/// recorded — independent of [`Vm::trace_enabled`] (item89b). The diagnostic trace stays the
+/// tool/test/survey product; the windowed game reads its requests from here instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRequest {
+    /// `PlayerController.ClientTravel` (the item16 structured note payload,
+    /// `canvas::TravelRequest`).
+    Travel(crate::canvas::TravelRequest),
+    /// `GUI.SaveLoad.LoadAtCheckpoint` (payload of the `GUI_SAVE_LOAD_SLOT:` note).
+    LoadSlot(u32),
+}
+
 impl fmt::Display for TraceEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[t{:>3} {:>7.3}s] ", self.tick, self.time)?;
@@ -1388,6 +1406,12 @@ pub struct Vm<'s> {
     pub trace: Vec<TraceEvent>,
     /// Record native calls in the trace.
     pub trace_natives: bool,
+    /// Master gate for [`Vm::note`]: when false, no trace records are appended and the
+    /// per-event strings are not retained. item89: interactive `--play` sessions turn this
+    /// off — the per-tick native/event trace of a level is a diagnostics product, and the
+    /// unbounded `Vec` grew commit by ~10 MiB/s (Plage00) to ~37 MiB/s (Banque01). Defaults
+    /// to true: tool runs, route tests and the survey read the trace.
+    pub trace_enabled: bool,
     stack: Vec<StackEntry>,
     /// Ticks run.
     pub tick_count: u64,
@@ -1452,6 +1476,14 @@ pub struct Vm<'s> {
     /// Explicit `ParticleEmitter.SpawnParticle` requests for the presentation host. The emitter
     /// object and request origin remain VM-owned; the renderer consumes these commands once.
     particle_spawns: Vec<(ObjectId, usize)>,
+    /// Bounded queue of host-request notes (`ClientTravel` travel, `LoadAtCheckpoint` slot;
+    /// item89b). Always recorded, independent of [`Vm::trace_enabled`]; the runtime consumers
+    /// drain it each frame with [`Vm::drain_host_requests`].
+    host_requests: Vec<HostRequest>,
+    /// Host requests evicted from the full bounded queue (oldest-first). A non-zero count
+    /// means the host did not drain fast enough for [`MAX_HOST_REQUESTS`] requests to pile up
+    /// within one frame; never silently reset.
+    pub host_requests_dropped: u64,
     /// Pending level-travel request (item15). Set by the `PlayerController.ClientTravel` native
     /// or observed on `LevelInfo.NextURL` after the game's `ServerTravel`; consumed by the host
     /// with [`Vm::take_travel_request`]. The VM itself never loads a map.
@@ -1659,6 +1691,7 @@ impl<'s> Vm<'s> {
             registry: Registry::builtin(),
             trace: Vec::new(),
             trace_natives: true,
+            trace_enabled: true,
             stack: Vec::new(),
             tick_count: 0,
             time: 0.0,
@@ -1687,6 +1720,8 @@ impl<'s> Vm<'s> {
             save_slots: None,
             events: Vec::new(),
             particle_spawns: Vec::new(),
+            host_requests: Vec::new(),
+            host_requests_dropped: 0,
             pending_travel: None,
             level_info: None,
             last_next_url: String::new(),
@@ -2050,8 +2085,13 @@ impl<'s> Vm<'s> {
         }
     }
 
-    /// Appends a trace record at the current tick/time.
+    /// Appends a trace record at the current tick/time. No-op when [`Vm::trace_enabled`] is
+    /// false (the payload is still constructed by the caller; the hot native path checks
+    /// [`Vm::trace_natives`] before formatting anything).
     pub fn note(&mut self, kind: TraceKind) {
+        if !self.trace_enabled {
+            return;
+        }
         self.trace.push(TraceEvent {
             tick: self.tick_count,
             time: self.time,
@@ -2124,6 +2164,24 @@ impl<'s> Vm<'s> {
     /// Drains particle spawn commands for the renderer. Commands are consumed exactly once.
     pub fn drain_particle_spawns(&mut self) -> Vec<(ObjectId, usize)> {
         std::mem::take(&mut self.particle_spawns)
+    }
+
+    /// Queues a host-request note for the runtime consumers (item89b). Always recorded —
+    /// independent of [`Vm::trace_enabled`], which gates only the diagnostic trace. Bounded
+    /// ([`MAX_HOST_REQUESTS`]): when full, the oldest request is evicted and counted in
+    /// [`Vm::host_requests_dropped`] (the eviction is never silent for diagnostics).
+    pub fn host_request(&mut self, request: HostRequest) {
+        if self.host_requests.len() >= MAX_HOST_REQUESTS {
+            self.host_requests.remove(0);
+            self.host_requests_dropped += 1;
+        }
+        self.host_requests.push(request);
+    }
+
+    /// Drains the queued host-request notes. Requests are consumed exactly once (the same
+    /// contract as [`Vm::drain_particle_spawns`]).
+    pub fn drain_host_requests(&mut self) -> Vec<HostRequest> {
+        std::mem::take(&mut self.host_requests)
     }
 
     /// Number of presentation events waiting to be drained.
