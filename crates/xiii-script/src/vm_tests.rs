@@ -2357,6 +2357,108 @@ fn spawn_none_class_returns_none_and_abstract_refused() {
 }
 
 #[test]
+fn item74_spawn_refuses_static_template_before_lifecycle() {
+    for flag in ["bStatic", "bNoDelete"] {
+        let mut b = SpawnB::new();
+        let actor = b.reserve(0, 0, "Actor");
+        let child = b.reserve(0, 0, "Child");
+        let prop = b.reserve(IMP_BOOLPROP, actor, flag);
+        b.prop(prop, 0, 0);
+        b.class(actor, 0, prop, 0);
+        b.class(child, actor, 0, 0);
+        let name = b.exports[(prop - 1) as usize].name;
+        let data = &mut b.exports[(child - 1) as usize].payload;
+        data.pop();
+        data.extend(compact(name));
+        data.push(0x83);
+        data.extend(compact(0));
+        let pkg = ScriptPackage::load(
+            "Test",
+            b.build(),
+            &ScriptLimits::default(),
+            &Limits::default(),
+        )
+        .unwrap();
+        let mut set = ScriptSet::new();
+        set.add(pkg);
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let spawner = vm.spawn(sg(&set, "Actor"), "Spawner").unwrap();
+        vm.set_physics(Box::new(crate::physics::FlatPhysics::new(10.0)));
+        let before = vm.objects.len();
+        assert_eq!(
+            vm.spawn_actor(
+                spawner,
+                Some(sg(&set, "Child")),
+                None,
+                None,
+                Some([0.0; 3]),
+                None
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            vm.trace
+                .iter()
+                .any(|e| matches!(e.kind, TraceKind::SpawnRefused { .. }))
+        );
+        assert!(
+            !vm.trace
+                .iter()
+                .any(|e| matches!(e.kind, TraceKind::Event { .. }))
+        );
+        assert_eq!(
+            vm.objects.len(),
+            before,
+            "refusal must not allocate or consume a name"
+        );
+    }
+}
+
+#[test]
+fn item74_trace_asymmetric_extent_uses_independent_y_bounds() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let source = phys_actor(&mut vm, &set, "Source", [-100.0, 15.0, 0.0]);
+    let target = phys_actor(&mut vm, &set, "Target", [0.0; 3]);
+    set_collision_fields(&mut vm, target, true, true);
+    vm.set_property(target, "CollisionRadius", 0, Value::Float(10.0));
+    vm.set_property(target, "CollisionHeight", 0, Value::Float(10.0));
+    vm.set_property(target, "bBlockNonZeroExtentTraces", 0, Value::Bool(true));
+    for (y, expected) in [(0.0, None), (20.0, Some(target))] {
+        let (hit, _, _) = vm
+            .vm_script_trace(
+                source,
+                [-100.0, 15.0, 0.0],
+                [100.0, 15.0, 0.0],
+                0xbf,
+                [20.0, y, 1.0],
+            )
+            .unwrap();
+        assert_eq!(hit, expected);
+    }
+}
+
+#[test]
+fn item74_move_zero_progress_and_static_refusal() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([10.0, -100.0, -100.0], [20.0, 100.0, 100.0]),
+    ));
+    let actor = phys_actor(&mut vm, &set, "Mover", [0.0; 3]);
+    set_collision_fields(&mut vm, actor, false, false);
+    assert!(!vm.vm_move(actor, [100.0, 0.0, 0.0]).unwrap());
+    assert_eq!(vm.vector_prop(actor, "Location"), Some([0.0; 3]));
+    assert!(vm.vm_move(actor, [0.0; 3]).unwrap());
+    vm.set_property(actor, "bStatic", 0, Value::Bool(true));
+    assert!(!vm.vm_move(actor, [0.0; 3]).unwrap());
+    assert!(!vm.vm_move(actor, [-100.0, 0.0, 0.0]).unwrap());
+    assert_eq!(vm.vector_prop(actor, "Location"), Some([0.0; 3]));
+}
+
+#[test]
 fn item49b_spawn_inherits_instigator_before_spawned_independently_of_owner() {
     let set = spawn_set();
     let mut vm = Vm::new(&set, VmLimits::default());
@@ -6483,7 +6585,10 @@ fn move_into_wall_stops_at_hit_and_bcollideworld_false_ignores_it() {
         NativeOutcome::Value(Value::Bool(b)) => b,
         other => panic!("{other:?}"),
     };
-    assert!(!moved, "blocked by the wall");
+    assert!(
+        moved,
+        "retail Move returns true for positive partial progress"
+    );
     assert_eq!(
         vm.get_property(a, "Location"),
         Some(&Value::Vector([90.0, 0.0, 0.0]))
@@ -7041,10 +7146,8 @@ fn exact_contact_boundary_overlaps() {
     let b = phys_actor(&mut vm, &set, "B", [20.0, 0.0, 0.0]);
     set_collision_fields(&mut vm, a, true, false);
     set_collision_fields(&mut vm, b, true, false);
-    // Zero delta still recomputes touching; distance == r1+r2 counts as overlap in XIII's
-    // decoded comparison (`VSize <= r1+r2`).
-    let mut args = [Value::Vector([0.0, 0.0, 0.0])];
-    try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    // Distance == r1+r2 counts as overlap. Retail zero Move exits before contact updates.
+    vm.refresh_touching(a, true).unwrap();
     assert_eq!(vm.get_property(a, "Touches"), Some(&Value::Int(1)));
     assert_eq!(vm.get_property(b, "Touches"), Some(&Value::Int(1)));
 }
@@ -7058,8 +7161,7 @@ fn set_collision_false_ends_touching() {
     let b = phys_actor(&mut vm, &set, "B", [5.0, 0.0, 0.0]);
     set_collision_fields(&mut vm, a, true, false);
     set_collision_fields(&mut vm, b, true, false);
-    let mut args = [Value::Vector([0.0, 0.0, 0.0])];
-    try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    vm.refresh_touching(a, true).unwrap();
     assert_eq!(vm.touching_list(a), vec![b]);
 
     let mut args = [Value::Bool(false), Value::Bool(false), Value::Bool(false)];
@@ -7128,7 +7230,10 @@ fn blocking_actor_stops_the_move_and_is_not_touched() {
         NativeOutcome::Value(Value::Bool(b)) => b,
         other => panic!("{other:?}"),
     };
-    assert!(!moved);
+    assert!(
+        moved,
+        "retail Move returns true for positive partial progress"
+    );
     // Stops exactly at contact (distance == r1 + r2), never past it.
     match vm.get_property(a, "Location") {
         Some(Value::Vector(v)) => assert!((v[0] - 30.0).abs() < 1e-3, "{v:?}"),
@@ -7341,8 +7446,7 @@ fn touching_actors_iterator_filters_by_base_class() {
     set_collision_fields(&mut vm, b, true, false);
     let c = phys_actor(&mut vm, &set, "C", [0.0, 5.0, 0.0]);
     set_collision_fields(&mut vm, c, true, false);
-    let mut args = [Value::Vector([0.0, 0.0, 0.0])];
-    try_native(&mut vm, "Engine.Actor.Move", a, &[false], &mut args).unwrap();
+    vm.refresh_touching(a, true).unwrap();
     assert_eq!(vm.touching_list(a).len(), 2);
 
     let base = Value::Object(Some(ObjRef::Static(pg(&set, "Child"))));
@@ -14373,6 +14477,36 @@ fn item63_setlocation_refusal_preserves_base_and_success_detaches() {
         vm.get_property(actor, "bJustTeleported"),
         Some(&Value::Bool(true))
     );
+}
+
+#[test]
+fn item74_setlocation_carries_nested_bases_and_refused_child_does_not_cancel_parent() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let parent = phys_actor(&mut vm, &set, "Parent", [10.0, 20.0, 30.0]);
+    let child = phys_actor(&mut vm, &set, "Child", [15.0, 22.0, 33.0]);
+    let nested = phys_actor(&mut vm, &set, "Nested", [16.0, 24.0, 35.0]);
+    let fixed = phys_actor(&mut vm, &set, "Fixed", [12.0, 21.0, 31.0]);
+    for id in [parent, child, nested, fixed] {
+        set_collision_fields(&mut vm, id, false, false);
+    }
+    for (id, base) in [(child, parent), (nested, child), (fixed, parent)] {
+        vm.set_property(id, "Base", 0, Value::Object(Some(ObjRef::Instance(base))));
+    }
+    vm.set_property(fixed, "bStatic", 0, Value::Bool(true));
+    assert!(vm.vm_set_location(parent, [110.0, -20.0, 40.0]).unwrap());
+    assert_eq!(
+        vm.vector_prop(child, "Location"),
+        Some([115.0, -18.0, 43.0])
+    );
+    assert_eq!(
+        vm.vector_prop(nested, "Location"),
+        Some([116.0, -16.0, 45.0])
+    );
+    assert_eq!(vm.vector_prop(fixed, "Location"), Some([12.0, 21.0, 31.0]));
+    assert_eq!(vm.obj_prop(child, "Base"), Some(parent));
+    assert_eq!(vm.obj_prop(nested, "Base"), Some(child));
 }
 
 #[test]
