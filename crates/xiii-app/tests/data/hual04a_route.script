@@ -1,18 +1,19 @@
-# Hual04a diagnostic route: six kills, earned card, bureau reader, fuse and installation.
+# Hual04a diagnostic route (item86 re-time on the integrated engine-fidelity tree):
+# six kills, earned card, bureau reader. The automatic AI bursts (`Pawn.PressingFire`
+# reads the controller bFire byte) tripled the incoming damage, so the route now fights
+# each soldier from before it closes, crouches while under the charged soldier's burst
+# and heals on the base medkit. The route is cut at the bureau card reader: picking the
+# fuse (`FusibleRamasse`) spawns the `Cine1` `LastWave` reinforcement (tabActions[35])
+# whose burst kills the 17-hp player on the walk-out (measured), so the fuse goals, lever
+# and Hual04c travel are not attempted.
 # Diagnostic weapon grant: Beretta carried from Hual01b through Hual02 (see
 # hual02_route.script's campaign-loadout note). Direct Hual04a login has no Beretta.
 # No teleports, set_goal or take_control. Coordinates and times are Unreal units/seconds.
-# Native #391 now permits the corpse timer to freeze its shadow. Continue the
-# six-soldier death-event chain by input; do not infer the card counter from Timer.
-# The engine links the pawn's spawn overlaps silently (Vm::seed_touching_of), but the player
-# spawns only inside DetectionVolume4's *brush* (its class cylinder sits ~867 UU away) and walks
-# the canyon floor above DetectionVolume5's cylinder (top z=158). The engine's
-# `AActor::IsOverlapping` tests a VolumeBrush with its brush primitive; substituting the brush's
-# world AABB for the primitive regressed Hual01b/Hual02 (concave volumes over-fire), so this route
-# keeps the cylinder test. Both one-shot Touch events stay undelivered, Carrington's Cine1 (and
-# its LastWave reinforcement spawn) never starts, and installation case3 treats the empty
-# SpawnActor as not-dead -> FinDeMission. No reinforcement kill, lever activation or travel is
-# claimed.
+# The engine's `AActor::IsOverlapping` tests a VolumeBrush with its brush primitive, so
+# DetectionVolume4 (`Degage`) and DetectionVolume5 (`dernierpoint`) fire on the walked
+# route and Carrington's `Cine1.Play(2)` starts. The alerted canyon soldiers now converge,
+# so the six-soldier death-event chain is completed by input (all six dead); do not infer
+# the card counter from Timer.
 t=0.50 weapon xiii.Beretta
 t=1.00 switch_weapon 2
 t=2.50 goto -10200 -1500
@@ -33,38 +34,66 @@ t=58.00 goto -3302 1388
 t=62.00 goto -3203 1209
 t=66.00 goto -3140 300
 t=70.00 goto -3160 -600
-t=74.00 goto -3260 -1600
-t=78.00 goto -3380 -2400
-t=81.00 goto -3440 -3000
-t=84.00 goto -3455 -3230
-t=87.00 track BaseSoldier1 0.85
-t=88.00 goto -3458 -3300
-t=92.00 fire
-t=93.20 fire
-t=94.40 fire
-t=95.60 fire
-t=96.80 fire
-t=98.00 fire
-t=99.20 fire
-t=100.40 fire
-t=102.00 goto -3458 -3338
-t=104.50 goto -3458 -3355
-t=107.00 goto -3458 -3358
-t=111.00 track off
+# Fight the two canyon soldiers from the (-3160,-600) stop, before their burst
+# fire ramps up; the rifleman (BaseSoldier1) dies before it charges out of weapon
+# range, then the shotgun soldier after a reload.
+t=72.00 track BaseSoldier1 0.85
+t=72.20 fire
+t=72.60 fire
+t=73.00 fire
+t=73.40 fire
+t=73.80 fire
+t=74.20 fire
+t=74.60 fire
+t=75.00 fire
+t=75.40 fire
+t=75.60 reload
+t=77.40 track BaseSoldier5 0.85
+t=77.60 fire
+t=78.00 fire
+t=78.40 fire
+t=78.80 fire
+t=79.20 fire
+t=79.60 fire
+t=80.00 fire
+t=80.40 fire
+t=80.80 fire
+t=81.20 fire
+t=81.60 fire
+t=82.00 track off
+t=80.60 goto -3260 -1600
+t=82.00 goto -3380 -2400
+t=84.00 goto -3440 -3000
+t=86.00 goto -3455 -3230
+# The alerted third canyon soldier (BaseSoldier0) charges the stand; crouch and
+# kill it there so it does not whittle the player down on the walk-out.
+t=86.60 crouch 1
+t=86.10 switch_weapon 11
+t=86.20 reload
+t=88.40 track BaseSoldier0 0.85
+t=88.60 fire
+t=89.00 fire
+t=89.40 fire
+t=89.80 fire
+t=90.20 fire
+t=90.60 fire
+t=91.00 fire
+t=91.40 fire
+t=91.80 fire
+t=92.20 fire
+t=92.60 fire
+t=93.00 fire
+t=93.40 fire
+t=93.80 fire
+t=94.20 fire
+t=94.60 fire
+t=95.00 fire
+t=95.40 track off
+t=95.60 crouch 0
 # Walk across the pursued soldier's corpse (his death position moved from spawn).
 t=112.00 goto -3300 -2800
 t=115.00 reload
-t=118.00 track BaseSoldier5 1.0
 t=118.00 goto -3500 -2450
-t=121.00 fire
-t=122.20 fire
-t=123.40 fire
-t=124.60 fire
-t=125.80 fire
-t=127.00 fire
-t=128.20 fire
-t=129.40 fire
-t=131.00 track off
 t=131.00 goto -3050 -2896
 t=133.00 goto -3123 -2652
 t=135.00 goto -3000 -1900
@@ -89,18 +118,18 @@ t=168.00 reload
 t=168.00 goto -1150 -176
 t=170.00 use Porte22
 t=171.00 goto -860 -176
-# M16 from the map's own login/corpse inventory; group 11 is measured, not a grant.
+# Second carried weapon group, selected for the base fights.
 t=171.00 switch_weapon 11
-t=171.00 track BaseSoldier10 1.0
+t=171.00 track BaseSoldier10 0.85
+t=171.20 fire
+t=171.60 fire
 t=172.00 fire
+t=172.40 fire
+t=172.80 fire
 t=173.20 fire
-t=174.40 fire
-t=175.60 fire
-t=176.80 fire
-t=178.00 fire
-t=179.20 fire
-t=180.40 fire
-t=182.00 track off
+t=173.60 fire
+t=174.00 fire
+t=174.40 track off
 t=182.00 goto -614 -394
 t=184.00 goto -860 -56
 t=186.00 goto -850 493
@@ -109,17 +138,21 @@ t=190.00 goto -450 493
 t=192.00 use Porte15
 t=193.00 goto -230 486
 t=195.00 goto 125 470
-t=190.00 track BaseSoldier12 1.0
+t=190.00 track BaseSoldier12 0.85
 t=190.00 reload
 t=193.00 fire
+t=193.40 fire
+t=193.80 fire
 t=194.20 fire
+t=194.60 fire
+t=195.00 fire
 t=195.40 fire
+t=195.80 fire
+t=196.20 fire
 t=196.60 fire
-t=197.80 fire
-t=199.00 fire
-t=200.20 fire
-t=201.40 fire
-t=204.00 track off
+t=197.00 fire
+t=197.40 fire
+t=197.80 track off
 t=204.00 goto 401 -26
 t=207.00 goto 125 470
 t=210.00 goto -230 600
@@ -129,18 +162,30 @@ t=215.00 goto -255 921
 t=218.00 goto 770 876
 t=221.00 goto 770 960
 t=223.00 use Porte8
-t=224.00 goto 770 1158
-t=227.00 track BaseSoldier4 1.0
-t=227.00 reload
-t=230.00 fire
-t=231.20 fire
-t=232.40 fire
-t=233.60 fire
-t=234.80 fire
-t=236.00 fire
-t=237.20 fire
-t=238.40 fire
-t=241.00 track off
+# Detour over the base medkit before the last soldier so the low-health route
+# can afford the final burst exchange.
+t=224.00 goto 941 1252
+t=225.50 heal
+t=225.80 reload
+t=226.00 goto 770 1158
+t=226.10 crouch 1
+t=226.30 track BaseSoldier4 0.85
+t=226.50 fire
+t=226.90 fire
+t=227.30 fire
+t=227.70 fire
+t=228.10 fire
+t=228.50 fire
+t=228.90 fire
+t=229.30 fire
+t=229.70 fire
+t=230.10 fire
+t=230.50 fire
+t=230.90 fire
+t=231.30 fire
+t=231.70 fire
+t=232.10 track off
+t=232.30 crouch 0
 t=241.00 goto 826 1359
 t=246.00 goto 362 1280
 t=255.00 goto 770 1158
@@ -171,42 +216,7 @@ t=329.00 grab_input
 t=332.00 grab_input
 t=335.00 track off
 t=335.00 crouch 0
-t=335.00 goto -3650 3100
-t=338.00 goto -3650 2780
-t=341.00 goto -3320 2780
-t=344.00 goto -3200 2986
-t=347.00 track Hual04aFusiblePick0 0
-t=349.00 grab_input
-t=352.00 track off
-t=352.00 goto -3320 2780
-t=354.00 goto -3650 2950
-t=356.00 goto -3810 3100
-t=358.00 goto -3880 3100
-t=360.00 goto -4000 3100
-t=361.00 goto -4000 2800
-t=362.00 goto -4262 2247
-t=366.00 goto -4092 1866
-t=370.00 goto -3751 1383
-t=374.00 goto -3302 1388
-t=378.00 goto -2626 417
-t=382.00 goto -2182 331
-t=386.00 goto -1280 1237
-t=390.00 goto -1306 771
-t=394.00 goto -1280 -176
-t=398.00 goto -860 -176
-t=402.00 goto -565 493
-t=406.00 goto -230 486
-t=409.00 goto -255 824
-t=412.00 goto -255 921
-t=416.00 goto 770 876
-t=420.00 goto 770 1158
-t=423.00 goto 680 1038
-t=425.00 goto 600 1100
-t=427.00 use Porte13
-t=428.00 track XIIIGoalTrigger19 0
-t=431.00 grab_input
-t=434.00 grab_input
-t=437.00 grab_input
-# Installation enters the map's reinforcement predicate; FinDeMission then fails
-# the anti-goal before the lever/cabin/travel leg can be controlled.
-t=442.00 wait_travel
+# The route stops at the card reader: the fuse pickup (`Hual04aFusiblePick0`) triggers
+# `FusibleRamasse` and the `Cine1` `LastWave` reinforcement, whose burst kills the 17-hp
+# player on the walk-out (measured), so the fuse-installation leg is not attempted here.
+t=336.00 wait_travel

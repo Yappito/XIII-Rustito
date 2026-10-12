@@ -7276,8 +7276,9 @@ mod tests {
         let _ = porte154;
     }
 
-    /// Hual04a: earned card, reader, bureau and fuse installation by player input.
-    /// Pin the next authored reinforcement/FinDeMission failure before lever/travel.
+    /// Hual04a (item86 re-time): with automatic AI bursts, fight the canyon soldiers before they
+    /// close, heal on the base medkits and complete the six-soldier death-event chain; the route
+    /// is cut at the bureau card reader because the fuse pick spawns the fatal Cine1 LastWave.
     #[test]
     fn opt_in_hual04a_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -7379,16 +7380,19 @@ mod tests {
             Some(&xiii_script::Value::Int(0)),
             "the delivered Degage cue started Cine1.Play(2)"
         );
-        // The remaining measured blocker (asserted): the corrected volume overlaps also deliver
-        // the AI/dialogue volumes the cylinder missed, so the alerted soldiers diverge and the
-        // six-kill card chain stalls (BaseSoldier0 survives out of the engagement range). The fuse
-        // is therefore never picked (goal 2) or installed (goal 3), the `LastWave` reinforcement
-        // spawn (Cine1 tabActions[35], reached only after `FusibleRamasse`) never runs, and the
-        // `XIIIMover1` lever / Hual04c travel are unreached.
+        // item86 (integ-hual04a): with the AI now firing automatic bursts, the canyon fight is
+        // re-timed to kill each soldier before it closes (and the medkit detour heals the
+        // walk-out). The corrected volume overlaps alert the canyon soldiers, but the route now
+        // completes the six-soldier death-event chain: all six (`BaseSoldier0/1/4/5/10/12`) are
+        // dead (`eNbVivants` 1; the item81c stall had 2, one soldier left). The card is read at
+        // `MagneticPassTrigger4`; the route is cut there because picking the fuse (`FusibleRamasse`)
+        // spawns the `Cine1` `LastWave` reinforcement (tabActions[35]) whose burst kills the 17-hp
+        // player on the walk-out (measured, `local/re/item86/exp_u.log`). Goals 2/3 stay unreached,
+        // the generator `SpawnActor`s stay empty and the lever/travel stay unreached.
         assert_eq!(
             vm.get_property(mi, "eNbVivants"),
-            Some(&xiii_script::Value::Int(2)),
-            "the six-kill card chain stalls with one soldier left"
+            Some(&xiii_script::Value::Int(1)),
+            "the re-timed route completes the six-kill death-event chain (all six soldiers dead)"
         );
         assert!(
             !goals[2].completed && !goals[3].completed,
@@ -7415,7 +7419,7 @@ mod tests {
             Some(&xiii_script::Value::Str("Hual04c.unr".to_owned()))
         );
         println!(
-            "[hual04a next blocker] DV4/DV5 fire through the brush primitive (Degage + dernierpoint, Cine1 Play(2) started), but the corrected volume overlaps change the alerted AI: the six-kill card chain stalls (BaseSoldier0 survives), so fuse goals 2/3, the LastWave reinforcement spawn, the XIIIMover1 lever and Hual04c travel are unreached"
+            "[hual04a next blocker] the re-timed route completes the six-kill death-event chain (all six soldiers dead, eNbVivants 1) and reads the card at MagneticPassTrigger4; picking the fuse there (FusibleRamasse) spawns the Cine1 LastWave reinforcement (tabActions[35]) whose burst fire kills the 17-hp player on the walk-out (measured), so fuse goals 2/3, the XIIIMover1 lever and Hual04c travel are not attempted"
         );
     }
 }
