@@ -1,0 +1,33 @@
+# Hual02 card-room + depot-reader probe (item67j): the magnetic-card chain by player input.
+#
+# Two labelled teleport diagnostics stand in for the two measured movement gaps that are pinned,
+# not fixed: (1) the card room is a nav island whose only corridor-side openings are the two
+# grande_vitre windows (ColCategory 3 = ColType_StaticGlass, engine.u Actor.ScriptText; item84
+# decoded that no retail consumer shatters them - the panes are script-less StaticMeshActors and
+# Engine.dll's only ColCategory reader is execActorInIterationCategory 0x103e6f00), whose 112 UU
+# sill (aperture z -112..16) no measured retail primitive crosses from the flat corridor floor
+# (APawn::physFalling 0x103c37b0 slides, never steps: processHitWall 0x103bed60 + TwoWallAdjust;
+# stepUp only from moveSmooth 0x103b7990, MAXSTEPHEIGHT 35; jump 92.8 = JumpZ 420,
+# PhysicsVolume.Gravity (0,0,-950) class-default; no sill-mantle script found) - the player is
+# placed inside the card room;
+# (2) the west corridor beyond the opened Porte19 ends at the ForeverLocked decor doors
+# PorteDecors18/19 (PorteDecors.SetInitialState -> GotoState('ForeverLocked'); PlayerTrigger
+# only plays the sound), so the player is placed at the depot-leg nav node (-5211,921) that the
+# main route already walks to. Everything between the teleports is the game's own chain:
+# the walk over Hual02MagneticCardPick4 picks the card up (Touch -> HandlePickupQuery), the
+# aimed use at the reader runs the controller's Grab (TargetActor=MagneticPassTrigger1,
+# bCanTrigger, FindPowerUpItemNameForTrigger matches the card) and the reader's OutEvent
+# 'Porteentrevs' Triggers Porte19 (TriggerControl) open, then the player walks west through the
+# doorway until the decor seal pins the walk at x~-6198.
+t=0.20 teleport -3475 1550 -149
+t=0.50 forward 0
+t=1.50 teleport -5211 921 -149
+t=2.00 forward 0
+t=2.50 goto -5235 860 -149
+t=8.00 forward 0
+t=9.00 yaw 233
+t=11.00 use
+t=13.00 use
+t=15.00 goto -5450 912 -149
+t=23.00 goto -6400 912 -149
+t=33.00 forward 0

@@ -1,12 +1,31 @@
-# Hual02 route (item59, re-authored by item67/item67f/item67g): player input from the vent
-# spawn to Carrington's cell and the exit plateau, objectives driven only by the game's own
-# chains.
+# Hual02 route (item59, re-authored by item67/item67f/item67g/item85b): player input from the
+# vent spawn to Carrington's cell and the exit plateau, objectives driven only by the game's own
+# chains, now in the level's own order: eavesdrop (goal 1) -> find the cell (goal 2) -> the cell
+# door -> escort (goal 3).
+#
+# item85b (this tree): the crawl's DetectionVolume21 Touch now fires (the integ-fidelity
+# brush-volume PointCheck overlap fix) -> 'demarre_bureau' -> XIIIGoalTrigger3 (91) ->
+# Hual02.SetGoalComplete -> SetPrimaryGoal(1): goal 1 "Eavesdrop" promotes during the crawl
+# (measured t=20.5). The conversation scene (Cine10 'Standwell' + Cine11 'MacCall', the
+# underfloor office at (-760,120)/(-779,-33)) starts at level start (Cine2.CineInit.Begin:
+# player controller + CineController.bInitialized + the intro-cartoon wait, CheckpointNumber 1
+# -> Play(5)) and sits at tabActions[0] 'wait event demarre_bureau'. The route therefore holds
+# in the duct after DV21 and does NOT break the duct's far grate (BreakAbleMover2, Event
+# 'grille_brisee') until the conversation completes: breaking it sends Trigger -> Play(2) ->
+# the bInterruptive alert Reactions (tabActions3/2 -> turnintosoldier), which interrupt the
+# scene and 'blam' never fires (measured both ways, the item85b report). With the wait, Cine11's
+# 'event blam' completes goal 1 through XIIIGoalTrigger4 (GoalNumber 1) and fires 'objectif92'
+# -> XIIIGoalTrigger6 (92) -> SetPrimaryGoal(2); the scene ends with
+# 'playerevent XIIISaveGameTrigger1' (the map's own checkpoint, CheckpointNumber 1 -> 2) and
+# both cine pawns 'destroy self' (measured scene end t~62.8 after the t=20.5 DV21 touch; the
+# grate shots at t=73/75 keep a ~10 s margin).
 #
 # Player input (no set_goal/take_control): crouch-crawl through the ceiling vent
-# (spawn 104,1840,-4536 -> gallery), two aimed shots break the two grates
-# (BreakableMover5 at 104,1192 yaw 270; BreakAbleMover2 at -496,-688 yaw 259.5,
-# measured legs 9-12), crawl the duct and drop into the office floor -4856,
-# walk the underfloor to the service lift lobby (the corridor's Porte11 is opened
+# (spawn 104,1840,-4536 -> gallery), one aimed shot breaks the first grate
+# (BreakableMover5 at 104,1192 yaw 270, no Event - measured, fires nothing), hold in the duct
+# for the conversation (above), two aimed shots break the second grate (BreakAbleMover2 at
+# -496,-688 yaw 259.5, Event 'grille_brisee'), crawl the duct and drop into the office floor
+# -4856, walk the underfloor to the service lift lobby (the corridor's Porte11 is opened
 # by real input: the game's Grab tail -> Porte11.PlayerTrigger), ride the lift (item67:
 # the game's own LiftButton0.PlayerTrigger -> LiftManager states -> LiftCage key move;
 # the player is carried by the decoded mover-base attachment), then walk out of the floor-2
@@ -14,66 +33,95 @@
 # chain to the depot reader (item67g). Only the locked `Porte19` gap and the later isolated
 # segments are labelled teleports.
 #
-# item67f: the doorway is not `Porte20`. Hual02's `Porte4`/`Porte20` (`XIDCine.Porte`, Tags
-# 'porte_bas'/'porte_haut') are serialised `bDeleteMe=true` in a trailing block of 54 destroyed
-# exports (with the LiftManager's stale XIIIMover0 cage reference); the engine's
+# item67f: the floor-2 doorway is not `Porte20`. Hual02's `Porte4`/`Porte20` (`XIDCine.Porte`,
+# Tags 'porte_bas'/'porte_haut') are serialised `bDeleteMe=true` in a trailing block of 54
+# destroyed exports (with the LiftManager's stale XIIIMover0 cage reference); the engine's
 # `AActor::IsPendingKill` reports them dead, so they are not part of the live level. No actor in
 # the map fires an event named 'porte_haut'/'porte_bas' (the strings occur only as the live
 # `LiftDoor` Tags), and the LiftManager's automatic radius search only matches `XIDCine.LiftDoor`.
 # The live floor-2 exit is `LiftDoor1`, which the manager's own outer-door states open.
 #
 # Labelled diagnostic: the hostile BaseSoldier* pawns are removed by the test
-# (remove_soldiers). Under the real level clock the unmodified level's underfloor
-# gauntlet (BaseSoldier26 (-1714.7,894.9), BaseSoldier27 (-2218.2,698.9, shotgun +
-# grenades), BaseSoldier25 (-1923.3,-1094.1), lobby BaseSoldier15/28, upper
-# BaseSoldier14) kills the unarmoured player at t~130-138 near (-1834,773)..
-# (-1663,1146) (measured; crouching does not save the player). That kill is the
+# (remove_soldiers; the Cine* scene pawns stay - the conversation needs them). Under the real
+# level clock the unmodified level's underfloor gauntlet (BaseSoldier26 (-1714.7,894.9),
+# BaseSoldier27 (-2218.2,698.9, shotgun + grenades), BaseSoldier25 (-1923.3,-1094.1), lobby
+# BaseSoldier15/28, upper BaseSoldier14) kills the unarmoured player around the underfloor
+# walk (measured, the item67 report; crouching does not save the player). That kill is the
 # pinned next blocker for playing this level through.
 #
 # Labelled teleports, each for a measured movement gap (see the report):
-# - "depot"          t=402 (-8880,722): after the ride the walker leaves the cage through the
+# - "depot"          t=422 (-8880,722): after the ride the walker leaves the cage through the
 #                    live `LiftDoor1` and follows the map's own nav chain (item67g) across the
 #                    surface to the reader (MagneticPassTrigger1 at -5259,803; touched at
-#                    t=396.2, used by real input at t=400.5: aim-focus
-#                    TargetActor=MagneticPassTrigger1, bCanTrigger=true, Grab runs). With no
-#                    magnetic card, Porte19 (Tag 'Porteentrevs') stays KeyNum=0/locked, so the
+#                    t=416.2, used by real input at t=420.5: aim-focus
+#                    TargetActor=MagneticPassTrigger1, bCanTrigger=true, Grab runs -> its
+#                    PlayerTrigger is the decoded PlaySound-only XIIITriggers.PlayerTrigger).
+#                    With no magnetic card, Porte19 (Tag 'Porteentrevs') stays locked, so the
 #                    teleport crosses it. The card pickup (Hual02MagneticCardPick4 at
-#                    -3474,1550) sits in the petitesalle card room: its entrance Porte21 (Event
-#                    'reveil_3') opens by real `use` from the neighbouring zone, but that zone
-#                    is a nav island walled off from the surface corridor (BSP wall at y=1664,
-#                    z -224..160; nearest nav boundary ~205 UU), so the card is unreachable on
-#                    foot (item67g re-check). The corridor west of Porte19 is itself blocked at
-#                    (-6198,842) in this sim (measured probe, local/re/item67/out/west.txt),
-#                    so the teleport also crosses that gap.
-# - "prison entry"   t=408 (-10368,2800): the prison compound perimeter is sealed
+#                    -3474,1550) sits in the petitesalle card room: its entrance Porte21
+#                    (Event 'reveil_3') opens by real `use` from the neighbouring zone, but that
+#                    zone (the office + card room nav island, 71 PathNodes) is walled off from
+#                    the surface corridor except the two `grande_vitre` window panes
+#                    (StaticMeshActor8 at -4328,1638 and StaticMeshActor7 at -3354,1632, the
+#                    map's only ColCategory-3 blocking meshes; item67j). item84 decoded that
+#                    entry closed: ColCategory 3 is `ColType_StaticGlass` (engine.u
+#                    Actor.ScriptText enum), but no consumer shatters such an actor - the panes
+#                    are script-less Engine.StaticMeshActor exports (0 functions/states),
+#                    XIIIBulletsAmmo.ProcessTraceHit's non-pawn branch only runs
+#                    Other.TakeDamage (a no-op on them) plus impact FX (GlassImpactEmitter /
+#                    BulletScorchGlass / HitMat.HitSound are dressing), and Engine.dll reads
+#                    AActor+0x1a0 (ColCategory) nowhere except
+#                    execActorInIterationCategory 0x103e6f00 and actor copy/serialize (Xiii.dll
+#                    and XIDPawn.dll read it never), so shooting cannot open the island. The
+#                    aperture is z -112..16 (sill 112 UU above the walked floors) and no measured
+#                    retail primitive crosses it from the flat corridor floor: APawn::physFalling
+#                    0x103c37b0 answers a wall hit (normal.Z < 0.7 at 0x10483428) with
+#                    processHitWall 0x103bed60 + a TwoWallAdjust slide, never stepUp (walking
+#                    only, moveSmooth 0x103b7990 vtbl+0x11c; MAXSTEPHEIGHT 35.0,
+#                    Actor.ScriptText) and never a mantle (processHitWall's downward-35 probe at
+#                    0x103bef37 runs for AI PHYS_Walking only); jump 92.8 = JumpZ 420 with
+#                    PhysicsVolume.Gravity (0,0,-950) < 112 - both pinned by unit tests
+#                    (play::sim::tests::*falling*). item85b re-measured the reader-area ladder
+#                    shaft (LadderVolume0, live) as a sealed dev leftover: the climb works but
+#                    the column is capped at z 1656.8 by the GR_echelles frame's retail
+#                    simplified-collision box (12 verts/18 tris), sealed east/west/north at
+#                    every probed height, floored at the mouth by the walkable grille1f128
+#                    plate, its nav marker Ladder1 is a destroyed export with no ReachSpec, so
+#                    the shaft offers no route to the walkway/card room either (report, task 2).
+#                    item67j measured the rest of the chain with the card in hand (the committed
+#                    probe opt_in_hual02_card_room_reader_chain): the reader use with the card
+#                    fires OutEvent 'Porteentrevs' and Porte19 opens, but the corridor west of
+#                    Porte19 then pins at x~-6198 against PorteDecors18/19 - decor doors whose
+#                    PorteDecors.SetInitialState forces ForeverLocked (its PlayerTrigger only
+#                    plays a sound), so the teleport also crosses that seal.
+# - "prison entry"   t=428 (-10368,2800): the prison compound perimeter is sealed
 #                    in this sim (Porte151 Locked opens only from Carrington's
 #                    escort moveseq); the landing touches DetectionVolume14 whose
-#                    'didact6' event completes goal 2 through XIIIGoalTrigger1.
-# - "prison grille escape" t=414 (-10176,2900): the DV14 landing sits inside the
+#                    'didact6' event completes goal 2 through XIIIGoalTrigger1 - now
+#                    validating (goal 2 is primary since the conversation's 'objectif92').
+# - "prison grille escape" t=434 (-10176,2900): the DV14 landing sits inside the
 #                    simplified collision of StaticMeshActor1024 'grille_prison';
 #                    measured leg31: the player is pinned until moved.
-# - "stair head"     t=462 (-14896,656,438): the exit stairwell pins the walker at
+# - "stair head"     t=482 (-14896,656,438): the exit stairwell pins the walker at
 #                    (-14078,1314,35) (measured legs 20-23); the corridor beyond is
 #                    sealed by the Locked Porte151, so the exit plateau is entered here.
 #
 # Weapon grant (labelled diagnostic): the player would carry the Beretta from
 # Hual01b (the campaign loadout; Hual01a's route test documents no grant because
 # the fresh-login inventory already has it). Starting on Hual02 directly hands the
-# Fists only, so the route re-grants xiii.Beretta to make the two grate shots real.
+# Fists only, so the route re-grants xiii.Beretta to make the grate shots real.
 #
-# Objectives completed by the game's chains on this route (measured legs 31-37 and the
-# fixture runs): goals 4/5/6 complete (the anti-goal completions), goal 3 promoted by the
-# depot reader chain (MagneticPassTrigger1 -> Grab) but not completed. The promotion chain
-# for goals 1 and 2 is blocked in this sim: DetectionVolume21 ('demarre_bureau', which
-# promotes goal 1 through XIIIGoalTrigger3) floats 78 UU above the real duct floor
-# (z=-4320, cylinder half-height 40, measured), and the eavesdrop scene's
-# 'Blam' -> 'objectif92' promotion of goal 2 stalls at the unimplemented CWndSFXTrigger
-# scene action. The DV14 -> 'didact6' -> XIIIGoalTrigger1 completion of goal 2 only
-# validates a promoted goal (measured: leg37 with the diagnostic cue vs the fixture).
-# (TouchTrigger8 z=63 gallery -> Cine7 'soldat_plan' raid -> 'soldat_assome' ->
-# CineTrigger8 CineGoto -> Carrington moveseqs open Porte151 -> 'fin') is blocked:
-# TouchTrigger8's gallery and Porte151 are both unreachable on foot in this sim, so
-# goal 0 and the travel request stay unmet; the test asserts that measured blocker.
+# Objectives driven by the game's chains on this route (item85b, measured): goal 1 promoted by
+# the DV21 crawl touch and completed by the conversation's 'blam'; goal 2 promoted by
+# 'objectif92' and completed by the DV14 'didact6' prison landing; goal 3 promoted by
+# Porte154 finishing opening (Event 'Carrington_CellDoorOpen' -> XIIIGoalTrigger2 (93) ->
+# SetPrimaryGoal(3); NOT by the depot reader - XIIITriggers.PlayerTrigger is decoded
+# PlaySound-only) but the escort never starts: TouchTrigger8 sits on a z=63 gallery with no
+# navigable access and the corridor's Porte151 opens only from Carrington's escort moveseq,
+# which waits forever on the 'soldat_assome' raid event (measured legs 31-37). Goal 0 stays
+# promoted-incomplete (the level-end 'fin2' -> XIIIGoalTrigger8 touch fires on the exit plateau
+# but the escort goals never complete, so TestGoalComplete never trips), and no travel is
+# requested.
 t=0.20 crouch 1
 t=0.50 goto 104 1840 -4536
 t=3.00 goto 104 1730 -4536
@@ -82,46 +130,50 @@ t=12.00 yaw 270
 t=12.50 grant xiii.Beretta
 t=14.00 fire
 t=20.00 goto 104 1128 -4536
+# The DV21 touch (~t=20.5) fires 'demarre_bureau': goal 1 promotes and the conversation below
+# starts. Hold here - breaking the far grate before the scene's 'blam' (~t=63) interrupts it
+# with the 'grille_brisee' alert (measured).
 t=26.00 goto -200 1128 -4536
 t=34.00 goto -424 1128 -4536
 t=38.00 goto -424 -300 -4536
-t=52.00 yaw 259.5
-t=53.00 fire
-t=55.00 fire
-t=58.00 goto -424 -680 -4536
-t=64.00 goto -560 -688 -4536
-t=72.00 crouch 0
-t=78.00 goto -713 -517 -4781
-t=86.00 goto -711 -18 -4781
-t=94.00 goto -1004 321 -4781
-t=100.00 goto -1394 305 -4781
-t=106.00 goto -1396 16 -4781
+# Two aimed shots break the second grate (BreakAbleMover2, Event 'grille_brisee'), after the
+# conversation has completed.
+t=72.00 yaw 259.5
+t=73.00 fire
+t=75.00 fire
+t=78.00 goto -424 -680 -4536
+t=84.00 goto -560 -688 -4536
+t=92.00 crouch 0
+t=98.00 goto -713 -517 -4781
+t=106.00 goto -711 -18 -4781
+t=114.00 goto -1004 321 -4781
+t=120.00 goto -1394 305 -4781
+t=126.00 goto -1396 16 -4781
 # Porte11 (fredprivate.porte208bois, Tag Carring_ShaftEnter, PlayerTriggerToggle) is authored
-# closed at level start and blocks the underfloor corridor at x~-1468 under the real level
-# clock (measured leg: the walker presses into it from t=112.5; the frozen-clock item59 walk
-# passed the same plane, so the closed door is a real-clock discovery). Real input opens it:
-# the game's Grab tail -> Porte11.PlayerTrigger (state PlayerTriggerToggle).
-t=110.00 use Porte11
-t=112.00 goto -1582 -2 -4781
-t=118.00 goto -1787 239 -4781
-t=124.00 goto -1832 742 -4781
-t=130.00 goto -1817 876 -4781
-t=136.00 goto -1680 1120 -4781
-t=142.00 goto -1695 1454 -4781
-t=148.00 goto -1674 1603 -4781
-t=154.00 goto -1704 2065 -4781
-t=160.00 goto -1775 2424 -4781
-t=166.00 goto -1836 2576 -4781
-t=172.00 goto -2031 2604 -4781
-t=178.00 goto -2209 2447 -4781
-t=184.00 goto -2206 2374 -4781
+# closed and is cinematically closed again behind the conversation pawns (Cine10 'od porte11'
+# t=57.1, Cine11 'cd porte11' t=60.45, measured). Real input opens it: the game's Grab tail ->
+# Porte11.PlayerTrigger (state PlayerTriggerToggle).
+t=130.00 use Porte11
+t=132.00 goto -1582 -2 -4781
+t=138.00 goto -1787 239 -4781
+t=144.00 goto -1832 742 -4781
+t=150.00 goto -1817 876 -4781
+t=156.00 goto -1680 1120 -4781
+t=162.00 goto -1695 1454 -4781
+t=168.00 goto -1674 1603 -4781
+t=174.00 goto -1704 2065 -4781
+t=180.00 goto -1775 2424 -4781
+t=186.00 goto -1836 2576 -4781
+t=192.00 goto -2031 2604 -4781
+t=198.00 goto -2209 2447 -4781
+t=204.00 goto -2206 2374 -4781
 # Service lift by player input (item67): walk into the cage on floor 1, press the internal
 # button on the cage wall, ride the cage up (the game's own LiftManager states drive the
 # cage key); the player is carried by the decoded mover-base attachment.
-t=189.00 goto -2209 2330 -4781
-t=194.00 goto -2209 2223 -4781
-t=199.00 yaw 270
-t=199.50 use
+t=209.00 goto -2209 2330 -4781
+t=214.00 goto -2209 2223 -4781
+t=219.00 yaw 270
+t=219.50 use
 # Floor-2 exit and the surface walk to the depot reader, all by player input (item67g):
 # the LiftManager's own states open the live floor-2 LiftDoor1; the destroyed Porte20 export is
 # not part of the level (bDeleteMe). The walk then follows the map's own ReachSpec/PathNode chain
@@ -131,59 +183,59 @@ t=199.50 use
 # (-3414,1792) .. (-4962,722), then around the x=-5120 BSP wall via AttackPoint47 (-5121,963) to
 # the depot reader. The item67f dead-end at (-2854,2338) was a wrong turn off this chain, not a
 # blocker (the wall is real BSP); the item67 surface teleport is removed.
-t=232.00 goto -2209 2330 -149
-t=236.00 goto -2209 2455 -149
-t=240.00 goto -2255 2601 -149
-t=250.00 goto -2681 2436 -149
-t=258.00 goto -2681 2061 -149
-t=266.00 goto -2702 1766 -149
-t=272.00 goto -2974 1629 -149
-t=278.00 goto -3127 1598 -149
-t=286.00 goto -3300 1722 -149
-t=292.00 goto -3414 1792 -149
-t=298.00 goto -3597 1793 -149
-t=304.00 goto -3776 1792 -149
-t=310.00 goto -3887 1793 -149
-t=316.00 goto -4000 1760 -149
-t=322.00 goto -4148 1802 -149
-t=330.00 goto -4545 1700 -149
-t=338.00 goto -4776 1788 -149
-t=344.00 goto -4936 1719 -149
-t=350.00 goto -4989 1489 -149
-t=356.00 goto -4989 1374 -149
-t=362.00 goto -4992 1040 -149
-t=368.00 goto -4957 894 -149
-t=374.00 goto -4962 722 -149
-t=380.00 goto -4957 894 -149
-t=386.00 goto -5121 963 -149
-t=390.00 goto -5211 921 -149
-t=396.00 goto -5259 803 -149
+t=252.00 goto -2209 2330 -149
+t=256.00 goto -2209 2455 -149
+t=260.00 goto -2255 2601 -149
+t=270.00 goto -2681 2436 -149
+t=278.00 goto -2681 2061 -149
+t=286.00 goto -2702 1766 -149
+t=292.00 goto -2974 1629 -149
+t=298.00 goto -3127 1598 -149
+t=306.00 goto -3300 1722 -149
+t=312.00 goto -3414 1792 -149
+t=318.00 goto -3597 1793 -149
+t=324.00 goto -3776 1792 -149
+t=330.00 goto -3887 1793 -149
+t=336.00 goto -4000 1760 -149
+t=342.00 goto -4148 1802 -149
+t=350.00 goto -4545 1700 -149
+t=358.00 goto -4776 1788 -149
+t=364.00 goto -4936 1719 -149
+t=370.00 goto -4989 1489 -149
+t=376.00 goto -4989 1374 -149
+t=382.00 goto -4992 1040 -149
+t=388.00 goto -4957 894 -149
+t=394.00 goto -4962 722 -149
+t=400.00 goto -4957 894 -149
+t=406.00 goto -5121 963 -149
+t=410.00 goto -5211 921 -149
+t=416.00 goto -5259 803 -149
 # The depot reader by player input: the aim-focus targeting picks MagneticPassTrigger1
 # (bCanTrigger), but the player carries no matching power-up item, so the controller's Grab
-# tail only runs XIIITriggers.PlayerTrigger (the reader's sound/goal side effects) - item67e
-# reports this as UseOutcome::PlayerTriggerOnly, not an item activation. The magnetic card
-# itself is unreachable (see the "depot" pin below).
-t=400.00 yaw 224
-t=400.50 use
+# tail only runs XIIITriggers.PlayerTrigger (decoded: PlaySound only) - UseOutcome::
+# PlayerTriggerOnly, not an item activation. The magnetic card itself is unreachable (see the
+# "depot" pin above).
+t=420.00 yaw 224
+t=420.50 use
 # Labelled teleport for the measured locked-door gap: Porte19 (Tag 'Porteentrevs', Event
 # 'finfocus1', TriggerControl) stays shut without the magnetic card. The card sits in the
 # petitesalle card room, whose entrance Porte21 (Event 'reveil_3') opens from a nav island that is
 # walled off from the surface corridor (BSP wall y=1664, z -224..160; item67g re-check), so the
 # card cannot be reached on foot and Porte19 stays locked.
-t=402.00 teleport -8880 722 -100
-t=408.00 teleport -10368 2800 -149
-t=410.00 use Porte153
-t=412.00 use Porte152
-t=414.00 teleport -10176 2900 -149
-t=416.00 goto -10176 2700 -149
-t=422.00 goto -9957 2500 -149
-t=430.00 use Porte154
-t=454.00 goto -10176 2700 -149
-t=460.00 goto -10176 2900 -149
-t=462.00 teleport -14896 656 438
-t=467.00 goto -15488 656 438
-t=473.00 goto -15808 688 438
-t=479.00 goto -16272 928 438
-t=484.00 goto -16496 976 438
-t=489.00 goto -16680 950 438
-t=495.00 wait_travel
+t=422.00 teleport -8880 722 -100
+t=428.00 teleport -10368 2800 -149
+t=430.00 use Porte153
+t=432.00 use Porte152
+t=434.00 teleport -10176 2900 -149
+t=436.00 goto -10176 2700 -149
+t=442.00 goto -9957 2500 -149
+t=450.00 use Porte154
+t=474.00 goto -10176 2700 -149
+t=480.00 goto -10176 2900 -149
+t=482.00 teleport -14896 656 438
+t=487.00 goto -15488 656 438
+t=493.00 goto -15808 688 438
+t=499.00 goto -16272 928 438
+t=504.00 goto -16496 976 438
+t=509.00 goto -16680 950 438
+t=515.00 wait_travel

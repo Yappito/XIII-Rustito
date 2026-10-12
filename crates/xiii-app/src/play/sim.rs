@@ -109,15 +109,20 @@ impl PlayerParams {
     }
 }
 
-/// UE2 `EPhysics` values the host writes into `Pawn.Physics` (upstream order: `PHYS_None`=0,
-/// `PHYS_Walking`=1, `PHYS_Falling`=2, `PHYS_Swimming`=3, ... `PHYS_Ladder`=10).
+/// UE2 `EPhysics` values the host writes into `Pawn.Physics` (XIII's enum, engine.u
+/// `Actor.ScriptText`: `PHYS_None, PHYS_Walking, PHYS_Falling, PHYS_Swimming, PHYS_Flying,
+/// PHYS_Rotating, PHYS_Projectile, PHYS_Interpolating, PHYS_MovingBrush, PHYS_Spider,
+/// PHYS_Trailer, PHYS_Ladder, ...` — so `PHYS_Ladder` is 11, which is the value the retail
+/// scripts compare (`engine.LadderVolume.PawnEnteredVolume` and
+/// `engine.PotentialClimbWatcher.Tick` both test `P.Physics == 11b` for "already climbing").
+/// `PHYS_Walking`=1, `PHYS_Falling`=2, `PHYS_Swimming`=3 match the stock UE2 numbering.
 pub const PHYS_WALKING: u8 = 1;
 /// `PHYS_Falling`.
 pub const PHYS_FALLING: u8 = 2;
 /// `PHYS_Swimming`.
 pub const PHYS_SWIMMING: u8 = 3;
-/// `PHYS_Ladder`.
-pub const PHYS_LADDER: u8 = 10;
+/// `PHYS_Ladder` (XIII's enum places it after `PHYS_Trailer`).
+pub const PHYS_LADDER: u8 = 11;
 
 /// Movement properties sampled from the physics/water volume the player is inside.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -139,6 +144,10 @@ pub struct WaterSample {
 pub struct LadderSample {
     /// `LadderVolume.ClimbDir` (Unreal axes, unit-ish).
     pub climb_dir: [f32; 3],
+    /// `LadderVolume.LookDir` (`vector(WallDir)`, default `(1,0,0)`): the pawn only attaches
+    /// while facing within ~25.8° of it (`Dot > 0.9`, `LadderVolume.PawnEnteredVolume` and
+    /// `PotentialClimbWatcher.Tick`).
+    pub look_dir: [f32; 3],
 }
 
 /// Read-only environment query for the movement modes. The host adapts the decoded map volumes
@@ -163,6 +172,14 @@ impl MotionQuery for NoMotion {
     fn ladder_at(&self, _center_uu: [f32; 3], _half_uu: [f32; 3]) -> Option<LadderSample> {
         None
     }
+}
+
+/// Retail ladder-attachment gate: `Dot(pawn facing (pitch 0), volume LookDir) > 0.9`
+/// (`engine.LadderVolume.PawnEnteredVolume`, `engine.PotentialClimbWatcher.Tick`).
+fn ladder_look_aligned(ladder: LadderSample, yaw: f32) -> bool {
+    let (sy, cy) = yaw.sin_cos();
+    let dot = ladder.look_dir[0] * cy + ladder.look_dir[1] * sy;
+    dot > 0.9
 }
 
 /// One fixed step of player input. `forward`/`right` are axis values in `[-1, 1]`.
@@ -352,7 +369,11 @@ impl PlayerSim {
         } else if let Some(l) = ladder
             && params.b_can_climb_ladders
             && water.is_none()
+            && ladder_look_aligned(l, self.yaw)
         {
+            // `LadderVolume.PawnEnteredVolume` / `PotentialClimbWatcher.Tick`: a pawn only
+            // enters PHYS_Ladder when it faces the volume's LookDir (Dot > 0.9, pitch
+            // ignored); otherwise retail only spawns a watcher and keeps the pawn's physics.
             self.on_ladder = true;
             self.crouched = false;
             self.in_water = false;
@@ -816,6 +837,237 @@ mod tests {
         sim
     }
 
+    /// A flat Bevy Y=0 floor plus a vertical slab standing on it in the plane
+    /// `Bevy z = wall_z` (the player faces Bevy -Z), from the floor up to `top_m` metres, with a
+    /// 20 m deep top (a walker at 472 UU/s covers ~10.5 m in the longest loop, so it stays on
+    /// the top instead of walking off its far edge). Used for the sill/step worlds: a 112 UU top
+    /// is the Hual02 window sill, 35 UU is `Engine.Actor.MAXSTEPHEIGHT`.
+    fn wall_world(wall_z: f32, top_m: f32) -> CollisionWorld {
+        let t: Vec<(Triangle, u32)> = vec![
+            (
+                [[-50.0, 0.0, -50.0], [50.0, 0.0, -50.0], [50.0, 0.0, 50.0]],
+                0,
+            ),
+            (
+                [[-50.0, 0.0, -50.0], [50.0, 0.0, 50.0], [-50.0, 0.0, 50.0]],
+                0,
+            ),
+            (
+                [
+                    [-50.0, 0.0, wall_z],
+                    [50.0, 0.0, wall_z],
+                    [50.0, top_m, wall_z],
+                ],
+                1,
+            ),
+            (
+                [
+                    [-50.0, 0.0, wall_z],
+                    [50.0, top_m, wall_z],
+                    [-50.0, top_m, wall_z],
+                ],
+                1,
+            ),
+            (
+                [
+                    [-50.0, top_m, wall_z - 20.0],
+                    [50.0, top_m, wall_z - 20.0],
+                    [50.0, top_m, wall_z],
+                ],
+                1,
+            ),
+            (
+                [
+                    [-50.0, top_m, wall_z - 20.0],
+                    [50.0, top_m, wall_z],
+                    [-50.0, top_m, wall_z],
+                ],
+                1,
+            ),
+        ];
+        CollisionWorld::new(t)
+    }
+
+    #[test]
+    fn falling_into_a_wall_slides_but_never_steps_up_or_mantles() {
+        // item84, decoded from Engine.dll: `APawn::physFalling` (0x103c37b0) answers a wall hit
+        // (sweep hit with normal.Z < 0.7, constant 0x10483428) with `processHitWall`
+        // (vtable+0x104 -> 0x103bed60) and a `TwoWallAdjust` slide, never `stepUp` (called only
+        // from `moveSmooth` 0x103b7990, vtable+0x11c) and never a mantle;
+        // `APawn::processHitWall` runs its only climb probe (a downward 35-unit `MoveActor`,
+        // delta constant 0xC20C0000 = -35.0, at 0x103bef37) for AI pawns in PHYS_Walking only.
+        // So a pawn jumping at the Hual02 window sill (aperture z -112..16, jump apex
+        // 420^2/(2*950) = 92.84 UU < 112) must bounce/slide in front of it and land back,
+        // whatever jump spam it does.
+        let params = instant_params();
+        // Sill top 112 UU above the floor, 90 UU (1 m) ahead.
+        let world = wall_world(-1.0, 112.0 / UNREAL_UNITS_PER_METER);
+        let mut sim = start_on_floor(&params, 0.0, 0.0);
+        let dt = 1.0 / 60.0;
+        let mut max_x = f32::MIN;
+        let mut max_center_z = f32::MIN;
+        let mut saw_falling = false;
+        // 3 s of jump spam into the sill, then 1 s of plain running into it.
+        for tick in 0..240 {
+            sim.step(
+                dt,
+                &world,
+                &params,
+                Input {
+                    forward: 1.0,
+                    jump: tick < 180,
+                    ..Default::default()
+                },
+                &[],
+            );
+            saw_falling |= !sim.grounded;
+            // Unreal x = -Bevy z * 90; the wall plane sits at Unreal x = 90.
+            max_x = max_x.max(sim.location[0]);
+            max_center_z = max_center_z.max(sim.location[2]);
+        }
+        assert!(saw_falling, "jump spam must actually leave the ground");
+        assert!(
+            sim.grounded,
+            "must land back on the floor in front of the sill"
+        );
+        assert!(
+            max_x < 80.0,
+            "must never pass the sill plane (Unreal x=90): max x {max_x}"
+        );
+        // Standing on the sill would put the centre at 75 + 112 = 187 UU; even reaching the
+        // analytic jump apex must stay below the sill top + half height.
+        assert!(
+            max_center_z < params.height_uu + 112.0 - 1.0,
+            "no step-up/mantle onto the sill: max centre z {max_center_z}"
+        );
+        assert!(
+            (sim.location[2] - params.height_uu).abs() < 0.5,
+            "ends on the start floor: z={}",
+            sim.location[2]
+        );
+    }
+
+    #[test]
+    fn ai_falling_into_a_wall_matches_the_player_fall() {
+        // The decode is class-generic: `APawn::physFalling` runs for AI pawns too (Xiii.dll and
+        // XIDPawn.dll re-export Engine.dll's physFalling/processHitWall/stepUp ordinals - no
+        // XIII override). An AI pawn (no crouch, no ladders) spamming jump at the same sill
+        // stays in front of it exactly like the player.
+        let params = PlayerParams {
+            b_can_crouch: false,
+            b_can_climb_ladders: false,
+            ..instant_params()
+        };
+        let world = wall_world(-1.0, 112.0 / UNREAL_UNITS_PER_METER);
+        let mut sim = start_on_floor(&params, 0.0, 0.0);
+        let dt = 1.0 / 60.0;
+        let mut max_x = f32::MIN;
+        let mut max_center_z = f32::MIN;
+        let mut saw_falling = false;
+        for tick in 0..240 {
+            sim.step(
+                dt,
+                &world,
+                &params,
+                Input {
+                    forward: 1.0,
+                    jump: tick < 180,
+                    ..Default::default()
+                },
+                &[],
+            );
+            saw_falling |= !sim.grounded;
+            max_x = max_x.max(sim.location[0]);
+            max_center_z = max_center_z.max(sim.location[2]);
+        }
+        assert!(saw_falling, "jump spam must actually leave the ground");
+        assert!(sim.grounded, "must land back on the floor");
+        assert!(
+            max_x < 80.0,
+            "must never pass the sill plane: max x {max_x}"
+        );
+        assert!(
+            max_center_z < params.height_uu + 112.0 - 1.0,
+            "no step-up/mantle onto the sill: max centre z {max_center_z}"
+        );
+    }
+
+    #[test]
+    fn walking_steps_maxstepheight_but_falling_does_not_step_anything() {
+        // The contrast the decode pins: `MAXSTEPHEIGHT = 35.0` (`Engine.Actor` ScriptText) is a
+        // WALKING primitive (`moveSmooth` 0x103b7990 -> vtable+0x11c `stepUp`); physFalling has
+        // no step path at all. Walking crosses a 30 UU step (within 35) and refuses a 112 UU
+        // sill; the 30 UU step under jump spam is crossed only through the air (apex 92.84 UU),
+        // which is a plain ballistic jump, not a step.
+        let params = instant_params();
+        let dt = 1.0 / 60.0;
+
+        // Walking up the 30 UU step (within `MAXSTEPHEIGHT` 35; exactly-35 leaves the box
+        // bottom touching the step top and the raise is refused as a starting contact).
+        let step = wall_world(-1.0, 30.0 / UNREAL_UNITS_PER_METER);
+        let mut sim = start_on_floor(&params, 0.0, 0.0);
+        for _ in 0..120 {
+            sim.step(
+                dt,
+                &step,
+                &params,
+                Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                &[],
+            );
+        }
+        assert!(
+            sim.grounded && (sim.location[2] - params.height_uu - 30.0).abs() < 1.0,
+            "walking must stand on the 30 UU step: grounded={} z={}",
+            sim.grounded,
+            sim.location[2]
+        );
+
+        // Walking into the 112 UU sill: blocked at floor height (above MAXSTEPHEIGHT).
+        let sill = wall_world(-1.0, 112.0 / UNREAL_UNITS_PER_METER);
+        let mut sim = start_on_floor(&params, 0.0, 0.0);
+        for _ in 0..120 {
+            sim.step(
+                dt,
+                &sill,
+                &params,
+                Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                &[],
+            );
+        }
+        assert!(
+            sim.grounded && (sim.location[2] - params.height_uu).abs() < 1.0,
+            "walking must not step the 112 UU sill: z={}",
+            sim.location[2]
+        );
+
+        // Jumping at the 30 UU step: crossed while airborne (ballistic, not a step-up).
+        let mut sim = start_on_floor(&params, 0.0, 0.0);
+        for _ in 0..240 {
+            sim.step(
+                dt,
+                &step,
+                &params,
+                Input {
+                    forward: 1.0,
+                    jump: true,
+                    ..Default::default()
+                },
+                &[],
+            );
+        }
+        assert!(
+            sim.location[0] > 90.0 + params.radius_uu,
+            "a plain jump must clear the 30 UU step: x={}",
+            sim.location[0]
+        );
+    }
+
     #[test]
     fn flat_floor_forward_distance_matches_ground_speed() {
         // Instant acceleration (AccelRate absent): after one second of full forward input the
@@ -1080,10 +1332,21 @@ mod tests {
     }
 
     /// Synthetic motion environment: optional axis-aligned water/ladder volumes (Unreal units).
-    #[derive(Default)]
+    /// The ladder LookDir defaults to `(1,0,0)` (`vector(WallDir)` for a default rotator).
     struct TestEnv {
         water: Option<([f32; 3], [f32; 3])>,
         ladder: Option<([f32; 3], [f32; 3])>,
+        ladder_look_dir: [f32; 3],
+    }
+
+    impl Default for TestEnv {
+        fn default() -> Self {
+            Self {
+                water: None,
+                ladder: None,
+                ladder_look_dir: [1.0, 0.0, 0.0],
+            }
+        }
     }
 
     impl MotionQuery for TestEnv {
@@ -1103,6 +1366,7 @@ mod tests {
                 .filter(|(mn, mx)| aabb_overlap(*mn, *mx, c, h))
                 .map(|_| LadderSample {
                     climb_dir: [0.0, 0.0, 1.0],
+                    look_dir: self.ladder_look_dir,
                 })
         }
     }
@@ -1255,6 +1519,159 @@ mod tests {
         );
         // Once past the top, the box leaves the volume and the ladder state clears.
         assert!(reached_top, "player never left the ladder volume");
+    }
+
+    /// The published `Pawn.Physics` bytes must be XIII's `EPhysics` values, not stock UE2's:
+    /// engine.u `Actor.ScriptText` orders the enum `PHYS_None, PHYS_Walking, PHYS_Falling,
+    /// PHYS_Swimming, PHYS_Flying, PHYS_Rotating, PHYS_Projectile, PHYS_Interpolating,
+    /// PHYS_MovingBrush, PHYS_Spider, PHYS_Trailer, PHYS_Ladder, ...`, so `PHYS_Ladder` is 11
+    /// (the retail ladder scripts test `P.Physics == 11b`, `LadderVolume.PawnEnteredVolume`
+    /// 0x0083 and `PotentialClimbWatcher.Tick` 0x0066). A wrong byte makes every
+    /// "already climbing" check in the shipped scripts fail.
+    #[test]
+    fn published_physics_bytes_match_xiiis_ephys_enum() {
+        assert_eq!(PHYS_WALKING, 1, "PHYS_Walking");
+        assert_eq!(PHYS_FALLING, 2, "PHYS_Falling");
+        assert_eq!(PHYS_SWIMMING, 3, "PHYS_Swimming");
+        assert_eq!(
+            PHYS_LADDER, 11,
+            "PHYS_Ladder (after PHYS_Trailer in XIII's enum)"
+        );
+    }
+
+    /// `engine.LadderVolume.PawnEnteredVolume` / `engine.PotentialClimbWatcher.Tick`: a pawn
+    /// only attaches to a ladder volume while `Dot(facing, LookDir) > 0.9` (LookDir is
+    /// `vector(WallDir)`, default `(1,0,0)`); otherwise it stays in its previous physics and
+    /// walks through the volume.
+    #[test]
+    fn ladder_attach_requires_facing_the_volume_lookdir() {
+        let params = instant_params();
+        let world = flat_floor();
+        let env = TestEnv {
+            ladder: Some(([-200.0, -200.0, 0.0], [200.0, 200.0, 500.0])),
+            ..Default::default()
+        };
+        let dt = 1.0 / 60.0;
+        // Facing +Y (90 deg off the +X LookDir): the volume must not attach the player even
+        // though its box overlaps it every tick.
+        let mut sim = PlayerSim::new([0.0, 0.0, params.height_uu], 90.0_f32.to_radians());
+        for _ in 0..30 {
+            sim.step_with_modes(
+                dt,
+                &world,
+                &params,
+                Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                &[],
+                &env,
+            );
+            assert!(
+                !sim.on_ladder && sim.physics != PHYS_LADDER,
+                "player attached while facing away from LookDir"
+            );
+        }
+        // 26 deg off: Dot = cos(26 deg) = 0.8988 <= 0.9 -> still refused (the gate is strict).
+        let mut sim = PlayerSim::new([0.0, 0.0, params.height_uu], 26.0_f32.to_radians());
+        for _ in 0..30 {
+            sim.step_with_modes(
+                dt,
+                &world,
+                &params,
+                Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                &[],
+                &env,
+            );
+            assert!(
+                !sim.on_ladder,
+                "player attached at Dot(cos 26deg) = 0.899 <= 0.9"
+            );
+        }
+        // Facing +X attaches immediately and climbs.
+        let mut sim = PlayerSim::new([0.0, 0.0, params.height_uu], 0.0);
+        let mut entered = false;
+        for _ in 0..30 {
+            sim.step_with_modes(
+                dt,
+                &world,
+                &params,
+                Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                &[],
+                &env,
+            );
+            if sim.on_ladder {
+                entered = true;
+                break;
+            }
+        }
+        assert!(
+            entered,
+            "player facing +X must attach to the +X LookDir volume"
+        );
+    }
+
+    /// A jump off the ladder leaves PHYS_Ladder; while the pawn still overlaps the volume the
+    /// retail watcher re-attaches only under the same facing gate, so a player facing along
+    /// LookDir re-attaches (and can climb again) while one facing away keeps falling.
+    #[test]
+    fn ladder_jump_off_reattach_follows_the_facing_gate() {
+        let params = instant_params();
+        let world = flat_floor();
+        let env = TestEnv {
+            ladder: Some(([-200.0, -200.0, 0.0], [200.0, 200.0, 200.0])),
+            ..Default::default()
+        };
+        let dt = 1.0 / 60.0;
+        let climb = |yaw_deg: f32| {
+            let mut sim = PlayerSim::new([0.0, 0.0, params.height_uu], 0.0);
+            for _ in 0..30 {
+                sim.step_with_modes(
+                    dt,
+                    &world,
+                    &params,
+                    Input {
+                        forward: 1.0,
+                        ..Default::default()
+                    },
+                    &[],
+                    &env,
+                );
+            }
+            assert!(sim.on_ladder, "precondition: on the ladder");
+            sim.step_with_modes(
+                dt,
+                &world,
+                &params,
+                Input {
+                    jump: true,
+                    ..Default::default()
+                },
+                &[],
+                &env,
+            );
+            assert!(!sim.on_ladder, "jump must leave the ladder");
+            // Keep stepping in the volume with the given facing.
+            sim.yaw = yaw_deg.to_radians();
+            for _ in 0..30 {
+                sim.step_with_modes(dt, &world, &params, Input::default(), &[], &env);
+            }
+            sim.on_ladder
+        };
+        assert!(
+            climb(0.0),
+            "facing along LookDir after a jump-off must re-attach (the watcher's gate)"
+        );
+        assert!(
+            !climb(90.0),
+            "facing away from LookDir after a jump-off must stay off the ladder"
+        );
     }
 
     #[test]
