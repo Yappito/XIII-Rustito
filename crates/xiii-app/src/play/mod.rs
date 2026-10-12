@@ -6842,6 +6842,92 @@ mod tests {
     /// and the reader's OutEvent 'Porteentrevs' Triggers the `TriggerControl` Porte19 open. The
     /// walk west then pins at the decor seal x~-6198, which stays the route's next blocker after
     /// the card.
+    // SCRATCH item85 probe (remove before finishing): drives the reader-area shaft mouth,
+    // the ladder climb to the walkway, and the u-room approach, printing a position log.
+    #[test]
+    fn scratch_item85_shaft_probe() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual02".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual02");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let probe_path =
+            std::path::Path::new("P:/AI/XIII/local/wt/viewer/local/re/item85/probe-shaft.script");
+        let script = script::Script::load(probe_path).expect("load shaft probe");
+        let mut runtime =
+            open_map_runtime(&game_dir, "Hual02", &scene, &resolved.params).expect("open Hual02");
+        let removed = remove_soldiers(&mut runtime.session);
+        println!("[probe] removed {removed} soldiers");
+        {
+            let vols = xiii_world::movement_volumes::MovementVolumes::import(&game_dir, "Hual02")
+                .expect("volumes");
+            for v in &vols.volumes {
+                if v.kind == xiii_world::movement_volumes::VolumeKind::Ladder {
+                    println!(
+                        "[probe] ladder {} min {:?} max {:?} climb {:?} look {:?}",
+                        v.name, v.min_uu, v.max_uu, v.climb_dir, v.look_dir
+                    );
+                }
+            }
+        }
+        let outcome = run_script_inner(
+            &game_dir,
+            "Hual02",
+            &script,
+            &resolved.params,
+            &scene,
+            70.0,
+            false,
+            RunnerOptions {
+                initial: Some(runtime),
+                ..Default::default()
+            },
+        )
+        .expect("run shaft probe");
+        for (tick, t, pos, rot) in outcome.trace.iter().step_by(6) {
+            println!("[probe] t={t:.1} at ({:.0},{:.0},{:.0}) rot {:.0}/{:.0}", pos[0], pos[1], pos[2], rot[0], rot[1]);
+        }
+        if let Some((tick, t, pos, rot)) = outcome.trace.last() {
+            println!(
+                "[probe] final t={t:.1} at ({:.0},{:.0},{:.0}) rot {:.0}/{:.0}",
+                pos[0], pos[1], pos[2], rot[0], rot[1]
+            );
+        }
+        let vm = outcome.session.vm();
+        for name in [
+            "TouchTrigger60",
+            "CWndFocusTrigger1",
+            "XIIIDispatcher3",
+            "BreakAbleMover8",
+        ] {
+            match vm.find_object(name) {
+                Some(obj) => {
+                    let state = vm.state_name(obj);
+                    println!("[probe] {name}: state {state:?}");
+                }
+                None => println!("[probe] {name}: NOT FOUND"),
+            }
+        }
+        let events: Vec<String> = vm
+            .trace
+            .iter()
+            .filter_map(|e| match &e.kind {
+                xiii_script::TraceKind::Event { target, function, .. } => {
+                    Some(format!("{}.{}", target, function))
+                }
+                _ => None,
+            })
+            .collect();
+        println!("[probe] events: {events:?}");
+        println!("[probe] health {:?}", outcome.session.player_health());
+    }
+
     #[test]
     fn opt_in_hual02_card_room_reader_chain() {
         let Some(game_dir) = opt_in_root() else {
@@ -6880,7 +6966,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            40.0,
+            70.0,
             false,
             RunnerOptions {
                 initial: Some(runtime),

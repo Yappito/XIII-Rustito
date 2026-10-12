@@ -67,6 +67,10 @@ pub struct MovementVolume {
     pub ground_friction: f32,
     /// `LadderVolume.ClimbDir` (Unreal axes).
     pub climb_dir: [f32; 3],
+    /// `LadderVolume.LookDir` as `vector(WallDir)` (LadderVolume.PostBeginPlay; the rotator
+    /// default 0 gives `(1,0,0)`): the facing a pawn needs before the volume attaches it
+    /// (`PawnEnteredVolume` / `PotentialClimbWatcher.Tick` require `Dot > 0.9`).
+    pub look_dir: [f32; 3],
     /// `bNoPhysicalLadder`.
     pub no_physical_ladder: bool,
     /// Minimum corner of the world-space AABB (Unreal units).
@@ -216,6 +220,21 @@ impl MovementVolumes {
             let climb_dir = get_vec("ClimbDir")
                 .or_else(|| defaults.vector_default(&a.class, "ClimbDir").ok().flatten())
                 .unwrap_or([0.0, 0.0, 1.0]);
+            // `LadderVolume.PostBeginPlay` sets `LookDir = vector(WallDir)`; a rotator of 0
+            // converts to the +X unit vector, which is therefore the default facing gate.
+            let wall_dir = p.as_ref().and_then(|p| p.rotator("WallDir"));
+            let look_dir = match wall_dir {
+                Some([pitch, yaw, _roll]) => {
+                    let k = std::f32::consts::TAU / 65536.0;
+                    // `f32::sin_cos` returns (sin, cos).
+                    let (s_p, c_p) = (pitch as f32 * k).sin_cos();
+                    let (s_y, c_y) = (yaw as f32 * k).sin_cos();
+                    // Unreal `vector(Rotator)`: X = cos(pitch)*cos(yaw), Y = cos(pitch)*sin(yaw),
+                    // Z = sin(pitch).
+                    [c_p * c_y, c_p * s_y, s_p]
+                }
+                None => [1.0, 0.0, 0.0],
+            };
             let no_physical_ladder = get_bool("bNoPhysicalLadder")
                 .or_else(|| {
                     defaults
@@ -287,6 +306,7 @@ impl MovementVolumes {
                 terminal_velocity,
                 ground_friction,
                 climb_dir,
+                look_dir,
                 no_physical_ladder,
                 min_uu,
                 max_uu,
@@ -434,6 +454,7 @@ mod tests {
             terminal_velocity: 0.0,
             ground_friction: 0.0,
             climb_dir: [0.0, 0.0, 1.0],
+            look_dir: [1.0, 0.0, 0.0],
             no_physical_ladder: false,
             min_uu: [1.0, 2.0, 3.0],
             max_uu: [1.0, 2.0, 3.0],
@@ -523,6 +544,19 @@ mod tests {
                 (vol.min_uu[2] + vol.max_uu[2]) * 0.5,
             ];
             assert_eq!(v.ladder_at(c).map(|x| &x.name), Some(&vol.name));
+            // `LookDir = vector(WallDir)` is a unit vector by construction; the default is
+            // `(1,0,0)`. The facing gate (`Dot > 0.9`) is meaningless otherwise.
+            let len = (vol.look_dir[0] * vol.look_dir[0]
+                + vol.look_dir[1] * vol.look_dir[1]
+                + vol.look_dir[2] * vol.look_dir[2])
+                .sqrt();
+            assert!(
+                (len - 1.0).abs() < 1e-3,
+                "{}: LookDir {} is not a unit vector",
+                vol.name,
+                vol.look_dir.map(|x| x.to_string()).join(",")
+            );
+            println!("[volumes test] {} look_dir {:?}", vol.name, vol.look_dir);
         }
     }
 }

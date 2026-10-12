@@ -139,6 +139,10 @@ pub struct WaterSample {
 pub struct LadderSample {
     /// `LadderVolume.ClimbDir` (Unreal axes, unit-ish).
     pub climb_dir: [f32; 3],
+    /// `LadderVolume.LookDir` (`vector(WallDir)`, default `(1,0,0)`): the pawn only attaches
+    /// while facing within ~25.8° of it (`Dot > 0.9`, `LadderVolume.PawnEnteredVolume` and
+    /// `PotentialClimbWatcher.Tick`).
+    pub look_dir: [f32; 3],
 }
 
 /// Read-only environment query for the movement modes. The host adapts the decoded map volumes
@@ -163,6 +167,14 @@ impl MotionQuery for NoMotion {
     fn ladder_at(&self, _center_uu: [f32; 3], _half_uu: [f32; 3]) -> Option<LadderSample> {
         None
     }
+}
+
+/// Retail ladder-attachment gate: `Dot(pawn facing (pitch 0), volume LookDir) > 0.9`
+/// (`engine.LadderVolume.PawnEnteredVolume`, `engine.PotentialClimbWatcher.Tick`).
+fn ladder_look_aligned(ladder: LadderSample, yaw: f32) -> bool {
+    let (sy, cy) = yaw.sin_cos();
+    let dot = ladder.look_dir[0] * cy + ladder.look_dir[1] * sy;
+    dot > 0.9
 }
 
 /// One fixed step of player input. `forward`/`right` are axis values in `[-1, 1]`.
@@ -352,7 +364,11 @@ impl PlayerSim {
         } else if let Some(l) = ladder
             && params.b_can_climb_ladders
             && water.is_none()
+            && ladder_look_aligned(l, self.yaw)
         {
+            // `LadderVolume.PawnEnteredVolume` / `PotentialClimbWatcher.Tick`: a pawn only
+            // enters PHYS_Ladder when it faces the volume's LookDir (Dot > 0.9, pitch
+            // ignored); otherwise retail only spawns a watcher and keeps the pawn's physics.
             self.on_ladder = true;
             self.crouched = false;
             self.in_water = false;
@@ -1311,10 +1327,21 @@ mod tests {
     }
 
     /// Synthetic motion environment: optional axis-aligned water/ladder volumes (Unreal units).
-    #[derive(Default)]
+    /// The ladder LookDir defaults to `(1,0,0)` (`vector(WallDir)` for a default rotator).
     struct TestEnv {
         water: Option<([f32; 3], [f32; 3])>,
         ladder: Option<([f32; 3], [f32; 3])>,
+        ladder_look_dir: [f32; 3],
+    }
+
+    impl Default for TestEnv {
+        fn default() -> Self {
+            Self {
+                water: None,
+                ladder: None,
+                ladder_look_dir: [1.0, 0.0, 0.0],
+            }
+        }
     }
 
     impl MotionQuery for TestEnv {
@@ -1334,6 +1361,7 @@ mod tests {
                 .filter(|(mn, mx)| aabb_overlap(*mn, *mx, c, h))
                 .map(|_| LadderSample {
                     climb_dir: [0.0, 0.0, 1.0],
+                    look_dir: self.ladder_look_dir,
                 })
         }
     }
@@ -1486,6 +1514,145 @@ mod tests {
         );
         // Once past the top, the box leaves the volume and the ladder state clears.
         assert!(reached_top, "player never left the ladder volume");
+    }
+
+    /// `engine.LadderVolume.PawnEnteredVolume` / `engine.PotentialClimbWatcher.Tick`: a pawn
+    /// only attaches to a ladder volume while `Dot(facing, LookDir) > 0.9` (LookDir is
+    /// `vector(WallDir)`, default `(1,0,0)`); otherwise it stays in its previous physics and
+    /// walks through the volume.
+    #[test]
+    fn ladder_attach_requires_facing_the_volume_lookdir() {
+        let params = instant_params();
+        let world = flat_floor();
+        let env = TestEnv {
+            ladder: Some(([-200.0, -200.0, 0.0], [200.0, 200.0, 500.0])),
+            ..Default::default()
+        };
+        let dt = 1.0 / 60.0;
+        // Facing +Y (90 deg off the +X LookDir): the volume must not attach the player even
+        // though its box overlaps it every tick.
+        let mut sim = PlayerSim::new([0.0, 0.0, params.height_uu], 90.0_f32.to_radians());
+        for _ in 0..30 {
+            sim.step_with_modes(
+                dt,
+                &world,
+                &params,
+                Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                &[],
+                &env,
+            );
+            assert!(
+                !sim.on_ladder && sim.physics != PHYS_LADDER,
+                "player attached while facing away from LookDir"
+            );
+        }
+        // 26 deg off: Dot = cos(26 deg) = 0.8988 <= 0.9 -> still refused (the gate is strict).
+        let mut sim = PlayerSim::new([0.0, 0.0, params.height_uu], 26.0_f32.to_radians());
+        for _ in 0..30 {
+            sim.step_with_modes(
+                dt,
+                &world,
+                &params,
+                Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                &[],
+                &env,
+            );
+            assert!(
+                !sim.on_ladder,
+                "player attached at Dot(cos 26deg) = 0.899 <= 0.9"
+            );
+        }
+        // Facing +X attaches immediately and climbs.
+        let mut sim = PlayerSim::new([0.0, 0.0, params.height_uu], 0.0);
+        let mut entered = false;
+        for _ in 0..30 {
+            sim.step_with_modes(
+                dt,
+                &world,
+                &params,
+                Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                &[],
+                &env,
+            );
+            if sim.on_ladder {
+                entered = true;
+                break;
+            }
+        }
+        assert!(entered, "player facing +X must attach to the +X LookDir volume");
+    }
+
+    /// A jump off the ladder leaves PHYS_Ladder; while the pawn still overlaps the volume the
+    /// retail watcher re-attaches only under the same facing gate, so a player facing along
+    /// LookDir re-attaches (and can climb again) while one facing away keeps falling.
+    #[test]
+    fn ladder_jump_off_reattach_follows_the_facing_gate() {
+        let params = instant_params();
+        let world = flat_floor();
+        let env = TestEnv {
+            ladder: Some(([-200.0, -200.0, 0.0], [200.0, 200.0, 200.0])),
+            ..Default::default()
+        };
+        let dt = 1.0 / 60.0;
+        let climb = |yaw_deg: f32| {
+            let mut sim = PlayerSim::new([0.0, 0.0, params.height_uu], 0.0);
+            for _ in 0..30 {
+                sim.step_with_modes(
+                    dt,
+                    &world,
+                    &params,
+                    Input {
+                        forward: 1.0,
+                        ..Default::default()
+                    },
+                    &[],
+                    &env,
+                );
+            }
+            assert!(sim.on_ladder, "precondition: on the ladder");
+            sim.step_with_modes(
+                dt,
+                &world,
+                &params,
+                Input {
+                    jump: true,
+                    ..Default::default()
+                },
+                &[],
+                &env,
+            );
+            assert!(!sim.on_ladder, "jump must leave the ladder");
+            // Keep stepping in the volume with the given facing.
+            sim.yaw = yaw_deg.to_radians();
+            for _ in 0..30 {
+                sim.step_with_modes(
+                    dt,
+                    &world,
+                    &params,
+                    Input::default(),
+                    &[],
+                    &env,
+                );
+            }
+            sim.on_ladder
+        };
+        assert!(
+            climb(0.0),
+            "facing along LookDir after a jump-off must re-attach (the watcher's gate)"
+        );
+        assert!(
+            !climb(90.0),
+            "facing away from LookDir after a jump-off must stay off the ladder"
+        );
     }
 
     #[test]
