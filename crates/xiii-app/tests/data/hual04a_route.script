@@ -10,11 +10,14 @@
 # reinforcement (tabActions[35] `Event LastWave01 LastWave03 LastWave04` spawns
 # BaseSoldier/BaseSoldier2/BaseSoldier3) by input, so goal 2 (find the fuse) completes.
 #
-# The route stops after the LastWave: installing the fuse (`use Hual04aFusible` on
-# `XIIIGoalTrigger19`) completes goals 3/4 but the map's `Hual04a.SetGoalComplete` case 3 loops
-# `i < 4` over `SoldiersEnRenforts` (3 entries) and our strict VM raises
-# `ArrayIndex { index: 3, len: 3 }`, so the install leg is not shipped in this fixture (it would
-# make the route test error). The Hual04c travel is therefore not attempted.
+# The route then, after the LastWave, walks back through the base to the bureau
+# circuit-breaker, works the base door (`use Porte21`) and attempts the fuse install
+# (`use XIIIGoalTrigger19`), works the cable-car lever (`use XIIIMover1`) and returns to the
+# cable-car cabin at (960,570). `item90` implemented Core.dll `execArrayElement`'s out-of-range
+# fixed-array clamp, so `Hual04a.SetGoalComplete` case 3's `i < 4` over the 3-entry
+# `SoldiersEnRenforts` array no longer errors. The install interaction is refused on this
+# reconstructed input (the game's aimed target resolves to the closed `Porte21` door,
+# `bCanTrigger=false`), so goals 3/4/5 and the Hual04c travel stay unclaimed.
 #
 # Input only: no teleport, set_goal, take_control, extra weapon grant or health edit. The
 # Beretta grant at t=0.5 is the carried-loadout diagnostic (see hual02_route.script).
@@ -261,3 +264,36 @@ t=376.85 fire
 t=377.15 reload
 t=377.45 track off
 t=377.45 crouch 0
+# Walk back through the base to the bureau circuit-breaker and install the fuse at
+# XIIIGoalTrigger19 (goal 3), then work the cable-car lever XIIIMover1 (goal 4). `item90`
+# implemented Core.dll `execArrayElement`'s out-of-range fixed-array clamp, so
+# `Hual04a.SetGoalComplete` case 3 no longer errors; on this reconstructed input the install
+# interaction itself is refused (the game's aimed target resolves to the closed Porte21 door,
+# `bCanTrigger=false`), so goals 3/4 stay unclaimed. Waypoints are the item86 fuse-leg trace;
+# `use Porte21` works the base door the retail route opened automatically.
+t=378.00 goto -4077.2 1836.9
+t=380.50 goto -3732.9 1357.8
+t=384.50 goto -3269.9 1390.3
+t=388.50 goto -2610.1 393.0
+t=392.50 goto -2150.8 326.5
+t=396.50 goto -1259.1 1258.9
+t=400.50 goto -1308.8 742.0
+t=404.50 goto -1279.0 -209.4
+t=408.50 goto -832.0 -173.8
+t=412.50 goto -554.2 520.0
+t=415.50 goto -202.1 483.1
+t=418.50 goto -260.0 856.2
+t=421.50 goto -253.7 937.9
+t=425.50 goto 798.5 874.3
+t=429.50 goto 777.6 959.8
+t=445.50 goto 576.8 1166.6
+t=448.00 goto 609.4 1038.7
+t=452.00 goto 609.4 1091.3
+t=453.00 use Porte21
+t=455.00 use XIIIGoalTrigger19
+t=457.00 use XIIIGoalTrigger19
+t=459.00 goto 700.0 1058.0
+t=463.00 goto 850.0 770.0
+t=467.00 goto 926.0 758.0
+t=472.50 use XIIIMover1
+t=475.00 goto 960.0 570.0

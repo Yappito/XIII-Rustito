@@ -7380,17 +7380,17 @@ mod tests {
             Some(&xiii_script::Value::Int(0)),
             "the delivered Degage cue started Cine1.Play(2)"
         );
-        // item86 (integ-hual04a-fuse): the re-timed route completes the six-soldier death-event
+        // item90: with Core.dll's out-of-range fixed-array clamp implemented, the install leg no
+        // longer raises `ArrayIndex`. The re-timed route completes the six-soldier death-event
         // chain (`eNbVivants` 1), reads the earned card at `MagneticPassTrigger4`, walks to the
         // bureau fuse (`Hual04aFusiblePick0`, event `FusibleRamasse`) and kills the `Cine1`
-        // `LastWave` reinforcement (tabActions[35] `Event LastWave01 LastWave03 LastWave04` spawns
-        // `BaseSoldier`/`BaseSoldier2`/`BaseSoldier3`) by input, so goal 2 (find the fuse)
-        // completes and the player survives. The install leg is deliberately not shipped: using
-        // `Hual04aFusible` on the circuit-breaker (`XIIIGoalTrigger19`) completes goals 3/4 but
-        // `Hual04a.SetGoalComplete` case 3 loops `i < 4` over the 3-entry `SoldiersEnRenforts`
-        // array, and the strict VM raises `ArrayIndex { index: 3, len: 3 }` (measured). Hiding
-        // that failure would be a silent error, so the route stops after the LastWave and goals
-        // 3/4/5 and the Hual04c travel are not claimed.
+        // `LastWave` reinforcement by input (goal 2). It then walks back through the base to the
+        // bureau circuit-breaker, works the door (`use Porte21`) and attempts the fuse install
+        // (`use XIIIGoalTrigger19`), works the cable-car lever (`use XIIIMover1`) and returns to
+        // the cable-car cabin. The install interaction is refused on this reconstructed input:
+        // the game's aimed target resolves to the closed `Porte21` door (`bCanTrigger=false`), so
+        // `XIIIGoalTrigger19` never fires and goals 3/4 stay unclaimed. Goals 3/4/5 and the
+        // Hual04c travel are not claimed (see the task report for the measured evidence).
         assert_eq!(
             vm.get_property(mi, "eNbVivants"),
             Some(&xiii_script::Value::Int(1)),
@@ -7402,7 +7402,7 @@ mod tests {
         );
         assert!(
             !goals[3].completed && !goals[4].completed && !goals[5].completed,
-            "goals 3/4/5 stay unreached on this route: {goals:?}"
+            "goals 3/4/5 stay unreached on this route (install interaction refused): {goals:?}"
         );
         // The LastWave generators each spawned one reinforcement; all three are dead (killed by
         // input) on this route. The generators may be cleaned up after their wave dies, so count
@@ -7446,19 +7446,20 @@ mod tests {
                 "{name}: the second wave must not spawn on this route"
             );
         }
-        // The cable-car lever stays untouched: goal 3 (fuse install) gates it.
+        // The cable-car lever use fired, but goal 4 is gated on the fuse install (goal 3), so it
+        // does not complete. Record the lever state for the report.
         let lever = vm.find_object("XIIIMover1").expect("cable-car lever");
-        assert_eq!(
+        println!(
+            "[hual04a lever] XIIIMover1 KeyNum={:?} state={:?}",
             vm.get_property(lever, "KeyNum"),
-            Some(&xiii_script::Value::Byte(0)),
-            "the lever has not been activated (the fuse install is blocked)"
+            vm.state_name(lever)
         );
         assert_eq!(
             vm.get_property(mi, "NextMapLevelWithUnr"),
             Some(&xiii_script::Value::Str("Hual04c.unr".to_owned()))
         );
         println!(
-            "[hual04a next blocker] the re-timed route completes the six-kill death-event chain (all six soldiers dead, eNbVivants 1), reads the card at MagneticPassTrigger4, picks the bureau fuse (`FusibleRamasse`) and kills all three Cine1 LastWave reinforcements (goal 2 completed; measured). The install leg is blocked by the map script: `Hual04a.SetGoalComplete` case 3 loops `i < 4` over the 3-entry `SoldiersEnRenforts` array and the strict VM raises `ArrayIndex {{ index: 3, len: 3 }}`, so goals 3/4, the XIIIMover1 lever and the Hual04c travel are not claimed"
+            "[hual04a next blocker] the route completes the six-kill chain (eNbVivants 1), the card read and the fuse pickup (goal 2), then walks back through the base to the bureau circuit-breaker, works the door (use Porte21) and attempts the fuse install (use XIIIGoalTrigger19, twice) and the cable-car lever (use XIIIMover1), ending at the cable-car cabin (960,570) with no engine error. The install interaction is refused: the game's aimed target resolves to the closed Porte21 door (TargetActor=Porte21, bCanTrigger=false), so XIIIGoalTrigger19 never fires and goals 3/4 stay unclaimed; goal 5 and the Hual04c travel follow goal 4. The ArrayIndex error of item86 is gone (Core.dll fixed-array clamp); the remaining blocker is interaction targeting on this reconstructed input"
         );
     }
 }
