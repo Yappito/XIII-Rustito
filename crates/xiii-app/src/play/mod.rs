@@ -7575,7 +7575,12 @@ mod tests {
             "BaseSoldier0",
             "BaseSoldier4",
         ] {
-            let id = vm.find_object(name).expect("authored soldier");
+            // A killed soldier's corpse may finish Dying and be destroyed before the route
+            // ends; the dead count is asserted through `eNbVivants` below.
+            let Some(id) = vm.find_object(name) else {
+                println!("[hual04a soldier] {name} destroyed");
+                continue;
+            };
             println!(
                 "[hual04a soldier] {name} health={:?} location={:?} dead={:?}",
                 vm.get_property(id, "Health"),
