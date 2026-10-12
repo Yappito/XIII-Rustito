@@ -117,6 +117,8 @@ pub enum Command {
     Menu,
     /// item72: close the in-game menu through the page's own Esc handler (resume).
     MenuClose,
+    /// item82: send one key through the active retail menu page's key-event dispatcher.
+    MenuKey(u8),
     /// item72: save a screenshot of the current frame to this path (repeatable).
     Shot(String),
 }
@@ -261,6 +263,17 @@ impl Script {
                     }
                     Command::MenuClose
                 }
+                "menu_key" => {
+                    let key = it
+                        .next()
+                        .ok_or_else(|| format!("line {n}: menu_key needs a byte"))?
+                        .parse::<u8>()
+                        .map_err(|_| format!("line {n}: invalid menu key"))?;
+                    if it.next().is_some() {
+                        return Err(format!("line {n}: unexpected menu_key argument"));
+                    }
+                    Command::MenuKey(key)
+                }
                 "shot" | "screenshot" => {
                     let path = it
                         .next()
@@ -329,6 +342,8 @@ pub struct Drive {
     menu_pending: bool,
     /// item72: `menu_close` requests, in order.
     menu_close_pending: usize,
+    /// item82: queued key events for the active retail page.
+    menu_keys: Vec<u8>,
     /// item72: `shot <path>` requests, in order.
     shots: Vec<String>,
     exec_inputs: Vec<&'static str>,
@@ -361,6 +376,7 @@ impl Drive {
             heal_pending: false,
             menu_pending: false,
             menu_close_pending: 0,
+            menu_keys: Vec::new(),
             shots: Vec::new(),
             exec_inputs: Vec::new(),
             tracking: None,
@@ -410,6 +426,11 @@ impl Drive {
         } else {
             false
         }
+    }
+
+    /// Drains menu key presses in script order.
+    pub fn take_menu_keys(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.menu_keys)
     }
 
     /// Drains the pending `shot <path>` requests, in order.
@@ -507,6 +528,7 @@ impl Drive {
                 Command::QuickHeal => self.heal_pending = true,
                 Command::Menu => self.menu_pending = true,
                 Command::MenuClose => self.menu_close_pending += 1,
+                &Command::MenuKey(key) => self.menu_keys.push(key),
                 Command::Shot(path) => self.shots.push(path.clone()),
             }
             self.cursor += 1;
@@ -674,6 +696,19 @@ mod tests {
         let s = Script::parse("\n# nothing\n").unwrap();
         assert!(s.events.is_empty());
         assert_eq!(s.last_time(), 0.0);
+    }
+
+    #[test]
+    fn menu_key_queue_preserves_order_and_rejects_invalid_bytes() {
+        let script = Script::parse("t=0 menu_key 13\nt=0 menu_key 27\n").unwrap();
+        let mut drive = Drive::new(&script);
+        let mut sim = PlayerSim::new([0.0; 3], 0.0);
+        drive.advance(0.0, &mut sim);
+        assert_eq!(drive.take_menu_keys(), [13, 27]);
+        assert!(drive.take_menu_keys().is_empty());
+        for bad in ["-1", "256", "13 extra", ""] {
+            assert!(Script::parse(&format!("t=0 menu_key {bad}")).is_err());
+        }
     }
 
     #[test]

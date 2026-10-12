@@ -3134,9 +3134,40 @@ impl<'s> Vm<'s> {
         self.unique_name(short)
     }
 
-    /// Applies an export's own tagged properties (a class-default subobject's serialized
-    /// template) to a freshly spawned instance, mirroring the map-property pass in
-    /// [`Vm::load_level`].
+    /// Materializes a retail GUI font template stored in GUIController.FontStack.
+    pub fn spawn_gui_font_template(&mut self, template: GlobalRef) -> VmResult<ObjectId> {
+        let class = if matches!(self.set.object(template), Some(ScriptObject::Class(_))) {
+            template
+        } else {
+            let entry = self
+                .set
+                .packages
+                .get(template.package)
+                .and_then(|p| p.package.exports().get(template.export as usize))
+                .ok_or_else(|| self.err(VmErrorKind::Other("invalid GUI font template".into())))?;
+            self.set
+                .resolve(template.package, entry.class)
+                .ok_or_else(|| {
+                    self.err(VmErrorKind::Other("GUI font template class missing".into()))
+                })?
+        };
+        if !self
+            .class_chain(class)
+            .iter()
+            .any(|g| self.object_name(*g).eq_ignore_ascii_case("GUIFont"))
+        {
+            return Err(self.err(VmErrorKind::Other(
+                "FontStack template is not a GUIFont".into(),
+            )));
+        }
+        let id = self.spawn(class, "GUIFont")?;
+        if class != template {
+            self.apply_export_properties(template, id)?;
+        }
+        Ok(id)
+    }
+
+    /// Applies an export's own tagged properties to a freshly spawned template instance.
     fn apply_export_properties(&mut self, g: GlobalRef, id: ObjectId) -> VmResult<()> {
         let set = self.set;
         let p = &set.packages[g.package];
@@ -4543,6 +4574,18 @@ impl<'s> Vm<'s> {
             self.call_values(f, id, Vec::new())?;
         }
         Ok(())
+    }
+
+    /// GUI.dll advances non-actor page states on the UI clock even while Level.Pauser is set.
+    /// This entry does not advance level time, actors, physics, or timers.
+    pub fn tick_gui_state(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
+        if !dt.is_finite() || dt < 0.0 || !self.is_a(id, "GUIPage") {
+            return Err(self.err(VmErrorKind::Other(
+                "GUI state tick requires a page and finite nonnegative delta".into(),
+            )));
+        }
+        self.steps = 0;
+        self.process_state(id, dt)
     }
 
     fn process_state(&mut self, id: ObjectId, dt: f32) -> VmResult<()> {
@@ -6338,10 +6381,14 @@ impl<'s> Vm<'s> {
             // context object (`self.__OnDraw__Delegate = delegateprop InternalOnDraw`).
             K::DelegateProperty(name) => {
                 let function = self.set.packages[frame.pkg].name_text(*name).to_owned();
-                Value::Delegate(Some(Delegate {
-                    object: Some(ObjRef::Instance(target)),
-                    function,
-                }))
+                if function.eq_ignore_ascii_case("None") {
+                    Value::Delegate(None)
+                } else {
+                    Value::Delegate(Some(Delegate {
+                        object: Some(ObjRef::Instance(target)),
+                        function,
+                    }))
+                }
             }
             // `0x3F`: an explicitly empty delegate (`delegate(D) = none`).
             K::EmptyDelegate => Value::Delegate(None),

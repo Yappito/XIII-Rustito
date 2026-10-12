@@ -1525,7 +1525,9 @@ fn registry_entries_are_documented() {
     // item69 adds the decoded Controller.PickWallAdjust (526) pursuit detour.
     // item70 adds the decoded Actor.RecomputeBoundingVolume (391) render-box freeze; item72 adds
     // the three decoded in-game menu natives (ResetInputs and GUI save/checkpoint writes).
-    assert_eq!(defs.len(), 347);
+    // item82 adds shift (148), GUI Sleep (430), config-write request/poll, checkpoint load,
+    // menu font lookup/selection, and GUI actual width/height (nine entries).
+    assert_eq!(defs.len(), 356);
     for d in defs {
         assert!(
             !d.signature.is_empty() && !d.evidence.is_empty(),
@@ -13185,6 +13187,10 @@ fn percent_float_float_matches_fmod() {
 /// Package with a delegate property `Handler`, the bound function `Target` (returns 42) and
 /// `Set` / `Clear` / `Fire` exercising `letdelegate`, `emptyd`, and the delegate call.
 fn delegate_fixture() -> Vec<u8> {
+    delegate_fixture_clear(false)
+}
+
+fn delegate_fixture_clear(none_name: bool) -> Vec<u8> {
     let mut b = B::new();
     let object = b.reserve(0, 0, "Object");
     // `Core.DelegateProperty` import (the property's class).
@@ -13210,8 +13216,21 @@ fn delegate_fixture() -> Vec<u8> {
     // `self.Handler = emptydelegate`.
     let mut clear_code = vec![0x45, 0x01];
     clear_code.extend(compact(handler));
-    clear_code.push(0x3F);
-    b.func(clear, 0, 0, &clear_code, 7, 0, ff::DEFINED);
+    if none_name {
+        clear_code.push(0x44);
+        clear_code.extend(compact(b.name("None")));
+    } else {
+        clear_code.push(0x3F);
+    }
+    b.func(
+        clear,
+        0,
+        0,
+        &clear_code,
+        if none_name { 11 } else { 7 },
+        0,
+        ff::DEFINED,
+    );
     // `return self.delegate Handler:Target()` (the context supplies `self`).
     let mut fire_code = vec![0x04, 0x19, 0x17, 0x00, 0x00, 0x00, 0x43];
     fire_code.extend(compact(handler));
@@ -13254,6 +13273,26 @@ fn empty_delegate_falls_back_to_the_declared_function() {
     // An unbound delegate call runs the declared function on the context.
     let v = vm.call_function(g(&set, "Object.Fire"), o, vec![]).unwrap();
     assert_eq!(v, Value::Int(42));
+}
+
+#[test]
+fn delegateprop_none_clears_previous_binding_for_script_and_host_calls() {
+    let set = set_of(delegate_fixture_clear(true));
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let o = vm.spawn(g(&set, "Object"), "D").unwrap();
+    vm.set_active(o, true);
+    vm.call_function(g(&set, "Object.Set"), o, vec![]).unwrap();
+    vm.call_function(g(&set, "Object.Clear"), o, vec![])
+        .unwrap();
+    assert_eq!(vm.get_property(o, "Handler"), Some(&Value::Delegate(None)));
+    assert_eq!(
+        vm.call_function(g(&set, "Object.Fire"), o, vec![]).unwrap(),
+        Value::Int(42)
+    );
+    assert_eq!(
+        vm.call_delegate(o, "Handler", "Target", vec![]).unwrap(),
+        Value::Int(42)
+    );
 }
 
 #[test]

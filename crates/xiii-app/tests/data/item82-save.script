@@ -1,0 +1,9 @@
+# Retail in-game Save action via the focused button.
+t=1.0 menu
+t=1.2 menu_key 13
+t=1.8 shot local/reports/item82/save-page.png
+t=2.0 menu_key 40
+t=2.1 menu_key 40
+t=2.2 menu_key 13
+t=2.5 menu_key 37
+t=2.7 menu_key 13

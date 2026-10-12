@@ -4,9 +4,50 @@ Updated: **2026-10-09 (coordinator session)**. Research phase (2026-10-04), M0, 
 
 ## Next session: start here
 
-State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `0bbd96e` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
+State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `36bb2b1` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
-### Session 2026-10-10/11 — read this first
+### Session 2026-10-11/12 — read this first
+
+Everything verified is on `origin/main` (`36bb2b1`, 1038 tests passed, Plage00 `--trace`
+byte-identical). Landed since `0bbd96e`, each decoded from the DLLs/scripts:
+
+- **AI:** `Controller.PickWallAdjust` (526, soldiers pursue); `Actor.RecomputeBoundingVolume` (391,
+  corpses finish `Dying`); pending-kill map exports (`bDeleteMe`, `AActor::IsPendingKill`
+  0x10304b40) no longer load as live actors (Hual02 had 54, incl. stale doors and a lift cage);
+  `EC_StringToByte`; interaction targeting as retail (TraceActors 0x9f|extra, mover mesh
+  triangles, no cylinder retry); falling pawns slide along walls (`physFalling` 0x103c37b0,
+  `processHitWall`, `TwoWallAdjust`; no step-up) is committed on `viewer` with item85.
+- **Routes:** Amos01 completes against live AI (the earlier pass ran with 106 suspended actors);
+  Hual02 lift ridden by the game's LiftManager, floor 2 -> depot walked (4 labelled teleports
+  left); Hual04a walked through six kills, keycard, bureau and fuse; Banque01 teleports
+  re-measured (one removed, four with measured causes); Hual01b re-aimed for the mesh trace.
+- **Windowed play:** in-game menu on Esc (XIIIMenuInGame over the paused level via SetPause ->
+  Level.Pauser; Save writes a real slot, Retry reloads it, Controls, Skills, Main menu -> MapMenu);
+  menu tiles stretch with alpha; the Bevy slab "Use-after-free" warnings are gone (no zero-vertex
+  particle meshes); the combat survey's SSH101a assertion follows the pending-kill rule.
+
+Committed on branches, NOT on main (verify would fail or the work is unfinished):
+
+| Worktree / branch | State |
+|---|---|
+| `fx` / `item76-pressing-fire` | `Pawn.PressingFire` reads the controller's `bFire` byte (execPressingFire 0x103afc50, Controller+0x212 != 0): AI fires automatic bursts. Plage01 re-timed (player 150 -> 83 hp). Hual02/Hual04a still need burst re-timing; lands after them. |
+| `bsp` / `item64-player-grapple` | Toits01 grapples by the game's own hook (HookPoint2 re-enabled by goal 99 after the sniper section). Depends on item76. |
+| `codex2` / `item77-ai-movement` | Walking AI pawns that step off a ledge fall; Toits01 regresses to 75 HP with it. Lands after Toits01. |
+| `viewer` / `item67-lifts-keycards` | item84 falling slide + card-room measurements; item85 (Z.AI) decoding how retail hands Hual02's card over. |
+| `steam` / `item71-interaction-target` | item81c (deepseek): retail brush-volume overlap (`AActor::IsOverlapping` 0x10352bd0 / `IsVolumeBrush` 0x1030f0d0) so Hual04a's DetectionVolume4/5 fire and the reinforcements spawn. |
+| `codex1` / `item74c-partials` | gpt-6.1-sol: SetLocation, Spawn, Trace, Move, AdjustAimForDisplay Partials. |
+
+**Machine limits (user, 2026-10-11):** three concurrent full test suites took 43-49 GB each and the
+PC hit 99% memory. `verify.sh` and both agent launchers export `RUST_TEST_THREADS=2`; run one full
+suite at a time (landings serial) and check free memory before starting heavy jobs.
+
+**Providers (user, 2026-10-11):** opencode `zai-coding-plan/glm-5.3-flash` (5-hour window; the
+printed reset time is Beijing time), opencode `openai/gpt-6.1-sol` (gpt-6-luna was ineffective:
+measurements only), Codex CLI `gpt-6.1-sol` (`local/codex-run-model.sh`, now with `< /dev/null`;
+credits run out after ~370k tokens), Ollama Cloud `ollama-cloud/deepseek-v4.1-flash` (2 sessions).
+**No new Opus sub-agents; no EUM.**
+
+### Session 2026-10-10/11 (historical)
 
 Everything verified is on `origin/main` (`0bbd96e`, 992 tests passed, Plage00 `--trace`
 byte-identical). Landed this session (each by the game's own scripts, headless scripted input):

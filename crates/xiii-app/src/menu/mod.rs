@@ -23,7 +23,7 @@
 
 mod cutscene;
 
-mod config;
+pub(crate) mod config;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};

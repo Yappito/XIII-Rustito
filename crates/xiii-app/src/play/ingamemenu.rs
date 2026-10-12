@@ -48,13 +48,13 @@ struct PlaySaveShared {
     write_result: Option<bool>,
     /// Slot handed to the game's `LoadAtCheckpoint` (the Retry path): the newest save.
     read_slot: Option<u32>,
+    last_written: Option<u32>,
 }
 
 /// The item20 provider over the host save store. Listing is synchronous from the store; the
 /// write is parked in the shared cell for the host frame (the snapshot needs `&Session`, which
 /// the provider cannot reach from inside the VM).
 struct PlaySaveSlots {
-    store: crate::save::SaveStore,
     slots: Vec<crate::save::SlotInfo>,
     shared: Rc<RefCell<PlaySaveShared>>,
     /// Slot of the request currently in flight (`Request*` → `Poll*` pairing).
@@ -66,7 +66,6 @@ impl PlaySaveSlots {
         let store = crate::save::SaveStore::open(dir);
         let slots = store.list()?;
         Ok(Self {
-            store,
             slots,
             shared,
             last_query: None,
@@ -136,8 +135,11 @@ impl xiii_script::SaveSlotProvider for PlaySaveSlots {
         Some(Self::info_date(self.info(s)?))
     }
     fn request_read(&mut self, s: u32) -> bool {
+        if self.info(s).is_none() {
+            return false;
+        }
         self.shared.borrow_mut().read_slot = Some(s);
-        self.info(s).is_some()
+        true
     }
     fn poll_read(&mut self) -> bool {
         self.shared.borrow().read_slot.is_some()
@@ -147,11 +149,19 @@ impl xiii_script::SaveSlotProvider for PlaySaveSlots {
         if shared.read_slot.is_none() {
             // Retail `LoadAtCheckpoint` reloads the last checkpoint of the current game; the
             // newest host save is that checkpoint.
-            shared.read_slot = self.store.newest().ok().flatten().map(|s| s.slot);
+            shared.read_slot = shared.last_written.or_else(|| {
+                self.slots
+                    .iter()
+                    .max_by_key(|s| (s.modified_unix, s.slot))
+                    .map(|s| s.slot)
+            });
         }
         shared.read_slot.take()
     }
     fn request_write(&mut self, slot: u32) -> bool {
+        if slot >= 10 {
+            return false;
+        }
         let mut shared = self.shared.borrow_mut();
         if shared.write_request.is_some() {
             return false;
@@ -172,6 +182,7 @@ impl xiii_script::SaveSlotProvider for PlaySaveSlots {
 /// meaningful while the session is open (reset on a travel rebuild).
 #[derive(Default)]
 pub struct InGameMenu {
+    config_path: Option<PathBuf>,
     save_dir: Option<PathBuf>,
     /// The campaign map of the open session (the save description and Quit interception).
     map: Option<String>,
@@ -195,6 +206,17 @@ pub struct InGameMenu {
 }
 
 impl InGameMenu {
+    pub fn install_settings(
+        &mut self,
+        session: &mut Session,
+        game: &std::path::Path,
+        config: &std::path::Path,
+    ) -> Result<(), String> {
+        let path = crate::menu::config::user_path(game, config)?;
+        session.vm_mut().canvas.menu = Some(crate::menu::config::load(game, &path)?);
+        self.config_path = Some(path);
+        Ok(())
+    }
     /// Configures the host directories/map for the session about to run.
     pub fn configure(&mut self, save_dir: Option<PathBuf>, map: Option<String>) {
         if self.installed {
@@ -246,6 +268,9 @@ impl InGameMenu {
         }
         let controller = session.controller;
         let vm = session.vm_mut();
+        vm.canvas
+            .menu
+            .get_or_insert_with(xiii_script::canvas::MenuSettings::default);
         let set = vm.set();
         let resolve = |path: &str| {
             xiii_world::runtime::resolve_class_path(set, path)
@@ -381,9 +406,6 @@ impl InGameMenu {
         // class defaults via `DynamicLoadObject` (`gui.u` @46520/@46566).
         if let Err(e) = vm.send_event(root, "LoadIngameMenu", vec![]) {
             self.record_error(format!("LoadIngameMenu: {e}"));
-        }
-        if let Err(e) = vm.send_event(root, "LoadMainMenu", vec![]) {
-            self.record_error(format!("LoadMainMenu: {e}"));
         }
         self.trace_cursor = vm.trace.len();
         self.root = Some(root);
@@ -554,20 +576,29 @@ impl InGameMenu {
         let args = vec![Value::Byte(key), Value::Byte(1), Value::Float(0.0)];
         let vm = session.vm_mut();
         let page = self.page.expect("poll opened");
-        // `XIIIMenuInGame.InternalOnKeyEvent` maps Enter and the native mouse-click key directly
-        // to `InternalOnClick(FocusedControl)`. Dispatch that decoded page path before generic
-        // control delegates; otherwise a button's base OnKeyEvent can consume Enter without
-        // invoking the page action in this native-GUI-free host.
+        // Each retail page owns Enter/click semantics (Save handles slots; Skills closes;
+        // InGame calls InternalOnClick). Generic button delegates can consume Enter without
+        // executing that page behavior, so dispatch the page's decoded key handler first.
         if matches!(key, 13 | 1)
-            && let Some(Value::Object(Some(ObjRef::Instance(control)))) =
+            && let Some(Value::Object(Some(ObjRef::Instance(_)))) =
                 vm.get_property(page, "FocusedControl").cloned()
         {
-            vm.send_event(
-                page,
-                "InternalOnClick",
-                vec![Value::Object(Some(ObjRef::Instance(control)))],
-            )
-            .map_err(|e| e.to_string())?;
+            let start = vm.trace.len();
+            vm.send_event(page, "InternalOnKeyEvent", args.clone())
+                .map_err(|e| e.to_string())?;
+            for event in &vm.trace[start..] {
+                match &event.kind {
+                    TraceKind::Event { function, .. }
+                        if function.contains("Menu") || function.contains("MsgBox") =>
+                    {
+                        println!("[menu dispatch] {:?}", event.kind)
+                    }
+                    TraceKind::Native { path, .. } if !path.starts_with("Object.") => {
+                        println!("[menu native] {:?}", event.kind)
+                    }
+                    _ => {}
+                }
+            }
             self.after_dispatch(session);
             return Ok(true);
         }
@@ -639,7 +670,7 @@ impl InGameMenu {
     /// (the save page's latent polling, which the paused VM cannot schedule), request
     /// fulfilment and trace scanning. The page draw runs in [`Self::page_commands`] from the
     /// HUD refresh.
-    pub fn frame(&mut self, session: &mut Session) {
+    pub fn frame(&mut self, session: &mut Session, delta: f32) {
         if self.root.is_none() {
             return;
         }
@@ -647,7 +678,24 @@ impl InGameMenu {
             self.complete_page(session);
             self.fulfil_save(session);
             self.drive_page_tick(session);
+            if let Some(page) = self.page
+                && !session
+                    .vm()
+                    .set()
+                    .path(session.vm().objects[page as usize].class)
+                    .eq_ignore_ascii_case("xidinterf.XIIIMenuSave")
+                && let Err(error) = session.vm_mut().tick_gui_state(page, delta)
+            {
+                self.record_error(format!("GUI page state: {error}"));
+            }
             self.scan_trace(session);
+        }
+        if let Some(path) = &self.config_path
+            && let Some(settings) = session.vm_mut().canvas.menu.as_mut()
+            && settings.save_requested
+            && let Err(error) = crate::menu::config::save(path, settings)
+        {
+            self.record_error(format!("menu settings save: {error}"));
         }
     }
 
@@ -675,12 +723,19 @@ impl InGameMenu {
         if !vm
             .set()
             .path(vm.objects[page as usize].class)
-            .eq_ignore_ascii_case("xidinterf.xiimenusave")
+            .eq_ignore_ascii_case("xidinterf.xiiimenusave")
         {
             return;
         }
         if let Err(e) = vm.send_event(page, "Tick", vec![Value::Float(0.0)]) {
             self.record_error(format!("XIIIMenuSave.Tick: {e}"));
+        }
+        if self.shared.borrow().write_result == Some(true)
+            && let Some(root) = self.root
+            && vm.get_property(root, "ActivePage")
+                != Some(&Value::Object(Some(ObjRef::Instance(page))))
+        {
+            vm.set_property(root, "bSavingPossible", 0, Value::Bool(true));
         }
     }
 
@@ -696,7 +751,7 @@ impl InGameMenu {
         if !vm
             .set()
             .path(vm.objects[page as usize].class)
-            .eq_ignore_ascii_case("xidinterf.xiimenusave")
+            .eq_ignore_ascii_case("xidinterf.xiiimenusave")
         {
             return;
         }
@@ -711,9 +766,14 @@ impl InGameMenu {
                     Some(Value::Str(s)) => s,
                     _ => String::new(),
                 };
+                let mut empty = vec![Value::Byte(1); max_slots];
+                let buttons = match vm.get_property(page, "SaveSlots").cloned() {
+                    Some(Value::Array(items)) => items,
+                    _ => Vec::new(),
+                };
                 // Fill the real slot texts/emptiness from the store, then leave the latent
                 // state (its remaining code after the loop is nothing).
-                for slot in 0..max_slots {
+                for (slot, is_empty) in empty.iter_mut().enumerate() {
                     let info = vm.save_slots_mut().and_then(|p| p.slot(slot as u32));
                     if let Some(info) = info {
                         let [year, month, day, hour, minute] = info.date;
@@ -727,18 +787,32 @@ impl InGameMenu {
                         if slot == 0 {
                             text = format!("{quick_prefix}{text}");
                         }
-                        vm.set_property(page, "bSaveSlotEmpty", slot, Value::Byte(0));
+                        *is_empty = Value::Byte(0);
                         if let Some(Value::Object(Some(ObjRef::Instance(btn)))) =
-                            vm.get_property_elem(page, "SaveSlots", slot).cloned()
+                            buttons.get(slot).cloned()
                         {
                             vm.set_property(btn, "Text", 0, Value::Str(text));
                         }
                     }
                 }
+                vm.set_property(page, "bSaveSlotEmpty", 0, Value::Array(empty));
                 let _ = vm.goto_state(page, "None", None);
                 println!("[menu] XIIIMenuSave slots filled from the host save store");
             }
             "SaveInSlot" => {
+                let slot = vm
+                    .get_property(page, "SlotNumberToSaveIn")
+                    .cloned()
+                    .unwrap_or(Value::Int(-1));
+                if let Some(root) = self.root {
+                    match vm.send_event(root, "RequestWriteSlot", vec![slot]) {
+                        Ok(Some(Value::Bool(true))) => {}
+                        Ok(result) => {
+                            self.record_error(format!("RequestWriteSlot rejected: {result:?}"))
+                        }
+                        Err(error) => self.record_error(format!("RequestWriteSlot: {error}")),
+                    }
+                }
                 // The write request is in flight (or queued); leaving the state is the host
                 // completion — `fulfil_save` settles the request and the page's own `Tick`
                 // runs `CloseMenu` once `bSavingPossible` drops.
@@ -772,6 +846,11 @@ impl InGameMenu {
         match result {
             Ok((dir, data)) => {
                 self.shared.borrow_mut().write_result = Some(true);
+                self.shared.borrow_mut().last_written = Some(slot);
+                match PlaySaveSlots::open(dir.clone(), self.shared.clone()) {
+                    Ok(provider) => session.vm_mut().set_save_slots(Box::new(provider)),
+                    Err(error) => self.record_error(format!("refresh save slots: {error}")),
+                }
                 println!(
                     "[menu] in-game save wrote slot {slot} ({}) to {}",
                     data.description,
@@ -784,7 +863,9 @@ impl InGameMenu {
                 self.record_error(format!("in-menu save slot {slot}: {e}"));
             }
         }
-        if let Some(root) = self.root {
+        if self.shared.borrow().write_result == Some(true)
+            && let Some(root) = self.root
+        {
             // Retail clears this when the save device settles; the page's own `Tick` then runs
             // `CloseMenu`.
             session
@@ -795,6 +876,16 @@ impl InGameMenu {
 
     /// Post-dispatch upkeep (key/click paths): page completion, save fulfilment, trace scan.
     fn after_dispatch(&mut self, session: &mut Session) {
+        self.poll(session.vm_mut());
+        if let Some(page) = self.page {
+            let vm = session.vm_mut();
+            println!(
+                "[menu] active page={} state={:?} focus={:?}",
+                vm.set().path(vm.objects[page as usize].class),
+                vm.state_name(page),
+                vm.get_property(page, "FocusedControl")
+            );
+        }
         self.complete_page(session);
         self.fulfil_save(session);
         self.scan_trace(session);
@@ -810,6 +901,9 @@ impl InGameMenu {
         let start = self.trace_cursor.min(vm.trace.len());
         for ev in &vm.trace[start..] {
             if let TraceKind::Note(note) = &ev.kind {
+                if !note.starts_with("Canvas.") && !note.contains("GetStyle") {
+                    println!("[menu script] {note}");
+                }
                 if let Some(req) = parse_travel_note(note) {
                     self.travel = Some(req);
                 }
@@ -843,11 +937,17 @@ impl InGameMenu {
         let page = self.page.expect("caller polled");
         let arg = Value::Object(Some(ObjRef::Instance(canvas)));
         let mut commands = Vec::new();
+        let mut errors = Vec::new();
         let run = |vm: &mut Vm<'static>, id: ObjectId, prop: &str, declared: &str| {
-            let _ = vm.call_delegate(id, prop, declared, vec![arg.clone()]);
+            vm.call_delegate(id, prop, declared, vec![arg.clone()])
+                .map_err(|error| format!("{}.{declared}: {error:?}", vm.objects[id as usize].name))
         };
-        run(vm, page, "__OnPreDraw__Delegate", "OnPreDraw");
-        run(vm, page, "__OnDraw__Delegate", "OnDraw");
+        if let Err(error) = run(vm, page, "__OnPreDraw__Delegate", "OnPreDraw") {
+            errors.push(error);
+        }
+        if let Err(error) = run(vm, page, "__OnDraw__Delegate", "OnDraw") {
+            errors.push(error);
+        }
         let controls = vm
             .get_property(page, "Controls")
             .cloned()
@@ -861,18 +961,27 @@ impl InGameMenu {
                 })
                 .collect();
             for c in &ids {
-                run(vm, *c, "__OnPreDraw__Delegate", "OnPreDraw");
+                if let Err(error) = run(vm, *c, "__OnPreDraw__Delegate", "OnPreDraw") {
+                    errors.push(error);
+                }
             }
             for c in &ids {
-                run(vm, *c, "__OnDraw__Delegate", "OnDraw");
+                if let Err(error) = run(vm, *c, "__OnDraw__Delegate", "OnDraw") {
+                    errors.push(error);
+                }
             }
         }
-        let _ = vm.send_event(
+        if let Err(error) = vm.send_event(
             page,
             "AfterPaint",
             vec![arg, Value::Float(0.0), Value::Float(0.0)],
-        );
+        ) {
+            errors.push(format!("menu AfterPaint: {error}"));
+        }
         commands.extend(vm.drain_canvas());
+        for error in errors {
+            self.record_error(error);
+        }
         commands
     }
 
@@ -891,6 +1000,7 @@ impl InGameMenu {
         shared.write_request = None;
         shared.write_result = None;
         shared.read_slot = None;
+        shared.last_written = None;
     }
 
     /// The front-end map name, for the travel interception.
@@ -940,6 +1050,7 @@ pub(crate) fn frame(
     mut script: ResMut<super::ScriptRes>,
     mut state: ResMut<super::TraceState>,
     mut exit: MessageWriter<AppExit>,
+    time: Res<Time>,
 ) {
     let Ok(sess) = session.as_mut() else {
         return;
@@ -953,8 +1064,13 @@ pub(crate) fn frame(
         while drive.take_menu_close() {
             menu.request_close(sess);
         }
+        for key in drive.take_menu_keys() {
+            if let Err(error) = menu.key(sess, key) {
+                menu.record_error(format!("scripted menu key {key}: {error}"));
+            }
+        }
     }
-    menu.frame(sess);
+    menu.frame(sess, time.delta_secs());
     state.menu_open = menu.is_open();
     if let Some(req) = menu.travel.take() {
         if InGameMenu::is_front_end_map(&req.map) {
@@ -1008,6 +1124,24 @@ pub(crate) fn scripted_shots(
 mod tests {
     use super::*;
     use xiii_script::SaveSlotProvider;
+
+    fn paint_test_page(menu: &mut InGameMenu, session: &mut Session) {
+        let class =
+            xiii_world::runtime::resolve_class_path(session.vm().set(), "Engine.Canvas").unwrap();
+        let canvas = session.vm_mut().spawn(class, "MenuTestCanvas").unwrap();
+        for (field, value) in [
+            ("SizeX", Value::Int(1280)),
+            ("SizeY", Value::Int(720)),
+            ("ClipX", Value::Float(1280.0)),
+            ("ClipY", Value::Float(720.0)),
+        ] {
+            session.vm_mut().set_property(canvas, field, 0, value);
+        }
+        for _ in 0..2 {
+            menu.page_commands(session, canvas, [1280.0, 720.0]);
+        }
+        assert!(menu.errors.is_empty(), "{:?}", menu.errors);
+    }
 
     #[test]
     fn front_end_map_detection_is_case_insensitive_and_exact() {
@@ -1074,6 +1208,330 @@ mod tests {
         );
         // An unreadable store lists no slots and the checkpoint query is false.
         assert!(!provider.has_any_checkpoint());
+        assert!(!provider.request_read(8));
+        assert!(!provider.poll_read());
+        assert!(!provider.request_write(10));
+        shared.borrow_mut().last_written = Some(4);
+        assert_eq!(provider.take_read_slot(), Some(4));
+    }
+
+    #[test]
+    fn opt_in_menu_save_survives_destroyed_checkpoint_trigger() {
+        let Some(game_dir) = std::env::var_os("XIII_GOG_DIR").map(PathBuf::from) else {
+            println!("SKIPPED: set XIII_GOG_DIR to run retail menu save acceptance");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("xiii-item82-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = Session::open(&game_dir, "Plage00").unwrap();
+        let mut menu = InGameMenu::default();
+        menu.configure(Some(dir.clone()), Some("Plage00".into()));
+        menu.open(&mut session);
+        menu.key(&mut session, 13).unwrap();
+        let page = menu.page.unwrap();
+        assert!(
+            session
+                .vm()
+                .set()
+                .path(session.vm().objects[page as usize].class)
+                .eq_ignore_ascii_case("xidinterf.XIIIMenuSave")
+        );
+        assert!(matches!(
+            session.vm().get_property(page, "bSaveSlotEmpty"),
+            Some(Value::Array(_))
+        ));
+        paint_test_page(&mut menu, &mut session);
+        let slot = match session.vm().get_property(page, "SaveSlots") {
+            Some(Value::Array(slots)) => slots[1].clone(),
+            other => panic!("SaveSlots: {other:?}"),
+        };
+        session
+            .vm_mut()
+            .set_property(page, "FocusedControl", 0, slot);
+        menu.key(&mut session, 13).unwrap();
+        menu.frame(&mut session, 1.0 / 60.0);
+        assert!(menu.errors.is_empty(), "{:?}", menu.errors);
+        let store = crate::save::SaveStore::open(dir.clone());
+        let saved = store.read(1).unwrap();
+        assert_eq!(saved.description, "Menu save (Plage00)");
+        assert_eq!(saved.teleporter, "PlayerStart");
+        assert!(
+            session.vm_mut().save_slots_mut().unwrap().slot(1).is_some(),
+            "provider must refresh after writing"
+        );
+        menu.poll(session.vm_mut());
+        let parent = menu.page.unwrap();
+        let retry = session
+            .vm()
+            .get_property(parent, "RestartBtn")
+            .unwrap()
+            .clone();
+        session
+            .vm_mut()
+            .set_property(parent, "FocusedControl", 0, retry.clone());
+        menu.key(&mut session, 13).unwrap();
+        menu.key(&mut session, 13).unwrap();
+        assert!(menu.load_slot.is_none(), "cancel must not reload");
+        session
+            .vm_mut()
+            .set_property(parent, "FocusedControl", 0, retry);
+        menu.key(&mut session, 13).unwrap();
+        menu.key(&mut session, 37).unwrap();
+        menu.key(&mut session, 13).unwrap();
+        assert_eq!(
+            menu.load_slot,
+            Some(1),
+            "Retry must select the menu-written save"
+        );
+        let mut restored = Session::open_checkpoint(&game_dir, &saved.map).unwrap();
+        restored.restore_checkpoint(&saved).unwrap();
+        assert_eq!(restored.player_health(), Some(saved.health));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn opt_in_controls_page_writes_config_then_pops_without_unpausing() {
+        let Some(game_dir) = std::env::var_os("XIII_GOG_DIR").map(PathBuf::from) else {
+            println!("SKIPPED: set XIII_GOG_DIR to test retail Controls");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("xiii-item82-controls-{}", std::process::id()));
+        let mut session = Session::open(&game_dir, "Plage00").unwrap();
+        let mut menu = InGameMenu::default();
+        menu.configure(Some(dir.join("save")), Some("Plage00".into()));
+        menu.install_settings(&mut session, &game_dir, &dir.join("config"))
+            .unwrap();
+        menu.open(&mut session);
+        let parent = menu.page.unwrap();
+        let focus = session
+            .vm()
+            .get_property(parent, "ControlsBtn")
+            .unwrap()
+            .clone();
+        session
+            .vm_mut()
+            .set_property(parent, "FocusedControl", 0, focus);
+        menu.key(&mut session, 13).unwrap();
+        let page = menu.page.unwrap();
+        assert!(
+            session
+                .vm()
+                .set()
+                .path(session.vm().objects[page as usize].class)
+                .eq_ignore_ascii_case("xidinterf.XIIIMenuInputPC")
+        );
+        assert!(session.vm().trace.iter().any(|e| matches!(&e.kind, TraceKind::Native { path, args, result, .. } if path == "PlayerController.ConsoleCommand" && args.iter().any(|a| a.contains("KEYNAME 65")) && result.contains('A'))));
+        paint_test_page(&mut menu, &mut session);
+        let clock = session
+            .vm()
+            .get_property(session.vm().find_level_info().unwrap(), "TimeSeconds")
+            .cloned();
+        assert!(session.vm_mut().tick_gui_state(page, f32::NAN).is_err());
+        assert!(
+            session
+                .vm_mut()
+                .tick_gui_state(menu.root.unwrap(), 0.1)
+                .is_err()
+        );
+        menu.key(&mut session, 27).unwrap();
+        for _ in 0..4 {
+            menu.frame(&mut session, 0.1);
+        }
+        menu.poll(session.vm_mut());
+        assert_eq!(menu.page, Some(parent), "{:?}", menu.errors);
+        assert!(dir.join("config/menu.ini").exists());
+        assert_eq!(
+            clock,
+            session
+                .vm()
+                .get_property(session.vm().find_level_info().unwrap(), "TimeSeconds")
+                .cloned()
+        );
+        assert!(menu.errors.is_empty(), "{:?}", menu.errors);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn opt_in_skills_wraps_focus_and_enter_returns_to_parent() {
+        let Some(game_dir) = std::env::var_os("XIII_GOG_DIR").map(PathBuf::from) else {
+            println!("SKIPPED: set XIII_GOG_DIR to test retail Skills");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Plage00").unwrap();
+        let mut menu = InGameMenu::default();
+        menu.open(&mut session);
+        let parent = menu.page.unwrap();
+        let focus = session
+            .vm()
+            .get_property(parent, "CompetencesBtn")
+            .unwrap()
+            .clone();
+        session
+            .vm_mut()
+            .set_property(parent, "FocusedControl", 0, focus);
+        menu.key(&mut session, 13).unwrap();
+        let page = menu.page.unwrap();
+        assert!(
+            session
+                .vm()
+                .set()
+                .path(session.vm().objects[page as usize].class)
+                .eq_ignore_ascii_case("xidinterf.XIIIMenuCompetencesIngame")
+        );
+        paint_test_page(&mut menu, &mut session);
+        let first = session.vm().get_property(page, "FocusedControl").cloned();
+        for _ in 0..8 {
+            menu.key(&mut session, 40).unwrap();
+        }
+        assert_eq!(
+            first,
+            session.vm().get_property(page, "FocusedControl").cloned()
+        );
+        menu.key(&mut session, 13).unwrap();
+        assert_eq!(menu.page, Some(parent));
+        assert!(menu.is_open());
+        assert!(menu.errors.is_empty(), "{:?}", menu.errors);
+    }
+
+    #[test]
+    fn opt_in_main_menu_confirmation_cancel_then_retail_travel() {
+        let Some(game_dir) = std::env::var_os("XIII_GOG_DIR").map(PathBuf::from) else {
+            println!("SKIPPED: set XIII_GOG_DIR to test retail Main menu");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "Plage00").unwrap();
+        let mut menu = InGameMenu::default();
+        menu.open(&mut session);
+        let parent = menu.page.unwrap();
+        let quit = session
+            .vm()
+            .get_property(parent, "QuitBtn")
+            .unwrap()
+            .clone();
+        session
+            .vm_mut()
+            .set_property(parent, "FocusedControl", 0, quit.clone());
+        menu.key(&mut session, 13).unwrap();
+        paint_test_page(&mut menu, &mut session);
+        let root = menu.root.unwrap();
+        let page = menu.page.unwrap();
+        let font = match session
+            .vm_mut()
+            .send_event(root, "GetMenuFont", vec![Value::Str("GUISmallFont".into())])
+            .unwrap()
+        {
+            Some(Value::Object(Some(ObjRef::Instance(id)))) => id,
+            other => panic!("GetMenuFont: {other:?}"),
+        };
+        let names = session
+            .vm()
+            .get_property(font, "FontArrayNames")
+            .unwrap()
+            .clone();
+        session
+            .vm_mut()
+            .set_property(font, "FontArrayNames", 0, Value::Array(vec![]));
+        assert!(
+            session
+                .vm_mut()
+                .send_event(font, "GetFont", vec![Value::Int(1280)])
+                .is_err()
+        );
+        session
+            .vm_mut()
+            .set_property(font, "FontArrayNames", 0, names);
+        let object_count = session.vm().objects.len();
+        let root_class = session.vm().objects[root as usize].class;
+        assert!(
+            session
+                .vm_mut()
+                .spawn_gui_font_template(root_class)
+                .is_err()
+        );
+        assert_eq!(
+            session.vm().objects.len(),
+            object_count,
+            "invalid template must not allocate a non-font"
+        );
+        let width = session.vm().get_property(page, "WinWidth").unwrap().clone();
+        let owner = session
+            .vm()
+            .get_property(page, "MenuOwner")
+            .unwrap()
+            .clone();
+        let bound = session
+            .vm()
+            .get_property(page, "bBoundToParent")
+            .unwrap()
+            .clone();
+        session
+            .vm_mut()
+            .set_property(page, "WinWidth", 0, Value::Float(f32::NAN));
+        assert!(
+            session
+                .vm_mut()
+                .send_event(page, "ActualWidth", vec![])
+                .is_err()
+        );
+        session
+            .vm_mut()
+            .set_property(page, "WinWidth", 0, Value::Float(0.5));
+        session
+            .vm_mut()
+            .set_property(page, "bBoundToParent", 0, Value::Bool(false));
+        assert_eq!(
+            session
+                .vm_mut()
+                .send_event(page, "ActualWidth", vec![])
+                .unwrap(),
+            Some(Value::Float(640.0))
+        );
+        session
+            .vm_mut()
+            .set_property(page, "bBoundToParent", 0, Value::Bool(true));
+        session.vm_mut().set_property(
+            page,
+            "MenuOwner",
+            0,
+            Value::Object(Some(ObjRef::Instance(page))),
+        );
+        assert!(
+            session
+                .vm_mut()
+                .send_event(page, "ActualWidth", vec![])
+                .is_err()
+        );
+        session.vm_mut().set_property(page, "WinWidth", 0, width);
+        session.vm_mut().set_property(page, "MenuOwner", 0, owner);
+        session
+            .vm_mut()
+            .set_property(page, "bBoundToParent", 0, bound);
+        assert!(
+            session
+                .vm_mut()
+                .send_event(root, "GetStyle", vec![Value::Str("MissingStyle".into())])
+                .is_err()
+        );
+        assert!(
+            session
+                .vm_mut()
+                .send_event(root, "GetMenuFont", vec![Value::Str("MissingFont".into())])
+                .is_err()
+        );
+        menu.key(&mut session, 13).unwrap();
+        assert!(menu.travel.is_none(), "default No must not quit");
+        assert_eq!(menu.page, Some(parent));
+        session
+            .vm_mut()
+            .set_property(parent, "FocusedControl", 0, quit);
+        menu.key(&mut session, 13).unwrap();
+        menu.key(&mut session, 37).unwrap();
+        menu.key(&mut session, 13).unwrap();
+        let travel = menu.travel.as_ref().unwrap();
+        assert!(InGameMenu::is_front_end_map(&travel.map));
+        assert_eq!(travel.url, "MapMenu");
+        assert!(!menu.is_open());
+        assert!(menu.errors.is_empty(), "{:?}", menu.errors);
     }
 
     /// Opt-in corpus test (item72): on Plage00 the retail open path pauses the level clock
