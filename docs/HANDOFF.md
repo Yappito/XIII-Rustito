@@ -4,9 +4,46 @@ Updated: **2026-10-09 (coordinator session)**. Research phase (2026-10-04), M0, 
 
 ## Next session: start here
 
-State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `36bb2b1` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
+State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `22be8fa` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
-### Session 2026-10-11/12 — read this first
+### Session 2026-10-12 — read this first
+
+Everything verified is on `origin/main` (`22be8fa`, 1071 tests passed, Plage00 `--trace`
+byte-identical; combat and level-start surveys clean on all 35 maps). Landed today:
+
+- **Engine fidelity bundle (`integ-fidelity`, merged as one so each route was re-timed once):**
+  AI automatic bursts (`Pawn.PressingFire` reads Controller+0x212, execPressingFire 0x103afc50);
+  retail brush-volume overlap (`AActor::IsOverlapping` 0x10352bd0 -> `IsVolumeBrush` 0x1030f0d0 ->
+  `UModel::PointCheck` 0x10418ab0; `SpawnActor` delivers Touch); walking AI pawns that step off a
+  ledge fall; the player grapple by the game's own hook (Toits01); falling pawns slide along walls
+  (`physFalling` 0x103c37b0, processHitWall/TwoWallAdjust, no step-up); `PHYS_Ladder` is 11 in
+  XIII's `EPhysics` (engine.u enum; the stock-UE2 10 failed every shipped "already climbing"
+  check); ladders attach only while `Dot(facing, LookDir) > 0.9`, `LookDir = vector(WallDir)`.
+- **Routes re-timed on that tree by input:** Banque01 (DetectionVolume12's brush lies below its
+  Location: walk into it; escape teleports after `fin_flash`); Amos01 (descent east of the
+  west-facing BaseSoldier9; min health 44); Hual04a (six-kill card chain completes, card read);
+  Toits01 (lane sniper now falls and is shot from a clear stand; the level's `act2b` courtyard
+  combat fires and is fought; health pin 79); Hual02 (the eavesdrop chain in the level's own order:
+  goals 1 and 2 promoted and completed, goal 3 promoted by the cell door; four labelled teleports).
+- **Natives (item74c/d):** `Actor.Move` (static refusal, zero-delta true, positive-progress return,
+  blocker-then-mover Bump), `Actor.Spawn` (static/no-delete refusal, killed-in-lifecycle None),
+  `SetLocation` carries based children, `Trace` grows cylinder bounds per axis.
+  AdjustAimForDisplay's snap stays Partial (anonymous native fields).
+- **Performance (item83):** Banque01 frame p50 10.6 -> 6.1 ms, p95 15.5 -> 11.8 ms (cached hot
+  property slots, per-scope function index).
+
+Committed on branches, NOT on main:
+
+| Worktree / branch | State |
+|---|---|
+| `sweep` / `integ-hual04a-fuse` | Hual04a fuse leg: player reaches the fuse at 44 hp, goal 2 completes, LastWave killed. item90 (deepseek) decodes Core.dll's out-of-bounds static array access (`Hual04a.SetGoalComplete` case 3 loops `i < 4` over the 3-entry `SoldiersEnRenforts`; the VM raises ArrayIndex 3/3), then the install, lever and Hual04c travel. |
+| `audio` / `integ-toits-gen` | WIP item87: Toits01's ending cine stalls at `CineController2` `wait notbeseenbyplayer` (`Level.TimeSeconds - LastRenderTime` negative: the map serialises `LevelInfo.TimeSeconds` 2649.8, our clock starts at 0). The WIP rebase + CineController2-only stand-in was rejected (class-specific, clock start undecoded); item87b (deepseek) decodes the load-time clock and `LastRenderTime` writers. The generator room opens only through that cine (`od porte6`). |
+| `codex1` / `item88-hual04c` | gpt-6.1-sol: first Hual04c route. |
+
+Open defect: **windowed play memory** — a windowed Hual04a run held 36 GB commit / 16 GB working
+set (the user saw a 23 GB xiii-app earlier); spec `local/tasks/item89-play-memory.md`, unassigned.
+
+### Session 2026-10-11/12 (historical)
 
 Everything verified is on `origin/main` (`36bb2b1`, 1038 tests passed, Plage00 `--trace`
 byte-identical). Landed since `0bbd96e`, each decoded from the DLLs/scripts:
@@ -479,8 +516,8 @@ Native Windows reports an RTX 4090. Rust/Cargo were not found on the inspected W
 
 ## Exact next work
 
-1. **Finish and land the open branches** above (Amos01, Toits01 grapple, Hual02 lift/keycard,
-   PickWallAdjust), each re-measured on the real clock.
+1. **Finish and land the open branches** in the 2026-10-12 table (Hual04a install/lever/travel
+   after the array-bounds decode; Toits01 render-time clock and generator; Hual04c route).
 2. **AI pursuit natives** reached now that the clock runs: `PickWallAdjust` (526) and whatever
    `Chasse`/`temporise` reach next; rerun the combat survey.
 3. **User playtest** of Plage00 -> Plage01 -> Banque01 in the window (`--menu`), then fix what
@@ -489,7 +526,8 @@ Native Windows reports an RTX 4090. Rust/Cargo were not found on the inspected W
    yard access; Banque01's residual strongroom/escape teleports.
 5. **Renderer diagnostics:** Bevy slab_allocator "Use-after-free" messages, missing
    RenderTargetMaterial tiles on the destination map's first comic, one Banque01 stale entity.
-6. **Performance:** Banque01 vm_step/hud_postrender/pawn_pose.
+6. **Performance and memory:** windowed play memory (item89, 20-36 GB commit); Banque01
+   vm_step after item83.
 7. **Host bridges still in use:** route diagnostic `weapon` grants and labelled teleports; each
    needs its engine path.
 
