@@ -113,90 +113,129 @@ t=126.00 forward 0
 # rifle (InventoryGroup 14) and take the stand where the first sniper's fire reached the
 # player in the stand-still probe (local/re/item64f/probe3.txt).
 t=129.60 select_weapon 14
-t=130.00 goto -3600 1330
+t=130.00 goto -3140 1180
 t=133.00 forward 0
-# The two snipers ('BaseSoldier' from GenNMI1, 'BaseSoldier4' from GenNMI0) pursue
-# (Chasse/Attaque) at a constant z 2478 across the street void - an AI walking artefact
-# (controller_move_step ignores walk_move's no-floor result; see the item64f report), not
-# authored behaviour - so they are shot as they come in. Measured: BaseSoldier 150 -> 44
-# -> dead at 135.5, BaseSoldier4 dead at 138.5 (CineTrigger1 counts both; no player hit).
+# The two snipers ('BaseSoldier' from GenNMI1, 'BaseSoldier4' from GenNMI0) pursue toward the
+# player and, with PHYS_Falling (item77), no longer float at a constant z 2478 across the
+# street void: they step off their ledge and fall. BaseSoldier4 falls across the open street
+# and is shot from the old roof stand; BaseSoldier falls into the covered lane under the roof
+# edge (measured x -3169, z 2016.6) and is occluded from -3600 (roof BSP) and from the
+# mid-roof (edge parapet StaticMeshActor46, top z 2188.8). The route walks east to the clear
+# stand (x -3110) where the lane is back in view; the soldier comes out and is shot. Both
+# deaths raise the CineTrigger1 'finact1' counter -> goal 99 at ~154.5. Measured item86:
+# BaseSoldier4 dead at 138.5, BaseSoldier dead at 148.0, player Health stays 150 (no hit).
 t=133.10 track BaseSoldier 0.85
 t=134.00 fire
 t=135.50 fire
 t=137.00 track BaseSoldier4 0.85
 t=138.50 fire
 t=140.00 fire
-t=141.00 track off
-# item64 grapple #2 (after goal 99): re-select the Hook with the retail item-cycle press
-# (cNextItem), walk past the opened crank to the clear stand east of it, aim at HookPoint2,
-# short fire press attaches (HookLength locks at the standing distance), walk east off the
-# roof edge - the taut-rope constraint (PlayerWalking.ProcessMove 0x0237) arrests the fall
-# (VM-owned while bHooked and PHYS_Falling) - then ALTFIRE pays the rope out and the
-# pendulum lowers toward the street below the anchor; the use key detaches on the street.
-t=145.50 next_item
-t=146.00 goto -3140 1180
-t=148.40 forward 0
-t=148.50 track HookPoint2
-t=149.30 fire_hold 1
-t=149.50 fire_hold 0
-t=149.70 goto -2700 1080
-t=150.90 altfire_hold 1
-t=158.00 altfire_hold 0
-t=161.00 use
-t=161.50 forward 0
-# courtyard: AI west corridor (the descent lands below HookPoint2; walk east then north)
-t=162.50 goto -1450 1100
-t=164.50 goto -1450 1500
-t=170.50 goto -1450 2100
-t=178.50 goto -900 2100
-t=186.50 goto -768 2838
-t=194.50 goto -734 3424
-t=202.50 goto -200 3900
+t=141.00 goto -3140 1180
+t=142.00 track BaseSoldier 0.85
+t=143.00 fire
+t=144.00 fire
+t=145.00 fire
+t=146.00 fire
+t=147.00 fire
+t=148.00 fire
+t=149.00 track off
+t=150.00 forward 0
+# item64 grapple #2 (after goal 99, item86: re-timed +10 s): the player is already on the
+# clear stand east of the crank; re-select the Hook with the retail item-cycle press
+# (cNextItem), aim at HookPoint2 (re-enabled by Toits01.SetGoalComplete(99) at ~154.5), short
+# fire press attaches (HookLength locks at the standing distance), walk east off the roof edge
+# - the taut-rope constraint (PlayerWalking.ProcessMove 0x0237) arrests the fall (VM-owned
+# while bHooked and PHYS_Falling) - then ALTFIRE pays the rope out and the pendulum lowers
+# toward the street below the anchor; the use key detaches on the street.
+t=155.50 next_item
+t=158.40 forward 0
+t=158.50 track HookPoint2
+t=159.30 fire_hold 1
+t=159.50 fire_hold 0
+t=159.70 goto -2700 1080
+t=160.90 altfire_hold 1
+t=168.00 altfire_hold 0
+t=171.00 use
+t=171.50 forward 0
+# courtyard (item86): DetectionVolume1's brush (item81c) now fires 'act2b' at the descent and
+# the three courtyard soldiers (BaseSoldier13/14/15) switch at t~162 to AttaqueScriptee. The
+# old damage-free west-corridor walk is re-timed to kill them as they come into the open; 13
+# is shootable from the landing, 14/15 open up as the player moves north.
+t=172.00 track BaseSoldier13 0.85
+t=172.50 fire
+t=173.50 fire
+t=174.00 goto -1450 1100
+t=175.00 track BaseSoldier14 0.85
+t=176.00 fire
+t=177.00 fire
+t=178.00 fire
+t=179.00 fire
+t=180.00 goto -1450 1500
+t=181.00 fire
+t=182.00 fire
+t=183.00 fire
+t=184.00 fire
+t=185.00 fire
+t=186.00 goto -1450 2100
+t=187.00 track BaseSoldier15 0.85
+t=188.00 fire
+t=189.00 fire
+t=190.00 fire
+t=191.00 fire
+t=192.00 fire
+t=193.00 fire
+t=194.00 track off
+t=195.00 goto -1450 2100
+t=198.50 goto -900 2100
+t=206.50 goto -768 2838
+t=214.50 goto -734 3424
+t=222.50 goto -200 3900
 # alley attempt; labelled teleport fallback (the alley's east end is the windowed wall)
-t=210.50 goto 200 3900
-t=216.50 goto 500 4100
-t=222.50 goto 800 4400
-t=228.50 teleport 800 4500 900
-t=228.60 forward 0
-t=230.50 goto 1400 4500
-t=238.50 goto 1900 4500
-t=246.50 goto 2300 4500
+t=238.50 goto 200 3900
+t=244.50 goto 500 4100
+t=250.50 goto 800 4400
+t=256.50 teleport 800 4500 900
+t=256.60 forward 0
+t=258.50 goto 1400 4500
+t=266.50 goto 1900 4500
+t=274.50 goto 2300 4500
 # labelled teleport (the north-roof gap x~2500-2900 is void)
-t=252.50 teleport 3100 4500 1520
-t=252.60 forward 0
-t=254.50 goto 3150 4490
+t=280.50 teleport 3100 4500 1520
+t=280.60 forward 0
+t=282.50 goto 3150 4490
 # labelled teleport (the level's SauterTempo crossing; measured void)
-t=260.50 teleport 4200 2700 1456
-t=260.60 forward 0
-t=262.50 goto 5000 2700
-t=270.50 goto 5800 2700
-t=278.50 goto 6600 2700
-t=286.50 goto 7400 2700
+t=288.50 teleport 4200 2700 1456
+t=288.60 forward 0
+t=290.50 goto 5000 2700
+t=298.50 goto 5800 2700
+t=306.50 goto 6600 2700
+t=314.50 goto 7400 2700
 # labelled teleport (the deck's east parapet blocks walk and jump)
-t=294.50 teleport 8500 1700 1060
-t=294.60 forward 0
-t=296.50 goto 9000 1400
-t=304.50 goto 10000 1300
-t=312.50 goto 11000 1300
-t=320.50 goto 11700 1261
+t=322.50 teleport 8500 1700 1060
+t=322.60 forward 0
+t=324.50 goto 9000 1400
+t=332.50 goto 10000 1300
+t=340.50 goto 11000 1300
+t=348.50 goto 11700 1261
 # labelled teleport (the palettetremplin ramp lip and the window gap)
-t=328.50 teleport 12700 1261 1170
-t=328.60 forward 0
-t=330.50 goto 13265 1300
-t=337.50 goto 13900 1400
+t=356.50 teleport 12700 1261 1170
+t=356.60 forward 0
+t=358.50 goto 13265 1300
+t=365.50 goto 13900 1400
 # labelled teleport (the roof dip strip x 14000-14150 with a 50-UU hole at x~14150-14200;
 # the east roof surface is 1167)
-t=343.50 teleport 14250 1400 1220
-t=343.60 forward 0
-t=345.50 goto 15500 1450
+t=371.50 teleport 14250 1400 1220
+t=371.60 forward 0
+t=373.50 goto 15500 1450
 # item68d (the item68b real-clock block re-timed for the item64 grapple route; item64f: +34.5 s
-# on main's teleport route, the sniper section and the gated HookPoint2 descent included):
-# move the diagnostic M60 bootstrap before the exposed descent. Roof return-fire was
-# blocked; the landing below supplies the real fire line.
-t=345.60 weapon XIII.m60
+# on main's teleport route; item86: the whole block is +18 s, the sniper section, the gated
+# HookPoint2 descent and the re-timed courtyard fight included): move the diagnostic M60
+# bootstrap before the exposed descent. Roof return-fire was blocked; the landing below
+# supplies the real fire line.
+t=373.60 weapon XIII.m60
 # labelled teleport (the roof's east edge drops onto a trapped ledge and a 486 pit)
-t=351.50 teleport 16000 1300 700
-t=351.60 forward 0
+t=379.50 teleport 16000 1300 700
+t=379.60 forward 0
 # item68b: live-clock rockets killed the old stationary landing/crossing. Engage
 # the launcher before crossing, then run continuously between cover positions.
 # The real-clock damage trace identifies BaseSoldier18 as the rocket instigator.
@@ -207,27 +246,27 @@ t=351.60 forward 0
 # local/re/item69/toits01-before-retiming.txt). Re-timed: the whole burst is
 # stationary again (the east run waits until he is dead) and starts at 317.15 so
 # the third M60 spine hit lands before his second rocket leaves the tube.
-# item64f (merge): the block below is main's item69 post-landing input shifted +34.5 s
-# onto this branch's grapple route (main's landing teleport at t=317.00, this route's at
-# t=351.50: the grapples replace the descent teleports and the HookPoint2 descent waits
-# for Jones's sniper-section gate). Main's stationary burst then took a direct rocket hit
+# item64f (merge): the block below is main's item69 post-landing input shifted onto this
+# branch's grapple route (main's landing teleport at t=317.00, this route's at t=379.50:
+# the grapples replace the descent teleports and the HookPoint2 descent waits for Jones's
+# sniper-section gate). Main's stationary burst then took a direct rocket hit
 # (600 + 575 raw, dead at -25; local/re/item64f/run11.txt), so the burst strafes left
 # (south) from 352.0 to 353.4: soldier18 150 -> 94 -> 38 -> dead by 352.3 with no rocket
 # damage, soldier17 dead by 356.8 after one DTGunned hit (150 -> 140;
 # local/re/item64f/run12.txt).
-t=351.65 track BaseSoldier18 0.85
-t=351.70 fire
-t=351.90 fire
-t=352.10 fire
-t=352.30 fire
-t=352.50 fire
-t=352.70 fire
-t=352.90 fire
-t=353.10 fire
-t=352.00 left 1
-t=353.30 track off
-t=353.40 right 0
-t=353.50 forward 0
+t=379.65 track BaseSoldier18 0.85
+t=379.70 fire
+t=379.90 fire
+t=380.10 fire
+t=380.30 fire
+t=380.50 fire
+t=380.70 fire
+t=380.90 fire
+t=381.10 fire
+t=380.00 left 1
+t=381.30 track off
+t=381.40 right 0
+t=381.50 forward 0
 # item69: soldier17 (bataillefinale, 150 hp) pursues behind soldier18. From the old
 # door-line stand the Tmetaldoorhelico mesh blocked every M60 ray to him while his
 # pursuit flank put his muzzle on the player side (DTGunned 75 at 342.1 and a
@@ -238,40 +277,40 @@ t=353.50 forward 0
 # under local/re/item69/toits01-retiming-v2/-v3/-v4.txt) all took the 318.8 blast
 # (50/45/41 hp), so the route eats it once and duels from range where v3 measured
 # zero returning DTGunned hits.
-t=353.60 track BaseSoldier17
-t=353.80 fire
-t=354.00 fire
-t=354.20 fire
-t=354.40 fire
-t=354.60 fire
-t=354.80 fire
-t=355.00 fire
-t=355.20 fire
-t=355.40 fire
-t=355.60 fire
-t=355.80 fire
-t=356.00 fire
-t=356.20 fire
-t=356.40 fire
-t=356.60 fire
-t=356.80 fire
-t=357.00 fire
-t=357.20 fire
-t=357.40 fire
-t=357.60 fire
-t=357.80 fire
-t=358.00 track off
-t=358.20 goto 17800 1150
-t=360.20 forward 0
+t=381.60 track BaseSoldier17
+t=381.80 fire
+t=382.00 fire
+t=382.20 fire
+t=382.40 fire
+t=382.60 fire
+t=382.80 fire
+t=383.00 fire
+t=383.20 fire
+t=383.40 fire
+t=383.60 fire
+t=383.80 fire
+t=384.00 fire
+t=384.20 fire
+t=384.40 fire
+t=384.60 fire
+t=384.80 fire
+t=385.00 fire
+t=385.20 fire
+t=385.40 fire
+t=385.60 fire
+t=385.80 fire
+t=386.00 track off
+t=386.20 goto 17800 1150
+t=388.20 forward 0
 # labelled teleport (the warehouse west wall + the Movable2 crate block the doorway;
 # TT10's r700 zone starts west of the wall)
-t=360.50 teleport 18300 1000 800
-t=360.60 forward 0
-t=360.80 goto 18800 1050
+t=388.50 teleport 18300 1000 800
+t=388.60 forward 0
+t=388.80 goto 18800 1050
 # item53b: the helipad wait is under MagnumPlus3 fire once the phantom mover cylinders no
 # longer absorb AI rounds; the wait moves behind the Tmetaldoorhelico line (the sweep from
 # the shooter's muzzle to (18500,1300) is blocked by the door mesh).
-t=362.50 goto 18500 1300
+t=390.50 goto 18500 1300
 # item61b: the route player SURVIVES the tarmac and the game's TouchTrigger10.Touch
 # fires while TT10 is still disarmed (the generator chain is blocked; pinned in the
 # test). The route continues by player input:
@@ -293,27 +332,27 @@ t=362.50 goto 18500 1300
 #    road side into the door band hits the Tportet3 door meshes or Model71 BSP; no clear ray
 #    at 5 UU resolution), and the in-game M60 burst from six road positions never lowered
 #    BreakableMover12.Health (local/re/item61b/shot-probe.txt).
-t=394.50 track off
-t=394.60 teleport 17400 1400 800
-t=394.70 forward 0
-t=394.80 track BreakableMover12
-t=395.50 fire
-t=396.00 fire
-t=396.50 fire
-t=397.00 fire
-t=397.50 fire
-t=398.00 fire
-t=398.50 fire
-t=399.00 fire
-t=399.50 fire
-t=400.00 fire
-t=400.50 fire
-t=401.00 fire
-t=401.50 fire
-t=402.00 fire
-t=402.50 fire
-t=403.00 fire
+t=422.50 track off
+t=422.60 teleport 17400 1400 800
+t=422.70 forward 0
+t=422.80 track BreakableMover12
+t=423.50 fire
+t=424.00 fire
+t=424.50 fire
+t=425.00 fire
+t=425.50 fire
+t=426.00 fire
+t=426.50 fire
+t=427.00 fire
+t=427.50 fire
+t=428.00 fire
+t=428.50 fire
+t=429.00 fire
+t=429.50 fire
+t=430.00 fire
+t=430.50 fire
+t=431.00 fire
 # The route ends waiting for the travel that only the generator -> PorteDebloquee ->
 # TouchTrigger10 -> RenfortHelico02 -> ... -> 'finmap' chain can request; every link ahead of
 # TouchTrigger10 is measured unreachable by route input (the pins in the route test).
-t=406.50 wait_travel
+t=434.50 wait_travel
