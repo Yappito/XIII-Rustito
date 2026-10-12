@@ -109,15 +109,20 @@ impl PlayerParams {
     }
 }
 
-/// UE2 `EPhysics` values the host writes into `Pawn.Physics` (upstream order: `PHYS_None`=0,
-/// `PHYS_Walking`=1, `PHYS_Falling`=2, `PHYS_Swimming`=3, ... `PHYS_Ladder`=10).
+/// UE2 `EPhysics` values the host writes into `Pawn.Physics` (XIII's enum, engine.u
+/// `Actor.ScriptText`: `PHYS_None, PHYS_Walking, PHYS_Falling, PHYS_Swimming, PHYS_Flying,
+/// PHYS_Rotating, PHYS_Projectile, PHYS_Interpolating, PHYS_MovingBrush, PHYS_Spider,
+/// PHYS_Trailer, PHYS_Ladder, ...` — so `PHYS_Ladder` is 11, which is the value the retail
+/// scripts compare (`engine.LadderVolume.PawnEnteredVolume` and
+/// `engine.PotentialClimbWatcher.Tick` both test `P.Physics == 11b` for "already climbing").
+/// `PHYS_Walking`=1, `PHYS_Falling`=2, `PHYS_Swimming`=3 match the stock UE2 numbering.
 pub const PHYS_WALKING: u8 = 1;
 /// `PHYS_Falling`.
 pub const PHYS_FALLING: u8 = 2;
 /// `PHYS_Swimming`.
 pub const PHYS_SWIMMING: u8 = 3;
-/// `PHYS_Ladder`.
-pub const PHYS_LADDER: u8 = 10;
+/// `PHYS_Ladder` (XIII's enum places it after `PHYS_Trailer`).
+pub const PHYS_LADDER: u8 = 11;
 
 /// Movement properties sampled from the physics/water volume the player is inside.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1516,6 +1521,24 @@ mod tests {
         assert!(reached_top, "player never left the ladder volume");
     }
 
+    /// The published `Pawn.Physics` bytes must be XIII's `EPhysics` values, not stock UE2's:
+    /// engine.u `Actor.ScriptText` orders the enum `PHYS_None, PHYS_Walking, PHYS_Falling,
+    /// PHYS_Swimming, PHYS_Flying, PHYS_Rotating, PHYS_Projectile, PHYS_Interpolating,
+    /// PHYS_MovingBrush, PHYS_Spider, PHYS_Trailer, PHYS_Ladder, ...`, so `PHYS_Ladder` is 11
+    /// (the retail ladder scripts test `P.Physics == 11b`, `LadderVolume.PawnEnteredVolume`
+    /// 0x0083 and `PotentialClimbWatcher.Tick` 0x0066). A wrong byte makes every
+    /// "already climbing" check in the shipped scripts fail.
+    #[test]
+    fn published_physics_bytes_match_xiiis_ephys_enum() {
+        assert_eq!(PHYS_WALKING, 1, "PHYS_Walking");
+        assert_eq!(PHYS_FALLING, 2, "PHYS_Falling");
+        assert_eq!(PHYS_SWIMMING, 3, "PHYS_Swimming");
+        assert_eq!(
+            PHYS_LADDER, 11,
+            "PHYS_Ladder (after PHYS_Trailer in XIII's enum)"
+        );
+    }
+
     /// `engine.LadderVolume.PawnEnteredVolume` / `engine.PotentialClimbWatcher.Tick`: a pawn
     /// only attaches to a ladder volume while `Dot(facing, LookDir) > 0.9` (LookDir is
     /// `vector(WallDir)`, default `(1,0,0)`); otherwise it stays in its previous physics and
@@ -1588,7 +1611,10 @@ mod tests {
                 break;
             }
         }
-        assert!(entered, "player facing +X must attach to the +X LookDir volume");
+        assert!(
+            entered,
+            "player facing +X must attach to the +X LookDir volume"
+        );
     }
 
     /// A jump off the ladder leaves PHYS_Ladder; while the pawn still overlaps the volume the
@@ -1634,14 +1660,7 @@ mod tests {
             // Keep stepping in the volume with the given facing.
             sim.yaw = yaw_deg.to_radians();
             for _ in 0..30 {
-                sim.step_with_modes(
-                    dt,
-                    &world,
-                    &params,
-                    Input::default(),
-                    &[],
-                    &env,
-                );
+                sim.step_with_modes(dt, &world, &params, Input::default(), &[], &env);
             }
             sim.on_ladder
         };

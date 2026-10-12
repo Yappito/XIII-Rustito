@@ -6189,7 +6189,9 @@ mod tests {
     /// Opt-in corpus test (requirement 5): on Banque01 the host walks the player onto the
     /// `LadderVolume5` brush, enters `PHYS_Ladder` and climbs up `ClimbDir` at `LadderSpeed`.
     /// The script teleports to the volume floor (the same harness bootstrap the other map demos
-    /// use) and then *only* holds forward; the climb is the simulation's, not a teleport.
+    /// use), faces the volume's decoded `LookDir` - `LadderVolume.PawnEnteredVolume` /
+    /// `PotentialClimbWatcher.Tick` attach the pawn only while `Dot(facing, LookDir) > 0.9`
+    /// (item85b) - and then *only* holds forward; the climb is the simulation's, not a teleport.
     #[test]
     fn opt_in_banque01_ladder_climb() {
         let Some(game_dir) = opt_in_root() else {
@@ -6216,8 +6218,11 @@ mod tests {
         let cx = (lv.min_uu[0] + lv.max_uu[0]) * 0.5;
         let cy = (lv.min_uu[1] + lv.max_uu[1]) * 0.5;
         let start_z = lv.min_uu[2] + resolved.params.height_uu;
+        // Face the wall the volume climbs (LookDir = vector(WallDir)); the sim's yaw convention
+        // is forward = (cos yaw, sin yaw).
+        let yaw_deg = lv.look_dir[1].atan2(lv.look_dir[0]).to_degrees();
         let script = script::Script::parse(&format!(
-            "t=0.0 teleport {cx} {cy} {start_z}\nt=0.0 forward 1\nt=6.0 forward 0\n"
+            "t=0.0 teleport {cx} {cy} {start_z}\nt=0.0 yaw {yaw_deg}\nt=0.0 forward 1\nt=6.0 forward 0\n"
         ))
         .unwrap();
         let outcome = run_script(
@@ -6994,31 +6999,49 @@ mod tests {
         );
     }
 
-    /// item59, re-authored by item67/item67f/item67g: Hual02 route by player input (the vent
-    /// crawl, the underfloor with the Porte11 use, the service-lift ride by the cage's own
-    /// button, the walk out through the manager-opened live LiftDoor1, the map's own surface
-    /// nav chain to the depot reader, the depot reader use, Carrington's cell) with labelled
-    /// teleports only for the measured movement gaps (the Locked Porte19 magnetic chain whose
-    /// only card pickup is sealed in the card-room petitesalle behind the 112 UU window sills,
-    /// the ForeverLocked decor-door seal at x~-6198 west of Porte19, the sealed prison
-    /// perimeter, the grille pin, the pinned exit stairwell). item67g removed the surface
-    /// teleport: the item67f (-2854,2338) dead-end was a wrong turn off the map's nav chain,
-    /// not a blocker. item67j measured the card -> reader -> Porte19 chain in
+    /// item59, re-authored by item67/item67f/item67g/item85b: Hual02 route by player input (the
+    /// vent crawl, the eavesdrop hold, the underfloor with the Porte11 use, the service-lift
+    /// ride by the cage's own button, the walk out through the manager-opened live LiftDoor1,
+    /// the map's own surface nav chain to the depot reader, the depot reader use, Carrington's
+    /// cell) with labelled teleports only for the measured movement gaps (the Locked Porte19
+    /// magnetic chain whose only card pickup is sealed in the card-room petitesalle behind the
+    /// 112 UU window sills, the ForeverLocked decor-door seal at x~-6198 west of Porte19, the
+    /// sealed prison perimeter, the grille pin, the pinned exit stairwell). item67g removed the
+    /// surface teleport: the item67f (-2854,2338) dead-end was a wrong turn off the map's nav
+    /// chain, not a blocker. item67j measured the card -> reader -> Porte19 chain in
     /// `opt_in_hual02_card_room_reader_chain`; item84 decoded the entry closed (the panes are
     /// `ColType_StaticGlass` `StaticMeshActor`s no consumer shatters - `Actor.ScriptText` enum,
     /// Engine.dll's only ColCategory reader is `execActorInIterationCategory` 0x103e6f00 - and
     /// `APawn::physFalling` 0x103c37b0 never steps or mantles: slide only, `stepUp` is
     /// walking-only at `MAXSTEPHEIGHT` 35), so the sill pin stands and the depot teleport
-    /// remains.
-    /// The objectives must come from the game's own chains: goals 4/5/6 complete, goal 3 is
-    /// promoted by the depot reader chain, goals 0/1/2 stay incomplete on measured blockers, and
-    /// no travel is requested.
+    /// remains. item85b measured the reader-area ladder shaft (LadderVolume0, live) as a sealed
+    /// dev leftover: the climb works but the column is capped/sealed at every probed height by
+    /// retail collision, so it offers no route to the card room either.
+    ///
+    /// The eavesdrop chain now runs - the level's own order (item85b decode): the crawl's
+    /// `DetectionVolume21` Touch fires `demarre_bureau` (measured t=20.5), which promotes goal 1
+    /// through `XIIIGoalTrigger3` (GoalNumber 91 -> `Hual02.SetGoalComplete` ->
+    /// `SetPrimaryGoal(1)`) and advances the conversation scene (Cine10 'Standwell' + Cine11
+    /// 'MacCall' in the underfloor office at (-760,120)/(-779,-33); started at level start per
+    /// `Cine2.CineInit.Begin` - player controller + `CineController.bInitialized` + the
+    /// intro-cartoon wait, `CheckpointNumber` 1 -> `Play(5)` - and waiting at `tabActions[0]
+    /// 'wait event demarre_bureau'`). The route holds in the duct and breaks the far grate
+    /// (`BreakAbleMover2`, Event `grille_brisee` -> the bInterruptive alert Reactions ->
+    /// `turnintosoldier`) only after the scene completes: Cine11's `event blam` completes goal 1
+    /// through `XIIIGoalTrigger4` (GoalNumber 1) and fires `objectif92` -> `XIIIGoalTrigger6`
+    /// (92) -> `SetPrimaryGoal(2)`; the scene ends with `playerevent XIIISaveGameTrigger1` (the
+    /// map's own checkpoint, `CheckpointNumber` 1 -> 2) and both pawns `destroy self`. Goal 2
+    /// then completes at the prison landing (`DetectionVolume14`'s `didact6` ->
+    /// `XIIIGoalTrigger1`, GoalNumber 2, now validating). Goal 3 is promoted by `Porte154`
+    /// finishing opening (`Event 'Carrington_CellDoorOpen'` -> `XIIIGoalTrigger2`, GoalNumber
+    /// 93) - NOT by the depot reader, whose `PlayerTrigger` is the decoded PlaySound-only
+    /// `XIIITriggers.PlayerTrigger`.
     ///
     /// Labelled diagnostic: the hostile `BaseSoldier*` pawns are removed (`remove_soldiers`,
-    /// the `Cine*` scene pawns kept). Under the real level clock the unmodified level's
-    /// underfloor gauntlet (BaseSoldier25/26/27 + lobby 15/28) kills the unarmoured player at
-    /// t~130-138 on this route (measured, the item67 report); that kill is the pinned next
-    /// blocker, not something this diagnostic hides.
+    /// the `Cine*` scene pawns kept - the conversation needs them). Under the real level clock
+    /// the unmodified level's underfloor gauntlet (BaseSoldier25/26/27 + lobby 15/28) kills the
+    /// unarmoured player on the underfloor walk (measured, the item67 report); that kill is the
+    /// pinned next blocker, not something this diagnostic hides.
     #[test]
     fn opt_in_hual02_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -7053,16 +7076,17 @@ mod tests {
             removed >= 20,
             "the Hual02 hostile garrison is ~22 BaseSoldier pawns, removed {removed}"
         );
-        // 500 s: the crawl, the underfloor, the lift ride (~40 s, item67), the surface nav-chain
-        // walk to the depot reader (item67g, ~160 s), the reader use, the cell unlock (~22 s
-        // hold), and the exit plateau walk; the script's wait_travel never completes.
+        // 520 s: the crawl, the eavesdrop hold (the conversation completes ~t=63, item85b), the
+        // underfloor, the lift ride (~40 s, item67), the surface nav-chain walk to the depot
+        // reader (item67g, ~160 s), the reader use, the cell unlock (~22 s hold), and the exit
+        // plateau walk; the script's wait_travel never completes.
         let outcome = run_script_inner(
             &game_dir,
             "Hual02",
             &script,
             &resolved.params,
             &scene,
-            500.0,
+            520.0,
             false,
             RunnerOptions {
                 initial: Some(runtime),
@@ -7091,28 +7115,30 @@ mod tests {
                     "objective {} must complete through the game's chains: {o:?}",
                     o.index
                 ),
-                // item67 measured: reaching and using the depot reader (MagneticPassTrigger1
-                // -> Grab, the game's own aim-focus chain) promotes goal 3 via the map's own
-                // chain, but the escort never starts: TouchTrigger8 sits on a z=63 gallery
-                // with no navigable access and the corridor's Porte151 opens only from
-                // Carrington's escort moveseq, which waits forever on the 'soldat_assome'
-                // raid event (measured legs 31-37).
+                // item85b: goal 3 is promoted when the picked cell door Porte154 finishes
+                // opening (Event 'Carrington_CellDoorOpen' -> XIIIGoalTrigger2, GoalNumber 93
+                // -> SetPrimaryGoal(3)), not by the depot reader (XIIITriggers.PlayerTrigger is
+                // decoded PlaySound-only). The escort never starts: TouchTrigger8 sits on a
+                // z=63 gallery with no navigable access and the corridor's Porte151 opens only
+                // from Carrington's escort moveseq, which waits forever on the
+                // 'soldat_assome' raid event (measured legs 31-37).
                 3 => assert!(
                     o.primary && !o.completed,
-                    "objective 3 is promoted by the reader chain but stays incomplete: {o:?}"
+                    "objective 3 is promoted by the cell door but stays incomplete: {o:?}"
                 ),
-                // Promotion chain blocked: DetectionVolume21 floats 78 UU above the real duct
-                // floor and the eavesdrop scene stalls on the unimplemented CWndSFXTrigger
-                // action, so 'objectif92' never promotes goal 2; DV14's completion only
-                // validates a promoted goal (measured leg37 vs the fixture).
+                // item85b: the conversation now completes (the route holds in the duct past the
+                // scene's 'blam' before breaking the 'grille_brisee' grate), so goal 1 is
+                // promoted (DV21 'demarre_bureau' -> GoalTrigger3) and completed ('Blam' ->
+                // GoalTrigger4), and goal 2 is promoted ('objectif92' -> GoalTrigger6) and then
+                // completed by the prison landing (DV14 'didact6' -> GoalTrigger1).
                 1 | 2 => assert!(
-                    !o.primary && !o.completed,
-                    "objective {} must stay unpromoted and incomplete: {o:?}",
+                    o.primary && o.completed,
+                    "objective {} must end promoted and completed through the game's chains: {o:?}",
                     o.index
                 ),
-                // The level-end trigger touches fire on the exit plateau, but the goal 0
-                // completion needs every primary goal first (SetGoalComplete's
-                // TestGoalComplete gate), so 'fin2' never completes goal 0.
+                // The level-end trigger touches fire on the exit plateau, but the escort goals
+                // never complete, so TestGoalComplete never trips and 'fin2' never completes
+                // goal 0.
                 0 => assert!(
                     o.primary && !o.completed,
                     "objective 0 must stay promoted and incomplete: {o:?}"
@@ -7120,6 +7146,59 @@ mod tests {
                 _ => {}
             }
         }
+        // The VM trace and live state for the chain pins below.
+        let vm = session.vm();
+        // item85b: the crawl walked into DetectionVolume21 ('demarre_bureau') after the spawn:
+        // the volume's own `Detection`-state `Touch` handler runs (its t=0 entries are
+        // begin-play overlap resolution), immediately followed by the GoalTrigger3 promotion
+        // pinned below. (The session touch ring holds only the last 64 touches and this 520 s
+        // route overflows it, so the touch is pinned from the VM trace.)
+        assert!(
+            vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target.eq_ignore_ascii_case("DetectionVolume21")
+                        && function.ends_with("Detection.Touch")
+                        && event.time > 5.0
+            )),
+            "the crawl must touch DetectionVolume21 (the eavesdrop volume)"
+        );
+        // item85b: the eavesdrop chain, pinned event by event in the VM trace: the promotion
+        // (demarre_bureau -> GoalTrigger3), the completion ('blam' -> GoalTrigger4), the goal-2
+        // promotion ('objectif92' -> GoalTrigger6), the goal-2 completion ('didact6' ->
+        // GoalTrigger1) and the goal-3 promotion (Porte154's opening event -> GoalTrigger2).
+        // GoalTrigger3's event IS the crawl's DetectionVolume21 touch (demarre_bureau is that
+        // volume's Event).
+        for (actor, what) in [
+            ("XIIIGoalTrigger3", "demarre_bureau promotion"),
+            ("XIIIGoalTrigger4", "blam completion"),
+            ("XIIIGoalTrigger6", "objectif92 promotion"),
+            ("XIIIGoalTrigger1", "didact6 completion"),
+            ("XIIIGoalTrigger2", "cell-door promotion"),
+        ] {
+            assert!(
+                vm.trace.iter().any(|event| matches!(
+                    &event.kind,
+                    xiii_script::TraceKind::Event { target, function, .. }
+                        if target.eq_ignore_ascii_case(actor)
+                            && function.ends_with("XIIIGoalTrigger.Trigger")
+                )),
+                "the game's own chain must run {actor}.Trigger ({what})"
+            );
+        }
+        // The conversation scene completed the level's own way: Cine11's
+        // 'playerevent XIIISaveGameTrigger1' checkpoint ran (CheckpointNumber 1 -> 2) and both
+        // scene pawns destroyed themselves ('destroy self', the scene's last action).
+        let game_info = session.game_info.expect("XIIIGameInfo must exist");
+        assert_eq!(
+            vm.get_property(game_info, "CheckpointNumber"),
+            Some(&xiii_script::Value::Int(2)),
+            "the conversation's own checkpoint must run"
+        );
+        assert!(
+            vm.find_object("Cine10").is_none() && vm.find_object("Cine11").is_none(),
+            "the conversation pawns must have destroyed themselves at scene end"
+        );
         // The game's own chains the route does fire, pinned by the session's touch log.
         let touched: Vec<String> = session
             .touches()
@@ -7160,7 +7239,7 @@ mod tests {
         );
         // item67: the service lift was ridden through the game's own chain: the cage button's
         // PlayerTrigger ran, the LiftManager states drove the cage to floor 2 and the player
-        // walked out on the surface (the teleport-free z=-149 corridor legs after t=232).
+        // walked out on the surface (the teleport-free z=-149 corridor legs after t=252).
         assert!(
             vm.trace.iter().any(|event| matches!(
                 &event.kind,
@@ -7216,7 +7295,7 @@ mod tests {
         let walk = outcome
             .trace
             .iter()
-            .filter(|s| (232.0..402.0).contains(&s.1));
+            .filter(|s| (252.0..422.0).contains(&s.1));
         let max_y = walk.clone().map(|s| s.2[1]).fold(f32::MIN, f32::max);
         assert!(
             max_y > 2550.0,
@@ -7287,92 +7366,6 @@ mod tests {
     /// and the reader's OutEvent 'Porteentrevs' Triggers the `TriggerControl` Porte19 open. The
     /// walk west then pins at the decor seal x~-6198, which stays the route's next blocker after
     /// the card.
-    // SCRATCH item85 probe (remove before finishing): drives the reader-area shaft mouth,
-    // the ladder climb to the walkway, and the u-room approach, printing a position log.
-    #[test]
-    fn scratch_item85_shaft_probe() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("Hual02".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import Hual02");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let probe_path =
-            std::path::Path::new("P:/AI/XIII/local/wt/viewer/local/re/item85/probe-shaft.script");
-        let script = script::Script::load(probe_path).expect("load shaft probe");
-        let mut runtime =
-            open_map_runtime(&game_dir, "Hual02", &scene, &resolved.params).expect("open Hual02");
-        let removed = remove_soldiers(&mut runtime.session);
-        println!("[probe] removed {removed} soldiers");
-        {
-            let vols = xiii_world::movement_volumes::MovementVolumes::import(&game_dir, "Hual02")
-                .expect("volumes");
-            for v in &vols.volumes {
-                if v.kind == xiii_world::movement_volumes::VolumeKind::Ladder {
-                    println!(
-                        "[probe] ladder {} min {:?} max {:?} climb {:?} look {:?}",
-                        v.name, v.min_uu, v.max_uu, v.climb_dir, v.look_dir
-                    );
-                }
-            }
-        }
-        let outcome = run_script_inner(
-            &game_dir,
-            "Hual02",
-            &script,
-            &resolved.params,
-            &scene,
-            70.0,
-            false,
-            RunnerOptions {
-                initial: Some(runtime),
-                ..Default::default()
-            },
-        )
-        .expect("run shaft probe");
-        for (tick, t, pos, rot) in outcome.trace.iter().step_by(6) {
-            println!("[probe] t={t:.1} at ({:.0},{:.0},{:.0}) rot {:.0}/{:.0}", pos[0], pos[1], pos[2], rot[0], rot[1]);
-        }
-        if let Some((tick, t, pos, rot)) = outcome.trace.last() {
-            println!(
-                "[probe] final t={t:.1} at ({:.0},{:.0},{:.0}) rot {:.0}/{:.0}",
-                pos[0], pos[1], pos[2], rot[0], rot[1]
-            );
-        }
-        let vm = outcome.session.vm();
-        for name in [
-            "TouchTrigger60",
-            "CWndFocusTrigger1",
-            "XIIIDispatcher3",
-            "BreakAbleMover8",
-        ] {
-            match vm.find_object(name) {
-                Some(obj) => {
-                    let state = vm.state_name(obj);
-                    println!("[probe] {name}: state {state:?}");
-                }
-                None => println!("[probe] {name}: NOT FOUND"),
-            }
-        }
-        let events: Vec<String> = vm
-            .trace
-            .iter()
-            .filter_map(|e| match &e.kind {
-                xiii_script::TraceKind::Event { target, function, .. } => {
-                    Some(format!("{}.{}", target, function))
-                }
-                _ => None,
-            })
-            .collect();
-        println!("[probe] events: {events:?}");
-        println!("[probe] health {:?}", outcome.session.player_health());
-    }
-
     #[test]
     fn opt_in_hual02_card_room_reader_chain() {
         let Some(game_dir) = opt_in_root() else {
