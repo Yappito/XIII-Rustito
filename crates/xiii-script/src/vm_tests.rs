@@ -11,7 +11,7 @@ use crate::reflect::function_flags as ff;
 use crate::reflect::property_flags as pf;
 use crate::tests::{Exp, build_package, compact};
 use crate::value::{Delegate, ObjRef, ObjectId, Value};
-use crate::vm::{Latent, TraceKind, Vm, VmErrorKind, VmLimits};
+use crate::vm::{HostRequest, Latent, MAX_HOST_REQUESTS, TraceKind, Vm, VmErrorKind, VmLimits};
 
 struct B {
     names: Vec<String>,
@@ -15492,6 +15492,81 @@ fn item72_write_slot_natives_report_codes_and_checkpoint_presence() {
     assert!(shared.borrow().write_requested.is_empty());
 }
 
+#[test]
+fn trace_gate_defaults_on_and_off_stops_collection() {
+    let mut b = B::new();
+    let actor = b.reserve(0, 0, "Actor");
+    b.class(actor, 0, 0);
+    let set = set_of(b.build());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    // Default stays on: tool `script run --trace`, route tests and the survey read the trace.
+    assert!(vm.trace_enabled);
+    vm.note(TraceKind::Note("kept".into()));
+    assert_eq!(vm.trace.len(), 1);
+    // item89: an interactive session turns the gate off; notes (including repeated small
+    // steps, the leak's shape) must not append and must not panic.
+    vm.trace_enabled = false;
+    for i in 0..1000 {
+        vm.note(TraceKind::Note(format!("dropped {i}")));
+    }
+    assert_eq!(vm.trace.len(), 1, "trace_enabled=false must not append");
+    // Re-enabling resumes collection from the current tick/time.
+    vm.trace_enabled = true;
+    vm.note(TraceKind::Note("resumed".into()));
+    assert_eq!(vm.trace.len(), 2);
+    assert!(matches!(vm.trace[1].kind, TraceKind::Note(ref t) if t == "resumed"));
+}
+
+/// item89b: the bounded host-request queue — FIFO, drains exactly once, independent of the
+/// trace gate, and the bound evicts the oldest (the newest request survives) while counting.
+#[test]
+fn host_request_queue_is_fifo_bounded_and_independent_of_the_trace_gate() {
+    let mut b = B::new();
+    let actor = b.reserve(0, 0, "Actor");
+    b.class(actor, 0, 0);
+    let set = set_of(b.build());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    assert!(vm.host_requests_dropped == 0);
+    // FIFO order and drain-once (the `drain_particle_spawns` contract).
+    vm.host_request(HostRequest::LoadSlot(3));
+    vm.host_request(HostRequest::Travel(crate::canvas::TravelRequest::from_url(
+        "MapMenu", 0, false,
+    )));
+    assert_eq!(vm.drain_host_requests().len(), 2);
+    assert!(
+        vm.drain_host_requests().is_empty(),
+        "requests drain exactly once"
+    );
+    // Independent of the diagnostic trace gate: the windowed game runs with the gate off,
+    // and queuing must not append trace records (nor read them back).
+    vm.trace_enabled = false;
+    let trace_len = vm.trace.len();
+    vm.host_request(HostRequest::LoadSlot(7));
+    assert_eq!(
+        vm.trace.len(),
+        trace_len,
+        "the queue must not append trace records"
+    );
+    let drained = vm.drain_host_requests();
+    assert_eq!(drained, vec![HostRequest::LoadSlot(7)]);
+    // Bound: pushing past the cap evicts the oldest and counts; the newest survives.
+    for i in 0..(MAX_HOST_REQUESTS as u32 + 10) {
+        vm.host_request(HostRequest::LoadSlot(i));
+    }
+    assert_eq!(vm.host_requests_dropped, 10, "10 over the cap");
+    let drained = vm.drain_host_requests();
+    assert_eq!(drained.len(), MAX_HOST_REQUESTS);
+    assert_eq!(
+        drained.first(),
+        Some(&HostRequest::LoadSlot(10)),
+        "the 10 oldest were evicted, in order"
+    );
+    assert_eq!(
+        drained.last(),
+        Some(&HostRequest::LoadSlot(MAX_HOST_REQUESTS as u32 + 9)),
+        "the newest request always survives"
+    );
+}
 // ---------------------------------------------------------------------------------------
 // Array bounds (Core.dll execArrayElement 0x10116c30 / execDynArrayElement 0x1011eeb0)
 // ---------------------------------------------------------------------------------------

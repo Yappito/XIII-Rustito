@@ -41,8 +41,8 @@ use bevy::window::PresentMode;
 use xiii_decode::texture::{RgbaImage, decode_texture};
 use xiii_package::Limits;
 use xiii_package::ObjectRef as PkgRef;
-use xiii_script::canvas::{CanvasFonts, DrawCommand, TravelRequest, parse_travel_note};
-use xiii_script::{ObjRef, ObjectId, ScriptSet, TraceKind, Value, Vm, VmLimits};
+use xiii_script::canvas::{CanvasFonts, DrawCommand, TravelRequest};
+use xiii_script::{HostRequest, ObjRef, ObjectId, ScriptSet, Value, Vm, VmLimits};
 use xiii_script::{SaveSlotInfo, SaveSlotProvider};
 use xiii_world::PackageCache;
 use xiii_world::runtime;
@@ -327,7 +327,6 @@ pub struct MenuSession {
     slot_lines: Vec<String>,
     entities: Vec<Entity>,
     clip: [f32; 2],
-    trace_cursor: usize,
     travel: Option<TravelRequest>,
     script: Option<MenuScript>,
     next_action: usize,
@@ -636,7 +635,9 @@ impl MenuSession {
         }
 
         let packages = PackageCache::open(game_dir)?;
-        let trace_cursor = vm.trace.len();
+        // item89b baseline: requests queued while the front-end page was built belong to the
+        // construction path, not the running session (the old trace cursor started here too).
+        vm.drain_host_requests();
         Ok(MenuSession {
             vm,
             save_dir,
@@ -652,7 +653,6 @@ impl MenuSession {
             slot_lines: Vec::new(),
             entities: Vec::new(),
             clip: [0.0, 0.0],
-            trace_cursor,
             travel: None,
             script,
             next_action: 0,
@@ -668,8 +668,8 @@ impl MenuSession {
         matches!(self.vm.get_property(id, name), Some(Value::Bool(true)))
     }
 
-    /// Advances the schedule, ticks the VM, drives the `PlayingVideo` state and scans the trace
-    /// for the game's `ClientTravel` request.
+    /// Advances the schedule, ticks the VM, drives the `PlayingVideo` state and drains the
+    /// VM's queued host requests (the game's `ClientTravel` request, load slots).
     fn advance(&mut self, dt: f32) {
         self.elapsed += dt;
         let elapsed = self.elapsed;
@@ -727,30 +727,23 @@ impl MenuSession {
         {
             self.errors.push(format!("PlayingVideo.Tick: {e}"));
         }
-        self.scan_trace();
+        self.take_host_requests();
     }
 
-    fn scan_trace(&mut self) {
-        if self.vm.trace.len() < self.trace_cursor {
-            self.trace_cursor = 0;
-        }
-        let start = self.trace_cursor.min(self.vm.trace.len());
-        for ev in &self.vm.trace[start..] {
-            if let TraceKind::Note(note) = &ev.kind
-                && let Some(req) = parse_travel_note(note)
-            {
-                self.travel = Some(req);
-            }
-            if let TraceKind::Note(note) = &ev.kind
-                && let Some(slot) = note
-                    .strip_prefix("GUI_SAVE_LOAD_SLOT:")
-                    .and_then(|s| s.parse().ok())
-                && let Ok(mut request) = SAVE_LOAD_REQUEST.lock()
-            {
-                *request = Some(slot);
+    /// Takes the VM's queued host-request notes: the game's `ClientTravel` request and the
+    /// checkpoint-load slot. item89b: these arrive on the bounded always-on request queue
+    /// ([`Vm::drain_host_requests`]) instead of the diagnostic trace.
+    fn take_host_requests(&mut self) {
+        for request in self.vm.drain_host_requests() {
+            match request {
+                HostRequest::Travel(req) => self.travel = Some(req),
+                HostRequest::LoadSlot(slot) => {
+                    if let Ok(mut request) = SAVE_LOAD_REQUEST.lock() {
+                        *request = Some(slot);
+                    }
+                }
             }
         }
-        self.trace_cursor = self.vm.trace.len();
     }
 
     /// Resolves a control target (`index` or label) to its object.
@@ -885,7 +878,7 @@ impl MenuSession {
         ) {
             self.errors.push(format!("live key {key}: {e}"));
         }
-        self.scan_trace();
+        self.take_host_requests();
     }
 
     /// Instantiates a decoded page class as the active page and runs its own `InitComponent`
