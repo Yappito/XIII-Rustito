@@ -1,0 +1,24 @@
+# Hual04c first input route (UU/seconds): opening cable-car ride, then jump to the
+# cabin rope ladder. No teleports, grants, goal writes or control overrides.
+# The game's HUD finishes its own slide-out and emits EndCartoonEffect; Telepherique0
+# rides to its first point, explodes and returns control at ~24.983 s.
+# Jump before crossing the open floor trap: walking off drops ~2000 UU (-114 HP).
+# Measured blocker: the ladder catches the box on its eastern edge at
+# (-1062.276,53.756,19.680). Upward input requests 200 UU/s but the box sweep hits
+# XIIIMover6 (Telephstatic.TL_boitecorde). After that part is destroyed during the
+# car's fall (~70 s), climbing advances to z=46.380 and stalls against
+# TelepheriquePoint0 (Telephstatic.TLcabine) through 119.9 s.
+# Crouching was also tried and produces the same pin (crouch is disabled on ladders).
+# Keep trying until 119.9 s, then wait for travel to pin the surviving partial route.
+# Goals 0/2/3 and kello01a travel remain unreached; completed goals 1/4/5/6 are
+# authored anti-goals, not accomplishments of this route.
+t=0.50 goto -3200 128
+t=3.00 forward 0
+t=26.00 goto -1100 70
+t=26.00 jump
+t=26.30 yaw -90
+t=26.30 pitch 60
+t=26.30 forward 1
+t=26.30 right 1
+t=27.00 right 0
+t=119.90 wait_travel

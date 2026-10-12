@@ -7279,6 +7279,122 @@ mod tests {
         let _ = porte154;
     }
 
+    /// Hual04c's first route pins the cabin-rope ladder obstruction after the real ride.
+    /// Completed authored anti-goals are preserved; escort/helicopter travel is not claimed.
+    #[test]
+    fn opt_in_hual04c_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual04c".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual04c");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let text = include_str!("../../tests/data/hual04c_route.script");
+        assert!(!text.lines().any(|line| {
+            let command = line.split('#').next().unwrap_or("");
+            ["teleport", "weapon ", "item ", "set_goal", "take_control"]
+                .iter()
+                .any(|forbidden| command.contains(forbidden))
+        }));
+        let script = script::Script::parse(text).expect("parse Hual04c route");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Hual04c",
+            &script,
+            &resolved.params,
+            &scene,
+            120.0,
+        )
+        .expect("run Hual04c route");
+        let session = &outcome.session;
+        let vm = session.vm();
+        println!(
+            "[hual04c route] error={:?} objectives={:?} travel={:?} position={:?} health={:?}",
+            session.first_error(),
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health()
+        );
+        survey::print_details(&survey::extract("Hual04c", &outcome));
+        assert!(
+            session.first_error().is_none(),
+            "{:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(session.blocked.is_empty(), "{:?}", session.blocked);
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "player must survive"
+        );
+        assert!(
+            outcome.travel.is_empty(),
+            "the blocked route must not travel"
+        );
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 7);
+        for index in [0, 2, 3] {
+            assert!(
+                !goals[index].completed,
+                "unreached objective {index}: {goals:?}"
+            );
+        }
+        assert!(goals[0].primary);
+        for index in [1, 4, 5, 6] {
+            assert!(
+                goals[index].anti_goal && goals[index].completed,
+                "authored anti-goal {index} must hold: {goals:?}"
+            );
+        }
+        let hud = vm.find_object("XIIIBaseHud").expect("player HUD");
+        assert_eq!(
+            vm.get_property(hud, "HudCartoonSFX"),
+            Some(&xiii_script::Value::Bool(false)),
+            "movement's early mission release must not stop the HUD slide-out"
+        );
+        let car = vm.find_object("Telepherique0").expect("authored cable car");
+        assert_eq!(
+            vm.state_name(car).as_deref(),
+            Some("TheFall"),
+            "the HUD's own EndCartoonEffect event must start the ride"
+        );
+        let carrington = vm.find_object("Cine0").expect("ground Carrington");
+        assert_eq!(
+            vm.get_property(carrington, "CurrentScript"),
+            Some(&xiii_script::Value::Int(-1)),
+            "the ground escort sequence has not started"
+        );
+        let position = session.player_location().expect("player position");
+        for (actual, expected) in position.into_iter().zip([-1062.276, 53.756, 46.380]) {
+            assert!(
+                (actual - expected).abs() < 0.5,
+                "ladder obstruction pin moved: {position:?}"
+            );
+        }
+        let pawns = session.player_pawn_actors();
+        assert_eq!(pawns.len(), 1, "one live player pawn");
+        let pawn = pawns[0].0;
+        assert_eq!(
+            vm.get_property(pawn, "Physics"),
+            Some(&xiii_script::Value::Byte(10)),
+            "player must be caught on the cabin rope ladder"
+        );
+        let mi = session.map_info().expect("Hual04c MapInfo");
+        assert_eq!(
+            vm.get_property(mi, "NextMapLevelWithUnr"),
+            Some(&xiii_script::Value::Str("kello01a.unr".to_owned()))
+        );
+        println!(
+            "[hual04c next blocker] LadderVolume1 entered by jump; upward input first hits XIIIMover6 -> Telephstatic.TL_boitecorde at z=19.680, then after the car falls stalls at (-1062.276,53.756,46.380) against TelepheriquePoint0 -> Telephstatic.TLcabine; goals 0/2/3 and kello01a travel unreached"
+        );
+    }
+
     /// Hual04a (item86 re-time): with automatic AI bursts, fight the canyon soldiers before they
     /// close, heal on the base medkits and complete the six-soldier death-event chain; the route
     /// is cut at the bureau card reader because the fuse pick spawns the fatal Cine1 LastWave.
