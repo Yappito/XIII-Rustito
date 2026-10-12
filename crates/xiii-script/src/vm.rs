@@ -7054,7 +7054,7 @@ impl<'s> Vm<'s> {
             return Ok(None);
         };
         self.run_lifecycle(id, RUNTIME_SPAWN_LIFECYCLE)?;
-        Ok(Some(id))
+        Ok((!self.objects[id as usize].deleted).then_some(id))
     }
 
     /// Creates an actor like [`Vm::spawn_actor`] but without running the runtime spawn
@@ -7085,6 +7085,18 @@ impl<'s> Vm<'s> {
         if self.class_is_abstract(class) {
             self.note(TraceKind::SpawnRefused {
                 reason: format!("{} is abstract", self.set.path(class)),
+            });
+            return Ok(None);
+        }
+        // SpawnActor 0x10388b24 refuses static/no-delete templates outside the editor.
+        let layout = self.class_layout(class)?;
+        if ["bStatic", "bNoDelete"].iter().any(|name| {
+            layout.slot_by_name(name).is_some_and(|slot| {
+                matches!(layout.defaults.get(slot.base), Some(Value::Bool(true)))
+            })
+        }) {
+            self.note(TraceKind::SpawnRefused {
+                reason: format!("{} is static or no-delete", self.set.path(class)),
             });
             return Ok(None);
         }
@@ -7870,12 +7882,21 @@ impl<'s> Vm<'s> {
     }
 
     /// `Actor.Move`: world swept move then blocking-actor stop, then touch maintenance.
-    /// Returns true when the whole delta was applied (no blocking hit), false when stopped.
+    /// Returns true for positive swept progress (including a partial move), or a movable
+    /// actor's unchanged zero delta; false for refusal or zero swept progress.
     pub(crate) fn vm_move(&mut self, id: ObjectId, delta: [f32; 3]) -> VmResult<bool> {
+        if self.bool_prop(id, "bStatic")
+            || matches!(self.get_property(id, "bMovable"), Some(Value::Bool(false)))
+        {
+            return Ok(false);
+        }
+        if delta == [0.0; 3] {
+            return Ok(true);
+        }
         let start = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
         let extent = self.actor_extent(id);
         let mut end = add3(start, delta);
-        let mut world_hit = false;
+        let mut fraction = 1.0;
         if self.bool_prop(id, "bCollideWorld") {
             let out = match self.physics.as_mut() {
                 Some(p) => p.move_box(start, delta, extent),
@@ -7886,20 +7907,36 @@ impl<'s> Vm<'s> {
                 }
             };
             end = out.end;
-            world_hit = out.hit.is_some();
+            fraction = out.hit.map_or(1.0, |hit| hit.time);
         }
         let mut blocked_actor = None;
         if self.bool_prop(id, "bCollideActors")
             && let Some((t, other)) = self.sweep_blocking_actor(id, start, end)
         {
             end = lerp3(start, end, t);
+            fraction *= t;
             blocked_actor = Some(other);
         }
         self.set_property(id, "Location", 0, Value::Vector(end));
-        // ULevel::MoveActor's captured disassembly is truncated before its Bump event dispatch,
-        // so do not infer a recipient or event order from this incomplete artifact.
+        // MoveActor 0x1038b15c..0x1038b17a: blocker first, then moving actor.
+        if let Some(other) = blocked_actor
+            && !self.bool_prop(other, "bWorldGeometry")
+            && !self.based_on(id, other)
+        {
+            self.send_event(
+                other,
+                "Bump",
+                vec![Value::Object(Some(ObjRef::Instance(id)))],
+            )?;
+            self.send_event(
+                id,
+                "Bump",
+                vec![Value::Object(Some(ObjRef::Instance(other)))],
+            )?;
+        }
         self.refresh_touching(id, true)?;
-        Ok(!world_hit && blocked_actor.is_none())
+        // Retail returns positive hit time, not completion of the entire requested delta.
+        Ok(fraction > 0.0)
     }
 
     /// Engine.dll `AActor::execMakeNoise` (0x103aff40): `CheckNoiseHearing(Loudness)` runs only
@@ -8220,6 +8257,19 @@ impl<'s> Vm<'s> {
     /// `Actor.SetLocation`: teleport when the destination is free of world geometry and not
     /// encroached by a blocking actor; returns whether it moved. Touch relations are updated.
     pub(crate) fn vm_set_location(&mut self, id: ObjectId, location: [f32; 3]) -> VmResult<bool> {
+        self.far_move_actor(id, location, false, &mut Vec::new())
+    }
+
+    fn far_move_actor(
+        &mut self,
+        id: ObjectId,
+        location: [f32; 3],
+        attached: bool,
+        visiting: &mut Vec<ObjectId>,
+    ) -> VmResult<bool> {
+        if visiting.contains(&id) {
+            return Err(self.err(VmErrorKind::Other("FarMoveActor: cyclic Base chain".into())));
+        }
         // FarMoveActor 0x1038a489 refuses bStatic or !bMovable outside the editor.
         // Generated fixtures without the native bMovable property use Actor's true default.
         if self.bool_prop(id, "bStatic")
@@ -8263,8 +8313,26 @@ impl<'s> Vm<'s> {
         // FarMoveActor 0x1038a5c1 marks a successful non-test teleport, and its
         // non-attached path calls SetBase(None, (0,0,1), true) before the Location store.
         self.set_property(id, "bJustTeleported", 0, Value::Bool(true));
-        self.set_property(id, "Base", 0, Value::Object(None));
-        self.set_property(id, "Floor", 0, Value::Vector([0.0, 0.0, 1.0]));
+        if !attached {
+            self.set_property(id, "Base", 0, Value::Object(None));
+            self.set_property(id, "Floor", 0, Value::Vector([0.0, 0.0, 1.0]));
+        }
+        // FarMoveActor moves children before storing the parent's new location, preserving
+        // each child's Base. A refused child does not cancel the parent's teleport.
+        let old = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
+        let delta = sub3(location, old);
+        visiting.push(id);
+        let children: Vec<_> = (0..self.objects.len() as ObjectId)
+            .filter(|&child| self.is_live_actor(child) && self.obj_prop(child, "Base") == Some(id))
+            .collect();
+        for child in children {
+            let destination = add3(
+                self.vector_prop(child, "Location").unwrap_or([0.0; 3]),
+                delta,
+            );
+            self.far_move_actor(child, destination, true, visiting)?;
+        }
+        visiting.pop();
         self.set_property(id, "Location", 0, Value::Vector(location));
         self.refresh_touching(id, false)?;
         Ok(true)
@@ -8338,8 +8406,19 @@ impl<'s> Vm<'s> {
                 continue;
             }
             let (lb, rb, hb) = self.actor_cylinder(b);
-            let r = rb + extent[0].max(0.0);
-            let hh = hb + extent[2].max(0.0);
+            let r = rb + extent[0];
+            let hh = hb + extent[2];
+            // UPrimitive::LineCheck 0x103c4f4d..0x103c50c0 grows all three bounds
+            // independently before the cylinder quadratic (which uses Extent.X).
+            // In particular Y is not interchangeable with X for asymmetric script extents.
+            let bounds = [r, rb + extent[1], hh];
+            if (0..3).any(|axis| {
+                (start[axis] > lb[axis] + bounds[axis] && end[axis] > lb[axis] + bounds[axis])
+                    || (start[axis] < lb[axis] - bounds[axis]
+                        && end[axis] < lb[axis] - bounds[axis])
+            }) {
+                continue;
+            }
             // item52: the engine's per-actor cylinder routine (VA 0x103c4cd0..0x103c5573, the
             // vtable+0x70 primitive dispatched by `FCollisionHash::ActorLineCheck`
             // 0x10349c60/0x1034a4d6) answers a line that starts inside (or within 1 UU of the

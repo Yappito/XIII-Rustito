@@ -111,38 +111,59 @@ fn opt_in_item51_combat_survey() {
                 "SSH101a must reach its authored movement latent, not exhaust the VM budget: {:?}",
                 session.failures
             );
-            // item80 decoded the old assertion here, which required a
-            // `LatentStart { actor: "IAController9", native: "Controller.MoveToward" }`.
-            // `IAController9` is the runtime name of the controller that `BaseSoldier17` spawns,
-            // and that map export is serialised as a pending-kill actor:
-            // `xiii-tool props XIII_Game/maps/SSH101a.unr --export BaseSoldier17` shows
-            // `bDeleteMe=true` and `bPendingDelete=true` (BaseSoldier13/14 too). The engine's
-            // `AActor::IsPendingKill` (Engine.dll 0x10304b40:
-            // `movb 0x2e(%ecx),%al; andl $1,%eax; ret`) reports `AActor+0x2e & 1` = `bDeleteMe`,
-            // so a pending-kill actor receives no `ProcessEvent` and never spawns a controller.
-            // item67f therefore correctly keeps these exports out of the live level; the old
-            // assertion instead depended on the dead `BaseSoldier17` being live. Decoding gate:
-            // temporarily disabling item67f's load-time `bDeleteMe` gate brings `BaseSoldier17`
-            // back live, respawns `IAController9` and re-runs its `AttaqueH2H` ->
-            // `Controller.MoveToward` latent (assertion passes), confirming item67f is what
-            // removed it (measured, item80 report). The `FindBestPathToward` -> `MoveTarget`
-            // behaviour itself stays covered by the unit test
-            // `find_best_path_toward_publishes_move_target_and_preserves_it_on_failure`.
+            // These exports have bDeleteMe/bPendingDelete serialized true (item80).
+            // Engine.dll IsPendingKill 0x10304b40 tests bDeleteMe; they must receive
+            // no lifecycle events and must never spawn/possess a controller. Runtime
+            // controller names are not pawn identities: item74's decoded zero-Move
+            // early return changes spawn order, and IAController9 now belongs to
+            // live BaseSoldier20. Check object relations, including deleted controllers
+            // retained in the VM, plus historical spawn/possess events so unlinking or
+            // destruction later in the run cannot conceal a violation.
             for dead in ["BaseSoldier13", "BaseSoldier14", "BaseSoldier17"] {
                 assert!(
                     vm.find_object(dead).is_none(),
                     "{dead} is a pending-kill (bDeleteMe=true/bPendingDelete=true) map export and \
                      must not be a live level actor"
                 );
+                let dead_id = vm
+                    .objects
+                    .iter()
+                    .position(|object| object.name.eq_ignore_ascii_case(dead))
+                    .expect("pending-kill map export must remain available for inspection")
+                    as u32;
+                assert_eq!(
+                    vm.get_property(dead_id, "Controller"),
+                    Some(&Value::Object(None)),
+                    "pending-kill {dead} must not have a Controller"
+                );
+                for (i, object) in vm.objects.iter().enumerate() {
+                    if vm.is_a(i as u32, "Controller") {
+                        assert_ne!(
+                            vm.get_property(i as u32, "Pawn"),
+                            Some(&Value::Object(Some(ObjRef::Instance(dead_id)))),
+                            "{} must not possess pending-kill {dead} (even if later destroyed)",
+                            object.name
+                        );
+                    }
+                }
+                assert!(
+                    !vm.trace.iter().any(|event| matches!(
+                        &event.kind,
+                        TraceKind::Native { path, this, .. }
+                            if path == "Actor.Spawn" && this.eq_ignore_ascii_case(dead)
+                    )),
+                    "pending-kill {dead} must never call Spawn"
+                );
+                assert!(
+                    !vm.trace.iter().any(|event| matches!(
+                        &event.kind,
+                        TraceKind::Event { function, args, .. }
+                            if function.ends_with(".Possess")
+                                && args.first().is_some_and(|pawn| pawn.eq_ignore_ascii_case(dead))
+                    )),
+                    "pending-kill {dead} must never be possessed"
+                );
             }
-            assert!(
-                !vm.trace.iter().any(|event| matches!(
-                    &event.kind,
-                    TraceKind::LatentStart { actor, native, .. }
-                        if actor == "IAController9" && native == "Controller.MoveToward"
-                )),
-                "the pending-kill BaseSoldier17 must not spawn a live IAController9"
-            );
         }
         for (i, object) in vm.objects.iter().enumerate() {
             let id = i as u32;
