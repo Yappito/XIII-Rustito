@@ -1,19 +1,28 @@
-# Hual04a diagnostic route (item86 re-time on the integrated engine-fidelity tree):
-# six kills, earned card, bureau reader. The automatic AI bursts (`Pawn.PressingFire`
-# reads the controller bFire byte) tripled the incoming damage, so the route now fights
-# each soldier from before it closes, crouches while under the charged soldier's burst
-# and heals on the base medkit. The route is cut at the bureau card reader: picking the
-# fuse (`FusibleRamasse`) spawns the `Cine1` `LastWave` reinforcement (tabActions[35])
-# whose burst kills the 17-hp player on the walk-out (measured), so the fuse goals, lever
-# and Hual04c travel are not attempted.
-# Diagnostic weapon grant: Beretta carried from Hual01b through Hual02 (see
-# hual02_route.script's campaign-loadout note). Direct Hual04a login has no Beretta.
-# No teleports, set_goal or take_control. Coordinates and times are Unreal units/seconds.
-# The engine's `AActor::IsOverlapping` tests a VolumeBrush with its brush primitive, so
-# DetectionVolume4 (`Degage`) and DetectionVolume5 (`dernierpoint`) fire on the walked
-# route and Carrington's `Cine1.Play(2)` starts. The alerted canyon soldiers now converge,
-# so the six-soldier death-event chain is completed by input (all six dead); do not infer
-# the card counter from Timer.
+# Hual04a route (item86 re-time on the integrated engine-fidelity tree): six kills, earned
+# card, bureau card-reader, bureau fuse and the Cine1 LastWave fight.
+#
+# The automatic AI bursts (`Pawn.PressingFire` reads the controller bFire byte) tripled the
+# incoming damage, so the route fights each soldier from before it closes, crouches under the
+# charged soldier's burst and heals on the base medkit. The base medkit fight tracks the head
+# band (0.90) so BaseSoldier4 dies before its burst drains the route, preserving health for the
+# bureau leg. The route then reads the earned card at MagneticPassTrigger4, walks to the bureau
+# fuse (`Hual04aFusiblePick0`, event `FusibleRamasse`) and kills the `Cine1` `LastWave`
+# reinforcement (tabActions[35] `Event LastWave01 LastWave03 LastWave04` spawns
+# BaseSoldier/BaseSoldier2/BaseSoldier3) by input, so goal 2 (find the fuse) completes.
+#
+# The route then, after the LastWave, walks back through the base to the bureau
+# circuit-breaker, works the base door (`use Porte21`) and attempts the fuse install
+# (`use XIIIGoalTrigger19`), works the cable-car lever (`use XIIIMover1`) and returns to the
+# cable-car cabin at (960,570). `item90` implemented Core.dll `execArrayElement`'s out-of-range
+# fixed-array clamp, so `Hual04a.SetGoalComplete` case 3's `i < 4` over the 3-entry
+# `SoldiersEnRenforts` array no longer errors. The install interaction is refused on this
+# reconstructed input (the game's aimed target resolves to the closed `Porte21` door,
+# `bCanTrigger=false`), so goals 3/4/5 and the Hual04c travel stay unclaimed.
+#
+# Input only: no teleport, set_goal, take_control, extra weapon grant or health edit. The
+# Beretta grant at t=0.5 is the carried-loadout diagnostic (see hual02_route.script).
+# Coordinates and times are Unreal units/seconds. The integrated volume-brush overlap fires
+# DetectionVolume4/5 (`Degage`/`dernierpoint`) and starts `Cine1.Play(2)`.
 t=0.50 weapon xiii.Beretta
 t=1.00 switch_weapon 2
 t=2.50 goto -10200 -1500
@@ -169,24 +178,18 @@ t=225.50 heal
 t=225.80 reload
 t=226.00 goto 770 1158
 t=226.10 crouch 1
-t=226.30 track BaseSoldier4 0.85
+t=226.30 track BaseSoldier4 0.90
 t=226.50 fire
-t=226.90 fire
-t=227.30 fire
+t=226.80 fire
+t=227.10 fire
+t=227.40 fire
 t=227.70 fire
-t=228.10 fire
-t=228.50 fire
+t=228.00 fire
+t=228.30 fire
+t=228.60 fire
 t=228.90 fire
-t=229.30 fire
-t=229.70 fire
-t=230.10 fire
-t=230.50 fire
-t=230.90 fire
-t=231.30 fire
-t=231.70 fire
-t=232.10 track off
-t=232.30 crouch 0
-t=241.00 goto 826 1359
+t=229.20 track off
+t=229.30 crouch 0
 t=246.00 goto 362 1280
 t=255.00 goto 770 1158
 # The station doors are still open; a second use would close them.
@@ -216,7 +219,81 @@ t=329.00 grab_input
 t=332.00 grab_input
 t=335.00 track off
 t=335.00 crouch 0
-# The route stops at the card reader: the fuse pickup (`Hual04aFusiblePick0`) triggers
-# `FusibleRamasse` and the `Cine1` `LastWave` reinforcement, whose burst kills the 17-hp
-# player on the walk-out (measured), so the fuse-installation leg is not attempted here.
-t=336.00 wait_travel
+t=336.00 goto -3650 2918
+t=339.50 goto -3294 2767
+t=343.50 goto -3188 3013
+t=346.00 goto -3150 2986
+t=350.00 goto -3804 3170
+t=354.00 goto -3880 3100
+t=357.00 goto -3900 2960
+t=360.00 goto -4000 2800
+t=362.00 goto -4262 2247
+t=365.00 crouch 1
+t=368.00 track BaseSoldier 0.90
+t=368.15 fire
+t=368.45 fire
+t=368.75 fire
+t=369.05 fire
+t=369.35 fire
+t=369.65 fire
+t=369.95 fire
+t=370.25 fire
+t=370.55 fire
+t=370.85 reload
+t=371.15 track BaseSoldier2 0.90
+t=371.30 fire
+t=371.60 fire
+t=371.90 fire
+t=372.20 fire
+t=372.50 fire
+t=372.80 fire
+t=373.10 fire
+t=373.40 fire
+t=373.70 fire
+t=374.00 reload
+t=374.30 track BaseSoldier3 0.90
+t=374.45 fire
+t=374.75 fire
+t=375.05 fire
+t=375.35 fire
+t=375.65 fire
+t=375.95 fire
+t=376.25 fire
+t=376.55 fire
+t=376.85 fire
+t=377.15 reload
+t=377.45 track off
+t=377.45 crouch 0
+# Walk back through the base to the bureau circuit-breaker and install the fuse at
+# XIIIGoalTrigger19 (goal 3), then work the cable-car lever XIIIMover1 (goal 4). `item90`
+# implemented Core.dll `execArrayElement`'s out-of-range fixed-array clamp, so
+# `Hual04a.SetGoalComplete` case 3 no longer errors; on this reconstructed input the install
+# interaction itself is refused (the game's aimed target resolves to the closed Porte21 door,
+# `bCanTrigger=false`), so goals 3/4 stay unclaimed. Waypoints are the item86 fuse-leg trace;
+# `use Porte21` works the base door the retail route opened automatically.
+t=378.00 goto -4077.2 1836.9
+t=380.50 goto -3732.9 1357.8
+t=384.50 goto -3269.9 1390.3
+t=388.50 goto -2610.1 393.0
+t=392.50 goto -2150.8 326.5
+t=396.50 goto -1259.1 1258.9
+t=400.50 goto -1308.8 742.0
+t=404.50 goto -1279.0 -209.4
+t=408.50 goto -832.0 -173.8
+t=412.50 goto -554.2 520.0
+t=415.50 goto -202.1 483.1
+t=418.50 goto -260.0 856.2
+t=421.50 goto -253.7 937.9
+t=425.50 goto 798.5 874.3
+t=429.50 goto 777.6 959.8
+t=445.50 goto 576.8 1166.6
+t=448.00 goto 609.4 1038.7
+t=452.00 goto 609.4 1091.3
+t=453.00 use Porte21
+t=455.00 use XIIIGoalTrigger19
+t=457.00 use XIIIGoalTrigger19
+t=459.00 goto 700.0 1058.0
+t=463.00 goto 850.0 770.0
+t=467.00 goto 926.0 758.0
+t=472.50 use XIIIMover1
+t=475.00 goto 960.0 570.0

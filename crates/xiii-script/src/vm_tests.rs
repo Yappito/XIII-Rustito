@@ -1746,6 +1746,18 @@ impl SpawnB {
         self.set(r, p);
     }
 
+    /// A fixed array declared as its element property type with `ArrayDim = dim` (no trailing
+    /// inner reference): `var int Fixed[3]` is an `IntProperty` with `ArrayDim` 3.
+    fn prop_dim(&mut self, r: i32, next: i32, flags: u32, dim: i16) {
+        let mut p = compact(0);
+        p.extend(compact(0));
+        p.extend(compact(next));
+        p.extend(dim.to_le_bytes());
+        p.extend(flags.to_le_bytes());
+        p.extend(compact(0));
+        self.set(r, p);
+    }
+
     fn header(
         &self,
         sup: i32,
@@ -15554,4 +15566,306 @@ fn host_request_queue_is_fifo_bounded_and_independent_of_the_trace_gate() {
         Some(&HostRequest::LoadSlot(MAX_HOST_REQUESTS as u32 + 9)),
         "the newest request always survives"
     );
+}
+// ---------------------------------------------------------------------------------------
+// Array bounds (Core.dll execArrayElement 0x10116c30 / execDynArrayElement 0x1011eeb0)
+// ---------------------------------------------------------------------------------------
+
+/// `Object`/`Actor` with a fixed `int[3]` (`Fixed`, declared as an `IntProperty` with
+/// `ArrayDim = 3` — the UE2 static-array form, as the retail `Hual04a.SoldiersEnRenforts` array
+/// is) and a dynamic `int` array (`Dyn`, an `ArrayProperty` with `ArrayDim = 1`), plus four
+/// script functions that read and write an element. Reproduces the `SetGoalComplete` case-3
+/// fixed-array overrun (`i < 4` over a 3-element array).
+fn array_bounds_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    // Dynamic-array element template (never spawned; the `Dyn` property refers to it).
+    let int_item = b.reserve(IMP_INTPROP, 0, "IntItem");
+
+    let fixed = b.reserve(IMP_INTPROP, actor, "Fixed");
+    let dynarr = b.reserve(IMP_ARRAYPROP, actor, "Dyn");
+
+    let read_fixed = b.reserve(IMP_FUNCTION, actor, "ReadFixed");
+    let rf_i = b.reserve(IMP_INTPROP, read_fixed, "I");
+    let rf_ret = b.reserve(IMP_INTPROP, read_fixed, "ReturnValue");
+    b.prop(rf_i, rf_ret, PARM);
+    b.prop(rf_ret, 0, PARM | RETURN_PARM);
+
+    let write_fixed = b.reserve(IMP_FUNCTION, actor, "WriteFixed");
+    let wf_i = b.reserve(IMP_INTPROP, write_fixed, "I");
+    let wf_v = b.reserve(IMP_INTPROP, write_fixed, "V");
+    b.prop(wf_i, wf_v, PARM);
+    b.prop(wf_v, 0, PARM);
+
+    let read_dyn = b.reserve(IMP_FUNCTION, actor, "ReadDyn");
+    let rd_i = b.reserve(IMP_INTPROP, read_dyn, "I");
+    let rd_ret = b.reserve(IMP_INTPROP, read_dyn, "ReturnValue");
+    b.prop(rd_i, rd_ret, PARM);
+    b.prop(rd_ret, 0, PARM | RETURN_PARM);
+
+    let write_dyn = b.reserve(IMP_FUNCTION, actor, "WriteDyn");
+    let wd_i = b.reserve(IMP_INTPROP, write_dyn, "I");
+    let wd_v = b.reserve(IMP_INTPROP, write_dyn, "V");
+    b.prop(wd_i, wd_v, PARM);
+    b.prop(wd_v, 0, PARM);
+
+    b.prop_dim(fixed, dynarr, 0, 3);
+    b.prop_array(dynarr, read_fixed, 0, int_item);
+    // `return Fixed[I]` -> Return(ArrayElement(Local I, Instance Fixed)).
+    let read_fixed_code = [0x04, 0x1A, 0x00, rf_i as u8, 0x01, fixed as u8];
+    b.func(
+        read_fixed,
+        write_fixed,
+        rf_i,
+        &read_fixed_code,
+        12,
+        0,
+        DEFINED,
+    );
+    // `Fixed[I] = V; return;`
+    let write_fixed_code = [
+        0x0F,
+        0x1A,
+        0x00,
+        wf_i as u8,
+        0x01,
+        fixed as u8,
+        0x00,
+        wf_v as u8,
+        0x04,
+        0x0B,
+    ];
+    b.func(
+        write_fixed,
+        read_dyn,
+        wf_i,
+        &write_fixed_code,
+        19,
+        0,
+        DEFINED,
+    );
+    // `return Dyn[I]` -> Return(DynArrayElement(Local I, Instance Dyn)).
+    let read_dyn_code = [0x04, 0x10, 0x00, rd_i as u8, 0x01, dynarr as u8];
+    b.func(read_dyn, write_dyn, rd_i, &read_dyn_code, 12, 0, DEFINED);
+    // `Dyn[I] = V; return;`
+    let write_dyn_code = [
+        0x0F,
+        0x10,
+        0x00,
+        wd_i as u8,
+        0x01,
+        dynarr as u8,
+        0x00,
+        wd_v as u8,
+        0x04,
+        0x0B,
+    ];
+    b.func(write_dyn, 0, wd_i, &write_dyn_code, 19, 0, DEFINED);
+
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, fixed, 0);
+    b.build()
+}
+
+fn array_bounds_vm(set: &ScriptSet) -> (Vm<'_>, ObjectId) {
+    let mut vm = Vm::new(set, VmLimits::default());
+    let a = vm.spawn(g(set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    for (i, v) in [10, 20, 30].into_iter().enumerate() {
+        assert!(vm.set_property(a, "Fixed", i, Value::Int(v)), "slot {i}");
+    }
+    vm.set_property(
+        a,
+        "Dyn",
+        0,
+        Value::Array(vec![Value::Int(5), Value::Int(6)]),
+    );
+    (vm, a)
+}
+
+fn array_notes(vm: &Vm<'_>) -> Vec<TraceKind> {
+    vm.trace
+        .iter()
+        .filter(|e| matches!(e.kind, TraceKind::ArrayOutOfBounds { .. }))
+        .map(|e| e.kind.clone())
+        .collect()
+}
+
+#[test]
+fn fixed_array_out_of_range_read_clamps_to_the_last_element() {
+    let set = set_of(array_bounds_fixture());
+    let (mut vm, a) = array_bounds_vm(&set);
+    // index == dim clamps to dim-1 (2): Core.dll execArrayElement.
+    let r = vm
+        .call_function(g(&set, "Actor.ReadFixed"), a, vec![Value::Int(3)])
+        .unwrap();
+    assert_eq!(r, Value::Int(30));
+    // negative clamps to 0.
+    let r = vm
+        .call_function(g(&set, "Actor.ReadFixed"), a, vec![Value::Int(-1)])
+        .unwrap();
+    assert_eq!(r, Value::Int(10));
+    // in-range reads are unchanged and emit no note.
+    let r = vm
+        .call_function(g(&set, "Actor.ReadFixed"), a, vec![Value::Int(1)])
+        .unwrap();
+    assert_eq!(r, Value::Int(20));
+    let notes = array_notes(&vm);
+    assert!(
+        matches!(&notes[0], TraceKind::ArrayOutOfBounds { array, index: 3, len: 3 } if array == "fixed")
+    );
+    assert!(
+        matches!(&notes[1], TraceKind::ArrayOutOfBounds { array, index: -1, len: 3 } if array == "fixed")
+    );
+    assert_eq!(notes.len(), 2);
+}
+
+#[test]
+fn fixed_array_out_of_range_write_clamps_to_the_last_element() {
+    let set = set_of(array_bounds_fixture());
+    let (mut vm, a) = array_bounds_vm(&set);
+    vm.call_function(
+        g(&set, "Actor.WriteFixed"),
+        a,
+        vec![Value::Int(9), Value::Int(99)],
+    )
+    .unwrap();
+    assert_eq!(vm.get_property_elem(a, "Fixed", 2), Some(&Value::Int(99)));
+    assert_eq!(vm.get_property_elem(a, "Fixed", 1), Some(&Value::Int(20)));
+    assert_eq!(vm.get_property_elem(a, "Fixed", 0), Some(&Value::Int(10)));
+    // A negative index clamps to element 0.
+    vm.call_function(
+        g(&set, "Actor.WriteFixed"),
+        a,
+        vec![Value::Int(-5), Value::Int(7)],
+    )
+    .unwrap();
+    assert_eq!(vm.get_property_elem(a, "Fixed", 0), Some(&Value::Int(7)));
+    // Both writes were diagnosed, not silent.
+    let notes = array_notes(&vm);
+    assert_eq!(notes.len(), 2);
+    assert!(matches!(
+        &notes[0],
+        TraceKind::ArrayOutOfBounds {
+            index: 9,
+            len: 3,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &notes[1],
+        TraceKind::ArrayOutOfBounds {
+            index: -5,
+            len: 3,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn dynamic_array_out_of_range_read_returns_the_element_zero() {
+    let set = set_of(array_bounds_fixture());
+    let (mut vm, a) = array_bounds_vm(&set);
+    // index == len (2) and negative both return the element type's zero, not the last element.
+    let r = vm
+        .call_function(g(&set, "Actor.ReadDyn"), a, vec![Value::Int(2)])
+        .unwrap();
+    assert_eq!(r, Value::Int(0));
+    let r = vm
+        .call_function(g(&set, "Actor.ReadDyn"), a, vec![Value::Int(-1)])
+        .unwrap();
+    assert_eq!(r, Value::Int(0));
+    // An in-range read still returns the stored value.
+    let r = vm
+        .call_function(g(&set, "Actor.ReadDyn"), a, vec![Value::Int(1)])
+        .unwrap();
+    assert_eq!(r, Value::Int(6));
+    // The array is untouched by the reads.
+    assert_eq!(
+        vm.get_property(a, "Dyn"),
+        Some(&Value::Array(vec![Value::Int(5), Value::Int(6)]))
+    );
+    let notes = array_notes(&vm);
+    assert_eq!(notes.len(), 2);
+    assert!(
+        matches!(&notes[0], TraceKind::ArrayOutOfBounds { array, index: 2, len: 2 } if array == "dyn")
+    );
+    assert!(
+        matches!(&notes[1], TraceKind::ArrayOutOfBounds { array, index: -1, len: 2 } if array == "dyn")
+    );
+}
+
+#[test]
+fn dynamic_array_out_of_range_read_of_an_empty_array_returns_zero() {
+    let set = set_of(array_bounds_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(g(&set, "Actor"), "A").unwrap();
+    vm.set_active(a, true);
+    // Default `Dyn` is empty; index 0 is already out of range.
+    let r = vm
+        .call_function(g(&set, "Actor.ReadDyn"), a, vec![Value::Int(0)])
+        .unwrap();
+    assert_eq!(r, Value::Int(0));
+    let notes = array_notes(&vm);
+    assert!(matches!(
+        &notes[0],
+        TraceKind::ArrayOutOfBounds {
+            index: 0,
+            len: 0,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn dynamic_array_write_past_the_end_grows_with_zeros() {
+    let set = set_of(array_bounds_fixture());
+    let (mut vm, a) = array_bounds_vm(&set);
+    vm.call_function(
+        g(&set, "Actor.WriteDyn"),
+        a,
+        vec![Value::Int(4), Value::Int(42)],
+    )
+    .unwrap();
+    assert_eq!(
+        vm.get_property(a, "Dyn"),
+        Some(&Value::Array(vec![
+            Value::Int(5),
+            Value::Int(6),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(42),
+        ]))
+    );
+    // A growth past the end is normal UE2 behaviour and is not diagnosed.
+    assert!(array_notes(&vm).is_empty());
+}
+
+#[test]
+fn dynamic_array_negative_write_is_skipped() {
+    let set = set_of(array_bounds_fixture());
+    let (mut vm, a) = array_bounds_vm(&set);
+    vm.call_function(
+        g(&set, "Actor.WriteDyn"),
+        a,
+        vec![Value::Int(-1), Value::Int(99)],
+    )
+    .unwrap();
+    // Core.dll clears the destination pointer on a negative index; the array is unchanged.
+    assert_eq!(
+        vm.get_property(a, "Dyn"),
+        Some(&Value::Array(vec![Value::Int(5), Value::Int(6)]))
+    );
+    let notes = array_notes(&vm);
+    assert!(matches!(
+        &notes[0],
+        TraceKind::ArrayOutOfBounds {
+            index: -1,
+            len: 2,
+            ..
+        }
+    ));
 }

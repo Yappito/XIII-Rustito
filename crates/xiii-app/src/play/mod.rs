@@ -7535,8 +7535,8 @@ mod tests {
     }
 
     /// Hual04a (item86 re-time): with automatic AI bursts, fight the canyon soldiers before they
-    /// close, heal on the base medkits and complete the six-soldier death-event chain; the route
-    /// is cut at the bureau card reader because the fuse pick spawns the fatal Cine1 LastWave.
+    /// close, heal on the base medkits, read the earned card, survive the `Cine1` LastWave,
+    /// install the fuse and activate the cable-car lever.
     #[test]
     fn opt_in_hual04a_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -7564,7 +7564,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            450.0,
+            500.0,
         )
         .expect("run Hual04a route");
         let session = &outcome.session;
@@ -7586,7 +7586,12 @@ mod tests {
             "BaseSoldier0",
             "BaseSoldier4",
         ] {
-            let id = vm.find_object(name).expect("authored soldier");
+            // A killed soldier's corpse may finish Dying and be destroyed before the route
+            // ends; the dead count is asserted through `eNbVivants` below.
+            let Some(id) = vm.find_object(name) else {
+                println!("[hual04a soldier] {name} destroyed");
+                continue;
+            };
             println!(
                 "[hual04a soldier] {name} health={:?} location={:?} dead={:?}",
                 vm.get_property(id, "Health"),
@@ -7638,46 +7643,86 @@ mod tests {
             Some(&xiii_script::Value::Int(0)),
             "the delivered Degage cue started Cine1.Play(2)"
         );
-        // item86 (integ-hual04a): with the AI now firing automatic bursts, the canyon fight is
-        // re-timed to kill each soldier before it closes (and the medkit detour heals the
-        // walk-out). The corrected volume overlaps alert the canyon soldiers, but the route now
-        // completes the six-soldier death-event chain: all six (`BaseSoldier0/1/4/5/10/12`) are
-        // dead (`eNbVivants` 1; the item81c stall had 2, one soldier left). The card is read at
-        // `MagneticPassTrigger4`; the route is cut there because picking the fuse (`FusibleRamasse`)
-        // spawns the `Cine1` `LastWave` reinforcement (tabActions[35]) whose burst kills the 17-hp
-        // player on the walk-out (measured, `local/re/item86/exp_u.log`). Goals 2/3 stay unreached,
-        // the generator `SpawnActor`s stay empty and the lever/travel stay unreached.
+        // item90: with Core.dll's out-of-range fixed-array clamp implemented, the install leg no
+        // longer raises `ArrayIndex`. The re-timed route completes the six-soldier death-event
+        // chain (`eNbVivants` 1), reads the earned card at `MagneticPassTrigger4`, walks to the
+        // bureau fuse (`Hual04aFusiblePick0`, event `FusibleRamasse`) and kills the `Cine1`
+        // `LastWave` reinforcement by input (goal 2). It then walks back through the base to the
+        // bureau circuit-breaker, works the door (`use Porte21`) and attempts the fuse install
+        // (`use XIIIGoalTrigger19`), works the cable-car lever (`use XIIIMover1`) and returns to
+        // the cable-car cabin. The install interaction is refused on this reconstructed input:
+        // the game's aimed target resolves to the closed `Porte21` door (`bCanTrigger=false`), so
+        // `XIIIGoalTrigger19` never fires and goals 3/4 stay unclaimed. Goals 3/4/5 and the
+        // Hual04c travel are not claimed (see the task report for the measured evidence).
         assert_eq!(
             vm.get_property(mi, "eNbVivants"),
             Some(&xiii_script::Value::Int(1)),
             "the re-timed route completes the six-kill death-event chain (all six soldiers dead)"
         );
         assert!(
-            !goals[2].completed && !goals[3].completed,
-            "fuse goals 2/3 are unreached on this route: {goals:?}"
+            goals[2].completed,
+            "goal 2 (find the fuse) must complete on this route: {goals:?}"
         );
-        let lever = vm.find_object("XIIIMover1").expect("cable-car lever");
+        assert!(
+            !goals[3].completed && !goals[4].completed && !goals[5].completed,
+            "goals 3/4/5 stay unreached on this route (install interaction refused): {goals:?}"
+        );
+        // The LastWave generators each spawned one reinforcement; all three are dead (killed by
+        // input) on this route. The generators may be cleaned up after their wave dies, so count
+        // the spawned soldiers by their `GenEnnemi` back-reference instead.
+        let mut renforts = 0;
+        for (i, o) in vm.objects.iter().enumerate() {
+            if !o.is_actor || o.deleted || o.name.starts_with("Default__") {
+                continue;
+            }
+            let id = i as xiii_script::ObjectId;
+            if !vm.is_a(id, "basesoldier") {
+                continue;
+            }
+            if !matches!(
+                vm.get_property(id, "GenEnnemi"),
+                Some(xiii_script::Value::Object(Some(_)))
+            ) {
+                continue;
+            }
+            renforts += 1;
+            assert_eq!(
+                vm.get_property(id, "bIsDead"),
+                Some(&xiii_script::Value::Bool(true)),
+                "{}: the LastWave reinforcement must be dead (killed by input)",
+                o.name
+            );
+        }
         assert_eq!(
-            vm.get_property(lever, "KeyNum"),
-            Some(&xiii_script::Value::Byte(0)),
-            "the lever has not been activated"
+            renforts, 3,
+            "the three Cine1 LastWave reinforcements must have spawned and died"
         );
-        for name in ["GenNMI1", "gennmi2", "gennmi3"] {
+        // The second wave (`Wave01`/`Wave02`) is not triggered on this route: the player never
+        // reaches Carrington's post-lever cine, so those generators stay empty.
+        for name in ["GenNMI6", "GenNMI7"] {
             let id = vm
                 .find_object(name)
-                .expect("authored reinforcement generator");
+                .expect("authored second-wave generator");
             assert_eq!(
                 vm.get_property(id, "SpawnActor"),
                 Some(&xiii_script::Value::Object(None)),
-                "{name}: no LastWave spawn on this route (FusibleRamasse undelivered)"
+                "{name}: the second wave must not spawn on this route"
             );
         }
+        // The cable-car lever use fired, but goal 4 is gated on the fuse install (goal 3), so it
+        // does not complete. Record the lever state for the report.
+        let lever = vm.find_object("XIIIMover1").expect("cable-car lever");
+        println!(
+            "[hual04a lever] XIIIMover1 KeyNum={:?} state={:?}",
+            vm.get_property(lever, "KeyNum"),
+            vm.state_name(lever)
+        );
         assert_eq!(
             vm.get_property(mi, "NextMapLevelWithUnr"),
             Some(&xiii_script::Value::Str("Hual04c.unr".to_owned()))
         );
         println!(
-            "[hual04a next blocker] the re-timed route completes the six-kill death-event chain (all six soldiers dead, eNbVivants 1) and reads the card at MagneticPassTrigger4; picking the fuse there (FusibleRamasse) spawns the Cine1 LastWave reinforcement (tabActions[35]) whose burst fire kills the 17-hp player on the walk-out (measured), so fuse goals 2/3, the XIIIMover1 lever and Hual04c travel are not attempted"
+            "[hual04a next blocker] the route completes the six-kill chain (eNbVivants 1), the card read and the fuse pickup (goal 2), then walks back through the base to the bureau circuit-breaker, works the door (use Porte21) and attempts the fuse install (use XIIIGoalTrigger19, twice) and the cable-car lever (use XIIIMover1), ending at the cable-car cabin (960,570) with no engine error. The install interaction is refused: the game's aimed target resolves to the closed Porte21 door (TargetActor=Porte21, bCanTrigger=false), so XIIIGoalTrigger19 never fires and goals 3/4 stay unclaimed; goal 5 and the Hual04c travel follow goal 4. The ArrayIndex error of item86 is gone (Core.dll fixed-array clamp); the remaining blocker is interaction targeting on this reconstructed input"
         );
     }
 }
