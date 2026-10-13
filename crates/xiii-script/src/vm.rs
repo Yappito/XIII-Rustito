@@ -37,6 +37,15 @@ use crate::reflect::{Property, PropertyKind, ScriptObject, function_flags, prope
 use crate::registry::{NativeCtx, NativeDef, NativeOutcome, Registry};
 use crate::value::{Delegate, ObjRef, ObjectId, Ty, Value};
 
+/// Inferred stages of the Partial HXAudio cue-name model, not decoded bank events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlashCueModelStage {
+    BeginBegin,
+    EndBegin,
+    BeginEnd,
+    EndEnd,
+}
+
 /// Interpreter limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmLimits {
@@ -1417,6 +1426,9 @@ pub struct Vm<'s> {
     pub tick_count: u64,
     /// VM time in seconds.
     pub time: f64,
+    /// Partial cue-name model: newest inferred stage, dispatched at the end of the next
+    /// unpaused VM tick. Retail observes a global audio variable; its bank timing is unknown.
+    pending_flash_cue_model: Option<FlashCueModelStage>,
     steps: u64,
     limits: VmLimits,
     /// Properties the loader could not place (name not in layout, bad index).
@@ -1695,6 +1707,7 @@ impl<'s> Vm<'s> {
             stack: Vec::new(),
             tick_count: 0,
             time: 0.0,
+            pending_flash_cue_model: None,
             steps: 0,
             limits,
             load_warnings: Vec::new(),
@@ -2494,7 +2507,12 @@ impl<'s> Vm<'s> {
                         let mut members = Vec::new();
                         for (pg, p) in self.child_props(g) {
                             let t = self.ty_of(pg.package, &p.kind, depth + 1);
-                            members.push((lower(self.object_name(pg)), t));
+                            // `transient` members are not in the serialized struct (the runtime
+                            // field still exists and defaults to zero), so the raw-struct decoder
+                            // must not consume bytes for them.
+                            let serialized =
+                                p.flags & crate::reflect::property_flags::TRANSIENT == 0;
+                            members.push((lower(self.object_name(pg)), t, serialized));
                         }
                         Ty::Struct(members)
                     }
@@ -2894,7 +2912,7 @@ impl<'s> Vm<'s> {
             // `XIIIDialogMessage.MessageColor` is read as a `struct<Color>`).
             (PropertyValue::Struct(StructValue::Color(c)), Ty::Struct(members)) => {
                 let mut fields = Vec::with_capacity(members.len());
-                for (name, _) in members {
+                for (name, _, _) in members {
                     let byte = match name.to_ascii_lowercase().as_str() {
                         "b" => c[0],
                         "g" => c[1],
@@ -2915,7 +2933,7 @@ impl<'s> Vm<'s> {
             // is applied when the subobject is instantiated.
             (PropertyValue::Struct(StructValue::Range(r)), Ty::Struct(members)) => {
                 let mut fields = Vec::with_capacity(members.len());
-                for (name, _) in members {
+                for (name, _, _) in members {
                     let v = match name.to_ascii_lowercase().as_str() {
                         "min" => r[0],
                         "max" => r[1],
@@ -2930,12 +2948,12 @@ impl<'s> Vm<'s> {
                     return Value::Unsupported(format!("range vector arity {}", members.len()));
                 }
                 let mut fields = Vec::with_capacity(3);
-                for (i, (name, ty)) in members.iter().enumerate() {
+                for (i, (name, ty, _)) in members.iter().enumerate() {
                     let r = rv[i];
                     let inner = match ty {
                         Ty::Struct(inner) => {
                             let mut sub = Vec::with_capacity(inner.len());
-                            for (n, _) in inner {
+                            for (n, _, _) in inner {
                                 let v = match n.to_ascii_lowercase().as_str() {
                                     "min" => r[0],
                                     "max" => r[1],
@@ -2972,7 +2990,7 @@ impl<'s> Vm<'s> {
         &self,
         pkg: usize,
         span: xiii_package::Span,
-        members: &[(String, Ty)],
+        members: &[(String, Ty, bool)],
     ) -> Value {
         let p = &self.set.packages[pkg];
         let tables = crate::reader::Tables::of(&p.package);
@@ -2980,7 +2998,12 @@ impl<'s> Vm<'s> {
             return Value::Unsupported("struct span".into());
         };
         let mut fields = Vec::new();
-        for (name, t) in members {
+        for (name, t, serialized) in members {
+            // A transient member is not in the span; keep the runtime field at its zero value.
+            if !*serialized {
+                fields.push((name.clone(), t.zero()));
+                continue;
+            }
             match self.decode_ty(&mut r, pkg, t) {
                 Some(v) => fields.push((name.clone(), v)),
                 None => return Value::Unsupported(format!("raw struct member {name}")),
@@ -3041,8 +3064,13 @@ impl<'s> Vm<'s> {
             }
             Ty::Struct(members) => {
                 let mut fields = Vec::new();
-                for (name, t) in members {
-                    fields.push((name.clone(), self.decode_ty(r, pkg, t)?));
+                for (name, t, serialized) in members {
+                    if *serialized {
+                        fields.push((name.clone(), self.decode_ty(r, pkg, t)?));
+                    } else {
+                        // A transient member is not in the byte stream.
+                        fields.push((name.clone(), t.zero()));
+                    }
                 }
                 Value::Struct(fields)
             }
@@ -4122,6 +4150,41 @@ impl<'s> Vm<'s> {
         self.do_goto_state(id, state, label.unwrap_or("Begin"))
     }
 
+    /// Partial model: defer the inferred stage so script waiters can park first. The delay is
+    /// a compatibility choice, not measured playback latency. Like retail's pending value
+    /// (subsystem+0xa0), a newer request replaces the previous pending stage.
+    pub(crate) fn queue_flash_cue_model(&mut self, stage: FlashCueModelStage) {
+        self.note(TraceKind::Note(format!(
+            "HXAudio flash cue model (Partial): inferred {stage:?}; deferred to next unpaused VM tick"
+        )));
+        self.pending_flash_cue_model = Some(stage);
+    }
+
+    /// Dispatches the model's inferred stage to Level.FlashManager. The event family and
+    /// value order are decoded from retail Update; selection and timing remain modelled.
+    /// Return campaign callback errors to the normal tick/suspension diagnostics.
+    fn fire_flash_cue_model(
+        &mut self,
+        stage: FlashCueModelStage,
+    ) -> Result<(), (ObjectId, VmError)> {
+        let Some(level) = self.find_level_info() else {
+            return Ok(());
+        };
+        let flash_manager = match self.get_property(level, "FlashManager") {
+            Some(Value::Object(Some(ObjRef::Instance(id)))) => *id,
+            _ => return Ok(()),
+        };
+        let event = match stage {
+            FlashCueModelStage::BeginBegin => "BeginBeginFlash",
+            FlashCueModelStage::EndBegin => "EndBeginFlash",
+            FlashCueModelStage::BeginEnd => "BeginEndFlash",
+            FlashCueModelStage::EndEnd => "EndEndFlash",
+        };
+        self.send_event(flash_manager, event, Vec::new())
+            .map(|_| ())
+            .map_err(|e| (flash_manager, e))
+    }
+
     /// Retail ULevel::Tick (Engine.dll 0x10390afc..0x10390be0): scale the incoming
     /// float delta, advance the double level clock unless Pauser is set, publish its
     /// float mirror before actor callbacks. VM tick accepts a simulation step;
@@ -4177,6 +4240,7 @@ impl<'s> Vm<'s> {
             }
             return Ok(());
         }
+        let flash = self.pending_flash_cue_model.take();
         for id in 0..self.objects.len() as ObjectId {
             if !self.objects[id as usize].active {
                 continue;
@@ -4237,6 +4301,9 @@ impl<'s> Vm<'s> {
         self.dispatch_player_ticks(dt)?;
         self.dispatch_hook_player_moves(dt)?;
         self.detect_server_travel();
+        if let Some(stage) = flash {
+            self.fire_flash_cue_model(stage).map_err(|(_, e)| e)?;
+        }
         Ok(())
     }
 
@@ -4304,6 +4371,7 @@ impl<'s> Vm<'s> {
             }
             return errors;
         }
+        let flash = self.pending_flash_cue_model.take();
         let profiling = self.profile.enabled;
         let t0 = Instant::now();
         for id in 0..self.objects.len() as ObjectId {
@@ -4425,6 +4493,12 @@ impl<'s> Vm<'s> {
             errors.push((suspended, e));
         }
         self.detect_server_travel();
+        if let Some(stage) = flash
+            && let Err((id, e)) = self.fire_flash_cue_model(stage)
+        {
+            let suspended = self.suspend_for_error(id, &e);
+            errors.push((suspended, e));
+        }
         errors
     }
 
@@ -6896,6 +6970,29 @@ impl<'s> Vm<'s> {
                 }
                 match self.context_value(v)? {
                     Some(obj) => return self.place(frame, &c.member, obj),
+                    None => return Ok(None),
+                }
+            }
+            K::ClassContext(c) => {
+                // A class-default lvalue (`obj'X'.static.default.P = v`) writes the class's
+                // default object, mirroring the `eval_in` read path. `xiii.MapInfo
+                // .SaveInventoryForFlash` toggles `XIIIPlayerPawn.default.bCollideWorld` around its
+                // spawn, so without this the write was `NotAPlace` and the whole flash sequence
+                // aborted before `GenFlash.IntroFlash`'s timer.
+                let v = self.eval_in(frame, &c.object, target)?;
+                let class = match v {
+                    Value::Object(Some(ObjRef::Static(g))) => Some(g),
+                    Value::Object(Some(ObjRef::Instance(i))) => {
+                        Some(self.objects[i as usize].class)
+                    }
+                    Value::Object(None) | Value::NativeClass(_) => None,
+                    other => return Err(self.type_err("class", &other)),
+                };
+                match class {
+                    Some(g) => {
+                        let d = self.default_object(g)?;
+                        return self.place(frame, &c.member, d);
+                    }
                     None => return Ok(None),
                 }
             }

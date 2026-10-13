@@ -121,8 +121,10 @@ pub enum Ty {
     Vector,
     /// `rotator`.
     Rotator,
-    /// Other struct with member (name, type) pairs.
-    Struct(Vec<(String, Ty)>),
+    /// Other struct with `(name, type, serialized)` member triples. `serialized` is false for a
+    /// `transient` member, which the engine's struct serializer omits from the byte stream (the
+    /// runtime field still exists and defaults to zero).
+    Struct(Vec<(String, Ty, bool)>),
     /// Dynamic array of the inner type.
     Array(Box<Ty>),
     /// Delegate (an `(object, function)` pair).
@@ -142,9 +144,12 @@ impl Ty {
             Ty::Object => Value::Object(None),
             Ty::Vector => Value::Vector([0.0; 3]),
             Ty::Rotator => Value::Rotator([0; 3]),
-            Ty::Struct(members) => {
-                Value::Struct(members.iter().map(|(n, t)| (n.clone(), t.zero())).collect())
-            }
+            Ty::Struct(members) => Value::Struct(
+                members
+                    .iter()
+                    .map(|(n, t, _)| (n.clone(), t.zero()))
+                    .collect(),
+            ),
             Ty::Array(_) => Value::Array(Vec::new()),
             Ty::Delegate => Value::Delegate(None),
         }

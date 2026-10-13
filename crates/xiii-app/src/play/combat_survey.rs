@@ -205,6 +205,14 @@ fn opt_in_item51_combat_survey() {
         let mut shots_by_soldier = BTreeMap::<String, u64>::new();
         let mut hits_by_soldier = BTreeMap::<String, u64>::new();
         let mut player_shots = 0;
+        // item97b: the host relinquishes player input when the controller dies or the game ends
+        // (the dead-input anomaly this item fixed), so a commanded shot only fires while the
+        // controller still walks. `outcome.control_ended` is the script second player control was
+        // first lost; the firing acceptance counts only shots commanded before it and separately
+        // rejects any trace shot after it.
+        let death_time = outcome.control_ended;
+        let death_vm = outcome.control_ended_vm;
+        let mut dead_player_shots = 0;
         for event in &vm.trace {
             match &event.kind {
                 TraceKind::Native {
@@ -265,7 +273,13 @@ fn opt_in_item51_combat_survey() {
                                 _ => None,
                             });
                     if instigator == Some(session.player) {
-                        player_shots += 1;
+                        // A shot fired on the last control-active tick shares that VM instant;
+                        // only a shot strictly after it is post-control.
+                        if death_vm.is_some_and(|dt| event.time > dt + 1e-4) {
+                            dead_player_shots += 1;
+                        } else {
+                            player_shots += 1;
+                        }
                     }
                     if let Some(p) = instigator
                         && p != session.player
@@ -297,7 +311,7 @@ fn opt_in_item51_combat_survey() {
             }
         }
         println!(
-            "[combat-result] map={map} ai_shots={ai_shots} player_shots={player_shots} player_hits={hits} damage_requested={damage} health_final={:?} final_map={} failures={} suspended={}",
+            "[combat-result] map={map} ai_shots={ai_shots} player_shots={player_shots} dead_player_shots={dead_player_shots} player_hits={hits} damage_requested={damage} health_final={:?} final_map={} failures={} suspended={}",
             session.player_health(),
             outcome.final_map,
             session.failures.len(),
@@ -306,11 +320,32 @@ fn opt_in_item51_combat_survey() {
         println!(
             "[combat-shooters] {map} shots={shots_by_soldier:?} hits_on_player={hits_by_soldier:?}"
         );
-        if soldier.is_some() && player_shots != 60 {
-            println!(
-                "[combat-acceptance-fail] {map}: expected 60 player shots, measured {player_shots}"
-            );
-            firing_failures.push(format!("{map}: {player_shots}/60 player shots"));
+        if soldier.is_some() {
+            // The player must fire for every commanded shot issued while alive; a map whose
+            // player was killed by the authored AI is expected to fire only the shots before
+            // that death. Any shot after death is the item97b dead-input regression.
+            // Only the shots commanded while the player still had control can fire; a command at
+            // or after the last control-active tick is the suppressed one.
+            let expected = match death_time {
+                Some(dt) => (0..60)
+                    .filter(|i| (6.5 + f64::from(*i)) <= f64::from(dt) + 1e-4)
+                    .count(),
+                None => 60,
+            };
+            if player_shots != expected {
+                println!(
+                    "[combat-acceptance-fail] {map}: expected {expected} player shots (death={death_time:?}), measured {player_shots}"
+                );
+                firing_failures.push(format!("{map}: {player_shots}/{expected} player shots"));
+            }
+            if dead_player_shots != 0 {
+                println!(
+                    "[combat-acceptance-fail] {map}: {dead_player_shots} player shots after the player died at {death_time:?}"
+                );
+                firing_failures.push(format!(
+                    "{map}: {dead_player_shots} post-death player shots"
+                ));
+            }
         }
         // Preserve orphaned/destroyed controllers and weapon reload states too: looking only
         // at each pawn's final Controller pointer loses earlier lifecycle transitions.

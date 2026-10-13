@@ -11,7 +11,10 @@ use crate::reflect::function_flags as ff;
 use crate::reflect::property_flags as pf;
 use crate::tests::{Exp, build_package, compact};
 use crate::value::{Delegate, ObjRef, ObjectId, Value};
-use crate::vm::{HostRequest, Latent, MAX_HOST_REQUESTS, TraceKind, Vm, VmErrorKind, VmLimits};
+use crate::vm::{
+    FlashCueModelStage, HostRequest, Latent, MAX_HOST_REQUESTS, TraceKind, Vm, VmErrorKind,
+    VmLimits,
+};
 
 struct B {
     names: Vec<String>,
@@ -1410,6 +1413,59 @@ fn bodyless_call_fixture() -> Vec<u8> {
     b.func(calls_no_code, 0, 0, &code, 8, 0, ff::DEFINED);
     b.class(object, 0, add);
     b.build()
+}
+
+/// A class-default lvalue write: `obj'Object'.static.default.Flag = true;` then reading it back.
+/// `xiii.MapInfo.SaveInventoryForFlash` does exactly this to
+/// `XIIIPlayerPawn.default.bCollideWorld` around its spawn; before `place` handled
+/// `ClassContext` the write was `NotAPlace`, which aborted the whole `GenFlash` flash transition.
+fn class_default_lvalue_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let set_default = b.reserve(IMP_FUNCTION, object, "SetDefaultTrue");
+    let flag = b.reserve(B_BOOLPROP, object, "Flag");
+    let ret = b.reserve(B_BOOLPROP, set_default, "ReturnValue");
+    b.prop(flag, set_default, 0);
+    b.prop(ret, 0, PARM | RETURN_PARM);
+    // ClassContext serialises `<object> <u16 skip> <u8 size> <member>`.
+    let mut member = vec![0x2Du8, 0x02];
+    member.extend(compact(flag));
+    let member_size = member.len() as u8;
+    let mut context = vec![0x12u8, 0x20];
+    context.extend(compact(object));
+    context.extend([0x00, 0x00, member_size]);
+    context.extend(&member);
+    // LetBool(ClassContext(...), True);  return default.Flag;
+    let mut code = vec![0x14u8];
+    code.extend(&context);
+    code.push(0x27); // True
+    code.push(0x04); // EX_Return
+    code.extend(&member);
+    // Memory size: object references count `OBJECT_MEMORY_SIZE` (4) each, not their compact
+    // byte length (1 here), so the declared script size is 24, not the 15-byte stream.
+    let mem = 1 + 1 + 1 + 4 + 2 + 1 + 6 + 1 + 1 + 6;
+    b.func(set_default, 0, ret, &code, mem, 0, DEFINED);
+    b.class(object, 0, flag);
+    b.build()
+}
+
+#[test]
+fn class_default_lvalue_writes_the_default_object() {
+    let set = set_of(class_default_lvalue_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let obj = vm.spawn(g(&set, "Object"), "O").unwrap();
+    vm.set_active(obj, true);
+    // Before the write, the class default is false. The call must not error with `NotAPlace`.
+    let value = vm
+        .call_function(g(&set, "Object.SetDefaultTrue"), obj, vec![])
+        .expect("class-default lvalue write must be a place");
+    assert_eq!(
+        value,
+        Value::Bool(true),
+        "the write must land on default.Flag"
+    );
 }
 
 #[test]
@@ -10015,6 +10071,180 @@ fn presentation_fixture() -> Vec<u8> {
     b.class(object, 0, 0);
     b.class(actor, object, play_sound);
     b.build()
+}
+
+/// Generated data only: a level, an arbitrary flash sink and the presentation native.
+fn flash_cue_model_fixture(failing_callback: bool) -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let level = b.reserve(0, 0, "LevelInfo");
+    let sink = b.reserve(0, 0, "FlashSink");
+    let manager = b.reserve(IMP_OBJPROP, level, "FlashManager");
+    let pauser = b.reserve(IMP_OBJPROP, level, "Pauser");
+    let seen = b.reserve(IMP_INTPROP, sink, "Seen");
+    let music = b.reserve(IMP_FUNCTION, actor, "PlayMusic");
+    let sound = b.reserve(IMP_OBJPROP, music, "Sound");
+    let events = [
+        "BeginBeginFlash",
+        "EndBeginFlash",
+        "BeginEndFlash",
+        "EndEndFlash",
+    ]
+    .map(|name| b.reserve(IMP_FUNCTION, sink, name));
+    b.prop_with(manager, pauser, 0, &compact(actor));
+    b.prop_with(pauser, 0, 0, &compact(actor));
+    b.prop(seen, events[0], 0);
+    b.prop_with(sound, 0, pf::PARM, &compact(object));
+    b.func(music, 0, sound, &[], 0, 358, ff::FINAL | ff::NATIVE);
+    for (i, event) in events.into_iter().enumerate() {
+        let next = events.get(i + 1).copied().unwrap_or(0);
+        // Seen = stage; return;
+        let mut code = vec![0x0f, 0x01];
+        code.extend(compact(seen));
+        code.push(0x1d);
+        code.extend((i as i32 + 1).to_le_bytes());
+        code.extend([0x04, 0x0b]);
+        if failing_callback && i == 0 {
+            b.func(event, next, 0, &[], 0, 0, ff::FINAL | ff::NATIVE);
+        } else {
+            b.func(event, next, 0, &code, 13, 0, ff::DEFINED);
+        }
+    }
+    b.class(object, 0, 0);
+    b.class(actor, object, music);
+    b.class(level, actor, manager);
+    b.class(sink, actor, seen);
+    for name in ["Flash1", "Flash2", "Flash3", "FlashsEnd"] {
+        let cue = b.reserve(0, 0, name);
+        b.class(cue, object, 0);
+    }
+    b.build()
+}
+
+fn flash_cue_model_world(vm: &mut Vm<'_>, set: &ScriptSet) -> (ObjectId, ObjectId) {
+    let level = vm.spawn(g(set, "LevelInfo"), "Level").unwrap();
+    let sink = vm.spawn(g(set, "FlashSink"), "Sink").unwrap();
+    vm.set_active(sink, true);
+    vm.set_property(
+        level,
+        "FlashManager",
+        0,
+        Value::Object(Some(ObjRef::Instance(sink))),
+    );
+    (level, sink)
+}
+
+#[test]
+fn flash_cue_model_native_defers_dispatch_and_consumes_each_stage_once() {
+    for suspending in [false, true] {
+        let set = set_of(flash_cue_model_fixture(false));
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let (_, sink) = flash_cue_model_world(&mut vm, &set);
+        let caller = vm.spawn(g(&set, "Actor"), "MusicCaller").unwrap();
+        for (i, cue) in ["Flash1", "Flash2", "Flash3", "FlashsEnd"]
+            .into_iter()
+            .enumerate()
+        {
+            vm.call_function(
+                g(&set, "Actor.PlayMusic"),
+                caller,
+                vec![Value::Object(Some(ObjRef::Static(g(&set, cue))))],
+            )
+            .unwrap();
+            assert_eq!(vm.get_property(sink, "Seen"), Some(&Value::Int(i as i32)));
+            assert_eq!(vm.drain_events().len(), 1, "presentation request preserved");
+            if suspending {
+                assert!(vm.tick_suspending(0.1).is_empty());
+            } else {
+                vm.tick(0.1).unwrap();
+            }
+            assert_eq!(
+                vm.get_property(sink, "Seen"),
+                Some(&Value::Int(i as i32 + 1))
+            );
+            vm.set_property(sink, "Seen", 0, Value::Int(-1));
+            if suspending {
+                assert!(vm.tick_suspending(0.1).is_empty());
+            } else {
+                vm.tick(0.1).unwrap();
+            }
+            assert_eq!(
+                vm.get_property(sink, "Seen"),
+                Some(&Value::Int(-1)),
+                "no replay"
+            );
+            vm.set_property(sink, "Seen", 0, Value::Int(i as i32 + 1));
+        }
+    }
+}
+
+#[test]
+fn flash_cue_model_keeps_latest_stage_across_pause_and_ignores_absent_manager() {
+    for suspending in [false, true] {
+        let set = set_of(flash_cue_model_fixture(false));
+        let mut vm = Vm::new(&set, VmLimits::default());
+        // Missing level/manager is a legitimate no-op, just as retail guards its null pointer.
+        vm.queue_flash_cue_model(FlashCueModelStage::BeginBegin);
+        vm.tick(0.1).unwrap();
+        let (level, sink) = flash_cue_model_world(&mut vm, &set);
+        vm.set_property(level, "FlashManager", 0, Value::Object(None));
+        vm.queue_flash_cue_model(FlashCueModelStage::EndBegin);
+        vm.tick(0.1).unwrap();
+        assert_eq!(vm.get_property(sink, "Seen"), Some(&Value::Int(0)));
+        vm.set_property(
+            level,
+            "FlashManager",
+            0,
+            Value::Object(Some(ObjRef::Instance(sink))),
+        );
+        vm.set_property(
+            level,
+            "Pauser",
+            0,
+            Value::Object(Some(ObjRef::Instance(sink))),
+        );
+        vm.queue_flash_cue_model(FlashCueModelStage::BeginBegin);
+        vm.queue_flash_cue_model(FlashCueModelStage::EndEnd);
+        if suspending {
+            assert!(vm.tick_suspending(0.1).is_empty());
+        } else {
+            vm.tick(0.1).unwrap();
+        }
+        assert_eq!(vm.get_property(sink, "Seen"), Some(&Value::Int(0)));
+        vm.set_property(level, "Pauser", 0, Value::Object(None));
+        if suspending {
+            assert!(vm.tick_suspending(0.1).is_empty());
+        } else {
+            vm.tick(0.1).unwrap();
+        }
+        assert_eq!(vm.get_property(sink, "Seen"), Some(&Value::Int(4)));
+    }
+}
+
+#[test]
+fn flash_cue_model_callback_failure_reaches_both_tick_error_paths() {
+    for suspending in [false, true] {
+        let set = set_of(flash_cue_model_fixture(true));
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let (_, sink) = flash_cue_model_world(&mut vm, &set);
+        vm.queue_flash_cue_model(FlashCueModelStage::BeginBegin);
+        if suspending {
+            let errors = vm.tick_suspending(0.1);
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].0, sink);
+            assert!(matches!(
+                errors[0].1.kind,
+                VmErrorKind::UnimplementedNative { .. }
+            ));
+            assert!(!vm.objects[sink as usize].active);
+        } else {
+            assert!(matches!(
+                vm.tick(0.1).unwrap_err().kind,
+                VmErrorKind::UnimplementedNative { .. }
+            ));
+        }
+    }
 }
 
 #[test]
