@@ -229,6 +229,8 @@ pub enum FireOutcome {
     Fired,
     /// The player pawn has no `Weapon`: nothing to fire.
     NoWeapon,
+    /// The controller's death/end state rejects weapon input.
+    Suppressed,
     /// The script raised on the fire path (the error carries the VM stack).
     Error(String),
 }
@@ -599,8 +601,9 @@ impl Session {
         // (`dispatch_hook_player_moves`' PlayerMove window). Publishing them on every tick
         // overwrote the weapon `fire` path's `bFire` and wrote the driver's yaw over the
         // pawn pose a cinematic (`NoControl`) owns, on every map.
-        let hook_buttons = self.hook_owns_buttons();
-        let hook_axes = self.hook_owns_pawn();
+        let input_ended = self.player_input_ended();
+        let hook_buttons = !input_ended && self.hook_owns_buttons();
+        let hook_axes = !input_ended && self.hook_owns_pawn();
         if let Some(pc) = self.controller {
             if hook_buttons || self.hook_buttons_published {
                 let (fire, altfire) = if hook_buttons {
@@ -1041,11 +1044,25 @@ impl Session {
     /// rope only tracks `HookLength` there (`ProcessMove` 0x01BB..0x0237) and the retail player
     /// stays in control.
     fn script_owns_player_pawn(&self) -> bool {
-        self.controller.is_some_and(|pc| {
-            self.vm.is_in_state(pc, "NoControl")
-                || self.vm.is_in_state(pc, "ClimbToHookNavPoint")
-                || (self.controller_flag(pc, "bHooked") && self.player_physics() == Some(2))
-        })
+        // Retail Controller.Dead/GameEnded.PlayerMove supplies zero acceleration;
+        // XIII's GameEnded.BeginState sets PHYS_None on every pawn. A corpse is
+        // no longer a host-controlled walker: preserve that physics and pose instead
+        // of publishing another input-derived PHYS_Walking/Location over it.
+        self.player_input_ended()
+            || self.controller.is_some_and(|pc| {
+                self.vm.is_in_state(pc, "NoControl")
+                    || self.vm.is_in_state(pc, "ClimbToHookNavPoint")
+                    || (self.controller_flag(pc, "bHooked") && self.player_physics() == Some(2))
+            })
+    }
+
+    /// Native death/end input boundary, including the health write before the
+    /// standalone Dying callback has notified the controller.
+    pub fn player_input_ended(&self) -> bool {
+        let ended_state = self.controller.is_some_and(|pc| {
+            self.vm.is_in_state(pc, "Dead") || self.vm.is_in_state(pc, "GameEnded")
+        });
+        dead_pawn_is_native_owned(self.player_health(), ended_state)
     }
 
     /// Boolean property of an object through the generic property read (the VM's typed
@@ -2457,6 +2474,9 @@ impl Session {
     /// a held trigger that emptied the M60 (item76, measured on the Plage01 route). The
     /// windowed live path writes `bFire` from the button state every frame instead.
     pub fn fire(&mut self, yaw: f32, pitch: f32) -> FireOutcome {
+        if self.player_input_ended() {
+            return FireOutcome::Suppressed;
+        }
         let held = self
             .controller
             .and_then(|ctrl| self.vm.get_property(ctrl, "bFire").cloned());
@@ -3370,8 +3390,27 @@ fn instance_prop(vm: &Vm, id: ObjectId, name: &str) -> Option<ObjectId> {
     }
 }
 
+/// Health is written before the standalone tear-off/PlayDying callback. The
+/// host must relinquish motion at exactly zero HP, before controller notification.
+fn dead_pawn_is_native_owned(health: Option<f32>, ended_state: bool) -> bool {
+    ended_state || health.is_some_and(|health| health <= 0.0)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dead_player_authority_covers_zero_hp_before_dying_callback() {
+        assert!(super::dead_pawn_is_native_owned(Some(0.0), false));
+        assert!(super::dead_pawn_is_native_owned(Some(-34.0), false));
+        assert!(!super::dead_pawn_is_native_owned(Some(1.0), false));
+        assert!(!super::dead_pawn_is_native_owned(None, false));
+        // GameEnded also freezes a surviving pawn (mission success/failure),
+        // and a controller without a current pawn cannot drive the previous body.
+        assert!(super::dead_pawn_is_native_owned(Some(150.0), true));
+        assert!(super::dead_pawn_is_native_owned(None, true));
+        // Recovery must release the guard rather than retain a sticky dead bit.
+        assert!(!super::dead_pawn_is_native_owned(Some(38.0), false));
+    }
     #[test]
     fn cartoon_movement_release_preserves_slide_out_callbacks() {
         // Generated lifecycle: initial HUD render, movement releases the mission, panels

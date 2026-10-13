@@ -2389,6 +2389,16 @@ pub(crate) struct ScriptOutcome {
     pub ticks: u64,
     /// Wall-clock seconds spent in the loop.
     pub wall_secs: f32,
+    /// item97b: script time (seconds since the player gained control) at which the run first
+    /// relinquished player input (death/game-end state or an authored cinematic). `None` when the
+    /// player kept control for the whole run. The combat survey uses it to count only the
+    /// commanded shots issued while the player still had control.
+    #[allow(dead_code)] // test-evidence field (combat survey)
+    pub control_ended: Option<f32>,
+    /// item97b: the same boundary in VM time, so trace events (which carry VM time) can be
+    /// classified as before/after the player lost control.
+    #[allow(dead_code)] // test-evidence field (combat survey)
+    pub control_ended_vm: Option<f64>,
     /// Trace samples: `(tick, seconds, position UU, velocity UU/s)`.
     pub trace: Vec<(u64, f32, [f32; 3], [f32; 3])>,
     /// Map stem active at the end of the run.
@@ -2717,6 +2727,9 @@ fn run_script_inner(
         None => open_map_runtime(game_dir, map, scene, params)?,
     };
     let mut control_tick = (!options.wait_for_control).then_some(0);
+    // item97b: first script second at which the player lost input (death/game-end or a cinematic).
+    let mut control_ended: Option<f32> = None;
+    let mut control_ended_vm: Option<f64> = None;
     // Accumulated unresolved voice names across maps (the provider is re-installed per map).
     let mut voice_unresolved_total = 0u64;
     // Player footsteps (item6e): the same notify-free synthesis `fixed_step` uses, so the
@@ -2790,6 +2803,17 @@ fn run_script_inner(
             use_named.clear();
             heal = false;
             exec_inputs.clear();
+        }
+        // item97b: track the last tick at which player control was still active. Control can be
+        // taken for an authored cinematic and handed back, so the effective end is the *last*
+        // active tick, not the first suppressed one; consumers use it to count commanded shots
+        // issued while alive and to reject input after control ended.
+        if control_tick.is_some()
+            && !cinematics::input_suppressed(&runtime.session)
+            && !runtime.session.player_input_ended()
+        {
+            control_ended = Some(elapsed);
+            control_ended_vm = Some(runtime.session.vm_time());
         }
         let fired = input.fire;
         if runtime.volumes.is_empty() {
@@ -3079,6 +3103,8 @@ fn run_script_inner(
         session: runtime.session,
         ticks: tick,
         wall_secs: started.elapsed().as_secs_f32(),
+        control_ended,
+        control_ended_vm,
         trace,
         final_map: runtime.name,
         travel,
@@ -7950,6 +7976,451 @@ mod tests {
     }
 
     #[test]
+    fn opt_in_dead_player_native_guard() {
+        let Some(root) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR for death guard");
+            return;
+        };
+        let mut s = session::Session::open(&root, "Plage01").expect("death session");
+        let player = s.player;
+        let pc = s.controller.expect("controller");
+        let loc = s.player_location().expect("location");
+        let corpse = s
+            .vm()
+            .find_live_object("BaseSoldier6")
+            .expect("corpse regression soldier");
+        let corpse_loc = s
+            .vm()
+            .vector_prop(corpse, "Location")
+            .expect("corpse stand");
+        s.vm_mut()
+            .send_event(
+                corpse,
+                "TakeDamage",
+                vec![
+                    xiii_script::Value::Int(10000),
+                    xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(player))),
+                    xiii_script::Value::Vector(corpse_loc),
+                    xiii_script::Value::Vector([0.0; 3]),
+                    xiii_script::Value::Object(None),
+                ],
+            )
+            .expect("corpse setup by damage");
+        s.vm_mut()
+            .send_event(
+                player,
+                "TakeDamage",
+                vec![
+                    xiii_script::Value::Int(10000),
+                    xiii_script::Value::Object(None),
+                    xiii_script::Value::Vector(loc),
+                    xiii_script::Value::Vector([0.0; 3]),
+                    xiii_script::Value::Object(None),
+                ],
+            )
+            .expect("lethal damage");
+        for _ in 0..3 {
+            s.step(
+                1.0 / 60.0,
+                loc,
+                0.0,
+                [0.0; 3],
+                &session::PlayerVMModes::default(),
+            );
+        }
+        for id in [player, pc] {
+            let o = &s.vm().objects[id as usize];
+            println!(
+                "[death guard] {} state={:?} metadata={:?} controller={:?} touching={:?} collision={:?}",
+                o.name,
+                s.vm().state_name(id),
+                o.state.and_then(|r| s.vm().set().object(r)),
+                s.vm().get_property(id, "Controller"),
+                s.vm().get_property(id, "Touching"),
+                s.vm().get_property(id, "bCollideActors")
+            );
+        }
+        assert!(cinematics::input_suppressed(&s));
+        assert_eq!(s.fire(1.0, 0.0), session::FireOutcome::Suppressed);
+        // The native corpse can fall a few UU; compare against a zero-input death,
+        // rather than replacing that physics by a frozen-location approximation.
+        let mut control = session::Session::open(&root, "Plage01").expect("control death session");
+        let control_player = control.player;
+        let control_corpse = control
+            .vm()
+            .find_live_object("BaseSoldier6")
+            .expect("control soldier");
+        control
+            .vm_mut()
+            .send_event(
+                control_corpse,
+                "TakeDamage",
+                vec![
+                    xiii_script::Value::Int(10000),
+                    xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(control_player))),
+                    xiii_script::Value::Vector(corpse_loc),
+                    xiii_script::Value::Vector([0.0; 3]),
+                    xiii_script::Value::Object(None),
+                ],
+            )
+            .expect("control corpse");
+        control
+            .vm_mut()
+            .send_event(
+                control_player,
+                "TakeDamage",
+                vec![
+                    xiii_script::Value::Int(10000),
+                    xiii_script::Value::Object(None),
+                    xiii_script::Value::Vector(loc),
+                    xiii_script::Value::Vector([0.0; 3]),
+                    xiii_script::Value::Object(None),
+                ],
+            )
+            .expect("control lethal damage");
+        for _ in 0..3 {
+            control.step(
+                1.0 / 60.0,
+                loc,
+                0.0,
+                [0.0; 3],
+                &session::PlayerVMModes::default(),
+            );
+        }
+        for _ in 0..600 {
+            s.step(
+                1.0 / 60.0,
+                corpse_loc,
+                1.0,
+                [472.0, 0.0, 0.0],
+                &session::PlayerVMModes::default(),
+            );
+            control.step(
+                1.0 / 60.0,
+                loc,
+                0.0,
+                [0.0; 3],
+                &session::PlayerVMModes::default(),
+            );
+        }
+        assert_eq!(
+            s.player_location(),
+            control.player_location(),
+            "repeated input must not move the dead pawn relative to native corpse physics"
+        );
+        assert_eq!(
+            s.player_physics(),
+            control.player_physics(),
+            "host must not replace death physics"
+        );
+        assert_eq!(
+            s.inventory_snapshot().expect("dead inventory"),
+            control.inventory_snapshot().expect("control inventory"),
+            "dead host input must not auto-loot the searchable corpse"
+        );
+        assert!(!s.vm().trace.iter().any(|e|matches!(&e.kind, xiii_script::TraceKind::Event{function,..} if function.ends_with(".SearchPawn"))), "dead pawn must not acquire corpse inventory through host motion");
+    }
+
+    /// item97b: carry the measured Hual04a endpoint loadout into Hual04c through the game's own
+    /// `ExportTravel`/`AcceptInventory` path (no grants, no health writes), clear the encounter
+    /// by input, and extend Carrington's escort as far as it goes. Negative control for the
+    /// direct-entry route: the same soldiers are fought with the campaign's carried rifle.
+    #[test]
+    fn opt_in_hual04c_travel_loadout_route() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR for Hual04a endpoint travel loadout");
+            return;
+        };
+        let params = resolve_params(&game_dir).expect("player parameters").params;
+        let source_scene = viewer::load_scene(&Options {
+            game_dir: Some(game_dir.clone()),
+            map: Some("Hual04a".into()),
+            ..Default::default()
+        })
+        .expect("Hual04a scene");
+        let source_input =
+            script::Script::parse(include_str!("../../tests/data/hual04a_route.script"))
+                .expect("source input");
+        let mut source = run_script_with_cinematic_input(
+            &game_dir,
+            "Hual04a",
+            &source_input,
+            &params,
+            &source_scene,
+            620.0,
+        )
+        .expect("measured Hual04a endpoint");
+        println!(
+            "[travel-loadout source] health={:?} inventory={:?} travel={:?}",
+            source.session.player_health(),
+            source
+                .session
+                .inventory_snapshot()
+                .expect("source inventory"),
+            source.travel
+        );
+        // Labelled endpoint import: Hual04a's authored travel is blocked at Carrington's
+        // refused tp23. Use the production ExportTravel/AcceptInventory path, with no grants.
+        let next = travel::open_next_session(
+            &mut source.session,
+            &game_dir,
+            &travel::TravelPlan::parse("Hual04c.unr", 0, true).expect("measured destination"),
+        )
+        .expect("native travel import");
+        println!(
+            "[travel-loadout accepted] health={:?} inventory={:?}",
+            next.player_health(),
+            next.inventory_snapshot().expect("accepted inventory")
+        );
+        for (name, class) in next.inventory_items() {
+            if let Some(id) = next.vm().find_live_object(&name) {
+                println!(
+                    "[travel-loadout group] {class} group={:?} state={:?} ammo={:?}",
+                    next.vm().get_property(id, "InventoryGroup"),
+                    next.vm().state_name(id),
+                    next.vm().get_property(id, "AmmoType")
+                );
+            }
+        }
+        let scene = viewer::load_scene(&Options {
+            game_dir: Some(game_dir.clone()),
+            map: Some("Hual04c".into()),
+            ..Default::default()
+        })
+        .expect("destination scene");
+        let initial = build_map_runtime(&game_dir, "Hual04c", &scene, &params, next)
+            .expect("carried runtime");
+        let prefix = include_str!("../../tests/data/hual04c_route.script")
+            .replace("t=124.90 wait_travel", "")
+            .replace("t=113.20 switch_weapon 14", "")
+            .replace(
+                "t=69.00 next_item",
+                "t=68.00 next_item\nt=69.00 next_item\nt=70.00 next_item",
+            )
+            .replace("t=100.00 goto -678 746", "t=75.10 forward 0")
+            .replace("t=100.00", "t=75.10")
+            .replace("t=113.", "t=83.")
+            .replace("t=116.00", "t=86.00")
+            .replace("t=117.00 goto -1752 596", "t=87.00 goto -2000 1100")
+            .replace("t=120.00", "t=90.00");
+        let input = script::Script::parse(&format!(
+            "{prefix}\n{}",
+            include_str!("../../tests/data/hual04c_travel_combat.script")
+        ))
+        .expect("carried combat input");
+        let mut outcome = run_script_inner(
+            &game_dir,
+            "Hual04c",
+            &input,
+            &params,
+            &scene,
+            300.0,
+            true,
+            RunnerOptions {
+                initial: Some(initial),
+                stop_on_travel: true,
+                ..Default::default()
+            },
+        )
+        .expect("carried route");
+        let cine = outcome
+            .session
+            .vm()
+            .find_live_object("Cine0")
+            .expect("living escort");
+        let pc = outcome.session.controller.expect("player controller");
+        let los = outcome
+            .session
+            .vm_mut()
+            .send_event(
+                pc,
+                "LineOfSightTo",
+                vec![xiii_script::Value::Object(Some(
+                    xiii_script::ObjRef::Instance(cine),
+                ))],
+            )
+            .expect("measure authored visibility gate");
+        println!(
+            "[escort visibility] LOS={los:?} LastRenderTime={:?} time={:.3} hidden={:?}",
+            outcome.session.vm().get_property(cine, "LastRenderTime"),
+            outcome.session.vm_time(),
+            outcome.session.vm().get_property(cine, "bHidden")
+        );
+        let session = &outcome.session;
+        println!(
+            "[travel-loadout end] health={:?} position={:?} inventory={:?} travel={:?} goals={:?}",
+            session.player_health(),
+            session.player_location(),
+            session.inventory_snapshot().expect("final inventory"),
+            outcome.travel,
+            session.objective_states()
+        );
+        println!(
+            "[travel-loadout hands] one_hand={:?} mode={:?} weapon={:?}",
+            session
+                .vm()
+                .get_property(session.player, "bHaveOnlyOneHandFree"),
+            session
+                .controller
+                .and_then(|pc| session.vm().get_property(pc, "bWeaponMode")),
+            session.player_weapon()
+        );
+        survey::print_details(&survey::extract("Hual04c", &outcome));
+        for e in &session.vm().trace {
+            if let xiii_script::TraceKind::Event {
+                target,
+                function,
+                args,
+            } = &e.kind
+                && function.ends_with(".TakeDamage")
+                && target == &session.player_name
+            {
+                println!(
+                    "[carried damage] {:.3} {target} {function} {args:?}",
+                    e.time
+                );
+            }
+            if let xiii_script::TraceKind::Native {
+                path, args, result, ..
+            } = &e.kind
+                && path.ends_with(".WeaponChange")
+            {
+                println!(
+                    "[carried weaponchange] {:.3} {path} {args:?} => {result}",
+                    e.time
+                );
+            }
+        }
+        for name in [
+            "BaseSoldier28",
+            "BaseSoldier29",
+            "BaseSoldier30",
+            "BaseSoldier2",
+            "BaseSoldier4",
+            "BaseSoldier15",
+            "BaseSoldier31",
+            "BaseSoldier32",
+            "BaseSoldier33",
+            "BaseSoldier1",
+            "BaseSoldier0",
+            "BaseSoldier5",
+            "BaseSoldier10",
+            "BaseSoldier12",
+            "CineController2",
+            "Cine0",
+        ] {
+            if let Some(id) = session.vm().find_object(name) {
+                println!(
+                    "[travel-loadout actor] {name} state={:?} health={:?} position={:?} action={:?} paused={:?}",
+                    session.vm().state_name(id),
+                    session.vm().get_property(id, "Health"),
+                    session.vm().get_property(id, "Location"),
+                    session.vm().get_property(id, "ScriptedActionIndex"),
+                    session.vm().get_property(id, "flagsPaused")
+                );
+            }
+        }
+        if let Some(cine) = session.vm().find_live_object("Cine0") {
+            if let Some(xiii_script::Value::Array(actions)) =
+                session.vm().get_property(cine, "tabActions")
+            {
+                for (i, action) in actions.iter().enumerate().skip(20) {
+                    println!("[escort action] {i}: {action:?}");
+                }
+            }
+            if let Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(c)))) =
+                session.vm().get_property(cine, "CineController")
+            {
+                println!(
+                    "[escort live] {} action={:?} paused={:?} tag={:?}",
+                    session.vm().objects[*c as usize].name,
+                    session.vm().get_property(*c, "ScriptedActionIndex"),
+                    session.vm().get_property(*c, "flagsPaused"),
+                    session.vm().get_property(*c, "Tag")
+                );
+            }
+        }
+        assert!(
+            session.first_error().is_none(),
+            "{:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "carried player must survive"
+        );
+        // item97b positive clear pin: every first-encounter soldier died to player input. A
+        // `bDestroyWhenDead` soldier leaves the actor array once its death clip ends, so a
+        // missing actor and a negative-health actor are both a clear; a live positive actor is
+        // the failure this pins (it would mean the first encounter was left standing).
+        for name in ["BaseSoldier28", "BaseSoldier29", "BaseSoldier30"] {
+            if let Some(id) = session.vm().find_live_object(name) {
+                assert!(
+                    session.actor_health(id).is_some_and(|h| h <= 0.0),
+                    "{name} must be cleared by input"
+                );
+            }
+        }
+        // item97b positive resume pin: soldier28's death delivered `move_move_02` and Carrington's
+        // action27 `wait event move_move_02` resumed. The interpreter only advances its action
+        // index after that event gate clears, so a large index proves the resume by input.
+        let escort_actor = session
+            .vm()
+            .find_live_object("Cine0")
+            .expect("living escort actor");
+        let escort = match session.vm().get_property(escort_actor, "CineController") {
+            Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(c)))) => *c,
+            other => panic!("Cine0.CineController: {other:?}"),
+        };
+        assert_eq!(
+            session.vm().objects[escort as usize].name,
+            "CineController2"
+        );
+        assert_eq!(
+            session.vm().state_name(escort).as_deref(),
+            Some("PlayingSequence"),
+            "the escort interpreter must still be running"
+        );
+        let action_index = match session.vm().get_property(escort, "ScriptedActionIndex") {
+            Some(xiii_script::Value::Int(i)) => *i,
+            other => panic!("escort ScriptedActionIndex: {other:?}"),
+        };
+        assert!(
+            action_index > 27,
+            "Carrington's action27 wait for move_move_02 must resume and advance the escort: index {action_index}"
+        );
+        // item97b precise next-blocker pin: the escort has walked the whole post-combat leg and
+        // now waits at action85 on the `vasypepechuismortthird` kill-count event (the northern
+        // end-of-track assault, BaseSoldier34 'Attackattheendofthetrack'). The carried 38 HP (no
+        // armour/medkit) survives the two sniper gauntlets at 2 HP, so it cannot clear that fight.
+        let current_action = match session.vm().get_property(escort_actor, "tabActions") {
+            Some(xiii_script::Value::Array(actions)) => {
+                actions.get(action_index as usize - 1).cloned()
+            }
+            other => panic!("Cine0.tabActions: {other:?}"),
+        };
+        assert_eq!(
+            current_action,
+            Some(xiii_script::Value::Str(
+                "wait event vasypepechuismortthird".to_owned()
+            )),
+            "the escort's measured next blocker must be the vosypepechus kill-event wait"
+        );
+        assert!(
+            outcome.travel.is_empty(),
+            "the blocked escort must not travel"
+        );
+        let goals = session.objective_states();
+        for index in [0, 2, 3] {
+            assert!(
+                !goals[index].completed,
+                "unreached objective {index}: {goals:?}"
+            );
+        }
+    }
+
+    #[test]
     fn opt_in_hual04c_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
@@ -7995,6 +8466,50 @@ mod tests {
             session.player_health()
         );
         survey::print_details(&survey::extract("Hual04c", &outcome));
+        // These are placed live soldiers, not generated enemies or the map's pending-kill
+        // copies. Soldier28's death emits move_move -> CineTrigger10 -> move_move_02;
+        // soldiers29/30 instead feed the later five-death voielibre counter.
+        for name in ["BaseSoldier28", "BaseSoldier29", "BaseSoldier30"] {
+            let soldier = vm
+                .find_live_object(name)
+                .expect("live first-encounter soldier");
+            assert_eq!(
+                vm.get_property(soldier, "Health"),
+                Some(&xiii_script::Value::Int(150)),
+                "unresolved encounter soldier {name}"
+            );
+            assert_eq!(
+                vm.get_property(soldier, "bIsDead"),
+                Some(&xiii_script::Value::Bool(false)),
+                "{name} must remain alive at the prefix blocker"
+            );
+            let Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(controller)))) =
+                vm.get_property(soldier, "Controller")
+            else {
+                panic!("{name} must retain its live AI controller");
+            };
+            assert_eq!(
+                vm.state_name(*controller).as_deref(),
+                Some("AttaqueScriptee"),
+                "authored first attack must remain active for {name}"
+            );
+            println!(
+                "[hual04c encounter] {name} location={:?} health=150 AI=AttaqueScriptee",
+                vm.get_property(soldier, "Location")
+            );
+        }
+        let counter = vm
+            .find_live_object("CineTrigger7")
+            .expect("later combat counter");
+        assert_eq!(
+            vm.get_property(counter, "Count"),
+            Some(&xiii_script::Value::Int(5)),
+            "no first-canyon soldier death has yet fed voielibre"
+        );
+        let buffer = vm
+            .find_live_object("CineTrigger10")
+            .expect("first combat event buffer");
+        assert_eq!(vm.state_name(buffer).as_deref(), Some("BufferTrigger"));
         assert!(
             session.first_error().is_none(),
             "{:?}",
@@ -8175,6 +8690,25 @@ mod tests {
         .expect("run Hual04a route");
         let session = &outcome.session;
         let vm = session.vm();
+        println!(
+            "[hual04a loadout] health={:?} inventory={:?}",
+            session.player_health(),
+            session
+                .inventory_snapshot()
+                .expect("strict measured endpoint inventory")
+        );
+        for name in [
+            "StunningSkill",
+            "bHaveStunningSkill",
+            "Skills",
+            "Armor",
+            "Armour",
+        ] {
+            println!(
+                "[hual04a skill] {name}={:?}",
+                vm.get_property(session.player, name)
+            );
+        }
         let mi = session.map_info().expect("Hual04a MapInfo");
         let error = session.first_error().map(ToString::to_string);
         println!(
