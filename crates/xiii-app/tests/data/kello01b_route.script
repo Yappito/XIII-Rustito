@@ -1,0 +1,36 @@
+# Kello01b input route (UU/seconds): first route by player input.
+# The PlayerStart is on the snow mountain's north flank (rotation yaw 3496 = 19.2 deg ENE);
+# the level's own facing is the descent. Hold that facing east along y~4700-4900, then turn
+# south at x~-2.7k and drop the east face of the massif to the chalet snow field (z~2075).
+# No teleports, grants, goal writes or control overrides.
+#
+# The chalet's north wall (K_chalet03) blocks a straight approach; the front door Porte0
+# (XIDCine.Porte, XIIIPorte.PlayerTriggerToggle, KeyNum 0) opens through its own
+# PlayerTrigger (the Grab key) and then swings its leaf ~96 deg. Walking straight south into
+# the opening wedges the player on the swung leaf, so the route retreats north, re-approaches
+# the doorway from the west of the hinge, and enters; TouchTrigger2 (Event='XIII_dans_chalet')
+# then fires the Cine0 cutscene (CineController21 -> PlayingSequence). The route ends here:
+# the cutscene's `wait event fin_transition` needs the flashback chain (Cine1), goal 0
+# ("Cover Kim's escape") and goal 1 ("Find Jones and Carrington again") and the travel stay
+# unreached; this is a first route, not a completed mission.
+t=0.50 forward 1
+t=35.0 forward 0
+t=36.0 goto -2800 4600
+t=44.0 goto -2700 4200
+t=52.0 goto -2600 3800
+t=60.0 goto -2500 3400
+t=68.0 goto -2400 2900
+t=76.0 goto -2300 2400
+t=84.0 goto -2200 1900
+t=92.0 goto -2100 1400
+t=100.0 goto -2000 900
+t=108.0 goto -2000 500
+t=116.0 goto -2300 400
+t=124.0 goto -2600 440
+t=130.0 use Porte0
+t=138.0 goto -2560 520
+t=148.0 goto -2950 480
+t=158.0 goto -2870 220
+t=168.0 goto -2830 -20
+t=178.0 goto -2784 -90
+t=240.0 wait_travel

@@ -4542,14 +4542,18 @@ mod tests {
     /// TestGoalComplete -> DoTravel -> EndGame -> GameEndedSuccess -> PlayingVideo ->
     /// PlayingVideo.PlayerTick -> ServerTravel` chain as Plage01. The route fixture
     /// (`tests/data/banque01_route.script`) walks onto the map's own trigger/volume actors and
-    /// keeps four labelled flow teleports whose legs are re-measured unwalkable on main
-    /// (item75: the strongroom is sealed at the safe level and the platform level and nothing
-    /// in the map opens it, the lift cannot be called from the hall and both known rides —
-    /// the direct cage use and the internal-button manager cycle — end against sealed BSP or
-    /// a floor-2 corridor dead end, and the shaft wall y=-2080 and the banksortiescasecour
-    /// tower enclose the TT2 landing). The old t=139 TT10 teleport is gone: the fbi_dial2
-    /// cutscene owns the player pose from t=133.017, so it never relocated the player nor
-    /// fired TouchTrigger10 (measured); the CarOut beat does not fire in this engine run.
+    /// keeps four labelled flow teleports whose legs are re-measured unwalkable on this tree
+    /// (item93, by input and `box-probe`: the strongroom is sealed at the safe level
+    /// (Model69 x=-6976, z 800..1312) and the platform level (x=-7360, z 1312..1504) and nothing
+    /// in the map opens it; the lift cage has no floor collision and the closed outer doors
+    /// answer the ray use with the empty `PlayerTrigger`, so no ride carries a player; the
+    /// shaft wall y=-2080 and the floor-2 corridor's desk + full-height hall wall y=-3664
+    /// dead-end the TT2 side; the banksortiescasecour tower's ramp face and east cheek x=998.2
+    /// stall every walk-off/jump from the TT2 landing and the courtyard's own walls allow no
+    /// street-side entry). The old t=139 TT10 teleport is gone: the fbi_dial2 cutscene owns the
+    /// player pose from t=134.017 (the TT3/TT11 touch tick, measured), so it never relocated
+    /// the player nor fired TouchTrigger10 (measured); the CarOut beat does not fire in this
+    /// engine run.
     ///
     /// item86 re-time on the integrated volume-brush tree: `DetectionVolume12` now uses its
     /// `Brush` BSP (x in (-7824,-7616), y in (-2784,-2336), z in (784,1248), measured), so its
@@ -5863,16 +5867,14 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        // item40e: fire at the awake killer (see `plage01_killer_awake_prefix`). The walked
-        // route's T7 shore touch wakes him at ~289.6 s; he then hunts the player's position, so
-        // the probe stands where the route stands - the truck shore (PathNode47) - where he
-        // settles at the water's edge ~(1127,-13750), ~730 UU out, from ~300 s (measured round
-        // 9, scratch r9_route1; the old southern spot (1771,-13200) is now point-blank to his
-        // approach path and the shots exit through the floor, scratch r8_fight1). Tracking
-        // stays on through the burst so the aim follows him while he walks in; the settled
-        // shots land 25 hp Beretta hits against his authored 125 hp.
+        // item91b: the T7 shore touch wakes the killer at ~289.6 s. Mesh primitive
+        // import removes the old WallExtinguisher cylinder shielding during the prefix;
+        // the player reaches this fight with 29 HP. The old truck-shore stand shoots
+        // StaticMeshActor3 while he approaches and dies before he clears it. This labelled
+        // diagnostic teleport stands north of his approach, with a clear firing lane.
+        // Measured: five 31 HP hits at292.5..294.7 kill him; player survives with20 HP.
         let script = script::Script::parse(&format!(
-            "{}t=291.00 teleport 643.2 -14174.5 1087.0\n\
+            "{}t=291.00 teleport 1802.0 -12700.0 1100.0\n\
              t=291.00 track BaseSoldier6\n\
              t=291.10 weapon XIII.Beretta\n\
              t=292.50 fire\nt=293.05 fire\nt=293.60 fire\nt=294.15 fire\nt=294.70 fire\n\
@@ -5913,6 +5915,18 @@ mod tests {
             weapon.map(|w| s.vm().objects[w as usize].name.clone())
         );
         assert!(weapon.is_some(), "the player must hold the granted weapon");
+        assert_eq!(
+            s.player_health(),
+            Some(20.0),
+            "measured surviving fight health"
+        );
+        let position = s.vm().location_prop(s.player).expect("player location");
+        assert!(
+            (position[0] - 1802.0).abs() < 1.0
+                && (position[1] + 12700.0).abs() < 1.0
+                && (position[2] - 1072.443).abs() < 1.0,
+            "measured diagnostic shooter stand: {position:?}"
+        );
         assert!(
             dead || health.is_some_and(|h| h <= 0.0),
             "BaseSoldier6 did not die: health {health:?}, dead {dead}"
@@ -7953,7 +7967,12 @@ mod tests {
             let command = line.split('#').next().unwrap_or("");
             ["teleport", "weapon ", "item ", "set_goal", "take_control"]
                 .iter()
-                .any(|forbidden| command.contains(forbidden))
+                .any(|forbidden| {
+                    command
+                        .split_whitespace()
+                        .nth(1)
+                        .is_some_and(|word| word == forbidden.trim())
+                })
         }));
         let script = script::Script::parse(text).expect("parse Hual04c route");
         let outcome = run_script_with_cinematic_input(
@@ -7962,7 +7981,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            120.0,
+            125.0,
         )
         .expect("run Hual04c route");
         let session = &outcome.session;
@@ -8021,14 +8040,34 @@ mod tests {
         let carrington = vm.find_object("Cine0").expect("ground Carrington");
         assert_eq!(
             vm.get_property(carrington, "CurrentScript"),
-            Some(&xiii_script::Value::Int(-1)),
-            "the ground escort sequence has not started"
+            Some(&xiii_script::Value::Int(0)),
+            "the ground escort must start through TouchTrigger4"
+        );
+        let escort = vm
+            .find_object("CineController2")
+            .expect("Carrington interpreter");
+        assert_eq!(
+            vm.get_property(escort, "ScriptedActionIndex"),
+            Some(&xiii_script::Value::Int(27)),
+            "first encounter wait event move_move_02"
+        );
+        assert_eq!(
+            vm.get_property(escort, "flagsPaused"),
+            Some(&xiii_script::Value::Int(2)),
+            "retail event wait bit"
+        );
+        let weapon = session
+            .player_weapon()
+            .expect("direct-entry default melee weapon");
+        assert!(
+            vm.is_a(weapon, "Fists"),
+            "group14 selection cannot create the missing campaign rifle"
         );
         let position = session.player_location().expect("player position");
-        for (actual, expected) in position.into_iter().zip([-1170.363, 56.460, 295.766]) {
+        for (actual, expected) in position.into_iter().zip([-1772.34, 617.889, -1971.271]) {
             assert!(
                 (actual - expected).abs() < 0.5,
-                "roof/grapple blocker pin moved: {position:?}"
+                "ground escort/combat pin moved: {position:?}"
             );
         }
         let pawns = session.player_pawn_actors();
@@ -8036,8 +8075,8 @@ mod tests {
         let pawn = pawns[0].0;
         assert_eq!(
             vm.get_property(pawn, "Physics"),
-            Some(&xiii_script::Value::Byte(11)),
-            "player holds the ladder top while attempting the grapple"
+            Some(&xiii_script::Value::Byte(1)),
+            "the player must land and walk to the ground escort"
         );
         let mi = session.map_info().expect("Hual04c MapInfo");
         assert_eq!(
@@ -8047,15 +8086,37 @@ mod tests {
         let hook = vm.find_object("Hook").expect("game-supplied grapple");
         assert_eq!(
             vm.get_property(hook, "bHooked"),
-            Some(&xiii_script::Value::Bool(false))
+            Some(&xiii_script::Value::Bool(false)),
+            "use releases the rope near the canyon floor"
         );
+        let locked_name = vm
+            .trace
+            .iter()
+            .find_map(|event| match &event.kind {
+                xiii_script::TraceKind::StateChange { actor, to, .. }
+                    if actor.starts_with("HookProjectile") && to.as_deref() == Some("Locked") =>
+                {
+                    Some(actor)
+                }
+                _ => None,
+            })
+            .expect("locked projectile trace");
+        // The escape event destroys the used anchor and release reaps its projectile.
+        // Pin their actual Touch and successful native placement rather than live objects.
+        assert!(vm.trace.iter().any(|event| matches!(&event.kind, xiii_script::TraceKind::Event { target, function, args } if target == locked_name && function == "XIIIProjectile.Touch" && args.first().is_some_and(|arg| arg == "HookPoint1"))), "the hook must contact the authored escape anchor");
+        let anchor_arg = "vect(-688.65295,60.903763,283.35825)".to_owned();
+        assert!(vm.trace.iter().any(|event| matches!(&event.kind, xiii_script::TraceKind::Native { this, path, args, result, .. } if this == locked_name && path == "Actor.SetLocation" && args.first() == Some(&anchor_arg) && result == "true")), "attachment is to the authored HookPoint1");
         let releases: Vec<_> = vm
             .trace
             .iter()
             .filter_map(|event| match &event.kind {
-                xiii_script::TraceKind::Event { function, args, .. }
-                    if function == "HookProjectile.ProcessTouch"
-                        || function == "Hook.HookInUse.Release" =>
+                xiii_script::TraceKind::Event {
+                    target,
+                    function,
+                    args,
+                    ..
+                } if (target == locked_name && function == "XIIIProjectile.Touch")
+                    || function == "Hook.HookInUse.Release" =>
                 {
                     Some(format!("{function} {args:?}"))
                 }
@@ -8067,13 +8128,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        println!("[hual04c grapple blocker] {releases:?}");
         assert!(
-            releases.iter().any(|text| text == "Releasing hook because Projectile hit wall BreakAbleMover44 (should not happen...)."),
-            "the roof attachment must reach the measured snow-plaque collision failure"
+            !releases
+                .iter()
+                .any(|text| text.contains("BreakAbleMover44")),
+            "mesh-external snow-plaque Touch must not release the attached hook: {releases:?}"
         );
         println!(
-            "[hual04c next blocker] cabin opening climbed to z=302.4, HookPoint1 attempted from the roof, returns to ladder top (-1170.363,56.460,295.766); grapple projectile releases on a mover Touch; goals 0/2/3 and kello01a travel unreached"
+            "[hual04c next blocker] HookPoint1 lock/descent/release and ground escort reached; Carrington action27 waits for move_move_02 (first combat clear). Direct-entry rifle selection leaves Fists; campaign ranged loadout/first encounter unresolved, goals0/2/3 and kello01a travel unreached. inventory={:?}",
+            session.inventory_items()
         );
     }
 
@@ -8346,6 +8409,133 @@ mod tests {
         );
         println!(
             "[hual04a next blocker] item94: goal 5 is `Rejoin Carrington in front of the cable-car cabin`. The player now walks the full station route down to the boarding platform at `PositionInfo23` (945.8,393.8,-105) below the station floor. The blocker is the post-lever cine: `on event TeleOn label00` jumps Carrington's `CineController2` sequence to `tabActions[52]`; action[54] `tp 23` calls `CineController2.TeleportTo(PositionInfo23)` -> `Actor.SetLocation`, but the VM's world-placement check (`point_free`, an approximation of `ULevel::FindSpot` 0x1038a080, called from `ULevel::FarMoveActor` 0x1038a440) refuses it because the cine pawn's extent overlaps one BSP triangle of `Model639` at the destination. Carrington therefore stays near `PositionInfo18`, the cine is parked at `wait player 128` (tabActions[61]), and `event LaFinDeLaMap` (tabActions[95]) is never fired, so goal 5 and the Hual04c travel stay unreached (travel=[]). The item92/item81 `PC.Pawn.SetBase` carry hypothesis is refuted: `Telepherique.STA_init.Trigger` sets `PC` only when `Level.Title == \"Hual04c\"`."
+        );
+    }
+
+    /// item99: the first Kello01b route driven entirely by retail input. The PlayerStart sits on
+    /// the snow mountain's north flank facing ENE (yaw 3496); the script holds that facing east
+    /// along the flank, turns south and drops the east face of the massif to the chalet snow
+    /// field, opens the front door `Porte0` with the retail Grab key (`use Porte0`, which runs the
+    /// door's own `XIIIPorte.PlayerTriggerToggle.PlayerTrigger`), re-approaches the doorway from
+    /// the open leaf's hinge side and enters; `TouchTrigger2` (`Event='XIII_dans_chalet'`) then
+    /// starts the Cine0 cutscene (`CineController21` -> `PlayingSequence`).
+    ///
+    /// The route is honest about what it reaches: the player survives, no objective is completed
+    /// and there is no travel. The next blocker is the Cine0 sequence itself, whose
+    /// `wait event fin_transition` needs the flashback chain (Cine1, whose pawn sits in the
+    /// far-west flashback room); goal 0/1 and the `PRock01a` travel stay unreached. See the report.
+    #[test]
+    fn opt_in_kello01b_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Kello01b".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Kello01b");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let text = include_str!("../../tests/data/kello01b_route.script");
+        assert!(!text.lines().any(|line| {
+            let command = line.split('#').next().unwrap_or("");
+            ["teleport", "weapon ", "item ", "set_goal", "take_control"]
+                .iter()
+                .any(|forbidden| command.contains(forbidden))
+        }));
+        let script = script::Script::parse(text).expect("parse Kello01b route");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Kello01b",
+            &script,
+            &resolved.params,
+            &scene,
+            300.0,
+        )
+        .expect("run Kello01b route");
+        let session = &outcome.session;
+        let vm = session.vm();
+        println!(
+            "[kello01b route] error={:?} objectives={:?} travel={:?} position={:?} health={:?} touches={:?}",
+            session.first_error(),
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health(),
+            session.touches(),
+        );
+        survey::print_details(&survey::extract("Kello01b", &outcome));
+        assert!(
+            session.first_error().is_none(),
+            "{:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(session.blocked.is_empty(), "{:?}", session.blocked);
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "player must survive"
+        );
+        // The mountain descent and the door entry are a fall-and-walk route, so the player is
+        // below full health (measured 102/150); still alive.
+        assert!(
+            session.player_health().is_some_and(|h| h < 150.0),
+            "the descent must cost some fall damage: {:?}",
+            session.player_health()
+        );
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 2, "the map authors two objectives: {goals:?}");
+        assert!(
+            !goals[0].completed,
+            "goal 0 (cover Kim's escape) is not completed by this first route: {goals:?}"
+        );
+        assert!(
+            !goals[1].completed,
+            "goal 1 (find Jones and Carrington again) is not completed by this first route: {goals:?}"
+        );
+        assert!(outcome.travel.is_empty(), "the route must not travel");
+        // Measured progress: the player entered the chalet and triggered the `XIII_dans_chalet`
+        // cutscene. `CineController21` interprets the Cine0 (Kim) sequence; it was in `STA_init`
+        // at level start and is `PlayingSequence` once TouchTrigger2 fires.
+        assert!(
+            session
+                .touches()
+                .iter()
+                .any(|(_, name)| name == "TouchTrigger2"),
+            "the player must reach TouchTrigger2 (XIII_dans_chalet): {:?}",
+            session.touches()
+        );
+        let cine0 = vm
+            .find_object("CineController21")
+            .expect("Cine0 controller");
+        assert_eq!(
+            vm.state_name(cine0).as_deref(),
+            Some("PlayingSequence"),
+            "touching the chalet trigger must start the Cine0 cutscene"
+        );
+        let position = session.player_location().expect("player position");
+        for (actual, expected) in position.into_iter().zip([-2750.0, -473.9, 2106.0]) {
+            assert!(
+                (actual - expected).abs() < 1.0,
+                "chalet interior pin moved: {position:?}"
+            );
+        }
+        assert_eq!(
+            vm.get_property(
+                session.map_info().expect("Kello01b MapInfo"),
+                "NextMapLevelWithUnr"
+            ),
+            Some(&Value::Str("PRock01a.unr".to_owned()))
+        );
+        println!(
+            "[kello01b next blocker] item99: the descent and the Porte0 door entry are reached; the route ends \
+             inside the chalet with CineController21 (Cine0/Kim) in PlayingSequence. Cine0's `debut_flash` \
+             branch then `freezeplayer` and `wait event fin_transition`, which needs the flashback chain \
+             (Cine1, whose pawn is in the far-west flashback room reached only by `playerevent flash`); the \
+             sequence never reaches `premiere_explosion`/`checkpoint`, so `event objectif99` (goal 0 primary), \
+             goal 0/1 completion and the PRock01a travel stay unreached (travel=[]). The player is pinned \
+             against the chalet wardrobe (K_armoir02) while the cutscene plays."
         );
     }
 }

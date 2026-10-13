@@ -475,7 +475,9 @@ pub fn build_map_providers(
         // RVA 0xE54F0) and calls `ULevel::SingleLineCheck` (RVA 0x8B680), which tests `TRACE_Level`
         // (0x4) and the actors' world-geometry flags; excluding static meshes was **not** proven
         // and would let every zero-extent trace pass through static-mesh walls.
-        Some(Box::new(WorldPhysicsAdapter::from_scene(&scene)) as Box<dyn WorldPhysics>)
+        Some(Box::new(WorldPhysicsAdapter::from_scene_and_install(
+            &scene, root, map,
+        )?) as Box<dyn WorldPhysics>)
     } else {
         None
     };

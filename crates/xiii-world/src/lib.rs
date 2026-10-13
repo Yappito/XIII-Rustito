@@ -170,6 +170,8 @@ pub struct WorldScene {
     /// Actor-local line-query products in placed Bevy space, including non-blocking actors
     /// admitted by script traces. Empty sets are known misses, not absent mesh data.
     pub actor_line_primitives: BTreeMap<String, Vec<[[f32; 3]; 3]>>,
+    /// PointCheck geometry, independent of movement blocking and line collision selection.
+    pub actor_point_primitives: BTreeMap<String, Vec<[[f32; 3]; 3]>>,
     /// BSP zones of the level: actor metadata, sky flag and per-zone geometry counts.
     pub zones: Vec<zones::SceneZone>,
     /// Indices into [`WorldScene::zones`] of the sky zones (`is_sky`), in increasing order.
@@ -1563,7 +1565,6 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
         if a.hidden {
             im.scene
                 .count(&format!("skip.actor.hidden ({class_short})"), 1);
-            continue;
         }
         if let Some(dt) = a.draw_type
             && dt != 8
@@ -1638,14 +1639,16 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                 };
                 for (mesh, label) in converted.sections {
                     label0.clone_from(&label);
-                    im.scene.objects.push(SceneObject {
-                        mesh,
-                        transform,
-                        path: format!("{} -> {label}", a.path),
-                        placement: Some(eff),
-                        zone,
-                        colors: object_colors.clone(),
-                    });
+                    if !a.hidden {
+                        im.scene.objects.push(SceneObject {
+                            mesh,
+                            transform,
+                            path: format!("{} -> {label}", a.path),
+                            placement: Some(eff),
+                            zone,
+                            colors: object_colors.clone(),
+                        });
+                    }
                 }
                 // Per-query-kind evidence: which collision set the rule chose, whether the flag
                 // requested the simplified model but the mesh had none (fallback to set 0), and
@@ -1687,6 +1690,17 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                         .map(|t| t.map(|v| apply_transform(&transform, v)))
                         .collect(),
                 );
+                im.scene.actor_point_primitives.insert(
+                    a.path.to_ascii_lowercase(),
+                    converted
+                        .collision_box
+                        .iter()
+                        .map(|t| t.map(|v| apply_transform(&transform, v)))
+                        .collect(),
+                );
+                if a.hidden {
+                    continue;
+                }
                 // Primitive queries honor the actor's extent-specific trace flags, including
                 // editor preview meshes serialized on navigation actors. Actor line primitives
                 // above remain available to the VM, which applies its own ShouldTrace filter.
