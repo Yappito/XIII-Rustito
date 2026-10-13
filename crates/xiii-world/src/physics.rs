@@ -1099,4 +1099,105 @@ mod tests {
         );
         assert!(hit.normal[2] > 0.9, "floor normal {:?}", hit.normal);
     }
+
+    /// Count of a lift cage's triangles lying in one horizontal plane (Unreal Z), per soup.
+    ///
+    /// item96 regression: a mover's mesh whose simplified collision set is absent takes the
+    /// per-triangle set for BOTH query kinds; a future importer change that drops those
+    /// triangles (or a partition that misses the mover) leaves the cage without a floor and
+    /// the ride carries nobody. The plane test is rotation-invariant (yaw/pitch keep Z).
+    fn cage_floor_planes(scene: &crate::WorldScene, line_soup: bool, z_unreal: f32) -> usize {
+        use xiii_decode::common::UNREAL_UNITS_PER_METER;
+        let entries: Vec<([[f32; 3]; 3], u32)> = if line_soup {
+            scene.line_collision().collect()
+        } else {
+            scene.box_collision().collect()
+        };
+        entries
+            .into_iter()
+            .filter(|(tri, source)| {
+                scene
+                    .collision_sources
+                    .get(*source as usize)
+                    .is_some_and(|s| s.starts_with("LiftCage0 -> "))
+                    && tri
+                        .iter()
+                        .all(|v| (v[1] * UNREAL_UNITS_PER_METER - z_unreal).abs() < 2.0)
+            })
+            .count()
+    }
+
+    #[test]
+    fn opt_in_banque01_and_hual02_lift_cage_floors_reach_both_soups() {
+        let Some(root) = std::env::var_os("XIII_GOG_DIR") else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let path = std::path::PathBuf::from(&root);
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = if path.is_relative() {
+            ws.join(path)
+        } else {
+            path
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+
+        // Banque01 (item96): the `Staticbanque.bankascenseur` cage (BasePos z 1027) has its
+        // cabin floor slab at world Z 991 (local -36) and inner floor at 1007 (local -20).
+        // Measured planes: `xiii-tool box-probe Banque01 --from 1296,-1920,400 --to
+        // 1296,-1920,1200` lists tris 6125/6126 at 991 and 6132/6133/6379/6380 at 1007 under
+        // `LiftCage0 -> Staticbanque.bankascenseur`.
+        let scene = import_map(&mut cache, "Banque01").expect("import Banque01");
+        for (z, min, what) in [(991.0, 2, "cabin floor"), (1007.0, 2, "inner floor")] {
+            let (box_tris, line_tris) = (
+                cage_floor_planes(&scene, false, z),
+                cage_floor_planes(&scene, true, z),
+            );
+            println!("Banque01 cage {what} z={z}: box {box_tris}, line {line_tris}");
+            assert!(
+                box_tris >= min,
+                "Banque01 lift cage {what} (z={z}) missing from the box soup: {box_tris}"
+            );
+            assert!(
+                line_tris >= min,
+                "Banque01 lift cage {what} (z={z}) missing from the line soup: {line_tris}"
+            );
+        }
+
+        // Hual02 (item75's working ride): the `fredprivate.ascenseur` cage (BasePos z -4725)
+        // HAS a simplified collision set (10 triangles), so the box soup takes the simplified
+        // hull while the line soup keeps the 72-triangle per-triangle set (measured:
+        // box 10 / line 72). The hull planes are local -132.1/+131.9 (world -4857/-4593); the
+        // per-triangle interior floor is local -22.7 (world -4747.7) with the bottom slab at
+        // -4869.3. Both selections must keep their floor planes or the ride breaks.
+        let scene = import_map(&mut cache, "Hual02").expect("import Hual02");
+        // Measured soup membership per plane (the hull planes exist in both sets — the
+        // per-triangle set repeats the hull's slab planes at local -132.1/+131.9 — while the
+        // interior planes are per-triangle only). The lock: the box soup (what a walking
+        // player lands on) keeps the hull planes and keeps the interior floor OUT of it; a
+        // change that put set 0 into the box soup would silently move the rider 109.4 UU up,
+        // and a change that dropped the hull would remove the ride's standing surface.
+        for (z, want_box, want_line, what) in [
+            (-4857.0, true, true, "hull floor"),
+            (-4593.0, true, true, "hull roof"),
+            (-4869.3, false, true, "bottom slab"),
+            (-4747.7, false, true, "interior floor"),
+        ] {
+            let (box_tris, line_tris) = (
+                cage_floor_planes(&scene, false, z),
+                cage_floor_planes(&scene, true, z),
+            );
+            println!("Hual02 cage {what} z={z}: box {box_tris}, line {line_tris}");
+            assert_eq!(
+                box_tris >= 2,
+                want_box,
+                "Hual02 lift cage {what} (z={z}) box-soup membership is wrong: box {box_tris}, line {line_tris}"
+            );
+            assert_eq!(
+                line_tris >= 2,
+                want_line,
+                "Hual02 lift cage {what} (z={z}) line-soup membership is wrong: box {box_tris}, line {line_tris}"
+            );
+        }
+    }
 }

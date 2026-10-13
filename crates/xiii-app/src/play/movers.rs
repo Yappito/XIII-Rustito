@@ -471,6 +471,74 @@ mod tests {
     }
 
     #[test]
+    fn a_mover_partitioned_from_a_set0_only_mesh_floor_blocks_and_carries() {
+        // item96: a mover mesh whose simplified collision set is absent (Banque01's
+        // `bankascenseur`) contributes its per-triangle set to the box soup; the partition
+        // must lift exactly those triangles into the moving object so the floor blocks a
+        // standing player and the rider is picked up from the walk's floor source.
+        let mut scene = WorldScene::default();
+        scene
+            .collision_sources
+            .push("LiftCage0 -> pkg.cage".to_owned());
+        // A 2x2 m floor slab at Bevy y=10 (Unreal z ~= 1000/UNREAL_UNITS_PER_METER).
+        let tri1 = [[-1.0, 10.0, -1.0], [1.0, 10.0, -1.0], [1.0, 10.0, 1.0]];
+        let tri2 = [[-1.0, 10.0, -1.0], [1.0, 10.0, 1.0], [-1.0, 10.0, 1.0]];
+        for (k, tri) in [tri1, tri2].into_iter().enumerate() {
+            let index = k as u32;
+            scene.collision_triangles.push((tri, 0));
+            scene.collision_box.push(index);
+            scene.collision_line.push(index);
+        }
+        let mover = cage_at(0.0);
+        let (mut world, movers) = MoverCollision::build(&scene, std::slice::from_ref(&mover));
+        assert_eq!(movers.count(), 1);
+        assert_eq!(movers.names(), vec!["LiftCage0"]);
+        // The floor blocks a downward sweep while the cage is at rest...
+        let above = [0.0_f32, 10.5, 0.0];
+        let below = [0.0_f32, 9.5, 0.0];
+        let half = [0.1_f32; 3];
+        assert!(
+            world.sweep(above, below, half).is_some(),
+            "the cage floor must block while the mover is at rest"
+        );
+        // ...and after `update` re-poses it one metre up, the old plane clears and the new
+        // one blocks (the stale base-pose copy must not stay in the static soup).
+        let mut raised = mover.clone();
+        raised.location = [0.0, 0.0, 100.0];
+        assert_eq!(movers.update(&mut world, &[raised.clone()]), 1);
+        assert!(
+            world.sweep(above, below, half).is_none(),
+            "the base-pose floor plane must not stay blocked after the mover leaves"
+        );
+        let raised_above = [0.0_f32, 11.5, 0.0];
+        let raised_below = [0.0_f32, 10.5, 0.0];
+        assert!(
+            world.sweep(raised_above, raised_below, half).is_some(),
+            "the re-posed cage floor must block at its new height"
+        );
+        // The rider is picked up from the floor source of a walk on the cage floor.
+        let sources = vec!["LiftCage0 -> pkg.cage".to_owned()];
+        let mut rider = Rider::default();
+        let live = |_: &str| Some(raised.clone());
+        assert_eq!(
+            rider.observe(true, Some(0), &sources, live),
+            BaseChange::Changed(Some("LiftCage0".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_mover_with_no_soup_triangles_builds_no_object_and_blocks_nothing() {
+        // Degenerate input: a live mover whose mesh contributed no collision triangles (the
+        // `collision.{box,line}.empty` import cases) must build no moving object, keep the
+        // update a no-op and never panic.
+        let scene = WorldScene::default();
+        let (mut world, movers) = MoverCollision::build(&scene, &[grille_state(true)]);
+        assert_eq!(movers.count(), 0);
+        assert_eq!(movers.update(&mut world, &[grille_state(true)]), 0);
+        assert!(world.sweep([-1.0; 3], [1.0; 3], [0.1; 3]).is_none());
+    }
+
+    #[test]
     fn identity_rotation_rows_are_identity() {
         let r = rotation_rows([0, 0, 0]);
         for (i, row) in r.iter().enumerate() {
