@@ -6,7 +6,40 @@ Updated: **2026-10-09 (coordinator session)**. Research phase (2026-10-04), M0, 
 
 State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `be56145` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
-### Coordinator handover 2026-10-13 07:10 — read this first
+### Coordinator session 2026-10-13 (08:15-) — current state, read this first
+
+A new coordinator took over at 08:15. `origin/main` = `34e803e` (last landing verify: 1107 passed).
+Landed this session, in order: item91 mesh overlap (`a8513c6`), item96 Banque01 lift-cage collision
+(`9265621`), item99 first Kello01b route (input only, to the chalet cutscene; `079178b`), items 87b-87e
+retail render-time clock (`34e803e`; Toits01 route and positive pins unchanged, ending-scene stall pinned:
+BaseSoldier14 wanders off the collision floor in `Errance` and falls out of the world; the generator-room
+teleport experiment is only the opt-in diagnostic `opt_in_diag_toits01_generator_room`).
+
+Review decisions this session: item87d's Toits01 survival-to-death pin inversion was rejected (item87e
+restored the pins); item98's Kello01a route was rejected because it pinned a steep slope its own path
+chose as the "blocker" (item98c re-plans along the nav network). item97 (Hual04c) was partial: the fight
+fails because the test player starts with Fists only while the campaign carries Hual04a's inventory
+(item97b measures and applies the travel loadout).
+
+**Tooling changes:** `local/verify.sh` now admits **two** concurrent full suites (user-approved
+2026-10-13; slots `local/tmp/verify-test.lock2` and the original `verify-test.lock`; `VERIFY_SLOTS`
+overrides). Keep `local/watchdog.ps1` running (restart every ~2 h) whenever two suites can run. Edit
+`verify.sh` only by writing a new file and `mv`-ing it over (running bash instances read the script
+incrementally). Delegates available (user, 2026-10-13): OpenCode Go and Ollama Cloud with 2-4 sessions
+each of `deepseek-v4.1-flash`, Z.AI `glm-5.3-flash`, opencode `openai/gpt-6.1-sol`, Codex CLI.
+
+**In flight when this was written (15:50):**
+
+| Worktree / branch | Agent | Task (spec in `local/tasks/`) |
+|---|---|---|
+| `codex2` / `item97-hual04c-escort` | openai/gpt-6.1-sol | item97b: Hual04c with the measured Hual04a travel loadout, clear soldier28, extend the escort; fix the dead-player input/auto-loot anomaly |
+| `fx` / `item95-findspot` | ollama deepseek | item95: retail FindSpot/CheckSlice placement (its verify passed 1087; report pending) |
+| `ai` / `item98-kello01a` | opencode-go deepseek | item98c: Kello01a route along the authored path |
+| `sweep` / `item99-kello01b` | opencode-go deepseek | item99b: Kello01b Cine1 flashback chain (`fin_transition`), objectives 0/1 |
+| `steam` / `item100-prock01a` | ollama deepseek | item100: first PRock01a route |
+| `viewer` / `item101-pawn-falls-out` | Z.AI glm-5.3-flash | item101: wandering AI pawns fall out of the world (Toits01 BaseSoldier14) |
+
+### Coordinator handover 2026-10-13 07:10 (historical)
 
 The previous coordinator stopped (weekly usage limit) with landings and agents in flight. Everything
 verified is on `origin/main` (`be56145`, last full verify 1086 passed). Since `d39b14e`: Hual04a walks to
