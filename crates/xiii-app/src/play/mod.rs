@@ -92,6 +92,8 @@ struct WorldRes {
     movers: movers::MoverCollision,
     /// The mover the player stands on (a lift cage carries the player).
     rider: movers::Rider,
+    /// A mover a script based the player pawn on (`Actor.SetBase`), carried like the rider.
+    based_carry: movers::BasedCarry,
 }
 
 /// Render entities per map actor (the part of the scene object path before `" -> "`), for the
@@ -212,6 +214,13 @@ impl Plugin for PlayPlugin {
         });
         if let Ok(s) = session.as_mut() {
             s.enable_native_timers(options.perf_natives);
+            // item89: the interactive session is not a trace consumer (`format_vm_trace` reads
+            // session counters, not `vm.trace`), so recording every per-tick native/event into
+            // the unbounded `Vec` is pure leak: it grew commit by ~10-37 MiB/s windowed. The
+            // headless deterministic run keeps tracing (route tests assert on `map_traces`).
+            let vm = s.vm_mut();
+            vm.trace_enabled = false;
+            vm.trace_natives = false;
         }
         app.insert_non_send(session);
         app.add_plugins((crate::video::CutscenePlugin, cutscene::CutsceneSystems));
@@ -859,6 +868,7 @@ fn setup_inner(
         sources,
         movers: mover_collision,
         rider: movers::Rider::default(),
+        based_carry: movers::BasedCarry::default(),
     });
     if !resetting {
         commands.insert_resource(ScriptRes { drive });
@@ -1164,6 +1174,14 @@ fn fixed_step(
     perf.span("footsteps", t0);
     if let Ok(sess) = session.as_mut() {
         let t0 = Instant::now();
+        // item94: mirror a script-set `Pawn.Base` mover carry for the host-owned pawn (see
+        // `BasedCarry`); recorded before the VM step, applied after.
+        let based_before = sess.player_base_mover();
+        let floor_base = world.rider.base().map(str::to_owned);
+        world.based_carry.observe(
+            based_before.map(|(n, s)| (n, s.location)),
+            floor_base.as_deref(),
+        );
         let modes = session::PlayerVMModes {
             crouched: sim.0.crouched,
             in_water: sim.0.in_water,
@@ -1176,6 +1194,9 @@ fn fixed_step(
         sess.sync_view_rotation(sim.0.yaw, sim.0.pitch);
         world
             .rider
+            .carry(&mut sim.0.location, |name| sess.vm().mover_state(name));
+        world
+            .based_carry
             .carry(&mut sim.0.location, |name| sess.vm().mover_state(name));
         if let Some((location, yaw, velocity)) = sess.script_pawn_pose() {
             sim.0.location = location;
@@ -2227,6 +2248,10 @@ fn travel(
             return;
         }
     };
+    // item89: keep the interactive (windowed) session's trace off across in-process travel,
+    // for the same reason as in `PlayPlugin::build`.
+    s.vm_mut().trace_enabled = false;
+    s.vm_mut().trace_natives = false;
     // item72: the in-game menu's VM references died with the outgoing session; re-configure for
     // the new map (the next `open` reinstalls the GUI graph into the new VM).
     menu.configure(cfg.options.save_dir.clone(), cfg.options.map.clone());
@@ -2367,6 +2392,8 @@ struct MapRuntime {
     mover_collision: movers::MoverCollision,
     /// The mover the player stands on (a lift cage carries the player).
     rider: movers::Rider,
+    /// A mover a script based the player pawn on (`Actor.SetBase`), carried like the rider.
+    based_carry: movers::BasedCarry,
     volumes: movement_modes::VolumeMotion,
     sim: PlayerSim,
     player_params: PlayerParams,
@@ -2514,6 +2541,7 @@ fn build_map_runtime(
         world,
         mover_collision,
         rider: movers::Rider::default(),
+        based_carry: movers::BasedCarry::default(),
         volumes,
         sim,
         player_params: *params,
@@ -2579,6 +2607,32 @@ struct RunnerOptions {
     initial: Option<MapRuntime>,
     stop_on_travel: bool,
     wait_for_control: bool,
+}
+
+fn headless_projection(
+    location: [f32; 3],
+    eye_height: f32,
+    yaw: f32,
+    pitch: f32,
+) -> xiii_script::canvas::ScreenProjection {
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    let forward = [cp * cy, cp * sy, sp];
+    let right = [-sy, cy, 0.0];
+    let up = [-sp * cy, -sp * sy, cp];
+    let eye = [location[0], location[1], location[2] + eye_height];
+    let dot = |a: [f32; 3]| a.into_iter().zip(eye).map(|(a, b)| a * b).sum::<f32>();
+    // Horizontal FOV 90 degrees, matching the default headless 1280x720 Canvas.
+    let aspect = 1280.0 / 720.0;
+    xiii_script::canvas::ScreenProjection {
+        clip_from_world: [
+            [right[0], up[0] * aspect, forward[0], forward[0]],
+            [right[1], up[1] * aspect, forward[1], forward[1]],
+            [right[2], up[2] * aspect, forward[2], forward[2]],
+            [-dot(right), -dot(up) * aspect, -dot(forward), -dot(forward)],
+        ],
+        viewport: [1280.0, 720.0],
+    }
 }
 
 fn player_has_control(session: &session::Session) -> bool {
@@ -2739,6 +2793,15 @@ fn run_script_inner(
         runtime
             .session
             .set_hook_move(input.forward, input.right, runtime.sim.yaw);
+        // item94: the host owns the player pawn's `Location`; a script-set `Base` (an
+        // `Actor.SetBase` on a moving brush) is carried by the VM for scripted actors, so record
+        // it before the VM step and mirror the base's displacement after (see `BasedCarry`).
+        let based_before = runtime.session.player_base_mover();
+        let floor_base = runtime.rider.base().map(str::to_owned);
+        runtime.based_carry.observe(
+            based_before.map(|(n, s)| (n, s.location)),
+            floor_base.as_deref(),
+        );
         runtime.session.step(
             DT,
             runtime.sim.location,
@@ -2756,6 +2819,19 @@ fn run_script_inner(
         runtime.rider.carry(&mut runtime.sim.location, |name| {
             runtime.session.vm().mover_state(name)
         });
+        runtime
+            .based_carry
+            .carry(&mut runtime.sim.location, |name| {
+                runtime.session.vm().mover_state(name)
+            });
+        // Headless rendering still needs the camera context required by WorldToScreen,
+        // including the Hook's authored target-outline pass. Use the simulated view.
+        runtime.session.vm_mut().canvas.screen_projection = Some(headless_projection(
+            runtime.sim.location,
+            runtime.sim.vm_eye_height(&runtime.player_params),
+            runtime.sim.yaw,
+            runtime.sim.pitch,
+        ));
         runtime.session.drive_render_phase();
         if let Some((location, yaw, velocity)) = runtime.session.script_pawn_pose() {
             runtime.sim.location = location;
@@ -6251,11 +6327,12 @@ mod tests {
     }
 
     /// Opt-in corpus test (requirement 5): on Banque01 the host walks the player onto the
-    /// `LadderVolume5` brush, enters `PHYS_Ladder` and climbs up `ClimbDir` at `LadderSpeed`.
+    /// `LadderVolume5` brush, enters `PHYS_Ladder` and climbs at `LadderSpeed` by looking up.
     /// The script teleports to the volume floor (the same harness bootstrap the other map demos
     /// use), faces the volume's decoded `LookDir` - `LadderVolume.PawnEnteredVolume` /
     /// `PotentialClimbWatcher.Tick` attach the pawn only while `Dot(facing, LookDir) > 0.9`
-    /// (item85b) - and then *only* holds forward; the climb is the simulation's, not a teleport.
+    /// (item85b) - and then holds forward while looking up (PlayerClimbing's decoded view-space
+    /// acceleration). The climb is the simulation's, not a teleport.
     #[test]
     fn opt_in_banque01_ladder_climb() {
         let Some(game_dir) = opt_in_root() else {
@@ -6286,7 +6363,7 @@ mod tests {
         // is forward = (cos yaw, sin yaw).
         let yaw_deg = lv.look_dir[1].atan2(lv.look_dir[0]).to_degrees();
         let script = script::Script::parse(&format!(
-            "t=0.0 teleport {cx} {cy} {start_z}\nt=0.0 yaw {yaw_deg}\nt=0.0 forward 1\nt=6.0 forward 0\n"
+            "t=0.0 teleport {cx} {cy} {start_z}\nt=0.0 yaw {yaw_deg}\nt=0.0 pitch 90\nt=0.0 forward 1\nt=6.0 forward 0\n"
         ))
         .unwrap();
         let outcome = run_script(
@@ -7527,6 +7604,171 @@ mod tests {
         );
     }
 
+    /// Hual04c's first route pins the cabin-rope ladder obstruction after the real ride.
+    /// Completed authored anti-goals are preserved; escort/helicopter travel is not claimed.
+    #[test]
+    fn headless_camera_projection_uses_eye_and_rotated_view() {
+        let p = headless_projection(
+            [100.0, 200.0, 300.0],
+            60.0,
+            std::f32::consts::FRAC_PI_2,
+            0.0,
+        );
+        let center = p.project([100.0, 300.0, 360.0]).unwrap();
+        assert!((center[0] - 640.0).abs() < 0.001);
+        assert!((center[1] - 360.0).abs() < 0.001);
+        let right = p.project([0.0, 300.0, 360.0]).unwrap();
+        assert!((right[0] - 1280.0).abs() < 0.001);
+        let above = p.project([100.0, 300.0, 410.0]).unwrap();
+        assert!(
+            above[1] < center[1],
+            "world Z up must project above the crosshair"
+        );
+        assert!(p.project([f32::NAN, 0.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn opt_in_hual04c_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual04c".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual04c");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let text = include_str!("../../tests/data/hual04c_route.script");
+        assert!(!text.lines().any(|line| {
+            let command = line.split('#').next().unwrap_or("");
+            ["teleport", "weapon ", "item ", "set_goal", "take_control"]
+                .iter()
+                .any(|forbidden| command.contains(forbidden))
+        }));
+        let script = script::Script::parse(text).expect("parse Hual04c route");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Hual04c",
+            &script,
+            &resolved.params,
+            &scene,
+            120.0,
+        )
+        .expect("run Hual04c route");
+        let session = &outcome.session;
+        let vm = session.vm();
+        println!(
+            "[hual04c route] error={:?} objectives={:?} travel={:?} position={:?} health={:?}",
+            session.first_error(),
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health()
+        );
+        survey::print_details(&survey::extract("Hual04c", &outcome));
+        assert!(
+            session.first_error().is_none(),
+            "{:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(session.blocked.is_empty(), "{:?}", session.blocked);
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "player must survive"
+        );
+        assert!(
+            outcome.travel.is_empty(),
+            "the blocked route must not travel"
+        );
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 7);
+        for index in [0, 2, 3] {
+            assert!(
+                !goals[index].completed,
+                "unreached objective {index}: {goals:?}"
+            );
+        }
+        assert!(goals[0].primary);
+        for index in [1, 4, 5, 6] {
+            assert!(
+                goals[index].anti_goal && goals[index].completed,
+                "authored anti-goal {index} must hold: {goals:?}"
+            );
+        }
+        let hud = vm.find_object("XIIIBaseHud").expect("player HUD");
+        assert_eq!(
+            vm.get_property(hud, "HudCartoonSFX"),
+            Some(&xiii_script::Value::Bool(false)),
+            "movement's early mission release must not stop the HUD slide-out"
+        );
+        let car = vm.find_object("Telepherique0").expect("authored cable car");
+        assert_eq!(
+            vm.state_name(car).as_deref(),
+            Some("TheFall"),
+            "the HUD's own EndCartoonEffect event must start the ride"
+        );
+        let carrington = vm.find_object("Cine0").expect("ground Carrington");
+        assert_eq!(
+            vm.get_property(carrington, "CurrentScript"),
+            Some(&xiii_script::Value::Int(-1)),
+            "the ground escort sequence has not started"
+        );
+        let position = session.player_location().expect("player position");
+        for (actual, expected) in position.into_iter().zip([-1170.363, 56.460, 295.766]) {
+            assert!(
+                (actual - expected).abs() < 0.5,
+                "roof/grapple blocker pin moved: {position:?}"
+            );
+        }
+        let pawns = session.player_pawn_actors();
+        assert_eq!(pawns.len(), 1, "one live player pawn");
+        let pawn = pawns[0].0;
+        assert_eq!(
+            vm.get_property(pawn, "Physics"),
+            Some(&xiii_script::Value::Byte(11)),
+            "player holds the ladder top while attempting the grapple"
+        );
+        let mi = session.map_info().expect("Hual04c MapInfo");
+        assert_eq!(
+            vm.get_property(mi, "NextMapLevelWithUnr"),
+            Some(&xiii_script::Value::Str("kello01a.unr".to_owned()))
+        );
+        let hook = vm.find_object("Hook").expect("game-supplied grapple");
+        assert_eq!(
+            vm.get_property(hook, "bHooked"),
+            Some(&xiii_script::Value::Bool(false))
+        );
+        let releases: Vec<_> = vm
+            .trace
+            .iter()
+            .filter_map(|event| match &event.kind {
+                xiii_script::TraceKind::Event { function, args, .. }
+                    if function == "HookProjectile.ProcessTouch"
+                        || function == "Hook.HookInUse.Release" =>
+                {
+                    Some(format!("{function} {args:?}"))
+                }
+                xiii_script::TraceKind::Log(text)
+                    if text.starts_with("Releasing hook because Projectile hit wall") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        println!("[hual04c grapple blocker] {releases:?}");
+        assert!(
+            releases.iter().any(|text| text == "Releasing hook because Projectile hit wall BreakAbleMover44 (should not happen...)."),
+            "the roof attachment must reach the measured snow-plaque collision failure"
+        );
+        println!(
+            "[hual04c next blocker] cabin opening climbed to z=302.4, HookPoint1 attempted from the roof, returns to ladder top (-1170.363,56.460,295.766); grapple projectile releases on a mover Touch; goals 0/2/3 and kello01a travel unreached"
+        );
+    }
+
     /// Hual04a (item86 re-time): with automatic AI bursts, fight the canyon soldiers before they
     /// close, heal on the base medkits, read the earned card, survive the `Cine1` LastWave,
     /// install the fuse and activate the cable-car lever.
@@ -7557,7 +7799,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            500.0,
+            620.0,
         )
         .expect("run Hual04a route");
         let session = &outcome.session;
@@ -7594,13 +7836,17 @@ mod tests {
         }
         assert!(error.is_none(), "unexpected blocker: {error:?}");
         assert!(session.suspended.is_empty(), "{:?}", session.suspended);
-        assert!(outcome.travel.is_empty(), "blocked route must not travel");
         assert!(
             session.player_health().is_some_and(|h| h > 0.0),
             "player must survive"
         );
         let goals = session.objective_states();
-        assert_eq!(goals.len(), 6);
+        // The map authors six `Objectif` entries. Completing goal 4 (the lever) runs
+        // `Hual04a.SetGoalComplete(94)`, which calls `SetPrimaryGoal(6)`; `Objectif` is a dynamic
+        // array and the UE2 dynamic-array write past the end grows it (item90
+        // `execDynArrayElement`), so a seventh zeroed (empty, primary) entry appears. Measured on
+        // this route: 7 entries, index 6 empty.
+        assert_eq!(goals.len(), 7);
         // The anti-goal is authored completed and must hold on this route.
         assert!(
             goals[1].anti_goal && goals[1].primary && goals[1].completed,
@@ -7608,6 +7854,66 @@ mod tests {
             goals[1]
         );
         let carrington = vm.find_object("Cine1").expect("Carrington's authored pawn");
+        // item94: after the lever the player walks back through `Porte12` (960,720,128) and around
+        // the station's north side down to the boarding platform below the station floor (the same
+        // path a collision-world BFS of the real walker finds; the direct line south is walled).
+        let player_loc = session.player_location();
+        println!(
+            "[hual04a item94] player={player_loc:?} carrington={:?} telepherique={:?}",
+            vm.get_property(carrington, "Location"),
+            vm.find_object("Telepherique0").map(|t| vm.state_name(t)),
+        );
+        // The post-lever cine: `on event TeleOn label00` (tabActions[39]) jumps Carrington's
+        // sequence to tabActions[52]; action 54 `tp 23` calls
+        // `CineController2.TeleportTo(PositionInfo23)` -> `Actor.SetLocation`. The cine then waits
+        // at action 61 `wait player 128` (action_index 62, flagsPaused bit 1).
+        let (cine_action_index, cine_action) = match vm.get_property(carrington, "CineController") {
+            Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(c)))) => {
+                let c = *c;
+                let idx = match vm.get_property(c, "ScriptedActionIndex") {
+                    Some(xiii_script::Value::Int(i)) => *i,
+                    _ => -1,
+                };
+                let list = match vm.get_property(carrington, "tabActions") {
+                    Some(xiii_script::Value::Array(a)) => a.clone(),
+                    _ => Vec::new(),
+                };
+                let cur = list.get(idx.saturating_sub(1) as usize).map(|v| match v {
+                    xiii_script::Value::Str(s) | xiii_script::Value::Name(s) => s.clone(),
+                    o => format!("{o:?}"),
+                });
+                (idx, cur)
+            }
+            _ => (-1, None),
+        };
+        println!("[hual04a item94] cine action_index={cine_action_index} current={cine_action:?}");
+        let p = player_loc.expect("player location");
+        assert!(
+            (p[0] - 945.8).abs() < 60.0 && (p[1] - 393.75).abs() < 60.0 && p[2] < -50.0,
+            "item94: the walked route must reach the boarding platform at PositionInfo23 \
+             (945.8,393.8,-105): {p:?}"
+        );
+        assert_eq!(
+            (cine_action_index, cine_action.as_deref()),
+            (62, Some("wait player 128")),
+            "item94: the post-lever cine must be parked at `wait player 128`"
+        );
+        // The scripted cine teleport `tp 23` calls `Actor.SetLocation(PositionInfo23.Location)`
+        // but the VM's world-placement check (`point_free`, an approximation of `ULevel::FindSpot`)
+        // refuses it (measured: the cine pawn's extent overlaps one BSP triangle of `Model639` at
+        // the destination), so Carrington stays near `PositionInfo18` and never reaches the
+        // platform; the `wait player 128` can never pass from the reached stand and goal 5 / the
+        // travel stay unreached. `xiii-tool` disasm: `CineController2.TeleportTo` @120418,
+        // `ULevel::FarMoveActor` 0x1038a440 calls `ULevel::FindSpot` 0x1038a080.
+        let cl = match vm.get_property(carrington, "Location") {
+            Some(xiii_script::Value::Vector(v)) => *v,
+            other => panic!("Cine1 location {other:?}"),
+        };
+        assert!(
+            (cl[0] - 945.8).abs() > 100.0 || (cl[1] - 393.75).abs() > 100.0,
+            "item94 pin: Carrington's `tp 23` must not have reached PositionInfo23 while the \
+             scripted SetLocation is refused: {cl:?}"
+        );
         // Retail `AActor::IsOverlapping` (Engine.dll @0x10352bd0) uses the brush primitive for a
         // volume brush, so `Degage` (DetectionVolume4) and `dernierpoint` (DetectionVolume5) now
         // fire on the walked route. The old class-cylinder test missed both (DV4's cylinder is
@@ -7636,17 +7942,12 @@ mod tests {
             Some(&xiii_script::Value::Int(0)),
             "the delivered Degage cue started Cine1.Play(2)"
         );
-        // item90: with Core.dll's out-of-range fixed-array clamp implemented, the install leg no
-        // longer raises `ArrayIndex`. The re-timed route completes the six-soldier death-event
-        // chain (`eNbVivants` 1), reads the earned card at `MagneticPassTrigger4`, walks to the
-        // bureau fuse (`Hual04aFusiblePick0`, event `FusibleRamasse`) and kills the `Cine1`
-        // `LastWave` reinforcement by input (goal 2). It then walks back through the base to the
-        // bureau circuit-breaker, works the door (`use Porte21`) and attempts the fuse install
-        // (`use XIIIGoalTrigger19`), works the cable-car lever (`use XIIIMover1`) and returns to
-        // the cable-car cabin. The install interaction is refused on this reconstructed input:
-        // the game's aimed target resolves to the closed `Porte21` door (`bCanTrigger=false`), so
-        // `XIIIGoalTrigger19` never fires and goals 3/4 stay unclaimed. Goals 3/4/5 and the
-        // Hual04c travel are not claimed (see the task report for the measured evidence).
+        // item92: with the electrical-box door `Porte21` opened and the view aimed at the exposed
+        // fuse socket `XIIIGoalTrigger19` (`track`), the game's own `ReturnTrace` targets the
+        // trigger, `bCanTrigger` is true and the carried fuse's `EventItem.UseMe` triggers goal 3.
+        // The `XIIIMover1` lever then completes goal 4 (its `PlayerTriggerToggle` open fires the
+        // map's `SetGoalComplete(94)`). Goals 3/4 are claimed; goal 5 / the Hual04c travel are the
+        // route's next leg (recorded below, see the report).
         assert_eq!(
             vm.get_property(mi, "eNbVivants"),
             Some(&xiii_script::Value::Int(1)),
@@ -7657,8 +7958,27 @@ mod tests {
             "goal 2 (find the fuse) must complete on this route: {goals:?}"
         );
         assert!(
-            !goals[3].completed && !goals[4].completed && !goals[5].completed,
-            "goals 3/4/5 stay unreached on this route (install interaction refused): {goals:?}"
+            goals[3].completed,
+            "goal 3 (install the fuse) must complete on this route: {goals:?}"
+        );
+        assert!(
+            goals[4].completed,
+            "goal 4 (activate the cable-car) must complete on this route: {goals:?}"
+        );
+        // item94 pin: goal 5 and the Hual04c travel stay unreached. The route now walks the player
+        // down to Carrington's boarding platform (`PositionInfo23`), but the post-lever cine's
+        // `tp 23` scripted `SetLocation` is refused by the VM world-placement check, so Carrington
+        // never leaves `PositionInfo18`; the cine is parked at `wait player 128` (asserted above)
+        // and never reaches `event LaFinDeLaMap` (tabActions[95]), so `travel` stays empty. See the
+        // report; the `item92`/item81 `SetBase`-carry hypothesis was refuted (see item94 decode).
+        assert!(
+            !goals[5].completed,
+            "goal 5 (rejoin Carrington) stays unreached on this route (cine teleport refused): {goals:?}"
+        );
+        assert!(
+            outcome.travel.is_empty(),
+            "the Hual04c travel stays unreached on this route: {:?}",
+            outcome.travel
         );
         // The LastWave generators each spawned one reinforcement; all three are dead (killed by
         // input) on this route. The generators may be cleaned up after their wave dies, so count
@@ -7690,8 +8010,10 @@ mod tests {
             renforts, 3,
             "the three Cine1 LastWave reinforcements must have spawned and died"
         );
-        // The second wave (`Wave01`/`Wave02`) is not triggered on this route: the player never
-        // reaches Carrington's post-lever cine, so those generators stay empty.
+        // The second wave (`Wave01`/`Wave02`) belongs to Carrington's post-lever cine (action 63
+        // `Event Wave01 Wave02`), which the route reaches only after the cine passes action 61
+        // `wait player 128`. The refused `tp 23` keeps the cine parked there, so the generators
+        // stay empty.
         for name in ["GenNMI6", "GenNMI7"] {
             let id = vm
                 .find_object(name)
@@ -7702,8 +8024,8 @@ mod tests {
                 "{name}: the second wave must not spawn on this route"
             );
         }
-        // The cable-car lever use fired, but goal 4 is gated on the fuse install (goal 3), so it
-        // does not complete. Record the lever state for the report.
+        // The cable-car lever use completed goal 4 (its `PlayerTriggerToggle` open fired the
+        // map's `SetGoalComplete(94)`). Record the lever state for the report.
         let lever = vm.find_object("XIIIMover1").expect("cable-car lever");
         println!(
             "[hual04a lever] XIIIMover1 KeyNum={:?} state={:?}",
@@ -7715,7 +8037,7 @@ mod tests {
             Some(&xiii_script::Value::Str("Hual04c.unr".to_owned()))
         );
         println!(
-            "[hual04a next blocker] the route completes the six-kill chain (eNbVivants 1), the card read and the fuse pickup (goal 2), then walks back through the base to the bureau circuit-breaker, works the door (use Porte21) and attempts the fuse install (use XIIIGoalTrigger19, twice) and the cable-car lever (use XIIIMover1), ending at the cable-car cabin (960,570) with no engine error. The install interaction is refused: the game's aimed target resolves to the closed Porte21 door (TargetActor=Porte21, bCanTrigger=false), so XIIIGoalTrigger19 never fires and goals 3/4 stay unclaimed; goal 5 and the Hual04c travel follow goal 4. The ArrayIndex error of item86 is gone (Core.dll fixed-array clamp); the remaining blocker is interaction targeting on this reconstructed input"
+            "[hual04a next blocker] item94: goal 5 is `Rejoin Carrington in front of the cable-car cabin`. The player now walks the full station route down to the boarding platform at `PositionInfo23` (945.8,393.8,-105) below the station floor. The blocker is the post-lever cine: `on event TeleOn label00` jumps Carrington's `CineController2` sequence to `tabActions[52]`; action[54] `tp 23` calls `CineController2.TeleportTo(PositionInfo23)` -> `Actor.SetLocation`, but the VM's world-placement check (`point_free`, an approximation of `ULevel::FindSpot` 0x1038a080, called from `ULevel::FarMoveActor` 0x1038a440) refuses it because the cine pawn's extent overlaps one BSP triangle of `Model639` at the destination. Carrington therefore stays near `PositionInfo18`, the cine is parked at `wait player 128` (tabActions[61]), and `event LaFinDeLaMap` (tabActions[95]) is never fired, so goal 5 and the Hual04c travel stay unreached (travel=[]). The item92/item81 `PC.Pawn.SetBase` carry hypothesis is refuted: `Telepherique.STA_init.Trigger` sets `PC` only when `Level.Title == \"Hual04c\"`."
         );
     }
 }

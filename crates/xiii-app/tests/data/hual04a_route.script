@@ -11,13 +11,21 @@
 # BaseSoldier/BaseSoldier2/BaseSoldier3) by input, so goal 2 (find the fuse) completes.
 #
 # The route then, after the LastWave, walks back through the base to the bureau
-# circuit-breaker, works the base door (`use Porte21`) and attempts the fuse install
-# (`use XIIIGoalTrigger19`), works the cable-car lever (`use XIIIMover1`) and returns to the
-# cable-car cabin at (960,570). `item90` implemented Core.dll `execArrayElement`'s out-of-range
-# fixed-array clamp, so `Hual04a.SetGoalComplete` case 3's `i < 4` over the 3-entry
-# `SoldiersEnRenforts` array no longer errors. The install interaction is refused on this
-# reconstructed input (the game's aimed target resolves to the closed `Porte21` door,
-# `bCanTrigger=false`), so goals 3/4/5 and the Hual04c travel stay unclaimed.
+# circuit-breaker: `use Porte21` opens the electrical-box door, `track XIIIGoalTrigger19` aims
+# at the exposed fuse socket so the game's own `ReturnTrace` targets the trigger, and the
+# carried fuse's `EventItem.UseMe` completes goal 3 (install the fuse). `use XIIIMover1` works
+# the cable-car lever; its `FinishedOpening` fires `ManetteTele` -> `SetGoalComplete(94)`, which
+# completes goal 4 (activate the cable-car) and fires the map's `TeleOn`. `item90` implemented
+# Core.dll `execArrayElement`'s out-of-range fixed-array clamp, so `Hual04a.SetGoalComplete`
+# case 3's `i < 4` over the 3-entry `SoldiersEnRenforts` array no longer errors.
+#
+# item94 (goal 5, `Rejoin Carrington in front of the cable-car cabin`): after the lever the
+# route walks back through `Porte12` and around the station's north side down to the boarding
+# platform below the station floor (`PositionInfo23`, 945.8,393.8,-105), following the path a
+# collision-world BFS of the real walker finds (the direct line south is walled). The post-lever
+# cine's `tp 23` (`CineController2.TeleportTo` -> `Actor.SetLocation`) is then refused by the VM
+# world-placement check, so Carrington never reaches the platform and the cine stays parked at
+# `wait player 128`; goal 5 and the Hual04c travel remain unclaimed (pinned, see the report).
 #
 # Input only: no teleport, set_goal, take_control, extra weapon grant or health edit. The
 # Beretta grant at t=0.5 is the carried-loadout diagnostic (see hual02_route.script).
@@ -264,13 +272,14 @@ t=376.85 fire
 t=377.15 reload
 t=377.45 track off
 t=377.45 crouch 0
-# Walk back through the base to the bureau circuit-breaker and install the fuse at
-# XIIIGoalTrigger19 (goal 3), then work the cable-car lever XIIIMover1 (goal 4). `item90`
-# implemented Core.dll `execArrayElement`'s out-of-range fixed-array clamp, so
-# `Hual04a.SetGoalComplete` case 3 no longer errors; on this reconstructed input the install
-# interaction itself is refused (the game's aimed target resolves to the closed Porte21 door,
-# `bCanTrigger=false`), so goals 3/4 stay unclaimed. Waypoints are the item86 fuse-leg trace;
-# `use Porte21` works the base door the retail route opened automatically.
+# Walk back through the base to the bureau circuit-breaker. `Porte21` is the electrical-box
+# door covering the fuse socket: `use Porte21` runs its own `XIIIPorte.PlayerTriggerToggle`
+# (open) and clears the box mesh from the sight line. `track XIIIGoalTrigger19` then points the
+# view at the exposed socket, so the game's own `XIIIPlayerController.ReturnTrace` picks the
+# trigger (measured: door closed -> TargetActor Porte21; door open + aim -> XIIIGoalTrigger19,
+# `bCanTrigger=true`). The carried fuse (`EventItem.UseMe`) then triggers the goal (goal 3).
+# `item90` implemented Core.dll `execArrayElement`'s out-of-range fixed-array clamp, so
+# `Hual04a.SetGoalComplete` case 3 no longer errors. Waypoints are the item86 fuse-leg trace.
 t=378.00 goto -4077.2 1836.9
 t=380.50 goto -3732.9 1357.8
 t=384.50 goto -3269.9 1390.3
@@ -289,11 +298,31 @@ t=429.50 goto 777.6 959.8
 t=445.50 goto 576.8 1166.6
 t=448.00 goto 609.4 1038.7
 t=452.00 goto 609.4 1091.3
+# Open the electrical-box door, then aim at the exposed fuse socket and install the fuse.
 t=453.00 use Porte21
-t=455.00 use XIIIGoalTrigger19
-t=457.00 use XIIIGoalTrigger19
-t=459.00 goto 700.0 1058.0
+t=453.50 track XIIIGoalTrigger19 0
+t=456.00 use XIIIGoalTrigger19
+t=458.00 use XIIIGoalTrigger19
+t=459.00 track off
+t=459.50 goto 700.0 1058.0
 t=463.00 goto 850.0 770.0
 t=467.00 goto 926.0 758.0
 t=472.50 use XIIIMover1
-t=475.00 goto 960.0 570.0
+# Item94: rejoin Carrington at the cable-car station's boarding platform. The lever completes
+# goal 4 and fires `TeleOn`; Carrington's post-lever cine teleports him to `PositionInfo23`
+# (945.8,393.8,-105) on the platform below the station floor. Walk back through `Porte12`
+# (960,720,128) and around the station's north side to the boarding platform
+# (waypoints from a collision-world BFS of the real walker; the direct line south is walled).
+t=475.00 goto 950 740
+t=479.00 use Porte12
+t=482.00 goto 900 640
+t=486.00 goto 850 570
+t=490.00 goto 819 570
+t=495.00 goto 677 623
+t=500.00 goto 526 606
+t=505.00 goto 442 508
+t=510.00 goto 482 432
+t=515.00 goto 638 425
+t=520.00 goto 796 425
+t=525.00 goto 941 396
+t=545.00 wait_travel

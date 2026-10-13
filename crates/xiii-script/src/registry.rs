@@ -2892,8 +2892,9 @@ fn console_command(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<
 /// (`XIIIMenu.EndOfVideo`, item16). The VM never loads a map: it records a
 /// [`TravelRequest`](crate::events::TravelRequest) (the URL, the `ETravelType` byte and `bItems`)
 /// for the host to consume with [`Vm::take_travel_request`], **and** the item16 structured trace
-/// note (`canvas::format_travel_note`) that the `xiii-app --menu` host reads via
-/// `canvas::parse_travel_note`. This is the single registration for the native.
+/// note (`canvas::format_travel_note`) plus the always-on host-request queue entry
+/// ([`Vm::host_request`], item89b) that the menu hosts read. This is the single registration
+/// for the native.
 fn client_travel(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     let url = string(vm, a, 0)?;
     let mode = byte(vm, a, 1)?;
@@ -2901,6 +2902,9 @@ fn client_travel(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Na
     vm.note(TraceKind::Note(crate::canvas::format_travel_note(
         &url, mode, items,
     )));
+    vm.host_request(crate::vm::HostRequest::Travel(
+        crate::canvas::TravelRequest::from_url(&url, mode, items),
+    ));
     let actor = vm.objects[c.this as usize].name.clone();
     let time = vm.time;
     vm.request_travel(TravelRequest {

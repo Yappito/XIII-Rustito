@@ -56,9 +56,9 @@ pub use reflect::{
 };
 pub use value::{ObjRef, ObjectId, Ty, Value};
 pub use vm::{
-    ActorAnimation, AnimChannelState, BoneDirection, BoneState, ExternalObject, MoverState,
-    NativeProfile, SpineControl, TraceEvent, TraceKind, VideoPlayerHost, VideoTiming, Vm, VmError,
-    VmErrorKind, VmLimits,
+    ActorAnimation, AnimChannelState, BoneDirection, BoneState, ExternalObject, HostRequest,
+    MoverState, NativeProfile, SpineControl, TraceEvent, TraceKind, VideoPlayerHost, VideoTiming,
+    Vm, VmError, VmErrorKind, VmLimits,
 };
 pub use voice::{FixedVoiceDuration, FixedWavePosition, VoiceDuration, WavePosition};
 
