@@ -4417,14 +4417,18 @@ mod tests {
     /// TestGoalComplete -> DoTravel -> EndGame -> GameEndedSuccess -> PlayingVideo ->
     /// PlayingVideo.PlayerTick -> ServerTravel` chain as Plage01. The route fixture
     /// (`tests/data/banque01_route.script`) walks onto the map's own trigger/volume actors and
-    /// keeps four labelled flow teleports whose legs are re-measured unwalkable on main
-    /// (item75: the strongroom is sealed at the safe level and the platform level and nothing
-    /// in the map opens it, the lift cannot be called from the hall and both known rides —
-    /// the direct cage use and the internal-button manager cycle — end against sealed BSP or
-    /// a floor-2 corridor dead end, and the shaft wall y=-2080 and the banksortiescasecour
-    /// tower enclose the TT2 landing). The old t=139 TT10 teleport is gone: the fbi_dial2
-    /// cutscene owns the player pose from t=133.017, so it never relocated the player nor
-    /// fired TouchTrigger10 (measured); the CarOut beat does not fire in this engine run.
+    /// keeps four labelled flow teleports whose legs are re-measured unwalkable on this tree
+    /// (item93, by input and `box-probe`: the strongroom is sealed at the safe level
+    /// (Model69 x=-6976, z 800..1312) and the platform level (x=-7360, z 1312..1504) and nothing
+    /// in the map opens it; the lift cage has no floor collision and the closed outer doors
+    /// answer the ray use with the empty `PlayerTrigger`, so no ride carries a player; the
+    /// shaft wall y=-2080 and the floor-2 corridor's desk + full-height hall wall y=-3664
+    /// dead-end the TT2 side; the banksortiescasecour tower's ramp face and east cheek x=998.2
+    /// stall every walk-off/jump from the TT2 landing and the courtyard's own walls allow no
+    /// street-side entry). The old t=139 TT10 teleport is gone: the fbi_dial2 cutscene owns the
+    /// player pose from t=134.017 (the TT3/TT11 touch tick, measured), so it never relocated
+    /// the player nor fired TouchTrigger10 (measured); the CarOut beat does not fire in this
+    /// engine run.
     ///
     /// item86 re-time on the integrated volume-brush tree: `DetectionVolume12` now uses its
     /// `Brush` BSP (x in (-7824,-7616), y in (-2784,-2336), z in (784,1248), measured), so its
