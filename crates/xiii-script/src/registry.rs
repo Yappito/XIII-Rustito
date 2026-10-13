@@ -4634,7 +4634,7 @@ fn builtin_defs() -> Vec<NativeDef> {
         ),
         NativeDef {
             status: NativeStatus::Partial(
-                "FindSpot/CheckSlice placement and post-BeginPlay encroachment callbacks remain incomplete; abstract-class flag remains unverified; static/no-delete template refusal and pending-kill return decoded",
+                "post-BeginPlay encroachment callbacks and the abstract-class flag remain incomplete; static/no-delete template refusal, pending-kill return and ULevel::FindSpot/CheckSlice placement for explicit runtime spawns decoded",
             ),
             ..def(
                 "Engine.Actor.Spawn",
@@ -4863,7 +4863,7 @@ fn builtin_defs() -> Vec<NativeDef> {
         },
         NativeDef {
             status: NativeStatus::Partial(
-                "static/movable refusal, teleport/base detach and recursive based-actor translation decoded; world placement still uses point_free instead of FindSpot/CheckSlice; encroachment geometry/callbacks, client placement exemption and zone/leaf updates remain incomplete",
+                "static/movable refusal, teleport/base detach, recursive based-actor translation and ULevel::FindSpot/CheckSlice world placement (0x1038a080/0x10389b80) decoded; actor-primitive vs raw-world branch of CheckSlice's down sweep and encroachment geometry/callbacks, client placement exemption and zone/leaf updates remain incomplete",
             ),
             ..def(
                 "Engine.Actor.SetLocation",

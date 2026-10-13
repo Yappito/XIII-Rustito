@@ -16,7 +16,9 @@ use xiii_collision::{
 use xiii_decode::common::{
     UNREAL_UNITS_PER_METER, to_bevy_direction, to_bevy_position, to_bevy_scale,
 };
-use xiii_script::physics::{ActorMeshHit, MoveOutcome, OverlapRecord, WorldHit, WorldPhysics};
+use xiii_script::physics::{
+    ActorMeshHit, MoveOutcome, OverlapRecord, SpotHit, WorldHit, WorldPhysics,
+};
 
 /// Rotation-matrix rows in Bevy space of an Unreal rotator (roll X / pitch Y / yaw Z), the
 /// axis-permutation conjugate `P R P^-1` of `FRotationMatrix`. Shared by the moving-brush
@@ -72,6 +74,10 @@ pub fn unreal_extent_to_bevy(e: [f32; 3]) -> BevyVec3 {
 pub struct WorldPhysicsAdapter {
     box_world: CollisionWorld,
     line_world: CollisionWorld,
+    /// Lazy level-only soups (the BSP, with actor-mesh/terrain sources removed) for
+    /// [`WorldPhysics::trace_level`], built on first use. Invalidated when a mover registers so a
+    /// removed base-pose copy is not retained.
+    level_worlds: Option<(CollisionWorld, CollisionWorld)>,
     /// Per collision source: whether its engine collision faces reject a ray from their back
     /// side (static-mesh sources, `UStaticMesh::LineCheck`).
     line_one_sided_sources: Vec<bool>,
@@ -141,6 +147,46 @@ fn static_mesh_line_hit(start: [f32; 3], end: [f32; 3], time: f32, normal: [f32;
     }
 }
 
+/// AABB-vs-triangle penetration for [`WorldPhysics::point_check`]: the depth along the triangle's
+/// unit plane normal (oriented from the plane toward the box centre) that separates the box, and
+/// that normal. `None` for a degenerate triangle or a box that does not penetrate the plane.
+fn aabb_triangle_penetration(
+    center: BevyVec3,
+    half: BevyVec3,
+    tri: &Triangle,
+) -> Option<(f32, [f32; 3])> {
+    let e1 = [
+        tri[1][0] - tri[0][0],
+        tri[1][1] - tri[0][1],
+        tri[1][2] - tri[0][2],
+    ];
+    let e2 = [
+        tri[2][0] - tri[0][0],
+        tri[2][1] - tri[0][1],
+        tri[2][2] - tri[0][2],
+    ];
+    let mut n = [
+        e1[1] * e2[2] - e1[2] * e2[1],
+        e1[2] * e2[0] - e1[0] * e2[2],
+        e1[0] * e2[1] - e1[1] * e2[0],
+    ];
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if len <= 1e-9 {
+        return None;
+    }
+    n = [n[0] / len, n[1] / len, n[2] / len];
+    let d = n[0] * (center[0] - tri[0][0])
+        + n[1] * (center[1] - tri[0][1])
+        + n[2] * (center[2] - tri[0][2]);
+    let support = half[0] * n[0].abs() + half[1] * n[1].abs() + half[2] * n[2].abs();
+    let depth = support - d.abs();
+    if depth <= 1e-9 {
+        return None;
+    }
+    let s = if d < 0.0 { -1.0 } else { 1.0 };
+    Some((depth, [n[0] * s, n[1] * s, n[2] * s]))
+}
+
 impl WorldPhysicsAdapter {
     /// Builds the adapter from the extent-query and zero-extent-query `(triangle, source id)`
     /// pairs in Bevy space (metres) produced by the importer.
@@ -151,6 +197,7 @@ impl WorldPhysicsAdapter {
         Self {
             box_world: CollisionWorld::new(box_entries),
             line_world: CollisionWorld::new(line_entries),
+            level_worlds: None,
             line_one_sided_sources: Vec::new(),
             movers: Vec::new(),
             mover_by_name: HashMap::new(),
@@ -229,6 +276,7 @@ impl WorldPhysicsAdapter {
     #[cfg(test)]
     fn with_source_names(mut self, names: &[&str]) -> Self {
         self.source_names = names.iter().map(|s| (*s).to_owned()).collect();
+        self.level_worlds = None;
         self
     }
 
@@ -240,6 +288,30 @@ impl WorldPhysicsAdapter {
     /// The zero-extent-query (line) collision world (for diagnostics and tests).
     pub fn line_world(&self) -> &CollisionWorld {
         &self.line_world
+    }
+
+    /// Lazy level-only soups for [`WorldPhysics::trace_level`]: the BSP `UModel` with placed-mesh
+    /// actor and terrain sources removed (the probe `ULevel::FindSpot`/`CheckSlice` uses, actors
+    /// flag off). Movers are not part of this probe (the collision hash is not consulted). Built on
+    /// first use and rebuilt whenever a mover registers so no stale base-pose copy is used.
+    fn level_worlds(&mut self) -> &(CollisionWorld, CollisionWorld) {
+        if self.level_worlds.is_none() {
+            let source_names = &self.source_names;
+            let is_actor = |source: u32| {
+                source_names
+                    .get(source as usize)
+                    .is_some_and(|label| label.contains(" -> ") || label.ends_with("(terrain)"))
+            };
+            let build = |world: &CollisionWorld| {
+                CollisionWorld::new((0..world.triangle_count()).filter_map(|i| {
+                    let source = world.source(i as u32);
+                    (!is_actor(source)).then(|| (*world.triangle(i as u32), source))
+                }))
+            };
+            let built = (build(&self.box_world), build(&self.line_world));
+            self.level_worlds = Some(built);
+        }
+        self.level_worlds.as_ref().expect("just built")
     }
 
     /// Shared implementation of [`WorldPhysics::trace`] and [`WorldPhysics::move_box`]: a
@@ -465,6 +537,37 @@ impl WorldPhysics for WorldPhysicsAdapter {
 
     fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
         self.swept_hit(start, end, extent)
+    }
+
+    fn trace_level(
+        &mut self,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+    ) -> Option<WorldHit> {
+        let s = to_bevy_position(start);
+        let e = to_bevy_position(end);
+        let half = unreal_extent_to_bevy(extent);
+        let zero = half.iter().all(|x| x.abs() < 1e-9);
+        let hit = {
+            let (box_world, line_world) = self.level_worlds();
+            if zero {
+                line_world.ray_with_one_sided_sources(s, e, &[])
+            } else {
+                box_world.sweep(s, e, half)
+            }
+        }?;
+        let t = hit.t;
+        let point = [
+            s[0] + (e[0] - s[0]) * t,
+            s[1] + (e[1] - s[1]) * t,
+            s[2] + (e[2] - s[2]) * t,
+        ];
+        Some(WorldHit {
+            location: bevy_to_unreal_position(point),
+            normal: bevy_to_unreal_direction(hit.normal),
+            time: t,
+        })
     }
 
     fn trace_with_mover(
@@ -753,6 +856,74 @@ impl WorldPhysics for WorldPhysicsAdapter {
         !overlaps
     }
 
+    fn point_check(&mut self, location: [f32; 3], extent: [f32; 3]) -> Option<SpotHit> {
+        let center = to_bevy_position(location);
+        let half = unreal_extent_to_bevy(extent);
+        let zero = half.iter().all(|x| x.abs() < 1e-9);
+        let hits = if zero {
+            self.line_world.overlap_aabb(center, half)
+        } else {
+            self.box_world.overlap_aabb(center, half)
+        };
+        // `ULevel::FindSpot`/`CheckSlice` probe the level through `SinglePointCheck`
+        // (`0x10387db0`) -> `MultiPointCheck` (`0x10387f90`), which checks only the BSP `UModel`
+        // (`[LevelInfo+0x80]+0x8c`, vtable `+0x6c`) and — only when the actors flag is set — the
+        // collision hash (`ULevel+0xec`, vtable `+0x1c`); there is no separate terrain check. The
+        // FindSpot call passes the actors flag as 0, so placed **actor** collision (static-mesh
+        // actors and the `ATerrainInfo` terrain, both actors) is not seen — only the BSP level
+        // model and registered movers. (item95: the Plage00 PlayerStart pawn box reaches the
+        // terrain heightfield, and the Plage01 box an actor-mesh ceiling; the level probe ignores
+        // both.) A registered mover's source stays in (its triangles are the moving brush,
+        // `triangle == u32::MAX`).
+        let is_actor_geometry = |source: u32| {
+            let Some(label) = self.source_names.get(source as usize) else {
+                return false;
+            };
+            (label.contains(" -> ") || label.ends_with("(terrain)"))
+                && !self.mover_names_by_source.contains_key(&source)
+        };
+        // Deepest penetrating triangle wins; its normal is oriented from the surface toward the
+        // box centre so moving along it separates the box (`0x10389d7e` pushes horizontally along
+        // these components).
+        let static_world = if zero {
+            &self.line_world
+        } else {
+            &self.box_world
+        };
+        let mut best: Option<(f32, [f32; 3])> = None;
+        for hit in &hits {
+            if is_actor_geometry(hit.source) {
+                continue;
+            }
+            if hit.triangle == u32::MAX {
+                // A moving-object overlap: `Hit` carries only the source, so re-test that mover's
+                // world triangles (as `dump_overlap` does).
+                let Some(m) = self.movers.iter().find_map(|(b, _)| {
+                    static_world.moving(*b).filter(|m| m.source() == hit.source)
+                }) else {
+                    continue;
+                };
+                for tri in m.world_triangles() {
+                    if let Some((depth, n)) = aabb_triangle_penetration(center, half, &tri)
+                        && best.is_none_or(|(bd, _)| depth > bd)
+                    {
+                        best = Some((depth, n));
+                    }
+                }
+            } else if let Some((depth, n)) =
+                aabb_triangle_penetration(center, half, static_world.triangle(hit.triangle))
+                && best.is_none_or(|(bd, _)| depth > bd)
+            {
+                best = Some((depth, n));
+            }
+        }
+        best.map(|(depth, n)| SpotHit {
+            location,
+            normal: bevy_to_unreal_direction(n),
+            penetration: depth * UNREAL_UNITS_PER_METER,
+        })
+    }
+
     fn dump_overlap(&mut self, location: [f32; 3], extent: [f32; 3]) -> Vec<OverlapRecord> {
         let center = to_bevy_position(location);
         let half = unreal_extent_to_bevy(extent);
@@ -862,6 +1033,9 @@ impl WorldPhysics for WorldPhysicsAdapter {
         self.mover_by_name
             .insert(actor.to_ascii_lowercase(), self.movers.len());
         self.movers.push((box_index, line_index));
+        // The level-only soups cache is built from the static soups, so rebuild it after a mover
+        // registration has removed that mover's base-pose copy.
+        self.level_worlds = None;
     }
 
     fn set_mover_collision(&mut self, actor: &str, enabled: bool) {
@@ -1443,6 +1617,125 @@ mod tests {
         // Point-free: in the air above the floor yes, inside the wall no.
         assert!(p.point_free(u([0.0, 4.0, 0.0]), [10.0, 10.0, 10.0]));
         assert!(!p.point_free(u([-5.0, 0.25, 0.0]), [10.0, 10.0, 10.0]));
+    }
+
+    #[test]
+    fn point_check_reports_the_floor_normal_and_penetration() {
+        // tiny_soup floor at Bevy y=0 (Unreal z=0). A 40-half box centred 30 UU above it has
+        // its bottom 10 UU inside: normal +Z, penetration 10.
+        let mut p = WorldPhysicsAdapter::from_entries(tiny_soup(), tiny_soup());
+        let hit = p
+            .point_check([0.0, 0.0, 30.0], [40.0, 40.0, 40.0])
+            .expect("the sunk floor box must block");
+        assert!(hit.normal[2] > 0.9, "normal {:?}", hit.normal);
+        assert!(
+            (hit.penetration - 10.0).abs() < 1.0,
+            "penetration {}",
+            hit.penetration
+        );
+        // A free box returns no contact.
+        assert!(
+            p.point_check([0.0, 0.0, 200.0], [40.0, 40.0, 40.0])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn find_spot_lifts_a_box_sunk_into_the_floor() {
+        let mut p = WorldPhysicsAdapter::from_entries(tiny_soup(), tiny_soup());
+        let extent = [40.0, 40.0, 40.0];
+        // Bottom 10 UU inside the floor; the (r, r, 1) slice at the centre is free, so
+        // CheckSlice settles the box onto the floor.
+        let spot = p
+            .find_spot([0.0, 0.0, 30.0], extent)
+            .expect("the sunk box is lifted");
+        assert!(spot[2] > 30.0, "lifted: {spot:?}");
+        assert!(
+            p.point_check(spot, extent).is_none(),
+            "the lifted spot must be free: {spot:?}"
+        );
+        // A free spot is used unchanged.
+        let free = p
+            .find_spot([0.0, 0.0, 200.0], extent)
+            .expect("a free spot is placed");
+        assert_eq!(free, [0.0, 0.0, 200.0]);
+    }
+
+    #[test]
+    fn point_check_ignores_actor_and_terrain_sources_but_sees_the_bsp() {
+        // `ULevel::SinglePointCheck` (`0x10387db0`) -> `MultiPointCheck` (`0x10387f90`) checks
+        // only the BSP `UModel` and (when the actors flag is set, which FindSpot passes as 0)
+        // the actor collision hash. Placed static-mesh actors and the `ATerrainInfo` terrain are
+        // actors, so a box sunk into them is free to the level probe; the same soup under a BSP
+        // label blocks. `point_free`/`trace` (movement) still see the actor geometry.
+        let extent = [40.0, 40.0, 40.0];
+        let sunk = [0.0, 0.0, 30.0];
+
+        let mut terrain = WorldPhysicsAdapter::from_entries(tiny_soup(), tiny_soup())
+            .with_source_names(&["TerrainInfo1 (terrain)", "Wall"]);
+        assert!(
+            terrain.point_check(sunk, extent).is_none(),
+            "the level probe must ignore terrain actor collision"
+        );
+        assert!(
+            !terrain.point_free(sunk, extent),
+            "movement's point_free still sees the terrain"
+        );
+
+        let mut actor = WorldPhysicsAdapter::from_entries(tiny_soup(), tiny_soup())
+            .with_source_names(&["StaticMeshActor1 -> StaticPlage.GR_floor", "Wall"]);
+        assert!(
+            actor.point_check(sunk, extent).is_none(),
+            "placed static-mesh actor collision is not in the level probe"
+        );
+
+        let mut bsp = WorldPhysicsAdapter::from_entries(tiny_soup(), tiny_soup())
+            .with_source_names(&["Model333 (BSP)", "Wall"]);
+        assert!(
+            bsp.point_check(sunk, extent).is_some(),
+            "a BSP floor blocks the level probe"
+        );
+    }
+
+    #[test]
+    fn trace_level_ignores_actor_and_terrain_surfaces_but_sees_the_bsp() {
+        // `ULevel::CheckSlice`'s downward `SingleLineCheck` on the FindSpot path probes the BSP
+        // `UModel` only (actors flag 0). Three stacked Bevy-space floors: a BSP floor at y=0, a
+        // placed static-mesh floor at y=0.5 and a terrain heightfield at y=1.0. A downward ray
+        // sees the highest (terrain) through `trace` (movement) but `trace_level` skips the actor
+        // surfaces and lands on the BSP.
+        let quad = |y: f32, source: u32| -> Vec<(Triangle, u32)> {
+            vec![
+                ([[-1.0, y, -1.0], [1.0, y, -1.0], [1.0, y, 1.0]], source),
+                ([[-1.0, y, -1.0], [1.0, y, 1.0], [-1.0, y, 1.0]], source),
+            ]
+        };
+        let soup: Vec<(Triangle, u32)> = quad(0.0, 0)
+            .into_iter()
+            .chain(quad(0.5, 1))
+            .chain(quad(1.0, 2))
+            .collect();
+        let mut p = WorldPhysicsAdapter::from_entries(soup.clone(), soup).with_source_names(&[
+            "Model333 (BSP)",
+            "StaticMeshActor1 -> StaticPlage.GR_floor",
+            "TerrainInfo1 (terrain)",
+        ]);
+        let start = u([0.0, 2.0, 0.0]);
+        let end = u([0.0, -1.0, 0.0]);
+        let movement = p
+            .trace(start, end, [0.0; 3])
+            .expect("movement's trace hits the terrain");
+        assert!(
+            (movement.location[2] - u([0.0, 1.0, 0.0])[2]).abs() < 1e-3,
+            "trace must see the terrain: {movement:?}"
+        );
+        let level = p
+            .trace_level(start, end, [0.0; 3])
+            .expect("the level probe hits the BSP");
+        assert!(
+            (level.location[2] - u([0.0, 0.0, 0.0])[2]).abs() < 1e-3,
+            "trace_level must skip the actor surfaces: {level:?}"
+        );
     }
 
     #[test]

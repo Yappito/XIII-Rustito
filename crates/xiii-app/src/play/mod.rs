@@ -5873,6 +5873,12 @@ mod tests {
         // StaticMeshActor3 while he approaches and dies before he clears it. This labelled
         // diagnostic teleport stands north of his approach, with a clear firing lane.
         // Measured: five 31 HP hits at292.5..294.7 kill him; player survives with20 HP.
+        // item95d: with `ULevel::FindSpot` ported, the map's script-spawned `BaseSoldier6` is
+        // re-placed out of the BSP floor (`Model333`) it was authored into; the level-only
+        // CheckSlice sweep (flags 0x86 exclude actors/terrain, `WorldPhysics::trace_level`) no
+        // longer settles it onto the adjacent `GR_falaise03` static-mesh cliff, so the killer's
+        // approach shifts and the same input leaves the player at 17 HP (was 20). The kill and
+        // the player surviving are unchanged.
         let script = script::Script::parse(&format!(
             "{}t=291.00 teleport 1802.0 -12700.0 1100.0\n\
              t=291.00 track BaseSoldier6\n\
@@ -5917,7 +5923,7 @@ mod tests {
         assert!(weapon.is_some(), "the player must hold the granted weapon");
         assert_eq!(
             s.player_health(),
-            Some(20.0),
+            Some(17.0),
             "measured surviving fight health"
         );
         let position = s.vm().location_prop(s.player).expect("player location");
@@ -8207,6 +8213,17 @@ mod tests {
         }
         assert!(error.is_none(), "unexpected blocker: {error:?}");
         assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        // item95: with `ULevel::FindSpot` ported, the post-lever cine's `tp 23` places Carrington
+        // on the platform and the cine advances past `wait player 128`, spawning the second wave
+        // (`Wave01`/`Wave02`). The route kills the charging shotgun soldier `BaseSoldier7`
+        // (head-band fire from t=520.6). item95d: the collision changes since item95 (item91's
+        // mesh/mover sweeps) push the lane clear only at ~522.5 s, so the original 0.2 s fire
+        // cadence left the kill one round late (the dying soldier landed its shotgun burst); the
+        // route now fires every 0.1 s and kills it by 523.4, before it fires, surviving at 10 hp.
+        // The other soldier `BaseSoldier6` holds position in its controller's `Tenir` state
+        // at `(-18,-710,102)` and never engages, so its `RushFinal` event never fires and the cine
+        // stays at `wait event RushFinalCine` (see the pinned blocker below). This is the honest
+        // next blocker, not a completed level.
         assert!(
             session.player_health().is_some_and(|h| h > 0.0),
             "player must survive"
@@ -8264,26 +8281,31 @@ mod tests {
             "item94: the walked route must reach the boarding platform at PositionInfo23 \
              (945.8,393.8,-105): {p:?}"
         );
-        assert_eq!(
-            (cine_action_index, cine_action.as_deref()),
-            (62, Some("wait player 128")),
-            "item94: the post-lever cine must be parked at `wait player 128`"
-        );
-        // The scripted cine teleport `tp 23` calls `Actor.SetLocation(PositionInfo23.Location)`
-        // but the VM's world-placement check (`point_free`, an approximation of `ULevel::FindSpot`)
-        // refuses it (measured: the cine pawn's extent overlaps one BSP triangle of `Model639` at
-        // the destination), so Carrington stays near `PositionInfo18` and never reaches the
-        // platform; the `wait player 128` can never pass from the reached stand and goal 5 / the
-        // travel stay unreached. `xiii-tool` disasm: `CineController2.TeleportTo` @120418,
+        // item95: the ported `ULevel::FindSpot` adjusts the cine's `tp 23` destination into a free
+        // spot (`z: -105 -> -90`), so Carrington reaches `PositionInfo23`, the cine advances past
+        // `wait player 128` (index 62), fires `Event Wave01 Wave02` and parks at
+        // `wait event RushFinalCine` (index 72), which needs both second-wave generators to fire
+        // `RushFinal`. `xiii-tool` disasm: `CineController2.TeleportTo` @120418,
         // `ULevel::FarMoveActor` 0x1038a440 calls `ULevel::FindSpot` 0x1038a080.
+        assert!(
+            cine_action_index > 62
+                && cine_action
+                    .as_deref()
+                    .is_some_and(|a| a.contains("RushFinalCine")),
+            "item95: the post-lever cine must advance past `wait player 128` to \
+             `wait event RushFinalCine`: {cine_action_index} {cine_action:?}"
+        );
         let cl = match vm.get_property(carrington, "Location") {
             Some(xiii_script::Value::Vector(v)) => *v,
             other => panic!("Cine1 location {other:?}"),
         };
+        // The `tp 23` placement put Carrington at `PositionInfo23` (found spot `(945.8,393.8,-90)`,
+        // measured by the item95 world-placement probe); the cine's later movement carries him
+        // away again, so the observable proof is that he left `PositionInfo18`
+        // `(-1529.6,-399.4,87.3)`, which the `wait player 128` gate above also requires.
         assert!(
-            (cl[0] - 945.8).abs() > 100.0 || (cl[1] - 393.75).abs() > 100.0,
-            "item94 pin: Carrington's `tp 23` must not have reached PositionInfo23 while the \
-             scripted SetLocation is refused: {cl:?}"
+            (cl[0] - -1529.57).abs() > 100.0 || (cl[1] - -399.44).abs() > 100.0,
+            "item95: the `tp 23` placement must move Carrington off PositionInfo18: {cl:?}"
         );
         // Retail `AActor::IsOverlapping` (Engine.dll @0x10352bd0) uses the brush primitive for a
         // volume brush, so `Degage` (DetectionVolume4) and `dernierpoint` (DetectionVolume5) now
@@ -8336,15 +8358,18 @@ mod tests {
             goals[4].completed,
             "goal 4 (activate the cable-car) must complete on this route: {goals:?}"
         );
-        // item94 pin: goal 5 and the Hual04c travel stay unreached. The route now walks the player
-        // down to Carrington's boarding platform (`PositionInfo23`), but the post-lever cine's
-        // `tp 23` scripted `SetLocation` is refused by the VM world-placement check, so Carrington
-        // never leaves `PositionInfo18`; the cine is parked at `wait player 128` (asserted above)
-        // and never reaches `event LaFinDeLaMap` (tabActions[95]), so `travel` stays empty. See the
-        // report; the `item92`/item81 `SetBase`-carry hypothesis was refuted (see item94 decode).
+        // item95 pin: goal 5 and the Hual04c travel still stay unreached. The `tp 23` placement now
+        // works, so Carrington reaches the platform and the cine advances past `wait player 128`,
+        // spawning the second wave (`Wave01`/`Wave02`). The route kills the charging shotgun
+        // soldier `BaseSoldier7` and survives the wave, but the other soldier `BaseSoldier6`
+        // holds position in its controller's `Tenir` state at `(-18,-710,102)` and never engages,
+        // so its `RushFinal` event never fires and `wait event RushFinalCine` (tabActions[71],
+        // `CineTrigger1` counter 2) cannot pass; the cine never reaches `event LaFinDeLaMap`
+        // (tabActions[95]) and `travel` stays empty. This is the honest next blocker (see report).
         assert!(
             !goals[5].completed,
-            "goal 5 (rejoin Carrington) stays unreached on this route (cine teleport refused): {goals:?}"
+            "goal 5 (rejoin Carrington) stays unreached on this route (the second-wave soldier \
+             BaseSoldier6 holds and never fires RushFinal): {goals:?}"
         );
         assert!(
             outcome.travel.is_empty(),
@@ -8352,9 +8377,14 @@ mod tests {
             outcome.travel
         );
         // The LastWave generators each spawned one reinforcement; all three are dead (killed by
-        // input) on this route. The generators may be cleaned up after their wave dies, so count
-        // the spawned soldiers by their `GenEnnemi` back-reference instead.
-        let mut renforts = 0;
+        // input). The post-lever second wave spawns two more soldiers via `GenNMI6`/`GenNMI7`
+        // (`Bases_Event`/soldier `Event` `RushFinal`): `BaseSoldier7` is dead (killed by input on
+        // this route) and `BaseSoldier6` is still alive (holding). The generators may be cleaned
+        // up after their wave dies, so count the spawned soldiers by their `GenEnnemi`
+        // back-reference instead.
+        let mut last_wave_dead = 0;
+        let mut second_wave_dead = 0;
+        let mut second_wave_alive = 0;
         for (i, o) in vm.objects.iter().enumerate() {
             if !o.is_actor || o.deleted || o.name.starts_with("Default__") {
                 continue;
@@ -8363,37 +8393,50 @@ mod tests {
             if !vm.is_a(id, "basesoldier") {
                 continue;
             }
-            if !matches!(
-                vm.get_property(id, "GenEnnemi"),
-                Some(xiii_script::Value::Object(Some(_)))
-            ) {
-                continue;
+            let gen_id = match vm.get_property(id, "GenEnnemi") {
+                Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(g)))) => *g,
+                _ => continue,
+            };
+            let gen_name = vm.objects[gen_id as usize].name.clone();
+            let dead = vm.get_property(id, "bIsDead") == Some(&xiii_script::Value::Bool(true));
+            // The post-lever second wave is spawned by `GenNMI6`/`GenNMI7`; the `LastWave`
+            // reinforcements by the authored `GenNMI1`/`gennmi2`/`gennmi3` (`SoldiersEnRenforts`).
+            if matches!(gen_name.as_str(), "GenNMI6" | "GenNMI7") {
+                if dead {
+                    second_wave_dead += 1;
+                } else {
+                    second_wave_alive += 1;
+                }
+            } else if dead {
+                last_wave_dead += 1;
             }
-            renforts += 1;
-            assert_eq!(
-                vm.get_property(id, "bIsDead"),
-                Some(&xiii_script::Value::Bool(true)),
-                "{}: the LastWave reinforcement must be dead (killed by input)",
-                o.name
-            );
         }
         assert_eq!(
-            renforts, 3,
+            last_wave_dead, 3,
             "the three Cine1 LastWave reinforcements must have spawned and died"
         );
+        assert_eq!(
+            second_wave_dead, 1,
+            "the post-lever second wave's charging soldier (BaseSoldier7) must be dead"
+        );
+        assert_eq!(
+            second_wave_alive, 1,
+            "the post-lever second wave's holding soldier (BaseSoldier6) must still be alive"
+        );
         // The second wave (`Wave01`/`Wave02`) belongs to Carrington's post-lever cine (action 63
-        // `Event Wave01 Wave02`), which the route reaches only after the cine passes action 61
-        // `wait player 128`. The refused `tp 23` keeps the cine parked there, so the generators
-        // stay empty.
+        // `Event Wave01 Wave02`), which the route now reaches because the `tp 23` placement
+        // succeeded. Each generator spawned one soldier; the generator whose soldier died is
+        // cleaned up (`GenNMI6` destroyed), the other still holds.
         for name in ["GenNMI6", "GenNMI7"] {
-            let id = vm
-                .find_object(name)
-                .expect("authored second-wave generator");
-            assert_eq!(
-                vm.get_property(id, "SpawnActor"),
-                Some(&xiii_script::Value::Object(None)),
-                "{name}: the second wave must not spawn on this route"
-            );
+            if let Some(id) = vm.find_object(name) {
+                assert!(
+                    matches!(
+                        vm.get_property(id, "SpawnActor"),
+                        Some(xiii_script::Value::Object(Some(_)))
+                    ),
+                    "{name}: the second wave must have spawned its soldier"
+                );
+            }
         }
         // The cable-car lever use completed goal 4 (its `PlayerTriggerToggle` open fired the
         // map's `SetGoalComplete(94)`). Record the lever state for the report.
@@ -8408,7 +8451,18 @@ mod tests {
             Some(&xiii_script::Value::Str("Hual04c.unr".to_owned()))
         );
         println!(
-            "[hual04a next blocker] item94: goal 5 is `Rejoin Carrington in front of the cable-car cabin`. The player now walks the full station route down to the boarding platform at `PositionInfo23` (945.8,393.8,-105) below the station floor. The blocker is the post-lever cine: `on event TeleOn label00` jumps Carrington's `CineController2` sequence to `tabActions[52]`; action[54] `tp 23` calls `CineController2.TeleportTo(PositionInfo23)` -> `Actor.SetLocation`, but the VM's world-placement check (`point_free`, an approximation of `ULevel::FindSpot` 0x1038a080, called from `ULevel::FarMoveActor` 0x1038a440) refuses it because the cine pawn's extent overlaps one BSP triangle of `Model639` at the destination. Carrington therefore stays near `PositionInfo18`, the cine is parked at `wait player 128` (tabActions[61]), and `event LaFinDeLaMap` (tabActions[95]) is never fired, so goal 5 and the Hual04c travel stay unreached (travel=[]). The item92/item81 `PC.Pawn.SetBase` carry hypothesis is refuted: `Telepherique.STA_init.Trigger` sets `PC` only when `Level.Title == \"Hual04c\"`."
+            "[hual04a next blocker] item95: with `ULevel::FindSpot` ported the post-lever cine's \
+             `tp 23` `Actor.SetLocation(PositionInfo23)` succeeds (WorldPhysicsAdapter::find_spot \
+             lifts the pawn extent out of the `Model639` BSP floor: z -105 -> -90), so Carrington \
+             reaches the platform, the cine passes `wait player 128` (tabActions[61]), fires \
+             `Event Wave01 Wave02` (tabActions[63]) and parks at `wait event RushFinalCine` \
+             (tabActions[71]). The route kills the charging shotgun soldier `BaseSoldier7` \
+             (GenNMI6's NMI; head-band fire from t=520.6 every 0.1 s) and survives at 10 hp, but \
+             the other second-wave soldier `BaseSoldier6` (GenNMI7's NMI) sits in its controller's \
+             `Tenir` \
+             state at (-18,-710,102) and never engages, so its `RushFinal` event never fires: \
+             `CineTrigger1` (counter 2) never reaches zero, `event LaFinDeLaMap` (tabActions[95]) \
+             never fires and goal 5 / the Hual04c travel stay unreached (`travel=[]`)."
         );
     }
 

@@ -7296,6 +7296,46 @@ impl<'s> Vm<'s> {
             });
             return Ok(None);
         }
+        // ULevel::SpawnActor 0x10388bb5..0x10388c0a runs FindSpot (vtable +0xc0, 0x1038a080) for
+        // a requested placement location when the class has `bCollideWorld` or
+        // `bCollideWhenPlacing` outside the client NetMode. The VM only re-places explicit runtime
+        // spawns: level-loaded actors never enter `SpawnActor`, and a location defaulted from the
+        // spawner is not adjusted.
+        let mut location = location;
+        if location.is_some()
+            && ["bCollideWorld", "bCollideWhenPlacing"].iter().any(|name| {
+                layout.slot_by_name(name).is_some_and(|slot| {
+                    matches!(layout.defaults.get(slot.base), Some(Value::Bool(true)))
+                })
+            })
+            && let Some(p) = self.physics.as_mut()
+        {
+            let f32_default = |name: &str| {
+                layout
+                    .slot_by_name(name)
+                    .and_then(|slot| layout.defaults.get(slot.base))
+                    .and_then(|v| match v {
+                        Value::Float(f) => Some(*f),
+                        _ => None,
+                    })
+                    .unwrap_or(0.0)
+            };
+            let radius = f32_default("CollisionRadius");
+            let height = f32_default("CollisionHeight");
+            let requested = location.expect("checked Some");
+            match p.find_spot(requested, [radius, radius, height]) {
+                Some(spot) => location = Some(spot),
+                None => {
+                    self.note(TraceKind::SpawnRefused {
+                        reason: format!(
+                            "{} has no free spot at {requested:?}",
+                            self.set.path(class)
+                        ),
+                    });
+                    return Ok(None);
+                }
+            }
+        }
         let class_name = self.object_name(class).to_owned();
         let name = self.unique_name(&class_name);
         let id = self.spawn(class, &name)?;
@@ -8702,17 +8742,22 @@ impl<'s> Vm<'s> {
         let extent = self.actor_extent(id);
         let check_world =
             self.bool_prop(id, "bCollideWorld") || self.bool_prop(id, "bCollideWhenPlacing");
+        // FarMoveActor 0x1038a50e..0x1038a547 calls `FindSpot` (vtable +0xc0, 0x1038a080) to
+        // adjust the destination into a free spot rather than refusing an overlapping one; a
+        // refused spot (fully enclosed) aborts the move.
+        let mut location = location;
         if check_world {
-            let free = match self.physics.as_mut() {
-                Some(p) => p.point_free(location, extent),
+            let adjusted = match self.physics.as_mut() {
+                Some(p) => p.find_spot(location, extent),
                 None => {
                     return Err(self.err(VmErrorKind::NoPhysicsProvider {
                         native: "Actor.SetLocation".into(),
                     }));
                 }
             };
-            if !free {
-                return Ok(false);
+            match adjusted {
+                Some(spot) => location = spot,
+                None => return Ok(false),
             }
         }
         // A scripted `SetLocation` with world/placement collision disabled is the UE2 cutscene

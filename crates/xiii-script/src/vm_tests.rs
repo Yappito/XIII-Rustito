@@ -4265,7 +4265,7 @@ fn survey_counts_missing_natives_without_aborting() {
 // ---------------------------------------------------------------------------------------
 // World physics bridge: Move/SetLocation/Trace/FastTrace/SetCollision(Size) + touching
 
-use crate::physics::{ActorMeshHit, MoveOutcome, WorldHit, WorldPhysics};
+use crate::physics::{ActorMeshHit, MoveOutcome, SpotHit, WorldHit, WorldPhysics};
 
 const IMP_ARRAYPROP: i32 = -12;
 
@@ -5793,10 +5793,196 @@ impl WorldPhysics for MockWorld {
             .iter()
             .any(|&(mn, mx)| aabb_overlaps(location, extent, mn, mx))
     }
+
+    fn point_check(&mut self, location: [f32; 3], extent: [f32; 3]) -> Option<SpotHit> {
+        if self.blocked_point {
+            return Some(SpotHit {
+                location,
+                normal: [0.0, 0.0, 1.0],
+                penetration: 0.0,
+            });
+        }
+        let mut best: Option<SpotHit> = None;
+        for &(mn, mx) in &self.walls {
+            let mut min_pen = f32::INFINITY;
+            let (mut axis, mut sign) = (0usize, 1.0f32);
+            let mut overlap = true;
+            for i in 0..3 {
+                let lo = (location[i] - extent[i]).max(mn[i]);
+                let hi = (location[i] + extent[i]).min(mx[i]);
+                let pen = hi - lo;
+                if pen <= 0.0 {
+                    overlap = false;
+                    break;
+                }
+                if pen < min_pen {
+                    min_pen = pen;
+                    axis = i;
+                    sign = if location[i] >= 0.5 * (mn[i] + mx[i]) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                }
+            }
+            if !overlap {
+                continue;
+            }
+            let mut normal = [0.0; 3];
+            normal[axis] = sign;
+            let hit = SpotHit {
+                location,
+                normal,
+                penetration: min_pen,
+            };
+            if best.is_none_or(|b| hit.penetration > b.penetration) {
+                best = Some(hit);
+            }
+        }
+        best
+    }
 }
 
 fn aabb_overlaps(c: [f32; 3], e: [f32; 3], mn: [f32; 3], mx: [f32; 3]) -> bool {
     (0..3).all(|i| c[i] + e[i] > mn[i] && c[i] - e[i] < mx[i])
+}
+
+// --- item95 ULevel::FindSpot/CheckSlice branches (0x1038a080 / 0x10389b80) -------------------
+
+#[test]
+fn find_spot_leaves_a_free_requested_spot_unchanged() {
+    let mut w = MockWorld::new();
+    let extent = [20.0, 20.0, 40.0];
+    assert_eq!(w.find_spot([0.0, 0.0, 0.0], extent), Some([0.0, 0.0, 0.0]));
+    assert_eq!(
+        w.find_spot([500.0, -20.0, 30.0], extent),
+        Some([500.0, -20.0, 30.0])
+    );
+}
+
+#[test]
+fn check_slice_lifts_a_spot_sunk_into_a_floor() {
+    // Floor slab with its top at z = 0.
+    let floor = MockWorld::new().with_wall([-2000.0, -2000.0, -400.0], [2000.0, 2000.0, 0.0]);
+    let extent = [20.0, 20.0, 40.0];
+    // Centre at z = 30: the (r, r, 1) slice is free but the box bottom (-10) is inside the floor.
+    let mut w = floor;
+    let mut encroach = false;
+    let lifted = w
+        .check_slice([0.0, 0.0, 30.0], extent, &mut encroach)
+        .expect("the sunk box is lifted");
+    assert!(!encroach, "a free slice must not set the encroachment flag");
+    assert!(lifted[2] > 30.0, "lifted: {lifted:?}");
+    assert!(
+        w.point_check(lifted, extent).is_none(),
+        "the lifted spot must be free: {lifted:?}"
+    );
+    // The full-extent overlap before the lift.
+    assert!(w.point_check([0.0, 0.0, 30.0], extent).is_some());
+}
+
+#[test]
+fn find_spot_pushes_a_spot_off_a_wall_horizontally() {
+    // Solid half-space x <= 0 spanning every z.
+    let mut w = MockWorld::new().with_wall([-2000.0, -2000.0, -2000.0], [0.0, 2000.0, 2000.0]);
+    let extent = [20.0, 20.0, 40.0];
+    // The box at x = 15 overlaps the wall on its -x side; the slice is blocked, so the
+    // horizontal corner search must move it clear.
+    let spot = w
+        .find_spot([15.0, 0.0, 0.0], extent)
+        .expect("the spot is pushed off the wall");
+    assert!(spot[0] >= 15.0, "moved away from the wall: {spot:?}");
+    assert!(
+        w.point_check(spot, extent).is_none(),
+        "the pushed spot must be free: {spot:?}"
+    );
+}
+
+#[test]
+fn find_spot_refuses_a_fully_enclosed_spot() {
+    // Solid everywhere: no corner of the box can be free.
+    let mut w = MockWorld::new().with_wall([-2000.0, -2000.0, -2000.0], [2000.0, 2000.0, 2000.0]);
+    assert_eq!(w.find_spot([0.0, 0.0, 0.0], [20.0, 20.0, 40.0]), None);
+    // A blocked zero extent fails at the zero-extent check (FindSpot 0x1038a12c).
+    let mut empty = MockWorld::new();
+    empty.blocked_point = true;
+    assert_eq!(empty.find_spot([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]), None);
+}
+
+#[test]
+fn check_slice_marks_a_blocked_slice_for_the_horizontal_search() {
+    // A wall occupies x in [-10, 10]; the slice at the requested centre is blocked.
+    let mut w = MockWorld::new().with_wall([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+    let mut encroach = false;
+    assert_eq!(
+        w.check_slice([0.0, 0.0, 0.0], [20.0, 20.0, 40.0], &mut encroach),
+        None
+    );
+    assert!(encroach, "a blocked slice must set the encroachment flag");
+}
+
+/// Provider for the `0x10389d7e` branch: the full extent blocks the box until it is pushed
+/// horizontally along the down-sweep contact normal, while the `(r, r, 1)` slice is always free.
+struct PushWorld;
+impl WorldPhysics for PushWorld {
+    fn trace(&mut self, _start: [f32; 3], end: [f32; 3], _extent: [f32; 3]) -> Option<WorldHit> {
+        Some(WorldHit {
+            location: end,
+            normal: [1.0, 0.0, 0.0],
+            time: 0.3,
+        })
+    }
+    fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        match self.trace(
+            start,
+            [
+                start[0] + delta[0],
+                start[1] + delta[1],
+                start[2] + delta[2],
+            ],
+            extent,
+        ) {
+            Some(hit) => MoveOutcome {
+                end: [
+                    start[0] + delta[0] * hit.time,
+                    start[1] + delta[1] * hit.time,
+                    start[2] + delta[2] * hit.time,
+                ],
+                hit: Some(hit),
+            },
+            None => MoveOutcome {
+                end: [
+                    start[0] + delta[0],
+                    start[1] + delta[1],
+                    start[2] + delta[2],
+                ],
+                hit: None,
+            },
+        }
+    }
+    fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool {
+        self.point_check(location, extent).is_none()
+    }
+    fn point_check(&mut self, location: [f32; 3], extent: [f32; 3]) -> Option<SpotHit> {
+        (extent[2] > 2.0 && location[0] < 20.0).then_some(SpotHit {
+            location,
+            normal: [1.0, 0.0, 0.0],
+            penetration: 5.0,
+        })
+    }
+}
+
+#[test]
+fn check_slice_pushes_a_spot_along_the_down_sweep_normal() {
+    let mut w = PushWorld;
+    let mut encroach = false;
+    let spot = w
+        .check_slice([10.0, 0.0, 10.0], [20.0, 20.0, 40.0], &mut encroach)
+        .expect("pushed out along the contact normal");
+    assert!(!encroach);
+    // z += (1 - 2*0.3) * 40 + 1 = 27, then x += 1 * 20 = 30 clears the block.
+    assert_eq!(spot, [30.0, 0.0, 27.0]);
+    assert!(w.point_check(spot, [20.0, 20.0, 40.0]).is_none());
 }
 
 fn wall_adjust_pair(vm: &mut Vm<'_>, set: &ScriptSet) -> (ObjectId, ObjectId) {
