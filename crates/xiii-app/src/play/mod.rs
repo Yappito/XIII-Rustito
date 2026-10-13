@@ -8040,4 +8040,131 @@ mod tests {
             "[hual04a next blocker] item94: goal 5 is `Rejoin Carrington in front of the cable-car cabin`. The player now walks the full station route down to the boarding platform at `PositionInfo23` (945.8,393.8,-105) below the station floor. The blocker is the post-lever cine: `on event TeleOn label00` jumps Carrington's `CineController2` sequence to `tabActions[52]`; action[54] `tp 23` calls `CineController2.TeleportTo(PositionInfo23)` -> `Actor.SetLocation`, but the VM's world-placement check (`point_free`, an approximation of `ULevel::FindSpot` 0x1038a080, called from `ULevel::FarMoveActor` 0x1038a440) refuses it because the cine pawn's extent overlaps one BSP triangle of `Model639` at the destination. Carrington therefore stays near `PositionInfo18`, the cine is parked at `wait player 128` (tabActions[61]), and `event LaFinDeLaMap` (tabActions[95]) is never fired, so goal 5 and the Hual04c travel stay unreached (travel=[]). The item92/item81 `PC.Pawn.SetBase` carry hypothesis is refuted: `Telepherique.STA_init.Trigger` sets `PC` only when `Level.Title == \"Hual04c\"`."
         );
     }
+
+    /// item99: the first Kello01b route driven entirely by retail input. The PlayerStart sits on
+    /// the snow mountain's north flank facing ENE (yaw 3496); the script holds that facing east
+    /// along the flank, turns south and drops the east face of the massif to the chalet snow
+    /// field, opens the front door `Porte0` with the retail Grab key (`use Porte0`, which runs the
+    /// door's own `XIIIPorte.PlayerTriggerToggle.PlayerTrigger`), re-approaches the doorway from
+    /// the open leaf's hinge side and enters; `TouchTrigger2` (`Event='XIII_dans_chalet'`) then
+    /// starts the Cine0 cutscene (`CineController21` -> `PlayingSequence`).
+    ///
+    /// The route is honest about what it reaches: the player survives, no objective is completed
+    /// and there is no travel. The next blocker is the Cine0 sequence itself, whose
+    /// `wait event fin_transition` needs the flashback chain (Cine1, whose pawn sits in the
+    /// far-west flashback room); goal 0/1 and the `PRock01a` travel stay unreached. See the report.
+    #[test]
+    fn opt_in_kello01b_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Kello01b".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Kello01b");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let text = include_str!("../../tests/data/kello01b_route.script");
+        assert!(!text.lines().any(|line| {
+            let command = line.split('#').next().unwrap_or("");
+            ["teleport", "weapon ", "item ", "set_goal", "take_control"]
+                .iter()
+                .any(|forbidden| command.contains(forbidden))
+        }));
+        let script = script::Script::parse(text).expect("parse Kello01b route");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Kello01b",
+            &script,
+            &resolved.params,
+            &scene,
+            300.0,
+        )
+        .expect("run Kello01b route");
+        let session = &outcome.session;
+        let vm = session.vm();
+        println!(
+            "[kello01b route] error={:?} objectives={:?} travel={:?} position={:?} health={:?} touches={:?}",
+            session.first_error(),
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health(),
+            session.touches(),
+        );
+        survey::print_details(&survey::extract("Kello01b", &outcome));
+        assert!(
+            session.first_error().is_none(),
+            "{:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(session.blocked.is_empty(), "{:?}", session.blocked);
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "player must survive"
+        );
+        // The mountain descent and the door entry are a fall-and-walk route, so the player is
+        // below full health (measured 102/150); still alive.
+        assert!(
+            session.player_health().is_some_and(|h| h < 150.0),
+            "the descent must cost some fall damage: {:?}",
+            session.player_health()
+        );
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 2, "the map authors two objectives: {goals:?}");
+        assert!(
+            !goals[0].completed,
+            "goal 0 (cover Kim's escape) is not completed by this first route: {goals:?}"
+        );
+        assert!(
+            !goals[1].completed,
+            "goal 1 (find Jones and Carrington again) is not completed by this first route: {goals:?}"
+        );
+        assert!(outcome.travel.is_empty(), "the route must not travel");
+        // Measured progress: the player entered the chalet and triggered the `XIII_dans_chalet`
+        // cutscene. `CineController21` interprets the Cine0 (Kim) sequence; it was in `STA_init`
+        // at level start and is `PlayingSequence` once TouchTrigger2 fires.
+        assert!(
+            session
+                .touches()
+                .iter()
+                .any(|(_, name)| name == "TouchTrigger2"),
+            "the player must reach TouchTrigger2 (XIII_dans_chalet): {:?}",
+            session.touches()
+        );
+        let cine0 = vm
+            .find_object("CineController21")
+            .expect("Cine0 controller");
+        assert_eq!(
+            vm.state_name(cine0).as_deref(),
+            Some("PlayingSequence"),
+            "touching the chalet trigger must start the Cine0 cutscene"
+        );
+        let position = session.player_location().expect("player position");
+        for (actual, expected) in position.into_iter().zip([-2750.0, -473.9, 2106.0]) {
+            assert!(
+                (actual - expected).abs() < 1.0,
+                "chalet interior pin moved: {position:?}"
+            );
+        }
+        assert_eq!(
+            vm.get_property(
+                session.map_info().expect("Kello01b MapInfo"),
+                "NextMapLevelWithUnr"
+            ),
+            Some(&Value::Str("PRock01a.unr".to_owned()))
+        );
+        println!(
+            "[kello01b next blocker] item99: the descent and the Porte0 door entry are reached; the route ends \
+             inside the chalet with CineController21 (Cine0/Kim) in PlayingSequence. Cine0's `debut_flash` \
+             branch then `freezeplayer` and `wait event fin_transition`, which needs the flashback chain \
+             (Cine1, whose pawn is in the far-west flashback room reached only by `playerevent flash`); the \
+             sequence never reaches `premiere_explosion`/`checkpoint`, so `event objectif99` (goal 0 primary), \
+             goal 0/1 completion and the PRock01a travel stay unreached (travel=[]). The player is pinned \
+             against the chalet wardrobe (K_armoir02) while the cutscene plays."
+        );
+    }
 }
