@@ -170,6 +170,8 @@ pub struct WorldScene {
     /// Actor-local line-query products in placed Bevy space, including non-blocking actors
     /// admitted by script traces. Empty sets are known misses, not absent mesh data.
     pub actor_line_primitives: BTreeMap<String, Vec<[[f32; 3]; 3]>>,
+    /// PointCheck geometry, independent of movement blocking and line collision selection.
+    pub actor_point_primitives: BTreeMap<String, Vec<[[f32; 3]; 3]>>,
     /// BSP zones of the level: actor metadata, sky flag and per-zone geometry counts.
     pub zones: Vec<zones::SceneZone>,
     /// Indices into [`WorldScene::zones`] of the sky zones (`is_sky`), in increasing order.
@@ -1388,6 +1390,12 @@ fn identity() -> BevyTransform {
     }
 }
 
+/// Explicit map trace flags gate the two collision soups independently. Absent tags retain
+/// the importer's existing inclusion policy; this does not resolve all actor class defaults.
+fn mesh_query_flags(flags: [Option<bool>; 2]) -> [bool; 2] {
+    flags.map(|flag| flag.unwrap_or(true))
+}
+
 /// The mesh's effective simplified-collision flags `(UseSimpleLineCollision, UseSimpleBoxCollision,
 /// UseSimpleKarmaCollision)`.
 ///
@@ -1557,7 +1565,6 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
         if a.hidden {
             im.scene
                 .count(&format!("skip.actor.hidden ({class_short})"), 1);
-            continue;
         }
         if let Some(dt) = a.draw_type
             && dt != 8
@@ -1632,14 +1639,16 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                 };
                 for (mesh, label) in converted.sections {
                     label0.clone_from(&label);
-                    im.scene.objects.push(SceneObject {
-                        mesh,
-                        transform,
-                        path: format!("{} -> {label}", a.path),
-                        placement: Some(eff),
-                        zone,
-                        colors: object_colors.clone(),
-                    });
+                    if !a.hidden {
+                        im.scene.objects.push(SceneObject {
+                            mesh,
+                            transform,
+                            path: format!("{} -> {label}", a.path),
+                            placement: Some(eff),
+                            zone,
+                            colors: object_colors.clone(),
+                        });
+                    }
                 }
                 // Per-query-kind evidence: which collision set the rule chose, whether the flag
                 // requested the simplified model but the mesh had none (fallback to set 0), and
@@ -1681,6 +1690,21 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                         .map(|t| t.map(|v| apply_transform(&transform, v)))
                         .collect(),
                 );
+                im.scene.actor_point_primitives.insert(
+                    a.path.to_ascii_lowercase(),
+                    converted
+                        .collision_box
+                        .iter()
+                        .map(|t| t.map(|v| apply_transform(&transform, v)))
+                        .collect(),
+                );
+                if a.hidden {
+                    continue;
+                }
+                // Primitive queries honor the actor's extent-specific trace flags, including
+                // editor preview meshes serialized on navigation actors. Actor line primitives
+                // above remain available to the VM, which applies its own ShouldTrace filter.
+                let [box_enabled, line_enabled] = mesh_query_flags(a.trace_flags);
                 // Collision: explicit bCollideActors/bBlockPlayers = false excludes the actor.
                 let [collide, _, block_players] = a.collision_flags;
                 if collide == Some(false) || block_players == Some(false) {
@@ -1711,8 +1735,8 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                             id,
                             tris,
                             Some((*converted.box_materials).clone()),
-                            true,
-                            true,
+                            box_enabled,
+                            line_enabled,
                         );
                     } else {
                         let box_tris = converted
@@ -1723,7 +1747,7 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                             id,
                             box_tris,
                             Some((*converted.box_materials).clone()),
-                            true,
+                            box_enabled,
                             false,
                         );
                         let line_tris = converted
@@ -1735,7 +1759,7 @@ pub fn import_map(cache: &mut PackageCache, map: &str) -> Result<WorldScene, Str
                             line_tris,
                             Some((*converted.line_materials).clone()),
                             false,
-                            true,
+                            line_enabled,
                         );
                     }
                 }
@@ -2347,6 +2371,29 @@ pub fn rotator_to_yaw_pitch(rot: [i32; 3]) -> (f32, f32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mesh_trace_flags_keep_box_and_line_queries_independent() {
+        let triangle = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        for (flags, expected) in [
+            ([Some(false), Some(false)], [0, 0]),
+            ([Some(false), Some(true)], [0, 1]),
+            ([Some(true), Some(false)], [1, 0]),
+            ([None, None], [1, 1]),
+        ] {
+            let mut scene = super::WorldScene::default();
+            let [boxes, lines] = super::mesh_query_flags(flags);
+            scene.add_collision_tris(0, [triangle], None, boxes, lines);
+            assert_eq!(
+                [
+                    scene.box_collision().count(),
+                    scene.line_collision().count()
+                ],
+                expected,
+                "disabled preview meshes and line-only primitives must not block boxes"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

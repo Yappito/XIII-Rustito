@@ -889,11 +889,22 @@ impl Session {
                 Some(Value::Bool(true))
             )
         });
-        if !end_cartoon
-            && let Some(hud) = self
-                .controller
-                .and_then(|pc| instance_prop(&self.vm, pc, "myHUD"))
-                .or_else(|| crate::play::hud::find_hud(&self.vm))
+        let hud = self
+            .controller
+            .and_then(|pc| instance_prop(&self.vm, pc, "myHUD"))
+            .or_else(|| crate::play::hud::find_hud(&self.vm));
+        // XIIIBaseHud.DrawCartoonWindowBis sets MI.EndCartoonEffect at 0x0100 when the
+        // player moves, but only emits EndCartoonEffect at 0x2B7C after the panels finish
+        // sliding out (and clears HudCartoonSFX at 0x2B3C). Keep rendering that slide:
+        // the early mission flag is not the presentation callback's completion flag.
+        let cartoon_rendering = hud.is_some_and(|hud| {
+            matches!(
+                self.vm.get_property(hud, "HudCartoonSFX"),
+                Some(Value::Bool(true))
+            )
+        });
+        if needs_cartoon_render(end_cartoon, cartoon_rendering)
+            && let Some(hud) = hud
             && let Err(e) = self.vm.send_event(hud, "PostRender", vec![arg.clone()])
         {
             self.record_failure("headless HUD.PostRender", &e);
@@ -1514,6 +1525,23 @@ impl Session {
                 Err(e) => UseOutcome::Error(e.to_string()),
             }
         }
+    }
+
+    /// The player pawn's script-set `Base`, when it is a live mover: `(name, state)`. Used by the
+    /// host to carry the host-owned pawn with a moving brush the script based it on
+    /// ([`super::movers::BasedCarry`]); `None` when the pawn has no base or the base is not a
+    /// mover.
+    pub fn player_base_mover(&self) -> Option<(String, xiii_script::vm::MoverState)> {
+        let base = match self.vm.get_property(self.player, "Base") {
+            Some(Value::Object(Some(ObjRef::Instance(i)))) => *i,
+            _ => return None,
+        };
+        let object = self.vm.objects.get(base as usize)?;
+        if object.deleted {
+            return None;
+        }
+        let name = object.name.clone();
+        self.vm.mover_state(&name).map(|state| (name, state))
     }
 
     /// Sets the player pawn's `Base` to the mover it stands on (`None` clears it), the pawn side of
@@ -3203,6 +3231,11 @@ fn bink_duration_secs(header: &[u8; 36]) -> Option<f32> {
     secs.is_finite().then_some(secs)
 }
 
+/// The mission may start before the HUD slide emits its final event.
+fn needs_cartoon_render(mission_released: bool, panels_active: bool) -> bool {
+    !mission_released || panels_active
+}
+
 /// First live `PlayerStart` in the map: `(Location, Rotation)` in Unreal units.
 #[cfg(test)]
 fn find_player_start(vm: &Vm) -> Option<([f32; 3], [i32; 3])> {
@@ -3298,6 +3331,20 @@ fn instance_prop(vm: &Vm, id: ObjectId, name: &str) -> Option<ObjectId> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cartoon_movement_release_preserves_slide_out_callbacks() {
+        // Generated lifecycle: initial HUD render, movement releases the mission, panels
+        // finish, then ordinary play. The middle state used to suppress the final event.
+        let phases = [(false, false), (false, true), (true, true), (true, false)];
+        let callbacks: Vec<_> = phases
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, (released, active))| {
+                super::needs_cartoon_render(released, active).then_some(i)
+            })
+            .collect();
+        assert_eq!(callbacks, [0, 1, 2]);
+    }
     use super::*;
     use crate::cli::Options;
     use crate::play::{resolve_params, run_script, script, viewer};

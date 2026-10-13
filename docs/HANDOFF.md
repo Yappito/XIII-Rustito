@@ -4,9 +4,98 @@ Updated: **2026-10-09 (coordinator session)**. Research phase (2026-10-04), M0, 
 
 ## Next session: start here
 
-State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `22be8fa` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
+State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `be56145` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
-### Session 2026-10-12 — read this first
+### Coordinator handover 2026-10-13 07:10 — read this first
+
+The previous coordinator stopped (weekly usage limit) with landings and agents in flight. Everything
+verified is on `origin/main` (`be56145`, last full verify 1086 passed). Since `d39b14e`: Hual04a walks to
+Carrington's boarding platform (item94, `movers::BasedCarry`), Banque01's four teleports re-measured
+(item93). Tooling notes below are essential.
+
+**Landings in flight (coordinator background shells; they die with the old session, so re-check):**
+1. `codex1` / `item91-mesh-overlap` (`dbb056f` after merging main): Touch overlap and blocking sweeps by
+   mesh/mover primitive, runtime mover colliders follow script moves, Hual04c grapple attaches and the
+   route reaches the ground escort (103 hp). Reviewed and accepted; its own verify passed (1086).
+   Was in the gated landing; this handover push moves main, so that landing will end MAIN_MOVED: re-run it. If not on main: `source P:/AI/XIII/local/land.sh; land codex1` (see below).
+2. `ai2` / `item96-lift-cage-collision` (`d5ad933`): Banque01's lift cage DOES have floor collision and
+   carries a rider (item93's "no floor" was a sweep artifact); TT5 stays because nothing can board by
+   input; regression tests pin both cage floors. Reviewed and accepted (verify 1080). Land after item91.
+
+**Agents running (opencode; logs in `local/logs/<title>.log`, reports in each worktree's `local/reports/`):**
+
+| Worktree / branch | Agent | Task (spec in `local/tasks/`) | Notes |
+|---|---|---|---|
+| `codex2` / `item97-hual04c-escort` | gpt-6.1-sol | item97: Hual04c Carrington action 27 waits for `move_move_02` (first combat-clear); extend toward objectives 0/2/3 and `kello01a` | from the item91 commit |
+| `fx` / `item95-findspot` | deepseek (3rd session, `item95c-findspot`) | item95: retail `ULevel::FindSpot` 0x1038a080 / `CheckSlice` 0x10389b80 for SetLocation/Spawn (implemented, committed WIP); Hual04a goal 5 now places Carrington; the second wave kills the low-health player | report not yet written; its verify is queued (pid 74291) |
+| `audio` / `integ-toits-gen` | deepseek | item87d: retail render-time clock (LoadMap 0x1037b210 resets `LevelInfo.TimeSeconds` and every `LastRenderTime`; `FDynamicActor::Render` 0x103ccd10 stamps drawn actors; frustum-only headless stand-in; windowed `ViewVisibility`). Doors auto-close (`XIIIPorte.PlayerTriggerToggle.Timer2`) so the long Hual04a route must be re-timed; then the Toits01 generator room | accepted in substance (item87b/c) |
+| `ai` / `item98-kello01a` | Z.AI glm-5.3-flash | item98: first Kello01a route (the map after Hual04c) | started 06:54 |
+
+Review rules the previous coordinator applied: reject class/map-specific code and host bridges;
+require decode evidence for engine behaviour (verify claims yourself with `xiii-tool script disasm`
+or llvm-objdump when they contradict stock UE2); never accept weakened assertions; a changed pin
+needs a measured cause; WIP-commit before relaunching; squash WIP commits before landing.
+
+**Tooling (all git-ignored, under `local/`):**
+- `local/verify.sh` takes a FIFO cross-worktree lock (`local/tmp/verify-test.lock`, tickets in
+  `local/tmp/verify-queue/`; oldest live ticket wins; `VERIFY_PRIORITY=1` sorts first) around
+  `cargo test --workspace`. One suite ~45 min; three concurrent suites once took 56 GB.
+- The coordinator's `land` function (`local/land.sh`, reproduced here):
+  `land() { cd P:/AI/XIII/local/wt/$1 && git fetch -q origin && git merge -q origin/main -m "Merge origin/main into $(git branch --show-current)"; git status --short | grep -E '^(UU|AA)' && { echo "$1 CONFLICT"; return 1; }; cargo run -q -p xiii-tool -- script run --game-dir P:/AI/XIII/XIII_Game --map Plage00 --touch TouchTrigger2 --ticks 60 --dt 0.0333 --touch-tick 1 --trace | cmp - P:/AI/XIII/local/reports/gog-trace-baseline.txt || { echo "$1 TRACE_DIFF"; return 1; }; out=$(VERIFY_PRIORITY=1 bash P:/AI/XIII/local/verify.sh 2>&1); rc=$?; echo "$1: $(echo "$out" | tail -2 | tr '
+' ' ')"; [ $rc -eq 0 ] && echo "$out" | grep -q '^VERIFY_OK' || { echo "$1 NOT_PUSHED"; return 1; }; git fetch -q origin && git merge-base --is-ancestor origin/main HEAD && git push -q origin HEAD:main && echo "$1 PUSHED" || echo "$1 MAIN_MOVED"; }`
+  Run landings as one sequential chain (`land a; land b`) so they do not invalidate each other.
+- Agents must start verify as `nohup bash P:/AI/XIII/local/verify.sh > local/reports/<x>-verify.txt
+  2>&1 < /dev/null &` and poll with short commands. Without `< /dev/null` the opencode session hangs
+  forever (three hangs on 2026-10-13). A hung session: log not updated for an hour with no tool call
+  running; kill the opencode process, WIP-commit, relaunch with "CONTINUATION ..." in the extra message.
+- A timed-out or killed agent leaves orphan verify waiters: `ps -ef | grep verify.sh`, worktree via
+  `readlink /proc/<pid>/cwd`; kill duplicates (and their `sleep` child).
+- Memory watchdog: `local/watchdog.ps1` (`powershell -NoProfile -ExecutionPolicy Bypass -File local/watchdog.ps1`, runs 115 min) (kills the largest `xiii_*`/`local_*` process when free
+  commit < 15 GB), restarted every ~2 h by the coordinator. Without it, keep at most one full suite.
+- Launch agents with `bash local/oc-launch.sh <worktree> <title> <spec> <model> "<extra>"`; models:
+  `openai/gpt-6.1-sol`, `ollama-cloud/deepseek-v4.1-flash` (2 sessions), `zai-coding-plan/glm-5.3-flash`
+  (5-hour window, printed reset times are Beijing time). Before launching on a merged branch, check
+  for conflicts first.
+
+### Session 2026-10-12/13 (historical)
+
+Everything verified is on `origin/main` (`d89c816`, 1086 tests passed, Plage00 `--trace`
+byte-identical). Landed after `22be8fa`:
+
+- **Windowed play memory (item89/89b):** the leak was the diagnostic `Vm.trace` (every native call
+  and event, 10-37 MiB/s). `Vm::trace_enabled` is off in windowed `--play` (Banque01 5.3 -> 1.6 GB,
+  Hual04a 5.3 -> 1.3 GB commit, flat); the in-game and front-end menus read their Main menu travel
+  and Retry load-slot requests from a bounded always-on queue (`Vm::host_request` /
+  `drain_host_requests`), tested with the trace off.
+- **Core.dll array bounds (item90):** `execArrayElement` clamps a fixed-array index and logs;
+  `execDynArrayElement` returns zero on an out-of-range read, grows on write, skips a negative write.
+- **Hual04a (items 86b/90/92):** six-kill chain, card, fuse (goal 2), LastWave killed, `use Porte21`
+  opens the electrical box so the aimed use reaches `XIIIGoalTrigger19` (goal 3), lever (goal 4). All
+  by input; then the walk through Porte12 to Carrington's boarding platform (item94) with a host carry
+  for a script-set `Pawn.Base` mover (`movers::BasedCarry`). Goal 5 is blocked: Carrington's cine
+  `tp 23` SetLocation is refused by `point_free` (item95 implements retail FindSpot).
+- **Hual04c (items 88/88b):** first route. Ladder input follows the view
+  (`PlayerController.PlayerClimbing.PlayerMove`: `aForward*X + aStrafe*Y`, no `ClimbDir` branch, no
+  XIII override) and keeps velocity on exit; static-mesh collision honours the map's
+  `bBlockNonZeroExtentTraces`/`bBlockZeroExtentTraces` per soup; headless HUD renders the cartoon
+  through its slide-out (`XIIIBaseHud.DrawCartoonWindowBis`). The route climbs to the roof and fires
+  the grapple (survives 120 s).
+
+Tooling: `local/verify.sh` takes a FIFO cross-worktree lock around `cargo test --workspace` (one
+full suite at a time, ~45 min each; `VERIFY_PRIORITY=1` for coordinator landings). Agents should run
+it with nohup in the background and poll; a timed-out bash leaves an orphan waiter
+(`ps -ef | grep verify.sh`, cwd via `/proc/<pid>/cwd`).
+
+Committed on branches, NOT on main:
+
+| Worktree / branch | State |
+|---|---|
+| `fx` / `item95-findspot` | deepseek: retail `ULevel::FindSpot` 0x1038a080 / `CheckSlice` 0x10389b80 placement for SetLocation and Spawn (item74 decode), then Hual04a goal 5 and the Hual04c travel. |
+| `codex1` / `item91-mesh-overlap` | gpt-6.1-sol: Touch overlap and blocking sweeps by mesh/mover primitive (the Hual04c hook attaches); WIP because `opt_in_plage01_player_fires_and_kills_soldier` regresses; item91b isolates it and syncs the `Telepherique0` runtime collider with its actor. |
+| `audio` / `integ-toits-gen` | deepseek item87c: retail render-time clock (`UGameEngine::LoadMap` 0x1037b210 resets `LevelInfo.TimeSeconds` and every `LastRenderTime`; `FDynamicActor::Render` 0x103ccd10 stamps drawn actors; generic headless frustum+LOS stand-in, windowed `ViewVisibility` report). Hual04a regressed with it; being measured route by route. |
+| `ai` / `item93-banque01-teleports` | Z.AI: re-measuring Banque01's four labelled escape teleports on current main. |
+
+### Session 2026-10-12 (part 1)
 
 Everything verified is on `origin/main` (`22be8fa`, 1071 tests passed, Plage00 `--trace`
 byte-identical; combat and level-start surveys clean on all 35 maps). Landed today:
@@ -31,17 +120,6 @@ byte-identical; combat and level-start surveys clean on all 35 maps). Landed tod
   AdjustAimForDisplay's snap stays Partial (anonymous native fields).
 - **Performance (item83):** Banque01 frame p50 10.6 -> 6.1 ms, p95 15.5 -> 11.8 ms (cached hot
   property slots, per-scope function index).
-
-Committed on branches, NOT on main:
-
-| Worktree / branch | State |
-|---|---|
-| `sweep` / `integ-hual04a-fuse` | Hual04a fuse leg: player reaches the fuse at 44 hp, goal 2 completes, LastWave killed. item90 (deepseek) decodes Core.dll's out-of-bounds static array access (`Hual04a.SetGoalComplete` case 3 loops `i < 4` over the 3-entry `SoldiersEnRenforts`; the VM raises ArrayIndex 3/3), then the install, lever and Hual04c travel. |
-| `audio` / `integ-toits-gen` | WIP item87: Toits01's ending cine stalls at `CineController2` `wait notbeseenbyplayer` (`Level.TimeSeconds - LastRenderTime` negative: the map serialises `LevelInfo.TimeSeconds` 2649.8, our clock starts at 0). The WIP rebase + CineController2-only stand-in was rejected (class-specific, clock start undecoded); item87b (deepseek) decodes the load-time clock and `LastRenderTime` writers. The generator room opens only through that cine (`od porte6`). |
-| `codex1` / `item88-hual04c` | gpt-6.1-sol: first Hual04c route. |
-
-Open defect: **windowed play memory** — a windowed Hual04a run held 36 GB commit / 16 GB working
-set (the user saw a 23 GB xiii-app earlier); spec `local/tasks/item89-play-memory.md`, unassigned.
 
 ### Session 2026-10-11/12 (historical)
 

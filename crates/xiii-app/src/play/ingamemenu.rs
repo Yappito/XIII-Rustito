@@ -31,8 +31,8 @@ use std::sync::Mutex;
 
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
-use xiii_script::canvas::{DrawCommand, TravelRequest, parse_travel_note};
-use xiii_script::{ObjRef, ObjectId, TraceKind, Value, Vm};
+use xiii_script::canvas::{DrawCommand, TravelRequest};
+use xiii_script::{HostRequest, ObjRef, ObjectId, TraceKind, Value, Vm};
 
 use super::session::Session;
 
@@ -194,8 +194,6 @@ pub struct InGameMenu {
     /// First errors from the install/open/dispatch path (visible in the log and the exit
     /// report; never silently dropped).
     pub errors: Vec<String>,
-    /// Trace scan cursor for travel/save-note discovery.
-    trace_cursor: usize,
     shared: Rc<RefCell<PlaySaveShared>>,
     /// `ClientTravel` observed while the menu was open (`QuitGame` → `MapMenu`).
     pub travel: Option<TravelRequest>,
@@ -407,7 +405,9 @@ impl InGameMenu {
         if let Err(e) = vm.send_event(root, "LoadIngameMenu", vec![]) {
             self.record_error(format!("LoadIngameMenu: {e}"));
         }
-        self.trace_cursor = vm.trace.len();
+        // item89b baseline: requests queued before the menu existed are gameplay travel, not
+        // menu requests (the old trace cursor skipped them the same way).
+        let _ = vm.drain_host_requests();
         self.root = Some(root);
         self.console = Some(console);
         self.installed = true;
@@ -539,7 +539,7 @@ impl InGameMenu {
             return;
         }
         self.complete_page(session);
-        self.scan_trace(session);
+        self.take_host_requests(session);
     }
 
     /// Closes the menu through the page's own Esc handler (the retail resume path:
@@ -668,8 +668,8 @@ impl InGameMenu {
 
     /// Per-rendered-frame upkeep run by the play app's Update chain: page-state completion
     /// (the save page's latent polling, which the paused VM cannot schedule), request
-    /// fulfilment and trace scanning. The page draw runs in [`Self::page_commands`] from the
-    /// HUD refresh.
+    /// fulfilment and host-request draining. The page draw runs in [`Self::page_commands`]
+    /// from the HUD refresh.
     pub fn frame(&mut self, session: &mut Session, delta: f32) {
         if self.root.is_none() {
             return;
@@ -688,7 +688,7 @@ impl InGameMenu {
             {
                 self.record_error(format!("GUI page state: {error}"));
             }
-            self.scan_trace(session);
+            self.take_host_requests(session);
         }
         if let Some(path) = &self.config_path
             && let Some(settings) = session.vm_mut().canvas.menu.as_mut()
@@ -874,7 +874,8 @@ impl InGameMenu {
         }
     }
 
-    /// Post-dispatch upkeep (key/click paths): page completion, save fulfilment, trace scan.
+    /// Post-dispatch upkeep (key/click paths): page completion, save fulfilment,
+    /// host-request drain.
     fn after_dispatch(&mut self, session: &mut Session) {
         self.poll(session.vm_mut());
         if let Some(page) = self.page {
@@ -888,34 +889,21 @@ impl InGameMenu {
         }
         self.complete_page(session);
         self.fulfil_save(session);
-        self.scan_trace(session);
+        self.take_host_requests(session);
     }
 
-    /// Scans new VM trace for the travel request (`QuitGame`) and the checkpoint-load note
-    /// (Retry), converting them into host relaunch requests.
-    fn scan_trace(&mut self, session: &mut Session) {
-        let vm = session.vm_mut();
-        if vm.trace.len() < self.trace_cursor {
-            self.trace_cursor = 0;
-        }
-        let start = self.trace_cursor.min(vm.trace.len());
-        for ev in &vm.trace[start..] {
-            if let TraceKind::Note(note) = &ev.kind {
-                if !note.starts_with("Canvas.") && !note.contains("GetStyle") {
-                    println!("[menu script] {note}");
-                }
-                if let Some(req) = parse_travel_note(note) {
-                    self.travel = Some(req);
-                }
-                if let Some(slot) = note
-                    .strip_prefix("GUI_SAVE_LOAD_SLOT:")
-                    .and_then(|s| s.parse().ok())
-                {
-                    self.load_slot = Some(slot);
-                }
+    /// Takes the VM's queued host-request notes and converts them into host relaunch
+    /// requests: the `QuitGame` travel (`Main menu` → `MapMenu`) and the checkpoint-load
+    /// slot (Retry). item89b: these arrive on the bounded always-on request queue
+    /// ([`Vm::drain_host_requests`]), not the diagnostic trace — the windowed session runs
+    /// with `trace_enabled = false`.
+    fn take_host_requests(&mut self, session: &mut Session) {
+        for request in session.vm_mut().drain_host_requests() {
+            match request {
+                HostRequest::Travel(req) => self.travel = Some(req),
+                HostRequest::LoadSlot(slot) => self.load_slot = Some(slot),
             }
         }
-        self.trace_cursor = vm.trace.len();
     }
 
     /// Runs the decoded GUI render loop for one frame into the session canvas and returns the
@@ -993,7 +981,6 @@ impl InGameMenu {
         self.root = None;
         self.console = None;
         self.page = None;
-        self.trace_cursor = 0;
         self.travel = None;
         self.load_slot = None;
         let mut shared = self.shared.borrow_mut();
@@ -1532,6 +1519,123 @@ mod tests {
         assert_eq!(travel.url, "MapMenu");
         assert!(!menu.is_open());
         assert!(menu.errors.is_empty(), "{:?}", menu.errors);
+    }
+
+    /// item89b acceptance: with the windowed `--play` trace gates **off** (`trace_enabled`,
+    /// `trace_natives`), the in-game menu's Main menu travel (`QuitGame` → `ClientTravel
+    /// MapMenu`) and the Retry load-slot request (`LoadAtCheckpoint`) must still reach the
+    /// host — through the VM's bounded host-request queue, not the diagnostic trace. Same
+    /// decoded `menu_key` steps as the traced fixtures above (Quit/Retry confirm dialogs
+    /// included: the default No must request nothing).
+    #[test]
+    fn opt_in_traceless_ingame_menu_travel_and_retry_still_reach_the_host() {
+        let Some(game_dir) = std::env::var_os("XIII_GOG_DIR").map(PathBuf::from) else {
+            println!("SKIPPED: set XIII_GOG_DIR to run the traceless in-game menu acceptance");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("xiii-item89b-menu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = Session::open(&game_dir, "Plage00").unwrap();
+        // Windowed-play parity (item89): the play plugin sets both gates off on the session's
+        // VM; the menu must not depend on the trace.
+        session.vm_mut().trace_enabled = false;
+        session.vm_mut().trace_natives = false;
+        let trace_len = session.vm().trace.len();
+        let mut menu = InGameMenu::default();
+        menu.configure(Some(dir.clone()), Some("Plage00".into()));
+        menu.open(&mut session);
+        assert!(menu.errors.is_empty(), "{:?}", menu.errors);
+
+        // Write one save slot through the menu Save page (the newest slot Retry resumes).
+        menu.key(&mut session, 13).unwrap();
+        let page = menu.page.unwrap();
+        assert!(
+            session
+                .vm()
+                .set()
+                .path(session.vm().objects[page as usize].class)
+                .eq_ignore_ascii_case("xidinterf.XIIIMenuSave"),
+            "open page is not the save page with the trace off"
+        );
+        let slot = match session.vm().get_property(page, "SaveSlots") {
+            Some(Value::Array(slots)) => slots[1].clone(),
+            other => panic!("SaveSlots: {other:?}"),
+        };
+        session
+            .vm_mut()
+            .set_property(page, "FocusedControl", 0, slot);
+        menu.key(&mut session, 13).unwrap();
+        menu.frame(&mut session, 1.0 / 60.0);
+        assert!(menu.errors.is_empty(), "{:?}", menu.errors);
+        let saved = crate::save::SaveStore::open(dir.clone()).read(1).unwrap();
+        assert_eq!(saved.description, "Menu save (Plage00)");
+
+        // Main menu: Enter on Quit opens the confirmation; the default No cancels, Yes
+        // requests the front-end travel handoff (and closes the page, like retail).
+        menu.poll(session.vm_mut());
+        let parent = menu.page.unwrap();
+        let quit = session
+            .vm()
+            .get_property(parent, "QuitBtn")
+            .unwrap()
+            .clone();
+        session
+            .vm_mut()
+            .set_property(parent, "FocusedControl", 0, quit.clone());
+        menu.key(&mut session, 13).unwrap();
+        menu.key(&mut session, 13).unwrap();
+        assert!(
+            menu.travel.is_none(),
+            "the confirmation default No must not quit"
+        );
+        session
+            .vm_mut()
+            .set_property(parent, "FocusedControl", 0, quit);
+        menu.key(&mut session, 13).unwrap();
+        menu.key(&mut session, 37).unwrap();
+        menu.key(&mut session, 13).unwrap();
+        let travel = menu.travel.take().expect("QuitGame travel request");
+        assert!(InGameMenu::is_front_end_map(&travel.map), "{:?}", travel);
+        assert_eq!(travel.url, "MapMenu");
+        assert!(menu.travel.is_none(), "Quit must not load a slot");
+
+        // Retry: Esc reopens the menu, Enter on Restart, the default No must not request,
+        // then Yes must hand the newest slot to the host.
+        menu.open(&mut session);
+        menu.poll(session.vm_mut());
+        let parent = menu.page.unwrap();
+        let retry = session
+            .vm()
+            .get_property(parent, "RestartBtn")
+            .unwrap()
+            .clone();
+        session
+            .vm_mut()
+            .set_property(parent, "FocusedControl", 0, retry.clone());
+        menu.key(&mut session, 13).unwrap();
+        menu.key(&mut session, 13).unwrap();
+        assert!(
+            menu.load_slot.is_none(),
+            "the default No must not request anything"
+        );
+        session
+            .vm_mut()
+            .set_property(parent, "FocusedControl", 0, retry);
+        menu.key(&mut session, 13).unwrap();
+        menu.key(&mut session, 37).unwrap();
+        menu.key(&mut session, 13).unwrap();
+        assert_eq!(
+            menu.load_slot,
+            Some(1),
+            "Retry load-slot request must reach the host with the trace off"
+        );
+        assert_eq!(
+            session.vm().trace.len(),
+            trace_len,
+            "the diagnostic trace must not grow while the gates are off"
+        );
+        assert!(menu.errors.is_empty(), "{:?}", menu.errors);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Opt-in corpus test (item72): on Plage00 the retail open path pauses the level clock
