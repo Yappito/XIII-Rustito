@@ -89,6 +89,27 @@ pub struct WorldPhysicsAdapter {
     /// Registered movers query moving objects first, retaining this base-pose line product
     /// for registration independently of the movement hull.
     actor_meshes: HashMap<String, Option<(CollisionWorld, Vec<bool>)>>,
+    actor_point_meshes: HashMap<String, CollisionWorld>,
+    mesh_cache: Option<crate::PackageCache>,
+    mesh_assets: HashMap<String, MeshCollisionAsset>,
+    dynamic_mesh_poses: HashMap<String, MeshPose>,
+    actor_mesh_bounds: HashMap<String, ([f32; 3], [f32; 3])>,
+    actor_brushes: HashMap<String, xiii_script::brush::BrushPrimitive>,
+}
+
+struct MeshCollisionAsset {
+    point: Vec<Triangle>,
+    line: Vec<Triangle>,
+    bounds: xiii_collision::Aabb,
+}
+
+#[derive(Clone, PartialEq)]
+struct MeshPose {
+    asset: String,
+    location: [f32; 3],
+    rotation: [i32; 3],
+    scale: [f32; 3],
+    pre_pivot: [f32; 3],
 }
 
 /// UStaticMesh::LineCheck 0x104030e0..0x1040314d pulls the reported hit back
@@ -136,6 +157,12 @@ impl WorldPhysicsAdapter {
             source_names: Vec::new(),
             mover_names_by_source: HashMap::new(),
             actor_meshes: HashMap::new(),
+            actor_point_meshes: HashMap::new(),
+            mesh_cache: None,
+            mesh_assets: HashMap::new(),
+            dynamic_mesh_poses: HashMap::new(),
+            actor_mesh_bounds: HashMap::new(),
+            actor_brushes: HashMap::new(),
         }
     }
 
@@ -162,6 +189,12 @@ impl WorldPhysicsAdapter {
                 )),
             );
         }
+        for (name, triangles) in &scene.actor_point_primitives {
+            physics.actor_point_meshes.insert(
+                name.clone(),
+                CollisionWorld::new(triangles.iter().copied().map(|tri| (tri, 0))),
+            );
+        }
         physics
     }
 
@@ -173,6 +206,22 @@ impl WorldPhysicsAdapter {
     /// Builds the adapter from an imported world's query-specific collision soups.
     pub fn from_scene(scene: &crate::WorldScene) -> Self {
         Self::from_scene_with_line_sidedness(scene)
+    }
+
+    /// Installation-backed adapter that can import runtime-spawned mesh primitives.
+    pub fn from_scene_and_install(
+        scene: &crate::WorldScene,
+        game_dir: &std::path::Path,
+        map: &str,
+    ) -> Result<Self, String> {
+        let mut physics = Self::from_scene(scene);
+        physics.mesh_cache = Some(crate::PackageCache::open(game_dir)?);
+        for brush in crate::volume_brushes::import(game_dir, map)?.brushes {
+            physics
+                .actor_brushes
+                .insert(brush.name.to_ascii_lowercase(), brush.primitive);
+        }
+        Ok(physics)
     }
 
     /// Test/diagnostic helper: overrides the collision-source labels (the map path sets them
@@ -235,6 +284,185 @@ impl WorldPhysicsAdapter {
 }
 
 impl WorldPhysics for WorldPhysicsAdapter {
+    fn actor_brush_overlap(&self, actor: &str, center: [f32; 3], extent: [f32; 3]) -> Option<bool> {
+        self.actor_brushes
+            .get(&actor.to_ascii_lowercase())
+            .map(|brush| brush.overlaps_box(center, extent))
+    }
+
+    fn prepare_actor_mesh(
+        &mut self,
+        actor: &str,
+        asset: &str,
+        location: [f32; 3],
+        rotation: [i32; 3],
+        scale: [f32; 3],
+        pre_pivot: [f32; 3],
+    ) -> Result<(), String> {
+        let key = actor.to_ascii_lowercase();
+        if self.mesh_cache.is_none()
+            && self.actor_point_meshes.contains_key(&key)
+            && !self.dynamic_mesh_poses.contains_key(&key)
+        {
+            return Ok(());
+        }
+        let pose = MeshPose {
+            asset: asset.to_ascii_lowercase(),
+            location,
+            rotation,
+            scale,
+            pre_pivot,
+        };
+        if self.dynamic_mesh_poses.get(&key) == Some(&pose) {
+            return Ok(());
+        }
+        if !self.mesh_assets.contains_key(&pose.asset) {
+            let cache = self
+                .mesh_cache
+                .as_mut()
+                .ok_or("no installation for runtime mesh import")?;
+            let (package_name, object_path) =
+                asset.split_once('.').ok_or("mesh path has no package")?;
+            let package = cache.get(package_name)?;
+            let export = (0..package.package.exports().len())
+                .find(|&i| {
+                    package
+                        .package
+                        .object_path(xiii_package::ObjectRef::Export(i as u32))
+                        .is_some_and(|path| path.eq_ignore_ascii_case(object_path))
+                })
+                .ok_or_else(|| format!("mesh {asset} not found"))?;
+            let mesh = xiii_decode::static_mesh::decode_static_mesh(
+                &package.package,
+                &package.data,
+                export,
+            )
+            .map_err(|error| format!("mesh {asset}: {error}"))?;
+            let (line_simple, point_simple, _) = crate::mesh_collision_flags(&package, export);
+            let simple_present = !mesh.collision[1].triangles.is_empty();
+            let triangles = |simple: bool| {
+                let set = &mesh.collision[usize::from(simple && simple_present)];
+                set.triangles
+                    .iter()
+                    .map(|triangle| {
+                        triangle
+                            .vertices
+                            .map(|index| to_bevy_position(set.vertices[index as usize]))
+                    })
+                    .collect()
+            };
+            self.mesh_assets.insert(
+                pose.asset.clone(),
+                MeshCollisionAsset {
+                    point: triangles(point_simple),
+                    line: triangles(line_simple),
+                    bounds: xiii_collision::Aabb {
+                        min: mesh.primitive.bounding_box.min,
+                        max: mesh.primitive.bounding_box.max,
+                    },
+                },
+            );
+        }
+        let mesh = &self.mesh_assets[&pose.asset];
+        let origin = to_bevy_position(location);
+        let pivot = to_bevy_position(pre_pivot);
+        let scale = to_bevy_scale(scale);
+        let rows = rotation_rows(rotation);
+        let transform = |triangle: &Triangle| {
+            triangle.map(|vertex| {
+                let local = std::array::from_fn::<_, 3, _>(|i| (vertex[i] - pivot[i]) * scale[i]);
+                std::array::from_fn(|i| {
+                    origin[i]
+                        + rows[i][0] * local[0]
+                        + rows[i][1] * local[1]
+                        + rows[i][2] * local[2]
+                })
+            })
+        };
+        let mut bounds = xiii_collision::Aabb::empty();
+        for x in [mesh.bounds.min[0], mesh.bounds.max[0]] {
+            for y in [mesh.bounds.min[1], mesh.bounds.max[1]] {
+                for z in [mesh.bounds.min[2], mesh.bounds.max[2]] {
+                    bounds.include(transform(&[to_bevy_position([x, y, z]); 3])[0]);
+                }
+            }
+        }
+        let center = bevy_to_unreal_position(bounds.center());
+        let half: [f32; 3] = std::array::from_fn(|i| (bounds.max[i] - bounds.min[i]) * 0.5);
+        let extent = [
+            -bevy_to_unreal_position(half)[0],
+            bevy_to_unreal_position(half)[1],
+            bevy_to_unreal_position(half)[2],
+        ];
+        self.actor_mesh_bounds.insert(key.clone(), (center, extent));
+        self.actor_point_meshes.insert(
+            key.clone(),
+            CollisionWorld::new(mesh.point.iter().map(|t| (transform(t), 0))),
+        );
+        self.actor_meshes.insert(
+            key.clone(),
+            Some((
+                CollisionWorld::new(mesh.line.iter().map(|t| (transform(t), 0))),
+                vec![true],
+            )),
+        );
+        // Registration may precede runtime mesh preparation. Keep world movement and
+        // per-actor primitive queries on the same mesh, including script mesh/scale swaps.
+        // Pose-only changes update the existing objects; they must not accumulate colliders.
+        if let Some(&slot) = self.mover_by_name.get(&key) {
+            let replace = self.dynamic_mesh_poses.get(&key).is_none_or(|old| {
+                old.asset != pose.asset
+                    || old.scale != pose.scale
+                    || old.pre_pivot != pose.pre_pivot
+            });
+            if replace {
+                let (old_box, old_line) = self.movers[slot];
+                let box_object = self
+                    .box_world
+                    .moving(old_box)
+                    .ok_or("registered mover box missing")?;
+                let source = box_object.source();
+                let box_enabled = box_object.is_enabled();
+                let line_enabled = self
+                    .line_world
+                    .moving(old_line)
+                    .ok_or("registered mover line missing")?
+                    .is_enabled();
+                self.box_world.set_moving_enabled(old_box, false);
+                self.line_world.set_moving_enabled(old_line, false);
+                let box_index = self
+                    .box_world
+                    .add_moving(MovingObject::from_world_triangles(
+                        mesh.point.iter().map(transform),
+                        source,
+                        origin,
+                        rows,
+                    ));
+                let line_index = self
+                    .line_world
+                    .add_moving(MovingObject::from_world_triangles(
+                        mesh.line.iter().map(transform),
+                        source,
+                        origin,
+                        rows,
+                    ));
+                self.box_world.set_moving_enabled(box_index, box_enabled);
+                self.line_world.set_moving_enabled(line_index, line_enabled);
+                self.movers[slot] = (box_index, line_index);
+            } else {
+                self.set_mover(actor, location, rotation);
+            }
+        }
+        self.dynamic_mesh_poses.insert(key, pose);
+        Ok(())
+    }
+
+    fn actor_mesh_bounds(&self, actor: &str) -> Option<([f32; 3], [f32; 3])> {
+        self.actor_mesh_bounds
+            .get(&actor.to_ascii_lowercase())
+            .copied()
+    }
+
     fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
         self.swept_hit(start, end, extent)
     }
@@ -269,6 +497,92 @@ impl WorldPhysics for WorldPhysicsAdapter {
 
     fn mover_is_registered(&self, actor: &str) -> bool {
         self.mover_by_name.contains_key(&actor.to_ascii_lowercase())
+    }
+
+    fn actor_mesh_overlap(
+        &mut self,
+        actor: &str,
+        center: [f32; 3],
+        extent: [f32; 3],
+    ) -> Option<bool> {
+        let key = actor.to_ascii_lowercase();
+        let center = to_bevy_position(center);
+        let extent = unreal_extent_to_bevy(extent);
+        if self.dynamic_mesh_poses.contains_key(&key) {
+            return self
+                .actor_point_meshes
+                .get(&key)
+                .map(|world| world.overlaps_aabb(center, extent));
+        }
+        if let Some(&i) = self.mover_by_name.get(&key) {
+            let &(box_index, _) = self.movers.get(i)?;
+            let object = self.box_world.moving(box_index)?;
+            return Some(
+                object
+                    .world_triangles()
+                    .any(|tri| xiii_collision::aabb_overlaps_triangle(center, extent, &tri)),
+            );
+        }
+        self.actor_point_meshes
+            .get(&key)
+            .map(|world| world.overlaps_aabb(center, extent))
+    }
+
+    fn actor_mesh_sweep(
+        &mut self,
+        actor: &str,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+    ) -> ActorMeshHit {
+        if extent == [0.0; 3] {
+            return self.actor_mesh_hit(actor, start, end);
+        }
+        let key = actor.to_ascii_lowercase();
+        let s = to_bevy_position(start);
+        let e = to_bevy_position(end);
+        let half = unreal_extent_to_bevy(extent);
+        let moving_world;
+        let world = if self.dynamic_mesh_poses.contains_key(&key) {
+            &self.actor_point_meshes[&key]
+        } else if let Some(&i) = self.mover_by_name.get(&key) {
+            let (box_index, _) = self.movers[i];
+            let Some(object) = self.box_world.moving(box_index) else {
+                return ActorMeshHit::NoData;
+            };
+            let bounds = xiii_collision::Aabb::from_center_half(s, half)
+                .union(&xiii_collision::Aabb::from_center_half(e, half));
+            if !bounds.overlaps(&object.bounds()) {
+                return ActorMeshHit::Miss;
+            }
+            moving_world = CollisionWorld::new(object.world_triangles().map(|tri| (tri, 0)));
+            &moving_world
+        } else if let Some(world) = self.actor_point_meshes.get(&key) {
+            world
+        } else {
+            return ActorMeshHit::NoData;
+        };
+        match xiii_collision::sweep_aabb(
+            world,
+            s,
+            e,
+            half,
+            &xiii_collision::SweepParams {
+                skip_start_penetration: false,
+                ..Default::default()
+            },
+        ) {
+            Some(hit) => ActorMeshHit::Hit(WorldHit {
+                time: hit.t,
+                location: [
+                    start[0] + (end[0] - start[0]) * hit.t,
+                    start[1] + (end[1] - start[1]) * hit.t,
+                    start[2] + (end[2] - start[2]) * hit.t,
+                ],
+                normal: bevy_to_unreal_direction(hit.normal),
+            }),
+            None => ActorMeshHit::Miss,
+        }
     }
 
     fn actor_mesh_hit(&mut self, actor: &str, start: [f32; 3], end: [f32; 3]) -> ActorMeshHit {
@@ -669,6 +983,228 @@ mod tests {
         );
         assert!(east.is_some(), "eastward ray must hit the registered brush");
         assert!(west.is_some(), "westward ray must hit the registered brush");
+    }
+
+    #[test]
+    fn runtime_mesh_preparation_updates_transform_and_rejects_missing_assets() {
+        let triangle = [[0.0, -10.0, -10.0], [0.0, 10.0, -10.0], [0.0, 0.0, 10.0]];
+        let mut physics = WorldPhysicsAdapter::from_entries([], []);
+        physics.mesh_assets.insert(
+            "fixture.panel".into(),
+            MeshCollisionAsset {
+                point: vec![triangle.map(to_bevy_position)],
+                line: vec![triangle.map(to_bevy_position)],
+                bounds: xiii_collision::Aabb {
+                    min: [0.0, -10.0, -10.0],
+                    max: [0.0, 10.0, 10.0],
+                },
+            },
+        );
+        physics
+            .prepare_actor_mesh(
+                "Spawned",
+                "Fixture.Panel",
+                [40.0, 0.0, 0.0],
+                [0; 3],
+                [1.0; 3],
+                [0.0; 3],
+            )
+            .unwrap();
+        assert_eq!(
+            physics.actor_mesh_overlap("Spawned", [40.0, 0.0, 0.0], [1.0; 3]),
+            Some(true)
+        );
+        let (center, extent) = physics.actor_mesh_bounds("Spawned").unwrap();
+        assert!((center[0] - 40.0).abs() < 0.0001);
+        assert!((extent[1] - 10.0).abs() < 0.0001);
+        // Move, rotate and anisotropically scale the cached local asset; no stale base pose.
+        physics
+            .prepare_actor_mesh(
+                "Spawned",
+                "Fixture.Panel",
+                [80.0, 0.0, 0.0],
+                [0, 16384, 0],
+                [1.0, 2.0, 1.0],
+                [0.0; 3],
+            )
+            .unwrap();
+        assert_eq!(
+            physics.actor_mesh_overlap("Spawned", [40.0, 0.0, 0.0], [1.0; 3]),
+            Some(false)
+        );
+        assert_eq!(
+            physics.actor_mesh_overlap("Spawned", [80.0, 0.0, 0.0], [1.0; 3]),
+            Some(true)
+        );
+        assert!(
+            physics
+                .prepare_actor_mesh(
+                    "Missing",
+                    "Fixture.Missing",
+                    [0.0; 3],
+                    [0; 3],
+                    [1.0; 3],
+                    [0.0; 3]
+                )
+                .is_err()
+        );
+        assert_eq!(
+            physics.actor_mesh_overlap("Missing", [0.0; 3], [1.0; 3]),
+            None
+        );
+    }
+
+    #[test]
+    fn registered_mover_runtime_mesh_and_world_queries_share_pose_and_mesh_swaps() {
+        let tri = [[0.0, -10.0, -10.0], [0.0, 10.0, -10.0], [0.0, 0.0, 10.0]];
+        let bevy = tri.map(to_bevy_position);
+        let mut p = WorldPhysicsAdapter::from_entries([(bevy, 0)], [(bevy, 0)]);
+        p.register_mover("Panel", 0, &[tri], [0.0; 3], [0; 3]);
+        for (asset, triangles) in [("fixture.panel", vec![bevy]), ("fixture.empty", Vec::new())] {
+            p.mesh_assets.insert(
+                asset.into(),
+                MeshCollisionAsset {
+                    point: triangles.clone(),
+                    line: triangles,
+                    bounds: xiii_collision::Aabb {
+                        min: [0.0, -10.0, -10.0],
+                        max: [0.0, 10.0, 10.0],
+                    },
+                },
+            );
+        }
+        p.prepare_actor_mesh(
+            "Panel",
+            "Fixture.Panel",
+            [0.0; 3],
+            [0; 3],
+            [1.0; 3],
+            [0.0; 3],
+        )
+        .unwrap();
+        let count = p.box_world.moving_count();
+        for step in 1..=200 {
+            let location = [step as f32, 0.0, -100.0];
+            p.prepare_actor_mesh(
+                "Panel",
+                "Fixture.Panel",
+                location,
+                [0, 16384, 0],
+                [1.0; 3],
+                [0.0; 3],
+            )
+            .unwrap();
+            let start = [location[0], -20.0, location[2]];
+            let end = [location[0], 20.0, location[2]];
+            assert!(p.trace(start, end, [0.0; 3]).is_some());
+            assert!(matches!(
+                p.actor_mesh_hit("Panel", start, end),
+                ActorMeshHit::Hit(_)
+            ));
+            assert!(p.actor_mesh_overlap("Panel", location, [1.0; 3]).unwrap());
+            assert!(!p.point_free(location, [1.0; 3]));
+            assert!(
+                p.trace([-20.0, 0.0, 0.0], [20.0, 0.0, 0.0], [0.0; 3])
+                    .is_none(),
+                "old registration pose still collides"
+            );
+        }
+        assert_eq!(
+            p.box_world.moving_count(),
+            count,
+            "pose-only updates must reuse collider storage"
+        );
+        // A script swap to a decoded empty wreck cannot retain intact movement geometry.
+        p.prepare_actor_mesh(
+            "Panel",
+            "Fixture.Empty",
+            [200.0, 0.0, -100.0],
+            [0, 16384, 0],
+            [1.0; 3],
+            [0.0; 3],
+        )
+        .unwrap();
+        assert!(p.point_free([200.0, 0.0, -100.0], [1.0; 3]));
+        assert!(
+            p.trace([200.0, -20.0, -100.0], [200.0, 20.0, -100.0], [0.0; 3])
+                .is_none()
+        );
+        assert!(matches!(
+            p.actor_mesh_hit("Panel", [200.0, -20.0, -100.0], [200.0, 20.0, -100.0]),
+            ActorMeshHit::Miss
+        ));
+        // Replacing a non-colliding mover must preserve its disabled state.
+        p.set_mover_collision("Panel", false);
+        p.prepare_actor_mesh(
+            "Panel",
+            "Fixture.Panel",
+            [0.0; 3],
+            [0; 3],
+            [2.0; 3],
+            [0.0; 3],
+        )
+        .unwrap();
+        assert!(p.point_free([0.0; 3], [1.0; 3]));
+        p.set_mover_collision("Panel", true);
+        assert!(!p.point_free([0.0; 3], [1.0; 3]));
+    }
+
+    #[test]
+    fn mesh_point_overlap_uses_box_triangles_and_current_mover_pose() {
+        let triangle = [[40.0, -10.0, -10.0], [40.0, 10.0, -10.0], [40.0, 0.0, 10.0]];
+        let mut scene = crate::WorldScene::default();
+        scene
+            .actor_point_primitives
+            .insert("door".into(), vec![triangle.map(to_bevy_position)]);
+        scene.actor_point_primitives.insert("empty".into(), vec![]);
+        let mut physics = WorldPhysicsAdapter::from_scene(&scene);
+        assert_eq!(
+            physics.actor_mesh_overlap("Door", [0.0; 3], [1.0; 3]),
+            Some(false)
+        );
+        assert_eq!(
+            physics.actor_mesh_overlap("Door", [40.0, 0.0, 0.0], [1.0; 3]),
+            Some(true)
+        );
+        let ActorMeshHit::Hit(hit) =
+            physics.actor_mesh_sweep("Door", [0.0; 3], [80.0, 0.0, 0.0], [1.0; 3])
+        else {
+            panic!("crossed thin primitive");
+        };
+        assert!((hit.time - 39.0 / 80.0).abs() < 0.0001);
+        assert!(matches!(
+            physics.actor_mesh_sweep("Empty", [0.0; 3], [80.0, 0.0, 0.0], [1.0; 3]),
+            ActorMeshHit::Miss
+        ));
+        let ActorMeshHit::Hit(hit) =
+            physics.actor_mesh_sweep("Door", [40.0, 0.0, 0.0], [80.0, 0.0, 0.0], [1.0; 3])
+        else {
+            panic!("overlapping start must be a candidate");
+        };
+        assert_eq!(hit.time, 0.0);
+        // Outside the triangle but inside its bounds: a bounds-only implementation over-fires.
+        assert_eq!(
+            physics.actor_mesh_overlap("Door", [40.0, 9.0, 9.0], [0.1; 3]),
+            Some(false)
+        );
+        assert_eq!(
+            physics.actor_mesh_overlap("Empty", [0.0; 3], [1.0; 3]),
+            Some(false)
+        );
+        assert_eq!(
+            physics.actor_mesh_overlap("Unknown", [0.0; 3], [1.0; 3]),
+            None
+        );
+        physics.register_mover("Door", 0, &[triangle], [0.0; 3], [0; 3]);
+        physics.set_mover("Door", [100.0, 0.0, 0.0], [0; 3]);
+        assert_eq!(
+            physics.actor_mesh_overlap("Door", [40.0, 0.0, 0.0], [1.0; 3]),
+            Some(false)
+        );
+        assert_eq!(
+            physics.actor_mesh_overlap("Door", [140.0, 0.0, 0.0], [1.0; 3]),
+            Some(true)
+        );
     }
 
     #[test]
@@ -1098,5 +1634,106 @@ mod tests {
             hit.location[2]
         );
         assert!(hit.normal[2] > 0.9, "floor normal {:?}", hit.normal);
+    }
+
+    /// Count of a lift cage's triangles lying in one horizontal plane (Unreal Z), per soup.
+    ///
+    /// item96 regression: a mover's mesh whose simplified collision set is absent takes the
+    /// per-triangle set for BOTH query kinds; a future importer change that drops those
+    /// triangles (or a partition that misses the mover) leaves the cage without a floor and
+    /// the ride carries nobody. The plane test is rotation-invariant (yaw/pitch keep Z).
+    fn cage_floor_planes(scene: &crate::WorldScene, line_soup: bool, z_unreal: f32) -> usize {
+        use xiii_decode::common::UNREAL_UNITS_PER_METER;
+        let entries: Vec<([[f32; 3]; 3], u32)> = if line_soup {
+            scene.line_collision().collect()
+        } else {
+            scene.box_collision().collect()
+        };
+        entries
+            .into_iter()
+            .filter(|(tri, source)| {
+                scene
+                    .collision_sources
+                    .get(*source as usize)
+                    .is_some_and(|s| s.starts_with("LiftCage0 -> "))
+                    && tri
+                        .iter()
+                        .all(|v| (v[1] * UNREAL_UNITS_PER_METER - z_unreal).abs() < 2.0)
+            })
+            .count()
+    }
+
+    #[test]
+    fn opt_in_banque01_and_hual02_lift_cage_floors_reach_both_soups() {
+        let Some(root) = std::env::var_os("XIII_GOG_DIR") else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let path = std::path::PathBuf::from(&root);
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = if path.is_relative() {
+            ws.join(path)
+        } else {
+            path
+        };
+        let mut cache = PackageCache::open(&path).expect("open install");
+
+        // Banque01 (item96): the `Staticbanque.bankascenseur` cage (BasePos z 1027) has its
+        // cabin floor slab at world Z 991 (local -36) and inner floor at 1007 (local -20).
+        // Measured planes: `xiii-tool box-probe Banque01 --from 1296,-1920,400 --to
+        // 1296,-1920,1200` lists tris 6125/6126 at 991 and 6132/6133/6379/6380 at 1007 under
+        // `LiftCage0 -> Staticbanque.bankascenseur`.
+        let scene = import_map(&mut cache, "Banque01").expect("import Banque01");
+        for (z, min, what) in [(991.0, 2, "cabin floor"), (1007.0, 2, "inner floor")] {
+            let (box_tris, line_tris) = (
+                cage_floor_planes(&scene, false, z),
+                cage_floor_planes(&scene, true, z),
+            );
+            println!("Banque01 cage {what} z={z}: box {box_tris}, line {line_tris}");
+            assert!(
+                box_tris >= min,
+                "Banque01 lift cage {what} (z={z}) missing from the box soup: {box_tris}"
+            );
+            assert!(
+                line_tris >= min,
+                "Banque01 lift cage {what} (z={z}) missing from the line soup: {line_tris}"
+            );
+        }
+
+        // Hual02 (item75's working ride): the `fredprivate.ascenseur` cage (BasePos z -4725)
+        // HAS a simplified collision set (10 triangles), so the box soup takes the simplified
+        // hull while the line soup keeps the 72-triangle per-triangle set (measured:
+        // box 10 / line 72). The hull planes are local -132.1/+131.9 (world -4857/-4593); the
+        // per-triangle interior floor is local -22.7 (world -4747.7) with the bottom slab at
+        // -4869.3. Both selections must keep their floor planes or the ride breaks.
+        let scene = import_map(&mut cache, "Hual02").expect("import Hual02");
+        // Measured soup membership per plane (the hull planes exist in both sets — the
+        // per-triangle set repeats the hull's slab planes at local -132.1/+131.9 — while the
+        // interior planes are per-triangle only). The lock: the box soup (what a walking
+        // player lands on) keeps the hull planes and keeps the interior floor OUT of it; a
+        // change that put set 0 into the box soup would silently move the rider 109.4 UU up,
+        // and a change that dropped the hull would remove the ride's standing surface.
+        for (z, want_box, want_line, what) in [
+            (-4857.0, true, true, "hull floor"),
+            (-4593.0, true, true, "hull roof"),
+            (-4869.3, false, true, "bottom slab"),
+            (-4747.7, false, true, "interior floor"),
+        ] {
+            let (box_tris, line_tris) = (
+                cage_floor_planes(&scene, false, z),
+                cage_floor_planes(&scene, true, z),
+            );
+            println!("Hual02 cage {what} z={z}: box {box_tris}, line {line_tris}");
+            assert_eq!(
+                box_tris >= 2,
+                want_box,
+                "Hual02 lift cage {what} (z={z}) box-soup membership is wrong: box {box_tris}, line {line_tris}"
+            );
+            assert_eq!(
+                line_tris >= 2,
+                want_line,
+                "Hual02 lift cage {what} (z={z}) line-soup membership is wrong: box {box_tris}, line {line_tris}"
+            );
+        }
     }
 }

@@ -93,6 +93,62 @@ pub trait WorldPhysics {
         ActorMeshHit::NoData
     }
 
+    /// PointCheck against a named actor's extent-query primitive. `None` means required
+    /// geometry is unavailable, distinct from a decoded empty primitive (`Some(false)`).
+    fn actor_mesh_overlap(
+        &mut self,
+        _actor: &str,
+        _center: [f32; 3],
+        _extent: [f32; 3],
+    ) -> Option<bool> {
+        None
+    }
+
+    /// Supplies the current static-mesh identity and transform for runtime-spawned actors.
+    /// Providers with pre-registered geometry may keep the default; installation-backed
+    /// providers decode the selected asset on demand and report failures to the VM.
+    fn prepare_actor_mesh(
+        &mut self,
+        _actor: &str,
+        _asset: &str,
+        _location: [f32; 3],
+        _rotation: [i32; 3],
+        _scale: [f32; 3],
+        _pre_pivot: [f32; 3],
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Transformed UStaticMesh primitive bounds, for GetEncroachCenter/Extent.
+    fn actor_mesh_bounds(&self, _actor: &str) -> Option<([f32; 3], [f32; 3])> {
+        None
+    }
+
+    /// Map brush PointCheck available before actor startup/spawn callbacks run.
+    fn actor_brush_overlap(
+        &self,
+        _actor: &str,
+        _center: [f32; 3],
+        _extent: [f32; 3],
+    ) -> Option<bool> {
+        None
+    }
+
+    /// LineCheck of a named actor's primitive with a nonzero moving extent.
+    fn actor_mesh_sweep(
+        &mut self,
+        actor: &str,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+    ) -> ActorMeshHit {
+        if extent == [0.0; 3] {
+            self.actor_mesh_hit(actor, start, end)
+        } else {
+            ActorMeshHit::NoData
+        }
+    }
+
     /// Whether the named actor is held as a registered mover (see
     /// [`WorldPhysics::register_mover`]): its collision triangles live in the moving world, so a
     /// world trace answers from the mover's real mesh. A mover that is NOT registered has no

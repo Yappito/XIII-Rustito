@@ -5818,16 +5818,14 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Plage01");
         let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        // item40e: fire at the awake killer (see `plage01_killer_awake_prefix`). The walked
-        // route's T7 shore touch wakes him at ~289.6 s; he then hunts the player's position, so
-        // the probe stands where the route stands - the truck shore (PathNode47) - where he
-        // settles at the water's edge ~(1127,-13750), ~730 UU out, from ~300 s (measured round
-        // 9, scratch r9_route1; the old southern spot (1771,-13200) is now point-blank to his
-        // approach path and the shots exit through the floor, scratch r8_fight1). Tracking
-        // stays on through the burst so the aim follows him while he walks in; the settled
-        // shots land 25 hp Beretta hits against his authored 125 hp.
+        // item91b: the T7 shore touch wakes the killer at ~289.6 s. Mesh primitive
+        // import removes the old WallExtinguisher cylinder shielding during the prefix;
+        // the player reaches this fight with 29 HP. The old truck-shore stand shoots
+        // StaticMeshActor3 while he approaches and dies before he clears it. This labelled
+        // diagnostic teleport stands north of his approach, with a clear firing lane.
+        // Measured: five 31 HP hits at292.5..294.7 kill him; player survives with20 HP.
         let script = script::Script::parse(&format!(
-            "{}t=291.00 teleport 643.2 -14174.5 1087.0\n\
+            "{}t=291.00 teleport 1802.0 -12700.0 1100.0\n\
              t=291.00 track BaseSoldier6\n\
              t=291.10 weapon XIII.Beretta\n\
              t=292.50 fire\nt=293.05 fire\nt=293.60 fire\nt=294.15 fire\nt=294.70 fire\n\
@@ -5868,6 +5866,18 @@ mod tests {
             weapon.map(|w| s.vm().objects[w as usize].name.clone())
         );
         assert!(weapon.is_some(), "the player must hold the granted weapon");
+        assert_eq!(
+            s.player_health(),
+            Some(20.0),
+            "measured surviving fight health"
+        );
+        let position = s.vm().location_prop(s.player).expect("player location");
+        assert!(
+            (position[0] - 1802.0).abs() < 1.0
+                && (position[1] + 12700.0).abs() < 1.0
+                && (position[2] - 1072.443).abs() < 1.0,
+            "measured diagnostic shooter stand: {position:?}"
+        );
         assert!(
             dead || health.is_some_and(|h| h <= 0.0),
             "BaseSoldier6 did not die: health {health:?}, dead {dead}"
@@ -7645,7 +7655,12 @@ mod tests {
             let command = line.split('#').next().unwrap_or("");
             ["teleport", "weapon ", "item ", "set_goal", "take_control"]
                 .iter()
-                .any(|forbidden| command.contains(forbidden))
+                .any(|forbidden| {
+                    command
+                        .split_whitespace()
+                        .nth(1)
+                        .is_some_and(|word| word == forbidden.trim())
+                })
         }));
         let script = script::Script::parse(text).expect("parse Hual04c route");
         let outcome = run_script_with_cinematic_input(
@@ -7654,7 +7669,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            120.0,
+            125.0,
         )
         .expect("run Hual04c route");
         let session = &outcome.session;
@@ -7713,14 +7728,34 @@ mod tests {
         let carrington = vm.find_object("Cine0").expect("ground Carrington");
         assert_eq!(
             vm.get_property(carrington, "CurrentScript"),
-            Some(&xiii_script::Value::Int(-1)),
-            "the ground escort sequence has not started"
+            Some(&xiii_script::Value::Int(0)),
+            "the ground escort must start through TouchTrigger4"
+        );
+        let escort = vm
+            .find_object("CineController2")
+            .expect("Carrington interpreter");
+        assert_eq!(
+            vm.get_property(escort, "ScriptedActionIndex"),
+            Some(&xiii_script::Value::Int(27)),
+            "first encounter wait event move_move_02"
+        );
+        assert_eq!(
+            vm.get_property(escort, "flagsPaused"),
+            Some(&xiii_script::Value::Int(2)),
+            "retail event wait bit"
+        );
+        let weapon = session
+            .player_weapon()
+            .expect("direct-entry default melee weapon");
+        assert!(
+            vm.is_a(weapon, "Fists"),
+            "group14 selection cannot create the missing campaign rifle"
         );
         let position = session.player_location().expect("player position");
-        for (actual, expected) in position.into_iter().zip([-1170.363, 56.460, 295.766]) {
+        for (actual, expected) in position.into_iter().zip([-1772.34, 617.889, -1971.271]) {
             assert!(
                 (actual - expected).abs() < 0.5,
-                "roof/grapple blocker pin moved: {position:?}"
+                "ground escort/combat pin moved: {position:?}"
             );
         }
         let pawns = session.player_pawn_actors();
@@ -7728,8 +7763,8 @@ mod tests {
         let pawn = pawns[0].0;
         assert_eq!(
             vm.get_property(pawn, "Physics"),
-            Some(&xiii_script::Value::Byte(11)),
-            "player holds the ladder top while attempting the grapple"
+            Some(&xiii_script::Value::Byte(1)),
+            "the player must land and walk to the ground escort"
         );
         let mi = session.map_info().expect("Hual04c MapInfo");
         assert_eq!(
@@ -7739,15 +7774,37 @@ mod tests {
         let hook = vm.find_object("Hook").expect("game-supplied grapple");
         assert_eq!(
             vm.get_property(hook, "bHooked"),
-            Some(&xiii_script::Value::Bool(false))
+            Some(&xiii_script::Value::Bool(false)),
+            "use releases the rope near the canyon floor"
         );
+        let locked_name = vm
+            .trace
+            .iter()
+            .find_map(|event| match &event.kind {
+                xiii_script::TraceKind::StateChange { actor, to, .. }
+                    if actor.starts_with("HookProjectile") && to.as_deref() == Some("Locked") =>
+                {
+                    Some(actor)
+                }
+                _ => None,
+            })
+            .expect("locked projectile trace");
+        // The escape event destroys the used anchor and release reaps its projectile.
+        // Pin their actual Touch and successful native placement rather than live objects.
+        assert!(vm.trace.iter().any(|event| matches!(&event.kind, xiii_script::TraceKind::Event { target, function, args } if target == locked_name && function == "XIIIProjectile.Touch" && args.first().is_some_and(|arg| arg == "HookPoint1"))), "the hook must contact the authored escape anchor");
+        let anchor_arg = "vect(-688.65295,60.903763,283.35825)".to_owned();
+        assert!(vm.trace.iter().any(|event| matches!(&event.kind, xiii_script::TraceKind::Native { this, path, args, result, .. } if this == locked_name && path == "Actor.SetLocation" && args.first() == Some(&anchor_arg) && result == "true")), "attachment is to the authored HookPoint1");
         let releases: Vec<_> = vm
             .trace
             .iter()
             .filter_map(|event| match &event.kind {
-                xiii_script::TraceKind::Event { function, args, .. }
-                    if function == "HookProjectile.ProcessTouch"
-                        || function == "Hook.HookInUse.Release" =>
+                xiii_script::TraceKind::Event {
+                    target,
+                    function,
+                    args,
+                    ..
+                } if (target == locked_name && function == "XIIIProjectile.Touch")
+                    || function == "Hook.HookInUse.Release" =>
                 {
                     Some(format!("{function} {args:?}"))
                 }
@@ -7759,13 +7816,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        println!("[hual04c grapple blocker] {releases:?}");
         assert!(
-            releases.iter().any(|text| text == "Releasing hook because Projectile hit wall BreakAbleMover44 (should not happen...)."),
-            "the roof attachment must reach the measured snow-plaque collision failure"
+            !releases
+                .iter()
+                .any(|text| text.contains("BreakAbleMover44")),
+            "mesh-external snow-plaque Touch must not release the attached hook: {releases:?}"
         );
         println!(
-            "[hual04c next blocker] cabin opening climbed to z=302.4, HookPoint1 attempted from the roof, returns to ladder top (-1170.363,56.460,295.766); grapple projectile releases on a mover Touch; goals 0/2/3 and kello01a travel unreached"
+            "[hual04c next blocker] HookPoint1 lock/descent/release and ground escort reached; Carrington action27 waits for move_move_02 (first combat clear). Direct-entry rifle selection leaves Fists; campaign ranged loadout/first encounter unresolved, goals0/2/3 and kello01a travel unreached. inventory={:?}",
+            session.inventory_items()
         );
     }
 

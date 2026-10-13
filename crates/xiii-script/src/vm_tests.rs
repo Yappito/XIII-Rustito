@@ -4353,6 +4353,7 @@ fn phys_fixture() -> Vec<u8> {
     // `ABrush.Brush` (the volume/mover brush model reference), used by the volume-brush overlap
     // test (`AActor::IsOverlapping`).
     let brush = b.reserve(IMP_OBJECTPROP, actor, "Brush");
+    let mesh = b.reserve(IMP_OBJECTPROP, actor, "Mesh");
 
     b.prop_with(owner, level, 0, &object_extra);
     b.prop_with(level, base, 0, &object_extra);
@@ -4389,7 +4390,8 @@ fn phys_fixture() -> Vec<u8> {
     b.prop_array(touching, just_teleported, 0, touching_template);
     b.prop(just_teleported, floor, 0);
     b.prop_with(floor, brush, 0, &vector_extra);
-    b.prop_with(brush, touch_fn, 0, &object_extra);
+    b.prop_with(brush, mesh, 0, &object_extra);
+    b.prop_with(mesh, touch_fn, 0, &object_extra);
 
     let tc = touches as u8;
     let touch_code = vec![0x0F, 0x01, tc, 0x92, 0x00, tc, 0x26, 0x16, 0x04, 0x0B];
@@ -4436,6 +4438,8 @@ fn phys_fixture() -> Vec<u8> {
     b.prop_with(ctrl_pawn, no_control, 0, &object_extra);
     b.class(pawn, actor, pawn_controller, 0);
     b.class(controller, actor, ctrl_pawn, 0);
+    let projectile = b.reserve(0, 0, "Projectile");
+    b.class(projectile, actor, 0, 0);
     b.build()
 }
 
@@ -6359,6 +6363,332 @@ impl WorldPhysics for MeshWorld {
             time: t,
         })
     }
+
+    fn actor_mesh_overlap(
+        &mut self,
+        actor: &str,
+        center: [f32; 3],
+        extent: [f32; 3],
+    ) -> Option<bool> {
+        if !self.with_data || !actor.eq_ignore_ascii_case("WindowDoor") {
+            return None;
+        }
+        Some(
+            (center[0] - self.wall_x).abs() <= extent[0]
+                && !(center[2] - extent[2] > self.window_z0
+                    && center[2] + extent[2] < self.window_z1),
+        )
+    }
+
+    fn actor_mesh_sweep(
+        &mut self,
+        actor: &str,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+    ) -> ActorMeshHit {
+        if !self.with_data || !actor.eq_ignore_ascii_case("WindowDoor") {
+            return ActorMeshHit::NoData;
+        }
+        let delta = std::array::from_fn(|i| end[i] - start[i]);
+        let Some((time, normal)) = swept_aabb(
+            start,
+            delta,
+            extent,
+            [self.wall_x, -1000.0, -1000.0],
+            [self.wall_x, 1000.0, 1000.0],
+        ) else {
+            return ActorMeshHit::Miss;
+        };
+        let location: [f32; 3] = std::array::from_fn(|i| start[i] + delta[i] * time);
+        if location[2] - extent[2] > self.window_z0 && location[2] + extent[2] < self.window_z1 {
+            return ActorMeshHit::Miss;
+        }
+        ActorMeshHit::Hit(WorldHit {
+            location,
+            normal,
+            time,
+        })
+    }
+
+    fn actor_mesh_bounds(&self, actor: &str) -> Option<([f32; 3], [f32; 3])> {
+        (self.with_data && actor.eq_ignore_ascii_case("WindowDoor"))
+            .then_some(([self.wall_x, 0.0, 0.0], [0.0, 10.0, 10.0]))
+    }
+
+    fn actor_brush_overlap(&self, actor: &str, center: [f32; 3], extent: [f32; 3]) -> Option<bool> {
+        (self.with_data && actor == "EarlyVolume")
+            .then(|| unit_cube_primitive().overlaps_box(center, extent))
+    }
+}
+
+#[test]
+fn mesh_mover_touch_rejects_cylinder_only_contact_and_reports_missing_data() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let projectile = vm.spawn(pg(&set, "Projectile"), "Projectile").unwrap();
+    vm.set_active(projectile, true);
+    vm.set_property(projectile, "Location", 0, Value::Vector([0.0; 3]));
+    set_collision_fields(&mut vm, projectile, true, false);
+    let mover = vm.spawn(pg(&set, "Mover"), "WindowDoor").unwrap();
+    set_collision_fields(&mut vm, mover, true, false);
+    vm.set_property(mover, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(mover, "CollisionHeight", 0, Value::Float(160.0));
+    vm.set_property(
+        mover,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    vm.refresh_touching_of(projectile).unwrap();
+    assert!(!vm.touching(projectile).contains(&mover));
+    assert!(!vm.actors_overlap(mover, projectile).unwrap());
+    vm.set_property(projectile, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    vm.refresh_touching_of(projectile).unwrap();
+    assert!(vm.touching(projectile).contains(&mover));
+    assert!(vm.touching(mover).contains(&projectile));
+    // The opening is inside the nominal cylinder; no mesh contact and symmetric UnTouch.
+    vm.set_property(projectile, "Location", 0, Value::Vector([40.0, 0.0, 90.0]));
+    vm.refresh_touching_of(projectile).unwrap();
+    assert!(!vm.touching(projectile).contains(&mover));
+    assert!(!vm.touching(mover).contains(&projectile));
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0).without_data()));
+    assert!(vm.refresh_touching_of(projectile).is_err());
+    vm.set_property(mover, "bUseCylinderCollision", 0, Value::Bool(true));
+    vm.refresh_touching_of(projectile).unwrap();
+    assert!(vm.touching(projectile).contains(&mover));
+    // GetPrimitive's Mesh takes precedence over StaticMesh even on an encroacher.
+    vm.set_property(mover, "bUseCylinderCollision", 0, Value::Bool(false));
+    vm.set_property(
+        mover,
+        "Mesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    assert!(vm.actors_overlap(projectile, mover).unwrap());
+}
+
+#[test]
+fn script_moved_noninterpolating_mover_syncs_world_pose_and_collision_lifecycle() {
+    struct MovingPanel {
+        world: MockWorld,
+        enabled: bool,
+    }
+    impl WorldPhysics for MovingPanel {
+        fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
+            if self.enabled {
+                self.world.trace(start, end, extent)
+            } else {
+                None
+            }
+        }
+        fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+            self.world.move_box(start, delta, extent)
+        }
+        fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool {
+            self.world.point_free(location, extent)
+        }
+        fn set_mover_collision(&mut self, _: &str, enabled: bool) {
+            self.enabled = enabled;
+        }
+        fn set_mover(&mut self, _: &str, location: [f32; 3], rotation: [i32; 3]) {
+            let half = if rotation[1] == 16384 {
+                [20.0, 1.0, 10.0]
+            } else {
+                [1.0, 20.0, 10.0]
+            };
+            self.world.walls = vec![(
+                std::array::from_fn(|i| location[i] - half[i]),
+                std::array::from_fn(|i| location[i] + half[i]),
+            )];
+        }
+    }
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MovingPanel {
+        world: MockWorld::new(),
+        enabled: true,
+    }));
+    let mover = vm.spawn(pg(&set, "Mover"), "Panel").unwrap();
+    set_collision_fields(&mut vm, mover, true, false);
+    vm.set_property(mover, "bInterpolating", 0, Value::Bool(false));
+    vm.set_property(mover, "Location", 0, Value::Vector([0.0; 3]));
+    vm.sync_mover_collision();
+    assert!(
+        vm.physics
+            .as_mut()
+            .unwrap()
+            .trace([-30.0, 0.0, 0.0], [30.0, 0.0, 0.0], [0.0; 3])
+            .is_some()
+    );
+    // Direct script/host property writes do not go through the interpolation updater.
+    // Repeated small steps must clear the original pose and expose the new one.
+    for step in 1..=200 {
+        let z = -(step as f32);
+        vm.set_property(mover, "Location", 0, Value::Vector([0.0, 0.0, z]));
+        vm.set_property(mover, "Rotation", 0, Value::Rotator([0, 16384, 0]));
+        vm.sync_mover_collision();
+        assert!(
+            vm.physics
+                .as_mut()
+                .unwrap()
+                .trace([15.0, -30.0, z], [15.0, 30.0, z], [0.0; 3])
+                .is_some(),
+            "rotated panel at step{step}"
+        );
+    }
+    assert!(
+        vm.physics
+            .as_mut()
+            .unwrap()
+            .trace([-30.0, 0.0, 0.0], [30.0, 0.0, 0.0], [0.0; 3])
+            .is_none(),
+        "stale collider at original pose"
+    );
+    for enabled in [false, true] {
+        vm.set_property(mover, "bCollideActors", 0, Value::Bool(enabled));
+        vm.sync_mover_collision();
+        assert_eq!(
+            vm.physics
+                .as_mut()
+                .unwrap()
+                .trace([15.0, -30.0, -200.0], [15.0, 30.0, -200.0], [0.0; 3])
+                .is_some(),
+            enabled
+        );
+    }
+    vm.destroy(mover).unwrap();
+    vm.sync_mover_collision();
+    assert!(
+        vm.physics
+            .as_mut()
+            .unwrap()
+            .trace([15.0, -30.0, -200.0], [15.0, 30.0, -200.0], [0.0; 3])
+            .is_none()
+    );
+}
+
+#[test]
+fn pawn_touching_keeps_vertical_cylinders_with_independent_radius_and_half_height() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let a = vm.spawn(pg(&set, "Pawn"), "PawnA").unwrap();
+    let b = vm.spawn(pg(&set, "Pawn"), "PawnB").unwrap();
+    for id in [a, b] {
+        vm.set_active(id, true);
+        set_collision_fields(&mut vm, id, true, false);
+        vm.set_property(id, "CollisionRadius", 0, Value::Float(34.0));
+        vm.set_property(id, "CollisionHeight", 0, Value::Float(75.0));
+    }
+    vm.set_property(a, "Location", 0, Value::Vector([0.0; 3]));
+    vm.set_property(b, "Location", 0, Value::Vector([40.0, 0.0, 100.0]));
+    vm.refresh_touching_of(a).unwrap();
+    assert!(vm.touching(a).contains(&b));
+    // Both coordinate differences fit the extent box, but the circular XY discs do not.
+    vm.set_property(b, "Location", 0, Value::Vector([50.0, 50.0, 100.0]));
+    vm.refresh_touching_of(a).unwrap();
+    assert!(vm.touching(a).is_empty());
+    vm.set_property(b, "Location", 0, Value::Vector([0.0, 0.0, 151.0]));
+    vm.refresh_touching_of(a).unwrap();
+    assert!(
+        vm.touching(a).is_empty(),
+        "75 is half-height, not full height"
+    );
+}
+
+#[test]
+fn mesh_encroachment_box_uses_primitive_center_not_actor_location() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let mesh_actor = vm.spawn(pg(&set, "Decoration"), "WindowDoor").unwrap();
+    set_collision_fields(&mut vm, mesh_actor, true, false);
+    vm.set_property(mesh_actor, "Location", 0, Value::Vector([500.0, 0.0, 0.0]));
+    vm.set_property(
+        mesh_actor,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    assert_eq!(
+        vm.touch_encroach_box(mesh_actor).unwrap(),
+        ([40.0, 0.0, 0.0], [0.0, 10.0, 10.0])
+    );
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0).without_data()));
+    assert!(vm.touch_encroach_box(mesh_actor).is_err());
+    vm.set_property(mesh_actor, "bUseCylinderCollision", 0, Value::Bool(true));
+    assert_eq!(
+        vm.touch_encroach_box(mesh_actor).unwrap().0,
+        [500.0, 0.0, 0.0]
+    );
+}
+
+#[test]
+fn blocking_mesh_sweep_passes_opening_and_stops_at_panel_not_nominal_cylinder() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let actor = phys_actor(&mut vm, &set, "Walker", [-100.0, 0.0, 90.0]);
+    set_collision_fields(&mut vm, actor, true, true);
+    let mover = vm.spawn(pg(&set, "Mover"), "WindowDoor").unwrap();
+    set_collision_fields(&mut vm, mover, true, true);
+    vm.set_property(mover, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(mover, "CollisionHeight", 0, Value::Float(160.0));
+    vm.set_property(
+        mover,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    assert!(vm.vm_move(actor, [200.0, 0.0, 0.0]).unwrap());
+    assert_eq!(
+        vm.get_property(actor, "Location"),
+        Some(&Value::Vector([100.0, 0.0, 90.0]))
+    );
+    vm.set_property(actor, "Location", 0, Value::Vector([-100.0, 0.0, 0.0]));
+    assert!(vm.vm_move(actor, [200.0, 0.0, 0.0]).unwrap());
+    let location = vm.vector_prop(actor, "Location").unwrap();
+    assert!((location[0] - (40.0 - vm.f32_prop(actor, "CollisionRadius"))).abs() < 0.0001);
+    vm.set_property(actor, "Location", 0, Value::Vector([-100.0, 0.0, 0.0]));
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0).without_data()));
+    assert!(vm.vm_move(actor, [200.0, 0.0, 0.0]).is_err());
+}
+
+#[test]
+fn touch_sweep_crosses_thin_mesh_without_endpoint_overlap_and_misses_opening() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let projectile = vm.spawn(pg(&set, "Projectile"), "Projectile").unwrap();
+    vm.set_active(projectile, true);
+    vm.set_property(projectile, "Location", 0, Value::Vector([100.0, 0.0, 90.0]));
+    set_collision_fields(&mut vm, projectile, true, false);
+    let mover = vm.spawn(pg(&set, "Mover"), "WindowDoor").unwrap();
+    set_collision_fields(&mut vm, mover, true, false);
+    vm.set_property(mover, "bBlockNonZeroExtentTraces", 0, Value::Bool(true));
+    vm.set_property(mover, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    vm.set_property(
+        mover,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    vm.sweep_touching(projectile, [0.0, 0.0, 90.0], [100.0, 0.0, 90.0])
+        .unwrap();
+    assert!(vm.touching(projectile).is_empty());
+    vm.set_property(projectile, "Location", 0, Value::Vector([100.0, 0.0, 0.0]));
+    vm.sweep_touching(projectile, [0.0; 3], [100.0, 0.0, 0.0])
+        .unwrap();
+    assert!(vm.touching(projectile).contains(&mover));
+    assert_eq!(vm.get_property(projectile, "Touches"), Some(&Value::Int(1)));
+    vm.refresh_touching_of(projectile).unwrap();
+    assert!(vm.touching(projectile).is_empty());
+    assert_eq!(
+        vm.get_property(projectile, "UnTouches"),
+        Some(&Value::Int(1))
+    );
 }
 
 /// item53: a zero-extent ray through a static-mesh actor's window opening does not hit the
@@ -6901,12 +7231,39 @@ fn volume_brush_overlap_uses_the_primitive_not_the_class_cylinder() {
     vm.set_property(player, "CollisionHeight", 0, Value::Float(5.0));
     // A cylinder inside the brush but far outside the volume's class cylinder: the primitive
     // reports the overlap, the cylinder would not.
-    assert!(vm.actors_overlap(player, volume));
-    assert!(vm.actors_overlap(volume, player));
+    assert!(vm.actors_overlap(player, volume).unwrap());
+    assert!(vm.actors_overlap(volume, player).unwrap());
 
     // Moved entirely outside the brush (and still outside the class cylinder): no overlap.
     vm.set_property(player, "Location", 0, Value::Vector([2.0, 2.0, 2.0]));
-    assert!(!vm.actors_overlap(player, volume));
+    assert!(!vm.actors_overlap(player, volume).unwrap());
+}
+
+#[test]
+fn startup_touch_uses_provider_brush_before_host_actor_registration() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let volume = vm.spawn(pg(&set, "Volume"), "EarlyVolume").unwrap();
+    vm.set_property(
+        volume,
+        "Brush",
+        0,
+        Value::Object(Some(ObjRef::Instance(volume))),
+    );
+    vm.set_property(volume, "Location", 0, Value::Vector([1000.0; 3]));
+    set_collision_fields(&mut vm, volume, true, false);
+    let actor = phys_actor(&mut vm, &set, "Spawned", [0.5; 3]);
+    set_collision_fields(&mut vm, actor, true, false);
+    vm.set_property(actor, "CollisionRadius", 0, Value::Float(0.1));
+    vm.set_property(actor, "CollisionHeight", 0, Value::Float(0.1));
+    vm.refresh_touching_of(actor).unwrap();
+    assert!(vm.touching(actor).contains(&volume));
+    vm.set_property(actor, "Location", 0, Value::Vector([2.0; 3]));
+    vm.refresh_touching_of(actor).unwrap();
+    assert!(vm.touching(actor).is_empty());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0).without_data()));
+    assert!(vm.refresh_touching_of(actor).is_err());
 }
 
 #[test]
@@ -6924,8 +7281,8 @@ fn two_brush_actors_never_overlap() {
         vm.set_property(id, "CollisionHeight", 0, Value::Float(50.0));
         vm.set_property(id, "Brush", 0, Value::Object(Some(ObjRef::Instance(id))));
     }
-    assert!(!vm.actors_overlap(a, b));
-    assert!(!vm.actors_overlap(b, a));
+    assert!(!vm.actors_overlap(a, b).unwrap());
+    assert!(!vm.actors_overlap(b, a).unwrap());
 }
 
 #[test]
@@ -7426,7 +7783,7 @@ fn exact_contact_boundary_overlaps() {
 }
 
 #[test]
-fn set_collision_false_ends_touching() {
+fn set_collision_false_defers_untouch_until_movement_refresh() {
     let set = phys_set();
     let mut vm = Vm::new(&set, VmLimits::default());
     vm.set_physics(Box::new(MockWorld::new()));
@@ -7446,6 +7803,9 @@ fn set_collision_false_ends_touching() {
         &mut args,
     )
     .unwrap();
+    assert_eq!(vm.touching_list(a), vec![b]);
+    assert_eq!(vm.get_property(a, "UnTouches"), Some(&Value::Int(0)));
+    vm.refresh_touching_of(a).unwrap();
     assert_eq!(vm.get_property(a, "UnTouches"), Some(&Value::Int(1)));
     assert_eq!(vm.get_property(b, "UnTouches"), Some(&Value::Int(1)));
     assert!(vm.touching_list(a).is_empty());
