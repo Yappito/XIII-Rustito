@@ -7392,12 +7392,20 @@ impl<'s> Vm<'s> {
             return;
         }
         let mut changes: Vec<(String, bool)> = Vec::new();
+        let mut poses = Vec::new();
         for (i, o) in self.objects.iter().enumerate() {
             if !o.is_actor || !o.layout.is_mover_class || o.name.starts_with("Default__") {
                 continue;
             }
             let id = i as ObjectId;
             let enabled = !o.deleted && self.bool_prop(id, "bCollideActors");
+            if !o.deleted {
+                poses.push((
+                    o.name.clone(),
+                    self.location_prop(id).unwrap_or([0.0; 3]),
+                    self.rotation_prop(id).unwrap_or([0; 3]),
+                ));
+            }
             if self.mover_collision_sent.get(&id) != Some(&enabled) {
                 self.mover_collision_sent.insert(id, enabled);
                 changes.push((o.name.clone(), enabled));
@@ -7406,6 +7414,12 @@ impl<'s> Vm<'s> {
         if let Some(p) = self.physics.as_mut() {
             for (name, enabled) in changes {
                 p.set_mover_collision(&name, enabled);
+            }
+            // Script SetLocation/SetRotation, direct property writes and falling can move
+            // movers without PHYS_MovingBrush interpolation. All registered world queries
+            // must see the same authoritative actor pose as per-actor primitive queries.
+            for (name, location, rotation) in poses {
+                p.set_mover(&name, location, rotation);
             }
         }
     }
@@ -7692,37 +7706,143 @@ impl<'s> Vm<'s> {
         self.brush_primitives.insert(id, primitive);
     }
 
+    fn prepare_touch_mesh(&mut self, id: ObjectId) -> VmResult<()> {
+        let asset = self
+            .get_property(id, "StaticMesh")
+            .and_then(|value| self.obj_path(value))
+            .ok_or_else(|| {
+                self.err(VmErrorKind::Unresolved {
+                    what: "Touch mesh identity".into(),
+                })
+            })?;
+        let name = self.objects[id as usize].name.clone();
+        let location = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
+        let rotation = self.rotator_prop(id, "Rotation").unwrap_or([0; 3]);
+        let draw_scale = self.f32_prop(id, "DrawScale");
+        let scale = self
+            .vector_prop(id, "DrawScale3D")
+            .unwrap_or([1.0; 3])
+            .map(|v| v * draw_scale);
+        let pivot = self.vector_prop(id, "PrePivot").unwrap_or([0.0; 3]);
+        match self.physics.as_mut() {
+            Some(physics) => physics
+                .prepare_actor_mesh(&name, &asset, location, rotation, scale, pivot)
+                .map_err(|what| self.err(VmErrorKind::Unresolved { what })),
+            None => Err(self.err(VmErrorKind::NoPhysicsProvider {
+                native: "Touch primitive".into(),
+            })),
+        }
+    }
+
+    pub(crate) fn touch_encroach_box(&mut self, id: ObjectId) -> VmResult<([f32; 3], [f32; 3])> {
+        if self.uses_static_mesh_primitive(id) && !self.bool_prop(id, "bUseCylinderCollision") {
+            self.prepare_touch_mesh(id)?;
+            let name = self.objects[id as usize].name.clone();
+            return self
+                .physics
+                .as_ref()
+                .and_then(|physics| physics.actor_mesh_bounds(&name))
+                .ok_or_else(|| {
+                    self.err(VmErrorKind::Unresolved {
+                        what: format!("GetEncroachExtent requires mesh bounds for {name}"),
+                    })
+                });
+        }
+        let (center, radius, height) = self.actor_cylinder(id);
+        Ok((center, [radius, radius, height]))
+    }
+
+    fn is_encroacher(&self, id: ObjectId) -> bool {
+        self.collides(id)
+            && self.is_mover(id)
+            && matches!(
+                self.get_property(id, "StaticMesh"),
+                Some(Value::Object(Some(_)))
+            )
+    }
+
+    fn uses_static_mesh_primitive(&self, id: ObjectId) -> bool {
+        !matches!(self.get_property(id, "Mesh"), Some(Value::Object(Some(_))))
+            && matches!(
+                self.get_property(id, "StaticMesh"),
+                Some(Value::Object(Some(_)))
+            )
+            && !self.is_volume_brush(id)
+    }
+
     /// `AActor::IsOverlapping` as decoded from Engine.dll @0x10352bd0:
     ///
     /// 1. Two brush actors never overlap (top check @0x10352bdc, `IsA(ABrush)` for both).
-    /// 2. If either actor is a volume brush (`IsVolumeBrush` @0x1030f0d0), the brush's
-    ///    `UModel::PointCheck` is asked whether the other actor's collision box is inside it
-    ///    (primitive path @0x10352cf3..0x10352d9c). The host registers that BSP; if it is absent
-    ///    the cylinder fallback is kept (reported by the host).
-    /// 3. Otherwise the vertical-cylinder test @0x10352d9e: `|dz| <= h1 + h2` and
-    ///    `sqrt(dx^2+dy^2) <= r1 + r2` (both inclusive).
-    pub(crate) fn actors_overlap(&self, a: ObjectId, b: ObjectId) -> bool {
+    /// 2. Volume A/B, then encroacher A/B select one target PointCheck. The other
+    ///    primitive supplies its encroachment box; missing required geometry fails explicitly.
+    /// 3. Ordinary pawn/projectile pairs retain the vertical-cylinder overlap shape.
+    pub(crate) fn actors_overlap(&mut self, a: ObjectId, b: ObjectId) -> VmResult<bool> {
         if a == b {
-            return false;
+            return Ok(false);
         }
         if self.is_brush_actor(a) && self.is_brush_actor(b) {
-            return false;
+            return Ok(false);
+        }
+        if self.is_encroacher(a) && self.is_encroacher(b) {
+            return Ok(false);
         }
         for (brush, other) in [(a, b), (b, a)] {
-            if self.is_volume_brush(brush)
-                && let Some(primitive) = self.brush_primitives.get(&brush)
-            {
-                let (center, radius, half_height) = self.actor_cylinder(other);
-                return primitive.overlaps_cylinder(center, radius, half_height);
+            if self.is_volume_brush(brush) {
+                let (center, extent) = self.touch_encroach_box(other)?;
+                if let Some(primitive) = self.brush_primitives.get(&brush) {
+                    return Ok(primitive.overlaps_box(center, extent));
+                }
+                let name = &self.objects[brush as usize].name;
+                if let Some(overlap) = self
+                    .physics
+                    .as_ref()
+                    .and_then(|physics| physics.actor_brush_overlap(name, center, extent))
+                {
+                    return Ok(overlap);
+                }
+                return Err(self.err(VmErrorKind::Unresolved {
+                    what: format!(
+                        "IsOverlapping requires brush PointCheck data for {}",
+                        self.objects[brush as usize].name
+                    ),
+                }));
+            }
+        }
+        // IsEncroacher 0x1030f100: colliding AMover with a non-null StaticMesh.
+        // IsOverlapping chooses A first, then B, and calls exactly one PointCheck.
+        for (mesh, other) in [(a, b), (b, a)] {
+            if self.is_encroacher(mesh) {
+                let (center, extent) = self.touch_encroach_box(other)?;
+                if !self.uses_static_mesh_primitive(mesh)
+                    || self.bool_prop(mesh, "bUseCylinderCollision")
+                {
+                    let (target, radius, height) = self.actor_cylinder(mesh);
+                    let delta = sub3(center, target);
+                    return Ok(delta[2].abs() <= extent[2] + height
+                        && delta[0] * delta[0] + delta[1] * delta[1]
+                            <= (extent[0] + radius).powi(2));
+                }
+                self.prepare_touch_mesh(mesh)?;
+                let name = self.objects[mesh as usize].name.clone();
+                if let Some(overlap) = self
+                    .physics
+                    .as_mut()
+                    .and_then(|physics| physics.actor_mesh_overlap(&name, center, extent))
+                {
+                    return Ok(overlap);
+                }
+                return Err(self.err(VmErrorKind::Unresolved {
+                    what: format!("IsOverlapping requires mesh PointCheck data for {name}"),
+                }));
             }
         }
         let (la, ra, ha) = self.actor_cylinder(a);
         let (lb, rb, hb) = self.actor_cylinder(b);
         if (la[2] - lb[2]).abs() > ha + hb {
-            return false;
+            return Ok(false);
         }
         let (dx, dy) = (la[0] - lb[0], la[1] - lb[1]);
-        dx * dx + dy * dy <= (ra + rb) * (ra + rb)
+        Ok(dx * dx + dy * dy <= (ra + rb) * (ra + rb))
     }
 
     /// Whether `other` blocks the movement of `mover` (UE1/UE2 pairwise blocking rule).
@@ -7752,14 +7872,13 @@ impl<'s> Vm<'s> {
         self.bool_prop(mover, a) && self.bool_prop(other, b)
     }
 
-    /// Earliest fraction of `start -> end` at which the mover's cylinder first touches a
-    /// blocking actor's cylinder (inclusive contact), if any.
+    /// Earliest target-primitive LineCheck that blocks the actor's extent box.
     fn sweep_blocking_actor(
-        &self,
+        &mut self,
         mover: ObjectId,
         start: [f32; 3],
         end: [f32; 3],
-    ) -> Option<(f32, ObjectId)> {
+    ) -> VmResult<Option<(f32, ObjectId)>> {
         let (_, rm, hm) = self.actor_cylinder(mover);
         let d = sub3(end, start);
         let mut best: Option<(f32, ObjectId)> = None;
@@ -7767,14 +7886,37 @@ impl<'s> Vm<'s> {
             if b == mover || !self.is_live_actor(b) || !self.blocks_pair(mover, b) {
                 continue;
             }
-            let (lb, rb, hb) = self.actor_cylinder(b);
-            if let Some(t) = segment_cylinder_contact(start, d, lb, rm + rb, hm + hb)
+            let time = if self.uses_static_mesh_primitive(b)
+                && !self.bool_prop(b, "bUseCylinderCollision")
+            {
+                self.prepare_touch_mesh(b)?;
+                let name = self.objects[b as usize].name.clone();
+                match self
+                    .physics
+                    .as_mut()
+                    .map(|physics| physics.actor_mesh_sweep(&name, start, end, [rm, rm, hm]))
+                {
+                    Some(crate::physics::ActorMeshHit::Hit(hit)) => Some(hit.time),
+                    Some(crate::physics::ActorMeshHit::Miss) => None,
+                    _ => {
+                        return Err(self.err(VmErrorKind::Unresolved {
+                            what: format!(
+                                "MoveActor requires blocking mesh LineCheck data for {name}"
+                            ),
+                        }));
+                    }
+                }
+            } else {
+                let (lb, rb, hb) = self.actor_cylinder(b);
+                segment_cylinder_contact(start, d, lb, rm + rb, hm + hb)
+            };
+            if let Some(t) = time
                 && best.is_none_or(|(bt, _)| t < bt)
             {
                 best = Some((t, b));
             }
         }
-        best
+        Ok(best)
     }
 
     /// Actors in `id`'s `Touching` array (live ones only).
@@ -7893,6 +8035,89 @@ impl<'s> Vm<'s> {
         self.refresh_touching(id, false)
     }
 
+    /// MoveActor's non-blocking hit list is produced by target-primitive LineCheck,
+    /// not an endpoint cylinder retry. Deliver contacts in travel order, including a
+    /// primitive crossed completely during this move; refresh_touching retires them.
+    pub(crate) fn sweep_touching(
+        &mut self,
+        id: ObjectId,
+        start: [f32; 3],
+        end: [f32; 3],
+    ) -> VmResult<()> {
+        if !self.collides(id) || start == end {
+            return Ok(());
+        }
+        let extent = self.actor_extent(id);
+        let nonzero = extent != [0.0; 3];
+        let instigator = self
+            .is_a(id, "Projectile")
+            .then(|| self.obj_prop(id, "Instigator"))
+            .flatten();
+        let mut contacts = Vec::new();
+        for other in 0..self.objects.len() as ObjectId {
+            if other == id
+                || !self.is_live_actor(other)
+                || !self.collides(other)
+                || instigator == Some(other)
+                || self.based_on(id, other)
+                || self.based_on(other, id)
+                || self.blocks_pair(id, other)
+                || self.is_volume_brush(other)
+            {
+                continue;
+            }
+            let time = if self.uses_static_mesh_primitive(other)
+                && !self.bool_prop(other, "bUseCylinderCollision")
+            {
+                let gate = if nonzero {
+                    "bBlockNonZeroExtentTraces"
+                } else {
+                    "bBlockZeroExtentTraces"
+                };
+                if !self.bool_prop(other, gate) {
+                    continue;
+                }
+                let name = self.objects[other as usize].name.clone();
+                self.prepare_touch_mesh(other)?;
+                match self
+                    .physics
+                    .as_mut()
+                    .map(|p| p.actor_mesh_sweep(&name, start, end, extent))
+                {
+                    Some(crate::physics::ActorMeshHit::Hit(hit)) => Some(hit.time),
+                    Some(crate::physics::ActorMeshHit::Miss) => None,
+                    _ => {
+                        return Err(self.err(VmErrorKind::Unresolved {
+                            what: format!("MoveActor requires mesh LineCheck data for {name}"),
+                        }));
+                    }
+                }
+            } else {
+                let (center, radius, height) = self.actor_cylinder(other);
+                segment_cylinder_contact(
+                    start,
+                    sub3(end, start),
+                    center,
+                    extent[0] + radius,
+                    extent[2] + height,
+                )
+            };
+            if let Some(time) = time {
+                contacts.push((time, other));
+            }
+        }
+        contacts.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (_, other) in contacts {
+            if !self.is_live_actor(id) {
+                break;
+            }
+            if self.is_live_actor(other) && !self.touching_list(id).contains(&other) {
+                self.begin_touch(id, other)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Recomputes the touching relations of `id` after it moved or its collision changed:
     /// begins overlap with actors it now touches, ends overlap it no longer has. `skip_blocking`
     /// mirrors upstream `TryMove` (an actor cannot touch what blocks it); `SetLocation` does
@@ -7924,7 +8149,7 @@ impl<'s> Vm<'s> {
             }
             let touches = collide
                 && self.collides(b)
-                && self.actors_overlap(id, b)
+                && self.actors_overlap(id, b)?
                 && !self.based_on(id, b)
                 && !self.based_on(b, id)
                 && !(skip_blocking && self.blocks_pair(id, b));
@@ -7975,13 +8200,14 @@ impl<'s> Vm<'s> {
         }
         let mut blocked_actor = None;
         if self.bool_prop(id, "bCollideActors")
-            && let Some((t, other)) = self.sweep_blocking_actor(id, start, end)
+            && let Some((t, other)) = self.sweep_blocking_actor(id, start, end)?
         {
             end = lerp3(start, end, t);
             fraction *= t;
             blocked_actor = Some(other);
         }
         self.set_property(id, "Location", 0, Value::Vector(end));
+        self.sweep_touching(id, start, end)?;
         // MoveActor 0x1038b15c..0x1038b17a: blocker first, then moving actor.
         if let Some(other) = blocked_actor
             && !self.bool_prop(other, "bWorldGeometry")
@@ -10545,6 +10771,11 @@ impl<'s> Vm<'s> {
         if self.objects[id as usize].deleted {
             return Ok(());
         }
+        let end = self.vector_prop(id, "Location").unwrap_or(start);
+        self.sweep_touching(id, start, end)?;
+        if self.objects[id as usize].deleted {
+            return Ok(());
+        }
         // Exit tail: the tracked bounce gate is `bBounce` (+0x34 bit 0x800000); the second
         // clear-bit (0x8000000) is not tracked as a property and the VM actors that reach this
         // path (CineHook, XIIIProjectile rounds) have it clear.
@@ -10705,7 +10936,8 @@ impl<'s> Vm<'s> {
         Ok(horizontal_distance(end, destination) <= radius)
     }
 
-    /// `Actor.SetCollision`: omitted flags keep their current value; touching is recomputed.
+    /// `Actor.SetCollision`: omitted flags keep their current value. Retail0x103527d0
+    /// only refreshes collision-hash membership; Touch maintenance waits for a move.
     pub(crate) fn vm_set_collision(
         &mut self,
         id: ObjectId,
@@ -10722,11 +10954,10 @@ impl<'s> Vm<'s> {
         if let Some(v) = block_players {
             self.set_property(id, "bBlockPlayers", 0, Value::Bool(v));
         }
-        self.refresh_touching(id, false)?;
         Ok(())
     }
 
-    /// `Actor.SetCollisionSize`: update the cylinder, recompute touching. Returns true (the
+    /// `Actor.SetCollisionSize`: update the cylinder/hash, without emitting Touch. Returns true (the
     /// decoded XIII declaration carries no encroachment flag; see the registry evidence).
     pub(crate) fn vm_set_collision_size(
         &mut self,
@@ -10736,7 +10967,6 @@ impl<'s> Vm<'s> {
     ) -> VmResult<bool> {
         self.set_property(id, "CollisionRadius", 0, Value::Float(radius));
         self.set_property(id, "CollisionHeight", 0, Value::Float(height));
-        self.refresh_touching(id, false)?;
         Ok(true)
     }
 
