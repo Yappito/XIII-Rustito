@@ -108,6 +108,12 @@ pub mod property_flags {
     pub const RETURN_PARM: u32 = 0x0000_0400;
     /// `coerce` parameter.
     pub const COERCE_PARM: u32 = 0x0000_0800;
+    /// `transient` property. Measured on the GOG corpus: `XIDCine.GenFlash.structFlash.bMemDuck`
+    /// (`VAR TRANSIENT bool bMemDuck`) carries `0x2000`, while the non-transient struct siblings
+    /// `StartReference`/`ArrivalReference` carry `0x1`. The engine's struct/property serializer
+    /// omits transient members from the byte stream (the runtime field still defaults to zero),
+    /// which is why the map's `structFlash` element is 3 bytes (two object refs) and not 4.
+    pub const TRANSIENT: u32 = 0x0000_2000;
     /// `localized` property. **XIII deviation**: stock UE2 uses `CPF_Localized = 0x2000`, but
     /// XIII reorders the property flags (measured on the GOG corpus): the known localized
     /// properties `XIIIGameInfo.GameName` (`0x00408000`), `XIIIMover.LockedMessage`

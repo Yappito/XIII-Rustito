@@ -8421,9 +8421,20 @@ mod tests {
     /// starts the Cine0 cutscene (`CineController21` -> `PlayingSequence`).
     ///
     /// The route is honest about what it reaches: the player survives, no objective is completed
-    /// and there is no travel. The next blocker is the Cine0 sequence itself, whose
-    /// `wait event fin_transition` needs the flashback chain (Cine1, whose pawn sits in the
-    /// far-west flashback room); goal 0/1 and the `PRock01a` travel stay unreached. See the report.
+    /// and there is no travel. item99b decoded and fixed the flash chain: `fin_transition` is
+    /// emitted by the level's `GenFlash` (`Level.FlashManager`), which the shipped Kello01b data
+    /// never triggers from script (Cine0/Cine1's `playerevent flash` flash prologue sits behind
+    /// `goto deroulement_normal`). Retail HXAudio observes its global integer variable `Flash`;
+    /// the bank program's writes and playback timing remain undecoded. The Partial cue-name
+    /// model infers stages from `Flash1`/`Flash2`/`Flash3`/`FlashsEnd` with a next-VM-tick delay.
+    /// The engine now (a) executes the class-default
+    /// lvalue write `XIIIPlayerPawn.default.bCollideWorld` in `MapInfo.SaveInventoryForFlash`,
+    /// (b) skips `transient` struct members when decoding the raw `structFlash`, and (c) drives
+    /// the FlashManager through that explicitly modelled cue path. `fin_transition` now fires (Cine0
+    /// advances to `wait event fin_flash`) and the flashback cine Cine1 starts and runs to its
+    /// `wait warning`. The route still ends frozen: the next blocker is Cine1's `wait warning`,
+    /// which needs the `DialogueManager` line-end warning (`SpeakersToWarnAtTheEndOfThisLine`)
+    /// that has not run by the 300 s budget; goal 0/1 and the `PRock01a` travel stay unreached.
     #[test]
     fn opt_in_kello01b_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -8514,6 +8525,46 @@ mod tests {
             Some("PlayingSequence"),
             "touching the chalet trigger must start the Cine0 cutscene"
         );
+        // item99b positive pins: the flash chain now runs. `GenFlash0` is the level's
+        // `Level.FlashManager`; its `count` advances through the Partial flash cue model,
+        // and the flashback cine Cine1 (`CineController22`) starts on the emitted
+        // `fin_transition`, so Cine0 is released past action 33.
+        let flash = vm
+            .find_object("GenFlash0")
+            .expect("GenFlash0 flash manager");
+        assert!(
+            matches!(vm.get_property(flash, "Count"), Some(Value::Int(n)) if *n > 0),
+            "the flash transition must have advanced GenFlash0.count: {:?}",
+            vm.get_property(flash, "Count")
+        );
+        let cine1 = vm
+            .find_object("CineController22")
+            .expect("Cine1 controller");
+        assert_eq!(
+            vm.state_name(cine1).as_deref(),
+            Some("PlayingSequence"),
+            "the flashback cine (Cine1) must have started on fin_transition"
+        );
+        // Preserve the item99b stopping point explicitly, not merely any PlayingSequence state.
+        assert_eq!(
+            vm.get_property(cine1, "ScriptedActionIndex"),
+            Some(&Value::Int(18)),
+            "Cine1 must remain parked after its wait warning action"
+        );
+        assert_eq!(
+            vm.get_property(cine1, "flagsPaused"),
+            Some(&Value::Int(4)),
+            "Cine1 must be waiting for a warning"
+        );
+        let cine1_pawn = match vm.get_property(cine1, "MyPawn") {
+            Some(Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => *id,
+            other => panic!("Cine1 controller pawn: {other:?}"),
+        };
+        assert!(
+            matches!(vm.get_property(cine1_pawn, "tabActions"), Some(Value::Array(actions))
+                if actions.get(17) == Some(&Value::Str("wait warning".to_owned()))),
+            "the paused action must be wait warning"
+        );
         let position = session.player_location().expect("player position");
         for (actual, expected) in position.into_iter().zip([-2750.0, -473.9, 2106.0]) {
             assert!(
@@ -8529,13 +8580,16 @@ mod tests {
             Some(&Value::Str("PRock01a.unr".to_owned()))
         );
         println!(
-            "[kello01b next blocker] item99: the descent and the Porte0 door entry are reached; the route ends \
-             inside the chalet with CineController21 (Cine0/Kim) in PlayingSequence. Cine0's `debut_flash` \
-             branch then `freezeplayer` and `wait event fin_transition`, which needs the flashback chain \
-             (Cine1, whose pawn is in the far-west flashback room reached only by `playerevent flash`); the \
-             sequence never reaches `premiere_explosion`/`checkpoint`, so `event objectif99` (goal 0 primary), \
-             goal 0/1 completion and the PRock01a travel stay unreached (travel=[]). The player is pinned \
-             against the chalet wardrobe (K_armoir02) while the cutscene plays."
+            "[kello01b next blocker] item99b: the descent, the Porte0 door entry and the flash transition are \
+             reached. The flash chain now runs: `GenFlash0` (the level's `Level.FlashManager`) advances and \
+             emits `fin_transition`, so Cine0 passes its `wait event fin_transition` and parks at \
+             `wait event fin_flash`, and the flashback cine Cine1 (`CineController22`) starts and runs to its \
+             `wait warning`. The route is still frozen inside the cutscene: Cine1's `wait warning` needs the \
+             `DialogueManager` line-end warning (`SpeakersToWarnAtTheEndOfThisLine`, `DialogueManager1` \
+             `dial_flash`), which has not run by the 300 s budget, so `premiere_explosion`/`checkpoint`, \
+             `event objectif99` (goal 0 primary), goal 0/1 completion and the PRock01a travel stay unreached \
+             (travel=[]). The player is pinned against the chalet wardrobe (K_armoir02) while the cutscene \
+             plays."
         );
     }
 }
