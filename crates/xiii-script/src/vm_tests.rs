@@ -7910,6 +7910,229 @@ fn visible_damageable_actors_without_physics_provider_fails() {
 }
 
 // ---------------------------------------------------------------------------------------
+// item87b: `Level.TimeSeconds` at map load and `AActor.LastRenderTime`
+// (`Vm::reset_render_times` / `Vm::update_render_times` / `Vm::mark_rendered`)
+
+/// Minimal `LevelInfo`/`Actor`/`Controller`/`PlayerController` package. `Actor` carries
+/// `Location`, `Rotation`, `LastRenderTime`, `BaseEyeHeight`, `CollisionHeight`,
+/// `CollisionRadius`, `bHidden`, `DrawType`; `Controller` a `Pawn` and `FOVAngle`; `LevelInfo`
+/// a `TimeSeconds`.
+fn render_time_fixture() -> Vec<u8> {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let levelinfo = b.reserve(0, 0, "LevelInfo");
+    let controller = b.reserve(0, 0, "Controller");
+    let playercontroller = b.reserve(0, 0, "PlayerController");
+    let loc = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let rot = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
+    let lrt = b.reserve(IMP_FLOATPROP, actor, "LastRenderTime");
+    let eye = b.reserve(IMP_FLOATPROP, actor, "BaseEyeHeight");
+    let ch = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
+    let cr = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
+    let hidden = b.reserve(IMP_BOOLPROP, actor, "bHidden");
+    let drawtype = b.reserve(IMP_BYTEPROP, actor, "DrawType");
+    let ctrl_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
+    let fov = b.reserve(IMP_FLOATPROP, controller, "FOVAngle");
+    let ts = b.reserve(IMP_FLOATPROP, levelinfo, "TimeSeconds");
+    b.prop_with(loc, rot, 0, &compact(IMP_STRUCT));
+    b.prop_with(rot, lrt, 0, &compact(IMP_STRUCT - 1));
+    b.prop(lrt, eye, 0);
+    b.prop(eye, ch, 0);
+    b.prop(ch, cr, 0);
+    b.prop(cr, hidden, 0);
+    b.prop(hidden, drawtype, 0);
+    b.prop_with(drawtype, 0, 0, &compact(0));
+    b.prop_with(ctrl_pawn, fov, 0, &compact(0));
+    b.prop(fov, 0, 0);
+    b.prop(ts, 0, 0);
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, loc, 0);
+    b.class(pawn, actor, 0, 0);
+    b.class(levelinfo, actor, ts, 0);
+    b.class(controller, actor, ctrl_pawn, 0);
+    b.class(playercontroller, controller, 0, 0);
+    b.build()
+}
+
+/// Spawns the fixture's `PlayerController`/player pawn at the origin facing +X (yaw 0), with
+/// `FOVAngle` 90. Returns `(pc, player)`.
+fn render_time_player(vm: &mut Vm<'_>, set: &ScriptSet) -> (ObjectId, ObjectId) {
+    let player = vm.spawn(pg(set, "Pawn"), "PlayerPawn").unwrap();
+    vm.set_property(player, "Location", 0, Value::Vector([0.0; 3]));
+    vm.set_property(player, "Rotation", 0, Value::Rotator([0, 0, 0]));
+    vm.set_property(player, "BaseEyeHeight", 0, Value::Float(60.0));
+    // DT_Mesh: the fixture's class default is the byte zero (DT_None), unlike `AActor`'s.
+    vm.set_property(player, "DrawType", 0, Value::Byte(2));
+    let pc = vm.spawn(pg(set, "PlayerController"), "PC").unwrap();
+    vm.set_property(pc, "Pawn", 0, Value::Object(Some(ObjRef::Instance(player))));
+    vm.set_property(pc, "FOVAngle", 0, Value::Float(90.0));
+    (pc, player)
+}
+
+/// `UGameEngine::LoadMap` restarts the level clock at 0 and clears every actor's
+/// `LastRenderTime`; the map's serialised editor values must not survive (`reset_render_times`).
+#[test]
+fn reset_render_times_zeros_the_level_clock_and_every_actor() {
+    let set = set_of(render_time_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let level = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    vm.set_property(level, "TimeSeconds", 0, Value::Float(2649.8));
+    let a = vm.spawn(pg(&set, "Actor"), "A").unwrap();
+    vm.set_property(a, "LastRenderTime", 0, Value::Float(700.0));
+    let b = vm.spawn(pg(&set, "Actor"), "B").unwrap();
+    vm.set_property(b, "LastRenderTime", 0, Value::Float(1252.0));
+    vm.time = 42.0;
+    vm.reset_render_times();
+    assert_eq!(vm.time, 0.0);
+    assert_eq!(
+        vm.get_property(level, "TimeSeconds"),
+        Some(&Value::Float(0.0))
+    );
+    assert_eq!(
+        vm.get_property(a, "LastRenderTime"),
+        Some(&Value::Float(0.0))
+    );
+    assert_eq!(
+        vm.get_property(b, "LastRenderTime"),
+        Some(&Value::Float(0.0))
+    );
+}
+
+/// Only the actors the camera draws are stamped: an in-frustum, unoccluded, drawable actor is
+/// marked; `bHidden`, `DrawType == DT_None`, an off-axis actor and an actor behind the camera
+/// keep their stale value so their age grows (the cinematic `NotSeenByPlayer` condition).
+#[test]
+fn update_render_times_marks_drawn_actors_and_leaves_the_rest_stale() {
+    let set = set_of(render_time_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let (pc, _player) = render_time_player(&mut vm, &set);
+
+    let drawn = vm.spawn(pg(&set, "Actor"), "Drawn").unwrap();
+    vm.set_property(drawn, "Location", 0, Value::Vector([200.0, 0.0, 0.0]));
+    vm.set_property(drawn, "DrawType", 0, Value::Byte(2));
+    vm.set_property(drawn, "LastRenderTime", 0, Value::Float(-1000.0));
+
+    let hidden = vm.spawn(pg(&set, "Actor"), "Hidden").unwrap();
+    vm.set_property(hidden, "Location", 0, Value::Vector([200.0, 50.0, 0.0]));
+    vm.set_property(hidden, "DrawType", 0, Value::Byte(2));
+    vm.set_property(hidden, "bHidden", 0, Value::Bool(true));
+    vm.set_property(hidden, "LastRenderTime", 0, Value::Float(-1000.0));
+
+    let none = vm.spawn(pg(&set, "Actor"), "NoDraw").unwrap();
+    vm.set_property(none, "Location", 0, Value::Vector([200.0, -50.0, 0.0]));
+    vm.set_property(none, "DrawType", 0, Value::Byte(0));
+    vm.set_property(none, "LastRenderTime", 0, Value::Float(-1000.0));
+
+    let behind = vm.spawn(pg(&set, "Actor"), "Behind").unwrap();
+    vm.set_property(behind, "Location", 0, Value::Vector([-9000.0, 0.0, 0.0]));
+    vm.set_property(behind, "DrawType", 0, Value::Byte(2));
+    vm.set_property(behind, "LastRenderTime", 0, Value::Float(-1000.0));
+
+    // A second actor past the 45-degree horizontal half-angle, on the +Y (right) side.
+    let off_axis = vm.spawn(pg(&set, "Actor"), "OffAxis").unwrap();
+    vm.set_property(off_axis, "Location", 0, Value::Vector([0.0, 500.0, 0.0]));
+    vm.set_property(off_axis, "DrawType", 0, Value::Byte(2));
+    vm.set_property(off_axis, "LastRenderTime", 0, Value::Float(-1000.0));
+
+    vm.time = 5.0;
+    vm.update_render_times(Some(pc));
+
+    assert_eq!(
+        vm.get_property(drawn, "LastRenderTime"),
+        Some(&Value::Float(5.0)),
+        "an in-frustum, clear, drawable actor is drawn"
+    );
+    assert_eq!(
+        vm.get_property(hidden, "LastRenderTime"),
+        Some(&Value::Float(-1000.0)),
+        "bHidden is not drawn"
+    );
+    assert_eq!(
+        vm.get_property(none, "LastRenderTime"),
+        Some(&Value::Float(-1000.0)),
+        "DrawType == DT_None is not drawn"
+    );
+    assert_eq!(
+        vm.get_property(behind, "LastRenderTime"),
+        Some(&Value::Float(-1000.0)),
+        "an actor behind the camera is not drawn"
+    );
+    assert_eq!(
+        vm.get_property(off_axis, "LastRenderTime"),
+        Some(&Value::Float(-1000.0)),
+        "an actor outside the horizontal FOV is not drawn"
+    );
+}
+
+/// item87c: the headless stand-in is frustum-only, matching the windowed renderer's Bevy
+/// `ViewVisibility`. A distant in-frustum actor must be marked even though world geometry lies
+/// between it and the camera: the previous ray-based occlusion test started inside the player's
+/// own collision and hit it, so every distant actor was treated as occluded and only camera-local
+/// actors were ever marked (measured 6 vs the renderer's 186 on Toits01).
+#[test]
+fn update_render_times_marks_a_distant_frustum_actor_through_world_geometry() {
+    let set = set_of(render_time_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([50.0, -100.0, -100.0], [51.0, 100.0, 100.0]),
+    ));
+    let (pc, _player) = render_time_player(&mut vm, &set);
+    let far = vm.spawn(pg(&set, "Actor"), "Far").unwrap();
+    vm.set_property(far, "Location", 0, Value::Vector([5000.0, 0.0, 0.0]));
+    vm.set_property(far, "DrawType", 0, Value::Byte(2));
+    vm.set_property(far, "LastRenderTime", 0, Value::Float(-1000.0));
+    vm.time = 5.0;
+    vm.update_render_times(Some(pc));
+    assert_eq!(
+        vm.get_property(far, "LastRenderTime"),
+        Some(&Value::Float(5.0)),
+        "a distant in-frustum actor is marked (frustum-only stand-in)"
+    );
+}
+
+/// Without a player controller (the `xiii-tool script` scope) the stand-in writes nothing.
+#[test]
+fn update_render_times_without_player_controller_is_a_noop() {
+    let set = set_of(render_time_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let pawn = vm.spawn(pg(&set, "Pawn"), "CinePawn").unwrap();
+    vm.set_property(pawn, "Location", 0, Value::Vector([0.0; 3]));
+    vm.set_property(pawn, "LastRenderTime", 0, Value::Float(-1000.0));
+    vm.time = 5.0;
+    vm.update_render_times(None);
+    assert_eq!(
+        vm.get_property(pawn, "LastRenderTime"),
+        Some(&Value::Float(-1000.0))
+    );
+}
+
+/// `mark_rendered` (the windowed renderer's report) stamps only live actor instances.
+#[test]
+fn mark_rendered_stamps_only_live_actor_instances() {
+    let set = set_of(render_time_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(pg(&set, "Actor"), "A").unwrap();
+    vm.set_property(a, "LastRenderTime", 0, Value::Float(-1000.0));
+    let b = vm.spawn(pg(&set, "Actor"), "B").unwrap();
+    vm.set_property(b, "LastRenderTime", 0, Value::Float(-1000.0));
+    vm.time = 7.0;
+    vm.mark_rendered(&[a, 9999]);
+    assert_eq!(
+        vm.get_property(a, "LastRenderTime"),
+        Some(&Value::Float(7.0))
+    );
+    assert_eq!(
+        vm.get_property(b, "LastRenderTime"),
+        Some(&Value::Float(-1000.0)),
+        "an actor the renderer did not report keeps its value"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
 // WaveHasPosition (item48) — the DialogueManager positional-voice query
 
 /// Provider answers flow through; with no provider the native fails explicitly; an

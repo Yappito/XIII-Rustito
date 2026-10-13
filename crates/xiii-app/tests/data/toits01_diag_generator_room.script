@@ -1,0 +1,368 @@
+# Toits01 DIAGNOSTIC fixture (item87e): the item87d generator-room experiment, split out of
+# the main route `toits01_route.script` so it cannot replace the route's positive pins. It is
+# the same input up to t=386.20, then a labelled diagnostic teleport into the scene-sealed
+# generator room (opened only by the ending scene's action[602] `od porte6`, which this tree
+# never reaches: the cine parks at action[227] `wait counter_finact2b`). The M60 destroys
+# `BreakableMover12`, arming `TouchTrigger10`; the game's own armed Touch then fires
+# `RenfortHelico02`, whose act2a squad kills the solo route player. The test
+# `opt_in_diag_toits01_generator_room` pins that measured diagnostic chain. Not a playable
+# route: the generator room is reached only by the labelled teleport, not by input.
+# Toits01 "Follow Major Jones" player-input route (item50, extended by item53).
+# Player input only (goto/forward/track/fire/wait_travel); no set_goal, no take_control.
+# The labelled teleports cover measured impassables: the ladder-top landing traps the walk
+# inside LadderVolume0, the start roof has no walkable exit to the courtyard, the deck's east
+# parapet blocks walk and jump, the ramp lip and the window gap, the roof dip strip with a
+# 50-UU hole, the east roof's trapped edge over a 486 pit, and the warehouse doorway blocked
+# by the Movable2 crate (probe12-probe20 logs under local/re/item50/).
+#
+# Measured outcome: the route reaches TouchTrigger10 (r700 at 18812,1118,791) and the game's
+# own Touch fires, but goal 0 does not complete: XIII's TouchTrigger.Touch requires
+# self.bActif, and TT10 is authored bActif=false (bActivableParTrigger=true, Tag
+# PorteDebloquee) - it arms only when BreakableMover12 (the generator, Health 50, inside the
+# walled yard) is destroyed. The yard is sealed by the ForeverLocked door line and the
+# through-window shot does not land in the current sim (see the item50 report).
+# item53: the route now enters the TT17 zone (r90 at -5010,1337,1009) after the scene's
+# 56.7 DonneGrappinStart gate. The grapple demonstration completes (the VM's scripted-physics
+# integration runs the demo's Walking/Projectile/Flying moves; measured probe23 under
+# local/re/item53/): the demonstrator reaches STA_Retract, fires JonesHookEnd at ~71.5 and
+# the handover returns the controller to PlayerWalking (the item50 permanent freeze is gone).
+# The Cine0 scene advances past the demo wait to action[117] (movseqb toward PositionInfo118),
+# where it stays: the NPC's own traverse across the grapple descent is blocked in the sim (a
+# separate measured blocker, distinct from the fixed demo wedge).
+# - ladder-top replaced by a labelled teleport onto the roof: the landing traps the
+#   walk inside LadderVolume0 (the slide-in distance is nondeterministic; jumps get
+#   swallowed in climb state; measured probe13/14/15)
+# - courtyard uses the AI west corridor (x~-1450): the (-1400,1350) approach runs
+#   into the (-1227,1182) stall (measured probe15)
+# - roof->terrace descent replaced by a teleport: the 1167 roof's east edge drops
+#   onto a trapped ledge and a pit at 486 (measured probe15, -43 hp)
+t=0.50 goto -6300 1383
+t=6.00 goto -5720 1385
+t=11.00 goto -5608 1387
+# labelled teleport (the ladder-top landing traps walking inside LadderVolume0)
+t=17.00 teleport -5440 1400 1010
+t=17.10 forward 0
+t=19.00 goto -5300 1400
+t=24.00 goto -4900 1450
+t=28.00 forward 0
+# item53: the scene arms TT17 (Tag DonneGrappinStart) at its ~56.7 gate; enter the zone after
+# the gate and stand through the grapple demonstration (the player is NoControl while the
+# demo runs; the handover releases the controller at ~71.5, measured probe23)
+t=56.80 goto -5010 1337
+t=58.00 forward 0
+# released by STA_Retract; the scene's [117] walk ends at PositionInfo0 (-3335,1241) and its
+# [118] 'event SpeechJones11' arms TouchTrigger24 (r220 at -3609,1316,2263, z band 2163-2363,
+# on the grapple-landing roof ~1200 above the player's start roof). Enter its zone after the
+# arm (measured probe72/74, local/re/item62/): the arrival Touch fires 'SpeechJones11Ttempo'
+# -> CineTrigger20 (BufferTrigger) -> 'SpeechJones11T' releases the demo's
+# 'wait event SpeechJones11T' (a teleport before ~85 is refused by the controller's
+# NoControl window, measured probe73).
+t=74.00 goto -4940 1420
+# item64 grapple #1: the player's own hook replaces the grapple-landing teleport. item64f: the
+# game gives the player the Hook itself (the grapple demo scene's XIIIItems.GiveTo of Hook1 at
+# ~58.8 with the live level clock; measured local/re/item64f/probe3.txt), so the old
+# route-side grant is gone: the retail item-cycle press (DefUser.ini InventoryNext ->
+# cNextItem -> bWaitForWeaponMode -> SwitchWeaponMode) puts the fists down and brings the
+# Hook up in item mode. Aim at HookPoint0 (-4883,1508,2734; RopeLength 1900,
+# ~1756 UU from the roof), fire: the exec Fire -> UseMe spawns HookProjectile +
+# HookLink, GoHooking sets bHooked, the +0.25s Timer starts the climb (HookUpSpeed 150/s) and
+# the PlayerWalking.ProcessMove taut-rope constraint reels the pawn in (VM-owned while it
+# hangs). ~11 s from ~1800 to the 150 minimum. No ClimbableHookNavPoint is authored on
+# Toits01 (measured, local/re/item64/toits01-props.txt), so the rope-top handoff never fires;
+# the only player-initiated detach is the use key (Grab's bHooked branch -> Hook.Release).
+t=85.00 next_item
+t=85.80 track HookPoint0
+# attach (the fire edge: exec -> ActivatedByFire -> ActivateItem -> Idle.Activate -> UseMe;
+# HookLength locks at max(VSize(HookPoint-Pawn),50) = ~1806 < RopeLength 1900). While Walking
+# the first HookInUse.Tick consumes the UseMe bGoDown payout request (stops it and clears the
+# ActivatedBy* flags), so a continuous hold never climbs: the retail input is a fresh fire
+# press, whose ActivateItem re-arms the 0.25 s Timer -> bGoUp + Enable('Tick').
+t=86.50 fire_hold 1
+t=86.70 fire_hold 0
+# climb: HookInUse.Tick ReduceRopeLength (150 UU/s) shortens the rope; each PlayerWalking.
+# ProcessMove (0x0237) then pulls the pawn up the excess (SetPhysics Falling + Pawn.Move +
+# the radial velocity projection) - (1806-150)/150 = ~11 s to the 150 rope floor.
+t=87.00 fire_hold 1
+t=98.50 fire_hold 0
+# swing east across the roof gap: the anchor (-4883,1508,2733) hangs west of the Model71 roof
+# (z=2160, x=-4512..-3490), so the descent must carry horizontal speed. The payout (300 UU/s,
+# 1.55 s -> rope ~615) plus the ProcessMove air accel (aForward 32768 -> Acceleration 327 after
+# the 0.01 scale) drives the pendulum; the arc crosses the edge ~10.5 s in rising through
+# z~2400. Detach on the upswing (the use key: Grab's bHooked branch -> Hook.Release; deselection
+# does NOT release the rope - measured, the HookInUse.Tick keeps running after cNextItem) and
+# drop onto the roof ~(-3910,858).
+t=99.00 yaw -9
+t=99.30 altfire_hold 1
+t=99.30 forward 1
+t=100.85 altfire_hold 0
+t=113.00 use
+# walk the landing roof into the TT24 zone (r220 at -3609,1316,2263; armed by the scene's
+# SpeechJones11 chain at ~81.2 - the arrival Touch fires it, same as the pre-item64 teleport run)
+t=112.00 goto -3609 1316
+t=119.00 forward 0
+# item64f: HookPoint2 is gated by the level's own progression. MapInfo.Timer ->
+# Toits01.FirstFrame sets HookPointToActive(HookPoint2).bInteractive = false (with the live
+# level clock the Timer now fires; the frozen clock never ran it, which is why the item64
+# run attached without the gate), and only Toits01.SetGoalComplete(99) re-enables it. Goal
+# 99 is XIIIGoalTrigger6 (Tag 'transmutation'), triggered ONLY by the 'GrappinPoint' crank
+# XIIIMoverVarTime1 (TriggerControl; FinishedOpening -> TriggerEvent('transmutation')),
+# and 'GrappinPoint' is ONLY Jones's scene action [189] (after his kick, [187]) - which
+# waits for [149] 'wait player 75' (the player at Jones's side; [156]/[158] 'give 4/5'
+# hand over the sniper rifle) and [179] 'wait event counter_finact1' (CineTrigger1
+# CounterTrigger, InitialCounterValue 2: both 'Activation_Sc1_Snipers' GenNMI snipers'
+# Bases_Event 'finact1'). Measured (local/re/item64f/probe6.txt): crank Trigger 144.367,
+# XIIIGoalTrigger6.Trigger + SetGoalComplete(99) 145.183, HookPoint2.bInteractive true.
+# The landing at ~114.3 enters TT24's armed zone; the scene holds the player (FPC) until
+# its RPC at 120.2 (SwitchWeapon(0): the Hook is put down).
+t=119.10 forward 0
+# Jones's spot after his [143] walk ends (~124.9; (-4120,2218)): stand inside 75 UU.
+t=120.30 goto -4090 2175
+t=126.00 forward 0
+# [150] FPC -> [156]/[158] give FusilSnipe + bmg50 ammo -> [161] RPC (~129.1). Select the
+# rifle (InventoryGroup 14) and take the stand where the first sniper's fire reached the
+# player in the stand-still probe (local/re/item64f/probe3.txt).
+t=129.60 select_weapon 14
+t=130.00 goto -3140 1180
+t=133.00 forward 0
+# The two snipers ('BaseSoldier' from GenNMI1, 'BaseSoldier4' from GenNMI0) pursue toward the
+# player and, with PHYS_Falling (item77), no longer float at a constant z 2478 across the
+# street void: they step off their ledge and fall. BaseSoldier4 falls across the open street
+# and is shot from the old roof stand; BaseSoldier falls into the covered lane under the roof
+# edge (measured x -3169, z 2016.6) and is occluded from -3600 (roof BSP) and from the
+# mid-roof (edge parapet StaticMeshActor46, top z 2188.8). The route walks east to the clear
+# stand (x -3110) where the lane is back in view; the soldier comes out and is shot. Both
+# deaths raise the CineTrigger1 'finact1' counter -> goal 99 at ~154.5. Measured item86:
+# BaseSoldier4 dead at 138.5, BaseSoldier dead at 148.0, player Health stays 150 (no hit).
+t=133.10 track BaseSoldier 0.85
+t=134.00 fire
+t=135.50 fire
+t=137.00 track BaseSoldier4 0.85
+t=138.50 fire
+t=140.00 fire
+t=141.00 goto -3140 1180
+t=142.00 track BaseSoldier 0.85
+t=143.00 fire
+t=144.00 fire
+t=145.00 fire
+t=146.00 fire
+t=147.00 fire
+t=148.00 fire
+t=149.00 track off
+t=150.00 forward 0
+# item64 grapple #2 (after goal 99, item86: re-timed +10 s): the player is already on the
+# clear stand east of the crank; re-select the Hook with the retail item-cycle press
+# (cNextItem), aim at HookPoint2 (re-enabled by Toits01.SetGoalComplete(99) at ~154.5), short
+# fire press attaches (HookLength locks at the standing distance), walk east off the roof edge
+# - the taut-rope constraint (PlayerWalking.ProcessMove 0x0237) arrests the fall (VM-owned
+# while bHooked and PHYS_Falling) - then ALTFIRE pays the rope out and the pendulum lowers
+# toward the street below the anchor; the use key detaches on the street.
+t=155.50 next_item
+t=158.40 forward 0
+t=158.50 track HookPoint2
+t=159.30 fire_hold 1
+t=159.50 fire_hold 0
+t=159.70 goto -2700 1080
+t=160.90 altfire_hold 1
+t=168.00 altfire_hold 0
+t=171.00 use
+t=171.50 forward 0
+# courtyard (item86): DetectionVolume1's brush (item81c) now fires 'act2b' at the descent and
+# the three courtyard soldiers (BaseSoldier13/14/15) switch at t~162 to AttaqueScriptee. The
+# old damage-free west-corridor walk is re-timed to kill them as they come into the open; 13
+# is shootable from the landing, 14/15 open up as the player moves north.
+t=172.00 track BaseSoldier13 0.85
+t=172.50 fire
+t=173.50 fire
+t=174.00 goto -1450 1100
+t=175.00 track BaseSoldier14 0.85
+t=176.00 fire
+t=177.00 fire
+t=178.00 fire
+t=179.00 fire
+t=180.00 goto -1450 1500
+t=181.00 fire
+t=182.00 fire
+t=183.00 fire
+t=184.00 fire
+t=185.00 fire
+t=186.00 goto -1450 2100
+t=187.00 track BaseSoldier15 0.85
+t=188.00 fire
+t=189.00 fire
+t=190.00 fire
+t=191.00 fire
+t=192.00 fire
+t=193.00 fire
+t=194.00 track off
+t=195.00 goto -1450 2100
+t=198.50 goto -900 2100
+t=206.50 goto -768 2838
+t=214.50 goto -734 3424
+t=222.50 goto -200 3900
+# alley attempt; labelled teleport fallback (the alley's east end is the windowed wall)
+t=238.50 goto 200 3900
+t=244.50 goto 500 4100
+t=250.50 goto 800 4400
+t=256.50 teleport 800 4500 900
+t=256.60 forward 0
+t=258.50 goto 1400 4500
+t=266.50 goto 1900 4500
+t=274.50 goto 2300 4500
+# labelled teleport (the north-roof gap x~2500-2900 is void)
+t=280.50 teleport 3100 4500 1520
+t=280.60 forward 0
+t=282.50 goto 3150 4490
+# labelled teleport (the level's SauterTempo crossing; measured void)
+t=288.50 teleport 4200 2700 1456
+t=288.60 forward 0
+t=290.50 goto 5000 2700
+t=298.50 goto 5800 2700
+t=306.50 goto 6600 2700
+t=314.50 goto 7400 2700
+# labelled teleport (the deck's east parapet blocks walk and jump)
+t=322.50 teleport 8500 1700 1060
+t=322.60 forward 0
+t=324.50 goto 9000 1400
+t=332.50 goto 10000 1300
+t=340.50 goto 11000 1300
+t=348.50 goto 11700 1261
+# labelled teleport (the palettetremplin ramp lip and the window gap)
+t=356.50 teleport 12700 1261 1170
+t=356.60 forward 0
+t=358.50 goto 13265 1300
+t=365.50 goto 13900 1400
+# labelled teleport (the roof dip strip x 14000-14150 with a 50-UU hole at x~14150-14200;
+# the east roof surface is 1167)
+t=371.50 teleport 14250 1400 1220
+t=371.60 forward 0
+t=373.50 goto 15500 1450
+# item68d (the item68b real-clock block re-timed for the item64 grapple route; item64f: +34.5 s
+# on main's teleport route; item86: the whole block is +18 s, the sniper section, the gated
+# HookPoint2 descent and the re-timed courtyard fight included): move the diagnostic M60
+# bootstrap before the exposed descent. Roof return-fire was blocked; the landing below
+# supplies the real fire line.
+t=373.60 weapon XIII.m60
+# labelled teleport (the roof's east edge drops onto a trapped ledge and a 486 pit)
+t=379.50 teleport 16000 1300 700
+t=379.60 forward 0
+# item68b: live-clock rockets killed the old stationary landing/crossing. Engage
+# the launcher before crossing, then run continuously between cover positions.
+# The real-clock damage trace identifies BaseSoldier18 as the rocket instigator.
+# Engage him on landing (roof return-fire was blocked). `goto` overrides tracked
+# yaw, so stand for this burst before starting the run. item69: PickWallAdjust
+# unblocked his pursuit, so he now closes and fires back during the burst (two
+# DTRocketed hits at 318.7 and 320.8 against the old input, measured
+# local/re/item69/toits01-before-retiming.txt). Re-timed: the whole burst is
+# stationary again (the east run waits until he is dead) and starts at 317.15 so
+# the third M60 spine hit lands before his second rocket leaves the tube.
+# item64f (merge): the block below is main's item69 post-landing input shifted onto this
+# branch's grapple route (main's landing teleport at t=317.00, this route's at t=379.50:
+# the grapples replace the descent teleports and the HookPoint2 descent waits for Jones's
+# sniper-section gate). Main's stationary burst then took a direct rocket hit
+# (600 + 575 raw, dead at -25; local/re/item64f/run11.txt), so the burst strafes left
+# (south) from 352.0 to 353.4: soldier18 150 -> 94 -> 38 -> dead by 352.3 with no rocket
+# damage, soldier17 dead by 356.8 after one DTGunned hit (150 -> 140;
+# local/re/item64f/run12.txt).
+t=379.65 track BaseSoldier18 0.85
+t=379.70 fire
+t=379.90 fire
+t=380.10 fire
+t=380.30 fire
+t=380.50 fire
+t=380.70 fire
+t=380.90 fire
+t=381.10 fire
+t=380.00 left 1
+t=381.30 track off
+t=381.40 right 0
+t=381.50 forward 0
+# item69: soldier17 (bataillefinale, 150 hp) pursues behind soldier18. From the old
+# door-line stand the Tmetaldoorhelico mesh blocked every M60 ray to him while his
+# pursuit flank put his muzzle on the player side (DTGunned 75 at 342.1 and a
+# 74-dmg series through the generator phase killed the route player; measured
+# local/re/item69/toits01-retiming-v1.txt). Duel him at long range instead, from
+# the landing spot, before closing on the door line. His one unavoidable hit is
+# soldier18's in-flight rocket: three dodge retimings (none, one juke, two jukes
+# under local/re/item69/toits01-retiming-v2/-v3/-v4.txt) all took the 318.8 blast
+# (50/45/41 hp), so the route eats it once and duels from range where v3 measured
+# zero returning DTGunned hits.
+t=381.60 track BaseSoldier17
+t=381.80 fire
+t=382.00 fire
+t=382.20 fire
+t=382.40 fire
+t=382.60 fire
+t=382.80 fire
+t=383.00 fire
+t=383.20 fire
+t=383.40 fire
+t=383.60 fire
+t=383.80 fire
+t=384.00 fire
+t=384.20 fire
+t=384.40 fire
+t=384.60 fire
+t=384.80 fire
+t=385.00 fire
+t=385.20 fire
+t=385.40 fire
+t=385.60 fire
+t=385.80 fire
+t=386.00 track off
+t=386.20 goto 17800 1150
+# item87d: the generator room is opened only by the ending scene's action[602] `od porte6`,
+# which this tree never reaches (the cine stalls at action[227] `wait event counter_finact2b`,
+# see the report). The room is sealed on every walk/shot line from the road (measured item61b:
+# no clear ray into the door band). A labelled diagnostic teleport into the room (the item86
+# measured stand) lets the M60 destroy `BreakableMover12` from inside, which fires
+# `PorteDebloquee_cine` -> `PorteDebloquee` and arms `TouchTrigger10`.
+t=387.00 teleport 17250 2200 700
+t=387.10 forward 0
+t=387.30 track BreakableMover12
+t=387.60 fire
+t=388.00 fire
+t=388.30 track off
+# labelled teleport to TT10's r700 zone; it is armed now, so the game's own
+# `TouchTrigger10.Touch` fires `RenfortHelico02` and the act2a squad (`BaseSoldier5/6`).
+t=388.50 teleport 18300 1000 800
+t=388.60 forward 0
+t=388.80 goto 18800 1050
+# item53b: the helipad wait is under MagnumPlus3 fire once the phantom mover cylinders no
+# longer absorb AI rounds; the wait moves behind the Tmetaldoorhelico line (the sweep from
+# the shooter's muzzle to (18500,1300) is blocked by the door mesh).
+t=390.50 goto 18500 1300
+# item87d: the RenfortHelico02 squad spawned by the armed touch closes on the helipad; kill
+# it with the granted M60 so the route can survive to the next blocker.
+t=393.00 track BaseSoldier5 0.9
+t=393.50 fire
+t=394.00 fire
+t=394.50 fire
+t=395.00 fire
+t=395.50 fire
+t=396.00 fire
+t=396.50 fire
+t=397.00 reload
+t=397.50 track BaseSoldier6 0.9
+t=398.00 fire
+t=398.50 fire
+t=399.00 fire
+t=399.50 fire
+t=400.00 fire
+t=400.50 fire
+t=401.00 fire
+t=401.50 reload
+t=402.00 track off
+# item61b: the route player SURVIVES the tarmac. Weapon (labelled M60 grant): the fresh
+# import carries only Fists (GameInfo.AcceptInventory grants no weapon on a campaign map
+# without travel data), so the route grants the M60 through the game's own
+# Weapon.GiveTo/BringUp - the same grant the item53b spec sanctioned. item69: both
+# bataillefinale soldiers (BaseSoldier18 rockets, BaseSoldier17 gun) are engaged and killed
+# in the open-road phase above.
+# item87d pin: the route survives the tarmac (health 79) but the armed TT10's
+# `RenfortHelico02` squad closes on the helipad and the solo player dies (measured: health
+# -1, controller GameEndedDeath; `BaseSoldier6` survives at 38 hp behind the
+# Tmetaldoorhelico cover). The scene is still parked at action[227] `wait counter_finact2b`
+# (`BaseSoldier14` survives), so action[602] `od porte6` and the intended scene-opened
+# generator route are out of reach; the route ends waiting for a travel that is never
+# requested.
+t=434.50 wait_travel

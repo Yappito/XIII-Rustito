@@ -9545,6 +9545,177 @@ impl<'s> Vm<'s> {
         [l[0], l[1], l[2] + eye]
     }
 
+    /// item87b: `UGameEngine::LoadMap` (Engine.dll 0x1037b210) restarts the level clock at 0.
+    /// Decoded writes: 0 to `ALevelInfo.TimeSeconds` (+0x314, 0x1037c8e6), 0 to the `ULevel`
+    /// double accumulator (+0xd0, 0x1037c889), and a loop over the level's actor array writing
+    /// 0 to every `AActor.LastRenderTime` (+0x28, `movl $0x0,0x28(%eax)` at 0x1037ca11). The VM
+    /// level clock already starts at zero, so this only has to clear the serialised editor
+    /// values the map still carries: the published `TimeSeconds` and every actor's
+    /// `LastRenderTime`, exactly as retail. Called once per level open by the host; the
+    /// `xiii-tool script` harness does not call it, so its traces keep the raw decoded values.
+    pub fn reset_render_times(&mut self) {
+        self.time = 0.0;
+        let Some(level) = self.level_info.or_else(|| self.find_level_info()) else {
+            return;
+        };
+        let _ = self.set_property(level, "TimeSeconds", 0, Value::Float(0.0));
+        for i in 0..self.objects.len() {
+            let id = i as ObjectId;
+            if !self.objects[i].is_actor {
+                continue;
+            }
+            if self.get_property(id, "LastRenderTime").is_some() {
+                let _ = self.set_property(id, "LastRenderTime", 0, Value::Float(0.0));
+            }
+        }
+    }
+
+    /// item87b: retail writes `AActor.LastRenderTime = Level.TimeSeconds` for every actor the
+    /// renderer draws (`FDynamicActor::Render`, Engine.dll 0x103ccd10, `movl 0x314(%ecx),%edx;
+    /// movl %edx,0x28(%eax)` at 0x103ccdc5) — every actor that passes
+    /// `FLevelSceneNode::FilterActorEngine` (0x10314da0, rejects bit 0x1000 = `bHidden` of
+    /// `actor+0x2c`) and whose render bounds intersect the camera view frustum (the box check
+    /// that guards the call in the level render loop, 0x103db412).
+    ///
+    /// The headless VM has no renderer, so it stands in with that same test over **every** live
+    /// actor (not one class): a drawable `DrawType` (`!= DT_None`, the `actor+0x3b` byte set by
+    /// `AActor::SetDrawType` 0x10352a92), `!bHidden`, inside the player camera's view frustum
+    /// (origin/rotation from the controller's `GetViewTarget`; horizontal half-angle from
+    /// `FOVAngle`, default 90). Actors the camera does not draw keep their previous value, so
+    /// `Level.TimeSeconds - LastRenderTime` grows and the cinematic `NotSeenByPlayer` waits fire
+    /// as in retail. Without a player controller (the `xiii-tool script` scope) it is a no-op.
+    /// Windowed play instead reports the actors it actually drew through [`Vm::mark_rendered`].
+    ///
+    /// item87c: this stand-in is frustum-only, matching the windowed renderer's Bevy
+    /// `ViewVisibility` (also a frustum test). An earlier `world_line` occlusion ray from the
+    /// camera was removed: it starts inside the player's own collision, so it blocked every
+    /// distant actor and the stand-in marked only the camera-local actors (measured 6 vs the
+    /// renderer's 186 on Toits01). BSP occlusion is not modelled by either half, so the two
+    /// agree on the frustum approximation; see the item87c windowed comparison.
+    pub fn update_render_times(&mut self, controller: Option<ObjectId>) {
+        let Some(controller) = controller else {
+            return;
+        };
+        if self
+            .objects
+            .get(controller as usize)
+            .is_none_or(|o| o.deleted)
+        {
+            return;
+        }
+        let now = Value::Float(self.time as f32);
+        for id in self.render_time_candidates(controller) {
+            let _ = self.set_property(id, "LastRenderTime", 0, now.clone());
+        }
+    }
+
+    /// item87c: the read-only half of [`Vm::update_render_times`] — the actors the headless
+    /// stand-in would mark rendered this frame (drawable, `!bHidden`, inside the player-camera
+    /// frustum). Used to compare the stand-in against the windowed renderer's actually-drawn set
+    /// for the same frames.
+    pub fn render_time_candidates(&self, controller: ObjectId) -> Vec<ObjectId> {
+        if self
+            .objects
+            .get(controller as usize)
+            .is_none_or(|o| o.deleted)
+        {
+            return Vec::new();
+        }
+        let Some(camera) = self.camera_view(controller) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for i in 0..self.objects.len() {
+            let id = i as ObjectId;
+            if !self.objects[i].is_actor || self.objects[i].deleted {
+                continue;
+            }
+            if self.bool_prop(id, "bHidden") {
+                continue;
+            }
+            if matches!(self.get_property(id, "DrawType"), Some(Value::Byte(0))) {
+                continue;
+            }
+            let Some(point) = self.render_point(id) else {
+                continue;
+            };
+            if !camera.contains(point, self.f32_prop(id, "CollisionRadius")) {
+                continue;
+            }
+            out.push(id);
+        }
+        out
+    }
+
+    /// item87b: windowed play calls this with the actor ids the Bevy renderer actually drew
+    /// this frame (its entity `ViewVisibility`); it writes `LastRenderTime = Level.TimeSeconds`
+    /// for each, exactly as `FDynamicActor::Render` does in retail.
+    pub fn mark_rendered(&mut self, ids: &[ObjectId]) {
+        let now = Value::Float(self.time as f32);
+        for &id in ids {
+            if self
+                .objects
+                .get(id as usize)
+                .is_some_and(|o| o.is_actor && !o.deleted)
+                && self.get_property(id, "LastRenderTime").is_some()
+            {
+                let _ = self.set_property(id, "LastRenderTime", 0, now.clone());
+            }
+        }
+    }
+
+    /// item87b: the camera view used by the headless [`Vm::update_render_times`] stand-in. The
+    /// origin is `Controller.GetViewTarget`'s eye point ([`Vm::los_view_location`]); the
+    /// direction is the view target's rotation (the PlayerController copies it into its own
+    /// each frame). `FOVAngle` (Engine.u default 90, horizontal) gives the horizontal
+    /// half-angle; the vertical half-angle assumes a 4:3 viewport (the headless VM has no
+    /// viewport aspect). Documented stand-in, not a decoded viewport.
+    fn camera_view(&self, controller: ObjectId) -> Option<CameraView> {
+        let origin = self.los_view_location(controller);
+        let view = if self.is_a(controller, "playercontroller") {
+            self.obj_prop(controller, "ViewTarget")
+        } else {
+            None
+        }
+        .or_else(|| self.obj_prop(controller, "Pawn"))
+        .unwrap_or(controller);
+        let rot = self
+            .rotation_prop(view)
+            .or_else(|| self.rotation_prop(controller))?;
+        let k = std::f32::consts::TAU / 65536.0;
+        let (sp, cp) = ((rot[0] as f32) * k).sin_cos();
+        let (sy, cy) = ((rot[1] as f32) * k).sin_cos();
+        let forward = normalize3([cp * cy, cp * sy, sp]);
+        let mut right = cross3(forward, [0.0, 0.0, 1.0]);
+        if dot3(right, right) < 1e-6 {
+            right = [1.0, 0.0, 0.0];
+        }
+        let right = normalize3(right);
+        let up = cross3(right, forward);
+        let fov = {
+            let f = self.f32_prop(controller, "FOVAngle");
+            if (1.0..179.0).contains(&f) { f } else { 90.0 }
+        };
+        let half_h = fov.to_radians() * 0.5;
+        let tan_h = half_h.tan();
+        Some(CameraView {
+            origin,
+            forward,
+            right,
+            up,
+            tan_h,
+            tan_v: tan_h * 0.75,
+        })
+    }
+
+    /// item87b: the point the headless stand-in tests against the frustum and the line of sight:
+    /// the actor's collision-cylinder centre (`Location.Z + 0.5*CollisionHeight`).
+    fn render_point(&self, id: ObjectId) -> Option<[f32; 3]> {
+        let mut p = self.vector_prop(id, "Location")?;
+        p[2] += 0.5 * self.f32_prop(id, "CollisionHeight");
+        Some(p)
+    }
+
     /// Host-driven engine perception (`item14b`): for every live `IAController`, test whether its
     /// pawn can see the player (range, facing cone, clear world line of sight) and dispatch the
     /// engine's own `SeePlayer` / `EnemyNotVisible` events only when visibility changes, as the
@@ -11920,6 +12091,43 @@ fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 
 fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// item87b: the headless render stand-in's camera frustum ([`Vm::camera_view`]). Documented
+/// approximation of the engine's `FLevelSceneNode` view: origin and direction from the player
+/// controller's view target, `FOVAngle` horizontal half-angle and an assumed 4:3 viewport.
+struct CameraView {
+    origin: [f32; 3],
+    forward: [f32; 3],
+    right: [f32; 3],
+    up: [f32; 3],
+    tan_h: f32,
+    tan_v: f32,
+}
+
+impl CameraView {
+    /// True when a sphere at `point` (radius `r`) intersects the view frustum. The engine tests
+    /// the actor's render bounding box against the frustum; this is the documented sphere
+    /// approximation over the collision cylinder.
+    fn contains(&self, point: [f32; 3], r: f32) -> bool {
+        let d = sub3(point, self.origin);
+        let z = dot3(d, self.forward);
+        if z <= -r {
+            return false;
+        }
+        let x = dot3(d, self.right).abs();
+        let y = dot3(d, self.up).abs();
+        let z = z.max(0.0);
+        x <= self.tan_h * z + r && y <= self.tan_v * z + r
+    }
 }
 
 fn scale3(a: [f32; 3], scale: f32) -> [f32; 3] {

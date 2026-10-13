@@ -273,6 +273,10 @@ impl Plugin for PlayPlugin {
                 Update,
                 (unattended, ingamemenu::scripted_shots).after(overlay),
             )
+            // item87b: the windowed `LastRenderTime` report, after the pawn renderer has set
+            // each instance's `Visibility`. Kept out of the big `Update` chain: that tuple is
+            // already at Bevy's 20-system arity limit.
+            .add_systems(Update, report_rendered_actors.after(pawns::update_pawns))
             .add_systems(
                 Last,
                 (
@@ -533,6 +537,9 @@ fn setup_inner(
         .clone()
         .ok_or("--game-dir is required for --play")?;
     let scene = viewer::load_scene(opts)?;
+    // item87b: the windowed renderer owns `AActor.LastRenderTime` (it reports the actors it
+    // actually drew each frame); the VM's headless stand-in is disabled for this session.
+    session.use_renderer_render_times();
     // Give the VM's physics provider the mover brushes too (the player simulation builds its own
     // dynamic collision below).
     session.register_movers(&scene);
@@ -1323,6 +1330,48 @@ fn fixed_step(
             println!("[play] {}", format_vm_trace(sess));
         }
     }
+}
+
+/// item87b: the windowed half of `AActor.LastRenderTime`. Retail writes
+/// `LastRenderTime = Level.TimeSeconds` for every actor `FDynamicActor::Render` (Engine.dll
+/// 0x103ccd10) draws; the Bevy renderer knows the drawn set through each entity's
+/// `ViewVisibility` (frustum-culled). Runs after `pawns::update_pawns` and reports the visible
+/// pawn and map-actor entities to the VM, so a cinematic `NotSeenByPlayer` wait only fires for
+/// an actor the camera did not draw. The headless stand-in is [`Vm::update_render_times`].
+fn report_rendered_actors(
+    pawns: Option<Res<pawns::PawnScene>>,
+    sync: Res<RenderSync>,
+    vis: Query<&ViewVisibility>,
+    mut session: NonSendMut<Result<session::Session, String>>,
+) {
+    let Ok(sess) = session.as_mut() else {
+        return;
+    };
+    if !sess.renderer_reports_rendered() {
+        return;
+    }
+    let mut drawn: Vec<xiii_script::ObjectId> = Vec::new();
+    if let Some(pawns) = pawns {
+        for inst in &pawns.instances {
+            if vis
+                .get(inst.root_entity())
+                .map(|v| v.get())
+                .unwrap_or(false)
+            {
+                drawn.push(inst.id);
+            }
+        }
+    }
+    for (name, entities) in &sync.entities {
+        if entities
+            .iter()
+            .any(|e| vis.get(*e).map(|v| v.get()).unwrap_or(false))
+            && let Some(id) = sess.vm().find_live_object(name)
+        {
+            drawn.push(id);
+        }
+    }
+    sess.report_rendered(&drawn);
 }
 
 /// Mirrors the VM-owned `ParticleEmitter.Disabled` field into the renderer's simulator gate.
@@ -6564,6 +6613,123 @@ mod tests {
             "[toits01 route] objectives={objectives:?} travel={:?} final_map={}",
             outcome.travel, outcome.final_map
         );
+        // item87e: pin the real blocker precisely. Under the render-time clock the ending
+        // scene's `CineController2` interpreter advances past action[211]
+        // `wait notbeseenbyplayer` (the item86 stall) but parks at action[227]
+        // `wait event counter_finact2b` (`CineTrigger10`, InitialCounterValue 3), which needs
+        // all three `act2b` courtyard soldiers (`BaseSoldier13/14/15`, Tag 'act2b') dead.
+        // `BaseSoldier13` and `BaseSoldier15` die to the route's courtyard fire, but
+        // `BaseSoldier14` survives (its Health stays 200: the route's fire never damages it).
+        // Measured at the cutoff: `BaseSoldier14` Location ~ (2808.6, 9819.3, -6433.8),
+        // `Physics` `PHYS_Walking` (1), Velocity (280.0, 0, 0), its `IAController` in state
+        // `Errance` (destination ~ (2848.5, 9819.3, -6355.6)). It authored at Location
+        // (-478.846, 3327.676, -12), i.e. on the courtyard floor, so it did not spawn outside;
+        // its `Errance` wander drove it off the courtyard's collision floor and it fell out of
+        // the world to z ~ -6434: ~6.4 km below the courtyard floor and far outside the fight,
+        // not a patrol point the player can reach or shoot, so the scene
+        // cannot leave action[227] and action[602] `od porte6` - the only path that opens the
+        // generator room - never runs. Full evidence in `local/reports/item87e-toits01-pin-restore.md`.
+        {
+            let vm = session.vm();
+            let s14 = vm
+                .find_object("BaseSoldier14")
+                .expect("BaseSoldier14 must exist");
+            assert_eq!(
+                vm.get_property(s14, "bIsDead"),
+                Some(&xiii_script::Value::Bool(false)),
+                "item87e pin: BaseSoldier14 (the third counter_finact2b soldier) must survive, \
+                 stalling the scene at action[227]"
+            );
+            assert_eq!(
+                vm.get_property(s14, "Health"),
+                Some(&xiii_script::Value::Int(200)),
+                "item87e pin: the route's fire never damages BaseSoldier14"
+            );
+            assert_eq!(
+                vm.get_property(s14, "Physics"),
+                Some(&xiii_script::Value::Byte(1)),
+                "item87e pin: BaseSoldier14 ends in PHYS_Walking, wandering far below the level"
+            );
+            let loc = vm
+                .vector_prop(s14, "Location")
+                .expect("BaseSoldier14 must keep a Location");
+            assert!(
+                (loc[2] + 6433.8).abs() < 5.0,
+                "item87e pin: BaseSoldier14 must have fallen far below the map (z ~ -6434), \
+                 got {loc:?}"
+            );
+            let controller_state = match vm.get_property(s14, "Controller") {
+                Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(c)))) => {
+                    vm.state_name(*c)
+                }
+                _ => None,
+            };
+            assert_eq!(
+                controller_state.as_deref(),
+                Some("Errance"),
+                "item87e pin: BaseSoldier14's IAController must be wandering (Errance)"
+            );
+            // The scene controller is parked at action[227] `wait event counter_finact2b`: the
+            // VM's cine trace treats `ScriptedActionIndex - 1` as the action that ran/is waiting
+            // (see `play::survey`).
+            let cc2 = vm
+                .find_object("CineController2")
+                .expect("CineController2 must exist");
+            assert!(
+                vm.is_in_state(cc2, "PlayingSequence"),
+                "item87e pin: the ending scene must still be running at the cutoff"
+            );
+            let action_index = match vm.get_property(cc2, "ScriptedActionIndex") {
+                Some(xiii_script::Value::Int(v)) => *v,
+                other => panic!("CineController2 ScriptedActionIndex: {other:?}"),
+            };
+            assert_eq!(
+                action_index, 228,
+                "item87e pin: CineController2 must be parked at action[227] \
+                 (`wait event counter_finact2b`), i.e. ScriptedActionIndex 228"
+            );
+            let action_text = vm
+                .get_property(cc2, "MyPawn")
+                .and_then(|pawn| match pawn {
+                    xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(p))) => Some(*p),
+                    _ => None,
+                })
+                .and_then(|pawn| {
+                    let tab = match vm.get_property(pawn, "CurrentTabActionIndex") {
+                        Some(xiii_script::Value::Int(t)) => *t,
+                        _ => 0,
+                    };
+                    let name = match tab {
+                        2 => "tabActions2",
+                        3 => "tabActions3",
+                        _ => "tabActions",
+                    };
+                    let items = match vm.get_property(pawn, name) {
+                        Some(xiii_script::Value::Array(items)) => items.clone(),
+                        _ => return None,
+                    };
+                    let idx = usize::try_from(action_index.saturating_sub(1)).ok()?;
+                    items.get(idx).map(|v| match v {
+                        xiii_script::Value::Str(s) | xiii_script::Value::Name(s) => s.clone(),
+                        other => format!("{other:?}"),
+                    })
+                });
+            assert!(
+                action_text
+                    .as_deref()
+                    .is_some_and(|t| t.contains("counter_finact2b")),
+                "item87e pin: the parked action must be `wait event counter_finact2b`, got \
+                 {action_text:?}"
+            );
+            println!(
+                "[toits01 route] item87e scene blocker: CineController2 action[{}] {action_text:?} \
+                 (index {action_index}), BaseSoldier14 alive health={:?} physics={:?} loc={loc:?} \
+                 controller={controller_state:?}",
+                action_index - 1,
+                vm.get_property(s14, "Health"),
+                vm.get_property(s14, "Physics"),
+            );
+        }
         assert_eq!(outcome.final_map, "Toits01");
         assert!(
             outcome.travel.is_empty(),
@@ -6723,7 +6889,14 @@ mod tests {
         // Jones's yaw turns to ~0 (east, the rWantedRotation facing) during the climb; the
         // teleport moves him by the posed offset (+226.4, +26.6, +159..187) to the building
         // roof (feet z 2160), east of the corniche band (x -4570..-4509), where action[117]'s
-        // movseqb walk proceeds.
+        // movseqb walk proceeds. item87b: with the level clock and every actor's
+        // `LastRenderTime` reset to 0 at load (as `UGameEngine::LoadMap` does) and the headless
+        // render stand-in (`Vm::update_render_times`) the scene no longer stalls at action[211]
+        // `wait notbeseenbyplayer`; it walks Jones on through the courtyard, so the FINAL Cine0
+        // position is no longer the retract landing. The retract is verified by
+        // `spoke_after_retract` (the [117] movseqb and forced dialogue only run once the posed
+        // teleport freed him) and by the east-of-corniche x; the z pin below is the measured
+        // final alley position of the now-advancing scene.
         let cine0 = vm
             .find_object("Cine0")
             .expect("the cine Jones pawn must exist");
@@ -6735,8 +6908,9 @@ mod tests {
             "Cine0 must stand east of the corniche band after the retract teleport, got {cine0_loc:?}"
         );
         assert!(
-            (cine0_loc[2] - 2234.3).abs() < 8.0,
-            "Cine0 must rest on the building roof (center z 2234.3 = roof 2160 + half height 74.3), got {cine0_loc:?}"
+            (cine0_loc[2] - -48.0).abs() < 40.0,
+            "Cine0 ends the run on the courtyard/alley floor once the scene advances past the \
+             demo (item86 gen), got {cine0_loc:?}"
         );
         // The fixed [117] movseqb completed: the demo's post-move dialogue ran — the forced
         // `dial dialtoits1 11` line speaks (DialogueManager0 enters STA_HeadAnimation, the
@@ -7005,6 +7179,144 @@ mod tests {
         //    CineTrigger17 never forwards 'PorteDebloquee' -> TT10 stays disarmed -> goal 0's
         //    chain, the RenfortHelico02 finale, goals 1/2 and the 'finmap' travel are all
         //    unreachable, and the route ends waiting for a travel that cannot be requested.
+    }
+
+    /// item87e DIAGNOSTIC (opt-in). The item87d generator-room experiment, moved out of the
+    /// main route so it cannot replace that route's positive survival pins. The fixture
+    /// (`tests/data/toits01_diag_generator_room.script`) is the main route's input up to
+    /// `t=386.20`, then a labelled diagnostic teleport into the scene-sealed generator room:
+    /// the ending scene never reaches action[602] `od porte6` (it parks at action[227]
+    /// `wait event counter_finact2b`, pinned by `opt_in_toits01_route_objectives_and_travel`),
+    /// so the room can only be entered by that labelled teleport. The granted M60 destroys
+    /// `BreakableMover12` (`Health 50 -> -40`), firing `PorteDebloquee_cine` ->
+    /// `PorteDebloquee` and arming `TouchTrigger10`; the game's own armed `Touch` then fires
+    /// `RenfortHelico02`, whose act2a squad kills the solo route player. This test pins that
+    /// measured chain, including the earlier route pins it shares with the main route. It is a
+    /// labelled diagnostic, NOT a playable route claim.
+    #[test]
+    fn opt_in_diag_toits01_generator_room() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Toits01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Toits01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/toits01_diag_generator_room.script");
+        let script = script::Script::load(&route_path).expect("load item87e Toits01 diag route");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Toits01",
+            &script,
+            &resolved.params,
+            &scene,
+            440.0,
+        )
+        .expect("run Toits01 diag route");
+        let session = &outcome.session;
+        let vm = session.vm();
+        // The generator is destroyed only by the labelled teleport into the room; the map's own
+        // `BreakableMover12.Health` drops to the measured -40 and `PorteDebloquee_cine` arms
+        // `TouchTrigger10` (Event `RenfortHelico02`).
+        let generator = vm
+            .find_object("BreakableMover12")
+            .expect("the generator BreakableMover12 must exist");
+        assert_eq!(
+            vm.get_property(generator, "Health"),
+            Some(&xiii_script::Value::Int(-40)),
+            "diag: the M60 from inside the room must destroy the generator (measured -40)"
+        );
+        let tt10 = vm
+            .objects
+            .iter()
+            .enumerate()
+            .position(|(i, o)| {
+                vm.set().path(o.class).ends_with("TouchTrigger")
+                    && vm
+                        .get_property(i as u32, "Event")
+                        .map(|v| v.to_string().contains("RenfortHelico02"))
+                        .unwrap_or(false)
+            })
+            .expect("TouchTrigger10 (Event RenfortHelico02) must exist on Toits01");
+        assert_eq!(
+            vm.get_property(tt10 as u32, "bActif"),
+            Some(&xiii_script::Value::Bool(true)),
+            "diag: TouchTrigger10 must be armed by the destroyed generator"
+        );
+        let tt10_touched = vm.trace.iter().any(|event| {
+            matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, args }
+                    if target.eq_ignore_ascii_case("TouchTrigger10")
+                        && function.ends_with("TouchTrigger.Touch")
+                        && args.iter().any(|a| a.contains("XIIIPlayerPawn"))
+            )
+        });
+        assert!(
+            tt10_touched,
+            "diag: the armed TouchTrigger10 must fire its own Touch with the player pawn"
+        );
+        // Goal 0 (`Follow Major Jones`) completes through the armed touch; goals 1/2 and the
+        // travel stay unreached (goal 3 completes).
+        let objectives = session.objective_states();
+        println!(
+            "[toits01 diag] objectives={objectives:?} travel={:?} final_map={}",
+            outcome.travel, outcome.final_map
+        );
+        for o in &objectives {
+            match o.index {
+                0 => assert!(o.completed, "diag: goal 0 must complete: {o:?}"),
+                3 => assert!(
+                    o.completed,
+                    "diag: the survival objective must complete: {o:?}"
+                ),
+                1 | 2 => assert!(
+                    !o.completed,
+                    "diag: objective {} must stay incomplete: {o:?}",
+                    o.index
+                ),
+                _ => {}
+            }
+        }
+        // The scene stays parked at action[227] (the pin lives in the main route test); the
+        // armed touch's `RenfortHelico02` squad kills the solo route player, the measured next
+        // blocker of this diagnostic chain.
+        assert_eq!(outcome.final_map, "Toits01");
+        assert!(
+            outcome.travel.is_empty(),
+            "diag route unexpectedly travelled: {:?}",
+            outcome.travel
+        );
+        let s14 = vm
+            .find_object("BaseSoldier14")
+            .expect("BaseSoldier14 must exist");
+        assert_eq!(
+            vm.get_property(s14, "bIsDead"),
+            Some(&xiii_script::Value::Bool(false)),
+            "diag: BaseSoldier14 must still survive (the scene blocker)"
+        );
+        let health = session
+            .player_health()
+            .expect("the player must have a Health property");
+        assert!(
+            health <= 0.0,
+            "diag: the RenfortHelico02 squad must end the solo route player, got health {health}"
+        );
+        assert_eq!(
+            session.player_controller_state(),
+            "GameEndedDeath",
+            "diag: the route player must end in GameEndedDeath"
+        );
+        println!(
+            "[toits01 diag] generator Health=-40, TT10 armed+touched, goal 0 complete; the \
+             RenfortHelico02 squad killed the route player (health {health}, GameEndedDeath); \
+             BaseSoldier14 survives (scene parked at action[227])"
+        );
     }
 
     /// Destroys every live `BaseSoldier*` of the session (labelled diagnostic): the Hual02

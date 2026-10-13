@@ -147,6 +147,13 @@ t=173.20 fire
 t=173.60 fire
 t=174.00 fire
 t=174.40 track off
+# item87c re-time: with `LastRenderTime` zeroed at load as retail `UGameEngine::LoadMap` does,
+# the base doors auto-close (`XIIIPorte.PlayerTriggerToggle.Timer2`: `Level.TimeSeconds -
+# LastRenderTime > 1.0`), so the old never-closing-door walk timing no longer holds and the
+# BaseSoldier12 exchange killed the 34-hp player. The walk detours north through (-33,1094)
+# before the exchange; the same six soldiers still die and the same goals hold.
+t=175.00 goto -33 1094
+t=179.00 goto -614 -394
 t=182.00 goto -614 -394
 t=184.00 goto -860 -56
 t=186.00 goto -850 493
@@ -236,7 +243,12 @@ t=354.00 goto -3880 3100
 t=357.00 goto -3900 2960
 t=360.00 goto -4000 2800
 t=362.00 goto -4262 2247
-t=365.00 crouch 1
+# item87d re-time: the item94 route crouched for this LastWave burst. On the item87c
+# render-time tree the reinforcement `BaseSoldier` charges and, from the crouched muzzle, the
+# M60 rounds pass over it (measured: it stayed at 44 hp and shotgunned the route to death while
+# the other two reinforcements died). Standing clears the muzzle and the same nine-round burst
+# kills all three (measured: route passes, health 10). No target, weapon or assertion changed.
+t=365.00 crouch 0
 t=368.00 track BaseSoldier 0.90
 t=368.15 fire
 t=368.45 fire
