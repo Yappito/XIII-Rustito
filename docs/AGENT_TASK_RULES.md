@@ -77,3 +77,17 @@ Tests and manual runs must not read or write the user's `%APPDATA%` (save slots,
 Tests create a fresh temporary directory. Manual `--play`/`--menu` runs pass `--save-dir` and
 `--config-dir` pointing to a temporary directory: a checkpoint reached during a benchmark or a
 route run otherwise writes a real save slot, and other tests or the user then see it.
+
+## Keep memory bounded (shared 64 GB machine)
+
+Several agents and one full test suite run at the same time. A single debug suite takes up to ~28 GB
+and a release route test ~15 GB with two test threads. Run tests with `RUST_TEST_THREADS=1` unless
+the spec says otherwise. Run only one heavy test or probe at a time in your worktree. Any diagnostic
+binary or probe you build must bound its memory: load one map at a time, cap collections and
+iteration counts, and stream output to a file instead of keeping it in memory. On 2026-10-13 an agent
+probe grew to 64 GB and pushed the machine to 1.2 GB of free commit. A watchdog kills the largest
+worktree process when free commit drops below 15 GB. If one of your test runs dies abruptly (exit
+code 1 with no panic, or "process didn't exit successfully"), it was probably killed by the watchdog:
+rerun it before treating it as a failure. Start `verify.sh` only as
+`nohup bash P:/AI/XIII/local/verify.sh > local/reports/<x>-verify.txt 2>&1 < /dev/null &` (without
+`< /dev/null` your session hangs) and poll it with short commands.
