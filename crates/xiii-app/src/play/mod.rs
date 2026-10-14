@@ -9107,11 +9107,29 @@ mod tests {
     /// The engine now (a) executes the class-default
     /// lvalue write `XIIIPlayerPawn.default.bCollideWorld` in `MapInfo.SaveInventoryForFlash`,
     /// (b) skips `transient` struct members when decoding the raw `structFlash`, and (c) drives
-    /// the FlashManager through that explicitly modelled cue path. `fin_transition` now fires (Cine0
-    /// advances to `wait event fin_flash`) and the flashback cine Cine1 starts and runs to its
-    /// `wait warning`. The route still ends frozen: the next blocker is Cine1's `wait warning`,
-    /// which needs the `DialogueManager` line-end warning (`SpeakersToWarnAtTheEndOfThisLine`)
-    /// that has not run by the 300 s budget; goal 0/1 and the `PRock01a` travel stay unreached.
+    /// the FlashManager through that explicitly modelled cue path. `fin_transition` fires and the
+    /// flashback cine Cine1 starts.
+    ///
+    /// item99d: the `wait warning` blocker is fixed generically. `CineController2`'s `wait warning`
+    /// sets `flagsPaused` bit 4; the warning comes from
+    /// `DialogueManager.STA_PlayingDialogue.EndOfLine`, which walks the line's
+    /// `SpeakersToWarnAtTheEndOfThisLine` and calls `CineWarn`. The line never spoke because
+    /// `DialogueManager1` (`dial_flash`) was destroyed by `MustBeStop` at `StartDialogue`: its
+    /// `Speakers[0].Pawn` names the map's pending-kill `Cine2` export (`bDeleteMe=true`), which the
+    /// engine removes and whose references it nulls. `Vm::load_level` now performs that generic
+    /// reference replacement (unit-tested). The whole cutscene runs (Cine0/Cine1 reach
+    /// `destroy self` at ~226 s, `event objectif99` promotes goal 0).
+    ///
+    /// item99e: the post-cutscene firefight is re-driven by input and survived with a margin. The
+    /// item99d claim that the route "loots the `FusilPompePick0` shotgun" was wrong: that pickup (and
+    /// `MiniUziPick0`/`MagnumPick0`) sits on a lower floor at z~1930, below the fully-enclosed
+    /// goal-trigger room floor at z~2091, so the player never touched it and fought `BaseSoldier2`
+    /// unarmed (`Fists`), which shotgunned it to death. The route now grabs the reachable
+    /// west-floor `M60Pick1` through the game's own interaction Grab, selects it with the retail
+    /// `next_weapon` key, returns to the chalet wardrobe for cover and kills the close
+    /// `BaseSoldier2`, then crosses the goal triggers and survives. Next blocker: goal 0
+    /// completes only on the level's own `objectif0` event, so goal 0/1 and the `PRock01a` travel
+    /// stay unreached.
     #[test]
     fn opt_in_kello01b_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -9163,10 +9181,11 @@ mod tests {
         assert!(session.blocked.is_empty(), "{:?}", session.blocked);
         assert!(
             session.player_health().is_some_and(|h| h > 0.0),
-            "player must survive"
+            "player must survive: {:?}",
+            session.player_health()
         );
         // The mountain descent and the door entry are a fall-and-walk route, so the player is
-        // below full health (measured 102/150); still alive.
+        // below full health; the post-cutscene firefight takes more, but the route must live.
         assert!(
             session.player_health().is_some_and(|h| h < 150.0),
             "the descent must cost some fall damage: {:?}",
@@ -9176,16 +9195,13 @@ mod tests {
         assert_eq!(goals.len(), 2, "the map authors two objectives: {goals:?}");
         assert!(
             !goals[0].completed,
-            "goal 0 (cover Kim's escape) is not completed by this first route: {goals:?}"
+            "goal 0 (cover Kim's escape) is not completed by this route: {goals:?}"
         );
         assert!(
             !goals[1].completed,
-            "goal 1 (find Jones and Carrington again) is not completed by this first route: {goals:?}"
+            "goal 1 (find Jones and Carrington again) is not completed by this route: {goals:?}"
         );
         assert!(outcome.travel.is_empty(), "the route must not travel");
-        // Measured progress: the player entered the chalet and triggered the `XIII_dans_chalet`
-        // cutscene. `CineController21` interprets the Cine0 (Kim) sequence; it was in `STA_init`
-        // at level start and is `PlayingSequence` once TouchTrigger2 fires.
         assert!(
             session
                 .touches()
@@ -9194,59 +9210,63 @@ mod tests {
             "the player must reach TouchTrigger2 (XIII_dans_chalet): {:?}",
             session.touches()
         );
-        let cine0 = vm
-            .find_object("CineController21")
-            .expect("Cine0 controller");
-        assert_eq!(
-            vm.state_name(cine0).as_deref(),
-            Some("PlayingSequence"),
-            "touching the chalet trigger must start the Cine0 cutscene"
-        );
-        // item99b positive pins: the flash chain now runs. `GenFlash0` is the level's
-        // `Level.FlashManager`; its `count` advances through the Partial flash cue model,
-        // and the flashback cine Cine1 (`CineController22`) starts on the emitted
-        // `fin_transition`, so Cine0 is released past action 33.
-        let flash = vm
-            .find_object("GenFlash0")
-            .expect("GenFlash0 flash manager");
+        // item99d: the DialogueManager line-end warning now releases Cine1's `wait warning`, so the
+        // whole chalet cutscene runs. `DialogueManager1` (tag `dial_flash`) is the flashback line
+        // whose `SpeakersToWarnAtTheEndOfThisLine` used to be unreachable; its line now speaks.
         assert!(
-            matches!(vm.get_property(flash, "Count"), Some(Value::Int(n)) if *n > 0),
-            "the flash transition must have advanced GenFlash0.count: {:?}",
-            vm.get_property(flash, "Count")
+            session
+                .dialogues
+                .iter()
+                .any(|(_, d)| d.actor.eq_ignore_ascii_case("DialogueManager1")),
+            "the flashback line (`DialogueManager1`, `dial_flash`) must speak: {:?}",
+            session.dialogues
         );
-        let cine1 = vm
-            .find_object("CineController22")
-            .expect("Cine1 controller");
-        assert_eq!(
-            vm.state_name(cine1).as_deref(),
-            Some("PlayingSequence"),
-            "the flashback cine (Cine1) must have started on fin_transition"
-        );
-        // Preserve the item99b stopping point explicitly, not merely any PlayingSequence state.
-        assert_eq!(
-            vm.get_property(cine1, "ScriptedActionIndex"),
-            Some(&Value::Int(18)),
-            "Cine1 must remain parked after its wait warning action"
-        );
-        assert_eq!(
-            vm.get_property(cine1, "flagsPaused"),
-            Some(&Value::Int(4)),
-            "Cine1 must be waiting for a warning"
-        );
-        let cine1_pawn = match vm.get_property(cine1, "MyPawn") {
-            Some(Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => *id,
-            other => panic!("Cine1 controller pawn: {other:?}"),
-        };
+        // The flashback cine (`CineController22`) is gone: it ran to `destroy self` when the
+        // warning released `wait warning`, and Cine0 (`CineController21`) followed past
+        // `fin_flash` to `destroy self` (measured at t~226.4), which is what promotes goal 0.
         assert!(
-            matches!(vm.get_property(cine1_pawn, "tabActions"), Some(Value::Array(actions))
-                if actions.get(17) == Some(&Value::Str("wait warning".to_owned()))),
-            "the paused action must be wait warning"
+            vm.find_object("CineController22").is_none(),
+            "the flashback cine must have completed and destroyed itself"
         );
-        let position = session.player_location().expect("player position");
-        for (actual, expected) in position.into_iter().zip([-2750.0, -473.9, 2106.0]) {
+        assert!(
+            goals[0].primary,
+            "the cutscene's `event objectif99` must promote goal 0 to primary: {goals:?}"
+        );
+        // item99e: the route arms the player before the firefight. The chalet's `FusilPompePick0`
+        // shotgun, `MiniUziPick0` and `MagnumPick0` sit on a lower floor (`z~1930`) under the
+        // fully-enclosed goal-trigger room floor (`z~2091`) and are unreachable; the reachable
+        // weapon is the west-floor `M60Pick1` (`z~2076`), grabbed through the game's own
+        // interaction Grab (`use M60Pick1`) and selected with the retail `next_weapon` key.
+        let player = vm.find_object("XIIIPlayerPawn").expect("player pawn");
+        assert!(
+            matches!(
+                vm.get_property(player, "Weapon"),
+                Some(Value::Object(Some(xiii_script::ObjRef::Instance(_))))
+            ),
+            "the player must pick up a weapon for the post-cutscene fight: {:?}",
+            vm.get_property(player, "Weapon")
+        );
+        // Positive pin: the active weapon is the reachable M60 machine gun, not the starting
+        // `Fists` (the item99d report's "loots the shotgun" claim was wrong: the shotgun is below
+        // the room and the player never had it).
+        assert!(
+            session
+                .player_weapon()
+                .is_some_and(|w| vm.objects[w as usize].name.starts_with("m60")),
+            "the route must loot the reachable M60 (M60Pick1), got {:?}",
+            session
+                .player_weapon()
+                .map(|w| vm.objects[w as usize].name.clone())
+        );
+        // Positive pins: the player crosses the chalet floor onto the map's own goal triggers
+        // (`XIIIGoalTrigger2` tag `objectif0`, `XIIIGoalTrigger1` tag `roquette`). Reaching them
+        // is the next objective step; neither completes yet because goal 0 waits on the level's
+        // own `objectif0` event (fired by the wave/progression script), not on the raw touch.
+        for trigger in ["XIIIGoalTrigger2", "XIIIGoalTrigger1"] {
             assert!(
-                (actual - expected).abs() < 1.0,
-                "chalet interior pin moved: {position:?}"
+                session.touches().iter().any(|(_, name)| name == trigger),
+                "the route must reach the goal trigger {trigger}: {:?}",
+                session.touches()
             );
         }
         assert_eq!(
@@ -9257,16 +9277,7 @@ mod tests {
             Some(&Value::Str("PRock01a.unr".to_owned()))
         );
         println!(
-            "[kello01b next blocker] item99b: the descent, the Porte0 door entry and the flash transition are \
-             reached. The flash chain now runs: `GenFlash0` (the level's `Level.FlashManager`) advances and \
-             emits `fin_transition`, so Cine0 passes its `wait event fin_transition` and parks at \
-             `wait event fin_flash`, and the flashback cine Cine1 (`CineController22`) starts and runs to its \
-             `wait warning`. The route is still frozen inside the cutscene: Cine1's `wait warning` needs the \
-             `DialogueManager` line-end warning (`SpeakersToWarnAtTheEndOfThisLine`, `DialogueManager1` \
-             `dial_flash`), which has not run by the 300 s budget, so `premiere_explosion`/`checkpoint`, \
-             `event objectif99` (goal 0 primary), goal 0/1 completion and the PRock01a travel stay unreached \
-             (travel=[]). The player is pinned against the chalet wardrobe (K_armoir02) while the cutscene \
-             plays."
+            "[kello01b next blocker] item99d: the `wait warning` blocker is fixed. Decoded: the              CineController2 `wait warning` action sets `flagsPaused` bit 4 (`nOnJump[2] = -1`) and              `CineController2.PlayingSequence.CineWarn` clears it; the warning is sent by              `DialogueManager.STA_PlayingDialogue.EndOfLine`, which walks              `Lines[LineIndex].SpeakersToWarnAtTheEndOfThisLine` and calls `CineWarn` on each              named speaker's controller. Our runtime parked at `wait warning` because the              flashback line never spoke: `DialogueManager1` (`dial_flash`) was destroyed by              `MustBeStop` at `StartDialogue` because its `Speakers[0].Pawn` names the map's              pending-kill `Cine2` export (`bDeleteMe=true`, measured). The engine removes that              actor at load and nulls references to it; the VM kept the stale reference, so              `PostBeginPlay` counted it as a present speaker and `MustBeStop` aborted the manager.              Fix: `Vm::load_level` now nulls every property reference to a pending-kill export              (generic, no map/class code; unit tests              `load_level_nulls_references_to_pending_kill_exports` and              `null_deleted_references_walks_structs_arrays_and_delegates`). With the line ending,              the whole cutscene runs (Cine0/Cine1 reach `destroy self` at t~226.4 and `event              objectif99` promotes goal 0 to primary). item99e: the post-cutscene firefight is              survived by input, not by the (unreachable) `FusilPompePick0` shotgun: the player              grabs the reachable west-floor `M60Pick1`, selects it, returns to the wardrobe              cover and kills the close `BaseSoldier2` that otherwise shotguns the unarmed player              to death, crossing `XIIIGoalTrigger2`/`XIIIGoalTrigger1` and surviving with a margin.              Next blocker: goal 0 (`Cover Kim's escape`) completes only when the level's own              `objectif0` event fires (the wave/progression script); touching `XIIIGoalTrigger2`              runs `Engine.Trigger.Touch` -> `TriggerEvent(Event=...)` and does not call its              `CauseGoal`, so goal 0/1 and the `PRock01a` travel stay unreached (travel=[])."
         );
     }
 

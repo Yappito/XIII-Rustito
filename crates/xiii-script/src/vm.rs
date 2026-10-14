@@ -3395,9 +3395,61 @@ impl<'s> Vm<'s> {
                 self.objects[id as usize].active = false;
             }
         }
+        // item99d: `ULevel::CleanupDestroyed` (Engine.dll 0x10387ae0) removes the map's
+        // pending-kill (`bDeleteMe`) exports from the live level and the engine's garbage
+        // collection nulls every remaining object reference to them (`FArchiveReplaceObjectRef`
+        // over all objects), so other actors read `None` where a stale pointer named a destroyed
+        // actor. Without the reference replacement `xidcine.DialogueManager.PostBeginPlay` marks
+        // such a speaker as given (`Pawn != None && Pawn.IsA('Pawn')`) and `MustBeStop` then
+        // destroys the manager before it can speak (Kello01b `DialogueManager1`'s `dial_flash`;
+        // its `Speakers[0].Pawn` names the pending-kill `Cine2`). The objects themselves stay so
+        // `find_object`/`send_event` still see them as pending kill (item67f).
+        let pending: HashSet<ObjectId> = created
+            .iter()
+            .copied()
+            .filter(|&id| self.objects[id as usize].deleted)
+            .collect();
+        if !pending.is_empty() {
+            for id in 0..self.objects.len() as ObjectId {
+                let mut props = std::mem::take(&mut self.objects[id as usize].props);
+                for value in &mut props {
+                    Self::null_deleted_references(value, &pending);
+                }
+                self.objects[id as usize].props = props;
+            }
+        }
         // Cache the map's `LevelInfo` for the per-tick `NextURL` travel check.
         self.level_info = self.find_level_info();
         Ok(actors)
+    }
+
+    /// Nulls every object reference in `value` that names a pending-kill instance (item99d, the
+    /// engine's load-time/GC reference replacement). Struct members, array elements and delegate
+    /// objects are walked; references to live or static objects are left alone.
+    pub(crate) fn null_deleted_references(value: &mut Value, deleted: &HashSet<ObjectId>) {
+        match value {
+            Value::Object(Some(ObjRef::Instance(id))) if deleted.contains(id) => {
+                *value = Value::Object(None);
+            }
+            Value::Struct(fields) => {
+                for (_, member) in fields.iter_mut() {
+                    Self::null_deleted_references(member, deleted);
+                }
+            }
+            Value::Array(items) => {
+                for item in items.iter_mut() {
+                    Self::null_deleted_references(item, deleted);
+                }
+            }
+            Value::Delegate(Some(delegate)) => {
+                if let Some(ObjRef::Instance(id)) = delegate.object
+                    && deleted.contains(&id)
+                {
+                    delegate.object = None;
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Object id by display name (case-insensitive).

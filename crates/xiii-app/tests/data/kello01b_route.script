@@ -9,10 +9,23 @@
 # PlayerTrigger (the Grab key) and then swings its leaf ~96 deg. Walking straight south into
 # the opening wedges the player on the swung leaf, so the route retreats north, re-approaches
 # the doorway from the west of the hinge, and enters; TouchTrigger2 (Event='XIII_dans_chalet')
-# then fires the Cine0 cutscene (CineController21 -> PlayingSequence). The route ends here:
-# the cutscene's `wait event fin_transition` needs the flashback chain (Cine1), goal 0
-# ("Cover Kim's escape") and goal 1 ("Find Jones and Carrington again") and the travel stay
-# unreached; this is a first route, not a completed mission.
+# then fires the Cine0 cutscene (CineController21 -> PlayingSequence).
+#
+# item99d: the whole cutscene now runs (the flashback `wait warning` is released by the
+# DialogueManager line-end warning once references to the map's pending-kill `Cine2` speaker are
+# nulled at load). Cine0/Cine1 reach `destroy self` at ~226 s and `event objectif99` promotes
+# goal 0 to primary.
+#
+# item99e: the post-cutscene firefight is survived by input, not by the chalet shotgun. The
+# `FusilPompePick0`/`MiniUziPick0`/`MagnumPick0` weapons sit on a lower floor (z~1930) below the
+# fully-enclosed goal-trigger room floor (z~2091) and are unreachable; the item99d route fought
+# unarmed (`Fists`) and only survived because an AI friendly-fire rocket happened to kill the
+# close shotgun soldier `BaseSoldier2`. The route now grabs the reachable west-floor `M60Pick1`
+# through the game's own interaction Grab (`track M60Pick1` + `use`), selects it with the retail
+# `next_weapon` key, returns to the wardrobe cover and kills the close `BaseSoldier2`, then
+# crosses the map's own goal triggers (`XIIIGoalTrigger2`->goal 0, `XIIIGoalTrigger1`->goal 1).
+# Goal 0 completes only when the level's own `objectif0` event fires, so goal 0/1 and the
+# PRock01a travel stay unreached by this route.
 t=0.50 forward 1
 t=35.0 forward 0
 t=36.0 goto -2800 4600
@@ -33,4 +46,42 @@ t=148.0 goto -2950 480
 t=158.0 goto -2870 220
 t=168.0 goto -2830 -20
 t=178.0 goto -2784 -90
-t=240.0 wait_travel
+t=227.0 goto -2720 -300
+t=236.0 goto -2577 -650
+t=238.0 goto -2784 -150
+t=242.0 goto -3100 -150
+t=246.0 goto -3090 -412
+t=249.0 track M60Pick1 0.6
+t=250.0 use
+t=251.0 next_weapon
+t=252.0 track off
+t=253.0 goto -2784 -150
+t=257.0 goto -2577 -300
+t=261.0 goto -2577 -526
+t=265.0 goto -2660 -504
+t=266.0 heal
+t=268.0 track BaseSoldier2 0.85
+t=269.0 fire
+t=270.0 fire
+t=271.0 fire
+t=272.0 fire
+t=273.0 fire
+t=274.0 fire
+t=275.0 fire
+t=276.0 fire
+t=277.0 fire
+t=278.0 fire
+t=279.0 fire
+t=280.0 fire
+t=281.0 fire
+t=282.0 fire
+t=282.5 heal
+t=283.0 fire
+t=284.0 fire
+t=285.0 fire
+t=286.0 fire
+t=287.0 fire
+t=288.0 fire
+t=289.0 fire
+t=290.0 fire
+t=300.0 wait_travel
