@@ -19,9 +19,16 @@ A new coordinator took over on 2026-10-13 at 08:15. Landed since then, in order:
 - items 99d/99e (`e67449e`): `Vm::load_level` nulls references to pending-kill exports. The Kello01b
   flashback completes and the M60 firefight is won.
 
-Being landed when this was written: the Kello01a ice crossing (items 98e-98h, `ai`):
-- HeadVolume via `APawn::SetZone` 0x1038CA50, and CheckWaterJump;
-- the route crosses the floating ice by input and pins a three-soldier ambush on the far ice (46 HP).
+Then, on 2026-10-14:
+- the Kello01a ice crossing (items 98e-98h, `b76efa5`): HeadVolume via `APawn::SetZone` 0x1038CA50 and
+  CheckWaterJump; the route crosses the floating ice by input and pins a three-soldier ambush on the far
+  ice (46 HP);
+- hotfix `a64a047`: that landing declared an agent probe module whose file was never committed, so clean
+  checkouts failed to compile tests. `local/land.sh` now refuses with `UNTRACKED` when `crates/` has
+  untracked files;
+- item103 first PRock03 route (`d633030`, verify 1139): the west cell block to the `porte_sec` checkpoint.
+  Pinned blocker: its opener `MagneticPassTrigger0` needs the magnetic card, which lies behind `Porte30`
+  (`clefgarde`, held by the guard `Cine2`).
 
 Review decisions:
 - Rejected: item87d (inverted a survival pin into a death pin), item98 (pinned a slope its own path chose),
@@ -68,15 +75,16 @@ then re-times Hual04a and both Hual04c routes. Land the result as one unit.
 
 Keep at most about 4 heavy agents at once.
 
-**In flight (2026-10-14 15:30):**
+**All agents stopped at the user's request (2026-10-14 16:30).** Their work is in WIP commits;
+relaunch only when the user asks:
 
-| Worktree / branch | Agent | Task (spec in `local/tasks/`) |
+| Worktree / branch | WIP commit | Task (spec in `local/tasks/`) |
 |---|---|---|
-| `codex2` / `item97d-hual04c-assault` | ollama deepseek | item97e: Hual04c escort past the terrain wedge (WIP `9f7d022`) |
-| `sweep` / `item99f-kello01b-objectif0` | opencode-go deepseek | item99f: who emits `objectif0`; Kello01b goals 0/1 and the PRock01a travel |
-| `codex1` / `item103-prock03` | ollama deepseek | item103: first PRock03 route |
-| `steam` / `item100-prock01a` | ollama deepseek | item100e: PRock01a Porte9 key; no verify, lands with the Hual04 integration |
-| `ai` / `item98f-kello01a-path` | coordinator | landing the Kello01a ice crossing |
+| `codex2` / `item97d-hual04c-assault` | `97270fd` | item97e: Hual04c escort past the terrain wedge |
+| `sweep` / `item99f-kello01b-objectif0` | `5d40139` | item99f: who emits `objectif0`; Kello01b goals 0/1 and the PRock01a travel |
+| `viewer` / `item103b-prock03-key` | `57da34a` | item103b: PRock03 guard key -> Porte30 -> card -> checkpoint (just started) |
+| `steam` / `item100-prock01a` | `83a049a` | item100e: PRock01a Porte9 key (no changes yet); lands with the Hual04 integration |
+| `fx` / `item102-hual04a-rushfinal` | `b9ca4f2` | item101d ledge rule + Hual04a re-drive; input to the Hual04 integration |
 
 ### Coordinator handover 2026-10-13 07:10 (historical)
 
