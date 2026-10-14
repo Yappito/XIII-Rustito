@@ -9128,6 +9128,23 @@ mod tests {
     /// `BaseSoldier2`, then crosses the goal triggers and survives. Next blocker: goal 0
     /// completes only on the level's own `objectif0` event, so goal 0/1 and the `PRock01a` travel
     /// stay unreached.
+    ///
+    /// item99f decoded the emitter chain and measured the blocker. `objectif0` has exactly one
+    /// emitter: `TouchTrigger0` (`Event='objectif0'` at `(-2262,-886,2127)`), a player-touch
+    /// trigger in the annex/exterior zone south of the chalet. It also reaches `XIIIGoalTrigger2`
+    /// (GoalNumber 0 -> `CauseGoal` -> goal 0), `TriggerSound29` and `gennmi23`/`gennmi27`. The
+    /// cutscene's `event wave1` opens the annex door `Porte1` (Tag='wave1'), but the passage to
+    /// the trigger is gated by a second door `Porte3` (Tag='veryend') and the `BreakableMover0`
+    /// wall (Tag='veryend', Health=1, `bWorldGeometry=true`). `veryend` comes only from the late
+    /// level script (`XIIIDispatcher1` Tag='fin_dial_artilleurs' <- `DialogueManager11` <-
+    /// `CineTrigger2` Tag='End'), and 'End' is fired by clearing the wave chain (gennmi10's
+    /// soldier) or the M60-armed chopper `NastyHelico2` (Health=1000, `DeadEvent='End'`,
+    /// `InvisibleUntilTriggered` until 'wave401'). Goal 1's completion event 'roquette' is fired
+    /// by `XIDPawn.XIIIDispatcher0` (Tag='pre_roquette'), triggered by `TouchTrigger6`
+    /// (`Event='pre_roquette'` at `(3303,-3417,1175)`), and completes `XIIIGoalTrigger1`
+    /// (GoalNumber 1, `TimeBeforeTrigger` 15). This route reaches the annex doorway but cannot
+    /// clear the whole wave chain in budget, so goal 0/1 and the `PRock01a` travel stay unreached;
+    /// the new pins record the two `veryend` gates, the emitter and the wave/chopper condition.
     #[test]
     fn opt_in_kello01b_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -9155,7 +9172,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            300.0,
+            360.0,
         )
         .expect("run Kello01b route");
         let session = &outcome.session;
@@ -9267,6 +9284,79 @@ mod tests {
                 session.touches()
             );
         }
+        // item99f: the emitter chain. `objectif0` (the event goal 0 completes on) has exactly one
+        // emitter in the map: `TouchTrigger0` (Event='objectif0' at (-2262,-886,2127)), a
+        // player-touch trigger in the annex/outside zone south of the chalet. The event also
+        // reaches `XIIIGoalTrigger2` (GoalNumber 0 -> `CauseGoal`), `TriggerSound29` (the
+        // objective music) and the reinforcement generators `gennmi23`/`gennmi27`. The route
+        // reaches it only as far as the annex doorway, so the event never fires.
+        let touch0 = vm
+            .find_object("TouchTrigger0")
+            .expect("the sole objectif0 emitter");
+        assert_eq!(
+            vm.get_property(touch0, "Event"),
+            Some(&Value::Name("objectif0".to_owned())),
+            "TouchTrigger0 must be the objectif0 emitter"
+        );
+        assert_eq!(
+            vm.get_property(touch0, "bActif"),
+            Some(&Value::Bool(true)),
+            "the emitter must be armed (its PostBeginPlay sets bActif)"
+        );
+        assert!(
+            !session
+                .touches()
+                .iter()
+                .any(|(_, name)| name == "TouchTrigger0"),
+            "the route must not reach the objectif0 emitter: {:?}",
+            session.touches()
+        );
+        // The cutscene's own `event wave1` (Cine0.tabActions[77]) opened the annex door `Porte1`
+        // (Tag='wave1') through `XIIIPorte.PlayerTriggerToggle.Trigger` -> `PlayerTrigger`.
+        let porte1 = vm.find_object("Porte1").expect("annex door");
+        assert_eq!(
+            vm.get_property(porte1, "bOpened"),
+            Some(&Value::Bool(true)),
+            "the cutscene's `event wave1` must open Porte1"
+        );
+        // The passage south to `TouchTrigger0` is gated behind the second annex door `Porte3`
+        // (Tag='veryend') and the `BreakableMover0` wall (Tag='veryend', Health=1,
+        // `bWorldGeometry=true`). `veryend` is fired only by the late level script
+        // (`XIIIDispatcher1`, Tag='fin_dial_artilleurs'), which needs 'End' from the wave chain,
+        // so neither gate opens on this route. The wall is `bWorldGeometry`, and
+        // `XIIIBulletsAmmo.ProcessTraceHit` only spawns impacts for such actors (it never calls
+        // `TakeDamage`), so the M60 cannot break it: the authored condition is the event, not fire.
+        let porte3 = vm.find_object("Porte3").expect("annex south door");
+        assert_eq!(
+            vm.get_property(porte3, "bClosed"),
+            Some(&Value::Bool(true)),
+            "Porte3 must stay closed until `veryend`"
+        );
+        let wall = vm.find_object("BreakableMover0").expect("south wall");
+        assert_eq!(
+            vm.get_property(wall, "bBroken"),
+            Some(&Value::Bool(false)),
+            "the veryend wall must stay intact on this route"
+        );
+        assert_eq!(
+            vm.get_property(wall, "bWorldGeometry"),
+            Some(&Value::Bool(true)),
+            "the wall is world geometry (bullet-proof; it breaks only on `veryend`)"
+        );
+        println!(
+            "[kello01b item99f] objectif0 emitter: TouchTrigger0 (Event='objectif0', \
+             (-2262,-886,2127), bActif=true), reached only from the annex/exterior zone south of \
+             the chalet; receivers are XIIIGoalTrigger2 (goal 0), TriggerSound29 and \
+             gennmi23/gennmi27. The route opens Porte1 (cutscene `event wave1`) but the annex \
+             south is gated by Porte3 and the BreakableMover0 wall, both Tag='veryend' \
+             (BreakableMover0 is bWorldGeometry so weapon fire cannot damage it; \
+             XIIIBulletsAmmo.ProcessTraceHit skips TakeDamage for bWorldGeometry actors). \
+             `veryend` needs 'End' from the wave chain (gennmi10's soldier / the M60 chopper \
+             NastyHelico2, InvisibleUntilTriggered until 'wave401'), so goal 0/1 and the PRock01a \
+             travel stay unreached. Goal 1 is fired by 'roquette': TouchTrigger6 \
+             (Event='pre_roquette' at (3303,-3417,1175)) -> XIIIDispatcher0 -> 'roquette' -> \
+             XIIIGoalTrigger1 (GoalNumber 1, TimeBeforeTrigger 15)."
+        );
         assert_eq!(
             vm.get_property(
                 session.map_info().expect("Kello01b MapInfo"),

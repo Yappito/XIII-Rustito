@@ -24,8 +24,16 @@
 # through the game's own interaction Grab (`track M60Pick1` + `use`), selects it with the retail
 # `next_weapon` key, returns to the wardrobe cover and kills the close `BaseSoldier2`, then
 # crosses the map's own goal triggers (`XIIIGoalTrigger2`->goal 0, `XIIIGoalTrigger1`->goal 1).
-# Goal 0 completes only when the level's own `objectif0` event fires, so goal 0/1 and the
-# PRock01a travel stay unreached by this route.
+#
+# item99f: the route continues to the annex doorway and retreats. `objectif0` (goal 0's
+# completion event) has exactly one emitter, `TouchTrigger0` (Event='objectif0' at
+# (-2262,-886,2127)), a player-touch trigger in the annex/exterior zone south of the chalet.
+# The cutscene's `event wave1` leaves the annex door `Porte1` open, but the passage south is
+# gated by `Porte3` (Tag='veryend') and the `BreakableMover0` wall (Tag='veryend',
+# bWorldGeometry=true, so weapon fire cannot damage it). `veryend` needs 'End' from the late
+# wave chain / the M60 chopper `NastyHelico2` (InvisibleUntilTriggered until 'wave401'), so
+# goal 0/1 and the `PRock01a` travel stay unreached. The tail below walks to that doorway
+# (proving Porte1 is open and the wall blocks) and returns to cover, alive.
 t=0.50 forward 1
 t=35.0 forward 0
 t=36.0 goto -2800 4600
@@ -84,4 +92,15 @@ t=287.0 fire
 t=288.0 fire
 t=289.0 fire
 t=290.0 fire
-t=300.0 wait_travel
+t=291.0 track off
+t=292.0 goto -2577 -200
+t=296.0 goto -2300 -180
+t=300.0 goto -2260 -430
+t=303.0 goto -2260 -520
+t=305.0 goto -2260 -560
+t=307.0 heal
+t=308.0 goto -2400 -500
+t=312.0 goto -2577 -300
+t=316.0 goto -2660 -504
+t=318.0 heal
+t=325.0 wait_travel
