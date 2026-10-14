@@ -4,7 +4,8 @@
 //! whether it is inside a water volume, a ladder volume or a plain physics volume and what that
 //! volume's movement properties are. UE2 keeps those on the placed `PhysicsVolume`/`WaterVolume`/
 //! `LadderVolume` brush actors; this module decodes the placed actors of a map read-only, resolves
-//! each brush's world-space bounds and exposes a point query.
+//! each brush's world-space BSP and bounds and exposes point/box queries. Bounds are a broad
+//! phase only: a rotated or sloped brush does not fill its world AABB.
 //!
 //! ## Evidence (measured, GOG corpus)
 //!
@@ -46,7 +47,7 @@ fn brush_world_aabb(
     map_pkg: &Arc<Loaded>,
     eff: &ResolvedPlacement,
     brush: Option<ObjectRef>,
-) -> Result<([f32; 3], [f32; 3]), String> {
+) -> Result<([f32; 3], [f32; 3], xiii_script::brush::BrushPrimitive), String> {
     let brush = brush.filter(|r| !r.is_null()).ok_or("no Brush property")?;
     let (bp, bx) = cache.resolve(map_pkg, brush)?;
     let model = decode_model(&bp.package, &bp.data, bx).map_err(|e| e.to_string())?;
@@ -69,7 +70,8 @@ fn brush_world_aabb(
             mx[k] = mx[k].max(uu[k]);
         }
     }
-    Ok((mn, mx))
+    let primitive = crate::volume_brushes::world_primitive(cache, map_pkg, eff, brush)?;
+    Ok((mn, mx, primitive))
 }
 
 /// Kind of a movement volume.
@@ -118,6 +120,9 @@ pub struct MovementVolume {
     pub max_uu: [f32; 3],
     /// True when the bounds are a degenerate point at the actor origin (brush not decoded).
     pub bounds_are_point: bool,
+    /// World-space CSG primitive. Imported brushes always have one when decoding succeeds;
+    /// `None` is available for explicitly constructed axis-aligned synthetic volumes.
+    pub primitive: Option<xiii_script::brush::BrushPrimitive>,
 }
 
 impl MovementVolume {
@@ -130,17 +135,21 @@ impl MovementVolume {
         ]
     }
 
-    /// True when the Unreal-space point lies inside the AABB. A degenerate point volume
+    /// True when the Unreal-space point lies inside the brush. A degenerate point volume
     /// contains nothing (so a brush decode failure never silently claims coverage).
     pub fn contains(&self, point: [f32; 3]) -> bool {
         if self.bounds_are_point {
             return false;
         }
         (0..3).all(|k| point[k] >= self.min_uu[k] && point[k] <= self.max_uu[k])
+            && self
+                .primitive
+                .as_ref()
+                .is_none_or(|b| b.contains_point(point))
     }
 
-    /// True when an AABB (`center_uu` +/- `half_uu`, Unreal axes) overlaps this volume. This is
-    /// the rule the pawn uses (a thin water slab is touched by the pawn's box, not its centre).
+    /// True when an AABB (`center_uu` +/- `half_uu`, Unreal axes) overlaps this brush. This is
+    /// the Touch overlap query, distinct from the centre-point PhysicsVolume movement query.
     pub fn overlaps_box(&self, center_uu: [f32; 3], half_uu: [f32; 3]) -> bool {
         if self.bounds_are_point {
             return false;
@@ -148,7 +157,10 @@ impl MovementVolume {
         (0..3).all(|k| {
             center_uu[k] + half_uu[k] >= self.min_uu[k]
                 && center_uu[k] - half_uu[k] <= self.max_uu[k]
-        })
+        }) && self
+            .primitive
+            .as_ref()
+            .is_none_or(|b| b.overlaps_box(center_uu, half_uu))
     }
 
     /// Volume of the AABB (used to pick the innermost volume deterministically).
@@ -285,17 +297,17 @@ impl MovementVolumes {
 
             // Brush geometry: the actor's `Brush` -> `Engine.Model` primitive bounding box,
             // transformed with the same effective placement the world importer uses.
-            let (min_uu, max_uu, point_fallback) = match brush_world_aabb(
+            let (min_uu, max_uu, primitive, point_fallback) = match brush_world_aabb(
                 &mut cache,
                 &map_pkg,
                 &eff,
                 p.as_ref().and_then(|p| p.object("Brush")),
             ) {
-                Ok((mn, mx)) => (mn, mx, false),
+                Ok((mn, mx, primitive)) => (mn, mx, Some(primitive), false),
                 Err(e) => {
                     out.diagnostics
                         .push(format!("{}: brush model decode failed: {e}", a.path));
-                    (eff.location, eff.location, true)
+                    (eff.location, eff.location, None, true)
                 }
             };
             let name = a.path.rsplit('.').next().unwrap_or(&a.path).to_owned();
@@ -315,6 +327,7 @@ impl MovementVolumes {
                 min_uu,
                 max_uu,
                 bounds_are_point: point_fallback,
+                primitive,
             });
         }
         Ok(out)
@@ -463,6 +476,7 @@ mod tests {
             min_uu: [1.0, 2.0, 3.0],
             max_uu: [1.0, 2.0, 3.0],
             bounds_are_point: true,
+            primitive: None,
         };
         assert!(!v.contains([1.0, 2.0, 3.0]));
         v.bounds_are_point = false;
@@ -473,6 +487,49 @@ mod tests {
         assert!(v.contains([0.0, 0.0, 0.0]));
         assert!(v.contains([1.0, 1.0, 1.0]));
         assert!((v.volume_uu3() - 1.0).abs() < 1e-6);
+        // A triangular prism fills only half its AABB. A broad-phase match must not apply
+        // water/current properties in the dry notch, including to a small box entirely there.
+        use xiii_script::brush::{BrushNode, BrushPrimitive};
+        let planes = [
+            [-1.0, 0.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0, 1.0],
+        ];
+        v.primitive = Some(BrushPrimitive {
+            root: 0,
+            root_outside: true,
+            nodes: planes
+                .iter()
+                .enumerate()
+                .map(|(i, p)| BrushNode {
+                    plane: *p,
+                    csg: true,
+                    front: -1,
+                    back: if i + 1 < planes.len() {
+                        (i + 1) as i16
+                    } else {
+                        -1
+                    },
+                })
+                .collect(),
+        });
+        assert!(v.contains([0.2, 0.2, 0.5]));
+        assert!(
+            !v.contains([0.8, 0.8, 0.5]),
+            "AABB corner is outside the sloped brush"
+        );
+        assert!(!v.overlaps_box([0.8, 0.8, 0.5], [0.05; 3]));
+        assert!(
+            v.overlaps_box([0.51, 0.51, 0.5], [0.02; 3]),
+            "extent crosses the sloped boundary even though its centre is outside"
+        );
+        assert!(
+            !v.contains([0.5, 0.5, 0.5]),
+            "BSP plane equality is the outside/front side"
+        );
+        assert!(!v.overlaps_box([0.5, 0.5, 0.5], [0.0; 3]));
     }
 
     /// The head-volume rule of retail `APawn::SetZone` (`Engine.dll` 0x1038CA50): the value
@@ -497,6 +554,7 @@ mod tests {
             min_uu: mn,
             max_uu: mx,
             bounds_are_point: false,
+            primitive: None,
         };
         let v = MovementVolumes {
             volumes: vec![
@@ -619,5 +677,44 @@ mod tests {
             );
             println!("[volumes test] {} look_dir {:?}", vol.name, vol.look_dir);
         }
+    }
+
+    #[test]
+    fn opt_in_kello01a_waterfall_query_rejects_the_empty_aabb_corner() {
+        let Some(root) = opt_in_game_dir() else {
+            println!("SKIPPED: set XIII_GOG_DIR to run the waterfall brush regression");
+            return;
+        };
+        let volumes = MovementVolumes::import(&root, "Kello01a").expect("movement volumes");
+        let brushes = crate::volume_brushes::import(&root, "Kello01a").expect("volume brushes");
+        let water = volumes
+            .volumes
+            .iter()
+            .find(|v| v.name == "WaterVolume2")
+            .expect("waterfall");
+        let brush = brushes
+            .brushes
+            .iter()
+            .find(|b| b.name == water.name)
+            .expect("waterfall brush");
+        let outside = [-18000.0, 0.0, -800.0];
+        let half = [34.0, 34.0, 75.0];
+        assert!(
+            (0..3).all(|k| outside[k] + half[k] >= water.min_uu[k]
+                && outside[k] - half[k] <= water.max_uu[k]),
+            "case must overlap the broad-phase bounds"
+        );
+        assert!(
+            !brush.primitive.overlaps_box(outside, half),
+            "independent VM brush excludes this corner"
+        );
+        assert!(!water.overlaps_box(outside, half));
+        assert!(!water.contains(outside));
+        let inside = [-15939.0, 6.0, -939.0];
+        assert!(
+            water.contains(inside) && brush.primitive.contains_point(inside),
+            "real river remains water"
+        );
+        println!("[waterfall-brush] empty AABB corner excluded; real river included");
     }
 }

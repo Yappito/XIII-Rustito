@@ -20,6 +20,8 @@ pub mod footsteps;
 pub mod hud;
 /// item72: the retail in-game menu hosted in the play session's VM.
 pub mod ingamemenu;
+#[cfg(test)]
+mod item98f_probe;
 pub mod movement_modes;
 pub mod movers;
 pub mod pawns;
@@ -9434,5 +9436,126 @@ mod tests {
         // DamagePerSec=60, DamageType=DTDrowned`, and the ice floe gaps (up to ~1200 UU at the
         // route's latitude) exceed the ~417 UU retail running jump. See the report for the
         // measured evidence.
+    }
+
+    /// Input replay of the ice-field crossing (item98f). The route leaves the authored valley
+    /// loop on the north rim, hops the ~300-UU `GR_banquise_01`/`02` floe chain at the latitude
+    /// the walkthroughs describe (`y ~ -2750..-3400`, not item98e's `y ~ -2200` open hole), and
+    /// stops alive on the far lake ice at ~(-10580,-3394,-1254). The replay matches the offline
+    /// `PlayerSim` search exactly once the approach's combat `track` is yaw-normalised after
+    /// `track off` (without it the pawn keeps a tracked heading the search does not model, and the
+    /// 0.8 s free run before the next `goto` desynchronises the two). The earlier north-band route
+    /// and every one of its assertions remain a separate regression above.
+    #[test]
+    fn opt_in_kello01a_chalet_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to run the Kello01a ice route");
+            return;
+        };
+        let opts = Options {
+            map: Some("Kello01a".into()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Kello01a");
+        let resolved = resolve_params(&game_dir).expect("player defaults");
+        let approach = include_str!("../../tests/data/kello01a_route.script");
+        let continuation = include_str!("../../tests/data/kello01a_chalet_route.script");
+        for text in [approach, continuation] {
+            assert!(
+                !text.lines().any(|line| {
+                    let command = line.split('#').next().unwrap_or("").trim();
+                    [
+                        "teleport",
+                        "place",
+                        "weapon",
+                        "item",
+                        "set_goal",
+                        "take_control",
+                        "assume_control",
+                    ]
+                    .contains(&command.split_whitespace().nth(1).unwrap_or(""))
+                }),
+                "route must contain only input commands"
+            );
+        }
+        let mut script = script::Script::parse(approach).expect("approach");
+        script.events.retain(|e| e.t < 85.8);
+        script.events.extend(
+            script::Script::parse(continuation)
+                .expect("continuation")
+                .events,
+        );
+        script.events.sort_by(|a, b| a.t.total_cmp(&b.t));
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Kello01a",
+            &script,
+            &resolved.params,
+            &scene,
+            script.last_time() + 3.0,
+        )
+        .expect("input replay");
+        let session = &outcome.session;
+        println!(
+            "[kello01a item98f] map={} goals={:?} travel={:?} position={:?} health={:?} min_health={:?}",
+            outcome.final_map,
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health(),
+            outcome.map_min_health
+        );
+        let player_name = session.player_name.clone();
+        let mut dmg_detail: Vec<String> = Vec::new();
+        for e in &session.vm().trace {
+            if let xiii_script::TraceKind::Event {
+                target,
+                function,
+                args,
+            } = &e.kind
+                && function.ends_with("TakeDamage")
+                && target.eq_ignore_ascii_case(&player_name)
+            {
+                dmg_detail.push(format!(
+                    "{:.2}s {}dmg/{}/{}",
+                    e.time,
+                    args.first().cloned().unwrap_or_default(),
+                    args.get(1).cloned().unwrap_or_default(),
+                    args.get(4).cloned().unwrap_or_default()
+                ));
+            }
+        }
+        println!("[kello01a item98f damage] {dmg_detail:?}");
+        survey::print_details(&survey::extract("Kello01a", &outcome));
+        assert!(
+            session.first_error().is_none(),
+            "{:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(session.blocked.is_empty(), "{:?}", session.blocked);
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 1);
+        assert!(goals[0].primary && goals[0].text == "Find the chalet");
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "player must survive the entire route"
+        );
+        assert!(
+            outcome.map_min_health.iter().all(|(_, h)| *h > 0.0),
+            "a later heal or travel must not conceal death"
+        );
+        // item98f positive pin: the input route leaves the valley loop at (~-5100,-1200), crosses the
+        // lake ice on the authored ~300-UU floe-hop chain (each landing inside the retail running
+        // jump and below the `-1.4*JumpZ` fall-damage threshold), and stops alive past the far
+        // shore at ~(-10580,-3394,-1254). The player stays at full health (150) through the valley
+        // and reaches the ice at 70/150, then loses only soldier-fire falloff (46/150 at the end).
+        // The item98e north-band and every one of its assertions remain a separate regression above.
+        let p = session.player_location().expect("player position");
+        assert!(
+            p[0] < -10000.0 && p[1] < -3200.0 && p[2] > -1300.0,
+            "must reach the far lake ice alive: {p:?}"
+        );
     }
 }
