@@ -1198,6 +1198,20 @@ fn fixed_step(
             eye_height: sim.0.vm_eye_height(&params.0),
         };
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
+        // Retail `APawn::SetZone`: publish the volume at the pawn's head (`Location +
+        // CollisionHeight`) so `Pawn.BreathTimer` sees `HeadVolume.bWaterVolume` (item98e).
+        let head_half = if sim.0.crouched {
+            params.0.crouch_height_uu
+        } else {
+            params.0.height_uu
+        };
+        let head = [
+            sim.0.location[0],
+            sim.0.location[1],
+            sim.0.location[2] + head_half,
+        ];
+        let head_volume = motion.0.volumes.physics_at(head).map(|v| v.name.clone());
+        sess.publish_head_volume(head_volume.as_deref());
         sess.sync_view_rotation(sim.0.yaw, sim.0.pitch);
         world
             .rider
@@ -2694,6 +2708,27 @@ fn headless_projection(
     }
 }
 
+/// The innermost decoded movement volume at the player pawn's head
+/// (`Location + (0, 0, CollisionHeight)`), the value retail `APawn::SetZone` publishes to
+/// `Pawn.HeadVolume` (`Engine.dll` 0x1038CA50). `None` when no volume contains the head point.
+fn head_volume_name(runtime: &MapRuntime, params: &PlayerParams) -> Option<String> {
+    let half = if runtime.sim.crouched {
+        params.crouch_height_uu
+    } else {
+        params.height_uu
+    };
+    let head = [
+        runtime.sim.location[0],
+        runtime.sim.location[1],
+        runtime.sim.location[2] + half,
+    ];
+    runtime
+        .volumes
+        .volumes
+        .physics_at(head)
+        .map(|v| v.name.clone())
+}
+
 fn player_has_control(session: &session::Session) -> bool {
     !cinematics::input_suppressed(session)
         && session
@@ -2882,6 +2917,8 @@ fn run_script_inner(
             runtime.sim.velocity,
             &modes,
         );
+        let head_volume = head_volume_name(&runtime, &runtime.player_params);
+        runtime.session.publish_head_volume(head_volume.as_deref());
         runtime
             .session
             .sync_view_rotation(runtime.sim.yaw, runtime.sim.pitch);
@@ -6550,6 +6587,56 @@ mod tests {
         assert_eq!(sim.physics, crate::play::sim::PHYS_SWIMMING);
     }
 
+    /// item98e opt-in corpus test of the host swim bridge: `Session::publish_head_volume` writes
+    /// the live `PhysicsVolume` actor into the pawn's `HeadVolume` and fires the engine's
+    /// `HeadVolumeChange` event, so `Pawn.BreathTimer` reads `HeadVolume.bWaterVolume`. Retail
+    /// source: `APawn::SetZone` (`Engine.dll` 0x1038CA50) and `Pawn.HeadVolumeChange` (`Engine.u`).
+    #[test]
+    fn opt_in_banque01_head_volume_is_published_to_the_pawn() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let volumes = xiii_world::movement_volumes::MovementVolumes::import(&game_dir, "Banque01")
+            .expect("import Banque01 volumes");
+        let wv = volumes
+            .volumes
+            .iter()
+            .find(|v| v.kind == xiii_world::movement_volumes::VolumeKind::Water)
+            .expect("Banque01 places WaterVolume0");
+        let name = wv.name.clone();
+        let mut session = session::Session::open(&game_dir, "Banque01").expect("open Banque01");
+        let player = session.player;
+        // A dry head point clears the property.
+        session.publish_head_volume(None);
+        assert_eq!(
+            session.vm().get_property(player, "HeadVolume").cloned(),
+            Some(xiii_script::Value::Object(None)),
+            "a dry head must publish no HeadVolume"
+        );
+        // The water volume actor is live and the bridge stores it on the pawn.
+        assert!(
+            session.vm().find_object(&name).is_some(),
+            "the water volume actor {name} must be loaded in the VM"
+        );
+        session.publish_head_volume(Some(&name));
+        let head = session.vm().get_property(player, "HeadVolume").cloned();
+        let id = session.vm().find_object(&name).unwrap();
+        assert_eq!(
+            head,
+            Some(xiii_script::Value::Object(Some(
+                xiii_script::ObjRef::Instance(id)
+            ))),
+            "the water volume must be published as the pawn's HeadVolume"
+        );
+        println!("[head volume test] {name} published to HeadVolume");
+        assert!(
+            session.first_error().is_none(),
+            "publishing the head volume must not raise: {:?}",
+            session.first_error()
+        );
+    }
+
     /// Opt-in corpus test (requirement 4): finds a real low-clearance spot on a campaign map
     /// where the standing box collides with the ceiling but the crouch box does not, and checks
     /// the reverse at a clear spot. The spot is discovered by scanning navigation points (their
@@ -9193,18 +9280,22 @@ mod tests {
     }
 
     /// Kello01a (the map after Hual04c): start fresh at PlayerStart0 with the map-entry
-    /// loadout and drive the level by input along the authored valley loop. item98 walked
-    /// south-west straight from the start into the start bowl's rim bank (~50 degrees, steeper
-    /// than the walker's `MINFLOORZ=0.7`) and pinned that. item98c planned the path from the
-    /// map's own data (nav graph, the 16 `PF_Portal` gaps, the BSP zone-connectivity chain
-    /// 11->8->7->9->10->12->13->3->2->5->6) south around the valley and across lake Keelownee;
-    /// its route drowned there. item98d shows why: the two lake `Gameplay.WaterVolume`s
-    /// (`WaterVolume0`/`WaterVolume1`) are `bPainCausing=true, DamagePerSec=60,
-    /// DamageType=DTDrowned`, so retail water is lethal on touch (`PhysicsVolume.Touch` ->
-    /// `CausePainTo`), and the ice floes that lie on the lake do not span the crossing. The
-    /// route therefore stops at the last dry waypoint on the lake's east shore, alive, before
-    /// the water; the objective `Find the chalet` and the Kello01b travel stay unreached. See
-    /// the item98d report section for the measured evidence.
+    /// loadout and drive the level by input along the authored valley loop, then north toward
+    /// the dry band, stopping at the authored invisible BSP sheet.
+    ///
+    /// item98 walked south-west straight from the start into the start bowl's rim bank
+    /// (~50 degrees, steeper than the walker's `MINFLOORZ=0.7`) and pinned that. item98c planned
+    /// a path across lake Keelownee from the map's own data; its route drowned. item98d showed
+    /// why: the two lake `Gameplay.WaterVolume`s (`WaterVolume0`/`WaterVolume1`) are
+    /// `bPainCausing=true, DamagePerSec=60, DamageType=DTDrowned`, so retail water is lethal on
+    /// touch, and the ice floes do not span the crossing. item98e re-mapped the floes and the
+    /// dry north band: the floe gaps (up to ~1200 UU at the route's latitude) exceed the ~417 UU
+    /// retail running jump, so the dry band is the path a retail player takes. This route leaves
+    /// the valley at (~-500,-3850) and climbs north to (~-4200,-776), where the walker is
+    /// stopped by the authored invisible solid BSP sheet (`Model207`, triangle
+    /// (-3664,-1440,-1344)-(-5280,896,3776)-(-5280,896,-1344), spanning x[-5280,-3664]
+    /// y[-1440,896] z[-1344,3776]). The objective `Find the chalet` and the Kello01b travel stay
+    /// unreached. See `local/reports/item98e-kello01a-crossing.md`.
     #[test]
     fn opt_in_kello01a_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -9236,7 +9327,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            110.0,
+            100.0,
         )
         .expect("run Kello01a route");
         let session = &outcome.session;
@@ -9312,12 +9403,13 @@ mod tests {
         );
         let pawns = session.player_pawn_actors();
         assert_eq!(pawns.len(), 1, "one live player pawn");
-        // item98d positive pins. The route leaves the start bowl, follows the authored valley loop
-        // south and west to the east shore of lake Keelownee and stops there, alive. item98 stopped
-        // at the bowl rim (~(-4484,4482)); this route reaches the lake shore at ~(-7996,-1751).
+        // item98e positive pins. The route leaves the start bowl, follows the authored valley
+        // loop south-west, then climbs north from the valley at (~-500,-3850) to the band's
+        // south face, where the authored invisible BSP sheet stops it. item98d stopped at the
+        // lake's east shore (~(-7996,-1751)); this route reaches ~(-4200,-776).
         let position = session.player_location().expect("player position");
         println!(
-            "[kello01a item98d] completed={} travel={:?} position={:?} health={:?}",
+            "[kello01a item98e] completed={} travel={:?} position={:?} health={:?}",
             goals[0].completed,
             outcome.travel,
             position,
@@ -9325,13 +9417,18 @@ mod tests {
         );
         assert!(
             session.player_health().is_some_and(|h| h > 0.0),
-            "the route must stop before the fatal point and the player must survive: {:?}",
+            "the route must stop before any fatal point and the player must survive: {:?}",
             session.player_health()
         );
         assert!(
-            position[0] < -7000.0 && position[1] < -1500.0,
-            "item98d: the route must reach the east shore of lake Keelownee (item98 stopped at the \
-             bowl rim ~(-4484,4482)): {position:?}"
+            (-4300.0..-4100.0).contains(&position[0]) && (-850.0..-650.0).contains(&position[1]),
+            "item98e: the route must reach the dry band's south face at ~(-4200,-776) where the \
+             invisible BSP sheet blocks it (item98d stopped at the lake shore ~(-7996,-1751)): \
+             {position:?}"
+        );
+        assert!(
+            position[2] > -400.0,
+            "the band approach is dry (no lake water): {position:?}"
         );
         assert!(
             !goals[0].completed,
@@ -9342,11 +9439,11 @@ mod tests {
             "the Kello01b travel must not be reached on this route: {:?}",
             outcome.travel
         );
-        // item98d pinned blocker: the lake crossing. The three `Gameplay.WaterVolume`s carry
-        // `bPainCausing=true, DamagePerSec=60, DamageType=DTDrowned` (WV0/WV1; WV2 is a
-        // non-lethal current), so retail water is lethal on touch. The ice floes
-        // (`statichalet.GR_banquise_01/02`, `banquise08/09`) are solid in our collision but do
-        // not span the crossing (measured gap x[-11000,-10000] at y~-2200). The route therefore
-        // stops at the last dry waypoint before WV0. See the report for the measured evidence.
+        // item98e pinned blocker: the authored invisible solid BSP sheet (`Model207`,
+        // `PolyFlags=0x1`) that spans x[-5280,-3664] y[-1440,896] z[-1344,3776]. The lake itself
+        // is also impassable: `WaterVolume0`/`WaterVolume1` are `bPainCausing=true,
+        // DamagePerSec=60, DamageType=DTDrowned`, and the ice floe gaps (up to ~1200 UU at the
+        // route's latitude) exceed the ~417 UU retail running jump. See the report for the
+        // measured evidence.
     }
 }

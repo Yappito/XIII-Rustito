@@ -532,6 +532,24 @@ impl PlayerSim {
         let gravity = w.gravity_z.abs();
         let buoyancy = params.buoyancy.max(w.buoyancy);
         if input.jump {
+            // Retail `Pawn.DoJump` in water launches up; when the pawn faces a non-pawn wall
+            // within `CollisionRadius` with clearance above it, `Pawn.CheckWaterJump` lets it
+            // mantle out (`Pawn.JumpOutOfWater`): `Velocity = jumpDir*WaterSpeed`,
+            // `Velocity.Z = max(380, JumpZ)` (Engine.u bytecode; see the report).
+            if let Some(dir) = self.check_water_jump(world, params) {
+                self.velocity[0] = dir[0] * params.water_speed;
+                self.velocity[1] = dir[1] * params.water_speed;
+                self.velocity[2] = params.jump_z.max(380.0);
+                let delta = [
+                    self.velocity[0] * dt,
+                    self.velocity[1] * dt,
+                    self.velocity[2] * dt,
+                ];
+                self.move_no_gravity(world, params, delta, sources);
+                self.physics = PHYS_FALLING;
+                self.grounded = false;
+                return;
+            }
             self.velocity[2] = params.jump_z;
         } else {
             self.velocity[2] += (buoyancy - gravity) * dt;
@@ -553,6 +571,49 @@ impl PlayerSim {
             (self.velocity[2] + w.zone_velocity[2]) * dt,
         ];
         self.move_no_gravity(world, params, delta, sources);
+    }
+
+    /// Retail `Pawn.CheckWaterJump` (decoded from `Engine.u` bytecode):
+    ///
+    /// ```text
+    /// checkpoint = vector(Rotation with Z=0)          // horizontal facing
+    /// Extent = (CollisionRadius, CollisionRadius, CollisionHeight)
+    /// HitActor = Trace(checkpoint + Location, Location, Extent)
+    /// if HitActor != None && Pawn(HitActor) == None:  // a wall, not a pawn
+    ///     Start = Location; Start.Z += 1.1 * 35.0
+    ///     return Trace(Start + 2*CollisionRadius*checkNorm, Start) == None
+    /// return false
+    /// ```
+    ///
+    /// Returns the horizontal facing direction (Unreal axes) when the pawn can mantle out of
+    /// the water, `None` otherwise. The first trace is the pawn's own box; the second is a
+    /// zero-extent head-clearance probe. `Pawn.JumpOutOfWater` then launches the pawn with the
+    /// returned direction (see [`PlayerSim::swim`]).
+    fn check_water_jump(&self, world: &CollisionWorld, params: &PlayerParams) -> Option<[f32; 3]> {
+        let (sy, cy) = self.yaw.sin_cos();
+        let norm = [cy, sy, 0.0];
+        let r = params.radius_uu;
+        let half = self.half_extents_bevy(params);
+        let loc = self.location;
+        let ahead = [loc[0] + norm[0] * r, loc[1] + norm[1] * r, loc[2]];
+        // Forward wall probe with the pawn box (retail `Actor.Trace` with `Extent`).
+        world.sweep(to_bevy_position(ahead), to_bevy_position(loc), half)?;
+        // Head clearance: 1.1*35 UU above the centre, 2*radius forward, zero extent.
+        let start = [loc[0], loc[1], loc[2] + 1.1 * 35.0];
+        let head = [
+            start[0] + norm[0] * 2.0 * r,
+            start[1] + norm[1] * 2.0 * r,
+            start[2],
+        ];
+        let tiny = unreal_extent_to_bevy([1.0, 1.0, 1.0]);
+        if world
+            .sweep(to_bevy_position(start), to_bevy_position(head), tiny)
+            .is_none()
+        {
+            Some(norm)
+        } else {
+            None
+        }
     }
 
     /// Moves the box without gravity and lands it on a walkable floor (used by ladder/swim).
@@ -1904,5 +1965,115 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A water [`TestEnv`] whose AABB covers the pawn at `center_uu` with a `top_uu` surface.
+    fn water_around(center_uu: [f32; 3], top_uu: f32) -> TestEnv {
+        TestEnv {
+            water: Some((
+                [
+                    center_uu[0] - 200.0,
+                    center_uu[1] - 200.0,
+                    center_uu[2] - 200.0,
+                ],
+                [center_uu[0] + 200.0, center_uu[1] + 200.0, top_uu],
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// Retail `Pawn.CheckWaterJump` + `Pawn.JumpOutOfWater` (Engine.u bytecode): pressing jump
+    /// while swimming in front of a low, non-pawn wall and with clearance above it launches the
+    /// pawn out at `WaterSpeed` horizontally and `max(380, JumpZ)` up. Without a wall (or with
+    /// one out of reach, or with its headroom blocked) the jump is only the ordinary swim
+    /// stroke. Engine.dll evidence: `?CheckWaterJump` is script (`Engine.u`), the caller is
+    /// `?physSwimming@APawn@@QAEXMH@Z` (`Engine.dll` 0x103C1C80).
+    #[test]
+    fn water_jump_mantles_only_onto_a_low_wall_with_clearance() {
+        let params = instant_params();
+        let dt = 1.0 / 60.0;
+
+        // Pawn 0.2 m (18 UU) in front of a wall at Bevy z=-0.556 (Unreal X = 50 UU), facing it.
+        let wall_z = -0.556;
+        let start_bevy = [0.0, 0.8, wall_z + 0.2];
+        let start_uu = bevy_to_unreal_position(start_bevy);
+        let water = water_around(start_uu, start_uu[2] + 40.0);
+        let run_jump = |world: &CollisionWorld, env: &TestEnv| -> PlayerSim {
+            let mut sim = PlayerSim::new(start_uu, 0.0);
+            sim.grounded = false;
+            sim.step_with_modes(
+                dt,
+                world,
+                &params,
+                Input {
+                    jump: true,
+                    ..Default::default()
+                },
+                &[],
+                env,
+            );
+            sim
+        };
+
+        // Low wall (top 70 UU): the mantle fires.
+        let low = wall_world(wall_z, 70.0 / UNREAL_UNITS_PER_METER);
+        let mantle = run_jump(&low, &water);
+        assert_eq!(mantle.physics, PHYS_FALLING);
+        assert!(
+            (mantle.velocity[0] - params.water_speed).abs() < 1.0,
+            "JumpOutOfWater must set horizontal speed to WaterSpeed: {:?}",
+            mantle.velocity
+        );
+        assert!(
+            (mantle.velocity[2] - params.jump_z.max(380.0)).abs() < 1.0,
+            "JumpOutOfWater must set Z to max(380, JumpZ): {:?}",
+            mantle.velocity
+        );
+
+        // No wall: ordinary swim stroke (no horizontal launch).
+        let empty = CollisionWorld::new(std::iter::empty::<(Triangle, u32)>());
+        let none = run_jump(&empty, &water);
+        assert!(
+            mantle.velocity[0].abs() > 100.0 && none.velocity[0].abs() < 1.0,
+            "without a wall the jump must not launch horizontally: mantle={:?} none={:?}",
+            mantle.velocity,
+            none.velocity
+        );
+        assert!(
+            none.velocity[2] > 380.0,
+            "the ordinary swim stroke must still launch upward: {:?}",
+            none.velocity
+        );
+
+        // Wall out of reach: place the pawn 0.6 m (54 UU) back; the radius-34 probe misses.
+        let far_uu = bevy_to_unreal_position([0.0, 0.8, wall_z + 0.6]);
+        let far_water = water_around(far_uu, far_uu[2] + 40.0);
+        let mut far = PlayerSim::new(far_uu, 0.0);
+        far.grounded = false;
+        far.step_with_modes(
+            dt,
+            &low,
+            &params,
+            Input {
+                jump: true,
+                ..Default::default()
+            },
+            &[],
+            &far_water,
+        );
+        assert!(
+            far.velocity[0].abs() < 1.0,
+            "a wall beyond CollisionRadius must not mantle: {:?}",
+            far.velocity
+        );
+
+        // Low wall but blocked headroom (a 200 UU top): no mantle.
+        let tall = wall_world(wall_z, 200.0 / UNREAL_UNITS_PER_METER);
+        let blocked = run_jump(&tall, &water);
+        assert!(
+            blocked.velocity[0].abs() < 1.0,
+            "a wall with no clearance above must not mantle: {:?}",
+            blocked.velocity
+        );
     }
 }
