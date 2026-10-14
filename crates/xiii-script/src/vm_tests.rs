@@ -11,7 +11,10 @@ use crate::reflect::function_flags as ff;
 use crate::reflect::property_flags as pf;
 use crate::tests::{Exp, build_package, compact};
 use crate::value::{Delegate, ObjRef, ObjectId, Value};
-use crate::vm::{HostRequest, Latent, MAX_HOST_REQUESTS, TraceKind, Vm, VmErrorKind, VmLimits};
+use crate::vm::{
+    FlashCueModelStage, HostRequest, Latent, MAX_HOST_REQUESTS, TraceKind, Vm, VmErrorKind,
+    VmLimits,
+};
 
 struct B {
     names: Vec<String>,
@@ -1410,6 +1413,59 @@ fn bodyless_call_fixture() -> Vec<u8> {
     b.func(calls_no_code, 0, 0, &code, 8, 0, ff::DEFINED);
     b.class(object, 0, add);
     b.build()
+}
+
+/// A class-default lvalue write: `obj'Object'.static.default.Flag = true;` then reading it back.
+/// `xiii.MapInfo.SaveInventoryForFlash` does exactly this to
+/// `XIIIPlayerPawn.default.bCollideWorld` around its spawn; before `place` handled
+/// `ClassContext` the write was `NotAPlace`, which aborted the whole `GenFlash` flash transition.
+fn class_default_lvalue_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let set_default = b.reserve(IMP_FUNCTION, object, "SetDefaultTrue");
+    let flag = b.reserve(B_BOOLPROP, object, "Flag");
+    let ret = b.reserve(B_BOOLPROP, set_default, "ReturnValue");
+    b.prop(flag, set_default, 0);
+    b.prop(ret, 0, PARM | RETURN_PARM);
+    // ClassContext serialises `<object> <u16 skip> <u8 size> <member>`.
+    let mut member = vec![0x2Du8, 0x02];
+    member.extend(compact(flag));
+    let member_size = member.len() as u8;
+    let mut context = vec![0x12u8, 0x20];
+    context.extend(compact(object));
+    context.extend([0x00, 0x00, member_size]);
+    context.extend(&member);
+    // LetBool(ClassContext(...), True);  return default.Flag;
+    let mut code = vec![0x14u8];
+    code.extend(&context);
+    code.push(0x27); // True
+    code.push(0x04); // EX_Return
+    code.extend(&member);
+    // Memory size: object references count `OBJECT_MEMORY_SIZE` (4) each, not their compact
+    // byte length (1 here), so the declared script size is 24, not the 15-byte stream.
+    let mem = 1 + 1 + 1 + 4 + 2 + 1 + 6 + 1 + 1 + 6;
+    b.func(set_default, 0, ret, &code, mem, 0, DEFINED);
+    b.class(object, 0, flag);
+    b.build()
+}
+
+#[test]
+fn class_default_lvalue_writes_the_default_object() {
+    let set = set_of(class_default_lvalue_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let obj = vm.spawn(g(&set, "Object"), "O").unwrap();
+    vm.set_active(obj, true);
+    // Before the write, the class default is false. The call must not error with `NotAPlace`.
+    let value = vm
+        .call_function(g(&set, "Object.SetDefaultTrue"), obj, vec![])
+        .expect("class-default lvalue write must be a place");
+    assert_eq!(
+        value,
+        Value::Bool(true),
+        "the write must land on default.Flag"
+    );
 }
 
 #[test]
@@ -4265,7 +4321,7 @@ fn survey_counts_missing_natives_without_aborting() {
 // ---------------------------------------------------------------------------------------
 // World physics bridge: Move/SetLocation/Trace/FastTrace/SetCollision(Size) + touching
 
-use crate::physics::{ActorMeshHit, MoveOutcome, WorldHit, WorldPhysics};
+use crate::physics::{ActorMeshHit, MoveOutcome, SpotHit, WorldHit, WorldPhysics};
 
 const IMP_ARRAYPROP: i32 = -12;
 
@@ -4353,6 +4409,7 @@ fn phys_fixture() -> Vec<u8> {
     // `ABrush.Brush` (the volume/mover brush model reference), used by the volume-brush overlap
     // test (`AActor::IsOverlapping`).
     let brush = b.reserve(IMP_OBJECTPROP, actor, "Brush");
+    let mesh = b.reserve(IMP_OBJECTPROP, actor, "Mesh");
 
     b.prop_with(owner, level, 0, &object_extra);
     b.prop_with(level, base, 0, &object_extra);
@@ -4389,7 +4446,8 @@ fn phys_fixture() -> Vec<u8> {
     b.prop_array(touching, just_teleported, 0, touching_template);
     b.prop(just_teleported, floor, 0);
     b.prop_with(floor, brush, 0, &vector_extra);
-    b.prop_with(brush, touch_fn, 0, &object_extra);
+    b.prop_with(brush, mesh, 0, &object_extra);
+    b.prop_with(mesh, touch_fn, 0, &object_extra);
 
     let tc = touches as u8;
     let touch_code = vec![0x0F, 0x01, tc, 0x92, 0x00, tc, 0x26, 0x16, 0x04, 0x0B];
@@ -4436,6 +4494,8 @@ fn phys_fixture() -> Vec<u8> {
     b.prop_with(ctrl_pawn, no_control, 0, &object_extra);
     b.class(pawn, actor, pawn_controller, 0);
     b.class(controller, actor, ctrl_pawn, 0);
+    let projectile = b.reserve(0, 0, "Projectile");
+    b.class(projectile, actor, 0, 0);
     b.build()
 }
 
@@ -5789,10 +5849,196 @@ impl WorldPhysics for MockWorld {
             .iter()
             .any(|&(mn, mx)| aabb_overlaps(location, extent, mn, mx))
     }
+
+    fn point_check(&mut self, location: [f32; 3], extent: [f32; 3]) -> Option<SpotHit> {
+        if self.blocked_point {
+            return Some(SpotHit {
+                location,
+                normal: [0.0, 0.0, 1.0],
+                penetration: 0.0,
+            });
+        }
+        let mut best: Option<SpotHit> = None;
+        for &(mn, mx) in &self.walls {
+            let mut min_pen = f32::INFINITY;
+            let (mut axis, mut sign) = (0usize, 1.0f32);
+            let mut overlap = true;
+            for i in 0..3 {
+                let lo = (location[i] - extent[i]).max(mn[i]);
+                let hi = (location[i] + extent[i]).min(mx[i]);
+                let pen = hi - lo;
+                if pen <= 0.0 {
+                    overlap = false;
+                    break;
+                }
+                if pen < min_pen {
+                    min_pen = pen;
+                    axis = i;
+                    sign = if location[i] >= 0.5 * (mn[i] + mx[i]) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                }
+            }
+            if !overlap {
+                continue;
+            }
+            let mut normal = [0.0; 3];
+            normal[axis] = sign;
+            let hit = SpotHit {
+                location,
+                normal,
+                penetration: min_pen,
+            };
+            if best.is_none_or(|b| hit.penetration > b.penetration) {
+                best = Some(hit);
+            }
+        }
+        best
+    }
 }
 
 fn aabb_overlaps(c: [f32; 3], e: [f32; 3], mn: [f32; 3], mx: [f32; 3]) -> bool {
     (0..3).all(|i| c[i] + e[i] > mn[i] && c[i] - e[i] < mx[i])
+}
+
+// --- item95 ULevel::FindSpot/CheckSlice branches (0x1038a080 / 0x10389b80) -------------------
+
+#[test]
+fn find_spot_leaves_a_free_requested_spot_unchanged() {
+    let mut w = MockWorld::new();
+    let extent = [20.0, 20.0, 40.0];
+    assert_eq!(w.find_spot([0.0, 0.0, 0.0], extent), Some([0.0, 0.0, 0.0]));
+    assert_eq!(
+        w.find_spot([500.0, -20.0, 30.0], extent),
+        Some([500.0, -20.0, 30.0])
+    );
+}
+
+#[test]
+fn check_slice_lifts_a_spot_sunk_into_a_floor() {
+    // Floor slab with its top at z = 0.
+    let floor = MockWorld::new().with_wall([-2000.0, -2000.0, -400.0], [2000.0, 2000.0, 0.0]);
+    let extent = [20.0, 20.0, 40.0];
+    // Centre at z = 30: the (r, r, 1) slice is free but the box bottom (-10) is inside the floor.
+    let mut w = floor;
+    let mut encroach = false;
+    let lifted = w
+        .check_slice([0.0, 0.0, 30.0], extent, &mut encroach)
+        .expect("the sunk box is lifted");
+    assert!(!encroach, "a free slice must not set the encroachment flag");
+    assert!(lifted[2] > 30.0, "lifted: {lifted:?}");
+    assert!(
+        w.point_check(lifted, extent).is_none(),
+        "the lifted spot must be free: {lifted:?}"
+    );
+    // The full-extent overlap before the lift.
+    assert!(w.point_check([0.0, 0.0, 30.0], extent).is_some());
+}
+
+#[test]
+fn find_spot_pushes_a_spot_off_a_wall_horizontally() {
+    // Solid half-space x <= 0 spanning every z.
+    let mut w = MockWorld::new().with_wall([-2000.0, -2000.0, -2000.0], [0.0, 2000.0, 2000.0]);
+    let extent = [20.0, 20.0, 40.0];
+    // The box at x = 15 overlaps the wall on its -x side; the slice is blocked, so the
+    // horizontal corner search must move it clear.
+    let spot = w
+        .find_spot([15.0, 0.0, 0.0], extent)
+        .expect("the spot is pushed off the wall");
+    assert!(spot[0] >= 15.0, "moved away from the wall: {spot:?}");
+    assert!(
+        w.point_check(spot, extent).is_none(),
+        "the pushed spot must be free: {spot:?}"
+    );
+}
+
+#[test]
+fn find_spot_refuses_a_fully_enclosed_spot() {
+    // Solid everywhere: no corner of the box can be free.
+    let mut w = MockWorld::new().with_wall([-2000.0, -2000.0, -2000.0], [2000.0, 2000.0, 2000.0]);
+    assert_eq!(w.find_spot([0.0, 0.0, 0.0], [20.0, 20.0, 40.0]), None);
+    // A blocked zero extent fails at the zero-extent check (FindSpot 0x1038a12c).
+    let mut empty = MockWorld::new();
+    empty.blocked_point = true;
+    assert_eq!(empty.find_spot([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]), None);
+}
+
+#[test]
+fn check_slice_marks_a_blocked_slice_for_the_horizontal_search() {
+    // A wall occupies x in [-10, 10]; the slice at the requested centre is blocked.
+    let mut w = MockWorld::new().with_wall([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+    let mut encroach = false;
+    assert_eq!(
+        w.check_slice([0.0, 0.0, 0.0], [20.0, 20.0, 40.0], &mut encroach),
+        None
+    );
+    assert!(encroach, "a blocked slice must set the encroachment flag");
+}
+
+/// Provider for the `0x10389d7e` branch: the full extent blocks the box until it is pushed
+/// horizontally along the down-sweep contact normal, while the `(r, r, 1)` slice is always free.
+struct PushWorld;
+impl WorldPhysics for PushWorld {
+    fn trace(&mut self, _start: [f32; 3], end: [f32; 3], _extent: [f32; 3]) -> Option<WorldHit> {
+        Some(WorldHit {
+            location: end,
+            normal: [1.0, 0.0, 0.0],
+            time: 0.3,
+        })
+    }
+    fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        match self.trace(
+            start,
+            [
+                start[0] + delta[0],
+                start[1] + delta[1],
+                start[2] + delta[2],
+            ],
+            extent,
+        ) {
+            Some(hit) => MoveOutcome {
+                end: [
+                    start[0] + delta[0] * hit.time,
+                    start[1] + delta[1] * hit.time,
+                    start[2] + delta[2] * hit.time,
+                ],
+                hit: Some(hit),
+            },
+            None => MoveOutcome {
+                end: [
+                    start[0] + delta[0],
+                    start[1] + delta[1],
+                    start[2] + delta[2],
+                ],
+                hit: None,
+            },
+        }
+    }
+    fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool {
+        self.point_check(location, extent).is_none()
+    }
+    fn point_check(&mut self, location: [f32; 3], extent: [f32; 3]) -> Option<SpotHit> {
+        (extent[2] > 2.0 && location[0] < 20.0).then_some(SpotHit {
+            location,
+            normal: [1.0, 0.0, 0.0],
+            penetration: 5.0,
+        })
+    }
+}
+
+#[test]
+fn check_slice_pushes_a_spot_along_the_down_sweep_normal() {
+    let mut w = PushWorld;
+    let mut encroach = false;
+    let spot = w
+        .check_slice([10.0, 0.0, 10.0], [20.0, 20.0, 40.0], &mut encroach)
+        .expect("pushed out along the contact normal");
+    assert!(!encroach);
+    // z += (1 - 2*0.3) * 40 + 1 = 27, then x += 1 * 20 = 30 clears the block.
+    assert_eq!(spot, [30.0, 0.0, 27.0]);
+    assert!(w.point_check(spot, [20.0, 20.0, 40.0]).is_none());
 }
 
 fn wall_adjust_pair(vm: &mut Vm<'_>, set: &ScriptSet) -> (ObjectId, ObjectId) {
@@ -6359,6 +6605,332 @@ impl WorldPhysics for MeshWorld {
             time: t,
         })
     }
+
+    fn actor_mesh_overlap(
+        &mut self,
+        actor: &str,
+        center: [f32; 3],
+        extent: [f32; 3],
+    ) -> Option<bool> {
+        if !self.with_data || !actor.eq_ignore_ascii_case("WindowDoor") {
+            return None;
+        }
+        Some(
+            (center[0] - self.wall_x).abs() <= extent[0]
+                && !(center[2] - extent[2] > self.window_z0
+                    && center[2] + extent[2] < self.window_z1),
+        )
+    }
+
+    fn actor_mesh_sweep(
+        &mut self,
+        actor: &str,
+        start: [f32; 3],
+        end: [f32; 3],
+        extent: [f32; 3],
+    ) -> ActorMeshHit {
+        if !self.with_data || !actor.eq_ignore_ascii_case("WindowDoor") {
+            return ActorMeshHit::NoData;
+        }
+        let delta = std::array::from_fn(|i| end[i] - start[i]);
+        let Some((time, normal)) = swept_aabb(
+            start,
+            delta,
+            extent,
+            [self.wall_x, -1000.0, -1000.0],
+            [self.wall_x, 1000.0, 1000.0],
+        ) else {
+            return ActorMeshHit::Miss;
+        };
+        let location: [f32; 3] = std::array::from_fn(|i| start[i] + delta[i] * time);
+        if location[2] - extent[2] > self.window_z0 && location[2] + extent[2] < self.window_z1 {
+            return ActorMeshHit::Miss;
+        }
+        ActorMeshHit::Hit(WorldHit {
+            location,
+            normal,
+            time,
+        })
+    }
+
+    fn actor_mesh_bounds(&self, actor: &str) -> Option<([f32; 3], [f32; 3])> {
+        (self.with_data && actor.eq_ignore_ascii_case("WindowDoor"))
+            .then_some(([self.wall_x, 0.0, 0.0], [0.0, 10.0, 10.0]))
+    }
+
+    fn actor_brush_overlap(&self, actor: &str, center: [f32; 3], extent: [f32; 3]) -> Option<bool> {
+        (self.with_data && actor == "EarlyVolume")
+            .then(|| unit_cube_primitive().overlaps_box(center, extent))
+    }
+}
+
+#[test]
+fn mesh_mover_touch_rejects_cylinder_only_contact_and_reports_missing_data() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let projectile = vm.spawn(pg(&set, "Projectile"), "Projectile").unwrap();
+    vm.set_active(projectile, true);
+    vm.set_property(projectile, "Location", 0, Value::Vector([0.0; 3]));
+    set_collision_fields(&mut vm, projectile, true, false);
+    let mover = vm.spawn(pg(&set, "Mover"), "WindowDoor").unwrap();
+    set_collision_fields(&mut vm, mover, true, false);
+    vm.set_property(mover, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(mover, "CollisionHeight", 0, Value::Float(160.0));
+    vm.set_property(
+        mover,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    vm.refresh_touching_of(projectile).unwrap();
+    assert!(!vm.touching(projectile).contains(&mover));
+    assert!(!vm.actors_overlap(mover, projectile).unwrap());
+    vm.set_property(projectile, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    vm.refresh_touching_of(projectile).unwrap();
+    assert!(vm.touching(projectile).contains(&mover));
+    assert!(vm.touching(mover).contains(&projectile));
+    // The opening is inside the nominal cylinder; no mesh contact and symmetric UnTouch.
+    vm.set_property(projectile, "Location", 0, Value::Vector([40.0, 0.0, 90.0]));
+    vm.refresh_touching_of(projectile).unwrap();
+    assert!(!vm.touching(projectile).contains(&mover));
+    assert!(!vm.touching(mover).contains(&projectile));
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0).without_data()));
+    assert!(vm.refresh_touching_of(projectile).is_err());
+    vm.set_property(mover, "bUseCylinderCollision", 0, Value::Bool(true));
+    vm.refresh_touching_of(projectile).unwrap();
+    assert!(vm.touching(projectile).contains(&mover));
+    // GetPrimitive's Mesh takes precedence over StaticMesh even on an encroacher.
+    vm.set_property(mover, "bUseCylinderCollision", 0, Value::Bool(false));
+    vm.set_property(
+        mover,
+        "Mesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    assert!(vm.actors_overlap(projectile, mover).unwrap());
+}
+
+#[test]
+fn script_moved_noninterpolating_mover_syncs_world_pose_and_collision_lifecycle() {
+    struct MovingPanel {
+        world: MockWorld,
+        enabled: bool,
+    }
+    impl WorldPhysics for MovingPanel {
+        fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
+            if self.enabled {
+                self.world.trace(start, end, extent)
+            } else {
+                None
+            }
+        }
+        fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+            self.world.move_box(start, delta, extent)
+        }
+        fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool {
+            self.world.point_free(location, extent)
+        }
+        fn set_mover_collision(&mut self, _: &str, enabled: bool) {
+            self.enabled = enabled;
+        }
+        fn set_mover(&mut self, _: &str, location: [f32; 3], rotation: [i32; 3]) {
+            let half = if rotation[1] == 16384 {
+                [20.0, 1.0, 10.0]
+            } else {
+                [1.0, 20.0, 10.0]
+            };
+            self.world.walls = vec![(
+                std::array::from_fn(|i| location[i] - half[i]),
+                std::array::from_fn(|i| location[i] + half[i]),
+            )];
+        }
+    }
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MovingPanel {
+        world: MockWorld::new(),
+        enabled: true,
+    }));
+    let mover = vm.spawn(pg(&set, "Mover"), "Panel").unwrap();
+    set_collision_fields(&mut vm, mover, true, false);
+    vm.set_property(mover, "bInterpolating", 0, Value::Bool(false));
+    vm.set_property(mover, "Location", 0, Value::Vector([0.0; 3]));
+    vm.sync_mover_collision();
+    assert!(
+        vm.physics
+            .as_mut()
+            .unwrap()
+            .trace([-30.0, 0.0, 0.0], [30.0, 0.0, 0.0], [0.0; 3])
+            .is_some()
+    );
+    // Direct script/host property writes do not go through the interpolation updater.
+    // Repeated small steps must clear the original pose and expose the new one.
+    for step in 1..=200 {
+        let z = -(step as f32);
+        vm.set_property(mover, "Location", 0, Value::Vector([0.0, 0.0, z]));
+        vm.set_property(mover, "Rotation", 0, Value::Rotator([0, 16384, 0]));
+        vm.sync_mover_collision();
+        assert!(
+            vm.physics
+                .as_mut()
+                .unwrap()
+                .trace([15.0, -30.0, z], [15.0, 30.0, z], [0.0; 3])
+                .is_some(),
+            "rotated panel at step{step}"
+        );
+    }
+    assert!(
+        vm.physics
+            .as_mut()
+            .unwrap()
+            .trace([-30.0, 0.0, 0.0], [30.0, 0.0, 0.0], [0.0; 3])
+            .is_none(),
+        "stale collider at original pose"
+    );
+    for enabled in [false, true] {
+        vm.set_property(mover, "bCollideActors", 0, Value::Bool(enabled));
+        vm.sync_mover_collision();
+        assert_eq!(
+            vm.physics
+                .as_mut()
+                .unwrap()
+                .trace([15.0, -30.0, -200.0], [15.0, 30.0, -200.0], [0.0; 3])
+                .is_some(),
+            enabled
+        );
+    }
+    vm.destroy(mover).unwrap();
+    vm.sync_mover_collision();
+    assert!(
+        vm.physics
+            .as_mut()
+            .unwrap()
+            .trace([15.0, -30.0, -200.0], [15.0, 30.0, -200.0], [0.0; 3])
+            .is_none()
+    );
+}
+
+#[test]
+fn pawn_touching_keeps_vertical_cylinders_with_independent_radius_and_half_height() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let a = vm.spawn(pg(&set, "Pawn"), "PawnA").unwrap();
+    let b = vm.spawn(pg(&set, "Pawn"), "PawnB").unwrap();
+    for id in [a, b] {
+        vm.set_active(id, true);
+        set_collision_fields(&mut vm, id, true, false);
+        vm.set_property(id, "CollisionRadius", 0, Value::Float(34.0));
+        vm.set_property(id, "CollisionHeight", 0, Value::Float(75.0));
+    }
+    vm.set_property(a, "Location", 0, Value::Vector([0.0; 3]));
+    vm.set_property(b, "Location", 0, Value::Vector([40.0, 0.0, 100.0]));
+    vm.refresh_touching_of(a).unwrap();
+    assert!(vm.touching(a).contains(&b));
+    // Both coordinate differences fit the extent box, but the circular XY discs do not.
+    vm.set_property(b, "Location", 0, Value::Vector([50.0, 50.0, 100.0]));
+    vm.refresh_touching_of(a).unwrap();
+    assert!(vm.touching(a).is_empty());
+    vm.set_property(b, "Location", 0, Value::Vector([0.0, 0.0, 151.0]));
+    vm.refresh_touching_of(a).unwrap();
+    assert!(
+        vm.touching(a).is_empty(),
+        "75 is half-height, not full height"
+    );
+}
+
+#[test]
+fn mesh_encroachment_box_uses_primitive_center_not_actor_location() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let mesh_actor = vm.spawn(pg(&set, "Decoration"), "WindowDoor").unwrap();
+    set_collision_fields(&mut vm, mesh_actor, true, false);
+    vm.set_property(mesh_actor, "Location", 0, Value::Vector([500.0, 0.0, 0.0]));
+    vm.set_property(
+        mesh_actor,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    assert_eq!(
+        vm.touch_encroach_box(mesh_actor).unwrap(),
+        ([40.0, 0.0, 0.0], [0.0, 10.0, 10.0])
+    );
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0).without_data()));
+    assert!(vm.touch_encroach_box(mesh_actor).is_err());
+    vm.set_property(mesh_actor, "bUseCylinderCollision", 0, Value::Bool(true));
+    assert_eq!(
+        vm.touch_encroach_box(mesh_actor).unwrap().0,
+        [500.0, 0.0, 0.0]
+    );
+}
+
+#[test]
+fn blocking_mesh_sweep_passes_opening_and_stops_at_panel_not_nominal_cylinder() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let actor = phys_actor(&mut vm, &set, "Walker", [-100.0, 0.0, 90.0]);
+    set_collision_fields(&mut vm, actor, true, true);
+    let mover = vm.spawn(pg(&set, "Mover"), "WindowDoor").unwrap();
+    set_collision_fields(&mut vm, mover, true, true);
+    vm.set_property(mover, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(mover, "CollisionHeight", 0, Value::Float(160.0));
+    vm.set_property(
+        mover,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    assert!(vm.vm_move(actor, [200.0, 0.0, 0.0]).unwrap());
+    assert_eq!(
+        vm.get_property(actor, "Location"),
+        Some(&Value::Vector([100.0, 0.0, 90.0]))
+    );
+    vm.set_property(actor, "Location", 0, Value::Vector([-100.0, 0.0, 0.0]));
+    assert!(vm.vm_move(actor, [200.0, 0.0, 0.0]).unwrap());
+    let location = vm.vector_prop(actor, "Location").unwrap();
+    assert!((location[0] - (40.0 - vm.f32_prop(actor, "CollisionRadius"))).abs() < 0.0001);
+    vm.set_property(actor, "Location", 0, Value::Vector([-100.0, 0.0, 0.0]));
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0).without_data()));
+    assert!(vm.vm_move(actor, [200.0, 0.0, 0.0]).is_err());
+}
+
+#[test]
+fn touch_sweep_crosses_thin_mesh_without_endpoint_overlap_and_misses_opening() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let projectile = vm.spawn(pg(&set, "Projectile"), "Projectile").unwrap();
+    vm.set_active(projectile, true);
+    vm.set_property(projectile, "Location", 0, Value::Vector([100.0, 0.0, 90.0]));
+    set_collision_fields(&mut vm, projectile, true, false);
+    let mover = vm.spawn(pg(&set, "Mover"), "WindowDoor").unwrap();
+    set_collision_fields(&mut vm, mover, true, false);
+    vm.set_property(mover, "bBlockNonZeroExtentTraces", 0, Value::Bool(true));
+    vm.set_property(mover, "bBlockZeroExtentTraces", 0, Value::Bool(true));
+    vm.set_property(
+        mover,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    vm.sweep_touching(projectile, [0.0, 0.0, 90.0], [100.0, 0.0, 90.0])
+        .unwrap();
+    assert!(vm.touching(projectile).is_empty());
+    vm.set_property(projectile, "Location", 0, Value::Vector([100.0, 0.0, 0.0]));
+    vm.sweep_touching(projectile, [0.0; 3], [100.0, 0.0, 0.0])
+        .unwrap();
+    assert!(vm.touching(projectile).contains(&mover));
+    assert_eq!(vm.get_property(projectile, "Touches"), Some(&Value::Int(1)));
+    vm.refresh_touching_of(projectile).unwrap();
+    assert!(vm.touching(projectile).is_empty());
+    assert_eq!(
+        vm.get_property(projectile, "UnTouches"),
+        Some(&Value::Int(1))
+    );
 }
 
 /// item53: a zero-extent ray through a static-mesh actor's window opening does not hit the
@@ -6901,12 +7473,39 @@ fn volume_brush_overlap_uses_the_primitive_not_the_class_cylinder() {
     vm.set_property(player, "CollisionHeight", 0, Value::Float(5.0));
     // A cylinder inside the brush but far outside the volume's class cylinder: the primitive
     // reports the overlap, the cylinder would not.
-    assert!(vm.actors_overlap(player, volume));
-    assert!(vm.actors_overlap(volume, player));
+    assert!(vm.actors_overlap(player, volume).unwrap());
+    assert!(vm.actors_overlap(volume, player).unwrap());
 
     // Moved entirely outside the brush (and still outside the class cylinder): no overlap.
     vm.set_property(player, "Location", 0, Value::Vector([2.0, 2.0, 2.0]));
-    assert!(!vm.actors_overlap(player, volume));
+    assert!(!vm.actors_overlap(player, volume).unwrap());
+}
+
+#[test]
+fn startup_touch_uses_provider_brush_before_host_actor_registration() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    let volume = vm.spawn(pg(&set, "Volume"), "EarlyVolume").unwrap();
+    vm.set_property(
+        volume,
+        "Brush",
+        0,
+        Value::Object(Some(ObjRef::Instance(volume))),
+    );
+    vm.set_property(volume, "Location", 0, Value::Vector([1000.0; 3]));
+    set_collision_fields(&mut vm, volume, true, false);
+    let actor = phys_actor(&mut vm, &set, "Spawned", [0.5; 3]);
+    set_collision_fields(&mut vm, actor, true, false);
+    vm.set_property(actor, "CollisionRadius", 0, Value::Float(0.1));
+    vm.set_property(actor, "CollisionHeight", 0, Value::Float(0.1));
+    vm.refresh_touching_of(actor).unwrap();
+    assert!(vm.touching(actor).contains(&volume));
+    vm.set_property(actor, "Location", 0, Value::Vector([2.0; 3]));
+    vm.refresh_touching_of(actor).unwrap();
+    assert!(vm.touching(actor).is_empty());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0).without_data()));
+    assert!(vm.refresh_touching_of(actor).is_err());
 }
 
 #[test]
@@ -6924,8 +7523,8 @@ fn two_brush_actors_never_overlap() {
         vm.set_property(id, "CollisionHeight", 0, Value::Float(50.0));
         vm.set_property(id, "Brush", 0, Value::Object(Some(ObjRef::Instance(id))));
     }
-    assert!(!vm.actors_overlap(a, b));
-    assert!(!vm.actors_overlap(b, a));
+    assert!(!vm.actors_overlap(a, b).unwrap());
+    assert!(!vm.actors_overlap(b, a).unwrap());
 }
 
 #[test]
@@ -7426,7 +8025,7 @@ fn exact_contact_boundary_overlaps() {
 }
 
 #[test]
-fn set_collision_false_ends_touching() {
+fn set_collision_false_defers_untouch_until_movement_refresh() {
     let set = phys_set();
     let mut vm = Vm::new(&set, VmLimits::default());
     vm.set_physics(Box::new(MockWorld::new()));
@@ -7446,6 +8045,9 @@ fn set_collision_false_ends_touching() {
         &mut args,
     )
     .unwrap();
+    assert_eq!(vm.touching_list(a), vec![b]);
+    assert_eq!(vm.get_property(a, "UnTouches"), Some(&Value::Int(0)));
+    vm.refresh_touching_of(a).unwrap();
     assert_eq!(vm.get_property(a, "UnTouches"), Some(&Value::Int(1)));
     assert_eq!(vm.get_property(b, "UnTouches"), Some(&Value::Int(1)));
     assert!(vm.touching_list(a).is_empty());
@@ -7907,6 +8509,229 @@ fn visible_damageable_actors_without_physics_provider_fails() {
         VmErrorKind::NoPhysicsProvider { ref native }
             if native == "Actor.VisibleDamageableActors"
     ));
+}
+
+// ---------------------------------------------------------------------------------------
+// item87b: `Level.TimeSeconds` at map load and `AActor.LastRenderTime`
+// (`Vm::reset_render_times` / `Vm::update_render_times` / `Vm::mark_rendered`)
+
+/// Minimal `LevelInfo`/`Actor`/`Controller`/`PlayerController` package. `Actor` carries
+/// `Location`, `Rotation`, `LastRenderTime`, `BaseEyeHeight`, `CollisionHeight`,
+/// `CollisionRadius`, `bHidden`, `DrawType`; `Controller` a `Pawn` and `FOVAngle`; `LevelInfo`
+/// a `TimeSeconds`.
+fn render_time_fixture() -> Vec<u8> {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let levelinfo = b.reserve(0, 0, "LevelInfo");
+    let controller = b.reserve(0, 0, "Controller");
+    let playercontroller = b.reserve(0, 0, "PlayerController");
+    let loc = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let rot = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
+    let lrt = b.reserve(IMP_FLOATPROP, actor, "LastRenderTime");
+    let eye = b.reserve(IMP_FLOATPROP, actor, "BaseEyeHeight");
+    let ch = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
+    let cr = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
+    let hidden = b.reserve(IMP_BOOLPROP, actor, "bHidden");
+    let drawtype = b.reserve(IMP_BYTEPROP, actor, "DrawType");
+    let ctrl_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
+    let fov = b.reserve(IMP_FLOATPROP, controller, "FOVAngle");
+    let ts = b.reserve(IMP_FLOATPROP, levelinfo, "TimeSeconds");
+    b.prop_with(loc, rot, 0, &compact(IMP_STRUCT));
+    b.prop_with(rot, lrt, 0, &compact(IMP_STRUCT - 1));
+    b.prop(lrt, eye, 0);
+    b.prop(eye, ch, 0);
+    b.prop(ch, cr, 0);
+    b.prop(cr, hidden, 0);
+    b.prop(hidden, drawtype, 0);
+    b.prop_with(drawtype, 0, 0, &compact(0));
+    b.prop_with(ctrl_pawn, fov, 0, &compact(0));
+    b.prop(fov, 0, 0);
+    b.prop(ts, 0, 0);
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, loc, 0);
+    b.class(pawn, actor, 0, 0);
+    b.class(levelinfo, actor, ts, 0);
+    b.class(controller, actor, ctrl_pawn, 0);
+    b.class(playercontroller, controller, 0, 0);
+    b.build()
+}
+
+/// Spawns the fixture's `PlayerController`/player pawn at the origin facing +X (yaw 0), with
+/// `FOVAngle` 90. Returns `(pc, player)`.
+fn render_time_player(vm: &mut Vm<'_>, set: &ScriptSet) -> (ObjectId, ObjectId) {
+    let player = vm.spawn(pg(set, "Pawn"), "PlayerPawn").unwrap();
+    vm.set_property(player, "Location", 0, Value::Vector([0.0; 3]));
+    vm.set_property(player, "Rotation", 0, Value::Rotator([0, 0, 0]));
+    vm.set_property(player, "BaseEyeHeight", 0, Value::Float(60.0));
+    // DT_Mesh: the fixture's class default is the byte zero (DT_None), unlike `AActor`'s.
+    vm.set_property(player, "DrawType", 0, Value::Byte(2));
+    let pc = vm.spawn(pg(set, "PlayerController"), "PC").unwrap();
+    vm.set_property(pc, "Pawn", 0, Value::Object(Some(ObjRef::Instance(player))));
+    vm.set_property(pc, "FOVAngle", 0, Value::Float(90.0));
+    (pc, player)
+}
+
+/// `UGameEngine::LoadMap` restarts the level clock at 0 and clears every actor's
+/// `LastRenderTime`; the map's serialised editor values must not survive (`reset_render_times`).
+#[test]
+fn reset_render_times_zeros_the_level_clock_and_every_actor() {
+    let set = set_of(render_time_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let level = vm.spawn(pg(&set, "LevelInfo"), "LevelInfo0").unwrap();
+    vm.set_property(level, "TimeSeconds", 0, Value::Float(2649.8));
+    let a = vm.spawn(pg(&set, "Actor"), "A").unwrap();
+    vm.set_property(a, "LastRenderTime", 0, Value::Float(700.0));
+    let b = vm.spawn(pg(&set, "Actor"), "B").unwrap();
+    vm.set_property(b, "LastRenderTime", 0, Value::Float(1252.0));
+    vm.time = 42.0;
+    vm.reset_render_times();
+    assert_eq!(vm.time, 0.0);
+    assert_eq!(
+        vm.get_property(level, "TimeSeconds"),
+        Some(&Value::Float(0.0))
+    );
+    assert_eq!(
+        vm.get_property(a, "LastRenderTime"),
+        Some(&Value::Float(0.0))
+    );
+    assert_eq!(
+        vm.get_property(b, "LastRenderTime"),
+        Some(&Value::Float(0.0))
+    );
+}
+
+/// Only the actors the camera draws are stamped: an in-frustum, unoccluded, drawable actor is
+/// marked; `bHidden`, `DrawType == DT_None`, an off-axis actor and an actor behind the camera
+/// keep their stale value so their age grows (the cinematic `NotSeenByPlayer` condition).
+#[test]
+fn update_render_times_marks_drawn_actors_and_leaves_the_rest_stale() {
+    let set = set_of(render_time_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let (pc, _player) = render_time_player(&mut vm, &set);
+
+    let drawn = vm.spawn(pg(&set, "Actor"), "Drawn").unwrap();
+    vm.set_property(drawn, "Location", 0, Value::Vector([200.0, 0.0, 0.0]));
+    vm.set_property(drawn, "DrawType", 0, Value::Byte(2));
+    vm.set_property(drawn, "LastRenderTime", 0, Value::Float(-1000.0));
+
+    let hidden = vm.spawn(pg(&set, "Actor"), "Hidden").unwrap();
+    vm.set_property(hidden, "Location", 0, Value::Vector([200.0, 50.0, 0.0]));
+    vm.set_property(hidden, "DrawType", 0, Value::Byte(2));
+    vm.set_property(hidden, "bHidden", 0, Value::Bool(true));
+    vm.set_property(hidden, "LastRenderTime", 0, Value::Float(-1000.0));
+
+    let none = vm.spawn(pg(&set, "Actor"), "NoDraw").unwrap();
+    vm.set_property(none, "Location", 0, Value::Vector([200.0, -50.0, 0.0]));
+    vm.set_property(none, "DrawType", 0, Value::Byte(0));
+    vm.set_property(none, "LastRenderTime", 0, Value::Float(-1000.0));
+
+    let behind = vm.spawn(pg(&set, "Actor"), "Behind").unwrap();
+    vm.set_property(behind, "Location", 0, Value::Vector([-9000.0, 0.0, 0.0]));
+    vm.set_property(behind, "DrawType", 0, Value::Byte(2));
+    vm.set_property(behind, "LastRenderTime", 0, Value::Float(-1000.0));
+
+    // A second actor past the 45-degree horizontal half-angle, on the +Y (right) side.
+    let off_axis = vm.spawn(pg(&set, "Actor"), "OffAxis").unwrap();
+    vm.set_property(off_axis, "Location", 0, Value::Vector([0.0, 500.0, 0.0]));
+    vm.set_property(off_axis, "DrawType", 0, Value::Byte(2));
+    vm.set_property(off_axis, "LastRenderTime", 0, Value::Float(-1000.0));
+
+    vm.time = 5.0;
+    vm.update_render_times(Some(pc));
+
+    assert_eq!(
+        vm.get_property(drawn, "LastRenderTime"),
+        Some(&Value::Float(5.0)),
+        "an in-frustum, clear, drawable actor is drawn"
+    );
+    assert_eq!(
+        vm.get_property(hidden, "LastRenderTime"),
+        Some(&Value::Float(-1000.0)),
+        "bHidden is not drawn"
+    );
+    assert_eq!(
+        vm.get_property(none, "LastRenderTime"),
+        Some(&Value::Float(-1000.0)),
+        "DrawType == DT_None is not drawn"
+    );
+    assert_eq!(
+        vm.get_property(behind, "LastRenderTime"),
+        Some(&Value::Float(-1000.0)),
+        "an actor behind the camera is not drawn"
+    );
+    assert_eq!(
+        vm.get_property(off_axis, "LastRenderTime"),
+        Some(&Value::Float(-1000.0)),
+        "an actor outside the horizontal FOV is not drawn"
+    );
+}
+
+/// item87c: the headless stand-in is frustum-only, matching the windowed renderer's Bevy
+/// `ViewVisibility`. A distant in-frustum actor must be marked even though world geometry lies
+/// between it and the camera: the previous ray-based occlusion test started inside the player's
+/// own collision and hit it, so every distant actor was treated as occluded and only camera-local
+/// actors were ever marked (measured 6 vs the renderer's 186 on Toits01).
+#[test]
+fn update_render_times_marks_a_distant_frustum_actor_through_world_geometry() {
+    let set = set_of(render_time_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([50.0, -100.0, -100.0], [51.0, 100.0, 100.0]),
+    ));
+    let (pc, _player) = render_time_player(&mut vm, &set);
+    let far = vm.spawn(pg(&set, "Actor"), "Far").unwrap();
+    vm.set_property(far, "Location", 0, Value::Vector([5000.0, 0.0, 0.0]));
+    vm.set_property(far, "DrawType", 0, Value::Byte(2));
+    vm.set_property(far, "LastRenderTime", 0, Value::Float(-1000.0));
+    vm.time = 5.0;
+    vm.update_render_times(Some(pc));
+    assert_eq!(
+        vm.get_property(far, "LastRenderTime"),
+        Some(&Value::Float(5.0)),
+        "a distant in-frustum actor is marked (frustum-only stand-in)"
+    );
+}
+
+/// Without a player controller (the `xiii-tool script` scope) the stand-in writes nothing.
+#[test]
+fn update_render_times_without_player_controller_is_a_noop() {
+    let set = set_of(render_time_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MockWorld::new()));
+    let pawn = vm.spawn(pg(&set, "Pawn"), "CinePawn").unwrap();
+    vm.set_property(pawn, "Location", 0, Value::Vector([0.0; 3]));
+    vm.set_property(pawn, "LastRenderTime", 0, Value::Float(-1000.0));
+    vm.time = 5.0;
+    vm.update_render_times(None);
+    assert_eq!(
+        vm.get_property(pawn, "LastRenderTime"),
+        Some(&Value::Float(-1000.0))
+    );
+}
+
+/// `mark_rendered` (the windowed renderer's report) stamps only live actor instances.
+#[test]
+fn mark_rendered_stamps_only_live_actor_instances() {
+    let set = set_of(render_time_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    let a = vm.spawn(pg(&set, "Actor"), "A").unwrap();
+    vm.set_property(a, "LastRenderTime", 0, Value::Float(-1000.0));
+    let b = vm.spawn(pg(&set, "Actor"), "B").unwrap();
+    vm.set_property(b, "LastRenderTime", 0, Value::Float(-1000.0));
+    vm.time = 7.0;
+    vm.mark_rendered(&[a, 9999]);
+    assert_eq!(
+        vm.get_property(a, "LastRenderTime"),
+        Some(&Value::Float(7.0))
+    );
+    assert_eq!(
+        vm.get_property(b, "LastRenderTime"),
+        Some(&Value::Float(-1000.0)),
+        "an actor the renderer did not report keeps its value"
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -9246,6 +10071,180 @@ fn presentation_fixture() -> Vec<u8> {
     b.class(object, 0, 0);
     b.class(actor, object, play_sound);
     b.build()
+}
+
+/// Generated data only: a level, an arbitrary flash sink and the presentation native.
+fn flash_cue_model_fixture(failing_callback: bool) -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let level = b.reserve(0, 0, "LevelInfo");
+    let sink = b.reserve(0, 0, "FlashSink");
+    let manager = b.reserve(IMP_OBJPROP, level, "FlashManager");
+    let pauser = b.reserve(IMP_OBJPROP, level, "Pauser");
+    let seen = b.reserve(IMP_INTPROP, sink, "Seen");
+    let music = b.reserve(IMP_FUNCTION, actor, "PlayMusic");
+    let sound = b.reserve(IMP_OBJPROP, music, "Sound");
+    let events = [
+        "BeginBeginFlash",
+        "EndBeginFlash",
+        "BeginEndFlash",
+        "EndEndFlash",
+    ]
+    .map(|name| b.reserve(IMP_FUNCTION, sink, name));
+    b.prop_with(manager, pauser, 0, &compact(actor));
+    b.prop_with(pauser, 0, 0, &compact(actor));
+    b.prop(seen, events[0], 0);
+    b.prop_with(sound, 0, pf::PARM, &compact(object));
+    b.func(music, 0, sound, &[], 0, 358, ff::FINAL | ff::NATIVE);
+    for (i, event) in events.into_iter().enumerate() {
+        let next = events.get(i + 1).copied().unwrap_or(0);
+        // Seen = stage; return;
+        let mut code = vec![0x0f, 0x01];
+        code.extend(compact(seen));
+        code.push(0x1d);
+        code.extend((i as i32 + 1).to_le_bytes());
+        code.extend([0x04, 0x0b]);
+        if failing_callback && i == 0 {
+            b.func(event, next, 0, &[], 0, 0, ff::FINAL | ff::NATIVE);
+        } else {
+            b.func(event, next, 0, &code, 13, 0, ff::DEFINED);
+        }
+    }
+    b.class(object, 0, 0);
+    b.class(actor, object, music);
+    b.class(level, actor, manager);
+    b.class(sink, actor, seen);
+    for name in ["Flash1", "Flash2", "Flash3", "FlashsEnd"] {
+        let cue = b.reserve(0, 0, name);
+        b.class(cue, object, 0);
+    }
+    b.build()
+}
+
+fn flash_cue_model_world(vm: &mut Vm<'_>, set: &ScriptSet) -> (ObjectId, ObjectId) {
+    let level = vm.spawn(g(set, "LevelInfo"), "Level").unwrap();
+    let sink = vm.spawn(g(set, "FlashSink"), "Sink").unwrap();
+    vm.set_active(sink, true);
+    vm.set_property(
+        level,
+        "FlashManager",
+        0,
+        Value::Object(Some(ObjRef::Instance(sink))),
+    );
+    (level, sink)
+}
+
+#[test]
+fn flash_cue_model_native_defers_dispatch_and_consumes_each_stage_once() {
+    for suspending in [false, true] {
+        let set = set_of(flash_cue_model_fixture(false));
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let (_, sink) = flash_cue_model_world(&mut vm, &set);
+        let caller = vm.spawn(g(&set, "Actor"), "MusicCaller").unwrap();
+        for (i, cue) in ["Flash1", "Flash2", "Flash3", "FlashsEnd"]
+            .into_iter()
+            .enumerate()
+        {
+            vm.call_function(
+                g(&set, "Actor.PlayMusic"),
+                caller,
+                vec![Value::Object(Some(ObjRef::Static(g(&set, cue))))],
+            )
+            .unwrap();
+            assert_eq!(vm.get_property(sink, "Seen"), Some(&Value::Int(i as i32)));
+            assert_eq!(vm.drain_events().len(), 1, "presentation request preserved");
+            if suspending {
+                assert!(vm.tick_suspending(0.1).is_empty());
+            } else {
+                vm.tick(0.1).unwrap();
+            }
+            assert_eq!(
+                vm.get_property(sink, "Seen"),
+                Some(&Value::Int(i as i32 + 1))
+            );
+            vm.set_property(sink, "Seen", 0, Value::Int(-1));
+            if suspending {
+                assert!(vm.tick_suspending(0.1).is_empty());
+            } else {
+                vm.tick(0.1).unwrap();
+            }
+            assert_eq!(
+                vm.get_property(sink, "Seen"),
+                Some(&Value::Int(-1)),
+                "no replay"
+            );
+            vm.set_property(sink, "Seen", 0, Value::Int(i as i32 + 1));
+        }
+    }
+}
+
+#[test]
+fn flash_cue_model_keeps_latest_stage_across_pause_and_ignores_absent_manager() {
+    for suspending in [false, true] {
+        let set = set_of(flash_cue_model_fixture(false));
+        let mut vm = Vm::new(&set, VmLimits::default());
+        // Missing level/manager is a legitimate no-op, just as retail guards its null pointer.
+        vm.queue_flash_cue_model(FlashCueModelStage::BeginBegin);
+        vm.tick(0.1).unwrap();
+        let (level, sink) = flash_cue_model_world(&mut vm, &set);
+        vm.set_property(level, "FlashManager", 0, Value::Object(None));
+        vm.queue_flash_cue_model(FlashCueModelStage::EndBegin);
+        vm.tick(0.1).unwrap();
+        assert_eq!(vm.get_property(sink, "Seen"), Some(&Value::Int(0)));
+        vm.set_property(
+            level,
+            "FlashManager",
+            0,
+            Value::Object(Some(ObjRef::Instance(sink))),
+        );
+        vm.set_property(
+            level,
+            "Pauser",
+            0,
+            Value::Object(Some(ObjRef::Instance(sink))),
+        );
+        vm.queue_flash_cue_model(FlashCueModelStage::BeginBegin);
+        vm.queue_flash_cue_model(FlashCueModelStage::EndEnd);
+        if suspending {
+            assert!(vm.tick_suspending(0.1).is_empty());
+        } else {
+            vm.tick(0.1).unwrap();
+        }
+        assert_eq!(vm.get_property(sink, "Seen"), Some(&Value::Int(0)));
+        vm.set_property(level, "Pauser", 0, Value::Object(None));
+        if suspending {
+            assert!(vm.tick_suspending(0.1).is_empty());
+        } else {
+            vm.tick(0.1).unwrap();
+        }
+        assert_eq!(vm.get_property(sink, "Seen"), Some(&Value::Int(4)));
+    }
+}
+
+#[test]
+fn flash_cue_model_callback_failure_reaches_both_tick_error_paths() {
+    for suspending in [false, true] {
+        let set = set_of(flash_cue_model_fixture(true));
+        let mut vm = Vm::new(&set, VmLimits::default());
+        let (_, sink) = flash_cue_model_world(&mut vm, &set);
+        vm.queue_flash_cue_model(FlashCueModelStage::BeginBegin);
+        if suspending {
+            let errors = vm.tick_suspending(0.1);
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].0, sink);
+            assert!(matches!(
+                errors[0].1.kind,
+                VmErrorKind::UnimplementedNative { .. }
+            ));
+            assert!(!vm.objects[sink as usize].active);
+        } else {
+            assert!(matches!(
+                vm.tick(0.1).unwrap_err().kind,
+                VmErrorKind::UnimplementedNative { .. }
+            ));
+        }
+    }
 }
 
 #[test]

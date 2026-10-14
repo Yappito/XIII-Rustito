@@ -37,6 +37,15 @@ use crate::reflect::{Property, PropertyKind, ScriptObject, function_flags, prope
 use crate::registry::{NativeCtx, NativeDef, NativeOutcome, Registry};
 use crate::value::{Delegate, ObjRef, ObjectId, Ty, Value};
 
+/// Inferred stages of the Partial HXAudio cue-name model, not decoded bank events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlashCueModelStage {
+    BeginBegin,
+    EndBegin,
+    BeginEnd,
+    EndEnd,
+}
+
 /// Interpreter limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmLimits {
@@ -1417,6 +1426,9 @@ pub struct Vm<'s> {
     pub tick_count: u64,
     /// VM time in seconds.
     pub time: f64,
+    /// Partial cue-name model: newest inferred stage, dispatched at the end of the next
+    /// unpaused VM tick. Retail observes a global audio variable; its bank timing is unknown.
+    pending_flash_cue_model: Option<FlashCueModelStage>,
     steps: u64,
     limits: VmLimits,
     /// Properties the loader could not place (name not in layout, bad index).
@@ -1695,6 +1707,7 @@ impl<'s> Vm<'s> {
             stack: Vec::new(),
             tick_count: 0,
             time: 0.0,
+            pending_flash_cue_model: None,
             steps: 0,
             limits,
             load_warnings: Vec::new(),
@@ -2494,7 +2507,12 @@ impl<'s> Vm<'s> {
                         let mut members = Vec::new();
                         for (pg, p) in self.child_props(g) {
                             let t = self.ty_of(pg.package, &p.kind, depth + 1);
-                            members.push((lower(self.object_name(pg)), t));
+                            // `transient` members are not in the serialized struct (the runtime
+                            // field still exists and defaults to zero), so the raw-struct decoder
+                            // must not consume bytes for them.
+                            let serialized =
+                                p.flags & crate::reflect::property_flags::TRANSIENT == 0;
+                            members.push((lower(self.object_name(pg)), t, serialized));
                         }
                         Ty::Struct(members)
                     }
@@ -2894,7 +2912,7 @@ impl<'s> Vm<'s> {
             // `XIIIDialogMessage.MessageColor` is read as a `struct<Color>`).
             (PropertyValue::Struct(StructValue::Color(c)), Ty::Struct(members)) => {
                 let mut fields = Vec::with_capacity(members.len());
-                for (name, _) in members {
+                for (name, _, _) in members {
                     let byte = match name.to_ascii_lowercase().as_str() {
                         "b" => c[0],
                         "g" => c[1],
@@ -2915,7 +2933,7 @@ impl<'s> Vm<'s> {
             // is applied when the subobject is instantiated.
             (PropertyValue::Struct(StructValue::Range(r)), Ty::Struct(members)) => {
                 let mut fields = Vec::with_capacity(members.len());
-                for (name, _) in members {
+                for (name, _, _) in members {
                     let v = match name.to_ascii_lowercase().as_str() {
                         "min" => r[0],
                         "max" => r[1],
@@ -2930,12 +2948,12 @@ impl<'s> Vm<'s> {
                     return Value::Unsupported(format!("range vector arity {}", members.len()));
                 }
                 let mut fields = Vec::with_capacity(3);
-                for (i, (name, ty)) in members.iter().enumerate() {
+                for (i, (name, ty, _)) in members.iter().enumerate() {
                     let r = rv[i];
                     let inner = match ty {
                         Ty::Struct(inner) => {
                             let mut sub = Vec::with_capacity(inner.len());
-                            for (n, _) in inner {
+                            for (n, _, _) in inner {
                                 let v = match n.to_ascii_lowercase().as_str() {
                                     "min" => r[0],
                                     "max" => r[1],
@@ -2972,7 +2990,7 @@ impl<'s> Vm<'s> {
         &self,
         pkg: usize,
         span: xiii_package::Span,
-        members: &[(String, Ty)],
+        members: &[(String, Ty, bool)],
     ) -> Value {
         let p = &self.set.packages[pkg];
         let tables = crate::reader::Tables::of(&p.package);
@@ -2980,7 +2998,12 @@ impl<'s> Vm<'s> {
             return Value::Unsupported("struct span".into());
         };
         let mut fields = Vec::new();
-        for (name, t) in members {
+        for (name, t, serialized) in members {
+            // A transient member is not in the span; keep the runtime field at its zero value.
+            if !*serialized {
+                fields.push((name.clone(), t.zero()));
+                continue;
+            }
             match self.decode_ty(&mut r, pkg, t) {
                 Some(v) => fields.push((name.clone(), v)),
                 None => return Value::Unsupported(format!("raw struct member {name}")),
@@ -3041,8 +3064,13 @@ impl<'s> Vm<'s> {
             }
             Ty::Struct(members) => {
                 let mut fields = Vec::new();
-                for (name, t) in members {
-                    fields.push((name.clone(), self.decode_ty(r, pkg, t)?));
+                for (name, t, serialized) in members {
+                    if *serialized {
+                        fields.push((name.clone(), self.decode_ty(r, pkg, t)?));
+                    } else {
+                        // A transient member is not in the byte stream.
+                        fields.push((name.clone(), t.zero()));
+                    }
                 }
                 Value::Struct(fields)
             }
@@ -4122,6 +4150,41 @@ impl<'s> Vm<'s> {
         self.do_goto_state(id, state, label.unwrap_or("Begin"))
     }
 
+    /// Partial model: defer the inferred stage so script waiters can park first. The delay is
+    /// a compatibility choice, not measured playback latency. Like retail's pending value
+    /// (subsystem+0xa0), a newer request replaces the previous pending stage.
+    pub(crate) fn queue_flash_cue_model(&mut self, stage: FlashCueModelStage) {
+        self.note(TraceKind::Note(format!(
+            "HXAudio flash cue model (Partial): inferred {stage:?}; deferred to next unpaused VM tick"
+        )));
+        self.pending_flash_cue_model = Some(stage);
+    }
+
+    /// Dispatches the model's inferred stage to Level.FlashManager. The event family and
+    /// value order are decoded from retail Update; selection and timing remain modelled.
+    /// Return campaign callback errors to the normal tick/suspension diagnostics.
+    fn fire_flash_cue_model(
+        &mut self,
+        stage: FlashCueModelStage,
+    ) -> Result<(), (ObjectId, VmError)> {
+        let Some(level) = self.find_level_info() else {
+            return Ok(());
+        };
+        let flash_manager = match self.get_property(level, "FlashManager") {
+            Some(Value::Object(Some(ObjRef::Instance(id)))) => *id,
+            _ => return Ok(()),
+        };
+        let event = match stage {
+            FlashCueModelStage::BeginBegin => "BeginBeginFlash",
+            FlashCueModelStage::EndBegin => "EndBeginFlash",
+            FlashCueModelStage::BeginEnd => "BeginEndFlash",
+            FlashCueModelStage::EndEnd => "EndEndFlash",
+        };
+        self.send_event(flash_manager, event, Vec::new())
+            .map(|_| ())
+            .map_err(|e| (flash_manager, e))
+    }
+
     /// Retail ULevel::Tick (Engine.dll 0x10390afc..0x10390be0): scale the incoming
     /// float delta, advance the double level clock unless Pauser is set, publish its
     /// float mirror before actor callbacks. VM tick accepts a simulation step;
@@ -4177,6 +4240,7 @@ impl<'s> Vm<'s> {
             }
             return Ok(());
         }
+        let flash = self.pending_flash_cue_model.take();
         for id in 0..self.objects.len() as ObjectId {
             if !self.objects[id as usize].active {
                 continue;
@@ -4237,6 +4301,9 @@ impl<'s> Vm<'s> {
         self.dispatch_player_ticks(dt)?;
         self.dispatch_hook_player_moves(dt)?;
         self.detect_server_travel();
+        if let Some(stage) = flash {
+            self.fire_flash_cue_model(stage).map_err(|(_, e)| e)?;
+        }
         Ok(())
     }
 
@@ -4304,6 +4371,7 @@ impl<'s> Vm<'s> {
             }
             return errors;
         }
+        let flash = self.pending_flash_cue_model.take();
         let profiling = self.profile.enabled;
         let t0 = Instant::now();
         for id in 0..self.objects.len() as ObjectId {
@@ -4425,6 +4493,12 @@ impl<'s> Vm<'s> {
             errors.push((suspended, e));
         }
         self.detect_server_travel();
+        if let Some(stage) = flash
+            && let Err((id, e)) = self.fire_flash_cue_model(stage)
+        {
+            let suspended = self.suspend_for_error(id, &e);
+            errors.push((suspended, e));
+        }
         errors
     }
 
@@ -6899,6 +6973,29 @@ impl<'s> Vm<'s> {
                     None => return Ok(None),
                 }
             }
+            K::ClassContext(c) => {
+                // A class-default lvalue (`obj'X'.static.default.P = v`) writes the class's
+                // default object, mirroring the `eval_in` read path. `xiii.MapInfo
+                // .SaveInventoryForFlash` toggles `XIIIPlayerPawn.default.bCollideWorld` around its
+                // spawn, so without this the write was `NotAPlace` and the whole flash sequence
+                // aborted before `GenFlash.IntroFlash`'s timer.
+                let v = self.eval_in(frame, &c.object, target)?;
+                let class = match v {
+                    Value::Object(Some(ObjRef::Static(g))) => Some(g),
+                    Value::Object(Some(ObjRef::Instance(i))) => {
+                        Some(self.objects[i as usize].class)
+                    }
+                    Value::Object(None) | Value::NativeClass(_) => None,
+                    other => return Err(self.type_err("class", &other)),
+                };
+                match class {
+                    Some(g) => {
+                        let d = self.default_object(g)?;
+                        return self.place(frame, &c.member, d);
+                    }
+                    None => return Ok(None),
+                }
+            }
             K::ArrayElement { index, array } => {
                 let i = self.int(frame, index)?;
                 let Some(base) = self.place(frame, array, target)? else {
@@ -7296,6 +7393,46 @@ impl<'s> Vm<'s> {
             });
             return Ok(None);
         }
+        // ULevel::SpawnActor 0x10388bb5..0x10388c0a runs FindSpot (vtable +0xc0, 0x1038a080) for
+        // a requested placement location when the class has `bCollideWorld` or
+        // `bCollideWhenPlacing` outside the client NetMode. The VM only re-places explicit runtime
+        // spawns: level-loaded actors never enter `SpawnActor`, and a location defaulted from the
+        // spawner is not adjusted.
+        let mut location = location;
+        if location.is_some()
+            && ["bCollideWorld", "bCollideWhenPlacing"].iter().any(|name| {
+                layout.slot_by_name(name).is_some_and(|slot| {
+                    matches!(layout.defaults.get(slot.base), Some(Value::Bool(true)))
+                })
+            })
+            && let Some(p) = self.physics.as_mut()
+        {
+            let f32_default = |name: &str| {
+                layout
+                    .slot_by_name(name)
+                    .and_then(|slot| layout.defaults.get(slot.base))
+                    .and_then(|v| match v {
+                        Value::Float(f) => Some(*f),
+                        _ => None,
+                    })
+                    .unwrap_or(0.0)
+            };
+            let radius = f32_default("CollisionRadius");
+            let height = f32_default("CollisionHeight");
+            let requested = location.expect("checked Some");
+            match p.find_spot(requested, [radius, radius, height]) {
+                Some(spot) => location = Some(spot),
+                None => {
+                    self.note(TraceKind::SpawnRefused {
+                        reason: format!(
+                            "{} has no free spot at {requested:?}",
+                            self.set.path(class)
+                        ),
+                    });
+                    return Ok(None);
+                }
+            }
+        }
         let class_name = self.object_name(class).to_owned();
         let name = self.unique_name(&class_name);
         let id = self.spawn(class, &name)?;
@@ -7524,12 +7661,20 @@ impl<'s> Vm<'s> {
             return;
         }
         let mut changes: Vec<(String, bool)> = Vec::new();
+        let mut poses = Vec::new();
         for (i, o) in self.objects.iter().enumerate() {
             if !o.is_actor || !o.layout.is_mover_class || o.name.starts_with("Default__") {
                 continue;
             }
             let id = i as ObjectId;
             let enabled = !o.deleted && self.bool_prop(id, "bCollideActors");
+            if !o.deleted {
+                poses.push((
+                    o.name.clone(),
+                    self.location_prop(id).unwrap_or([0.0; 3]),
+                    self.rotation_prop(id).unwrap_or([0; 3]),
+                ));
+            }
             if self.mover_collision_sent.get(&id) != Some(&enabled) {
                 self.mover_collision_sent.insert(id, enabled);
                 changes.push((o.name.clone(), enabled));
@@ -7538,6 +7683,12 @@ impl<'s> Vm<'s> {
         if let Some(p) = self.physics.as_mut() {
             for (name, enabled) in changes {
                 p.set_mover_collision(&name, enabled);
+            }
+            // Script SetLocation/SetRotation, direct property writes and falling can move
+            // movers without PHYS_MovingBrush interpolation. All registered world queries
+            // must see the same authoritative actor pose as per-actor primitive queries.
+            for (name, location, rotation) in poses {
+                p.set_mover(&name, location, rotation);
             }
         }
     }
@@ -7824,37 +7975,143 @@ impl<'s> Vm<'s> {
         self.brush_primitives.insert(id, primitive);
     }
 
+    fn prepare_touch_mesh(&mut self, id: ObjectId) -> VmResult<()> {
+        let asset = self
+            .get_property(id, "StaticMesh")
+            .and_then(|value| self.obj_path(value))
+            .ok_or_else(|| {
+                self.err(VmErrorKind::Unresolved {
+                    what: "Touch mesh identity".into(),
+                })
+            })?;
+        let name = self.objects[id as usize].name.clone();
+        let location = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
+        let rotation = self.rotator_prop(id, "Rotation").unwrap_or([0; 3]);
+        let draw_scale = self.f32_prop(id, "DrawScale");
+        let scale = self
+            .vector_prop(id, "DrawScale3D")
+            .unwrap_or([1.0; 3])
+            .map(|v| v * draw_scale);
+        let pivot = self.vector_prop(id, "PrePivot").unwrap_or([0.0; 3]);
+        match self.physics.as_mut() {
+            Some(physics) => physics
+                .prepare_actor_mesh(&name, &asset, location, rotation, scale, pivot)
+                .map_err(|what| self.err(VmErrorKind::Unresolved { what })),
+            None => Err(self.err(VmErrorKind::NoPhysicsProvider {
+                native: "Touch primitive".into(),
+            })),
+        }
+    }
+
+    pub(crate) fn touch_encroach_box(&mut self, id: ObjectId) -> VmResult<([f32; 3], [f32; 3])> {
+        if self.uses_static_mesh_primitive(id) && !self.bool_prop(id, "bUseCylinderCollision") {
+            self.prepare_touch_mesh(id)?;
+            let name = self.objects[id as usize].name.clone();
+            return self
+                .physics
+                .as_ref()
+                .and_then(|physics| physics.actor_mesh_bounds(&name))
+                .ok_or_else(|| {
+                    self.err(VmErrorKind::Unresolved {
+                        what: format!("GetEncroachExtent requires mesh bounds for {name}"),
+                    })
+                });
+        }
+        let (center, radius, height) = self.actor_cylinder(id);
+        Ok((center, [radius, radius, height]))
+    }
+
+    fn is_encroacher(&self, id: ObjectId) -> bool {
+        self.collides(id)
+            && self.is_mover(id)
+            && matches!(
+                self.get_property(id, "StaticMesh"),
+                Some(Value::Object(Some(_)))
+            )
+    }
+
+    fn uses_static_mesh_primitive(&self, id: ObjectId) -> bool {
+        !matches!(self.get_property(id, "Mesh"), Some(Value::Object(Some(_))))
+            && matches!(
+                self.get_property(id, "StaticMesh"),
+                Some(Value::Object(Some(_)))
+            )
+            && !self.is_volume_brush(id)
+    }
+
     /// `AActor::IsOverlapping` as decoded from Engine.dll @0x10352bd0:
     ///
     /// 1. Two brush actors never overlap (top check @0x10352bdc, `IsA(ABrush)` for both).
-    /// 2. If either actor is a volume brush (`IsVolumeBrush` @0x1030f0d0), the brush's
-    ///    `UModel::PointCheck` is asked whether the other actor's collision box is inside it
-    ///    (primitive path @0x10352cf3..0x10352d9c). The host registers that BSP; if it is absent
-    ///    the cylinder fallback is kept (reported by the host).
-    /// 3. Otherwise the vertical-cylinder test @0x10352d9e: `|dz| <= h1 + h2` and
-    ///    `sqrt(dx^2+dy^2) <= r1 + r2` (both inclusive).
-    pub(crate) fn actors_overlap(&self, a: ObjectId, b: ObjectId) -> bool {
+    /// 2. Volume A/B, then encroacher A/B select one target PointCheck. The other
+    ///    primitive supplies its encroachment box; missing required geometry fails explicitly.
+    /// 3. Ordinary pawn/projectile pairs retain the vertical-cylinder overlap shape.
+    pub(crate) fn actors_overlap(&mut self, a: ObjectId, b: ObjectId) -> VmResult<bool> {
         if a == b {
-            return false;
+            return Ok(false);
         }
         if self.is_brush_actor(a) && self.is_brush_actor(b) {
-            return false;
+            return Ok(false);
+        }
+        if self.is_encroacher(a) && self.is_encroacher(b) {
+            return Ok(false);
         }
         for (brush, other) in [(a, b), (b, a)] {
-            if self.is_volume_brush(brush)
-                && let Some(primitive) = self.brush_primitives.get(&brush)
-            {
-                let (center, radius, half_height) = self.actor_cylinder(other);
-                return primitive.overlaps_cylinder(center, radius, half_height);
+            if self.is_volume_brush(brush) {
+                let (center, extent) = self.touch_encroach_box(other)?;
+                if let Some(primitive) = self.brush_primitives.get(&brush) {
+                    return Ok(primitive.overlaps_box(center, extent));
+                }
+                let name = &self.objects[brush as usize].name;
+                if let Some(overlap) = self
+                    .physics
+                    .as_ref()
+                    .and_then(|physics| physics.actor_brush_overlap(name, center, extent))
+                {
+                    return Ok(overlap);
+                }
+                return Err(self.err(VmErrorKind::Unresolved {
+                    what: format!(
+                        "IsOverlapping requires brush PointCheck data for {}",
+                        self.objects[brush as usize].name
+                    ),
+                }));
+            }
+        }
+        // IsEncroacher 0x1030f100: colliding AMover with a non-null StaticMesh.
+        // IsOverlapping chooses A first, then B, and calls exactly one PointCheck.
+        for (mesh, other) in [(a, b), (b, a)] {
+            if self.is_encroacher(mesh) {
+                let (center, extent) = self.touch_encroach_box(other)?;
+                if !self.uses_static_mesh_primitive(mesh)
+                    || self.bool_prop(mesh, "bUseCylinderCollision")
+                {
+                    let (target, radius, height) = self.actor_cylinder(mesh);
+                    let delta = sub3(center, target);
+                    return Ok(delta[2].abs() <= extent[2] + height
+                        && delta[0] * delta[0] + delta[1] * delta[1]
+                            <= (extent[0] + radius).powi(2));
+                }
+                self.prepare_touch_mesh(mesh)?;
+                let name = self.objects[mesh as usize].name.clone();
+                if let Some(overlap) = self
+                    .physics
+                    .as_mut()
+                    .and_then(|physics| physics.actor_mesh_overlap(&name, center, extent))
+                {
+                    return Ok(overlap);
+                }
+                return Err(self.err(VmErrorKind::Unresolved {
+                    what: format!("IsOverlapping requires mesh PointCheck data for {name}"),
+                }));
             }
         }
         let (la, ra, ha) = self.actor_cylinder(a);
         let (lb, rb, hb) = self.actor_cylinder(b);
         if (la[2] - lb[2]).abs() > ha + hb {
-            return false;
+            return Ok(false);
         }
         let (dx, dy) = (la[0] - lb[0], la[1] - lb[1]);
-        dx * dx + dy * dy <= (ra + rb) * (ra + rb)
+        Ok(dx * dx + dy * dy <= (ra + rb) * (ra + rb))
     }
 
     /// Whether `other` blocks the movement of `mover` (UE1/UE2 pairwise blocking rule).
@@ -7884,14 +8141,13 @@ impl<'s> Vm<'s> {
         self.bool_prop(mover, a) && self.bool_prop(other, b)
     }
 
-    /// Earliest fraction of `start -> end` at which the mover's cylinder first touches a
-    /// blocking actor's cylinder (inclusive contact), if any.
+    /// Earliest target-primitive LineCheck that blocks the actor's extent box.
     fn sweep_blocking_actor(
-        &self,
+        &mut self,
         mover: ObjectId,
         start: [f32; 3],
         end: [f32; 3],
-    ) -> Option<(f32, ObjectId)> {
+    ) -> VmResult<Option<(f32, ObjectId)>> {
         let (_, rm, hm) = self.actor_cylinder(mover);
         let d = sub3(end, start);
         let mut best: Option<(f32, ObjectId)> = None;
@@ -7899,14 +8155,37 @@ impl<'s> Vm<'s> {
             if b == mover || !self.is_live_actor(b) || !self.blocks_pair(mover, b) {
                 continue;
             }
-            let (lb, rb, hb) = self.actor_cylinder(b);
-            if let Some(t) = segment_cylinder_contact(start, d, lb, rm + rb, hm + hb)
+            let time = if self.uses_static_mesh_primitive(b)
+                && !self.bool_prop(b, "bUseCylinderCollision")
+            {
+                self.prepare_touch_mesh(b)?;
+                let name = self.objects[b as usize].name.clone();
+                match self
+                    .physics
+                    .as_mut()
+                    .map(|physics| physics.actor_mesh_sweep(&name, start, end, [rm, rm, hm]))
+                {
+                    Some(crate::physics::ActorMeshHit::Hit(hit)) => Some(hit.time),
+                    Some(crate::physics::ActorMeshHit::Miss) => None,
+                    _ => {
+                        return Err(self.err(VmErrorKind::Unresolved {
+                            what: format!(
+                                "MoveActor requires blocking mesh LineCheck data for {name}"
+                            ),
+                        }));
+                    }
+                }
+            } else {
+                let (lb, rb, hb) = self.actor_cylinder(b);
+                segment_cylinder_contact(start, d, lb, rm + rb, hm + hb)
+            };
+            if let Some(t) = time
                 && best.is_none_or(|(bt, _)| t < bt)
             {
                 best = Some((t, b));
             }
         }
-        best
+        Ok(best)
     }
 
     /// Actors in `id`'s `Touching` array (live ones only).
@@ -8025,6 +8304,89 @@ impl<'s> Vm<'s> {
         self.refresh_touching(id, false)
     }
 
+    /// MoveActor's non-blocking hit list is produced by target-primitive LineCheck,
+    /// not an endpoint cylinder retry. Deliver contacts in travel order, including a
+    /// primitive crossed completely during this move; refresh_touching retires them.
+    pub(crate) fn sweep_touching(
+        &mut self,
+        id: ObjectId,
+        start: [f32; 3],
+        end: [f32; 3],
+    ) -> VmResult<()> {
+        if !self.collides(id) || start == end {
+            return Ok(());
+        }
+        let extent = self.actor_extent(id);
+        let nonzero = extent != [0.0; 3];
+        let instigator = self
+            .is_a(id, "Projectile")
+            .then(|| self.obj_prop(id, "Instigator"))
+            .flatten();
+        let mut contacts = Vec::new();
+        for other in 0..self.objects.len() as ObjectId {
+            if other == id
+                || !self.is_live_actor(other)
+                || !self.collides(other)
+                || instigator == Some(other)
+                || self.based_on(id, other)
+                || self.based_on(other, id)
+                || self.blocks_pair(id, other)
+                || self.is_volume_brush(other)
+            {
+                continue;
+            }
+            let time = if self.uses_static_mesh_primitive(other)
+                && !self.bool_prop(other, "bUseCylinderCollision")
+            {
+                let gate = if nonzero {
+                    "bBlockNonZeroExtentTraces"
+                } else {
+                    "bBlockZeroExtentTraces"
+                };
+                if !self.bool_prop(other, gate) {
+                    continue;
+                }
+                let name = self.objects[other as usize].name.clone();
+                self.prepare_touch_mesh(other)?;
+                match self
+                    .physics
+                    .as_mut()
+                    .map(|p| p.actor_mesh_sweep(&name, start, end, extent))
+                {
+                    Some(crate::physics::ActorMeshHit::Hit(hit)) => Some(hit.time),
+                    Some(crate::physics::ActorMeshHit::Miss) => None,
+                    _ => {
+                        return Err(self.err(VmErrorKind::Unresolved {
+                            what: format!("MoveActor requires mesh LineCheck data for {name}"),
+                        }));
+                    }
+                }
+            } else {
+                let (center, radius, height) = self.actor_cylinder(other);
+                segment_cylinder_contact(
+                    start,
+                    sub3(end, start),
+                    center,
+                    extent[0] + radius,
+                    extent[2] + height,
+                )
+            };
+            if let Some(time) = time {
+                contacts.push((time, other));
+            }
+        }
+        contacts.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (_, other) in contacts {
+            if !self.is_live_actor(id) {
+                break;
+            }
+            if self.is_live_actor(other) && !self.touching_list(id).contains(&other) {
+                self.begin_touch(id, other)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Recomputes the touching relations of `id` after it moved or its collision changed:
     /// begins overlap with actors it now touches, ends overlap it no longer has. `skip_blocking`
     /// mirrors upstream `TryMove` (an actor cannot touch what blocks it); `SetLocation` does
@@ -8056,7 +8418,7 @@ impl<'s> Vm<'s> {
             }
             let touches = collide
                 && self.collides(b)
-                && self.actors_overlap(id, b)
+                && self.actors_overlap(id, b)?
                 && !self.based_on(id, b)
                 && !self.based_on(b, id)
                 && !(skip_blocking && self.blocks_pair(id, b));
@@ -8107,13 +8469,14 @@ impl<'s> Vm<'s> {
         }
         let mut blocked_actor = None;
         if self.bool_prop(id, "bCollideActors")
-            && let Some((t, other)) = self.sweep_blocking_actor(id, start, end)
+            && let Some((t, other)) = self.sweep_blocking_actor(id, start, end)?
         {
             end = lerp3(start, end, t);
             fraction *= t;
             blocked_actor = Some(other);
         }
         self.set_property(id, "Location", 0, Value::Vector(end));
+        self.sweep_touching(id, start, end)?;
         // MoveActor 0x1038b15c..0x1038b17a: blocker first, then moving actor.
         if let Some(other) = blocked_actor
             && !self.bool_prop(other, "bWorldGeometry")
@@ -8476,17 +8839,22 @@ impl<'s> Vm<'s> {
         let extent = self.actor_extent(id);
         let check_world =
             self.bool_prop(id, "bCollideWorld") || self.bool_prop(id, "bCollideWhenPlacing");
+        // FarMoveActor 0x1038a50e..0x1038a547 calls `FindSpot` (vtable +0xc0, 0x1038a080) to
+        // adjust the destination into a free spot rather than refusing an overlapping one; a
+        // refused spot (fully enclosed) aborts the move.
+        let mut location = location;
         if check_world {
-            let free = match self.physics.as_mut() {
-                Some(p) => p.point_free(location, extent),
+            let adjusted = match self.physics.as_mut() {
+                Some(p) => p.find_spot(location, extent),
                 None => {
                     return Err(self.err(VmErrorKind::NoPhysicsProvider {
                         native: "Actor.SetLocation".into(),
                     }));
                 }
             };
-            if !free {
-                return Ok(false);
+            match adjusted {
+                Some(spot) => location = spot,
+                None => return Ok(false),
             }
         }
         // A scripted `SetLocation` with world/placement collision disabled is the UE2 cutscene
@@ -9543,6 +9911,177 @@ impl<'s> Vm<'s> {
         let l = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
         let eye = self.f32_prop(id, "BaseEyeHeight");
         [l[0], l[1], l[2] + eye]
+    }
+
+    /// item87b: `UGameEngine::LoadMap` (Engine.dll 0x1037b210) restarts the level clock at 0.
+    /// Decoded writes: 0 to `ALevelInfo.TimeSeconds` (+0x314, 0x1037c8e6), 0 to the `ULevel`
+    /// double accumulator (+0xd0, 0x1037c889), and a loop over the level's actor array writing
+    /// 0 to every `AActor.LastRenderTime` (+0x28, `movl $0x0,0x28(%eax)` at 0x1037ca11). The VM
+    /// level clock already starts at zero, so this only has to clear the serialised editor
+    /// values the map still carries: the published `TimeSeconds` and every actor's
+    /// `LastRenderTime`, exactly as retail. Called once per level open by the host; the
+    /// `xiii-tool script` harness does not call it, so its traces keep the raw decoded values.
+    pub fn reset_render_times(&mut self) {
+        self.time = 0.0;
+        let Some(level) = self.level_info.or_else(|| self.find_level_info()) else {
+            return;
+        };
+        let _ = self.set_property(level, "TimeSeconds", 0, Value::Float(0.0));
+        for i in 0..self.objects.len() {
+            let id = i as ObjectId;
+            if !self.objects[i].is_actor {
+                continue;
+            }
+            if self.get_property(id, "LastRenderTime").is_some() {
+                let _ = self.set_property(id, "LastRenderTime", 0, Value::Float(0.0));
+            }
+        }
+    }
+
+    /// item87b: retail writes `AActor.LastRenderTime = Level.TimeSeconds` for every actor the
+    /// renderer draws (`FDynamicActor::Render`, Engine.dll 0x103ccd10, `movl 0x314(%ecx),%edx;
+    /// movl %edx,0x28(%eax)` at 0x103ccdc5) — every actor that passes
+    /// `FLevelSceneNode::FilterActorEngine` (0x10314da0, rejects bit 0x1000 = `bHidden` of
+    /// `actor+0x2c`) and whose render bounds intersect the camera view frustum (the box check
+    /// that guards the call in the level render loop, 0x103db412).
+    ///
+    /// The headless VM has no renderer, so it stands in with that same test over **every** live
+    /// actor (not one class): a drawable `DrawType` (`!= DT_None`, the `actor+0x3b` byte set by
+    /// `AActor::SetDrawType` 0x10352a92), `!bHidden`, inside the player camera's view frustum
+    /// (origin/rotation from the controller's `GetViewTarget`; horizontal half-angle from
+    /// `FOVAngle`, default 90). Actors the camera does not draw keep their previous value, so
+    /// `Level.TimeSeconds - LastRenderTime` grows and the cinematic `NotSeenByPlayer` waits fire
+    /// as in retail. Without a player controller (the `xiii-tool script` scope) it is a no-op.
+    /// Windowed play instead reports the actors it actually drew through [`Vm::mark_rendered`].
+    ///
+    /// item87c: this stand-in is frustum-only, matching the windowed renderer's Bevy
+    /// `ViewVisibility` (also a frustum test). An earlier `world_line` occlusion ray from the
+    /// camera was removed: it starts inside the player's own collision, so it blocked every
+    /// distant actor and the stand-in marked only the camera-local actors (measured 6 vs the
+    /// renderer's 186 on Toits01). BSP occlusion is not modelled by either half, so the two
+    /// agree on the frustum approximation; see the item87c windowed comparison.
+    pub fn update_render_times(&mut self, controller: Option<ObjectId>) {
+        let Some(controller) = controller else {
+            return;
+        };
+        if self
+            .objects
+            .get(controller as usize)
+            .is_none_or(|o| o.deleted)
+        {
+            return;
+        }
+        let now = Value::Float(self.time as f32);
+        for id in self.render_time_candidates(controller) {
+            let _ = self.set_property(id, "LastRenderTime", 0, now.clone());
+        }
+    }
+
+    /// item87c: the read-only half of [`Vm::update_render_times`] — the actors the headless
+    /// stand-in would mark rendered this frame (drawable, `!bHidden`, inside the player-camera
+    /// frustum). Used to compare the stand-in against the windowed renderer's actually-drawn set
+    /// for the same frames.
+    pub fn render_time_candidates(&self, controller: ObjectId) -> Vec<ObjectId> {
+        if self
+            .objects
+            .get(controller as usize)
+            .is_none_or(|o| o.deleted)
+        {
+            return Vec::new();
+        }
+        let Some(camera) = self.camera_view(controller) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for i in 0..self.objects.len() {
+            let id = i as ObjectId;
+            if !self.objects[i].is_actor || self.objects[i].deleted {
+                continue;
+            }
+            if self.bool_prop(id, "bHidden") {
+                continue;
+            }
+            if matches!(self.get_property(id, "DrawType"), Some(Value::Byte(0))) {
+                continue;
+            }
+            let Some(point) = self.render_point(id) else {
+                continue;
+            };
+            if !camera.contains(point, self.f32_prop(id, "CollisionRadius")) {
+                continue;
+            }
+            out.push(id);
+        }
+        out
+    }
+
+    /// item87b: windowed play calls this with the actor ids the Bevy renderer actually drew
+    /// this frame (its entity `ViewVisibility`); it writes `LastRenderTime = Level.TimeSeconds`
+    /// for each, exactly as `FDynamicActor::Render` does in retail.
+    pub fn mark_rendered(&mut self, ids: &[ObjectId]) {
+        let now = Value::Float(self.time as f32);
+        for &id in ids {
+            if self
+                .objects
+                .get(id as usize)
+                .is_some_and(|o| o.is_actor && !o.deleted)
+                && self.get_property(id, "LastRenderTime").is_some()
+            {
+                let _ = self.set_property(id, "LastRenderTime", 0, now.clone());
+            }
+        }
+    }
+
+    /// item87b: the camera view used by the headless [`Vm::update_render_times`] stand-in. The
+    /// origin is `Controller.GetViewTarget`'s eye point ([`Vm::los_view_location`]); the
+    /// direction is the view target's rotation (the PlayerController copies it into its own
+    /// each frame). `FOVAngle` (Engine.u default 90, horizontal) gives the horizontal
+    /// half-angle; the vertical half-angle assumes a 4:3 viewport (the headless VM has no
+    /// viewport aspect). Documented stand-in, not a decoded viewport.
+    fn camera_view(&self, controller: ObjectId) -> Option<CameraView> {
+        let origin = self.los_view_location(controller);
+        let view = if self.is_a(controller, "playercontroller") {
+            self.obj_prop(controller, "ViewTarget")
+        } else {
+            None
+        }
+        .or_else(|| self.obj_prop(controller, "Pawn"))
+        .unwrap_or(controller);
+        let rot = self
+            .rotation_prop(view)
+            .or_else(|| self.rotation_prop(controller))?;
+        let k = std::f32::consts::TAU / 65536.0;
+        let (sp, cp) = ((rot[0] as f32) * k).sin_cos();
+        let (sy, cy) = ((rot[1] as f32) * k).sin_cos();
+        let forward = normalize3([cp * cy, cp * sy, sp]);
+        let mut right = cross3(forward, [0.0, 0.0, 1.0]);
+        if dot3(right, right) < 1e-6 {
+            right = [1.0, 0.0, 0.0];
+        }
+        let right = normalize3(right);
+        let up = cross3(right, forward);
+        let fov = {
+            let f = self.f32_prop(controller, "FOVAngle");
+            if (1.0..179.0).contains(&f) { f } else { 90.0 }
+        };
+        let half_h = fov.to_radians() * 0.5;
+        let tan_h = half_h.tan();
+        Some(CameraView {
+            origin,
+            forward,
+            right,
+            up,
+            tan_h,
+            tan_v: tan_h * 0.75,
+        })
+    }
+
+    /// item87b: the point the headless stand-in tests against the frustum and the line of sight:
+    /// the actor's collision-cylinder centre (`Location.Z + 0.5*CollisionHeight`).
+    fn render_point(&self, id: ObjectId) -> Option<[f32; 3]> {
+        let mut p = self.vector_prop(id, "Location")?;
+        p[2] += 0.5 * self.f32_prop(id, "CollisionHeight");
+        Some(p)
     }
 
     /// Host-driven engine perception (`item14b`): for every live `IAController`, test whether its
@@ -10677,6 +11216,11 @@ impl<'s> Vm<'s> {
         if self.objects[id as usize].deleted {
             return Ok(());
         }
+        let end = self.vector_prop(id, "Location").unwrap_or(start);
+        self.sweep_touching(id, start, end)?;
+        if self.objects[id as usize].deleted {
+            return Ok(());
+        }
         // Exit tail: the tracked bounce gate is `bBounce` (+0x34 bit 0x800000); the second
         // clear-bit (0x8000000) is not tracked as a property and the VM actors that reach this
         // path (CineHook, XIIIProjectile rounds) have it clear.
@@ -10837,7 +11381,8 @@ impl<'s> Vm<'s> {
         Ok(horizontal_distance(end, destination) <= radius)
     }
 
-    /// `Actor.SetCollision`: omitted flags keep their current value; touching is recomputed.
+    /// `Actor.SetCollision`: omitted flags keep their current value. Retail0x103527d0
+    /// only refreshes collision-hash membership; Touch maintenance waits for a move.
     pub(crate) fn vm_set_collision(
         &mut self,
         id: ObjectId,
@@ -10854,11 +11399,10 @@ impl<'s> Vm<'s> {
         if let Some(v) = block_players {
             self.set_property(id, "bBlockPlayers", 0, Value::Bool(v));
         }
-        self.refresh_touching(id, false)?;
         Ok(())
     }
 
-    /// `Actor.SetCollisionSize`: update the cylinder, recompute touching. Returns true (the
+    /// `Actor.SetCollisionSize`: update the cylinder/hash, without emitting Touch. Returns true (the
     /// decoded XIII declaration carries no encroachment flag; see the registry evidence).
     pub(crate) fn vm_set_collision_size(
         &mut self,
@@ -10868,7 +11412,6 @@ impl<'s> Vm<'s> {
     ) -> VmResult<bool> {
         self.set_property(id, "CollisionRadius", 0, Value::Float(radius));
         self.set_property(id, "CollisionHeight", 0, Value::Float(height));
-        self.refresh_touching(id, false)?;
         Ok(true)
     }
 
@@ -11920,6 +12463,43 @@ fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 
 fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// item87b: the headless render stand-in's camera frustum ([`Vm::camera_view`]). Documented
+/// approximation of the engine's `FLevelSceneNode` view: origin and direction from the player
+/// controller's view target, `FOVAngle` horizontal half-angle and an assumed 4:3 viewport.
+struct CameraView {
+    origin: [f32; 3],
+    forward: [f32; 3],
+    right: [f32; 3],
+    up: [f32; 3],
+    tan_h: f32,
+    tan_v: f32,
+}
+
+impl CameraView {
+    /// True when a sphere at `point` (radius `r`) intersects the view frustum. The engine tests
+    /// the actor's render bounding box against the frustum; this is the documented sphere
+    /// approximation over the collision cylinder.
+    fn contains(&self, point: [f32; 3], r: f32) -> bool {
+        let d = sub3(point, self.origin);
+        let z = dot3(d, self.forward);
+        if z <= -r {
+            return false;
+        }
+        let x = dot3(d, self.right).abs();
+        let y = dot3(d, self.up).abs();
+        let z = z.max(0.0);
+        x <= self.tan_h * z + r && y <= self.tan_v * z + r
+    }
 }
 
 fn scale3(a: [f32; 3], scale: f32) -> [f32; 3] {

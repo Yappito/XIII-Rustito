@@ -147,6 +147,13 @@ t=173.20 fire
 t=173.60 fire
 t=174.00 fire
 t=174.40 track off
+# item87c re-time: with `LastRenderTime` zeroed at load as retail `UGameEngine::LoadMap` does,
+# the base doors auto-close (`XIIIPorte.PlayerTriggerToggle.Timer2`: `Level.TimeSeconds -
+# LastRenderTime > 1.0`), so the old never-closing-door walk timing no longer holds and the
+# BaseSoldier12 exchange killed the 34-hp player. The walk detours north through (-33,1094)
+# before the exchange; the same six soldiers still die and the same goals hold.
+t=175.00 goto -33 1094
+t=179.00 goto -614 -394
 t=182.00 goto -614 -394
 t=184.00 goto -860 -56
 t=186.00 goto -850 493
@@ -236,7 +243,12 @@ t=354.00 goto -3880 3100
 t=357.00 goto -3900 2960
 t=360.00 goto -4000 2800
 t=362.00 goto -4262 2247
-t=365.00 crouch 1
+# item87d re-time: the item94 route crouched for this LastWave burst. On the item87c
+# render-time tree the reinforcement `BaseSoldier` charges and, from the crouched muzzle, the
+# M60 rounds pass over it (measured: it stayed at 44 hp and shotgunned the route to death while
+# the other two reinforcements died). Standing clears the muzzle and the same nine-round burst
+# kills all three (measured: route passes, health 10). No target, weapon or assertion changed.
+t=365.00 crouch 0
 t=368.00 track BaseSoldier 0.90
 t=368.15 fire
 t=368.45 fire
@@ -324,5 +336,78 @@ t=505.00 goto 442 508
 t=510.00 goto 482 432
 t=515.00 goto 638 425
 t=520.00 goto 796 425
+# item95: `ULevel::FindSpot` now adjusts the post-lever cine's `tp 23` `SetLocation` into a free
+# spot, so Carrington reaches `PositionInfo23` (the platform), the cine passes `wait player 128`,
+# fires `Event Wave01 Wave02` (tabActions[63]) and parks at `wait event RushFinalCine`
+# (tabActions[71]). `GenNMI6`/`GenNMI7` spawn `BaseSoldier6`/`BaseSoldier7` at t=520.4. The route
+# tracks `BaseSoldier7` at t=520.5 (head band, 0.90) and fires from t=520.6 every 0.1 s, killing it
+# before its shotgun burst, so the player survives the wave at 10 hp. item95d: the collision
+# changes since item95 (item91's mesh/mover sweeps) clear the firing lane only at ~522.5 s; the
+# original 0.2 s cadence killed the soldier at 523.6, after it had fired twice, so the cadence is
+# doubled (input only). `BaseSoldier6` holds position in its controller's `Tenir` state at
+# (-18,-710,102) and never engages, so its `RushFinal` event never fires; `CineTrigger1`
+# (counter 2) never reaches zero and `wait event RushFinalCine` cannot pass. This is the pinned
+# next blocker: goal 5 and the Hual04c travel stay unreached.
+t=520.50 track BaseSoldier7 0.90
+t=520.60 fire
+t=520.70 fire
+t=520.80 fire
+t=520.90 fire
+t=521.00 fire
+t=521.10 fire
+t=521.20 fire
+t=521.30 fire
+t=521.40 fire
+t=521.50 fire
+t=521.60 fire
+t=521.70 fire
+t=521.80 fire
+t=521.90 fire
+t=522.00 fire
+t=522.10 fire
+t=522.20 fire
+t=522.30 fire
+t=522.40 fire
+t=522.50 fire
+t=522.60 fire
+t=522.70 fire
+t=522.80 fire
+t=522.90 fire
+t=523.00 fire
+t=523.10 fire
+t=523.20 fire
+t=523.30 fire
+t=523.40 fire
+t=523.50 fire
+t=523.60 fire
+t=523.70 fire
+t=523.80 fire
+t=523.90 fire
+t=524.00 fire
+t=524.10 fire
+t=524.20 fire
+t=524.30 fire
+t=524.40 track BaseSoldier6 0.90
+t=524.50 fire
+t=524.70 fire
+t=524.90 fire
 t=525.00 goto 941 396
+t=525.10 fire
+t=525.30 fire
+t=525.50 fire
+t=525.70 fire
+t=525.90 fire
+t=526.10 fire
+t=526.30 fire
+t=526.50 fire
+t=526.70 fire
+t=526.90 fire
+t=527.10 fire
+t=527.30 fire
+t=527.50 fire
+t=527.70 fire
+t=527.90 fire
+t=528.10 fire
+t=528.30 fire
+t=528.50 track off
 t=545.00 wait_travel

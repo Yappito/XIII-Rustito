@@ -1,18 +1,20 @@
-# Hual04c input route (UU/seconds): cable-car ride, cabin ladder, grapple attempts.
+# Hual04c input route (UU/seconds): cable-car ride, ladder, grapple descent, ground escort.
 # No teleports, grants, goal writes or control overrides.
 # The game's HUD finishes its own slide-out and emits EndCartoonEffect; Telepherique0
 # rides to its first point, explodes and returns control at ~24.983 s.
 # Jump before crossing the open floor trap: walking off drops ~2000 UU (-114 HP).
-# item88b: face the ladder's south LookDir, enter the opening horizontally, then look
-# vertically up to climb. Retail PlayerClimbing uses view-space acceleration, not
-# an unconditional vertical forward axis. Peak z=302.4, then settle at the ladder
-# top (-1122.338,58.252,296.702). Navigation-preview TLcabine no longer collides.
-# Walk east onto the roof; the game's supplied Hook is selected by InventoryNext
-# and fired at HookPoint1. Spurious BreakAbleMover44 Touch (mesh TraceActors returns
-# zero hits) calls HitWall and releases it. Return to the ladder by input to survive
-# the same 120-second run, ending at (-1170.363,56.460,295.766),52HP.
-# An unarrested descent costs 114 HP and is fatal
-# under the live AI. This is a blocked route, not a completed helicopter mission.
+# item91b: current collider poses also affect the cinematic's carried player.
+# Enter the south-facing ladder and move east within it. The intact cabin ceiling
+# stops the initial climb; keep upward input until the authored cabin fall (~70s).
+# Select the game's Hook, lock HookPoint1, release fire, then use alt-fire to descend.
+# Release with use near the ground, avoiding the old 114HP uncontrolled fall.
+# Current wreck mesh replaces intact world collision; walk to Carrington, whose
+# TouchTrigger4 starts the escort. Follow his first waypoints by ordinary input.
+# Next encounter: action27 waits for move_move_02 (first combat-clear event).
+# Direct entry supplies Fists/Hook/LockPick, not the campaign rifle: selection14
+# leaves Fists. Longer melee/cover explorations failed or harmed Carrington;
+# this fixture pins the surviving escort/first-encounter prefix at125s.
+# This is not a completed helicopter mission or a claim that combat is impossible.
 # Goals 0/2/3 and kello01a travel remain unreached; completed goals 1/4/5/6 are
 # authored anti-goals, not accomplishments of this route.
 t=0.50 goto -3200 128
@@ -23,21 +25,26 @@ t=26.00 jump
 t=26.65 yaw -90
 t=26.65 pitch 0
 t=26.65 forward 1
-t=27.00 pitch 90
-t=28.50 forward 0
-t=28.50 next_item
-t=30.00 yaw 0
-t=30.00 pitch 0
-t=30.00 forward 1
-t=30.80 forward 0
-t=30.80 track HookPoint1
-t=31.30 fire_hold 1
-t=31.50 fire_hold 0
-t=31.60 track off
-t=31.60 yaw 180
-t=31.60 pitch 0
-t=31.60 forward 1
-t=32.45 yaw -90
-t=32.45 pitch 90
-t=33.00 forward 0
-t=119.90 wait_travel
+t=27.25 pitch 90
+t=28.00 yaw 0
+t=28.00 pitch 0
+t=28.15 yaw -90
+t=28.15 pitch 90
+t=69.00 next_item
+t=72.00 forward 0
+t=72.00 track HookPoint1
+t=72.50 fire_hold 1
+t=74.00 fire_hold 0
+t=75.00 track off
+t=75.00 yaw 0
+t=75.00 pitch 0
+t=100.00 goto -678 746
+t=100.00 altfire_hold 1
+t=113.00 altfire_hold 0
+t=113.00 use
+t=113.10 goto -678 746
+t=113.20 switch_weapon 14
+t=116.00 forward 0
+t=117.00 goto -1752 596
+t=120.00 forward 0
+t=124.90 wait_travel

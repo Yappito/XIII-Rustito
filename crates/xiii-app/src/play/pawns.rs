@@ -380,6 +380,14 @@ pub(crate) struct PawnInstance {
     pub current: Vec<(u8, String, f32)>,
 }
 
+impl PawnInstance {
+    /// item87b: the root render entity (queried for `ViewVisibility` to know what the renderer
+    /// actually drew this frame).
+    pub(crate) fn root_entity(&self) -> Entity {
+        self.root
+    }
+}
+
 /// Render state of the `--play` pawns.
 #[derive(Resource, Default)]
 pub(crate) struct PawnScene {

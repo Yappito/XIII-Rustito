@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use crate::events::{PresentationEvent, SoundEvent, TravelRequest, TravelSource};
 use crate::linker::GlobalRef;
 use crate::value::{ObjRef, ObjectId, Value};
-use crate::vm::{Latent, TraceKind, Vm, VmErrorKind, VmResult};
+use crate::vm::{FlashCueModelStage, Latent, TraceKind, Vm, VmErrorKind, VmResult};
 
 /// Context of one native invocation.
 #[derive(Debug, Clone)]
@@ -2781,7 +2781,34 @@ fn play_sound(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<Nativ
 
 fn play_music(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<NativeOutcome> {
     vm.emit_sound(true, c.this, a, &c.omitted);
+    // Partial compatibility model, not an HX bank interpreter. Retail observes changes to the
+    // global integer audio variable "Flash" (HXAudio.dll Init RVA 0x1c36e, callback 0x1f790),
+    // then Update dispatches its value 1..4 to the cached FlashManager (RVA 0x2589e..0x258e3).
+    // The bank program's variable writes and timing are not decoded. Until they are, infer a
+    // stage from an exact cue token and defer it by a VM tick; neither inference is retail timing.
+    if let Some(sound) = a.first().and_then(|v| vm.obj_path(v))
+        && let Some(stage) = flash_cue_model_stage(&sound)
+    {
+        vm.queue_flash_cue_model(stage);
+    }
     val(Value::Void)
+}
+
+/// Hypothesized cue-name -> stage mapping for the Partial flash compatibility model.
+/// Retail uses the global audio variable `Flash`, not this name classifier. Only complete
+/// tokens match: `Flash10`/`FlashSender` must not accidentally fire a campaign transition.
+fn flash_cue_model_stage(path: &str) -> Option<FlashCueModelStage> {
+    let leaf = path.rsplit(['.', ':']).next().unwrap_or(path);
+    // The bank prefix separates the package from the cue token with `__` (`Kello01b__Flash1`).
+    let cue = leaf.rsplit("__").next().unwrap_or(leaf);
+    let lower = cue.to_ascii_lowercase();
+    match lower.as_str() {
+        "flash1" => Some(FlashCueModelStage::BeginBegin),
+        "flash2" => Some(FlashCueModelStage::EndBegin),
+        "flash3" => Some(FlashCueModelStage::BeginEnd),
+        "flash4" | "flashsend" => Some(FlashCueModelStage::EndEnd),
+        _ => None,
+    }
 }
 
 /// `Actor.StopVoice()`: stop the actor's current voice/dialogue audio. The engine
@@ -4634,7 +4661,7 @@ fn builtin_defs() -> Vec<NativeDef> {
         ),
         NativeDef {
             status: NativeStatus::Partial(
-                "FindSpot/CheckSlice placement and post-BeginPlay encroachment callbacks remain incomplete; abstract-class flag remains unverified; static/no-delete template refusal and pending-kill return decoded",
+                "post-BeginPlay encroachment callbacks and the abstract-class flag remain incomplete; static/no-delete template refusal, pending-kill return and ULevel::FindSpot/CheckSlice placement for explicit runtime spawns decoded",
             ),
             ..def(
                 "Engine.Actor.Spawn",
@@ -4863,7 +4890,7 @@ fn builtin_defs() -> Vec<NativeDef> {
         },
         NativeDef {
             status: NativeStatus::Partial(
-                "static/movable refusal, teleport/base detach and recursive based-actor translation decoded; world placement still uses point_free instead of FindSpot/CheckSlice; encroachment geometry/callbacks, client placement exemption and zone/leaf updates remain incomplete",
+                "static/movable refusal, teleport/base detach, recursive based-actor translation and ULevel::FindSpot/CheckSlice world placement (0x1038a080/0x10389b80) decoded; actor-primitive vs raw-world branch of CheckSlice's down sweep and encroachment geometry/callbacks, client placement exemption and zone/leaf updates remain incomplete",
             ),
             ..def(
                 "Engine.Actor.SetLocation",
@@ -5105,12 +5132,14 @@ fn builtin_defs() -> Vec<NativeDef> {
         "engine.u Actor.PlaySound decoded (Sound + five optional ints, void); emits PresentationEvent::PlaySound",
         play_sound,
     ));
-    v.push(def(
-        "Engine.Actor.PlayMusic",
-        "native(358) final static function PlayMusic(object<Sound> Sound, optional int Param1, optional int Param2, optional int Param3, optional int Param4, optional int Param5)",
-        "engine.u Actor.PlayMusic decoded (Sound + five optional ints, void); emits PresentationEvent::PlayMusic",
-        play_music,
-    ));
+    v.push(NativeDef {
+        path: "Engine.Actor.PlayMusic",
+        signature: "native(358) final static function PlayMusic(object<Sound> Sound, optional int Param1, optional int Param2, optional int Param3, optional int Param4, optional int Param5)",
+        evidence: "engine.u Actor.PlayMusic declaration; HXAudio.dll SHA256 2b95b14fb346997cb13018b3d2ad8a0c5de03da4b2899fcfdf0fd919dd567745: Init RVA 0x1c36e registers global integer Flash callback 0x1f790; Update RVA 0x2589e..0x258e3 dispatches values 1..4 on cached FlashManager (LoadSounds RVA 0x1efcc). Cue-name mapping and next-VM-tick delay are hypotheses; bank program execution is undecoded.",
+        status: NativeStatus::Partial("flash cue model: infers global audio Flash changes from exact cue names; bank variable writes, playback timing and other music program behaviour are not implemented"),
+        short_circuit: None,
+        f: play_music,
+    });
     v.push(def(
         "Engine.Actor.ReplaceATextureByAnOther",
         "native(0) final static function ReplaceATextureByAnOther(object<Texture> SrcTexture, object<Texture> DestTexture)",
@@ -6070,6 +6099,61 @@ fn builtin_defs() -> Vec<NativeDef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Partial model must not manufacture transitions from a prefix collision.
+    #[test]
+    fn flash_cue_model_matches_complete_tokens_only() {
+        assert_eq!(
+            flash_cue_model_stage("XIIIsound.Music__Kello01b.Kello01b__Flash1"),
+            Some(FlashCueModelStage::BeginBegin)
+        );
+        assert_eq!(
+            flash_cue_model_stage("Music__Any.Any__Flash2"),
+            Some(FlashCueModelStage::EndBegin)
+        );
+        assert_eq!(
+            flash_cue_model_stage("Music__Any.Any__Flash3"),
+            Some(FlashCueModelStage::BeginEnd)
+        );
+        assert_eq!(
+            flash_cue_model_stage("Music__Any.Any__FlashsEnd"),
+            Some(FlashCueModelStage::EndEnd)
+        );
+        assert_eq!(
+            flash_cue_model_stage("pkg:FLASH4"),
+            Some(FlashCueModelStage::EndEnd)
+        );
+        for name in [
+            "",
+            "pkg.",
+            "pkg.Flash",
+            "pkg.Flash0",
+            "pkg.Flash5",
+            "pkg.Flash10",
+            "pkg.Flash2Extra",
+            "pkg.FlashSender",
+            "pkg.FlashsEndExtra",
+            "pkg.Flash1__",
+            "pkg.Flash1.Other",
+            "pkg.hFlashOn",
+            "pkg.hFlashOff",
+            "pkg.hFlashRequested",
+            "pkg.ahCallFlash",
+        ] {
+            assert_eq!(flash_cue_model_stage(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn play_music_registry_documents_partial_flash_model() {
+        let registry = Registry::builtin();
+        let music = registry.get("actor.playmusic").unwrap();
+        assert!(
+            matches!(music.status, NativeStatus::Partial(reason) if reason.contains("flash cue model"))
+        );
+        assert!(music.evidence.contains("global integer Flash"));
+        assert!(music.evidence.contains("hypotheses"));
+    }
 
     #[test]
     fn integer_shift_masks_counts_and_wraps_sign_bit() {

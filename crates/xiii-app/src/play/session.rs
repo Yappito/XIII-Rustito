@@ -134,6 +134,10 @@ pub struct Session {
     /// controller fields to the rest of the host (the weapon `fire` click owns `bFire` then).
     hook_buttons_published: bool,
     hook_axes_published: bool,
+    /// item87b: set by the windowed Bevy renderer. When true, `step` does not run the headless
+    /// `LastRenderTime` stand-in; the renderer reports the actors it drew each frame through
+    /// [`Session::report_rendered`], exactly as `FDynamicActor::Render` writes it in retail.
+    renderer_reports_rendered: bool,
 }
 
 /// Host-owned player movement fields published to the VM pawn each fixed tick (item7b).
@@ -225,6 +229,8 @@ pub enum FireOutcome {
     Fired,
     /// The player pawn has no `Weapon`: nothing to fire.
     NoWeapon,
+    /// The controller's death/end state rejects weapon input.
+    Suppressed,
     /// The script raised on the fire path (the error carries the VM stack).
     Error(String),
 }
@@ -288,6 +294,13 @@ impl Session {
         let actors = vm
             .load_level(map_idx, &Limits::default())
             .map_err(|e| e.to_string())?;
+        // item87b: retail `UGameEngine::LoadMap` (Engine.dll 0x1037b210) restarts the level
+        // clock at 0: it writes 0 to `LevelInfo.TimeSeconds` (+0x314) and loops over the level's
+        // actors writing 0 to every `AActor.LastRenderTime` (+0x28). The VM clock already starts
+        // at 0; clear the serialised editor `LastRenderTime`s the map still carries so the
+        // cinematic `Level.TimeSeconds - Pawn.LastRenderTime` ages match retail (see
+        // `Vm::reset_render_times`).
+        vm.reset_render_times();
         for &id in &actors {
             vm.set_active(id, true);
         }
@@ -500,6 +513,7 @@ impl Session {
             hook_move_yaw: 0.0,
             hook_buttons_published: false,
             hook_axes_published: false,
+            renderer_reports_rendered: false,
         };
         session.localized_overrides = session.vm.localized_overrides;
         session.suspended.dedup();
@@ -587,8 +601,9 @@ impl Session {
         // (`dispatch_hook_player_moves`' PlayerMove window). Publishing them on every tick
         // overwrote the weapon `fire` path's `bFire` and wrote the driver's yaw over the
         // pawn pose a cinematic (`NoControl`) owns, on every map.
-        let hook_buttons = self.hook_owns_buttons();
-        let hook_axes = self.hook_owns_pawn();
+        let input_ended = self.player_input_ended();
+        let hook_buttons = !input_ended && self.hook_owns_buttons();
+        let hook_axes = !input_ended && self.hook_owns_pawn();
         if let Some(pc) = self.controller {
             if hook_buttons || self.hook_buttons_published {
                 let (fire, altfire) = if hook_buttons {
@@ -748,6 +763,13 @@ impl Session {
         // HitDamageType, TakeHitLocation) at 0x103b5e2a while bTearOff is set and bPlayedDeath is
         // not. The death clip choice stays in XIIIPawn.PlayDying / PlayDyingAnim.
         self.finish_tearoff_deaths();
+        // item87b: the renderer writes `AActor.LastRenderTime = Level.TimeSeconds` for every
+        // actor it draws (`FDynamicActor::Render`); with no renderer the VM stands in over all
+        // actors (frustum + line of sight). Windowed play sets `renderer_reports_rendered` and
+        // reports its drawn actors through `report_rendered` instead.
+        if !self.renderer_reports_rendered {
+            self.vm.update_render_times(self.controller);
+        }
         // item14b: drive the engine's own AI perception. The host performs the sight test (range /
         // facing / line of sight) and dispatches `SeePlayer`/`EnemyNotVisible`; the soldier's own
         // `IAController` states react (acquire, turn, fire). Run after the VM tick so the
@@ -1022,11 +1044,25 @@ impl Session {
     /// rope only tracks `HookLength` there (`ProcessMove` 0x01BB..0x0237) and the retail player
     /// stays in control.
     fn script_owns_player_pawn(&self) -> bool {
-        self.controller.is_some_and(|pc| {
-            self.vm.is_in_state(pc, "NoControl")
-                || self.vm.is_in_state(pc, "ClimbToHookNavPoint")
-                || (self.controller_flag(pc, "bHooked") && self.player_physics() == Some(2))
-        })
+        // Retail Controller.Dead/GameEnded.PlayerMove supplies zero acceleration;
+        // XIII's GameEnded.BeginState sets PHYS_None on every pawn. A corpse is
+        // no longer a host-controlled walker: preserve that physics and pose instead
+        // of publishing another input-derived PHYS_Walking/Location over it.
+        self.player_input_ended()
+            || self.controller.is_some_and(|pc| {
+                self.vm.is_in_state(pc, "NoControl")
+                    || self.vm.is_in_state(pc, "ClimbToHookNavPoint")
+                    || (self.controller_flag(pc, "bHooked") && self.player_physics() == Some(2))
+            })
+    }
+
+    /// Native death/end input boundary, including the health write before the
+    /// standalone Dying callback has notified the controller.
+    pub fn player_input_ended(&self) -> bool {
+        let ended_state = self.controller.is_some_and(|pc| {
+            self.vm.is_in_state(pc, "Dead") || self.vm.is_in_state(pc, "GameEnded")
+        });
+        dead_pawn_is_native_owned(self.player_health(), ended_state)
     }
 
     /// Boolean property of an object through the generic property read (the VM's typed
@@ -1082,6 +1118,28 @@ impl Session {
     /// presentation call.
     pub fn vm_mut(&mut self) -> &mut Vm<'static> {
         &mut self.vm
+    }
+
+    /// item87b: switch the renderer to authoritative mode. Called once by the windowed Bevy
+    /// setup; after this `step` does not run the headless `LastRenderTime` stand-in and the
+    /// per-frame renderer instead reports the actors it actually drew (see
+    /// [`Session::report_rendered`]).
+    pub fn use_renderer_render_times(&mut self) {
+        self.renderer_reports_rendered = true;
+    }
+
+    /// item87b: true once the windowed renderer owns the `LastRenderTime` updates.
+    pub fn renderer_reports_rendered(&self) -> bool {
+        self.renderer_reports_rendered
+    }
+
+    /// item87b: report the actors the Bevy renderer drew this frame. Writes
+    /// `LastRenderTime = Level.TimeSeconds` for each, as `FDynamicActor::Render` does in retail.
+    /// Only meaningful after [`Session::use_renderer_render_times`].
+    pub fn report_rendered(&mut self, ids: &[ObjectId]) {
+        if self.renderer_reports_rendered {
+            self.vm.mark_rendered(ids);
+        }
     }
 
     /// Live actors still in the executed scope.
@@ -2416,6 +2474,9 @@ impl Session {
     /// a held trigger that emptied the M60 (item76, measured on the Plage01 route). The
     /// windowed live path writes `bFire` from the button state every frame instead.
     pub fn fire(&mut self, yaw: f32, pitch: f32) -> FireOutcome {
+        if self.player_input_ended() {
+            return FireOutcome::Suppressed;
+        }
         let held = self
             .controller
             .and_then(|ctrl| self.vm.get_property(ctrl, "bFire").cloned());
@@ -3329,8 +3390,27 @@ fn instance_prop(vm: &Vm, id: ObjectId, name: &str) -> Option<ObjectId> {
     }
 }
 
+/// Health is written before the standalone tear-off/PlayDying callback. The
+/// host must relinquish motion at exactly zero HP, before controller notification.
+fn dead_pawn_is_native_owned(health: Option<f32>, ended_state: bool) -> bool {
+    ended_state || health.is_some_and(|health| health <= 0.0)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dead_player_authority_covers_zero_hp_before_dying_callback() {
+        assert!(super::dead_pawn_is_native_owned(Some(0.0), false));
+        assert!(super::dead_pawn_is_native_owned(Some(-34.0), false));
+        assert!(!super::dead_pawn_is_native_owned(Some(1.0), false));
+        assert!(!super::dead_pawn_is_native_owned(None, false));
+        // GameEnded also freezes a surviving pawn (mission success/failure),
+        // and a controller without a current pawn cannot drive the previous body.
+        assert!(super::dead_pawn_is_native_owned(Some(150.0), true));
+        assert!(super::dead_pawn_is_native_owned(None, true));
+        // Recovery must release the guard rather than retain a sticky dead bit.
+        assert!(!super::dead_pawn_is_native_owned(Some(38.0), false));
+    }
     #[test]
     fn cartoon_movement_release_preserves_slide_out_callbacks() {
         // Generated lifecycle: initial HUD render, movement releases the mission, panels

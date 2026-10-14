@@ -182,23 +182,40 @@ pub fn active_view(session: &Session) -> Option<ViewPose> {
 /// `NoControl` (`FPC`/`FreezePlayer`) or `NoMove` (`FPL`/`FreezePlayerLocation`); `CameraView` and
 /// `PlayingVideo` likewise ignore movement input.
 pub fn input_suppressed(session: &Session) -> bool {
+    if session.player_input_ended() {
+        return true;
+    }
     let Some(pc) = session.controller else {
         return false;
     };
     let vm = session.vm();
-    ["NoControl", "NoMove", "CameraView", "PlayingVideo"]
-        .iter()
-        .any(|s| vm.is_in_state(pc, s))
+    [
+        "NoControl",
+        "NoMove",
+        "CameraView",
+        "PlayingVideo",
+        "Dead",
+        "GameEnded",
+    ]
+    .iter()
+    .any(|s| vm.is_in_state(pc, s))
 }
 
 /// The suppression state name, for logging.
 fn suppress_state(session: &Session) -> Option<String> {
     let pc = session.controller?;
     let vm = session.vm();
-    ["NoControl", "NoMove", "CameraView", "PlayingVideo"]
-        .into_iter()
-        .find(|s| vm.is_in_state(pc, s))
-        .map(str::to_owned)
+    [
+        "NoControl",
+        "NoMove",
+        "CameraView",
+        "PlayingVideo",
+        "Dead",
+        "GameEnded",
+    ]
+    .into_iter()
+    .find(|s| vm.is_in_state(pc, s))
+    .map(str::to_owned)
 }
 
 /// Bevy `(translation, rotation)` of an Unreal camera pose. Uses the same axis policy as the

@@ -71,6 +71,10 @@ result — so the scale constant and axis mapping are never duplicated.
 - `move_box(start, delta, extent)`: UE2 `MoveActor`-like move that stops at the first blocking
   hit; no sliding (sliding is script/physics logic above it).
 - `point_free(location, extent)`: placement overlap test.
+- `point_check(location, extent)`: the same check with the deepest blocking contact's Unreal-space
+  normal and penetration (upstream `ULevel::SinglePointCheck`, `Engine.dll` vtable `+0xcc`); the
+  provided `find_spot`/`check_slice` placement algorithms (upstream `ULevel::FindSpot` `0x1038a080`
+  / `ULevel::CheckSlice` `0x10389b80`) consume it (item95).
 
 `WorldPhysicsAdapter::from_scene(&WorldScene)` builds it from an imported map;
 `from_entries` takes raw `(triangle, source id)` pairs. The adapter is deliberately **not**
