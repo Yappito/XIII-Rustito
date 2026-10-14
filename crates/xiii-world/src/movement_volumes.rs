@@ -475,6 +475,63 @@ mod tests {
         assert!((v.volume_uu3() - 1.0).abs() < 1e-6);
     }
 
+    /// The head-volume rule of retail `APawn::SetZone` (`Engine.dll` 0x1038CA50): the value
+    /// published to `Pawn.HeadVolume` is the **innermost** `PhysicsVolume` encompassing
+    /// `Location + CollisionHeight`. `physics_at` selects it by AABB volume, so a small volume
+    /// nested inside a large water volume wins, and a head point outside every volume is `None`.
+    #[test]
+    fn head_volume_is_the_innermost_volume_at_the_head_point() {
+        let mk = |name: &str, kind, mn: [f32; 3], mx: [f32; 3]| MovementVolume {
+            name: name.into(),
+            class: "Test.Volume".into(),
+            kind,
+            gravity: [0.0, 0.0, -950.0],
+            zone_velocity: [0.0; 3],
+            fluid_friction: 0.0,
+            buoyancy: 0.0,
+            terminal_velocity: 0.0,
+            ground_friction: 0.0,
+            climb_dir: [0.0, 0.0, 1.0],
+            look_dir: [1.0, 0.0, 0.0],
+            no_physical_ladder: false,
+            min_uu: mn,
+            max_uu: mx,
+            bounds_are_point: false,
+        };
+        let v = MovementVolumes {
+            volumes: vec![
+                mk(
+                    "BigWater",
+                    VolumeKind::Water,
+                    [0.0, 0.0, 0.0],
+                    [1000.0, 1000.0, 500.0],
+                ),
+                mk(
+                    "SmallInner",
+                    VolumeKind::Physics,
+                    [100.0, 100.0, 100.0],
+                    [200.0, 200.0, 200.0],
+                ),
+            ],
+            diagnostics: Vec::new(),
+            map: "Test".into(),
+        };
+        assert_eq!(
+            v.physics_at([150.0, 150.0, 150.0]).map(|x| x.name.as_str()),
+            Some("SmallInner"),
+            "a nested physics volume is the innermost at the head"
+        );
+        assert_eq!(
+            v.physics_at([150.0, 150.0, 400.0]).map(|x| x.name.as_str()),
+            Some("BigWater"),
+            "outside the inner volume the outer water volume is the head volume"
+        );
+        assert!(
+            v.physics_at([-1.0, 0.0, 0.0]).is_none(),
+            "a head point outside every volume has no head volume"
+        );
+    }
+
     /// Opt-in: Banque01 places one `WaterVolume`, two `LadderVolume`s and one `PhysicsVolume`.
     /// The brush AABB must be non-degenerate and contain the actor origin (a brush is built around
     /// its Location), and the water/ladder point query must find the volume at its own centre.
