@@ -8040,4 +8040,162 @@ mod tests {
             "[hual04a next blocker] item94: goal 5 is `Rejoin Carrington in front of the cable-car cabin`. The player now walks the full station route down to the boarding platform at `PositionInfo23` (945.8,393.8,-105) below the station floor. The blocker is the post-lever cine: `on event TeleOn label00` jumps Carrington's `CineController2` sequence to `tabActions[52]`; action[54] `tp 23` calls `CineController2.TeleportTo(PositionInfo23)` -> `Actor.SetLocation`, but the VM's world-placement check (`point_free`, an approximation of `ULevel::FindSpot` 0x1038a080, called from `ULevel::FarMoveActor` 0x1038a440) refuses it because the cine pawn's extent overlaps one BSP triangle of `Model639` at the destination. Carrington therefore stays near `PositionInfo18`, the cine is parked at `wait player 128` (tabActions[61]), and `event LaFinDeLaMap` (tabActions[95]) is never fired, so goal 5 and the Hual04c travel stay unreached (travel=[]). The item92/item81 `PC.Pawn.SetBase` carry hypothesis is refuted: `Telepherique.STA_init.Trigger` sets `PC` only when `Level.Title == \"Hual04c\"`."
         );
     }
+
+    /// Kello01a (the map after Hual04c): start fresh at PlayerStart0 with the map-entry
+    /// loadout and drive the level by input along the authored valley loop. item98 walked
+    /// south-west straight from the start into the start bowl's rim bank (~50 degrees, steeper
+    /// than the walker's `MINFLOORZ=0.7`) and pinned that. item98c planned the path from the
+    /// map's own data (nav graph, the 16 `PF_Portal` gaps, the BSP zone-connectivity chain
+    /// 11->8->7->9->10->12->13->3->2->5->6) south around the valley and across lake Keelownee;
+    /// its route drowned there. item98d shows why: the two lake `Gameplay.WaterVolume`s
+    /// (`WaterVolume0`/`WaterVolume1`) are `bPainCausing=true, DamagePerSec=60,
+    /// DamageType=DTDrowned`, so retail water is lethal on touch (`PhysicsVolume.Touch` ->
+    /// `CausePainTo`), and the ice floes that lie on the lake do not span the crossing. The
+    /// route therefore stops at the last dry waypoint on the lake's east shore, alive, before
+    /// the water; the objective `Find the chalet` and the Kello01b travel stay unreached. See
+    /// the item98d report section for the measured evidence.
+    #[test]
+    fn opt_in_kello01a_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Kello01a".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Kello01a");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let text = include_str!("../../tests/data/kello01a_route.script");
+        // The route is input-only: forbid the host bridges and a `weapon <Class>` grant. A
+        // `select_weapon`/`switch_weapon` number-key selection is ordinary input (the carried
+        // magnum/shotgun from the map-entry loadout), so match the command word, not a substring.
+        assert!(!text.lines().any(|line| {
+            let command = line.split('#').next().unwrap_or("").trim();
+            let word = command.split_whitespace().nth(1);
+            ["teleport", "weapon", "item", "set_goal", "take_control"]
+                .iter()
+                .any(|forbidden| word == Some(*forbidden))
+        }));
+        let script = script::Script::parse(text).expect("parse Kello01a route");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Kello01a",
+            &script,
+            &resolved.params,
+            &scene,
+            110.0,
+        )
+        .expect("run Kello01a route");
+        let session = &outcome.session;
+        let vm = session.vm();
+        println!(
+            "[kello01a route] error={:?} objectives={:?} travel={:?} position={:?} health={:?}",
+            session.first_error(),
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health()
+        );
+        survey::print_details(&survey::extract("Kello01a", &outcome));
+        println!(
+            "[kello01a loadout] weapon={:?} inventory={:?}",
+            session
+                .player_weapon()
+                .map(|w| vm.objects[w as usize].name.clone()),
+            session
+                .inventory_items()
+                .iter()
+                .map(|(n, c)| format!("{n}[{c}]"))
+                .collect::<Vec<_>>()
+        );
+        let player_name = session.player_name.clone();
+        let mut dmg_by: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        let mut dmg_detail: Vec<String> = Vec::new();
+        for e in &vm.trace {
+            if let xiii_script::TraceKind::Event {
+                target,
+                function,
+                args,
+            } = &e.kind
+                && function.ends_with("TakeDamage")
+                && target.eq_ignore_ascii_case(&player_name)
+            {
+                *dmg_by
+                    .entry(args.get(1).cloned().unwrap_or_default())
+                    .or_default() += 1;
+                dmg_detail.push(format!(
+                    "{}dmg/{}/{}",
+                    args.first().cloned().unwrap_or_default(),
+                    args.get(1).cloned().unwrap_or_default(),
+                    args.get(4).cloned().unwrap_or_default()
+                ));
+            }
+        }
+        println!("[kello01a damage] by instigator: {dmg_by:?}");
+        println!("[kello01a damage] detail: {dmg_detail:?}");
+        assert!(
+            session.first_error().is_none(),
+            "{:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(session.blocked.is_empty(), "{:?}", session.blocked);
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 1, "Kello01a authors one objective: {goals:?}");
+        assert!(
+            goals[0].primary,
+            "the single objective is primary: {goals:?}"
+        );
+        assert!(
+            goals[0].text.eq_ignore_ascii_case("Find the chalet"),
+            "unexpected objective text: {:?}",
+            goals[0].text
+        );
+        let mi = session.map_info().expect("Kello01a MapInfo");
+        assert_eq!(
+            vm.get_property(mi, "NextMapLevelWithUnr"),
+            Some(&xiii_script::Value::Str("Kello01b.unr".to_owned()))
+        );
+        let pawns = session.player_pawn_actors();
+        assert_eq!(pawns.len(), 1, "one live player pawn");
+        // item98d positive pins. The route leaves the start bowl, follows the authored valley loop
+        // south and west to the east shore of lake Keelownee and stops there, alive. item98 stopped
+        // at the bowl rim (~(-4484,4482)); this route reaches the lake shore at ~(-7996,-1751).
+        let position = session.player_location().expect("player position");
+        println!(
+            "[kello01a item98d] completed={} travel={:?} position={:?} health={:?}",
+            goals[0].completed,
+            outcome.travel,
+            position,
+            session.player_health()
+        );
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "the route must stop before the fatal point and the player must survive: {:?}",
+            session.player_health()
+        );
+        assert!(
+            position[0] < -7000.0 && position[1] < -1500.0,
+            "item98d: the route must reach the east shore of lake Keelownee (item98 stopped at the \
+             bowl rim ~(-4484,4482)): {position:?}"
+        );
+        assert!(
+            !goals[0].completed,
+            "the objective must not complete on this route: {goals:?}"
+        );
+        assert!(
+            outcome.travel.is_empty(),
+            "the Kello01b travel must not be reached on this route: {:?}",
+            outcome.travel
+        );
+        // item98d pinned blocker: the lake crossing. The three `Gameplay.WaterVolume`s carry
+        // `bPainCausing=true, DamagePerSec=60, DamageType=DTDrowned` (WV0/WV1; WV2 is a
+        // non-lethal current), so retail water is lethal on touch. The ice floes
+        // (`statichalet.GR_banquise_01/02`, `banquise08/09`) are solid in our collision but do
+        // not span the crossing (measured gap x[-11000,-10000] at y~-2200). The route therefore
+        // stops at the last dry waypoint before WV0. See the report for the measured evidence.
+    }
 }
