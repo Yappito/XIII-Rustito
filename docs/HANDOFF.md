@@ -6,38 +6,77 @@ Updated: **2026-10-09 (coordinator session)**. Research phase (2026-10-04), M0, 
 
 State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `be56145` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
-### Coordinator session 2026-10-13 (08:15-) — current state, read this first
+### Coordinator session 2026-10-13/14 — current state, read this first
 
-A new coordinator took over at 08:15. `origin/main` = `34e803e` (last landing verify: 1107 passed).
-Landed this session, in order: item91 mesh overlap (`a8513c6`), item96 Banque01 lift-cage collision
-(`9265621`), item99 first Kello01b route (input only, to the chalet cutscene; `079178b`), items 87b-87e
-retail render-time clock (`34e803e`; Toits01 route and positive pins unchanged, ending-scene stall pinned:
-BaseSoldier14 wanders off the collision floor in `Errance` and falls out of the world; the generator-room
-teleport experiment is only the opt-in diagnostic `opt_in_diag_toits01_generator_room`).
+A new coordinator took over on 2026-10-13 at 08:15. Landed since then, in order:
+- item91 mesh overlap (`a8513c6`);
+- item96 Banque01 lift-cage collision (`9265621`);
+- item99 first Kello01b route (`079178b`);
+- items 87b-87e retail render-time clock (`34e803e`);
+- items 99b/99c Kello01b flash chain (`8fc52bd`): class-default lvalues, transient struct members, and a
+  **Partial** HXAudio flash-cue model;
+- items 98/98c/98d first Kello01a route by input (`381fa02`);
+- items 99d/99e (`e67449e`): `Vm::load_level` nulls references to pending-kill exports. The Kello01b
+  flashback completes and the M60 firefight is won.
 
-Review decisions this session: item87d's Toits01 survival-to-death pin inversion was rejected (item87e
-restored the pins); item98's Kello01a route was rejected because it pinned a steep slope its own path
-chose as the "blocker" (item98c re-plans along the nav network). item97 (Hual04c) was partial: the fight
-fails because the test player starts with Fists only while the campaign carries Hual04a's inventory
-(item97b measures and applies the travel loadout).
+Being landed when this was written: the Kello01a ice crossing (items 98e-98h, `ai`):
+- HeadVolume via `APawn::SetZone` 0x1038CA50, and CheckWaterJump;
+- the route crosses the floating ice by input and pins a three-soldier ambush on the far ice (46 HP).
 
-**Tooling changes:** `local/verify.sh` now admits **two** concurrent full suites (user-approved
-2026-10-13; slots `local/tmp/verify-test.lock2` and the original `verify-test.lock`; `VERIFY_SLOTS`
-overrides). Keep `local/watchdog.ps1` running (restart every ~2 h) whenever two suites can run. Edit
-`verify.sh` only by writing a new file and `mv`-ing it over (running bash instances read the script
-incrementally). Delegates available (user, 2026-10-13): OpenCode Go and Ollama Cloud with 2-4 sessions
-each of `deepseek-v4.1-flash`, Z.AI `glm-5.3-flash`, opencode `openai/gpt-6.1-sol`, Codex CLI.
+Review decisions:
+- Rejected: item87d (inverted a survival pin into a death pin), item98 (pinned a slope its own path chose),
+  item100b (gated the friction, which retail does not gate; item100c applies it ungated), and item97d
+  (asserted `GameEnded`).
+- New rule: **no pin may assert player death or `GameEnded`.** A route stops before the fatal point and
+  pins the blocker.
+- item101's AI ledge rule was too strict. item101d decoded the retail condition: `CheckForLedges`
+  0x103b8da0 runs only for non-human-controlled pawns with the `Pawn+0x1f4` bit 0x1000 clear, and a
+  `MoveToward` to a NavigationPoint more than 35 UU below may drop.
 
-**In flight when this was written (15:50):**
+**Hual04 integration pending (do this next).** Two unlanded branches each break the Hual04 routes:
+- `fx` / `item102-hual04a-rushfinal` (`b9ca4f2`): item101d's ledge rule and the item102b Hual04a re-drive.
+  Hual04a BaseSoldier6 now descends but holds behind the station wall. Hual04c travel-loadout fails because
+  the Hual04a endpoint inventory changed.
+- `steam` / `item100-prock01a` (`83a049a`, item100e in progress): steered walking applies
+  `APawn::calcVelocity` friction (0x103ba250 from `physWalking` 0x103bdac0), plus the PRock01a route and
+  the Amos01 re-time. It breaks Hual04a and both Hual04c routes.
+
+Plan: when item97e (Hual04c escort, `codex2`) finishes, merge `fx` and `steam` into `codex2`. One agent
+then re-times Hual04a and both Hual04c routes. Land the result as one unit.
+
+**Tooling changes (all under the git-ignored `local/`):**
+- `verify.sh` is back to **one** suite slot. Two slots were tried on 2026-10-13: one suite peaked at
+  27.8 GB and the watchdog killed a landing. `VERIFY_SLOTS` overrides the slot count. Edit `verify.sh` only
+  by writing a new file and `mv`-ing it over.
+- `verify.sh --bg <log>` detaches the suite through PowerShell `Start-Process` and returns at once.
+  Agents started with `nohup ... &` hung their sessions even with `< /dev/null`.
+- `watchdog.ps1` runs for 115 minutes; restart it every time it ends. It kills the largest `xiii_*` or
+  `local_*` test process, or any process whose executable lives under `local\wt\`, when free commit drops
+  below 15 GB. An agent probe once grew to 64 GB.
+  - Diagnosing a dead suite: exit code `0xffffffff` with no watchdog line means something else killed it.
+- `oc-launch.sh` exports `RUST_TEST_THREADS=1` and tells agents never to kill processes they did not start.
+  item98g killed every `xiii_app` process three times and aborted two landings. `opencode.json` now denies
+  `Stop-Process`, `taskkill`, `pkill` and `killall`.
+- Resumed opencode sessions sometimes stall with an empty log. Relaunch a fresh session on top of a WIP
+  commit instead.
+
+**Delegates (user, 2026-10-13):**
+- OpenCode Go and Ollama Cloud, 2-4 sessions each of `deepseek-v4.1-flash`;
+- Z.AI `glm-5.3-flash` (5-hour window; reset times are UTC+8);
+- opencode `openai/gpt-6.1-sol` (one session, often overloaded);
+- Codex CLI (runs out of workspace credits).
+
+Keep at most about 4 heavy agents at once.
+
+**In flight (2026-10-14 15:30):**
 
 | Worktree / branch | Agent | Task (spec in `local/tasks/`) |
 |---|---|---|
-| `codex2` / `item97-hual04c-escort` | openai/gpt-6.1-sol | item97b: Hual04c with the measured Hual04a travel loadout, clear soldier28, extend the escort; fix the dead-player input/auto-loot anomaly |
-| `fx` / `item95-findspot` | ollama deepseek | item95: retail FindSpot/CheckSlice placement (its verify passed 1087; report pending) |
-| `ai` / `item98-kello01a` | opencode-go deepseek | item98c: Kello01a route along the authored path |
-| `sweep` / `item99-kello01b` | opencode-go deepseek | item99b: Kello01b Cine1 flashback chain (`fin_transition`), objectives 0/1 |
-| `steam` / `item100-prock01a` | ollama deepseek | item100: first PRock01a route |
-| `viewer` / `item101-pawn-falls-out` | Z.AI glm-5.3-flash | item101: wandering AI pawns fall out of the world (Toits01 BaseSoldier14) |
+| `codex2` / `item97d-hual04c-assault` | ollama deepseek | item97e: Hual04c escort past the terrain wedge (WIP `9f7d022`) |
+| `sweep` / `item99f-kello01b-objectif0` | opencode-go deepseek | item99f: who emits `objectif0`; Kello01b goals 0/1 and the PRock01a travel |
+| `codex1` / `item103-prock03` | ollama deepseek | item103: first PRock03 route |
+| `steam` / `item100-prock01a` | ollama deepseek | item100e: PRock01a Porte9 key; no verify, lands with the Hual04 integration |
+| `ai` / `item98f-kello01a-path` | coordinator | landing the Kello01a ice crossing |
 
 ### Coordinator handover 2026-10-13 07:10 (historical)
 
