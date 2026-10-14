@@ -78,6 +78,12 @@ pub struct Session {
     /// `Touch` events involving the player, most recent last (bounded).
     pub touches: VecDeque<(f64, String)>,
     player_touching: Vec<ObjectId>,
+    /// The `PhysicsVolume` currently published to the pawn's `HeadVolume` (item98e). Retail
+    /// `APawn::SetZone` (`Engine.dll` 0x1038CA50) computes the innermost `PhysicsVolume`
+    /// encompassing `Location + CollisionHeight` and, when it changes, calls
+    /// `eventHeadVolumeChange(NewHeadVolume)` (0x10305B40) before storing it. `Pawn.BreathTimer`
+    /// reads `HeadVolume.bWaterVolume`; the host drives it from the decoded movement volumes.
+    head_volume: Option<ObjectId>,
     /// Actors the VM moved this step (cleared at the start of [`Session::step`]).
     pub moved: Vec<MovedActor>,
     /// Level-travel request observed by the VM (item15), if any. Consumed by
@@ -491,6 +497,7 @@ impl Session {
             save_total: 0,
             touches: VecDeque::new(),
             player_touching: Vec::new(),
+            head_volume: None,
             moved: Vec::new(),
             travel: None,
             dispatcher,
@@ -809,6 +816,41 @@ impl Session {
         if profiling {
             self.vm.native_profile_mut().sync_micros += t0.elapsed().as_micros() as u64;
         }
+    }
+
+    /// Publishes the `PhysicsVolume` at the player pawn's head and dispatches the engine's
+    /// `HeadVolumeChange` event, mirroring `APawn::SetZone` (`Engine.dll` 0x1038CA50): the
+    /// event runs with the old `HeadVolume` still in place, then the field is stored.
+    ///
+    /// `name` is the innermost decoded movement volume containing
+    /// `Location + (0, 0, CollisionHeight)` (retail uses the volume's own `Encompasses`; the host
+    /// uses the decoded brush AABB), or `None` when the head is in no volume. A no-op when the
+    /// volume has not changed since the last call.
+    pub fn publish_head_volume(&mut self, name: Option<&str>) {
+        let new = name.and_then(|n| self.vm.find_live_object(n));
+        if new == self.head_volume {
+            return;
+        }
+        // The event runs with the old `HeadVolume` still in place (`APawn::SetZone` order);
+        // `HeadVolumeChange` reads `newHeadVolume.bWaterVolume` (false for the `None` used when
+        // the head leaves every volume) to arm or clear the breath timer.
+        let arg = match new {
+            Some(id) => Value::Object(Some(ObjRef::Instance(id))),
+            None => Value::Object(None),
+        };
+        if let Err(e) = self
+            .vm
+            .send_event(self.player, "HeadVolumeChange", vec![arg])
+        {
+            self.record_failure("HeadVolumeChange", &e);
+        }
+        self.drain_events();
+        let value = match new {
+            Some(id) => Value::Object(Some(ObjRef::Instance(id))),
+            None => Value::Object(None),
+        };
+        let _ = self.vm.set_property(self.player, "HeadVolume", 0, value);
+        self.head_volume = new;
     }
 
     /// The engine's native `PlayDying` delivery for torn-off pawns (`APawn::UpdateMovementAnimation`,

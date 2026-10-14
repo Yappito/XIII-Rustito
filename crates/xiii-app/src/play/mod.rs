@@ -20,6 +20,8 @@ pub mod footsteps;
 pub mod hud;
 /// item72: the retail in-game menu hosted in the play session's VM.
 pub mod ingamemenu;
+#[cfg(test)]
+mod item98f_probe;
 pub mod movement_modes;
 pub mod movers;
 pub mod pawns;
@@ -1198,6 +1200,20 @@ fn fixed_step(
             eye_height: sim.0.vm_eye_height(&params.0),
         };
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
+        // Retail `APawn::SetZone`: publish the volume at the pawn's head (`Location +
+        // CollisionHeight`) so `Pawn.BreathTimer` sees `HeadVolume.bWaterVolume` (item98e).
+        let head_half = if sim.0.crouched {
+            params.0.crouch_height_uu
+        } else {
+            params.0.height_uu
+        };
+        let head = [
+            sim.0.location[0],
+            sim.0.location[1],
+            sim.0.location[2] + head_half,
+        ];
+        let head_volume = motion.0.volumes.physics_at(head).map(|v| v.name.clone());
+        sess.publish_head_volume(head_volume.as_deref());
         sess.sync_view_rotation(sim.0.yaw, sim.0.pitch);
         world
             .rider
@@ -2694,6 +2710,27 @@ fn headless_projection(
     }
 }
 
+/// The innermost decoded movement volume at the player pawn's head
+/// (`Location + (0, 0, CollisionHeight)`), the value retail `APawn::SetZone` publishes to
+/// `Pawn.HeadVolume` (`Engine.dll` 0x1038CA50). `None` when no volume contains the head point.
+fn head_volume_name(runtime: &MapRuntime, params: &PlayerParams) -> Option<String> {
+    let half = if runtime.sim.crouched {
+        params.crouch_height_uu
+    } else {
+        params.height_uu
+    };
+    let head = [
+        runtime.sim.location[0],
+        runtime.sim.location[1],
+        runtime.sim.location[2] + half,
+    ];
+    runtime
+        .volumes
+        .volumes
+        .physics_at(head)
+        .map(|v| v.name.clone())
+}
+
 fn player_has_control(session: &session::Session) -> bool {
     !cinematics::input_suppressed(session)
         && session
@@ -2882,6 +2919,8 @@ fn run_script_inner(
             runtime.sim.velocity,
             &modes,
         );
+        let head_volume = head_volume_name(&runtime, &runtime.player_params);
+        runtime.session.publish_head_volume(head_volume.as_deref());
         runtime
             .session
             .sync_view_rotation(runtime.sim.yaw, runtime.sim.pitch);
@@ -6550,6 +6589,56 @@ mod tests {
         assert_eq!(sim.physics, crate::play::sim::PHYS_SWIMMING);
     }
 
+    /// item98e opt-in corpus test of the host swim bridge: `Session::publish_head_volume` writes
+    /// the live `PhysicsVolume` actor into the pawn's `HeadVolume` and fires the engine's
+    /// `HeadVolumeChange` event, so `Pawn.BreathTimer` reads `HeadVolume.bWaterVolume`. Retail
+    /// source: `APawn::SetZone` (`Engine.dll` 0x1038CA50) and `Pawn.HeadVolumeChange` (`Engine.u`).
+    #[test]
+    fn opt_in_banque01_head_volume_is_published_to_the_pawn() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let volumes = xiii_world::movement_volumes::MovementVolumes::import(&game_dir, "Banque01")
+            .expect("import Banque01 volumes");
+        let wv = volumes
+            .volumes
+            .iter()
+            .find(|v| v.kind == xiii_world::movement_volumes::VolumeKind::Water)
+            .expect("Banque01 places WaterVolume0");
+        let name = wv.name.clone();
+        let mut session = session::Session::open(&game_dir, "Banque01").expect("open Banque01");
+        let player = session.player;
+        // A dry head point clears the property.
+        session.publish_head_volume(None);
+        assert_eq!(
+            session.vm().get_property(player, "HeadVolume").cloned(),
+            Some(xiii_script::Value::Object(None)),
+            "a dry head must publish no HeadVolume"
+        );
+        // The water volume actor is live and the bridge stores it on the pawn.
+        assert!(
+            session.vm().find_object(&name).is_some(),
+            "the water volume actor {name} must be loaded in the VM"
+        );
+        session.publish_head_volume(Some(&name));
+        let head = session.vm().get_property(player, "HeadVolume").cloned();
+        let id = session.vm().find_object(&name).unwrap();
+        assert_eq!(
+            head,
+            Some(xiii_script::Value::Object(Some(
+                xiii_script::ObjRef::Instance(id)
+            ))),
+            "the water volume must be published as the pawn's HeadVolume"
+        );
+        println!("[head volume test] {name} published to HeadVolume");
+        assert!(
+            session.first_error().is_none(),
+            "publishing the head volume must not raise: {:?}",
+            session.first_error()
+        );
+    }
+
     /// Opt-in corpus test (requirement 4): finds a real low-clearance spot on a campaign map
     /// where the standing box collides with the ceiling but the crouch box does not, and checks
     /// the reverse at a clear spot. The spot is discovered by scanning navigation points (their
@@ -9018,11 +9107,29 @@ mod tests {
     /// The engine now (a) executes the class-default
     /// lvalue write `XIIIPlayerPawn.default.bCollideWorld` in `MapInfo.SaveInventoryForFlash`,
     /// (b) skips `transient` struct members when decoding the raw `structFlash`, and (c) drives
-    /// the FlashManager through that explicitly modelled cue path. `fin_transition` now fires (Cine0
-    /// advances to `wait event fin_flash`) and the flashback cine Cine1 starts and runs to its
-    /// `wait warning`. The route still ends frozen: the next blocker is Cine1's `wait warning`,
-    /// which needs the `DialogueManager` line-end warning (`SpeakersToWarnAtTheEndOfThisLine`)
-    /// that has not run by the 300 s budget; goal 0/1 and the `PRock01a` travel stay unreached.
+    /// the FlashManager through that explicitly modelled cue path. `fin_transition` fires and the
+    /// flashback cine Cine1 starts.
+    ///
+    /// item99d: the `wait warning` blocker is fixed generically. `CineController2`'s `wait warning`
+    /// sets `flagsPaused` bit 4; the warning comes from
+    /// `DialogueManager.STA_PlayingDialogue.EndOfLine`, which walks the line's
+    /// `SpeakersToWarnAtTheEndOfThisLine` and calls `CineWarn`. The line never spoke because
+    /// `DialogueManager1` (`dial_flash`) was destroyed by `MustBeStop` at `StartDialogue`: its
+    /// `Speakers[0].Pawn` names the map's pending-kill `Cine2` export (`bDeleteMe=true`), which the
+    /// engine removes and whose references it nulls. `Vm::load_level` now performs that generic
+    /// reference replacement (unit-tested). The whole cutscene runs (Cine0/Cine1 reach
+    /// `destroy self` at ~226 s, `event objectif99` promotes goal 0).
+    ///
+    /// item99e: the post-cutscene firefight is re-driven by input and survived with a margin. The
+    /// item99d claim that the route "loots the `FusilPompePick0` shotgun" was wrong: that pickup (and
+    /// `MiniUziPick0`/`MagnumPick0`) sits on a lower floor at z~1930, below the fully-enclosed
+    /// goal-trigger room floor at z~2091, so the player never touched it and fought `BaseSoldier2`
+    /// unarmed (`Fists`), which shotgunned it to death. The route now grabs the reachable
+    /// west-floor `M60Pick1` through the game's own interaction Grab, selects it with the retail
+    /// `next_weapon` key, returns to the chalet wardrobe for cover and kills the close
+    /// `BaseSoldier2`, then crosses the goal triggers and survives. Next blocker: goal 0
+    /// completes only on the level's own `objectif0` event, so goal 0/1 and the `PRock01a` travel
+    /// stay unreached.
     #[test]
     fn opt_in_kello01b_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -9074,10 +9181,11 @@ mod tests {
         assert!(session.blocked.is_empty(), "{:?}", session.blocked);
         assert!(
             session.player_health().is_some_and(|h| h > 0.0),
-            "player must survive"
+            "player must survive: {:?}",
+            session.player_health()
         );
         // The mountain descent and the door entry are a fall-and-walk route, so the player is
-        // below full health (measured 102/150); still alive.
+        // below full health; the post-cutscene firefight takes more, but the route must live.
         assert!(
             session.player_health().is_some_and(|h| h < 150.0),
             "the descent must cost some fall damage: {:?}",
@@ -9087,16 +9195,13 @@ mod tests {
         assert_eq!(goals.len(), 2, "the map authors two objectives: {goals:?}");
         assert!(
             !goals[0].completed,
-            "goal 0 (cover Kim's escape) is not completed by this first route: {goals:?}"
+            "goal 0 (cover Kim's escape) is not completed by this route: {goals:?}"
         );
         assert!(
             !goals[1].completed,
-            "goal 1 (find Jones and Carrington again) is not completed by this first route: {goals:?}"
+            "goal 1 (find Jones and Carrington again) is not completed by this route: {goals:?}"
         );
         assert!(outcome.travel.is_empty(), "the route must not travel");
-        // Measured progress: the player entered the chalet and triggered the `XIII_dans_chalet`
-        // cutscene. `CineController21` interprets the Cine0 (Kim) sequence; it was in `STA_init`
-        // at level start and is `PlayingSequence` once TouchTrigger2 fires.
         assert!(
             session
                 .touches()
@@ -9105,59 +9210,63 @@ mod tests {
             "the player must reach TouchTrigger2 (XIII_dans_chalet): {:?}",
             session.touches()
         );
-        let cine0 = vm
-            .find_object("CineController21")
-            .expect("Cine0 controller");
-        assert_eq!(
-            vm.state_name(cine0).as_deref(),
-            Some("PlayingSequence"),
-            "touching the chalet trigger must start the Cine0 cutscene"
-        );
-        // item99b positive pins: the flash chain now runs. `GenFlash0` is the level's
-        // `Level.FlashManager`; its `count` advances through the Partial flash cue model,
-        // and the flashback cine Cine1 (`CineController22`) starts on the emitted
-        // `fin_transition`, so Cine0 is released past action 33.
-        let flash = vm
-            .find_object("GenFlash0")
-            .expect("GenFlash0 flash manager");
+        // item99d: the DialogueManager line-end warning now releases Cine1's `wait warning`, so the
+        // whole chalet cutscene runs. `DialogueManager1` (tag `dial_flash`) is the flashback line
+        // whose `SpeakersToWarnAtTheEndOfThisLine` used to be unreachable; its line now speaks.
         assert!(
-            matches!(vm.get_property(flash, "Count"), Some(Value::Int(n)) if *n > 0),
-            "the flash transition must have advanced GenFlash0.count: {:?}",
-            vm.get_property(flash, "Count")
+            session
+                .dialogues
+                .iter()
+                .any(|(_, d)| d.actor.eq_ignore_ascii_case("DialogueManager1")),
+            "the flashback line (`DialogueManager1`, `dial_flash`) must speak: {:?}",
+            session.dialogues
         );
-        let cine1 = vm
-            .find_object("CineController22")
-            .expect("Cine1 controller");
-        assert_eq!(
-            vm.state_name(cine1).as_deref(),
-            Some("PlayingSequence"),
-            "the flashback cine (Cine1) must have started on fin_transition"
-        );
-        // Preserve the item99b stopping point explicitly, not merely any PlayingSequence state.
-        assert_eq!(
-            vm.get_property(cine1, "ScriptedActionIndex"),
-            Some(&Value::Int(18)),
-            "Cine1 must remain parked after its wait warning action"
-        );
-        assert_eq!(
-            vm.get_property(cine1, "flagsPaused"),
-            Some(&Value::Int(4)),
-            "Cine1 must be waiting for a warning"
-        );
-        let cine1_pawn = match vm.get_property(cine1, "MyPawn") {
-            Some(Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => *id,
-            other => panic!("Cine1 controller pawn: {other:?}"),
-        };
+        // The flashback cine (`CineController22`) is gone: it ran to `destroy self` when the
+        // warning released `wait warning`, and Cine0 (`CineController21`) followed past
+        // `fin_flash` to `destroy self` (measured at t~226.4), which is what promotes goal 0.
         assert!(
-            matches!(vm.get_property(cine1_pawn, "tabActions"), Some(Value::Array(actions))
-                if actions.get(17) == Some(&Value::Str("wait warning".to_owned()))),
-            "the paused action must be wait warning"
+            vm.find_object("CineController22").is_none(),
+            "the flashback cine must have completed and destroyed itself"
         );
-        let position = session.player_location().expect("player position");
-        for (actual, expected) in position.into_iter().zip([-2750.0, -473.9, 2106.0]) {
+        assert!(
+            goals[0].primary,
+            "the cutscene's `event objectif99` must promote goal 0 to primary: {goals:?}"
+        );
+        // item99e: the route arms the player before the firefight. The chalet's `FusilPompePick0`
+        // shotgun, `MiniUziPick0` and `MagnumPick0` sit on a lower floor (`z~1930`) under the
+        // fully-enclosed goal-trigger room floor (`z~2091`) and are unreachable; the reachable
+        // weapon is the west-floor `M60Pick1` (`z~2076`), grabbed through the game's own
+        // interaction Grab (`use M60Pick1`) and selected with the retail `next_weapon` key.
+        let player = vm.find_object("XIIIPlayerPawn").expect("player pawn");
+        assert!(
+            matches!(
+                vm.get_property(player, "Weapon"),
+                Some(Value::Object(Some(xiii_script::ObjRef::Instance(_))))
+            ),
+            "the player must pick up a weapon for the post-cutscene fight: {:?}",
+            vm.get_property(player, "Weapon")
+        );
+        // Positive pin: the active weapon is the reachable M60 machine gun, not the starting
+        // `Fists` (the item99d report's "loots the shotgun" claim was wrong: the shotgun is below
+        // the room and the player never had it).
+        assert!(
+            session
+                .player_weapon()
+                .is_some_and(|w| vm.objects[w as usize].name.starts_with("m60")),
+            "the route must loot the reachable M60 (M60Pick1), got {:?}",
+            session
+                .player_weapon()
+                .map(|w| vm.objects[w as usize].name.clone())
+        );
+        // Positive pins: the player crosses the chalet floor onto the map's own goal triggers
+        // (`XIIIGoalTrigger2` tag `objectif0`, `XIIIGoalTrigger1` tag `roquette`). Reaching them
+        // is the next objective step; neither completes yet because goal 0 waits on the level's
+        // own `objectif0` event (fired by the wave/progression script), not on the raw touch.
+        for trigger in ["XIIIGoalTrigger2", "XIIIGoalTrigger1"] {
             assert!(
-                (actual - expected).abs() < 1.0,
-                "chalet interior pin moved: {position:?}"
+                session.touches().iter().any(|(_, name)| name == trigger),
+                "the route must reach the goal trigger {trigger}: {:?}",
+                session.touches()
             );
         }
         assert_eq!(
@@ -9168,32 +9277,27 @@ mod tests {
             Some(&Value::Str("PRock01a.unr".to_owned()))
         );
         println!(
-            "[kello01b next blocker] item99b: the descent, the Porte0 door entry and the flash transition are \
-             reached. The flash chain now runs: `GenFlash0` (the level's `Level.FlashManager`) advances and \
-             emits `fin_transition`, so Cine0 passes its `wait event fin_transition` and parks at \
-             `wait event fin_flash`, and the flashback cine Cine1 (`CineController22`) starts and runs to its \
-             `wait warning`. The route is still frozen inside the cutscene: Cine1's `wait warning` needs the \
-             `DialogueManager` line-end warning (`SpeakersToWarnAtTheEndOfThisLine`, `DialogueManager1` \
-             `dial_flash`), which has not run by the 300 s budget, so `premiere_explosion`/`checkpoint`, \
-             `event objectif99` (goal 0 primary), goal 0/1 completion and the PRock01a travel stay unreached \
-             (travel=[]). The player is pinned against the chalet wardrobe (K_armoir02) while the cutscene \
-             plays."
+            "[kello01b next blocker] item99d: the `wait warning` blocker is fixed. Decoded: the              CineController2 `wait warning` action sets `flagsPaused` bit 4 (`nOnJump[2] = -1`) and              `CineController2.PlayingSequence.CineWarn` clears it; the warning is sent by              `DialogueManager.STA_PlayingDialogue.EndOfLine`, which walks              `Lines[LineIndex].SpeakersToWarnAtTheEndOfThisLine` and calls `CineWarn` on each              named speaker's controller. Our runtime parked at `wait warning` because the              flashback line never spoke: `DialogueManager1` (`dial_flash`) was destroyed by              `MustBeStop` at `StartDialogue` because its `Speakers[0].Pawn` names the map's              pending-kill `Cine2` export (`bDeleteMe=true`, measured). The engine removes that              actor at load and nulls references to it; the VM kept the stale reference, so              `PostBeginPlay` counted it as a present speaker and `MustBeStop` aborted the manager.              Fix: `Vm::load_level` now nulls every property reference to a pending-kill export              (generic, no map/class code; unit tests              `load_level_nulls_references_to_pending_kill_exports` and              `null_deleted_references_walks_structs_arrays_and_delegates`). With the line ending,              the whole cutscene runs (Cine0/Cine1 reach `destroy self` at t~226.4 and `event              objectif99` promotes goal 0 to primary). item99e: the post-cutscene firefight is              survived by input, not by the (unreachable) `FusilPompePick0` shotgun: the player              grabs the reachable west-floor `M60Pick1`, selects it, returns to the wardrobe              cover and kills the close `BaseSoldier2` that otherwise shotguns the unarmed player              to death, crossing `XIIIGoalTrigger2`/`XIIIGoalTrigger1` and surviving with a margin.              Next blocker: goal 0 (`Cover Kim's escape`) completes only when the level's own              `objectif0` event fires (the wave/progression script); touching `XIIIGoalTrigger2`              runs `Engine.Trigger.Touch` -> `TriggerEvent(Event=...)` and does not call its              `CauseGoal`, so goal 0/1 and the `PRock01a` travel stay unreached (travel=[])."
         );
     }
 
     /// Kello01a (the map after Hual04c): start fresh at PlayerStart0 with the map-entry
-    /// loadout and drive the level by input along the authored valley loop. item98 walked
-    /// south-west straight from the start into the start bowl's rim bank (~50 degrees, steeper
-    /// than the walker's `MINFLOORZ=0.7`) and pinned that. item98c planned the path from the
-    /// map's own data (nav graph, the 16 `PF_Portal` gaps, the BSP zone-connectivity chain
-    /// 11->8->7->9->10->12->13->3->2->5->6) south around the valley and across lake Keelownee;
-    /// its route drowned there. item98d shows why: the two lake `Gameplay.WaterVolume`s
-    /// (`WaterVolume0`/`WaterVolume1`) are `bPainCausing=true, DamagePerSec=60,
-    /// DamageType=DTDrowned`, so retail water is lethal on touch (`PhysicsVolume.Touch` ->
-    /// `CausePainTo`), and the ice floes that lie on the lake do not span the crossing. The
-    /// route therefore stops at the last dry waypoint on the lake's east shore, alive, before
-    /// the water; the objective `Find the chalet` and the Kello01b travel stay unreached. See
-    /// the item98d report section for the measured evidence.
+    /// loadout and drive the level by input along the authored valley loop, then north toward
+    /// the dry band, stopping at the authored invisible BSP sheet.
+    ///
+    /// item98 walked south-west straight from the start into the start bowl's rim bank
+    /// (~50 degrees, steeper than the walker's `MINFLOORZ=0.7`) and pinned that. item98c planned
+    /// a path across lake Keelownee from the map's own data; its route drowned. item98d showed
+    /// why: the two lake `Gameplay.WaterVolume`s (`WaterVolume0`/`WaterVolume1`) are
+    /// `bPainCausing=true, DamagePerSec=60, DamageType=DTDrowned`, so retail water is lethal on
+    /// touch, and the ice floes do not span the crossing. item98e re-mapped the floes and the
+    /// dry north band: the floe gaps (up to ~1200 UU at the route's latitude) exceed the ~417 UU
+    /// retail running jump, so the dry band is the path a retail player takes. This route leaves
+    /// the valley at (~-500,-3850) and climbs north to (~-4200,-776), where the walker is
+    /// stopped by the authored invisible solid BSP sheet (`Model207`, triangle
+    /// (-3664,-1440,-1344)-(-5280,896,3776)-(-5280,896,-1344), spanning x[-5280,-3664]
+    /// y[-1440,896] z[-1344,3776]). The objective `Find the chalet` and the Kello01b travel stay
+    /// unreached. See `local/reports/item98e-kello01a-crossing.md`.
     #[test]
     fn opt_in_kello01a_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -9225,7 +9329,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            110.0,
+            100.0,
         )
         .expect("run Kello01a route");
         let session = &outcome.session;
@@ -9301,12 +9405,13 @@ mod tests {
         );
         let pawns = session.player_pawn_actors();
         assert_eq!(pawns.len(), 1, "one live player pawn");
-        // item98d positive pins. The route leaves the start bowl, follows the authored valley loop
-        // south and west to the east shore of lake Keelownee and stops there, alive. item98 stopped
-        // at the bowl rim (~(-4484,4482)); this route reaches the lake shore at ~(-7996,-1751).
+        // item98e positive pins. The route leaves the start bowl, follows the authored valley
+        // loop south-west, then climbs north from the valley at (~-500,-3850) to the band's
+        // south face, where the authored invisible BSP sheet stops it. item98d stopped at the
+        // lake's east shore (~(-7996,-1751)); this route reaches ~(-4200,-776).
         let position = session.player_location().expect("player position");
         println!(
-            "[kello01a item98d] completed={} travel={:?} position={:?} health={:?}",
+            "[kello01a item98e] completed={} travel={:?} position={:?} health={:?}",
             goals[0].completed,
             outcome.travel,
             position,
@@ -9314,13 +9419,18 @@ mod tests {
         );
         assert!(
             session.player_health().is_some_and(|h| h > 0.0),
-            "the route must stop before the fatal point and the player must survive: {:?}",
+            "the route must stop before any fatal point and the player must survive: {:?}",
             session.player_health()
         );
         assert!(
-            position[0] < -7000.0 && position[1] < -1500.0,
-            "item98d: the route must reach the east shore of lake Keelownee (item98 stopped at the \
-             bowl rim ~(-4484,4482)): {position:?}"
+            (-4300.0..-4100.0).contains(&position[0]) && (-850.0..-650.0).contains(&position[1]),
+            "item98e: the route must reach the dry band's south face at ~(-4200,-776) where the \
+             invisible BSP sheet blocks it (item98d stopped at the lake shore ~(-7996,-1751)): \
+             {position:?}"
+        );
+        assert!(
+            position[2] > -400.0,
+            "the band approach is dry (no lake water): {position:?}"
         );
         assert!(
             !goals[0].completed,
@@ -9331,12 +9441,133 @@ mod tests {
             "the Kello01b travel must not be reached on this route: {:?}",
             outcome.travel
         );
-        // item98d pinned blocker: the lake crossing. The three `Gameplay.WaterVolume`s carry
-        // `bPainCausing=true, DamagePerSec=60, DamageType=DTDrowned` (WV0/WV1; WV2 is a
-        // non-lethal current), so retail water is lethal on touch. The ice floes
-        // (`statichalet.GR_banquise_01/02`, `banquise08/09`) are solid in our collision but do
-        // not span the crossing (measured gap x[-11000,-10000] at y~-2200). The route therefore
-        // stops at the last dry waypoint before WV0. See the report for the measured evidence.
+        // item98e pinned blocker: the authored invisible solid BSP sheet (`Model207`,
+        // `PolyFlags=0x1`) that spans x[-5280,-3664] y[-1440,896] z[-1344,3776]. The lake itself
+        // is also impassable: `WaterVolume0`/`WaterVolume1` are `bPainCausing=true,
+        // DamagePerSec=60, DamageType=DTDrowned`, and the ice floe gaps (up to ~1200 UU at the
+        // route's latitude) exceed the ~417 UU retail running jump. See the report for the
+        // measured evidence.
+    }
+
+    /// Input replay of the ice-field crossing (item98f). The route leaves the authored valley
+    /// loop on the north rim, hops the ~300-UU `GR_banquise_01`/`02` floe chain at the latitude
+    /// the walkthroughs describe (`y ~ -2750..-3400`, not item98e's `y ~ -2200` open hole), and
+    /// stops alive on the far lake ice at ~(-10580,-3394,-1254). The replay matches the offline
+    /// `PlayerSim` search exactly once the approach's combat `track` is yaw-normalised after
+    /// `track off` (without it the pawn keeps a tracked heading the search does not model, and the
+    /// 0.8 s free run before the next `goto` desynchronises the two). The earlier north-band route
+    /// and every one of its assertions remain a separate regression above.
+    #[test]
+    fn opt_in_kello01a_chalet_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to run the Kello01a ice route");
+            return;
+        };
+        let opts = Options {
+            map: Some("Kello01a".into()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Kello01a");
+        let resolved = resolve_params(&game_dir).expect("player defaults");
+        let approach = include_str!("../../tests/data/kello01a_route.script");
+        let continuation = include_str!("../../tests/data/kello01a_chalet_route.script");
+        for text in [approach, continuation] {
+            assert!(
+                !text.lines().any(|line| {
+                    let command = line.split('#').next().unwrap_or("").trim();
+                    [
+                        "teleport",
+                        "place",
+                        "weapon",
+                        "item",
+                        "set_goal",
+                        "take_control",
+                        "assume_control",
+                    ]
+                    .contains(&command.split_whitespace().nth(1).unwrap_or(""))
+                }),
+                "route must contain only input commands"
+            );
+        }
+        let mut script = script::Script::parse(approach).expect("approach");
+        script.events.retain(|e| e.t < 85.8);
+        script.events.extend(
+            script::Script::parse(continuation)
+                .expect("continuation")
+                .events,
+        );
+        script.events.sort_by(|a, b| a.t.total_cmp(&b.t));
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Kello01a",
+            &script,
+            &resolved.params,
+            &scene,
+            script.last_time() + 3.0,
+        )
+        .expect("input replay");
+        let session = &outcome.session;
+        println!(
+            "[kello01a item98f] map={} goals={:?} travel={:?} position={:?} health={:?} min_health={:?}",
+            outcome.final_map,
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health(),
+            outcome.map_min_health
+        );
+        let player_name = session.player_name.clone();
+        let mut dmg_detail: Vec<String> = Vec::new();
+        for e in &session.vm().trace {
+            if let xiii_script::TraceKind::Event {
+                target,
+                function,
+                args,
+            } = &e.kind
+                && function.ends_with("TakeDamage")
+                && target.eq_ignore_ascii_case(&player_name)
+            {
+                dmg_detail.push(format!(
+                    "{:.2}s {}dmg/{}/{}",
+                    e.time,
+                    args.first().cloned().unwrap_or_default(),
+                    args.get(1).cloned().unwrap_or_default(),
+                    args.get(4).cloned().unwrap_or_default()
+                ));
+            }
+        }
+        println!("[kello01a item98f damage] {dmg_detail:?}");
+        survey::print_details(&survey::extract("Kello01a", &outcome));
+        assert!(
+            session.first_error().is_none(),
+            "{:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(session.blocked.is_empty(), "{:?}", session.blocked);
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 1);
+        assert!(goals[0].primary && goals[0].text == "Find the chalet");
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "player must survive the entire route"
+        );
+        assert!(
+            outcome.map_min_health.iter().all(|(_, h)| *h > 0.0),
+            "a later heal or travel must not conceal death"
+        );
+        // item98f positive pin: the input route leaves the valley loop at (~-5100,-1200), crosses the
+        // lake ice on the authored ~300-UU floe-hop chain (each landing inside the retail running
+        // jump and below the `-1.4*JumpZ` fall-damage threshold), and stops alive past the far
+        // shore at ~(-10580,-3394,-1254). The player stays at full health (150) through the valley
+        // and reaches the ice at 70/150, then loses only soldier-fire falloff (46/150 at the end).
+        // The item98e north-band and every one of its assertions remain a separate regression above.
+        let p = session.player_location().expect("player position");
+        assert!(
+            p[0] < -10000.0 && p[1] < -3200.0 && p[2] > -1300.0,
+            "must reach the far lake ice alive: {p:?}"
+        );
     }
 
     #[test]

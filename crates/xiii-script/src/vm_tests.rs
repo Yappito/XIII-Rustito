@@ -1,6 +1,8 @@
 //! Synthetic interpreter tests: a generated version-100 package with an `Object` class
 //! (native operators, script functions) and an `Actor` subclass with two states.
 
+use std::collections::HashSet;
+
 use xiii_package::Limits;
 
 use crate::bytecode::ScriptLimits;
@@ -1024,6 +1026,119 @@ fn load_level_marks_bdeleteme_exports_pending_kill() {
             .unwrap()
             .is_none()
     );
+}
+
+/// item99d: a map export whose object property names a `bDeleteMe` export. Generated data only.
+/// `Live0.Pointer` names the pending-kill `Dead0`; `Keep0.Pointer` names the live `Target0`.
+fn pending_kill_reference_fixture() -> Vec<u8> {
+    let mut b = B::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let bdelete = b.reserve(B_BOOLPROP, actor, "bDeleteMe");
+    let pointer = b.reserve(IMP_OBJPROP, actor, "Pointer");
+    let live = b.reserve(actor, 0, "Live0");
+    let keep = b.reserve(actor, 0, "Keep0");
+    let target = b.reserve(actor, 0, "Target0");
+    let dead = b.reserve(actor, 0, "Dead0");
+    b.prop(bdelete, 0, 0);
+    b.prop_with(pointer, bdelete, 0, &compact(0));
+    b.class(object, 0, actor);
+    b.class(actor, object, pointer);
+    // ObjectProperty tag: name, info (type code 5 | size-code nibble), then the compact ref.
+    let object_tag = |b: &mut B, name: &str, raw: i32| {
+        let reference = compact(raw);
+        let size_code = match reference.len() {
+            1 => 0u8,
+            2 => 1,
+            _ => 2,
+        };
+        let mut tag = compact(b.name(name));
+        tag.push(0x05 | (size_code << 4));
+        tag.extend(&reference);
+        tag
+    };
+    // `Dead0` is a pending-kill export (`bDeleteMe` true lives in the info bit).
+    let mut dead_block = compact(b.name("bDeleteMe"));
+    dead_block.extend([0xd3, 0x00, 0x00]);
+    b.set(dead, dead_block);
+    let mut live_block = object_tag(&mut b, "Pointer", dead);
+    live_block.extend(compact(0));
+    b.set(live, live_block);
+    let mut keep_block = object_tag(&mut b, "Pointer", target);
+    keep_block.extend(compact(0));
+    b.set(keep, keep_block);
+    b.set(target, compact(0));
+    b.build()
+}
+
+/// item99d: at load, references to a pending-kill export are nulled (the engine removes the
+/// `bDeleteMe` actor and garbage collection replaces every reference to it), while a reference to
+/// a live export is untouched. The Kello01b `DialogueManager1.Speakers[0].Pawn` (a destroyed
+/// `Cine2`) must read `None`, or `DialogueManager.PostBeginPlay`/`MustBeStop` count it as a
+/// present speaker and destroy the manager before it speaks `dial_flash`.
+#[test]
+fn load_level_nulls_references_to_pending_kill_exports() {
+    let set = set_of(pending_kill_reference_fixture());
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.load_level(0, &Limits::default()).unwrap();
+    let live = vm.find_object("Live0").expect("Live0 instance");
+    let keep = vm.find_object("Keep0").expect("Keep0 instance");
+    assert_eq!(
+        vm.get_property(live, "Pointer"),
+        Some(&Value::Object(None)),
+        "a reference to a pending-kill export must read None after load"
+    );
+    let target = vm.find_object("Target0").expect("Target0 instance");
+    assert_eq!(
+        vm.get_property(keep, "Pointer"),
+        Some(&Value::Object(Some(ObjRef::Instance(target)))),
+        "a reference to a live export must survive"
+    );
+}
+
+/// item99d: the reference replacement walks structs, arrays and delegate objects (the Kello01b
+/// warning list is a `Speakers` array of `SSpeaker` structs, each carrying a `Pawn` object).
+#[test]
+fn null_deleted_references_walks_structs_arrays_and_delegates() {
+    let mut deleted = HashSet::new();
+    deleted.insert(7u32);
+    let dead = Value::Object(Some(ObjRef::Instance(7)));
+    let live = Value::Object(Some(ObjRef::Instance(9)));
+    let mut value = Value::Struct(vec![
+        ("Pawn".to_owned(), dead.clone()),
+        (
+            "Sentences".to_owned(),
+            Value::Array(vec![dead.clone(), live.clone()]),
+        ),
+        (
+            "Callback".to_owned(),
+            Value::Delegate(Some(Delegate {
+                object: Some(ObjRef::Instance(7)),
+                function: "Warn".to_owned(),
+            })),
+        ),
+    ]);
+    crate::vm::Vm::null_deleted_references(&mut value, &deleted);
+    let Value::Struct(fields) = &value else {
+        panic!("struct preserved");
+    };
+    assert_eq!(fields[0].1, Value::Object(None));
+    assert_eq!(
+        fields[1].1,
+        Value::Array(vec![Value::Object(None), live.clone()])
+    );
+    assert_eq!(
+        fields[2].1,
+        Value::Delegate(Some(Delegate {
+            object: None,
+            function: "Warn".to_owned(),
+        }))
+    );
+    // An all-live value is left byte-for-byte unchanged.
+    let mut untouched = Value::Object(Some(ObjRef::Instance(9)));
+    let before = untouched.clone();
+    crate::vm::Vm::null_deleted_references(&mut untouched, &deleted);
+    assert_eq!(untouched, before);
 }
 
 fn pressing_fire_package() -> Vec<u8> {

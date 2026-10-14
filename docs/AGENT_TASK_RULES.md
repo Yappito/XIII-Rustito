@@ -89,5 +89,14 @@ probe grew to 64 GB and pushed the machine to 1.2 GB of free commit. A watchdog 
 worktree process when free commit drops below 15 GB. If one of your test runs dies abruptly (exit
 code 1 with no panic, or "process didn't exit successfully"), it was probably killed by the watchdog:
 rerun it before treating it as a failure. Start `verify.sh` only as
-`nohup bash P:/AI/XIII/local/verify.sh > local/reports/<x>-verify.txt 2>&1 < /dev/null &` (without
-`< /dev/null` your session hangs) and poll it with short commands.
+`bash P:/AI/XIII/local/verify.sh --bg local/reports/<x>-verify.txt`. It detaches the suite and returns
+at once. Never use `nohup` or `&`: an attached child can hang your session. Then poll that log with short
+commands.
+
+## Never stop processes you did not start
+
+Other agents' tests, other worktrees' builds and the coordinator's landings run on the same machine.
+Never use `Stop-Process`, `taskkill`, `pkill` or `killall`, and never kill processes by name (for
+example every `xiii_app`). On 2026-10-13 an agent killed all `xiii_app` processes three times and
+aborted two landings. If you must stop something you started in this session, record its PID when
+you start it. Check that its working directory is your worktree, then kill only that PID.

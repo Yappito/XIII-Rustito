@@ -1,5 +1,5 @@
-# Kello01a route by player input (item98d): the authored valley loop to the east shore of
-# lake Keelownee, where it stops before the lethal water.
+# Kello01a route by player input (item98e): the authored valley loop to the start of the north
+# bank climb, where the walker meets the authored invisible BSP wall and stops, alive.
 #
 # Start: MapInfo `Kello0` (XIDMaps.Kello01) `NextMapLevelWithUnr = "Kello01b.unr"`, one
 # objective `[0 P] Find the chalet`, player at PlayerStart0 (-3005.8, 6127.0, 90.6) UU,
@@ -14,10 +14,14 @@
 # lake. item98c continued across lake Keelownee with jump strokes; item98d measured that the
 # lake's `WaterVolume0`/`WaterVolume1` are `bPainCausing=true, DamagePerSec=60,
 # DamageType=DTDrowned`, so the crossing is lethal on touch and the ice floes do not span it.
-# The route therefore stops at the last dry waypoint before `WaterVolume0`'s AABB
-# (x <= -8192), at ~(-7965,-1739) on the lake's east shore. Coordinates are Unreal units;
-# times are seconds. Input only: `goto`, `select_weapon`/`track`/`fire`/`reload` for the
-# authored soldier fights. No teleport, weapon grant, item, set_goal or control override.
+# item98e re-mapped the floes/ice and the dry north band: the floes do not form a jumpable
+# chain (gaps up to 1200 UU against a ~417 UU retail running jump), so the route leaves the
+# valley north toward the dry band. The walker reaches ~(-4200,-776) on the band's south face
+# and is stopped there by the authored invisible solid BSP sheet (Model207, the triangle
+# (-3664,-1440,-1344)-(-5280,896,3776)-(-5280,896,-1344)) that spans x[-5280,-3664]
+# y[-1440,896] z[-1344,3776]. Coordinates are Unreal units; times are seconds. Input only:
+# `goto`, `select_weapon`/`track`/`fire`/`reload` for the authored soldier fights. No
+# teleport, weapon grant, item, set_goal or control override.
 t=1.0 select_weapon 3
 t=1.500 goto -3006 6127
 t=2.300 goto -3177 6056
@@ -79,6 +83,7 @@ t=35.300 fire
 t=35.600 fire
 t=35.900 fire
 t=36.150 track off
+t=36.200 yaw 0
 t=36.550 reload
 t=37.150 forward 1
 t=37.950 goto 287 143
@@ -116,6 +121,7 @@ t=51.750 fire
 t=52.050 fire
 t=52.350 fire
 t=52.600 track off
+t=52.650 yaw 0
 t=53.000 reload
 t=53.600 forward 1
 t=54.400 goto 264 -1769
@@ -178,46 +184,12 @@ t=83.200 goto -4612 -1511
 t=84.000 goto -4779 -1344
 t=84.800 goto -5004 -1317
 t=85.600 goto -5182 -1177
-t=86.400 goto -5407 -1150
-t=87.200 goto -5626 -1067
-t=88.000 goto -5844 -976
-t=88.800 goto -6079 -970
-t=89.600 goto -6204 -1135
-t=90.400 goto -6365 -1306
-t=91.200 goto -6566 -1349
-t=92.000 goto -6694 -1452
-t=93.000 forward 0
-t=93.250 track BaseSoldier9 0.85
-t=93.550 fire
-t=93.850 fire
-t=94.150 fire
-t=94.450 fire
-t=94.750 fire
-t=95.000 track BaseSoldier0 0.85
-t=95.300 fire
-t=95.600 fire
-t=95.900 fire
-t=96.200 fire
-t=96.500 fire
-t=96.750 track BaseSoldier 0.85
-t=97.050 fire
-t=97.350 fire
-t=97.650 fire
-t=97.950 fire
-t=98.250 fire
-t=98.500 track BaseSoldier1 0.85
-t=98.800 fire
-t=99.100 fire
-t=99.400 fire
-t=99.700 fire
-t=100.000 fire
-t=100.250 track off
-t=100.650 reload
-t=101.250 forward 1
-t=102.050 goto -6889 -1594
-t=102.850 goto -7067 -1734
-t=103.650 goto -7292 -1761
-t=104.450 goto -7528 -1761
-t=105.250 goto -7747 -1677
-t=106.050 goto -7965 -1739
-t=107.000 wait_travel
+t=86.000 goto -5100 -1200
+t=86.800 goto -5000 -1000
+t=87.600 goto -4900 -800
+t=88.400 goto -4800 -700
+t=89.200 goto -4600 -700
+t=90.000 goto -4400 -700
+t=90.800 goto -4300 -700
+t=91.600 goto -4200 -750
+t=92.400 forward 0
