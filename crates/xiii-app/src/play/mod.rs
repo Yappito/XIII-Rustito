@@ -20,8 +20,6 @@ pub mod footsteps;
 pub mod hud;
 /// item72: the retail in-game menu hosted in the play session's VM.
 pub mod ingamemenu;
-#[cfg(test)]
-mod item98f_probe;
 pub mod movement_modes;
 pub mod movers;
 pub mod pawns;
