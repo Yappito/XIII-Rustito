@@ -9142,9 +9142,18 @@ mod tests {
     /// `InvisibleUntilTriggered` until 'wave401'). Goal 1's completion event 'roquette' is fired
     /// by `XIDPawn.XIIIDispatcher0` (Tag='pre_roquette'), triggered by `TouchTrigger6`
     /// (`Event='pre_roquette'` at `(3303,-3417,1175)`), and completes `XIIIGoalTrigger1`
-    /// (GoalNumber 1, `TimeBeforeTrigger` 15). This route reaches the annex doorway but cannot
-    /// clear the whole wave chain in budget, so goal 0/1 and the `PRock01a` travel stay unreached;
-    /// the new pins record the two `veryend` gates, the emitter and the wave/chopper condition.
+    /// (GoalNumber 1, `TimeBeforeTrigger` 15).
+    ///
+    /// item99g completes the level by input. `veryend` needs `CineTrigger2` (Tag `End`,
+    /// `InitialCounterValue` 4, not 1 as item99f wrote) to count four `End` events: the soldiers of
+    /// `gennmi10` (wave1), `gennmi25` (wave602), `gennmi20` (wave603) and the chopper
+    /// `NastyHelico2` (`DeadEvent`), which appears on `wave401` and dies to the player's M60
+    /// (`HelicoDeco.TakeDamage`, Health 1000). The generators spawn their soldier only when the
+    /// spawn point is hidden from, or behind, the player (`gennmi.genese.Timer`), which the route
+    /// handles by turning away. Then `Porte3` opens, `BreakableMover0` breaks, `TouchTrigger0`
+    /// completes goal 0, the three backup soldiers are killed, and `TouchTrigger6` completes goal 1
+    /// 15 s later; the map's own `DoTravel` requests `PRock01a` (the run stops at that request).
+    /// The route is a replay: the fight lines are recorded input commands (see the script header).
     #[test]
     fn opt_in_kello01b_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -9166,17 +9175,47 @@ mod tests {
                 .any(|forbidden| command.contains(forbidden))
         }));
         let script = script::Script::parse(text).expect("parse Kello01b route");
-        let outcome = run_script_with_cinematic_input(
+        // item99g: the route now ends with the map's own `DoTravel` -> `PRock01a`. Stop the run at
+        // the travel request so the assertions below read the Kello01b session, not the carried one.
+        let outcome = run_script_inner(
             &game_dir,
             "Kello01b",
             &script,
             &resolved.params,
             &scene,
-            360.0,
+            800.0,
+            true,
+            RunnerOptions {
+                stop_on_travel: true,
+                ..Default::default()
+            },
         )
         .expect("run Kello01b route");
         let session = &outcome.session;
         let vm = session.vm();
+        let events_of = |target: &str, function_suffix: &str| -> Vec<(f64, Vec<String>)> {
+            vm.trace
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    xiii_script::TraceKind::Event {
+                        target: t,
+                        function,
+                        args,
+                    } if t == target && function.ends_with(function_suffix) => {
+                        Some((e.time, args.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        // The session keeps only the last 64 player touches, so a touch is also looked up in the
+        // full VM event trace (`TouchTrigger.Touch` / `Actor.Touch` with the player pawn as arg).
+        let touched = |name: &str| -> bool {
+            session.touches().iter().any(|(_, n)| n == name)
+                || events_of(name, ".Touch")
+                    .iter()
+                    .any(|(_, args)| args.first().is_some_and(|a| a == "XIIIPlayerPawn"))
+        };
         println!(
             "[kello01b route] error={:?} objectives={:?} travel={:?} position={:?} health={:?} touches={:?}",
             session.first_error(),
@@ -9199,29 +9238,54 @@ mod tests {
             "player must survive: {:?}",
             session.player_health()
         );
-        // The mountain descent and the door entry are a fall-and-walk route, so the player is
-        // below full health; the post-cutscene firefight takes more, but the route must live.
+        // item99g: alive and not ended: no GameEnded/death state took the controller.
         assert!(
-            session.player_health().is_some_and(|h| h < 150.0),
-            "the descent must cost some fall damage: {:?}",
-            session.player_health()
+            !session.player_input_ended(),
+            "the player must keep control (no GameEnded): {}",
+            session.player_controller_state()
+        );
+        // The route is a walk-and-fight route (the start path has no big drop, the chalet fights
+        // and the backup soldiers cost health), so the player dipped below full health on this map
+        // but never died: the per-map minimum Health is positive and below 150. (The travel request
+        // itself restores the carried Health, so the end-of-run value is not the pin.)
+        let min_health = outcome
+            .map_min_health
+            .iter()
+            .find(|(map, _)| map == "Kello01b")
+            .map(|(_, h)| *h);
+        println!("[kello01b item99g] minimum Health on Kello01b: {min_health:?}");
+        assert!(
+            min_health.is_some_and(|h| h > 0.0 && h < 150.0),
+            "the fights must cost some health, never all of it: {min_health:?}"
         );
         let goals = session.objective_states();
         assert_eq!(goals.len(), 2, "the map authors two objectives: {goals:?}");
+        // item99g: goal 0 (cover Kim's escape) used to be pinned incomplete (item99f: the
+        // `veryend` gate was unreachable). Measured cause of the change: the wave chain, the chopper
+        // and the backup soldiers are now cleared by input, `veryend` opens the annex and the
+        // player touches `TouchTrigger0`, whose `objectif0` completes goal 0 through
+        // `XIIIGoalTrigger2`; `TouchTrigger6` -> `roquette` completes goal 1 after its 15 s timer.
         assert!(
-            !goals[0].completed,
-            "goal 0 (cover Kim's escape) is not completed by this route: {goals:?}"
+            goals[0].completed,
+            "goal 0 (cover Kim's escape) must complete through `objectif0`: {goals:?}"
         );
         assert!(
-            !goals[1].completed,
-            "goal 1 (find Jones and Carrington again) is not completed by this route: {goals:?}"
+            goals[1].completed,
+            "goal 1 (find Jones and Carrington again) must complete through `roquette`: {goals:?}"
         );
-        assert!(outcome.travel.is_empty(), "the route must not travel");
+        // The map's own `TestGoalComplete` -> `DoTravel` requests the next map once both goals
+        // are complete; the old `travel.is_empty()` pin is reversed for that measured cause.
+        assert_eq!(
+            outcome.travel.len(),
+            1,
+            "one travel hop: {:?}",
+            outcome.travel
+        );
+        assert_eq!(outcome.travel[0].from, "Kello01b");
+        assert_eq!(outcome.travel[0].to, "PRock01a");
+        assert_eq!(outcome.travel[0].url, "PRock01a.unr");
         assert!(
-            session
-                .touches()
-                .iter()
-                .any(|(_, name)| name == "TouchTrigger2"),
+            touched("TouchTrigger2"),
             "the player must reach TouchTrigger2 (XIII_dans_chalet): {:?}",
             session.touches()
         );
@@ -9252,34 +9316,38 @@ mod tests {
         // fully-enclosed goal-trigger room floor (`z~2091`) and are unreachable; the reachable
         // weapon is the west-floor `M60Pick1` (`z~2076`), grabbed through the game's own
         // interaction Grab (`use M60Pick1`) and selected with the retail `next_weapon` key.
-        let player = vm.find_object("XIIIPlayerPawn").expect("player pawn");
+        // item99g: the run now stops at the map's own travel request, and `DoTravel`'s level-exit
+        // bookkeeping has already stripped the carried weapons from the pawn by then (measured at
+        // the request: `Weapon == None`, inventory = left hand, skills, documents; Health is also
+        // back at its carried value), so the item99e "active weapon is the M60" pin reads the
+        // event trace instead: the M60 pickup (`Inventory.PickupFunction` on an `m60*` weapon) and
+        // the shots fired with it (`XIIIWeapon.NormalFire.AnimEnd`, one per `fire` input line).
+        let m60_events = |function_suffix: &str| -> usize {
+            vm.trace
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        &e.kind,
+                        xiii_script::TraceKind::Event { target, function, .. }
+                            if target.starts_with("m60") && function.ends_with(function_suffix)
+                    )
+                })
+                .count()
+        };
         assert!(
-            matches!(
-                vm.get_property(player, "Weapon"),
-                Some(Value::Object(Some(xiii_script::ObjRef::Instance(_))))
-            ),
-            "the player must pick up a weapon for the post-cutscene fight: {:?}",
-            vm.get_property(player, "Weapon")
+            m60_events("Inventory.PickupFunction") >= 1,
+            "the route must loot the reachable M60 (M60Pick1)"
         );
-        // Positive pin: the active weapon is the reachable M60 machine gun, not the starting
-        // `Fists` (the item99d report's "loots the shotgun" claim was wrong: the shotgun is below
-        // the room and the player never had it).
+        let m60_shots = m60_events("NormalFire.AnimEnd");
         assert!(
-            session
-                .player_weapon()
-                .is_some_and(|w| vm.objects[w as usize].name.starts_with("m60")),
-            "the route must loot the reachable M60 (M60Pick1), got {:?}",
-            session
-                .player_weapon()
-                .map(|w| vm.objects[w as usize].name.clone())
+            m60_shots >= 200,
+            "the route must fire the looted M60 for the waves and the chopper: {m60_shots}"
         );
         // Positive pins: the player crosses the chalet floor onto the map's own goal triggers
-        // (`XIIIGoalTrigger2` tag `objectif0`, `XIIIGoalTrigger1` tag `roquette`). Reaching them
-        // is the next objective step; neither completes yet because goal 0 waits on the level's
-        // own `objectif0` event (fired by the wave/progression script), not on the raw touch.
+        // (`XIIIGoalTrigger2` tag `objectif0`, `XIIIGoalTrigger1` tag `roquette`).
         for trigger in ["XIIIGoalTrigger2", "XIIIGoalTrigger1"] {
             assert!(
-                session.touches().iter().any(|(_, name)| name == trigger),
+                touched(trigger),
                 "the route must reach the goal trigger {trigger}: {:?}",
                 session.touches()
             );
@@ -9288,8 +9356,7 @@ mod tests {
         // emitter in the map: `TouchTrigger0` (Event='objectif0' at (-2262,-886,2127)), a
         // player-touch trigger in the annex/outside zone south of the chalet. The event also
         // reaches `XIIIGoalTrigger2` (GoalNumber 0 -> `CauseGoal`), `TriggerSound29` (the
-        // objective music) and the reinforcement generators `gennmi23`/`gennmi27`. The route
-        // reaches it only as far as the annex doorway, so the event never fires.
+        // objective music) and the reinforcement generators `gennmi23`/`gennmi27`.
         let touch0 = vm
             .find_object("TouchTrigger0")
             .expect("the sole objectif0 emitter");
@@ -9303,12 +9370,16 @@ mod tests {
             Some(&Value::Bool(true)),
             "the emitter must be armed (its PostBeginPlay sets bActif)"
         );
+        // item99g: the old pin "the route must not reach TouchTrigger0" is reversed: the annex
+        // gate is open now (measured cause below), and the touch is what completes goal 0.
         assert!(
-            !session
-                .touches()
-                .iter()
-                .any(|(_, name)| name == "TouchTrigger0"),
-            "the route must not reach the objectif0 emitter: {:?}",
+            touched("TouchTrigger0"),
+            "the route must reach the objectif0 emitter: {:?}",
+            session.touches()
+        );
+        assert!(
+            touched("TouchTrigger6"),
+            "the route must reach the pre_roquette emitter: {:?}",
             session.touches()
         );
         // The cutscene's own `event wave1` (Cine0.tabActions[77]) opened the annex door `Porte1`
@@ -9319,43 +9390,109 @@ mod tests {
             Some(&Value::Bool(true)),
             "the cutscene's `event wave1` must open Porte1"
         );
-        // The passage south to `TouchTrigger0` is gated behind the second annex door `Porte3`
+        // The passage south to `TouchTrigger0` was gated behind the second annex door `Porte3`
         // (Tag='veryend') and the `BreakableMover0` wall (Tag='veryend', Health=1,
         // `bWorldGeometry=true`). `veryend` is fired only by the late level script
-        // (`XIIIDispatcher1`, Tag='fin_dial_artilleurs'), which needs 'End' from the wave chain,
-        // so neither gate opens on this route. The wall is `bWorldGeometry`, and
-        // `XIIIBulletsAmmo.ProcessTraceHit` only spawns impacts for such actors (it never calls
-        // `TakeDamage`), so the M60 cannot break it: the authored condition is the event, not fire.
+        // (`XIIIDispatcher1`, Tag='fin_dial_artilleurs'), which needs the `End` counter (below).
+        // The wall is `bWorldGeometry`, and `XIIIBulletsAmmo.ProcessTraceHit` only spawns impacts
+        // for such actors (it never calls `TakeDamage`), so fire cannot break it: the authored
+        // condition is the event. item99g: the gates are now open (reversed pins, measured).
         let porte3 = vm.find_object("Porte3").expect("annex south door");
         assert_eq!(
-            vm.get_property(porte3, "bClosed"),
+            vm.get_property(porte3, "bOpened"),
             Some(&Value::Bool(true)),
-            "Porte3 must stay closed until `veryend`"
+            "Porte3 must have opened on `veryend`"
         );
-        let wall = vm.find_object("BreakableMover0").expect("south wall");
         assert_eq!(
-            vm.get_property(wall, "bBroken"),
+            vm.get_property(porte3, "bClosed"),
             Some(&Value::Bool(false)),
-            "the veryend wall must stay intact on this route"
+            "Porte3 must no longer be closed after `veryend`"
+        );
+        // `BreakableMover.Break` destroys the mover (measured: it is gone from the live objects once
+        // `veryend` fires), so the exported object is looked up including deleted ones.
+        let wall_id = vm
+            .objects
+            .iter()
+            .position(|o| o.name == "BreakableMover0")
+            .expect("south wall") as xiii_script::ObjectId;
+        assert!(
+            vm.objects[wall_id as usize].deleted
+                || vm.get_property(wall_id, "bBroken") == Some(&Value::Bool(true)),
+            "the veryend wall must be broken (and destroyed) after `veryend`"
+        );
+        assert!(
+            vm.find_live_object("BreakableMover0").is_none(),
+            "the broken wall must no longer be a live collision mover"
         );
         assert_eq!(
-            vm.get_property(wall, "bWorldGeometry"),
+            vm.get_property(wall_id, "bWorldGeometry"),
             Some(&Value::Bool(true)),
             "the wall is world geometry (bullet-proof; it breaks only on `veryend`)"
         );
+        // item99g: the `End` counter. `CineTrigger2` (Tag='End', InitialCounterValue=4; the item99f
+        // report's "1" was wrong) fires `avant_veryend` on the fourth `End`: the three wave
+        // generators' soldiers (`gennmi10` wave1, `gennmi25` wave602, `gennmi20` wave603) and the
+        // chopper `NastyHelico2.DeadEvent`. Each is a `CounterTrigger.Trigger` event in the trace.
+        let counts = events_of("CineTrigger2", "CounterTrigger.Trigger");
+        assert_eq!(
+            counts.len(),
+            4,
+            "four `End` events must reach CineTrigger2: {counts:?}"
+        );
+        for (_, args) in &counts[..3] {
+            assert!(
+                args[0].starts_with("BaseSoldier"),
+                "the first three `End`s come from the wave soldiers: {counts:?}"
+            );
+        }
+        assert_eq!(
+            counts[3].1[0], "NastyHelico2",
+            "the fourth `End` is the chopper's DeadEvent: {counts:?}"
+        );
+        // The chopper appears on `wave401` (a wave soldier's death triggers it while
+        // `InvisibleUntilTriggered`), takes the player's M60 damage (Health 1000) and is gone.
+        let appear = events_of("NastyHelico2", "InvisibleUntilTriggered.Trigger");
+        assert_eq!(appear.len(), 1, "NastyHelico2 appears once: {appear:?}");
+        assert!(
+            appear[0].0 < counts[3].0,
+            "the chopper must appear before it dies: {appear:?} {counts:?}"
+        );
+        let heli_damage: i64 = events_of("NastyHelico2", "HelicoDeco.TakeDamage")
+            .iter()
+            .filter(|(_, args)| args.get(1).is_some_and(|a| a == "XIIIPlayerPawn"))
+            .filter_map(|(_, args)| args[0].parse::<i64>().ok())
+            .sum();
+        assert!(
+            heli_damage >= 1000,
+            "the player's fire must deal the chopper's 1000 Health: {heli_damage}"
+        );
+        assert!(
+            vm.find_live_object("NastyHelico2").is_none(),
+            "the destroyed chopper must be gone"
+        );
+        // The chain after the fourth `End`: `DialogueManager11` (avant_veryend) -> `XIIIDispatcher1`
+        // (fin_dial_artilleurs) -> `veryend` after its 3 s delay.
+        assert!(
+            !events_of("DialogueManager11", "DialogueManager.Trigger").is_empty(),
+            "avant_veryend must trigger the dialogue manager"
+        );
+        assert!(
+            !events_of("XIIIDispatcher1", "XIIIDispatcher.Trigger").is_empty(),
+            "fin_dial_artilleurs must run the veryend dispatcher"
+        );
+        // Goal 1's chain: TouchTrigger6 (`pre_roquette`) -> XIIIDispatcher0 -> `roquette`.
+        assert!(
+            !events_of("XIIIDispatcher0", "XIIIDispatcher.Trigger").is_empty(),
+            "pre_roquette must run XIIIDispatcher0"
+        );
         println!(
-            "[kello01b item99f] objectif0 emitter: TouchTrigger0 (Event='objectif0', \
-             (-2262,-886,2127), bActif=true), reached only from the annex/exterior zone south of \
-             the chalet; receivers are XIIIGoalTrigger2 (goal 0), TriggerSound29 and \
-             gennmi23/gennmi27. The route opens Porte1 (cutscene `event wave1`) but the annex \
-             south is gated by Porte3 and the BreakableMover0 wall, both Tag='veryend' \
-             (BreakableMover0 is bWorldGeometry so weapon fire cannot damage it; \
-             XIIIBulletsAmmo.ProcessTraceHit skips TakeDamage for bWorldGeometry actors). \
-             `veryend` needs 'End' from the wave chain (gennmi10's soldier / the M60 chopper \
-             NastyHelico2, InvisibleUntilTriggered until 'wave401'), so goal 0/1 and the PRock01a \
-             travel stay unreached. Goal 1 is fired by 'roquette': TouchTrigger6 \
+            "[kello01b item99g] End counter events {counts:?}; chopper appeared {appear:?}, player \
+             damage to it {heli_damage}; objectif0 emitter TouchTrigger0 (Event='objectif0', \
+             (-2262,-886,2127)) touched after `veryend` opened Porte3 and broke BreakableMover0 \
+             (bWorldGeometry, so only the event breaks it); receivers XIIIGoalTrigger2 (goal 0), \
+             TriggerSound29 and the backup generators gennmi23/gennmi27; goal 1 via TouchTrigger6 \
              (Event='pre_roquette' at (3303,-3417,1175)) -> XIIIDispatcher0 -> 'roquette' -> \
-             XIIIGoalTrigger1 (GoalNumber 1, TimeBeforeTrigger 15)."
+             XIIIGoalTrigger1 (GoalNumber 1, TimeBeforeTrigger 15) -> DoTravel."
         );
         assert_eq!(
             vm.get_property(
@@ -9363,9 +9500,6 @@ mod tests {
                 "NextMapLevelWithUnr"
             ),
             Some(&Value::Str("PRock01a.unr".to_owned()))
-        );
-        println!(
-            "[kello01b next blocker] item99d: the `wait warning` blocker is fixed. Decoded: the              CineController2 `wait warning` action sets `flagsPaused` bit 4 (`nOnJump[2] = -1`) and              `CineController2.PlayingSequence.CineWarn` clears it; the warning is sent by              `DialogueManager.STA_PlayingDialogue.EndOfLine`, which walks              `Lines[LineIndex].SpeakersToWarnAtTheEndOfThisLine` and calls `CineWarn` on each              named speaker's controller. Our runtime parked at `wait warning` because the              flashback line never spoke: `DialogueManager1` (`dial_flash`) was destroyed by              `MustBeStop` at `StartDialogue` because its `Speakers[0].Pawn` names the map's              pending-kill `Cine2` export (`bDeleteMe=true`, measured). The engine removes that              actor at load and nulls references to it; the VM kept the stale reference, so              `PostBeginPlay` counted it as a present speaker and `MustBeStop` aborted the manager.              Fix: `Vm::load_level` now nulls every property reference to a pending-kill export              (generic, no map/class code; unit tests              `load_level_nulls_references_to_pending_kill_exports` and              `null_deleted_references_walks_structs_arrays_and_delegates`). With the line ending,              the whole cutscene runs (Cine0/Cine1 reach `destroy self` at t~226.4 and `event              objectif99` promotes goal 0 to primary). item99e: the post-cutscene firefight is              survived by input, not by the (unreachable) `FusilPompePick0` shotgun: the player              grabs the reachable west-floor `M60Pick1`, selects it, returns to the wardrobe              cover and kills the close `BaseSoldier2` that otherwise shotguns the unarmed player              to death, crossing `XIIIGoalTrigger2`/`XIIIGoalTrigger1` and surviving with a margin.              Next blocker: goal 0 (`Cover Kim's escape`) completes only when the level's own              `objectif0` event fires (the wave/progression script); touching `XIIIGoalTrigger2`              runs `Engine.Trigger.Touch` -> `TriggerEvent(Event=...)` and does not call its              `CauseGoal`, so goal 0/1 and the `PRock01a` travel stay unreached (travel=[])."
         );
     }
 
