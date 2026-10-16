@@ -33,6 +33,8 @@
 //!   player (yaw toward the waypoint) and holds the forward axis until it is within a small
 //!   radius, then stops. The simulation still owns the movement (this is not a teleport); it is
 //!   used to follow a decoded `ReachSpec` path through a room)
+//! - `goto off`: cancel waypoint steering, retaining the explicitly set movement axes. This
+//!   permits timed yaw/axis/jump input to take over for a running jump.
 
 use std::path::Path;
 
@@ -78,6 +80,8 @@ pub enum Command {
     Teleport([f32; 3]),
     /// Autopilot toward an Unreal-unit waypoint (the driver re-aims and walks; not a teleport).
     Goto([f32; 3]),
+    /// Cancel waypoint steering without changing position, velocity or movement axes.
+    StopGoto,
     /// Request one use/interact action (edge-triggered; the VM `Grab`/use chain). Ray-based: the
     /// host picks the actor in front of the camera.
     Use,
@@ -226,11 +230,19 @@ impl Script {
                     Command::Teleport([x, y, z])
                 }
                 "goto" => {
-                    let x = num(&mut it)?;
-                    let y = num(&mut it)?;
-                    // The waypoint Z is optional; 0 is fine for the horizontal autopilot.
-                    let z = it.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
-                    Command::Goto([x, y, z])
+                    if it.clone().next() == Some("off") {
+                        it.next();
+                        if it.next().is_some() {
+                            return Err(format!("line {n}: unexpected goto off argument"));
+                        }
+                        Command::StopGoto
+                    } else {
+                        let x = num(&mut it)?;
+                        let y = num(&mut it)?;
+                        // The waypoint Z is optional; 0 is fine for the horizontal autopilot.
+                        let z = it.next().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+                        Command::Goto([x, y, z])
+                    }
                 }
                 "use" | "grab" | "interact" => match it.next() {
                     Some(target) => Command::UseNamed(target.to_owned()),
@@ -609,6 +621,7 @@ impl Drive {
                     self.goto = None;
                 }
                 &Command::Goto(p) => self.goto = Some(p),
+                Command::StopGoto => self.goto = None,
                 Command::Use => self.use_pending = true,
                 Command::UseNamed(target) => self.use_named.push(target.clone()),
                 Command::Fire => self.fire_pending = true,
@@ -759,6 +772,36 @@ mod tests {
         assert_eq!(i1.forward, 0.0);
         // A bad/absent coordinate is rejected.
         assert!(Script::parse("t=0.0 goto 1\n").is_err());
+    }
+
+    #[test]
+    fn cancelling_goto_keeps_manual_axes_and_does_not_restore_steering() {
+        let script = Script::parse(
+            "t=0 goto 1000 0\nt=1 goto off\nt=1 forward 1\nt=1 yaw 90\nt=1 jump\nt=2 forward 0\n",
+        )
+        .unwrap();
+        let mut drive = Drive::new(&script);
+        let mut sim = PlayerSim::new([0.0; 3], 0.0);
+        assert_eq!(drive.advance(0.0, &mut sim).forward, 1.0);
+        let before = (sim.location, sim.velocity);
+        let input = drive.advance(1.0, &mut sim);
+        assert_eq!(
+            (sim.location, sim.velocity),
+            before,
+            "cancelling steering must not place or stop the pawn"
+        );
+        assert_eq!(input.forward, 1.0);
+        assert!(input.jump);
+        assert!((sim.yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+        sim.location = [0.0, 100.0, 75.0];
+        let input = drive.advance(1.5, &mut sim);
+        assert!(!input.jump, "jump remains edge-triggered");
+        assert!(
+            (sim.yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-6,
+            "old waypoint must not re-aim subsequent ticks"
+        );
+        assert_eq!(drive.advance(2.0, &mut sim).forward, 0.0);
+        assert!(Script::parse("t=0 goto off 1").is_err());
     }
 
     #[test]

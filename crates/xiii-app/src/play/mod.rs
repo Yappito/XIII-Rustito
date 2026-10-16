@@ -9536,4 +9536,257 @@ mod tests {
         // route's latitude) exceed the ~417 UU retail running jump. See the report for the
         // measured evidence.
     }
+
+    /// Input replay of the ice-field crossing (item98f). The route leaves the authored valley
+    /// loop on the north rim, hops the ~300-UU `GR_banquise_01`/`02` floe chain at the latitude
+    /// the walkthroughs describe (`y ~ -2750..-3400`, not item98e's `y ~ -2200` open hole), and
+    /// stops alive on the far lake ice at ~(-10580,-3394,-1254). The replay matches the offline
+    /// `PlayerSim` search exactly once the approach's combat `track` is yaw-normalised after
+    /// `track off` (without it the pawn keeps a tracked heading the search does not model, and the
+    /// 0.8 s free run before the next `goto` desynchronises the two). The earlier north-band route
+    /// and every one of its assertions remain a separate regression above.
+    #[test]
+    fn opt_in_kello01a_chalet_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to run the Kello01a ice route");
+            return;
+        };
+        let opts = Options {
+            map: Some("Kello01a".into()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Kello01a");
+        let resolved = resolve_params(&game_dir).expect("player defaults");
+        let approach = include_str!("../../tests/data/kello01a_route.script");
+        let continuation = include_str!("../../tests/data/kello01a_chalet_route.script");
+        for text in [approach, continuation] {
+            assert!(
+                !text.lines().any(|line| {
+                    let command = line.split('#').next().unwrap_or("").trim();
+                    [
+                        "teleport",
+                        "place",
+                        "weapon",
+                        "item",
+                        "set_goal",
+                        "take_control",
+                        "assume_control",
+                    ]
+                    .contains(&command.split_whitespace().nth(1).unwrap_or(""))
+                }),
+                "route must contain only input commands"
+            );
+        }
+        let mut script = script::Script::parse(approach).expect("approach");
+        script.events.retain(|e| e.t < 85.8);
+        script.events.extend(
+            script::Script::parse(continuation)
+                .expect("continuation")
+                .events,
+        );
+        script.events.sort_by(|a, b| a.t.total_cmp(&b.t));
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "Kello01a",
+            &script,
+            &resolved.params,
+            &scene,
+            script.last_time() + 3.0,
+        )
+        .expect("input replay");
+        let session = &outcome.session;
+        println!(
+            "[kello01a item98f] map={} goals={:?} travel={:?} position={:?} health={:?} min_health={:?}",
+            outcome.final_map,
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health(),
+            outcome.map_min_health
+        );
+        let player_name = session.player_name.clone();
+        let mut dmg_detail: Vec<String> = Vec::new();
+        for e in &session.vm().trace {
+            if let xiii_script::TraceKind::Event {
+                target,
+                function,
+                args,
+            } = &e.kind
+                && function.ends_with("TakeDamage")
+                && target.eq_ignore_ascii_case(&player_name)
+            {
+                dmg_detail.push(format!(
+                    "{:.2}s {}dmg/{}/{}",
+                    e.time,
+                    args.first().cloned().unwrap_or_default(),
+                    args.get(1).cloned().unwrap_or_default(),
+                    args.get(4).cloned().unwrap_or_default()
+                ));
+            }
+        }
+        println!("[kello01a item98f damage] {dmg_detail:?}");
+        survey::print_details(&survey::extract("Kello01a", &outcome));
+        assert!(
+            session.first_error().is_none(),
+            "{:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(session.blocked.is_empty(), "{:?}", session.blocked);
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 1);
+        assert!(goals[0].primary && goals[0].text == "Find the chalet");
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "player must survive the entire route"
+        );
+        assert!(
+            outcome.map_min_health.iter().all(|(_, h)| *h > 0.0),
+            "a later heal or travel must not conceal death"
+        );
+        // item98f positive pin: the input route leaves the valley loop at (~-5100,-1200), crosses the
+        // lake ice on the authored ~300-UU floe-hop chain (each landing inside the retail running
+        // jump and below the `-1.4*JumpZ` fall-damage threshold), and stops alive past the far
+        // shore at ~(-10580,-3394,-1254). The player stays at full health (150) through the valley
+        // and reaches the ice at 70/150, then loses only soldier-fire falloff (46/150 at the end).
+        // The item98e north-band and every one of its assertions remain a separate regression above.
+        let p = session.player_location().expect("player position");
+        assert!(
+            p[0] < -10000.0 && p[1] < -3200.0 && p[2] > -1300.0,
+            "must reach the far lake ice alive: {p:?}"
+        );
+    }
+
+    #[test]
+    fn opt_in_prock03_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("PRock03".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import PRock03");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let text = include_str!("../../tests/data/prock03_route.script");
+        assert!(!text.lines().any(|line| {
+            let command = line.split('#').next().unwrap_or("").trim();
+            let word = command.split_whitespace().nth(1);
+            ["teleport", "weapon", "item", "set_goal", "take_control"]
+                .iter()
+                .any(|forbidden| word == Some(*forbidden))
+        }));
+        let script = script::Script::parse(text).expect("parse PRock03 route");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "PRock03",
+            &script,
+            &resolved.params,
+            &scene,
+            60.0,
+        )
+        .expect("run PRock03 route");
+        let session = &outcome.session;
+        let vm = session.vm();
+        println!(
+            "[prock03 route] error={:?} objectives={:?} travel={:?} position={:?} health={:?}",
+            session.first_error(),
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health()
+        );
+        println!(
+            "[prock03 loadout] weapon={:?} inventory={:?}",
+            session
+                .player_weapon()
+                .map(|w| vm.objects[w as usize].name.clone()),
+            session
+                .inventory_items()
+                .iter()
+                .map(|(n, c)| format!("{n}[{c}]"))
+                .collect::<Vec<_>>()
+        );
+        survey::print_details(&survey::extract("PRock03", &outcome));
+        assert!(
+            session.first_error().is_none(),
+            "unexpected blocker: {:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(session.blocked.is_empty(), "{:?}", session.blocked);
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "player must survive"
+        );
+        let goals = session.objective_states();
+        assert_eq!(
+            goals.len(),
+            3,
+            "the map authors three objectives: {goals:?}"
+        );
+        assert!(
+            goals[0].primary && !goals[0].anti_goal && !goals[0].completed,
+            "goal 0 (find a way out of the asylum) is the primary open objective: {goals:?}"
+        );
+        assert!(
+            !goals[1].primary && !goals[1].completed,
+            "goal 1 (use the hostage) stays open and is not primary on this route: {goals:?}"
+        );
+        assert!(
+            goals[2].primary && goals[2].anti_goal && goals[2].completed,
+            "the authored anti-goal (do not kill the medical staff) must still hold: {goals:?}"
+        );
+        assert!(
+            outcome.travel.is_empty(),
+            "the blocked route must not travel: {:?}",
+            outcome.travel
+        );
+        // The route reached the west cell-block checkpoint and cannot open it. The measured
+        // stopping point is pinned exactly (no tolerance-widening).
+        let position = session.player_location().expect("player location");
+        assert!(
+            (position[0] - -3821.96).abs() < 2.0
+                && (position[1] - 1720.03).abs() < 2.0
+                && (position[2] - 75.0).abs() < 2.0,
+            "the route must stop at the porte_sec checkpoint: {position:?}"
+        );
+        // Pin the blocker from the game's own state, not from a host bridge:
+        // `Porte29` is the `porte_sec` security door in its `TriggerControl` state (only a `Trigger`
+        // event moves it), and the authored opener `MagneticPassTrigger0` needs the pawn to carry a
+        // `pass` item (`FindPowerUpItemNameForTrigger`, Tag `pass`) that this map never gives out.
+        let security = vm.find_object("Porte29").expect("porte_sec security door");
+        assert_eq!(
+            vm.state_name(security).as_deref(),
+            Some("TriggerControl"),
+            "the security door must be in its event-gated TriggerControl state"
+        );
+        let pass = vm
+            .find_object("MagneticPassTrigger0")
+            .expect("authored magnetic-pass checkpoint opener");
+        assert_eq!(
+            vm.get_property(pass, "Tag"),
+            Some(&Value::Name("pass".to_owned())),
+            "the checkpoint opener reads the pawn's `pass` item"
+        );
+        assert!(
+            session
+                .inventory_items()
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("PRock03MagneticCard")),
+            "the pawn must carry no magnetic card (the map gives none)"
+        );
+        println!(
+            "[prock03 next blocker] the west cell-block corridor and its four ordinary doors \
+             (Porte33/35/40/42) are reached by input; `Porte29` (porte_sec, TriggerControl) is the \
+             event-gated checkpoint and `use` only runs the bare `XIIIMover.PlayerTrigger` no-op \
+             because `MagneticPassTrigger0` needs a `pass` item the map never grants \
+             (MagneticPassHolder is None). Goals 0/1 and the Prock04a travel stay unreached; \
+             health={:?}.",
+            session.player_health()
+        );
+    }
 }

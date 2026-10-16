@@ -59,7 +59,11 @@
       "rmdir *": "deny",
       "Remove-Item*": "deny",
       "rm -rf*": "deny",
-      "rm -r *": "deny"
+      "rm -r *": "deny",
+      "*Stop-Process*": "deny",
+      "*taskkill*": "deny",
+      "*pkill*": "deny",
+      "*killall*": "deny"
     },
     "webfetch": "allow",
     "websearch": "allow",

@@ -1,0 +1,34 @@
+# PRock03 (Plain Rock asylum) input route. Probe: west corridor to the `porte_sec` checkpoint
+# (Porte29, state TriggerControl) whose opener is the aimed `MagneticPassTrigger0`.
+t=0.50 goto -1246 2604
+t=2.50 goto -1476 2543
+t=4.00 goto -1680 2464
+t=5.00 use Porte33
+t=6.00 goto -1857 2527
+t=7.50 goto -2106 2563
+t=9.00 goto -2228 2552
+t=10.50 goto -2339 2530
+t=12.00 goto -2539 2582
+t=13.50 goto -2592 2597
+t=15.00 goto -2728 2656
+t=16.00 use Porte35
+t=17.00 goto -2909 2590
+t=19.00 goto -3296 2388
+t=20.00 use Porte40
+t=21.00 goto -3357 2216
+t=22.50 goto -3456 2157
+t=24.00 goto -3652 1984
+t=25.00 use Porte42
+t=26.00 goto -3468 2051
+t=27.50 goto -3764 2043
+t=29.00 goto -3790 2016
+t=30.50 goto -3840 1720
+t=33.00 track MagneticPassTrigger0
+t=34.00 use MagneticPassTrigger0
+t=35.00 use MagneticPassTrigger0
+t=36.00 track off
+t=37.00 goto -3778 1592
+t=39.00 goto -3787 1504
+t=40.50 goto -3879 1439
+t=42.00 goto -4200 1440
+t=48.00 wait_travel
