@@ -11032,9 +11032,16 @@ impl<'s> Vm<'s> {
                         pawn_z - t[2] > 35.0
                     })
             });
+        // item106: the AI-side gate at 0x103be20a..0x103be219 is `test ah,0x10` on Pawn+0x1f4
+        // (bit 0x1000) with `jne` skipping the call. `APawn::calcMoveFlags` (0x103b00c0) maps
+        // that word's bits 0x400/0x1000/0x800/0x200/0x2000 to R_WALK/R_FLY/R_SWIM/R_JUMP/R_LADDER,
+        // and the Pawn property chain (engine.u) places `bCanFly` at 0x1000: a pawn that can fly
+        // is never ledge-checked.
+        let can_fly = self.bool_prop(pawn, "bCanFly");
         let ledge_guard = !self
             .obj_prop(pawn, "Controller")
             .is_some_and(|ctrl| self.is_a(ctrl, "PlayerController"))
+            && !can_fly
             && !path_drop;
         let mut end;
         let mut on_floor;

@@ -11170,6 +11170,7 @@ fn item101_ledges_fixture() -> Vec<u8> {
     let can_walk_off = b.reserve(IMP_BOOLPROP, actor, "bCanWalkOffLedges");
     let avoid_ledges = b.reserve(IMP_BOOLPROP, actor, "bAvoidLedges");
     let stop_at_ledges = b.reserve(IMP_BOOLPROP, actor, "bStopAtLedges");
+    let can_fly = b.reserve(IMP_BOOLPROP, actor, "bCanFly");
     let physics = b.reserve(IMP_BYTEPROP, actor, "Physics");
 
     let vector_extra = compact(IMP_STRUCT);
@@ -11194,6 +11195,7 @@ fn item101_ledges_fixture() -> Vec<u8> {
         (can_walk_off, vec![]),
         (avoid_ledges, vec![]),
         (stop_at_ledges, vec![]),
+        (can_fly, vec![]),
         (physics, compact(0)),
     ];
     for (i, (field, extra)) in fields.iter().enumerate() {
@@ -11389,7 +11391,7 @@ fn controller_ledge_clamp_holds_the_edge_position_exactly() {
 fn crouching_ai_pawn_is_still_guarded_at_a_ledge() {
     // The physWalking gate does not test the crouch flag: bIsCrouched is Pawn+0x1f4 bit 0x10
     // (`IsCrouched() << 4`, Engine.dll 0x103c2545..0x103c2551), a different bit from the
-    // 0x1000 suppression flag tested at 0x103be213. A crouching AI walker must therefore stop
+    // 0x1000 flag (`bCanFly`) tested at 0x103be213. A crouching AI walker must therefore stop
     // at a ledge exactly like a standing one.
     let set = item101_ledges_set();
     let mut vm = Vm::new(&set, VmLimits::default());
@@ -11442,6 +11444,51 @@ fn ledge_flags_are_not_the_engine_gate() {
     }
     assert!(!fell, "the ledge flags must not disable the retail check");
     assert_eq!(vm.byte_prop(pawn, "Physics"), 1);
+}
+
+#[test]
+fn can_fly_ai_pawn_skips_the_ledge_check() {
+    // item106: the AI gate in APawn::physWalking (Engine.dll 0x103be210: `test ah,0x10` on
+    // Pawn+0x1f4, `jne` skips CheckForLedges) is bit 0x1000. APawn::calcMoveFlags
+    // (0x103b00c0) maps the same word's bits 0x400/0x1000/0x800/0x200/0x2000 to R_WALK/R_FLY/
+    // R_SWIM/R_JUMP/R_LADDER, and the Pawn property chain (engine.u) places `bCanFly` at
+    // 0x1000. A walking AI pawn that can fly is not ledge-checked and steps off.
+    let set = item101_ledges_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(LedgeWorld {
+        ledge_x: 200.0,
+        floor_z: 0.0,
+    }));
+    let (ctrl, pawn) = ledge_pair(&mut vm, &set, "IAController");
+    vm.set_property(pawn, "bCanFly", 0, Value::Bool(true));
+    let mut fell = false;
+    for _ in 0..200 {
+        ledge_step(&mut vm, ctrl, pawn, 0.05);
+        if vm.byte_prop(pawn, "Physics") == 2 {
+            fell = true;
+            break;
+        }
+    }
+    assert!(fell, "a bCanFly AI pawn must not be ledge-clamped");
+    assert!(vm.vector_prop(pawn, "Location").unwrap()[0] > 200.0);
+}
+
+#[test]
+fn other_movement_capability_bits_are_not_the_ledge_gate() {
+    // Break-the-code counterpart: the other calcMoveFlags capability bits (bCanJump 0x200,
+    // bCanSwim 0x800, bCanWalk 0x400) are NOT the AI gate; only bCanFly is. A walking AI pawn
+    // without bCanFly is still held at the edge.
+    let set = item101_ledges_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(LedgeWorld {
+        ledge_x: 200.0,
+        floor_z: 0.0,
+    }));
+    let (ctrl, pawn) = ledge_pair(&mut vm, &set, "IAController");
+    for _ in 0..200 {
+        ledge_step(&mut vm, ctrl, pawn, 0.05);
+        assert_eq!(vm.byte_prop(pawn, "Physics"), 1);
+    }
 }
 
 #[test]
