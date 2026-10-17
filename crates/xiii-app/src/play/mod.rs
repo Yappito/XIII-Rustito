@@ -85,26 +85,76 @@ struct MotionRes(movement_modes::VolumeMotion);
 #[derive(Resource)]
 struct SimRes(PlayerSim);
 
-/// Whether the live fire key went down this frame (`Fire` in DefUser.ini: LeftMouse, RControl).
-fn fire_key_pressed(keys: &ButtonInput<KeyCode>, buttons: &ButtonInput<MouseButton>) -> bool {
-    buttons.just_pressed(MouseButton::Left) || keys.just_pressed(KeyCode::ControlRight)
+/// An edge-triggered live input the fixed tick consumes (a key or button going down).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveEdge {
+    /// `Fire` in DefUser.ini: LeftMouse, RControl.
+    Fire,
+    /// Jump (Space).
+    Jump,
+    /// Use / interact (E, Enter).
+    Use,
 }
 
-/// item105: latches the live fire-press edge once per render frame, before the fixed ticks
+/// The live edge table: every press the fixed tick reads. One entry per edge; adding an input
+/// here routes it through [`latch_live_edges`] with no other change.
+const LIVE_EDGES: [(LiveEdge, &[KeyCode], &[MouseButton]); 3] = [
+    (
+        LiveEdge::Fire,
+        &[KeyCode::ControlRight],
+        &[MouseButton::Left],
+    ),
+    (LiveEdge::Jump, &[KeyCode::Space], &[]),
+    (LiveEdge::Use, &[KeyCode::KeyE, KeyCode::Enter], &[]),
+];
+
+/// A set of [`LiveEdge`]s: those pressed this frame, or latched and not yet consumed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LiveEdges(u8);
+
+impl LiveEdges {
+    const fn bit(edge: LiveEdge) -> u8 {
+        1 << edge as u8
+    }
+
+    fn contains(self, edge: LiveEdge) -> bool {
+        self.0 & Self::bit(edge) != 0
+    }
+
+    /// The edges whose key or button went down this frame.
+    fn pressed(keys: &ButtonInput<KeyCode>, buttons: &ButtonInput<MouseButton>) -> Self {
+        let mut set = 0;
+        for (edge, key_codes, mouse) in LIVE_EDGES {
+            if keys.any_just_pressed(key_codes.iter().copied())
+                || buttons.any_just_pressed(mouse.iter().copied())
+            {
+                set |= Self::bit(edge);
+            }
+        }
+        Self(set)
+    }
+
+    /// Returns the latched edges and clears them: a latched press reaches one tick only.
+    fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+}
+
+/// item105/item105b: latches the live press edges once per render frame, before the fixed ticks
 /// (`RunFixedMainLoopSystems::BeforeFixedMainLoop`), for exactly one fixed tick to consume
-/// (`TraceState::fire_edge`). `ButtonInput::just_pressed` is valid for one render frame, but the
-/// fixed loop runs zero, one or several ticks in it: reading the edge inside `fixed_step` lost
-/// the press when a frame ran no tick (a refresh rate above 60 Hz) and fired the weapon twice
-/// when it ran two. For an automatic weapon the lost edge is worse than a lost click: with the
-/// key held and nothing to start the shot, no `NormalFire` cycle begins, so nothing refires.
-fn latch_fire_edge(
+/// (`TraceState::edges`). `ButtonInput::just_pressed` is valid for one render frame, but the
+/// fixed loop runs zero, one or several ticks in it: reading an edge inside `fixed_step` lost
+/// the press when a frame ran no tick (a refresh rate above 60 Hz) and acted twice when it ran
+/// two. For an automatic weapon the lost fire edge is worse than a lost click: with the key held
+/// and nothing to start the shot, no `NormalFire` cycle begins, so nothing refires. Jump and use
+/// had the same defect. Held (level) inputs are read directly and need no latch; the VM execs
+/// (`live_execs`) are dispatched once per frame from `controls` and need none either.
+fn latch_live_edges(
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut state: ResMut<TraceState>,
 ) {
-    if fire_key_pressed(&keys, &buttons) {
-        state.fire_edge = true;
-    }
+    state.edges.0 |= LiveEdges::pressed(&keys, &buttons).0;
 }
 
 /// A press made while the in-game menu page is open belongs to the page, not to the weapon.
@@ -160,9 +210,9 @@ pub(crate) struct TraceState {
     /// item72: the in-game menu page is open (retail pauses the level; the fixed step
     /// suppresses the player input while it is).
     menu_open: bool,
-    /// item105: a live fire press latched by [`latch_fire_edge`] and not yet consumed by a fixed
-    /// tick.
-    fire_edge: bool,
+    /// item105/item105b: live press edges (fire, jump, use) latched by [`latch_live_edges`] and
+    /// not yet consumed by a fixed tick.
+    edges: LiveEdges,
 }
 
 #[derive(Resource, Default)]
@@ -266,7 +316,7 @@ impl Plugin for PlayPlugin {
             .init_resource::<RuntimeLights>()
             .add_systems(
                 RunFixedMainLoop,
-                latch_fire_edge
+                latch_live_edges
                     .run_if(live_menu_closed)
                     .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
             )
@@ -926,7 +976,7 @@ fn setup_inner(
             post_travel_at: None,
             video_exit_at: None,
             menu_open: false,
-            fire_edge: false,
+            edges: LiveEdges::default(),
         });
     } else {
         // The reload owns a fresh per-map runtime, but the input-script cursor (`ScriptRes`) and
@@ -949,7 +999,8 @@ fn setup_inner(
     Ok(())
 }
 
-fn read_keyboard(keys: &ButtonInput<KeyCode>, buttons: &ButtonInput<MouseButton>) -> Input {
+/// Held (level) keyboard input. The press edges are latched per frame instead ([`LiveEdges`]).
+fn read_keyboard(keys: &ButtonInput<KeyCode>) -> Input {
     let mut forward = 0.0;
     if keys.any_pressed([KeyCode::KeyW, KeyCode::ArrowUp]) {
         forward += 1.0;
@@ -967,10 +1018,11 @@ fn read_keyboard(keys: &ButtonInput<KeyCode>, buttons: &ButtonInput<MouseButton>
     Input {
         forward,
         right,
-        jump: keys.just_pressed(KeyCode::Space),
+        // Edges (jump, use, fire) are not read here: see [`latch_live_edges`].
+        jump: false,
         walk: keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]),
-        use_action: keys.any_just_pressed([KeyCode::KeyE, KeyCode::Enter]),
-        fire: fire_key_pressed(keys, buttons),
+        use_action: false,
+        fire: false,
         // XIII binds `C=Duck` (DefUser.ini); ControlLeft is accepted as the conventional
         // alternative the task names.
         crouch: keys.any_pressed([KeyCode::KeyC, KeyCode::ControlLeft]),
@@ -1060,7 +1112,6 @@ fn fixed_step(
     params: Res<ParamsRes>,
     mut world: ResMut<WorldRes>,
     keys: Res<ButtonInput<KeyCode>>,
-    buttons: Res<ButtonInput<MouseButton>>,
     mut script: ResMut<ScriptRes>,
     mut state: ResMut<TraceState>,
     mut session: NonSendMut<Result<session::Session, String>>,
@@ -1117,6 +1168,9 @@ fn fixed_step(
             drive.set_track_location(None, None);
         }
     }
+    // item105b: consume the latched press edges every tick, also under a script or a
+    // suppression, so a press never waits for a later tick.
+    let edges = state.edges.take();
     // Always advance the script so an explicit `take_control` diagnostic can be read even while a cutscene
     // suppresses input; the axis input and the other command queues are dropped when suppressed.
     let (mut input, weapons, goals, use_named) = match script.drive.as_mut() {
@@ -1130,9 +1184,11 @@ fn fixed_step(
             )
         }
         None => {
-            let mut input = read_keyboard(&keys, &buttons);
-            // item105: the press edge comes from the per-frame latch, consumed exactly once.
-            input.fire = std::mem::take(&mut state.fire_edge);
+            let mut input = read_keyboard(&keys);
+            // item105b: the press edges come from the per-frame latch, consumed exactly once.
+            input.jump = edges.contains(LiveEdge::Jump);
+            input.use_action = edges.contains(LiveEdge::Use);
+            input.fire = edges.contains(LiveEdge::Fire);
             (input, Vec::new(), Vec::new(), Vec::new())
         }
     };
@@ -1687,77 +1743,223 @@ mod live_input_tests {
             post_travel_at: None,
             video_exit_at: None,
             menu_open: false,
-            fire_edge: false,
+            edges: LiveEdges::default(),
         }
     }
 
+    /// Per fixed tick: the edges that tick saw.
     #[derive(Resource, Default)]
-    struct EdgesSeen(Vec<bool>);
+    struct EdgesSeen(Vec<LiveEdges>);
 
-    /// item105: one render frame can run zero, one or several fixed ticks, and
-    /// `ButtonInput::just_pressed` lives for exactly that frame. A press must reach exactly one
-    /// fixed tick whatever the frame/tick ratio: reading `just_pressed` inside the fixed tick
-    /// lost it on a frame without a tick and fired twice on a frame with two.
-    #[test]
-    fn live_fire_press_reaches_exactly_one_fixed_tick() {
+    /// How a test fixed tick reads the press edges.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Reader {
+        /// The shipped path: [`latch_live_edges`] before the fixed loop, `take` in the tick.
+        Latch,
+        /// The pre-item105 path: `just_pressed` read inside the fixed tick.
+        DirectInTick,
+    }
+
+    /// One physical key or button driving an edge.
+    #[derive(Clone, Copy, Debug)]
+    enum Source {
+        Key(KeyCode),
+        Mouse(MouseButton),
+    }
+
+    /// Every physical source of every edge in the table, as `(edge, source)`.
+    fn all_sources() -> Vec<(LiveEdge, Source)> {
+        let mut out = Vec::new();
+        for (edge, keys, mouse) in LIVE_EDGES {
+            out.extend(keys.iter().map(|k| (edge, Source::Key(*k))));
+            out.extend(mouse.iter().map(|m| (edge, Source::Mouse(*m))));
+        }
+        out
+    }
+
+    /// Presses `drive` at `press_frame`, releases it three frames later and presses it again ten
+    /// frames after the first press; 40 frames at `frame_hz`. Returns what each fixed tick saw
+    /// and, per press, the index of the first tick of the press frame (if that frame ran one).
+    fn run_frames(
+        frame_hz: f64,
+        press_frame: usize,
+        drive: &[(LiveEdge, Source)],
+        reader: Reader,
+    ) -> (Vec<LiveEdges>, Vec<Option<usize>>) {
         use bevy::time::{TimePlugin, TimeUpdateStrategy};
-        for frame_hz in [240.0f64, 144.0, 60.0, 45.0, 30.0, 20.0] {
-            for press_frame in 0..6 {
-                let mut app = App::new();
-                app.add_plugins(TimePlugin)
-                    .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
-                    .init_resource::<ButtonInput<KeyCode>>()
-                    .init_resource::<ButtonInput<MouseButton>>()
-                    .insert_resource(latch_state())
-                    .init_resource::<EdgesSeen>()
-                    .add_systems(
-                        RunFixedMainLoop,
-                        latch_fire_edge.in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
-                    )
-                    .add_systems(
-                        FixedUpdate,
-                        |mut state: ResMut<TraceState>, mut seen: ResMut<EdgesSeen>| {
-                            seen.0.push(std::mem::take(&mut state.fire_edge));
-                        },
-                    );
-                app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
-                    1.0 / frame_hz,
-                )));
-                app.update(); // primes the clock: no time has elapsed yet
-                let mut pressed_in_tick_frame = None;
-                for frame in 0..40 {
-                    // The engine's input system clears the per-frame edges, then applies the
-                    // frame's events, before the fixed loop runs.
-                    let mut buttons = app.world_mut().resource_mut::<ButtonInput<MouseButton>>();
-                    buttons.clear();
-                    if frame == press_frame {
-                        buttons.press(MouseButton::Left);
-                    } else if frame == press_frame + 3 {
-                        buttons.release(MouseButton::Left);
-                    }
-                    let before = app.world().resource::<EdgesSeen>().0.len();
-                    app.update();
-                    let seen = &app.world().resource::<EdgesSeen>().0;
-                    if frame == press_frame && seen.len() > before {
-                        pressed_in_tick_frame = Some(seen[before]);
+        let mut app = App::new();
+        app.add_plugins(TimePlugin)
+            .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .insert_resource(latch_state())
+            .init_resource::<EdgesSeen>();
+        match reader {
+            Reader::Latch => {
+                app.add_systems(
+                    RunFixedMainLoop,
+                    latch_live_edges.in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
+                )
+                .add_systems(
+                    FixedUpdate,
+                    |mut state: ResMut<TraceState>, mut seen: ResMut<EdgesSeen>| {
+                        seen.0.push(state.edges.take());
+                    },
+                );
+            }
+            Reader::DirectInTick => {
+                app.add_systems(
+                    FixedUpdate,
+                    |keys: Res<ButtonInput<KeyCode>>,
+                     buttons: Res<ButtonInput<MouseButton>>,
+                     mut seen: ResMut<EdgesSeen>| {
+                        seen.0.push(LiveEdges::pressed(&keys, &buttons));
+                    },
+                );
+            }
+        }
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+            1.0 / frame_hz,
+        )));
+        app.update(); // primes the clock: no time has elapsed yet
+        let mut first_tick = Vec::new();
+        for frame in 0..40 {
+            // The engine's input system clears the per-frame edges, then applies the frame's
+            // events, before the fixed loop runs.
+            let down = frame == press_frame || frame == press_frame + 10;
+            let up = frame == press_frame + 3 || frame == press_frame + 13;
+            {
+                let w = app.world_mut();
+                w.resource_mut::<ButtonInput<KeyCode>>().clear();
+                w.resource_mut::<ButtonInput<MouseButton>>().clear();
+                for (_, source) in drive {
+                    match (*source, down, up) {
+                        (Source::Key(k), true, _) => {
+                            w.resource_mut::<ButtonInput<KeyCode>>().press(k)
+                        }
+                        (Source::Key(k), _, true) => {
+                            w.resource_mut::<ButtonInput<KeyCode>>().release(k);
+                        }
+                        (Source::Mouse(m), true, _) => {
+                            w.resource_mut::<ButtonInput<MouseButton>>().press(m);
+                        }
+                        (Source::Mouse(m), _, true) => {
+                            w.resource_mut::<ButtonInput<MouseButton>>().release(m);
+                        }
+                        _ => {}
                     }
                 }
-                let seen = &app.world().resource::<EdgesSeen>().0;
-                let presses = seen.iter().filter(|e| **e).count();
-                assert_eq!(
-                    presses,
-                    1,
-                    "frame {frame_hz} Hz, press frame {press_frame}: one press must reach one tick ({} ticks ran)",
-                    seen.len()
-                );
-                if let Some(first) = pressed_in_tick_frame {
-                    assert!(
-                        first,
-                        "frame {frame_hz} Hz, press frame {press_frame}: the frame's first tick must see the press"
-                    );
+            }
+            let before = app.world().resource::<EdgesSeen>().0.len();
+            app.update();
+            if down {
+                let ran = app.world().resource::<EdgesSeen>().0.len() > before;
+                first_tick.push(ran.then_some(before));
+            }
+        }
+        (app.world().resource::<EdgesSeen>().0.clone(), first_tick)
+    }
+
+    /// item105/item105b: one render frame can run zero, one or several fixed ticks, and
+    /// `ButtonInput::just_pressed` lives for exactly that frame. A press of fire, jump or use must
+    /// reach exactly one fixed tick whatever the frame/tick ratio (two presses, two ticks):
+    /// reading `just_pressed` inside the fixed tick lost it on a frame without a tick and acted
+    /// twice on a frame with two. Every physical key and button of the edge table alone, and all
+    /// edges pressed together, so a shared flag cannot merge or drop one.
+    #[test]
+    fn live_fire_press_reaches_exactly_one_fixed_tick() {
+        let mut cases: Vec<Vec<(LiveEdge, Source)>> =
+            all_sources().into_iter().map(|s| vec![s]).collect();
+        cases.push(
+            LIVE_EDGES
+                .iter()
+                .map(|(edge, keys, mouse)| {
+                    (
+                        *edge,
+                        keys.first()
+                            .map_or_else(|| Source::Mouse(mouse[0]), |k| Source::Key(*k)),
+                    )
+                })
+                .collect(),
+        );
+        for drive in &cases {
+            for frame_hz in [240.0f64, 144.0, 60.0, 45.0, 30.0, 20.0] {
+                for press_frame in 0..6 {
+                    let (seen, first) = run_frames(frame_hz, press_frame, drive, Reader::Latch);
+                    for (edge, _) in drive {
+                        let presses = seen.iter().filter(|e| e.contains(*edge)).count();
+                        assert_eq!(
+                            presses,
+                            2,
+                            "{drive:?} at {frame_hz} Hz, press frame {press_frame}: two presses of {edge:?} must reach two ticks ({} ticks ran)",
+                            seen.len()
+                        );
+                    }
+                    for tick in first.into_iter().flatten() {
+                        for (edge, _) in drive {
+                            assert!(
+                                seen[tick].contains(*edge),
+                                "{drive:?} at {frame_hz} Hz, press frame {press_frame}: the frame's first tick must see the {edge:?} press"
+                            );
+                        }
+                    }
+                    // No edge appears that was not driven.
+                    for (edge, _, _) in LIVE_EDGES {
+                        if !drive.iter().any(|(e, _)| *e == edge) {
+                            assert!(
+                                seen.iter().all(|e| !e.contains(edge)),
+                                "{drive:?}: {edge:?} appeared without being pressed"
+                            );
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// The same harness with the pre-fix read (`just_pressed` inside the fixed tick) must fail the
+    /// exactly-once check: it loses presses at 240 Hz and doubles them at 20 Hz, for every edge.
+    /// This keeps the test above honest: it distinguishes the old code from the new.
+    #[test]
+    fn direct_read_in_the_fixed_tick_loses_and_doubles_presses() {
+        for (edge, source) in all_sources() {
+            let count = |hz: f64, press_frame: usize| {
+                let (seen, _) =
+                    run_frames(hz, press_frame, &[(edge, source)], Reader::DirectInTick);
+                seen.iter().filter(|e| e.contains(edge)).count()
+            };
+            let lost = (0..6).any(|f| count(240.0, f) < 2);
+            let doubled = (0..6).any(|f| count(20.0, f) > 2);
+            assert!(lost, "{edge:?}/{source:?}: a press must be lost at 240 Hz");
+            assert!(doubled, "{edge:?}/{source:?}: a press must double at 20 Hz");
+        }
+    }
+
+    /// A latched edge is consumed by one take and never replays; edges are independent bits.
+    #[test]
+    fn taken_edges_do_not_replay() {
+        let mut edges = LiveEdges::default();
+        edges.0 |= LiveEdges::bit(LiveEdge::Jump) | LiveEdges::bit(LiveEdge::Use);
+        let first = edges.take();
+        assert!(first.contains(LiveEdge::Jump) && first.contains(LiveEdge::Use));
+        assert!(!first.contains(LiveEdge::Fire));
+        assert_eq!(
+            edges.take(),
+            LiveEdges::default(),
+            "a take clears the latch"
+        );
+    }
+
+    /// A key held across frames is one edge, not one per frame (level is not an edge).
+    #[test]
+    fn held_key_latches_one_edge() {
+        let mut keys = ButtonInput::<KeyCode>::default();
+        let buttons = ButtonInput::<MouseButton>::default();
+        keys.press(KeyCode::Space);
+        assert!(LiveEdges::pressed(&keys, &buttons).contains(LiveEdge::Jump));
+        keys.clear(); // next frame, still held
+        assert_eq!(LiveEdges::pressed(&keys, &buttons), LiveEdges::default());
+        assert!(keys.pressed(KeyCode::Space));
     }
 
     #[test]
@@ -1796,7 +1998,7 @@ mod live_input_tests {
         keys.press(KeyCode::ArrowUp);
         keys.press(KeyCode::ArrowDown);
         assert_eq!(
-            read_keyboard(&keys, &buttons).forward,
+            read_keyboard(&keys).forward,
             0.0,
             "opposing directions cancel"
         );
