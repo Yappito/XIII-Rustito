@@ -6,7 +6,22 @@ Updated: **2026-10-09 (coordinator session)**. Research phase (2026-10-04), M0, 
 
 State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `be56145` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
-### Coordinator handover 2026-10-17 (evening) — current state, read this first
+### Coordinator session 2026-10-17/18 (night) — newest; read first, then the evening handover below
+
+- Landed `affab8e` (verify 1166 passed): item106 (`bCanFly` ledge skip) + item103e (PRock03 past `prsas02`) as one batch.
+  item103f WIP (`viewer`, `dc2f39d`) was left out, unreviewed.
+- Landing with this note: item107 steps 1-2 (closed-loop route commands). `engage [Actor] [radius] [secs] [aim=]
+  [hold=] [period=] [linger=]`, `engage_on`/`engage_off` (standing engagement, pauses a pending `goto`), `loot`,
+  `wait_until <cond> [or|and ...] [timeout]`, `goto_until x y <cond>`; documented in `play/script.rs`, facts gathered
+  read-only in `play/perception.rs`. Converted: plage01, hual04a, kello01b C-F + chopper, kello01a valley, hual01a
+  cabanon. Still recorded (conversion measured and rejected): toits01, kello01a_chalet, hual04c_travel_combat. Known
+  gap: the sight test is stricter than bullets for some soldiers (an ineffective-target rule works around it).
+  Report `local/wt/sweep/local/reports/item107-adaptive-routes.md`. Next: item107 step 3 (PickStartPoint + NotifyBump)
+  in `sweep`, then Hual04a goal 5.
+- **Providers (user, 2026-10-17 night): no Ollama Cloud.** deepseek only via OpenCode Go
+  (`opencode-go/deepseek-v4.1-flash`); plus Z.AI, opencode/Codex gpt-6.1-sol and Sonnet subagents (max 2).
+
+### Coordinator handover 2026-10-17 (evening)
 
 The coordinator stopped near its weekly limit. **No agents, landings or watchdog are running.** `origin/main` = `19baf2a`
 (last landing verify: 1164 passed). Everything below that is not on main is committed as WIP in its worktree.
@@ -55,8 +70,8 @@ is long. Until then, prefer engine fixes that do not change AI timing, or budget
   while verifying; `local/watchdog.ps1` never kills processes under that worktree (agents' tests die and rerun instead).
 - Gate landings on free commit >= 35 GB (`Win32_OperatingSystem.FreeVirtualMemory`); a suite peaks at ~31 GB.
 - Sonnet subagents (Agent tool, model sonnet, at most 2 in parallel, user-approved 2026-10-16) work well for hard tasks;
-  they stop on the Claude session limit and resume with `SendMessage` after the reset. opencode deepseek (OpenCode Go and
-  Ollama Cloud) for the rest; run each agent's launcher as a background task (never `&`).
+  they stop on the Claude session limit and resume with `SendMessage` after the reset. opencode deepseek (OpenCode Go only; no
+  Ollama Cloud since 2026-10-17) for the rest; run each agent's launcher as a background task (never `&`).
 - Review lessons: check agents' Engine.dll claims yourself (item103b2 claimed `FarMoveActor` had no actor test; the call
   at 0x1038a59b proves otherwise); "infeasible" reports often hide a wrong assertion (item103c); "unwinnable" fights may
   be an empty weapon (item98i).
