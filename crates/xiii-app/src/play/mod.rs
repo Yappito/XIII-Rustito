@@ -10854,7 +10854,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            190.0,
+            215.0,
         )
         .expect("run PRock03 key-chain probe");
         let session = &outcome.session;
@@ -10970,24 +10970,54 @@ mod tests {
             "the map does not travel on this route: {:?}",
             outcome.travel
         );
-        // item103d Task 3: the continuation south then east toward the hostage/exit pins against
-        // the `StaticPRock03.prsas02` airlock decor (the `MagneticPassTrigger3` `Door2`/`Porte27`
-        // it opens is behind the player); the measured stop is pinned exactly (no
-        // tolerance-widening). The hostage leg and the `Prock04a` travel stay unreached on this
-        // route, and the player is alive and the game not ended (asserted above).
+        // item103e Task 3: the continuation now crosses the `prsas02` airlock. The carried card is
+        // read on the aimed `MagneticPassTrigger3` (OutEvent `Door2`, opening the `Door2` movers
+        // Porte27/Porte26); the player then crosses the open gap onto the east side and follows
+        // the canonical nav corridor south along x~-2600 through the `PorteAlarme2` alarm doors
+        // into the central-south ward. It stops at the last measured 150-hp waypoint
+        // (-1712,-265, measured stop -1684,-277) because the ward soldiers are hostile: measured
+        // (`local/reports/item103e-probe12.txt`), Health 150 -> 6 between (-1730,-571) and
+        // (135,-1541), death at ~t=238. The measured stop is pinned exactly (no
+        // tolerance-widening). The hostage cell / `Johansson3` (behind the `NMI_Otage10`-gated
+        // Porte15/Porte16) and the `Prock04a` travel stay unreached on this route; the player is
+        // alive and the game not ended (asserted above).
         let position = session.player_location().expect("player location");
         assert!(
-            (position[0] - -2763.0).abs() < 2.0
-                && (position[1] - 838.0).abs() < 2.0
-                && (position[2] - 79.0).abs() < 2.0,
-            "the route must pin at the measured prsas02 seal (-2763,838): {position:?}"
+            (position[0] - -1684.0).abs() < 2.0
+                && (position[1] - -277.0).abs() < 2.0
+                && (position[2] - 75.0).abs() < 2.0,
+            "the route must stop at the last measured safe waypoint (-1684,-277): {position:?}"
+        );
+        // Positive pins for the advance past the old prsas02 pin: the player crossed the
+        // airlock's `Door2` movers and the alarm doors into the central ward (east of x=-1962).
+        assert!(
+            position[0] > -1962.0,
+            "the route must cross the airlock and alarm doors into the central ward: {position:?}"
+        );
+        let porte27 = vm.find_object("Porte27").expect("airlock south leaf");
+        let porte26 = vm.find_object("Porte26").expect("airlock north leaf");
+        assert!(
+            !vm.is_in_state(porte27, "Locked") && !vm.is_in_state(porte26, "Locked"),
+            "the card reader's `Door2` OutEvent must leave both airlock leaves out of Locked: \
+             {:?} {:?}",
+            vm.state_name(porte27),
+            vm.state_name(porte26)
+        );
+        // The player takes no hostile damage before the measured stop; this is the "stop before a
+        // fatal point" pin (the ward soldiers shoot from the next corridor).
+        assert!(
+            session.player_health().is_some_and(|h| h >= 140.0),
+            "the route must stop before the hostile ward: {:?}",
+            session.player_health()
         );
         println!(
             "[prock03 key] on-foot chain complete: cine action index {cine_action_index}, Porte30 \
-             not Locked (no key grant), card carried, porte_sec opened; the continuation pins at \
-             the prsas02 airlock decor, so the hostage leg and the Prock04a travel stay \
-             unreached. Porte30 state={:?}. health={:?}.",
-            vm.state_name(porte30),
+             not Locked (no key grant), card carried, porte_sec opened; the route crossed the \
+             airlock and the alarm doors into the central ward and stops at the last 150-hp \
+             waypoint -1684,-277, before the hostile ward soldiers that kill the player further \
+             east (measured). The `NMI_Otage10`-gated hostage cell and the Prock04a travel stay \
+             unreached. Porte27 state={:?}. health={:?}.",
+            vm.state_name(porte27),
             session.player_health()
         );
     }
