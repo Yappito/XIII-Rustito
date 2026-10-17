@@ -9460,13 +9460,278 @@ mod tests {
                 .all(|(name, _)| !name.eq_ignore_ascii_case("PRock03MagneticCard")),
             "the pawn must carry no magnetic card (the map gives none)"
         );
+        // The card and therefore the checkpoint are behind the level's guard/key chain: the
+        // only nav route to the card crosses `Porte30` (`UnlockItemCode "clefgarde"`). The
+        // detection volume at the checkpoint (`DetectionVolume7`, `Event 'gardien_lostpass'`)
+        // starts the guard `Cine2`'s authored sequence, which walks its waypoint chain and runs
+        // action `opendoor porte30` (tabActions[12]). With the retailed `ULevel::FarMoveActor`
+        // placement (no actor-encroachment rejection) that cine teleport now succeeds, so the
+        // door is open at the end of this walking route. Pinned from the game's own state.
+        let porte30 = vm.find_object("Porte30").expect("clefgarde door");
+        assert!(
+            !vm.is_in_state(porte30, "Locked"),
+            "the guard cine's `opendoor porte30` must have unlocked the door by the checkpoint: \
+             {:?}",
+            vm.state_name(porte30)
+        );
+        assert!(
+            vm.is_in_state(porte30, "PlayerTriggerToggle"),
+            "the cine leaves Porte30 in its open `PlayerTriggerToggle` state: {:?}",
+            vm.state_name(porte30)
+        );
+        assert_eq!(
+            vm.get_property(porte30, "bOpened"),
+            Some(&Value::Bool(true)),
+            "the cine's `open door` leaves Porte30 open"
+        );
+        assert_eq!(
+            vm.get_property(porte30, "UnlockItemCode"),
+            Some(&Value::Str("clefgarde".to_owned())),
+            "Porte30's unlock code is the clefgarde key"
+        );
+        let guard = vm
+            .find_object("Cine2")
+            .expect("gardien_lostpass key holder");
+        assert_eq!(
+            vm.get_property(guard, "Event"),
+            Some(&Value::Name("garde_porte".to_owned())),
+            "the guard's death Event (XIIIPawn.Died -> TriggerEvent) is garde_porte"
+        );
+        let opens_door = match vm.get_property(guard, "tabActions") {
+            Some(Value::Array(entries)) => entries.iter().any(|v| match v {
+                Value::Str(s) | Value::Name(s) => s.eq_ignore_ascii_case("opendoor porte30"),
+                _ => false,
+            }),
+            _ => false,
+        };
+        assert!(
+            opens_door,
+            "Cine2's authored action list must contain the 'opendoor porte30' opener"
+        );
+        // The controller advanced past action index 12 (the opener): after executing action 12
+        // `Interpret` increments `ScriptedActionIndex`, so a value > 12 proves the cine reached
+        // and ran `opendoor porte30`.
+        let cine_action_index = match vm.get_property(guard, "CineController") {
+            Some(Value::Object(Some(xiii_script::ObjRef::Instance(c)))) => {
+                match vm.get_property(*c, "ScriptedActionIndex") {
+                    Some(Value::Int(i)) => *i,
+                    _ => -1,
+                }
+            }
+            _ => -1,
+        };
+        assert!(
+            cine_action_index > 12,
+            "the guard cine must advance past the `opendoor porte30` action (index 12): \
+             {cine_action_index}"
+        );
+        // The guard left its authored start (-3360.56,3311.56) for the card-side waypoints.
+        let guard_loc = vm.vector_prop(guard, "Location").expect("guard location");
+        assert!(
+            (guard_loc[1] - 3311.56).abs() > 200.0,
+            "the guard cine must carry the guard along its waypoint chain: {guard_loc:?}"
+        );
         println!(
             "[prock03 next blocker] the west cell-block corridor and its four ordinary doors \
-             (Porte33/35/40/42) are reached by input; `Porte29` (porte_sec, TriggerControl) is the \
-             event-gated checkpoint and `use` only runs the bare `XIIIMover.PlayerTrigger` no-op \
-             because `MagneticPassTrigger0` needs a `pass` item the map never grants \
-             (MagneticPassHolder is None). Goals 0/1 and the Prock04a travel stay unreached; \
-             health={:?}.",
+             (Porte33/35/40/42) are reached by input; the checkpoint DetectionVolume now starts \
+             the guard cine, which runs `opendoor porte30` and parks the guard at PositionInfo22 \
+             (cine action index {cine_action_index}). `Porte29` (porte_sec, TriggerControl) is \
+             still the event-gated checkpoint: `use` runs only the bare `XIIIMover.PlayerTrigger` \
+             no-op because `MagneticPassTrigger0` needs a `pass` item the map never grants \
+             (`MagneticPassHolder` is None). The magnetic card behind the now-open `Porte30` and \
+             the Prock04a travel stay unreached; health={:?}.",
+            session.player_health()
+        );
+    }
+
+    /// item103d acceptance: the PRock03 guard-key -> magnetic-card -> `porte_sec` chain driven
+    /// entirely by player input, with **no teleports** (the previous labelled diagnostics are
+    /// removed). The natural west-corridor route reaches the `porte_sec` checkpoint, which touches
+    /// the guard detection volume `DetectionVolume7` (`Event 'gardien_lostpass'`); the guard
+    /// `Cine2` cine then runs its action 12 `opendoor porte30`, so the player walks north through
+    /// the now-open `Porte30` to the magnetic card `Hual02MagneticCardPick0`, walks over it
+    /// (`Hual02MagneticCard`, Event `pass`) and returns to the checkpoint. Because the cine already
+    /// opened `Porte30`, `XIDMaps.PRock03.Trigger` never grants the `clefgarde` key (its grant is
+    /// gated on `DoorToOpen` still being `Locked`); the key is the alternative path, not a retail
+    /// requirement. The carried card, read on `MagneticPassTrigger0` through
+    /// `XIIIPawn.FindPowerUpItemNameForTrigger`, opens the `TriggerControl` checkpoint `Porte29`.
+    /// The route then continues toward the objectives (hostage `Johansson3` / `CellKey`) and the
+    /// `Prock04a` travel as far as the map allows.
+    ///
+    /// The `Porte30` leaf is a `PlayerTriggerToggle` mover: walking through it toggles it shut, so
+    /// the return leg re-opens it with the player's own `use` before stepping through.
+    #[test]
+    fn opt_in_prock03_guard_key_card_chain() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("PRock03".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import PRock03");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let text = include_str!("../../tests/data/prock03_key_chain.script");
+        assert!(
+            !text.lines().any(|line| {
+                let command = line.split('#').next().unwrap_or("").trim();
+                let word = command.split_whitespace().nth(1);
+                [
+                    "teleport",
+                    "place",
+                    "weapon",
+                    "item",
+                    "set_goal",
+                    "take_control",
+                ]
+                .iter()
+                .any(|forbidden| word == Some(*forbidden))
+            }),
+            "item103d: the on-foot chain must be input-only, with no teleports or host bridges"
+        );
+        let script = script::Script::parse(text).expect("parse PRock03 key-chain probe");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "PRock03",
+            &script,
+            &resolved.params,
+            &scene,
+            190.0,
+        )
+        .expect("run PRock03 key-chain probe");
+        let session = &outcome.session;
+        let vm = session.vm();
+        println!(
+            "[prock03 key] error={:?} objectives={:?} travel={:?} position={:?} health={:?}",
+            session.first_error(),
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health()
+        );
+        println!(
+            "[prock03 key] inventory={:?}",
+            session
+                .inventory_items()
+                .iter()
+                .map(|(n, c)| format!("{n}[{c}]"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            session.first_error().is_none(),
+            "unexpected blocker: {:?}",
+            session.first_error()
+        );
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "the player must survive the key chain"
+        );
+        // --- item103d on-foot positive pins -------------------------------------------------
+        // The guard cine opened Porte30 (`opendoor porte30`); it is not the player's key use.
+        // (`bOpened` is left by the player's own later `use`/walk-through, so the pins are the
+        // state leaving `Locked` plus the cine action index, below.)
+        let porte30 = vm.find_object("Porte30").expect("Porte30");
+        assert!(
+            !vm.is_in_state(porte30, "Locked"),
+            "the guard cine's `opendoor porte30` must leave Porte30 not Locked: {:?}",
+            vm.state_name(porte30)
+        );
+        // The cine reached and ran action 12 (`opendoor porte30`); `Interpret` increments
+        // `ScriptedActionIndex` after each action, so a value > 12 proves the opener ran.
+        let guard = vm
+            .find_object("Cine2")
+            .expect("gardien_lostpass key holder");
+        let cine_action_index = match vm.get_property(guard, "CineController") {
+            Some(Value::Object(Some(xiii_script::ObjRef::Instance(c)))) => {
+                match vm.get_property(*c, "ScriptedActionIndex") {
+                    Some(Value::Int(i)) => *i,
+                    _ => -1,
+                }
+            }
+            _ => -1,
+        };
+        assert!(
+            cine_action_index > 12,
+            "the guard cine must advance past the `opendoor porte30` action (index 12): \
+             {cine_action_index}"
+        );
+        // `XIDMaps.PRock03.Trigger` grants the `clefgarde` key only while `DoorToOpen` (Porte30)
+        // is still `Locked`. The cine opened it, so the grant was skipped and the player carries
+        // no `clefgarde` key on the on-foot path; the key is the alternative path, not a retail
+        // requirement.
+        let carried_key = (0..vm.objects.len() as xiii_script::ObjectId).find(|&i| {
+            let o = &vm.objects[i as usize];
+            !o.deleted
+                && vm.is_a(i, "keys")
+                && matches!(
+                    vm.get_property(i, "Owner"),
+                    Some(Value::Object(Some(xiii_script::ObjRef::Instance(owner))))
+                        if *owner == session.player
+                )
+        });
+        assert!(
+            carried_key.is_none(),
+            "the on-foot path must skip the clefgarde grant: the player must carry no key"
+        );
+        // The walk-over card pickup put the `pass` item into the game's inventory.
+        assert!(
+            session
+                .inventory_items()
+                .iter()
+                .any(|(item, _)| item.eq_ignore_ascii_case("Hual02MagneticCard")),
+            "the player must carry Hual02MagneticCard after the pickup"
+        );
+        // The aimed reader use matched the card and its OutEvent opened the TriggerControl
+        // checkpoint (`Mover.TriggerControl.Open`).
+        let security = vm.find_object("Porte29").expect("porte_sec security door");
+        assert_eq!(
+            vm.get_property(security, "bOpened"),
+            Some(&Value::Bool(true)),
+            "the porte_sec checkpoint must open through MagneticPassTrigger0's OutEvent"
+        );
+        // item103d Task 3: the player is still alive and the game has not ended (no death or
+        // `GameEnded` pin).
+        assert!(
+            !session.player_input_ended(),
+            "the game must not end (death or GameEnded) on the on-foot chain"
+        );
+        // The objectives keep their authored states over the chain (the anti-goal still holds).
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 3, "three authored objectives: {goals:?}");
+        assert!(
+            goals[0].primary && !goals[0].completed,
+            "goal 0 stays the open primary objective: {goals:?}"
+        );
+        assert!(!goals[1].completed, "goal 1 stays open: {goals:?}");
+        assert!(
+            goals[2].primary && goals[2].anti_goal && goals[2].completed,
+            "the anti-goal (do not kill the medical staff) must still hold: {goals:?}"
+        );
+        assert!(
+            outcome.travel.is_empty(),
+            "the map does not travel on this route: {:?}",
+            outcome.travel
+        );
+        // item103d Task 3: the continuation south then east toward the hostage/exit pins against
+        // the `StaticPRock03.prsas02` airlock decor (the `MagneticPassTrigger3` `Door2`/`Porte27`
+        // it opens is behind the player); the measured stop is pinned exactly (no
+        // tolerance-widening). The hostage leg and the `Prock04a` travel stay unreached on this
+        // route, and the player is alive and the game not ended (asserted above).
+        let position = session.player_location().expect("player location");
+        assert!(
+            (position[0] - -2763.0).abs() < 2.0
+                && (position[1] - 838.0).abs() < 2.0
+                && (position[2] - 79.0).abs() < 2.0,
+            "the route must pin at the measured prsas02 seal (-2763,838): {position:?}"
+        );
+        println!(
+            "[prock03 key] on-foot chain complete: cine action index {cine_action_index}, Porte30 \
+             not Locked (no key grant), card carried, porte_sec opened; the continuation pins at \
+             the prsas02 airlock decor, so the hostage leg and the Prock04a travel stay \
+             unreached. Porte30 state={:?}. health={:?}.",
+            vm.state_name(porte30),
             session.player_health()
         );
     }
