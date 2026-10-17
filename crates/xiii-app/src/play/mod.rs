@@ -85,6 +85,83 @@ struct MotionRes(movement_modes::VolumeMotion);
 #[derive(Resource)]
 struct SimRes(PlayerSim);
 
+/// An edge-triggered live input the fixed tick consumes (a key or button going down).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveEdge {
+    /// `Fire` in DefUser.ini: LeftMouse, RControl.
+    Fire,
+    /// Jump (Space).
+    Jump,
+    /// Use / interact (E, Enter).
+    Use,
+}
+
+/// The live edge table: every press the fixed tick reads. One entry per edge; adding an input
+/// here routes it through [`latch_live_edges`] with no other change.
+const LIVE_EDGES: [(LiveEdge, &[KeyCode], &[MouseButton]); 3] = [
+    (
+        LiveEdge::Fire,
+        &[KeyCode::ControlRight],
+        &[MouseButton::Left],
+    ),
+    (LiveEdge::Jump, &[KeyCode::Space], &[]),
+    (LiveEdge::Use, &[KeyCode::KeyE, KeyCode::Enter], &[]),
+];
+
+/// A set of [`LiveEdge`]s: those pressed this frame, or latched and not yet consumed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LiveEdges(u8);
+
+impl LiveEdges {
+    const fn bit(edge: LiveEdge) -> u8 {
+        1 << edge as u8
+    }
+
+    fn contains(self, edge: LiveEdge) -> bool {
+        self.0 & Self::bit(edge) != 0
+    }
+
+    /// The edges whose key or button went down this frame.
+    fn pressed(keys: &ButtonInput<KeyCode>, buttons: &ButtonInput<MouseButton>) -> Self {
+        let mut set = 0;
+        for (edge, key_codes, mouse) in LIVE_EDGES {
+            if keys.any_just_pressed(key_codes.iter().copied())
+                || buttons.any_just_pressed(mouse.iter().copied())
+            {
+                set |= Self::bit(edge);
+            }
+        }
+        Self(set)
+    }
+
+    /// Returns the latched edges and clears them: a latched press reaches one tick only.
+    fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+}
+
+/// item105/item105b: latches the live press edges once per render frame, before the fixed ticks
+/// (`RunFixedMainLoopSystems::BeforeFixedMainLoop`), for exactly one fixed tick to consume
+/// (`TraceState::edges`). `ButtonInput::just_pressed` is valid for one render frame, but the
+/// fixed loop runs zero, one or several ticks in it: reading an edge inside `fixed_step` lost
+/// the press when a frame ran no tick (a refresh rate above 60 Hz) and acted twice when it ran
+/// two. For an automatic weapon the lost fire edge is worse than a lost click: with the key held
+/// and nothing to start the shot, no `NormalFire` cycle begins, so nothing refires. Jump and use
+/// had the same defect. Held (level) inputs are read directly and need no latch; the VM execs
+/// (`live_execs`) are dispatched once per frame from `controls` and need none either.
+fn latch_live_edges(
+    keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    mut state: ResMut<TraceState>,
+) {
+    state.edges.0 |= LiveEdges::pressed(&keys, &buttons).0;
+}
+
+/// A press made while the in-game menu page is open belongs to the page, not to the weapon.
+fn live_menu_closed(menu: NonSend<ingamemenu::InGameMenu>) -> bool {
+    !menu.is_open()
+}
+
 #[derive(Resource)]
 struct WorldRes {
     world: CollisionWorld,
@@ -133,6 +210,9 @@ pub(crate) struct TraceState {
     /// item72: the in-game menu page is open (retail pauses the level; the fixed step
     /// suppresses the player input while it is).
     menu_open: bool,
+    /// item105/item105b: live press edges (fire, jump, use) latched by [`latch_live_edges`] and
+    /// not yet consumed by a fixed tick.
+    edges: LiveEdges,
 }
 
 #[derive(Resource, Default)]
@@ -234,6 +314,12 @@ impl Plugin for PlayPlugin {
             .init_resource::<RenderSync>()
             .init_resource::<weapons::WeaponView>()
             .init_resource::<RuntimeLights>()
+            .add_systems(
+                RunFixedMainLoop,
+                latch_live_edges
+                    .run_if(live_menu_closed)
+                    .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
+            )
             .add_plugins(viewer::particles::ParticlePlugin)
             .add_plugins(MaterialPlugin::<viewer::lights::ReceiverMaterial>::default())
             .init_resource::<cinematics::CinematicState>()
@@ -890,6 +976,7 @@ fn setup_inner(
             post_travel_at: None,
             video_exit_at: None,
             menu_open: false,
+            edges: LiveEdges::default(),
         });
     } else {
         // The reload owns a fresh per-map runtime, but the input-script cursor (`ScriptRes`) and
@@ -912,7 +999,8 @@ fn setup_inner(
     Ok(())
 }
 
-fn read_keyboard(keys: &ButtonInput<KeyCode>, buttons: &ButtonInput<MouseButton>) -> Input {
+/// Held (level) keyboard input. The press edges are latched per frame instead ([`LiveEdges`]).
+fn read_keyboard(keys: &ButtonInput<KeyCode>) -> Input {
     let mut forward = 0.0;
     if keys.any_pressed([KeyCode::KeyW, KeyCode::ArrowUp]) {
         forward += 1.0;
@@ -930,10 +1018,11 @@ fn read_keyboard(keys: &ButtonInput<KeyCode>, buttons: &ButtonInput<MouseButton>
     Input {
         forward,
         right,
-        jump: keys.just_pressed(KeyCode::Space),
+        // Edges (jump, use, fire) are not read here: see [`latch_live_edges`].
+        jump: false,
         walk: keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]),
-        use_action: keys.any_just_pressed([KeyCode::KeyE, KeyCode::Enter]),
-        fire: buttons.just_pressed(MouseButton::Left) || keys.just_pressed(KeyCode::ControlRight),
+        use_action: false,
+        fire: false,
         // XIII binds `C=Duck` (DefUser.ini); ControlLeft is accepted as the conventional
         // alternative the task names.
         crouch: keys.any_pressed([KeyCode::KeyC, KeyCode::ControlLeft]),
@@ -1023,7 +1112,6 @@ fn fixed_step(
     params: Res<ParamsRes>,
     mut world: ResMut<WorldRes>,
     keys: Res<ButtonInput<KeyCode>>,
-    buttons: Res<ButtonInput<MouseButton>>,
     mut script: ResMut<ScriptRes>,
     mut state: ResMut<TraceState>,
     mut session: NonSendMut<Result<session::Session, String>>,
@@ -1080,6 +1168,9 @@ fn fixed_step(
             drive.set_track_location(None, None);
         }
     }
+    // item105b: consume the latched press edges every tick, also under a script or a
+    // suppression, so a press never waits for a later tick.
+    let edges = state.edges.take();
     // Always advance the script so an explicit `take_control` diagnostic can be read even while a cutscene
     // suppresses input; the axis input and the other command queues are dropped when suppressed.
     let (mut input, weapons, goals, use_named) = match script.drive.as_mut() {
@@ -1092,12 +1183,14 @@ fn fixed_step(
                 drive.take_use_named(),
             )
         }
-        None => (
-            read_keyboard(&keys, &buttons),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ),
+        None => {
+            let mut input = read_keyboard(&keys);
+            // item105b: the press edges come from the per-frame latch, consumed exactly once.
+            input.jump = edges.contains(LiveEdge::Jump);
+            input.use_action = edges.contains(LiveEdge::Use);
+            input.fire = edges.contains(LiveEdge::Fire);
+            (input, Vec::new(), Vec::new(), Vec::new())
+        }
     };
     let mut weapon_inputs = if let Some(drive) = script.drive.as_mut() {
         drive.take_weapon_inputs()
@@ -1133,6 +1226,15 @@ fn fixed_step(
     };
     let use_action = input.use_action;
     let fire = input.fire;
+    // item105: a windowed `--play-script` run carries the same held buttons as the headless
+    // route runner (`fire_hold`/`altfire_hold`); without this they were parsed and dropped. A
+    // live (no script) run publishes the real key state from `controls` instead.
+    let ((hold_fire, fire_edge), (hold_altfire, altfire_edge)) = script
+        .drive
+        .as_mut()
+        .map(script::Drive::take_hook_buttons)
+        .unwrap_or_default();
+    let (fire_edge, altfire_edge) = (fire_edge && !suppressed, altfire_edge && !suppressed);
     let t0 = Instant::now();
     if motion.0.is_empty() {
         sim.0
@@ -1197,6 +1299,9 @@ fn fixed_step(
             floor_normal: sim.0.floor_normal,
             eye_height: sim.0.vm_eye_height(&params.0),
         };
+        if script.drive.is_some() {
+            sess.set_hook_buttons(hold_fire, hold_altfire);
+        }
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
         // Retail `APawn::SetZone`: publish the volume at the pawn's head (`Location +
         // CollisionHeight`) so `Pawn.BreathTimer` sees `HeadVolume.bWaterVolume` (item98e).
@@ -1318,6 +1423,14 @@ fn fixed_step(
                 }
                 other => println!("[play] fire: {other:?}"),
             }
+        }
+        if fire_edge {
+            let outcome = sess.fire_pressed(sim.0.yaw, sim.0.pitch);
+            println!("[play] fire_hold press: {outcome:?}");
+        }
+        if altfire_edge {
+            let outcome = sess.altfire_pressed();
+            println!("[play] altfire_hold press: {outcome:?}");
         }
         let t0 = Instant::now();
         crate::audio::pump(sess.events.iter());
@@ -1618,6 +1731,237 @@ fn live_execs(
 mod live_input_tests {
     use super::*;
 
+    fn latch_state() -> TraceState {
+        TraceState {
+            tick: 0,
+            saved_total: 0,
+            start: Instant::now(),
+            exit_secs: None,
+            shot: 0,
+            shot_done: false,
+            target_at: None,
+            post_travel_at: None,
+            video_exit_at: None,
+            menu_open: false,
+            edges: LiveEdges::default(),
+        }
+    }
+
+    /// Per fixed tick: the edges that tick saw.
+    #[derive(Resource, Default)]
+    struct EdgesSeen(Vec<LiveEdges>);
+
+    /// How a test fixed tick reads the press edges.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Reader {
+        /// The shipped path: [`latch_live_edges`] before the fixed loop, `take` in the tick.
+        Latch,
+        /// The pre-item105 path: `just_pressed` read inside the fixed tick.
+        DirectInTick,
+    }
+
+    /// One physical key or button driving an edge.
+    #[derive(Clone, Copy, Debug)]
+    enum Source {
+        Key(KeyCode),
+        Mouse(MouseButton),
+    }
+
+    /// Every physical source of every edge in the table, as `(edge, source)`.
+    fn all_sources() -> Vec<(LiveEdge, Source)> {
+        let mut out = Vec::new();
+        for (edge, keys, mouse) in LIVE_EDGES {
+            out.extend(keys.iter().map(|k| (edge, Source::Key(*k))));
+            out.extend(mouse.iter().map(|m| (edge, Source::Mouse(*m))));
+        }
+        out
+    }
+
+    /// Presses `drive` at `press_frame`, releases it three frames later and presses it again ten
+    /// frames after the first press; 40 frames at `frame_hz`. Returns what each fixed tick saw
+    /// and, per press, the index of the first tick of the press frame (if that frame ran one).
+    fn run_frames(
+        frame_hz: f64,
+        press_frame: usize,
+        drive: &[(LiveEdge, Source)],
+        reader: Reader,
+    ) -> (Vec<LiveEdges>, Vec<Option<usize>>) {
+        use bevy::time::{TimePlugin, TimeUpdateStrategy};
+        let mut app = App::new();
+        app.add_plugins(TimePlugin)
+            .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .insert_resource(latch_state())
+            .init_resource::<EdgesSeen>();
+        match reader {
+            Reader::Latch => {
+                app.add_systems(
+                    RunFixedMainLoop,
+                    latch_live_edges.in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
+                )
+                .add_systems(
+                    FixedUpdate,
+                    |mut state: ResMut<TraceState>, mut seen: ResMut<EdgesSeen>| {
+                        seen.0.push(state.edges.take());
+                    },
+                );
+            }
+            Reader::DirectInTick => {
+                app.add_systems(
+                    FixedUpdate,
+                    |keys: Res<ButtonInput<KeyCode>>,
+                     buttons: Res<ButtonInput<MouseButton>>,
+                     mut seen: ResMut<EdgesSeen>| {
+                        seen.0.push(LiveEdges::pressed(&keys, &buttons));
+                    },
+                );
+            }
+        }
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+            1.0 / frame_hz,
+        )));
+        app.update(); // primes the clock: no time has elapsed yet
+        let mut first_tick = Vec::new();
+        for frame in 0..40 {
+            // The engine's input system clears the per-frame edges, then applies the frame's
+            // events, before the fixed loop runs.
+            let down = frame == press_frame || frame == press_frame + 10;
+            let up = frame == press_frame + 3 || frame == press_frame + 13;
+            {
+                let w = app.world_mut();
+                w.resource_mut::<ButtonInput<KeyCode>>().clear();
+                w.resource_mut::<ButtonInput<MouseButton>>().clear();
+                for (_, source) in drive {
+                    match (*source, down, up) {
+                        (Source::Key(k), true, _) => {
+                            w.resource_mut::<ButtonInput<KeyCode>>().press(k)
+                        }
+                        (Source::Key(k), _, true) => {
+                            w.resource_mut::<ButtonInput<KeyCode>>().release(k);
+                        }
+                        (Source::Mouse(m), true, _) => {
+                            w.resource_mut::<ButtonInput<MouseButton>>().press(m);
+                        }
+                        (Source::Mouse(m), _, true) => {
+                            w.resource_mut::<ButtonInput<MouseButton>>().release(m);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let before = app.world().resource::<EdgesSeen>().0.len();
+            app.update();
+            if down {
+                let ran = app.world().resource::<EdgesSeen>().0.len() > before;
+                first_tick.push(ran.then_some(before));
+            }
+        }
+        (app.world().resource::<EdgesSeen>().0.clone(), first_tick)
+    }
+
+    /// item105/item105b: one render frame can run zero, one or several fixed ticks, and
+    /// `ButtonInput::just_pressed` lives for exactly that frame. A press of fire, jump or use must
+    /// reach exactly one fixed tick whatever the frame/tick ratio (two presses, two ticks):
+    /// reading `just_pressed` inside the fixed tick lost it on a frame without a tick and acted
+    /// twice on a frame with two. Every physical key and button of the edge table alone, and all
+    /// edges pressed together, so a shared flag cannot merge or drop one.
+    #[test]
+    fn live_fire_press_reaches_exactly_one_fixed_tick() {
+        let mut cases: Vec<Vec<(LiveEdge, Source)>> =
+            all_sources().into_iter().map(|s| vec![s]).collect();
+        cases.push(
+            LIVE_EDGES
+                .iter()
+                .map(|(edge, keys, mouse)| {
+                    (
+                        *edge,
+                        keys.first()
+                            .map_or_else(|| Source::Mouse(mouse[0]), |k| Source::Key(*k)),
+                    )
+                })
+                .collect(),
+        );
+        for drive in &cases {
+            for frame_hz in [240.0f64, 144.0, 60.0, 45.0, 30.0, 20.0] {
+                for press_frame in 0..6 {
+                    let (seen, first) = run_frames(frame_hz, press_frame, drive, Reader::Latch);
+                    for (edge, _) in drive {
+                        let presses = seen.iter().filter(|e| e.contains(*edge)).count();
+                        assert_eq!(
+                            presses,
+                            2,
+                            "{drive:?} at {frame_hz} Hz, press frame {press_frame}: two presses of {edge:?} must reach two ticks ({} ticks ran)",
+                            seen.len()
+                        );
+                    }
+                    for tick in first.into_iter().flatten() {
+                        for (edge, _) in drive {
+                            assert!(
+                                seen[tick].contains(*edge),
+                                "{drive:?} at {frame_hz} Hz, press frame {press_frame}: the frame's first tick must see the {edge:?} press"
+                            );
+                        }
+                    }
+                    // No edge appears that was not driven.
+                    for (edge, _, _) in LIVE_EDGES {
+                        if !drive.iter().any(|(e, _)| *e == edge) {
+                            assert!(
+                                seen.iter().all(|e| !e.contains(edge)),
+                                "{drive:?}: {edge:?} appeared without being pressed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same harness with the pre-fix read (`just_pressed` inside the fixed tick) must fail the
+    /// exactly-once check: it loses presses at 240 Hz and doubles them at 20 Hz, for every edge.
+    /// This keeps the test above honest: it distinguishes the old code from the new.
+    #[test]
+    fn direct_read_in_the_fixed_tick_loses_and_doubles_presses() {
+        for (edge, source) in all_sources() {
+            let count = |hz: f64, press_frame: usize| {
+                let (seen, _) =
+                    run_frames(hz, press_frame, &[(edge, source)], Reader::DirectInTick);
+                seen.iter().filter(|e| e.contains(edge)).count()
+            };
+            let lost = (0..6).any(|f| count(240.0, f) < 2);
+            let doubled = (0..6).any(|f| count(20.0, f) > 2);
+            assert!(lost, "{edge:?}/{source:?}: a press must be lost at 240 Hz");
+            assert!(doubled, "{edge:?}/{source:?}: a press must double at 20 Hz");
+        }
+    }
+
+    /// A latched edge is consumed by one take and never replays; edges are independent bits.
+    #[test]
+    fn taken_edges_do_not_replay() {
+        let mut edges = LiveEdges::default();
+        edges.0 |= LiveEdges::bit(LiveEdge::Jump) | LiveEdges::bit(LiveEdge::Use);
+        let first = edges.take();
+        assert!(first.contains(LiveEdge::Jump) && first.contains(LiveEdge::Use));
+        assert!(!first.contains(LiveEdge::Fire));
+        assert_eq!(
+            edges.take(),
+            LiveEdges::default(),
+            "a take clears the latch"
+        );
+    }
+
+    /// A key held across frames is one edge, not one per frame (level is not an edge).
+    #[test]
+    fn held_key_latches_one_edge() {
+        let mut keys = ButtonInput::<KeyCode>::default();
+        let buttons = ButtonInput::<MouseButton>::default();
+        keys.press(KeyCode::Space);
+        assert!(LiveEdges::pressed(&keys, &buttons).contains(LiveEdge::Jump));
+        keys.clear(); // next frame, still held
+        assert_eq!(LiveEdges::pressed(&keys, &buttons), LiveEdges::default());
+        assert!(keys.pressed(KeyCode::Space));
+    }
+
     #[test]
     fn live_input_edges_release_and_retail_groups() {
         let mut keys = ButtonInput::default();
@@ -1654,7 +1998,7 @@ mod live_input_tests {
         keys.press(KeyCode::ArrowUp);
         keys.press(KeyCode::ArrowDown);
         assert_eq!(
-            read_keyboard(&keys, &buttons).forward,
+            read_keyboard(&keys).forward,
             0.0,
             "opposing directions cancel"
         );
@@ -1739,22 +2083,18 @@ fn controls(
         && let Ok(sess) = session.as_mut()
         && let Some(pc) = sess.controller
     {
-        sess.vm_mut().set_property(
-            pc,
-            "bFire",
-            0,
-            Value::Byte(u8::from(
-                buttons.pressed(MouseButton::Left) || keys.pressed(KeyCode::ControlRight),
-            )),
-        );
-        sess.vm_mut().set_property(
-            pc,
-            "bAltFire",
-            0,
-            Value::Byte(u8::from(
-                buttons.pressed(MouseButton::Right) || keys.pressed(KeyCode::AltRight),
-            )),
-        );
+        let fire_down = buttons.pressed(MouseButton::Left) || keys.pressed(KeyCode::ControlRight);
+        let altfire_down = buttons.pressed(MouseButton::Right) || keys.pressed(KeyCode::AltRight);
+        sess.vm_mut()
+            .set_property(pc, "bFire", 0, Value::Byte(u8::from(fire_down)));
+        sess.vm_mut()
+            .set_property(pc, "bAltFire", 0, Value::Byte(u8::from(altfire_down)));
+        // item105: the fixed step's `Session::step` republishes the held buttons every tick
+        // (the hook owns them while selected/attached, a held weapon fire otherwise). Feed it the
+        // live key state too: while the hook owned the buttons it published the scripted
+        // default (nothing held) over the byte written above on the next tick, so a held key
+        // never reached the rope's `PressingFire` polls in windowed play.
+        sess.set_hook_buttons(fire_down, altfire_down);
         // State-aware dispatch preserves retail NoControl/NoMove exec overrides.
         for (name, args) in live_execs(&keys, &buttons, wheel.delta.y) {
             if let Err(e) = sess.vm_mut().send_event(pc, name, args) {
@@ -10376,13 +10716,278 @@ mod tests {
                 .all(|(name, _)| !name.eq_ignore_ascii_case("PRock03MagneticCard")),
             "the pawn must carry no magnetic card (the map gives none)"
         );
+        // The card and therefore the checkpoint are behind the level's guard/key chain: the
+        // only nav route to the card crosses `Porte30` (`UnlockItemCode "clefgarde"`). The
+        // detection volume at the checkpoint (`DetectionVolume7`, `Event 'gardien_lostpass'`)
+        // starts the guard `Cine2`'s authored sequence, which walks its waypoint chain and runs
+        // action `opendoor porte30` (tabActions[12]). With the retailed `ULevel::FarMoveActor`
+        // placement (no actor-encroachment rejection) that cine teleport now succeeds, so the
+        // door is open at the end of this walking route. Pinned from the game's own state.
+        let porte30 = vm.find_object("Porte30").expect("clefgarde door");
+        assert!(
+            !vm.is_in_state(porte30, "Locked"),
+            "the guard cine's `opendoor porte30` must have unlocked the door by the checkpoint: \
+             {:?}",
+            vm.state_name(porte30)
+        );
+        assert!(
+            vm.is_in_state(porte30, "PlayerTriggerToggle"),
+            "the cine leaves Porte30 in its open `PlayerTriggerToggle` state: {:?}",
+            vm.state_name(porte30)
+        );
+        assert_eq!(
+            vm.get_property(porte30, "bOpened"),
+            Some(&Value::Bool(true)),
+            "the cine's `open door` leaves Porte30 open"
+        );
+        assert_eq!(
+            vm.get_property(porte30, "UnlockItemCode"),
+            Some(&Value::Str("clefgarde".to_owned())),
+            "Porte30's unlock code is the clefgarde key"
+        );
+        let guard = vm
+            .find_object("Cine2")
+            .expect("gardien_lostpass key holder");
+        assert_eq!(
+            vm.get_property(guard, "Event"),
+            Some(&Value::Name("garde_porte".to_owned())),
+            "the guard's death Event (XIIIPawn.Died -> TriggerEvent) is garde_porte"
+        );
+        let opens_door = match vm.get_property(guard, "tabActions") {
+            Some(Value::Array(entries)) => entries.iter().any(|v| match v {
+                Value::Str(s) | Value::Name(s) => s.eq_ignore_ascii_case("opendoor porte30"),
+                _ => false,
+            }),
+            _ => false,
+        };
+        assert!(
+            opens_door,
+            "Cine2's authored action list must contain the 'opendoor porte30' opener"
+        );
+        // The controller advanced past action index 12 (the opener): after executing action 12
+        // `Interpret` increments `ScriptedActionIndex`, so a value > 12 proves the cine reached
+        // and ran `opendoor porte30`.
+        let cine_action_index = match vm.get_property(guard, "CineController") {
+            Some(Value::Object(Some(xiii_script::ObjRef::Instance(c)))) => {
+                match vm.get_property(*c, "ScriptedActionIndex") {
+                    Some(Value::Int(i)) => *i,
+                    _ => -1,
+                }
+            }
+            _ => -1,
+        };
+        assert!(
+            cine_action_index > 12,
+            "the guard cine must advance past the `opendoor porte30` action (index 12): \
+             {cine_action_index}"
+        );
+        // The guard left its authored start (-3360.56,3311.56) for the card-side waypoints.
+        let guard_loc = vm.vector_prop(guard, "Location").expect("guard location");
+        assert!(
+            (guard_loc[1] - 3311.56).abs() > 200.0,
+            "the guard cine must carry the guard along its waypoint chain: {guard_loc:?}"
+        );
         println!(
             "[prock03 next blocker] the west cell-block corridor and its four ordinary doors \
-             (Porte33/35/40/42) are reached by input; `Porte29` (porte_sec, TriggerControl) is the \
-             event-gated checkpoint and `use` only runs the bare `XIIIMover.PlayerTrigger` no-op \
-             because `MagneticPassTrigger0` needs a `pass` item the map never grants \
-             (MagneticPassHolder is None). Goals 0/1 and the Prock04a travel stay unreached; \
-             health={:?}.",
+             (Porte33/35/40/42) are reached by input; the checkpoint DetectionVolume now starts \
+             the guard cine, which runs `opendoor porte30` and parks the guard at PositionInfo22 \
+             (cine action index {cine_action_index}). `Porte29` (porte_sec, TriggerControl) is \
+             still the event-gated checkpoint: `use` runs only the bare `XIIIMover.PlayerTrigger` \
+             no-op because `MagneticPassTrigger0` needs a `pass` item the map never grants \
+             (`MagneticPassHolder` is None). The magnetic card behind the now-open `Porte30` and \
+             the Prock04a travel stay unreached; health={:?}.",
+            session.player_health()
+        );
+    }
+
+    /// item103d acceptance: the PRock03 guard-key -> magnetic-card -> `porte_sec` chain driven
+    /// entirely by player input, with **no teleports** (the previous labelled diagnostics are
+    /// removed). The natural west-corridor route reaches the `porte_sec` checkpoint, which touches
+    /// the guard detection volume `DetectionVolume7` (`Event 'gardien_lostpass'`); the guard
+    /// `Cine2` cine then runs its action 12 `opendoor porte30`, so the player walks north through
+    /// the now-open `Porte30` to the magnetic card `Hual02MagneticCardPick0`, walks over it
+    /// (`Hual02MagneticCard`, Event `pass`) and returns to the checkpoint. Because the cine already
+    /// opened `Porte30`, `XIDMaps.PRock03.Trigger` never grants the `clefgarde` key (its grant is
+    /// gated on `DoorToOpen` still being `Locked`); the key is the alternative path, not a retail
+    /// requirement. The carried card, read on `MagneticPassTrigger0` through
+    /// `XIIIPawn.FindPowerUpItemNameForTrigger`, opens the `TriggerControl` checkpoint `Porte29`.
+    /// The route then continues toward the objectives (hostage `Johansson3` / `CellKey`) and the
+    /// `Prock04a` travel as far as the map allows.
+    ///
+    /// The `Porte30` leaf is a `PlayerTriggerToggle` mover: walking through it toggles it shut, so
+    /// the return leg re-opens it with the player's own `use` before stepping through.
+    #[test]
+    fn opt_in_prock03_guard_key_card_chain() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("PRock03".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import PRock03");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let text = include_str!("../../tests/data/prock03_key_chain.script");
+        assert!(
+            !text.lines().any(|line| {
+                let command = line.split('#').next().unwrap_or("").trim();
+                let word = command.split_whitespace().nth(1);
+                [
+                    "teleport",
+                    "place",
+                    "weapon",
+                    "item",
+                    "set_goal",
+                    "take_control",
+                ]
+                .iter()
+                .any(|forbidden| word == Some(*forbidden))
+            }),
+            "item103d: the on-foot chain must be input-only, with no teleports or host bridges"
+        );
+        let script = script::Script::parse(text).expect("parse PRock03 key-chain probe");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "PRock03",
+            &script,
+            &resolved.params,
+            &scene,
+            190.0,
+        )
+        .expect("run PRock03 key-chain probe");
+        let session = &outcome.session;
+        let vm = session.vm();
+        println!(
+            "[prock03 key] error={:?} objectives={:?} travel={:?} position={:?} health={:?}",
+            session.first_error(),
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health()
+        );
+        println!(
+            "[prock03 key] inventory={:?}",
+            session
+                .inventory_items()
+                .iter()
+                .map(|(n, c)| format!("{n}[{c}]"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            session.first_error().is_none(),
+            "unexpected blocker: {:?}",
+            session.first_error()
+        );
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "the player must survive the key chain"
+        );
+        // --- item103d on-foot positive pins -------------------------------------------------
+        // The guard cine opened Porte30 (`opendoor porte30`); it is not the player's key use.
+        // (`bOpened` is left by the player's own later `use`/walk-through, so the pins are the
+        // state leaving `Locked` plus the cine action index, below.)
+        let porte30 = vm.find_object("Porte30").expect("Porte30");
+        assert!(
+            !vm.is_in_state(porte30, "Locked"),
+            "the guard cine's `opendoor porte30` must leave Porte30 not Locked: {:?}",
+            vm.state_name(porte30)
+        );
+        // The cine reached and ran action 12 (`opendoor porte30`); `Interpret` increments
+        // `ScriptedActionIndex` after each action, so a value > 12 proves the opener ran.
+        let guard = vm
+            .find_object("Cine2")
+            .expect("gardien_lostpass key holder");
+        let cine_action_index = match vm.get_property(guard, "CineController") {
+            Some(Value::Object(Some(xiii_script::ObjRef::Instance(c)))) => {
+                match vm.get_property(*c, "ScriptedActionIndex") {
+                    Some(Value::Int(i)) => *i,
+                    _ => -1,
+                }
+            }
+            _ => -1,
+        };
+        assert!(
+            cine_action_index > 12,
+            "the guard cine must advance past the `opendoor porte30` action (index 12): \
+             {cine_action_index}"
+        );
+        // `XIDMaps.PRock03.Trigger` grants the `clefgarde` key only while `DoorToOpen` (Porte30)
+        // is still `Locked`. The cine opened it, so the grant was skipped and the player carries
+        // no `clefgarde` key on the on-foot path; the key is the alternative path, not a retail
+        // requirement.
+        let carried_key = (0..vm.objects.len() as xiii_script::ObjectId).find(|&i| {
+            let o = &vm.objects[i as usize];
+            !o.deleted
+                && vm.is_a(i, "keys")
+                && matches!(
+                    vm.get_property(i, "Owner"),
+                    Some(Value::Object(Some(xiii_script::ObjRef::Instance(owner))))
+                        if *owner == session.player
+                )
+        });
+        assert!(
+            carried_key.is_none(),
+            "the on-foot path must skip the clefgarde grant: the player must carry no key"
+        );
+        // The walk-over card pickup put the `pass` item into the game's inventory.
+        assert!(
+            session
+                .inventory_items()
+                .iter()
+                .any(|(item, _)| item.eq_ignore_ascii_case("Hual02MagneticCard")),
+            "the player must carry Hual02MagneticCard after the pickup"
+        );
+        // The aimed reader use matched the card and its OutEvent opened the TriggerControl
+        // checkpoint (`Mover.TriggerControl.Open`).
+        let security = vm.find_object("Porte29").expect("porte_sec security door");
+        assert_eq!(
+            vm.get_property(security, "bOpened"),
+            Some(&Value::Bool(true)),
+            "the porte_sec checkpoint must open through MagneticPassTrigger0's OutEvent"
+        );
+        // item103d Task 3: the player is still alive and the game has not ended (no death or
+        // `GameEnded` pin).
+        assert!(
+            !session.player_input_ended(),
+            "the game must not end (death or GameEnded) on the on-foot chain"
+        );
+        // The objectives keep their authored states over the chain (the anti-goal still holds).
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 3, "three authored objectives: {goals:?}");
+        assert!(
+            goals[0].primary && !goals[0].completed,
+            "goal 0 stays the open primary objective: {goals:?}"
+        );
+        assert!(!goals[1].completed, "goal 1 stays open: {goals:?}");
+        assert!(
+            goals[2].primary && goals[2].anti_goal && goals[2].completed,
+            "the anti-goal (do not kill the medical staff) must still hold: {goals:?}"
+        );
+        assert!(
+            outcome.travel.is_empty(),
+            "the map does not travel on this route: {:?}",
+            outcome.travel
+        );
+        // item103d Task 3: the continuation south then east toward the hostage/exit pins against
+        // the `StaticPRock03.prsas02` airlock decor (the `MagneticPassTrigger3` `Door2`/`Porte27`
+        // it opens is behind the player); the measured stop is pinned exactly (no
+        // tolerance-widening). The hostage leg and the `Prock04a` travel stay unreached on this
+        // route, and the player is alive and the game not ended (asserted above).
+        let position = session.player_location().expect("player location");
+        assert!(
+            (position[0] - -2763.0).abs() < 2.0
+                && (position[1] - 838.0).abs() < 2.0
+                && (position[2] - 79.0).abs() < 2.0,
+            "the route must pin at the measured prsas02 seal (-2763,838): {position:?}"
+        );
+        println!(
+            "[prock03 key] on-foot chain complete: cine action index {cine_action_index}, Porte30 \
+             not Locked (no key grant), card carried, porte_sec opened; the continuation pins at \
+             the prsas02 airlock decor, so the hostage leg and the Prock04a travel stay \
+             unreached. Porte30 state={:?}. health={:?}.",
+            vm.state_name(porte30),
             session.player_health()
         );
     }
