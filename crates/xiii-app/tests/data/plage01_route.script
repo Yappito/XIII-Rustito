@@ -67,13 +67,7 @@ t=71.80 forward 1
 # the hut steps and fires at his head straight away: he dies at 72.9 s (r5: 147 -> 141 hp here,
 # against 147 -> 93 hp when the old schedule fired from 74.7 s, run c_orig).
 t=72.30 forward 0
-t=72.30 track BaseSoldier 0.85
-t=72.50 fire
-t=72.90 fire
-t=73.30 fire
-t=73.70 fire
-t=74.10 fire
-t=74.40 track off
+t=72.30 engage BaseSoldier 1500 10
 # TouchTrigger9 (-307,-1396) on the way down; objective 0 completes in the game's own chain.
 t=73.50 goto -307.0 -1400.0
 
@@ -106,18 +100,7 @@ t=144.20 goto -861.8 -8127.4
 # on the spot he reaches, (-877,-8153) (the goto above ends 30 UU short, so it stays active and
 # would keep the yaw), and bursts him: he dies at 147.1 s (r5).
 t=146.40 goto -877.1 -8153.1
-t=146.50 track BaseSoldier4 0.85
-t=146.70 fire
-t=147.10 fire
-t=147.50 fire
-t=147.90 fire
-t=148.30 fire
-t=148.70 fire
-t=149.10 fire
-t=149.50 fire
-t=149.90 fire
-t=150.30 fire
-t=150.50 track off
+t=146.50 engage BaseSoldier4 2000 10
 t=152.90 goto -1686.3 -8702.9
 t=160.90 goto -2554.9 -8907.9
 t=169.10 goto -3413.6 -9257.6
@@ -138,25 +121,11 @@ t=189.70 goto -4319.9 -9475.7
 # yaw, so it is replaced by the reached spot before the tracked burst (measured r5:
 # BaseSoldier7 dies at 190.8 s on the first two hits).
 t=190.10 goto -4347.7 -9495.1
-t=190.20 track BaseSoldier7
-t=190.40 fire
-t=190.80 fire
-t=191.20 fire
-t=191.60 fire
-t=192.00 track off
+t=190.20 engage BaseSoldier7 2000 10
 # BaseSoldier4 hunted along the shore from the east and parks 300-600 UU north-east of the
 # crossing; burst him from the same stand - before walking past BaseSoldier7's corpse, which
 # sits directly on the firing line afterwards (measured: the post-leg burst hit the corpse).
-t=192.10 track BaseSoldier4
-t=192.20 fire
-t=192.60 fire
-t=193.00 fire
-t=193.40 fire
-t=193.80 fire
-t=194.20 fire
-t=194.60 fire
-t=195.00 fire
-t=195.10 track off
+t=192.10 engage BaseSoldier4 2000 10
 t=195.30 goto -4630.0 -9531.7
 t=202.70 goto -5568.0 -9793.0
 t=209.50 goto -5902.0 -10424.5
@@ -164,16 +133,7 @@ t=209.50 goto -5902.0 -10424.5
 # walks the shore and hovers around (-5902,-10424) - 150-250 UU off this leg. Walking past him
 # unharmed measured ~45 hp of magnum fire (the first round-8 route run), so the player bursts
 # him here at contact range.
-t=210.60 track BaseSoldier8
-t=210.80 fire
-t=211.20 fire
-t=211.60 fire
-t=212.00 fire
-t=212.40 fire
-t=212.80 fire
-t=213.20 fire
-t=213.60 fire
-t=213.70 track off
+t=210.60 engage BaseSoldier8 2000 10
 t=213.20 goto -5839.7 -10664.2
 t=217.80 goto -5738.4 -11048.0
 t=223.20 goto -5445.3 -11461.0
@@ -201,31 +161,9 @@ t=288.20 goto 643.2 -14174.5
 # round 8: -12/10 s each). The hut-granted m60 (switch_weapon 16, its decoded InventoryGroup)
 # reaches them with `track` aim at 1540/2750 UU, 45 hp/hit, every fired round landing (measured
 # r8_e2). The fires start as the player arrives at PathNode47 (the goto above lands ~291).
-t=291.10 track BaseSoldier9
-t=291.30 switch_weapon 16
-t=291.60 fire
-t=292.15 fire
-t=292.70 fire
-t=293.25 fire
-t=293.80 fire
-t=294.35 fire
-t=294.90 fire
-t=295.45 fire
-t=296.00 fire
-t=296.10 track off
-t=296.40 track BaseSoldier10
-t=296.70 fire
-t=297.25 fire
-t=297.80 fire
-t=298.35 fire
-t=298.90 fire
-t=299.45 fire
-t=300.00 fire
-t=300.55 fire
-t=301.10 fire
-t=301.65 fire
-t=302.20 fire
-t=302.30 track off
+t=291.10 switch_weapon 16
+t=291.30 engage BaseSoldier9 3500 20
+t=291.40 engage BaseSoldier10 3500 20
 # ---- the killer: he settles at the water's edge ~(1100,-13750) from ~300 s (r8_e2) and stays
 # there while the player holds the shore. switch_weapon 2 requests the picked-up Beretta
 # (InventoryGroup 2) before the burst; the checkpoint acceptance also checks its selection
@@ -233,29 +171,15 @@ t=302.30 track off
 # item76 (measured r5): from the 630 UU stand no round reached him (0 hits in 15), and a fire
 # during the M60's 0.67 s DownWeapon aborted the switch. The player now walks to ~250 UU of him
 # while the Beretta comes up, then fires head-aimed from 304.4 s: he dies at 305.0 s.
-t=302.60 track BaseSoldier6 0.85
-t=302.90 switch_weapon 2
-t=303.00 goto 947.0 -13924.0
-t=304.40 fire
-t=304.95 fire
-t=305.50 fire
-t=306.05 fire
-t=306.60 fire
-t=307.15 fire
-t=307.70 fire
-t=308.25 fire
-t=308.80 fire
-t=309.35 fire
-t=309.90 fire
-t=310.45 fire
-t=311.00 fire
-t=311.10 track off
+t=302.60 switch_weapon 2
+t=303.00 goto_until 947.0 -13924.0 arrived 10
+t=303.10 engage BaseSoldier6 3000 20
 # ---- corpse walk: the game's own XIIIPlayerPawn.Tick auto-search drains the killer's chain
 # (the truck key) as the player walks over him (measured r8_e2: Touch BaseSoldier6 at ~309,
 # then `use Porte1: Unlocked`). item76 (measured): the killer now dies coming at the player and
 # his corpse comes to rest at (1391.6,-13495.1) (diagnostic run to 311 s), so the walk aims
 # there instead of the old (1170,-13700) hover spot.
-t=311.50 goto 1391.6 -13495.1
+t=311.50 loot 2500 20
 # Measured: the pre-save run left the M60 selected. Re-select the Beretta through the game's
 # normal switch after the auto-search, preserving the checkpoint's expected selection.
 t=315.00 switch_weapon 2

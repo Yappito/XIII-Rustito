@@ -23,6 +23,7 @@ pub mod ingamemenu;
 pub mod movement_modes;
 pub mod movers;
 pub mod pawns;
+mod perception;
 pub mod script;
 pub mod session;
 pub mod sim;
@@ -775,7 +776,7 @@ fn setup_inner(
                 script.events.len(),
                 script.last_time()
             );
-            (Some(script::Drive::new(&script)), Some(script.last_time()))
+            (Some(script::Drive::new(&script)), Some(script.budget()))
         }
         None => (None, None),
     };
@@ -1166,6 +1167,17 @@ fn fixed_step(
             drive.set_track_location(Some(&name), location);
         } else {
             drive.set_track_location(None, None);
+        }
+        // item107: facts for the closed-loop blocking commands. The windowed VM keeps no trace,
+        // so an `event` condition says so (`observe_trace`) instead of silently never holding.
+        if drive.wants_facts()
+            && let Ok(sess) = (*session).as_mut()
+        {
+            let facts =
+                perception::gather(&drive.fact_request(), sess, &sim.0, &params.0, suppressed);
+            drive.set_facts(facts);
+            let vm = sess.vm();
+            drive.observe_trace(&vm.trace, vm.trace_enabled);
         }
     }
     // item105b: consume the latched press edges every tick, also under a script or a
@@ -3151,6 +3163,22 @@ fn run_script_inner(
         } else {
             drive.set_track_location(None, None);
         }
+        // item107: facts for the closed-loop blocking commands (`engage`, `wait_until`).
+        drive.set_travel_count(travel.len() as u32);
+        if drive.wants_facts() {
+            let suppressed =
+                respect_cinematic_input && cinematics::input_suppressed(&runtime.session);
+            let facts = perception::gather(
+                &drive.fact_request(),
+                &mut runtime.session,
+                &runtime.sim,
+                params,
+                suppressed,
+            );
+            drive.set_facts(facts);
+            let vm = runtime.session.vm();
+            drive.observe_trace(&vm.trace, vm.trace_enabled);
+        }
         let mut input = if control_tick.is_some() {
             drive.advance(elapsed, &mut runtime.sim)
         } else {
@@ -3371,7 +3399,16 @@ fn run_script_inner(
             let outcome = runtime
                 .session
                 .fire_pressed(runtime.sim.yaw, runtime.sim.pitch);
-            println!("[play] fire_hold press [{elapsed:.3}s]: {outcome:?}");
+            println!(
+                "[play] fire_hold press [{elapsed:.3}s]: {outcome:?} | player {} | bone {} | {}",
+                runtime
+                    .session
+                    .player_health()
+                    .map(|h| format!("{h:.0} hp"))
+                    .unwrap_or_else(|| "? hp".to_owned()),
+                runtime.session.vm().last_trace_bone(),
+                combat_snapshot(&runtime.session)
+            );
         }
         if altfire_edge {
             let outcome = runtime.session.altfire_pressed();
@@ -3422,6 +3459,7 @@ fn run_script_inner(
             }
             // The script block (if any) is released; the next map starts a fresh run.
             drive.notify_travel();
+            drive.session_changed();
             let opts = crate::cli::Options {
                 game_dir: Some(game_dir.to_path_buf()),
                 map: Some(plan.map.clone()),
@@ -3583,9 +3621,9 @@ fn run_headless_inner(opts: &Options) -> Result<(), String> {
     let duration = opts.exit_after_secs.unwrap_or_else(|| {
         if script.has_wait_travel() {
             // `wait_travel` scripts run until the game requests travel; give them a budget.
-            script.last_time() + 60.0
+            script.budget() + 60.0
         } else {
-            script.last_time() + 2.0
+            script.budget() + 2.0
         }
     });
     let outcome =
@@ -4574,9 +4612,20 @@ mod tests {
             .iter()
             .filter(|event| matches!(event.command, script::Command::Fire))
             .count();
+        // item107: the killer's burst is a closed-loop `engage BaseSoldier6` (it presses the
+        // trigger as often as the target stays alive and visible) instead of >= 10 recorded
+        // `fire` lines; the kill asserted below is the measured proof that the burst fired.
+        let killer_engagements = script
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(&event.command, script::Command::Engage(spec)
+                    if spec.target.as_deref() == Some("BaseSoldier6"))
+            })
+            .count();
         assert!(
-            requested_shots >= 10,
-            "tracked route must fire a burst, got {requested_shots} fire commands"
+            requested_shots >= 10 || killer_engagements >= 1,
+            "tracked route must fire a burst, got {requested_shots} fire commands and {killer_engagements} killer engagements"
         );
         let target = outcome
             .session
@@ -6338,8 +6387,12 @@ mod tests {
         assert!(weapon.is_some(), "the player must hold the granted weapon");
         assert_eq!(
             s.player_health(),
-            Some(18.0),
-            "measured surviving fight health (item104: re-measured on the integrated tree, 18; \
+            Some(12.0),
+            "measured surviving fight health (item107: 12, was 18. The route prefix now fights \
+             with closed-loop `engage` blocks that pause the script clock, so the `t=291` lines \
+             above start about 5 s later in game time (measured: BaseSoldier6 dies at 305.6 s, \
+             not 294.7 s; 37 hp at the stand instead of 39); the same tree with the previous \
+             recorded prefix still measures 18. item104: 18 on the integrated tree; \
              item102 measured 31 on its own base with FindSpot + the ledge rule. On this tree \
              skipping the steered-walking friction (temporary env gate) also gives 18, so the \
              friction is not the cause; disabling only the ledge rule gives 0 (player dead). The \

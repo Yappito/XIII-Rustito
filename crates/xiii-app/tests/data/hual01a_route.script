@@ -160,14 +160,9 @@ t=155.00 use XIIIMover6
 # and/or Cine14 killed (+13 c9mm through the game's own SearchPawn loot chain). The cabanon
 # walls cover the exchange (zero incoming hits measured in every probe run).
 t=157.00 switch_weapon 9
-t=157.50 track Cine14
-t=158.50 fire
-t=160.00 fire
-t=161.50 fire
-t=163.00 fire
-t=164.20 fire
-t=165.40 fire
-t=166.40 track off
+# item107: closed-loop; `engage` turns to the nearest visible hostile (Cine14 or the guard
+# behind him), re-presses every 1.4 s (the shotgun's recorded cadence) and ends when none is left.
+t=157.50 engage 3000 12 period=1.4 linger=2
 # Labelled teleport (measured cabanon-exit wedge, see header), then north around the poste
 # and east across the CLOSED bridge (x 4765..6232 panels + static GR_pont ramps), fought
 # through on foot (see header): BaseSoldier0's fire lines only reach the abutment and the

@@ -8969,6 +8969,19 @@ impl<'s> Vm<'s> {
         Ok(false)
     }
 
+    /// item107: the level-geometry half of a sight test (`Controller.LineOfSightTo` /
+    /// `Actor.FastTrace` without actor occlusion): `None` when a zero-extent trace from `start`
+    /// to `end` crosses no world geometry, otherwise `Some(owner)` where `owner` names the actor
+    /// whose geometry blocks it, when the provider knows it (a mover or a placed mesh). Without a
+    /// physics provider nothing is known, which reads as clear.
+    pub fn world_line_blocker(&mut self, start: [f32; 3], end: [f32; 3]) -> Option<Option<String>> {
+        let provider = self.physics.as_mut()?;
+        match provider.trace_with_mover(start, end, [0.0; 3]) {
+            (Some(_), owner) => Some(owner),
+            (None, _) => None,
+        }
+    }
+
     /// Zero-extent world line trace through the installed provider (callers check
     /// [`Vm::physics_ready`] first).
     fn world_line(&mut self, start: [f32; 3], end: [f32; 3]) -> Option<WorldHit> {
