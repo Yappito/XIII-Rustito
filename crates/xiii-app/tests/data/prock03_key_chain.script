@@ -1,9 +1,11 @@
-# PRock03 (Plain Rock asylum) on-foot chain (item103d): the natural west-corridor route to the
-# `porte_sec` checkpoint, the guard cine, the magnetic card, the checkpoint opener and the
-# continuation toward the objectives. No teleports, no weapon/item/goal bridges: every step is
-# player input through the game's own movement/use chain.
+# PRock03 (Plain Rock asylum) on-foot chain (item103e): the natural west-corridor route to the
+# `porte_sec` checkpoint, the guard cine, the magnetic card, the checkpoint opener, then the
+# canonical `ReachSpec` corridor north of the airlock across the east wing, as far as the hostile
+# central ward allows. No teleports, no weapon/item/goal bridges: every step is player input
+# through the game's own movement/use chain.
 #
-# Measured on-foot flow (see local/reports/item103b-prock03-key.md, item103d section):
+# Measured on-foot flow (probe logs `local/reports/item103e-probe*.txt`; report
+# `local/reports/item103e-prock03-hostage.md`):
 #   t= 0.5..30.5  the west cell-block corridor (Porte33/35/40/42) to the checkpoint (-3840,1720).
 #                 On the way the checkpoint detection volume `DetectionVolume7` fires
 #                 `gardien_lostpass`, starting the guard `Cine2` sequence, whose action 12 is
@@ -18,8 +20,21 @@
 #   t=100..104    the aimed `use MagneticPassTrigger0` (Tag 'pass') matches the carried card through
 #                 `XIIIPawn.FindPowerUpItemNameForTrigger` and its OutEvent 'porte_sec' opens the
 #                 `TriggerControl` checkpoint `Porte29`.
-#   t=108..       continue south/east toward the objectives (hostage `Johansson3` / `CellKey`) and
-#                 the `Prock04a` level travel, as far as the map allows.
+#   t=108..135    the canonical nav path from PathNode185 south-east: PathNode53, PatrolPoint19,
+#                 PathNode52, AttackPoint12, then the west side of the `prsas02` airlock. The
+#                 airlock's two `Door2` movers (Porte27/Porte26) are opened with the carried card
+#                 on the aimed `use MagneticPassTrigger3` (`XIII.MagneticPassTrigger.Trigger` needs
+#                 `MyInteraction.TargetActor == self`), then the player crosses at the open gap
+#                 (~y=975, north of the closed Porte27 leaf) onto the east side.
+#   t=137..181    the corridor south along x~-2600 (PathNode61, doorpoint18, AttackPoint47,
+#                 PatrolPoint26, AttackPoint48, PatrolPoint17, PathNode166) to doorpoint22.
+#   t=182..189    the two `PlayerTriggerToggle` alarm doors Porte11/Porte12 (Tag 'PorteAlarme2')
+#                 are opened with the player's own `use` and crossed before they auto-close.
+#   t=190..209    PathNode171, doorpoint19, PathNode12, PathNode176: the central-south ward. From
+#                 here the ward soldiers are hostile (measured: Health 150 -> 6 between
+#                 (-1730,-571) and (135,-1541), death at ~t=238), so this route stops at the last
+#                 measured 150-hp waypoint `goto -1712 -265` (the measured stop is (-1684,-277))
+#                 and pins that blocker.
 t=0.50 goto -1246 2604
 t=2.50 goto -1476 2543
 t=4.00 goto -1680 2464
@@ -71,23 +86,38 @@ t=102.00 use MagneticPassTrigger0
 t=103.00 use MagneticPassTrigger0
 t=104.00 use MagneticPassTrigger0
 t=105.00 track off
-# continue toward the objectives and the Prock04a travel as far as the route allows:
-# south through the porte_sec checkpoint, then east toward the hostage (`Johansson3` /
-# `CellKey`) and the `Teleporter_Jo` (`Teleporter0`) area.
+# canonical nav path south-east from the checkpoint toward the airlock
 t=108.00 goto -3778 1592
-t=112.00 goto -3787 1504
-t=116.00 goto -3879 1439
-t=122.00 goto -3910 1380
-t=128.00 goto -3919 1286
-t=136.00 goto -3600 1286
-t=144.00 goto -3000 1100
-t=152.00 goto -2763 812
-t=160.00 goto -2763 798
-t=164.00 use MagneticPassTrigger3
-t=168.00 goto -2688 725
-t=176.00 goto -2200 1000
-t=184.00 goto -1500 1200
-t=192.00 goto -700 1000
-t=200.00 goto 0 800
-t=208.00 goto 800 900
-t=216.00 goto 1500 1100
+t=112.00 goto -3682 1536
+t=116.00 goto -3592 1403
+t=120.00 goto -3216 1072
+t=124.00 goto -2960 846
+# detour to the airlock card reader, open Porte27/Porte26, then cross at the open gap
+t=128.00 goto -2817 1000
+t=130.00 goto -2780 790
+t=132.00 goto -2755 760
+t=134.00 use MagneticPassTrigger3
+t=135.50 use MagneticPassTrigger3
+t=137.50 goto -2816 959
+t=141.50 goto -2810 926
+t=145.50 goto -2647 973
+t=149.50 goto -2602 982
+# corridor south along x~-2600 toward the alarm doors
+t=153.50 goto -2539 917
+t=157.50 goto -2611 897
+t=161.50 goto -2633 617
+t=165.50 goto -2590 562
+t=169.50 goto -2589 505
+t=173.50 goto -2592 226
+t=177.50 goto -2563 182
+t=181.50 goto -2384 203
+# open the two PorteAlarme2 doors with the player's own use, then cross before they close
+t=184.00 goto -2300 203
+t=185.00 use Porte11
+t=186.00 use Porte11
+t=189.50 goto -2159 204
+t=193.50 goto -2074 204
+t=197.50 goto -2027 58
+t=201.50 goto -1962 -138
+# the central-south ward: stop at the last measured 150-hp waypoint before the hostile soldiers
+t=205.50 goto -1712 -265
