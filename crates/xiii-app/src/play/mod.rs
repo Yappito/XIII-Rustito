@@ -9546,6 +9546,32 @@ mod tests {
     /// `BaseSoldier2`, then crosses the goal triggers and survives. Next blocker: goal 0
     /// completes only on the level's own `objectif0` event, so goal 0/1 and the `PRock01a` travel
     /// stay unreached.
+    ///
+    /// item99f decoded the emitter chain and measured the blocker. `objectif0` has exactly one
+    /// emitter: `TouchTrigger0` (`Event='objectif0'` at `(-2262,-886,2127)`), a player-touch
+    /// trigger in the annex/exterior zone south of the chalet. It also reaches `XIIIGoalTrigger2`
+    /// (GoalNumber 0 -> `CauseGoal` -> goal 0), `TriggerSound29` and `gennmi23`/`gennmi27`. The
+    /// cutscene's `event wave1` opens the annex door `Porte1` (Tag='wave1'), but the passage to
+    /// the trigger is gated by a second door `Porte3` (Tag='veryend') and the `BreakableMover0`
+    /// wall (Tag='veryend', Health=1, `bWorldGeometry=true`). `veryend` comes only from the late
+    /// level script (`XIIIDispatcher1` Tag='fin_dial_artilleurs' <- `DialogueManager11` <-
+    /// `CineTrigger2` Tag='End'), and 'End' is fired by clearing the wave chain (gennmi10's
+    /// soldier) or the M60-armed chopper `NastyHelico2` (Health=1000, `DeadEvent='End'`,
+    /// `InvisibleUntilTriggered` until 'wave401'). Goal 1's completion event 'roquette' is fired
+    /// by `XIDPawn.XIIIDispatcher0` (Tag='pre_roquette'), triggered by `TouchTrigger6`
+    /// (`Event='pre_roquette'` at `(3303,-3417,1175)`), and completes `XIIIGoalTrigger1`
+    /// (GoalNumber 1, `TimeBeforeTrigger` 15).
+    ///
+    /// item99g completes the level by input. `veryend` needs `CineTrigger2` (Tag `End`,
+    /// `InitialCounterValue` 4, not 1 as item99f wrote) to count four `End` events: the soldiers of
+    /// `gennmi10` (wave1), `gennmi25` (wave602), `gennmi20` (wave603) and the chopper
+    /// `NastyHelico2` (`DeadEvent`), which appears on `wave401` and dies to the player's M60
+    /// (`HelicoDeco.TakeDamage`, Health 1000). The generators spawn their soldier only when the
+    /// spawn point is hidden from, or behind, the player (`gennmi.genese.Timer`), which the route
+    /// handles by turning away. Then `Porte3` opens, `BreakableMover0` breaks, `TouchTrigger0`
+    /// completes goal 0, the three backup soldiers are killed, and `TouchTrigger6` completes goal 1
+    /// 15 s later; the map's own `DoTravel` requests `PRock01a` (the run stops at that request).
+    /// The route is a replay: the fight lines are recorded input commands (see the script header).
     #[test]
     fn opt_in_kello01b_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -9567,17 +9593,47 @@ mod tests {
                 .any(|forbidden| command.contains(forbidden))
         }));
         let script = script::Script::parse(text).expect("parse Kello01b route");
-        let outcome = run_script_with_cinematic_input(
+        // item99g: the route now ends with the map's own `DoTravel` -> `PRock01a`. Stop the run at
+        // the travel request so the assertions below read the Kello01b session, not the carried one.
+        let outcome = run_script_inner(
             &game_dir,
             "Kello01b",
             &script,
             &resolved.params,
             &scene,
-            300.0,
+            800.0,
+            true,
+            RunnerOptions {
+                stop_on_travel: true,
+                ..Default::default()
+            },
         )
         .expect("run Kello01b route");
         let session = &outcome.session;
         let vm = session.vm();
+        let events_of = |target: &str, function_suffix: &str| -> Vec<(f64, Vec<String>)> {
+            vm.trace
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    xiii_script::TraceKind::Event {
+                        target: t,
+                        function,
+                        args,
+                    } if t == target && function.ends_with(function_suffix) => {
+                        Some((e.time, args.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        // The session keeps only the last 64 player touches, so a touch is also looked up in the
+        // full VM event trace (`TouchTrigger.Touch` / `Actor.Touch` with the player pawn as arg).
+        let touched = |name: &str| -> bool {
+            session.touches().iter().any(|(_, n)| n == name)
+                || events_of(name, ".Touch")
+                    .iter()
+                    .any(|(_, args)| args.first().is_some_and(|a| a == "XIIIPlayerPawn"))
+        };
         println!(
             "[kello01b route] error={:?} objectives={:?} travel={:?} position={:?} health={:?} touches={:?}",
             session.first_error(),
@@ -9600,29 +9656,54 @@ mod tests {
             "player must survive: {:?}",
             session.player_health()
         );
-        // The mountain descent and the door entry are a fall-and-walk route, so the player is
-        // below full health; the post-cutscene firefight takes more, but the route must live.
+        // item99g: alive and not ended: no GameEnded/death state took the controller.
         assert!(
-            session.player_health().is_some_and(|h| h < 150.0),
-            "the descent must cost some fall damage: {:?}",
-            session.player_health()
+            !session.player_input_ended(),
+            "the player must keep control (no GameEnded): {}",
+            session.player_controller_state()
+        );
+        // The route is a walk-and-fight route (the start path has no big drop, the chalet fights
+        // and the backup soldiers cost health), so the player dipped below full health on this map
+        // but never died: the per-map minimum Health is positive and below 150. (The travel request
+        // itself restores the carried Health, so the end-of-run value is not the pin.)
+        let min_health = outcome
+            .map_min_health
+            .iter()
+            .find(|(map, _)| map == "Kello01b")
+            .map(|(_, h)| *h);
+        println!("[kello01b item99g] minimum Health on Kello01b: {min_health:?}");
+        assert!(
+            min_health.is_some_and(|h| h > 0.0 && h < 150.0),
+            "the fights must cost some health, never all of it: {min_health:?}"
         );
         let goals = session.objective_states();
         assert_eq!(goals.len(), 2, "the map authors two objectives: {goals:?}");
+        // item99g: goal 0 (cover Kim's escape) used to be pinned incomplete (item99f: the
+        // `veryend` gate was unreachable). Measured cause of the change: the wave chain, the chopper
+        // and the backup soldiers are now cleared by input, `veryend` opens the annex and the
+        // player touches `TouchTrigger0`, whose `objectif0` completes goal 0 through
+        // `XIIIGoalTrigger2`; `TouchTrigger6` -> `roquette` completes goal 1 after its 15 s timer.
         assert!(
-            !goals[0].completed,
-            "goal 0 (cover Kim's escape) is not completed by this route: {goals:?}"
+            goals[0].completed,
+            "goal 0 (cover Kim's escape) must complete through `objectif0`: {goals:?}"
         );
         assert!(
-            !goals[1].completed,
-            "goal 1 (find Jones and Carrington again) is not completed by this route: {goals:?}"
+            goals[1].completed,
+            "goal 1 (find Jones and Carrington again) must complete through `roquette`: {goals:?}"
         );
-        assert!(outcome.travel.is_empty(), "the route must not travel");
+        // The map's own `TestGoalComplete` -> `DoTravel` requests the next map once both goals
+        // are complete; the old `travel.is_empty()` pin is reversed for that measured cause.
+        assert_eq!(
+            outcome.travel.len(),
+            1,
+            "one travel hop: {:?}",
+            outcome.travel
+        );
+        assert_eq!(outcome.travel[0].from, "Kello01b");
+        assert_eq!(outcome.travel[0].to, "PRock01a");
+        assert_eq!(outcome.travel[0].url, "PRock01a.unr");
         assert!(
-            session
-                .touches()
-                .iter()
-                .any(|(_, name)| name == "TouchTrigger2"),
+            touched("TouchTrigger2"),
             "the player must reach TouchTrigger2 (XIII_dans_chalet): {:?}",
             session.touches()
         );
@@ -9653,47 +9734,190 @@ mod tests {
         // fully-enclosed goal-trigger room floor (`z~2091`) and are unreachable; the reachable
         // weapon is the west-floor `M60Pick1` (`z~2076`), grabbed through the game's own
         // interaction Grab (`use M60Pick1`) and selected with the retail `next_weapon` key.
-        let player = vm.find_object("XIIIPlayerPawn").expect("player pawn");
+        // item99g: the run now stops at the map's own travel request, and `DoTravel`'s level-exit
+        // bookkeeping has already stripped the carried weapons from the pawn by then (measured at
+        // the request: `Weapon == None`, inventory = left hand, skills, documents; Health is also
+        // back at its carried value), so the item99e "active weapon is the M60" pin reads the
+        // event trace instead: the M60 pickup (`Inventory.PickupFunction` on an `m60*` weapon) and
+        // the shots fired with it (`XIIIWeapon.NormalFire.AnimEnd`, one per `fire` input line).
+        let m60_events = |function_suffix: &str| -> usize {
+            vm.trace
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        &e.kind,
+                        xiii_script::TraceKind::Event { target, function, .. }
+                            if target.starts_with("m60") && function.ends_with(function_suffix)
+                    )
+                })
+                .count()
+        };
         assert!(
-            matches!(
-                vm.get_property(player, "Weapon"),
-                Some(Value::Object(Some(xiii_script::ObjRef::Instance(_))))
-            ),
-            "the player must pick up a weapon for the post-cutscene fight: {:?}",
-            vm.get_property(player, "Weapon")
+            m60_events("Inventory.PickupFunction") >= 1,
+            "the route must loot the reachable M60 (M60Pick1)"
         );
-        // Positive pin: the active weapon is the reachable M60 machine gun, not the starting
-        // `Fists` (the item99d report's "loots the shotgun" claim was wrong: the shotgun is below
-        // the room and the player never had it).
+        let m60_shots = m60_events("NormalFire.AnimEnd");
         assert!(
-            session
-                .player_weapon()
-                .is_some_and(|w| vm.objects[w as usize].name.starts_with("m60")),
-            "the route must loot the reachable M60 (M60Pick1), got {:?}",
-            session
-                .player_weapon()
-                .map(|w| vm.objects[w as usize].name.clone())
+            m60_shots >= 200,
+            "the route must fire the looted M60 for the waves and the chopper: {m60_shots}"
         );
         // Positive pins: the player crosses the chalet floor onto the map's own goal triggers
-        // (`XIIIGoalTrigger2` tag `objectif0`, `XIIIGoalTrigger1` tag `roquette`). Reaching them
-        // is the next objective step; neither completes yet because goal 0 waits on the level's
-        // own `objectif0` event (fired by the wave/progression script), not on the raw touch.
+        // (`XIIIGoalTrigger2` tag `objectif0`, `XIIIGoalTrigger1` tag `roquette`).
         for trigger in ["XIIIGoalTrigger2", "XIIIGoalTrigger1"] {
             assert!(
-                session.touches().iter().any(|(_, name)| name == trigger),
+                touched(trigger),
                 "the route must reach the goal trigger {trigger}: {:?}",
                 session.touches()
             );
         }
+        // item99f: the emitter chain. `objectif0` (the event goal 0 completes on) has exactly one
+        // emitter in the map: `TouchTrigger0` (Event='objectif0' at (-2262,-886,2127)), a
+        // player-touch trigger in the annex/outside zone south of the chalet. The event also
+        // reaches `XIIIGoalTrigger2` (GoalNumber 0 -> `CauseGoal`), `TriggerSound29` (the
+        // objective music) and the reinforcement generators `gennmi23`/`gennmi27`.
+        let touch0 = vm
+            .find_object("TouchTrigger0")
+            .expect("the sole objectif0 emitter");
+        assert_eq!(
+            vm.get_property(touch0, "Event"),
+            Some(&Value::Name("objectif0".to_owned())),
+            "TouchTrigger0 must be the objectif0 emitter"
+        );
+        assert_eq!(
+            vm.get_property(touch0, "bActif"),
+            Some(&Value::Bool(true)),
+            "the emitter must be armed (its PostBeginPlay sets bActif)"
+        );
+        // item99g: the old pin "the route must not reach TouchTrigger0" is reversed: the annex
+        // gate is open now (measured cause below), and the touch is what completes goal 0.
+        assert!(
+            touched("TouchTrigger0"),
+            "the route must reach the objectif0 emitter: {:?}",
+            session.touches()
+        );
+        assert!(
+            touched("TouchTrigger6"),
+            "the route must reach the pre_roquette emitter: {:?}",
+            session.touches()
+        );
+        // The cutscene's own `event wave1` (Cine0.tabActions[77]) opened the annex door `Porte1`
+        // (Tag='wave1') through `XIIIPorte.PlayerTriggerToggle.Trigger` -> `PlayerTrigger`.
+        let porte1 = vm.find_object("Porte1").expect("annex door");
+        assert_eq!(
+            vm.get_property(porte1, "bOpened"),
+            Some(&Value::Bool(true)),
+            "the cutscene's `event wave1` must open Porte1"
+        );
+        // The passage south to `TouchTrigger0` was gated behind the second annex door `Porte3`
+        // (Tag='veryend') and the `BreakableMover0` wall (Tag='veryend', Health=1,
+        // `bWorldGeometry=true`). `veryend` is fired only by the late level script
+        // (`XIIIDispatcher1`, Tag='fin_dial_artilleurs'), which needs the `End` counter (below).
+        // The wall is `bWorldGeometry`, and `XIIIBulletsAmmo.ProcessTraceHit` only spawns impacts
+        // for such actors (it never calls `TakeDamage`), so fire cannot break it: the authored
+        // condition is the event. item99g: the gates are now open (reversed pins, measured).
+        let porte3 = vm.find_object("Porte3").expect("annex south door");
+        assert_eq!(
+            vm.get_property(porte3, "bOpened"),
+            Some(&Value::Bool(true)),
+            "Porte3 must have opened on `veryend`"
+        );
+        assert_eq!(
+            vm.get_property(porte3, "bClosed"),
+            Some(&Value::Bool(false)),
+            "Porte3 must no longer be closed after `veryend`"
+        );
+        // `BreakableMover.Break` destroys the mover (measured: it is gone from the live objects once
+        // `veryend` fires), so the exported object is looked up including deleted ones.
+        let wall_id = vm
+            .objects
+            .iter()
+            .position(|o| o.name == "BreakableMover0")
+            .expect("south wall") as xiii_script::ObjectId;
+        assert!(
+            vm.objects[wall_id as usize].deleted
+                || vm.get_property(wall_id, "bBroken") == Some(&Value::Bool(true)),
+            "the veryend wall must be broken (and destroyed) after `veryend`"
+        );
+        assert!(
+            vm.find_live_object("BreakableMover0").is_none(),
+            "the broken wall must no longer be a live collision mover"
+        );
+        assert_eq!(
+            vm.get_property(wall_id, "bWorldGeometry"),
+            Some(&Value::Bool(true)),
+            "the wall is world geometry (bullet-proof; it breaks only on `veryend`)"
+        );
+        // item99g: the `End` counter. `CineTrigger2` (Tag='End', InitialCounterValue=4; the item99f
+        // report's "1" was wrong) fires `avant_veryend` on the fourth `End`: the three wave
+        // generators' soldiers (`gennmi10` wave1, `gennmi25` wave602, `gennmi20` wave603) and the
+        // chopper `NastyHelico2.DeadEvent`. Each is a `CounterTrigger.Trigger` event in the trace.
+        let counts = events_of("CineTrigger2", "CounterTrigger.Trigger");
+        assert_eq!(
+            counts.len(),
+            4,
+            "four `End` events must reach CineTrigger2: {counts:?}"
+        );
+        for (_, args) in &counts[..3] {
+            assert!(
+                args[0].starts_with("BaseSoldier"),
+                "the first three `End`s come from the wave soldiers: {counts:?}"
+            );
+        }
+        assert_eq!(
+            counts[3].1[0], "NastyHelico2",
+            "the fourth `End` is the chopper's DeadEvent: {counts:?}"
+        );
+        // The chopper appears on `wave401` (a wave soldier's death triggers it while
+        // `InvisibleUntilTriggered`), takes the player's M60 damage (Health 1000) and is gone.
+        let appear = events_of("NastyHelico2", "InvisibleUntilTriggered.Trigger");
+        assert_eq!(appear.len(), 1, "NastyHelico2 appears once: {appear:?}");
+        assert!(
+            appear[0].0 < counts[3].0,
+            "the chopper must appear before it dies: {appear:?} {counts:?}"
+        );
+        let heli_damage: i64 = events_of("NastyHelico2", "HelicoDeco.TakeDamage")
+            .iter()
+            .filter(|(_, args)| args.get(1).is_some_and(|a| a == "XIIIPlayerPawn"))
+            .filter_map(|(_, args)| args[0].parse::<i64>().ok())
+            .sum();
+        assert!(
+            heli_damage >= 1000,
+            "the player's fire must deal the chopper's 1000 Health: {heli_damage}"
+        );
+        assert!(
+            vm.find_live_object("NastyHelico2").is_none(),
+            "the destroyed chopper must be gone"
+        );
+        // The chain after the fourth `End`: `DialogueManager11` (avant_veryend) -> `XIIIDispatcher1`
+        // (fin_dial_artilleurs) -> `veryend` after its 3 s delay.
+        assert!(
+            !events_of("DialogueManager11", "DialogueManager.Trigger").is_empty(),
+            "avant_veryend must trigger the dialogue manager"
+        );
+        assert!(
+            !events_of("XIIIDispatcher1", "XIIIDispatcher.Trigger").is_empty(),
+            "fin_dial_artilleurs must run the veryend dispatcher"
+        );
+        // Goal 1's chain: TouchTrigger6 (`pre_roquette`) -> XIIIDispatcher0 -> `roquette`.
+        assert!(
+            !events_of("XIIIDispatcher0", "XIIIDispatcher.Trigger").is_empty(),
+            "pre_roquette must run XIIIDispatcher0"
+        );
+        println!(
+            "[kello01b item99g] End counter events {counts:?}; chopper appeared {appear:?}, player \
+             damage to it {heli_damage}; objectif0 emitter TouchTrigger0 (Event='objectif0', \
+             (-2262,-886,2127)) touched after `veryend` opened Porte3 and broke BreakableMover0 \
+             (bWorldGeometry, so only the event breaks it); receivers XIIIGoalTrigger2 (goal 0), \
+             TriggerSound29 and the backup generators gennmi23/gennmi27; goal 1 via TouchTrigger6 \
+             (Event='pre_roquette' at (3303,-3417,1175)) -> XIIIDispatcher0 -> 'roquette' -> \
+             XIIIGoalTrigger1 (GoalNumber 1, TimeBeforeTrigger 15) -> DoTravel."
+        );
         assert_eq!(
             vm.get_property(
                 session.map_info().expect("Kello01b MapInfo"),
                 "NextMapLevelWithUnr"
             ),
             Some(&Value::Str("PRock01a.unr".to_owned()))
-        );
-        println!(
-            "[kello01b next blocker] item99d: the `wait warning` blocker is fixed. Decoded: the              CineController2 `wait warning` action sets `flagsPaused` bit 4 (`nOnJump[2] = -1`) and              `CineController2.PlayingSequence.CineWarn` clears it; the warning is sent by              `DialogueManager.STA_PlayingDialogue.EndOfLine`, which walks              `Lines[LineIndex].SpeakersToWarnAtTheEndOfThisLine` and calls `CineWarn` on each              named speaker's controller. Our runtime parked at `wait warning` because the              flashback line never spoke: `DialogueManager1` (`dial_flash`) was destroyed by              `MustBeStop` at `StartDialogue` because its `Speakers[0].Pawn` names the map's              pending-kill `Cine2` export (`bDeleteMe=true`, measured). The engine removes that              actor at load and nulls references to it; the VM kept the stale reference, so              `PostBeginPlay` counted it as a present speaker and `MustBeStop` aborted the manager.              Fix: `Vm::load_level` now nulls every property reference to a pending-kill export              (generic, no map/class code; unit tests              `load_level_nulls_references_to_pending_kill_exports` and              `null_deleted_references_walks_structs_arrays_and_delegates`). With the line ending,              the whole cutscene runs (Cine0/Cine1 reach `destroy self` at t~226.4 and `event              objectif99` promotes goal 0 to primary). item99e: the post-cutscene firefight is              survived by input, not by the (unreachable) `FusilPompePick0` shotgun: the player              grabs the reachable west-floor `M60Pick1`, selects it, returns to the wardrobe              cover and kills the close `BaseSoldier2` that otherwise shotguns the unarmed player              to death, crossing `XIIIGoalTrigger2`/`XIIIGoalTrigger1` and surviving with a margin.              Next blocker: goal 0 (`Cover Kim's escape`) completes only when the level's own              `objectif0` event fires (the wave/progression script); touching `XIIIGoalTrigger2`              runs `Engine.Trigger.Touch` -> `TriggerEvent(Event=...)` and does not call its              `CauseGoal`, so goal 0/1 and the `PRock01a` travel stay unreached (travel=[])."
         );
     }
 
@@ -9865,18 +10089,23 @@ mod tests {
         // measured evidence.
     }
 
-    /// Input replay of the ice-field crossing (item98f). The route leaves the authored valley
-    /// loop on the north rim, hops the ~300-UU `GR_banquise_01`/`02` floe chain at the latitude
-    /// the walkthroughs describe (`y ~ -2750..-3400`, not item98e's `y ~ -2200` open hole), and
-    /// stops alive on the far lake ice at ~(-10580,-3394,-1254). The replay matches the offline
-    /// `PlayerSim` search exactly once the approach's combat `track` is yaw-normalised after
-    /// `track off` (without it the pawn keeps a tracked heading the search does not model, and the
-    /// 0.8 s free run before the next `goto` desynchronises the two). The earlier north-band route
-    /// and every one of its assertions remain a separate regression above.
+    /// Input replay of the whole Kello01a route: PlayerStart, the start-bowl and ambush fights,
+    /// the lake ice crossing, the far shore and west cliffs, the chalet soldiers, `Find the
+    /// chalet` (`Trigger0` -> `XIIIGoalTrigger0`) and the map's own `DoTravel` to Kello01b
+    /// (item98j, extending item98f/item98i).
+    ///
+    /// The route is one self-contained input script (`kello01a_chalet_route.script`): `goto`/`jump`
+    /// waypoints on the walkable floes (the open-water channels between the `GR_banquise_01`/`02`
+    /// floes are jumped, not walked) and `select_weapon`/`track`/`fire`/`reload` for the soldiers.
+    /// Magnum rounds (12) and the shared shotgun/rifle shells (13) are the only ammunition on the
+    /// route, so every shot is placed on a visible soldier. The run continues a few seconds into
+    /// Kello01b so that the end state is the new map's walking player, not the Kello01a
+    /// `GameEndedSuccess` hand-over. The earlier north-band route and every one of its assertions
+    /// remain a separate regression above.
     #[test]
     fn opt_in_kello01a_chalet_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to run the Kello01a ice route");
+            println!("SKIPPED: set XIII_GOG_DIR to run the Kello01a chalet route");
             return;
         };
         let opts = Options {
@@ -9886,34 +10115,24 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Kello01a");
         let resolved = resolve_params(&game_dir).expect("player defaults");
-        let approach = include_str!("../../tests/data/kello01a_route.script");
-        let continuation = include_str!("../../tests/data/kello01a_chalet_route.script");
-        for text in [approach, continuation] {
-            assert!(
-                !text.lines().any(|line| {
-                    let command = line.split('#').next().unwrap_or("").trim();
-                    [
-                        "teleport",
-                        "place",
-                        "weapon",
-                        "item",
-                        "set_goal",
-                        "take_control",
-                        "assume_control",
-                    ]
-                    .contains(&command.split_whitespace().nth(1).unwrap_or(""))
-                }),
-                "route must contain only input commands"
-            );
-        }
-        let mut script = script::Script::parse(approach).expect("approach");
-        script.events.retain(|e| e.t < 85.8);
-        script.events.extend(
-            script::Script::parse(continuation)
-                .expect("continuation")
-                .events,
+        let text = include_str!("../../tests/data/kello01a_chalet_route.script");
+        assert!(
+            !text.lines().any(|line| {
+                let command = line.split('#').next().unwrap_or("").trim();
+                [
+                    "teleport",
+                    "place",
+                    "weapon",
+                    "item",
+                    "set_goal",
+                    "take_control",
+                    "assume_control",
+                ]
+                .contains(&command.split_whitespace().nth(1).unwrap_or(""))
+            }),
+            "route must contain only input commands"
         );
-        script.events.sort_by(|a, b| a.t.total_cmp(&b.t));
+        let script = script::Script::parse(text).expect("chalet route");
         let outcome = run_script_with_cinematic_input(
             &game_dir,
             "Kello01a",
@@ -9925,25 +10144,36 @@ mod tests {
         .expect("input replay");
         let session = &outcome.session;
         println!(
-            "[kello01a item98f] map={} goals={:?} travel={:?} position={:?} health={:?} min_health={:?}",
+            "[kello01a item98j] map={} objectives={:?} travel={:?} position={:?} health={:?} min_health={:?} state={}",
             outcome.final_map,
-            session.objective_states(),
+            outcome.map_objectives,
             outcome.travel,
             session.player_location(),
             session.player_health(),
-            outcome.map_min_health
+            outcome.map_min_health,
+            session.player_controller_state()
         );
         let player_name = session.player_name.clone();
+        let (_, kello_trace) = outcome
+            .map_traces
+            .iter()
+            .find(|(map, _)| map == "Kello01a")
+            .expect("Kello01a trace");
         let mut dmg_detail: Vec<String> = Vec::new();
-        for e in &session.vm().trace {
-            if let xiii_script::TraceKind::Event {
+        let mut player_hits: Vec<(String, f64)> = Vec::new();
+        for e in kello_trace {
+            let xiii_script::TraceKind::Event {
                 target,
                 function,
                 args,
             } = &e.kind
-                && function.ends_with("TakeDamage")
-                && target.eq_ignore_ascii_case(&player_name)
-            {
+            else {
+                continue;
+            };
+            if !function.ends_with("TakeDamage") {
+                continue;
+            }
+            if target.eq_ignore_ascii_case(&player_name) {
                 dmg_detail.push(format!(
                     "{:.2}s {}dmg/{}/{}",
                     e.time,
@@ -9951,10 +10181,15 @@ mod tests {
                     args.get(1).cloned().unwrap_or_default(),
                     args.get(4).cloned().unwrap_or_default()
                 ));
+            } else if args
+                .get(1)
+                .is_some_and(|a| a.eq_ignore_ascii_case(&player_name))
+            {
+                player_hits.push((target.clone(), e.time));
             }
         }
-        println!("[kello01a item98f damage] {dmg_detail:?}");
-        survey::print_details(&survey::extract("Kello01a", &outcome));
+        println!("[kello01a item98j damage] {dmg_detail:?}");
+        println!("[kello01a item98j] player-dealt TakeDamage events: {player_hits:?}");
         assert!(
             session.first_error().is_none(),
             "{:?}",
@@ -9962,28 +10197,62 @@ mod tests {
         );
         assert!(session.suspended.is_empty(), "{:?}", session.suspended);
         assert!(session.blocked.is_empty(), "{:?}", session.blocked);
-        let goals = session.objective_states();
+        // Kello01a's own objective state at the travel request: the single primary objective,
+        // now completed by the map's own goal trigger (no host bridge: only the input script ran).
+        let (map, goals) = outcome
+            .map_objectives
+            .first()
+            .expect("Kello01a objective states");
+        assert_eq!(map, "Kello01a");
         assert_eq!(goals.len(), 1);
         assert!(goals[0].primary && goals[0].text == "Find the chalet");
+        assert!(
+            goals[0].completed,
+            "`Find the chalet` must be completed by the map's own goal trigger: {goals:?}"
+        );
+        // item98j positive pin: the map's own DoTravel requests Kello01b, exactly once.
+        assert_eq!(
+            outcome.travel.len(),
+            1,
+            "exactly one travel hop: {:?}",
+            outcome.travel
+        );
+        assert_eq!(outcome.travel[0].from, "Kello01a");
+        assert_eq!(outcome.travel[0].to, "Kello01b");
+        assert_eq!(outcome.travel[0].url, "Kello01b.unr");
+        assert_eq!(outcome.final_map, "Kello01b");
+        // The player must be alive on both maps and the game not ended at the end.
+        assert!(
+            outcome.map_min_health.len() >= 2
+                && outcome.map_min_health.iter().all(|(_, h)| *h > 0.0),
+            "min health on every map must stay positive: {:?}",
+            outcome.map_min_health
+        );
         assert!(
             session.player_health().is_some_and(|h| h > 0.0),
             "player must survive the entire route"
         );
         assert!(
-            outcome.map_min_health.iter().all(|(_, h)| *h > 0.0),
-            "a later heal or travel must not conceal death"
+            !session.player_input_ended(),
+            "the player must not be dead or in GameEnded at the end: state={}",
+            session.player_controller_state()
         );
-        // item98f positive pin: the input route leaves the valley loop at (~-5100,-1200), crosses the
-        // lake ice on the authored ~300-UU floe-hop chain (each landing inside the retail running
-        // jump and below the `-1.4*JumpZ` fall-damage threshold), and stops alive past the far
-        // shore at ~(-10580,-3394,-1254). The player stays at full health (150) through the valley
-        // and reaches the ice at 70/150, then loses only soldier-fire falloff (46/150 at the end).
-        // The item98e north-band and every one of its assertions remain a separate regression above.
-        let p = session.player_location().expect("player position");
-        assert!(
-            p[0] < -10000.0 && p[1] < -3200.0 && p[2] > -1300.0,
-            "must reach the far lake ice alive: {p:?}"
+        assert_ne!(
+            session.player_controller_state(),
+            "GameEnded",
+            "no pin may end the game"
         );
+        // The three ambush soldiers (BaseSoldier/BaseSoldier1/BaseSoldier2) are killed by the
+        // player's own rounds (item98i measured 0 hits with the route that kept running), and the
+        // chalet soldiers by the carried rifle/shotgun.
+        for soldier in ["BaseSoldier", "BaseSoldier1", "BaseSoldier2"] {
+            assert!(
+                player_hits
+                    .iter()
+                    .any(|(t, time)| t == soldier && *time > 60.0),
+                "the player must hit {soldier} on the ambush: {player_hits:?}"
+            );
+        }
     }
 
     #[test]
