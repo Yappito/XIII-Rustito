@@ -6,7 +6,68 @@ Updated: **2026-10-09 (coordinator session)**. Research phase (2026-10-04), M0, 
 
 State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `be56145` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
-### Coordinator session 2026-10-13/14 — current state, read this first
+### Coordinator handover 2026-10-17 (evening) — current state, read this first
+
+The coordinator stopped near its weekly limit. **No agents, landings or watchdog are running.** `origin/main` = `19baf2a`
+(last landing verify: 1164 passed). Everything below that is not on main is committed as WIP in its worktree.
+
+**Landed 2026-10-16/17 (on main):**
+- Kello01b objectif0 chain (item99f), then Kello01b complete by input (item99g): wave chain, NastyHelico2 shot down with the
+  M60, `veryend`, goals 0/1, travel to PRock01a. Re-recorded on the friction tree as item99h.
+- Kello01a past the ice ambush (item98i), then Kello01a complete (item98j): chalet reached, travel to Kello01b (92 HP).
+- Batch: held fire refires automatic weapons as in retail (item105: `NormalFire.Finish` `PressingFire()` gate); windowed
+  jump/use/fire presses latched once per frame (item105b); PRock03 on foot to `porte_sec` without key or teleports, with
+  retail `ULevel::CheckEncroachment` (0x1038b2e0) for `SetLocation` (items 103b-103d); batch-landing docs.
+- Hual04 integration: retail AI ledge rule (item101d), ungated steered-walking friction (item100c), PRock01a first route,
+  Hual04c assault (item97d/e), Hual04a and both Hual04c routes re-driven (item104), Kello01b re-record (item99h).
+- Hotfix `a64a047` (a landing had declared an uncommitted probe module).
+
+**Accepted, committed, NOT yet landed (land them as ONE batch):**
+| Worktree / branch | Commit | Content |
+|---|---|---|
+| `ai` / `item106-ai-ledge-hold` | `fdcae67` | AI ledge check skipped for `bCanFly` pawns (Pawn+0x1f4 bit 0x1000 = `bCanFly`, decoded); route filter 17/17 |
+| `viewer` / `item103e-prock03-hostage` | `dc2f39d` (item103e commit + item103f WIP on top) | PRock03 past the `prsas02` airlock into the central ward (item103e, accepted, route filter 17/17). The top commit is item103f WIP (unreviewed): review it, or land only the item103e commit |
+
+**Stopped mid-task (WIP, unreviewed):**
+| Worktree / branch | Commit | Task (spec in `local/tasks/`) |
+|---|---|---|
+| `sweep` / `item107-adaptive-routes` | `63c6e85` | **item107, the most important open item.** Closed-loop route commands (`engage`, `wait_until`) so route tests survive AI-fidelity fixes, convert fragile combat sections, then land item106's two decoded AI fixes (below). Report `local/reports/item107-adaptive-routes.md`. It stopped while updating tests (`EngageSpec` literals, semi-auto test) |
+| `steam` / `item100f-prock01a-porte9` | `f6b2e78` | item100g: cine controllers. `SeePlayer` must also reach `CineController2` (measured), and the Cine2 `on event` waits deadlock PRock01a's Tabasseur guards (key `ClefDebarrasLingerie` for `Porte9`). Reports `item100f-prock01a-porte9.md`, `item100g-cine-events.md` |
+| `viewer` (top commit) | `dc2f39d` | item103f: how the unarmed PRock03 prisoner gets through the ward (weapons, knock-outs, stealth); objectives need `gardien_fin` and `Johansson3` dead, then Prock04a |
+
+**item106's decoded AI divergences (not landed; item107 step 3):**
+- `IAController.PickStartPoint` (XIDPawn.dll 0x11903b80) must return null when no matching PatrolPoint is within 780 UU and
+  reachable, so soldiers go `Errance`; ours returns the nearest nav point, so they `Tenir` at spawn. Needs a faithful
+  `actorReachable`. Patch: `local/wt/ai/local/re/item106-pickstartpoint-registry.patch`. Breaks 8 exact-replay routes.
+- AI door opening: `APawn::NotifyBump` (0x10387d80) calls `Controller.NotifyBump`; our VM never does, so AI never opens doors
+  (Hual04a `BaseSoldier6` presses against `porte10`; goal 5 then becomes reachable). Patch:
+  `local/wt/ai/local/re/item106-vm-with-probes-and-doorbump.patch`. Breaks Amos01, Hual04a, Toits01 replays.
+
+**Why item107 matters.** Route tests replay recorded aim/fire timing exactly, so every AI or physics fidelity fix forces
+route re-recordings (items 99h, 104, 106). Closed-loop commands compute ordinary player input each tick from what the
+player can perceive (no game-state writes), so routes survive such fixes. Land item107 steps 1-2 on their own if step 3
+is long. Until then, prefer engine fixes that do not change AI timing, or budget the re-drives.
+
+**Process rules added this session:**
+- **Batch landings (user rule):** one full verify per batch of accepted, non-overlapping branches; never one per change.
+  Agents run the route filter and targeted tests, not `verify.sh`, unless the spec asks (`local/oc-launch.sh` says so).
+- `local/land.sh` refuses with `UNTRACKED` when `crates/` has untracked files, and writes `local/tmp/protect-wt.txt`
+  while verifying; `local/watchdog.ps1` never kills processes under that worktree (agents' tests die and rerun instead).
+- Gate landings on free commit >= 35 GB (`Win32_OperatingSystem.FreeVirtualMemory`); a suite peaks at ~31 GB.
+- Sonnet subagents (Agent tool, model sonnet, at most 2 in parallel, user-approved 2026-10-16) work well for hard tasks;
+  they stop on the Claude session limit and resume with `SendMessage` after the reset. opencode deepseek (OpenCode Go and
+  Ollama Cloud) for the rest; run each agent's launcher as a background task (never `&`).
+- Review lessons: check agents' Engine.dll claims yourself (item103b2 claimed `FarMoveActor` had no actor test; the call
+  at 0x1038a59b proves otherwise); "infeasible" reports often hide a wrong assertion (item103c); "unwinnable" fights may
+  be an empty weapon (item98i).
+
+**Suggested next steps:**
+1. Land `ai` (item106) + the item103e commit as one batch.
+2. Resume item107 (closed-loop commands, then PickStartPoint + NotifyBump), then Hual04a goal 5.
+3. Then item100g (cine SeePlayer / `on event`) and item103f (PRock03 ward), re-checked on item107's commands.
+4. Next maps after PRock03: Prock04a onward.
+
+### Coordinator session 2026-10-13/14 (historical)
 
 A new coordinator took over on 2026-10-13 at 08:15. Landed since then, in order:
 - item91 mesh overlap (`a8513c6`);
