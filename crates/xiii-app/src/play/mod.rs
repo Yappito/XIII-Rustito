@@ -9447,14 +9447,23 @@ mod tests {
         // measured evidence.
     }
 
-    /// Input replay of the ice-field crossing (item98f). The route leaves the authored valley
-    /// loop on the north rim, hops the ~300-UU `GR_banquise_01`/`02` floe chain at the latitude
-    /// the walkthroughs describe (`y ~ -2750..-3400`, not item98e's `y ~ -2200` open hole), and
-    /// stops alive on the far lake ice at ~(-10580,-3394,-1254). The replay matches the offline
+    /// Input replay of the ice-field crossing and the far-floe extension (item98f + item98i). The
+    /// route leaves the authored valley loop on the north rim, hops the ~300-UU
+    /// `GR_banquise_01`/`02` floe chain at the latitude the walkthroughs describe
+    /// (`y ~ -2750..-3400`), engages the three-soldier ambush on the ice by input, then leaves the
+    /// committed open-loop crossing at `(-10580,-3394,-1254)` for a `goto` extension west along
+    /// the verified dry floe band to `~(-11423,-2581,-1196)`, alive. The replay matches the offline
     /// `PlayerSim` search exactly once the approach's combat `track` is yaw-normalised after
-    /// `track off` (without it the pawn keeps a tracked heading the search does not model, and the
-    /// 0.8 s free run before the next `goto` desynchronises the two). The earlier north-band route
-    /// and every one of its assertions remain a separate regression above.
+    /// `track off`.
+    ///
+    /// item98i: the ambush `BaseSoldier`/`BaseSoldier1`/`BaseSoldier2` (IAController7/8/9) open
+    /// fire on the pass; the input engagement (`select_weapon`/`pitch`/`fire`) runs during the
+    /// pass. Measured: a stationary stand-and-fight at contact range is lethal (the close-range
+    /// shotgun bursts of five 30-raw pellets each apply ~20 HP after the single-player
+    /// `Damage *= (1+Difficulty)*0.15` scaling), so the survivable behaviour is to keep moving.
+    /// The route reaches the far lake ice at 70/150 and ends west of the committed stop at
+    /// 54/150; `Find the chalet` and the Kello01b travel stay unreached. The earlier north-band
+    /// route and every one of its assertions remain a separate regression above.
     #[test]
     fn opt_in_kello01a_chalet_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
@@ -9536,6 +9545,31 @@ mod tests {
             }
         }
         println!("[kello01a item98f damage] {dmg_detail:?}");
+        // item98i: damage the input engagement dealt to the three-soldier ambush
+        // (`BaseSoldier`/`BaseSoldier1`/`BaseSoldier2`; the start-bowl `BaseSoldier0`/`BaseSoldier9`
+        // are dead by the time the crossing begins). A `TakeDamage` on an ambush soldier instigated
+        // by the player would be the positive pin that the `fire` inputs hit; measured 0, reported
+        // as a finding (see the report).
+        let mut ambush_hits = 0usize;
+        for e in &session.vm().trace {
+            if let xiii_script::TraceKind::Event {
+                target,
+                function,
+                args,
+            } = &e.kind
+                && function.ends_with("TakeDamage")
+                && e.time > 90.0
+                && ["basesoldier", "basesoldier1", "basesoldier2"]
+                    .iter()
+                    .any(|n| target.eq_ignore_ascii_case(n))
+                && args
+                    .get(1)
+                    .is_some_and(|a| a.eq_ignore_ascii_case(&player_name))
+            {
+                ambush_hits += 1;
+            }
+        }
+        println!("[kello01a item98i] player-dealt ambush TakeDamage events: {ambush_hits}");
         survey::print_details(&survey::extract("Kello01a", &outcome));
         assert!(
             session.first_error().is_none(),
@@ -9555,16 +9589,27 @@ mod tests {
             outcome.map_min_health.iter().all(|(_, h)| *h > 0.0),
             "a later heal or travel must not conceal death"
         );
-        // item98f positive pin: the input route leaves the valley loop at (~-5100,-1200), crosses the
-        // lake ice on the authored ~300-UU floe-hop chain (each landing inside the retail running
-        // jump and below the `-1.4*JumpZ` fall-damage threshold), and stops alive past the far
-        // shore at ~(-10580,-3394,-1254). The player stays at full health (150) through the valley
-        // and reaches the ice at 70/150, then loses only soldier-fire falloff (46/150 at the end).
-        // The item98e north-band and every one of its assertions remain a separate regression above.
+        assert!(
+            !session.player_input_ended(),
+            "the player must not be dead or in GameEnded at the end: state={}",
+            session.player_controller_state()
+        );
+        assert_ne!(
+            session.player_controller_state(),
+            "GameEnded",
+            "no pin may end the game"
+        );
+        // item98i positive pin: the input route leaves the valley loop at (~-5100,-1200), crosses
+        // the lake ice on the authored ~300-UU floe-hop chain, engages the three-soldier ambush by
+        // input, then leaves the committed open-loop crossing at (-10580,-3394) for a `goto`
+        // extension west along the verified dry floe band. It ends alive at ~(-11423,-2581,-1196).
+        // The player stays at full health (150) through the valley, reaches the ice at 70/150 and
+        // loses only soldier-fire falloff (54/150 at the new end). The item98e north-band and every
+        // one of its assertions remain a separate regression above.
         let p = session.player_location().expect("player position");
         assert!(
-            p[0] < -10000.0 && p[1] < -3200.0 && p[2] > -1300.0,
-            "must reach the far lake ice alive: {p:?}"
+            p[0] < -11300.0 && (-2700.0..-2450.0).contains(&p[1]) && p[2] > -1300.0,
+            "must extend west of the committed far lake ice alive: {p:?}"
         );
     }
 

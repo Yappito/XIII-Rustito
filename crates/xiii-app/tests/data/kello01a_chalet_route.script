@@ -1,9 +1,8 @@
-# item98f ice crossing: continuation of kello01a_route.script from t=85.8. Timed 0.2 s
-# open-loop yaw/jump actions from the offline `PlayerSim` hop search across the two decoded
-# lake ice meshes (GR_banquise_01/02), first landing each hop within the retail running jump
-# and below the `-1.4*JumpZ` fall-damage threshold. Input only: goto/forward/yaw/jump.
-# The route is trimmed alive at t=102.7 on the far lake ice, ~(-10580,-3394,-1254) UU; past
-# that the floe chain drifts off the mesh. No teleport, weapon grant, item, set_goal or control.
+# item98i: continuation of kello01a_route.script from t=85.8. Input only.
+# Committed item98f ice crossing (open-loop yaw/jump) to the far lake ice, an input-driven
+# engagement of the three-soldier ambush during the pass (magnum, aimed low, `fire`), then a
+# `goto` extension west onto the far floe, alive. No teleport, weapon grant, item, set_goal or
+# control override. Player must be alive and Find the chalet / travel unreached at the end.
 t=85.799 goto off
 t=85.799 forward 1
 t=85.799 yaw 157.5
@@ -32,28 +31,46 @@ t=90.199 yaw 236.25
 t=90.399 yaw 236.25
 t=90.599 yaw 236.25
 t=90.799 yaw 225
+t=90.900 pitch -12
+t=90.950 select_weapon 3
 t=90.999 yaw 225
+t=91.050 fire
 t=91.199 yaw 337.5
+t=91.350 fire
 t=91.399 yaw 258.75
 t=91.599 yaw 258.75
+t=91.650 fire
 t=91.799 yaw 270
+t=91.950 fire
 t=91.999 yaw 168.75
 t=92.199 yaw 258.75
+t=92.250 fire
 t=92.399 yaw 258.75
+t=92.550 fire
 t=92.599 yaw 225
 t=92.799 yaw 258.75
+t=92.850 fire
 t=92.999 yaw 225
+t=93.150 reload
 t=93.199 yaw 281.25
+t=93.350 fire
 t=93.399 yaw 202.5
 t=93.599 yaw 225
+t=93.650 fire
 t=93.799 yaw 258.75
+t=93.950 fire
 t=93.999 yaw 247.5
 t=94.199 yaw 258.75
+t=94.250 fire
 t=94.399 yaw 236.25
+t=94.550 fire
 t=94.599 yaw 281.25
 t=94.799 yaw 258.75
+t=94.850 fire
 t=94.999 yaw 146.25
+t=95.150 reload
 t=95.199 yaw 90
+t=95.350 pitch 0
 t=95.399 yaw 101.25
 t=95.599 yaw 146.25
 t=95.799 yaw 146.25
@@ -95,4 +112,6 @@ t=102.199 yaw 180
 t=102.399 yaw 168.75
 t=102.599 yaw 180
 t=102.599 jump
-t=102.699 forward 0
+t=102.800 goto -11000 -2900
+t=104.100 goto -11400 -2600
+t=104.400 forward 0
