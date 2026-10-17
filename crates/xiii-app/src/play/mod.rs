@@ -10011,27 +10011,23 @@ mod tests {
         // measured evidence.
     }
 
-    /// Input replay of the ice-field crossing and the far-floe extension (item98f + item98i). The
-    /// route leaves the authored valley loop on the north rim, hops the ~300-UU
-    /// `GR_banquise_01`/`02` floe chain at the latitude the walkthroughs describe
-    /// (`y ~ -2750..-3400`), engages the three-soldier ambush on the ice by input, then leaves the
-    /// committed open-loop crossing at `(-10580,-3394,-1254)` for a `goto` extension west along
-    /// the verified dry floe band to `~(-11423,-2581,-1196)`, alive. The replay matches the offline
-    /// `PlayerSim` search exactly once the approach's combat `track` is yaw-normalised after
-    /// `track off`.
+    /// Input replay of the whole Kello01a route: PlayerStart, the start-bowl and ambush fights,
+    /// the lake ice crossing, the far shore and west cliffs, the chalet soldiers, `Find the
+    /// chalet` (`Trigger0` -> `XIIIGoalTrigger0`) and the map's own `DoTravel` to Kello01b
+    /// (item98j, extending item98f/item98i).
     ///
-    /// item98i: the ambush `BaseSoldier`/`BaseSoldier1`/`BaseSoldier2` (IAController7/8/9) open
-    /// fire on the pass; the input engagement (`select_weapon`/`pitch`/`fire`) runs during the
-    /// pass. Measured: a stationary stand-and-fight at contact range is lethal (the close-range
-    /// shotgun bursts of five 30-raw pellets each apply ~20 HP after the single-player
-    /// `Damage *= (1+Difficulty)*0.15` scaling), so the survivable behaviour is to keep moving.
-    /// The route reaches the far lake ice at 70/150 and ends west of the committed stop at
-    /// 54/150; `Find the chalet` and the Kello01b travel stay unreached. The earlier north-band
-    /// route and every one of its assertions remain a separate regression above.
+    /// The route is one self-contained input script (`kello01a_chalet_route.script`): `goto`/`jump`
+    /// waypoints on the walkable floes (the open-water channels between the `GR_banquise_01`/`02`
+    /// floes are jumped, not walked) and `select_weapon`/`track`/`fire`/`reload` for the soldiers.
+    /// Magnum rounds (12) and the shared shotgun/rifle shells (13) are the only ammunition on the
+    /// route, so every shot is placed on a visible soldier. The run continues a few seconds into
+    /// Kello01b so that the end state is the new map's walking player, not the Kello01a
+    /// `GameEndedSuccess` hand-over. The earlier north-band route and every one of its assertions
+    /// remain a separate regression above.
     #[test]
     fn opt_in_kello01a_chalet_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to run the Kello01a ice route");
+            println!("SKIPPED: set XIII_GOG_DIR to run the Kello01a chalet route");
             return;
         };
         let opts = Options {
@@ -10041,34 +10037,24 @@ mod tests {
         };
         let scene = viewer::load_scene(&opts).expect("import Kello01a");
         let resolved = resolve_params(&game_dir).expect("player defaults");
-        let approach = include_str!("../../tests/data/kello01a_route.script");
-        let continuation = include_str!("../../tests/data/kello01a_chalet_route.script");
-        for text in [approach, continuation] {
-            assert!(
-                !text.lines().any(|line| {
-                    let command = line.split('#').next().unwrap_or("").trim();
-                    [
-                        "teleport",
-                        "place",
-                        "weapon",
-                        "item",
-                        "set_goal",
-                        "take_control",
-                        "assume_control",
-                    ]
-                    .contains(&command.split_whitespace().nth(1).unwrap_or(""))
-                }),
-                "route must contain only input commands"
-            );
-        }
-        let mut script = script::Script::parse(approach).expect("approach");
-        script.events.retain(|e| e.t < 85.8);
-        script.events.extend(
-            script::Script::parse(continuation)
-                .expect("continuation")
-                .events,
+        let text = include_str!("../../tests/data/kello01a_chalet_route.script");
+        assert!(
+            !text.lines().any(|line| {
+                let command = line.split('#').next().unwrap_or("").trim();
+                [
+                    "teleport",
+                    "place",
+                    "weapon",
+                    "item",
+                    "set_goal",
+                    "take_control",
+                    "assume_control",
+                ]
+                .contains(&command.split_whitespace().nth(1).unwrap_or(""))
+            }),
+            "route must contain only input commands"
         );
-        script.events.sort_by(|a, b| a.t.total_cmp(&b.t));
+        let script = script::Script::parse(text).expect("chalet route");
         let outcome = run_script_with_cinematic_input(
             &game_dir,
             "Kello01a",
@@ -10080,25 +10066,36 @@ mod tests {
         .expect("input replay");
         let session = &outcome.session;
         println!(
-            "[kello01a item98f] map={} goals={:?} travel={:?} position={:?} health={:?} min_health={:?}",
+            "[kello01a item98j] map={} objectives={:?} travel={:?} position={:?} health={:?} min_health={:?} state={}",
             outcome.final_map,
-            session.objective_states(),
+            outcome.map_objectives,
             outcome.travel,
             session.player_location(),
             session.player_health(),
-            outcome.map_min_health
+            outcome.map_min_health,
+            session.player_controller_state()
         );
         let player_name = session.player_name.clone();
+        let (_, kello_trace) = outcome
+            .map_traces
+            .iter()
+            .find(|(map, _)| map == "Kello01a")
+            .expect("Kello01a trace");
         let mut dmg_detail: Vec<String> = Vec::new();
-        for e in &session.vm().trace {
-            if let xiii_script::TraceKind::Event {
+        let mut player_hits: Vec<(String, f64)> = Vec::new();
+        for e in kello_trace {
+            let xiii_script::TraceKind::Event {
                 target,
                 function,
                 args,
             } = &e.kind
-                && function.ends_with("TakeDamage")
-                && target.eq_ignore_ascii_case(&player_name)
-            {
+            else {
+                continue;
+            };
+            if !function.ends_with("TakeDamage") {
+                continue;
+            }
+            if target.eq_ignore_ascii_case(&player_name) {
                 dmg_detail.push(format!(
                     "{:.2}s {}dmg/{}/{}",
                     e.time,
@@ -10106,35 +10103,15 @@ mod tests {
                     args.get(1).cloned().unwrap_or_default(),
                     args.get(4).cloned().unwrap_or_default()
                 ));
-            }
-        }
-        println!("[kello01a item98f damage] {dmg_detail:?}");
-        // item98i: damage the input engagement dealt to the three-soldier ambush
-        // (`BaseSoldier`/`BaseSoldier1`/`BaseSoldier2`; the start-bowl `BaseSoldier0`/`BaseSoldier9`
-        // are dead by the time the crossing begins). A `TakeDamage` on an ambush soldier instigated
-        // by the player would be the positive pin that the `fire` inputs hit; measured 0, reported
-        // as a finding (see the report).
-        let mut ambush_hits = 0usize;
-        for e in &session.vm().trace {
-            if let xiii_script::TraceKind::Event {
-                target,
-                function,
-                args,
-            } = &e.kind
-                && function.ends_with("TakeDamage")
-                && e.time > 90.0
-                && ["basesoldier", "basesoldier1", "basesoldier2"]
-                    .iter()
-                    .any(|n| target.eq_ignore_ascii_case(n))
-                && args
-                    .get(1)
-                    .is_some_and(|a| a.eq_ignore_ascii_case(&player_name))
+            } else if args
+                .get(1)
+                .is_some_and(|a| a.eq_ignore_ascii_case(&player_name))
             {
-                ambush_hits += 1;
+                player_hits.push((target.clone(), e.time));
             }
         }
-        println!("[kello01a item98i] player-dealt ambush TakeDamage events: {ambush_hits}");
-        survey::print_details(&survey::extract("Kello01a", &outcome));
+        println!("[kello01a item98j damage] {dmg_detail:?}");
+        println!("[kello01a item98j] player-dealt TakeDamage events: {player_hits:?}");
         assert!(
             session.first_error().is_none(),
             "{:?}",
@@ -10142,16 +10119,40 @@ mod tests {
         );
         assert!(session.suspended.is_empty(), "{:?}", session.suspended);
         assert!(session.blocked.is_empty(), "{:?}", session.blocked);
-        let goals = session.objective_states();
+        // Kello01a's own objective state at the travel request: the single primary objective,
+        // now completed by the map's own goal trigger (no host bridge: only the input script ran).
+        let (map, goals) = outcome
+            .map_objectives
+            .first()
+            .expect("Kello01a objective states");
+        assert_eq!(map, "Kello01a");
         assert_eq!(goals.len(), 1);
         assert!(goals[0].primary && goals[0].text == "Find the chalet");
         assert!(
-            session.player_health().is_some_and(|h| h > 0.0),
-            "player must survive the entire route"
+            goals[0].completed,
+            "`Find the chalet` must be completed by the map's own goal trigger: {goals:?}"
+        );
+        // item98j positive pin: the map's own DoTravel requests Kello01b, exactly once.
+        assert_eq!(
+            outcome.travel.len(),
+            1,
+            "exactly one travel hop: {:?}",
+            outcome.travel
+        );
+        assert_eq!(outcome.travel[0].from, "Kello01a");
+        assert_eq!(outcome.travel[0].to, "Kello01b");
+        assert_eq!(outcome.travel[0].url, "Kello01b.unr");
+        assert_eq!(outcome.final_map, "Kello01b");
+        // The player must be alive on both maps and the game not ended at the end.
+        assert!(
+            outcome.map_min_health.len() >= 2
+                && outcome.map_min_health.iter().all(|(_, h)| *h > 0.0),
+            "min health on every map must stay positive: {:?}",
+            outcome.map_min_health
         );
         assert!(
-            outcome.map_min_health.iter().all(|(_, h)| *h > 0.0),
-            "a later heal or travel must not conceal death"
+            session.player_health().is_some_and(|h| h > 0.0),
+            "player must survive the entire route"
         );
         assert!(
             !session.player_input_ended(),
@@ -10163,18 +10164,17 @@ mod tests {
             "GameEnded",
             "no pin may end the game"
         );
-        // item98i positive pin: the input route leaves the valley loop at (~-5100,-1200), crosses
-        // the lake ice on the authored ~300-UU floe-hop chain, engages the three-soldier ambush by
-        // input, then leaves the committed open-loop crossing at (-10580,-3394) for a `goto`
-        // extension west along the verified dry floe band. It ends alive at ~(-11423,-2581,-1196).
-        // The player stays at full health (150) through the valley, reaches the ice at 70/150 and
-        // loses only soldier-fire falloff (54/150 at the new end). The item98e north-band and every
-        // one of its assertions remain a separate regression above.
-        let p = session.player_location().expect("player position");
-        assert!(
-            p[0] < -11300.0 && (-2700.0..-2450.0).contains(&p[1]) && p[2] > -1300.0,
-            "must extend west of the committed far lake ice alive: {p:?}"
-        );
+        // The three ambush soldiers (BaseSoldier/BaseSoldier1/BaseSoldier2) are killed by the
+        // player's own rounds (item98i measured 0 hits with the route that kept running), and the
+        // chalet soldiers by the carried rifle/shotgun.
+        for soldier in ["BaseSoldier", "BaseSoldier1", "BaseSoldier2"] {
+            assert!(
+                player_hits
+                    .iter()
+                    .any(|(t, time)| t == soldier && *time > 60.0),
+                "the player must hit {soldier} on the ambush: {player_hits:?}"
+            );
+        }
     }
 
     #[test]
