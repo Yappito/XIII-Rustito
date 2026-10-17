@@ -105,29 +105,35 @@ t=93.80 fire
 t=94.20 fire
 t=94.60 fire
 t=95.00 fire
-t=95.40 track off
-t=95.60 crouch 0
-# Walk across the pursued soldier's corpse (his death position moved from spawn).
-t=112.00 goto -3300 -2800
-t=115.00 reload
-t=118.00 goto -3500 -2450
-t=131.00 goto -3050 -2896
-t=133.00 goto -3123 -2652
-t=135.00 goto -3000 -1900
+# item102: with the ledge rule (item101) BaseSoldier0 no longer walks off the canyon ledge
+# into the (-3160,-600) stand; it holds at (-2720,-1177) in `Attaque` and shoots the route.
+# The stand kills it with a longer M16 burst, then walks over its corpse to loot the dropped
+# M16 + 30 rounds (the ammo the base fights need). It then holds at the corpse until the
+# route's base-fight timeline (no enemies nearby) and rejoins the original path.
+t=95.40 fire
+t=95.80 fire
+t=96.20 fire
+t=96.60 fire
+t=97.00 fire
+t=97.40 fire
+t=97.80 fire
+t=98.20 fire
+t=98.60 fire
+t=99.00 fire
+t=99.40 fire
+t=99.80 fire
+t=100.20 fire
+t=100.60 fire
+t=101.00 fire
+t=101.40 fire
+t=101.80 track off
+t=101.90 crouch 0
+t=103.00 goto -2700 -1250
+t=109.00 goto -2700 -1250
+t=110.00 reload
 t=139.00 goto -2400 -1600
 t=143.00 goto -1800 -1400
-t=140.00 reload
-t=146.00 track BaseSoldier0 1.0
 t=146.00 goto -1400 -1300
-t=149.00 fire
-t=150.20 fire
-t=151.40 fire
-t=152.60 fire
-t=153.80 fire
-t=155.00 fire
-t=156.20 fire
-t=157.40 fire
-t=160.00 track off
 t=160.00 goto -1899 -1821
 t=164.00 goto -1280 -900
 t=166.50 goto -1280 -272
@@ -243,47 +249,56 @@ t=354.00 goto -3880 3100
 t=357.00 goto -3900 2960
 t=360.00 goto -4000 2800
 t=362.00 goto -4262 2247
-# item87d re-time: the item94 route crouched for this LastWave burst. On the item87c
-# render-time tree the reinforcement `BaseSoldier` charges and, from the crouched muzzle, the
-# M60 rounds pass over it (measured: it stayed at 44 hp and shotgunned the route to death while
-# the other two reinforcements died). Standing clears the muzzle and the same nine-round burst
-# kills all three (measured: route passes, health 10). No target, weapon or assertion changed.
+# item102: the LastWave reinforcements charge across open ground. With the ledge rule their
+# approach differs from the item95 measurement, so the 0.3 s nine-round bursts no longer kill
+# them; the bursts are lengthened (13 rounds at 0.2 s, a reload between) and the same three
+# soldiers die (measured: route passes the wave, health 60). Targets and weapon unchanged.
 t=365.00 crouch 0
 t=368.00 track BaseSoldier 0.90
 t=368.15 fire
-t=368.45 fire
+t=368.35 fire
+t=368.55 fire
 t=368.75 fire
-t=369.05 fire
+t=368.95 fire
+t=369.15 fire
 t=369.35 fire
-t=369.65 fire
+t=369.55 fire
+t=369.75 fire
 t=369.95 fire
-t=370.25 fire
+t=370.15 fire
+t=370.35 fire
 t=370.55 fire
-t=370.85 reload
-t=371.15 track BaseSoldier2 0.90
-t=371.30 fire
-t=371.60 fire
-t=371.90 fire
-t=372.20 fire
-t=372.50 fire
-t=372.80 fire
-t=373.10 fire
-t=373.40 fire
-t=373.70 fire
-t=374.00 reload
-t=374.30 track BaseSoldier3 0.90
-t=374.45 fire
+t=370.65 reload
+t=370.75 track BaseSoldier2 0.90
+t=370.85 fire
+t=371.05 fire
+t=371.25 fire
+t=371.45 fire
+t=371.65 fire
+t=371.85 fire
+t=372.05 fire
+t=372.25 fire
+t=372.45 fire
+t=372.65 fire
+t=372.85 fire
+t=373.05 fire
+t=373.25 fire
+t=373.35 reload
+t=373.45 track BaseSoldier3 0.90
+t=373.55 fire
+t=373.75 fire
+t=373.95 fire
+t=374.15 fire
+t=374.35 fire
+t=374.55 fire
 t=374.75 fire
-t=375.05 fire
+t=374.95 fire
+t=375.15 fire
 t=375.35 fire
-t=375.65 fire
+t=375.55 fire
+t=375.75 fire
 t=375.95 fire
-t=376.25 fire
-t=376.55 fire
-t=376.85 fire
-t=377.15 reload
-t=377.45 track off
-t=377.45 crouch 0
+t=376.10 track off
 # Walk back through the base to the bureau circuit-breaker. `Porte21` is the electrical-box
 # door covering the fuse socket: `use Porte21` runs its own `XIIIPorte.PlayerTriggerToggle`
 # (open) and clears the box mesh from the sight line. `track XIIIGoalTrigger19` then points the
@@ -292,11 +307,17 @@ t=377.45 crouch 0
 # `bCanTrigger=true`). The carried fuse (`EventItem.UseMe`) then triggers the goal (goal 3).
 # `item90` implemented Core.dll `execArrayElement`'s out-of-range fixed-array clamp, so
 # `Hual04a.SetGoalComplete` case 3 no longer errors. Waypoints are the item86 fuse-leg trace.
-t=378.00 goto -4077.2 1836.9
+t=376.60 goto -4560 1760
+t=379.00 goto -4077.2 1836.9
 t=380.50 goto -3732.9 1357.8
 t=384.50 goto -3269.9 1390.3
-t=388.50 goto -2610.1 393.0
-t=392.50 goto -2150.8 326.5
+# item104: with the integrated steered-walking friction the first LastWave soldier (`BaseSoldier`, the
+# one that carries the 30-round M16 clip the bureau fight needs) dies and lies at (-2718.6,710.6)
+# instead of (-2611.9,321.0) (measured, item104 report), so the route walks over that corpse to loot
+# it (`M16Ammo` 22 -> 52) before rejoining the old line.
+t=388.50 goto -2718.0 705.0
+t=391.80 goto -2610.1 393.0
+t=393.00 goto -2150.8 326.5
 t=396.50 goto -1259.1 1258.9
 t=400.50 goto -1308.8 742.0
 t=404.50 goto -1279.0 -209.4
@@ -341,13 +362,13 @@ t=520.00 goto 796 425
 # fires `Event Wave01 Wave02` (tabActions[63]) and parks at `wait event RushFinalCine`
 # (tabActions[71]). `GenNMI6`/`GenNMI7` spawn `BaseSoldier6`/`BaseSoldier7` at t=520.4. The route
 # tracks `BaseSoldier7` at t=520.5 (head band, 0.90) and fires from t=520.6 every 0.1 s, killing it
-# before its shotgun burst, so the player survives the wave at 10 hp. item95d: the collision
-# changes since item95 (item91's mesh/mover sweeps) clear the firing lane only at ~522.5 s; the
-# original 0.2 s cadence killed the soldier at 523.6, after it had fired twice, so the cadence is
-# doubled (input only). `BaseSoldier6` holds position in its controller's `Tenir` state at
-# (-18,-710,102) and never engages, so its `RushFinal` event never fires; `CineTrigger1`
-# (counter 2) never reaches zero and `wait event RushFinalCine` cannot pass. This is the pinned
-# next blocker: goal 5 and the Hual04c travel stay unreached.
+# before its shotgun burst, so the player survives the wave. item102: `BaseSoldier6` spawns from
+# `GenNMI7` on the station's upper level at (871,-590,462) and its attack-point network 222
+# (`AttackPoint13` -> `AttackPoint12` -> `AttackPoint0` on the ground) sends it toward the ground,
+# but the item101 ledge rule stops it at the roof edge (615,-926,462); it never reaches or sees
+# the player, so its `RushFinal` event never fires and `CineTrigger1` (counter 2) never reaches
+# zero. The route therefore tracks it and fires (measured: no line of sight, 0 damage); goal 5 and
+# the Hual04c travel stay unreached. This is the pinned next blocker (see the report).
 t=520.50 track BaseSoldier7 0.90
 t=520.60 fire
 t=520.70 fire
@@ -377,37 +398,9 @@ t=523.00 fire
 t=523.10 fire
 t=523.20 fire
 t=523.30 fire
-t=523.40 fire
-t=523.50 fire
-t=523.60 fire
-t=523.70 fire
-t=523.80 fire
-t=523.90 fire
-t=524.00 fire
-t=524.10 fire
-t=524.20 fire
-t=524.30 fire
-t=524.40 track BaseSoldier6 0.90
-t=524.50 fire
-t=524.70 fire
-t=524.90 fire
+# item104: `BaseSoldier7` dies at t=523.2 (measured). The old 0.1-0.2 s fire on the corpse and on
+# `BaseSoldier6` (no line of sight, 0 damage, item102) emptied the carried M16 (reserve 52 -> 0),
+# which the Hual04c travel route inherits; the fire stops once `BaseSoldier7` is down.
+t=523.50 track off
 t=525.00 goto 941 396
-t=525.10 fire
-t=525.30 fire
-t=525.50 fire
-t=525.70 fire
-t=525.90 fire
-t=526.10 fire
-t=526.30 fire
-t=526.50 fire
-t=526.70 fire
-t=526.90 fire
-t=527.10 fire
-t=527.30 fire
-t=527.50 fire
-t=527.70 fire
-t=527.90 fire
-t=528.10 fire
-t=528.30 fire
-t=528.50 track off
 t=545.00 wait_travel

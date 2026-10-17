@@ -18,6 +18,11 @@
 //! - `turn <degrees>`: add to yaw.
 //! - `pitch <degrees>`: set camera pitch.
 //! - `track <actor|off>`: continuously aim at a named actor (resolved by the playback host).
+//! - `follow <actor|off> [distance]`: continuously aim at and trail a named actor (resolved by the
+//!   playback host), holding the forward axis whenever the horizontal distance exceeds `distance`
+//!   (default 200 UU) and releasing it inside. This is the same class of autopilot input as `goto`
+//!   (the simulation still owns the movement; it is not a teleport): a campaign route uses it to
+//!   walk behind an escorted NPC without a sensor bridge to the escort's own state.
 //! - `use` (alias `grab`/`interact`): request one use/interact action (edge-triggered); the
 //!   host runs the VM's mover lock/unlock/open chain (`Session::use_mover`).
 //! - `use <ActorName>`: use/interact with a named actor directly (edges around hidden interaction
@@ -72,6 +77,9 @@ pub enum Command {
     /// fraction of the tracked pawn's CollisionHeight (0.6 default: spine band; a level ray at
     /// 0.85 crosses the head band for 3x bullet damage, see mod.rs track sites).
     Track(Option<(String, f32)>),
+    /// Continuously aim at and trail a named actor, holding forward beyond the stop distance
+    /// (default 200 UU). `None` disables it. Like `Track`, the host supplies the live location.
+    Follow(Option<(String, f32)>),
     /// Press the player's Reload exec, as the R binding does.
     Reload,
     /// Dispatch the controller's ordinary Grab exec using its script-selected aim target.
@@ -222,6 +230,17 @@ impl Script {
                         Command::Track(Some((actor.to_owned(), height)))
                     }
                     None => return Err(format!("line {n}: track needs an actor name or off")),
+                },
+                "follow" => match it.next() {
+                    Some("off") => Command::Follow(None),
+                    Some(actor) => {
+                        let distance = it
+                            .next()
+                            .and_then(|v| v.parse::<f32>().ok())
+                            .unwrap_or(200.0);
+                        Command::Follow(Some((actor.to_owned(), distance)))
+                    }
+                    None => return Err(format!("line {n}: follow needs an actor name or off")),
                 },
                 "teleport" | "place" => {
                     let x = num(&mut it)?;
@@ -436,6 +455,8 @@ pub struct Drive {
     /// Aim height fraction for the active tracking (0.6 default, `track <actor> <f>` sets it).
     track_height: f32,
     track_location: Option<[f32; 3]>,
+    /// Active `follow <actor> [distance]` target and stop distance (Unreal units).
+    follow: Option<(String, f32)>,
 }
 
 impl Drive {
@@ -473,6 +494,7 @@ impl Drive {
             tracking: None,
             track_height: 0.6,
             track_location: None,
+            follow: None,
         }
     }
 
@@ -614,6 +636,18 @@ impl Drive {
                     }
                     self.track_location = None;
                 }
+                Command::Follow(actor_distance) => {
+                    match actor_distance {
+                        Some((actor, distance)) => {
+                            self.follow = Some((actor.clone(), *distance));
+                            // Resolve the followed actor through the host's tracking-location hook
+                            // (the same one `track` uses).
+                            self.tracking = Some(actor.clone());
+                        }
+                        None => self.follow = None,
+                    }
+                    self.track_location = None;
+                }
                 &Command::Teleport(p) => {
                     sim.location = p;
                     sim.velocity = [0.0; 3];
@@ -685,6 +719,19 @@ impl Drive {
                 sim.yaw = yaw;
                 self.forward = 1.0;
             }
+        }
+        // `follow` autopilot: the tracking block above already aims at the actor; hold forward
+        // while the horizontal gap exceeds the stop distance, otherwise release it. This trails
+        // the actor without ever driving into it (the same input axes a careful player uses).
+        if let Some((_, distance)) = &self.follow
+            && let Some(target) = self.track_location
+        {
+            let (dx, dy) = (target[0] - sim.location[0], target[1] - sim.location[1]);
+            self.forward = if dx * dx + dy * dy > distance * distance {
+                1.0
+            } else {
+                0.0
+            };
         }
         let jump = std::mem::take(&mut self.jump_pending);
         let use_action = std::mem::take(&mut self.use_pending);
@@ -942,6 +989,40 @@ mod tests {
         let mut d2 = Drive::new(&s2);
         d2.advance(0.0, &mut sim);
         assert!((d2.track_height() - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn follow_trails_a_named_actor_and_releases_inside_the_stop_distance() {
+        let s = Script::parse("t=0 follow Cine3 200\nt=5 follow off\n").unwrap();
+        assert_eq!(
+            s.events[0].command,
+            Command::Follow(Some(("Cine3".into(), 200.0)))
+        );
+        assert_eq!(s.events[1].command, Command::Follow(None));
+        let mut d = Drive::new(&s);
+        let mut sim = PlayerSim::new([0.0; 3], 0.0);
+        d.advance(0.0, &mut sim);
+        // `follow` also arms the host's location hook, so the actor resolves like `track`.
+        assert_eq!(d.tracking_actor(), Some("Cine3"));
+        // Far: forward held and aimed at the actor.
+        d.set_track_location(Some("Cine3"), Some([500.0, 0.0, 60.0]));
+        let i = d.advance(0.1, &mut sim);
+        assert_eq!(i.forward, 1.0);
+        assert!(sim.yaw.abs() < 1e-4, "aimed at the actor, got {}", sim.yaw);
+        // Inside the stop distance: released, so the trailing player never drives into it.
+        d.set_track_location(Some("Cine3"), Some([100.0, 0.0, 60.0]));
+        assert_eq!(d.advance(0.2, &mut sim).forward, 0.0);
+        // A default distance applies when the argument is omitted.
+        let s2 = Script::parse("t=0 follow Cine3\n").unwrap();
+        assert_eq!(
+            s2.events[0].command,
+            Command::Follow(Some(("Cine3".into(), 200.0)))
+        );
+        // `off` releases the follow control.
+        d.set_track_location(Some("Cine3"), Some([500.0, 0.0, 60.0]));
+        let i = d.advance(5.0, &mut sim);
+        assert_eq!(i.forward, 0.0);
+        assert!(Script::parse("t=0 follow\n").is_err());
     }
 
     #[test]

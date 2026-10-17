@@ -50,6 +50,22 @@ fn opt_in_item51_combat_survey() {
                 })
                 .map(|(i, _)| i as u32)
         };
+        // item101: authored pawn positions for the out-of-world check after the fight.
+        let authored: Vec<(String, f32)> = vm
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(i, o)| {
+                o.is_actor
+                    && !o.deleted
+                    && !o.name.starts_with("Default__")
+                    && vm.is_a(*i as u32, "Pawn")
+            })
+            .filter_map(|(i, o)| {
+                vm.vector_prop(i as u32, "Location")
+                    .map(|l| (o.name.clone(), l[2]))
+            })
+            .collect();
         let mut text = String::new();
         if let Some(soldier) = soldier {
             let name = vm.objects[soldier as usize].name.clone();
@@ -172,6 +188,16 @@ fn opt_in_item51_combat_survey() {
                 || !vm.is_a(id, "BaseSoldier")
             {
                 continue;
+            }
+            // item101: flag any pawn (soldier or not) ending far below its authored position.
+            if let Some(z) = vm.vector_prop(id, "Location").map(|l| l[2])
+                && let Some((_, az)) = authored.iter().find(|(n, _)| n == &object.name)
+                && z < az - 2000.0
+            {
+                println!(
+                    "[combat-fall] {map} {} authored_z={az:.0} now_z={z:.0}",
+                    object.name
+                );
             }
             let controller = match vm.get_property(id, "Controller") {
                 Some(Value::Object(Some(ObjRef::Instance(c)))) => Some(*c),

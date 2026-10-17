@@ -189,12 +189,19 @@ t=186.00 goto -1450 2100
 t=187.00 track BaseSoldier15 0.85
 t=188.00 fire
 t=189.00 fire
-t=190.00 fire
+# item101: BaseSoldier15 is dead by ~188. To hit BaseSoldier14 the `goto` autopilot must
+# release the aim: the player is pinned against the courtyard wall at (-1429,2118), so a
+# waypoint within its 24-UU arrival radius clears `goto` and `track` owns the yaw/pitch.
+t=189.50 goto -1429 2118
+t=190.50 track BaseSoldier14 0.85
 t=191.00 fire
 t=192.00 fire
 t=193.00 fire
-t=194.00 track off
-t=195.00 goto -1450 2100
+t=194.00 fire
+t=195.00 fire
+t=196.00 fire
+t=197.00 fire
+t=198.00 fire
 t=198.50 goto -900 2100
 t=206.50 goto -768 2838
 t=214.50 goto -734 3424

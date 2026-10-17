@@ -171,23 +171,47 @@ t=177.00 fire
 t=178.00 fire
 t=179.00 fire
 t=180.00 goto -1450 1500
-t=181.00 fire
-t=182.00 fire
-t=183.00 fire
-t=184.00 fire
-t=185.00 fire
+# item101: 14 (200 hp) stays in the courtyard now and charges (Acquisition ~180.3, Attaque
+# ~181.75, at point-blank by ~184); the old untracked 181-185 burst missed it. Re-track it
+# through the charge window.
+t=181.00 track BaseSoldier14 0.85
+t=181.50 fire
+t=182.50 fire
+t=183.50 fire
+t=184.50 fire
+t=185.50 fire
+t=186.50 fire
 t=186.00 goto -1450 2100
 t=187.00 track BaseSoldier15 0.85
 t=188.00 fire
 t=189.00 fire
-t=190.00 fire
+# item101: BaseSoldier15 is dead by ~188. To hit BaseSoldier14 the `goto` autopilot must
+# release the aim: the player is pinned against the courtyard wall at (-1429,2118), so a
+# waypoint within its 24-UU arrival radius clears `goto` and `track` owns the yaw/pitch.
+t=189.50 goto -1429 2118
+t=190.50 track BaseSoldier14 0.85
 t=191.00 fire
 t=192.00 fire
 t=193.00 fire
-t=194.00 track off
-t=195.00 goto -1450 2100
+t=194.00 fire
+t=195.00 fire
+t=196.00 fire
+t=197.00 fire
+t=198.00 fire
 t=198.50 goto -900 2100
+t=200.00 fire
+t=201.00 fire
+t=202.00 fire
+t=203.00 fire
+t=204.00 fire
 t=206.50 goto -768 2838
+t=208.50 fire
+t=209.50 fire
+t=210.50 fire
+t=211.50 fire
+t=212.50 fire
+t=213.50 fire
+t=214.00 track off
 t=214.50 goto -734 3424
 t=222.50 goto -200 3900
 # alley attempt; labelled teleport fallback (the alley's east end is the windowed wall)

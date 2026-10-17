@@ -11092,6 +11092,492 @@ fn move_toward_sets_move_target_and_destination() {
     assert_eq!(vm.vector_prop(pawn, "Location"), Some([250.0, 0.0, 0.0]));
 }
 
+// ---------------------------------------------------------------------------------------
+// item101: the retail AI ledge rule in controller_move_step (APawn::physWalking ->
+// CheckForLedges, Engine.dll 0x103be27c). A plateau ending at x = LEDGE_X; beyond it there is
+// no floor within the 35 UU step height, so an unguarded walker steps off and starts falling.
+// ---------------------------------------------------------------------------------------
+
+/// Redistributable fixture: `Object/Actor/Pawn/Controller/PlayerController/IAController` with
+/// the fields `controller_move_step` reads, including `bCanWalkOffLedges`.
+fn item101_ledges_fixture() -> Vec<u8> {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "Controller");
+    let player_controller = b.reserve(0, 0, "PlayerController");
+    let ia_controller = b.reserve(0, 0, "IAController");
+    let navigation_point = b.reserve(0, 0, "NavigationPoint");
+    let attack_point = b.reserve(0, 0, "AttackPoint");
+
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let velocity = b.reserve(IMP_STRUCTPROP, actor, "Velocity");
+    let acceleration = b.reserve(IMP_STRUCTPROP, actor, "Acceleration");
+    let radius = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
+    let height = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
+    let ground_speed = b.reserve(IMP_FLOATPROP, actor, "GroundSpeed");
+    let accel_rate = b.reserve(IMP_FLOATPROP, actor, "AccelRate");
+    let desired_speed = b.reserve(IMP_FLOATPROP, actor, "DesiredSpeed");
+    let crouching_pct = b.reserve(IMP_FLOATPROP, actor, "CrouchingPct");
+    let walking_pct = b.reserve(IMP_FLOATPROP, actor, "WalkingPct");
+    let c_pawn = b.reserve(IMP_OBJECTPROP, actor, "Pawn");
+    let c_controller = b.reserve(IMP_OBJECTPROP, actor, "Controller");
+    let c_move_target = b.reserve(IMP_OBJECTPROP, actor, "MoveTarget");
+    let collide_world = b.reserve(IMP_BOOLPROP, actor, "bCollideWorld");
+    let b_walking = b.reserve(IMP_BOOLPROP, actor, "bWalking");
+    let is_crouched = b.reserve(IMP_BOOLPROP, actor, "bIsCrouched");
+    let can_walk_off = b.reserve(IMP_BOOLPROP, actor, "bCanWalkOffLedges");
+    let avoid_ledges = b.reserve(IMP_BOOLPROP, actor, "bAvoidLedges");
+    let stop_at_ledges = b.reserve(IMP_BOOLPROP, actor, "bStopAtLedges");
+    let physics = b.reserve(IMP_BYTEPROP, actor, "Physics");
+
+    let vector_extra = compact(IMP_STRUCT);
+    let object_extra = compact(actor);
+    let fields = [
+        (location, vector_extra.clone()),
+        (velocity, vector_extra.clone()),
+        (acceleration, vector_extra.clone()),
+        (radius, vec![]),
+        (height, vec![]),
+        (ground_speed, vec![]),
+        (accel_rate, vec![]),
+        (desired_speed, vec![]),
+        (crouching_pct, vec![]),
+        (walking_pct, vec![]),
+        (c_pawn, object_extra.clone()),
+        (c_controller, object_extra.clone()),
+        (c_move_target, object_extra.clone()),
+        (collide_world, vec![]),
+        (b_walking, vec![]),
+        (is_crouched, vec![]),
+        (can_walk_off, vec![]),
+        (avoid_ledges, vec![]),
+        (stop_at_ledges, vec![]),
+        (physics, compact(0)),
+    ];
+    for (i, (field, extra)) in fields.iter().enumerate() {
+        b.prop_with(*field, fields.get(i + 1).map_or(0, |next| next.0), 0, extra);
+    }
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, location, 0);
+    b.class(pawn, actor, location, 0);
+    b.class(controller, actor, location, 0);
+    b.class(player_controller, controller, 0, 0);
+    b.class(ia_controller, controller, 0, 0);
+    b.class(navigation_point, actor, location, 0);
+    b.class(attack_point, navigation_point, location, 0);
+    b.build()
+}
+
+fn item101_ledges_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Test",
+        item101_ledges_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+/// A floor plateau whose top is `floor_z` for all `x < ledge_x` and nothing beyond: the drop
+/// past the edge is deeper than the 35 UU step height, so a walker over it has no support.
+struct LedgeWorld {
+    ledge_x: f32,
+    floor_z: f32,
+}
+
+impl LedgeWorld {
+    fn supported(&self, x: f32, extent: [f32; 3]) -> bool {
+        x - extent[0] < self.ledge_x
+    }
+}
+
+impl WorldPhysics for LedgeWorld {
+    fn trace(&mut self, start: [f32; 3], end: [f32; 3], extent: [f32; 3]) -> Option<WorldHit> {
+        if !self.supported(end[0], extent) && !self.supported(start[0], extent) {
+            return None;
+        }
+        let d = end[2] - start[2];
+        if d >= 0.0 {
+            return None;
+        }
+        // The box bottom crosses the plateau top while any part of the footprint overlaps it.
+        let bottom = start[2] - extent[2];
+        if bottom <= self.floor_z {
+            return Some(WorldHit {
+                location: [start[0], start[1], self.floor_z],
+                normal: [0.0, 0.0, 1.0],
+                time: 0.0,
+            });
+        }
+        if bottom + d <= self.floor_z {
+            let t = (self.floor_z - bottom) / d;
+            return Some(WorldHit {
+                location: [start[0], start[1], self.floor_z + extent[2]],
+                normal: [0.0, 0.0, 1.0],
+                time: t,
+            });
+        }
+        None
+    }
+
+    fn move_box(&mut self, start: [f32; 3], delta: [f32; 3], extent: [f32; 3]) -> MoveOutcome {
+        let end = [
+            start[0] + delta[0],
+            start[1] + delta[1],
+            start[2] + delta[2],
+        ];
+        match self.trace(start, end, extent) {
+            Some(hit) => MoveOutcome {
+                end,
+                hit: Some(hit),
+            },
+            None => MoveOutcome { end, hit: None },
+        }
+    }
+
+    fn walk_box(&mut self, start: [f32; 3], delta: [f32; 3], _extent: [f32; 3]) -> MoveOutcome {
+        // Flat-roof walking: the horizontal move is unobstructed and stays at its z (the pawn
+        // rests exactly on the plateau top). No floor-follow snap is needed at rest height.
+        MoveOutcome {
+            end: [
+                start[0] + delta[0],
+                start[1] + delta[1],
+                start[2] + delta[2],
+            ],
+            hit: None,
+        }
+    }
+
+    fn point_free(&mut self, location: [f32; 3], extent: [f32; 3]) -> bool {
+        !self.supported(location[0], extent) || location[2] - extent[2] >= self.floor_z
+    }
+}
+
+/// Pawn + controller pair resting on the plateau top, walking toward `destination`.
+fn ledge_pair(vm: &mut Vm<'_>, set: &ScriptSet, controller_class: &str) -> (ObjectId, ObjectId) {
+    let pawn = vm.spawn(pg(set, "Pawn"), "P").unwrap();
+    vm.set_property(pawn, "Location", 0, Value::Vector([0.0, 0.0, 30.0]));
+    vm.set_property(pawn, "Physics", 0, Value::Byte(1));
+    vm.set_property(pawn, "CollisionRadius", 0, Value::Float(20.0));
+    vm.set_property(pawn, "CollisionHeight", 0, Value::Float(30.0));
+    vm.set_property(pawn, "GroundSpeed", 0, Value::Float(200.0));
+    vm.set_property(pawn, "AccelRate", 0, Value::Float(400.0));
+    vm.set_property(pawn, "DesiredSpeed", 0, Value::Float(1.0));
+    vm.set_property(pawn, "bCollideWorld", 0, Value::Bool(true));
+    let ctrl = vm.spawn(pg(set, controller_class), "C").unwrap();
+    vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
+    vm.set_property(
+        pawn,
+        "Controller",
+        0,
+        Value::Object(Some(ObjRef::Instance(ctrl))),
+    );
+    (ctrl, pawn)
+}
+
+/// The destination is far past the ledge; one step of the given length.
+fn ledge_step(vm: &mut Vm<'_>, ctrl: ObjectId, pawn: ObjectId, dt: f32) -> bool {
+    vm.controller_move_step(ctrl, pawn, [1000.0, 0.0, 30.0], dt)
+        .unwrap()
+}
+
+#[test]
+fn controller_ledges_stop_ai_walker_at_ledge() {
+    let set = item101_ledges_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(LedgeWorld {
+        ledge_x: 200.0,
+        floor_z: 0.0,
+    }));
+    let (ctrl, pawn) = ledge_pair(&mut vm, &set, "IAController");
+
+    // Walk until the pawn reaches the edge (support ends at x = 180 for radius 20); every
+    // step must keep PHYS_Walking and keep the box over the plateau.
+    let mut reached_edge = false;
+    for _ in 0..200 {
+        let arrived = ledge_step(&mut vm, ctrl, pawn, 0.05);
+        let loc = vm.vector_prop(pawn, "Location").unwrap();
+        assert_eq!(vm.byte_prop(pawn, "Physics"), 1, "must not start falling");
+        assert!(
+            loc[0] - 20.0 <= 200.0 + 1.0e-3,
+            "no step may lose floor support: {loc:?}"
+        );
+        if arrived || loc[0] >= 170.0 {
+            reached_edge = true;
+            break;
+        }
+    }
+    assert!(
+        reached_edge,
+        "the walker must actually reach the ledge: {:?}",
+        vm.vector_prop(pawn, "Location")
+    );
+}
+
+#[test]
+fn controller_ledge_clamp_holds_the_edge_position_exactly() {
+    let set = item101_ledges_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(LedgeWorld {
+        ledge_x: 200.0,
+        floor_z: 0.0,
+    }));
+    let (ctrl, pawn) = ledge_pair(&mut vm, &set, "IAController");
+    for _ in 0..120 {
+        ledge_step(&mut vm, ctrl, pawn, 0.05);
+    }
+    let held = vm.vector_prop(pawn, "Location").unwrap();
+    assert!(
+        held[0] >= 170.0,
+        "the walker should reach the edge: {held:?}"
+    );
+    assert!(held[0] - 20.0 <= 200.0 + 1.0e-3);
+    // Ten more steps must not move it further (it rests against the edge).
+    for _ in 0..10 {
+        ledge_step(&mut vm, ctrl, pawn, 0.05);
+    }
+    assert_eq!(vm.vector_prop(pawn, "Location"), Some(held));
+}
+
+#[test]
+fn crouching_ai_pawn_is_still_guarded_at_a_ledge() {
+    // The physWalking gate does not test the crouch flag: bIsCrouched is Pawn+0x1f4 bit 0x10
+    // (`IsCrouched() << 4`, Engine.dll 0x103c2545..0x103c2551), a different bit from the
+    // 0x1000 suppression flag tested at 0x103be213. A crouching AI walker must therefore stop
+    // at a ledge exactly like a standing one.
+    let set = item101_ledges_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(LedgeWorld {
+        ledge_x: 200.0,
+        floor_z: 0.0,
+    }));
+    let (ctrl, pawn) = ledge_pair(&mut vm, &set, "IAController");
+    vm.set_property(pawn, "WalkingPct", 0, Value::Float(1.0));
+    vm.set_property(pawn, "CrouchingPct", 0, Value::Float(0.5));
+    vm.set_property(pawn, "bIsCrouched", 0, Value::Bool(true));
+    for _ in 0..200 {
+        ledge_step(&mut vm, ctrl, pawn, 0.05);
+        assert_eq!(
+            vm.byte_prop(pawn, "Physics"),
+            1,
+            "a crouching AI pawn must not step off a ledge"
+        );
+        let loc = vm.vector_prop(pawn, "Location").unwrap();
+        assert!(
+            loc[0] - 20.0 <= 200.0 + 1.0e-3,
+            "a crouching AI walker must keep floor support: {loc:?}"
+        );
+    }
+}
+
+#[test]
+fn ledge_flags_are_not_the_engine_gate() {
+    // The reflected bAvoidLedges/bStopAtLedges/bCanWalkOffLedges properties do not gate the
+    // engine's check (no game script references them and XIIIPawn serializes
+    // bCanWalkOffLedges=true for every character while retail still keeps AI off ledges):
+    // setting all three must NOT let an AI pawn step off.
+    let set = item101_ledges_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(LedgeWorld {
+        ledge_x: 200.0,
+        floor_z: 0.0,
+    }));
+    let (ctrl, pawn) = ledge_pair(&mut vm, &set, "IAController");
+    for name in ["bAvoidLedges", "bStopAtLedges", "bCanWalkOffLedges"] {
+        vm.set_property(pawn, name, 0, Value::Bool(true));
+    }
+    let mut fell = false;
+    for _ in 0..200 {
+        ledge_step(&mut vm, ctrl, pawn, 0.05);
+        if vm.byte_prop(pawn, "Physics") == 2 {
+            fell = true;
+            break;
+        }
+    }
+    assert!(!fell, "the ledge flags must not disable the retail check");
+    assert_eq!(vm.byte_prop(pawn, "Physics"), 1);
+}
+
+#[test]
+fn human_controlled_pawn_skips_the_ledge_check() {
+    let set = item101_ledges_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(LedgeWorld {
+        ledge_x: 200.0,
+        floor_z: 0.0,
+    }));
+    // IsHumanControlled (Engine.dll 0x103b09d0) is Controller->IsA(PlayerController): those
+    // pawns never run CheckForLedges and step off as before.
+    let (ctrl, pawn) = ledge_pair(&mut vm, &set, "PlayerController");
+    let mut fell = false;
+    for _ in 0..200 {
+        ledge_step(&mut vm, ctrl, pawn, 0.05);
+        if vm.byte_prop(pawn, "Physics") == 2 {
+            fell = true;
+            break;
+        }
+    }
+    assert!(fell, "a human-controlled pawn must step off");
+    assert!(vm.vector_prop(pawn, "Location").unwrap()[0] > 200.0);
+}
+
+#[test]
+fn pawn_already_past_the_ledge_falls_despite_the_guard() {
+    let set = item101_ledges_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(LedgeWorld {
+        ledge_x: 200.0,
+        floor_z: 0.0,
+    }));
+    let (ctrl, pawn) = ledge_pair(&mut vm, &set, "IAController");
+    // Start with no support under the pawn at all: the guard must not freeze it in the air,
+    // the move stands and the pawn flips to PHYS_Falling (retail returns the delta unchanged
+    // when its own support trace finds nothing to stand on).
+    vm.set_property(pawn, "Location", 0, Value::Vector([400.0, 0.0, 130.0]));
+    ledge_step(&mut vm, ctrl, pawn, 0.1);
+    assert_eq!(vm.byte_prop(pawn, "Physics"), 2);
+}
+
+#[test]
+fn controller_path_move_toward_a_node_walks_off_the_ledge() {
+    // item101d: `Controller.MoveToward` (Engine.dll execMoveToward 0x1036d8c0) records the
+    // navigation target in `MoveTarget` (controller+0x228, written at 0x1036da37) and resolves
+    // its FReachSpec (0x1036dbd7..0x1036dbd2) before each step, so a scripted path move (the
+    // IAController attack-path states) may leave the ledge: the pawn must step off the plateau
+    // and hand off to PHYS_Falling instead of being clamped at the edge.
+    let set = item101_ledges_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(LedgeWorld {
+        ledge_x: 200.0,
+        floor_z: 0.0,
+    }));
+    let (ctrl, pawn) = ledge_pair(&mut vm, &set, "IAController");
+    // An attack point (a NavigationPoint) well below the plateau, recorded as the controller's
+    // MoveTarget by MoveToward: the reachspec leaves the ground, so the drop is allowed.
+    let node = vm.spawn(pg(&set, "AttackPoint"), "AP0").unwrap();
+    vm.set_property(node, "Location", 0, Value::Vector([1000.0, 0.0, -500.0]));
+    vm.set_property(
+        ctrl,
+        "MoveTarget",
+        0,
+        Value::Object(Some(ObjRef::Instance(node))),
+    );
+    let mut fell = false;
+    for _ in 0..200 {
+        ledge_step(&mut vm, ctrl, pawn, 0.05);
+        if vm.byte_prop(pawn, "Physics") == 2 {
+            fell = true;
+            break;
+        }
+    }
+    assert!(
+        fell,
+        "a path move toward a lower node must be allowed to leave the ledge, loc={:?}",
+        vm.vector_prop(pawn, "Location")
+    );
+    assert!(vm.vector_prop(pawn, "Location").unwrap()[0] > 200.0);
+}
+
+#[test]
+fn path_move_toward_a_same_level_node_is_still_clamped() {
+    // A NavigationPoint target that is not below the pawn (a same-level patrol/attack node)
+    // requires no drop and must be clamped exactly like a wander.
+    let set = item101_ledges_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(LedgeWorld {
+        ledge_x: 200.0,
+        floor_z: 0.0,
+    }));
+    let (ctrl, pawn) = ledge_pair(&mut vm, &set, "IAController");
+    let node = vm.spawn(pg(&set, "AttackPoint"), "AP0").unwrap();
+    vm.set_property(node, "Location", 0, Value::Vector([1000.0, 0.0, 30.0]));
+    vm.set_property(
+        ctrl,
+        "MoveTarget",
+        0,
+        Value::Object(Some(ObjRef::Instance(node))),
+    );
+    for _ in 0..200 {
+        ledge_step(&mut vm, ctrl, pawn, 0.05);
+        assert_eq!(
+            vm.byte_prop(pawn, "Physics"),
+            1,
+            "a same-level path node must not let the walker off the ledge"
+        );
+        let loc = vm.vector_prop(pawn, "Location").unwrap();
+        assert!(
+            loc[0] - 20.0 <= 200.0 + 1.0e-3,
+            "the walker must keep floor support: {loc:?}"
+        );
+    }
+}
+
+#[test]
+fn path_move_toward_a_lower_actor_is_still_clamped() {
+    // A chase records its target actor in MoveTarget too. An actor is not a NavigationPoint, so
+    // even a lower target must not turn the move into a ledge drop.
+    let set = item101_ledges_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(LedgeWorld {
+        ledge_x: 200.0,
+        floor_z: 0.0,
+    }));
+    let (ctrl, pawn) = ledge_pair(&mut vm, &set, "IAController");
+    let enemy = vm.spawn(pg(&set, "Pawn"), "Enemy").unwrap();
+    vm.set_property(enemy, "Location", 0, Value::Vector([1000.0, 0.0, -500.0]));
+    vm.set_property(
+        ctrl,
+        "MoveTarget",
+        0,
+        Value::Object(Some(ObjRef::Instance(enemy))),
+    );
+    for _ in 0..200 {
+        ledge_step(&mut vm, ctrl, pawn, 0.05);
+        assert_eq!(
+            vm.byte_prop(pawn, "Physics"),
+            1,
+            "a chase toward an actor must not let the walker off the ledge"
+        );
+    }
+}
+
+#[test]
+fn wander_move_to_still_holds_the_ledge_with_a_lower_destination() {
+    // item102b's rejected gate let a wander leave whenever the destination was more than the
+    // 35 UU step height below the floor. The retail/official distinction is the controller's
+    // navigation target, not the destination depth: a MoveTo wander (`MoveTarget == None`,
+    // execMoveTo 0x1036a7f5) to a point far below the plateau must still be clamped.
+    let set = item101_ledges_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(LedgeWorld {
+        ledge_x: 200.0,
+        floor_z: 0.0,
+    }));
+    let (ctrl, pawn) = ledge_pair(&mut vm, &set, "IAController");
+    assert!(vm.obj_prop(ctrl, "MoveTarget").is_none());
+    for _ in 0..200 {
+        // Destination far past and far below the ledge.
+        vm.controller_move_step(ctrl, pawn, [1000.0, 0.0, -500.0], 0.05)
+            .unwrap();
+        assert_eq!(
+            vm.byte_prop(pawn, "Physics"),
+            1,
+            "a wander to a lower destination must not be let off the ledge"
+        );
+        let loc = vm.vector_prop(pawn, "Location").unwrap();
+        assert!(
+            loc[0] - 20.0 <= 200.0 + 1.0e-3,
+            "the wander must keep floor support: {loc:?}"
+        );
+    }
+}
+
 #[test]
 fn line_of_sight_to_uses_the_pawn_eyes_and_reports_the_blocking_wall() {
     let set = nav_set();
@@ -15756,6 +16242,8 @@ fn item63_eye_position_reads_current_height_without_base_or_crouch_fallback() {
     let mut vm = Vm::new(&set, VmLimits::default());
     let pawn = vm.spawn(pg(&set, "Pawn"), "Eye").unwrap();
     vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(60.0));
+    vm.set_property(pawn, "WalkingPct", 0, Value::Float(1.0));
+    vm.set_property(pawn, "CrouchingPct", 0, Value::Float(0.5));
     vm.set_property(pawn, "bIsCrouched", 0, Value::Bool(true));
     for height in [0.0, -7.0, 35.5] {
         vm.set_property(pawn, "EyeHeight", 0, Value::Float(height));
@@ -16982,4 +17470,291 @@ fn dynamic_array_negative_write_is_skipped() {
             ..
         }
     ));
+}
+
+/// item100b: a `CineController2`-steered walking pawn must apply `calcVelocity`'s directional
+/// friction, so a steering change removes a stale velocity component instead of only adding
+/// acceleration. The escort's rear guard is steered along a moving marker; when the marker arrives
+/// on the pawn the steering direction becomes a tiny lateral residual, and the earlier add-and-cap
+/// form kept the old forward velocity alive (the guard slid past the marker into the player's 130
+/// UU beatdown ring).
+#[test]
+fn item100b_steered_walking_friction_sheds_stale_velocity_component() {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "Controller");
+    let cine = b.reserve(0, 0, "CineController2");
+    let phys_volume = b.reserve(0, 0, "PhysicsVolume");
+    let obj = compact(0);
+    let vec = compact(IMP_STRUCT);
+    let rot = compact(IMP_STRUCT - 1);
+
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let rotation = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
+    let velocity = b.reserve(IMP_STRUCTPROP, actor, "Velocity");
+    let acceleration = b.reserve(IMP_STRUCTPROP, actor, "Acceleration");
+    let physics = b.reserve(IMP_BYTEPROP, actor, "Physics");
+    let bcollide = b.reserve(IMP_BOOLPROP, actor, "bCollideWorld");
+    let pawn_ctrl = b.reserve(IMP_OBJECTPROP, actor, "Controller");
+    b.prop_with(location, rotation, 0, &vec);
+    b.prop_with(rotation, velocity, 0, &rot);
+    b.prop_with(velocity, acceleration, 0, &vec);
+    b.prop_with(acceleration, physics, 0, &vec);
+    b.prop_with(physics, bcollide, 0, &compact(0));
+    b.prop(bcollide, pawn_ctrl, 0);
+    b.prop_with(pawn_ctrl, 0, 0, &obj);
+
+    let ground = b.reserve(IMP_FLOATPROP, pawn, "GroundSpeed");
+    let accelrate = b.reserve(IMP_FLOATPROP, pawn, "AccelRate");
+    let pvol = b.reserve(IMP_OBJECTPROP, pawn, "PhysicsVolume");
+    let prad = b.reserve(IMP_FLOATPROP, pawn, "CollisionRadius");
+    b.prop(ground, accelrate, 0);
+    b.prop(accelrate, pvol, 0);
+    b.prop_with(pvol, prad, 0, &obj);
+    b.prop(prad, 0, 0);
+
+    let gfrac = b.reserve(IMP_FLOATPROP, phys_volume, "GroundFriction");
+    b.prop(gfrac, 0, 0);
+
+    let ctrl_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
+    let bmoving = b.reserve(IMP_BOOLPROP, controller, "bMoving");
+    let ctarget = b.reserve(IMP_OBJECTPROP, controller, "Target");
+    b.prop_with(ctrl_pawn, bmoving, 0, &obj);
+    b.prop(bmoving, ctarget, 0);
+    b.prop_with(ctarget, 0, 0, &obj);
+
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, location, 0);
+    b.class(pawn, actor, ground, 0);
+    b.class(controller, actor, ctrl_pawn, 0);
+    b.class(cine, controller, 0, 0);
+    b.class(phys_volume, object, gfrac, 0);
+    let p = ScriptPackage::load(
+        "Test",
+        b.build(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([-10_000.0, -10_000.0, -20.0], [10_000.0, 10_000.0, -1.0]),
+    ));
+    let ctrl = vm.spawn(sg(&set, "CineController2"), "C").unwrap();
+    let pwn = vm.spawn(sg(&set, "Pawn"), "P").unwrap();
+    let vol = vm.spawn(sg(&set, "PhysicsVolume"), "V").unwrap();
+    let tgt = vm.spawn(sg(&set, "Actor"), "T").unwrap();
+    vm.set_active(ctrl, true);
+    vm.set_active(pwn, true);
+    vm.set_property(vol, "GroundFriction", 0, Value::Float(8.0));
+    vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pwn))));
+    vm.set_property(ctrl, "bMoving", 0, Value::Bool(true));
+    // The steering target sits on the pawn (the escort's re-SetLocation'd marker case).
+    vm.set_property(tgt, "Location", 0, Value::Vector([0.0, 0.0, 0.0]));
+    vm.set_property(
+        ctrl,
+        "Target",
+        0,
+        Value::Object(Some(ObjRef::Instance(tgt))),
+    );
+    vm.set_property(
+        pwn,
+        "Controller",
+        0,
+        Value::Object(Some(ObjRef::Instance(ctrl))),
+    );
+    vm.set_property(
+        pwn,
+        "PhysicsVolume",
+        0,
+        Value::Object(Some(ObjRef::Instance(vol))),
+    );
+    vm.set_property(pwn, "Location", 0, Value::Vector([0.0, 0.0, 0.0]));
+    vm.set_property(pwn, "CollisionRadius", 0, Value::Float(34.0));
+    vm.set_property(pwn, "Physics", 0, Value::Byte(1)); // PHYS_Walking
+    vm.set_property(pwn, "bCollideWorld", 0, Value::Bool(true));
+    vm.set_property(pwn, "GroundSpeed", 0, Value::Float(270.0));
+    vm.set_property(pwn, "AccelRate", 0, Value::Float(2048.0));
+    // Steering acceleration points +Y while the stale velocity runs -X: a perpendicular pair.
+    vm.set_property(pwn, "Acceleration", 0, Value::Vector([0.0, 200.0, 0.0]));
+    vm.set_property(pwn, "Velocity", 0, Value::Vector([-220.0, 0.0, 0.0]));
+
+    let dt = 1.0 / 30.0;
+    assert!(vm.tick_suspending(dt).is_empty());
+    let after_one = vm.vector_prop(pwn, "Velocity").unwrap();
+    // GroundFriction removes the component perpendicular to the steering direction. The old
+    // add-and-cap form left the -X component at -220 even after a tick.
+    assert!(
+        after_one[0] > -210.0,
+        "steered pawn must shed the stale velocity component, vx={}",
+        after_one[0]
+    );
+    assert!(
+        after_one[1] > 40.0,
+        "steered pawn must gain velocity along the steering direction, vy={}",
+        after_one[1]
+    );
+
+    // Over a few ticks the velocity aligns with the steering direction and reaches GroundSpeed.
+    for _ in 0..20 {
+        assert!(vm.tick_suspending(dt).is_empty());
+    }
+    let settled = vm.vector_prop(pwn, "Velocity").unwrap();
+    assert!(
+        settled[0].abs() < 1.0,
+        "the perpendicular component must decay away, vx={}",
+        settled[0]
+    );
+    assert!(
+        settled[1] > 240.0,
+        "the velocity must reach GroundSpeed along the steering direction, vy={}",
+        settled[1]
+    );
+}
+
+/// item100c: the `calcVelocity` directional friction is applied for *every* steered walk, not only
+/// when the controller's steering `Target` sits on the pawn. `physWalking` (Engine.dll
+/// 0x103bdba5) calls `calcVelocity` (0x103ba250) unconditionally for a walking pawn, and the
+/// friction is the pawn's `GroundFriction`; there is no target-distance gate. This is the item100b
+/// fixture with the target far away (2000 UU east, well outside `CollisionRadius`): the stale
+/// perpendicular velocity must still shed, and the velocity must still reach `GroundSpeed` along
+/// the steering direction. The pre-item100c gated form leaves the `-X` component at `-220`.
+#[test]
+fn item100c_steered_walking_friction_applies_with_far_target() {
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "Controller");
+    let cine = b.reserve(0, 0, "CineController2");
+    let phys_volume = b.reserve(0, 0, "PhysicsVolume");
+    let obj = compact(0);
+    let vec = compact(IMP_STRUCT);
+    let rot = compact(IMP_STRUCT - 1);
+
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let rotation = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
+    let velocity = b.reserve(IMP_STRUCTPROP, actor, "Velocity");
+    let acceleration = b.reserve(IMP_STRUCTPROP, actor, "Acceleration");
+    let physics = b.reserve(IMP_BYTEPROP, actor, "Physics");
+    let bcollide = b.reserve(IMP_BOOLPROP, actor, "bCollideWorld");
+    let pawn_ctrl = b.reserve(IMP_OBJECTPROP, actor, "Controller");
+    b.prop_with(location, rotation, 0, &vec);
+    b.prop_with(rotation, velocity, 0, &rot);
+    b.prop_with(velocity, acceleration, 0, &vec);
+    b.prop_with(acceleration, physics, 0, &vec);
+    b.prop_with(physics, bcollide, 0, &compact(0));
+    b.prop(bcollide, pawn_ctrl, 0);
+    b.prop_with(pawn_ctrl, 0, 0, &obj);
+
+    let ground = b.reserve(IMP_FLOATPROP, pawn, "GroundSpeed");
+    let accelrate = b.reserve(IMP_FLOATPROP, pawn, "AccelRate");
+    let pvol = b.reserve(IMP_OBJECTPROP, pawn, "PhysicsVolume");
+    b.prop(ground, accelrate, 0);
+    b.prop(accelrate, pvol, 0);
+    b.prop_with(pvol, 0, 0, &obj);
+
+    let gfrac = b.reserve(IMP_FLOATPROP, phys_volume, "GroundFriction");
+    b.prop(gfrac, 0, 0);
+
+    let ctrl_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
+    let bmoving = b.reserve(IMP_BOOLPROP, controller, "bMoving");
+    let ctarget = b.reserve(IMP_OBJECTPROP, controller, "Target");
+    b.prop_with(ctrl_pawn, bmoving, 0, &obj);
+    b.prop(bmoving, ctarget, 0);
+    b.prop_with(ctarget, 0, 0, &obj);
+
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, location, 0);
+    b.class(pawn, actor, ground, 0);
+    b.class(controller, actor, ctrl_pawn, 0);
+    b.class(cine, controller, 0, 0);
+    b.class(phys_volume, object, gfrac, 0);
+    let p = ScriptPackage::load(
+        "Test",
+        b.build(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([-10_000.0, -10_000.0, -20.0], [10_000.0, 10_000.0, -1.0]),
+    ));
+    let ctrl = vm.spawn(sg(&set, "CineController2"), "C").unwrap();
+    let pwn = vm.spawn(sg(&set, "Pawn"), "P").unwrap();
+    let vol = vm.spawn(sg(&set, "PhysicsVolume"), "V").unwrap();
+    let tgt = vm.spawn(sg(&set, "Actor"), "T").unwrap();
+    vm.set_active(ctrl, true);
+    vm.set_active(pwn, true);
+    vm.set_property(vol, "GroundFriction", 0, Value::Float(8.0));
+    vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pwn))));
+    vm.set_property(ctrl, "bMoving", 0, Value::Bool(true));
+    // The steering target is far away (2000 UU east): the friction must not be target-gated.
+    vm.set_property(tgt, "Location", 0, Value::Vector([2000.0, 0.0, 0.0]));
+    vm.set_property(
+        ctrl,
+        "Target",
+        0,
+        Value::Object(Some(ObjRef::Instance(tgt))),
+    );
+    vm.set_property(
+        pwn,
+        "Controller",
+        0,
+        Value::Object(Some(ObjRef::Instance(ctrl))),
+    );
+    vm.set_property(
+        pwn,
+        "PhysicsVolume",
+        0,
+        Value::Object(Some(ObjRef::Instance(vol))),
+    );
+    vm.set_property(pwn, "Location", 0, Value::Vector([0.0, 0.0, 0.0]));
+    vm.set_property(pwn, "Physics", 0, Value::Byte(1)); // PHYS_Walking
+    vm.set_property(pwn, "bCollideWorld", 0, Value::Bool(true));
+    vm.set_property(pwn, "GroundSpeed", 0, Value::Float(270.0));
+    vm.set_property(pwn, "AccelRate", 0, Value::Float(2048.0));
+    // Steering acceleration points +Y while the stale velocity runs -X: a perpendicular pair.
+    vm.set_property(pwn, "Acceleration", 0, Value::Vector([0.0, 200.0, 0.0]));
+    vm.set_property(pwn, "Velocity", 0, Value::Vector([-220.0, 0.0, 0.0]));
+
+    let dt = 1.0 / 30.0;
+    assert!(vm.tick_suspending(dt).is_empty());
+    let after_one = vm.vector_prop(pwn, "Velocity").unwrap();
+    assert!(
+        after_one[0] > -210.0,
+        "far-target steering must still shed the stale velocity component, vx={}",
+        after_one[0]
+    );
+    assert!(
+        after_one[1] > 40.0,
+        "far-target steering must gain velocity along the steering direction, vy={}",
+        after_one[1]
+    );
+
+    for _ in 0..20 {
+        assert!(vm.tick_suspending(dt).is_empty());
+    }
+    let settled = vm.vector_prop(pwn, "Velocity").unwrap();
+    assert!(
+        settled[0].abs() < 1.0,
+        "the perpendicular component must decay away, vx={}",
+        settled[0]
+    );
+    assert!(
+        settled[1] > 240.0,
+        "the velocity must reach GroundSpeed along the steering direction, vy={}",
+        settled[1]
+    );
 }

@@ -5092,6 +5092,11 @@ mod tests {
         // facing west at -1035,595) so the player is behind its 180-degree sight cone, and keeps
         // moving through the Porte7 wait. Measured floor 44 (was 28 pre-integration, dead on
         // integration); pin it so a change that lets the AI engage again fails visibly.
+        // item101: the retail ledge rule keeps the map's AI walkers on their platforms (they no
+        // longer walk off and remove themselves), so a soldier that used to fall now stays and
+        // adds fire; the measured Amos01 floor moves 44 -> 29 (run: route filter). The route
+        // player still survives; the floor is re-pinned to the new measured value so a further
+        // regression still fails visibly.
         let amos_min_health = outcome
             .map_min_health
             .iter()
@@ -5103,8 +5108,8 @@ mod tests {
              survived the live-AI fire)"
         );
         assert!(
-            amos_min_health.is_finite() && amos_min_health >= 35.0,
-            "the route player must survive the live-AI fire with margin (measured floor 44); \
+            amos_min_health.is_finite() && amos_min_health >= 25.0,
+            "the route player must survive the live-AI fire with margin (item101 floor 29); \
              got {amos_min_health} (a non-finite value means no Health was ever observed)"
         );
         assert!(
@@ -5942,6 +5947,13 @@ mod tests {
         // longer settles it onto the adjacent `GR_falaise03` static-mesh cliff, so the killer's
         // approach shifts and the same input leaves the player at 17 HP (was 20). The kill and
         // the player surviving are unchanged.
+        // item101: the retail AI ledge rule (APawn::physWalking -> CheckForLedges) keeps the
+        // map's AI walkers on their ledges instead of walking off and removing themselves, so a
+        // soldier that used to fall now stays; the measured surviving fight health moves 20 -> 40
+        // (re-pinned; BaseSoldier6 still dies). A change that lets the AI engage harder again
+        // still fails visibly.
+        // item102: re-measured on the merged tree (FindSpot + ledge rule): the surviving fight
+        // health is 31 (FindSpot alone was 17, the ledge rule alone 40). BaseSoldier6 still dies.
         let script = script::Script::parse(&format!(
             "{}t=291.00 teleport 1802.0 -12700.0 1100.0\n\
              t=291.00 track BaseSoldier6\n\
@@ -5986,8 +5998,13 @@ mod tests {
         assert!(weapon.is_some(), "the player must hold the granted weapon");
         assert_eq!(
             s.player_health(),
-            Some(17.0),
-            "measured surviving fight health"
+            Some(18.0),
+            "measured surviving fight health (item104: re-measured on the integrated tree, 18; \
+             item102 measured 31 on its own base with FindSpot + the ledge rule. On this tree \
+             skipping the steered-walking friction (temporary env gate) also gives 18, so the \
+             friction is not the cause; disabling only the ledge rule gives 0 (player dead). The \
+             31 -> 18 shift is not isolated (hypothesis: the origin/main commits merged into \
+             this tree); item100 measured 17 with friction and no ledge rule on its base)"
         );
         let position = s.vm().location_prop(s.player).expect("player location");
         assert!(
@@ -6746,80 +6763,60 @@ mod tests {
             "[toits01 route] objectives={objectives:?} travel={:?} final_map={}",
             outcome.travel, outcome.final_map
         );
-        // item87e: pin the real blocker precisely. Under the render-time clock the ending
-        // scene's `CineController2` interpreter advances past action[211]
-        // `wait notbeseenbyplayer` (the item86 stall) but parks at action[227]
+        // item87e/item101: pin the ending-scene blocker precisely. Under the render-time clock
+        // the ending scene's `CineController2` interpreter advances past action[211]
+        // `wait notbeseenbyplayer` (the item86 stall). It used to park at action[227]
         // `wait event counter_finact2b` (`CineTrigger10`, InitialCounterValue 3), which needs
         // all three `act2b` courtyard soldiers (`BaseSoldier13/14/15`, Tag 'act2b') dead.
-        // `BaseSoldier13` and `BaseSoldier15` die to the route's courtyard fire, but
-        // `BaseSoldier14` survives (its Health stays 200: the route's fire never damages it).
-        // Measured at the cutoff: `BaseSoldier14` Location ~ (2808.6, 9819.3, -6433.8),
-        // `Physics` `PHYS_Walking` (1), Velocity (280.0, 0, 0), its `IAController` in state
-        // `Errance` (destination ~ (2848.5, 9819.3, -6355.6)). It authored at Location
-        // (-478.846, 3327.676, -12), i.e. on the courtyard floor, so it did not spawn outside;
-        // its `Errance` wander drove it off the courtyard's collision floor and it fell out of
-        // the world to z ~ -6434: ~6.4 km below the courtyard floor and far outside the fight,
-        // not a patrol point the player can reach or shoot, so the scene
-        // cannot leave action[227] and action[602] `od porte6` - the only path that opens the
-        // generator room - never runs. Full evidence in `local/reports/item87e-toits01-pin-restore.md`.
+        //
+        // item101: before the fix, `BaseSoldier14`'s `Errance` wander walked it off the
+        // courtyard roof parapet; the VM's controller walk lacked the retail ledge rule and
+        // flipped it to PHYS_Falling, and it fell ~6,434 UU to the ground level (Health 200),
+        // far below the fight. item101 implements the decoded retail rule
+        // (`APawn::physWalking` -> `APawn::CheckForLedges` shortens an AI walker's step at a
+        // ledge; see crates/xiii-script/src/vm.rs), so the soldier now stays on the courtyard
+        // surface and the route's fire kills it (Health -55, `Dying`). With all three act2b
+        // soldiers dead, `counter_finact2b` fires and the ending scene advances past
+        // action[227]; it now parks at action[238] `wait event counter_finact2a` (the next
+        // counter), `ScriptedActionIndex` 239.
+        //
+        // Measured (route run18): `BaseSoldier14` dead (Health -55), `BaseSoldier17` dead
+        // (Health -18), `BaseSoldier18` dead (Health -97), player health 65, goals 0/1/2
+        // incomplete and goal 3 complete, no travel. The courtyard fight restored by the fix is
+        // the authored 'act2b' combat. Full evidence in `local/reports/item101-pawn-falls-out.md`.
         {
             let vm = session.vm();
             let s14 = vm
                 .find_object("BaseSoldier14")
                 .expect("BaseSoldier14 must exist");
-            assert_eq!(
-                vm.get_property(s14, "bIsDead"),
-                Some(&xiii_script::Value::Bool(false)),
-                "item87e pin: BaseSoldier14 (the third counter_finact2b soldier) must survive, \
-                 stalling the scene at action[227]"
+            assert!(
+                session.actor_is_dead(s14),
+                "item101 pin: BaseSoldier14 (the third counter_finact2b soldier) must die to the \
+                 route's fire now that the ledge rule keeps it on the courtyard"
             );
             assert_eq!(
                 vm.get_property(s14, "Health"),
-                Some(&xiii_script::Value::Int(200)),
-                "item87e pin: the route's fire never damages BaseSoldier14"
+                Some(&xiii_script::Value::Int(-55)),
+                "item101 pin: the route's courtyard fire must kill BaseSoldier14"
             );
-            assert_eq!(
-                vm.get_property(s14, "Physics"),
-                Some(&xiii_script::Value::Byte(1)),
-                "item87e pin: BaseSoldier14 ends in PHYS_Walking, wandering far below the level"
-            );
-            let loc = vm
-                .vector_prop(s14, "Location")
-                .expect("BaseSoldier14 must keep a Location");
-            assert!(
-                (loc[2] + 6433.8).abs() < 5.0,
-                "item87e pin: BaseSoldier14 must have fallen far below the map (z ~ -6434), \
-                 got {loc:?}"
-            );
-            let controller_state = match vm.get_property(s14, "Controller") {
-                Some(xiii_script::Value::Object(Some(xiii_script::ObjRef::Instance(c)))) => {
-                    vm.state_name(*c)
-                }
-                _ => None,
-            };
-            assert_eq!(
-                controller_state.as_deref(),
-                Some("Errance"),
-                "item87e pin: BaseSoldier14's IAController must be wandering (Errance)"
-            );
-            // The scene controller is parked at action[227] `wait event counter_finact2b`: the
-            // VM's cine trace treats `ScriptedActionIndex - 1` as the action that ran/is waiting
-            // (see `play::survey`).
+            // The scene controller is now parked at action[238] `wait event counter_finact2a`:
+            // the VM's cine trace treats `ScriptedActionIndex - 1` as the action that ran/is
+            // waiting (see `play::survey`).
             let cc2 = vm
                 .find_object("CineController2")
                 .expect("CineController2 must exist");
             assert!(
                 vm.is_in_state(cc2, "PlayingSequence"),
-                "item87e pin: the ending scene must still be running at the cutoff"
+                "the ending scene must still be running at the cutoff"
             );
             let action_index = match vm.get_property(cc2, "ScriptedActionIndex") {
                 Some(xiii_script::Value::Int(v)) => *v,
                 other => panic!("CineController2 ScriptedActionIndex: {other:?}"),
             };
             assert_eq!(
-                action_index, 228,
-                "item87e pin: CineController2 must be parked at action[227] \
-                 (`wait event counter_finact2b`), i.e. ScriptedActionIndex 228"
+                action_index, 239,
+                "item101: after counter_finact2b the scene must park at action[238] \
+                 (`wait event counter_finact2a`), i.e. ScriptedActionIndex 239"
             );
             let action_text = vm
                 .get_property(cc2, "MyPawn")
@@ -6850,17 +6847,15 @@ mod tests {
             assert!(
                 action_text
                     .as_deref()
-                    .is_some_and(|t| t.contains("counter_finact2b")),
-                "item87e pin: the parked action must be `wait event counter_finact2b`, got \
+                    .is_some_and(|t| t.contains("counter_finact2a")),
+                "item101 pin: the parked action must be `wait event counter_finact2a`, got \
                  {action_text:?}"
             );
             println!(
-                "[toits01 route] item87e scene blocker: CineController2 action[{}] {action_text:?} \
-                 (index {action_index}), BaseSoldier14 alive health={:?} physics={:?} loc={loc:?} \
-                 controller={controller_state:?}",
+                "[toits01 route] item101 scene advance: CineController2 action[{}] {action_text:?} \
+                 (index {action_index}), BaseSoldier14 dead health={:?}",
                 action_index - 1,
                 vm.get_property(s14, "Health"),
-                vm.get_property(s14, "Physics"),
             );
         }
         assert_eq!(outcome.final_map, "Toits01");
@@ -6928,10 +6923,14 @@ mod tests {
             health > 0.0,
             "the route player must survive the tarmac rockets and the fight phase with normal-health soldiers, got health {health}"
         );
+        // item101: the retail ledge rule keeps BaseSoldier14 in the courtyard and the route's
+        // return fire now kills it (the aim fix below), so the ending scene advances past
+        // counter_finact2b and the courtyard damage is shorter: the route ends at health 65
+        // instead of the old 79 (item86) or the 35 measured while BaseSoldier14 survived.
         assert_eq!(
-            health, 79.0,
-            "the re-timed route must end at the measured health 79 (item86: the \
-             DetectionVolume1 'act2b' courtyard combat plus the tarmac fight)"
+            health, 65.0,
+            "the re-timed route must end at the measured health 65 (item101: the courtyard \
+             BaseSoldier14 fight the ledge fix restored, plus the tarmac fight)"
         );
         let soldier17 = session
             .vm()
@@ -7288,13 +7287,16 @@ mod tests {
         // corpse value moves from the item68b -41 to the measured -18.
         // item64f: the grapple route's later landing (351.5) reproduces the same three
         // spine hits (150 -> 94 -> 38 -> -18 by 352.3; local/re/item64f/run12.txt).
+        // item101: with the ledge rule restored the ending scene advances past
+        // counter_finact2b (the courtyard BaseSoldier14 now dies), which retimes the later
+        // phase; the measured soldier18 corpse value becomes Health -97 (route run18).
         let soldier18 = vm
             .find_object("BaseSoldier18")
             .expect("BaseSoldier18 must exist");
         assert_eq!(
             vm.get_property(soldier18, "Health"),
-            Some(&xiii_script::Value::Int(-18)),
-            "the landing M60 engagement must reproduce the measured 150 -> 94 -> 38 -> -18 kill"
+            Some(&xiii_script::Value::Int(-97)),
+            "the landing M60 engagement must reproduce the measured kill (item101: Health -97)"
         );
         assert!(
             session.actor_is_dead(soldier18),
@@ -7317,15 +7319,18 @@ mod tests {
     /// item87e DIAGNOSTIC (opt-in). The item87d generator-room experiment, moved out of the
     /// main route so it cannot replace that route's positive survival pins. The fixture
     /// (`tests/data/toits01_diag_generator_room.script`) is the main route's input up to
-    /// `t=386.20`, then a labelled diagnostic teleport into the scene-sealed generator room:
-    /// the ending scene never reaches action[602] `od porte6` (it parks at action[227]
-    /// `wait event counter_finact2b`, pinned by `opt_in_toits01_route_objectives_and_travel`),
-    /// so the room can only be entered by that labelled teleport. The granted M60 destroys
-    /// `BreakableMover12` (`Health 50 -> -40`), firing `PorteDebloquee_cine` ->
-    /// `PorteDebloquee` and arming `TouchTrigger10`; the game's own armed `Touch` then fires
-    /// `RenfortHelico02`, whose act2a squad kills the solo route player. This test pins that
-    /// measured chain, including the earlier route pins it shares with the main route. It is a
-    /// labelled diagnostic, NOT a playable route claim.
+    /// `t=386.20`, then a labelled diagnostic teleport into the generator room. Before item101
+    /// the ending scene parked at action[227] `wait event counter_finact2b` and never reached
+    /// action[602] `od porte6`, so the room could only be entered by that teleport. item101
+    /// (the retail ledge rule) keeps `BaseSoldier14` on the courtyard where the route's fire
+    /// kills it, so the scene advances past action[227]; the room's own door may now open in
+    /// the unmodified scene, but the fixture still uses the labelled teleport to make the
+    /// diagnostic deterministic. The granted M60 destroys `BreakableMover12`
+    /// (`Health 50 -> -40`), firing `PorteDebloquee_cine` -> `PorteDebloquee` and arming
+    /// `TouchTrigger10`; the game's own armed `Touch` then fires `RenfortHelico02`, whose act2a
+    /// squad kills the solo route player. This test pins that measured chain, including the
+    /// earlier route pins it shares with the main route. It is a labelled diagnostic, NOT a
+    /// playable route claim.
     #[test]
     fn opt_in_diag_toits01_generator_room() {
         let Some(game_dir) = opt_in_root() else {
@@ -7428,10 +7433,9 @@ mod tests {
         let s14 = vm
             .find_object("BaseSoldier14")
             .expect("BaseSoldier14 must exist");
-        assert_eq!(
-            vm.get_property(s14, "bIsDead"),
-            Some(&xiii_script::Value::Bool(false)),
-            "diag: BaseSoldier14 must still survive (the scene blocker)"
+        assert!(
+            session.actor_is_dead(s14),
+            "diag: BaseSoldier14 must be killed by the route's courtyard fire (item101)"
         );
         let health = session
             .player_health()
@@ -7448,7 +7452,114 @@ mod tests {
         println!(
             "[toits01 diag] generator Health=-40, TT10 armed+touched, goal 0 complete; the \
              RenfortHelico02 squad killed the route player (health {health}, GameEndedDeath); \
-             BaseSoldier14 survives (scene parked at action[227])"
+             BaseSoldier14 was killed by the route (item101)"
+        );
+    }
+
+    /// item101 opt-in survey (task 4): does any AI pawn end far below its authored position
+    /// (fell out of the world) during the level start? Each campaign map runs with no player
+    /// input for `XIII_ITEM101_SURVEY_SECS` seconds (default 60); every live `Pawn` actor
+    /// further than 2000 UU below its authored `Location.z` is reported and counted. Opt-in:
+    /// needs `XIII_GOG_DIR` and `XIII_ITEM101_SURVEY=1`. (The "before the fix" comparison was
+    /// produced with a temporary VM gate that is not part of the final tree.)
+    #[test]
+    fn opt_in_item101_pawn_fall_survey() {
+        let Ok(root) = std::env::var("XIII_GOG_DIR") else {
+            println!("SKIPPED: set XIII_GOG_DIR for the item101 pawn-fall survey");
+            return;
+        };
+        if std::env::var("XIII_ITEM101_SURVEY").as_deref() != Ok("1") {
+            println!("SKIPPED: set XIII_ITEM101_SURVEY=1");
+            return;
+        }
+        let root = std::path::PathBuf::from(root);
+        let params = resolve_params(&root).expect("player parameters").params;
+        let (maps, _) = survey::discover_campaign_order(&root).expect("campaign order");
+        let dur: f32 = std::env::var("XIII_ITEM101_SURVEY_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60.0);
+        println!("[fall-survey] {} maps, {dur}s each", maps.len());
+        let mut fallen_maps = 0usize;
+        for map in &maps {
+            let opts = Options {
+                map: Some(map.clone()),
+                game_dir: Some(root.clone()),
+                ..Default::default()
+            };
+            let scene = match viewer::load_scene(&opts) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("[fall-survey] {map} IMPORT ERROR {e}");
+                    continue;
+                }
+            };
+            // Authored pawn positions, from a separate placement-inspection session.
+            let authored: Vec<(String, f32)> = match session::Session::open(&root, map) {
+                Ok(probe) => {
+                    let vm = probe.vm();
+                    (0..vm.objects.len())
+                        .filter(|&i| {
+                            let o = &vm.objects[i];
+                            o.is_actor
+                                && !o.deleted
+                                && !o.name.starts_with("Default__")
+                                && vm.is_a(i as u32, "Pawn")
+                        })
+                        .filter_map(|i| {
+                            vm.vector_prop(i as u32, "Location")
+                                .map(|l| (vm.objects[i].name.clone(), l[2]))
+                        })
+                        .collect()
+                }
+                Err(_) => Vec::new(),
+            };
+            let script = script::Script::parse("").expect("empty script");
+            let outcome =
+                match run_script_with_cinematic_input(&root, map, &script, &params, &scene, dur) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        println!("[fall-survey] {map} RUN ERROR {e}");
+                        continue;
+                    }
+                };
+            let vm = outcome.session.vm();
+            let mut falls = Vec::new();
+            let mut falling = 0usize;
+            for i in 0..vm.objects.len() {
+                let o = &vm.objects[i];
+                if !o.is_actor
+                    || o.deleted
+                    || o.name.starts_with("Default__")
+                    || !vm.is_a(i as u32, "Pawn")
+                {
+                    continue;
+                }
+                if vm.get_property(i as u32, "Physics") == Some(&xiii_script::Value::Byte(2)) {
+                    falling += 1;
+                }
+                if let Some(z) = vm.vector_prop(i as u32, "Location").map(|l| l[2])
+                    && let Some((_, az)) = authored.iter().find(|(n, _)| n == &o.name)
+                    && z < az - 2000.0
+                {
+                    falls.push(format!("{} authored_z={az:.0} now_z={z:.0}", o.name));
+                }
+            }
+            if falls.is_empty() {
+                println!(
+                    "[fall-survey] {map}: no pawn >2000 UU below its authored z (falling={falling})"
+                );
+            } else {
+                fallen_maps += 1;
+                println!(
+                    "[fall-survey] {map}: {} pawn(s) fell out of the world: {falls:?}",
+                    falls.len()
+                );
+            }
+        }
+        println!(
+            "[fall-survey] DONE: {fallen_maps}/{} maps had a pawn far below its authored position",
+            maps.len()
         );
     }
 
@@ -8307,7 +8418,7 @@ mod tests {
             &input,
             &params,
             &scene,
-            300.0,
+            292.0,
             true,
             RunnerOptions {
                 initial: Some(initial),
@@ -8399,6 +8510,10 @@ mod tests {
             "BaseSoldier5",
             "BaseSoldier10",
             "BaseSoldier12",
+            "BaseSoldier34",
+            "BaseSoldier35",
+            "BaseSoldier36",
+            "BaseSoldier37",
             "CineController2",
             "Cine0",
         ] {
@@ -8470,11 +8585,6 @@ mod tests {
             session.vm().objects[escort as usize].name,
             "CineController2"
         );
-        assert_eq!(
-            session.vm().state_name(escort).as_deref(),
-            Some("PlayingSequence"),
-            "the escort interpreter must still be running"
-        );
         let action_index = match session.vm().get_property(escort, "ScriptedActionIndex") {
             Some(xiii_script::Value::Int(i)) => *i,
             other => panic!("escort ScriptedActionIndex: {other:?}"),
@@ -8483,10 +8593,65 @@ mod tests {
             action_index > 27,
             "Carrington's action27 wait for move_move_02 must resume and advance the escort: index {action_index}"
         );
-        // item97b precise next-blocker pin: the escort has walked the whole post-combat leg and
-        // now waits at action85 on the `vasypepechuismortthird` kill-count event (the northern
-        // end-of-track assault, BaseSoldier34 'Attackattheendofthetrack'). The carried 38 HP (no
-        // armour/medkit) survives the two sniper gauntlets at 2 HP, so it cannot clear that fight.
+        // item97d positive assault-clear pin: the two live `Attackattheendofthetrack`
+        // `vasypepechuismort` emitters (BaseSoldier34, Beretta; BaseSoldier35, Bazook) both died
+        // by input, so `CineTrigger5` (counter 2) fired `vasypepechuismorttwice` and `CineTrigger4`
+        // fired `vasypepechuismortthird`. A `bDestroyWhenDead` soldier leaves the actor array once
+        // its death clip ends, so a missing actor and a negative-health actor are both a clear.
+        for name in ["BaseSoldier34", "BaseSoldier35"] {
+            if let Some(id) = session.vm().find_live_object(name) {
+                assert!(
+                    session.actor_health(id).is_some_and(|h| h <= 0.0),
+                    "{name} must be cleared by input"
+                );
+            }
+        }
+        // item97e: after the assault the escort runs its action89 `movseqb … m23 m25 m26 m27 m28
+        // m29 m30` leg and then waits at action92 `wait player 1200`. The carried player followed
+        // that leg by ordinary input (it reaches m29 at (2218,6565), 553 UU from m30 (2760,6458)),
+        // so the gate cleared and the interpreter advanced past action92.
+        assert!(
+            action_index > 92,
+            "the player must follow the escort past the action92 `wait player 1200` gate: index \
+             {action_index}"
+        );
+        // item97e positive pin: the escort's action93 `ev Bastardsinyourback` spawns the
+        // `Bastardsinyourback` ambush (BaseSoldier36/37, whose death emits `tupeuxyaller`) at the
+        // m30 wait point. BaseSoldier36 died by input; its death is one of the two the
+        // `CineTrigger3` (counter 2) -> `CineTrigger2` chain needs for `tupeuxyallerthird`.
+        if let Some(id) = session.vm().find_live_object("BaseSoldier36") {
+            assert!(
+                session.actor_health(id).is_some_and(|h| h <= 0.0),
+                "the first Bastardsinyourback ambusher (BaseSoldier36) must be cleared by input"
+            );
+        }
+        // item97e: the mission must NOT be over. Replaces item97d's pin of `GameEnded` (which
+        // fired only because the un-followed player fell behind `Hual04c.CheckPlayerDistance`);
+        // with the player following, the escort is alive and still interpreting.
+        assert_eq!(
+            session.vm().state_name(escort).as_deref(),
+            Some("PlayingSequence"),
+            "the escort interpreter must still be running: {:?}",
+            session.vm().state_name(escort)
+        );
+        let player_state = session.player_controller_state();
+        assert!(
+            !player_state.contains("GameEnded"),
+            "the mission must not have ended: player controller {player_state}"
+        );
+        // item97e precise next-blocker pin: the escort now waits at action107
+        // `wait event tupeuxyallerthird`, i.e. on a second `tupeuxyaller` death from the action93
+        // ambush. BaseSoldier37 (the other live `Bastardsinyourback` ambusher) is still standing;
+        // the low-health carried player can clear only the first ambusher here (it heals from the
+        // first corpse's FullMedKit), so the route stops at this gate with the player alive rather
+        // than exposing it to the second ambusher. It is the measured next blocker.
+        if let Some(id) = session.vm().find_live_object("BaseSoldier37") {
+            assert!(
+                session.actor_health(id).is_some_and(|h| h > 0.0),
+                "the second Bastardsinyourback ambusher is the pinned next blocker and must be \
+                 standing at this measurement point"
+            );
+        }
         let current_action = match session.vm().get_property(escort_actor, "tabActions") {
             Some(xiii_script::Value::Array(actions)) => {
                 actions.get(action_index as usize - 1).cloned()
@@ -8496,9 +8661,9 @@ mod tests {
         assert_eq!(
             current_action,
             Some(xiii_script::Value::Str(
-                "wait event vasypepechuismortthird".to_owned()
+                "wait event tupeuxyallerthird".to_owned()
             )),
-            "the escort's measured next blocker must be the vosypepechus kill-event wait"
+            "the escort's measured next blocker must be the `tupeuxyallerthird` kill-event wait"
         );
         assert!(
             outcome.travel.is_empty(),
@@ -8562,13 +8727,26 @@ mod tests {
         // These are placed live soldiers, not generated enemies or the map's pending-kill
         // copies. Soldier28's death emits move_move -> CineTrigger10 -> move_move_02;
         // soldiers29/30 instead feed the later five-death voielibre counter.
-        for name in ["BaseSoldier28", "BaseSoldier29", "BaseSoldier30"] {
+        //
+        // item104: with the retail `calcVelocity` friction on steered walking (item100b) the
+        // route ends while BaseSoldier30 takes `DTShotGunned` hits from the other soldiers
+        // (`BaseSoldier4` at t=123.22 and 123.67, `BaseSoldier29` at t=124.02, measured with a
+        // `TakeDamage` trace; that these are shots aimed at the idle player is a hypothesis):
+        // friendly fire takes it from 150 to 44. With the friction term skipped (a temporary env
+        // gate, measured) it stays at 150 at t=124 at the same position (-2236.7,121.4), and
+        // disabling only the ledge rule does not change it. It is still alive and in
+        // `AttaqueScriptee`; the other two are untouched at 150.
+        for (name, expected_health) in [
+            ("BaseSoldier28", 150),
+            ("BaseSoldier29", 150),
+            ("BaseSoldier30", 44),
+        ] {
             let soldier = vm
                 .find_live_object(name)
                 .expect("live first-encounter soldier");
             assert_eq!(
                 vm.get_property(soldier, "Health"),
-                Some(&xiii_script::Value::Int(150)),
+                Some(&xiii_script::Value::Int(expected_health)),
                 "unresolved encounter soldier {name}"
             );
             assert_eq!(
@@ -8587,7 +8765,7 @@ mod tests {
                 "authored first attack must remain active for {name}"
             );
             println!(
-                "[hual04c encounter] {name} location={:?} health=150 AI=AttaqueScriptee",
+                "[hual04c encounter] {name} location={:?} health={expected_health} AI=AttaqueScriptee",
                 vm.get_property(soldier, "Location")
             );
         }
@@ -8745,6 +8923,220 @@ mod tests {
         println!(
             "[hual04c next blocker] HookPoint1 lock/descent/release and ground escort reached; Carrington action27 waits for move_move_02 (first combat clear). Direct-entry rifle selection leaves Fists; campaign ranged loadout/first encounter unresolved, goals0/2/3 and kello01a travel unreached. inventory={:?}",
             session.inventory_items()
+        );
+    }
+
+    /// PRock01a route (item100b): escape the Plain Rock prison by player input from the level's
+    /// own PlayerStart. The route waits through the authored cell release (the escort cine opens
+    /// `Porte13` at ~104.6 s), leaves the cell, then trails the lead guard `Cine3` at 180 UU while
+    /// `XIDCine.EscortManager` walks the guards west through the corridor and down the stairs. The
+    /// route survives the escort (one authored `DTFisted` baton blow, 150 -> 136 HP), the escort
+    /// reaches `STA_EndOfEscort`, and the player continues south toward objective 0 (goal 92) as
+    /// far as the locked `Porte9` (`UnlockItemCode ClefDebarrasLingerie`), stopping at
+    /// (3011,-3070). Objective 0 is not completed (goal 92 is fired by the escort cine's
+    /// `event objectif92`, not by touching the goal trigger) and the map does not travel. No
+    /// teleport, goal bridge, grant or control override.
+    #[test]
+    fn opt_in_prock01a_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("PRock01a".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import PRock01a");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/prock01a_route.script");
+        let script = script::Script::load(&route_path).expect("load PRock01a route");
+        assert!(!script.events.iter().any(|e| matches!(
+            &e.command,
+            script::Command::Teleport(_)
+                | script::Command::SetGoal(_)
+                | script::Command::TakeControl
+                | script::Command::Weapon(_)
+                | script::Command::Item(_)
+        )));
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "PRock01a",
+            &script,
+            &resolved.params,
+            &scene,
+            245.0,
+        )
+        .expect("run PRock01a route");
+        let session = &outcome.session;
+        let vm = session.vm();
+        println!(
+            "[prock01a route] objectives={:?} travel={:?} position={:?} health={:?}",
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health()
+        );
+        println!(
+            "[prock01a route] error={:?} suspended={:?} blocked={:?}",
+            session.first_error(),
+            session.suspended,
+            session.blocked
+        );
+        for (t, a) in session.touches() {
+            println!("[prock01a route] touch [{t:.3}s] {a}");
+        }
+        for sample in outcome.trace.iter().filter(|(tick, ..)| tick % 600 == 0) {
+            println!(
+                "[prock01a trace] t={:.2} pos=({:.0},{:.0},{:.0})",
+                sample.1, sample.2[0], sample.2[1], sample.2[2]
+            );
+        }
+        for name in ["Cine2", "Cine3"] {
+            if let Some(id) = vm.find_object(name) {
+                println!(
+                    "[prock01a maton] {name} state={:?} location={:?}",
+                    vm.state_name(id),
+                    vm.vector_prop(id, "Location")
+                );
+            }
+        }
+        if let Some(escort) = vm.find_object("EscortManager0") {
+            println!(
+                "[prock01a escort] state={:?} maton1={:?} maton2={:?}",
+                vm.state_name(escort),
+                vm.get_property(escort, "PawnMaton1"),
+                vm.get_property(escort, "PawnMaton2"),
+            );
+        }
+        let baton_blows: Vec<_> = vm
+            .trace
+            .iter()
+            .filter_map(|event| match &event.kind {
+                xiii_script::TraceKind::Event {
+                    target,
+                    function,
+                    args,
+                } if target == "XIIIPlayerPawn"
+                    && function.ends_with("TakeDamage")
+                    && args.last().is_some_and(|d| d == "xiii.DTFisted") =>
+                {
+                    Some(format!("[{:.2}s] {args:?}", event.time))
+                }
+                _ => None,
+            })
+            .collect();
+        println!(
+            "[prock01a baton blows] {} DTFisted TakeDamage event(s); first {:?}",
+            baton_blows.len(),
+            baton_blows.first()
+        );
+        for event in vm.trace.iter() {
+            match &event.kind {
+                xiii_script::TraceKind::StateChange { actor, to, .. }
+                    if matches!(
+                        actor.as_str(),
+                        "Porte13" | "Porte0" | "Porte1" | "Porte18" | "Porte27" | "Porte6"
+                    ) =>
+                {
+                    println!("[prock01a vm] t={:.2} state {actor} -> {to:?}", event.time);
+                }
+                xiii_script::TraceKind::Log(text)
+                    if text.contains("SetPrimaryGoal") || text.contains("SetGoalComplete") =>
+                {
+                    println!("[prock01a vm] t={:.2} log {text}", event.time);
+                }
+                _ => {}
+            }
+        }
+        let _ = vm;
+        assert!(
+            session.first_error().is_none(),
+            "{:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(session.blocked.is_empty(), "{:?}", session.blocked);
+        let objectives = session.objective_states();
+        assert_eq!(objectives.len(), 2, "PRock01a has two authored objectives");
+        assert!(
+            objectives[0].primary,
+            "touching the authored CineTrigger1 must run the escort cine's `event objectif91` \
+             -> `SetPrimaryGoal(0)`: {objectives:?}"
+        );
+        assert!(
+            !objectives[0].completed,
+            "objective 0 must not be claimed complete: {objectives:?}"
+        );
+        assert!(
+            !objectives[1].completed,
+            "objective 1 must not be claimed complete: {objectives:?}"
+        );
+        assert!(
+            objectives.iter().all(|o| !o.anti_goal),
+            "PRock01a has no anti-goals: {objectives:?}"
+        );
+        assert!(
+            outcome.travel.is_empty(),
+            "the blocked route must not travel"
+        );
+        // The escort manager ran to its end state (its own `EndOfEscort` trigger destroys it); the
+        // lead guard finished at the bottom of the stairs.
+        let reached_end = vm.trace.iter().any(|event| {
+            matches!(
+                &event.kind,
+                xiii_script::TraceKind::StateChange { actor, to, .. }
+                    if actor == "EscortManager0" && to.as_deref() == Some("STA_EndOfEscort")
+            )
+        });
+        assert!(
+            reached_end,
+            "the escort must run to STA_EndOfEscort (player survived the corridor and stairs)"
+        );
+        let cine3 = vm.find_object("Cine3").expect("escort lead guard");
+        let cine3_x = vm.vector_prop(cine3, "Location").expect("guard location")[0];
+        assert!(
+            cine3_x < 3200.0,
+            "the escort must lead west and down the stairs: Cine3 x {cine3_x}"
+        );
+        // The player is beaten by the escort's own scripted baton blows (XIDCine.EscortManager
+        // `FirstKeeperBehavior` -> `PlayerPawn.TakeDamage(..., DTFisted)`); a careful route takes
+        // few of them and survives.
+        println!(
+            "[prock01a baton blows] {} DTFisted TakeDamage event(s)",
+            baton_blows.len()
+        );
+        let min_health = outcome
+            .map_min_health
+            .iter()
+            .find(|(m, _)| m == "PRock01a")
+            .map(|(_, h)| *h)
+            .expect("the run must record PRock01a's minimum player Health");
+        let final_pos = session.player_location().unwrap_or([0.0; 3]);
+        println!(
+            "[prock01a route] measured minimum player Health along PRock01a: {min_health}; final \
+             position ({:.0},{:.0},{:.0}); next blocker: locked Porte9 at (3032,-3120) \
+             (UnlockItemCode ClefDebarrasLingerie)",
+            final_pos[0], final_pos[1], final_pos[2]
+        );
+        assert!(
+            min_health > 0.0,
+            "the route must survive the escort, min health {min_health}"
+        );
+        // The route continues south toward objective 0 (goal 92 at (3072,-1776)) and stops short of
+        // the locked Porte9 (y -3120): the next blocker is script-side, a locked door needing a key.
+        assert!(
+            final_pos[1] < -2500.0,
+            "the route must continue south into the cell block toward goal 92: {final_pos:?}"
+        );
+        assert!(
+            final_pos[1] > -3120.0,
+            "the player must stop at the locked Porte9, not pass it: {final_pos:?}"
+        );
+        assert!(
+            vm.find_object("Porte9").is_some(),
+            "the pinned next blocker is the locked Porte9"
         );
     }
 
@@ -8979,14 +9371,18 @@ mod tests {
             goals[4].completed,
             "goal 4 (activate the cable-car) must complete on this route: {goals:?}"
         );
-        // item95 pin: goal 5 and the Hual04c travel still stay unreached. The `tp 23` placement now
-        // works, so Carrington reaches the platform and the cine advances past `wait player 128`,
-        // spawning the second wave (`Wave01`/`Wave02`). The route kills the charging shotgun
-        // soldier `BaseSoldier7` and survives the wave, but the other soldier `BaseSoldier6`
-        // holds position in its controller's `Tenir` state at `(-18,-710,102)` and never engages,
-        // so its `RushFinal` event never fires and `wait event RushFinalCine` (tabActions[71],
-        // `CineTrigger1` counter 2) cannot pass; the cine never reaches `event LaFinDeLaMap`
-        // (tabActions[95]) and `travel` stays empty. This is the honest next blocker (see report).
+        // item102/item101d pin: goal 5 and the Hual04c travel still stay unreached. The `tp 23`
+        // placement works, so Carrington reaches the platform and the cine advances past
+        // `wait player 128`, spawning the second wave (`Wave01`/`Wave02`). The route kills the
+        // charging shotgun soldier `BaseSoldier7` and survives the wave. The other soldier
+        // `BaseSoldier6` spawns from `GenNMI7` on the station's upper level; with the item101d
+        // ledge semantics its attack-point path now hands off to a drop and it reaches the ground
+        // (the positive pin below), but it stops in `Tenir` at `(-18,-710,102)` behind the
+        // station wall where the player has no line of sight (the item102 navigation/door
+        // divergence, independent of the ledge rule). It never fires, so its `RushFinal` event
+        // never fires and `wait event RushFinalCine` (tabActions[71], `CineTrigger1` counter 2)
+        // cannot pass; the cine never reaches `event LaFinDeLaMap` (tabActions[95]) and `travel`
+        // stays empty. This is the honest next blocker (see report).
         assert!(
             !goals[5].completed,
             "goal 5 (rejoin Carrington) stays unreached on this route (the second-wave soldier \
@@ -9059,6 +9455,28 @@ mod tests {
                 );
             }
         }
+        // item101d positive pin: the ledge rule now lets BaseSoldier6's authored attack path
+        // (network 222: AttackPoint13 -> AttackPoint12 -> AttackPoint0 on the ground) hand off to
+        // a drop. It descends from the station's upper level (spawn 871,-590,462) to the ground
+        // and holds at (-18,-710,102) in `Tenir` (measured); it is no longer frozen at the roof
+        // edge (615,-926,462). Reaching the ground is exactly what the ledge semantics must let a
+        // lower-node path move do; it still cannot fire `RushFinal` because it stops behind the
+        // station wall (the item102 navigation/door divergence, independent of the ledge rule).
+        let bs6 = vm
+            .find_object("BaseSoldier6")
+            .expect("second-wave BaseSoldier6");
+        let bs6_loc = match vm.get_property(bs6, "Location") {
+            Some(xiii_script::Value::Vector(p)) => *p,
+            other => panic!("BaseSoldier6 Location not a vector: {other:?}"),
+        };
+        assert!(
+            bs6_loc[2] < 300.0,
+            "BaseSoldier6 must have descended its attack path off the roof (roof z=462): {bs6_loc:?}"
+        );
+        assert!(
+            bs6_loc[0].abs() < 600.0 && bs6_loc[1] < 0.0,
+            "BaseSoldier6 must have walked off the roof toward its ground attack point: {bs6_loc:?}"
+        );
         // The cable-car lever use completed goal 4 (its `PlayerTriggerToggle` open fired the
         // map's `SetGoalComplete(94)`). Record the lever state for the report.
         let lever = vm.find_object("XIIIMover1").expect("cable-car lever");

@@ -10832,6 +10832,12 @@ impl<'s> Vm<'s> {
             self.set_property(pawn, "Acceleration", 0, Value::Vector([0.0; 3]));
             return Ok(true);
         }
+        // Retail `APawn::moveToward` (Engine.dll 0x103b3950) zeroes the Z of
+        // (Destination - Location) before building the acceleration direction in BOTH the
+        // walking branch (0x103b39b8) and the falling branch (0x103b3b8b), so a falling
+        // pawn's MoveTo acceleration is horizontal-only (item101: without this a falling
+        // AI pawn accelerates toward an elevated destination and glides instead of falling).
+        delta[2] = 0.0;
         let direction = normalize3(delta);
         let mut acceleration = scale3(direction, self.f32_prop(pawn, "AccelRate"));
         self.set_property(pawn, "Acceleration", 0, Value::Vector(acceleration));
@@ -10872,7 +10878,45 @@ impl<'s> Vm<'s> {
         let displacement = scale3(velocity, dt);
         let extent = self.actor_extent(pawn);
         let collides_world = self.bool_prop(pawn, "bCollideWorld");
-        let (end, on_floor) = if collides_world {
+        // The ledge guard is read before the physics provider is borrowed mutably. Retail
+        // `APawn::physWalking` (Engine.dll 0x103bdac0) calls `APawn::CheckForLedges`
+        // (0x103b8da0) from the block at 0x103be1d5..0x103be27c only for a pawn that has a
+        // Controller and is not `IsHumanControlled` (0x103b09d0 = `Controller->IsA(
+        // PlayerController)`); the vector it returns replaces the move delta before the
+        // level move call (0x103be281..0x103be31a). It shortens the step so the pawn stops at
+        // the ledge instead of stepping off.
+        //
+        // item101d: this clamp is the *wander* rule. `AController::MoveTo` (execMoveTo
+        // 0x1036a6e0) clears the controller's `MoveTarget` to None (`mov [esi+0x228], 0` at
+        // 0x1036a7f5) and walks the pawn to a raw destination vector — `IAController.Errance`
+        // wanders this way and must be held at a ledge. `AController::MoveToward`
+        // (execMoveToward 0x1036d8c0) records the navigation target in `MoveTarget`
+        // (controller+0x228, written at 0x1036da37) and resolves that node's `FReachSpec`
+        // (0x1036dbd7..0x1036dbd2) before each step: a scripted attack path
+        // (`IAController.AttaqueScriptee`, `VaVers`) may hand off to a drop onto a lower ground
+        // node, so the pawn is allowed to leave the ledge. Only a *genuine* drop counts — the
+        // recorded target must be a `NavigationPoint` more than the 35 UU step height below the
+        // pawn (the reachspec leaves the ground, the R_JUMP/R_FLY case). A same-level patrol
+        // node, a wander, or a chase toward an actor is still clamped. The reflected
+        // bAvoidLedges/bStopAtLedges/bCanWalkOffLedges properties are not the engine gate (no
+        // game script references them and XIIIPawn serializes bCanWalkOffLedges=true for every
+        // character while retail still keeps wanderers off ledges).
+        let path_drop = self
+            .obj_prop(controller, "MoveTarget")
+            .is_some_and(|target| {
+                self.is_a(target, "NavigationPoint")
+                    && self.vector_prop(target, "Location").is_some_and(|t| {
+                        let pawn_z = self.vector_prop(pawn, "Location").map_or(0.0, |p| p[2]);
+                        pawn_z - t[2] > 35.0
+                    })
+            });
+        let ledge_guard = !self
+            .obj_prop(pawn, "Controller")
+            .is_some_and(|ctrl| self.is_a(ctrl, "PlayerController"))
+            && !path_drop;
+        let mut end;
+        let mut on_floor;
+        if collides_world {
             let Some(provider) = self.physics.as_mut() else {
                 return Err(self.err(VmErrorKind::NoPhysicsProvider {
                     native: "Controller movement".into(),
@@ -10885,13 +10929,53 @@ impl<'s> Vm<'s> {
             // move horizontally at the old Z forever. Probe down by the engine's 35 UU step
             // height (plus a small contact tolerance) at the resulting pawn location.
             let floor = provider.move_box(outcome.end, [0.0, 0.0, -(35.0 + 1.0e-3)], extent);
-            (
-                outcome.end,
-                floor.hit.is_some_and(|hit| hit.normal[2] >= FLOOR_NORMAL_Z),
-            )
+            end = outcome.end;
+            on_floor = floor.hit.is_some_and(|hit| hit.normal[2] >= FLOOR_NORMAL_Z);
+            // item101: retail `APawn::physWalking` (Engine.dll 0x103bdac0) runs
+            // `APawn::CheckForLedges` (0x103b8da0) for every pawn that is NOT
+            // `IsHumanControlled` (0x103b09d0: `Controller->IsA(PlayerController)`); the gate
+            // is 0x103be1e5..0x103be27c and the vector it returns replaces the move delta
+            // before the level move call (0x103be281..0x103be31a). The check probes the pawn's
+            // floor support and shortens the step so an AI walker stops at a ledge instead of
+            // stepping off (the reduced step is derived from the pawn's own speed, ×0.8 at
+            // 0x103b95a8).
+            // Here: when the post-move position has no walkable floor within the 35 UU step
+            // height, re-walk shrinking fractions of the step and take the largest one that
+            // still has support; with no support even at the start the pawn is already off
+            // its floor and the move stands (it falls, as retail).
+            if !on_floor && ledge_guard {
+                let start_floor = provider.move_box(loc, [0.0, 0.0, -(35.0 + 1.0e-3)], extent);
+                let start_supported = start_floor
+                    .hit
+                    .is_some_and(|hit| hit.normal[2] >= FLOOR_NORMAL_Z);
+                if start_supported {
+                    // The pawn still has its floor: it must not move to a position without
+                    // one. Take the largest fraction of the step that keeps support; when
+                    // even the smallest is unsupported the pawn rests against the edge and
+                    // holds its position this tick (the retail shortened delta).
+                    let mut clamped = None;
+                    let mut fraction = 0.5;
+                    while fraction >= 1.0 / 64.0 {
+                        let trial = provider.walk_box(loc, scale3(displacement, fraction), extent);
+                        let trial_floor =
+                            provider.move_box(trial.end, [0.0, 0.0, -(35.0 + 1.0e-3)], extent);
+                        if trial_floor
+                            .hit
+                            .is_some_and(|hit| hit.normal[2] >= FLOOR_NORMAL_Z)
+                        {
+                            clamped = Some(trial.end);
+                            break;
+                        }
+                        fraction *= 0.5;
+                    }
+                    end = clamped.unwrap_or(loc);
+                    on_floor = true;
+                }
+            }
         } else {
-            (add3(loc, displacement), true)
-        };
+            end = add3(loc, displacement);
+            on_floor = true;
+        }
         self.set_property(pawn, "Location", 0, Value::Vector(end));
         self.set_property(
             pawn,
@@ -11190,31 +11274,56 @@ impl<'s> Vm<'s> {
     /// ([`WorldPhysics::walk_box`]) moves the pawn. The obstacle slide this produces is what
     /// lets a steered pawn walk around a wall and cross the arrival plane behind it.
     ///
-    /// Documented approximation: the engine's per-tick ground friction and the exact
-    /// `calcVelocity` friction iterations are reduced to the accelerate-then-cap form here (a
-    /// steered cine pawn's velocity starts at zero after its landing, so the cap is the
-    /// operative rule), and a steering tick without acceleration parks the velocity (the engine
-    /// decays it).
+    /// Documented approximation: the engine's exact `calcVelocity` friction iteration is reduced to
+    /// its directional term (the same term [`Vm::controller_move_step`] uses): the horizontal
+    /// velocity not along `Normal(Acceleration)` is removed at the pawn's `GroundFriction`. The
+    /// engine applies this every walking tick (`physWalking` 0x103bdba5 calls `calcVelocity`
+    /// 0x103ba250 unconditionally; the friction is the pawn's `GroundFriction` — `pawn+0x24c`,
+    /// pushed at 0x103bdb79 — and is not gated on the steering target, on `bIsWalking`, or on the
+    /// acceleration magnitude). It is what lets a steering change shed a stale velocity component
+    /// instead of only adding acceleration — the escort's rear guard is steered along a moving
+    /// marker, and when that marker arrives on the pawn (`STA_AttenteCouloir`) the steering
+    /// direction becomes a tiny lateral residual; with the earlier add-and-cap form the alternating
+    /// residual kept the old forward velocity alive and the guard slid past the marker into the
+    /// player's 130 UU beatdown ring. A steering tick without acceleration parks the velocity (the
+    /// engine decays it through the `bBraked && Acceleration==0` branch at `calcVelocity`
+    /// 0x103ba56c).
     fn integrate_steered_walking(&mut self, pawn: ObjectId, dt: f32) -> VmResult<()> {
         let Some(location) = self.vector_prop(pawn, "Location") else {
             return Ok(());
         };
         let acceleration = self.vector_prop(pawn, "Acceleration").unwrap_or([0.0; 3]);
-        let speed = self.f32_prop(pawn, "GroundSpeed");
+        let max_speed = self.f32_prop(pawn, "GroundSpeed");
         let mut velocity = self.vector_prop(pawn, "Velocity").unwrap_or([0.0; 3]);
         let length = (acceleration[0] * acceleration[0] + acceleration[1] * acceleration[1]).sqrt();
-        if length > 0.0 && speed > 0.0 {
+        if length > 0.0 && max_speed > 0.0 {
             let dir = [acceleration[0] / length, acceleration[1] / length, 0.0];
             let accel_rate = {
                 let rate = self.f32_prop(pawn, "AccelRate");
                 if rate > 0.0 { rate } else { 2048.0 }
             };
+            let friction = self
+                .obj_prop(pawn, "PhysicsVolume")
+                .map_or(0.0, |volume| self.f32_prop(volume, "GroundFriction"));
+            // `physWalking` calls `calcVelocity` every tick for every walking pawn, and
+            // `calcVelocity` applies the directional ground friction unconditionally: it depends on
+            // the pawn's `GroundFriction`, not on the steering `Target` distance, not on `bIsWalking`
+            // (the `bWalking`/`bIsCrouched` flags only cap the acceleration, `calcVelocity`
+            // 0x103ba5b4), and not on the acceleration magnitude (the `bBraked && Acceleration==0`
+            // branch at 0x103ba56c applies the same friction to a coasting pawn). Item100b gated this
+            // on the controller target; that gate is not in retail and is removed here.
+            if friction > 0.0 {
+                velocity = sub3(
+                    velocity,
+                    scale3(sub3(velocity, scale3(dir, max_speed)), dt * friction),
+                );
+            }
             for axis in 0..2 {
                 velocity[axis] += dir[axis] * accel_rate * dt;
             }
             let vlen = (velocity[0] * velocity[0] + velocity[1] * velocity[1]).sqrt();
-            if vlen > speed {
-                velocity = [dir[0] * speed, dir[1] * speed, 0.0];
+            if vlen > max_speed {
+                velocity = [dir[0] * max_speed, dir[1] * max_speed, 0.0];
             }
         } else {
             velocity = [0.0; 3];
