@@ -611,13 +611,16 @@ impl Session {
         let input_ended = self.player_input_ended();
         let hook_buttons = !input_ended && self.hook_owns_buttons();
         let hook_axes = !input_ended && self.hook_owns_pawn();
+        // item105: a held fire button that the hook does not own belongs to the weapon (see
+        // `held_button_publication`).
+        let (button_bytes, buttons_published) = held_button_publication(
+            input_ended,
+            hook_buttons,
+            (self.hook_fire_held, self.hook_altfire_held),
+            self.hook_buttons_published,
+        );
         if let Some(pc) = self.controller {
-            if hook_buttons || self.hook_buttons_published {
-                let (fire, altfire) = if hook_buttons {
-                    (self.hook_fire_held, self.hook_altfire_held)
-                } else {
-                    (false, false)
-                };
+            if let Some((fire, altfire)) = button_bytes {
                 let _ = self
                     .vm
                     .set_property(pc, "bFire", 0, Value::Byte(u8::from(fire)));
@@ -643,7 +646,7 @@ impl Session {
                 let _ = self.vm.set_property(pc, "aStrafe", 0, Value::Float(strafe));
             }
         }
-        self.hook_buttons_published = hook_buttons;
+        self.hook_buttons_published = buttons_published;
         self.hook_axes_published = hook_axes;
         if hook_axes {
             let yaw_units = (self.hook_move_yaw / std::f32::consts::TAU * ROTATOR_UNITS_PER_TURN)
@@ -3421,6 +3424,36 @@ fn build_hit_boxes(
 }
 
 /// Live instance held by the object property `name` of `id`.
+/// item105: which controller button bytes `Session::step` writes this tick, and whether it
+/// published (so the tick publishing stops writes the released value once).
+///
+/// While the hook owns the buttons both held states are published (item64). Otherwise a held
+/// fire button belongs to the weapon: DefUser.ini binds `Fire` to `Button bFire | Fire |
+/// onrelease UnFire`, the byte stays set for as long as the key is down, and the weapon's
+/// end-of-shot `Finish` polls it (`Pawn.PressingFire`, Engine.dll `execPressingFire` 0x103afc50
+/// reads `Controller.bFire`) to refire an automatic weapon. Publishing only for the hook left
+/// the held byte at 0 between shots, so a held M60 fired once. The alt-fire byte is the hook's
+/// alone (no weapon alt-fire is driven by a held scripted button). Input that has ended
+/// (death, cinematic) never publishes a held button.
+fn held_button_publication(
+    input_ended: bool,
+    hook_owns: bool,
+    (fire_held, altfire_held): (bool, bool),
+    published_before: bool,
+) -> (Option<(bool, bool)>, bool) {
+    let hook = !input_ended && hook_owns;
+    let weapon_fire = !input_ended && !hook_owns && fire_held;
+    if hook {
+        (Some((fire_held, altfire_held)), true)
+    } else if weapon_fire {
+        (Some((true, false)), true)
+    } else if published_before {
+        (Some((false, false)), false)
+    } else {
+        (None, false)
+    }
+}
+
 fn instance_prop(vm: &Vm, id: ObjectId, name: &str) -> Option<ObjectId> {
     match vm.get_property(id, name) {
         Some(Value::Object(Some(ObjRef::Instance(p))))
@@ -5202,5 +5235,175 @@ mod tests {
             "no HudMessage was spawned through the generic path: {spawned:?}"
         );
         println!("[hud test] generic message path Ok; HudMsg={spawned:?}");
+    }
+
+    #[test]
+    fn held_buttons_belong_to_the_hook_then_the_weapon() {
+        // Hook owns the buttons: both held states are published (item64), exactly as before.
+        assert_eq!(
+            held_button_publication(false, true, (true, true), false),
+            (Some((true, true)), true)
+        );
+        assert_eq!(
+            held_button_publication(false, true, (false, false), true),
+            (Some((false, false)), true),
+            "an owned hook with nothing held still writes the released byte"
+        );
+        // No hook, nothing ever held (every route that never uses `fire_hold`): never writes,
+        // so the `fire` tap's own `bFire` handling is untouched.
+        assert_eq!(
+            held_button_publication(false, false, (false, false), false),
+            (None, false)
+        );
+        // A held weapon fire is published every tick and the release is written exactly once.
+        assert_eq!(
+            held_button_publication(false, false, (true, false), false),
+            (Some((true, false)), true)
+        );
+        assert_eq!(
+            held_button_publication(false, false, (true, false), true),
+            (Some((true, false)), true)
+        );
+        assert_eq!(
+            held_button_publication(false, false, (false, false), true),
+            (Some((false, false)), false)
+        );
+        assert_eq!(
+            held_button_publication(false, false, (false, false), false),
+            (None, false)
+        );
+        // A held alt-fire without the hook is not published (no weapon alt-fire is driven).
+        assert_eq!(
+            held_button_publication(false, false, (false, true), false),
+            (None, false)
+        );
+        // Ended input (death, cinematic) never keeps a held button down: the byte is released
+        // once, whoever held it.
+        assert_eq!(
+            held_button_publication(true, true, (true, true), true),
+            (Some((false, false)), false)
+        );
+        assert_eq!(
+            held_button_publication(true, false, (true, false), true),
+            (Some((false, false)), false)
+        );
+        assert_eq!(
+            held_button_publication(true, false, (true, false), false),
+            (None, false)
+        );
+    }
+
+    /// `NormalFire.AnimEnd` ticks of the player's `class` weapon over a headless 60 Hz run on
+    /// Plage01 in which the fire key is down for each `presses` tick range, in the headless
+    /// runner's order (`set_hook_buttons`, `step`, then the press edge's `fire_pressed`), plus
+    /// the VM tick of the first press edge and the final controller `bFire` byte.
+    fn held_fire_run(class: &str, presses: &[(usize, usize)], total: usize) -> (Vec<u64>, u64, u8) {
+        let game_dir = opt_in_root().expect("XIII_GOG_DIR");
+        let mut session = Session::open(&game_dir, "Plage01").expect("open Plage01");
+        session.grant_weapon(class).expect("grant weapon");
+        let modes = PlayerVMModes::default();
+        let dt = 1.0f32 / 60.0;
+        let mut first_press = None;
+        for i in 0..total {
+            let loc = session.player_location().unwrap_or([0.0; 3]);
+            let down = presses.iter().any(|&(from, to)| i >= from && i < to);
+            let edge = presses.iter().any(|&(from, _)| i == from);
+            session.set_hook_buttons(down, false);
+            session.step(dt, loc, 0.0, [0.0; 3], &modes);
+            if edge {
+                assert_eq!(session.fire_pressed(0.0, 0.0), FireOutcome::Fired);
+                first_press.get_or_insert(session.vm().trace.last().map_or(0, |e| e.tick));
+            }
+        }
+        let class_prefix = class.rsplit('.').next().expect("class").to_lowercase();
+        let ends = session
+            .vm()
+            .trace
+            .iter()
+            .filter_map(|e| match &e.kind {
+                xiii_script::TraceKind::Event {
+                    target, function, ..
+                } if target.to_lowercase().starts_with(&class_prefix)
+                    && function.ends_with("NormalFire.AnimEnd") =>
+                {
+                    Some(e.tick)
+                }
+                _ => None,
+            })
+            .collect();
+        let pc = session.controller.expect("controller");
+        let b_fire = match session.vm().get_property(pc, "bFire") {
+            Some(Value::Byte(b)) => *b,
+            other => panic!("bFire is {other:?}"),
+        };
+        (ends, first_press.expect("a press edge"), b_fire)
+    }
+
+    /// item105: holding the fire key on an automatic weapon refires at the weapon's own rate
+    /// (`NormalFire.AnimEnd` -> `Finish` -> `Pawn.PressingFire && bAllowShot` -> `ServerFire`,
+    /// xiii.u `XIIIWeapon.Finish` 0x030C) until release; a tap fires once. Measured divergence:
+    /// before the fix a held `fire_hold` fired one shot and never repeated.
+    #[test]
+    fn opt_in_held_automatic_weapons_refire_at_the_decoded_rate_until_release() {
+        if opt_in_root().is_none() {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        }
+        for class in ["XIII.m60", "XIII.m16", "XIII.kalash"] {
+            // A tap: the weapon's own period is the distance between its press and the
+            // `AnimEnd` that ends the shot; a held key then repeats at exactly that period.
+            let (tap, tap_press, _) = held_fire_run(class, &[(5, 6)], 60);
+            assert_eq!(
+                tap.len(),
+                1,
+                "{class}: a one-tick press fires once: {tap:?}"
+            );
+            let period = tap[0] - tap_press;
+            assert!(period >= 2, "{class}: implausible fire period {period}");
+            let (held, held_press, b_fire) = held_fire_run(class, &[(5, 95)], 200);
+            assert_eq!(
+                held_press, tap_press,
+                "{class}: same press tick in both runs"
+            );
+            println!("[item105] {class}: period {period} ticks, held AnimEnds {held:?}");
+            // 90 held ticks: one shot per period, the last one inside the window.
+            let expected = (90 / period) as usize;
+            assert!(
+                held.len().abs_diff(expected) <= 1 && held.len() >= 5,
+                "{class}: held 90 ticks at period {period} should fire ~{expected}: {held:?}"
+            );
+            for pair in held.windows(2) {
+                assert_eq!(
+                    pair[1] - pair[0],
+                    period,
+                    "{class}: refire interval must equal the decoded fire period: {held:?}"
+                );
+            }
+            // Release stops the stream: no shot ends after the key went up plus one period.
+            assert!(
+                held.iter().all(|&t| t <= held_press + 90 + period),
+                "{class}: fired after release: {held:?}"
+            );
+            assert_eq!(b_fire, 0, "{class}: bFire must be released with the key");
+        }
+    }
+
+    /// item105: a semi-automatic weapon (`WeaponMode` 1: `bAllowShot` is cleared in its
+    /// `NormalFire` Begin label and `Idle.Begin`) fires once per press even with the key held,
+    /// and a second press fires again.
+    #[test]
+    fn opt_in_held_semi_automatic_weapons_fire_once_per_press() {
+        if opt_in_root().is_none() {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        }
+        for class in ["XIII.Beretta", "XIII.magnum"] {
+            let (held, _, b_fire) = held_fire_run(class, &[(5, 150)], 220);
+            assert_eq!(held.len(), 1, "{class}: held key fired {held:?}");
+            assert_eq!(b_fire, 0, "{class}: bFire must be released with the key");
+            // Release then press again: one more shot per press.
+            let (twice, _, _) = held_fire_run(class, &[(5, 60), (100, 180)], 260);
+            assert_eq!(twice.len(), 2, "{class}: two presses fired {twice:?}");
+        }
     }
 }

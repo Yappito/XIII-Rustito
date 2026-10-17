@@ -85,6 +85,33 @@ struct MotionRes(movement_modes::VolumeMotion);
 #[derive(Resource)]
 struct SimRes(PlayerSim);
 
+/// Whether the live fire key went down this frame (`Fire` in DefUser.ini: LeftMouse, RControl).
+fn fire_key_pressed(keys: &ButtonInput<KeyCode>, buttons: &ButtonInput<MouseButton>) -> bool {
+    buttons.just_pressed(MouseButton::Left) || keys.just_pressed(KeyCode::ControlRight)
+}
+
+/// item105: latches the live fire-press edge once per render frame, before the fixed ticks
+/// (`RunFixedMainLoopSystems::BeforeFixedMainLoop`), for exactly one fixed tick to consume
+/// (`TraceState::fire_edge`). `ButtonInput::just_pressed` is valid for one render frame, but the
+/// fixed loop runs zero, one or several ticks in it: reading the edge inside `fixed_step` lost
+/// the press when a frame ran no tick (a refresh rate above 60 Hz) and fired the weapon twice
+/// when it ran two. For an automatic weapon the lost edge is worse than a lost click: with the
+/// key held and nothing to start the shot, no `NormalFire` cycle begins, so nothing refires.
+fn latch_fire_edge(
+    keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    mut state: ResMut<TraceState>,
+) {
+    if fire_key_pressed(&keys, &buttons) {
+        state.fire_edge = true;
+    }
+}
+
+/// A press made while the in-game menu page is open belongs to the page, not to the weapon.
+fn live_menu_closed(menu: NonSend<ingamemenu::InGameMenu>) -> bool {
+    !menu.is_open()
+}
+
 #[derive(Resource)]
 struct WorldRes {
     world: CollisionWorld,
@@ -133,6 +160,9 @@ pub(crate) struct TraceState {
     /// item72: the in-game menu page is open (retail pauses the level; the fixed step
     /// suppresses the player input while it is).
     menu_open: bool,
+    /// item105: a live fire press latched by [`latch_fire_edge`] and not yet consumed by a fixed
+    /// tick.
+    fire_edge: bool,
 }
 
 #[derive(Resource, Default)]
@@ -234,6 +264,12 @@ impl Plugin for PlayPlugin {
             .init_resource::<RenderSync>()
             .init_resource::<weapons::WeaponView>()
             .init_resource::<RuntimeLights>()
+            .add_systems(
+                RunFixedMainLoop,
+                latch_fire_edge
+                    .run_if(live_menu_closed)
+                    .in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
+            )
             .add_plugins(viewer::particles::ParticlePlugin)
             .add_plugins(MaterialPlugin::<viewer::lights::ReceiverMaterial>::default())
             .init_resource::<cinematics::CinematicState>()
@@ -890,6 +926,7 @@ fn setup_inner(
             post_travel_at: None,
             video_exit_at: None,
             menu_open: false,
+            fire_edge: false,
         });
     } else {
         // The reload owns a fresh per-map runtime, but the input-script cursor (`ScriptRes`) and
@@ -933,7 +970,7 @@ fn read_keyboard(keys: &ButtonInput<KeyCode>, buttons: &ButtonInput<MouseButton>
         jump: keys.just_pressed(KeyCode::Space),
         walk: keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]),
         use_action: keys.any_just_pressed([KeyCode::KeyE, KeyCode::Enter]),
-        fire: buttons.just_pressed(MouseButton::Left) || keys.just_pressed(KeyCode::ControlRight),
+        fire: fire_key_pressed(keys, buttons),
         // XIII binds `C=Duck` (DefUser.ini); ControlLeft is accepted as the conventional
         // alternative the task names.
         crouch: keys.any_pressed([KeyCode::KeyC, KeyCode::ControlLeft]),
@@ -1092,12 +1129,12 @@ fn fixed_step(
                 drive.take_use_named(),
             )
         }
-        None => (
-            read_keyboard(&keys, &buttons),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ),
+        None => {
+            let mut input = read_keyboard(&keys, &buttons);
+            // item105: the press edge comes from the per-frame latch, consumed exactly once.
+            input.fire = std::mem::take(&mut state.fire_edge);
+            (input, Vec::new(), Vec::new(), Vec::new())
+        }
     };
     let mut weapon_inputs = if let Some(drive) = script.drive.as_mut() {
         drive.take_weapon_inputs()
@@ -1133,6 +1170,15 @@ fn fixed_step(
     };
     let use_action = input.use_action;
     let fire = input.fire;
+    // item105: a windowed `--play-script` run carries the same held buttons as the headless
+    // route runner (`fire_hold`/`altfire_hold`); without this they were parsed and dropped. A
+    // live (no script) run publishes the real key state from `controls` instead.
+    let ((hold_fire, fire_edge), (hold_altfire, altfire_edge)) = script
+        .drive
+        .as_mut()
+        .map(script::Drive::take_hook_buttons)
+        .unwrap_or_default();
+    let (fire_edge, altfire_edge) = (fire_edge && !suppressed, altfire_edge && !suppressed);
     let t0 = Instant::now();
     if motion.0.is_empty() {
         sim.0
@@ -1197,6 +1243,9 @@ fn fixed_step(
             floor_normal: sim.0.floor_normal,
             eye_height: sim.0.vm_eye_height(&params.0),
         };
+        if script.drive.is_some() {
+            sess.set_hook_buttons(hold_fire, hold_altfire);
+        }
         sess.step(dt, sim.0.location, sim.0.yaw, sim.0.velocity, &modes);
         // Retail `APawn::SetZone`: publish the volume at the pawn's head (`Location +
         // CollisionHeight`) so `Pawn.BreathTimer` sees `HeadVolume.bWaterVolume` (item98e).
@@ -1318,6 +1367,14 @@ fn fixed_step(
                 }
                 other => println!("[play] fire: {other:?}"),
             }
+        }
+        if fire_edge {
+            let outcome = sess.fire_pressed(sim.0.yaw, sim.0.pitch);
+            println!("[play] fire_hold press: {outcome:?}");
+        }
+        if altfire_edge {
+            let outcome = sess.altfire_pressed();
+            println!("[play] altfire_hold press: {outcome:?}");
         }
         let t0 = Instant::now();
         crate::audio::pump(sess.events.iter());
@@ -1618,6 +1675,91 @@ fn live_execs(
 mod live_input_tests {
     use super::*;
 
+    fn latch_state() -> TraceState {
+        TraceState {
+            tick: 0,
+            saved_total: 0,
+            start: Instant::now(),
+            exit_secs: None,
+            shot: 0,
+            shot_done: false,
+            target_at: None,
+            post_travel_at: None,
+            video_exit_at: None,
+            menu_open: false,
+            fire_edge: false,
+        }
+    }
+
+    #[derive(Resource, Default)]
+    struct EdgesSeen(Vec<bool>);
+
+    /// item105: one render frame can run zero, one or several fixed ticks, and
+    /// `ButtonInput::just_pressed` lives for exactly that frame. A press must reach exactly one
+    /// fixed tick whatever the frame/tick ratio: reading `just_pressed` inside the fixed tick
+    /// lost it on a frame without a tick and fired twice on a frame with two.
+    #[test]
+    fn live_fire_press_reaches_exactly_one_fixed_tick() {
+        use bevy::time::{TimePlugin, TimeUpdateStrategy};
+        for frame_hz in [240.0f64, 144.0, 60.0, 45.0, 30.0, 20.0] {
+            for press_frame in 0..6 {
+                let mut app = App::new();
+                app.add_plugins(TimePlugin)
+                    .insert_resource(Time::<Fixed>::from_hz(FIXED_HZ))
+                    .init_resource::<ButtonInput<KeyCode>>()
+                    .init_resource::<ButtonInput<MouseButton>>()
+                    .insert_resource(latch_state())
+                    .init_resource::<EdgesSeen>()
+                    .add_systems(
+                        RunFixedMainLoop,
+                        latch_fire_edge.in_set(RunFixedMainLoopSystems::BeforeFixedMainLoop),
+                    )
+                    .add_systems(
+                        FixedUpdate,
+                        |mut state: ResMut<TraceState>, mut seen: ResMut<EdgesSeen>| {
+                            seen.0.push(std::mem::take(&mut state.fire_edge));
+                        },
+                    );
+                app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+                    1.0 / frame_hz,
+                )));
+                app.update(); // primes the clock: no time has elapsed yet
+                let mut pressed_in_tick_frame = None;
+                for frame in 0..40 {
+                    // The engine's input system clears the per-frame edges, then applies the
+                    // frame's events, before the fixed loop runs.
+                    let mut buttons = app.world_mut().resource_mut::<ButtonInput<MouseButton>>();
+                    buttons.clear();
+                    if frame == press_frame {
+                        buttons.press(MouseButton::Left);
+                    } else if frame == press_frame + 3 {
+                        buttons.release(MouseButton::Left);
+                    }
+                    let before = app.world().resource::<EdgesSeen>().0.len();
+                    app.update();
+                    let seen = &app.world().resource::<EdgesSeen>().0;
+                    if frame == press_frame && seen.len() > before {
+                        pressed_in_tick_frame = Some(seen[before]);
+                    }
+                }
+                let seen = &app.world().resource::<EdgesSeen>().0;
+                let presses = seen.iter().filter(|e| **e).count();
+                assert_eq!(
+                    presses,
+                    1,
+                    "frame {frame_hz} Hz, press frame {press_frame}: one press must reach one tick ({} ticks ran)",
+                    seen.len()
+                );
+                if let Some(first) = pressed_in_tick_frame {
+                    assert!(
+                        first,
+                        "frame {frame_hz} Hz, press frame {press_frame}: the frame's first tick must see the press"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn live_input_edges_release_and_retail_groups() {
         let mut keys = ButtonInput::default();
@@ -1739,22 +1881,18 @@ fn controls(
         && let Ok(sess) = session.as_mut()
         && let Some(pc) = sess.controller
     {
-        sess.vm_mut().set_property(
-            pc,
-            "bFire",
-            0,
-            Value::Byte(u8::from(
-                buttons.pressed(MouseButton::Left) || keys.pressed(KeyCode::ControlRight),
-            )),
-        );
-        sess.vm_mut().set_property(
-            pc,
-            "bAltFire",
-            0,
-            Value::Byte(u8::from(
-                buttons.pressed(MouseButton::Right) || keys.pressed(KeyCode::AltRight),
-            )),
-        );
+        let fire_down = buttons.pressed(MouseButton::Left) || keys.pressed(KeyCode::ControlRight);
+        let altfire_down = buttons.pressed(MouseButton::Right) || keys.pressed(KeyCode::AltRight);
+        sess.vm_mut()
+            .set_property(pc, "bFire", 0, Value::Byte(u8::from(fire_down)));
+        sess.vm_mut()
+            .set_property(pc, "bAltFire", 0, Value::Byte(u8::from(altfire_down)));
+        // item105: the fixed step's `Session::step` republishes the held buttons every tick
+        // (the hook owns them while selected/attached, a held weapon fire otherwise). Feed it the
+        // live key state too: while the hook owned the buttons it published the scripted
+        // default (nothing held) over the byte written above on the next tick, so a held key
+        // never reached the rope's `PressingFire` polls in windowed play.
+        sess.set_hook_buttons(fire_down, altfire_down);
         // State-aware dispatch preserves retail NoControl/NoMove exec overrides.
         for (name, args) in live_execs(&keys, &buttons, wheel.delta.y) {
             if let Err(e) = sess.vm_mut().send_event(pc, name, args) {

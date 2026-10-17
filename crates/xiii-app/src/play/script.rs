@@ -627,10 +627,19 @@ impl Drive {
                 Command::Fire => self.fire_pending = true,
                 Command::FireHold(v) => {
                     self.fire_hold_edge = *v && !self.fire_hold;
+                    // item105: DefUser.ini `Fire` = `Button bFire | Fire | onrelease UnFire`:
+                    // the release also dispatches the `UnFire` exec (a weapon's own `UnFire`,
+                    // e.g. `m60.UnFire` resets `iBurstCount`).
+                    if !*v && self.fire_hold {
+                        self.exec_inputs.push("UnFire");
+                    }
                     self.fire_hold = *v;
                 }
                 Command::AltFireHold(v) => {
                     self.altfire_hold_edge = *v && !self.altfire_hold;
+                    if !*v && self.altfire_hold {
+                        self.exec_inputs.push("UnFire");
+                    }
                     self.altfire_hold = *v;
                 }
                 Command::Item(path) => self.items.push(path.clone()),
@@ -894,6 +903,38 @@ mod tests {
         drive.advance(3.0, &mut sim);
         assert_eq!(drive.take_exec_inputs(), ["Reload"]);
         assert!(drive.take_exec_inputs().is_empty());
+    }
+
+    #[test]
+    fn releasing_a_held_fire_button_dispatches_unfire_once() {
+        // DefUser.ini: `Fire` = `Button bFire | Fire | onrelease UnFire`. A release of a button
+        // that is up (a repeated `fire_hold 0`) or a press must not dispatch it.
+        let script = Script::parse(
+            "t=1 fire_hold 1
+t=2 fire_hold 0
+t=3 fire_hold 0
+t=4 altfire_hold 1
+t=5 altfire_hold 0
+",
+        )
+        .unwrap();
+        let mut drive = Drive::new(&script);
+        let mut sim = PlayerSim::new([0.0; 3], 0.0);
+        drive.advance(1.0, &mut sim);
+        assert_eq!(drive.take_hook_buttons(), ((true, true), (false, false)));
+        assert!(
+            drive.take_exec_inputs().is_empty(),
+            "a press is not a release"
+        );
+        drive.advance(2.0, &mut sim);
+        assert_eq!(drive.take_hook_buttons(), ((false, false), (false, false)));
+        assert_eq!(drive.take_exec_inputs(), ["UnFire"]);
+        drive.advance(3.0, &mut sim);
+        assert!(drive.take_exec_inputs().is_empty(), "already released");
+        drive.advance(4.0, &mut sim);
+        assert!(drive.take_exec_inputs().is_empty());
+        drive.advance(5.0, &mut sim);
+        assert_eq!(drive.take_exec_inputs(), ["UnFire"]);
     }
 
     #[test]
