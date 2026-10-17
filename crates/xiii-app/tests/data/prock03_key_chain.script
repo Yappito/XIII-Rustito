@@ -1,0 +1,93 @@
+# PRock03 (Plain Rock asylum) on-foot chain (item103d): the natural west-corridor route to the
+# `porte_sec` checkpoint, the guard cine, the magnetic card, the checkpoint opener and the
+# continuation toward the objectives. No teleports, no weapon/item/goal bridges: every step is
+# player input through the game's own movement/use chain.
+#
+# Measured on-foot flow (see local/reports/item103b-prock03-key.md, item103d section):
+#   t= 0.5..30.5  the west cell-block corridor (Porte33/35/40/42) to the checkpoint (-3840,1720).
+#                 On the way the checkpoint detection volume `DetectionVolume7` fires
+#                 `gardien_lostpass`, starting the guard `Cine2` sequence, whose action 12 is
+#                 `opendoor porte30` (it later parks the guard at PositionInfo22, ~(-3431,3748)).
+#   t=33.5..50    walk north from the checkpoint to the `Porte30` doorway. With `Porte30` opened by
+#                 the cine the player passes through (the door leaf is collision-less while open).
+#   t=55..58      walk north-west to the magnetic card `Hual02MagneticCardPick0` (-3872,3810); the
+#                 walk-over pickup puts `Hual02MagneticCard` (Event 'pass') into the inventory.
+#   t=66..97      walk back south. The `Porte30` leaf is a `PlayerTriggerToggle` mover: a walk
+#                 through it toggles it shut, so the return re-opens it with the player's own
+#                 `use` before stepping through, then returns to the checkpoint.
+#   t=100..104    the aimed `use MagneticPassTrigger0` (Tag 'pass') matches the carried card through
+#                 `XIIIPawn.FindPowerUpItemNameForTrigger` and its OutEvent 'porte_sec' opens the
+#                 `TriggerControl` checkpoint `Porte29`.
+#   t=108..       continue south/east toward the objectives (hostage `Johansson3` / `CellKey`) and
+#                 the `Prock04a` level travel, as far as the map allows.
+t=0.50 goto -1246 2604
+t=2.50 goto -1476 2543
+t=4.00 goto -1680 2464
+t=5.00 use Porte33
+t=6.00 goto -1857 2527
+t=7.50 goto -2106 2563
+t=9.00 goto -2228 2552
+t=10.50 goto -2339 2530
+t=12.00 goto -2539 2582
+t=13.50 goto -2592 2597
+t=15.00 goto -2728 2656
+t=16.00 use Porte35
+t=17.00 goto -2909 2590
+t=19.00 goto -3296 2388
+t=20.00 use Porte40
+t=21.00 goto -3357 2216
+t=22.50 goto -3456 2157
+t=24.00 goto -3652 1984
+t=25.00 use Porte42
+t=26.00 goto -3468 2051
+t=27.50 goto -3764 2043
+t=29.00 goto -3790 2016
+t=30.50 goto -3840 1720
+# north from the checkpoint to the cine-opened Porte30 and through it
+t=33.50 goto -3820 1922
+t=35.00 goto -3797 2129
+t=38.00 goto -3576 2515
+t=40.50 goto -3391 2828
+t=42.50 goto -3385 3022
+t=44.00 goto -3360 3138
+t=50.00 goto -3436 3358
+t=55.00 goto -3604 3627
+t=56.50 goto -3862 3758
+t=58.00 goto -3872 3810
+# back south: re-open the toggled Porte30 with the player's own use, return to the checkpoint
+t=66.00 goto -3862 3758
+t=70.00 goto -3436 3358
+t=74.00 goto -3360 3138
+t=76.00 use Porte30
+t=80.00 goto -3379 3138
+t=84.00 goto -3391 2828
+t=88.00 goto -3576 2515
+t=92.00 goto -3797 2129
+t=97.00 goto -3840 1720
+# read the magnetic card on the checkpoint opener
+t=100.00 track MagneticPassTrigger0
+t=101.00 use MagneticPassTrigger0
+t=102.00 use MagneticPassTrigger0
+t=103.00 use MagneticPassTrigger0
+t=104.00 use MagneticPassTrigger0
+t=105.00 track off
+# continue toward the objectives and the Prock04a travel as far as the route allows:
+# south through the porte_sec checkpoint, then east toward the hostage (`Johansson3` /
+# `CellKey`) and the `Teleporter_Jo` (`Teleporter0`) area.
+t=108.00 goto -3778 1592
+t=112.00 goto -3787 1504
+t=116.00 goto -3879 1439
+t=122.00 goto -3910 1380
+t=128.00 goto -3919 1286
+t=136.00 goto -3600 1286
+t=144.00 goto -3000 1100
+t=152.00 goto -2763 812
+t=160.00 goto -2763 798
+t=164.00 use MagneticPassTrigger3
+t=168.00 goto -2688 725
+t=176.00 goto -2200 1000
+t=184.00 goto -1500 1200
+t=192.00 goto -700 1000
+t=200.00 goto 0 800
+t=208.00 goto 800 900
+t=216.00 goto 1500 1100

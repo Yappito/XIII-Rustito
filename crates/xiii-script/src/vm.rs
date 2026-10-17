@@ -8166,6 +8166,125 @@ impl<'s> Vm<'s> {
         Ok(dx * dx + dy * dy <= (ra + rb) * (ra + rb))
     }
 
+    /// `AActor::IsBlockedBy` (Engine.dll 0x10315620): whether `other` blocks `this_` under the
+    /// retail actor-blocking rule that `ULevel::CheckEncroachment` consumes (the pair rule the
+    /// movement sweep approximates with [`Vm::blocks_pair`]). Decoded branches:
+    ///
+    /// 1. `other->bWorldGeometry` -> `this_->bCollideWorld`;
+    /// 2. either side is an `ABrush` (non-null `Brush`, field `0x144`, and `IsA(ABrush)`) ->
+    ///    `this_.bCollideWorld` (resp. `other.bCollideWorld`) combined with the brush side's
+    ///    `bBlockPlayers` when the non-brush side is a player pawn, else `bBlockActors`;
+    /// 3. otherwise `(other player/projectile ? other.bBlockPlayers : other.bBlockActors) &&
+    ///    (this_ player/projectile ? this_.bBlockPlayers : this_.bBlockActors)`.
+    ///
+    /// The engine's `GetPlayerPawn()!=null` test is approximated by the class-name
+    /// classification [`Vm::is_player_or_projectile`] (XIII stores no `bIsPlayerPawn`); the
+    /// brush branch conflates a projectile with a player pawn, which is the only difference.
+    fn is_blocked_by(&self, this_: ObjectId, other: ObjectId) -> bool {
+        if self.bool_prop(other, "bWorldGeometry") {
+            return self.bool_prop(this_, "bCollideWorld");
+        }
+        if self.is_brush_actor(other) {
+            return self.bool_prop(this_, "bCollideWorld")
+                && if self.is_player_or_projectile(this_) {
+                    self.bool_prop(other, "bBlockPlayers")
+                } else {
+                    self.bool_prop(other, "bBlockActors")
+                };
+        }
+        if self.is_brush_actor(this_) {
+            return self.bool_prop(other, "bCollideWorld")
+                && if self.is_player_or_projectile(other) {
+                    self.bool_prop(this_, "bBlockPlayers")
+                } else {
+                    self.bool_prop(this_, "bBlockActors")
+                };
+        }
+        let a = if self.is_player_or_projectile(other) {
+            self.bool_prop(other, "bBlockPlayers")
+        } else {
+            self.bool_prop(other, "bBlockActors")
+        };
+        let b = if self.is_player_or_projectile(this_) {
+            self.bool_prop(this_, "bBlockPlayers")
+        } else {
+            self.bool_prop(this_, "bBlockActors")
+        };
+        a && b
+    }
+
+    /// `AActor::eventEncroachingOn` (Engine.dll 0x10303f00): dispatches the actor's
+    /// `EncroachingOn(Other)` script event and returns its result. No handler (or a
+    /// non-numeric result) is `false`, so an actor whose class does not override the event
+    /// never refuses a teleport.
+    fn encroaching_on(&mut self, id: ObjectId, other: ObjectId) -> VmResult<bool> {
+        let arg = Value::Object(Some(ObjRef::Instance(other)));
+        match self.send_event(id, "EncroachingOn", vec![arg])? {
+            Some(Value::Bool(b)) => Ok(b),
+            Some(Value::Int(n)) => Ok(n != 0),
+            Some(Value::Byte(b)) => Ok(b != 0),
+            _ => Ok(false),
+        }
+    }
+
+    /// `ULevel::CheckEncroachment` (Engine.dll 0x1038b2e0), the destination actor test that
+    /// `ULevel::FarMoveActor` (0x1038a59b) runs with `bTouchNotify = 1`. Returns true when the
+    /// move must be refused because `id`, placed at `location`, overlaps another actor and that
+    /// actor passes [`Vm::is_blocked_by`] and the moved actor's `EncroachingOn` event returns
+    /// non-zero (the loop at 0x1038b490-0x1038b4ed).
+    ///
+    /// The candidate overlap uses the decoded `FCollisionHash::ActorEncroachmentCheck`
+    /// (0x103490c0) primitive, i.e. [`Vm::actors_overlap`] (`AActor::IsOverlapping`): a mesh for
+    /// the mover/brush side and a vertical cylinder otherwise. It is not the coarse
+    /// cylinder-versus-cylinder box that refused PRock03's `teleportto 87` inside the thin
+    /// `PorteDecors4` door frame.
+    fn check_encroachment(&mut self, id: ObjectId, location: [f32; 3]) -> VmResult<bool> {
+        // Gate 0x1038b32f: an actor with no collision role and no static-mesh mover primitive
+        // is never tested.
+        let mesh_mover = self.is_mover(id)
+            && matches!(
+                self.get_property(id, "StaticMesh"),
+                Some(Value::Object(Some(_)))
+            );
+        if !mesh_mover
+            && !self.bool_prop(id, "bCollideActors")
+            && !self.bool_prop(id, "bCollideWorld")
+            && !self.bool_prop(id, "bBlockPlayers")
+        {
+            return Ok(false);
+        }
+        if self.objects.get(id as usize).is_some_and(|o| o.deleted) {
+            return Ok(false);
+        }
+        // Test the moved actor's own primitive at the candidate pose. Only live hash members
+        // (`bCollideActors`) can be returned by the collision query.
+        let old = self.vector_prop(id, "Location").unwrap_or([0.0; 3]);
+        self.set_property(id, "Location", 0, Value::Vector(location));
+        let others: Vec<ObjectId> = (0..self.objects.len() as ObjectId)
+            .filter(|&b| b != id && self.is_live_actor(b) && self.collides(b))
+            .collect();
+        let mut encroached = false;
+        for b in others {
+            // Skip the level info and any actor based on the moved actor (0x1038b4a0-0x1038b4af).
+            if self.is_a(b, "LevelInfo") || self.based_on(b, id) {
+                continue;
+            }
+            if !self.actors_overlap(id, b)? {
+                continue;
+            }
+            if !self.is_blocked_by(id, b) {
+                continue;
+            }
+            if !self.encroaching_on(id, b)? {
+                continue;
+            }
+            encroached = true;
+            break;
+        }
+        self.set_property(id, "Location", 0, Value::Vector(old));
+        Ok(encroached)
+    }
+
     /// Whether `other` blocks the movement of `mover` (UE1/UE2 pairwise blocking rule).
     pub(crate) fn blocks_pair(&self, mover: ObjectId, other: ObjectId) -> bool {
         let e = self.actor_extent(mover);
@@ -8865,8 +8984,10 @@ impl<'s> Vm<'s> {
         }
     }
 
-    /// `Actor.SetLocation`: teleport when the destination is free of world geometry and not
-    /// encroached by a blocking actor; returns whether it moved. Touch relations are updated.
+    /// `Actor.SetLocation`: teleport when the destination is free of **world** geometry
+    /// (`ULevel::FarMoveActor`/`FindSpot`) **and** free of a blocking actor
+    /// (`ULevel::CheckEncroachment` with `bTouchNotify = 1`); returns whether it moved. Touch
+    /// relations are updated.
     pub(crate) fn vm_set_location(&mut self, id: ObjectId, location: [f32; 3]) -> VmResult<bool> {
         self.far_move_actor(id, location, false, &mut Vec::new())
     }
@@ -8909,22 +9030,23 @@ impl<'s> Vm<'s> {
                 None => return Ok(false),
             }
         }
-        // A scripted `SetLocation` with world/placement collision disabled is the UE2 cutscene
-        // teleport path: `BeachInBedWithXIII.Waiting.Tick` moves the player into the authored bed
-        // pose while `bCollideWorld == false`. The Plage01 bed pose overlaps the map's closed
-        // window actor cylinders; UE2 permits this scripted placement in collisionless mode.
-        // Normal encroachment rejection remains active whenever either collision check is enabled.
-        if self.bool_prop(id, "bCollideActors") && check_world {
-            for b in 0..self.objects.len() as ObjectId {
-                if b == id || !self.is_live_actor(b) || !self.blocks_pair(id, b) {
-                    continue;
-                }
-                let (bl, rb, hb) = self.actor_cylinder(b);
-                let (_, ri, hi) = self.actor_cylinder(id);
-                if cylinders_overlap(location, ri, hi, bl, rb, hb) {
-                    return Ok(false);
-                }
-            }
+        // `ULevel::FarMoveActor` (`Engine.dll` 0x1038a440, reached from `AActor::SetLocation`
+        // 0x103e4ad0 with `bTest=bNoCheck=bAttached=0`). When `!bTest`, it calls the level
+        // `FindSpot` (vtable `+0xc0`, call at 0x1038a547) if the actor collides with the world,
+        // returns 0 when that fails, and then calls `ULevel::CheckEncroachment` (vtable `+0xc8`,
+        // call at 0x1038a59b) with the adjusted destination, the actor's own rotation and
+        // `bTouchNotify = 1`: `result = (CheckEncroachment(...) == 0)` (0x1038a5a1-0x1038a5a8).
+        // `CheckEncroachment` refuses the move when the destination overlaps a blocking actor
+        // whose `EncroachingOn` event returns non-zero — the real `FCollisionHash` overlap test
+        // (mesh for the mover/brush side), not a coarse cylinder box.
+        //
+        // A scripted `SetLocation` with world/placement collision disabled (`bCollideWorld ==
+        // false`) skips FindSpot entirely — the UE2 cutscene teleport path
+        // (`BeachInBedWithXIII.Waiting.Tick` moves the player into the authored bed pose) — but
+        // `CheckEncroachment` still runs (a player pawn's `EncroachingOn` returns false against a
+        // non-pawn, so the collisionless pose is not refused).
+        if self.check_encroachment(id, location)? {
+            return Ok(false);
         }
         // FarMoveActor 0x1038a5c1 marks a successful non-test teleport, and its
         // non-attached path calls SetBase(None, (0,0,1), true) before the Location store.
@@ -12594,23 +12716,6 @@ fn horizontal_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
     let dx = a[0] - b[0];
     let dy = a[1] - b[1];
     (dx * dx + dy * dy).sqrt()
-}
-
-/// True when a cylinder `(loc, radius, half_height)` overlaps another cylinder, including the
-/// exact contact boundary (XIII `Actor.TouchingActor` comparison).
-fn cylinders_overlap(
-    loc: [f32; 3],
-    radius: f32,
-    half_height: f32,
-    other_loc: [f32; 3],
-    other_radius: f32,
-    other_half_height: f32,
-) -> bool {
-    if (loc[2] - other_loc[2]).abs() > half_height + other_half_height {
-        return false;
-    }
-    let (dx, dy) = (loc[0] - other_loc[0], loc[1] - other_loc[1]);
-    dx * dx + dy * dy <= (radius + other_radius) * (radius + other_radius)
 }
 
 /// Earliest fraction `t in [0, 1]` at which a point moving `start + t*delta` first sits inside

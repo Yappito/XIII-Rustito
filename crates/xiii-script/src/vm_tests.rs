@@ -4611,6 +4611,18 @@ fn phys_fixture() -> Vec<u8> {
     b.class(controller, actor, ctrl_pawn, 0);
     let projectile = b.reserve(0, 0, "Projectile");
     b.class(projectile, actor, 0, 0);
+    // A class whose `EncroachingOn` event refuses every overlap (the retail `Pawn.EncroachingOn`
+    // result for a pawn with no player controller). `ULevel::CheckEncroachment` dispatches it
+    // from `Actor.SetLocation`; without a handler the event result is 0 and the teleport is
+    // allowed, so only this class refuses.
+    let encroacher = b.reserve(0, 0, "Encroacher");
+    let encroach_fn = b.reserve(IMP_FUNCTION, encroacher, "EncroachingOn");
+    let encroach_other = b.reserve(IMP_OBJECTPROP, encroach_fn, "Other");
+    let encroach_ret = b.reserve(IMP_BOOLPROP, encroach_fn, "ReturnValue");
+    b.prop_with(encroach_other, encroach_ret, PARM, &object_extra);
+    b.prop(encroach_ret, 0, PARM | RETURN_PARM);
+    b.func(encroach_fn, 0, encroach_other, &[0x04, 0x27], 2, 0, DEFINED);
+    b.class(encroacher, actor, encroach_fn, 0);
     b.build()
 }
 
@@ -8344,83 +8356,111 @@ fn trace_hits_nearer_of_world_and_actor_and_fasttrace_ignores_actors() {
 }
 
 #[test]
-fn set_location_refuses_encroachment_and_moves_when_free() {
+fn set_location_encroachment_uses_the_mesh_primitive_and_honours_encroaching_on() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(MeshWorld::window_wall(40.0)));
+    // The moved actor refuses overlaps: its `EncroachingOn` event returns true, like
+    // `Engine.Pawn.EncroachingOn` for a pawn with no player controller.
+    let a = vm.spawn(pg(&set, "Encroacher"), "Mover").unwrap();
+    vm.set_property(a, "Location", 0, Value::Vector([0.0; 3]));
+    set_collision_fields(&mut vm, a, true, true);
+    // A thin door frame: a 160 UU collision cylinder around a mesh wall at x=40 with a window
+    // opening in Z. `FCollisionHash::ActorEncroachmentCheck` / `AActor::IsOverlapping` test the
+    // mover's mesh, not its coarse cylinder.
+    let door = vm.spawn(pg(&set, "Mover"), "WindowDoor").unwrap();
+    vm.set_property(door, "Location", 0, Value::Vector([40.0, 0.0, 0.0]));
+    set_collision_fields(&mut vm, door, true, true);
+    vm.set_property(door, "CollisionRadius", 0, Value::Float(160.0));
+    vm.set_property(door, "CollisionHeight", 0, Value::Float(160.0));
+    vm.set_property(
+        door,
+        "StaticMesh",
+        0,
+        Value::Object(Some(ObjRef::Static(pg(&set, "Child")))),
+    );
+    // Destination inside the frame's coarse 160 UU cylinder but inside the mesh's window opening:
+    // a cylinder-versus-cylinder test would refuse it; the mesh primitive does not (PRock03's
+    // `teleportto 87` lands in exactly this kind of thin door frame).
+    let mut args = [Value::Vector([40.0, 0.0, 90.0])];
+    let ok = bool_result(
+        try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap(),
+    );
+    assert!(
+        ok,
+        "a coarse-cylinder-only overlap must not refuse the teleport (mesh primitive)"
+    );
+    assert_eq!(vm.vector_prop(a, "Location"), Some([40.0, 0.0, 90.0]));
+    // Destination on the mesh below the opening: the primitive overlaps, `IsBlockedBy` holds and
+    // `EncroachingOn` returns true, so the teleport is refused and Location is unchanged.
+    let mut args = [Value::Vector([40.0, 0.0, 0.0])];
+    let ok = bool_result(
+        try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap(),
+    );
+    assert!(
+        !ok,
+        "a destination inside a blocking mesh primitive must be refused"
+    );
+    assert_eq!(vm.vector_prop(a, "Location"), Some([40.0, 0.0, 90.0]));
+    // No `EncroachingOn` handler (event result 0): retail only refuses when the event returns 1,
+    // so a plain actor may teleport onto the same blocking primitive.
+    let plain = phys_actor(&mut vm, &set, "Plain", [0.0, 0.0, 0.0]);
+    set_collision_fields(&mut vm, plain, true, true);
+    let mut args = [Value::Vector([40.0, 0.0, 0.0])];
+    let ok = bool_result(
+        try_native(
+            &mut vm,
+            "Engine.Actor.SetLocation",
+            plain,
+            &[false],
+            &mut args,
+        )
+        .unwrap(),
+    );
+    assert!(ok, "no EncroachingOn handler -> the event result is 0");
+    assert_eq!(vm.vector_prop(plain, "Location"), Some([40.0, 0.0, 0.0]));
+}
+
+#[test]
+fn set_location_refuses_world_overlap_and_allows_collisionless_placement() {
     let set = phys_set();
     let mut vm = Vm::new(&set, VmLimits::default());
     vm.set_physics(Box::new(
         MockWorld::new().with_wall([40.0, -5.0, -5.0], [60.0, 5.0, 5.0]),
     ));
     let a = phys_actor(&mut vm, &set, "A", [0.0, 0.0, 0.0]);
-    let b = phys_actor(&mut vm, &set, "B", [500.0, 0.0, 0.0]);
-    set_collision_fields(&mut vm, a, true, false);
-    set_collision_fields(&mut vm, b, true, false);
-    // Both sides block: B blocks the destination.
-    vm.set_property(a, "bBlockActors", 0, Value::Bool(true));
-    vm.set_property(b, "bBlockActors", 0, Value::Bool(true));
-    vm.set_property(b, "bBlockNonZeroExtentTraces", 0, Value::Bool(true));
-    let mut args = [Value::Vector([500.0, 5.0, 0.0])];
-    let ok = match try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap()
-    {
-        NativeOutcome::Value(Value::Bool(b)) => b,
-        other => panic!("{other:?}"),
-    };
-    assert!(!ok, "encroached by a blocking actor");
-    assert_eq!(
-        vm.get_property(a, "Location"),
-        Some(&Value::Vector([0.0, 0.0, 0.0]))
-    );
-
-    // World-blocked destination is refused.
-    let mut args = [Value::Vector([50.0, 0.0, 0.0])];
-    let ok = match try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap()
-    {
-        NativeOutcome::Value(Value::Bool(b)) => b,
-        other => panic!("{other:?}"),
-    };
-    assert!(!ok, "destination inside the wall");
-    assert_eq!(
-        vm.get_property(a, "Location"),
-        Some(&Value::Vector([0.0, 0.0, 0.0]))
-    );
-
+    set_collision_fields(&mut vm, a, true, true);
     // The decoded Plage01 wake-up script disables `bCollideWorld` before setting the pawn's bed
-    // pose, which overlaps the closed `Fenetre3`/nearby window actor cylinders. UE2's scripted
-    // FarMoveActor path permits that collisionless cutscene placement; restoring world collision
-    // restores normal encroachment rejection.
+    // pose; UE2's scripted FarMoveActor path skips FindSpot for that collisionless placement, so
+    // a destination inside world geometry still succeeds.
     vm.set_property(a, "bCollideWorld", 0, Value::Bool(false));
-    let mut args = [Value::Vector([500.0, 0.0, 0.0])];
-    let ok = match try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap()
-    {
-        NativeOutcome::Value(Value::Bool(b)) => b,
-        other => panic!("{other:?}"),
-    };
+    let mut args = [Value::Vector([50.0, 0.0, 0.0])];
+    let ok = bool_result(
+        try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap(),
+    );
     assert!(
         ok,
-        "collisionless scripted placement must not be blocked by an actor"
+        "collisionless scripted placement must not be blocked by world geometry"
     );
-    assert_eq!(
-        vm.get_property(a, "Location"),
-        Some(&Value::Vector([500.0, 0.0, 0.0]))
-    );
+    assert_eq!(vm.vector_prop(a, "Location"), Some([50.0, 0.0, 0.0]));
     vm.set_property(a, "bCollideWorld", 0, Value::Bool(true));
-
-    // A free destination moves and touches an actor already there.
-    let c = phys_actor(&mut vm, &set, "C", [0.0, 100.0, 0.0]);
-    set_collision_fields(&mut vm, c, true, false);
-    let mut args = [Value::Vector([0.0, 100.0, 0.0])];
-    let ok = match try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap()
-    {
-        NativeOutcome::Value(Value::Bool(b)) => b,
-        other => panic!("{other:?}"),
-    };
-    assert!(ok);
-    assert_eq!(
-        vm.get_property(a, "Location"),
-        Some(&Value::Vector([0.0, 100.0, 0.0]))
+    // The same destination with world collision enabled is refused (FindSpot).
+    let mut args = [Value::Vector([50.0, 0.0, 0.0])];
+    let ok = bool_result(
+        try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap(),
     );
-    // The earlier collisionless move still generated its overlap touch with B; the later move
-    // adds the touch with C rather than resetting the actor's accumulated touch counter.
-    assert_eq!(vm.get_property(a, "Touches"), Some(&Value::Int(2)));
+    assert!(!ok, "destination inside the wall");
+    assert_eq!(vm.vector_prop(a, "Location"), Some([50.0, 0.0, 0.0]));
+    // A free destination moves and touches an actor already there.
+    let c = phys_actor(&mut vm, &set, "C", [500.0, 100.0, 0.0]);
+    set_collision_fields(&mut vm, c, true, false);
+    let mut args = [Value::Vector([500.0, 100.0, 0.0])];
+    let ok = bool_result(
+        try_native(&mut vm, "Engine.Actor.SetLocation", a, &[false], &mut args).unwrap(),
+    );
+    assert!(ok);
+    assert_eq!(vm.vector_prop(a, "Location"), Some([500.0, 100.0, 0.0]));
+    // SetLocation refreshes the touch relations: A now touches C.
     assert_eq!(vm.get_property(c, "Touches"), Some(&Value::Int(1)));
 }
 
