@@ -52,6 +52,10 @@ Plan: when item97e (Hual04c escort, `codex2`) finishes, merge `fx` and `steam` i
 then re-times Hual04a and both Hual04c routes. Land the result as one unit.
 
 **Tooling changes (all under the git-ignored `local/`):**
+- **Batch landings (user rule, 2026-10-17).** Never land accepted branches one by one: each `land` re-runs the
+  full ~45-min suite on the newest main. Merge every accepted, non-overlapping branch into one batch worktree,
+  `cargo check --workspace --tests`, and `land` it once; on VERIFY_FAIL bisect by branch. Task specs ask agents for
+  the route filter and targeted tests, not `verify.sh`, unless the coordinator needs a pre-landing suite.
 - `verify.sh` is back to **one** suite slot. Two slots were tried on 2026-10-13: one suite peaked at
   27.8 GB and the watchdog killed a landing. `VERIFY_SLOTS` overrides the slot count. Edit `verify.sh` only
   by writing a new file and `mv`-ing it over.

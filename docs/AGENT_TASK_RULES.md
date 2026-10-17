@@ -88,7 +88,8 @@ iteration counts, and stream output to a file instead of keeping it in memory. O
 probe grew to 64 GB and pushed the machine to 1.2 GB of free commit. A watchdog kills the largest
 worktree process when free commit drops below 15 GB. If one of your test runs dies abruptly (exit
 code 1 with no panic, or "process didn't exit successfully"), it was probably killed by the watchdog:
-rerun it before treating it as a failure. Start `verify.sh` only as
+rerun it before treating it as a failure. Run `verify.sh` only when your task spec asks for it: the coordinator
+batches accepted branches and runs one full suite per batch at landing. When asked, start it only as
 `bash P:/AI/XIII/local/verify.sh --bg local/reports/<x>-verify.txt`. It detaches the suite and returns
 at once. Never use `nohup` or `&`: an attached child can hang your session. Then poll that log with short
 commands.
