@@ -151,11 +151,11 @@ pub struct LadderSample {
 }
 
 /// Read-only environment query for the movement modes. The host adapts the decoded map volumes
-/// to this trait; synthetic tests implement it directly. The box (`center_uu` + `half_uu` in
-/// Unreal axes) is tested against the volume, because a thin water slab is only touched by the
-/// player's box, not its centre point.
+/// to this trait; synthetic tests implement it directly. Water movement uses the centre's
+/// PhysicsVolume (retail SetZone), while ladder attachment uses the box (`center_uu` + `half_uu`
+/// in Unreal axes). Touch/pain is a separate VM overlap test and can occur before swimming.
 pub trait MotionQuery {
-    /// Water volume overlapping the player box, if any.
+    /// Water PhysicsVolume encompassing the player centre, if any.
     fn water_at(&self, center_uu: [f32; 3], half_uu: [f32; 3]) -> Option<WaterSample>;
     /// Ladder volume overlapping the player box, if any.
     fn ladder_at(&self, center_uu: [f32; 3], half_uu: [f32; 3]) -> Option<LadderSample>;
@@ -576,9 +576,10 @@ impl PlayerSim {
     /// Retail `Pawn.CheckWaterJump` (decoded from `Engine.u` bytecode):
     ///
     /// ```text
-    /// checkpoint = vector(Rotation with Z=0)          // horizontal facing
+    /// checkNorm = Normal(vector(Rotation) with Z=0)   // horizontal facing
+    /// checkpoint = Location + CollisionRadius*checkNorm
     /// Extent = (CollisionRadius, CollisionRadius, CollisionHeight)
-    /// HitActor = Trace(checkpoint + Location, Location, Extent)
+    /// HitActor = Trace(checkpoint, Location, Extent)
     /// if HitActor != None && Pawn(HitActor) == None:  // a wall, not a pawn
     ///     Start = Location; Start.Z += 1.1 * 35.0
     ///     return Trace(Start + 2*CollisionRadius*checkNorm, Start) == None
@@ -597,7 +598,10 @@ impl PlayerSim {
         let loc = self.location;
         let ahead = [loc[0] + norm[0] * r, loc[1] + norm[1] * r, loc[2]];
         // Forward wall probe with the pawn box (retail `Actor.Trace` with `Extent`).
-        world.sweep(to_bevy_position(ahead), to_bevy_position(loc), half)?;
+        // Actor.Trace takes (end, start); CollisionWorld::sweep takes (start, end). Reversing
+        // this sweep misses a legal approach whose ahead box overlaps the wall but moves away
+        // from it on the reversed segment (the starting-penetration filter then drops the hit).
+        world.sweep(to_bevy_position(loc), to_bevy_position(ahead), half)?;
         // Head clearance: 1.1*35 UU above the centre, 2*radius forward, zero extent.
         let start = [loc[0], loc[1], loc[2] + 1.1 * 35.0];
         let head = [
@@ -605,9 +609,8 @@ impl PlayerSim {
             start[1] + norm[1] * 2.0 * r,
             start[2],
         ];
-        let tiny = unreal_extent_to_bevy([1.0, 1.0, 1.0]);
         if world
-            .sweep(to_bevy_position(start), to_bevy_position(head), tiny)
+            .sweep(to_bevy_position(start), to_bevy_position(head), [0.0; 3])
             .is_none()
         {
             Some(norm)
@@ -1012,6 +1015,95 @@ mod tests {
             "ends on the start floor: z={}",
             sim.location[2]
         );
+    }
+
+    #[test]
+    fn jumping_clears_a_55_uu_step_but_walking_does_not() {
+        let params = decoded_params();
+        let world = wall_world(-2.0, 55.0 / UNREAL_UNITS_PER_METER);
+        for jumping in [false, true] {
+            let mut sim = start_on_floor(&params, 0.0, 0.0);
+            for tick in 0..150 {
+                sim.step(
+                    1.0 / 60.0,
+                    &world,
+                    &params,
+                    Input {
+                        forward: 1.0,
+                        jump: jumping && tick == 8,
+                        ..Default::default()
+                    },
+                    &[],
+                );
+            }
+            if jumping {
+                assert!(
+                    sim.location[0] > 200.0 && sim.grounded,
+                    "jump must cross and land: {sim:?}"
+                );
+                assert!((sim.location[2] - params.height_uu - 55.0).abs() < 1.0);
+            } else {
+                assert!(
+                    sim.location[0] < 180.0 - params.radius_uu + 1.0,
+                    "walking must not mantle: {sim:?}"
+                );
+                assert!((sim.location[2] - params.height_uu).abs() < 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn steep_bank_enters_falling_and_slides_down_to_walkable_ground() {
+        // 60-degree bank: it is not a floor (MINFLOORZ=0.7), but gravity must still move
+        // the pawn down it. A planner that discards every non-walkable normal loses this edge.
+        let z = |x: f32| -x * 3.0_f32.sqrt();
+        let points = [
+            [-500.0, -1000.0, z(-500.0)],
+            [-500.0, 1000.0, z(-500.0)],
+            [500.0, 1000.0, z(500.0)],
+            [500.0, -1000.0, z(500.0)],
+        ];
+        let floor_z = z(500.0);
+        let floor = [
+            [500.0, -1000.0, floor_z],
+            [500.0, 1000.0, floor_z],
+            [2000.0, 1000.0, floor_z],
+            [2000.0, -1000.0, floor_z],
+        ];
+        let mut triangles = Vec::new();
+        for q in [points, floor] {
+            let q = q.map(to_bevy_position);
+            triangles.extend([([q[0], q[1], q[2]], 0), ([q[0], q[2], q[3]], 0)]);
+        }
+        let world = CollisionWorld::new(triangles);
+        let params = decoded_params();
+        // Extent support on a tilted plane includes radius*slope as well as half-height.
+        let start = [
+            -400.0,
+            0.0,
+            z(-400.0) + params.height_uu + params.radius_uu * 3.0_f32.sqrt() + 0.1,
+        ];
+        let mut sim = PlayerSim::new(start, 0.0);
+        let mut saw_falling = false;
+        for _ in 0..240 {
+            sim.step(
+                1.0 / 60.0,
+                &world,
+                &params,
+                Input {
+                    forward: 1.0,
+                    ..Default::default()
+                },
+                &[],
+            );
+            saw_falling |= !sim.grounded;
+        }
+        assert!(saw_falling, "steep bank must not remain walking");
+        assert!(
+            sim.location[0] > 550.0 && sim.grounded,
+            "must descend and land: {sim:?}"
+        );
+        assert!((sim.location[2] - floor_z - params.height_uu).abs() < 1.0);
     }
 
     #[test]
@@ -2017,6 +2109,13 @@ mod tests {
 
         // Low wall (top 70 UU): the mantle fires.
         let low = wall_world(wall_z, 70.0 / UNREAL_UNITS_PER_METER);
+        // The initial pawn box need not already penetrate the wall. Here the nearest box face
+        // has 16 UU of clearance, and the forward radius sweep reaches the low wall.
+        let clear_start = PlayerSim::new([0.0, 0.0, 72.0], 0.0);
+        assert!(clear_start.check_water_jump(&low, &params).is_some());
+        // The second retail trace has zero extent: a wall 0.5 UU below that ray is clear.
+        let narrow = wall_world(wall_z, (72.0 + 38.5 - 0.5) / UNREAL_UNITS_PER_METER);
+        assert!(clear_start.check_water_jump(&narrow, &params).is_some());
         let mantle = run_jump(&low, &water);
         assert_eq!(mantle.physics, PHYS_FALLING);
         assert!(
@@ -2045,7 +2144,8 @@ mod tests {
             none.velocity
         );
 
-        // Wall out of reach: place the pawn 0.6 m (54 UU) back; the radius-34 probe misses.
+        // The retail trace travels R with extent R: its front face reaches 2*R (68 UU).
+        // Keep the original 54-UU case, but correct its old point-trace interpretation.
         let far_uu = bevy_to_unreal_position([0.0, 0.8, wall_z + 0.6]);
         let far_water = water_around(far_uu, far_uu[2] + 40.0);
         let mut far = PlayerSim::new(far_uu, 0.0);
@@ -2062,9 +2162,17 @@ mod tests {
             &far_water,
         );
         assert!(
-            far.velocity[0].abs() < 1.0,
-            "a wall beyond CollisionRadius must not mantle: {:?}",
+            (far.velocity[0] - params.water_speed).abs() < 1.0,
+            "the original 54-UU case is within the extent trace's 68-UU reach: {:?}",
             far.velocity
+        );
+        let beyond = PlayerSim::new(
+            bevy_to_unreal_position([0.0, 0.8, wall_z + 70.0 / UNREAL_UNITS_PER_METER]),
+            0.0,
+        );
+        assert!(
+            beyond.check_water_jump(&low, &params).is_none(),
+            "a wall beyond 2*CollisionRadius must not mantle"
         );
 
         // Low wall but blocked headroom (a 200 UU top): no mantle.

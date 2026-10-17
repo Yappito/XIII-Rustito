@@ -169,7 +169,7 @@ pub fn import(game_dir: &Path, map: &str) -> Result<VolumeBrushes, String> {
 }
 
 /// Builds one brush's world-space BSP from its `Brush` -> `Engine.Model`.
-fn world_primitive(
+pub(crate) fn world_primitive(
     cache: &mut PackageCache,
     map_pkg: &Arc<Loaded>,
     eff: &ResolvedPlacement,
