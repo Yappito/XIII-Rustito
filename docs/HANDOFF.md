@@ -18,6 +18,14 @@ State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XII
   gap: the sight test is stricter than bullets for some soldiers (an ineffective-target rule works around it).
   Report `local/wt/sweep/local/reports/item107-adaptive-routes.md`. Next: item107 step 3 (PickStartPoint + NotifyBump)
   in `sweep`, then Hual04a goal 5.
+- Landing with this note (2026-10-19): item107 step 3 (`165c0cd`): retail `PickStartPoint` + AI door bumps; Hual04a goal 5
+  and the Hual04c travel by input. PRock03 key chain now stops at (-2138.8,204.2) (the ward wakes: BaseSoldier6 opens its
+  doors). Follow-up: `Controller.actorReachable` still uses the nav approximation.
+- **No Opus/Sonnet subagents (user, 2026-10-18).** Agents in flight (opencode / Codex, logs `local/logs/<title>.log`):
+  `viewer` item103g (Z.AI glm-5.3-flash, PRock03 ward; written before the door-bump landing, re-check after merging main),
+  `steam` item100h (opencode gpt-6.1-sol, cine SeePlayer / `on event`, PRock01a Porte9), `locale` item108c (OpenCode Go
+  deepseek, Prock04a: falling start-penetration divergence and the tyrolines; prefix route pinned alive). Codex CLI is out
+  of credits (item108 used ~355k tokens).
 - **Providers (user, 2026-10-17 night): no Ollama Cloud.** deepseek only via OpenCode Go
   (`opencode-go/deepseek-v4.1-flash`); plus Z.AI, opencode/Codex gpt-6.1-sol and Sonnet subagents (max 2).
 
