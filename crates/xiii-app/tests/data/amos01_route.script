@@ -19,6 +19,18 @@
 # The Beretta+c9mmAmmo is the level's own pickup at (-2674,3679,75) (t=429 measured,
 # BerettaPick1 Touch); no host grant. No teleports.
 #
+# item107c re-time after the decoded `IAController.PickStartPoint` (null when no PatrolPoint is within
+# 780 UU, XIDPawn.dll 0x11903b80): the hall and descent soldiers without a patrol network now wander
+# (`Errance`) instead of holding (`Tenir`), the attack network wakes BaseSoldier9/14/20 and the
+# unchanged recorded dash (Fists + a few Beretta rounds, no cover) dies to them at ~365 s (measured,
+# `[bump107]`-free, identical with the bump path disabled). One input change: at t=343 the route
+# holds for up to 6 s with `engage BaseSoldier9` (closed loop: it shoots BaseSoldier9 if it comes
+# into sight, the pending `goto` keeps walking to its last waypoint meanwhile). Measured: BaseSoldier9
+# never comes into sight during the hold (`engaged false`, the block times out), so the effect is the
+# 6 s hold; the same route passes at 393 s vm time with minimum Health 25 (>= 25 pin). Holds of 3, 4, 5, 7,
+# 8, 10 s (as event shifts) and other start times (336-353) all die at 364-377 s: the pass is
+# timing-sensitive, not robust. Medkit detour (`MedPick4` -2292,5679 + `heal`) and a standing
+# `engage_on` were tried and did not help (Beretta has 13 rounds in total).
 # item86 re-time on the integrated engine-fidelity tree (automatic AI bursts + retail
 # volume-brush overlap). Same route geometry, two player-input changes:
 #   * Porte7 wait filled (t=293.3-294.5): the old schedule stood still ~1.7 s at the hall door
@@ -511,3 +523,4 @@ t=383.71 goto -2045 -650
 t=383.71 crouch off
 t=384.47 goto -1999 -553
 t=400.97 wait_travel
+t=343.0 engage BaseSoldier9 2500 6 aim=0.9 period=0.25

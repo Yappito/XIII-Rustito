@@ -29,9 +29,7 @@ use crate::linker::{GlobalRef, ScriptSet};
 use crate::localize::{LocalizationData, placeholder};
 #[cfg(test)]
 use crate::navigation::move_step;
-use crate::navigation::{
-    NavEdgeInfo, NavPointInfo, NavigationData, find_path, nearest_point, point_fits,
-};
+use crate::navigation::{NavEdgeInfo, NavPointInfo, NavigationData, find_path, nearest_point};
 use crate::physics::{HitZones, WorldHit, WorldPhysics};
 use crate::reflect::{Property, PropertyKind, ScriptObject, function_flags, property_flags};
 use crate::registry::{NativeCtx, NativeDef, NativeOutcome, Registry};
@@ -5081,11 +5079,17 @@ impl<'s> Vm<'s> {
                         }
                     }
                     let destination = self.vector_prop(id, "Destination").unwrap_or(destination);
+                    let generation_before_step = self.objects[id as usize].generation;
                     let arrived = if self.bool_prop(id, "bPreparingMove") {
                         false
                     } else {
                         self.controller_move_step(id, pawn, destination, dt)?
                     };
+                    if self.objects[id as usize].generation != generation_before_step {
+                        // item107: a bump handler (`Controller.NotifyBump`) changed the
+                        // controller's state during the step; the old latent is dead.
+                        return Ok(());
+                    }
                     let remaining = match self.get_property(id, "MoveTimer") {
                         Some(Value::Float(timer)) => *timer,
                         _ => remaining,
@@ -9812,34 +9816,6 @@ impl<'s> Vm<'s> {
         self.find_object(&p.actor)
     }
 
-    /// Nearest navigation point actor to `from` whose collision fits the pawn's size, optionally
-    /// restricted to an actor class name. Returns `None` when no provider is installed or no
-    /// point survives the fit/class test.
-    pub(crate) fn nav_nearest_point_actor(
-        &self,
-        from: [f32; 3],
-        radius: f32,
-        height: f32,
-        class: Option<&str>,
-    ) -> Option<ObjectId> {
-        let points = self.nav_points()?;
-        let mut order: Vec<(f32, u32)> = points
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| point_fits(p, radius, height))
-            .map(|(i, p)| (horizontal_distance(from, p.location), i as u32))
-            .collect();
-        order.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        for (_, i) in order {
-            if let Some(a) = self.nav_point_actor(i)
-                && class.is_none_or(|c| self.is_a(a, c))
-            {
-                return Some(a);
-            }
-        }
-        None
-    }
-
     /// Half-extents of `pawn` (its collision cylinder) used for edge/arrival tests.
     fn nav_pawn_size(&self, pawn: ObjectId) -> (f32, f32) {
         (
@@ -10717,6 +10693,135 @@ impl<'s> Vm<'s> {
         }
     }
 
+    /// `APawn::actorReachable(Other, bKnowVisible, 0)` (Engine.dll 0x103b71b0), the test behind
+    /// `Controller.actorReachable` (`execactorReachable` 0x10367d40 calls it with both flags 0) and
+    /// `IAController.PickStartPoint` (XIDPawn.dll 0x11903ca1 calls it as `(candidate, 0, 0)`).
+    ///
+    /// Decoded gates, in order: a null/deleted goal is unreachable (0x103b71dd); a goal further than
+    /// 1200 UU (squared 1440000.0 at 0x10481bc0, skipped only in the editor) is unreachable
+    /// (0x103b7320); the pawn must be able to walk or fly (`bCanWalk` 0x400 | `bCanFly` 0x1000 of
+    /// `Pawn+0x1f4`, 0x103b7374; a goal in a water zone needs `bCanSwim` 0x800 instead, not
+    /// modelled); without `bKnowVisible` the line eye -> goal (flags 0x86) must not be blocked by
+    /// anything but the goal (0x103b73d8..0x103b7449); a goal pawn whose collision cylinder
+    /// touches the pawn's is reachable (0x103b7455..0x103b7483); otherwise `APawn::Reachable`
+    /// (0x103b7050) dispatches on `Physics`: Walking, Swimming and Ladder to `walkReachable`
+    /// (0x103b6860), Flying to `flyReachable` (0x103b6560), anything else is unreachable.
+    ///
+    /// Partial (not decoded to the instruction): the goal-is-a-Controller redirect and the
+    /// "enemy within 120 UU" shortcut (0x103b71f4..0x103b72b6); the virtual call at +0x140
+    /// (0x103b733e); the `FarMoveActor` placement tests (0x103b74d9, 0x103b7516); the water-zone
+    /// capability branch; and `walkReachable`'s internals (`walkMove` 0x103b1850, the jump/drop
+    /// helpers 0x103b4d40/0x103b4f80, `ReachedDestination` 0x103b10f0). The walk itself is
+    /// reproduced from its structure: up to 100 steps toward the goal of `max(CollisionRadius,
+    /// 128)` UU for a pawn that can jump and `max(CollisionRadius, 12)` otherwise (0x103b68dc..
+    /// 0x103b691d), each taken with the walking primitive (step-up, floor-follow), succeeding when
+    /// the pawn reaches the goal (the arrival rule of [`Vm::controller_move_step`]) and failing
+    /// when a step makes no progress or drops the pawn off its floor.
+    pub(crate) fn pawn_actor_reachable(
+        &mut self,
+        pawn: ObjectId,
+        other: ObjectId,
+        know_visible: bool,
+    ) -> VmResult<bool> {
+        if self.objects[other as usize].deleted {
+            return Ok(false);
+        }
+        if !self.physics_ready("Pawn.actorReachable", Some(520), pawn, Value::Bool(false))? {
+            return Ok(false);
+        }
+        let from = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let goal = self.vector_prop(other, "Location").unwrap_or([0.0; 3]);
+        let to_goal = sub3(goal, from);
+        let dist_sq = dot3(to_goal, to_goal);
+        // 0x103b7320: `fcomp [0x10481bc0]` (1200^2) then `je` skips only a larger distance.
+        if dist_sq > 1_440_000.0 {
+            return Ok(false);
+        }
+        if !(self.bool_prop(pawn, "bCanWalk") || self.bool_prop(pawn, "bCanFly")) {
+            return Ok(false);
+        }
+        if !know_visible {
+            let eye = add3(from, [0.0, 0.0, self.f32_prop(pawn, "BaseEyeHeight")]);
+            let other_name = self.objects[other as usize].name.clone();
+            if let Some(owner) = self.world_line_blocker(eye, goal)
+                && !owner.is_some_and(|o| o.eq_ignore_ascii_case(&other_name))
+            {
+                return Ok(false);
+            }
+        }
+        if self.is_a(other, "Pawn") {
+            let touch =
+                self.f32_prop(other, "CollisionRadius") + self.f32_prop(pawn, "CollisionRadius");
+            if dist_sq <= touch * touch {
+                return Ok(true);
+            }
+        }
+        match self.byte_prop(pawn, "Physics") {
+            PHYS_WALKING | 3 | 11 => self.walk_reachable(pawn, other, goal),
+            PHYS_FLYING => {
+                let extent = self.actor_extent(pawn);
+                Ok(self
+                    .physics
+                    .as_mut()
+                    .is_some_and(|p| p.trace(from, goal, extent).is_none()))
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// `APawn::walkReachable` (Engine.dll 0x103b6860) over the walking primitive; see
+    /// [`Vm::pawn_actor_reachable`]. The pawn is not moved: the steps are taken on a copy of its
+    /// position (retail moves the actor and restores it at 0x103b6d82).
+    fn walk_reachable(
+        &mut self,
+        pawn: ObjectId,
+        goal_actor: ObjectId,
+        goal: [f32; 3],
+    ) -> VmResult<bool> {
+        let radius = self.f32_prop(pawn, "CollisionRadius");
+        let height = self.f32_prop(pawn, "CollisionHeight");
+        let goal_radius = self.f32_prop(goal_actor, "CollisionRadius");
+        let extent = [radius, radius, height];
+        let step = if self.bool_prop(pawn, "bCanJump") {
+            radius.max(128.0)
+        } else {
+            radius.max(12.0)
+        };
+        let mut at = self.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+        let Some(provider) = self.physics.as_mut() else {
+            return Ok(false);
+        };
+        for _ in 0..100 {
+            let delta = sub3(goal, at);
+            let flat = [delta[0], delta[1], 0.0];
+            let flat_len = dot3(flat, flat).sqrt();
+            // The arrival rule of `controller_move_step` (the full `ReachedDestination` stays
+            // Partial there too).
+            if flat_len <= radius + goal_radius && delta[2].abs() <= height {
+                return Ok(true);
+            }
+            let walk = if flat_len <= step {
+                flat
+            } else {
+                scale3(flat, step / flat_len)
+            };
+            let outcome = provider.walk_box(at, walk, extent);
+            let moved = sub3(outcome.end, at);
+            // No progress: the pawn is blocked (retail `walkMove` returns 0 and, unable to
+            // jump, gives up).
+            if dot3([moved[0], moved[1], 0.0], [moved[0], moved[1], 0.0]) < 1.0e-4 {
+                return Ok(false);
+            }
+            // Dropped off its floor (walkMove's "fell" result): unreachable by walking.
+            let floor = provider.move_box(outcome.end, [0.0, 0.0, -(35.0 + 1.0e-3)], extent);
+            if !floor.hit.is_some_and(|hit| hit.normal[2] >= FLOOR_NORMAL_Z) {
+                return Ok(false);
+            }
+            at = outcome.end;
+        }
+        Ok(false)
+    }
+
     /// `Controller.actorReachable`: `pointReachable` on the actor's location.
     pub(crate) fn nav_actor_reachable(
         &mut self,
@@ -11058,6 +11163,8 @@ impl<'s> Vm<'s> {
             && !path_drop;
         let mut end;
         let mut on_floor;
+        // item107: the mover that stopped this step, if any (see the bump notification below).
+        let mut blocker: Option<String> = None;
         if collides_world {
             let Some(provider) = self.physics.as_mut() else {
                 return Err(self.err(VmErrorKind::NoPhysicsProvider {
@@ -11065,6 +11172,18 @@ impl<'s> Vm<'s> {
                 }));
             };
             let outcome = provider.walk_box(loc, displacement, extent);
+            if outcome.hit.is_some() && dot3(displacement, displacement) > 0.0 {
+                // Which registered mover (a door) is in the way: the same box swept a little
+                // beyond the step names it (`ULevel::MoveActor`'s `Hit.Actor`).
+                let reach = dot3(displacement, displacement).sqrt() + 2.0;
+                blocker = provider
+                    .trace_with_mover(
+                        loc,
+                        add3(loc, scale3(normalize3(displacement), reach)),
+                        extent,
+                    )
+                    .1;
+            }
             // `walk_box` follows the floor when one is within the walking step height. A
             // controller-driven walk must hand off to scripted falling physics when it has
             // stepped beyond that support; otherwise its next MoveToward poll continues to
@@ -11128,7 +11247,42 @@ impl<'s> Vm<'s> {
         if walking && collides_world && !on_floor {
             self.set_property(pawn, "Physics", 0, Value::Byte(PHYS_FALLING));
         }
+        // item107: `ULevel::MoveActor` (Engine.dll 0x1038b15c..0x1038b17a) tells the blocking
+        // actor about the mover (`Bump`, `AActor::NotifyBump`) and then the mover about the
+        // blocker (`APawn::NotifyBump`). A walking AI pawn pressing against a door therefore
+        // reaches `IAController.NotifyBump`, which opens a closed `XIIIPorte` (for any other
+        // blocker that script returns false at once, so the pawn's own `Bump` runs).
+        if let Some(name) = blocker
+            && let Some(mover) = self.find_object(&name)
+            // Engine.dll 0x1038b142..0x1038b15a: `Hit.Actor` must not have the
+            // `bWorldGeometry` bit (0x40000000 of the first Actor bool dword at +0x2c: the 31st bool
+            // of the Actor property chain, `bWorldGeometry`) and the moving actor must not be based
+            // on it (`AActor::IsBasedOn`, 0x1030f1d0, a walk of the `Base` chain at +0x94).
+            && !self.bool_prop(mover, "bWorldGeometry")
+            && !self.based_on(pawn, mover)
+        {
+            self.send_event(
+                mover,
+                "Bump",
+                vec![Value::Object(Some(ObjRef::Instance(pawn)))],
+            )?;
+            self.pawn_notify_bump(pawn, mover)?;
+        }
         Ok(false)
+    }
+
+    /// `APawn::NotifyBump` (Engine.dll 0x10387d80): the pawn's Controller is offered the bump
+    /// first (`eventNotifyBump`, 0x10305170); only when it does not handle it (returns false) does
+    /// the pawn's own `eventBump` (0x10387d30) run.
+    pub(crate) fn pawn_notify_bump(&mut self, pawn: ObjectId, other: ObjectId) -> VmResult<()> {
+        let other_value = Value::Object(Some(ObjRef::Instance(other)));
+        if let Some(controller) = self.obj_prop(pawn, "Controller") {
+            let handled = self.send_event(controller, "NotifyBump", vec![other_value.clone()])?;
+            if matches!(handled, Some(Value::Bool(true))) {
+                return Ok(());
+            }
+        }
+        self.send_event(pawn, "Bump", vec![other_value]).map(|_| ())
     }
 
     /// item53: engine physics integration for script-driven actors, run once per tick after the

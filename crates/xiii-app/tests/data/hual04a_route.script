@@ -232,8 +232,27 @@ t=465.90 goto 796 425
 # (`AttackPoint13` -> `AttackPoint12` -> `AttackPoint0` on the ground) sends it toward the ground,
 # but the item101 ledge rule stops it at the roof edge (615,-926,462); it never reaches or sees
 # the player, so its `RushFinal` event never fires and `CineTrigger1` (counter 2) never reaches
-# zero. The route therefore tracks it and fires (measured: no line of sight, 0 damage); goal 5 and
-# the Hual04c travel stay unreached. This is the pinned next blocker (see the report).
+# zero. item107c: with the retail `APawn::NotifyBump` path it opens `porte10` and attacks, is shot by
+# the standing engagement below, and the cine runs to `event LaFinDeLaMap`; goal 5 and the Hual04c
+# travel are reached (see the end of this file).
 t=466.40 engage BaseSoldier7 3000 15 aim=0.9 period=0.1
 t=466.50 goto 941 396
-t=486.50 wait_travel
+# item107c: with the retail `APawn::NotifyBump` path `BaseSoldier6` presses against `porte10`,
+# `IAController.NotifyBump` opens it and the soldier attacks the platform (measured: the old route
+# died to it at ~558 s). A standing engagement shoots it when it comes into sight; its death-side
+# `RushFinal` event then releases the cine.
+t=466.60 engage_on 3500 aim=0.9 period=0.15
+t=466.70 wait_until dead BaseSoldier6 120
+# BaseSoldier6 is dead: its `RushFinal` released Carrington's cine, which now waits at
+# `wait player 200` (action 78) for the player to come within 200 UU. Walk to him by trailing the
+# escort (`follow` is ordinary aim-and-walk input) until the map's goal 5 completes, then wait for
+# the map's own travel.
+t=466.80 follow Cine1 120
+# The cine ends with `event LaFinDeLaMap` (tabActions[95]), which triggers `DetectionVolume10`
+# (Event `finmap`, at (784,-48,-160) in front of the cabin): wait for that trigger, then walk into
+# the volume.
+t=466.90 wait_until event DetectionVolume10 .Trigger 90
+t=467.00 follow off
+t=467.10 goto 784 -48
+t=467.20 wait_until goal 5 30
+t=467.30 wait_travel

@@ -4778,11 +4778,17 @@ mod tests {
         );
         // The live clock takes temporise into Chasse. Decoded wall adjustment now
         // allows the authored search to finish and return to patrol without firing.
+        // item107c: back in `Patrouille` the killer asks `IAController.PickStartPoint` for a
+        // patrol point; the decoded native (XIDPawn.dll 0x11903b80) returns null when none of
+        // the map's 6 PatrolPoints is within 780 UU of the parked soldier (measured:
+        // `BaseSoldier6 route=0 -> None (candidates=6)`), so `Patrouille.PickDestination` takes its
+        // "can't go anywhere" branch and the soldier wanders (`Errance`) instead of staying in
+        // `Patrouille` (the earlier approximation returned the nearest navigation point).
         assert!(
             cue_enemy == Some(player)
                 && final_enemy.is_none()
                 && left_scripted_attack
-                && controller_state.as_deref() == Some("Patrouille")
+                && controller_state.as_deref() == Some("Errance")
                 && !controller_attack_seen
                 && !held_fire_seen
                 && !fire_request_seen
@@ -4806,6 +4812,13 @@ mod tests {
                 .iter()
                 .any(|(from, to)| from.as_deref() == Some("Chasse")
                     && to.as_deref() == Some("Patrouille"))
+        );
+        assert!(
+            scripted_states
+                .iter()
+                .any(|(from, to)| from.as_deref() == Some("Patrouille")
+                    && to.as_deref() == Some("Errance")),
+            "item107c: PickStartPoint finds no patrol point, so the soldier wanders"
         );
         assert_eq!(
             wall_adjust.len(),

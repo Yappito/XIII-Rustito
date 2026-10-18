@@ -1804,31 +1804,98 @@ fn test_direction(vm: &mut Vm<'_>, c: &NativeCtx, a: &mut [Value]) -> VmResult<N
 
 /// `IAController.PickStartPoint() -> PatrolPoint`.
 ///
-/// Disassembly evidence (XIDPawn.dll `?execPickStartPoint@AIAController` RVA 0x3B80): with no
-/// `BaseS` it returns null; otherwise it scans a level/`Game` list of points matching a route
-/// field (`candidate+0x268 == BaseS+0x574`, then a fallback `candidate+0x268 == None`), keeps the
-/// nearest that `Pawn.actorReachable(...)` accepts, and returns it. The list and route field names
-/// are not in the decoded reflection, so this returns the nearest decoded navigation point that
-/// fits the pawn (falling back to `StartSpot`); `None` when neither is available (documented
-/// `Partial`).
+/// Disassembly evidence (XIDPawn.dll `?execPickStartPoint@AIAController` RVA 0x3B80, image base
+/// 0x11900000), re-checked instruction by instruction (item106 decode, item107 re-check):
+///
+/// - `BaseS` (controller `+0x3b0`) null returns null (0x11903bc4..0x11903bed).
+/// - The candidate list is `Level.Game.PatrolPointList` (controller `+0x7c` Level, `+0x444` Game,
+///   `+0x310` the `FArray`; `GameInfo` script fills it with every `PatrolPoint`); null entries
+///   are skipped (`test esi,esi` at 0x11903c2f).
+/// - First pass, only when `BaseS.NumReseauPropre` (`+0x574`) is non-zero (0x11903bf0 jumps
+///   straight to the second pass otherwise): a candidate counts when its `NumReseau` (`+0x268`)
+///   equals `BaseS.NumReseauPropre`, its squared distance to the controller's pawn is at most
+///   608400.0 = 780 UU (the `fcomp` against the float at 0x11908d28, read from the DLL image:
+///   608400.0; `test ah,0x41; je` skips only a strictly larger distance) and
+///   `Pawn.actorReachable(candidate, 0, 0)` (call at 0x11903ca1, `Pawn` = controller `+0x1f0`)
+///   holds. The nearest such candidate wins; a later candidate replaces it only when strictly
+///   nearer (0x11903cf1..0x11903cfb: `best <= new` keeps the old one).
+/// - The second pass (0x11903d40..0x11903e47, disassembled in full) runs only when the first
+///   found nothing (0x11903d11..0x11903d18) and accepts candidates with `NumReseau == 0` under
+///   the same distance, reach and nearest-wins rules.
+/// - A pass that finds nothing returns null. Retail does NOT fall back to an arbitrary navigation
+///   point or `StartSpot`: `Patrouille.PickDestination` then takes its "can't go anywhere" branch
+///   and the soldier wanders (`Errance`) instead of holding in `Tenir`.
+///
+/// Hypothesis, not measured: the `+0x268`/`+0x574` offsets are matched to `PatrolPoint.NumReseau`
+/// and `BaseSoldier.NumReseauPropre` by name and by the property chain order, not by an
+/// offset computation (item106 measured support: the soldiers' `NumReseauPropre` values occur as
+/// `PatrolPoint.NumReseau` values within 780 UU of them on Hual01b).
 fn pick_start_point(vm: &mut Vm<'_>, c: &NativeCtx, _a: &mut [Value]) -> VmResult<NativeOutcome> {
-    let Some(pawn) = vm.obj_prop(c.this, "Pawn") else {
+    /// `fcomp` operand at XIDPawn.dll 0x11908d28: 780 squared.
+    const MAX_DIST_SQ: f32 = 608_400.0;
+    let (Some(base), Some(pawn)) = (vm.obj_prop(c.this, "BaseS"), vm.obj_prop(c.this, "Pawn"))
+    else {
         return val(Value::Object(None));
     };
-    let loc = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
-    let radius = vm.f32_prop(pawn, "CollisionRadius");
-    let height = vm.f32_prop(pawn, "CollisionHeight");
-    // The script follows `DestNavPoint.NextPatrolPoint`, so prefer an actual `PatrolPoint`.
-    if let Some(id) = vm.nav_nearest_point_actor(loc, radius, height, Some("PatrolPoint")) {
-        return val(Value::Object(Some(ObjRef::Instance(id))));
+    let route = match vm.get_property(base, "NumReseauPropre") {
+        Some(Value::Int(n)) => *n,
+        _ => 0,
+    };
+    let candidates: Vec<ObjectId> = vm
+        .obj_prop(c.this, "Level")
+        .and_then(|level| vm.obj_prop(level, "Game"))
+        .and_then(|game| match vm.get_property(game, "PatrolPointList") {
+            Some(Value::Array(items)) => Some(
+                items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Value::Object(Some(ObjRef::Instance(id)))
+                            if !vm.objects[*id as usize].deleted =>
+                        {
+                            Some(*id)
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let from = vm.vector_prop(pawn, "Location").unwrap_or([0.0; 3]);
+    let mut best: Option<(ObjectId, f32)> = None;
+    let mut passes = Vec::new();
+    if route != 0 {
+        passes.push(route);
     }
-    if let Some(id) = vm.nav_nearest_point_actor(loc, radius, height, None) {
-        return val(Value::Object(Some(ObjRef::Instance(id))));
+    passes.push(0);
+    for wanted in passes {
+        for &candidate in &candidates {
+            let number = match vm.get_property(candidate, "NumReseau") {
+                Some(Value::Int(n)) => *n,
+                _ => 0,
+            };
+            if number != wanted {
+                continue;
+            }
+            let at = vm.vector_prop(candidate, "Location").unwrap_or([0.0; 3]);
+            let d = [at[0] - from[0], at[1] - from[1], at[2] - from[2]];
+            let dist_sq = dot3(d, d);
+            if dist_sq > MAX_DIST_SQ {
+                continue;
+            }
+            let reachable = vm.pawn_actor_reachable(pawn, candidate, false)?;
+            if !reachable {
+                continue;
+            }
+            if best.is_none_or(|(_, nearest)| dist_sq < nearest) {
+                best = Some((candidate, dist_sq));
+            }
+        }
+        if best.is_some() {
+            break;
+        }
     }
-    if let Some(spot) = vm.obj_prop(c.this, "StartSpot") {
-        return val(Value::Object(Some(ObjRef::Instance(spot))));
-    }
-    val(Value::Object(None))
+    val(object_out(best.map(|(id, _)| id)))
 }
 
 /// `LevelInfo.IncAttaque()` (native 589, static).
@@ -5448,17 +5515,12 @@ fn builtin_defs() -> Vec<NativeDef> {
             test_direction,
         )
     });
-    v.push(NativeDef {
-        status: NativeStatus::Partial(
-            "nearest decoded navigation point that fits the pawn (fallback Controller.StartSpot); the engine's patrol-list/route-field search is not reproduced",
-        ),
-        ..def(
-            "IAController.PickStartPoint",
-            "native(0) function PatrolPoint PickStartPoint()",
-            "XIDPawn.dll ?execPickStartPoint@AIAController RVA 0x3B80 (scans a level/Game point list for the nearest reachable point on the soldier's route); see local/reports/item3g-xiii-ai-natives-re.md",
-            pick_start_point,
-        )
-    });
+    v.push(def(
+        "IAController.PickStartPoint",
+        "native(0) function PatrolPoint PickStartPoint()",
+        "XIDPawn.dll ?execPickStartPoint@AIAController RVA 0x3B80 (item107: Level.Game.PatrolPointList scan, route NumReseau match then NumReseau 0, 780 UU, Pawn.actorReachable, null when none); see the doc comment on pick_start_point",
+        pick_start_point,
+    ));
     // item14b: the combat-state AI natives. `incattaque` is the first native the attacked
     // soldier's `Attaque.BeginState` calls; the rest are used by the attack/steering states.
     v.push(NativeDef {

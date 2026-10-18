@@ -4838,6 +4838,8 @@ fn ai_fixture() -> Vec<u8> {
     let controller = b.reserve(0, 0, "Controller");
     let ia_controller = b.reserve(0, 0, "IAController");
     let patrol = b.reserve(0, 0, "PatrolPoint");
+    let level_class = b.reserve(0, 0, "LevelInfo");
+    let game_class = b.reserve(0, 0, "GameInfo");
 
     let object_extra = compact(0);
     let vector_extra = compact(IMP_STRUCT);
@@ -4854,38 +4856,58 @@ fn ai_fixture() -> Vec<u8> {
     let rotation = b.reserve(IMP_STRUCTPROP, actor, "Rotation");
     let radius = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
     let height = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
+    let physics = b.reserve(IMP_BYTEPROP, actor, "Physics");
 
     let ground = b.reserve(IMP_FLOATPROP, pawn, "GroundSpeed");
     let eye = b.reserve(IMP_FLOATPROP, pawn, "BaseEyeHeight");
     let alliance = b.reserve(IMP_NAMEPROP, pawn, "Alliance");
     let initial_alliances = b.reserve(IMP_STRUCTPROP, pawn, "InitialAlliances");
+    let route_own = b.reserve(IMP_INTPROP, pawn, "NumReseauPropre");
+    let can_walk = b.reserve(IMP_BOOLPROP, pawn, "bCanWalk");
+    let can_jump = b.reserve(IMP_BOOLPROP, pawn, "bCanJump");
+    let patrol_route = b.reserve(IMP_INTPROP, patrol, "NumReseau");
+    let level_game = b.reserve(IMP_OBJECTPROP, level_class, "Game");
+    let list_inner = b.reserve(IMP_OBJECTPROP, game_class, "PatrolPointListInner");
+    let patrol_list = b.reserve(IMP_ARRAYPROP, game_class, "PatrolPointList");
 
     let c_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
     let c_xiii = b.reserve(IMP_OBJECTPROP, controller, "XIII");
     let c_base = b.reserve(IMP_OBJECTPROP, controller, "BaseS");
     let c_start = b.reserve(IMP_OBJECTPROP, controller, "StartSpot");
     let c_dest = b.reserve(IMP_STRUCTPROP, controller, "Destination");
+    let c_level = b.reserve(IMP_OBJECTPROP, controller, "Level");
 
     b.prop_with(location, rotation, 0, &vector_extra);
     b.prop_with(rotation, radius, 0, &rotator_extra);
     b.prop(radius, height, 0);
-    b.prop(height, 0, 0);
+    b.prop(height, physics, 0);
+    b.prop_with(physics, 0, 0, &compact(0));
     b.prop(ground, eye, 0);
     b.prop(eye, alliance, 0);
     b.prop(alliance, initial_alliances, 0);
-    b.prop_array_dim(initial_alliances, 0, 0, alliance_entry, 4);
+    b.prop_array_dim(initial_alliances, route_own, 0, alliance_entry, 4);
+    b.prop(route_own, can_walk, 0);
+    b.prop(can_walk, can_jump, 0);
+    b.prop(can_jump, 0, 0);
+    b.prop(patrol_route, 0, 0);
+    b.prop_with(level_game, 0, 0, &object_extra);
+    b.prop_with(list_inner, 0, 0, &compact(patrol));
+    b.prop_with(patrol_list, 0, 0, &compact(list_inner));
     b.prop_with(c_pawn, c_xiii, 0, &object_extra);
     b.prop_with(c_xiii, c_base, 0, &object_extra);
     b.prop_with(c_base, c_start, 0, &object_extra);
     b.prop_with(c_start, c_dest, 0, &object_extra);
-    b.prop_with(c_dest, 0, 0, &vector_extra);
+    b.prop_with(c_dest, c_level, 0, &vector_extra);
+    b.prop_with(c_level, 0, 0, &object_extra);
 
     b.class(object, 0, 0, 0);
     b.class(actor, object, location, 0);
     b.class(pawn, actor, ground, 0);
     b.class(controller, actor, c_pawn, 0);
     b.class(ia_controller, controller, 0, 0);
-    b.class(patrol, actor, 0, 0);
+    b.class(patrol, actor, patrol_route, 0);
+    b.class(level_class, actor, level_game, 0);
+    b.class(game_class, actor, patrol_list, 0);
     b.build()
 }
 
@@ -5885,14 +5907,6 @@ impl MockNav {
                     distance: 500,
                 },
             ],
-        }
-    }
-
-    /// A graph with the given points and no edges.
-    fn with_points(points: Vec<NavPointInfo>) -> Self {
-        Self {
-            points,
-            edges: Vec::new(),
         }
     }
 }
@@ -12683,61 +12697,472 @@ fn test_direction_traces_and_reports_mindist_clearance() {
     }
 }
 
-#[test]
-fn pick_start_point_prefers_a_patrol_point_then_falls_back() {
-    let set = ai_set();
-    let mut vm = Vm::new(&set, VmLimits::default());
-    let ctrl = vm.spawn(pg(&set, "IAController"), "C").unwrap();
-    let pawn = spawn_at(&mut vm, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
+/// item107 fixture for `IAController.PickStartPoint` and `Pawn.actorReachable`: a walking pawn at
+/// the origin (radius 20, height 25, centre 0.5 UU above a floor slab with its top at z = 0)
+/// that is also its own `BaseS` (route `NumReseauPropre = route`), a `Level.Game.PatrolPointList`
+/// holding `points` (`(x, NumReseau)` on the x axis at the pawn's height, in list order) and the
+/// given extra walls.
+fn pick_start_world<'s>(
+    set: &'s ScriptSet,
+    route: i32,
+    points: &[(f32, i32)],
+    walls: &[([f32; 3], [f32; 3])],
+) -> (Vm<'s>, ObjectId, ObjectId, Vec<ObjectId>) {
+    let mut vm = Vm::new(set, VmLimits::default());
+    let mut world = MockWorld::new().with_wall([-5000.0, -5000.0, -100.0], [5000.0, 5000.0, 0.0]);
+    for &(min, max) in walls {
+        world = world.with_wall(min, max);
+    }
+    vm.set_physics(Box::new(world));
+    let ctrl = vm.spawn(pg(set, "IAController"), "C").unwrap();
+    let pawn = spawn_at(&mut vm, set, "Pawn", "P", [0.0, 0.0, 25.5]);
+    vm.set_property(pawn, "CollisionRadius", 0, Value::Float(20.0));
+    vm.set_property(pawn, "CollisionHeight", 0, Value::Float(25.0));
+    vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(20.0));
+    vm.set_property(pawn, "Physics", 0, Value::Byte(1));
+    vm.set_property(pawn, "bCanWalk", 0, Value::Bool(true));
+    vm.set_property(pawn, "NumReseauPropre", 0, Value::Int(route));
     vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
-    let _nav = spawn_at(&mut vm, &set, "Actor", "Nav0", [0.0, 0.0, 0.0]);
-    let patrol = spawn_at(&mut vm, &set, "PatrolPoint", "PP0", [400.0, 0.0, 0.0]);
-    vm.set_navigation(Box::new(MockNav::with_points(vec![
-        NavPointInfo {
-            actor: "Nav0".into(),
-            location: [0.0, 0.0, 0.0],
-            collision_radius: 120.0,
-            collision_height: 120.0,
-        },
-        NavPointInfo {
-            actor: "PP0".into(),
-            location: [400.0, 0.0, 0.0],
-            collision_radius: 120.0,
-            collision_height: 120.0,
-        },
-    ])));
-    let mut args: [Value; 0] = [];
-    assert_eq!(
-        call_native(&mut vm, "IAController.PickStartPoint", ctrl, &[], &mut args),
-        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(patrol))))
+    vm.set_property(
+        ctrl,
+        "BaseS",
+        0,
+        Value::Object(Some(ObjRef::Instance(pawn))),
     );
+    let level = vm.spawn(pg(set, "LevelInfo"), "L").unwrap();
+    let game = vm.spawn(pg(set, "GameInfo"), "G").unwrap();
+    vm.set_property(
+        ctrl,
+        "Level",
+        0,
+        Value::Object(Some(ObjRef::Instance(level))),
+    );
+    vm.set_property(
+        level,
+        "Game",
+        0,
+        Value::Object(Some(ObjRef::Instance(game))),
+    );
+    let mut ids = Vec::new();
+    for (i, (x, number)) in points.iter().enumerate() {
+        let id = spawn_at(
+            &mut vm,
+            set,
+            "PatrolPoint",
+            &format!("PP{i}"),
+            [*x, 0.0, 25.5],
+        );
+        vm.set_property(id, "NumReseau", 0, Value::Int(*number));
+        ids.push(id);
+    }
+    let list = ids
+        .iter()
+        .map(|id| Value::Object(Some(ObjRef::Instance(*id))))
+        .collect();
+    vm.set_property(game, "PatrolPointList", 0, Value::Array(list));
+    (vm, ctrl, pawn, ids)
+}
 
-    // No PatrolPoint: the nearest navigation point is used.
-    let mut vm = Vm::new(&set, VmLimits::default());
-    let ctrl = vm.spawn(pg(&set, "IAController"), "C").unwrap();
-    let pawn = spawn_at(&mut vm, &set, "Pawn", "P", [0.0, 0.0, 0.0]);
-    vm.set_property(ctrl, "Pawn", 0, Value::Object(Some(ObjRef::Instance(pawn))));
-    let near = spawn_at(&mut vm, &set, "Actor", "Nav0", [0.0, 0.0, 0.0]);
-    let _far = spawn_at(&mut vm, &set, "Actor", "Nav1", [900.0, 0.0, 0.0]);
-    vm.set_navigation(Box::new(MockNav::with_points(vec![
-        NavPointInfo {
-            actor: "Nav0".into(),
-            location: [0.0, 0.0, 0.0],
-            collision_radius: 120.0,
-            collision_height: 120.0,
-        },
-        NavPointInfo {
-            actor: "Nav1".into(),
-            location: [900.0, 0.0, 0.0],
-            collision_radius: 120.0,
-            collision_height: 120.0,
-        },
-    ])));
+fn pick_start(vm: &mut Vm<'_>, ctrl: ObjectId) -> Value {
     let mut args: [Value; 0] = [];
-    assert_eq!(
-        call_native(&mut vm, "IAController.PickStartPoint", ctrl, &[], &mut args),
-        NativeOutcome::Value(Value::Object(Some(ObjRef::Instance(near))))
+    match call_native(vm, "IAController.PickStartPoint", ctrl, &[], &mut args) {
+        NativeOutcome::Value(v) => v,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn instance(id: ObjectId) -> Value {
+    Value::Object(Some(ObjRef::Instance(id)))
+}
+
+#[test]
+fn pick_start_point_takes_the_nearest_point_of_the_soldiers_own_route() {
+    // XIDPawn.dll 0x11903bf0..0x11903d11: pass 1 keeps candidates with
+    // NumReseau == BaseS.NumReseauPropre; the nearest reachable one within 780 UU wins even
+    // when a point of another route (or route 0) is nearer.
+    let set = ai_set();
+    let (mut vm, ctrl, _, ids) = pick_start_world(
+        &set,
+        7,
+        &[(600.0, 7), (300.0, 7), (100.0, 0), (50.0, 3)],
+        &[],
     );
+    assert_eq!(pick_start(&mut vm, ctrl), instance(ids[1]));
+}
+
+#[test]
+fn pick_start_point_falls_back_to_unrouted_points_when_its_route_has_none() {
+    // 0x11903d11..0x11903d18: only when pass 1 found nothing does pass 2 accept NumReseau == 0.
+    let set = ai_set();
+    let (mut vm, ctrl, _, ids) =
+        pick_start_world(&set, 7, &[(50.0, 3), (400.0, 0), (200.0, 0)], &[]);
+    assert_eq!(pick_start(&mut vm, ctrl), instance(ids[2]));
+}
+
+#[test]
+fn pick_start_point_with_route_zero_never_takes_a_numbered_point() {
+    // 0x11903bf0: NumReseauPropre == 0 jumps straight to pass 2 (NumReseau == 0 only).
+    let set = ai_set();
+    let (mut vm, ctrl, _, ids) = pick_start_world(&set, 0, &[(50.0, 3), (400.0, 0)], &[]);
+    assert_eq!(pick_start(&mut vm, ctrl), instance(ids[1]));
+}
+
+#[test]
+fn pick_start_point_returns_null_when_no_patrol_point_qualifies() {
+    // The Kello01b wave soldiers: the map has no PatrolPoint at all, yet navigation points and a
+    // StartSpot exist. Retail returns null (no navigation-point or StartSpot fallback), which
+    // sends `Patrouille.PickDestination` to `Errance`; the old approximation returned the
+    // nearest navigation point and the soldier fell into `Tenir`.
+    let set = ai_set();
+    let (mut vm, ctrl, _, _) = pick_start_world(&set, 0, &[], &[]);
+    vm.set_navigation(Box::new(MockNav::line()));
+    let spot = spawn_at(&mut vm, &set, "Actor", "Spot", [10.0, 0.0, 25.5]);
+    vm.set_property(ctrl, "StartSpot", 0, instance(spot));
+    assert_eq!(pick_start(&mut vm, ctrl), Value::Object(None));
+    // Points of other routes only: still null.
+    let (mut vm, ctrl, _, _) = pick_start_world(&set, 7, &[(100.0, 3), (200.0, 5)], &[]);
+    assert_eq!(pick_start(&mut vm, ctrl), Value::Object(None));
+}
+
+#[test]
+fn pick_start_point_distance_limit_is_780_uu_inclusive() {
+    // 608400.0 = 780^2 at XIDPawn.dll 0x11908d28; a candidate at exactly 780 UU passes
+    // (`test ah,0x41; je` skips only a strictly larger distance), 780.5 does not.
+    let set = ai_set();
+    let (mut vm, ctrl, _, ids) = pick_start_world(&set, 0, &[(780.5, 0), (780.0, 0)], &[]);
+    assert_eq!(pick_start(&mut vm, ctrl), instance(ids[1]));
+    let (mut vm, ctrl, _, _) = pick_start_world(&set, 0, &[(780.5, 0), (900.0, 0)], &[]);
+    assert_eq!(pick_start(&mut vm, ctrl), Value::Object(None));
+}
+
+#[test]
+fn pick_start_point_requires_the_candidate_to_be_reachable() {
+    // `Pawn.actorReachable(candidate, 0, 0)` (0x11903ca1): a point behind a wall is skipped even
+    // when it is nearer than a reachable one, and with only walled-off points the result is null.
+    let set = ai_set();
+    let wall = ([140.0, -500.0, 0.0], [160.0, 500.0, 300.0]);
+    let (mut vm, ctrl, _, ids) = pick_start_world(&set, 0, &[(200.0, 0), (-300.0, 0)], &[wall]);
+    assert_eq!(pick_start(&mut vm, ctrl), instance(ids[1]));
+    let (mut vm, ctrl, _, _) = pick_start_world(&set, 0, &[(200.0, 0)], &[wall]);
+    assert_eq!(pick_start(&mut vm, ctrl), Value::Object(None));
+}
+
+#[test]
+fn pick_start_point_equal_distance_keeps_the_first_candidate_and_missing_base_is_null() {
+    // A later candidate replaces the best only when strictly nearer (0x11903cf1..0x11903cfb).
+    let set = ai_set();
+    let (mut vm, ctrl, _, ids) = pick_start_world(&set, 0, &[(200.0, 0), (-200.0, 0)], &[]);
+    assert_eq!(pick_start(&mut vm, ctrl), instance(ids[0]));
+    // No BaseS: null (0x11903bca..0x11903bed).
+    vm.set_property(ctrl, "BaseS", 0, Value::Object(None));
+    assert_eq!(pick_start(&mut vm, ctrl), Value::Object(None));
+}
+
+#[test]
+fn actor_reachable_walks_the_floor_and_stops_at_walls_ledges_and_the_range_limit() {
+    // Engine.dll APawn::actorReachable 0x103b71b0 / walkReachable 0x103b6860 (structure; see the
+    // doc comment on `Vm::pawn_actor_reachable` for what is Partial).
+    let set = ai_set();
+    let (mut vm, _, pawn, ids) = pick_start_world(&set, 0, &[(400.0, 0)], &[]);
+    assert!(vm.pawn_actor_reachable(pawn, ids[0], false).unwrap());
+    // 0x103b7320: beyond 1200 UU (1440000.0 squared) nothing is reachable, 1200 itself is.
+    let (mut vm, _, pawn, ids) = pick_start_world(&set, 0, &[(1200.0, 0), (1200.5, 0)], &[]);
+    assert!(vm.pawn_actor_reachable(pawn, ids[0], false).unwrap());
+    assert!(!vm.pawn_actor_reachable(pawn, ids[1], false).unwrap());
+    // A wall in the way blocks the walk (the pawn box cannot pass it).
+    let wall = ([140.0, -500.0, 0.0], [160.0, 500.0, 300.0]);
+    let (mut vm, _, pawn, ids) = pick_start_world(&set, 0, &[(400.0, 0)], &[wall]);
+    assert!(!vm.pawn_actor_reachable(pawn, ids[0], false).unwrap());
+    // A gap in the floor (the slab ends at x = 200 for the whole width): walking there drops the
+    // pawn off its floor, which walkReachable does not follow.
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([-5000.0, -5000.0, -100.0], [200.0, 5000.0, 0.0]),
+    ));
+    let pawn = spawn_at(&mut vm, &set, "Pawn", "P", [0.0, 0.0, 25.5]);
+    for (prop, v) in [
+        ("CollisionRadius", Value::Float(20.0)),
+        ("CollisionHeight", Value::Float(25.0)),
+        ("Physics", Value::Byte(1)),
+        ("bCanWalk", Value::Bool(true)),
+    ] {
+        vm.set_property(pawn, prop, 0, v);
+    }
+    let across = spawn_at(&mut vm, &set, "PatrolPoint", "Across", [400.0, 0.0, 25.5]);
+    assert!(!vm.pawn_actor_reachable(pawn, across, true).unwrap());
+    let before = spawn_at(&mut vm, &set, "PatrolPoint", "Before", [100.0, 0.0, 25.5]);
+    assert!(vm.pawn_actor_reachable(pawn, before, true).unwrap());
+    // The test never moves the pawn.
+    assert_eq!(vm.vector_prop(pawn, "Location"), Some([0.0, 0.0, 25.5]));
+}
+
+#[test]
+fn actor_reachable_needs_a_walking_pawn_and_a_clear_line_unless_visibility_is_known() {
+    let set = ai_set();
+    // 0x103b7374: a pawn that can neither walk nor fly reaches nothing.
+    let (mut vm, _, pawn, ids) = pick_start_world(&set, 0, &[(200.0, 0)], &[]);
+    vm.set_property(pawn, "bCanWalk", 0, Value::Bool(false));
+    assert!(!vm.pawn_actor_reachable(pawn, ids[0], false).unwrap());
+    // 0x103b73d8..0x103b7449: without bKnowVisible the eye -> goal line must be clear. This wall
+    // hangs above the pawn box (top z = 50.5) but across the eye line (z ~ 55 at x = 200).
+    let hanging = ([190.0, -500.0, 60.0], [210.0, 500.0, 300.0]);
+    let (mut vm, _, pawn, ids) = pick_start_world(&set, 0, &[(400.0, 0)], &[hanging]);
+    vm.set_property(pawn, "BaseEyeHeight", 0, Value::Float(80.0));
+    assert!(!vm.pawn_actor_reachable(pawn, ids[0], false).unwrap());
+    assert!(
+        vm.pawn_actor_reachable(pawn, ids[0], true).unwrap(),
+        "the walk itself passes under the wall; only the sight line fails"
+    );
+    // A deleted goal is unreachable (0x103b71dd).
+    let (mut vm, _, pawn, ids) = pick_start_world(&set, 0, &[(100.0, 0)], &[]);
+    assert!(vm.pawn_actor_reachable(pawn, ids[0], false).unwrap());
+    vm.destroy(ids[0]).unwrap();
+    assert!(!vm.pawn_actor_reachable(pawn, ids[0], false).unwrap());
+}
+
+// ---------------------------------------------------------------------------------------
+// item107: `ULevel::MoveActor` -> `APawn::NotifyBump` (Engine.dll 0x1038b15c, 0x10387d80)
+
+/// Fixture for the bump path: the pieces `controller_move_step` reads plus
+/// - `Actor.Bump(Other)`   `Bumped = 3`        (the blocking mover's `eventBump`)
+/// - `Pawn.Bump(Other)`    `PawnBumped = 3`    (the pawn's own `eventBump`)
+/// - `Controller.NotifyBump(Other) : bool`  `Notified = 3; return Handles`.
+fn item107_bump_fixture() -> Vec<u8> {
+    use ff::*;
+    use pf::*;
+    let mut b = SpawnB::new();
+    let object = b.reserve(0, 0, "Object");
+    let actor = b.reserve(0, 0, "Actor");
+    let pawn = b.reserve(0, 0, "Pawn");
+    let controller = b.reserve(0, 0, "Controller");
+    let mover = b.reserve(0, 0, "Mover");
+
+    let location = b.reserve(IMP_STRUCTPROP, actor, "Location");
+    let velocity = b.reserve(IMP_STRUCTPROP, actor, "Velocity");
+    let acceleration = b.reserve(IMP_STRUCTPROP, actor, "Acceleration");
+    let radius = b.reserve(IMP_FLOATPROP, actor, "CollisionRadius");
+    let height = b.reserve(IMP_FLOATPROP, actor, "CollisionHeight");
+    let ground_speed = b.reserve(IMP_FLOATPROP, actor, "GroundSpeed");
+    let accel_rate = b.reserve(IMP_FLOATPROP, actor, "AccelRate");
+    let desired_speed = b.reserve(IMP_FLOATPROP, actor, "DesiredSpeed");
+    let c_pawn = b.reserve(IMP_OBJECTPROP, actor, "Pawn");
+    let c_controller = b.reserve(IMP_OBJECTPROP, actor, "Controller");
+    let collide_world = b.reserve(IMP_BOOLPROP, actor, "bCollideWorld");
+    let physics = b.reserve(IMP_BYTEPROP, actor, "Physics");
+    let world_geometry = b.reserve(IMP_BOOLPROP, actor, "bWorldGeometry");
+    let base = b.reserve(IMP_OBJECTPROP, actor, "Base");
+    let bumped = b.reserve(IMP_INTPROP, actor, "Bumped");
+    let actor_bump = b.reserve(IMP_FUNCTION, actor, "Bump");
+    let actor_bump_other = b.reserve(IMP_OBJECTPROP, actor_bump, "Other");
+
+    let pawn_bumped = b.reserve(IMP_INTPROP, pawn, "PawnBumped");
+    let pawn_bump = b.reserve(IMP_FUNCTION, pawn, "Bump");
+    let pawn_bump_other = b.reserve(IMP_OBJECTPROP, pawn_bump, "Other");
+
+    let notified = b.reserve(IMP_INTPROP, controller, "Notified");
+    let handles = b.reserve(IMP_BOOLPROP, controller, "Handles");
+    let notify_bump = b.reserve(IMP_FUNCTION, controller, "NotifyBump");
+    let notify_other = b.reserve(IMP_OBJECTPROP, notify_bump, "Other");
+    let notify_ret = b.reserve(IMP_BOOLPROP, notify_bump, "ReturnValue");
+
+    let vector_extra = compact(IMP_STRUCT);
+    let object_extra = compact(actor);
+    let fields = [
+        (location, vector_extra.clone()),
+        (velocity, vector_extra.clone()),
+        (acceleration, vector_extra.clone()),
+        (radius, vec![]),
+        (height, vec![]),
+        (ground_speed, vec![]),
+        (accel_rate, vec![]),
+        (desired_speed, vec![]),
+        (c_pawn, object_extra.clone()),
+        (c_controller, object_extra.clone()),
+        (collide_world, vec![]),
+        (physics, compact(0)),
+        (world_geometry, vec![]),
+        (base, object_extra.clone()),
+        (bumped, vec![]),
+    ];
+    for (i, (field, extra)) in fields.iter().enumerate() {
+        let next = fields.get(i + 1).map_or(actor_bump, |next| next.0);
+        b.prop_with(*field, next, 0, extra);
+    }
+    b.prop_with(actor_bump_other, 0, PARM, &object_extra);
+    b.prop_with(pawn_bump_other, 0, PARM, &object_extra);
+    b.prop_with(notify_other, notify_ret, PARM, &object_extra);
+    b.prop(notify_ret, 0, RETURN_PARM);
+    b.prop(pawn_bumped, pawn_bump, 0);
+    b.prop(notified, handles, 0);
+    b.prop(handles, notify_bump, 0);
+
+    // `Bumped = 3; return`.
+    let code = [0x0F, 0x01, bumped as u8, 0x2C, 3, 0x04, 0x0B];
+    b.func(actor_bump, 0, actor_bump_other, &code, 10, 0, DEFINED);
+    // `PawnBumped = 3; return`.
+    let code = [0x0F, 0x01, pawn_bumped as u8, 0x2C, 3, 0x04, 0x0B];
+    b.func(pawn_bump, 0, pawn_bump_other, &code, 10, 0, DEFINED);
+    // `Notified = 3; return Handles`.
+    let code = [
+        0x0F,
+        0x01,
+        notified as u8,
+        0x2C,
+        3,
+        0x04,
+        0x01,
+        handles as u8,
+    ];
+    b.func(notify_bump, 0, notify_other, &code, 14, 0, DEFINED);
+
+    b.class(object, 0, 0, 0);
+    b.class(actor, object, location, 0);
+    b.class(pawn, actor, pawn_bumped, 0);
+    b.class(controller, actor, notified, 0);
+    b.class(mover, actor, 0, 0);
+    b.build()
+}
+
+fn item107_bump_set() -> ScriptSet {
+    let p = ScriptPackage::load(
+        "Test",
+        item107_bump_fixture(),
+        &ScriptLimits::default(),
+        &Limits::default(),
+    )
+    .expect("package");
+    assert!(p.errors.is_empty(), "{:?}", p.errors);
+    let mut set = ScriptSet::new();
+    set.add(p);
+    set
+}
+
+/// A pawn walking +x into a door-shaped wall at x = 100..120 that the world names `Porte`.
+fn bump_world<'s>(set: &'s ScriptSet, wall: bool) -> (Vm<'s>, ObjectId, ObjectId, ObjectId) {
+    let mut vm = Vm::new(set, VmLimits::default());
+    // A floor slab (top at z = 0) under the pawn, so the walk is supported, and the door.
+    let mut inner = MockWorld::new().with_wall([-5000.0, -5000.0, -100.0], [5000.0, 5000.0, 0.0]);
+    if wall {
+        inner = inner.with_wall([100.0, -50.0, 0.0], [120.0, 50.0, 200.0]);
+    }
+    vm.set_physics(Box::new(NamedHitWorld {
+        inner,
+        actor: "Porte".into(),
+        registered: true,
+    }));
+    let door = vm.spawn(pg(set, "Mover"), "Porte").unwrap();
+    let pawn = vm.spawn(pg(set, "Pawn"), "P").unwrap();
+    vm.set_property(pawn, "Location", 0, Value::Vector([0.0, 0.0, 30.5]));
+    vm.set_property(pawn, "Physics", 0, Value::Byte(1));
+    vm.set_property(pawn, "CollisionRadius", 0, Value::Float(20.0));
+    vm.set_property(pawn, "CollisionHeight", 0, Value::Float(30.0));
+    vm.set_property(pawn, "GroundSpeed", 0, Value::Float(400.0));
+    vm.set_property(pawn, "AccelRate", 0, Value::Float(800.0));
+    vm.set_property(pawn, "DesiredSpeed", 0, Value::Float(1.0));
+    vm.set_property(pawn, "bCollideWorld", 0, Value::Bool(true));
+    let ctrl = vm.spawn(pg(set, "Controller"), "C").unwrap();
+    vm.set_property(ctrl, "Pawn", 0, instance(pawn));
+    vm.set_property(pawn, "Controller", 0, instance(ctrl));
+    (vm, ctrl, pawn, door)
+}
+
+fn walk_into_the_door(vm: &mut Vm<'_>, ctrl: ObjectId, pawn: ObjectId) {
+    for _ in 0..60 {
+        vm.controller_move_step(ctrl, pawn, [1000.0, 0.0, 30.5], 0.05)
+            .unwrap();
+    }
+}
+
+fn int_prop(vm: &Vm<'_>, id: ObjectId, name: &str) -> i32 {
+    match vm.get_property(id, name) {
+        Some(Value::Int(n)) => *n,
+        other => panic!("{name}: {other:?}"),
+    }
+}
+
+#[test]
+fn a_walking_pawn_pressing_a_mover_is_offered_to_its_controller_first() {
+    // MoveActor notifies the blocker (`Bump` on the door) and then the mover: `APawn::NotifyBump`
+    // runs `Controller.NotifyBump`; the pawn's own `Bump` only runs when that returns false.
+    let set = item107_bump_set();
+    let (mut vm, ctrl, pawn, door) = bump_world(&set, true);
+    walk_into_the_door(&mut vm, ctrl, pawn);
+    let loc = vm.vector_prop(pawn, "Location").unwrap();
+    assert!(
+        loc[0] > 60.0 && loc[0] < 81.0,
+        "stopped at the door: {loc:?}"
+    );
+    assert_eq!(int_prop(&vm, door, "Bumped"), 3, "the door was bumped");
+    assert_eq!(
+        int_prop(&vm, ctrl, "Notified"),
+        3,
+        "the controller was asked"
+    );
+    assert_eq!(
+        int_prop(&vm, pawn, "PawnBumped"),
+        3,
+        "an unhandled bump falls through to the pawn's Bump"
+    );
+}
+
+#[test]
+fn a_controller_that_handles_the_bump_keeps_it_from_the_pawn() {
+    let set = item107_bump_set();
+    let (mut vm, ctrl, pawn, door) = bump_world(&set, true);
+    vm.set_property(ctrl, "Handles", 0, Value::Bool(true));
+    walk_into_the_door(&mut vm, ctrl, pawn);
+    assert_eq!(int_prop(&vm, ctrl, "Notified"), 3);
+    assert_eq!(int_prop(&vm, door, "Bumped"), 3);
+    assert_eq!(
+        int_prop(&vm, pawn, "PawnBumped"),
+        0,
+        "Engine.dll 0x10387d98: a true result skips eventBump"
+    );
+}
+
+#[test]
+fn world_geometry_blockers_and_the_actor_below_are_not_bumped() {
+    // Engine.dll 0x1038b149: `Hit.Actor` with the bWorldGeometry bit is skipped, and 0x1030f1d0
+    // (`AActor::IsBasedOn`) skips an actor standing on the blocker (a rider on its mover).
+    let set = item107_bump_set();
+    let (mut vm, ctrl, pawn, door) = bump_world(&set, true);
+    vm.set_property(door, "bWorldGeometry", 0, Value::Bool(true));
+    walk_into_the_door(&mut vm, ctrl, pawn);
+    assert!(
+        vm.vector_prop(pawn, "Location").unwrap()[0] < 81.0,
+        "still blocked"
+    );
+    assert_eq!(int_prop(&vm, door, "Bumped"), 0);
+    assert_eq!(int_prop(&vm, ctrl, "Notified"), 0);
+    assert_eq!(int_prop(&vm, pawn, "PawnBumped"), 0);
+    let (mut vm, ctrl, pawn, door) = bump_world(&set, true);
+    vm.set_property(pawn, "Base", 0, instance(door));
+    walk_into_the_door(&mut vm, ctrl, pawn);
+    assert_eq!(int_prop(&vm, door, "Bumped"), 0, "based on the blocker");
+    assert_eq!(int_prop(&vm, ctrl, "Notified"), 0);
+    // A blocker that is neither is bumped (the default case, see the first test).
+    let (mut vm, ctrl, pawn, door) = bump_world(&set, true);
+    walk_into_the_door(&mut vm, ctrl, pawn);
+    assert_eq!(int_prop(&vm, door, "Bumped"), 3);
+}
+
+#[test]
+fn no_bump_is_raised_without_a_blocking_mover_or_without_a_controller() {
+    let set = item107_bump_set();
+    // Free walk: nothing blocks, nobody is notified.
+    let (mut vm, ctrl, pawn, door) = bump_world(&set, false);
+    walk_into_the_door(&mut vm, ctrl, pawn);
+    assert!(vm.vector_prop(pawn, "Location").unwrap()[0] > 300.0);
+    assert_eq!(int_prop(&vm, door, "Bumped"), 0);
+    assert_eq!(int_prop(&vm, ctrl, "Notified"), 0);
+    assert_eq!(int_prop(&vm, pawn, "PawnBumped"), 0);
+    // A pawn with no Controller: `NotifyBump` goes straight to the pawn's `eventBump`
+    // (0x10387d80: `test ecx,ecx; je` to 0x10387d9c).
+    let (mut vm, ctrl, pawn, door) = bump_world(&set, true);
+    vm.set_property(pawn, "Controller", 0, Value::Object(None));
+    vm.pawn_notify_bump(pawn, door).unwrap();
+    assert_eq!(int_prop(&vm, pawn, "PawnBumped"), 3);
+    assert_eq!(int_prop(&vm, ctrl, "Notified"), 0);
 }
 
 // ---------------------------------------------------------------------------------------

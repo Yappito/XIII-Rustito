@@ -1569,10 +1569,11 @@ impl Drive {
             None => {
                 e.ignored.retain(|(_, until)| *until > elapsed);
                 let mut current = e.target.as_deref().and_then(|t| {
-                    self.facts
-                        .hostiles
-                        .iter()
-                        .find(|s| s.name == t && s.distance <= radius)
+                    self.facts.hostiles.iter().find(|s| {
+                        s.name == t
+                            && s.distance <= radius
+                            && !e.ignored.iter().any(|(n, _)| *n == s.name)
+                    })
                 });
                 // Shots that never hurt the target: give up on it for a while.
                 if let Some(c) = current {
@@ -1600,7 +1601,8 @@ impl Drive {
                 }
                 current
                     .or_else(|| nearest_hostile(&self.facts.hostiles, radius, &e.ignored, true))
-                    // Nothing else to shoot at: keep trying the ignored one.
+                    // Nothing else to shoot at: keep trying the ignored one (a long-range
+                    // automatic burst often needs seconds to land its first hits).
                     .or_else(|| nearest_hostile(&self.facts.hostiles, radius, &e.ignored, false))
                     .map(|s| {
                         if e.target.as_deref() != Some(s.name.as_str()) {
@@ -1625,6 +1627,10 @@ impl Drive {
                 e.target = Some(name);
                 self.engage_aim = Some(aim);
                 if self.engage_fire(e, elapsed) {
+                    // Nothing carried can fire: stop holding the aim so a pending `goto` walks on
+                    // (a standing engagement must not pin the player to a spot with an empty gun).
+                    self.engage_aim = None;
+                    self.engage_release();
                     return true;
                 }
                 false
@@ -3343,5 +3349,43 @@ t=0.5 forward 1
             );
         }
         assert!((sim.yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+    }
+    #[test]
+    fn standing_engagement_with_an_empty_gun_lets_the_waypoint_walk_on() {
+        // Measured on Amos01: the level's Beretta ran dry, the standing engagement kept the aim on a
+        // distant soldier and the player stood there for the rest of the run.
+        let s = Script::parse(
+            "t=0 engage_on 2000
+t=0 goto 1000 0
+",
+        )
+        .unwrap();
+        let mut d = Drive::new(&s);
+        let mut sim = PlayerSim::new([0.0; 3], 0.0);
+        let mut t = 0.0;
+        step(&mut d, &mut sim, &mut t, Facts::default());
+        let foe = seen("Foe", [0.0, 300.0, 70.0], 300.0);
+        let dry = |foe: &Seen| Facts {
+            hostiles: vec![foe.clone()],
+            weapon: Some(WeaponFact {
+                clip: Some(0),
+                melee: false,
+                alternatives: vec![],
+            }),
+            ..Facts::default()
+        };
+        // While the reload is given its time the player stands and aims.
+        let (i, _, execs) = step(&mut d, &mut sim, &mut t, dry(&foe));
+        assert_eq!(i.forward, 0.0);
+        assert!(execs.contains(&"Reload"));
+        // Past the reload wait with nothing else to switch to: nothing can fire, the aim is dropped and
+        // the pending waypoint walks on.
+        let mut walked = false;
+        while t < 6.0 {
+            let (i, fire, _) = step(&mut d, &mut sim, &mut t, dry(&foe));
+            assert!(!fire.0, "an empty gun is never pressed");
+            walked |= i.forward == 1.0;
+        }
+        assert!(walked, "the waypoint resumes");
     }
 }

@@ -70,6 +70,13 @@ t=72.30 forward 0
 t=72.30 engage BaseSoldier 1500 10
 # TouchTrigger9 (-307,-1396) on the way down; objective 0 completes in the game's own chain.
 t=73.50 goto -307.0 -1400.0
+# item107c: with the retail `PickStartPoint` (null when no PatrolPoint qualifies) the shore soldiers
+# wander (`Errance`) instead of holding, so they arrive when and where the recorded stand-and-burst
+# blocks did not expect them (measured: the player died at t=314 with the killer never in sight).
+# From here a standing engagement shoots whichever hostile is visible, whenever it is, while the
+# walking schedule keeps its clock; it is switched off around the fight-probe cut and for the
+# killer fight below.
+t=74.00 engage_on 3500 period=0.3
 
 # ---- beach: nav polyline southwest to the truck shore ------------------------------------
 # Waypoints are the map's decoded ReachSpec polyline. The distance/150 + 2 s per goto is a
@@ -100,7 +107,6 @@ t=144.20 goto -861.8 -8127.4
 # on the spot he reaches, (-877,-8153) (the goto above ends 30 UU short, so it stays active and
 # would keep the yaw), and bursts him: he dies at 147.1 s (r5).
 t=146.40 goto -877.1 -8153.1
-t=146.50 engage BaseSoldier4 2000 10
 t=152.90 goto -1686.3 -8702.9
 t=160.90 goto -2554.9 -8907.9
 t=169.10 goto -3413.6 -9257.6
@@ -121,11 +127,9 @@ t=189.70 goto -4319.9 -9475.7
 # yaw, so it is replaced by the reached spot before the tracked burst (measured r5:
 # BaseSoldier7 dies at 190.8 s on the first two hits).
 t=190.10 goto -4347.7 -9495.1
-t=190.20 engage BaseSoldier7 2000 10
 # BaseSoldier4 hunted along the shore from the east and parks 300-600 UU north-east of the
 # crossing; burst him from the same stand - before walking past BaseSoldier7's corpse, which
 # sits directly on the firing line afterwards (measured: the post-leg burst hit the corpse).
-t=192.10 engage BaseSoldier4 2000 10
 t=195.30 goto -4630.0 -9531.7
 t=202.70 goto -5568.0 -9793.0
 t=209.50 goto -5902.0 -10424.5
@@ -133,7 +137,6 @@ t=209.50 goto -5902.0 -10424.5
 # walks the shore and hovers around (-5902,-10424) - 150-250 UU off this leg. Walking past him
 # unharmed measured ~45 hp of magnum fire (the first round-8 route run), so the player bursts
 # him here at contact range.
-t=210.60 engage BaseSoldier8 2000 10
 t=213.20 goto -5839.7 -10664.2
 t=217.80 goto -5738.4 -11048.0
 t=223.20 goto -5445.3 -11461.0
@@ -149,6 +152,7 @@ t=278.90 goto -366.7 -13757.3
 t=288.20 goto 643.2 -14174.5
 
 
+t=288.50 engage_off
 # fight-probe cut: the opt-in fight tests (plage01_killer_awake_prefix) take the route only up
 # to this line. The T7 shore touch above (~289.6 s) has woken BaseSoldier6 out of his
 # IAController `faction` stasis; he then hunts the player's position and stops at the water's
@@ -162,8 +166,7 @@ t=288.20 goto 643.2 -14174.5
 # reaches them with `track` aim at 1540/2750 UU, 45 hp/hit, every fired round landing (measured
 # r8_e2). The fires start as the player arrives at PathNode47 (the goto above lands ~291).
 t=291.10 switch_weapon 16
-t=291.30 engage BaseSoldier9 3500 20
-t=291.40 engage BaseSoldier10 3500 20
+t=291.20 engage_on 3500 period=0.3
 # ---- the killer: he settles at the water's edge ~(1100,-13750) from ~300 s (r8_e2) and stays
 # there while the player holds the shore. switch_weapon 2 requests the picked-up Beretta
 # (InventoryGroup 2) before the burst; the checkpoint acceptance also checks its selection
@@ -171,6 +174,7 @@ t=291.40 engage BaseSoldier10 3500 20
 # item76 (measured r5): from the 630 UU stand no round reached him (0 hits in 15), and a fire
 # during the M60's 0.67 s DownWeapon aborted the switch. The player now walks to ~250 UU of him
 # while the Beretta comes up, then fires head-aimed from 304.4 s: he dies at 305.0 s.
+t=302.50 engage_off
 t=302.60 switch_weapon 2
 t=303.00 goto_until 947.0 -13924.0 arrived 10
 t=303.10 engage BaseSoldier6 3000 20

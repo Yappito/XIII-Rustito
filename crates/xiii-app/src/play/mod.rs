@@ -6345,6 +6345,7 @@ mod tests {
         // health is 31 (FindSpot alone was 17, the ledge rule alone 40). BaseSoldier6 still dies.
         let script = script::Script::parse(&format!(
             "{}t=291.00 teleport 1802.0 -12700.0 1100.0\n\
+             t=291.02 goto 1802.0 -12700.0\n\
              t=291.00 track BaseSoldier6\n\
              t=291.10 weapon XIII.Beretta\n\
              t=292.50 fire\nt=293.05 fire\nt=293.60 fire\nt=294.15 fire\nt=294.70 fire\n\
@@ -6387,17 +6388,17 @@ mod tests {
         assert!(weapon.is_some(), "the player must hold the granted weapon");
         assert_eq!(
             s.player_health(),
-            Some(12.0),
-            "measured surviving fight health (item107: 12, was 18. The route prefix now fights \
-             with closed-loop `engage` blocks that pause the script clock, so the `t=291` lines \
-             above start about 5 s later in game time (measured: BaseSoldier6 dies at 305.6 s, \
-             not 294.7 s; 37 hp at the stand instead of 39); the same tree with the previous \
-             recorded prefix still measures 18. item104: 18 on the integrated tree; \
-             item102 measured 31 on its own base with FindSpot + the ledge rule. On this tree \
-             skipping the steered-walking friction (temporary env gate) also gives 18, so the \
-             friction is not the cause; disabling only the ledge rule gives 0 (player dead). The \
-             31 -> 18 shift is not isolated (hypothesis: the origin/main commits merged into \
-             this tree); item100 measured 17 with friction and no ledge rule on its base)"
+            Some(78.0),
+            "measured surviving fight health (item107d: 78. The item107c prefix now shoots the \
+             shore soldiers with a standing `engage_on` (the retail `PickStartPoint` leaves them \
+             wandering instead of holding), so the player reaches the stand at 95 hp; the killer \
+             fight below then costs 17 hp (95 -> 78). The item107c pin was 86, measured while the \
+             prefix's last `goto` was still pending, so the diagnostic stand drifted off the \
+             teleport spot; this test now issues `goto 1802 -12700` after the teleport to cancel \
+             the orphaned route destination and hold the intended fixed stand (measured \
+             (1802,-12700,1072.4)), so the fight costs 17 hp instead of 9. BaseSoldier6 still \
+             dies. Older history: item107c 86, item107 12, item104 18 on the integrated tree; \
+             item102 measured 31 on its own base with FindSpot + the ledge rule.)"
         );
         let position = s.vm().location_prop(s.player).expect("player location");
         assert!(
@@ -7320,10 +7321,15 @@ mod tests {
         // return fire now kills it (the aim fix below), so the ending scene advances past
         // counter_finact2b and the courtyard damage is shorter: the route ends at health 65
         // instead of the old 79 (item86) or the 35 measured while BaseSoldier14 survived.
+        // item107c: the route now ends at health 70 (was 65). Measured cause: the pawn bump path
+        // (`APawn::NotifyBump` -> `IAController.NotifyBump`) lets `BaseSoldier5` open the door `porte1`
+        // it presses against (first bump 194.9 s), so it reaches the player at 202 s (hits 25+25+21+
+        // 15x5 raw) and the tarmac soldier `BaseSoldier18` lands 116 raw instead of 268 (without the
+        // bump path the same run ends at 65). Same kills.
         assert_eq!(
-            health, 65.0,
-            "the re-timed route must end at the measured health 65 (item101: the courtyard \
-             BaseSoldier14 fight the ledge fix restored, plus the tarmac fight)"
+            health, 70.0,
+            "the re-timed route must end at the measured health 70 (item107c: door-bump path; \
+             item101: the courtyard BaseSoldier14 fight the ledge fix restored, plus the tarmac fight)"
         );
         let soldier17 = session
             .vm()
@@ -7683,13 +7689,17 @@ mod tests {
         // item101: with the ledge rule restored the ending scene advances past
         // counter_finact2b (the courtyard BaseSoldier14 now dies), which retimes the later
         // phase; the measured soldier18 corpse value becomes Health -97 (route run18).
+        // item107c: with the pawn bump path (`BaseSoldier5` opens `porte1`, see the health pin
+        // below) the landing fight is re-timed again: the corpse value is -18 = 150 - 3 x 56, the
+        // minimal three-hit M60 kill (the item64f pattern 150 -> 94 -> 38 -> -18); the extra rounds
+        // that made it -97 no longer land after the death.
         let soldier18 = vm
             .find_object("BaseSoldier18")
             .expect("BaseSoldier18 must exist");
         assert_eq!(
             vm.get_property(soldier18, "Health"),
-            Some(&xiii_script::Value::Int(-97)),
-            "the landing M60 engagement must reproduce the measured kill (item101: Health -97)"
+            Some(&xiii_script::Value::Int(-18)),
+            "the landing M60 engagement must reproduce the measured kill (item107c: Health -18;              item101: -97)"
         );
         assert!(
             session.actor_is_dead(soldier18),
@@ -8738,13 +8748,20 @@ mod tests {
         let source_input =
             script::Script::parse(include_str!("../../tests/data/hual04a_route.script"))
                 .expect("source input");
-        let mut source = run_script_with_cinematic_input(
+        // item107c: the Hual04a route now ends with the map's own travel request; stop there so the
+        // source session is still Hual04a's.
+        let mut source = run_script_inner(
             &game_dir,
             "Hual04a",
             &source_input,
             &params,
             &source_scene,
             620.0,
+            true,
+            RunnerOptions {
+                stop_on_travel: true,
+                ..Default::default()
+            },
         )
         .expect("measured Hual04a endpoint");
         println!(
@@ -9557,13 +9574,20 @@ mod tests {
                 || command.contains("teleport")
         }));
         let script = script::Script::parse(text).expect("parse Hual04a route");
-        let outcome = run_script_with_cinematic_input(
+        // item107c: the route now ends with the map's own travel to Hual04c; stop the run at the
+        // request so the assertions below read the Hual04a session.
+        let outcome = run_script_inner(
             &game_dir,
             "Hual04a",
             &script,
             &resolved.params,
             &scene,
             620.0,
+            true,
+            RunnerOptions {
+                stop_on_travel: true,
+                ..Default::default()
+            },
         )
         .expect("run Hual04a route");
         let session = &outcome.session;
@@ -9681,11 +9705,15 @@ mod tests {
             _ => (-1, None),
         };
         println!("[hual04a item94] cine action_index={cine_action_index} current={cine_action:?}");
-        let p = player_loc.expect("player location");
+        let _p = player_loc.expect("player location");
+        // item107c: the route no longer ends on the platform: after the second wave it walks to
+        // `DetectionVolume10` and the map travels. The old end-position pin therefore reads the
+        // trace: the walked route must have stood on the boarding platform (PositionInfo23).
         assert!(
-            (p[0] - 945.8).abs() < 60.0 && (p[1] - 393.75).abs() < 60.0 && p[2] < -50.0,
-            "item94: the walked route must reach the boarding platform at PositionInfo23 \
-             (945.8,393.8,-105): {p:?}"
+            outcome.trace.iter().any(|(_, _, p, _)| {
+                (p[0] - 945.8).abs() < 60.0 && (p[1] - 393.75).abs() < 60.0 && p[2] < -50.0
+            }),
+            "item94: the walked route must reach the boarding platform at PositionInfo23 (945.8,393.8,-105)"
         );
         // item95: the ported `ULevel::FindSpot` adjusts the cine's `tp 23` destination into a free
         // spot (`z: -105 -> -90`), so Carrington reaches `PositionInfo23`, the cine advances past
@@ -9693,13 +9721,11 @@ mod tests {
         // `wait event RushFinalCine` (index 72), which needs both second-wave generators to fire
         // `RushFinal`. `xiii-tool` disasm: `CineController2.TeleportTo` @120418,
         // `ULevel::FarMoveActor` 0x1038a440 calls `ULevel::FindSpot` 0x1038a080.
+        // item107c: BaseSoldier6 now reaches the player (see the goal 5 pins below), so the cine
+        // does not park at `wait event RushFinalCine` (index 72) any more: it runs past it.
         assert!(
-            cine_action_index > 62
-                && cine_action
-                    .as_deref()
-                    .is_some_and(|a| a.contains("RushFinalCine")),
-            "item95: the post-lever cine must advance past `wait player 128` to \
-             `wait event RushFinalCine`: {cine_action_index} {cine_action:?}"
+            cine_action_index > 72,
+            "item107c: the post-lever cine must advance past `wait event RushFinalCine` once both second-wave soldiers are dead: {cine_action_index} {cine_action:?}"
         );
         let cl = match vm.get_property(carrington, "Location") {
             Some(xiii_script::Value::Vector(v)) => *v,
@@ -9764,28 +9790,25 @@ mod tests {
             goals[4].completed,
             "goal 4 (activate the cable-car) must complete on this route: {goals:?}"
         );
-        // item102/item101d pin: goal 5 and the Hual04c travel still stay unreached. The `tp 23`
-        // placement works, so Carrington reaches the platform and the cine advances past
-        // `wait player 128`, spawning the second wave (`Wave01`/`Wave02`). The route kills the
-        // charging shotgun soldier `BaseSoldier7` and survives the wave. The other soldier
-        // `BaseSoldier6` spawns from `GenNMI7` on the station's upper level; with the item101d
-        // ledge semantics its attack-point path now hands off to a drop and it reaches the ground
-        // (the positive pin below), but it stops in `Tenir` at `(-18,-710,102)` behind the
-        // station wall where the player has no line of sight (the item102 navigation/door
-        // divergence, independent of the ledge rule). It never fires, so its `RushFinal` event
-        // never fires and `wait event RushFinalCine` (tabActions[71], `CineTrigger1` counter 2)
-        // cannot pass; the cine never reaches `event LaFinDeLaMap` (tabActions[95]) and `travel`
-        // stays empty. This is the honest next blocker (see report).
+        // item107c: goal 5 and the Hual04c travel are reached. With the retail `APawn::NotifyBump`
+        // path (Engine.dll 0x10387d80: `Controller.NotifyBump` first) `BaseSoldier6` presses against
+        // `porte10`, `IAController.NotifyBump` opens it and the soldier attacks the platform; the
+        // route shoots it (standing `engage_on`), its `RushFinal` releases `wait event RushFinalCine`
+        // (tabActions[71], `CineTrigger1` counter 2), the cine runs to `event LaFinDeLaMap`
+        // (tabActions[95]), which triggers `DetectionVolume10` (Event `finmap`); the route walks into
+        // that volume, goal 5 completes and the map requests Hual04c (measured vm_time 571.6 s).
         assert!(
-            !goals[5].completed,
-            "goal 5 (rejoin Carrington) stays unreached on this route (the second-wave soldier \
-             BaseSoldier6 holds and never fires RushFinal): {goals:?}"
+            goals[5].completed,
+            "item107c: goal 5 (rejoin Carrington) must complete on this route: {goals:?}"
         );
-        assert!(
-            outcome.travel.is_empty(),
-            "the Hual04c travel stays unreached on this route: {:?}",
+        assert_eq!(
+            outcome.travel.len(),
+            1,
+            "item107c: the route ends with the map's own travel: {:?}",
             outcome.travel
         );
+        assert_eq!(outcome.travel[0].from, "Hual04a");
+        assert_eq!(outcome.travel[0].to, "Hual04c");
         // The LastWave generators each spawned one reinforcement; all three are dead (killed by
         // input). The post-lever second wave spawns two more soldiers via `GenNMI6`/`GenNMI7`
         // (`Bases_Event`/soldier `Event` `RushFinal`): `BaseSoldier7` is dead (killed by input on
@@ -9825,13 +9848,16 @@ mod tests {
             last_wave_dead, 3,
             "the three Cine1 LastWave reinforcements must have spawned and died"
         );
+        // item107c: both second-wave soldiers die by input: `BaseSoldier7` (the charging shotgun
+        // soldier) and `BaseSoldier6`, which now comes down its attack path, opens `porte10`
+        // through the bump path and is shot by the standing engagement.
         assert_eq!(
-            second_wave_dead, 1,
-            "the post-lever second wave's charging soldier (BaseSoldier7) must be dead"
+            second_wave_dead, 2,
+            "item107c: both second-wave soldiers (BaseSoldier7, BaseSoldier6) must be dead"
         );
         assert_eq!(
-            second_wave_alive, 1,
-            "the post-lever second wave's holding soldier (BaseSoldier6) must still be alive"
+            second_wave_alive, 0,
+            "item107c: no second-wave soldier may be left alive"
         );
         // The second wave (`Wave01`/`Wave02`) belongs to Carrington's post-lever cine (action 63
         // `Event Wave01 Wave02`), which the route now reaches because the `tp 23` placement
@@ -9855,6 +9881,8 @@ mod tests {
         // edge (615,-926,462). Reaching the ground is exactly what the ledge semantics must let a
         // lower-node path move do; it still cannot fire `RushFinal` because it stops behind the
         // station wall (the item102 navigation/door divergence, independent of the ledge rule).
+        // item107c: it now opens `porte10` (`IAController.NotifyBump`), attacks and dies to the
+        // route's fire; the position pins below describe where its corpse lies.
         let bs6 = vm
             .find_object("BaseSoldier6")
             .expect("second-wave BaseSoldier6");
@@ -9863,12 +9891,18 @@ mod tests {
             other => panic!("BaseSoldier6 Location not a vector: {other:?}"),
         };
         assert!(
+            session.actor_is_dead(bs6),
+            "item107c: BaseSoldier6 must have been shot dead by the route"
+        );
+        assert!(
             bs6_loc[2] < 300.0,
             "BaseSoldier6 must have descended its attack path off the roof (roof z=462): {bs6_loc:?}"
         );
+        // item107c: the corpse lies north of `porte10` (y = -710), i.e. the soldier passed the door it
+        // opened and came on toward the platform (measured corpse at (53,268,102)).
         assert!(
-            bs6_loc[0].abs() < 600.0 && bs6_loc[1] < 0.0,
-            "BaseSoldier6 must have walked off the roof toward its ground attack point: {bs6_loc:?}"
+            bs6_loc[0].abs() < 600.0 && bs6_loc[1] > -700.0,
+            "BaseSoldier6 must have passed the opened porte10 toward the platform: {bs6_loc:?}"
         );
         // The cable-car lever use completed goal 4 (its `PlayerTriggerToggle` open fired the
         // map's `SetGoalComplete(94)`). Record the lever state for the report.
@@ -9883,18 +9917,11 @@ mod tests {
             Some(&xiii_script::Value::Str("Hual04c.unr".to_owned()))
         );
         println!(
-            "[hual04a next blocker] item95: with `ULevel::FindSpot` ported the post-lever cine's \
-             `tp 23` `Actor.SetLocation(PositionInfo23)` succeeds (WorldPhysicsAdapter::find_spot \
-             lifts the pawn extent out of the `Model639` BSP floor: z -105 -> -90), so Carrington \
-             reaches the platform, the cine passes `wait player 128` (tabActions[61]), fires \
-             `Event Wave01 Wave02` (tabActions[63]) and parks at `wait event RushFinalCine` \
-             (tabActions[71]). The route kills the charging shotgun soldier `BaseSoldier7` \
-             (GenNMI6's NMI; head-band fire from t=520.6 every 0.1 s) and survives at 10 hp, but \
-             the other second-wave soldier `BaseSoldier6` (GenNMI7's NMI) sits in its controller's \
-             `Tenir` \
-             state at (-18,-710,102) and never engages, so its `RushFinal` event never fires: \
-             `CineTrigger1` (counter 2) never reaches zero, `event LaFinDeLaMap` (tabActions[95]) \
-             never fires and goal 5 / the Hual04c travel stay unreached (`travel=[]`)."
+            "[hual04a end] item107c: the post-lever cine passes `wait player 128`, fires `Event Wave01 Wave02` and parks at \
+             `wait event RushFinalCine` until both second-wave soldiers have fired `RushFinal`. The route kills \
+             `BaseSoldier7` and, once `APawn::NotifyBump` lets `BaseSoldier6` open `porte10`, `BaseSoldier6` too; \
+             the cine then runs `wait player 200` and `event LaFinDeLaMap`, the route walks into \
+             `DetectionVolume10` (Event `finmap`), goal 5 completes and the map requests Hual04c."
         );
     }
 
@@ -11026,26 +11053,31 @@ mod tests {
         // item103e Task 3: the continuation now crosses the `prsas02` airlock. The carried card is
         // read on the aimed `MagneticPassTrigger3` (OutEvent `Door2`, opening the `Door2` movers
         // Porte27/Porte26); the player then crosses the open gap onto the east side and follows
-        // the canonical nav corridor south along x~-2600 through the `PorteAlarme2` alarm doors
-        // into the central-south ward. It stops at the last measured 150-hp waypoint
-        // (-1712,-265, measured stop -1684,-277) because the ward soldiers are hostile: measured
-        // (`local/reports/item103e-probe12.txt`), Health 150 -> 6 between (-1730,-571) and
-        // (135,-1541), death at ~t=238. The measured stop is pinned exactly (no
-        // tolerance-widening). The hostage cell / `Johansson3` (behind the `NMI_Otage10`-gated
-        // Porte15/Porte16) and the `Prock04a` travel stay unreached on this route; the player is
-        // alive and the game not ended (asserted above).
+        // the canonical nav corridor south along x~-2600 through the `PorteAlarme2` alarm door
+        // `Porte11` (opened with the player's own `use`).
+        // item107d: with the retail `ULevel::MoveActor` bump path the patrolling ward soldier
+        // `BaseSoldier6` opens the ward doors it presses against (`IAController.NotifyBump` ->
+        // `XIIIPorte.PlayerTrigger`) and the central-south ward is awake by the time the player
+        // arrives; measured, the player then takes a rifle hit at x~-2060 and bleeds 12 hp/s down
+        // to 6 hp at the old stop (-1684,-277). The route therefore stops at the last measured
+        // 150-hp waypoint `goto -2159 204` (measured stop (-2138.8,204.2)), east of the alarm
+        // doors and short of the deeper ward. The hostage cell / `Johansson3` (behind the
+        // `NMI_Otage10`-gated Porte15/Porte16) and the `Prock04a` travel stay unreached on this
+        // route; the player is alive and the game not ended (asserted above). The measured stop is
+        // pinned exactly (no tolerance-widening).
         let position = session.player_location().expect("player location");
         assert!(
-            (position[0] - -1684.0).abs() < 2.0
-                && (position[1] - -277.0).abs() < 2.0
+            (position[0] - -2138.8).abs() < 2.0
+                && (position[1] - 204.2).abs() < 2.0
                 && (position[2] - 75.0).abs() < 2.0,
-            "the route must stop at the last measured safe waypoint (-1684,-277): {position:?}"
+            "the route must stop at the last measured safe waypoint (-2138.8,204.2): {position:?}"
         );
         // Positive pins for the advance past the old prsas02 pin: the player crossed the
-        // airlock's `Door2` movers and the alarm doors into the central ward (east of x=-1962).
+        // airlock's `Door2` movers and the `PorteAlarme2` alarm doors (Porte11 opened by the
+        // player's own `use`, Porte12 by the alert cine) and stands east of the alarm doors.
         assert!(
-            position[0] > -1962.0,
-            "the route must cross the airlock and alarm doors into the central ward: {position:?}"
+            position[0] > -2200.0,
+            "the route must cross the airlock and alarm doors: {position:?}"
         );
         let porte27 = vm.find_object("Porte27").expect("airlock south leaf");
         let porte26 = vm.find_object("Porte26").expect("airlock north leaf");
@@ -11057,7 +11089,8 @@ mod tests {
             vm.state_name(porte26)
         );
         // The player takes no hostile damage before the measured stop; this is the "stop before a
-        // fatal point" pin (the ward soldiers shoot from the next corridor).
+        // fatal point" pin (item107d: the awakened ward fires down the corridor past x~-2060, so
+        // the stop moved east of it; measured 150 hp).
         assert!(
             session.player_health().is_some_and(|h| h >= 140.0),
             "the route must stop before the hostile ward: {:?}",
@@ -11066,10 +11099,10 @@ mod tests {
         println!(
             "[prock03 key] on-foot chain complete: cine action index {cine_action_index}, Porte30 \
              not Locked (no key grant), card carried, porte_sec opened; the route crossed the \
-             airlock and the alarm doors into the central ward and stops at the last 150-hp \
-             waypoint -1684,-277, before the hostile ward soldiers that kill the player further \
-             east (measured). The `NMI_Otage10`-gated hostage cell and the Prock04a travel stay \
-             unreached. Porte27 state={:?}. health={:?}.",
+             airlock and the `PorteAlarme2` alarm doors and stops at the last 150-hp waypoint \
+             -2138.8,204.2 (item107d: the door-bump path wakes the ward, which fires past x~-2060). \
+             The `NMI_Otage10`-gated hostage cell and the Prock04a travel stay unreached. \
+             Porte27 state={:?}. health={:?}.",
             vm.state_name(porte27),
             session.player_health()
         );

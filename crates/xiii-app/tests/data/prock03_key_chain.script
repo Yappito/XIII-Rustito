@@ -30,11 +30,14 @@
 #                 PatrolPoint26, AttackPoint48, PatrolPoint17, PathNode166) to doorpoint22.
 #   t=182..189    the two `PlayerTriggerToggle` alarm doors Porte11/Porte12 (Tag 'PorteAlarme2')
 #                 are opened with the player's own `use` and crossed before they auto-close.
-#   t=190..209    PathNode171, doorpoint19, PathNode12, PathNode176: the central-south ward. From
-#                 here the ward soldiers are hostile (measured: Health 150 -> 6 between
-#                 (-1730,-571) and (135,-1541), death at ~t=238), so this route stops at the last
-#                 measured 150-hp waypoint `goto -1712 -265` (the measured stop is (-1684,-277))
-#                 and pins that blocker.
+#   t=190..209    PathNode171, doorpoint19, PathNode12, PathNode176: the central-south ward. With
+#                 the item107 retail door-bump path (`ULevel::MoveActor` -> `IAController.
+#                 NotifyBump` -> `XIIIPorte.PlayerTrigger`) the patrolling ward soldier
+#                 `BaseSoldier6` opens the ward doors it presses against, so the ward is awake by
+#                 the time the player arrives and shoots down the corridor. The route now stops at
+#                 the last measured 150-hp waypoint `goto -2159 204` (the measured stop is
+#                 (-2138.8,204.2)), east of the `PorteAlarme2` alarm doors and short of the deeper
+#                 ward corridor; measured, the player is at 150 hp there over the whole tail.
 t=0.50 goto -1246 2604
 t=2.50 goto -1476 2543
 t=4.00 goto -1680 2464
@@ -116,8 +119,6 @@ t=184.00 goto -2300 203
 t=185.00 use Porte11
 t=186.00 use Porte11
 t=189.50 goto -2159 204
-t=193.50 goto -2074 204
-t=197.50 goto -2027 58
-t=201.50 goto -1962 -138
-# the central-south ward: stop at the last measured 150-hp waypoint before the hostile soldiers
-t=205.50 goto -1712 -265
+# stop at the last measured 150-hp waypoint (see the header): the ward is awake and fires down
+# the corridor; the route holds east of the `PorteAlarme2` alarm doors.
+t=197.50 goto -2159 204
