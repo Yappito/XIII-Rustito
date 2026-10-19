@@ -788,7 +788,17 @@ impl Session {
         self.vm.update_ai_perception(self.player, &mut perception);
         for (controller, event) in perception {
             let t = self.vm.time;
-            println!("[play] AI t={t:.3}s {controller}: {event}");
+            let observer = self.vm.find_object(&controller).and_then(|c| {
+                let p = instance_prop(&self.vm, c, "Pawn")?;
+                Some((
+                    self.vm.objects[p as usize].name.clone(),
+                    self.vm.vector_prop(p, "Location"),
+                ))
+            });
+            println!(
+                "[play] AI t={t:.3}s {controller}: {event}; observer={observer:?} player={:?}",
+                self.player_location()
+            );
             self.perception_log.push_back((t, controller, event));
         }
         while self.perception_log.len() > 128 {

@@ -1,43 +1,56 @@
-# PRock01a route (item100b, re-timed item100c), Unreal units / seconds.
-#
-# Input only: no teleport, set_goal, take_control, weapon/item grant or health edit.
-# The level's own intro cine (CineController21) opens the starting cell Porte13 at ~104.6 s.
-# The route waits it out, leaves the cell, and trails the lead guard Cine3:
-# XIDCine.EscortManager walks both guards west through the corridor and down the stairs, so a
-# careful player stays behind Maton1 and ahead of Maton2's 130 UU beatdown ring. At the stair top
-# the route pushes the player past PositionInfo37 (x < 3439.8) so the escort's TestXIIIDansEscalier
-# fires and Maton2 descends, then continues south toward objective 0 (goal 92 at (3072,-1776)).
-# The next blocker is the locked Porte9 (UnlockItemCode ClefDebarrasLingerie) at (3032,-3120): the
-# player stops at (3011,-3070).
-#
-# item100c re-time: removing the item100b `Target`-within-`CollisionRadius` gate (the friction now
-# applies every steered-walking tick) slides the escort's rear guard further along its marker, so
-# the item100b 180 UU follow distance clipped the player once (t=176.4, 150 -> 136). The follow
-# distance is widened to 210 UU; measured 0 baton blows, health 150, the escort reaches
-# STA_EndOfEscort and objective 0 is not completed (goal 92 is fired by the escort cine's
-# `event objectif92`). See local/reports/item100-prock01a.md.
+# PRock01a: authored cell release and escort, laundry guards, corpse key, Porte9.
+# Ordinary input only. Combat and corpse search use the closed-loop route driver.
 t=0.50 goto 6096 -669
 t=2.00 forward 0
-# Wait through the cell release; Porte13 re-opens on contact (PlayerTriggerToggle).
 t=150.0 goto 6140 -880
 t=152.0 goto 6301 -400
-# Trail the escort's lead guard (Cine3) at 180 UU.
 t=153.0 follow Cine3 210
-# Enter the stairwell past PositionInfo37 from the north lane (away from Maton1's path), then
-# descend the stairs behind the escort.
 t=171.4 follow off
-t=171.5 goto 3430 300
-t=173.5 goto 2950 476 -1432
-t=176.5 goto 3050 -478 -1432
-# Porte3 (TriggerToggle) opens on the player's bump; wait it out then pass.
-t=182.0 goto 3168 -536 -1432
+t=171.5 goto 2814 291 -1459
+t=173.2 forward 0
+t=174.0 goto 3430 300
+t=175.5 goto 2950 476 -1432
+t=178.5 goto 3050 -478 -1432
+t=184.0 goto 3168 -536 -1432
 t=202.0 goto 3296 -703 -1432
 t=206.0 goto 3296 -1152 -1432
 t=210.0 goto 2880 -1655 -1432
 t=215.0 goto 3072 -1776 -1488
-t=218.0 goto 3192 -2110 -1432
-t=221.0 goto 3192 -2280 -1432
-t=225.0 goto 3169 -2975 -1432
-t=232.0 goto 3184 -3157 -1446
-t=235.0 goto 3011 -3262 -1458
-t=242.0 forward 0
+t=219.0 goto 3300 -1850 -1432
+t=223.0 goto 3600 -1950 -1432
+t=227.0 goto 3892 -2001 -1461
+t=230.0 forward 0
+t=234.0 goto 3892 -2100 -1461
+t=237.0 goto 3700 -2400 -1432
+t=241.0 goto 3300 -2600 -1432
+t=245.0 goto 2900 -2746 -1461
+t=248.0 goto off
+t=248.0 follow Cine6 65
+t=248.0 engage Cine6 1500 30
+t=249.0 follow Cine7 65
+t=249.0 engage Cine7 3000 40
+t=250.0 follow off
+t=250.0 forward 0
+t=252.0 loot 300 15
+t=253.0 goto_until 2867 -2650 arrived 15
+t=254.0 goto_until 2867 -2940 arrived 15
+t=255.0 goto_until 2940 -3060 arrived 15
+t=256.0 goto off
+t=256.0 forward 0
+t=256.0 yaw -90
+t=257.0 use Porte9
+t=258.0 use Porte9
+t=260.0 goto_until 2940 -3300 goal 0 15
+# The key opens the supply cupboard, not a southbound corridor. Return to the
+# laundry and the lead guard (holder of ClefCouloir) toward the escape objective.
+t=262.0 goto_until 2940 -2940 arrived 15
+t=264.0 goto_until 2880 -1655 arrived 15
+t=266.0 goto_until 3296 -1152 arrived 15
+t=268.0 goto_until 3296 -703 arrived 15
+t=270.0 goto_until 3168 -620 arrived 15
+t=271.0 use Porte3
+# The authored TriggerToggle closure does not respond to player use. Pin the
+# blocked attempt to return to the escort rather than claim the escape/travel.
+t=272.0 goto_until 3168 -450 arrived 5
+t=273.0 goto off
+t=273.0 forward 0

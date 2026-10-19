@@ -524,3 +524,9 @@ t=383.71 crouch off
 t=384.47 goto -1999 -553
 t=400.97 wait_travel
 t=343.0 engage BaseSoldier9 2500 6 aim=0.9 period=0.25
+# item100j: after the item100h sight-countdown decode the dormant Roulade patroller
+# BaseSoldier9 acquires the player during the descent (SeePlayer 362.2 s, player at
+# -1388,816, the 6 s hold at 343 shifts this line to ~362), and its shotgun fire plus
+# BaseSoldier20/IAController22 kill the route at 368 s. Engage it when it is actually
+# in sight, before it empties its magazine into the player.
+t=356.0 engage BaseSoldier9 2500 8 aim=0.9 period=0.25

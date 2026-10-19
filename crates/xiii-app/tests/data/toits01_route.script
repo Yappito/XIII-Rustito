@@ -157,61 +157,30 @@ t=160.90 altfire_hold 1
 t=168.00 altfire_hold 0
 t=171.00 use
 t=171.50 forward 0
+# Leave Hook item mode explicitly before the courtyard fight. The measurement
+# otherwise issued Fire with an unchanged 16-round rifle clip and no soldier damage.
+t=171.60 select_weapon 14
 # courtyard (item86): DetectionVolume1's brush (item81c) now fires 'act2b' at the descent and
 # the three courtyard soldiers (BaseSoldier13/14/15) switch at t~162 to AttaqueScriptee. The
 # old damage-free west-corridor walk is re-timed to kill them as they come into the open; 13
 # is shootable from the landing, 14/15 open up as the player moves north.
-t=172.00 track BaseSoldier13 0.85
-t=172.50 fire
-t=173.50 fire
+t=172.00 engage_on 3000 period=1
+t=172.50 engage BaseSoldier13 3000 15 period=1
 t=174.00 goto -1450 1100
-t=175.00 track BaseSoldier14 0.85
-t=176.00 fire
-t=177.00 fire
-t=178.00 fire
-t=179.00 fire
 t=180.00 goto -1450 1500
 # item101: 14 (200 hp) stays in the courtyard now and charges (Acquisition ~180.3, Attaque
 # ~181.75, at point-blank by ~184); the old untracked 181-185 burst missed it. Re-track it
 # through the charge window.
-t=181.00 track BaseSoldier14 0.85
-t=181.50 fire
-t=182.50 fire
-t=183.50 fire
-t=184.50 fire
-t=185.50 fire
-t=186.50 fire
 t=186.00 goto -1450 2100
-t=187.00 track BaseSoldier15 0.85
-t=188.00 fire
-t=189.00 fire
+t=187.00 engage BaseSoldier15 3000 20 period=1
 # item101: BaseSoldier15 is dead by ~188. To hit BaseSoldier14 the `goto` autopilot must
 # release the aim: the player is pinned against the courtyard wall at (-1429,2118), so a
 # waypoint within its 24-UU arrival radius clears `goto` and `track` owns the yaw/pitch.
 t=189.50 goto -1429 2118
-t=190.50 track BaseSoldier14 0.85
-t=191.00 fire
-t=192.00 fire
-t=193.00 fire
-t=194.00 fire
-t=195.00 fire
-t=196.00 fire
-t=197.00 fire
-t=198.00 fire
+t=190.50 engage BaseSoldier14 3000 20 period=1
 t=198.50 goto -900 2100
-t=200.00 fire
-t=201.00 fire
-t=202.00 fire
-t=203.00 fire
-t=204.00 fire
 t=206.50 goto -768 2838
-t=208.50 fire
-t=209.50 fire
-t=210.50 fire
-t=211.50 fire
-t=212.50 fire
-t=213.50 fire
-t=214.00 track off
+t=214.00 engage_off
 t=214.50 goto -734 3424
 t=222.50 goto -200 3900
 # alley attempt; labelled teleport fallback (the alley's east end is the windowed wall)
@@ -278,17 +247,10 @@ t=379.60 forward 0
 # (south) from 352.0 to 353.4: soldier18 150 -> 94 -> 38 -> dead by 352.3 with no rocket
 # damage, soldier17 dead by 356.8 after one DTGunned hit (150 -> 140;
 # local/re/item64f/run12.txt).
-t=379.65 track BaseSoldier18 0.85
-t=379.70 fire
-t=379.90 fire
-t=380.10 fire
-t=380.30 fire
-t=380.50 fire
-t=380.70 fire
-t=380.90 fire
-t=381.10 fire
-t=380.00 left 1
-t=381.30 track off
+# Use Jones's carried sniper rifle for the two exposed soldiers. The M60
+# measurement spent a whole clip through cover and left the launcher alive.
+t=379.60 select_weapon 14
+t=379.65 engage BaseSoldier18 3500 20 period=1.4
 t=381.40 right 0
 t=381.50 forward 0
 # item69: soldier17 (bataillefinale, 150 hp) pursues behind soldier18. From the old
@@ -301,29 +263,7 @@ t=381.50 forward 0
 # under local/re/item69/toits01-retiming-v2/-v3/-v4.txt) all took the 318.8 blast
 # (50/45/41 hp), so the route eats it once and duels from range where v3 measured
 # zero returning DTGunned hits.
-t=381.60 track BaseSoldier17
-t=381.80 fire
-t=382.00 fire
-t=382.20 fire
-t=382.40 fire
-t=382.60 fire
-t=382.80 fire
-t=383.00 fire
-t=383.20 fire
-t=383.40 fire
-t=383.60 fire
-t=383.80 fire
-t=384.00 fire
-t=384.20 fire
-t=384.40 fire
-t=384.60 fire
-t=384.80 fire
-t=385.00 fire
-t=385.20 fire
-t=385.40 fire
-t=385.60 fire
-t=385.80 fire
-t=386.00 track off
+t=381.60 engage BaseSoldier17 3500 20 period=1.4
 t=386.20 goto 17800 1150
 t=388.20 forward 0
 # labelled teleport (the warehouse west wall + the Movable2 crate block the doorway;

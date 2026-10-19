@@ -23,10 +23,23 @@ t=28.00 goto -3596 -3095
 t=33.50 goto -3000 -3060
 t=38.50 goto -2758 -2920
 t=44.00 goto -2652 -2974
+# item100h: BaseSoldier15 (-1180,-4119) and BaseSoldier3 (-1521,-4070)
+# acquire immediately on the original riverbed landing (50.067/50.117s).
+# Direct entry carries fists only: close and knock them out, then loot their
+# actual weapons. Firing a gun that is not carried cannot protect this landing.
 # generator 1 (riverbed, east bank chain): the riverbed wall is the measured stall; break by
 # hand from the measured sabotage spot
 t=50.00 teleport -1183 -3450 -1015
 t=50.00 forward 0
+t=50.00 goto off
+t=50.00 follow BaseSoldier15 65
+t=50.00 engage BaseSoldier15 1800 15 aim=0.9
+t=50.10 follow BaseSoldier3 65
+t=50.10 engage BaseSoldier3 1800 15 aim=0.9
+t=50.20 follow off
+t=50.20 forward 0
+t=50.20 loot 1200 15
+t=50.30 switch_weapon 0
 t=50.50 goto -1070 -3530
 t=52.00 track BreakAbleMover1
 t=52.50 fire

@@ -60,17 +60,24 @@ t=70.00 goto -3160 -600
 # ramps up: its M16 and ammo are what the rest of the canyon and the base fights need.
 t=72.00 engage BaseSoldier1 3000 20
 t=72.00 loot 2500 20
-t=72.10 switch_weapon 11
-t=72.20 reload
+t=72.10 select_weapon 11
 # The shotgun soldier (BaseSoldier5) and the alerted third canyon soldier (BaseSoldier0) are
 # killed from a crouch; with the ledge rule (item101) BaseSoldier0 holds at (-2720,-1177) in
 # `Attaque` and shoots the route, so the stand needs a longer burst. Then both corpses are
 # walked over for the dropped M16s + ammo the base fights need.
 t=72.30 crouch 1
-t=72.40 engage 3000 40
-t=72.50 crouch 0
-t=72.60 loot 3000 30
-t=72.80 reload
+t=74.40 engage BaseSoldier5 3000 30
+t=74.50 crouch 0
+t=74.60 loot 3000 30
+# item100h merged sight clock: the old all-target stand fired its only rifle clip
+# at BaseSoldier0 ~2500 UU away (mostly 3-damage/cover hits, 73 HP left), then
+# resumed the stale -3160,-600 waypoint and died there. Close before this fight.
+t=75.00 goto_until -2400 -1600 arrived 15
+t=76.00 crouch 1
+t=76.10 engage BaseSoldier0 2000 30
+t=76.20 crouch 0
+t=76.30 loot 2000 20
+t=76.80 reload
 t=101.80 goto -2400 -1600
 t=105.80 goto -1800 -1400
 t=108.80 goto -1400 -1300

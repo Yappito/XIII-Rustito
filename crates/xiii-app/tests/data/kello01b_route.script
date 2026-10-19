@@ -237,7 +237,12 @@ t=530 heal
 t=530.49 goto -349 -1504
 t=531.51 goto -301 -1513
 t=532.53 goto -253 -1513
-t=533.00 engage_off
+# item100j: the item100h sight-countdown decode delays the last backup soldier's
+# acquisition to the cliff ascent (BaseSoldier20 SeePlayer 652.3 s, player at
+# 1943,-2729,1933), after this engage was released at 533; it shot the route 43 -> -2
+# between 656 and 660. Keep the standing engagement through the cliff walk so the M60
+# answers it.
+t=715.00 engage_off
 t=533.54 goto -206 -1513
 t=534.55 goto -159 -1513
 t=535.56 goto -112 -1513

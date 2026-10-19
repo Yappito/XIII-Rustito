@@ -1537,8 +1537,8 @@ pub struct Vm<'s> {
     /// precedence (including duplicate names and malformed-list termination).
     scope_functions: std::cell::RefCell<HashMap<GlobalRef, HashMap<String, GlobalRef>>>,
     /// Edge state of the host-driven AI perception (`item14b`): `controller -> player visible`.
-    /// Set by [`Vm::update_ai_perception`] so `SeePlayer`/`EnemyNotVisible` fire only on change,
-    /// as the engine's sight counter does, instead of restarting an AI state every tick.
+    /// Used only to deduplicate the host timeline; native probe delivery is governed by
+    /// SightCounter and the current state probe mask, not visibility transitions.
     ai_visible: HashMap<ObjectId, bool>,
     /// item14c: non-static calls dropped because the target actor was **suspended** (not merely
     /// out of the executed scope). Every such drop also records a trace note; this counter makes
@@ -4604,6 +4604,33 @@ impl<'s> Vm<'s> {
                 *self.profile.tick_calls.entry(key.clone()).or_default() += 1;
                 *self.profile.tick_fns.entry(key).or_default() += t0.elapsed().as_micros() as u64;
             }
+        }
+        if self.is_a(id, "controller") {
+            // AController::Tick 0x1038e26e..0x1038e2d6. SightCounter is a
+            // countdown, not a visibility latch: only a negative value is due.
+            let mut counter = self.f32_prop(id, "SightCounter");
+            if counter < 0.0 {
+                if self.is_probing(id, "EnemyNotVisible", 41) {
+                    if let Some(enemy) = self.obj_prop(id, "Enemy") {
+                        if self.nav_line_of_sight_to(id, enemy)? {
+                            self.set_property(
+                                id,
+                                "LastSeenTime",
+                                0,
+                                Value::Float(self.time as f32),
+                            );
+                        } else {
+                            self.send_event(id, "EnemyNotVisible", Vec::new())?;
+                        }
+                    }
+                    // The event can change state and write SightCounter. Retail reloads
+                    // +0x1f4 after CheckEnemyVisible before adding its interval.
+                    counter = self.f32_prop(id, "SightCounter") + 0.1;
+                } else {
+                    counter += 0.2;
+                }
+            }
+            self.set_property(id, "SightCounter", 0, Value::Float(counter - dt));
         }
         Ok(())
     }
@@ -10251,15 +10278,29 @@ impl<'s> Vm<'s> {
         Some(p)
     }
 
-    /// Host-driven engine perception (`item14b`): for every live `IAController`, test whether its
-    /// pawn can see the player (range, facing cone, clear world line of sight) and dispatch the
-    /// engine's own `SeePlayer` / `EnemyNotVisible` events only when visibility changes, as the
-    /// engine's sight counter does. This is the native half of perception (the sight test and the
-    /// event dispatch); the AI's own states decide what to do with the event. Appends
-    /// `(controller, event)` to `out` for the host timeline. Never a silent success: an event call
-    /// that raises is reported in `out` as `event: error`.
+    /// Host-driven engine perception (`item14b`, retargeted item100h): for every live
+    /// `Controller`, test whether its pawn can see the player (range, facing cone, clear world
+    /// line of sight) and dispatch the engine's own `SeePlayer` event on due sight checks.
+    /// `EnemyNotVisible` is checked independently in the controller tick. This is the native half of
+    /// perception (the sight test and the event dispatch); the observer's own states decide what
+    /// to do with the event.
+    ///
+    /// Delivery rule (decoded item100g, Engine.dll): the player's `AController::Tick`
+    /// (`0x1038e1a0`) calls `AController::ShowSelf` (`0x1036df40`) when its pawn is current; for a
+    /// player controller (`+0x200` bit 0, `bIsPlayer`) `ShowSelf` walks `Level.ControllerList` and
+    /// for every controller `C != this` with negative `SightCounter` and an enabled `SeePlayer`
+    /// probe (`IsProbing` on FName `0x154`, bit 40), whose `SeePawn(this->Pawn, 1)` accepts the
+    /// player pawn, dispatches `C->eventSeePlayer` (`0x10305030`). There is no `IAController`
+    /// filter: `XIDCine.CineController2.SeePlayer` exists precisely so cines observe the player.
+    /// A non-player *source* uses `SeeMonster`; observer `bIsPlayer` is not a gate.
+    ///
+    /// Appends `(controller, event)` to `out` for the host timeline. Never a silent success: an
+    /// event call that raises is reported in `out` as `event: error`.
     pub fn update_ai_perception(&mut self, player: ObjectId, out: &mut Vec<(String, String)>) {
         if self.objects.get(player as usize).is_none_or(|o| o.deleted) {
+            return;
+        }
+        if !self.pawn_is_player(player) || self.bool_prop(player, "bHidden") {
             return;
         }
         let t0 = self.profile.enabled.then(Instant::now);
@@ -10269,7 +10310,12 @@ impl<'s> Vm<'s> {
             .iter()
             .enumerate()
             .filter(|(i, o)| {
-                o.is_actor && !o.deleted && o.active && self.is_a(*i as ObjectId, "iacontroller")
+                o.is_actor
+                    && !o.deleted
+                    && o.active
+                    && self.is_a(*i as ObjectId, "controller")
+                    && self.f32_prop(*i as ObjectId, "SightCounter") < 0.0
+                    && self.is_probing(*i as ObjectId, "SeePlayer", 40)
             })
             .map(|(i, _)| i as ObjectId)
             .collect();
@@ -10280,26 +10326,33 @@ impl<'s> Vm<'s> {
             if pawn == player || self.bool_prop(pawn, "bIsDead") {
                 continue;
             }
-            let visible = !player_dead && self.ai_sight(ctrl, pawn, player);
+            let visible = if player_dead {
+                false
+            } else {
+                match self.ai_sight(ctrl, pawn, player) {
+                    Ok(visible) => visible,
+                    Err(e) => {
+                        out.push((
+                            self.objects[ctrl as usize].name.clone(),
+                            format!("SeePlayer: {e}"),
+                        ));
+                        continue;
+                    }
+                }
+            };
             let was = self.ai_visible.get(&ctrl).copied().unwrap_or(false);
             self.ai_visible.insert(ctrl, visible);
             let name = self.objects[ctrl as usize].name.clone();
-            // The engine's sight counter calls `SeePlayer` repeatedly while the player stays
-            // visible (the base handler only reacts until `EnemyAcquired` disables the event), and
-            // `EnemyNotVisible` once when sight is lost. The host only logs a transition.
+            // Native delivery repeats on due checks until the script disables its probe.
+            // Successful delivery is logged only on transition; every error remains visible.
             if visible {
                 let args = vec![Value::Object(Some(ObjRef::Instance(player)))];
                 let res = self.send_event(ctrl, "SeePlayer", args);
-                if !was {
+                if !was || res.is_err() {
                     match res {
                         Ok(_) => out.push((name, "SeePlayer".to_owned())),
                         Err(e) => out.push((name.clone(), format!("SeePlayer: {e}"))),
                     }
-                }
-            } else if was {
-                match self.send_event(ctrl, "EnemyNotVisible", Vec::new()) {
-                    Ok(_) => out.push((name, "EnemyNotVisible".to_owned())),
-                    Err(e) => out.push((name, format!("EnemyNotVisible: {e}"))),
                 }
             }
         }
@@ -10312,7 +10365,7 @@ impl<'s> Vm<'s> {
     /// (`Pawn.PeripheralVision`, cos of the half-angle after the pawn's `Init` conversion) and a
     /// clear world trace between the eyes (`Controller.LineOfSightTo`). Actor occlusion is not
     /// modelled, matching the existing `LineOfSightTo` native.
-    fn ai_sight(&mut self, ctrl: ObjectId, pawn: ObjectId, player: ObjectId) -> bool {
+    fn ai_sight(&mut self, ctrl: ObjectId, pawn: ObjectId, player: ObjectId) -> VmResult<bool> {
         let eye = self.eye_location(pawn);
         let target = self.eye_location(player);
         let d = [target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]];
@@ -10322,7 +10375,7 @@ impl<'s> Vm<'s> {
             sight = 5000.0;
         }
         if dist2 > sight * sight {
-            return false;
+            return Ok(false);
         }
         let dot = {
             let rot = self.rotation_prop(pawn).unwrap_or([0; 3]);
@@ -10347,9 +10400,9 @@ impl<'s> Vm<'s> {
             cone = 0.0;
         }
         if dot < cone {
-            return false;
+            return Ok(false);
         }
-        self.nav_line_of_sight_to(ctrl, player).unwrap_or(false)
+        self.nav_line_of_sight_to(ctrl, player)
     }
 
     /// Retail XIDPawn 0x11903ea0: scan the actual linked NavigationPointList in list order.

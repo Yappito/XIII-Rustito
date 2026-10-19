@@ -16178,6 +16178,8 @@ fn hearing_fixture() -> Vec<u8> {
     let controller = b.reserve(0, 0, "Controller");
     let ai = b.reserve(0, 0, "AIController");
     let nav = b.reserve(0, 0, "NavigationPoint");
+    let observer = b.reserve(0, 0, "ScriptObserver");
+    let enemy_observer = b.reserve(0, 0, "EnemyObserver");
     let obj = compact(0);
     let vec = compact(IMP_STRUCT);
 
@@ -16227,10 +16229,36 @@ fn hearing_fixture() -> Vec<u8> {
     let is_player = b.reserve(IMP_BOOLPROP, controller, "bIsPlayer");
     let next_controller = b.reserve(IMP_OBJECTPROP, controller, "NextController");
     let enemy = b.reserve(IMP_OBJECTPROP, controller, "Enemy");
+    let sight_counter = b.reserve(IMP_FLOATPROP, controller, "SightCounter");
+    let last_seen = b.reserve(IMP_FLOATPROP, controller, "LastSeenTime");
     b.prop_with(c_pawn, is_player, 0, &obj);
     b.prop(is_player, next_controller, 0);
     b.prop_with(next_controller, enemy, 0, &obj);
-    b.prop_with(enemy, 0, 0, &obj);
+    b.prop_with(enemy, sight_counter, 0, &obj);
+    b.prop(sight_counter, last_seen, 0);
+    b.prop(last_seen, 0, 0);
+
+    let see = b.reserve(IMP_FUNCTION, observer, "SeePlayer");
+    let blind = b.reserve(IMP_STATE, observer, "Blind");
+    let seen = b.reserve(IMP_OBJECTPROP, see, "Seen");
+    b.prop_with(seen, 0, PARM, &obj);
+    b.func(see, blind, seen, &[0x04, 0x0B], 2, 0, DEFINED | EVENT);
+    b.state_masks(blind, 0, 0, !(1 << 40));
+    let enemy_not_visible = b.reserve(IMP_FUNCTION, enemy_observer, "EnemyNotVisible");
+    let mut reset_sight = vec![0x0F, 0x01]; // SightCounter = 0.15; return;
+    reset_sight.extend(compact(sight_counter));
+    reset_sight.push(0x1E);
+    reset_sight.extend(0.15f32.to_le_bytes());
+    reset_sight.extend([0x04, 0x0B]);
+    b.func(
+        enemy_not_visible,
+        0,
+        0,
+        &reset_sight,
+        13,
+        0,
+        DEFINED | EVENT,
+    );
 
     let hear = b.reserve(IMP_FUNCTION, ai, "HearNoise");
     let deaf = b.reserve(IMP_STATE, ai, "Deaf");
@@ -16254,7 +16282,123 @@ fn hearing_fixture() -> Vec<u8> {
     b.class(controller, actor, c_pawn, 0);
     b.class_masks(ai, controller, hear, HEAR_BIT, u64::MAX);
     b.class(nav, actor, next_nav, 0);
+    b.class_masks(observer, controller, see, 1 << 40, u64::MAX);
+    b.class_masks(
+        enemy_observer,
+        observer,
+        enemy_not_visible,
+        (1 << 40) | (1 << 41),
+        u64::MAX,
+    );
     b.build()
+}
+
+#[test]
+fn sight_delivers_to_non_ai_controller_only_when_due_and_probing() {
+    let set = hearing_set();
+    let mut w = HearWorld::new(&set, Some(MockWorld::new()));
+    let player = w.player([100.0, 0.0, 0.0]);
+    let pawn = w.pawn("ObserverPawn", [0.0; 3], 0.0);
+    let ctrl = w.controller("ScriptObserver", "Observer", Some(pawn));
+    w.vm.set_active(ctrl, true);
+    w.vm.set_property(ctrl, "SightCounter", 0, Value::Float(-0.01));
+    let mut out = Vec::new();
+    w.vm.update_ai_perception(player, &mut out);
+    assert_eq!(out, [("Observer".into(), "SeePlayer".into())]);
+    // A visible player is delivered again, even without a visibility transition.
+    w.vm.trace.clear();
+    w.vm.update_ai_perception(player, &mut out);
+    assert!(w.vm.trace.iter().any(|e| matches!(&e.kind,
+        TraceKind::Event { function, .. } if function.ends_with("SeePlayer"))));
+    for counter in [0.0, 0.1, f32::NAN] {
+        w.vm.set_property(ctrl, "SightCounter", 0, Value::Float(counter));
+        w.vm.trace.clear();
+        w.vm.update_ai_perception(player, &mut out);
+        assert!(w.vm.trace.is_empty(), "not due: {counter}");
+    }
+    w.vm.set_property(ctrl, "SightCounter", 0, Value::Float(-0.01));
+    w.vm.disable_probe(ctrl, "SeePlayer", true);
+    w.vm.trace.clear();
+    w.vm.update_ai_perception(player, &mut out);
+    assert!(w.vm.trace.is_empty(), "Disable must gate native delivery");
+    w.vm.disable_probe(ctrl, "SeePlayer", false);
+    w.vm.goto_state(ctrl, "Blind", None).unwrap();
+    w.vm.trace.clear();
+    w.vm.update_ai_perception(player, &mut out);
+    assert!(
+        w.vm.trace.is_empty(),
+        "state ignores must gate native delivery"
+    );
+    let mut missing_world = HearWorld::new(&set, None);
+    let player = missing_world.player([100.0, 0.0, 0.0]);
+    let pawn = missing_world.pawn("ObserverPawn", [0.0; 3], 0.0);
+    let ctrl = missing_world.controller("ScriptObserver", "Observer", Some(pawn));
+    missing_world.vm.set_active(ctrl, true);
+    missing_world
+        .vm
+        .set_property(ctrl, "SightCounter", 0, Value::Float(-0.01));
+    let mut errors = Vec::new();
+    missing_world.vm.update_ai_perception(player, &mut errors);
+    assert_eq!(errors.len(), 1);
+    assert!(
+        errors[0].1.starts_with("SeePlayer: "),
+        "missing physics must be diagnosed: {errors:?}"
+    );
+}
+
+#[test]
+fn sight_counter_counts_down_and_refills_without_clamping_long_ticks() {
+    let set = hearing_set();
+    let mut w = HearWorld::new(&set, None);
+    let ctrl = w.controller("ScriptObserver", "Observer", None);
+    w.vm.set_active(ctrl, true);
+    w.vm.set_property(ctrl, "SightCounter", 0, Value::Float(0.0));
+    w.vm.tick(0.05).unwrap();
+    assert_eq!(w.vm.f32_prop(ctrl, "SightCounter"), -0.05);
+    w.vm.tick(0.05).unwrap();
+    assert!((w.vm.f32_prop(ctrl, "SightCounter") - 0.1).abs() < 1e-6);
+    w.vm.tick(0.5).unwrap();
+    w.vm.tick(0.5).unwrap();
+    assert!((w.vm.f32_prop(ctrl, "SightCounter") + 0.7).abs() < 1e-6);
+}
+
+#[test]
+fn enemy_visibility_checks_los_on_each_due_tick_independently_of_sight_transitions() {
+    let set = hearing_set();
+    let mut w = HearWorld::new(&set, Some(MockWorld::new()));
+    let pawn = w.pawn("ObserverPawn", [0.0; 3], 0.0);
+    let enemy = w.pawn("EnemyPawn", [-100.0, 0.0, 0.0], 0.0);
+    let ctrl = w.controller("EnemyObserver", "Observer", Some(pawn));
+    w.vm.set_active(ctrl, true);
+    w.vm.set_property(ctrl, "Enemy", 0, inst(enemy));
+    w.vm.set_property(ctrl, "SightCounter", 0, Value::Float(-0.01));
+    w.vm.tick(0.02).unwrap();
+    assert!((w.vm.f32_prop(ctrl, "SightCounter") - 0.07).abs() < 1e-6);
+    assert_eq!(
+        w.vm.get_property(ctrl, "LastSeenTime"),
+        Some(&Value::Float(0.02))
+    );
+    // Behind the observer still counts: EnemyNotVisible is LOS-only, not facing-cone based.
+    assert!(!w.vm.trace.iter().any(|e| matches!(&e.kind,
+        TraceKind::Event { function, .. } if function.ends_with("EnemyNotVisible"))));
+    w.vm.set_physics(Box::new(
+        MockWorld::new().with_wall([-60.0, -1000.0, -1000.0], [-40.0, 1000.0, 1000.0]),
+    ));
+    for _ in 0..2 {
+        w.vm.set_property(ctrl, "SightCounter", 0, Value::Float(-0.01));
+        w.vm.trace.clear();
+        w.vm.tick(0.02).unwrap();
+        assert!(w.vm.trace.iter().any(|e| matches!(&e.kind,
+            TraceKind::Event { function, .. } if function.ends_with("EnemyNotVisible"))));
+        assert_eq!(
+            w.vm.get_property(ctrl, "LastSeenTime"),
+            Some(&Value::Float(0.02))
+        );
+        assert!(
+            (w.vm.f32_prop(ctrl, "SightCounter") - 0.23).abs() < 1e-6,
+            "an EnemyNotVisible/state callback's counter write must survive native refill"
+        );
+    }
 }
 
 fn hearing_set() -> ScriptSet {

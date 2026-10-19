@@ -61,64 +61,71 @@ t=26.00 goto -3468 2051
 t=27.50 goto -3764 2043
 t=29.00 goto -3790 2016
 t=30.50 goto -3840 1720
+# item100j: the guard `Cine2` is a `BaseSoldier` whose authored SeeXIII reaction
+# (Cine2.CineInit.SeeXIII -> Play -> StartSequence) restarts the cine when the player
+# is seen, so a northbound walk before the cine runs `opendoor porte30` pre-empts the
+# opener. Hold at the checkpoint (outside the guard cone) until the guard itself opens
+# Porte30, then run the chain; the post-wait schedule is shifted back to the absolute
+# times of the previous (IAController-only) perception so the ward behaves as recorded.
+t=31.00 wait_until event Porte30 PlayerTrigger 40
 # north from the checkpoint to the cine-opened Porte30 and through it
 t=33.50 goto -3820 1922
-t=35.00 goto -3797 2129
-t=38.00 goto -3576 2515
-t=40.50 goto -3391 2828
-t=42.50 goto -3385 3022
-t=44.00 goto -3360 3138
-t=50.00 goto -3436 3358
-t=55.00 goto -3604 3627
-t=56.50 goto -3862 3758
-t=58.00 goto -3872 3810
+t=34.59 goto -3797 2129
+t=36.78 goto -3576 2515
+t=38.61 goto -3391 2828
+t=40.07 goto -3385 3022
+t=41.16 goto -3360 3138
+t=45.55 goto -3436 3358
+t=49.20 goto -3604 3627
+t=50.29 goto -3862 3758
+t=51.38 goto -3872 3810
 # back south: re-open the toggled Porte30 with the player's own use, return to the checkpoint
-t=66.00 goto -3862 3758
-t=70.00 goto -3436 3358
-t=74.00 goto -3360 3138
-t=76.00 use Porte30
-t=80.00 goto -3379 3138
-t=84.00 goto -3391 2828
-t=88.00 goto -3576 2515
-t=92.00 goto -3797 2129
-t=97.00 goto -3840 1720
+t=57.22 goto -3862 3758
+t=60.14 goto -3436 3358
+t=63.06 goto -3360 3138
+t=64.53 use Porte30
+t=67.44 goto -3379 3138
+t=70.37 goto -3391 2828
+t=73.28 goto -3576 2515
+t=76.20 goto -3797 2129
+t=79.85 goto -3840 1720
 # read the magnetic card on the checkpoint opener
-t=100.00 track MagneticPassTrigger0
-t=101.00 use MagneticPassTrigger0
-t=102.00 use MagneticPassTrigger0
-t=103.00 use MagneticPassTrigger0
-t=104.00 use MagneticPassTrigger0
-t=105.00 track off
-# canonical nav path south-east from the checkpoint toward the airlock
-t=108.00 goto -3778 1592
-t=112.00 goto -3682 1536
-t=116.00 goto -3592 1403
-t=120.00 goto -3216 1072
-t=124.00 goto -2960 846
-# detour to the airlock card reader, open Porte27/Porte26, then cross at the open gap
-t=128.00 goto -2817 1000
-t=130.00 goto -2780 790
-t=132.00 goto -2755 760
-t=134.00 use MagneticPassTrigger3
-t=135.50 use MagneticPassTrigger3
-t=137.50 goto -2816 959
-t=141.50 goto -2810 926
-t=145.50 goto -2647 973
-t=149.50 goto -2602 982
-# corridor south along x~-2600 toward the alarm doors
-t=153.50 goto -2539 917
-t=157.50 goto -2611 897
-t=161.50 goto -2633 617
-t=165.50 goto -2590 562
-t=169.50 goto -2589 505
-t=173.50 goto -2592 226
-t=177.50 goto -2563 182
-t=181.50 goto -2384 203
-# open the two PorteAlarme2 doors with the player's own use, then cross before they close
-t=184.00 goto -2300 203
-t=185.00 use Porte11
-t=186.00 use Porte11
-t=189.50 goto -2159 204
-# stop at the last measured 150-hp waypoint (see the header): the ward is awake and fires down
-# the corridor; the route holds east of the `PorteAlarme2` alarm doors.
-t=197.50 goto -2159 204
+t=81.80 track MagneticPassTrigger0
+t=82.80 use MagneticPassTrigger0
+t=83.80 use MagneticPassTrigger0
+t=84.80 use MagneticPassTrigger0
+t=85.80 use MagneticPassTrigger0
+t=86.00 track off
+# item100k: Cine0 (CineController25) is `XIDCine.Cine2` with map SightRadius 800 and
+# PeripheralVision -0.1 (a 191-degree cone). It looks at the checkpoint from the north-east
+# only for ~1.4 s at ~110.4-111.7 and again at 112.3 (measured: (-3696,722)/yaw 266 at
+# 105-110, then (-3564,779)/yaw ~332 at 112.3). Sprint immediately after the chain and clear
+# the airlock (>800 east) before it turns; the rest of the route stays in the x~-2600
+# corridor and the ward, >800 from Cine0. Cine15/Cine12 also see the player but do not wake
+# the ward (measured `prock03-expD.log`).
+t=86.10 goto -3778 1592
+t=86.70 goto -3682 1536
+t=87.30 goto -3592 1403
+t=88.30 goto -3216 1072
+t=89.30 goto -2960 846
+t=89.80 goto -2817 1000
+t=90.30 goto -2780 790
+t=90.80 goto -2755 760
+t=91.20 use MagneticPassTrigger3
+t=91.80 use MagneticPassTrigger3
+t=92.40 goto -2816 959
+t=93.00 goto -2647 973
+t=94.00 goto -2602 982
+t=95.00 goto -2539 917
+t=96.00 goto -2611 897
+t=97.00 goto -2633 617
+t=98.00 goto -2590 562
+t=99.00 goto -2589 505
+t=100.00 goto -2592 226
+t=101.00 goto -2563 182
+t=102.00 goto -2384 203
+t=103.50 goto -2300 203
+t=104.50 use Porte11
+t=105.50 use Porte11
+t=108.00 goto -2159 204
+t=171.30 goto -2159 204

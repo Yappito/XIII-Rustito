@@ -97,6 +97,13 @@ t=13.50 goto -2294 2549
 t=16.00 goto -2478 2540
 t=18.50 goto -2661 2536
 t=21.00 goto -2831 2310
+# item100h: Cine0 now acquires at22.250s from(-2541,1678) while the
+# player crosses(-2846,2286). Clear this close soldier and take his rifle
+# before the valley/camp, instead of running the whole leg under his fire.
+t=21.10 select_weapon 2
+t=23.00 engage Cine0 1800 25 aim=0.9
+t=23.10 loot 1500 15
+t=23.20 select_weapon 11
 t=23.50 goto -2600 1930
 t=26.00 goto -2568 1709
 t=28.00 goto -2419 1606
@@ -124,6 +131,8 @@ t=81.00 goto 1224 -4002
 t=84.50 goto 1006 -4459
 # Valley bottom east past StrategicPoint45 to the camp's north-east door.
 t=88.50 goto 2067 -4674
+t=89.00 engage 2500 30 aim=0.9
+t=89.10 loot 1500 15
 t=92.50 goto 2438 -5505
 t=96.00 goto 1872 -5739
 t=99.00 goto 1868 -6028
