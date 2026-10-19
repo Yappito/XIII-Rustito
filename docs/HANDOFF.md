@@ -6,7 +6,30 @@ Updated: **2026-10-09 (coordinator session)**. Research phase (2026-10-04), M0, 
 
 State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `be56145` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
-### Coordinator session 2026-10-17/18 (night) — newest; read first, then the evening handover below
+### Coordinator session 2026-10-19 — newest; read first
+
+Landed today (each one verify): item107 step 3 (`c8fa761`, retail PickStartPoint + AI door bumps, Hual04a goal 5 and the
+Hual04c travel); item108 (`9d0a6fb`, PRock04a tyrolines, falling no-progress recovery labelled Partial); retail SeePlayer
+/SightCounter (`0b5988c`, `ShowSelf` 0x1036df40 delivers to every controller, so cines react; PRock01a Porte9 + objective 0;
+routes re-driven); item107e (`17b5bde`, no route replays recorded fire timing any more; fire presses use the weapon in weapon
+mode); item109 (`64bcc37`, first PRock04b route to the mine-roof shelf); item108f-h (this landing: PRock04a past the cliff,
+first tyrol ridden by input to NavPoint1).
+
+Open, in worktrees:
+- `viewer` / `item103e-prock03-hostage` (Z.AI, item103k): hostage grab by ordinary input via `DrawInteractions` (the `carry`
+  host bridge was rejected and removed), item103h's `Landed` dispatch (APawn::processLanded 0x103c1580). The PRock03 ward
+  route is blocked under retail SeePlayer (Cine12 sees the Door2 crossing); being converted to a blocker pin plus a grab
+  mechanism test. Lands when every filter passes.
+- PRock04a: the NavPoint1 shelf has no eastward walk exit; goal 0 (`Fini`) and the PRock04b travel unreached.
+- PRock04b: past the shelf the standalone (unarmed) start dies in the canyon camp; needs PRock04a's loadout (travel chain).
+- Follow-ups: `Controller.actorReachable` still uses the nav approximation; the closed-loop sight test is stricter than
+  bullets for some soldiers; falling velocity clip is a labelled Partial deviation.
+
+Providers now: no Ollama Cloud, no Opus/Sonnet subagents (user, 2026-10-17/18). OpenCode Go deepseek (v4.1-flash, v4-pro as
+fallback; sessions sometimes hang silently — check log mtime and child test processes), Z.AI glm-5.3-flash (5-hour window,
+UTC+8 reset times), opencode/Codex gpt-6.1-sol (OpenAI limit; Codex CLI out of credits).
+
+### Coordinator session 2026-10-17/18 (night)
 
 - Landed `affab8e` (verify 1166 passed): item106 (`bCanFly` ledge skip) + item103e (PRock03 past `prsas02`) as one batch.
   item103f WIP (`viewer`, `dc2f39d`) was left out, unreviewed.
