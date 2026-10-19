@@ -11513,4 +11513,170 @@ mod tests {
             session.player_health()
         );
     }
+
+    /// PRock04b first input route (item109): normal standalone start -> the start-cave
+    /// planks -> the yard pass -> TyrolTrigger0 -> the far mine-roof shelf.
+    ///
+    /// Map facts measured for the route: one primary objective
+    /// (`Jones has hidden an airplane away. Find it.`), completed by the canyon
+    /// `objectif0` goal trigger (`TouchTrigger1` at 11195,187,-552 fires
+    /// `TriggerEvent('objectif0')` -> `XIIIGoalTrigger6`); `MapInfo.NextMapLevelWithUnr`
+    /// is `spads01.unr`. The `Fini` goal trigger at the start cave is not on that event
+    /// path. The route uses ordinary input only (fists on the plank movers, crouch under
+    /// the last plank, the named tyroline interaction).
+    ///
+    /// Measured stop (see `local/reports/item109-prock04b.md`): the tyroline release puts
+    /// the pawn on the shelf above the mine gallery at (18437.7,-3298.9,1359.9), 150 HP,
+    /// PlayerWalking. The next stretch is not survived by this standalone save: the slope
+    /// carries the pawn west off the shelf, the fall takes 114 HP, and the canyon camp then
+    /// kills the unarmed player. The route therefore stops before that point and pins the
+    /// incomplete objective, the absent travel and the surviving position.
+    #[test]
+    fn opt_in_prock04b_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("PRock04b".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import PRock04b");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let text = include_str!("../../tests/data/prock04b_route.script");
+        let script = script::Script::parse(text).expect("parse PRock04b route");
+        assert!(
+            script.events.iter().all(|event| !matches!(
+                event.command,
+                script::Command::Teleport(_)
+                    | script::Command::Weapon(_)
+                    | script::Command::Item(_)
+                    | script::Command::SetGoal(_)
+                    | script::Command::TakeControl
+            )),
+            "the route must use ordinary input only"
+        );
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "PRock04b",
+            &script,
+            &resolved.params,
+            &scene,
+            76.0,
+        )
+        .expect("run PRock04b route");
+        let session = &outcome.session;
+        let vm = session.vm();
+        println!(
+            "[prock04b] error={:?} goals={:?} travel={:?} position={:?} health={:?}",
+            session.first_error(),
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health()
+        );
+        survey::print_details(&survey::extract("PRock04b", &outcome));
+        assert!(
+            session.first_error().is_none(),
+            "{:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(session.blocked.is_empty(), "{:?}", session.blocked);
+        assert!(!session.player_input_ended(), "stop before a fatal point");
+        assert_ne!(session.player_controller_state(), "GameEnded");
+        assert_eq!(
+            session.player_health(),
+            Some(150.0),
+            "the route must reach the tyroline landing unharmed"
+        );
+        let near = |position: [f32; 3], expected: [f32; 3], tolerance: f32| {
+            position
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| (a - b).abs() < tolerance)
+        };
+        let start = outcome.trace.first().expect("spawn sample").2;
+        assert!(
+            near(start, [14794.5, -4703.5, 2411.0], 2.0),
+            "normal spawn: {start:?}"
+        );
+        // The start-cave plank wall and the yard plank wall are destroyed by the player's
+        // own fists; the route walks through the openings they leave.
+        for mover in [
+            "BreakAbleMover260",
+            "BreakAbleMover258",
+            "BreakAbleMover254",
+            "BreakAbleMover255",
+            "BreakAbleMover19",
+            "BreakAbleMover16",
+        ] {
+            assert!(
+                vm.find_live_object(mover).is_none(),
+                "{mover} must be destroyed by the route: {:?}",
+                vm.find_live_object(mover)
+            );
+        }
+        assert!(
+            session
+                .touches()
+                .iter()
+                .any(|(_, actor)| actor == "TyrolTrigger0"),
+            "the route must reach TyrolTrigger0: {:?}",
+            session.touches()
+        );
+        assert!(
+            vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target == "XIIIPlayerController" && function.ends_with("GoTyroling")
+            )),
+            "the tyroline must run GoTyroling"
+        );
+        // Measured far-end landing (the tyroline release overshoots the NavPoint by a tick or
+        // two; 40 UU is the same tolerance as the PRock04a tyrol mechanism test).
+        let position = session.player_location().expect("player location");
+        assert!(
+            near(position, [18437.7, -3298.9, 1359.9], 40.0),
+            "the tyroline must reach the mine-roof shelf: {position:?}"
+        );
+        assert_ne!(
+            session.player_physics(),
+            Some(2),
+            "the stop must not be a falling state"
+        );
+        assert_eq!(
+            session.player_controller_state(),
+            "PlayerWalking",
+            "the tyroline must hand back to walking"
+        );
+        // The objectives/travel pin. `XIIIGoalTrigger6` (Tag `objectif0`) is fired only by
+        // `TouchTrigger1` at the canyon floor; the route stops far above it, so goal 0 is
+        // still primary and incomplete and the map's DoTravel never runs.
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 1);
+        assert!(goals[0].primary && !goals[0].anti_goal);
+        assert_eq!(goals[0].text, "Jones has hidden an airplane away. Find it.");
+        assert!(
+            !goals[0].completed,
+            "the canyon goal stays unreached: {goals:?}"
+        );
+        assert!(outcome.travel.is_empty(), "PRock04b travel remains blocked");
+        let map_info = vm
+            .find_object("PRock04b0")
+            .expect("map info / travel owner");
+        assert_eq!(
+            vm.get_property(map_info, "NextMapLevelWithUnr"),
+            Some(&Value::Str("spads01.unr".to_owned()))
+        );
+        let fini = vm
+            .find_object("XIIIGoalTrigger14")
+            .expect("start-cave Fini goal trigger");
+        assert_eq!(
+            vm.get_property(fini, "Tag"),
+            Some(&Value::Name("Fini".to_owned())),
+            "the start-cave Fini trigger is not the canyon objective"
+        );
+    }
 }
