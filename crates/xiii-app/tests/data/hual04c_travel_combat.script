@@ -5,22 +5,20 @@
 # No teleports, grants, health writes or control overrides; only the game's own corpse
 # QuickHeal medkit is used. The route clears the first encounter (soldier28/29/30), the
 # second wave (2/31/32/33) and the BaseSoldier1 high-spot sniper, reaches Carrington, and
-# retreats south at 2 HP; the escort then waits on the northern kill event (see the test).
+# retreats south at low HP; the escort then waits on the northern kill event (see the test).
+#
+# item107e: every recorded track/fire volley is a closed-loop named standing engagement. The
+# route's contact schedule is tied to the game's own wave/escort timing, so the engagement must
+# not pause the script clock: `engage_on <Actor>` turns to and taps that pinned soldier while
+# the goto/reload/heal/strafe lines below keep their recorded times.
 t=84.00 select_weapon 2
 t=86.00 select_weapon 2
-t=90.00 track BaseSoldier30 0.90
-t=90.10 fire
-t=90.50 fire
-t=90.90 fire
-t=91.30 fire
-t=91.70 fire
-t=92.00 track BaseSoldier29 0.90
-t=92.10 fire
-t=92.50 fire
-t=92.90 fire
-t=93.30 fire
-t=93.70 fire
-t=94.00 track off
+# item107e: the first encounter's recorded track/fire volley is two named standing engagements
+# (the old switch at 92). Naming the target keeps the route's walking schedule (the goto/heals
+# below still run on the script clock) while the player turns to and taps each pinned soldier.
+t=90.00 engage_on BaseSoldier30 4000 aim=0.90 period=0.4
+t=92.00 engage_on BaseSoldier29 4000 aim=0.90 period=0.4
+t=94.00 engage_off
 t=94.00 goto -3100 580
 t=94.20 reload
 t=96.00 heal
@@ -28,88 +26,32 @@ t=97.00 heal
 t=98.00 heal
 t=98.00 forward 0
 # item104: BaseSoldier28 (bazooka, 2400 UU away at (-4861,-1065)) fires a rocket every ~2 s from about t=97.7
-# (impacts measured at 100.27, 102.05, 104.58: 46/73/46 hp). With the friction-world dispersion the old
-# 100.1 start left three rockets in flight and killed the player; the player crouches (hypothesis: lower dispersion)
-# and engages at 98.3 instead, with the reload moved before the heals.
+# (impacts measured at 100.27, 102.05, 104.58: 46/73/46 hp). The player crouches (hypothesis: lower
+# dispersion) and engages as soon as the heals finish.
 t=98.00 crouch 1
-t=98.30 track BaseSoldier28 1.20
-t=98.40 fire
-t=98.70 fire
-t=99.00 fire
-t=99.30 fire
-t=99.60 fire
-t=99.90 fire
-# BaseSoldier28 is dead by t=100.25 (measured); the second-wave bazooka soldier BaseSoldier2 (stationary at
-# (-3906,-2278), launches from about 101.7) is engaged at once instead of at 102.3.
-t=100.30 track BaseSoldier2 0.90
-t=100.10 fire
-t=100.40 fire
-t=100.70 fire
-t=101.00 fire
-t=101.30 fire
-t=101.60 fire
-t=101.90 fire
-t=102.20 fire
-t=102.30 track BaseSoldier2 0.90
+# item107e: BaseSoldier28 (aimed at the measured 1.20 height) then the second-wave bazooka soldier
+# BaseSoldier2 (stationary at (-3906,-2278), launches from about 101.7) are named standing
+# engagements, so the recorded strafe still dodges the rockets and the clock keeps running.
+t=98.30 engage_on BaseSoldier28 5000 aim=1.20 period=0.3
+t=100.30 engage_on BaseSoldier2 5000 aim=0.90 period=0.4
 t=102.30 right 1
-t=102.60 fire
-t=103.00 fire
-t=103.40 fire
-t=103.80 fire
-t=104.20 fire
-t=104.60 fire
-t=105.00 fire
-t=105.40 fire
-t=105.80 fire
-t=106.20 fire
-t=106.60 fire
 t=107.00 right 0
 t=107.00 crouch 0
-t=107.00 track off
+t=107.00 engage_off
 t=107.00 goto -1500 1800
 t=110.00 goto -844 2066
 t=113.00 forward 0
 t=113.00 reload
 t=114.50 crouch 1
-t=115.00 track BaseSoldier33 0.90
-t=115.10 fire
-t=115.50 fire
-t=115.90 fire
-t=116.30 fire
-t=116.70 fire
-t=117.10 fire
-t=118.00 track BaseSoldier31 0.90
-t=118.10 fire
-t=118.50 fire
-t=118.90 fire
-t=119.30 fire
-t=119.70 fire
-t=120.10 fire
-# item104: the carried Beretta (13 + 39 rounds) is empty by here (c9mmAmmo 0 at the end of the failed run, measured);
-# the 32 engagement uses the carried M16 (the old fire on `BaseSoldier32` hit nothing: `TakeDamage` trace).
+t=115.00 engage_on BaseSoldier33 4000 aim=0.90 period=0.4
+t=118.00 engage_on BaseSoldier31 4000 aim=0.90 period=0.4
+# item104: the carried Beretta is empty by here; the 32 engagement uses the carried M16 (the
+# old fire on `BaseSoldier32` hit nothing: `TakeDamage` trace). BaseSoldier32 walks around to
+# (-1083,1762) and is only in sight later; the standing engagement opens fire when it appears.
+t=120.50 engage_off
 t=121.00 select_weapon 11
-t=123.00 track BaseSoldier32 0.90
-t=123.10 fire
-t=123.50 fire
-t=123.90 fire
-t=124.30 fire
-t=124.70 fire
-t=125.10 fire
-t=125.50 fire
-t=125.90 fire
-t=126.30 fire
-t=126.70 fire
-t=127.10 fire
-t=127.50 fire
-t=127.90 fire
-t=128.30 fire
-t=128.70 fire
-t=129.10 fire
-# item104: BaseSoldier32 (shotgun) walks around to (-1083,1762) and is only in sight from t~130 (measured);
-# the old (Beretta) engagement hit nothing; with the M16 it dies at t=129.5 (measured), so the engagement runs
-# to 129.5 and the rest of the route is delayed by 0.7 s relative to the original timeline.
-t=129.50 fire
-t=130.00 track off
+t=123.00 engage_on BaseSoldier32 5000 aim=0.90 period=0.3
+t=130.50 engage_off
 t=130.00 crouch 0
 t=130.00 reload
 t=130.70 goto -53 2835
@@ -133,28 +75,8 @@ t=164.70 goto -1342 2069
 t=170.70 select_weapon 11
 t=172.70 goto -1907 1912
 t=174.20 goto -1939 1902
-t=174.70 track BaseSoldier1 0.85
-t=174.70 fire
-t=175.00 fire
-t=175.30 fire
-t=175.60 fire
-t=175.90 fire
-t=176.20 fire
-t=176.50 fire
-t=176.80 fire
-t=177.10 fire
-t=177.40 fire
-t=177.70 fire
-t=178.00 fire
-t=178.30 fire
-t=178.60 fire
-t=178.90 fire
-t=179.20 fire
-t=179.50 fire
-t=179.80 fire
-t=180.10 fire
-t=180.40 fire
-t=180.70 track off
+t=174.70 engage_on BaseSoldier1 4000 aim=0.85 period=0.3
+t=180.70 engage_off
 t=180.70 reload
 t=182.70 goto -2370 2236
 t=205.70 goto -2277 2766
@@ -163,135 +85,26 @@ t=232.70 goto -1925 3800
 t=248.70 goto -1257 4979
 # item97d probe: the trailing `goto` must complete (within 24 UU) before `track` can own
 # the aim; -1257 4979 is the measured stable track point. Clear the end-of-track assault
-# (BaseSoldier35 Bazook first, then BaseSoldier34 Beretta) with the carried M16.
+# (BaseSoldier34 Beretta first, then BaseSoldier35 Bazook) with the carried M16.
 t=256.70 select_weapon 11
 t=257.20 crouch 1
-t=257.70 track BaseSoldier34 1.0
-t=257.80 fire
-t=258.00 fire
-t=258.20 fire
-t=258.40 fire
-t=258.60 fire
-t=258.80 fire
-t=259.00 fire
-t=259.20 fire
-t=259.40 fire
-t=259.60 fire
-t=259.70 track BaseSoldier35 1.0
-t=259.80 fire
-t=260.00 fire
-t=260.20 fire
-t=260.40 fire
-t=260.60 fire
-t=260.80 fire
-t=261.00 fire
-t=261.20 fire
-t=261.40 fire
-t=261.60 fire
-t=261.80 fire
-t=262.00 fire
-t=262.20 fire
-t=262.40 fire
-t=262.60 fire
-t=262.80 fire
-t=263.00 fire
-t=263.20 fire
-t=263.40 fire
-t=263.60 fire
-t=263.80 fire
-t=264.00 fire
-t=264.20 fire
-t=264.40 fire
-t=265.00 fire
-t=265.20 fire
-t=265.40 fire
-t=265.60 fire
-t=265.80 fire
-t=266.00 fire
-t=266.20 fire
-t=266.40 fire
-t=266.60 fire
-t=266.80 fire
-t=267.00 fire
-t=267.20 fire
-t=267.40 fire
-t=267.60 fire
-t=267.80 fire
-t=268.00 fire
-t=268.20 fire
-t=268.40 fire
-t=268.60 fire
-t=268.80 fire
-t=269.00 fire
-t=269.20 fire
-t=269.40 fire
-t=269.60 fire
-t=269.80 fire
-t=270.00 fire
-t=270.20 fire
-t=270.40 fire
-t=270.60 fire
-t=270.80 fire
-t=271.00 fire
-t=271.20 fire
-t=271.40 fire
-t=271.60 fire
-t=271.80 fire
-t=272.00 fire
-t=272.20 fire
-t=272.40 fire
-t=272.60 fire
-t=272.70 track off
+t=257.70 engage_on BaseSoldier34 5000 aim=0.6 period=0.2
+t=260.50 engage_on BaseSoldier35 5000 aim=0.6 period=0.2
+t=272.70 engage_off
 t=272.70 crouch 0
 # item97e: follow the escort's action89 moveseq north by dense gotos to m29 (within 1200 UU
 # of the action92 `wait player 1200` point m30) so that gate clears; the escort then
 # advances to action107 `wait event tupeuxyallerthird`. Clear the first action93
 # `Bastardsinyourback` ambusher (BaseSoldier36) and heal from its corpse medkit. The route
 # stops before the second ambusher (BaseSoldier37) can wear the carried player down. No
-# teleports; only goto/track/forward/fire/heal.
+# teleports; only goto/track/forward/engage/heal.
 t=273.20 goto -842 5359
 t=274.70 goto -238 5949
 t=276.20 goto 997 6711
 t=278.90 goto 2218 6565
 t=280.70 forward 0
 t=280.80 select_weapon 11
-t=281.20 track BaseSoldier36 0.9
-t=281.30 fire
-t=281.45 fire
-t=281.60 fire
-t=281.75 fire
-t=281.90 fire
-t=282.05 fire
-t=282.20 fire
-t=282.35 fire
-t=282.50 fire
-t=282.65 fire
-t=282.80 fire
-t=282.95 fire
-t=283.10 fire
-t=283.25 fire
-t=283.40 fire
-t=283.55 fire
-t=283.70 fire
-t=283.85 fire
-t=284.00 fire
-t=284.15 fire
-t=284.30 fire
-t=284.45 fire
-t=284.60 fire
-t=284.75 fire
-t=284.90 fire
-t=285.05 fire
-t=285.20 fire
-t=285.35 fire
-t=285.50 fire
-t=285.65 fire
-t=285.80 fire
-t=285.95 fire
-t=286.10 fire
-t=286.25 fire
-t=286.40 fire
-t=286.55 fire
-t=286.70 track off
+t=281.20 engage_on BaseSoldier36 5000 aim=0.9 period=0.15
+t=286.70 engage_off
 t=286.90 heal
 t=290.70 wait_travel

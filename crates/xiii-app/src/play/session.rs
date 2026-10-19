@@ -2811,7 +2811,13 @@ impl Session {
     /// `Hook.ActivatedByFire` and calls `ActivateItem` — the same path a mouse click takes.
     /// Anything else keeps the item14 weapon path.
     pub fn fire_pressed(&mut self, yaw: f32, pitch: f32) -> FireOutcome {
-        if !self.selected_item_is_hook() {
+        // The hook owns the fire button only in item mode (or while attached). A weapon
+        // selected with the retail number keys leaves `SelectedItem` pointing at the last
+        // item (e.g. the Hook) while `bWeaponMode` is true; the press must then fire the
+        // weapon with the host view, exactly like the `fire` command (which bypasses this
+        // check). Treating the stale item as the hook dispatched `Controller.Fire` without
+        // re-asserting the player rotation and every closed-loop shot missed.
+        if !self.hook_owns_buttons() {
             return self.fire(yaw, pitch);
         }
         let Some(pc) = self.controller else {

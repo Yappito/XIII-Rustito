@@ -74,14 +74,15 @@
 //!   2.5 s; the bullets go into cover that the sight line does not show) is given up on for 6 s
 //!   while another hostile is visible, as a player turns to another enemy when the health bar
 //!   stays full.
-//! - `engage_on [radius] [aim=<f>] [hold=<s>] [period=<s>]` / `engage_off`: the same shooting as a
-//!   non-blocking *standing* engagement. The script clock keeps running, so a route whose walking
-//!   schedule is tied to the game's own timing (waves that spawn on timers) keeps its schedule
-//!   while the aiming and firing follow whatever hostile is visible, whenever that is. It never
-//!   ends by itself (only `engage_off`, or a later `engage_on` that replaces it); it yields the
-//!   trigger to a blocking `engage` or `loot` while one runs; a pending `goto` pauses while a
-//!   target is engaged and resumes after. It engages visible hostile pawns only (name a target
-//!   with the blocking form).
+//! - `engage_on [Actor] [radius] [aim=<f>] [hold=<s>] [period=<s>]` / `engage_off`: the same
+//!   shooting as a non-blocking *standing* engagement. The script clock keeps running, so a route
+//!   whose walking schedule is tied to the game's own timing (waves that spawn on timers) keeps
+//!   its schedule while the aiming and firing follow whatever hostile is visible, whenever that
+//!   is. With an `Actor` name only that actor is aimed at (the same target rule as the blocking
+//!   form), which lets a schedule-bound route name the pinned kill without pausing its clock. It
+//!   never ends by itself (only `engage_off`, or a later `engage_on` that replaces it); it yields
+//!   the trigger to a blocking `engage` or `loot` while one runs; a pending `goto` pauses while a
+//!   target is engaged and resumes after.
 //! - `loot [radius] [secs]`: blocking. Walks onto the nearest visible dead pawn within `radius`
 //!   (default 1500 UU) that still carries inventory, one corpse after another, as a player
 //!   collects a fallen soldier's weapon (the game hands a corpse's weapon, ammo and keys over on
@@ -217,7 +218,8 @@ pub enum Command {
     /// item107: blocking walk onto visible corpses that still carry a weapon (see the module docs).
     Loot(LootSpec),
     /// item107: non-blocking standing engagement (`engage_on`): the script clock keeps running
-    /// while the player shoots at whatever hostile is visible (see the module docs).
+    /// while the player shoots at the named actor, or at whatever hostile is visible when no
+    /// actor is named (see the module docs).
     EngageOn(EngageSpec),
     /// item107: ends a standing engagement (`engage_off`).
     EngageOff,
@@ -816,15 +818,7 @@ impl Script {
                     Command::Shot(path.to_owned())
                 }
                 "engage" => Command::Engage(parse_engage(&mut it, n)?),
-                "engage_on" | "engage-on" => {
-                    let spec = parse_engage(&mut it, n)?;
-                    if spec.target.is_some() {
-                        return Err(format!(
-                            "line {n}: engage_on engages visible hostiles; name a target with a blocking `engage`"
-                        ));
-                    }
-                    Command::EngageOn(spec)
-                }
+                "engage_on" | "engage-on" => Command::EngageOn(parse_engage(&mut it, n)?),
                 "engage_off" | "engage-off" => {
                     if it.next().is_some() {
                         return Err(format!("line {n}: engage_off takes no arguments"));
@@ -1319,10 +1313,15 @@ impl Drive {
         {
             req.weapon = true;
             req.aim = st.spec.aim;
-            req.hostile_radius = Some(
-                req.hostile_radius
-                    .map_or(st.spec.radius, |r| r.max(st.spec.radius)),
-            );
+            match &st.spec.target {
+                Some(name) => req.actors.push(name.clone()),
+                None => {
+                    req.hostile_radius = Some(
+                        req.hostile_radius
+                            .map_or(st.spec.radius, |r| r.max(st.spec.radius)),
+                    );
+                }
+            }
         }
         req
     }
@@ -3118,7 +3117,7 @@ t=0.5 forward 1
     fn parses_engage_on_and_off() {
         let s = Script::parse(
             "t=1 engage_on\nt=2 engage_on 2500 aim=0.9 period=0.1 hold=0.05\nt=3 engage_off\n\
-             t=4 engage-on 900\n",
+             t=4 engage-on 900\nt=5 engage_on Foe 1800 aim=0.8 period=0.4\n",
         )
         .unwrap();
         assert!(matches!(&s.events[0].command, Command::EngageOn(e)
@@ -3127,9 +3126,10 @@ t=0.5 forward 1
             if e.radius == 2500.0 && e.aim == 0.9 && e.period == 0.1 && e.hold == 0.05));
         assert_eq!(s.events[2].command, Command::EngageOff);
         assert!(matches!(&s.events[3].command, Command::EngageOn(e) if e.radius == 900.0));
-        // A standing engagement has no named target and `engage_off` takes no arguments.
+        assert!(matches!(&s.events[4].command, Command::EngageOn(e)
+            if e.target.as_deref() == Some("Foe") && e.radius == 1800.0 && e.aim == 0.8));
+        // `engage_off` takes no arguments and bad numbers are rejected.
         for bad in [
-            "t=0 engage_on Foe",
             "t=0 engage_on 1000 nonsense",
             "t=0 engage_off now",
             "t=0 engage_on -3",
@@ -3203,6 +3203,43 @@ t=0.5 forward 1
         assert!(!d.wants_facts(), "no facts needed once it is off");
         let jumped_at = jumped_at.expect("jump");
         assert!((jumped_at - 2.5).abs() < 2.0 * TICK, "{jumped_at}");
+    }
+
+    #[test]
+    fn standing_engagement_with_a_named_target_shoots_only_it_and_keeps_the_clock() {
+        // A nearer hostile stands east; the named target is north. The named standing
+        // engagement aims north and the t=1 walking event still applies on the script clock.
+        let s = Script::parse("t=0 engage_on Foe 2000 period=0.1\nt=1 forward 1\n").unwrap();
+        let mut d = Drive::new(&s);
+        let mut sim = PlayerSim::new([0.0; 3], 0.0);
+        let mut t = 0.0;
+        let facts = Facts {
+            actors: vec![actor("foe", ActorState::Alive, true, [0.0, 300.0, 70.0])],
+            hostiles: vec![seen("Nearer", [100.0, 0.0, 70.0], 100.0)],
+            weapon: Some(WeaponFact::default()),
+            ..Facts::default()
+        };
+        // The first tick applies `engage_on`; facts are gathered from the next tick on.
+        step(&mut d, &mut sim, &mut t, Facts::default());
+        let (_, fire, _) = step(&mut d, &mut sim, &mut t, facts.clone());
+        assert!(fire.0, "the named target is in sight");
+        assert!(
+            (sim.yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-5,
+            "must aim at the named target, not the nearer hostile: {}",
+            sim.yaw
+        );
+        let mut forward_at = None;
+        while t < 1.2 {
+            let (i, _, _) = step(&mut d, &mut sim, &mut t, facts.clone());
+            if i.forward == 1.0 && forward_at.is_none() {
+                forward_at = Some(t);
+            }
+        }
+        let forward_at = forward_at.expect("the walking event applied");
+        assert!(
+            (forward_at - 1.0).abs() < 2.0 * TICK,
+            "the named standing engagement must not pause the script clock: {forward_at}"
+        );
     }
 
     #[test]

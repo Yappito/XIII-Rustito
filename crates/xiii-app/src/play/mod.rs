@@ -7192,18 +7192,20 @@ mod tests {
                 "item101 pin: BaseSoldier14 (the third counter_finact2b soldier) must die to the \
                  route's fire now that the ledge rule keeps it on the courtyard"
             );
-            // item100j: re-pinned from -55 to the measured -161. Measured cause: the item100h
-            // negative-SightCounter gate delays the act2b courtyard soldiers' acquisition
-            // (BaseSoldier14's first SeePlayer is 166.5 s, player at -2612,1181,393), so the
-            // standing engagement opens fire on it for longer before the scene advances past
-            // counter_finact2b; the soldier is still killed by the route's fire at the same
-            // courtyard fight (item101's ledge rule keeps it there). The assertion's purpose
-            // (it must die to the route's fire, not walk off) is unchanged.
+            // item107e: re-pinned from -161 to the measured -12. Measured cause: the sniper
+            // phase is closed-loop and, after `Session::fire_pressed` learned to fire the
+            // selected weapon in weapon mode even when `SelectedItem` still names the Hook,
+            // every closed-loop shot in this route lands. Both snipers die at their first
+            // clear shot (BaseSoldier4 at 133.1 s, BaseSoldier at 134.8 s; measured
+            // local/reports/item107e-toits-run5.txt) instead of the recorded 138.5/148.0, and
+            // the courtyard fire kills the same act2b soldier (item101's ledge rule keeps it
+            // on the courtyard). The assertion's purpose (it must die to the route's fire, not
+            // walk off) is unchanged.
             assert_eq!(
                 vm.get_property(s14, "Health"),
-                Some(&xiii_script::Value::Int(-161)),
-                "item101/item100j pin: the route's courtyard fire must kill BaseSoldier14 \
-                 (measured -161 after the sight-countdown decode; it must be < 0, i.e. dead)"
+                Some(&xiii_script::Value::Int(-12)),
+                "item101/item107e pin: the route's courtyard fire must kill BaseSoldier14 \
+                 (measured -12 after the closed-loop sniper phase; it must be < 0, i.e. dead)"
             );
             // The scene controller is now parked at action[238] `wait event counter_finact2a`:
             // the VM's cine trace treats `ScriptedActionIndex - 1` as the action that ran/is
@@ -7353,11 +7355,18 @@ mod tests {
         // of the raw damage the pre-decode timing inflicted (same kills: BaseSoldier14/17/18
         // all dead, the scene still advances past counter_finact2b). The route survives; the
         // value is pinned so a further regression still fails visibly.
+        // item107e: re-pinned from 145 to the measured 150. Measured cause: the closed-loop
+        // sniper phase plus the `Session::fire_pressed` weapon-mode fix (closed-loop shots now
+        // use the host view even when `SelectedItem` still names the Hook) kills both snipers at
+        // their first clear shot (133.1/134.8 s; local/reports/item107e-toits-run5.txt) and
+        // clears the courtyard/tarmac return fire before it lands, so the route ends at full
+        // health. Same kills; the pin still catches a further regression.
         assert_eq!(
-            health, 145.0,
-            "the re-timed route must end at the measured health 145 (item100j: the sight-countdown \
-             decode delays the courtyard/tarmac acquisition; item107c: door-bump path; item101: the \
-             courtyard BaseSoldier14 fight the ledge fix restored)"
+            health, 150.0,
+            "the re-timed route must end at the measured health 150 (item100j: the sight-countdown \
+             decode delays the courtyard/tarmac acquisition; item107c: door-bump path; item101: \
+             the courtyard BaseSoldier14 fight the ledge fix restored; item107e: closed-loop \
+             combat and the weapon-mode fire fix)"
         );
         let soldier17 = session
             .vm()
@@ -7730,17 +7739,16 @@ mod tests {
         let soldier18 = vm
             .find_object("BaseSoldier18")
             .expect("BaseSoldier18 must exist");
-        // item100j: re-pinned from -18 to the measured -105. Measured cause: the sight-countdown
-        // decode delays BaseSoldier18's acquisition (SeePlayer 380.6 s, player at 16000,1300,693)
-        // so the landing engagement opens fire on it for longer before the scripted engagement
-        // cadence moves on, landing the extra rounds the item107c timing cut off (item107c's -18
-        // was the minimal three-hit kill; the decode restores -105, between item101's -97 and the
-        // earlier -41). Same death.
+        // item107e: re-pinned from -105 to the measured -18. Measured cause: the landing
+        // engagement is a closed-loop `engage BaseSoldier18` (linger=10) and the
+        // `Session::fire_pressed` weapon-mode fix makes its shots use the host view; measured
+        // local/reports/item107e-toits-run7.txt, the fight lands exactly the three M60 spine
+        // hits (150 -> 94 -> 38 -> -18) before the soldier dies and the block ends. Same death.
         assert_eq!(
             vm.get_property(soldier18, "Health"),
-            Some(&xiii_script::Value::Int(-105)),
-            "the landing M60 engagement must reproduce the measured kill (item100j: Health -105 \
-             after the sight-countdown decode; item107c: -18; item101: -97)"
+            Some(&xiii_script::Value::Int(-18)),
+            "the landing M60 engagement must reproduce the measured kill (item107e: Health -18, \
+             the three-hit M60 kill after the closed-loop fix; item100j: -105)"
         );
         assert!(
             session.actor_is_dead(soldier18),
@@ -7805,19 +7813,20 @@ mod tests {
         let session = &outcome.session;
         let vm = session.vm();
         // The generator is destroyed only by the labelled teleport into the room; the map's own
-        // `BreakableMover12.Health` drops to the measured -120 and `PorteDebloquee_cine` arms
-        // `TouchTrigger10` (Event `RenfortHelico02`). item100m: re-pinned from -40 to -120.
-        // Measured cause: the item100m closed-loop re-drive selects the scene-granted sniper
-        // (InventoryGroup 14) for the tarmac fight, so that rifle - not the earlier M60 grant -
-        // is in hand for the diagnostic shot. Two shots leave the measured -120 residue
-        // (170 total damage from Health 50; measured local/reports/item100m-diag-run5.txt).
-        // The destruction itself is unchanged; only the measured residue moves.
+        // `BreakableMover12.Health` drops below zero and `PorteDebloquee_cine` arms
+        // `TouchTrigger10` (Event `RenfortHelico02`). item107e: re-pinned from -120 to the
+        // measured -40. Measured cause: the item107e closed-loop tarmac engagements and the
+        // `Session::fire_pressed` weapon-mode fix pause the script clock for a different length,
+        // so the diagnostic fixture's three recorded `fire`s fall at a different phase of the
+        // sniper's refire animation and only one lands (50 - 90 = -40; measured
+        // local/reports/item107e-diag.txt). The generator is still destroyed and the arming
+        // chain unchanged; only the residue moves.
         let generator = vm
             .find_object("BreakableMover12")
             .expect("the generator BreakableMover12 must exist");
         assert_eq!(
             vm.get_property(generator, "Health"),
-            Some(&xiii_script::Value::Int(-120)),
+            Some(&xiii_script::Value::Int(-40)),
             "diag: the room shot must destroy the generator (item100m measured -120)"
         );
         let tt10 = vm
@@ -7893,15 +7902,18 @@ mod tests {
         // phase had already killed; the arriving RenfortHelico02 wave (BaseSoldier8/9, spawned
         // at ~394 s) then shot the player unopposed. The re-driven fixture replaces that burst
         // with a standing closed-loop engagement: measured, the wave is dead by 399.0 s and the
-        // player survives to the 440 s cutoff with health 125 in PlayerWalking
-        // (local/reports/item100m-diag-run5.txt). The pin is now survival, not death.
+        // player survives to the 440 s cutoff. item107e: re-pinned from 125 to the measured 19.
+        // Measured cause: the `Session::fire_pressed` weapon-mode fix makes the closing
+        // engagement's shots use the host view, so the courtyard/tarmac phases clear faster and
+        // the helipad wave lands more of its return fire before it dies (measured
+        // local/reports/item107e-diag2.txt); the wave is still dead and the player still walks.
         let health = session
             .player_health()
             .expect("the player must have a Health property");
         assert_eq!(
-            health, 125.0,
+            health, 19.0,
             "diag: the re-driven route must end the helipad wave and survive with the measured \
-             health 125, got {health}"
+             health 19, got {health}"
         );
         assert_eq!(
             session.player_controller_state(),
@@ -7909,7 +7921,7 @@ mod tests {
             "diag: the route player must still be walking at the cutoff"
         );
         println!(
-            "[toits01 diag] generator Health=-120, TT10 armed+touched, goal 0 complete; the \
+            "[toits01 diag] generator Health=-40, TT10 armed+touched, goal 0 complete; the \
              RenfortHelico02 wave was killed and the route player survived (health {health}, \
              PlayerWalking); BaseSoldier14 was killed by the route (item101)"
         );

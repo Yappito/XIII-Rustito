@@ -23,11 +23,10 @@
 #                 requests Kello01b.unr
 # The waypoint chain (each `goto x y` and its optional `jump`) was generated offline by a best-first
 # search over the real PlayerSim (same walker and water volumes; hops that touch a water volume or
-# land harder than the retail fall-damage threshold are rejected). The `track`/`fire`/
-# `select_weapon`/`reload` lines were recorded from an authoring-time aim assist (nearest visible
-# living soldier, `track` at 0.85, one `fire` per 0.3 s, `reload` when the clip is spent). Neither
-# tool is in the repository: only these plain script lines. The replay is exact and as fragile as
-# every other recorded route against changes that alter RNG consumption, AI timing or physics.
+# land harder than the retail fall-damage threshold are rejected). The weapon selections and reloads
+# are the recorded authoring-time aim assist; item107e replaced its `track`/`fire` volleys with
+# named standing engagements (`engage_on <Actor>`), so each pinned soldier is aimed at by name and
+# tapped at the measured cadence while the waypoint clock keeps running.
 t=1.0 select_weapon 3
 t=1.500 goto -3006 6127
 t=2.300 goto -3177 6056
@@ -64,13 +63,11 @@ t=26.300 goto -214 644
 t=27.100 goto -47 477
 t=27.900 goto 120 310
 t=28.900 forward 0
-t=28.991669 track BaseSoldier9 0.85
-t=29.041668 fire
-t=29.058334 track off
-t=29.075001 track BaseSoldier0 0.85
-t=29.125002 fire
-t=29.425001 fire
-t=29.441668 track off
+# item107e: named standing engagements keep the waypoint clock; each window starts when the
+# recorded volley did and fires at the magnum's measured cadence.
+t=28.991669 engage_on BaseSoldier9 3500 aim=0.85 period=0.3
+t=29.075001 engage_on BaseSoldier0 3500 aim=0.85 period=0.3
+t=29.450000 engage_off
 t=29.458336 goto 234.67743 195.35422
 t=30.025002 goto 254.00508 -83.97327
 t=30.191668 jump
@@ -142,17 +139,11 @@ t=71.758339 goto -6533.503 -1701.1023
 t=71.925003 jump
 t=72.958336 goto -6804.021 -1967.0264
 t=73.125008 jump
-t=74.141670 track BaseSoldier 0.85
-t=74.191673 fire
-t=74.208336 track off
-t=74.225006 track BaseSoldier2 0.85
-t=74.275009 fire
-t=74.291672 track off
-t=74.308342 track BaseSoldier1 0.85
-t=74.358337 fire
+t=74.141670 engage_on BaseSoldier 3500 aim=0.85 period=0.3
+t=74.225006 engage_on BaseSoldier2 3500 aim=0.85 period=0.3
+t=74.308342 engage_on BaseSoldier1 3500 aim=0.85 period=0.3
 t=74.375008 reload
-t=75.541672 fire
-t=75.558342 track off
+t=75.558342 engage_off
 t=75.575005 goto -7074.9634 -2237.967
 t=75.741676 jump
 t=76.791672 goto -7347.776 -2510.1316
@@ -194,10 +185,8 @@ t=96.825005 jump
 t=97.591675 goto -13556.715 -2697.221
 t=97.758339 jump
 t=98.558342 goto -13392.053 -2597.7231
-t=99.408340 track BaseSoldier4 0.85
-t=99.458344 fire
-t=99.758339 fire
-t=99.775009 track off
+t=99.408340 engage_on BaseSoldier4 3500 aim=0.85 period=0.3
+t=99.775009 engage_off
 t=99.791672 goto -13123.162 -2685.3433
 t=100.641670 goto -13094.4795 -2957.2224
 t=101.641670 goto -13354.4795 -3047.1504
@@ -221,9 +210,8 @@ t=112.758339 goto -15569.73 -1915.7935
 t=113.625008 goto -15838.841 -1814.6837
 t=114.475006 goto -16051.395 -1618.947
 t=114.641678 jump
-t=115.591675 track BaseSoldier8 0.85
-t=115.641678 fire
-t=115.658340 track off
+t=115.591675 engage_on BaseSoldier8 3500 aim=0.85 period=0.3
+t=115.658340 engage_off
 t=115.675011 goto -16323.845 -1447.0516
 t=116.808342 goto -16596.572 -1536.9747
 t=116.975006 jump
@@ -242,10 +230,8 @@ t=124.758339 goto -16785.855 -3352.1055
 t=125.608345 goto -16580.047 -3557.919
 t=126.458344 goto -16374.244 -3763.7275
 t=126.625008 jump
-t=127.691673 track BaseSoldier3 0.85
-t=127.741676 fire
-t=128.041672 fire
-t=128.058350 track off
+t=127.691673 engage_on BaseSoldier3 3500 aim=0.85 period=0.3
+t=128.058350 engage_off
 t=128.075012 goto -16118.0205 -3979.0352
 t=128.975006 goto -16219.477 -4053.82
 t=129.541672 goto -16484.945 -4163.7783
@@ -266,20 +252,16 @@ t=140.091675 jump
 t=141.325012 goto -18536.338 -4036.227
 t=141.491669 jump
 t=154.675003 select_weapon 10
-t=155.925003 track BaseSoldier12 0.85
-t=155.975006 fire
-t=156.275009 fire
-t=156.291672 track off
+t=155.925003 engage_on BaseSoldier12 3500 aim=0.85 period=0.3
+t=156.291672 engage_off
 t=156.308334 reload
 t=157.458344 select_weapon 9
-t=158.708344 track BaseSoldier10 0.85
-t=158.758347 fire
-t=158.775009 track off
+t=158.708344 engage_on BaseSoldier10 3500 aim=0.85 period=0.3
+t=158.775009 engage_off
 t=158.791672 select_weapon 10
 t=160.041672 select_weapon 9
-t=161.291672 track BaseSoldier13 0.85
-t=161.341675 fire
-t=161.358337 track off
+t=161.291672 engage_on BaseSoldier13 3500 aim=0.85 period=0.3
+t=161.358337 engage_off
 t=161.375015 goto -18560.092 -3759.1328
 t=163.958344 goto -18468.168 -3729.111
 t=164.425003 goto -18448.85 -3488.4329
@@ -288,10 +270,8 @@ t=165.658340 goto -18508.693 -3272.6687
 t=166.225006 goto -18528.037 -2993.336
 t=166.391678 jump
 t=167.375015 select_weapon 10
-t=168.625015 track BaseSoldier11 0.85
-t=168.675018 fire
-t=168.975006 fire
-t=168.991684 track off
+t=168.625015 engage_on BaseSoldier11 3500 aim=0.85 period=0.3
+t=168.991684 engage_off
 t=169.008347 reload
 t=170.158340 goto -18627.535 -2635.3652
 t=171.008347 goto -18639.43 -2346.6548
@@ -308,10 +288,8 @@ t=177.258347 jump
 t=178.258347 goto -19903.63 -1011.0156
 t=178.825012 goto -19903.63 -723.6837
 t=178.991684 jump
-t=179.958344 track BaseSoldier15 0.85
-t=180.008347 fire
-t=180.308350 fire
-t=180.325012 track off
+t=179.958344 engage_on BaseSoldier15 3500 aim=0.85 period=0.3
+t=180.325012 engage_off
 t=180.341675 reload
 t=181.491684 goto -19903.154 -346.61176
 t=181.658340 jump
