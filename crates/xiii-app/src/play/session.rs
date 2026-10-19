@@ -5439,4 +5439,42 @@ mod tests {
             assert_eq!(twice.len(), 2, "{class}: two presses fired {twice:?}");
         }
     }
+
+    #[test]
+    fn opt_in_fire_after_putting_hook_away_preserves_weapon_aim() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let mut session = Session::open(&game_dir, "PRock04a").expect("open map");
+        session.grant_item("XIII.Hook").expect("select hook");
+        let hook = session.selected_item().expect("selected hook");
+        session.grant_weapon("XIII.kalash").expect("equip rifle");
+        let pc = session.controller.expect("controller");
+        session
+            .vm
+            .set_property(pc, "bWeaponMode", 0, Value::Bool(true));
+        // A selected but put-away hook must not divert the weapon press. Nonzero yaw
+        // and pitch expose the stale zero-vector cache (which fires along +X).
+        assert_eq!(session.selected_item(), Some(hook));
+        let (yaw, pitch) = (1.2f32, 0.35f32);
+        assert_eq!(session.fire_pressed(yaw, pitch), FireOutcome::Fired);
+        let expected = [
+            pitch.cos() * yaw.cos(),
+            pitch.cos() * yaw.sin(),
+            pitch.sin(),
+        ];
+        let Some(Value::Vector(actual)) = session.vm.get_property(pc, "OldAdjustAim") else {
+            panic!("weapon aim cache must be a vector");
+        };
+        for (a, b) in actual.iter().zip(expected) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "weapon aim {actual:?}, expected {expected:?}"
+            );
+        }
+        assert_eq!(session.selected_item(), Some(hook));
+        assert!(!session.vm.trace.iter().any(|e| matches!(&e.kind,
+            xiii_script::TraceKind::Event { function, .. } if function == "Hook.Activate")));
+    }
 }

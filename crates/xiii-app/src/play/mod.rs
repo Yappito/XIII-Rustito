@@ -10848,7 +10848,7 @@ mod tests {
             &script,
             &resolved.params,
             &scene,
-            74.0,
+            155.0,
         )
         .expect("run PRock04a route");
         let session = &outcome.session;
@@ -10871,13 +10871,14 @@ mod tests {
         assert!(session.suspended.is_empty(), "{:?}", session.suspended);
         assert!(session.blocked.is_empty(), "{:?}", session.blocked);
         assert!(!session.player_input_ended(), "stop before a fatal point");
-        // The route stops on the open canyon floor by the medical crate, alive. item100h: 134,
-        // was 122. With the retail `ShowSelf` SightCounter countdown (Engine.dll 0x1036df40) the
-        // second exchange lands one 12-hp hit (64.0 s) instead of two (60.5 s, 65.5 s on the
-        // previous perception); the medkit at ~68 s then heals to 134 instead of 122 (measured).
+        // The route rides the first tyrol to the far rim (item108f/g): after the crate it clears
+        // the overlooking guards, climbs the south rim, clears the rim guards, rides
+        // `TyrolTrigger0` and ends alive at the `NavPoint1` landing. item108h: the detour fight
+        // costs health (the route takes fire from the overlook and rim guards it clears); the
+        // measured stop is 65 hp after the far-side `engage` drops the `pat2` guard by the landing.
         assert_eq!(
             session.player_health(),
-            Some(134.0),
+            Some(65.0),
             "surviving measured stop"
         );
         assert!(
@@ -10939,7 +10940,7 @@ mod tests {
         assert_eq!(vm.trace.iter().filter(|event| matches!(
             &event.kind,
             xiii_script::TraceKind::Event { function, .. } if function.ends_with(".UseMeQuick")
-        )).count(), 2, "both carried medical kits must be used through QuickHeal");
+        )).count(), 3, "all three carried medical kits must be used through QuickHeal (two pickups plus one looted on the rim)");
         let nurse = vm.find_object("Cine1").expect("nurse");
         assert!(
             !session.actor_is_dead(nurse),
@@ -10965,61 +10966,12 @@ mod tests {
             vm.get_property(finish, "Tag"),
             Some(&Value::Name("Fini".to_owned()))
         );
-        // The player stands on the flat canyon floor beside the medical crate, alive and
-        // still in control: the prefix's furthest stable point. The terrain north of here
-        // is a collision trap and the floor east is a sniper field (see the report).
-        let position = session.player_location().expect("player location");
-        assert!(
-            near(position, [1248.5105, -2546.0454, 1380.5625]),
-            "crate floor stop: {position:?}"
-        );
-        assert_ne!(
-            session.player_physics(),
-            Some(2),
-            "the stop must not be a falling/stuck state"
-        );
-    }
-
-    /// PRock04a tyrol ride (item108b): the map crosses the canyon with the tyrolines
-    /// (`XIIITyrolNavPoint*`/`TyrolTrigger*`); `TyrolTrigger.PlayerTrigger` ->
-    /// `XIIIPlayerController.GoTyroling` -> the `Tyroling` state's `PlayerMove`/`ProcessMove`
-    /// (`Pawn.Move`, `PHYS_None`, `fTyrolSpeed` 600).
-    ///
-    /// **Mechanism test, not a route.** The map's first tyrol trigger (`TyrolTrigger0` at
-    /// (3168,-4099,2138)) sits on the far rim of the start pit with no measured walkable
-    /// approach (see `local/reports/item108-prock04a.md`: the second-grapple landing shelf
-    /// (z~1471) is separated from the nav shelf (z~1700-2150) by a ~490 UU cliff at x=800,
-    /// and the closed-loop walker drifts into the pit). This test therefore bootstraps the
-    /// player next to the trigger with the diagnostic `teleport` and rides it with the ordinary
-    /// `use` input; the ride itself is the game's own chain, not a host bridge. A foot route to
-    /// the trigger is unproven, so the test asserts only the mechanism.
-    #[test]
-    fn opt_in_prock04a_tyrol_mechanism() {
-        let Some(game_dir) = opt_in_root() else {
-            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
-            return;
-        };
-        let opts = Options {
-            map: Some("PRock04a".to_owned()),
-            game_dir: Some(game_dir.clone()),
-            ..Default::default()
-        };
-        let scene = viewer::load_scene(&opts).expect("import PRock04a");
-        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
-        let text =
-            "t=0.05 teleport 3168 -4099 2140\nt=0.6 use TyrolTrigger0\nt=0.8 use TyrolTrigger0\n";
-        let script = script::Script::parse(text).expect("parse tyrol probe");
-        let outcome = run_script_with_cinematic_input(
-            &game_dir,
-            "PRock04a",
-            &script,
-            &resolved.params,
-            &scene,
-            20.0,
-        )
-        .expect("run tyrol probe");
-        let session = &outcome.session;
-        let vm = session.vm();
+        // The player crossed the canyon: the first tyrol was ridden from the south rim
+        // (`TyrolTrigger0` at (3168,-4099,2138)) to the far rim and dropped at the
+        // `XIIITyrolNavPoint1` landing, alive and back in the walking state. item108f/g: the
+        // crate prefix used to stop here is now a mid-route waypoint, superseded by this
+        // beyond-the-cliff stop; the eastward continuation to goal 0 / PRock04b is not yet
+        // pinned (see the report).
         for (name, function) in [
             ("TyrolTrigger0", "TyrolTrigger.PlayerTrigger"),
             ("XIIIPlayerController", "XIIIPlayerController.GoTyroling"),
@@ -11033,25 +10985,20 @@ mod tests {
                 "the tyrol must run {name}.{function}"
             );
         }
-        assert!(
-            !session.player_input_ended(),
-            "the ride must not end the game"
-        );
-        // Measured: the ride carries the pawn from NavPoint0 (3166,-4110,2366) to
-        // NavPoint1 (7176,-3311,2720) at fTyrolSpeed and drops it on the far rim.
         let position = session.player_location().expect("player location");
-        let near_end = position
-            .iter()
-            .zip([7217.7, -3290.9, 2457.8])
-            .all(|(a, b)| (a - b).abs() < 40.0);
         assert!(
-            position[0] > 7000.0 && near_end,
-            "the tyrol must reach the far NavPoint: {position:?}"
+            near(position, [7217.7, -3290.9, 2457.8]),
+            "tyrol far-rim landing: {position:?}"
         );
         assert_eq!(
             session.player_controller_state(),
             "PlayerWalking",
             "the tyrol state must hand back to walking at the far end"
+        );
+        assert_ne!(
+            session.player_physics(),
+            Some(2),
+            "the stop must not be a falling/stuck state"
         );
     }
 

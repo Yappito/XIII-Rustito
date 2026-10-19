@@ -1,12 +1,10 @@
-# PRock04a first input route (normal standalone start).
+# PRock04a input route (normal standalone start).
 # Collect the start medkit; grapple HookPoint10, land on the patrol ledge, jump the
 # canyon lip. Close on BaseSoldier3 with fists (the melee `engage` gives the target
 # up when it stops losing health; the corpse then hands its weapons over on
 # contact) and heal with the carried medkit (the ordinary H key). Grapple
 # HookPoint2 and use the raw Grab input to release (ray-based use can select
 # scenery). Follow the canyon to MedPick2, collect it and heal.
-# The route stops on the open canyon floor at the crate: eastward the floor is a
-# sniper field and the north slope is a collision trap (see the report).
 # Combat, pickup and healing waits use closed-loop commands.
 # No teleports, grants, goal writes or control overrides.
 t=0.05 goto -6437 -4304
@@ -76,8 +74,71 @@ t=55.2 heal
 t=55.3 wait_until health_above 60 4
 t=55.4 select_weapon 14
 
-# The route stops at the medical crate on the open canyon floor. Beyond it the
-# floor is covered by the canyon snipers and the north slope is a collision trap;
-# neither is part of this first prefix (see the report).
-t=55.5 goto off
-t=55.5 forward 0
+# From the medical crate the canyon floor east is a sniper field and the north
+# slope is a collision trap. The route clears the overlooking guards from cover,
+# detours down the lower valley, climbs the south rim, clears the rim guards and
+# rides the first tyrol (TyrolTrigger0) to the far rim (NavPoint1). item108g/h
+# fire fix: weapon presses honour bWeaponMode over a selected (put-away) hook, so
+# the rifle fires along the live aim instead of a stale +X cache.
+t=55.6 select_weapon 12
+t=56.3 engage BaseSoldier15 5000 8 aim=0.9 period=0.4
+t=56.4 select_weapon 12
+t=56.5 wait_until not hostile_visible 5000 1
+t=56.6 goto_until 1456 -2520 arrived 3
+t=56.7 goto_until 1800 -2450 arrived 4
+t=56.8 goto_until 2100 -2424 arrived 4
+t=56.9 engage BaseSoldier21 5000 8 aim=0.9 period=0.15 hold=0.1
+t=57 engage BaseSoldier23 5000 8 aim=0.9 period=0.15 hold=0.1
+t=57.1 goto_until 2350 -2200 arrived 4
+t=57.3 goto_until 2550 -2000 arrived 4
+t=57.4 goto_until 2600 -1650 arrived 4
+t=57.5 goto_until 2450 -1464 arrived 4
+t=57.55 engage BaseSoldier18 5000 8 aim=0.9 period=0.15 hold=0.1
+t=57.6 goto_until 2200 -1464 arrived 4
+t=57.7 goto_until 1900 -1480 arrived 4
+t=57.8 goto_until 1630 -1480 arrived 4
+t=57.9 goto_until 1272 -1840 arrived 4
+t=58 goto_until 1272 -2040 arrived 4
+t=58.1 goto_until 1000 -2320 arrived 4
+t=58.2 goto_until 856 -2568 arrived 4
+t=58.3 engage 5000 8 aim=0.9 period=0.15 hold=0.1
+t=58.4 goto_until 856 -3000 arrived 4
+t=58.5 goto_until 856 -3176 arrived 4
+t=58.6 goto_until 1048 -3336 arrived 4
+t=58.7 goto_until 1272 -3528 arrived 4
+t=58.8 goto_until 1304 -3880 arrived 4
+t=58.9 goto_until 1496 -4104 arrived 4
+t=59 engage 5000 12 aim=0.9 period=0.15 hold=0.1
+t=59.1 wait_until not hostile_visible 5000 2
+t=59.2 goto_until 1432 -4264 arrived 3
+t=59.3 jump
+t=59.3 goto_until 1496 -4424 arrived 3
+t=59.35 goto_until 1464 -4552 arrived 3
+t=59.36 goto_until 1464 -4616 arrived 3
+t=59.4 goto off
+t=59.4 forward 0
+t=60 goto_until 1496 -4552 arrived 3
+t=60.1 jump
+t=60.1 goto_until 1656 -4264 arrived 3
+t=60.12 goto_until 1740 -3890 arrived 3
+t=60.13 loot 250 2
+t=60.14 heal
+t=60.15 goto_until 1944 -3890 arrived 3
+t=60.2 goto_until 1944 -4200 arrived 3
+t=60.3 goto_until 2104 -4488 arrived 3
+t=60.4 goto_until 2264 -4648 arrived 3
+t=60.5 goto_until 2424 -4552 arrived 3
+t=60.6 goto_until 2584 -4392 arrived 3
+t=60.65 engage 3000 8 aim=0.9 period=0.15 hold=0.1
+t=60.7 goto_until 3168 -4099 arrived 4
+t=60.72 select_weapon 3
+t=60.75 engage 6000 16 aim=0.9 period=0.6
+t=60.8 use TyrolTrigger0
+t=60.9 goto_until 7176 -3311 arrived 25
+t=60.95 engage 5000 8 aim=0.9 period=0.15 hold=0.1
+t=61 goto off
+t=61 forward 0
+
+# The route now stands on the far rim at the TyrolTrigger0->NavPoint1 landing,
+# alive. The continuation east along the canyon to goal 0 (Fini) and the
+# PRock04b travel is not yet pinned (see the report).
