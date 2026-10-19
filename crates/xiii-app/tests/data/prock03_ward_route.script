@@ -1,0 +1,102 @@
+# PRock03 (Plain Rock asylum) route: the item103e west cell-block -> checkpoint -> guard cine ->
+# magnetic card -> `porte_sec` -> `prsas02` airlock chain, ending at the east airlock reader.
+#
+# No teleports, no weapon/item/goal bridges: every step is player input through the game's own
+# movement/use/fire chain.
+#
+# item103j (coordinator round; measured, local/re/item103i/ward-seeplayer-solo1..7.txt): under
+# retail SeePlayer delivery (origin/main 0b5988c) this route stops at the last measured safe
+# point - the east airlock reader `MagneticPassTrigger3` (-2755,760), read at t=91.2/91.8 -
+# BEFORE crossing the `Door2` movers. The next step of the route (the cache corridor, y~900)
+# crosses inside cine `Cine12`'s sight: Cine12 patrols the corridor at (-2267..-2351,907..911)
+# with SightRadius 800, the crossing waypoint (-2816,959) lies ~470-530 UU from it with a clear
+# sight line through the open `Door2` gap, and the measured `SeePlayer` deliveries fire during
+# the crossing (t=111.5 standing, t=111.7 crouched) in every run. Cine12 and `BaseSoldier4`
+# then hunt the corridor at 10-15 hp/s with hit stagger; the player is unarmed there (the
+# level's only weapon, `MagnumPick0`, lies past the corridor behind `Porte43`), so the arming
+# run cannot be made input-only yet - six closed-loop variants (early walk, recorded idle, a
+# Door2-gap wait gate, a west retreat into the airlock, a south-lane detour, a crouched detour)
+# all died 144 -> 0 hp, and the checkpoint guard wanders out of punch range. The route pins the
+# pre-crossing state (the test reads Cine12's position/SightRadius from the VM).
+#
+# Proven phases (all input):
+#   t=0.5..30.5   the west cell-block: the doors `Porte33/35/40/42` opened with the player's own
+#                 use, the walk to the checkpoint.
+#   t=31..95      the key-chain block (prock03_key_chain.script, SeePlayer-green): hold at the
+#                 checkpoint until the guard cine itself opens `Porte30` (its SeeXIII reaction
+#                 restarts the cine when the player is seen - do not pre-empt the opener), the
+#                 strongbox loop (the `Hual02MagneticCard` pickup), `Porte30` re-opened on the
+#                 way back, the aimed card read on `MagneticPassTrigger0` (opening the
+#                 TriggerControl `Porte29`), then the sprint crossing of the `Cine0` corridor so
+#                 the player is >800 UU east before Cine0's ~110.4-112.3 look window, and the
+#                 airlock card read on `MagneticPassTrigger3`.
+t=0.50 goto -1246 2604
+t=2.50 goto -1476 2543
+t=4.00 goto -1680 2464
+t=5.00 use Porte33
+t=6.00 goto -1857 2527
+t=7.50 goto -2106 2563
+t=9.00 goto -2228 2552
+t=10.50 goto -2339 2530
+t=12.00 goto -2539 2582
+t=13.50 goto -2592 2597
+t=15.00 goto -2728 2656
+t=16.00 use Porte35
+t=17.00 goto -2909 2590
+t=19.00 goto -3296 2388
+t=20.00 use Porte40
+t=21.00 goto -3357 2216
+t=22.50 goto -3456 2157
+t=24.00 goto -3652 1984
+t=25.00 use Porte42
+t=26.00 goto -3468 2051
+t=27.50 goto -3764 2043
+t=29.00 goto -3790 2016
+t=30.50 goto -3840 1720
+# item100j/key-chain block (proven under SeePlayer): hold at the checkpoint, outside the guard
+# cone, until the guard's own cine opens Porte30 (its SeeXIII reaction restarts the cine when
+# the player is seen - do not pre-empt the opener), then the strongbox loop on the compressed
+# post-wait stamps, Porte30 re-opened on the way back, the card read, and the Cine0 sprint.
+t=31.00 wait_until event Porte30 PlayerTrigger 40
+t=33.50 goto -3820 1922
+t=34.59 goto -3797 2129
+t=36.78 goto -3576 2515
+t=38.61 goto -3391 2828
+t=40.07 goto -3385 3022
+t=41.16 goto -3360 3138
+t=45.55 goto -3436 3358
+t=49.20 goto -3604 3627
+t=50.29 goto -3862 3758
+t=51.38 goto -3872 3810
+t=57.22 goto -3862 3758
+t=60.14 goto -3436 3358
+t=63.06 goto -3360 3138
+t=64.53 use Porte30
+t=67.44 goto -3379 3138
+t=70.37 goto -3391 2828
+t=73.28 goto -3576 2515
+t=76.20 goto -3797 2129
+t=79.85 goto -3840 1720
+t=81.80 track MagneticPassTrigger0
+t=82.80 use MagneticPassTrigger0
+t=83.80 use MagneticPassTrigger0
+t=84.80 use MagneticPassTrigger0
+t=85.80 use MagneticPassTrigger0
+t=86.00 track off
+# item100k: Cine0 (CineController25) is `XIDCine.Cine2` with map SightRadius 800 and
+# PeripheralVision -0.1 (a 191-degree cone). It looks at the checkpoint from the north-east
+# only for ~1.4 s at ~110.4-111.7 and again at 112.3. Sprint immediately after the card read
+# and clear the airlock (>800 east) before it turns.
+t=86.10 goto -3778 1592
+t=86.70 goto -3682 1536
+t=87.30 goto -3592 1403
+t=88.30 goto -3216 1072
+t=89.30 goto -2960 846
+t=89.80 goto -2817 1000
+t=90.30 goto -2780 790
+t=90.80 goto -2755 760
+t=91.20 use MagneticPassTrigger3
+t=91.80 use MagneticPassTrigger3
+# The stop: the next route step (the Door2 crossing at (-2816,959)) lies inside cine Cine12's
+# sight (see the header). The route pins the pre-crossing state and stops here.
+t=92.00 forward 0

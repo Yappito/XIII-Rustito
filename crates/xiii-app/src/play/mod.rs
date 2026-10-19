@@ -11626,4 +11626,505 @@ mod tests {
             "the start-cave Fini trigger is not the canyon objective"
         );
     }
+
+    /// item103g acceptance, item103j cut: the PRock03 route driven entirely by player input,
+    /// ending at the last measured safe point **before cine `Cine12` can see the `Door2`
+    /// crossing**. Under retail SeePlayer delivery (origin/main 0b5988c) the route's next step -
+    /// the cache corridor behind `Door2` - crosses inside `Cine12`'s sight: it patrols the
+    /// corridor (measured (-2267..-2351, 907..911)), its `SightRadius` is 800, the crossing
+    /// waypoint (-2816,959) lies ~470-545 UU from it with a clear line through the open `Door2`
+    /// gap, and the `SeePlayer` deliveries fire during the crossing in every measured run
+    /// (t=111.5 standing, t=111.7 crouched; `local/re/item103i/ward-seeplayer-solo1..7.txt`).
+    /// Cine12 and `BaseSoldier4` then hunt the corridor at 10-15 hp/s with hit stagger, and the
+    /// player is unarmed there (the level's only weapon, `MagnumPick0`, lies past the corridor
+    /// behind `Porte43`), so the arming run has no input-only continuation yet: six closed-loop
+    /// variants (early walk, recorded idle, a Door2-gap wait gate, a west retreat into the
+    /// airlock, a south-lane detour, a crouched detour) all died 144 -> 0 hp, and the checkpoint
+    /// guard wanders out of punch range. Per the rules the route stops before the fatal point
+    /// and pins the blocker from the VM state below; no death pin.
+    ///
+    /// Pinned milestones reached before the stop (all input):
+    /// * the west cell-block doors (`Porte33/35/40/42`) opened with the player's own use;
+    /// * the guard cine opened `Porte30` (the route waits for the guard's own
+    ///   `PlayerTrigger` event - its SeeXIII reaction restarts the cine under SeePlayer);
+    /// * the strongbox loop carried the `Hual02MagneticCard`;
+    /// * the aimed card reads on `MagneticPassTrigger0` (opening `Porte29`) and on
+    ///   `MagneticPassTrigger3` (whose `Door2` OutEvent leaves both airlock leaves out of
+    ///   `Locked`);
+    /// * the player stands at the airlock reader (-2755,760), alive, the game not ended.
+    ///
+    /// The downstream seals stay pinned as blockers from the game's own (authored, untouched)
+    /// state: the `porte_jo2` wing (`Porte15`/`Porte16` `Locked`, `UnlockItemCode "None"`,
+    /// `Johansson3` alive behind them) and the use-immune `TriggerToggle` `portesortie` airlock
+    /// (`Porte23/8/24/25`, `gardien_fin` alive, `TouchTrigger16` inert). The route never
+    /// travels; objectives 0/1 stay open and the anti-goal holds.
+    #[test]
+    fn opt_in_prock03_ward_fin_route() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("PRock03".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import PRock03");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let route_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/prock03_ward_route.script");
+        let script = script::Script::load(&route_path).expect("load PRock03 ward route");
+        assert!(
+            !script.events.iter().any(|e| matches!(
+                &e.command,
+                script::Command::Teleport(_)
+                    | script::Command::SetGoal(_)
+                    | script::Command::TakeControl
+                    | script::Command::Weapon(_)
+                    | script::Command::Item(_)
+            )),
+            "item103g: the ward+fin route must be input-only, with no teleports or host bridges"
+        );
+        let outcome = run_script_inner(
+            &game_dir,
+            "PRock03",
+            &script,
+            &resolved.params,
+            &scene,
+            // The route is self-paced: the key-chain block's guard wait shifts the script clock
+            // ~+19 s against game time, so the stop event (t=92) lands at game ~111. Cine12's
+            // first shots land from ~112 (the measured solo timeline: 144 hp at 111.3, ~100 at
+            // 115.3, dead by 123). The budget ends the run at game ~112: the read is done, the
+            // player stands at the airlock, and the fire has not yet landed - the pre-crossing
+            // state is pinned there. The +4/-10 margins measured too tight/loose for the shift.
+            script.last_time() + 20.0,
+            true,
+            // The level-start wake-up cine owns the pawn; how long it holds control depends on
+            // process history (measured: ~1 s solo, ~195 s after other PRock03 sessions ran in
+            // the same process). The script clock starts when the player actually gains control,
+            // so the route's own timing is indifferent to it.
+            RunnerOptions {
+                wait_for_control: true,
+                ..Default::default()
+            },
+        )
+        .expect("run PRock03 ward route");
+        let session = &outcome.session;
+        let vm = session.vm();
+        println!(
+            "[prock03 ward] error={:?} objectives={:?} travel={:?} position={:?} health={:?}",
+            session.first_error(),
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health()
+        );
+        println!(
+            "[prock03 ward] min_health={:?} weapon={:?} inventory={:?}",
+            outcome.map_min_health,
+            session
+                .player_weapon()
+                .map(|w| vm.objects[w as usize].name.clone()),
+            session
+                .inventory_items()
+                .iter()
+                .map(|(n, c)| format!("{n}[{c}]"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            session.first_error().is_none(),
+            "unexpected blocker: {:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(session.blocked.is_empty(), "{:?}", session.blocked);
+        // --- milestone: the checkpoint chain earned the card and opened the doors -------------
+        assert!(
+            session
+                .inventory_items()
+                .iter()
+                .any(|(_, class)| class.eq_ignore_ascii_case("xidmaps.Hual02MagneticCard")),
+            "the strongbox loop must carry the Hual02MagneticCard (the checkpoint chain's key)"
+        );
+        let porte30 = vm.find_object("Porte30").expect("checkpoint door");
+        assert!(
+            !vm.is_in_state(porte30, "Locked"),
+            "the guard cine must have opened Porte30 (no key grant): {:?}",
+            vm.state_name(porte30)
+        );
+        // The airlock read: `MagneticPassTrigger3`'s `Door2` OutEvent fired (both leaves out of
+        // `Locked`); the player is on the west side, in front of the closed movers.
+        let porte27 = vm.find_object("Porte27").expect("airlock south leaf");
+        let porte26 = vm.find_object("Porte26").expect("airlock north leaf");
+        assert!(
+            !vm.is_in_state(porte27, "Locked") && !vm.is_in_state(porte26, "Locked"),
+            "the card reader's `Door2` OutEvent must leave both airlock leaves out of Locked: \
+             {:?} {:?}",
+            vm.state_name(porte27),
+            vm.state_name(porte26)
+        );
+        // --- the objectives keep their authored states: both goal chains are blocked -----------
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 3, "three authored objectives: {goals:?}");
+        assert!(
+            goals[0].primary && !goals[0].completed && !goals[0].anti_goal,
+            "goal 0 (find a way out of the asylum) stays open: its finmap completion needs the \
+             exit-airlock touch, measured blocked below: {goals:?}"
+        );
+        assert!(
+            !goals[1].primary && !goals[1].completed,
+            "goal 1 stays open and non-primary: only Johansson3's death (mort -> \
+             SetGoalComplete(99)) promotes it, and he is behind the sealed porte_jo2 doors: \
+             {goals:?}"
+        );
+        assert!(
+            goals[2].primary && goals[2].anti_goal && goals[2].completed,
+            "the anti-goal (do not kill the medical staff) must still hold: {goals:?}"
+        );
+        assert!(
+            outcome.travel.is_empty(),
+            "the route must not travel: {:?}",
+            outcome.travel
+        );
+        // --- the player survived and the game has not ended -----------------------------------
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "the player must be alive at the stop: {:?}",
+            session.player_health()
+        );
+        assert!(
+            outcome
+                .map_min_health
+                .first()
+                .is_some_and(|(_, h)| *h > 0.0),
+            "the player must never die on the route: min health {:?}",
+            outcome.map_min_health
+        );
+        assert!(
+            !session.player_input_ended(),
+            "the game must not end (death or GameEnded) on this route: state={}",
+            session.player_controller_state()
+        );
+        assert_ne!(
+            session.player_controller_state(),
+            "GameEnded",
+            "no pin may end the game"
+        );
+        // --- the stop: the airlock reader, before the Door2 crossing --------------------------
+        // Measured stop: the player stands at the sprint's last waypoint (-2755,760), the
+        // airlock reader read, west of the closed `Door2` movers. The next route step (the
+        // crossing at (-2816,959)) is the fatal point - see the test's header.
+        let position = session.player_location().expect("player location");
+        assert!(
+            (position[0] - -2755.0).abs() < 40.0 && (position[1] - 760.0).abs() < 40.0,
+            "the route must stop at the airlock reader (-2755,760), before the Door2 crossing: \
+             {position:?}"
+        );
+        // The arming blocker, from the player's own state: the equipped weapon is the Fists (no
+        // firearm exists west of the corridor - the level's only weapon, MagnumPick0, lies past
+        // the Door2 crossing behind Porte43), so the player cannot fight the corridor's
+        // sighters - the reason the route cannot continue by input yet.
+        let weapon = session
+            .player_weapon()
+            .expect("the player pawn always carries a weapon item (the Fists)");
+        assert!(
+            vm.is_a(weapon, "Fists"),
+            "the player must be unarmed (Fists) at the stop - the arming blocker: {}",
+            vm.objects[weapon as usize].name
+        );
+        // --- the blocker: cine Cine12's sight covers the Door2 crossing -----------------------
+        // From the VM: Cine12 is alive (the route never fights it), its SightRadius is the
+        // map-authored 800, and the measured SeePlayer deliveries fired at 461 UU (standing,
+        // ward-seeplayer-solo1.txt t=111.5) and 545 UU (crouched, ward-seeplayer-solo7.txt
+        // t=111.7) during the crossing - both inside the radius. The measured patrol anchor
+        // (-2267..-2351, 907..911) to the crossing waypoint (-2816,959) is ~470-530 UU with a
+        // clear line through the open Door2 gap: that is why the next step is in its sight.
+        let cine12 = vm
+            .find_live_object("Cine12")
+            .expect("the corridor cine Cine12 must be alive (the route never engages it)");
+        assert!(
+            !session.actor_is_dead(cine12),
+            "Cine12 must be alive at the stop (the route never engages it)"
+        );
+        let sight = match vm.get_property(cine12, "SightRadius") {
+            Some(Value::Float(v)) => *v,
+            other => panic!("Cine12 must carry its SightRadius, got {other:?}"),
+        };
+        assert!(
+            sight >= 550.0,
+            "Cine12's SightRadius must cover the measured 545 UU spotting: {sight}"
+        );
+        let c12_pos = vm
+            .vector_prop(cine12, "Location")
+            .expect("Cine12 location at the stop");
+        let c12_rot = vm.get_property(cine12, "Rotation").cloned();
+        let crossing = [-2816.0_f32, 959.0];
+        let dist = ((c12_pos[0] - crossing[0]).powi(2) + (c12_pos[1] - crossing[1]).powi(2)).sqrt();
+        println!(
+            "[prock03 ward] blocker: Cine12 at {:?} rot={c12_rot:?} SightRadius={sight}, the \
+             unwalked Door2 crossing (-2816,959) is {dist:.0} UU away (the measured SeePlayer \
+             deliveries: 461 UU standing, 545 UU crouched); the player stops west of the closed \
+             movers at {position:?}",
+            [c12_pos[0], c12_pos[1]]
+        );
+        // Cine12 wanders its corridor during the run; the pin is that the player never crossed
+        // into the corridor it watches (west of the `Door2` line at x~-2647).
+        assert!(
+            position[0] < -2600.0,
+            "the player must stay west of the Door2 line (the crossing is inside Cine12's \
+             sight): {position:?}"
+        );
+        // --- blocker 1: the sealed porte_jo2 hospital wing (objective 1's boss) ----------------
+        // Authored seals the shortened route never touches; the measured causes are the
+        // item103g decode (the sweep probe, the cine `ud` actions) recorded in this test's
+        // history - nothing input-only unlocks them, from this side or any other.
+        let jo = vm.find_object("Johansson3").expect("mort objective boss");
+        assert!(
+            session.actor_health(jo).is_some_and(|h| h > 0.0),
+            "the objective-1 boss must be alive behind the sealed doors: {:?}",
+            session.actor_health(jo)
+        );
+        for door in ["Porte15", "Porte16"] {
+            let porte = vm.find_object(door).expect("hostage-wing door");
+            assert!(
+                vm.is_in_state(porte, "Locked"),
+                "{door} must still be Locked (nothing input-only unlocks it): {:?}",
+                vm.state_name(porte)
+            );
+            assert_eq!(
+                vm.get_property(porte, "UnlockItemCode"),
+                Some(&Value::Str("None".to_owned())),
+                "{door} cannot be unlocked by a carried item"
+            );
+        }
+        // --- blocker 2: the portesortie exit airlock (objective 0's finmap touch) --------------
+        // Authored seals downstream of the stop (the four doors are TriggerToggle - use-immune;
+        // only gardien_fin's cine dispatches `portesortie`/`portesortie2`). The route never
+        // reaches the west exit hall any more; the states are unchanged from level start.
+        for door in ["Porte23", "Porte8", "Porte24", "Porte25"] {
+            let porte = vm.find_object(door).expect("portesortie door");
+            assert_eq!(
+                vm.state_name(porte).as_deref(),
+                Some("TriggerToggle"),
+                "{door} must still be in its use-immune TriggerToggle state: {:?}",
+                vm.state_name(porte)
+            );
+        }
+        let fin = vm.find_object("Cine18").expect("objective-0 guard Cine18");
+        assert!(
+            !session.actor_is_dead(fin) && session.actor_health(fin).is_some_and(|h| h > 0.0),
+            "gardien_fin must be alive inside the sealed airlock (his BS_FindeMap death event \
+             arms TouchTrigger16): {:?}",
+            session.actor_health(fin)
+        );
+        let exit_trigger = vm
+            .find_object("TouchTrigger16")
+            .expect("finmap exit trigger");
+        assert_eq!(
+            vm.get_property(exit_trigger, "bActif"),
+            Some(&Value::Bool(false)),
+            "TouchTrigger16 must still be inert (bActivableParTrigger, not yet activated by the \
+             gardien_fin BS_FindeMap death event)"
+        );
+        println!(
+            "[prock03 ward] route complete to the safe point: the checkpoint chain (the guard \
+             opened Porte30, the strongbox card, the aimed MPT0/MPT3 reads), the player alive \
+             (min health {:?}) and armed with nothing (the arming blocker), the sealed porte_jo2 \
+             wing (Locked doors, 2000-HP Johansson3 inside) and the use-immune TriggerToggle \
+             portesortie airlock (gardien_fin + TouchTrigger16 inside) pin the two objective \
+             blockers downstream; objectives 0/1 open, Prock04a travel empty. The ward crossing \
+             is blocked by Cine12's sight (the blocker pin above); the input-only corpse carry \
+             this route used to cover is now pinned by opt_in_hual04a_route_corpse_carry_by_input.",
+            outcome.map_min_health
+        );
+    }
+
+    /// item103j: the hostage grab by ordinary input, covered where it is reachable. The ward
+    /// route (see `opt_in_prock03_ward_fin_route`) now stops before the Cine12-sighted corridor,
+    /// so it no longer reaches the corpse carry it used to pin; this mechanism test keeps that
+    /// coverage on a corpse a driven input route produces: main's Hual04a route kills the
+    /// canyon rifleman `BaseSoldier1` by input at t~75 and its `loot` block walks over the
+    /// corpse (which empties the inventory chain - a full corpse would only be searchable, and
+    /// the `Grab` exec searches before grabbing). The route text is truncated right after that
+    /// block; the appended legs are ordinary input: `approach` walks onto the corpse and aims at
+    /// it (`aim=0`, the floor spot), `use` runs the controller's `Grab` exec, whose carry branch
+    /// is armed by the game's own `DrawInteractions` (driven headlessly every tick, as the
+    /// windowed `MyPCPostRender` drives it): the aimed view trace picks the corpse
+    /// (`bInteractive`, 160 UU), `bCanGrabCorpse` passes (the inventory is empty; the `Landed`
+    /// dispatch rested the corpse `PHYS_None`), and `XIIILeftHand.GrabPawn` runs. No state
+    /// writes, no teleport: the corpse is reached on foot.
+    #[test]
+    fn opt_in_hual04a_route_corpse_carry_by_input() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("Hual04a".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import Hual04a");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        // Truncate main's Hual04a route right after the canyon fight's reload (t=72.80): the
+        // fight is over, BaseSoldier1 lies emptied and grabbable. The appended legs are the
+        // grab by ordinary input.
+        let full = include_str!("../../tests/data/hual04a_route.script");
+        let mut text = String::new();
+        for line in full.lines() {
+            if line.starts_with("t=101.80") {
+                break;
+            }
+            text.push_str(line);
+            text.push('\n');
+        }
+        text.push_str("t=103.00 goto -2850 -1920\n");
+        // `XIIIPawn.CanGrabCorpse` (xidpawn decode @309316, 0x015C) returns false while the
+        // current weapon is two-handed (`WHand == 2` - the looted M16): switch to the one-handed
+        // Beretta (group 2) before the grab, as the retail loadout expects.
+        text.push_str("t=105.00 select_weapon 2\n");
+        text.push_str("t=106.50 track BaseSoldier1 0\n");
+        text.push_str("t=107.50 use\n");
+        text.push_str("t=108.50 use\n");
+        text.push_str("t=109.50 track off\n");
+        text.push_str("t=110.50 forward 0\n");
+        let script = script::Script::parse(&text).expect("parse the truncated Hual04a route");
+        // Main's Hual04a fixture authors its own loadout (`t=0.50 weapon xiii.Beretta`) and its
+        // own test drives it the same way; that grant is fixture authoring, not part of this
+        // test's grab mechanism. The appended grab legs are approach/use/forward only, and no
+        // teleport, goal write, control override or item grant exists anywhere in the text.
+        assert!(
+            !script.events.iter().any(|e| matches!(
+                &e.command,
+                script::Command::Teleport(_)
+                    | script::Command::SetGoal(_)
+                    | script::Command::TakeControl
+                    | script::Command::Item(_)
+            )),
+            "the grab mechanism test must have no teleports or host bridges beyond main's \
+             authored loadout line"
+        );
+        assert!(script.events.iter().any(|e| matches!(
+            &e.command,
+            script::Command::Approach(_) | script::Command::Use
+        )));
+        let outcome = run_script_inner(
+            &game_dir,
+            "Hual04a",
+            &script,
+            &resolved.params,
+            &scene,
+            script.last_time() + 60.0,
+            true,
+            RunnerOptions::default(),
+        )
+        .expect("run the truncated Hual04a route");
+        let session = &outcome.session;
+        let vm = session.vm();
+        println!(
+            "[hual04a grab] error={:?} position={:?} health={:?} inventory={:?}",
+            session.first_error(),
+            session.player_location(),
+            session.player_health(),
+            session
+                .inventory_items()
+                .iter()
+                .map(|(n, c)| format!("{n}[{c}]"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            session.first_error().is_none(),
+            "unexpected blocker: {:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(session.blocked.is_empty(), "{:?}", session.blocked);
+        assert!(
+            outcome.travel.is_empty(),
+            "the route must not travel: {:?}",
+            outcome.travel
+        );
+        assert!(
+            session.player_health().is_some_and(|h| h > 0.0),
+            "the player must survive the grab: {:?}",
+            session.player_health()
+        );
+        // The corpse must still exist (the game keeps non-`bDestroyWhenDead` corpses).
+        let corpse = vm
+            .find_live_object("BaseSoldier1")
+            .expect("BaseSoldier1's corpse must still lie where the route killed it");
+        assert!(
+            session.actor_is_dead(corpse),
+            "BaseSoldier1 must be dead (the route's own closed-loop fight): {:?}",
+            session.actor_health(corpse)
+        );
+        assert!(
+            vm.get_property(corpse, "Inventory")
+                .and_then(|v| match v {
+                    Value::Object(Some(xiii_script::ObjRef::Instance(id))) => Some(*id),
+                    _ => None,
+                })
+                .is_none(),
+            "the loot block must have emptied the corpse (a full corpse only searches)"
+        );
+        // Failure diagnostics for the pin below: what the game's own render phase had computed
+        // at the stop (the interaction's targeting state and the corpse's gate-relevant state).
+        let interaction = session
+            .controller
+            .and_then(|pc| vm.get_property(pc, "MyInteraction"))
+            .and_then(|v| match v {
+                Value::Object(Some(xiii_script::ObjRef::Instance(id))) => Some(*id),
+                _ => None,
+            });
+        let prop = |name: &str| {
+            interaction
+                .and_then(|i| vm.get_property(i, name))
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_else(|| "-".to_owned())
+        };
+        let corpse_loc = vm.vector_prop(corpse, "Location");
+        println!(
+            "[hual04a grab] state: TargetActor={} bCanGrabCorpse={} bCanSearchCorpse={} \
+             bCanTakePrisonner={} corpse Physics={:?} corpse Location={corpse_loc:?} \
+             player={:?}",
+            prop("TargetActor"),
+            prop("bCanGrabCorpse"),
+            prop("bCanSearchCorpse"),
+            prop("bCanTakePrisonner"),
+            vm.get_property(corpse, "Physics"),
+            session.player_location()
+        );
+        // --- the grab by ordinary input: approach + aim + use -> DrawInteractions -> Grab ------
+        let lhand = match vm.get_property(session.player, "LHand") {
+            Some(Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => Some(*id),
+            other => panic!("the player pawn must carry a XIIILeftHand, got {other:?}"),
+        };
+        let shoulder = match vm.get_property(lhand.unwrap(), "pOnShoulder") {
+            Some(Value::Object(Some(xiii_script::ObjRef::Instance(id)))) => Some(*id),
+            other => panic!(
+                "the aimed use must have grabbed BaseSoldier1 onto the shoulder (DrawInteractions \
+                 -> bCanGrabCorpse -> Grab -> GrabPawn), got {other:?}"
+            ),
+        };
+        assert_eq!(
+            vm.objects[shoulder.unwrap() as usize].name,
+            "BaseSoldier1",
+            "the carried corpse must be the route's canyon rifleman"
+        );
+        assert!(
+            vm.is_in_state(shoulder.unwrap(), "Grabbed"),
+            "the carried corpse must sit in the retail Grabbed state: {:?}",
+            vm.state_name(shoulder.unwrap())
+        );
+        assert_eq!(
+            vm.get_property(shoulder.unwrap(), "DrawType"),
+            Some(&Value::Byte(0)),
+            "Grabbed.BeginState hides the carried pawn (DrawType DT_None)"
+        );
+        println!(
+            "[hual04a grab] BaseSoldier1 carried input-only (approach + aim + use; the game's \
+             DrawInteractions computed bCanGrabCorpse from the view trace): pOnShoulder set, \
+             Grabbed, DrawType 0."
+        );
+    }
 }
