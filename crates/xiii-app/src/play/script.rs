@@ -26,7 +26,11 @@
 //! - `use` (alias `grab`/`interact`): request one use/interact action (edge-triggered); the
 //!   host runs the VM's mover lock/unlock/open chain (`Session::use_mover`).
 //! - `use <ActorName>`: use/interact with a named actor directly (edges around hidden interaction
-//!   doors and dynamic pawns the camera ray cannot pick).
+//!   doors and dynamic pawns the camera ray cannot pick). Carrying a pawn (the hostage grab) is
+//!   ordinary input: aim at it and press `use` — the game's own `DrawInteractions` computes the
+//!   carry flags (`bCanGrabCorpse` for a looted corpse in 160 UU, `bCanTakePrisonner` for a live
+//!   pawn aimed from behind) and the `Grab` exec runs `XIIILeftHand.GrabPawn` (or `UnGrabPawn`
+//!   when `LHand.pOnShoulder` is already set).
 //! - `take_control` (alias `assume_control`): explicit diagnostic command that runs the
 //!   controller's own `EnterStartState` with `bOkForMoving = true`. No normal interactive or
 //!   campaign route issues this command; it is available only in a supplied `--play-script`.
@@ -87,7 +91,9 @@
 //!   (default 1500 UU) that still carries inventory, one corpse after another, as a player
 //!   collects a fallen soldier's weapon (the game hands a corpse's weapon, ammo and keys over on
 //!   contact). A corpse that was seen stays the target when the player walks out of sight of it;
-//!   each is visited once. Ends when none is left, or after `secs` (default 20).
+//!   each is visited once. When a targeted corpse stops carrying its inventory mid-walk (the
+//!   game dropped the weapon at death) the walk continues onto the drop at the corpse's last
+//!   seen spot instead of giving up short. Ends when none is left, or after `secs` (default 20).
 //! - `wait_until <cond> [or|and <cond> ...] [timeout]`: blocking; continue when the condition
 //!   holds (default timeout 60 s). Conditions: `dead <Actor>` (a dead pawn, or an actor that has
 //!   been destroyed), `alive <Actor>`, `visible <Actor>` (alive and in line of sight),
@@ -99,6 +105,12 @@
 //!   `goto` waypoint pending). `not <cond>` negates one condition.
 //! - `goto_until <x> <y> <cond> [timeout]`: `goto <x> <y>`, then block until the player arrives
 //!   or the condition holds (default timeout 60 s).
+//! - `approach <Pawn> [stop] [secs] [aim=<f>]`: blocking. Walks toward the named pawn and faces
+//!   it (movement and aim only, no game-state writes), holding the forward axis until the
+//!   horizontal distance to the pawn's Location is within `stop` (default 60 UU) and aiming at
+//!   `aim` x its CollisionHeight above that Location (default 0.6; `aim=0` aims at a corpse on
+//!   the floor). Ends when close enough, when the pawn no longer exists, or after `secs` (default
+//!   30). The aimed yaw/pitch stand for a following `use` (the hostage grab by ordinary input).
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -239,6 +251,9 @@ pub enum Command {
         /// Timeout in seconds.
         timeout: f32,
     },
+    /// item103i: blocking walk toward a named pawn and face it, as a player does before taking a
+    /// prisoner or carrying a corpse. Movement and aim only (see the module docs).
+    Approach(ApproachSpec),
 }
 
 /// Parameters of an `engage` command.
@@ -267,6 +282,20 @@ pub struct LootSpec {
     pub radius: f32,
     /// Block timeout in seconds.
     pub secs: f32,
+}
+
+/// Parameters of an `approach` command (item103i).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApproachSpec {
+    /// The pawn to walk toward and face.
+    pub target: String,
+    /// Stop (release the forward axis) within this horizontal distance, in Unreal units.
+    pub stop: f32,
+    /// Block timeout in seconds.
+    pub secs: f32,
+    /// Aim height as a fraction of the pawn's CollisionHeight above its Location (`0` aims at a
+    /// corpse's Location on the floor).
+    pub aim: f32,
 }
 
 /// A single closed-loop condition term.
@@ -424,6 +453,10 @@ const LOOT_RADIUS: f32 = 1500.0;
 const LOOT_SECS: f32 = 20.0;
 /// Horizontal distance at which a corpse counts as walked over (Unreal units).
 const LOOT_REACH: f32 = 35.0;
+/// Default `approach` stop distance (Unreal units), timeout (seconds) and aim fraction.
+const APPROACH_STOP: f32 = 60.0;
+const APPROACH_SECS: f32 = 30.0;
+const APPROACH_AIM: f32 = 0.6;
 
 fn next_actor<'a>(
     it: &mut std::str::SplitWhitespace<'a>,
@@ -600,6 +633,39 @@ fn parse_loot(it: &mut std::str::SplitWhitespace, n: usize) -> Result<LootSpec, 
             0 => spec.radius = x,
             1 => spec.secs = x,
             _ => return Err(format!("line {n}: loot takes at most a radius and secs")),
+        }
+    }
+    Ok(spec)
+}
+
+fn parse_approach(it: &mut std::str::SplitWhitespace, n: usize) -> Result<ApproachSpec, String> {
+    let target = next_actor(it, n, "approach")?.to_owned();
+    let mut spec = ApproachSpec {
+        target,
+        stop: APPROACH_STOP,
+        secs: APPROACH_SECS,
+        aim: APPROACH_AIM,
+    };
+    let mut numbers = 0;
+    for tok in it {
+        if let Some(v) = tok.strip_prefix("aim=") {
+            spec.aim = v
+                .parse::<f32>()
+                .ok()
+                .filter(|a| a.is_finite() && (0.0..=1.5).contains(a))
+                .ok_or_else(|| format!("line {n}: bad aim fraction {v:?}"))?;
+        } else if let Ok(x) = tok.parse::<f32>() {
+            if !x.is_finite() || x <= 0.0 {
+                return Err(format!("line {n}: approach stop/secs must be positive"));
+            }
+            match numbers {
+                0 => spec.stop = x,
+                1 => spec.secs = x,
+                _ => return Err(format!("line {n}: approach takes at most a stop and secs")),
+            }
+            numbers += 1;
+        } else {
+            return Err(format!("line {n}: unexpected approach argument {tok:?}"));
         }
     }
     Ok(spec)
@@ -826,6 +892,7 @@ impl Script {
                     Command::EngageOff
                 }
                 "loot" => Command::Loot(parse_loot(&mut it, n)?),
+                "approach" => Command::Approach(parse_approach(&mut it, n)?),
                 "wait_until" | "wait-until" => {
                     let (cond, timeout) = parse_condition(&mut it, n, WAIT_SECS)?;
                     Command::WaitUntil { cond, timeout }
@@ -871,6 +938,7 @@ impl Script {
                 .map(|e| match &e.command {
                     Command::Engage(spec) => spec.secs,
                     Command::Loot(spec) => spec.secs,
+                    Command::Approach(spec) => spec.secs,
                     Command::WaitUntil { timeout, .. } | Command::GotoUntil { timeout, .. } => {
                         *timeout
                     }
@@ -926,6 +994,7 @@ enum BlockKind {
     Wait(Condition, bool),
     Engage(EngageState),
     Loot(LootState),
+    Approach(ApproachState),
 }
 
 struct EngageState {
@@ -1000,6 +1069,11 @@ struct LootState {
     looted: HashSet<String>,
     /// Where the target corpse was last seen.
     last_aim: [f32; 3],
+}
+
+/// The pawn `approach` walks toward and faces.
+struct ApproachState {
+    spec: ApproachSpec,
 }
 
 impl Cond {
@@ -1303,6 +1377,7 @@ impl Drive {
                 }
             }
             Some(BlockKind::Loot(l)) => req.corpse_radius = Some(l.spec.radius),
+            Some(BlockKind::Approach(a)) => req.actors.push(a.spec.target.clone()),
             None => {}
         }
         if let Some(st) = &self.standing
@@ -1407,6 +1482,15 @@ impl Drive {
                     secs,
                 )
             }
+            Command::Approach(spec) => {
+                let secs = spec.secs;
+                // Aim at the pawn (`track`) and trail it (`follow`): the movement + aim the
+                // blocking step below waits out. No game state is written.
+                self.tracking = Some(spec.target.clone());
+                self.track_height = spec.aim;
+                self.follow = Some((spec.target.clone(), spec.stop));
+                (BlockKind::Approach(ApproachState { spec }), secs)
+            }
             Command::WaitUntil { cond, timeout } => (BlockKind::Wait(cond, false), timeout),
             Command::GotoUntil {
                 target,
@@ -1424,6 +1508,7 @@ impl Drive {
                 BlockKind::Wait(..) => "wait_until/goto_until",
                 BlockKind::Engage(_) => "engage",
                 BlockKind::Loot(_) => "loot",
+                BlockKind::Approach(_) => "approach",
             }
         );
         // A new block rescans the whole trace so an event that already fired still counts.
@@ -1648,7 +1733,8 @@ impl Drive {
         }
     }
 
-    /// One tick of `loot`; returns whether it is over (no unvisited lootable corpse is visible).
+    /// One tick of `loot`; returns whether it is over (no unvisited lootable corpse is visible
+    /// and no dropped-inventory walk is pending).
     fn loot_step(&mut self, l: &mut LootState, location: [f32; 3]) -> bool {
         if self.facts.suppressed {
             self.loot_target = None;
@@ -1693,6 +1779,25 @@ impl Drive {
         l.target.is_none()
     }
 
+    /// One tick of `approach`; returns whether it is over (the player is within the stop distance,
+    /// or the pawn no longer exists).
+    fn approach_step(&mut self, a: &mut ApproachState, location: [f32; 3]) -> bool {
+        if self.facts.suppressed {
+            return false;
+        }
+        match self.facts.actor(&a.spec.target) {
+            // The pawn is gone (a destroyed corpse): stop walking.
+            None => true,
+            Some(f) => {
+                let dist = f
+                    .aim
+                    .map(|p| (p[0] - location[0]).hypot(p[1] - location[1]))
+                    .unwrap_or(f.distance);
+                dist <= a.spec.stop
+            }
+        }
+    }
+
     /// item107: advances the active blocking command by one tick and ends it when it is done or
     /// out of time, shifting the script clock so later events keep their relative timing.
     fn progress_block(&mut self, elapsed: f32, location: [f32; 3]) {
@@ -1711,6 +1816,7 @@ impl Drive {
             }
             BlockKind::Engage(e) => self.engage_step(e, elapsed),
             BlockKind::Loot(l) => self.loot_step(l, location),
+            BlockKind::Approach(a) => self.approach_step(a, location),
         };
         let timed_out = elapsed >= block.deadline;
         if !done && !timed_out {
@@ -1735,12 +1841,22 @@ impl Drive {
                 e.acquired,
                 if e.out_of_ammo { ", OUT OF AMMO" } else { "" }
             ),
+            BlockKind::Approach(a) => println!(
+                "[play] approach [{elapsed:.3}s] {} after {waited:.1}s (target {})",
+                if done { "ended" } else { "timed out" },
+                a.spec.target
+            ),
         }
         self.engage_release();
         self.engage_aim = None;
         if matches!(block.kind, BlockKind::Loot(_)) {
             // Stop the walk `loot` was driving; a pending `goto` re-asserts its own forward.
             self.loot_target = None;
+            self.forward = 0.0;
+        }
+        if matches!(block.kind, BlockKind::Approach(_)) {
+            // Stop trailing the pawn; the last aimed yaw/pitch stand for the following `use`.
+            self.follow = None;
             self.forward = 0.0;
         }
         self.shift += waited;
@@ -1766,6 +1882,7 @@ impl Drive {
                     | Command::Loot(_)
                     | Command::WaitUntil { .. }
                     | Command::GotoUntil { .. }
+                    | Command::Approach(_)
             ) {
                 let command = self.events[self.cursor].command.clone();
                 self.cursor += 1;
@@ -1866,7 +1983,8 @@ impl Drive {
                 Command::Engage(_)
                 | Command::Loot(_)
                 | Command::WaitUntil { .. }
-                | Command::GotoUntil { .. } => {}
+                | Command::GotoUntil { .. }
+                | Command::Approach(_) => {}
             }
             self.cursor += 1;
         }
@@ -2105,6 +2223,7 @@ mod tests {
             "loot BaseSoldier6",
             "wake BaseSoldier6",
             "wake",
+            "carry BaseSoldier6",
         ] {
             assert!(Script::parse(&format!("t=0.0 {command}\n")).is_err());
         }
@@ -2115,6 +2234,30 @@ mod tests {
         let s = Script::parse("\n# nothing\n").unwrap();
         assert!(s.events.is_empty());
         assert_eq!(s.last_time(), 0.0);
+    }
+
+    #[test]
+    fn approach_parses_a_named_pawn_and_defaults() {
+        // item103i: `approach` walks toward a named pawn and faces it (blocking, input only).
+        let s =
+            Script::parse("t=0.0 approach BaseSoldier7\nt=1.0 approach BaseSoldier9 40 15 aim=0\n")
+                .unwrap();
+        assert_eq!(s.events.len(), 2);
+        assert!(matches!(
+            &s.events[0].command,
+            Command::Approach(ApproachSpec { target, stop, secs, aim })
+                if target == "BaseSoldier7" && *stop == 60.0 && *secs == 30.0 && *aim == 0.6
+        ));
+        assert!(matches!(
+            &s.events[1].command,
+            Command::Approach(ApproachSpec { target, stop, secs, aim })
+                if target == "BaseSoldier9" && *stop == 40.0 && *secs == 15.0 && *aim == 0.0
+        ));
+        assert!(
+            Script::parse("t=0.0 approach\n").is_err(),
+            "approach needs a pawn name"
+        );
+        assert!(Script::parse("t=0.0 approach Foo extra\n").is_err());
     }
 
     #[test]

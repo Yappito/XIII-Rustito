@@ -4563,7 +4563,6 @@ fn phys_fixture() -> Vec<u8> {
     b.prop_with(floor, brush, 0, &vector_extra);
     b.prop_with(brush, mesh, 0, &object_extra);
     b.prop_with(mesh, touch_fn, 0, &object_extra);
-
     let tc = touches as u8;
     let touch_code = vec![0x0F, 0x01, tc, 0x92, 0x00, tc, 0x26, 0x16, 0x04, 0x0B];
     b.prop_with(touch_other, 0, PARM, &object_extra);
@@ -4602,7 +4601,29 @@ fn phys_fixture() -> Vec<u8> {
     let emitter = b.reserve(0, 0, "Emitter");
     b.class(emitter, actor, 0, 0);
     let pawn_controller = b.reserve(IMP_OBJECTPROP, pawn, "Controller");
-    b.prop_with(pawn_controller, 0, 0, &object_extra);
+    // item103h: a `Landed(HitNormal)` event on Pawn — the physics pass dispatches it on a
+    // floor-grade landing before the still-Falling -> Walking fallback. The body counts
+    // landings in `Landings` (the override changed nothing else, so the test sees both the
+    // dispatch and the engine fallback).
+    let landings = b.reserve(IMP_INTPROP, pawn, "Landings");
+    let landed_fn = b.reserve(IMP_FUNCTION, pawn, "Landed");
+    let landed_normal = b.reserve(IMP_STRUCTPROP, landed_fn, "HitNormal");
+    let bisdead = b.reserve(IMP_BOOLPROP, pawn, "bIsDead");
+    b.prop_with(pawn_controller, landings, 0, &object_extra);
+    b.prop(landings, landed_fn, 0);
+    b.prop_with(landed_normal, 0, PARM, &vector_extra);
+    b.prop(bisdead, 0, 0);
+    let lc = landings as u8;
+    let landed_code = vec![0x0F, 0x01, lc, 0x92, 0x00, lc, 0x26, 0x16, 0x04, 0x0B];
+    b.func(
+        landed_fn,
+        bisdead,
+        landed_normal,
+        &landed_code,
+        0x10,
+        0,
+        DEFINED,
+    );
     let ctrl_pawn = b.reserve(IMP_OBJECTPROP, controller, "Pawn");
     let no_control = b.reserve(IMP_STATE, controller, "NoControl");
     b.state_masks(no_control, 0, 0, u64::MAX);
@@ -7340,6 +7361,69 @@ fn scripted_physics_falling_integrates_zone_gravity() {
         (velocity[2] + 2.0 * 950.0 * 0.016).abs() < 0.5,
         "{velocity:?}"
     );
+}
+
+/// item103h: a floor-grade landing settles a DEAD pawn at PHYS_None — the decoded
+/// `XIIIPawn.Landed` -> `LandedSpecial` rest outcome (`SetPhysics(0)`), which
+/// `XIIIPawn.CanGrabCorpse`'s `P.Physics == 0` gate requires — without dispatching the script
+/// `Landed` event (the event's landing noise measurably shifts tuned route engagements: see
+/// `falling_live_pawn_landing_keeps_the_walking_fallback`).
+#[test]
+fn falling_dead_pawn_settles_to_phys_none_on_landing() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([-100.0, -100.0, -20.0], [100.0, 100.0, 0.0]),
+    ));
+    let corpse = vm.spawn(pg(&set, "Pawn"), "Body").unwrap();
+    vm.set_active(corpse, true);
+    vm.set_property(corpse, "Location", 0, Value::Vector([0.0, 0.0, 100.0]));
+    vm.set_property(corpse, "Physics", 0, Value::Byte(2));
+    vm.set_property(corpse, "Velocity", 0, Value::Vector([0.0; 3]));
+    vm.set_property(corpse, "bIsDead", 0, Value::Bool(true));
+    set_collision_fields(&mut vm, corpse, true, true);
+    // z(t) = 100 - 950/2 * t^2: the floor plane at z=0 is reached ~29 ticks in.
+    for _ in 0..32 {
+        vm.tick_suspending(0.016);
+    }
+    let physics = vm.byte_prop(corpse, "Physics");
+    assert_eq!(
+        physics, 0,
+        "the landed corpse must rest PHYS_None (the CanGrabCorpse gate)"
+    );
+    // The script event is not dispatched by the settle (the fixture's Pawn.Landed counts into
+    // Landings; it stays 0).
+    let landings = vm.get_property(corpse, "Landings");
+    assert_eq!(landings, Some(&Value::Int(0)), "no Landed dispatch");
+}
+
+/// The pre-existing engine fallback stands for a live pawn: a floor-grade landing flips a
+/// still-PHYS_Falling pawn to PHYS_Walking (Engine.dll 0x103c188d/0x103c18cb, measured on
+/// Toits01 Cine0, probe24c), and the physics pass does not dispatch the script `Landed` event
+/// (the fixture's `Pawn.Landed` counts into `Landings`; it stays 0).
+#[test]
+fn falling_live_pawn_landing_keeps_the_walking_fallback() {
+    let set = phys_set();
+    let mut vm = Vm::new(&set, VmLimits::default());
+    vm.set_physics(Box::new(
+        MockWorld::new().with_wall([-100.0, -100.0, -20.0], [100.0, 100.0, 0.0]),
+    ));
+    let pawn = vm.spawn(pg(&set, "Pawn"), "Faller").unwrap();
+    vm.set_active(pawn, true);
+    vm.set_property(pawn, "Location", 0, Value::Vector([0.0, 0.0, 100.0]));
+    vm.set_property(pawn, "Physics", 0, Value::Byte(2));
+    vm.set_property(pawn, "Velocity", 0, Value::Vector([0.0; 3]));
+    set_collision_fields(&mut vm, pawn, true, true);
+    for _ in 0..32 {
+        vm.tick_suspending(0.016);
+    }
+    let physics = vm.byte_prop(pawn, "Physics");
+    assert_eq!(
+        physics, 1,
+        "the engine fallback switches a still-Falling pawn to Walking after Landed"
+    );
+    let landings = vm.get_property(pawn, "Landings");
+    assert_eq!(landings, Some(&Value::Int(0)), "no Landed dispatch");
 }
 
 /// `PHYS_Flying` moves the actor by the script-written velocity (the demo rewrites

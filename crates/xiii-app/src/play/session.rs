@@ -209,6 +209,20 @@ pub enum UseOutcome {
     DecoAlreadyHeld,
     /// The deco pickup's own `ValidTouch` refused the pickup (nothing was taken).
     PickupRefused,
+    /// A dead pawn was grabbed onto the shoulder through the Grab exec's carry branch
+    /// (`LHand.pOnShoulder` now names it; the pawn hid itself through `Grabbed.BeginState` and
+    /// its controller entered `Otage`).
+    CarriedCorpse,
+    /// A live pawn was grabbed as a prisoner (`bPrisonner` set, `Prisonner` state).
+    CarriedPrisonner,
+    /// The carried pawn was released (`UnGrabPawn` ran; its `UnGrabbing.AnimEnd` drop follows the
+    /// animation).
+    Released,
+    /// The player pawn carries no `XIIILeftHand` inventory item (the exec's grab-branch guard).
+    NoLeftHand,
+    /// The game's own gates refused the carry (`CanGrabCorpse`/`CanTakePrisonner` false, or the
+    /// aimed view trace did not pick this pawn); the reason is quoted.
+    CarryRefused(String),
     /// The script raised on the transition.
     Error(String),
 }
@@ -1682,17 +1696,16 @@ impl Session {
 
     /// Plain `use` with nothing mover-like under the host ray: if the game's own interaction render
     /// (`XIIIPlayerInteraction.MyPCPostRender`) chose a `TargetActor` for a trigger (a card reader),
-    /// the controller's `Grab` runs. Returns the target's name; `None` when nothing is targeted.
+    /// a pawn (the hostage carry) or a pickup, the controller's `Grab` runs. Returns the target's
+    /// name; `None` when nothing relevant is targeted.
     pub fn grab_interaction_target(&mut self) -> Option<(String, UseOutcome)> {
         let controller = self.controller?;
         let interaction = instance_prop(&self.vm, controller, "MyInteraction")?;
         let target = instance_prop(&self.vm, interaction, "TargetActor");
         let target = target?;
-        if !self.vm.is_a(target, "XIIITriggers")
-            || !matches!(
-                self.vm.get_property(interaction, "bCanTrigger"),
-                Some(Value::Bool(true))
-            )
+        if !(self.vm.is_a(target, "XIIITriggers")
+            || self.vm.is_a(target, "XIIIPawn")
+            || self.vm.is_a(target, "XIIIDecoPickup"))
         {
             return None;
         }
@@ -1707,7 +1720,8 @@ impl Session {
         let Some(target) = self.vm.find_live_object(target_name) else {
             return UseOutcome::NotAMover;
         };
-        let corpse = self.vm.is_a(target, "XIIIPawn") && self.actor_is_dead(target);
+        let pawn = self.vm.is_a(target, "XIIIPawn");
+        let corpse = pawn && self.actor_is_dead(target);
         // An interactive trigger (a card reader: `MagneticPassTrigger`, `XIIITriggers`) is the
         // `bCanTrigger` branch of `Grab`: the controller's own `TryInteractWithTrigger` picks the
         // matching inventory item, which a second `Grab` activates.
@@ -1720,7 +1734,7 @@ impl Session {
         } else {
             None
         };
-        if !corpse && !trigger && !self.vm.is_a(target, "XIIIDecoPickup") {
+        if !pawn && !trigger && !self.vm.is_a(target, "XIIIDecoPickup") {
             return UseOutcome::NotAMover;
         }
         let Some(controller) = self.controller else {
@@ -1729,7 +1743,7 @@ impl Session {
         let Some(interaction) = instance_prop(&self.vm, controller, "MyInteraction") else {
             return UseOutcome::Error("controller has no MyInteraction".to_owned());
         };
-        if !corpse
+        if !pawn
             && !trigger
             && ["Weapon", "PendingWeapon"].iter().any(|slot| {
                 instance_prop(&self.vm, self.player, slot)
@@ -1738,17 +1752,48 @@ impl Session {
         {
             return UseOutcome::DecoAlreadyHeld;
         }
-        if instance_prop(&self.vm, interaction, "TargetActor") != Some(target)
+        // The carry branch of the Grab exec (below hook/break/door/search/pickup/trigger): a live
+        // pawn aimed from behind (`bCanTakePrisonner`) or a looted corpse in reach
+        // (`bCanGrabCorpse`), both computed by the game's own `DrawInteractions` from the aimed
+        // view trace. A corpse that still carries inventory sets `bCanSearchCorpse` (which the
+        // exec searches before grabbing), so only the emptied corpse falls through to the carry.
+        let targeted = instance_prop(&self.vm, interaction, "TargetActor") == Some(target);
+        if pawn {
+            let searching = corpse
+                && matches!(
+                    self.vm.get_property(interaction, "bCanSearchCorpse"),
+                    Some(Value::Bool(true))
+                );
+            let carry_flag = if corpse {
+                "bCanGrabCorpse"
+            } else {
+                "bCanTakePrisonner"
+            };
+            if targeted
+                && matches!(
+                    self.vm.get_property(interaction, carry_flag),
+                    Some(Value::Bool(true))
+                )
+                && !searching
+            {
+                return self.grab_carry_target(target);
+            }
+            if corpse && targeted && searching {
+                return self.grab_search_corpse(target, controller);
+            }
+            return UseOutcome::CarryRefused(format!(
+                "the game's own view trace did not set {carry_flag} for {target_name} \
+                 (TargetActor={targeted_name:?})",
+                targeted_name =
+                    instance_prop(&self.vm, interaction, "TargetActor")
+                        .map(|id| self.vm.objects[id as usize].name.clone())
+            ));
+        }
+        if !targeted
             || !matches!(
                 self.vm.get_property(
                     interaction,
-                    if corpse {
-                        "bCanSearchCorpse"
-                    } else if trigger {
-                        "bCanTrigger"
-                    } else {
-                        "bCanPickup"
-                    }
+                    if trigger { "bCanTrigger" } else { "bCanPickup" }
                 ),
                 Some(Value::Bool(true))
             )
@@ -1766,12 +1811,76 @@ impl Session {
             } else {
                 UseOutcome::PlayerTriggerOnly
             }
-        } else if corpse && instance_prop(&self.vm, target, "Inventory").is_none() {
-            UseOutcome::CorpseSearched
         } else if self.inventory_items().len() > before.len() {
             UseOutcome::PickedUp
         } else {
             UseOutcome::PickupRefused
+        }
+    }
+
+    /// The corpse-search branch of the Grab exec: run the exec on a full corpse (its inventory
+    /// transfers to the player). The caller has already validated the game's own view-trace target
+    /// and the `bCanSearchCorpse` flag.
+    fn grab_search_corpse(&mut self, target: ObjectId, controller: ObjectId) -> UseOutcome {
+        if let Err(e) = self.vm.send_event(controller, "Grab", Vec::new()) {
+            return UseOutcome::Error(e.to_string());
+        }
+        self.drain_events();
+        if instance_prop(&self.vm, target, "Inventory").is_none() {
+            UseOutcome::CorpseSearched
+        } else {
+            UseOutcome::PickupRefused
+        }
+    }
+
+    /// The Grab exec's carry branch on a pawn the game's own view trace picked. Unlike the removed
+    /// named-carry host bridge, this does **not** write any `XIIIPlayerInteraction` flag or
+    /// `TargetActor`: `DrawInteractions` (driven by the headless render phase, as the windowed
+    /// driver's `MyPCPostRender` drives it) computed the carry flag from the aimed view trace, and
+    /// the exec re-validates through the pawn's own `CanGrabCorpse`/`CanTakePrisonner` before
+    /// `XIIILeftHand.GrabPawn` (or `UnGrabPawn` when `LHand.pOnShoulder` is already this pawn).
+    pub fn grab_carry_target(&mut self, target: ObjectId) -> UseOutcome {
+        let Some(controller) = self.controller else {
+            return UseOutcome::Error("no player controller".to_owned());
+        };
+        let Some(lhand) = instance_prop(&self.vm, self.player, "LHand") else {
+            return UseOutcome::NoLeftHand;
+        };
+        let before = instance_prop(&self.vm, lhand, "pOnShoulder");
+        let releasing = before == Some(target);
+        if let Err(e) = self.vm.send_event(controller, "Grab", Vec::new()) {
+            return UseOutcome::Error(e.to_string());
+        }
+        self.drain_events();
+        let after = instance_prop(&self.vm, lhand, "pOnShoulder");
+        if before.is_none() && after == Some(target) {
+            if self.actor_is_dead(target) {
+                UseOutcome::CarriedCorpse
+            } else {
+                UseOutcome::CarriedPrisonner
+            }
+        } else if releasing {
+            // Retail `UnGrabPawn` leaves `pOnShoulder` set until `UnGrabbing.AnimEnd` runs the
+            // pawn's `UnGrabbed` drop; the exec having run is the release.
+            UseOutcome::Released
+        } else {
+            UseOutcome::CarryRefused(format!(
+                "Grab left LHand.pOnShoulder = {} (the exec-time CanGrabCorpse/CanTakePrisonner \
+                 gate: target Physics={physics:?}, bCanBeGrabbed={grabbable:?}, \
+                 bHaveOnlyOneHandFree={one_hand:?}, bWeaponMode={weapon_mode:?}, \
+                 bWaitForWeaponMode={wait_mode:?}, player Physics={own_physics:?}, \
+                 crouched={crouched:?})",
+                after
+                    .map(|id| self.vm.objects[id as usize].name.clone())
+                    .unwrap_or_else(|| "None".to_owned()),
+                physics = self.vm.get_property(target, "Physics"),
+                grabbable = self.vm.get_property(target, "bCanBeGrabbed"),
+                one_hand = self.vm.get_property(self.player, "bHaveOnlyOneHandFree"),
+                weapon_mode = self.vm.get_property(controller, "bWeaponMode"),
+                wait_mode = self.vm.get_property(controller, "bWaitForWeaponMode"),
+                own_physics = self.vm.get_property(self.player, "Physics"),
+                crouched = self.vm.get_property(self.player, "bIsCrouched"),
+            ))
         }
     }
 

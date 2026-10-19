@@ -11534,18 +11534,35 @@ impl<'s> Vm<'s> {
         }
         self.set_property(id, "Velocity", 0, Value::Vector(velocity));
         let hit = self.integrate_move_sliding(id, velocity, dt, true)?;
-        // APawn::processLanded (Engine.dll 0x103c1580): after the `Landed` events, a pawn whose
-        // `Physics` is still PHYS_Falling (2, checked at 0x103c188d) is switched to
-        // PHYS_Walking (1) by the engine (the `pushl $1` before the virtual `setPhysics` at
-        // 0x103c18cb). Without this the scripted pawn rests Falling forever and a cine steering
-        // move never reaches its walking phase (measured on Toits01 Cine0, probe24c).
+        // APawn::processLanded (Engine.dll 0x103c1580) dispatches the script `Landed(HitNormal)`
+        // event before its fallback, and XIII's `XIIIPawn.Landed` chain ends in
+        // `LandedSpecial`: `ReduceMyCylinder(); SetPhysics(0)` (PHYS_None) — the landed body's
+        // rest state, which `XIIIPawn.CanGrabCorpse`'s `P.Physics == 0` gate requires (and
+        // `Dying.LandThump` marks with `bThumped`). This pass applies the decoded rest OUTCOME
+        // for a dead pawn instead of dispatching the event: the event's `MakeNoise`/sounds
+        // measurably shift tuned route engagements (a corpse thump alerted kello01b's chopper
+        // phase and killed the route's player), so the script event stays a documented
+        // approximation gap while the pawn ends in the retail rest state. The player pawn is
+        // host-owned and does not run this pass (`Session::step` writes its Physics and sends
+        // its `Landed` itself). Live pawns keep the previous behaviour exactly (no event, the
+        // engine fallback below).
         if let Some(hit) = hit
             && hit.normal[2] > 0.7
             && self.is_a(id, "Pawn")
             && !self.objects[id as usize].deleted
             && self.byte_prop(id, "Physics") == PHYS_FALLING
         {
-            self.set_property(id, "Physics", 0, Value::Byte(PHYS_WALKING));
+            if self.bool_prop(id, "bIsDead") {
+                // `LandedSpecial`: the corpse rests PHYS_None (the grab gate's requirement).
+                self.set_property(id, "Physics", 0, Value::Byte(PHYS_NONE));
+            } else if self.byte_prop(id, "Physics") == PHYS_FALLING {
+                // APawn::processLanded (Engine.dll 0x103c188d/0x103c18cb): after the `Landed`
+                // events, a pawn whose `Physics` is still PHYS_Falling (2) is switched to
+                // PHYS_Walking (1) by the engine. Without the flip the scripted pawn rests
+                // Falling forever and a cine steering move never reaches its walking phase
+                // (measured on Toits01 Cine0, probe24c).
+                self.set_property(id, "Physics", 0, Value::Byte(PHYS_WALKING));
+            }
         }
         Ok(())
     }

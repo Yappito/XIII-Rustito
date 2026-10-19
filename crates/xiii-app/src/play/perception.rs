@@ -110,6 +110,13 @@ fn actor_fact(vm: &mut Vm, eye: [f32; 3], name: &str, aim: f32) -> ActorFact {
     };
     if dead {
         fact.state = ActorState::Dead;
+        // A dead pawn still has its `Location` (the corpse rests there); report it so an
+        // `approach` can walk onto the body to carry it (`aim` is the raw Location, not an
+        // aimed band — the caller aims at a corpse on the floor).
+        if let Some(location) = vm.vector_prop(id, "Location") {
+            fact.distance = distance(eye, location);
+            fact.aim = Some(location);
+        }
         return fact;
     }
     fact.state = ActorState::Alive;
