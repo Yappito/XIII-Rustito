@@ -1,0 +1,83 @@
+# PRock04a first input route (normal standalone start).
+# Collect the start medkit; grapple HookPoint10, land on the patrol ledge, jump the
+# canyon lip. Close on BaseSoldier3 with fists (the melee `engage` gives the target
+# up when it stops losing health; the corpse then hands its weapons over on
+# contact) and heal with the carried medkit (the ordinary H key). Grapple
+# HookPoint2 and use the raw Grab input to release (ray-based use can select
+# scenery). Follow the canyon to MedPick2, collect it and heal.
+# The route stops on the open canyon floor at the crate: eastward the floor is a
+# sniper field and the north slope is a collision trap (see the report).
+# Combat, pickup and healing waits use closed-loop commands.
+# No teleports, grants, goal writes or control overrides.
+t=0.05 goto -6437 -4304
+t=0.1 wait_until not alive MedPick10 4
+t=0.5 goto -5900 -4470
+t=2 goto -5500 -4500
+t=4 goto -5400 -4450
+t=6 goto -5400 -4200
+t=9 goto -5400 -3950
+t=12 goto off
+t=12 forward 0
+t=12 next_item
+t=13 track HookPoint10
+t=14 fire_hold 1
+t=14.2 fire_hold 0
+t=15 fire_hold 1
+t=23 fire_hold 0
+t=23 track off
+t=23 goto -5267 -3736
+t=24 grab_input
+t=27 select_weapon 0
+t=28 goto -4650 -3450
+t=30 goto -4147 -3490
+t=32 goto -3725 -3523
+t=33.5 goto -3480 -3644
+t=35 goto -3250 -4100
+t=37 goto -3250 -4480
+t=39 goto -2900 -4440
+t=39.1 jump
+t=40.5 goto -2005 -4436
+t=42.5 goto -1000 -4443
+t=44 select_weapon 0
+t=44 follow BaseSoldier3 65
+t=44 engage BaseSoldier3 4000 25 aim=0.6 period=0.8
+t=44.1 follow off
+t=44.1 goto off
+t=44.1 forward 0
+t=44.15 wait_until event XIIIPlayerController SearchPawn 5
+t=44.2 loot 800 10
+t=44.3 select_weapon 14
+t=44.35 heal
+t=44.4 wait_until health_above 115 3
+t=44.5 goto_until -240 -4590 arrived 5
+t=44.6 goto_until 300 -4550 arrived 5
+t=44.7 goto_until 620 -4380 arrived 3
+t=44.8 goto_until 830 -4197 arrived 3
+t=44.9 goto off
+t=44.9 forward 0
+t=45 next_item
+t=45.6 track HookPoint2
+t=46.6 fire_hold 1
+t=46.8 fire_hold 0
+t=47.6 fire_hold 1
+t=52.1 fire_hold 0
+t=52.1 track off
+t=52.1 goto 850 -3900
+t=53.1 grab_input
+t=54.5 select_weapon 14
+t=54.6 goto_until 850 -3500 arrived 5
+t=54.7 goto_until 1050 -3200 arrived 5
+t=54.8 goto_until 1130 -2780 arrived 3
+t=54.9 goto 1248 -2492
+t=55 wait_until not alive MedPick2 3
+t=55.1 goto off
+t=55.1 forward 0
+t=55.2 heal
+t=55.3 wait_until health_above 60 4
+t=55.4 select_weapon 14
+
+# The route stops at the medical crate on the open canyon floor. Beyond it the
+# floor is covered by the canyon snipers and the north slope is a collision trap;
+# neither is part of this first prefix (see the report).
+t=55.5 goto off
+t=55.5 forward 0

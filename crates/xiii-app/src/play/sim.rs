@@ -16,9 +16,10 @@
 //! walkable floor (`MINFLOORZ`).
 
 use xiii_collision::{
-    CollisionWorld, MoveParams, SweepHit, Vec3, WalkParams, move_slide, walk_move,
+    CollisionWorld, MoveContact, MoveParams, SweepHit, Vec3, WalkParams, clip_velocity, move_slide,
+    walk_move,
 };
-use xiii_decode::common::{UNREAL_UNITS_PER_METER, to_bevy_position};
+use xiii_decode::common::{UNREAL_UNITS_PER_METER, to_bevy_direction, to_bevy_position};
 use xiii_world::physics::{
     bevy_to_unreal_direction, bevy_to_unreal_position, unreal_extent_to_bevy,
 };
@@ -783,6 +784,38 @@ impl PlayerSim {
             let result = move_slide(world, center, to_bevy_position(delta_uu), half, &slide);
             self.location = bevy_to_unreal_position(result.position);
             self.record_contact(&result.contacts.last().map(|c| c.source), sources);
+            // **Partial deviation from retail.** UE2 `APawn::physFalling` (0x103c37b0) removes
+            // the velocity component into every wall it hits on a blocked sub-move
+            // (`Velocity -= HitNormal * (Velocity | HitNormal)`, measured at 0x103c3f50; the
+            // wall branch is `Hit.Normal.Z < MINFLOORZ`). The host applies it only when the move
+            // made no progress at all, and only against the wall contacts (`normal[1] <
+            // MINFLOORZ`), because our swept-AABB-vs-triangle-soup "blocked" classification
+            // over-triggers: a fall that merely grazes a wall is flagged blocked although the
+            // engine's line-check-with-extent would not stop the move. Clipping on every blocked
+            // sub-move changes the landing trajectory on five existing routes (Hual04a,
+            // Hual04c, Hual04c travel, Kello01a chalet, and this map — see the report). Ordinary
+            // blocked falls keep their simulated trajectory. This is not a claimed retail
+            // behaviour.
+            let moved = result
+                .position
+                .iter()
+                .zip(center)
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f32>()
+                .sqrt();
+            if result.blocked && moved <= skin {
+                let walls: Vec<MoveContact> = result
+                    .contacts
+                    .iter()
+                    .filter(|c| c.normal[1] < MINFLOORZ)
+                    .copied()
+                    .collect();
+                let bevy = to_bevy_direction(self.velocity);
+                let clipped = clip_velocity(bevy, &walls);
+                if clipped != bevy {
+                    self.velocity = bevy_to_unreal_direction(clipped);
+                }
+            }
             // Land when a walkable floor is within a small probe below the box.
             let down = [
                 result.position[0],

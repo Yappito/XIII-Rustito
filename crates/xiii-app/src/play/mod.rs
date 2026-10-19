@@ -10676,6 +10676,242 @@ mod tests {
     }
 
     #[test]
+    fn opt_in_prock04a_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("PRock04a".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import PRock04a");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let text = include_str!("../../tests/data/prock04a_route.script");
+        let script = script::Script::parse(text).expect("parse PRock04a route");
+        assert!(
+            script.events.iter().all(|event| !matches!(
+                event.command,
+                script::Command::Teleport(_)
+                    | script::Command::Weapon(_)
+                    | script::Command::Item(_)
+                    | script::Command::SetGoal(_)
+                    | script::Command::TakeControl
+            )),
+            "the route must use ordinary input only"
+        );
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "PRock04a",
+            &script,
+            &resolved.params,
+            &scene,
+            74.0,
+        )
+        .expect("run PRock04a route");
+        let session = &outcome.session;
+        let vm = session.vm();
+        println!(
+            "[prock04a] error={:?} goals={:?} travel={:?} position={:?} health={:?} inventory={:?}",
+            session.first_error(),
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health(),
+            session.inventory_items()
+        );
+        survey::print_details(&survey::extract("PRock04a", &outcome));
+        assert!(
+            session.first_error().is_none(),
+            "{:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(session.blocked.is_empty(), "{:?}", session.blocked);
+        assert!(!session.player_input_ended(), "stop before a fatal point");
+        // The route stops on the open canyon floor by the medical crate, alive.
+        assert_eq!(
+            session.player_health(),
+            Some(122.0),
+            "surviving measured stop"
+        );
+        assert!(
+            outcome.map_min_health.iter().all(|(_, h)| *h > 0.0),
+            "min health on the map must stay positive: {:?}",
+            outcome.map_min_health
+        );
+        let near = |position: [f32; 3], expected: [f32; 3]| {
+            position
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| (a - b).abs() < 2.0)
+        };
+        let start = outcome.trace.first().expect("spawn sample").2;
+        assert!(
+            near(start, [-6238.5015, -4465.876, 678.5102]),
+            "normal spawn: {start:?}"
+        );
+        // Measured landing centres, with the same 2-UU pin as the other PRock route.
+        for landing in [[-5259.8, -3623.4, 1347.7], [848.6, -3891.2, 1545.9]] {
+            assert!(
+                outcome.trace.iter().any(|(_, _, p, _)| near(*p, landing)),
+                "grapple landing {landing:?} must be reached"
+            );
+        }
+        for anchor in ["HookPoint10", "HookPoint2"] {
+            assert!(vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { function, args, .. }
+                    if function == "XIIIProjectile.Touch" && args.first().is_some_and(|arg| arg == anchor)
+            )), "the player's hook must contact {anchor}");
+        }
+        // The first canyon soldier is defeated: the game runs its authored death
+        // presentation on `BaseSoldier3` (the pawn is removed by the retail corpse path,
+        // so it cannot be looked up at the end).
+        assert!(
+            vm.trace.iter().any(|event| matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target == "BaseSoldier3" && function == "BaseSoldier.PlayDying"
+            )),
+            "the first soldier must be defeated"
+        );
+        let inventory = session.inventory_items();
+        for class in ["xiii.kalash", "xiii.magnum"] {
+            assert!(
+                inventory
+                    .iter()
+                    .any(|(_, carried)| carried.eq_ignore_ascii_case(class)),
+                "looted {class} must remain carried: {inventory:?}"
+            );
+        }
+        for pickup in ["MedPick10", "MedPick2"] {
+            assert!(
+                vm.find_live_object(pickup).is_none(),
+                "{pickup} must be collected"
+            );
+        }
+        assert_eq!(vm.trace.iter().filter(|event| matches!(
+            &event.kind,
+            xiii_script::TraceKind::Event { function, .. } if function.ends_with(".UseMeQuick")
+        )).count(), 2, "both carried medical kits must be used through QuickHeal");
+        let nurse = vm.find_object("Cine1").expect("nurse");
+        assert!(
+            !session.actor_is_dead(nurse),
+            "preserve the nurse anti-goal"
+        );
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 2);
+        assert!(goals[0].primary && !goals[0].anti_goal && !goals[0].completed);
+        assert_eq!(goals[0].text, "Find the mine entrance to rejoin Jones.");
+        assert!(goals[1].primary && goals[1].anti_goal && goals[1].completed);
+        assert!(outcome.travel.is_empty(), "PRock04b travel remains blocked");
+        let map_info = vm
+            .find_object("PRock04a1")
+            .expect("map info / travel owner");
+        assert_eq!(
+            vm.get_property(map_info, "NextMapLevelWithUnr"),
+            Some(&Value::Str("PRock04b".to_owned()))
+        );
+        let finish = vm
+            .find_live_object("XIIIGoalTrigger0")
+            .expect("unreached Fini goal trigger");
+        assert_eq!(
+            vm.get_property(finish, "Tag"),
+            Some(&Value::Name("Fini".to_owned()))
+        );
+        // The player stands on the flat canyon floor beside the medical crate, alive and
+        // still in control: the prefix's furthest stable point. The terrain north of here
+        // is a collision trap and the floor east is a sniper field (see the report).
+        let position = session.player_location().expect("player location");
+        assert!(
+            near(position, [1248.5105, -2546.0454, 1380.5625]),
+            "crate floor stop: {position:?}"
+        );
+        assert_ne!(
+            session.player_physics(),
+            Some(2),
+            "the stop must not be a falling/stuck state"
+        );
+    }
+
+    /// PRock04a tyrol ride (item108b): the map crosses the canyon with the tyrolines
+    /// (`XIIITyrolNavPoint*`/`TyrolTrigger*`); `TyrolTrigger.PlayerTrigger` ->
+    /// `XIIIPlayerController.GoTyroling` -> the `Tyroling` state's `PlayerMove`/`ProcessMove`
+    /// (`Pawn.Move`, `PHYS_None`, `fTyrolSpeed` 600).
+    ///
+    /// **Mechanism test, not a route.** The map's first tyrol trigger (`TyrolTrigger0` at
+    /// (3168,-4099,2138)) sits on the far rim of the start pit with no measured walkable
+    /// approach (see `local/reports/item108-prock04a.md`: the second-grapple landing shelf
+    /// (z~1471) is separated from the nav shelf (z~1700-2150) by a ~490 UU cliff at x=800,
+    /// and the closed-loop walker drifts into the pit). This test therefore bootstraps the
+    /// player next to the trigger with the diagnostic `teleport` and rides it with the ordinary
+    /// `use` input; the ride itself is the game's own chain, not a host bridge. A foot route to
+    /// the trigger is unproven, so the test asserts only the mechanism.
+    #[test]
+    fn opt_in_prock04a_tyrol_mechanism() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("PRock04a".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import PRock04a");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let text =
+            "t=0.05 teleport 3168 -4099 2140\nt=0.6 use TyrolTrigger0\nt=0.8 use TyrolTrigger0\n";
+        let script = script::Script::parse(text).expect("parse tyrol probe");
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "PRock04a",
+            &script,
+            &resolved.params,
+            &scene,
+            20.0,
+        )
+        .expect("run tyrol probe");
+        let session = &outcome.session;
+        let vm = session.vm();
+        for (name, function) in [
+            ("TyrolTrigger0", "TyrolTrigger.PlayerTrigger"),
+            ("XIIIPlayerController", "XIIIPlayerController.GoTyroling"),
+        ] {
+            assert!(
+                vm.trace.iter().any(|event| matches!(
+                    &event.kind,
+                    xiii_script::TraceKind::Event { target, function: f, .. }
+                        if target == name && f == function
+                )),
+                "the tyrol must run {name}.{function}"
+            );
+        }
+        assert!(
+            !session.player_input_ended(),
+            "the ride must not end the game"
+        );
+        // Measured: the ride carries the pawn from NavPoint0 (3166,-4110,2366) to
+        // NavPoint1 (7176,-3311,2720) at fTyrolSpeed and drops it on the far rim.
+        let position = session.player_location().expect("player location");
+        let near_end = position
+            .iter()
+            .zip([7217.7, -3290.9, 2457.8])
+            .all(|(a, b)| (a - b).abs() < 40.0);
+        assert!(
+            position[0] > 7000.0 && near_end,
+            "the tyrol must reach the far NavPoint: {position:?}"
+        );
+        assert_eq!(
+            session.player_controller_state(),
+            "PlayerWalking",
+            "the tyrol state must hand back to walking at the far end"
+        );
+    }
+
+    #[test]
     fn opt_in_prock03_route_objectives_and_travel() {
         let Some(game_dir) = opt_in_root() else {
             println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");

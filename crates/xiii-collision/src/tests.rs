@@ -1719,3 +1719,136 @@ fn dynamic_mover_ray_hits_base_pose_panel() {
     assert!(plain.ray_with_one_sided_sources(start, end, &[]).is_some());
     assert!(plain.ray_with_one_sided_sources(end, start, &[]).is_some());
 }
+
+/// A box that starts embedded in a steep, non-walkable slope and is pushed into it must
+/// escape under gravity, not stay in `PHYS_Falling` forever.
+///
+/// Fixture: the slope/crate corner measured at PRock04a (numeric geometry only). A box
+/// floats 49 UU above a flat floor with its lower-west side inside a ~60-degree slope, and a
+/// vertical wall (the ammunition crate) 46 UU to its east; the gap is narrower than the box.
+/// A pawn can be driven there by the walking step-up approximation, so the falling path must
+/// still recover, as retail does: `APawn::physFalling` (0x103c37b0) calls `processHitWall`
+/// (which removes the velocity into the wall) and `AActor::TwoWallAdjust` (0x10304b50), so the
+/// pawn never stays embedded.
+#[test]
+fn falling_box_embedded_in_a_steep_corner_slides_out() {
+    let s = 90.0f32;
+    let b = |u: [f32; 3]| [u[1] / s, u[2] / s, -u[0] / s];
+    let tri = |a: [f32; 3], b2: [f32; 3], c: [f32; 3], src: u32| ([b(a), b(b2), b(c)], src);
+    let t: Vec<(Triangle, u32)> = vec![
+        // The steep slope next to the box (up-component 0.34-0.44, below MINFLOORZ).
+        tri(
+            [1068.0, -2424.0, 1503.6],
+            [1164.0, -2364.0, 1415.6],
+            [1164.0, -2424.0, 1305.6],
+            1,
+        ),
+        tri(
+            [1164.0, -2424.0, 1305.6],
+            [1164.0, -2364.0, 1415.6],
+            [1260.0, -2364.0, 1357.8],
+            2,
+        ),
+        tri(
+            [1164.0, -2424.0, 1305.6],
+            [1260.0, -2364.0, 1357.8],
+            [1260.0, -2424.0, 1305.6],
+            3,
+        ),
+        tri(
+            [1068.0, -2484.0, 1456.8],
+            [1068.0, -2424.0, 1503.6],
+            [1164.0, -2424.0, 1305.6],
+            4,
+        ),
+        tri(
+            [1068.0, -2484.0, 1456.8],
+            [1164.0, -2424.0, 1305.6],
+            [1164.0, -2484.0, 1305.6],
+            5,
+        ),
+        tri(
+            [1068.0, -2544.0, 1374.3],
+            [1068.0, -2484.0, 1456.8],
+            [1164.0, -2484.0, 1305.6],
+            6,
+        ),
+        tri(
+            [1068.0, -2544.0, 1374.3],
+            [1164.0, -2484.0, 1305.6],
+            [1164.0, -2544.0, 1305.6],
+            7,
+        ),
+        // A large flat floor at the slope's base so a freed box can land.
+        tri(
+            [600.0, -3200.0, 1305.6],
+            [1800.0, -3200.0, 1305.6],
+            [1800.0, -1600.0, 1305.6],
+            8,
+        ),
+        tri(
+            [600.0, -3200.0, 1305.6],
+            [1800.0, -1600.0, 1305.6],
+            [600.0, -1600.0, 1305.6],
+            9,
+        ),
+        // The vertical crate wall east of the box (the second wall of the corner).
+        tri(
+            [1210.0, -2512.0, 1305.6],
+            [1210.0, -2448.0, 1305.6],
+            [1210.0, -2448.0, 1375.0],
+            10,
+        ),
+        tri(
+            [1210.0, -2512.0, 1305.6],
+            [1210.0, -2448.0, 1375.0],
+            [1210.0, -2512.0, 1375.0],
+            11,
+        ),
+    ];
+    let world = CollisionWorld::new(t);
+    let half = [34.0 / s, 75.0 / s, 34.0 / s];
+    let skin = 0.05 / s;
+    let params = MoveParams {
+        skin,
+        max_iterations: 4,
+        max_step_height: 0.0,
+    };
+    // The measured wedge: centre 49 UU above the floor, pressed north into the slope, with a
+    // northward + terminal-fall velocity.
+    let start = b([1176.0, -2455.9, 1429.8]);
+    let mut pos = start;
+    let mut vel = [460.0 / s, -1200.0 / s, 0.0];
+    let dt = 1.0 / 60.0;
+    let gravity = -950.0 / s;
+    let max_fall = -1200.0 / s;
+    let floor_center_y = 1305.6 / s + half[1];
+    let mut landed = false;
+    for _ in 0..900 {
+        vel[1] = (vel[1] + gravity * dt).max(max_fall);
+        let delta = [vel[0] * dt, vel[1] * dt, vel[2] * dt];
+        let r = move_slide(&world, pos, delta, half, &params);
+        pos = r.position;
+        vel = clip_velocity(vel, &r.contacts);
+        // The sim's own landing probe: a walkable floor within a small step below.
+        let down = [pos[0], pos[1] - 0.02, pos[2]];
+        if world
+            .sweep(pos, down, half)
+            .is_some_and(|h| h.normal[1] >= 0.7)
+        {
+            landed = true;
+            break;
+        }
+    }
+    let moved = (0..3).map(|k| (pos[k] - start[k]).abs()).sum::<f32>();
+    assert!(moved > 20.0 / s, "the box must leave the wedge: {pos:?}");
+    assert!(
+        landed,
+        "the box must reach the floor rather than stay falling: {pos:?}"
+    );
+    assert!(
+        (pos[1] - floor_center_y).abs() < 1.0,
+        "the box must end standing on the floor: y={} expected {floor_center_y}",
+        pos[1]
+    );
+}

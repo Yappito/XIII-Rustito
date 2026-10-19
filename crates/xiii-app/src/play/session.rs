@@ -1097,6 +1097,10 @@ impl Session {
             || self.controller.is_some_and(|pc| {
                 self.vm.is_in_state(pc, "NoControl")
                     || self.vm.is_in_state(pc, "ClimbToHookNavPoint")
+                    // `XIIIPlayerController.Tyroling` moves the pawn along the tyroline from its
+                    // own `PlayerMove` (`GoTyroling`, xiii.u @340755); the host walker follows the
+                    // scripted pawn pose instead of publishing input over it.
+                    || self.vm.is_in_state(pc, "Tyroling")
                     || (self.controller_flag(pc, "bHooked") && self.player_physics() == Some(2))
             })
     }

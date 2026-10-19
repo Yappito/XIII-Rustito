@@ -4756,10 +4756,14 @@ impl<'s> Vm<'s> {
                 continue;
             }
             // `bHooked` is set by `XIIIPawn.GoHooking` and cleared by `Hook.*.Release`; the
-            // climb-nav handoff state runs its own PlayerMove too.
+            // climb-nav handoff state runs its own PlayerMove too, and the `Tyroling` state
+            // (`XIIIPlayerController.GoTyroling`, xiii.u @340755) drives the pawn along the
+            // tyroline from its own `PlayerMove` (`Tyroling.PlayerMove` -> `Tyroling.ProcessMove`
+            // -> `Pawn.Move`). All three are script-owned pawn movement, not the host walker.
             let hooked = self.bool_prop(id, "bHooked");
             let climbing = self.is_in_state(id, "ClimbToHookNavPoint");
-            if !hooked && !climbing {
+            let tyroling = self.is_in_state(id, "Tyroling");
+            if !hooked && !climbing && !tyroling {
                 continue;
             }
             if !self.state_defines_function(id, "PlayerMove") {

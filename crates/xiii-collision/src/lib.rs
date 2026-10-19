@@ -39,6 +39,13 @@ pub type Vec3 = [f32; 3];
 /// `SKIN_UU = 0.05`, so this crate default is only for callers that do not override it.
 pub const DEFAULT_SKIN: f32 = 0.001;
 
+/// Up-component of a unit surface normal at which the surface is a walkable floor (UE2
+/// `MINFLOORZ`, measured in XIII's `Engine.dll` at `0x10483428` = 0.7). [`move_slide`]'s
+/// depenetration recovery uses it to tell a wall from a floor: a box embedded in a floor is
+/// resting on it and must not be pushed out. (The walk primitive takes the same threshold as
+/// `WalkParams::min_floor_z`.)
+pub const MIN_FLOOR_UP: f32 = 0.7;
+
 /// One overlap hit against a triangle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Hit {
@@ -621,12 +628,47 @@ fn is_degenerate(t: &Triangle) -> bool {
 /// This is a documented **approximation** of `UPawn::physWalking` / `stepUp`, not a fidelity
 /// claim: the sweep is a single AABB against two-sided triangles, the skin is empirical and
 /// step-up is a three-sweep heuristic when enabled.
+///
+/// **Depenetration recovery is a partial deviation from retail.** When the plain slide makes no
+/// progress at all, this retries once with `push_out_of_plane`, which pushes a start-penetrating
+/// box out of the hit triangle's face plane. The engine has no such step: its heightfield
+/// `LineCheck` never leaves a pawn inside the surface, and `APawn::physFalling` (0x103c37b0)
+/// recurses through `processHitWall`/`TwoWallAdjust` instead. The host uses this fallback (and
+/// [`clip_velocity`]) only for the stuck case; ordinary moves are unchanged.
 pub fn move_slide(
     world: &CollisionWorld,
     start: Vec3,
     delta: Vec3,
     half_extents: Vec3,
     params: &MoveParams,
+) -> MoveResult {
+    // First attempt: the plain slide. It is correct for every progressing move.
+    let first = slide_attempt(world, start, delta, half_extents, params, false);
+    // Recovery: a box already inside a surface (or touching it within the skin from several
+    // sides) can be blocked at `t = 0` on every sub-move and never move. UE2 never embeds a
+    // pawn: its `ATerrainInfo::LineCheck` always answers with the heightfield surface and
+    // `APawn::physFalling` (0x103c37b0) slides it out of every contact. When the plain slide
+    // makes no progress at all, depenetrate the start plane-by-plane and retry once.
+    let progress = length(sub(first.position, start));
+    if first.blocked && progress <= params.skin {
+        let second = slide_attempt(world, start, delta, half_extents, params, true);
+        if length(sub(second.position, start)) > progress {
+            return second;
+        }
+    }
+    first
+}
+
+/// One [`move_slide`] attempt. `depenetrate` selects the recovery behaviour: a start-penetrating
+/// contact is resolved by pushing the box out of the triangle's plane before sliding the
+/// remainder, instead of dropping the sub-move.
+fn slide_attempt(
+    world: &CollisionWorld,
+    start: Vec3,
+    delta: Vec3,
+    half_extents: Vec3,
+    params: &MoveParams,
+    depenetrate: bool,
 ) -> MoveResult {
     let mut pos = start;
     let mut remaining = delta;
@@ -651,7 +693,22 @@ pub fn move_slide(
             }
         };
         blocked = true;
-        let at = add(pos, mul(dir, (hit.t * travel - params.skin).max(0.0)));
+        // The recovery depenetrates only a **non-walkable** surface (the engine's wall branch,
+        // `Hit.Normal.Z < MINFLOORZ`). A box embedded in a walkable floor is legitimately resting
+        // on it: pushing it out would lift it (measured in the Banque01 water test, where it
+        // jumped 67 UU out of the 16 UU water slab). The gate must use the triangle's *face*
+        // normal, not the SAT contact normal: a floor hit can report a horizontal SAT axis while
+        // the face it is embedded in is horizontal-up.
+        let face = (hit.triangle != u32::MAX).then(|| *world.triangle(hit.triangle));
+        let surface_up = match face.as_ref() {
+            Some(t) => normalize(triangle_normal(t))[1],
+            None => hit.normal[1],
+        };
+        let at = if depenetrate && hit.start_penetrating && surface_up.abs() < MIN_FLOOR_UP {
+            push_out_of_plane(pos, half_extents, face.as_ref(), hit.normal, params.skin)
+        } else {
+            add(pos, mul(dir, (hit.t * travel - params.skin).max(0.0)))
+        };
         contacts.push(MoveContact {
             source: hit.source,
             triangle: hit.triangle,
@@ -699,6 +756,26 @@ pub fn move_slide(
         on_floor,
         falling: false,
     }
+}
+
+/// Removes the component of `velocity` that points into each recorded contact normal: the
+/// `Velocity -= HitNormal * (Velocity | HitNormal)` step UE2 `APawn::physFalling`
+/// (`Engine.dll` 0x103c37b0, measured at 0x103c3f50, after `processHitWall`) applies to a blocked
+/// sub-move.
+///
+/// **Partial deviation from retail:** the engine clips on *every* blocked falling sub-move. The
+/// host caller (`crates/xiii-app/src/play/sim.rs`) applies it only when the move made no progress
+/// at all, because the ungated clip changes the landing/contact trajectory on five existing routes
+/// (listed in `local/reports/item108-prock04a.md`). This is not a claimed retail behaviour.
+pub fn clip_velocity(velocity: Vec3, contacts: &[MoveContact]) -> Vec3 {
+    let mut v = velocity;
+    for c in contacts {
+        let into = dot(v, c.normal);
+        if into < 0.0 {
+            v = sub(v, mul(c.normal, into));
+        }
+    }
+    v
 }
 
 /// Attempts to step up over a near-vertical surface: up, forward, down. Returns the landing
@@ -755,6 +832,39 @@ fn try_step(
 /// Public static overlap test between an AABB and one triangle (diagnostics/dumps).
 pub fn aabb_overlaps_triangle(center: Vec3, half: Vec3, t: &Triangle) -> bool {
     aabb_triangle_overlap(center, half, t).is_some()
+}
+
+/// Moves an AABB out of one triangle's plane along the face normal (oriented from the triangle
+/// toward the box) by the box's penetration into that plane, plus `skin`. Falls back to the
+/// reported contact normal when the triangle is not available (a moving object's hit). Used by
+/// [`move_slide`] to resolve a start-penetrating contact, as the engine's heightfield never
+/// leaves a pawn inside the terrain.
+fn push_out_of_plane(
+    center: Vec3,
+    half: Vec3,
+    face: Option<&Triangle>,
+    contact_normal: Vec3,
+    skin: f32,
+) -> Vec3 {
+    let Some(t) = face else {
+        return add(center, mul(contact_normal, skin));
+    };
+    let mut n = normalize(triangle_normal(t));
+    if n == [0.0, 0.0, 0.0] {
+        return add(center, mul(contact_normal, skin));
+    }
+    let centroid = [
+        (t[0][0] + t[1][0] + t[2][0]) / 3.0,
+        (t[0][1] + t[1][1] + t[2][1]) / 3.0,
+        (t[0][2] + t[1][2] + t[2][2]) / 3.0,
+    ];
+    if dot(sub(center, centroid), n) < 0.0 {
+        n = mul(n, -1.0);
+    }
+    let radius = half[0] * n[0].abs() + half[1] * n[1].abs() + half[2] * n[2].abs();
+    let dist = dot(sub(center, t[0]), n);
+    let depth = (radius - dist).max(0.0);
+    add(center, mul(n, depth + skin))
 }
 
 /// Static overlap test between an AABB and a triangle with the separating-axis theorem.
