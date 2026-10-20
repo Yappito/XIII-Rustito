@@ -140,5 +140,13 @@ t=61 goto off
 t=61 forward 0
 
 # The route now stands on the far rim at the TyrolTrigger0->NavPoint1 landing,
-# alive. The continuation east along the canyon to goal 0 (Fini) and the
-# PRock04b travel is not yet pinned (see the report).
+# alive. item108i: the chain's next line is TyrolTrigger1 — the same cable in the
+# reverse direction, its trigger volume right at the landing — ridden back west
+# by the ordinary use input; the pawn lands on the south rim by NavPoint0, alive,
+# back in PlayerWalking. (The continuation east to goal 0 / PRock04b is blocked
+# past this point by the west-middle terrain; see the item108i report.)
+t=61.2 use TyrolTrigger1
+t=61.5 wait_until event XIIIPlayerController GoTyroling 5
+t=75 goto_until 3121 -4130 arrived 10
+t=76 goto off
+t=76 forward 0

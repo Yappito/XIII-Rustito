@@ -10968,13 +10968,16 @@ mod tests {
         );
         // The player crossed the canyon: the first tyrol was ridden from the south rim
         // (`TyrolTrigger0` at (3168,-4099,2138)) to the far rim and dropped at the
-        // `XIIITyrolNavPoint1` landing, alive and back in the walking state. item108f/g: the
-        // crate prefix used to stop here is now a mid-route waypoint, superseded by this
-        // beyond-the-cliff stop; the eastward continuation to goal 0 / PRock04b is not yet
-        // pinned (see the report).
+        // `XIIITyrolNavPoint1` landing. item108i: the chain's next line `TyrolTrigger1` — the
+        // same cable in the reverse direction, its volume right at the landing — is then ridden
+        // back west by the ordinary use input and the pawn lands on the south rim by
+        // `XIIITyrolNavPoint0`, alive and back in the walking state. Both landings are pinned
+        // from the movement trace; the eastward continuation to goal 0 / PRock04b is blocked
+        // past the south rim (see the item108i report).
         for (name, function) in [
             ("TyrolTrigger0", "TyrolTrigger.PlayerTrigger"),
             ("XIIIPlayerController", "XIIIPlayerController.GoTyroling"),
+            ("TyrolTrigger1", "TyrolTrigger.PlayerTrigger"),
         ] {
             assert!(
                 vm.trace.iter().any(|event| matches!(
@@ -10985,10 +10988,29 @@ mod tests {
                 "the tyrol must run {name}.{function}"
             );
         }
+        assert_eq!(
+            vm.trace.iter().filter(|event| matches!(
+                &event.kind,
+                xiii_script::TraceKind::Event { target, function, .. }
+                    if target == "XIIIPlayerController" && function == "XIIIPlayerController.GoTyroling"
+            )).count(),
+            2,
+            "both tyrol rides must dispatch GoTyroling (east on TyrolTrigger0, then back west \
+             on TyrolTrigger1)"
+        );
+        // The far-rim landing (the ride east) and the south-rim landing (the ride back west):
+        // both settled positions are deterministic, with the same 2-UU pin as the other PRock
+        // route.
+        for landing in [[7217.7, -3290.9, 2457.8], [3121.3, -4130.3, 2156.4]] {
+            assert!(
+                outcome.trace.iter().any(|(_, _, p, _)| near(*p, landing)),
+                "tyrol landing {landing:?} must be reached"
+            );
+        }
         let position = session.player_location().expect("player location");
         assert!(
-            near(position, [7217.7, -3290.9, 2457.8]),
-            "tyrol far-rim landing: {position:?}"
+            near(position, [3121.3, -4130.3, 2156.4]),
+            "the route must stop at the south-rim landing after the ride back west: {position:?}"
         );
         assert_eq!(
             session.player_controller_state(),
