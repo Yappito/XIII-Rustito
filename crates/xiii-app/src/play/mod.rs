@@ -12127,4 +12127,159 @@ mod tests {
              Grabbed, DrawType 0."
         );
     }
+
+    /// SPADS01 first input route (item112): normal standalone start on the insertion boat,
+    /// the start dialogue touches, the dive into `WaterVolume2` and the swim east toward the
+    /// SPADS camp's underwater sewer entrance.
+    ///
+    /// Map facts measured for the route: `MapInfo` `Spads0` (`XIDMaps.Spads01`) with
+    /// `NextMapLevelWithUnr = "Spads02a.unr"`. `SetUpInitialInventory` grants the 18-entry
+    /// `InitialInv`: Fists, Beretta + c9mmAmmo, the Hook, the Stunning/SixSense skills, the
+    /// arbalete + bolts, the LockPick and the two Spads02 mission items. Three objectives:
+    /// 0 empty (primary anti-goal, completed at begin-play), 1 "Infiltrate the SPADS camp."
+    /// (primary, incomplete) and 2 "Avoid being spotted." (primary anti-goal, completed at
+    /// begin-play and failed by the `Alarme1` spotlight goal).
+    ///
+    /// The route is input-only. It reaches the rock face that closes the north approach to the
+    /// sewer. Measured blocker: the underwater corridor is clear for a 0.6 m half-extent point
+    /// box (a BFS path at z=-2000 runs from (-3300,900) east to (-650,900) and then south
+    /// through (-650,-1200..-2400)), but the 150-UU player box (half extents 34,75,34) finds
+    /// no path on the same 50x50x25 UU grid: `sparock_start` and the `spa_embouch` mouth close
+    /// the passage at the player's height. The 75-UU half-height is retail in swimming:
+    /// Engine.dll `performPhysics` calls `UnCrouch` when `Physics != PHYS_Walking`, and
+    /// `startSwimming`/`physSwimming` never call `SetCollisionSize` (see the item112 report). The route also stays east of the searchlight beam; a
+    /// measured control run crossing the beam line at (-1879,243,-2712) ended the level
+    /// through the `Alarme1` anti-goal at t=13.0, so this route stops before that point (no
+    /// death pin).
+    ///
+    /// Pinned milestones (all ordinary input): the `PlayerStart2` spawn and the first
+    /// `Dispatcher0` touch; the `JonesDebut` `TouchTrigger0`; the dive into `WaterVolume2`; the
+    /// swim stop at (-260.9,738.2,-3121.9) at 150 hp, still swimming and still walking-control.
+    #[test]
+    fn opt_in_spads01_route_objectives_and_travel() {
+        let Some(game_dir) = opt_in_root() else {
+            println!("SKIPPED: set XIII_GOG_DIR to the GOG installation root to run this test");
+            return;
+        };
+        let opts = Options {
+            map: Some("SPADS01".to_owned()),
+            game_dir: Some(game_dir.clone()),
+            ..Default::default()
+        };
+        let scene = viewer::load_scene(&opts).expect("import SPADS01");
+        let resolved = resolve_params(&game_dir).expect("resolve player parameters");
+        let text = include_str!("../../tests/data/spads01_route.script");
+        let script = script::Script::parse(text).expect("parse SPADS01 route");
+        assert!(
+            script.events.iter().all(|event| !matches!(
+                event.command,
+                script::Command::Teleport(_)
+                    | script::Command::Weapon(_)
+                    | script::Command::Item(_)
+                    | script::Command::SetGoal(_)
+                    | script::Command::TakeControl
+            )),
+            "the route must use ordinary input only"
+        );
+        let outcome = run_script_with_cinematic_input(
+            &game_dir,
+            "SPADS01",
+            &script,
+            &resolved.params,
+            &scene,
+            30.0,
+        )
+        .expect("run SPADS01 route");
+        let session = &outcome.session;
+        let vm = session.vm();
+        println!(
+            "[spads01] error={:?} goals={:?} travel={:?} position={:?} health={:?} physics={:?}              state={} touches={:?} inventory={:?}",
+            session.first_error(),
+            session.objective_states(),
+            outcome.travel,
+            session.player_location(),
+            session.player_health(),
+            session.player_physics(),
+            session.player_controller_state(),
+            session.touches(),
+            session
+                .inventory_items()
+                .iter()
+                .map(|(n, c)| format!("{n}[{c}]"))
+                .collect::<Vec<_>>()
+        );
+        survey::print_details(&survey::extract("SPADS01", &outcome));
+        assert!(
+            session.first_error().is_none(),
+            "{:?}",
+            session.first_error()
+        );
+        assert!(session.suspended.is_empty(), "{:?}", session.suspended);
+        assert!(session.blocked.is_empty(), "{:?}", session.blocked);
+        assert!(!session.player_input_ended(), "stop before a fatal point");
+        assert_ne!(session.player_controller_state(), "GameEnded");
+        let near = |position: [f32; 3], expected: [f32; 3], tolerance: f32| {
+            position
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| (a - b).abs() < tolerance)
+        };
+        let start = outcome.trace.first().expect("spawn sample").2;
+        assert!(
+            near(start, [-3938.5903, 1118.4583, -1612.261], 2.0),
+            "normal spawn: {start:?}"
+        );
+        assert!(
+            session
+                .touches()
+                .iter()
+                .any(|(_, actor)| actor == "TouchTrigger0"),
+            "the start JonesDebut trigger must fire: {:?}",
+            session.touches()
+        );
+        assert!(
+            session
+                .touches()
+                .iter()
+                .any(|(_, actor)| actor == "WaterVolume2"),
+            "the dive must touch the map water volume: {:?}",
+            session.touches()
+        );
+        assert_eq!(
+            session.player_health(),
+            Some(150.0),
+            "the route reaches the rock face unharmed"
+        );
+        assert_eq!(
+            session.player_physics(),
+            Some(3),
+            "the stop is a swimming state (PHYS_Swimming)"
+        );
+        let position = session.player_location().expect("player location");
+        assert!(
+            near(position, [-260.9, 738.2, -3121.9], 100.0),
+            "the measured rock-face stop: {position:?}"
+        );
+        let goals = session.objective_states();
+        assert_eq!(goals.len(), 3);
+        assert_eq!(goals[0].text, "");
+        assert!(goals[0].primary && goals[0].anti_goal && goals[0].completed);
+        assert_eq!(goals[1].text, "Infiltrate the SPADS camp.");
+        assert!(goals[1].primary && !goals[1].anti_goal && !goals[1].completed);
+        assert_eq!(goals[2].text, "Avoid being spotted.");
+        assert!(goals[2].primary && goals[2].anti_goal && goals[2].completed);
+        assert!(outcome.travel.is_empty(), "SPADS01 travel remains blocked");
+        let map_info = vm.find_object("Spads0").expect("map info / travel owner");
+        assert_eq!(
+            vm.get_property(map_info, "NextMapLevelWithUnr"),
+            Some(&Value::Str("Spads02a.unr".to_owned()))
+        );
+        let inventory = session.inventory_items();
+        for expected in ["Fists", "Beretta", "Hook"] {
+            assert!(
+                inventory.iter().any(|(name, _)| name == expected),
+                "the map loadout must carry {expected}: {inventory:?}"
+            );
+        }
+    }
 }

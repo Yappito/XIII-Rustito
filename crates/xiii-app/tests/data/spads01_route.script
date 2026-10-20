@@ -1,0 +1,21 @@
+# SPADS01 first input route (item112): the boat insertion, the start dialogue triggers and the
+# swim toward the camp's sewer entrance, stopping at the authored rock face.
+# Spawn: PlayerStart2 (-3938.5903,1118.4583,-1582.3219), box centre z -1612.26. The player
+# steps off the boat's deck into WaterVolume2 (touch at t=0.933) and swims east/south.
+# The route stays east of the searchlight beam: the beam runs from Projo0 (-912.4,178.2,-1792)
+# toward XIIIMover0 (about -1600,152,-2521), and the narrow 0.9987-dot test sees a pawn on the
+# line beyond the mover. A measured control run crossing that line at (-1879,243,-2712) ended
+# the level through the Alarme1/XIIIGoalTrigger2 "Avoid being spotted" anti-goal at t=13.0;
+# this route turns east and never crosses the beam line.
+# The next leg is blocked by the island's rock: the 150-UU player box cannot follow the
+# point-clear underwater corridor (a 123-cell BFS path at z=-2000 with a 0.6 m box runs from
+# (-3300,900) east to (-650,900) and then south through (-650,-1200..-2400)), and the
+# static-rock/pipe collision (`sparock_start`, `spa_embouch`) closes the sewer pipe mouth at
+# the player's height. The 150-UU box is retail in water: Engine.dll `performPhysics` uncrouches
+# when Physics != PHYS_Walking, and `startSwimming`/`physSwimming` never SetCollisionSize.
+# The route stops on the north face, alive, with the objective unfinished.
+# No teleports, grants, goal writes or control overrides.
+t=0.2 goto -3000 800
+t=4 goto 0 600
+t=14 goto 0 700
+t=20 goto off
