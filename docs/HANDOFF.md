@@ -6,7 +6,40 @@ Updated: **2026-10-09 (coordinator session)**. Research phase (2026-10-04), M0, 
 
 State: all verified work is pushed to `origin/main` (`git@github.com:Yappito/XIII-Rustito.git`, `be56145` or later). Tasks that were still running when this was written are listed under "In flight"; check `git worktree list`, `local/logs/` and `local/reports/` for their output before starting anything new. Results are in "Implementation status", the priority list in "Exact next work".
 
-### Coordinator session 2026-10-19 — newest; read first
+### Coordinator session 2026-10-20 — newest; read first
+
+**Everything was stopped at the user's request (2026-10-20 ~14:40).** No agents, landings, timers or watchdog are running.
+`origin/main` = `4a058ae` (last verify 1215 passed). All unfinished work is committed as WIP in its worktree
+(`P:/AI/XIII/local/wt/<name>`, git-ignored); each worktree's `local/reports/` holds the agent's report.
+
+Landed since the 2026-10-19 note: `e27f64c` (PRock04a past the cliff; PRock03 hostage grab by input via `DrawInteractions`;
+the `Landed` dispatch, APawn::processLanded 0x103c1580; PRock03 ward stops before the Cine12-watched Door2 crossing),
+`2f38464` (first SPADS01 route; retail swims at standing height: APawn::performPhysics 0x103c2562 uncrouches non-walking
+pawns), `4a058ae` (PRock04a: TyrolTrigger1 is the first cable in reverse, ridden back west).
+
+**Accepted, NOT landed — land first** (one verify; it was waiting for free commit >= 35 GB):
+| Worktree / branch | Commit | Content |
+|---|---|---|
+| `audio` / `item112d-spads01-hooks` | `1b77540` | SPADS01 through the pipe, HookPoint0 climb, walkway soldier killed, past the sewer gate and the long tunnel to the `spa_tuyautrou` bend. Engine: `XIIIMoverVarTime` mesh swaps (`VarStaticMesh[KeyNum]`, InterpolateTo 0x0112) drop the stale serialized-mesh collision (Partial: the swapped-in mesh has no collision). Agent's route filter 22/22. |
+
+**Stopped mid-task (WIP, needs review before landing):**
+| Worktree / branch | Commit | State |
+|---|---|---|
+| `bsp` / `item110-actorreachable` | `3a66bf2` | Faithful `Controller.actorReachable` (native 520 -> `pawn_actor_reachable`) plus the decoded `walkReachable` / `walkMove` / `ReachedDestination`, `FindJumpUp` / `FindBestJump` / `jumpLanding` (35 UU step-up used in walkMove 0x103b18ca, verified). Route filter 20/22: Hual04a/Hual04c re-driven (decoded `actorReachable(AttackPoint0)` true makes `AttaqueScriptee` take its direct branch); diag/plage01 pins re-measured with causes (AttackPoint reachability true -> false, retail). **Amos01** (death at 330 s) and **PRock04a** (dies in the `Trigger3` explosion at 86.6 s before `TyrolTrigger0`) still fail. Top commit: the last agent's unreviewed probe edits in vm.rs. |
+| `steam` / `item100n-prock01a-obj1` | `efdc0dc` | PRock01a objective 1: decoded (Porte3 sealed by DetectionVolume1; the cines wait for `XIII_devant_bouche_aeration`, TouchTrigger13 in the duct). The route climbs the supply cupboard's crate stack and breaks the vent grille by aimed fire; the crouched crawl through the Model4 window is blocked by a 0.018 UU import-roundoff embed in the sill. Engine: `sweep.rs` touching-SAT boundary rule (retail extent clipper UStaticMesh::LineCheck 0x10402e00 -> 0x104022f9 / 0x10401410) — the top commit holds Z.AI's mid-edit to it and to sim.rs: re-check. |
+| `viewer` / `item103m-prock03-cine12` | `bc37ede` | PRock03 past Cine12 (sight/stealth decode, then arm from MagnumPick0): just started by gpt-6.1-sol, unreviewed. |
+| `fx` / `item108i-prock04a-chain` | `5a9b132` | **Parked.** Player falling/slope physics corrections (blocked air control = zero acceleration, projected vs stored velocity, steep-floor branch) with slope tests; breaks 14 route cases and the landing-speed test. Landing it means re-driving most routes. PRock04a goal 0 is blocked behind it (the sim wedges in the middle terrain the walk engine crosses). |
+
+Other open blockers: PRock04b past the shelf needs PRock04a's loadout (travel chain); SPADS01 beyond the `spa_tuyautrou` bend.
+
+Providers (user, 2026-10-20): OpenCode Go and **two Ollama Cloud** sessions (deepseek-v4.1-flash; OpenCode Go hung at startup
+four times in a row on 2026-10-20 — after two startup hangs move the task elsewhere), Z.AI glm-5.3-flash (5-hour window,
+UTC+8 reset times), the two ChatGPT agents (opencode `openai/gpt-6.1-sol` and Codex CLI `CODEX_MODEL=gpt-6.1-sol
+local/codex-run-model.sh`; Codex ran out of workspace credits at 580k tokens). No Opus/Sonnet subagents. Codex CLI writes CRLF
+and several worktrees have `core.autocrlf=true`: strip CRs before committing. When stopping agents, match `opencode.exe` and
+`xiii_app*` only: `codex.exe` / `codex-*` may be the user's Codex desktop app.
+
+### Coordinator session 2026-10-19
 
 Landed today (each one verify): item107 step 3 (`c8fa761`, retail PickStartPoint + AI door bumps, Hual04a goal 5 and the
 Hual04c travel); item108 (`9d0a6fb`, PRock04a tyrolines, falling no-progress recovery labelled Partial); retail SeePlayer
